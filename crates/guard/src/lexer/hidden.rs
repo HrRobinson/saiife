@@ -2,6 +2,10 @@
 //! `find -exec` runs, what a shell reads from a pipe or a here-string, and a
 //! `trap` action. Each becomes segments of its own, after the segment that
 //! runs it, so every rule judges it, as the body of `bash <<EOF` already is.
+//! A pipe feeds every command of a group it feeds (`| { true; sh; }`), the
+//! commands of a `-c` line (`| bash -c 'sh'`) and what find runs; a shell
+//! reads it as its script with no command, with `-s`, or given a path to
+//! its stdin (`bash /dev/stdin`).
 //! Text a shell runs that the guard cannot read (`echo "$x" | sh`, `curl … |
 //! sh`) is noted (`UNREAD_SCRIPT`): a recorded fail-open, which a caller that
 //! fails closed denies. Literal text is still judged.
@@ -9,10 +13,12 @@
 //! The gates are a pass over each segment's words, with no allocation; the
 //! rest runs only for a segment that has one of these shapes.
 
+use super::FedScript;
 use super::{
     lex_in, printed, strip_leading_keywords, Chars, Ctx, LexTok, Operator, Segment, Word,
     MAX_FRAME_DEPTH, TOO_DEEP,
 };
+use crate::payload::inline_payload;
 use crate::wintable::{unread_shell, without_redirects};
 use crate::wrappers::{effective_command, peeled_wrappers};
 
@@ -36,16 +42,51 @@ pub(super) fn segments(toks: Vec<LexTok>, ctx: &mut Ctx) -> Vec<Segment> {
         segments: Vec::new(),
         traps: Vec::new(),
     };
-    out.collect(toks, ctx, 0);
+    out.collect(toks, ctx, 0, None);
     // A trap action runs when its trap fires: at the latest where the line
     // ends, in the directory the line left it in. Judged there, it is judged
     // with all the directories the line may be in.
     let mut i = 0;
     while let Some((action, depth)) = out.traps.get_mut(i).map(std::mem::take) {
-        out.splice(&action, ctx, depth);
+        out.splice(&action, ctx, depth, None);
         i += 1;
     }
     out.segments
+}
+
+/// Where a command's stdin comes from, when that is a pipe or a here-string.
+#[derive(Clone)]
+enum Source {
+    /// The segment at this index, one simple command, writes the pipe.
+    Segment(usize),
+    /// A here-string's text, and whether the guard can read it.
+    Text(String, bool),
+    /// Something else writes it: a group, a compound command, a pipeline.
+    Unknown,
+}
+
+/// A group (`{ … }`, `( … )`) inside one a pipe feeds: what opened it, the
+/// source every command in it reads, and the `case` commands open in it
+/// (whose patterns end in a `)` that closes no group).
+struct Group {
+    open: Operator,
+    source: Source,
+    cases: usize,
+}
+
+/// How a shell fed by a pipe or a here-string runs it.
+enum Reader {
+    /// As its script: no command, `-s`, or a path to its stdin.
+    Script,
+    /// `-c LINE`, and whether the guard can read the line: the commands of
+    /// the line read that stdin.
+    Inline(String, bool),
+    /// A script path the guard cannot read (`sh "$f"`, `sh /dev/std*`):
+    /// it may be its stdin.
+    Unread,
+    /// A relative script path: whether it is the shell's stdin depends on
+    /// the directory, which the engine resolves (`FedScript`).
+    Relative(String),
 }
 
 struct Out {
@@ -55,57 +96,94 @@ struct Out {
 }
 
 impl Out {
-    /// `toks` as segments, read at `depth`.
-    fn collect(&mut self, toks: Vec<LexTok>, ctx: &mut Ctx, depth: usize) {
+    /// `toks` as segments, read at `depth`. `outer`: every command of the
+    /// line reads this, unless a pipe of its own feeds it (`bash -c 'sh'` fed
+    /// by a pipe).
+    fn collect(&mut self, toks: Vec<LexTok>, ctx: &mut Ctx, depth: usize, outer: Option<Source>) {
         let mut current: Segment = Vec::new();
-        // After a `|`: `Some(source)`, where `source` is the index of the
-        // segment that writes to it when that is one simple command.
-        let mut pipe: Option<Option<usize>> = None;
-        // What `pipe` was when the current segment started.
-        let mut fed: Option<Option<usize>> = None;
+        // After a `|`: what writes it.
+        let mut pipe: Option<Source> = None;
+        // What the current segment reads.
+        let mut fed: Option<Source> = None;
+        // Groups a pipe feeds, innermost last: until each closes, every
+        // command in it reads that pipe. No allocation until a pipe feeds a
+        // group.
+        let mut groups: Vec<Group> = Vec::new();
         for tok in toks {
             match tok {
                 LexTok::Word(w) => {
                     if current.is_empty() {
-                        fed = pipe.take();
+                        fed = pipe
+                            .take()
+                            .or_else(|| groups.last().map(|g| g.source.clone()))
+                            .or_else(|| outer.clone());
+                        if let Some(g) = groups.last_mut().filter(|_| !w.quoted) {
+                            match w.text.as_str() {
+                                "case" => g.cases += 1,
+                                "esac" => g.cases = g.cases.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
                     }
                     current.push(w);
                 }
                 LexTok::Operator(op) => {
                     let ended = !current.is_empty();
-                    let source = if ended {
-                        Some(self.finish(std::mem::take(&mut current), fed.take(), ctx, depth))
-                    } else {
-                        None
-                    };
-                    pipe = match op {
-                        Operator::Pipe => Some(source),
-                        // `|&`, a newline after `|`, and a group the pipe
-                        // feeds (`| (sh)`) leave the pipe open.
-                        Operator::Amp | Operator::Newline | Operator::LParen | Operator::LBrace
-                            if !ended =>
-                        {
-                            pipe
+                    let source = ended.then(|| {
+                        self.finish(std::mem::take(&mut current), fed.take(), ctx, depth, false)
+                    });
+                    match op {
+                        Operator::LParen | Operator::LBrace => {
+                            let feeds = pipe
+                                .take()
+                                .filter(|_| !ended)
+                                .or_else(|| groups.last().map(|g| g.source.clone()));
+                            if let Some(source) = feeds {
+                                groups.push(Group {
+                                    open: op,
+                                    source,
+                                    cases: 0,
+                                });
+                            }
                         }
+                        Operator::RParen | Operator::RBrace => {
+                            let opens = if op == Operator::RParen {
+                                Operator::LParen
+                            } else {
+                                Operator::LBrace
+                            };
+                            if groups.last().is_some_and(|g| {
+                                g.open == opens && (g.cases == 0 || op == Operator::RBrace)
+                            }) {
+                                groups.pop();
+                            }
+                        }
+                        _ => {}
+                    }
+                    pipe = match op {
+                        Operator::Pipe => Some(source.map_or(Source::Unknown, Source::Segment)),
+                        // `|&` and a newline after `|` leave the pipe open.
+                        Operator::Amp | Operator::Newline if !ended => pipe,
                         _ => None,
                     };
                 }
             }
         }
         if !current.is_empty() {
-            self.finish(current, fed, ctx, depth);
+            self.finish(current, fed, ctx, depth, false);
         }
     }
 
-    /// Add `seg`, and after it the command lines it runs. `fed`: it reads a
-    /// pipe (`Some`), written by the segment at that index when that one is a
-    /// simple command. Returns the index of `seg`.
+    /// Add `seg`, and after it the command lines it runs. `fed`: what it
+    /// reads on stdin. `in_find`: it is what a `find` action runs. Returns
+    /// the index of `seg`.
     fn finish(
         &mut self,
         seg: Segment,
-        fed: Option<Option<usize>>,
+        fed: Option<Source>,
         ctx: &mut Ctx,
         depth: usize,
+        in_find: bool,
     ) -> usize {
         let seg = strip_leading_keywords(seg);
         let at = self.segments.len();
@@ -120,33 +198,63 @@ impl Out {
             exec |= is_exec(w);
             trap |= w.text == "trap";
         }
-        // Text a shell reads on stdin: from the here-string, else the pipe.
-        let mut script: Option<Option<(String, bool)>> = None;
-        if (here.is_some() || fed.is_some()) && stdin_shell(&seg) {
-            script = Some(match (here.and_then(|i| seg.get(i)), fed) {
-                (Some(w), _) => Some((w.text.clone(), readable(w))),
-                (None, Some(Some(source))) => {
-                    let src = &self.segments[source];
-                    printed(src).map(|t| (t, src.iter().all(readable)))
-                }
-                (None, _) => None,
-            });
-        }
-        let slices = if exec { find_slices(&seg) } else { Vec::new() };
+        // Its stdin: the here-string, else what fed it.
+        let source = match here.and_then(|i| seg.get(i)) {
+            Some(w) => Some(Source::Text(w.text.clone(), readable(w))),
+            None => fed,
+        };
+        let reader = if source.is_some() {
+            stdin_reader(&seg)
+        } else {
+            None
+        };
+        let slices = if exec {
+            find_slices(&seg, in_find)
+        } else {
+            Vec::new()
+        };
         let action = if trap { trap_action(&seg) } else { None };
+        let mut seg = seg;
+        if let (Some(Reader::Relative(path)), Some(src), Some(first)) =
+            (&reader, &source, seg.first_mut())
+        {
+            let known = self.text_of(src);
+            first.fed_script = Some(Box::new(FedScript {
+                path: path.clone(),
+                readable: known.as_ref().is_some_and(|(_, r)| *r),
+                text: known.map(|(t, _)| t),
+            }));
+        }
         self.segments.push(seg);
-        match script {
-            Some(Some((text, readable))) => {
+        match (reader, &source) {
+            (Some(Reader::Script), Some(src)) => match self.text_of(src) {
+                Some((text, readable)) => {
+                    if !readable {
+                        ctx.note(UNREAD_SCRIPT);
+                    }
+                    self.splice(&text, ctx, depth, None);
+                }
+                None => ctx.note(UNREAD_SCRIPT),
+            },
+            (Some(Reader::Inline(line, readable)), Some(_)) => {
                 if !readable {
                     ctx.note(UNREAD_SCRIPT);
                 }
-                self.splice(&text, ctx, depth);
+                self.splice(&line, ctx, depth, source.clone());
             }
-            Some(None) => ctx.note(UNREAD_SCRIPT),
-            None => {}
+            (Some(Reader::Unread), Some(_)) => ctx.note(UNREAD_SCRIPT),
+            _ => {}
         }
+        // What find runs reads find's stdin.
         for slice in slices {
-            self.finish(slice, None, ctx, depth);
+            if depth + 1 >= MAX_FRAME_DEPTH {
+                ctx.note(TOO_DEEP);
+                break;
+            }
+            if !spend(ctx, slice.iter().map(|w| w.text.len()).sum()) {
+                break;
+            }
+            self.finish(slice, source.clone(), ctx, depth + 1, true);
         }
         if let Some((text, readable)) = action {
             if !readable {
@@ -157,22 +265,46 @@ impl Out {
         at
     }
 
+    /// What `src` writes, when the guard can know it, and whether it is
+    /// readable.
+    fn text_of(&self, src: &Source) -> Option<(String, bool)> {
+        match src {
+            Source::Segment(i) => {
+                let seg = &self.segments[*i];
+                printed(seg).map(|t| (t, seg.iter().all(readable)))
+            }
+            Source::Text(text, readable) => Some((text.clone(), *readable)),
+            Source::Unknown => None,
+        }
+    }
+
     /// Lex `text` as a command line one level below `depth`, and add its
-    /// segments.
-    fn splice(&mut self, text: &str, ctx: &mut Ctx, depth: usize) {
+    /// segments, each reading `outer` unless fed otherwise.
+    fn splice(&mut self, text: &str, ctx: &mut Ctx, depth: usize, outer: Option<Source>) {
         if depth + 1 >= MAX_FRAME_DEPTH {
             ctx.note(TOO_DEEP);
             return;
         }
-        match ctx.hidden_bytes.checked_sub(text.len()) {
-            Some(left) => ctx.hidden_bytes = left,
-            None => {
-                ctx.hidden_spent = true;
-                return;
-            }
+        if !spend(ctx, text.len()) {
+            return;
         }
         let toks = lex_in(&mut Chars::new(text), ctx, depth + 1, false, false, false).toks;
-        self.collect(toks, ctx, depth + 1);
+        self.collect(toks, ctx, depth + 1, outer);
+    }
+}
+
+/// Pay `bytes` from the line's hidden-line bytes; false, and the line is
+/// past its limit, when they are spent.
+fn spend(ctx: &mut Ctx, bytes: usize) -> bool {
+    match ctx.hidden_bytes.checked_sub(bytes) {
+        Some(left) => {
+            ctx.hidden_bytes = left;
+            true
+        }
+        None => {
+            ctx.hidden_spent = true;
+            false
+        }
     }
 }
 
@@ -210,64 +342,172 @@ fn names_this_shell(text: &str) -> bool {
     matches!(text, "$SHELL" | "${SHELL}" | "$BASH" | "${BASH}")
 }
 
-/// `seg` runs a POSIX shell that reads its commands from stdin.
-fn stdin_shell(seg: &[Word]) -> bool {
+/// How `seg` runs its stdin, when it is a POSIX shell that reads it.
+fn stdin_reader(seg: &[Word]) -> Option<Reader> {
     let named = |w: &Word| {
         let base = base_name(&w.text);
         names_this_shell(&w.text) || POSIX_SHELLS.iter().any(|s| base.eq_ignore_ascii_case(s))
     };
     // `xargs` reads the pipe itself, and its command's stdin is /dev/null.
     if !seg.iter().any(named) || peeled_wrappers(seg).iter().any(|w| w == "xargs") {
-        return false;
+        return None;
     }
     let mut argv = without_redirects(effective_command(seg));
-    let Some(first) = argv.first_mut() else {
-        return false;
-    };
+    let first = argv.first_mut()?;
     if names_this_shell(&first.text) {
         first.text = "sh".to_string();
     }
-    let posix = POSIX_SHELLS
-        .iter()
-        .any(|s| base_name(&first.text).eq_ignore_ascii_case(s));
-    posix && unread_shell(&argv).is_some()
+    let name = base_name(&first.text).to_ascii_lowercase();
+    if !POSIX_SHELLS.contains(&name.as_str()) {
+        return None;
+    }
+    if unread_shell(&argv).is_some() {
+        return Some(Reader::Script);
+    }
+    let mut texts: Vec<String> = argv.iter().map(|w| w.text.clone()).collect();
+    texts[0] = name;
+    if let Some(line) = inline_payload(&texts) {
+        let readable = argv.iter().find(|w| w.text == line).is_none_or(readable);
+        return Some(Reader::Inline(line, readable));
+    }
+    // `bash /dev/stdin`, `sh -`: the script is its stdin.
+    let at = 1 + script_operand(&texts[1..])?;
+    let word = &argv[at];
+    match stdin_path(&word.text) {
+        PathKind::Stdin => Some(Reader::Script),
+        // Its value or its glob decides which file it runs.
+        _ if !readable(word) || word.glob => Some(Reader::Unread),
+        PathKind::Unread => Some(Reader::Unread),
+        PathKind::Relative => Some(Reader::Relative(word.text.clone())),
+        PathKind::Other => None,
+    }
 }
 
-/// The commands `find -exec`, `-execdir`, `-ok` and `-okdir` run: the words
-/// after each up to `;`, or `+` right after `{}`. One ends early at the next
-/// such action, which has its own; so each word is in one command at most,
-/// and `find . -exec find . -exec CMD \; \;` judges `CMD`. Find refuses an
-/// action with no end after it: that runs nothing.
-fn find_slices(seg: &[Word]) -> Vec<Segment> {
+/// The index in `args` of a POSIX shell's script operand: its first word
+/// that is no option, the values of `-o`/`-O`/`+o`/`+O`, `--rcfile` and
+/// `--init-file` skipped. A lone `-` is one.
+fn script_operand(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "--" => return (i + 1 < args.len()).then_some(i + 1),
+            "--rcfile" | "--init-file" => i += 1,
+            a if a.starts_with("--") => {}
+            a if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 => {
+                if a[1..].contains(['o', 'O']) {
+                    i += 1;
+                }
+            }
+            _ => return Some(i),
+        }
+        i += 1;
+    }
+    None
+}
+
+/// What a script operand names, read lexically.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PathKind {
+    /// The shell's own stdin: `-`, `/dev/stdin`, `/dev/fd/0`, `/proc/ANY/fd/0`.
+    Stdin,
+    /// Some other file, an ordinary one.
+    Other,
+    /// It may be the shell's stdin and the guard cannot tell: fail closed.
+    Unread,
+    /// A relative path with no `..`: the engine resolves it against the
+    /// directories the shell may be in (`fed_script_in`).
+    Relative,
+}
+
+/// Devices under `/dev/` that are no stdin: a script read from one is
+/// another file (`/dev/null` is empty).
+const PLAIN_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
+
+/// What `path` names, read lexically: repeated `/` collapsed and `.`
+/// dropped. Exactly `-`, `/dev/stdin`, `/dev/fd/0` or `/proc/ANY/fd/0` is
+/// stdin. Anything else that could reach it is `Unread`, not matched by
+/// shape: a `..` anywhere, and any other path under `/proc/` or `/dev/` but
+/// a plain device. A relative path is `Relative`: the directory it starts
+/// from is the engine's. A symlink to stdin is not seen: no file is read.
+fn stdin_path(path: &str) -> PathKind {
+    if path == "-" {
+        return PathKind::Stdin;
+    }
+    let absolute = path.starts_with('/');
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    if parts.contains(&"..") {
+        return PathKind::Unread;
+    }
+    if absolute {
+        return match parts.as_slice() {
+            ["dev", "stdin"] | ["dev", "fd", "0"] | ["proc", _, "fd", "0"] => PathKind::Stdin,
+            ["dev", device] if PLAIN_DEVICES.contains(device) => PathKind::Other,
+            ["dev" | "proc", ..] => PathKind::Unread,
+            _ => PathKind::Other,
+        };
+    }
+    PathKind::Relative
+}
+
+/// A relative script path `path` run from `dir`: `dir` joined to it, read
+/// as an absolute path by `stdin_path`. `dir` that is not a POSIX absolute
+/// path (a Windows one) names no stdin path.
+pub(crate) fn fed_script_in(dir: &str, path: &str) -> PathKind {
+    if !dir.starts_with('/') {
+        return PathKind::Other;
+    }
+    stdin_path(&format!("{dir}/{path}"))
+}
+
+/// A relative script path run from a directory the guard does not know:
+/// fail closed when a component could lead to stdin (`fd`, `dev`, `proc`,
+/// `self`, `thread-self`, `stdin`) or the last one is a descriptor number.
+pub(crate) fn fed_script_may_be_stdin(path: &str) -> bool {
+    let parts = || path.split('/').filter(|p| !p.is_empty() && *p != ".");
+    parts().any(|p| matches!(p, "fd" | "dev" | "proc" | "self" | "thread-self" | "stdin"))
+        || parts()
+            .next_back()
+            .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The commands `find -exec`, `-execdir`, `-ok` and `-okdir` run, as find
+/// reads them: after an action, every word up to the first `;`, or `+` right
+/// after `{}`, words that look like `-exec` too; then the next action. Find
+/// refuses an action with no end, which runs nothing. `in_find`: `seg` is
+/// what an outer find runs, whose end was the outer action's; an inner action
+/// with no end of its own runs to there (`find . -exec find . -exec CMD \;`).
+/// Each word of a line is in one command of each level at most.
+fn find_slices(seg: &[Word], in_find: bool) -> Vec<Segment> {
     let Some((name, args)) = effective_command(seg).split_first() else {
         return Vec::new();
     };
     if !base_name(&name.text).eq_ignore_ascii_case("find") {
         return Vec::new();
     }
-    let ends = |j: usize| {
-        let t = args[j].text.as_str();
-        t == ";" || (t == "+" && j > 0 && args[j - 1].text == "{}")
-    };
-    let Some(last_end) = (0..args.len()).rev().find(|&j| ends(j)) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
     let mut i = 0;
-    while i < last_end {
+    while i < args.len() {
         if !is_exec(&args[i]) {
             i += 1;
             continue;
         }
         let start = i + 1;
-        let mut j = start;
-        while j < args.len() && !ends(j) && !is_exec(&args[j]) {
-            j += 1;
+        let ends = |j: usize| {
+            let t = args[j].text.as_str();
+            t == ";" || (t == "+" && j > start && args[j - 1].text == "{}")
+        };
+        let stop = match (start..args.len()).find(|&j| ends(j)) {
+            Some(j) => j,
+            None if in_find => args.len(),
+            None => break,
+        };
+        if start < stop {
+            out.push(args[start..stop].to_vec());
         }
-        if start < j {
-            out.push(args[start..j].to_vec());
-        }
-        i = j;
+        i = stop + 1;
     }
     out
 }

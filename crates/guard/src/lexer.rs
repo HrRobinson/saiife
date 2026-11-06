@@ -121,6 +121,21 @@ pub struct Word {
     /// `else` or `elif` (`! cd x`, `if cd x`), or a word that may vanish: its `cd`
     /// has directory slots of its own (`engine::ShellState::plain_cwds`).
     pub behind_reserved: bool,
+    /// On a segment's first word: the segment is a POSIX shell fed by a pipe
+    /// or a here-string, whose script is a relative path. Whether that path
+    /// is its stdin depends on the directory, which the engine knows.
+    pub fed_script: Option<Box<FedScript>>,
+}
+
+/// A relative script path a fed shell runs, and what it would read there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedScript {
+    /// The path, as written.
+    pub path: String,
+    /// What the shell reads on stdin, when the guard knows it.
+    pub text: Option<String>,
+    /// That text is readable as it is (no live `$`, no substitution).
+    pub readable: bool,
 }
 
 impl AsRef<str> for Word {
@@ -178,6 +193,7 @@ fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>
 }
 
 mod hidden;
+pub(crate) use hidden::{fed_script_in, fed_script_may_be_stdin, PathKind};
 pub use hidden::{HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT};
 
 /// Shell keywords that only ever *introduce* a real command inside a
@@ -538,6 +554,7 @@ impl Lexer<'_, '_> {
             dq_substitution,
             literal_dollars: !w.live_dollar && !w.has_sub && text_has_dollar,
             behind_reserved: false,
+            fed_script: None,
         };
         // Brace expansion happens before anything else looks at
         // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
@@ -1383,6 +1400,7 @@ fn redirect_tok(text: String) -> LexTok {
         dq_substitution: false,
         literal_dollars: false,
         behind_reserved: false,
+        fed_script: None,
     })
 }
 

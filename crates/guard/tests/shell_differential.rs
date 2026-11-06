@@ -344,7 +344,23 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
     ("echo ${x:-${y:-$(touch ran)}}", true),
     ("echo ${x:-\"$(touch ran)\"}", true),
     ("echo \"${x:-'$(touch ran)'}\"", true),
+    (r"find . -maxdepth 0 -exec sh -c -exec 'touch ran' \;", true),
+    (r"find . -maxdepth 0 -exec env X=-exec touch ran \;", true),
+    ("echo 'touch ran' | { true; sh; }", true),
+    ("echo 'touch ran' | ( case a in a) sh;; esac )", true),
+    ("echo 'touch ran' | bash /dev/stdin", true),
+    ("echo 'touch ran' | sh /proc/self/fd/0", true),
+    ("echo 'touch ran' | sh //dev/stdin", true),
+    ("echo 'touch ran' | sh /dev/./stdin", true),
+    ("echo 'touch ran' | sh /dev/fd//0", true),
+    ("echo 'touch ran' | sh -", true),
+    ("echo 'touch ran' | bash -c 'sh'", true),
+    ("bash -c 'sh' <<< 'touch ran'", true),
+    (r"echo 'touch ran' | find . -maxdepth 0 -exec sh \;", true),
     // These do not.
+    ("echo 'touch ran' | (cat >/dev/null; sh)", false),
+    ("echo 'touch ran' | { cat; }; sh -c 'echo hi'", false),
+    ("echo 'touch ran' | bash -c 'cat'", false),
     (r"find . -maxdepth 0 -exec echo touch ran \;", false),
     ("find . -maxdepth 0 -exec touch ran", false),
     ("echo 'echo touch ran' | sh", false),
@@ -360,8 +376,12 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
 ];
 
 /// A trap for a signal that never comes: its action does not run here, but
-/// it could. Denied, on the safe side.
-const HIDDEN_LINE_OVER_DENIES: &[&str] = &["trap 'touch ran' INT"];
+/// it could. A shell in a group after a command that may read the pipe
+/// first (`cat`): what is left for it is not known. Denied, on the safe side.
+const HIDDEN_LINE_OVER_DENIES: &[&str] = &[
+    "trap 'touch ran' INT",
+    "echo 'touch ran' | (cat >/dev/null; sh)",
+];
 
 #[test]
 fn hidden_lines_match_bash() {

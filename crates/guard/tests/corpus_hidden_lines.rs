@@ -179,7 +179,33 @@ fn find_without_exec_stays_allowed() {
         r"find . -name x -execdir ls {} \;",
         "find . -name -exec",
         r"echo find . -exec rm -rf / \;",
+        "find . -exec grep -l x {} +",
+        r"find . -exec echo -ok {} \;",
     ]);
+}
+
+/// As find reads it: after an action, every word up to the first `;` (or
+/// `+` right after `{}`) is one command, words that look like `-exec` too.
+#[test]
+fn a_find_action_runs_to_its_terminator() {
+    assert_judged_as_inner(&[
+        r"find . -exec sh -c -exec 'CMD' \;",
+        r"find . -exec find . -exec CMD \; \;",
+        r"find . -exec true \; -exec CMD \;",
+    ]);
+    let f = Fixture::new();
+    let e = f.engine();
+    for (line, whole) in [
+        (r"find . -exec sudo -ok rm -rf / \;", "sudo -ok rm -rf /"),
+        (
+            r"find . -exec env X=-exec rm -rf / \;",
+            "env X=-exec rm -rf /",
+        ),
+    ] {
+        let alone = e.evaluate(whole);
+        assert!(alone.is_deny(), "{whole}: {alone:?}");
+        assert_eq!(e.evaluate(line), alone, "{line}");
+    }
 }
 
 // 2. A pipe into a shell: what the shell reads is a command line.
@@ -250,6 +276,119 @@ fn a_pipe_into_anything_else_stays_allowed() {
         // (`corpus_windows_wave`); the Windows engine denies them.
         "echo 'dir' | cmd",
         "echo 'ls' | pwsh",
+    ]);
+}
+
+/// A pipe into a group feeds every command in it until the group closes,
+/// and a shell reads it as a script however it is named: `-s`, a path to
+/// its stdin, or a `-c` line whose commands read it.
+#[test]
+fn a_pipe_into_a_group_or_a_stdin_reader_runs_its_input() {
+    assert_judged_as_inner(&[
+        "echo 'CMD' | { true; sh; }",
+        "echo 'CMD' | (cat >/dev/null; sh)",
+        "echo 'CMD' | { { true; }; sh; }",
+        "echo 'CMD' | ( case a in a) sh;; esac )",
+        "echo 'CMD' | { true | true; sh; }",
+        "echo 'CMD' | bash /dev/stdin",
+        "echo 'CMD' | sh /proc/self/fd/0",
+        "echo 'CMD' | sh /dev/fd/0",
+        "echo 'CMD' | bash -c 'sh'",
+        "echo 'CMD' | bash -c 'true; sh -s'",
+        "echo 'CMD' | sudo bash -c sh",
+        "bash -c 'sh' <<< 'CMD'",
+        r"echo 'CMD' | find . -maxdepth 0 -exec sh \;",
+    ]);
+    assert_unjudged(&[
+        "echo \"$x\" | { true; sh; }",
+        "cat f | (sh)",
+        "cat f | bash /dev/stdin",
+        "cat f | bash -c 'sh'",
+        "echo 'ls' | bash -c \"$y\"",
+    ]);
+}
+
+/// A path to a shell's stdin, however it is spelled: read lexically, then
+/// by its shape (`/dev/stdin`, `/dev/fd/0`, `/proc/ANY/fd/0`, `-`).
+#[test]
+fn a_shell_given_its_stdin_by_any_spelling_runs_it() {
+    assert_judged_as_inner(&[
+        "echo 'CMD' | sh //dev/stdin",
+        "echo 'CMD' | sh /dev/./stdin",
+        "echo 'CMD' | sh /dev/fd//0",
+        "echo 'CMD' | sh /proc/1234/fd/0",
+        "echo 'CMD' | sh /proc/$$/fd/0",
+        "echo 'CMD' | sh -",
+        "echo 'CMD' | sh -x -",
+        "echo 'CMD' | bash -- /dev/stdin",
+    ]);
+    // Fail closed: a path the guard cannot read, one with a `..`, and any
+    // other path under /proc/, /dev/fd/ or /dev/ that is no plain device.
+    assert_unjudged(&[
+        "echo 'ls' | sh \"$script\"",
+        "echo 'ls' | sh $(which x)",
+        "echo 'ls' | sh /dev/std*",
+        "echo 'ls' | sh /../dev/stdin",
+        "echo 'ls' | sh ../../dev/stdin",
+        "echo 'ls' | sh /dev/x/../stdin",
+        "echo 'ls' | sh /proc/self/root/dev/stdin",
+        "echo 'ls' | sh /proc/self/cwd/../../dev/stdin",
+        "echo 'ls' | sh /proc/self/task/1/fd/0",
+        "echo 'ls' | sh /dev/fd/../stdin",
+        "echo 'ls' | sh /dev/fd/3",
+        "echo 'ls' | sh /dev/pts/0",
+    ]);
+    // Relative: resolved against the known working directory, the project.
+    assert_clean(&[
+        "echo 'rm -rf /' | sh dev/stdin",
+        "echo 'rm -rf /' | sh proc/self/fd/0",
+        "echo 'rm -rf /' | sh ./script.sh",
+        "echo 'rm -rf /' | sh ./build.sh",
+        "echo 'rm -rf /' | bash /home/dev/stdin.sh",
+        "echo 'rm -rf /' | sh /dev/null",
+        "cat x | sh scripts/build.sh",
+        "cat x | sh scripts/x.sh",
+    ]);
+}
+
+/// A relative script path is resolved against the directories the guard
+/// tracks for the line, then read as an absolute one. Where the directory
+/// is unknown, a path with a component like `fd`, `dev`, `proc`, `self` or
+/// `stdin`, or ending in digits, fails closed.
+#[test]
+fn a_relative_path_to_stdin_is_resolved_where_the_shell_is() {
+    assert_judged_as_inner(&[
+        "cd /proc/self; echo 'CMD' | sh fd/0",
+        "cd /dev; echo 'CMD' | sh stdin",
+        "cd /dev && echo 'CMD' | sh ./fd/0",
+        "cd /; echo 'CMD' | sh dev/stdin",
+    ]);
+    assert_unjudged(&[
+        "cd \"$d\"; echo 'ls' | sh fd/0",
+        "cd \"$d\"; echo 'ls' | sh stdin",
+        "cd \"$d\"; echo 'ls' | sh x/self/y",
+        "cd \"$d\"; echo 'ls' | sh 0",
+        "cd /proc/self; echo 'ls' | sh fd/3",
+    ]);
+    assert_clean(&[
+        "echo 'rm -rf /' | sh ./build.sh",
+        "echo 'rm -rf /' | sh fd/0",
+        "cd /tmp; echo 'rm -rf /' | sh ./build.sh",
+        "cd \"$d\"; echo 'rm -rf /' | sh ./build.sh",
+    ]);
+}
+
+#[test]
+fn a_group_reading_a_pipe_stays_allowed() {
+    assert_clean(&[
+        "echo hi | { read x; echo \"$x\"; }",
+        "echo hi | (cat; echo done)",
+        "echo 'rm -rf /' | { cat; }; sh -c 'echo hi'",
+        "echo 'rm -rf /' | (grep rm) && (sh -c ls)",
+        "echo 'rm -rf /' | bash -c 'cat'",
+        "echo 'ls' | bash -c 'sh'",
+        "echo 'rm -rf /' | bash /etc/profile",
+        "{ echo a; }; sh -c ls",
     ]);
 }
 
