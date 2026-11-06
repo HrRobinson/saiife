@@ -101,7 +101,7 @@ function Build-Msi {
 }
 
 function Build-Intunewin {
-  if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { Fail "no MSI at $msi: build it first" }
+  if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { Fail "no MSI at ${msi}: build it first" }
   $pin = @{}
   Get-Content -LiteralPath (Join-Path $PSScriptRoot 'intunewin.version') | ForEach-Object {
     if ($_ -match '^([a-z0-9]+)=(.+)$') { $pin[$Matches[1]] = $Matches[2].Trim() }

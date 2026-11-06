@@ -266,10 +266,16 @@ mod tests {
         let c = load(&default_config(&l, &[], false));
         assert_eq!(c.daemon.socket_dir, l.root().join("var/db/saiife-run"));
         // The policy crate's own defaults are this platform's layout values.
+        // Windows has no run dir (`RUN_DIR` has no Windows spelling), so its
+        // socket dir is `WINDOWS_SOCKET_DIR`; Linux and macOS use `RUN_DIR`.
         let sys = Layout::system();
         let d = saiife_policy::system::DaemonCfg::default();
         assert_eq!(d.user, sys.daemon_user());
-        assert_eq!(d.socket_dir, Path::new(sys.logical(RUN_DIR)));
+        let socket_dir = match sys.platform() {
+            Platform::Windows => WINDOWS_SOCKET_DIR,
+            Platform::Linux | Platform::Macos => sys.logical(RUN_DIR),
+        };
+        assert_eq!(d.socket_dir, Path::new(socket_dir));
     }
 
     #[test]
