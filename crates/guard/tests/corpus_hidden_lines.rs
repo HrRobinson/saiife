@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use saiifeguard::builtins::{builtin_packs, Catalog};
+use saiifeguard::builtins::{builtin_packs_for, Catalog};
 use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::Dialects;
@@ -35,17 +35,28 @@ impl Fixture {
         Fixture { _dir: dir, root }
     }
 
-    fn engine(&self) -> Engine {
-        let (packs, warnings) = builtin_packs();
+    /// The engine a POSIX host builds, with the POSIX packs and path style
+    /// named, not taken from the host. `None` on a Windows host: its
+    /// `std::path` does not take the fixture's paths as POSIX ones, so the
+    /// rules could not anchor them, a configuration production never builds
+    /// there. The Windows engine has tests of its own below, on every host.
+    fn engine(&self) -> Option<Engine> {
+        if cfg!(windows) {
+            return None;
+        }
+        let (packs, warnings) = builtin_packs_for(PathStyle::Posix);
         assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-        Engine::new(select_active(packs, &[]))
-            .with_budget(TEST_BUDGET)
-            .with_paths(
-                PathVars::new()
-                    .with_cwd(self.root.join("home/app"))
-                    .with_var("HOME", self.root.join("home"))
-                    .with_var("PROJECT", self.root.join("home/app")),
-            )
+        Some(
+            Engine::new(select_active(packs, &[]))
+                .with_budget(TEST_BUDGET)
+                .with_paths(
+                    PathVars::new()
+                        .with_style(PathStyle::Posix)
+                        .with_cwd(self.root.join("home/app"))
+                        .with_var("HOME", self.root.join("home"))
+                        .with_var("PROJECT", self.root.join("home/app")),
+                ),
+        )
     }
 }
 
@@ -71,7 +82,9 @@ const INNER: &[(&str, &str)] = &[
 /// Every `CMD` must be judged as `CMD` alone is.
 fn assert_judged_as_inner(templates: &[&str]) {
     let f = Fixture::new();
-    let e = f.engine();
+    let Some(e) = f.engine() else {
+        return;
+    };
     let mut misses = Vec::new();
     for t in templates {
         for (inner, pack) in INNER {
@@ -91,7 +104,9 @@ fn assert_judged_as_inner(templates: &[&str]) {
 
 fn assert_deny(cmds: &[&str]) {
     let f = Fixture::new();
-    let e = f.engine();
+    let Some(e) = f.engine() else {
+        return;
+    };
     let wrong: Vec<String> = cmds
         .iter()
         .filter(|c| !e.evaluate(c).is_deny())
@@ -103,7 +118,9 @@ fn assert_deny(cmds: &[&str]) {
 /// Allowed and fully judged: no deny, and nothing recorded as unjudged.
 fn assert_clean(cmds: &[&str]) {
     let f = Fixture::new();
-    let e = f.engine();
+    let Some(e) = f.engine() else {
+        return;
+    };
     let wrong: Vec<String> = cmds
         .iter()
         .filter(|c| {
@@ -123,7 +140,9 @@ fn assert_clean(cmds: &[&str]) {
 /// (locked mode) denies it. The same as any line the guard cannot read.
 fn assert_unjudged(cmds: &[&str]) {
     let f = Fixture::new();
-    let e = f.engine();
+    let Some(e) = f.engine() else {
+        return;
+    };
     let wrong: Vec<String> = cmds
         .iter()
         .filter(|c| {
@@ -194,7 +213,9 @@ fn a_find_action_runs_to_its_terminator() {
         r"find . -exec true \; -exec CMD \;",
     ]);
     let f = Fixture::new();
-    let e = f.engine();
+    let Some(e) = f.engine() else {
+        return;
+    };
     for (line, whole) in [
         (r"find . -exec sudo -ok rm -rf / \;", "sudo -ok rm -rf /"),
         (
@@ -378,6 +399,40 @@ fn a_relative_path_to_stdin_is_resolved_where_the_shell_is() {
     ]);
 }
 
+/// A pipe or a here-string into a compound command feeds every command in
+/// it, until its `fi`, `done` or `esac`, nested ones counted.
+#[test]
+fn a_pipe_into_a_compound_command_feeds_every_command_in_it() {
+    assert_judged_as_inner(&[
+        "echo 'CMD' | if true; then sh; fi",
+        "echo 'CMD' | if false; then :; else sh; fi",
+        "echo 'CMD' | case a in a) sh;; esac",
+        "echo 'CMD' | while true; do sh; break; done",
+        "echo 'CMD' | until false; do sh; break; done",
+        "echo 'CMD' | for i in 1; do sh; done",
+        "echo 'CMD' | select i in 1; do sh; break; done",
+        "echo 'CMD' | if true; then if true; then :; fi; sh; fi",
+        "echo 'CMD' | for i in 1; do for j in 2; do :; done; sh; done",
+        "echo 'CMD' | { if true; then :; fi; sh; }",
+        "echo 'CMD' | ! if true; then sh; fi",
+        "if true; then sh; fi <<< 'CMD'",
+    ]);
+    // A block that never closes: what is in it is still judged as fed, and
+    // the line is recorded as not fully judged.
+    assert_unjudged(&["echo 'ls' | if true; then sh"]);
+}
+
+#[test]
+fn a_compound_command_reading_a_pipe_stays_allowed() {
+    assert_clean(&[
+        "printf '%s\\n' a b | while read l; do echo \"$l\"; done",
+        "echo 'rm -rf /' | if true; then cat; fi",
+        "echo 'rm -rf /' | while read l; do echo \"$l\"; done; sh -c ls",
+        "echo 'rm -rf /' | case a in a) grep rm;; esac",
+        "git ls-files | while read f; do wc -l \"$f\"; done",
+    ]);
+}
+
 #[test]
 fn a_group_reading_a_pipe_stays_allowed() {
     assert_clean(&[
@@ -532,7 +587,9 @@ fn is_too_costly(d: &Decision) -> bool {
 #[test]
 fn nested_hidden_lines_have_a_limit() {
     let f = Fixture::new();
-    let e = f.engine();
+    let Some(e) = f.engine() else {
+        return;
+    };
     let trues = format!("true {}", "a".repeat(200 * 1024));
     // Three levels of 200 KB: 600 KB lexed again, under the limit.
     let under = e.evaluate(&nested_pipes(3, trues.clone()));

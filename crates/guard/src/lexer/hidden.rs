@@ -65,13 +65,48 @@ enum Source {
     Unknown,
 }
 
-/// A group (`{ … }`, `( … )`) inside one a pipe feeds: what opened it, the
-/// source every command in it reads, and the `case` commands open in it
-/// (whose patterns end in a `)` that closes no group).
+/// What opened a frame: a group or a compound command a pipe or a
+/// here-string feeds, closed by `)`, `}`, `fi`, `done` or `esac`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opener {
+    Paren,
+    Brace,
+    If,
+    /// `while`, `until`, `for`, `select`.
+    Loop,
+    Case,
+}
+
+/// A group (`{ … }`, `( … )`) or compound command (`if`, a loop, `case`) a
+/// pipe feeds, or one inside it: what opened it, the source every command in
+/// it reads, and the index of the first segment after it opened. A `case`
+/// pattern's `)` closes no group: a `case` frame is on top then.
 struct Group {
-    open: Operator,
+    open: Opener,
     source: Source,
-    cases: usize,
+    start: usize,
+}
+
+/// A reserved word that opens or closes a compound command, where a command
+/// starts.
+fn compound_word(text: &str) -> Option<(Opener, bool)> {
+    Some(match text {
+        "if" => (Opener::If, true),
+        "while" | "until" | "for" | "select" => (Opener::Loop, true),
+        "case" => (Opener::Case, true),
+        "fi" => (Opener::If, false),
+        "done" => (Opener::Loop, false),
+        "esac" => (Opener::Case, false),
+        _ => return None,
+    })
+}
+
+/// A reserved word after which a command still starts (`then if`, `! while`).
+fn keeps_command_start(text: &str) -> bool {
+    matches!(
+        text,
+        "!" | "time" | "then" | "do" | "else" | "elif" | "if" | "while" | "until"
+    )
 }
 
 /// How a shell fed by a pipe or a here-string runs it.
@@ -100,14 +135,19 @@ impl Out {
     /// line reads this, unless a pipe of its own feeds it (`bash -c 'sh'` fed
     /// by a pipe).
     fn collect(&mut self, toks: Vec<LexTok>, ctx: &mut Ctx, depth: usize, outer: Option<Source>) {
+        let first = self.segments.len();
         let mut current: Segment = Vec::new();
         // After a `|`: what writes it.
         let mut pipe: Option<Source> = None;
         // What the current segment reads.
         let mut fed: Option<Source> = None;
-        // Groups a pipe feeds, innermost last: until each closes, every
+        // The current segment so far is reserved words a command may follow.
+        let mut head = true;
+        // The current segment comes right after a group's `)` or `}`.
+        let mut after_group = false;
+        // Frames a pipe feeds, innermost last: until each closes, every
         // command in it reads that pipe. No allocation until a pipe feeds a
-        // group.
+        // group or a compound command.
         let mut groups: Vec<Group> = Vec::new();
         for tok in toks {
             match tok {
@@ -117,20 +157,45 @@ impl Out {
                             .take()
                             .or_else(|| groups.last().map(|g| g.source.clone()))
                             .or_else(|| outer.clone());
-                        if let Some(g) = groups.last_mut().filter(|_| !w.quoted) {
-                            match w.text.as_str() {
-                                "case" => g.cases += 1,
-                                "esac" => g.cases = g.cases.saturating_sub(1),
-                                _ => {}
+                        head = true;
+                    }
+                    if head && !w.quoted {
+                        match compound_word(&w.text) {
+                            Some((open, true)) => {
+                                if let Some(source) = fed.clone() {
+                                    groups.push(Group {
+                                        open,
+                                        source,
+                                        start: self.segments.len(),
+                                    });
+                                }
                             }
+                            Some((close, false))
+                                if groups.last().is_some_and(|g| g.open == close) =>
+                            {
+                                groups.pop();
+                            }
+                            _ => {}
                         }
                     }
+                    head &= !w.quoted && keeps_command_start(&w.text);
                     current.push(w);
                 }
                 LexTok::Operator(op) => {
                     let ended = !current.is_empty();
                     let source = ended.then(|| {
-                        self.finish(std::mem::take(&mut current), fed.take(), ctx, depth, false)
+                        let seg = std::mem::take(&mut current);
+                        // `fi <<< 'x'`, `} <<< 'x'`: the compound command
+                        // before reads the here-string.
+                        let closes = after_group
+                            || seg.first().is_some_and(|w| {
+                                !w.quoted && matches!(w.text.as_str(), "fi" | "done" | "esac")
+                            });
+                        let at = self.finish(seg, fed.take(), ctx, depth, false);
+                        if closes {
+                            self.compound_here_string(first, at, ctx, depth);
+                        }
+                        at
                     });
                     match op {
                         Operator::LParen | Operator::LBrace => {
@@ -140,26 +205,29 @@ impl Out {
                                 .or_else(|| groups.last().map(|g| g.source.clone()));
                             if let Some(source) = feeds {
                                 groups.push(Group {
-                                    open: op,
+                                    open: if op == Operator::LParen {
+                                        Opener::Paren
+                                    } else {
+                                        Opener::Brace
+                                    },
                                     source,
-                                    cases: 0,
+                                    start: self.segments.len(),
                                 });
                             }
                         }
                         Operator::RParen | Operator::RBrace => {
                             let opens = if op == Operator::RParen {
-                                Operator::LParen
+                                Opener::Paren
                             } else {
-                                Operator::LBrace
+                                Opener::Brace
                             };
-                            if groups.last().is_some_and(|g| {
-                                g.open == opens && (g.cases == 0 || op == Operator::RBrace)
-                            }) {
+                            if groups.last().is_some_and(|g| g.open == opens) {
                                 groups.pop();
                             }
                         }
                         _ => {}
                     }
+                    after_group = matches!(op, Operator::RParen | Operator::RBrace);
                     pipe = match op {
                         Operator::Pipe => Some(source.map_or(Source::Unknown, Source::Segment)),
                         // `|&` and a newline after `|` leave the pipe open.
@@ -170,8 +238,60 @@ impl Out {
             }
         }
         if !current.is_empty() {
-            self.finish(current, fed, ctx, depth, false);
+            let closes = after_group
+                || current.first().is_some_and(|w| {
+                    !w.quoted && matches!(w.text.as_str(), "fi" | "done" | "esac")
+                });
+            let at = self.finish(current, fed, ctx, depth, false);
+            if closes {
+                self.compound_here_string(first, at, ctx, depth);
+            }
         }
+        // A frame that never closed (an unbalanced block): what is in it was
+        // judged as fed, but where the pipe goes is not known.
+        if let Some(open) = groups.first() {
+            let start = open.start.min(self.segments.len());
+            if self.segments[start..]
+                .iter()
+                .any(|s| stdin_reader(s).is_some())
+            {
+                ctx.note(UNREAD_SCRIPT);
+            }
+        }
+    }
+
+    /// The segment at `at` ends a compound command or a group (`fi`, `done`,
+    /// `esac`, after `)` or `}`) and may hold a here-string, which every
+    /// command of it reads. When a shell that reads stdin is among the
+    /// segments of this line since `first`, the here-string is judged as its
+    /// script (an over-approximation: the block's own start is not tracked
+    /// outside a pipe).
+    fn compound_here_string(&mut self, first: usize, at: usize, ctx: &mut Ctx, depth: usize) {
+        let Some(i) = self.segments[at]
+            .iter()
+            .position(|w| w.redirect && w.text.ends_with("<<<"))
+        else {
+            return;
+        };
+        let Some((text, readable)) = self.segments[at]
+            .get(i + 1)
+            .map(|w| (w.text.clone(), readable(w)))
+        else {
+            return;
+        };
+        if !spend(ctx, at - first.min(at)) {
+            return;
+        }
+        if !self.segments[first.min(at)..at]
+            .iter()
+            .any(|s| stdin_reader(s).is_some())
+        {
+            return;
+        }
+        if !readable {
+            ctx.note(UNREAD_SCRIPT);
+        }
+        self.splice(&text, ctx, depth, None);
     }
 
     /// Add `seg`, and after it the command lines it runs. `fed`: what it
