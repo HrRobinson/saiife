@@ -145,7 +145,9 @@ fn open_dir(dir: &Path, owner: &Owner) -> Result<(), String> {
 }
 
 /// Opens `name` in `dir` for appending, creating it when it is not there. Refuses
-/// anything but a regular file, never through a reparse point, owned by `owner`. A hard
+/// anything but a regular file, never through a reparse point, owned by `owner` or a SID
+/// [`saiife_win::sddl::trusted_for`] it (the system's accounts: an elevated admin's new
+/// files are owned by Administrators). A hard
 /// link cannot be counted without a call off the W1 list; [`open_dir`] keeps out anyone
 /// who could plant one.
 #[cfg(windows)]
@@ -167,9 +169,15 @@ fn open_month(dir_path: &Path, name: &str, owner: &Owner) -> Result<std::fs::Fil
     }
     let text = saiife_win::ffi::acl::get_sddl(&path).map_err(what)?;
     let actual = saiife_win::sddl::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    if owner.is_empty() || actual.owner.as_deref() != Some(owner.as_str()) {
+    // The owners the directory's own check trusts: the system's accounts or this daemon. A
+    // file this process creates as an elevated admin is owned by Administrators.
+    let trusted = actual
+        .owner
+        .as_deref()
+        .is_some_and(|o| saiife_win::sddl::trusted_for(o, owner));
+    if owner.is_empty() || !trusted {
         return Err(format!(
-            "{} is owned by {}, not {owner} (a planted file?); refused",
+            "{} is owned by {}, not by {owner} or the system's accounts (a planted file?); refused",
             path.display(),
             actual.owner.as_deref().unwrap_or("nobody"),
         ));
@@ -628,6 +636,120 @@ mod tests {
                 Err(e) => assert!(std::time::Instant::now() < end, "{e:?}"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// Run in CI's `test` job on windows-latest only: no Windows machine builds this crate
+/// locally. The runner is an elevated admin there, so the files it creates are owned by
+/// Administrators.
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+    use saiife_win::ffi::acl;
+
+    fn me() -> String {
+        crate::fsx::own_sid().unwrap()
+    }
+
+    fn line(seq: u64, ts: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"v":1,"seq":{seq},"ts":"{ts}","kind":"guard"}}"#
+        ))
+    }
+
+    /// A target dir only the runner and SYSTEM may use, as `open_dir` wants, in a temp
+    /// root that holds it. Canonical: `set_sddl` compares the path with where the handle
+    /// really is, and the runner's %TEMP% can hold an 8.3 name.
+    fn share() -> (tempfile::TempDir, PathBuf) {
+        let base = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
+        let me = me();
+        let dir = root.path().join("share");
+        let sddl = format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+        acl::create_dir_with_sddl(&dir, &sddl).unwrap();
+        (root, dir)
+    }
+
+    /// The month file is made at the first send and appended to at the next, whichever of
+    /// this process and the system's accounts Windows made its owner.
+    #[tokio::test]
+    async fn the_month_file_is_created_then_appended_to() {
+        let (_root, dir) = share();
+        let t = FileTransport::new(dir.clone(), "h".into());
+        let a = line(1, "2026-10-01T00:00:00.000Z");
+        t.send(std::slice::from_ref(&a)).await.unwrap();
+        let month = dir.join("h-2026-10.jsonl");
+        assert_eq!(std::fs::read(&month).unwrap(), [&a[..], b"\n"].concat());
+        let text = acl::get_sddl(&month).unwrap();
+        let _ = writeln!(std::io::stderr(), "a new month file reads {text}");
+        let b = line(2, "2026-10-02T00:00:00.000Z");
+        t.send(std::slice::from_ref(&b)).await.unwrap();
+        assert_eq!(
+            std::fs::read(&month).unwrap(),
+            [&a[..], b"\n", &b[..], b"\n"].concat()
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    /// A symlink planted as the month file is a reparse point: refused, and its target
+    /// is not written.
+    #[tokio::test]
+    async fn a_reparse_point_month_file_is_refused() {
+        let (root, dir) = share();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"keep\n").unwrap();
+        let planted = dir.join("h-2026-10.jsonl");
+        if let Err(e) = std::os::windows::fs::symlink_file(&elsewhere, &planted) {
+            assert!(
+                std::env::var_os("RUNNER_TEMP").is_none(),
+                "the CI runner should be able to make a link: {e}"
+            );
+            return;
+        }
+        let t = FileTransport::new(dir, "h".into());
+        let err = t
+            .send(&[line(1, "2026-10-01T00:00:00.000Z")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Retry(w) if w.contains("not a regular file")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"keep\n");
+    }
+
+    /// A month file owned by `Users` (no account the dir check trusts) is refused and left
+    /// as it is. Without `SeRestorePrivilege` a token may name as owner only itself or a
+    /// group it holds with the owner attribute (Administrators, elevated): Windows refuses
+    /// `BU` with `ERROR_INVALID_OWNER`, and then only the predicate's refusal of a plain
+    /// owner is testable (saiife-win's `trusted_for_is_the_system_accounts_and_own`).
+    #[tokio::test]
+    async fn a_month_file_owned_by_users_is_refused() {
+        const ERROR_INVALID_OWNER: i32 = 1307;
+        let (_root, dir) = share();
+        let month = dir.join("h-2026-10.jsonl");
+        std::fs::write(&month, b"").unwrap();
+        let me = me();
+        match acl::set_sddl(&month, &format!("O:BUD:P(A;;FA;;;{me})(A;;FA;;;SY)")) {
+            Ok(()) => {
+                let t = FileTransport::new(dir, "h".into());
+                let err = t
+                    .send(&[line(1, "2026-10-01T00:00:00.000Z")])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, SendError::Retry(w) if w.contains("owned by")),
+                    "{err:?}"
+                );
+                assert_eq!(std::fs::read(&month).unwrap(), b"");
+            }
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "BU as owner refused: {e}");
+                assert_eq!(e.raw_os_error(), Some(ERROR_INVALID_OWNER), "{e}");
+            }
         }
     }
 }

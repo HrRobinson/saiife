@@ -415,19 +415,24 @@ const CREATOR_OWNER: &str = "S-1-3-0";
 /// What holds a read right: `FILE_READ_DATA`, `GENERIC_READ`, `GENERIC_ALL`.
 const READ_LIKE: u32 = 0x0000_0001 | 0x8000_0000 | 0x1000_0000;
 
-/// Why `text`, a path's descriptor, is not private to the SID `own`: an owner other than
-/// SYSTEM, Administrators, TrustedInstaller or `own`, or another SID that may write (and,
-/// with `readers_too`, read). `None` when it is private. Text that cannot be read is a
-/// problem, never a pass.
-pub fn private_problem(text: &str, own: &str, readers_too: bool) -> Option<String> {
+/// Whether `sid` may own or change a path private to the SID `own`: SYSTEM,
+/// Administrators, TrustedInstaller, `LA` (how Windows prints the built-in Administrator,
+/// always in Administrators) or `own`. An empty `own` trusts no extra SID.
+pub fn trusted_for(sid: &str, own: &str) -> bool {
     use crate::sid::{ADMINISTRATORS, SYSTEM, TRUSTED_INSTALLER};
+    [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER, LOCAL_ADMIN].contains(&sid)
+        || (!own.is_empty() && sid == own)
+}
+
+/// Why `text`, a path's descriptor, is not private to the SID `own`: an owner other than
+/// one [`trusted_for`] `own`, or another SID that may write (and, with `readers_too`,
+/// read). `None` when it is private. Text that cannot be read is a problem, never a pass.
+pub fn private_problem(text: &str, own: &str, readers_too: bool) -> Option<String> {
     let sd = match parse(text) {
         Ok(sd) => sd,
         Err(e) => return Some(format!("cannot read its descriptor: {e}")),
     };
-    // `LA` is how Windows prints the built-in Administrator, always in Administrators.
-    let trusted =
-        |sid: &str| [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER, LOCAL_ADMIN, own].contains(&sid);
+    let trusted = |sid: &str| trusted_for(sid, own);
     match sd.owner.as_deref() {
         Some(o) if trusted(o) => {}
         Some(o) => return Some(format!("owned by {o}")),
@@ -454,6 +459,27 @@ mod tests {
     use crate::sid::{ADMINISTRATORS, AUTHENTICATED_USERS, SYSTEM, USERS};
 
     const ME: &str = "S-1-5-21-1-2-3-1001";
+
+    /// The owners a private path may have: the system's accounts and `own`, never a
+    /// plain user, `Users` or `Authenticated Users`, and nobody extra for an unknown `own`.
+    #[test]
+    fn trusted_for_is_the_system_accounts_and_own() {
+        for sid in [
+            SYSTEM,
+            ADMINISTRATORS,
+            sid::TRUSTED_INSTALLER,
+            LOCAL_ADMIN,
+            ME,
+        ] {
+            assert!(trusted_for(sid, ME), "{sid}");
+        }
+        for sid in ["S-1-5-21-1-2-3-1002", USERS, AUTHENTICATED_USERS, ""] {
+            assert!(!trusted_for(sid, ME), "{sid}");
+        }
+        assert!(!trusted_for(ME, ""));
+        assert!(!trusted_for("", ""));
+        assert!(trusted_for(SYSTEM, ""));
+    }
 
     #[test]
     fn private_problem_reads_owner_writers_and_readers() {
