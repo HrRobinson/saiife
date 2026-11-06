@@ -405,8 +405,6 @@ enum AuditAction {
 fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
     /// W18: no sandbox for a gateway's children.
     const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
-    /// A command the rest of plan 19b brings: it is not ported in this build.
-    const NOT_YET: &str = "saiife: locked mode is not supported here: this command is not ported to Windows yet. Developer mode works as before.";
     match cmd {
         Cmd::McpSpawn => Some(NO_GATEWAY),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).

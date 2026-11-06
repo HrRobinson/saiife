@@ -1,4 +1,4 @@
-//! Windows: what is not ported yet is refused with one line and exit 2, and
+//! Windows: what cannot run here is refused with one line and exit 2, and
 //! developer mode works. Compiled and run on `windows-latest` only; Linux and
 //! macOS never see this file.
 //!
@@ -13,8 +13,8 @@ use predicates::prelude::*;
 use predicates::str::contains;
 use std::path::Path;
 
-/// The spec's refusal, for what the rest of plan 19b brings. Each task that ports a
-/// command takes its line out of [`locked_commands_refuse_on_windows`].
+/// The spec's refusal for a command not ported yet. Every command is ported now, so the
+/// tests only check that it is absent.
 const REFUSAL: &str = "saiife: locked mode is not supported here: this command is not ported to Windows yet. Developer mode works as before.";
 /// W18.
 const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
@@ -131,14 +131,6 @@ fn a_squatted_pipe_is_w11s_line_and_exit_1() {
 #[test]
 fn locked_commands_refuse_on_windows() {
     let home = tempfile::tempdir().unwrap();
-    let cases: &[&[&str]] = &[];
-    for args in cases {
-        saiife(home.path())
-            .args(*args)
-            .assert()
-            .code(2)
-            .stderr(contains(REFUSAL));
-    }
     // W18 stays: no sandbox for a gateway's children.
     saiife(home.path())
         .args(["__mcp-spawn"])
