@@ -345,9 +345,16 @@ const PERSONAL_LOCK: &str = "broker.lock";
 
 /// Whether the personal broker may run as this token on Windows (Task 11). Never as an
 /// administrator or SYSTEM, whose uid label is 0 and would read as root; never as a
-/// service account, which has no profile or credential store of its own; never as
-/// anonymous or the machine's guest account, which are nobody's own. A debug build's test
-/// pipe runs as the runner, an elevated admin on CI (W23).
+/// service, virtual, AppContainer or other account that is not a person's, which has no
+/// profile or credential store of its own; never as anonymous or the machine's guest
+/// account, which are nobody's own. A debug build's test pipe runs as the runner, an
+/// elevated admin on CI (W23).
+///
+/// The accounts a person signs in with are allow-listed by authority, so an authority
+/// Windows adds later is refused, not let through: a local or domain account
+/// (`S-1-5-21-<domain>-<rid>`) and a Microsoft Entra ID account (`S-1-12-1-…`). Every
+/// virtual account (`S-1-5-80` services, `-82` app pools, `-83` VMs, `-90` window
+/// managers, `-96` font drivers) is outside both.
 ///
 /// With UAC off, or as the built-in Administrator, every token of that user is elevated,
 /// so that user can never run it. This fails closed, and the line says so.
@@ -377,8 +384,12 @@ pub(crate) fn personal_start_problem(sid: &str, elevated: bool, test_pipe: bool)
                 .into(),
         );
     }
-    sid.starts_with("S-1-5-80-")
-        .then(|| format!("the personal broker runs as a user, not the service account {sid}"))
+    let person = saiife_win::sid::valid_sid(sid)
+        && ((sid.starts_with("S-1-5-21-") && sid.split('-').count() == 8)
+            || sid.starts_with("S-1-12-1-"));
+    (!person).then(|| {
+        format!("the personal broker runs as a user, not the service or virtual account {sid}")
+    })
 }
 
 /// The personal broker's pipe name and descriptor: a name per user SID, and a descriptor
@@ -2200,6 +2211,35 @@ mod windows_start_tests {
             personal_start_problem("S-1-5-21-1-2-3-1501", false, false),
             None
         );
+        // A Microsoft Entra ID account is a person's too.
+        assert_eq!(
+            personal_start_problem(
+                "S-1-12-1-1111111111-2222222222-3333333333-444444444",
+                false,
+                false
+            ),
+            None
+        );
+        // Every virtual account, and anything else that is not a person's account, is
+        // refused and named: services, app pools, VMs, window managers, font drivers, an
+        // AppContainer, a well-known group, a malformed or short domain SID.
+        for sid in [
+            "S-1-5-80-1-2-3-4-5",
+            "S-1-5-82-1-2-3-4-5",
+            "S-1-5-83-1-2-3-4-5",
+            "S-1-5-90-0-1",
+            "S-1-5-96-0-1",
+            "S-1-15-2-1-2-3-4-5-6-7",
+            "S-1-5-32-544",
+            "S-1-5-21-1-2-3",
+            "S-1-5-21-1-2-3-4-1001",
+            "S-1-5-21-01-2-3-1001",
+            "not a sid",
+        ] {
+            let why = personal_start_problem(sid, false, false)
+                .unwrap_or_else(|| panic!("{sid} was let through"));
+            assert!(why.contains(sid), "{why}");
+        }
         // An always-elevated user is refused, and the line says why and what to do.
         let why = personal_start_problem(RUNNER, true, false).unwrap();
         assert!(why.contains("elevated") && why.contains("UAC"), "{why}");
