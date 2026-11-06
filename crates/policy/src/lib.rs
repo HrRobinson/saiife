@@ -49,5 +49,6 @@ pub use system::{
 #[cfg(windows)]
 pub use users::FfiAccounts;
 pub use users::{
-    Directory, FixedDirectory, Getent, GroupEntry, UserEntry, WinAccounts, WinDirectory,
+    names_account, Directory, FixedDirectory, Getent, GroupEntry, UserEntry, WinAccounts,
+    WinDirectory,
 };

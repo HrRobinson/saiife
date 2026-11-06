@@ -756,7 +756,8 @@ impl Ctx {
     }
 
     /// Whether a token's groups hold the SID of any of the local groups `names` (W12).
-    /// A name that cannot be resolved matches nothing.
+    /// A name that cannot be resolved matches nothing. With the peer's own SID as
+    /// `token` and user names as `names`, it says whether one of them is the peer.
     pub(crate) async fn token_in_any_group(&self, token: &[String], names: &[String]) -> bool {
         if names.is_empty() {
             return false;

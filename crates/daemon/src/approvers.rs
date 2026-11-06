@@ -88,7 +88,7 @@ pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
                 .get_or_insert_with(|| dir.groups_of(user))
                 .iter()
                 .any(|x| x == g),
-            None => e == user,
+            None => saiife_policy::names_account(dir, e, user),
         })
 }
 

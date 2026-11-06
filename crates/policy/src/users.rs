@@ -43,6 +43,21 @@ pub trait Directory {
     }
 }
 
+/// Whether the policy entry `entry` names the account `name`, the daemon's own lookup
+/// of a peer. On Linux and macOS names are compared as written. On Windows `name` is
+/// the canonical `DOMAIN\name` its SID resolves to, while policy names users as `name`
+/// or `DOMAIN\name` in any case (W12), so a different spelling counts when both
+/// resolve to one SID. A failed lookup matches nothing.
+pub fn names_account(dir: &dyn Directory, entry: &str, name: &str) -> bool {
+    if entry == name {
+        return true;
+    }
+    match (dir.sid_of(entry), dir.sid_of(name)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// NSS lookups through `getent passwd|group` and `id -Gn`. macOS has no
 /// `getent`: there users and groups come from Directory Services through
 /// `getpwnam_r`, `getpwuid_r` and `getgrnam_r`, and `id -Gn` stays.
@@ -528,6 +543,21 @@ mod tests {
         assert_eq!(d.user("nobody"), None);
         // Names may hold spaces and a backslash.
         assert!(d.user(r"ACME\some user").is_some());
+    }
+
+    /// A policy's `alice` names the account Windows calls `HOST\alice`; another SID
+    /// never matches, and neither does a name that does not resolve.
+    #[test]
+    fn names_account_compares_sids_on_windows_and_text_elsewhere() {
+        let d = win_dir();
+        assert!(names_account(&d, "alice", r"HOST\alice"));
+        assert!(names_account(&d, "ALICE", r"HOST\alice"));
+        assert!(names_account(&d, r"HOST\alice", r"HOST\alice"));
+        assert!(!names_account(&d, "alice", r"ACME\some user"));
+        assert!(!names_account(&d, "nobody", r"HOST\alice"));
+        let f = FixedDirectory::from_text("alice:x:1000:1000::/h:/s\n", "");
+        assert!(names_account(&f, "alice", "alice"));
+        assert!(!names_account(&f, "alice", "ALICE"));
     }
 
     #[test]

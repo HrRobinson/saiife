@@ -87,14 +87,24 @@ pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
     let Some(name) = ctx.peer_name(peer).await else {
         return false;
     };
-    // Windows: a `group:` entry matches the token's groups (W12). A later lookup of the
-    // name's groups can only add to that.
-    if peer.sid.is_some() {
-        let wanted: Vec<String> = approvers
+    // Windows: a `group:` entry matches the token's groups, and a user entry the peer's
+    // SID (W12). `name` is the canonical `DOMAIN\name`, which a policy's `approver`
+    // never equals as text. A later lookup of the name's groups can only add to that.
+    if let Some(sid) = peer.sid.as_deref() {
+        let (groups, users): (Vec<&String>, Vec<&String>) =
+            approvers.iter().partition(|a| a.starts_with("group:"));
+        let wanted: Vec<String> = groups
             .iter()
             .filter_map(|a| a.strip_prefix("group:").map(str::to_string))
             .collect();
         if ctx.token_in_any_group(&peer.group_sids, &wanted).await {
+            return true;
+        }
+        let users: Vec<String> = users.into_iter().cloned().collect();
+        if ctx
+            .token_in_any_group(std::slice::from_ref(&sid.to_string()), &users)
+            .await
+        {
             return true;
         }
     }
@@ -2035,6 +2045,139 @@ mod tests {
         assert_eq!(r.state, State::Rejected);
         assert_eq!(r.note.as_deref(), Some(CANCELLED));
         assert_eq!(r.decided_by_sid.as_deref(), Some(A));
+    }
+
+    /// Windows' accounts as the locked-windows CI has them: a policy names `approver`,
+    /// and the daemon's lookup of the pipe peer's SID says `HOST\approver`.
+    struct CiAccounts;
+
+    const AGENT_SID: &str = "S-1-5-21-1-2-3-1003";
+    const APPROVER_SID: &str = "S-1-5-21-1-2-3-1004";
+
+    impl saiife_policy::WinAccounts for CiAccounts {
+        fn lookup_name(&self, name: &str) -> Result<(String, String), String> {
+            let bare = name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(name)
+                .to_ascii_lowercase();
+            match bare.as_str() {
+                "agent" => Ok((AGENT_SID.into(), r"HOST\agent".into())),
+                "approver" => Ok((APPROVER_SID.into(), r"HOST\approver".into())),
+                _ => Err(format!("no account {name}")),
+            }
+        }
+        fn lookup_sid(&self, sid: &str) -> Result<String, String> {
+            match sid {
+                AGENT_SID => Ok(r"HOST\agent".into()),
+                APPROVER_SID => Ok(r"HOST\approver".into()),
+                _ => Err(format!("no SID {sid}")),
+            }
+        }
+        fn local_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
+            Ok(vec!["Users".into()])
+        }
+        fn local_group_members(&self, group: &str) -> Result<Vec<String>, String> {
+            Err(format!("no group {group}"))
+        }
+    }
+
+    fn sid_conn(sid: &str) -> Conn {
+        Conn::new(
+            PeerCred {
+                uid: saiife_win::sid::uid_of(sid, false),
+                gid: 0,
+                pid: 1,
+                sid: Some(sid.into()),
+                group_sids: Vec::new(),
+            },
+            Some(1),
+        )
+    }
+
+    fn windows_ctx(d: &std::path::Path) -> (Arc<Ctx>, std::thread::JoinHandle<()>) {
+        let (mut ctx, join) = crate::ops::test_ctx(d, crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.join("approvals")).unwrap();
+        let c = Arc::get_mut(&mut ctx).unwrap();
+        c.approvals = Ok(store);
+        c.directory = Arc::new(saiife_policy::WinDirectory::new(CiAccounts));
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[approval]\napprovers = [\"approver\"]\nsame_user = \"deny\"\n",
+        )
+        .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            system: Some(Arc::new(cfg)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        (ctx, join)
+    }
+
+    /// locked-windows CI run 9: `approvers = ["approver"]` never matched the daemon's
+    /// `HOST\approver`, so the second account saw no request ("or not yours") and was
+    /// no approver for lockdown. The entry names the account when the SIDs agree.
+    #[tokio::test]
+    async fn a_bare_approver_name_matches_its_windows_account() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = windows_ctx(d.path());
+        let new = NewRequest {
+            uid: saiife_win::sid::uid_of(AGENT_SID, false),
+            sid: Some(AGENT_SID.into()),
+            user: r"HOST\agent".into(),
+            session: None,
+            agent: "claude".into(),
+            project: "/w".into(),
+            kind: ApprovalType::Command,
+            service: None,
+            operation: None,
+            capability: None,
+            params: Default::default(),
+            input: Some("git push --force".into()),
+            grant_key: None,
+            scope: None,
+            ask_rule: None,
+            send: SendDisplay::default(),
+        };
+        let rid = ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .create(new, |_| Ok(None), Duration::from_secs(600), now())
+            .unwrap()
+            .id;
+        assert!(is_approver(&ctx, &sid_conn(APPROVER_SID).peer).await);
+        assert!(!is_approver(&ctx, &sid_conn(AGENT_SID).peer).await);
+        // A reject, as this request carries no grant key; both pass the same checks.
+        let reject = Request {
+            id: 4,
+            op: OP_APPROVAL_DECIDE.into(),
+            args: json!({"request": rid, "action": "reject"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let v = decide(&ctx, &sid_conn(APPROVER_SID), reject).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let r = ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+        assert_eq!(r.state, State::Rejected);
+        assert_eq!(r.decided_by_sid.as_deref(), Some(APPROVER_SID));
+    }
+
+    /// The same run's lockdown half: the approver is an approver, so `lockdown off`
+    /// meets same_user = "deny" (`reauth_required`), not `forbidden`.
+    #[tokio::test]
+    async fn a_bare_approver_name_is_an_approver_for_lockdown() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = windows_ctx(d.path());
+        let off = || Request {
+            id: 5,
+            op: saiife_ipc::msg::OP_LOCKDOWN_SET.into(),
+            args: json!({"on": false}).as_object().unwrap().clone(),
+        };
+        let v = crate::lockdown::set(&ctx, &sid_conn(APPROVER_SID), off()).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v.to_string().contains("reauth_required"), "{v}");
+        let v = crate::lockdown::set(&ctx, &sid_conn(AGENT_SID), off()).await;
+        assert!(v.to_string().contains("[approval] approvers"), "{v}");
     }
 
     /// Bad `auth` hex is a bad request, before anything is looked up.
