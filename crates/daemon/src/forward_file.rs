@@ -10,7 +10,10 @@
 //!   a failing target, retried with backoff.
 //! - The directory is opened without following a symlink (its last
 //!   component) and refused when group or others may write to it, unless it
-//!   has the sticky bit. Month files are opened relative to it (`openat`),
+//!   has the sticky bit. On Windows it is held open so it cannot be renamed,
+//!   its final path must be the one configured (no junction above it), and a
+//!   month file must be in it before it is written. On Unix, month files are
+//!   opened relative to it (`openat`),
 //!   without following a symlink and without blocking on a FIFO, and
 //!   refused unless they are regular files with one link, owned by the
 //!   daemon's user: a file someone planted (a hard link to another file, a
@@ -118,28 +121,62 @@ fn this_month() -> String {
     format!("{:04}-{:02}", now.year(), u8::from(now.month()))
 }
 
-/// The target directory on Windows: no reparse point, and only the system's accounts and
-/// this daemon may write in it. The same rule as on Unix: someone else's file there is
-/// someone else's to plant. There is no sticky bit to look for.
+/// The target directory on Windows, held open: no reparse point, and only the system's
+/// accounts and this daemon may write in it. The same rule as on Unix: someone else's
+/// file there is someone else's to plant. There is no sticky bit to look for.
+///
+/// Windows has no `openat` short of `NtCreateFile`, which is not on the W1 list. So the
+/// directory is held instead, and every check reads that handle, never the path again:
+/// - It is opened without following a reparse point and without `FILE_SHARE_DELETE`, so
+///   while the batch runs nobody can rename or delete it to put another in its place.
+/// - Its final path must be `dir` ([`saiife_win::ffi::acl::refuse_redirect`]): a junction
+///   anywhere above it would show there. So `dir` must be the full, long path.
+/// - Its descriptor is read from the handle.
+///
+/// [`open_month`] then checks that the file it opened is in this directory.
 #[cfg(windows)]
-fn open_dir(dir: &Path, owner: &Owner) -> Result<(), String> {
-    let md = std::fs::symlink_metadata(dir).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => format!(
-            "directory {} does not exist (saiife does not create it)",
-            dir.display()
-        ),
-        _ => format!("{}: {e}", dir.display()),
-    })?;
+fn open_dir(dir: &Path, owner: &Owner) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_LIST_DIRECTORY: u32 = 0x0001;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let held = std::fs::OpenOptions::new()
+        // FILE_LIST_DIRECTORY, not attributes alone: a handle that asks only for those is
+        // left out of the sharing checks, and would keep nobody from renaming the dir.
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "directory {} does not exist (saiife does not create it)",
+                dir.display()
+            ),
+            _ => format!("{}: {e}", dir.display()),
+        })?;
+    let md = held
+        .metadata()
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
     if crate::fsx::is_link(&md) || !md.is_dir() {
         return Err(format!(
             "{} is not a directory (a link is not followed)",
             dir.display()
         ));
     }
+    saiife_win::ffi::acl::refuse_redirect(&held, dir).map_err(|e| {
+        format!(
+            "directory {}: {e} (give its full, long path); refused",
+            dir.display()
+        )
+    })?;
     let text =
-        saiife_win::ffi::acl::get_sddl(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        saiife_win::ffi::acl::get_sddl_of(&held).map_err(|e| format!("{}: {e}", dir.display()))?;
     match saiife_win::sddl::private_problem(&text, owner, false) {
-        None => Ok(()),
+        None => Ok(held),
         Some(why) => Err(format!("directory {}: {why}; refused", dir.display())),
     }
 }
@@ -150,8 +187,19 @@ fn open_dir(dir: &Path, owner: &Owner) -> Result<(), String> {
 /// files are owned by Administrators). A hard
 /// link cannot be counted without a call off the W1 list; [`open_dir`] keeps out anyone
 /// who could plant one.
+///
+/// The open goes by path, so before a byte is written the file must really be
+/// `dir_path\name`, and `held`, the checked directory, must still be at `dir_path`: the
+/// file is then in the directory checked, with no junction on the way. The owner is read
+/// from the opened handle.
 #[cfg(windows)]
-fn open_month(dir_path: &Path, name: &str, owner: &Owner) -> Result<std::fs::File, String> {
+fn open_month(
+    held: &std::fs::File,
+    dir_path: &Path,
+    name: &str,
+    owner: &Owner,
+) -> Result<std::fs::File, String> {
+    use saiife_win::ffi::acl;
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let path = dir_path.join(name);
@@ -167,7 +215,11 @@ fn open_month(dir_path: &Path, name: &str, owner: &Owner) -> Result<std::fs::Fil
     if crate::fsx::is_link(&md) || !md.is_file() {
         return Err(format!("{} is not a regular file; refused", path.display()));
     }
-    let text = saiife_win::ffi::acl::get_sddl(&path).map_err(what)?;
+    let moved = |e: std::io::Error| format!("{}: {e}; refused", path.display());
+    acl::refuse_redirect(&f, &path).map_err(moved)?;
+    acl::refuse_redirect(held, dir_path).map_err(moved)?;
+    // GENERIC_READ, which `read(true)` asks for, holds READ_CONTROL.
+    let text = acl::get_sddl_of(&f).map_err(what)?;
     let actual = saiife_win::sddl::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     // The owners the directory's own check trusts: the system's accounts or this daemon. A
     // file this process creates as an elevated admin is owned by Administrators.
@@ -331,7 +383,7 @@ fn write_batch(dir: &Path, host: &str, owner: &Owner, lines: &[Bytes]) -> Result
     #[cfg(unix)]
     let dfd = open_dir(dir)?;
     #[cfg(windows)]
-    open_dir(dir, owner)?;
+    let held = open_dir(dir, owner)?;
     // Consecutive runs of one month, in order; each file fsynced once.
     let mut month: Option<String> = None;
     let mut runs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -357,7 +409,7 @@ fn write_batch(dir: &Path, host: &str, owner: &Owner, lines: &[Bytes]) -> Result
         #[cfg(unix)]
         let f = open_month(&dfd, dir, &name, *owner)?;
         #[cfg(windows)]
-        let f = open_month(dir, &name, owner)?;
+        let f = open_month(&held, dir, &name, owner)?;
         append(f, &dir.join(&name), &body)?;
     }
     Ok(())
@@ -719,6 +771,37 @@ mod win_tests {
             "{err:?}"
         );
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"keep\n");
+    }
+
+    /// A link above the target dir is followed by a path open, so the dir checked and the
+    /// dir written would be wherever it points: refused by the final path, and nothing is
+    /// written. Then the same dir by its real path delivers.
+    #[tokio::test]
+    async fn a_link_above_the_dir_is_refused() {
+        let (root, dir) = share();
+        let link = root.path().join("link");
+        if let Err(e) = std::os::windows::fs::symlink_dir(root.path(), &link) {
+            assert!(
+                std::env::var_os("RUNNER_TEMP").is_none(),
+                "the CI runner should be able to make a link: {e}"
+            );
+            return;
+        }
+        let t = FileTransport::new(link.join("share"), "h".into());
+        let err = t
+            .send(&[line(1, "2026-10-01T00:00:00.000Z")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Retry(w) if w.contains("full, long path")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let t = FileTransport::new(dir.clone(), "h".into());
+        t.send(&[line(1, "2026-10-01T00:00:00.000Z")])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 
     /// A month file owned by `Users` (no account the dir check trusts) is refused and left

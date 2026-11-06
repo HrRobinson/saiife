@@ -338,13 +338,18 @@ pub fn check_links(attributes: u32, links: u32) -> Result<(), String> {
 /// `expected`, the path that was asked for. A junction anywhere on the way makes them
 /// differ, which a check of the last component cannot see.
 ///
-/// The `\\?\` prefix is not compared, and `/` counts as `\`. Letters compare as ASCII,
+/// The `\\?\` prefix is not compared, a share's `\\?\UNC\server\share` is
+/// `\\server\share`, and `/` counts as `\`. Letters compare as ASCII,
 /// ignoring case: a non-ASCII name in another case is refused, which fails closed, and
 /// the install tree has none. So does an 8.3 short name, since Windows answers with the
 /// long one: canonicalize a path before setting a descriptor on it.
 pub fn same_final_path(expected: &str, actual: &str) -> bool {
     fn plain(p: &str) -> String {
         let p = p.replace('/', r"\");
+        let p = p
+            .strip_prefix(r"\\?\UNC\")
+            .map(|share| format!(r"\\{share}"))
+            .unwrap_or(p);
         let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
         // `C:\` keeps its slash; `C:\a\` loses it.
         match p.strip_suffix('\\') {
@@ -819,6 +824,23 @@ mod tests {
         }
         assert!(same_final_path(r"\\?\D:\a\_temp\x", r"\\?\D:\a\_temp\x"));
         assert!(same_final_path(r"C:\", r"\\?\C:\"));
+        // A share, as Windows gives a handle's path on it back.
+        assert!(same_final_path(
+            r"\\server\share\logs",
+            r"\\?\UNC\server\share\logs"
+        ));
+        assert!(same_final_path(
+            r"\\server\share\logs\h-2026-10.jsonl",
+            r"\\?\UNC\Server\Share\logs\h-2026-10.jsonl"
+        ));
+        for (want, other) in [
+            (r"\\server\share\logs", r"\\?\UNC\server\other\logs"),
+            (r"\\server\share\logs", r"\\?\UNC\elsewhere\share\logs"),
+            (r"\\server\share\logs", r"\\?\C:\server\share\logs"),
+            (r"\\server\share\logs", r"\\?\UNCserver\share\logs"),
+        ] {
+            assert!(!same_final_path(want, other), "{other}");
+        }
         for other in [
             // A junction took it elsewhere.
             r"\\?\C:\Users\agent\planted\etc",

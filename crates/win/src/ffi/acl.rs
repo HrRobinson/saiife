@@ -3,6 +3,10 @@
 //! FFI calls: `GetSecurityInfo`, `SetSecurityInfo`, `GetFileInformationByHandle`,
 //! `GetFinalPathNameByHandleW`, `CreateDirectoryW`.
 //!
+//! `get_sddl_of` and `refuse_redirect` also take a handle the caller opened, so a caller
+//! can check the object it holds rather than a path that may name another by then
+//! (`forward_file`, whole-branch review finding 3).
+//!
 //! The named-path calls follow a reparse point, and between any check and such a call
 //! a writer of the parent could swap one in, and an elevated `set_sddl` would re-ACL its
 //! target. So both functions here open the path itself, without following the last
@@ -85,8 +89,9 @@ fn refuse_hard_links(file: &File, path: &Path) -> io::Result<()> {
 
 /// An error unless `file`, opened as `path`, really is at `path`
 /// ([`sddl::same_final_path`]). The open follows a junction above the last component;
-/// this is what catches one swapped in after the caller checked the chain.
-fn refuse_redirect(file: &File, path: &Path) -> io::Result<()> {
+/// this is what catches one swapped in after the caller checked the chain. So `path` must
+/// be the long, canonical spelling.
+pub fn refuse_redirect(file: &File, path: &Path) -> io::Result<()> {
     let mut buf = vec![0u16; 1024];
     let len = loop {
         // SAFETY: the handle is open and `file` outlives the call; `buf` holds as many
@@ -179,12 +184,18 @@ fn settable(sddl_text: &str) -> io::Result<sd::SecurityDescriptor> {
 
 /// The owner, group and DACL of `path`, as SDDL. A reparse point is an error.
 pub fn get_sddl(path: &Path) -> io::Result<String> {
-    let file = open_no_follow(path, READ_CONTROL)?;
+    get_sddl_of(&open_no_follow(path, READ_CONTROL)?)
+}
+
+/// The owner, group and DACL of the object `file` is open on, as SDDL. The handle needs
+/// `READ_CONTROL` (`GENERIC_READ` has it).
+pub fn get_sddl_of(file: &File) -> io::Result<String> {
     let info = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut raw: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the handle is open with READ_CONTROL and `file` outlives the call. The
-    // owner, group, DACL and SACL out pointers may be null, as `raw` receives the whole
-    // descriptor. On success `raw` is ours to free.
+    // SAFETY: the handle is open and `file` outlives the call; a handle without
+    // READ_CONTROL is an error, not undefined. The owner, group, DACL and SACL out
+    // pointers may be null, as `raw` receives the whole descriptor. On success `raw` is
+    // ours to free.
     let status = unsafe {
         GetSecurityInfo(
             file.as_raw_handle(),
