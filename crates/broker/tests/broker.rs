@@ -262,10 +262,28 @@ fn a_failed_acl_check_refuses_the_manifest() {
     assert!(matches!(r, Err(BrokerError::Manifest(_))));
 }
 
+/// A manifest dir the Windows ACL check accepts: a temp dir inherits the runner temp's
+/// ACL, which lets Users write, so there it is a child with a protected descriptor naming
+/// only this process and SYSTEM. On Unix a plain tempdir.
+fn manifest_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let dir = {
+        let me = saiife_win::ffi::token::current().unwrap().sid;
+        let sddl = format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+        let d = tmp.path().join("m");
+        saiife_win::ffi::acl::create_dir_with_sddl(&d, &sddl).unwrap();
+        d
+    };
+    #[cfg(not(windows))]
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
+}
+
 #[test]
 fn local_manifest_cannot_shadow_builtin() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+    let (_tmp, dir) = manifest_dir();
+    let dir = dir.as_path();
     std::fs::write(dir.join("echo.toml"), ECHO).unwrap();
     let uid = own_uid(dir);
     let fake_builtin = vec![echo()];

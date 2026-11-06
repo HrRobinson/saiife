@@ -1145,18 +1145,18 @@ mod tests {
     }
 
     struct Env {
-        t: tempfile::TempDir,
+        t: crate::fsx::TestDir,
         store: Store,
     }
 
     fn env() -> Env {
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::fsx::TestDir::new();
         let store = Store::open(&dir_in(t.path())).unwrap();
         Env { t, store }
     }
 
     #[cfg(unix)]
-    fn vault(t: &tempfile::TempDir) -> Shared {
+    fn vault(t: &crate::fsx::TestDir) -> Shared {
         let key = t.path().join("vault-key");
         std::fs::write(&key, [7u8; 32]).unwrap();
         // The key is the daemon's own and private (macOS checks it).

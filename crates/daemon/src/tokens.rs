@@ -393,7 +393,7 @@ mod tests {
         Arc::new(move || at.load(Ordering::SeqCst))
     }
 
-    fn scratch() -> tempfile::TempDir {
+    fn scratch() -> crate::fsx::TestDir {
         let base = std::env::var_os("SAIIFE_TEST_TMP")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -403,7 +403,7 @@ mod tests {
                 ))
             });
         std::fs::create_dir_all(&base).unwrap();
-        tempfile::tempdir_in(base).unwrap()
+        crate::fsx::TestDir::new_in(&base)
     }
 
     #[test]

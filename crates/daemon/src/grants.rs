@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn revoke_drops_the_grant() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         let (g, _) = Grants::open(p.clone(), t0());
         g.insert(key(UID, CMD), 42, t0() + ttl()).unwrap();
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn grants_survive_restart() {
         use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         let (g, why) = Grants::open(p.clone(), t0());
         assert!(why.is_none() && g.is_empty());
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn unreadable_file_is_no_grants() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"{not json").unwrap();
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn unsafe_dir_is_no_grants() {
         use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         let (g, _) = Grants::open(p.clone(), t0());
         g.insert(key(UID, CMD), 42, t0() + ttl()).unwrap();

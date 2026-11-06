@@ -108,6 +108,44 @@ pub(crate) fn check_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// A scratch dir the daemon's private-dir checks accept, for tests. On Unix it is a
+/// plain tempdir (`check_dir` sets 0700). On Windows a temp dir inherits the runner
+/// temp's ACL, which lets Users write, so the dir is a child made with a protected
+/// descriptor naming only this process and SYSTEM, as W14 gives the service's state.
+#[cfg(test)]
+pub(crate) struct TestDir {
+    _root: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl TestDir {
+    /// A private scratch dir in the system temp dir.
+    pub(crate) fn new() -> TestDir {
+        TestDir::new_in(&std::env::temp_dir())
+    }
+
+    /// A private scratch dir in `base`.
+    pub(crate) fn new_in(base: &Path) -> TestDir {
+        let root = tempfile::tempdir_in(base).unwrap();
+        #[cfg(windows)]
+        let path = {
+            let me = own_sid().unwrap();
+            let sddl = format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+            let p = root.path().join("t");
+            saiife_win::ffi::acl::create_dir_with_sddl(&p, &sddl).unwrap();
+            p
+        };
+        #[cfg(not(windows))]
+        let path = root.path().to_path_buf();
+        TestDir { _root: root, path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

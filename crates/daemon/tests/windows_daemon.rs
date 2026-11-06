@@ -291,9 +291,14 @@ fn http(
     let mut s = std::net::TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let mut head = format!(
-        "{method} {uri} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {uri} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
+    // The listener's own name and port, as gateway.rs's tests send: a `Host` without the
+    // port is browser-like (DNS rebinding) and refused with 403 before the token is read.
+    if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")) {
+        head.push_str(&format!("Host: 127.0.0.1:{}\r\n", addr.port()));
+    }
     for (n, v) in headers {
         head.push_str(&format!("{n}: {v}\r\n"));
     }
@@ -705,5 +710,10 @@ fn a_restart_keeps_the_chain() {
         tx.send(Control::Stop).unwrap();
         assert_eq!(join.join().unwrap(), 0);
     }
-    assert_eq!(audit_text(&t.audit).matches("\"stop\"").count(), 2);
+    // A stop record says `stop` twice (its `tool`/`input` and its `event`): count records.
+    let stops = records(&t.audit, "daemon")
+        .into_iter()
+        .filter(|r| r["event"] == "stop")
+        .count();
+    assert_eq!(stops, 2);
 }
