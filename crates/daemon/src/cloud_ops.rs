@@ -159,10 +159,9 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             if let Err(code) = crate::disk::disk_gate(
                 free.unwrap_or(0),
                 ctx.policy().min_free_mb,
-                peer.uid,
-                ctx.own_uid,
+                ctx.peer_is_own(peer),
             ) {
-                ctx.notice(peer.uid, Notice::LowDisk);
+                ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
                 return err(id, code, "the audit volume is below [audit] min_free_mb");
             }
             decide(
@@ -179,7 +178,8 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     };
     let mut r = ctx.record("secret", &format!("cloud_lease {service} {exe}"));
     r.uid = Some(peer.uid);
-    r.user = ctx.name_of(peer.uid).await;
+    r.sid = peer.sid.clone();
+    r.user = ctx.peer_name(peer).await;
     r.extra.insert("event".into(), "cloud_lease".into());
     r.extra.insert("service".into(), service.clone().into());
     r.extra.insert("exe".into(), exe.clone().into());
@@ -266,10 +266,17 @@ async fn decide(
     // for `api.call`: the scope's in locked mode (a client `env` ignored);
     // the project `env` for the personal broker, an undefined one the base
     // config with a warning.
-    let Some(user) = ctx.name_of(peer.uid).await else {
+    let Some(user) = ctx.peer_name(peer).await else {
         return Err(deny("no_scope", "the caller has no user name"));
     };
-    let groups = Groups(ctx.groups_of(&user).await);
+    let groups = Groups::of(
+        ctx,
+        g,
+        &user,
+        peer.sid.as_deref(),
+        ctx.groups_of(&user).await,
+    )
+    .await;
     let (env_name, warning) = g
         .select_env(gateway_mode(ctx), &groups, &user, project_env)
         .map_err(|rule| deny(rule, "the caller's environment has no policy"))?;
@@ -339,8 +346,8 @@ async fn decide(
             "the limits could not be rebuilt",
         ));
     }
-    let session_of =
-        agent_ancestor(ctx.proc.as_ref(), peer.pid).and_then(|a| ctx.sessions.lookup(a));
+    let session_of = agent_ancestor(ctx.proc.as_ref(), peer.pid)
+        .and_then(|a| ctx.sessions.lookup_as(peer.sid.as_deref(), a));
     // The record carries it, so a restart rebuilds the same bucket.
     facts.agent_session.clone_from(&session_of);
     let key = Key {
@@ -454,7 +461,7 @@ fn check_cloud_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -37,6 +37,9 @@ pub enum FileKind {
     Managed,
     /// The polkit action file (`com.saiife.approve`).
     Polkit,
+    /// The Windows service: `path` is its name and `sha256` the fingerprint of its
+    /// spec (W10). No file is behind it, so nothing removes it by path.
+    Service,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +228,25 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
+
+    /// The service is on the list by its name, with its spec's fingerprint (W10).
+    #[test]
+    fn installed_toml_service_kind_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installed.toml");
+        let mut i = sample();
+        i.files.push(InstalledFile {
+            path: "saiifed".into(),
+            sha256: Some("bb".repeat(32)),
+            kind: FileKind::Service,
+            created: true,
+        });
+        write_installed(&path, &i).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("kind = \"service\""));
+        assert_eq!(read_installed(&path).unwrap(), Some(i));
+    }
 
     fn sample() -> Installed {
         Installed {

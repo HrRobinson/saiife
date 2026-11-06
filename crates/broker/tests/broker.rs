@@ -227,16 +227,63 @@ fn own_uid(dir: &std::path::Path) -> u32 {
     std::fs::metadata(dir).unwrap().uid()
 }
 
-// Windows has no uid; the manifest loader ignores the owner there (19a).
+// Windows has no uid. Anything but 0 lets this process's own SID own the manifests.
 #[cfg(not(unix))]
 fn own_uid(_dir: &std::path::Path) -> u32 {
-    0
+    1
+}
+
+/// A manifest with a writer it shouldn't have is refused by name, for the directory or the
+/// file, before it is parsed. On Windows this is the descriptor, which a moved file keeps.
+#[test]
+fn a_failed_acl_check_refuses_the_manifest() {
+    use saiife_broker::manifest::load_local_checked;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("a.toml"), ECHO).unwrap();
+    std::fs::write(dir.join("bad.toml"), "not a manifest").unwrap();
+    let uid = own_uid(dir);
+    let loose = dir.join("bad.toml");
+    let r = load_local_checked(dir, &[], uid, &|p| {
+        (p != loose)
+            .then_some(())
+            .ok_or_else(|| "S-1-5-32-545 may write it".to_string())
+    });
+    match r {
+        Err(BrokerError::Manifest(m)) => {
+            assert!(m.contains("bad.toml"), "{m}");
+            assert!(m.contains("S-1-5-32-545"), "{m}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let r = load_local_checked(dir, &[], uid, &|p| {
+        (p != dir).then_some(()).ok_or_else(|| "loose".to_string())
+    });
+    assert!(matches!(r, Err(BrokerError::Manifest(_))));
+}
+
+/// A manifest dir the Windows ACL check accepts: a temp dir inherits the runner temp's
+/// ACL, which lets Users write, so there it is a child with a protected descriptor naming
+/// only this process and SYSTEM. On Unix a plain tempdir.
+fn manifest_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let dir = {
+        let me = saiife_win::ffi::token::current().unwrap().sid;
+        let sddl = format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+        let d = tmp.path().join("m");
+        saiife_win::ffi::acl::create_dir_with_sddl(&d, &sddl).unwrap();
+        d
+    };
+    #[cfg(not(windows))]
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 #[test]
 fn local_manifest_cannot_shadow_builtin() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+    let (_tmp, dir) = manifest_dir();
+    let dir = dir.as_path();
     std::fs::write(dir.join("echo.toml"), ECHO).unwrap();
     let uid = own_uid(dir);
     let fake_builtin = vec![echo()];
@@ -245,8 +292,8 @@ fn local_manifest_cannot_shadow_builtin() {
     // Without the clash it loads.
     let ok = load_local_with(dir, &[], uid).unwrap();
     assert_eq!(ok.len(), 1);
-    // A file not owned by the required uid is refused (Unix only: the Windows
-    // loader has no owner check until plan 19b adds the DACL one).
+    // A file not owned by the required uid is refused (Unix: on Windows the uid is no
+    // owner, and `a_failed_acl_check_refuses_the_manifest` covers the descriptor).
     #[cfg(unix)]
     {
         let r = load_local_with(dir, &[], uid + 1);

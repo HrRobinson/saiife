@@ -1,7 +1,6 @@
 //! Directory lookups in the daemon fail closed: a failed group lookup is
 //! never cached as "no groups", and `policy.show` answers an error rather
 //! than a policy without the user's environment.
-#![cfg(unix)]
 
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::ops::{Ctx, CtxInit, PolicyState};
@@ -112,6 +111,8 @@ fn alice() -> PeerCred {
         uid: 4242,
         gid: 4242,
         pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
     }
 }
 

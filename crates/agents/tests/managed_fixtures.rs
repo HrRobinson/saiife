@@ -166,7 +166,7 @@ fn codex_fresh_file_matches_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("requirements.toml");
     assert!(matches!(
-        codex::install_managed(&f).unwrap(),
+        codex::install_managed_for(&f, false).unwrap(),
         Change::Created { .. }
     ));
     let got = fs::read_to_string(&f).unwrap();
@@ -182,7 +182,7 @@ fn gemini_fresh_file_matches_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("settings.json");
     assert!(matches!(
-        gemini::install_managed(&f).unwrap(),
+        gemini::install_managed_for(&f, false).unwrap(),
         Change::Created { .. }
     ));
     assert_eq!(json_file(&f), json("gemini/settings.json"));
@@ -206,7 +206,10 @@ fn codex_requirements_keeps_admin_entries() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("requirements.toml");
     fs::write(&f, ADMIN_CODEX).unwrap();
-    assert_eq!(codex::install_managed(&f).unwrap(), Change::Updated);
+    assert_eq!(
+        codex::install_managed_for(&f, false).unwrap(),
+        Change::Updated
+    );
     let text = fs::read_to_string(&f).unwrap();
     assert!(text.starts_with("# company policy\n"), "{text}");
     let d = text.parse::<DocumentMut>().unwrap();
@@ -290,7 +293,10 @@ fn gemini_settings_keeps_admin_entries() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("settings.json");
     fs::write(&f, ADMIN_GEMINI).unwrap();
-    assert_eq!(gemini::install_managed(&f).unwrap(), Change::Updated);
+    assert_eq!(
+        gemini::install_managed_for(&f, false).unwrap(),
+        Change::Updated
+    );
     let v = json_file(&f);
     assert_eq!(v["general"]["vimMode"], true);
     let groups = v["hooks"]["BeforeTool"].as_array().unwrap();
@@ -459,4 +465,95 @@ fn codex_inline_features_keeps_the_admin_comment() {
     );
     assert!(back.contains("} # company default"), "{back}");
     assert!(!back.contains("saiife"), "{back}");
+}
+
+// ------------------------------------------------ Windows managed hooks (19b)
+
+const WIN_BIN: &str = "C:/ProgramData/saiife/bin/saiife.exe";
+
+/// The Linux fixture with the binary path swapped: the Windows files differ
+/// in the command only.
+fn win_of(fixture: &str) -> String {
+    read(fixture).replace("/opt/saiife/bin/saiife ", &format!("{WIN_BIN} "))
+}
+
+#[test]
+fn linux_managed_files_unchanged() {
+    assert_eq!(
+        claude::managed_settings_for(false),
+        read("claude/50-saiife.json")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("requirements.toml");
+    let g = dir.path().join("settings.json");
+    codex::install_managed_for(&c, false).unwrap();
+    gemini::install_managed_for(&g, false).unwrap();
+    assert!(toml_eq(
+        &fs::read_to_string(&c).unwrap(),
+        &read("codex/requirements.toml")
+    ));
+    assert_eq!(json_file(&g), json("gemini/settings.json"));
+    // The default entry point is the Linux one off Windows.
+    #[cfg(not(windows))]
+    assert_eq!(
+        claude::managed_settings(),
+        claude::managed_settings_for(false)
+    );
+}
+
+#[test]
+fn windows_claude_dropin_golden() {
+    let got = claude::managed_settings_for(true);
+    assert_eq!(got, win_of("claude/50-saiife.json"));
+    assert!(got.contains(WIN_BIN));
+}
+
+#[test]
+fn windows_codex_requirements_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("requirements.toml");
+    codex::install_managed_for(&f, true).unwrap();
+    let got = fs::read_to_string(&f).unwrap();
+    assert!(
+        toml_eq(&got, &win_of("codex/requirements.toml")),
+        "got:\n{got}"
+    );
+    assert!(!got.contains("command_windows"), "{got}");
+    assert!(got.contains(&format!(
+        "command = \"{WIN_BIN} check --managed --hook-exit --agent codex\""
+    )));
+    assert_eq!(
+        codex::install_managed_for(&f, true).unwrap(),
+        Change::Unchanged
+    );
+    // Switching platform replaces the entry; it never adds a second.
+    assert_eq!(
+        codex::install_managed_for(&f, false).unwrap(),
+        Change::Updated
+    );
+    assert_eq!(
+        fs::read_to_string(&f)
+            .unwrap()
+            .matches("[[hooks.PreToolUse]]")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn windows_gemini_settings_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    gemini::install_managed_for(&f, true).unwrap();
+    let want: Value = serde_json::from_str(&win_of("gemini/settings.json")).unwrap();
+    assert_eq!(json_file(&f), want);
+    assert_eq!(
+        gemini::install_managed_for(&f, true).unwrap(),
+        Change::Unchanged
+    );
+    assert_eq!(
+        gemini::install_managed_for(&f, false).unwrap(),
+        Change::Updated
+    );
+    assert_eq!(json_file(&f), json("gemini/settings.json"));
 }

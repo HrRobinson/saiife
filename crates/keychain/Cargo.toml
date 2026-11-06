@@ -18,6 +18,10 @@ zeroize = "=1.9.1"
 # Already in Cargo.lock; geteuid for the test dir's owner check.
 rustix = { version = "1", features = ["process"] }
 
+[target.'cfg(windows)'.dependencies]
+# Credential Manager: the one FFI boundary on Windows is saiife-win's (this crate stays safe).
+saiife-win = { path = "../win" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Secret Service over D-Bus in pure Rust (no libdbus): zbus 5.19.0 is from
 # 2026-08-09; 6.x is newer than the 14-day rule allows. tokio is already in

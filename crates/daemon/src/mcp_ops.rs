@@ -74,6 +74,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 /// One `mcp.call` after step 1.
 pub struct McpCall {
     pub uid: u32,
+    /// Windows: the caller's SID, the identity behind `uid`. `None` elsewhere.
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub project: String,
@@ -106,6 +108,9 @@ impl std::fmt::Debug for McpCall {
 #[serde(deny_unknown_fields)]
 pub struct StoredMcpCall {
     pub uid: u32,
+    /// Windows: the caller's SID, the identity behind `uid`. Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub project: String,
@@ -144,6 +149,7 @@ impl StoredMcpCall {
     pub fn call(&self) -> McpCall {
         McpCall {
             uid: self.uid,
+            sid: self.sid.clone(),
             user: self.user.clone(),
             session: self.session.clone(),
             project: self.project.clone(),
@@ -289,6 +295,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<McpCall, &'static 
     };
     Ok(McpCall {
         uid: 0,
+        sid: None,
         user: String::new(),
         session: None,
         project,
@@ -661,6 +668,7 @@ async fn steps(
         let pending = PendingMcp {
             stored: StoredMcpCall {
                 uid: call.uid,
+                sid: call.sid.clone(),
                 user: call.user.clone(),
                 session: call.session.clone(),
                 project: call.project.clone(),
@@ -867,6 +875,7 @@ pub fn mcp_record(
     );
     r.kind = Some("connector".into());
     r.uid = Some(call.uid);
+    r.sid = call.sid.clone();
     r.user = Some(call.user.clone());
     let e = &mut r.extra;
     e.insert("service".into(), service.into());
@@ -899,7 +908,7 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Err(m) => return bad(id, m),
     };
     let tools = Arc::clone(&ctx.tool_caller);
-    match execute(ctx, tools.as_ref(), &Caller::Unix(*peer), call).await {
+    match execute(ctx, tools.as_ref(), &Caller::Unix(peer.clone()), call).await {
         Ok(outcome) => answer(id, outcome),
         Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
         Err(Refused::Unrecorded(m)) => err(id, ErrorCode::Internal, &m),
@@ -919,20 +928,24 @@ pub(crate) async fn execute(
     let _busy = ctx.calls.enter();
     // 2. Disk gate: a call that cannot be recorded is not made.
     let uid = caller.uid();
-    if let Err(code) = api_ops::disk_ok(ctx, uid) {
-        ctx.notice(uid, Notice::LowDisk);
+    if let Err(code) = api_ops::disk_ok(ctx, uid, caller.sid()) {
+        ctx.notice_sid(uid, caller.sid(), Notice::LowDisk);
         return Err(Refused::LowDisk(code));
     }
     // 1. Identify.
     let mut who = Identity::default();
     api_ops::identify(ctx, caller, &mut who).await;
     call.uid = who.uid;
+    call.sid = who.sid;
     call.user = who.user;
     call.session = who.session;
     let agent = who.agent;
-    let groups = Groups(who.groups);
 
     let state = ctx.policy();
+    let groups = match &state.gateway {
+        Some(g) => Groups::of(ctx, g, &call.user, call.sid.as_deref(), who.groups).await,
+        None => Groups::plain(who.groups),
+    };
     let (outcome, trace, gw, env_name) = match &state.gateway {
         Some(g) => match g.select_env(api_ops::gateway_mode(ctx), &groups, &call.user, None) {
             Ok((env_name, _)) => {
@@ -1019,7 +1032,7 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(o) => o,
         Err(m) => return bad(id, m),
     };
-    let servers = servers_for(ctx, ctx.tool_caller.as_ref(), peer.uid, &overlays).await;
+    let servers = servers_for(ctx, ctx.tool_caller.as_ref(), peer, &overlays).await;
     let servers = Value::Array(servers);
     let tools_hash = format!(
         "sha256:{}",
@@ -1033,19 +1046,26 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     ok(id, m)
 }
 
-/// The servers of `uid`'s scope and their listed tools (see [`list`]).
+/// The servers of the peer's scope and their listed tools (see [`list`]).
 pub(crate) async fn servers_for(
     ctx: &Arc<Ctx>,
     tools: &dyn ToolCaller,
-    uid: u32,
+    peer: &PeerCred,
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let state = ctx.policy();
-    let (Some(g), Some(user)) = (&state.gateway, ctx.name_of(uid).await) else {
+    let (Some(g), Some(user)) = (&state.gateway, ctx.peer_name(peer).await) else {
         return out;
     };
-    let groups = Groups(ctx.groups_of(&user).await);
+    let groups = Groups::of(
+        ctx,
+        g,
+        &user,
+        peer.sid.as_deref(),
+        ctx.groups_of(&user).await,
+    )
+    .await;
     let Ok((env, _)) = g.select_env(api_ops::gateway_mode(ctx), &groups, &user, None) else {
         return out;
     };

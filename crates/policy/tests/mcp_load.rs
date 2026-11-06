@@ -138,13 +138,29 @@ fn no_mcp_hash_is_unchanged() {
     let v = saiife_policy::effective_policy(&p.config, &[], None, None);
     // Same value on main (1c975b5) for this config. macOS has its own
     // daemon defaults in the effective policy: the value a macOS runner
-    // computed.
-    let want = if cfg!(target_os = "macos") {
+    // computed. Windows too, whose audit dir differs as well (CI run 41998930399).
+    let want = if cfg!(windows) {
+        WINDOWS_NO_MCP_HASH
+    } else if cfg!(target_os = "macos") {
         "sha256:0b3a35a173f8cdbc4ccf57ad4975654be086498b2ef2ccceeb00176a12bcdabf"
     } else {
         "sha256:2865f5d87de5b97228c121d4ee0cd5b8c78b75ba2b1f06486c39823035848892"
     };
     assert_eq!(saiife_policy::policy_hash(&v), want);
+}
+
+const WINDOWS_NO_MCP_HASH: &str =
+    "sha256:58783fd32018cbb3766dc6c5f94beb6b8f2f2fd9770b63cee853b510542f0434";
+
+/// The Windows pin, off Windows: its defaults on this OS's config give that very hash.
+#[test]
+fn windows_no_mcp_hash_differs_by_the_platform_defaults_alone() {
+    let (_d, cfg) = etc(LOCKED, &[]);
+    let mut c = load_system(&cfg).unwrap().config;
+    c.daemon = saiife_policy::DaemonCfg::windows_default();
+    c.audit.dir = std::path::PathBuf::from(saiife_policy::system::WINDOWS_AUDIT_DIR);
+    let v = saiife_policy::effective_policy(&c, &[], None, None);
+    assert_eq!(saiife_policy::policy_hash(&v), WINDOWS_NO_MCP_HASH);
 }
 
 /// Plan 17 is silent on environments, so `[mcp.*]` is not overridable there:

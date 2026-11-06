@@ -731,7 +731,7 @@ async fn refresh_failed(ctx: &Arc<Ctx>, w: &Want<'_>, what: &str, reason: String
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -7,11 +7,13 @@ use crate::layout::{
     Layout, AUDIT_GROUP, DAEMON_GROUP, DAEMON_USER, MACOS_AUDIT_GROUP, MACOS_DAEMON_GROUP,
     MACOS_DAEMON_USER,
 };
+use crate::winservice::{ServiceOp, ServiceSpec, ServiceState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::ops::RangeInclusive;
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,9 +37,18 @@ pub const LAUNCHCTL: &str = "/bin/launchctl";
 pub const SW_VERS: &str = "/usr/bin/sw_vers";
 pub const SECURITY: &str = "/usr/bin/security";
 
+// Windows (plan 19b). `exec` runs them by this path, never through `PATH`.
+pub const NET_EXE: &str = r"C:\Windows\System32\net.exe";
+pub const SC_EXE: &str = r"C:\Windows\System32\sc.exe";
+/// The registry key of `CurrentBuildNumber` and `InstallationType`, below HKLM.
+pub const REG_NT_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+
 /// The uids and gids the macOS daemon accounts may take (spec §5.3): below
 /// 500, where macOS keeps its hidden system accounts.
 pub const MACOS_ID_RANGE: RangeInclusive<u32> = 200..=400;
+
+/// Every program locked mode runs on Windows.
+pub const WIN_PROGRAMS: &[&str] = &[NET_EXE, SC_EXE];
 
 /// Every program locked mode runs (plan 9b global constraints), always by
 /// absolute path.
@@ -62,7 +73,9 @@ pub const PROGRAMS: &[&str] = &[
 /// How long the user and group tools may take.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// `systemctl enable --now` waits for the daemon's start-up notification.
+#[cfg(unix)]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(unix)]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most bytes kept of a program's stdout and of its stderr (64 KiB).
 const OUTPUT_CAP: usize = 64 * 1024;
@@ -115,6 +128,33 @@ pub struct UserInfo {
     pub shell: String,
 }
 
+/// A Windows build, from `CurrentBuildNumber` and `InstallationType`.
+/// This process's own token, as [`Host::own_token`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnToken {
+    /// The token's user SID: the identity.
+    pub sid: String,
+    /// The token holds `Administrators` enabled, at any integrity level, or
+    /// [`Host::elevated`] says so.
+    pub elevated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WinBuild {
+    pub build: u32,
+    pub server: bool,
+}
+
+/// A value in a [`FakeState`]'s registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegValue {
+    Str(String),
+    Dword(u32),
+    /// Any other type: `reg_string` and `reg_dword` cannot read it, and
+    /// `reg_value_present` still finds it.
+    Other,
+}
+
 pub trait Host: Send + Sync {
     fn euid(&self) -> u32;
     /// The user from `/etc/passwd` (not NSS: a locked-mode user must be
@@ -146,6 +186,7 @@ pub trait Host: Send + Sync {
     /// Changes owner and group of the open file `fd` (`fchown`), so a path
     /// swapped after it was checked cannot redirect the change. `shown`
     /// names it in errors (and in a fake's record).
+    #[cfg(unix)]
     fn fchown(&self, fd: BorrowedFd<'_>, shown: &Path, uid: u32, gid: u32) -> io::Result<()>;
     /// Runs `systemctl <args>`. A non-zero exit is an `Ok` with its status.
     fn systemctl(&self, args: &[&str]) -> io::Result<CmdOutput>;
@@ -187,7 +228,93 @@ pub trait Host: Send + Sync {
         daemon_uid: u32,
         wait: Duration,
     ) -> io::Result<ReloadAnswer>;
+    /// Windows: sets the owner, a protected DACL and any group of `path`, which must
+    /// not be a reparse point. The text must name an owner and say `D:P`.
+    ///
+    /// This propagates inheritable entries to existing children that inherit, as CI
+    /// showed (`SetSecurityInfo` on a directory handle). It does not reach a
+    /// protected child (`P`) or an explicit entry a child holds. To set those too,
+    /// call [`crate::winacl::set_sddl_tree`], which sets each entry itself.
+    fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()>;
+    /// Windows: the owner, group and DACL of `path`. A reparse point is an error.
+    fn get_sddl(&self, path: &Path) -> io::Result<String>;
+    /// Windows: creates the dir `path` with this descriptor from its first moment.
+    /// An existing path is an error.
+    fn create_dir_sddl(&self, path: &Path, sddl: &str) -> io::Result<()>;
+    /// Windows: the SID of an account. The SID is the identity; a uid is a label.
+    fn lookup_sid(&self, name: &str) -> Option<String>;
+    /// A string value below HKLM. `REG_EXPAND_SZ` comes back unexpanded.
+    fn reg_string(&self, key: &str, value: &str) -> Option<String>;
+    /// A `DWORD` value below HKLM.
+    fn reg_dword(&self, key: &str, value: &str) -> Option<u32>;
+    /// Whether a value exists below HKLM, of any type. Only "not found", of the key
+    /// or the value, is `false`: any other failure is an `Err`, for callers that must
+    /// fail closed. `reg_string` and `reg_dword` cannot tell those cases apart.
+    fn reg_value_present(&self, key: &str, value: &str) -> io::Result<bool>;
+    /// The Windows build. Unreadable or unrecognised values are an error.
+    fn windows_build(&self) -> io::Result<WinBuild>;
+    /// One operation on the service `saiifed`.
+    fn service(&self, op: ServiceOp) -> io::Result<ServiceState>;
+    /// Whether this process may do what needs root or an elevated administrator. On
+    /// Windows that is more than [`Host::euid`]: a low-integrity or restricted child of an
+    /// elevated admin still holds `Administrators`, enabled (W26).
+    fn elevated(&self) -> bool {
+        self.euid() == 0
+    }
+    /// Windows: the SID of the local group `name`. `Ok(None)` when no account has that
+    /// name; an account of another kind is an `Err`, as is a failed lookup.
+    fn lookup_local_group(&self, name: &str) -> io::Result<Option<String>>;
+    /// Windows: holds the directory `path` so it cannot be renamed or deleted until the
+    /// result is dropped. A reparse point is an error.
+    fn hold_dir(&self, path: &Path) -> io::Result<Hold>;
+    /// Windows: takes the lock file `path`, which goes when the result is dropped or the
+    /// process ends. `Ok(None)` when another holds it.
+    fn lock_file(&self, path: &Path) -> io::Result<Option<Hold>>;
+    /// Windows: whether Claude Code's machine policy leaves saiife's drop-in in force
+    /// (W24).
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy;
+    /// Windows: connects to the daemon's pipe, checking its owner, within `wait`.
+    fn wait_for_pipe(&self, wait: Duration) -> io::Result<()>;
+    /// Windows: the service `saiifed` as the service manager has it now, so doctor can
+    /// compare it with W10. `Ok(None)` when it does not exist. Its `sddl` is what
+    /// `sc.exe sdshow` prints, which may hold a SACL.
+    fn service_spec(&self) -> io::Result<Option<crate::winservice::ServiceSpec>> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Windows: `WinVerifyTrust`'s answer for the file's embedded signature, in this
+    /// process: see [`crate::binary::authenticode_verdict`].
+    fn authenticode_status(&self, path: &Path) -> io::Result<i32> {
+        let _ = path;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Windows: the local groups `user` is in, nested ones included. Names only, and
+    /// they are localized, so compare the SIDs [`Host::lookup_sid`] gives for them.
+    fn local_groups_of(&self, user: &str) -> io::Result<Vec<String>> {
+        let _ = user;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Windows: the daemon's answer to `status` over its pipe, whose owner is checked,
+    /// within `wait`.
+    fn daemon_status(
+        &self,
+        wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        let _ = wait;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Renames a file. Its descriptor goes with it, which the fake must be told.
+    fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    /// Windows: this process's own token. A token that cannot be read is an `Err`, which
+    /// callers must treat as elevated.
+    fn own_token(&self) -> io::Result<OwnToken> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 }
+
+/// Something [`Host`] keeps open for as long as this lives.
+pub type Hold = Box<dyn std::any::Any + Send>;
 
 /// [`Host::policy_reload`] over the control socket. A socket that does not
 /// answer yet is tried again until `wait` has passed. Linux and macOS: the
@@ -271,7 +398,11 @@ pub fn host_for(layout: &Layout) -> io::Result<Box<dyn Host>> {
             ),
         ));
     }
-    let euid = rustix::process::geteuid().as_raw();
+    #[cfg(windows)]
+    if layout.is_system() {
+        return Ok(Box::new(RealHost));
+    }
+    let euid = own_euid();
     match host_kind(layout.root(), euid) {
         Ok(HostKind::Real) => Ok(Box::new(RealHost)),
         Ok(HostKind::Fake) => Ok(Box::new(FakeHost::open(layout.root())?)),
@@ -285,6 +416,39 @@ pub fn host_for(layout: &Layout) -> io::Result<Box<dyn Host>> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealHost;
 
+#[cfg(windows)]
+#[path = "host_win.rs"]
+mod win;
+
+#[cfg(unix)]
+fn own_euid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+#[cfg(unix)]
+fn own_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+#[cfg(unix)]
+fn own_gid() -> u32 {
+    rustix::process::getgid().as_raw()
+}
+#[cfg(windows)]
+use win::{own_euid, own_uid};
+/// Windows has no primary group a fake's test user needs.
+#[cfg(windows)]
+fn own_gid() -> u32 {
+    0
+}
+
+/// What a call answers on an OS it does not exist on.
+fn windows_only() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this call does not exist on this OS",
+    )
+}
+
+#[cfg(unix)]
 impl Host for RealHost {
     fn euid(&self) -> u32 {
         rustix::process::geteuid().as_raw()
@@ -398,7 +562,6 @@ impl Host for RealHost {
         on_disk
     }
 
-    #[cfg(unix)]
     fn policy_reload(
         &self,
         socket_dir: &Path,
@@ -406,20 +569,6 @@ impl Host for RealHost {
         wait: Duration,
     ) -> io::Result<ReloadAnswer> {
         call_policy_reload(socket_dir, daemon_uid, wait)
-    }
-
-    #[cfg(not(unix))]
-    fn policy_reload(
-        &self,
-        socket_dir: &Path,
-        daemon_uid: u32,
-        wait: Duration,
-    ) -> io::Result<ReloadAnswer> {
-        let _ = (socket_dir, daemon_uid, wait);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            crate::supported::NOT_SUPPORTED_OS,
-        ))
     }
 
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput> {
@@ -464,11 +613,67 @@ impl Host for RealHost {
     ) -> io::Result<CmdOutput> {
         exec(program, args, Some(input), timeout)
     }
+
+    fn set_sddl(&self, _path: &Path, _sddl: &str) -> io::Result<()> {
+        Err(windows_only())
+    }
+
+    fn get_sddl(&self, _path: &Path) -> io::Result<String> {
+        Err(windows_only())
+    }
+
+    fn create_dir_sddl(&self, _path: &Path, _sddl: &str) -> io::Result<()> {
+        Err(windows_only())
+    }
+
+    fn lookup_sid(&self, _name: &str) -> Option<String> {
+        None
+    }
+
+    fn reg_string(&self, _key: &str, _value: &str) -> Option<String> {
+        None
+    }
+
+    fn reg_dword(&self, _key: &str, _value: &str) -> Option<u32> {
+        None
+    }
+
+    fn reg_value_present(&self, _key: &str, _value: &str) -> io::Result<bool> {
+        Err(windows_only())
+    }
+
+    fn windows_build(&self) -> io::Result<WinBuild> {
+        Err(windows_only())
+    }
+
+    fn service(&self, _op: ServiceOp) -> io::Result<ServiceState> {
+        Err(windows_only())
+    }
+
+    fn lookup_local_group(&self, _name: &str) -> io::Result<Option<String>> {
+        Err(windows_only())
+    }
+
+    fn hold_dir(&self, _path: &Path) -> io::Result<Hold> {
+        Err(windows_only())
+    }
+
+    fn lock_file(&self, _path: &Path) -> io::Result<Option<Hold>> {
+        Err(windows_only())
+    }
+
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy {
+        saiife_agents::claude::HklmPolicy::Absent
+    }
+
+    fn wait_for_pipe(&self, _wait: Duration) -> io::Result<()> {
+        Err(windows_only())
+    }
 }
 
 /// The account calls of [`RealHost`] on Linux (and any other unix): the
 /// files `/etc/passwd` and `/etc/group`, and the shadow-utils tools.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod accounts {
     use super::*;
 
@@ -674,6 +879,7 @@ mod accounts {
 /// `none` means none. Anything else (missing program, timeout, an error)
 /// is [`CONTAINER_UNKNOWN`] on a systemd host, so the check fails closed;
 /// without systemd the systemd check refuses anyway.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn container_from(res: io::Result<CmdOutput>, systemd_running: bool) -> Option<String> {
     if let Ok(out) = &res {
         let name = out.stdout.trim();
@@ -714,7 +920,7 @@ fn owned(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn argv_create_user(name: &str, group: &str) -> io::Result<Vec<String>> {
     check_names(&[name, group])?;
     Ok(owned(&[
@@ -731,36 +937,37 @@ pub(crate) fn argv_create_user(name: &str, group: &str) -> io::Result<Vec<String
     ]))
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn argv_create_group(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[GROUPADD, "--system", name]))
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn argv_add_to_group(user: &str, group: &str) -> io::Result<Vec<String>> {
     check_names(&[user, group])?;
     Ok(owned(&[USERMOD, "-aG", group, user]))
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn argv_delete_user(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[USERDEL, name]))
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn argv_remove_from_group(user: &str, group: &str) -> io::Result<Vec<String>> {
     check_names(&[user, group])?;
     Ok(owned(&[GPASSWD, "-d", user, group]))
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn argv_delete_group(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[GROUPDEL, name]))
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn argv_encrypt(name: &str, out: &Path) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     let out_s = out.to_str().filter(|_| out.is_absolute()).ok_or_else(|| {
@@ -1106,13 +1313,108 @@ pub fn argv_dscl_delete_group(name: &str) -> io::Result<Vec<String>> {
     Ok(owned(&[DSCL, ".", "-delete", &format!("/Groups/{name}")]))
 }
 
+// ----------------------------------------------------------- Windows argv
+
+/// A name safe to give `net.exe`, which reads anything starting with `/` as a switch
+/// and `-` as an option on other tools. Windows names may hold spaces and `\`
+/// (`DOMAIN\name`), but never `/`.
+pub fn valid_win_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-') && !name.chars().any(|c| c == '/' || c.is_control())
+}
+
+fn check_win_names(names: &[&str]) -> io::Result<()> {
+    match names.iter().find(|n| !valid_win_name(n)) {
+        Some(bad) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid user or group name {bad:?}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `net.exe localgroup <name> /add`.
+pub fn argv_net_create_group(name: &str) -> io::Result<Vec<String>> {
+    check_win_names(&[name])?;
+    Ok(owned(&[NET_EXE, "localgroup", name, "/add"]))
+}
+
+/// `net.exe localgroup <name> /delete`.
+pub fn argv_net_delete_group(name: &str) -> io::Result<Vec<String>> {
+    check_win_names(&[name])?;
+    Ok(owned(&[NET_EXE, "localgroup", name, "/delete"]))
+}
+
+/// `net.exe localgroup <group> <user> /add`.
+pub fn argv_net_add_member(user: &str, group: &str) -> io::Result<Vec<String>> {
+    check_win_names(&[user, group])?;
+    Ok(owned(&[NET_EXE, "localgroup", group, user, "/add"]))
+}
+
+/// `net.exe localgroup <group> <user> /delete`.
+pub fn argv_net_remove_member(user: &str, group: &str) -> io::Result<Vec<String>> {
+    check_win_names(&[user, group])?;
+    Ok(owned(&[NET_EXE, "localgroup", group, user, "/delete"]))
+}
+
+/// `sc.exe sdset <service> <sddl>`.
+pub fn argv_sc_sdset(service: &str, sddl: &str) -> io::Result<Vec<String>> {
+    check_win_names(&[service])?;
+    saiife_win::sddl::parse(sddl).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(owned(&[SC_EXE, "sdset", service, sddl]))
+}
+
+/// `sc.exe control <service> paramchange`.
+pub fn argv_sc_paramchange(service: &str) -> io::Result<Vec<String>> {
+    check_win_names(&[service])?;
+    Ok(owned(&[SC_EXE, "control", service, "paramchange"]))
+}
+
+/// A Windows tool's result, by exit code only: its text is localized.
+pub fn check_exit(argv: &[String], out: &CmdOutput) -> io::Result<()> {
+    if out.status == 0 {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{} failed (exit {})",
+        argv.join(" "),
+        out.status
+    )))
+}
+
+/// [`WinBuild`] from the registry's `CurrentBuildNumber` and `InstallationType`
+/// (`Client`, `Server`, `Server Core`, `Nano Server`). A missing or unknown value is
+/// an error, so the supported check fails closed.
+pub fn parse_win_build(build: Option<String>, kind: Option<String>) -> io::Result<WinBuild> {
+    let bad = |what: &str, v: &Option<String>| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the registry's {what} is {v:?}"),
+        )
+    };
+    let number = build
+        .as_deref()
+        .and_then(digits_u32)
+        .ok_or_else(|| bad("CurrentBuildNumber", &build))?;
+    let server = match kind.as_deref() {
+        Some("Client") => false,
+        Some(k) if k.contains("Server") => true,
+        _ => return Err(bad("InstallationType", &kind)),
+    };
+    Ok(WinBuild {
+        build: number,
+        server,
+    })
+}
+
 /// Runs an admin tool and turns a non-zero exit into an error.
+#[cfg_attr(windows, allow(dead_code))]
 fn admin(argv: &[String]) -> io::Result<()> {
     let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
     let out = exec(&argv[0], &args, None, ADMIN_TIMEOUT)?;
     check_status(argv, &out)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn check_status(argv: &[String], out: &CmdOutput) -> io::Result<()> {
     if out.status == 0 {
         return Ok(());
@@ -1125,8 +1427,27 @@ fn check_status(argv: &[String], out: &CmdOutput) -> io::Result<()> {
     )))
 }
 
+/// The whole environment of a program Windows' [`RealHost`] runs, and its working
+/// directory. Nothing is inherited. Doctor and install run elevated, and an agent running
+/// as the admin's own user can set `HKCU\\Environment`, which the next shell inherits:
+/// `PATH` decides what `net.exe` starts as `net1.exe`, `__COMPAT_LAYER` applies shims to any
+/// program, and a dir the caller chose must not be where a program looks for a DLL.
+pub const WINDOWS_CHILD_ENV: [(&str, &str); 8] = [
+    ("SystemRoot", r"C:\Windows"),
+    ("windir", r"C:\Windows"),
+    ("SystemDrive", "C:"),
+    ("Path", r"C:\Windows\System32;C:\Windows"),
+    ("PATHEXT", ".COM;.EXE"),
+    ("ComSpec", r"C:\Windows\System32\cmd.exe"),
+    ("TEMP", r"C:\Windows\Temp"),
+    ("TMP", r"C:\Windows\Temp"),
+];
+/// See [`WINDOWS_CHILD_ENV`].
+pub const WINDOWS_CHILD_DIR: &str = r"C:\Windows\System32";
+
 /// Spawns `program` (absolute) with `stdin` (or none), collects its output
-/// and kills it after `timeout`.
+/// and kills it after `timeout`. On Windows it inherits no environment and no working
+/// directory: [`WINDOWS_CHILD_ENV`].
 fn exec(
     program: &str,
     args: &[&str],
@@ -1155,6 +1476,10 @@ fn exec_with(
     for v in remove_env {
         cmd.env_remove(v);
     }
+    #[cfg(windows)]
+    cmd.env_clear()
+        .envs(WINDOWS_CHILD_ENV)
+        .current_dir(WINDOWS_CHILD_DIR);
     let mut child = cmd
         .args(args)
         .stdin(if stdin.is_some() {
@@ -1254,10 +1579,14 @@ fn exec_with(
     };
     let stdout = collect(out_t);
     let stderr = collect(err_t);
+    #[cfg(unix)]
     let code = status.code().unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
         128 + status.signal().unwrap_or(0)
     });
+    // On Windows every process has an exit code.
+    #[cfg(windows)]
+    let code = status.code().unwrap_or(-1);
     Ok(CmdOutput {
         status: code,
         stdout,
@@ -1266,6 +1595,7 @@ fn exec_with(
 }
 
 /// The `N` of `systemctl --version`'s first line, `systemd N (…)`.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn parse_systemd_version(out: &str) -> Option<u32> {
     let mut words = out.lines().next()?.split_whitespace();
     if words.next()? != "systemd" {
@@ -1275,7 +1605,7 @@ pub(crate) fn parse_systemd_version(out: &str) -> Option<u32> {
 }
 
 /// The `name` entry of `/etc/passwd` text.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn find_passwd(text: &str, name: &str) -> Option<UserInfo> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -1292,7 +1622,7 @@ pub(crate) fn find_passwd(text: &str, name: &str) -> Option<UserInfo> {
 }
 
 /// The gid of `name` in `/etc/group` text.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn find_group(text: &str, name: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -1305,7 +1635,7 @@ pub(crate) fn find_group(text: &str, name: &str) -> Option<u32> {
 
 /// The member list of `name` in `/etc/group` text.
 /// Names in `/etc/passwd` text whose primary gid (field 4) is `gid`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn find_primary_gid_users(text: &str, gid: u32) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
@@ -1315,7 +1645,7 @@ pub(crate) fn find_primary_gid_users(text: &str, gid: u32) -> Vec<String> {
         .collect()
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn find_group_members(text: &str, name: &str) -> Option<Vec<String>> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -1402,12 +1732,101 @@ pub struct FakeState {
     pub policy_reload: ReloadAnswer,
     /// When set, `policy_reload` fails with this error instead.
     pub policy_reload_error: Option<String>,
+    /// Acts as Windows' accounts (default false): names follow [`valid_win_name`],
+    /// a created group gets a SID in `sids`, every group change records its `net.exe`
+    /// argv in `calls`, and `create_system_user`, `delete_user` and `chown` are
+    /// `Unsupported`, as on the real host.
+    pub net: bool,
+    /// What `get_sddl` reads: what was set or created, by path.
+    pub sddl: BTreeMap<PathBuf, String>,
+    /// What `lookup_sid` answers, by account name.
+    pub sids: BTreeMap<String, String>,
+    /// HKLM, by (key, value). The default holds a stock machine's folders.
+    #[serde(with = "registry_entries")]
+    pub registry: BTreeMap<(String, String), RegValue>,
+    /// When set, `reg_value_present` fails with this error (access denied, say).
+    pub reg_probe_error: Option<String>,
+    /// What `windows_build` returns (default 26100, server).
+    pub build: WinBuild,
+    /// The services that exist, by name. `service` acts on `saiifed`.
+    pub services: BTreeMap<String, ServiceSpec>,
+    /// Whether `saiifed` is running.
+    pub service_running: bool,
+    /// The token holds `Administrators` but cannot use it (low integrity, or restricted
+    /// SIDs): `elevated` answers false whatever `euid` says.
+    pub limited_token: bool,
+    /// Accounts that exist and are no local group: `lookup_local_group` refuses them.
+    pub not_local_groups: Vec<String>,
+    /// When set, `wait_for_pipe` fails with this error: the daemon never answered, or
+    /// somebody else owns the pipe.
+    pub pipe_error: Option<String>,
+    /// `service` answers `Stop` with a timeout, and the service keeps running.
+    pub service_will_not_stop: bool,
+    /// What `local_groups_of` answers, by user (default: no groups).
+    pub local_groups: BTreeMap<String, Vec<String>>,
+    /// When set, `local_groups_of` fails with this error.
+    pub local_groups_error: Option<String>,
+    /// What `daemon_status` answers; `None` is a daemon that does not answer.
+    pub daemon_status: Option<serde_json::Map<String, serde_json::Value>>,
+    /// When set, `service_spec` fails with this error.
+    pub service_spec_error: Option<String>,
+    /// Paths whose `get_sddl` is access denied, as a plain user's is on `state`.
+    pub sddl_denied: Vec<PathBuf>,
+    /// `service_spec` is access denied.
+    pub service_spec_denied: bool,
+    /// `local_groups_of` is access denied.
+    pub local_groups_denied: bool,
+    /// When set, `service(Query)` fails with this error: the service manager cannot be
+    /// asked.
+    pub service_query_error: Option<String>,
+    /// What `authenticode_status` answers; `None` fails the call.
+    pub authenticode: Option<i32>,
+    /// The SID `own_token` answers with; `None` is a token that cannot be read. Whether
+    /// it is elevated is what `elevated` answers.
+    pub own_sid: Option<String>,
+}
+
+/// JSON maps need string keys, so the registry is saved as a list.
+mod registry_entries {
+    use super::RegValue;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    type Map = BTreeMap<(String, String), RegValue>;
+
+    pub fn serialize<S: Serializer>(map: &Map, out: S) -> Result<S::Ok, S::Error> {
+        let list: Vec<(&(String, String), &RegValue)> = map.iter().collect();
+        list.serialize(out)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<Map, D::Error> {
+        let list = Vec::<((String, String), RegValue)>::deserialize(input)?;
+        Ok(list.into_iter().collect())
+    }
+}
+
+/// What a stock machine's registry holds for the folder check: `ProgramData` is
+/// really stored with the variable.
+fn stock_registry() -> BTreeMap<(String, String), RegValue> {
+    use crate::supported::{REG_CURRENT_VERSION, REG_PROFILE_LIST};
+    [
+        (REG_CURRENT_VERSION, "ProgramFilesDir", r"C:\Program Files"),
+        (
+            REG_PROFILE_LIST,
+            "ProgramData",
+            r"%SystemDrive%\ProgramData",
+        ),
+        (REG_NT_CURRENT_VERSION, "SystemRoot", r"C:\Windows"),
+    ]
+    .into_iter()
+    .map(|(k, v, d)| ((k.to_string(), v.to_string()), RegValue::Str(d.to_string())))
+    .collect()
 }
 
 impl Default for FakeState {
     fn default() -> FakeState {
         FakeState {
-            euid: rustix::process::geteuid().as_raw(),
+            euid: own_euid(),
             users: BTreeMap::new(),
             groups: BTreeMap::new(),
             members: BTreeMap::new(),
@@ -1431,6 +1850,31 @@ impl Default for FakeState {
                 hash: Some("fake".into()),
             },
             policy_reload_error: None,
+            net: false,
+            sddl: BTreeMap::new(),
+            sids: BTreeMap::new(),
+            registry: stock_registry(),
+            reg_probe_error: None,
+            build: WinBuild {
+                build: 26100,
+                server: true,
+            },
+            services: BTreeMap::new(),
+            service_running: false,
+            limited_token: false,
+            not_local_groups: Vec::new(),
+            pipe_error: None,
+            service_will_not_stop: false,
+            local_groups: BTreeMap::new(),
+            local_groups_error: None,
+            daemon_status: None,
+            service_spec_error: None,
+            sddl_denied: Vec::new(),
+            service_spec_denied: false,
+            local_groups_denied: false,
+            service_query_error: None,
+            authenticode: None,
+            own_sid: None,
         }
     }
 }
@@ -1468,8 +1912,8 @@ impl FakeState {
             return None;
         }
         Some(UserInfo {
-            uid: rustix::process::getuid().as_raw(),
-            gid: rustix::process::getgid().as_raw(),
+            uid: own_uid(),
+            gid: own_gid(),
             home: if name == "root" {
                 PathBuf::from("/root")
             } else {
@@ -1486,7 +1930,23 @@ impl FakeState {
         if CREATED_NAMES.contains(&name) {
             return None;
         }
-        Some(rustix::process::getgid().as_raw())
+        Some(own_gid())
+    }
+
+    fn check_names(&self, names: &[&str]) -> io::Result<()> {
+        if self.net {
+            check_win_names(names)
+        } else {
+            check_names(names)
+        }
+    }
+
+    fn refuse_on_windows(&self) -> io::Result<()> {
+        if self.net {
+            Err(windows_only())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1511,6 +1971,41 @@ fn already(what: &str, name: &str) -> io::Error {
         io::ErrorKind::AlreadyExists,
         format!("{what} {name} already exists"),
     )
+}
+
+/// What the real `set_sddl` refuses: a reparse point (here, a symlink), a file
+/// with more than one hard link (here, on Unix), and a path whose handle really is
+/// somewhere else (a link above the last component). A missing path is an error too.
+fn refuse_like_windows(root: &Path, path: &Path) -> io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    // Against the root's own resolved path, so a temp dir below a system link (macOS's
+    // `/var`) is no redirect.
+    let real = std::fs::canonicalize(path)?;
+    let want = std::fs::canonicalize(root)?.join(path.strip_prefix(root).unwrap_or(path));
+    if real != want {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is really {}: a reparse point is on the way",
+                path.display(),
+                real.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    if meta.is_file() && std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has more than one hard link", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn missing(what: &str, name: &str) -> io::Error {
@@ -1606,9 +2101,7 @@ impl FakeHost {
 
 impl Host for FakeHost {
     fn euid(&self) -> u32 {
-        self.read()
-            .map(|s| s.euid)
-            .unwrap_or_else(|_| rustix::process::geteuid().as_raw())
+        self.read().map(|s| s.euid).unwrap_or_else(|_| own_euid())
     }
 
     fn user(&self, name: &str) -> Option<UserInfo> {
@@ -1642,10 +2135,15 @@ impl Host for FakeHost {
     }
 
     fn create_system_group(&self, name: &str) -> io::Result<()> {
-        check_names(&[name])?;
         self.update(|s| {
+            s.check_names(&[name])?;
             if s.group_id(name).is_some() {
                 return Err(already("group", name));
+            }
+            if s.net {
+                s.record_argv(&argv_net_create_group(name)?);
+                let sid = format!("S-1-5-21-1-2-3-{}", 1000 + s.sids.len());
+                s.sids.insert(name.to_string(), sid);
             }
             if s.dscl {
                 let (uids, gids) = s.taken_ids();
@@ -1657,15 +2155,15 @@ impl Host for FakeHost {
                 s.groups.insert(name.to_string(), gid);
                 return Ok(());
             }
-            s.groups
-                .insert(name.to_string(), rustix::process::getgid().as_raw());
+            s.groups.insert(name.to_string(), own_gid());
             Ok(())
         })
     }
 
     fn create_system_user(&self, name: &str, group: &str) -> io::Result<()> {
-        check_names(&[name, group])?;
         self.update(|s| {
+            s.refuse_on_windows()?;
+            s.check_names(&[name, group])?;
             if s.user(name).is_some() {
                 return Err(already("user", name));
             }
@@ -1699,7 +2197,7 @@ impl Host for FakeHost {
             s.users.insert(
                 name.to_string(),
                 UserInfo {
-                    uid: rustix::process::getuid().as_raw(),
+                    uid: own_uid(),
                     gid,
                     home: PathBuf::from("/nonexistent"),
                     shell: "/usr/sbin/nologin".to_string(),
@@ -1710,10 +2208,13 @@ impl Host for FakeHost {
     }
 
     fn add_to_group(&self, user: &str, group: &str) -> io::Result<()> {
-        check_names(&[user, group])?;
         self.update(|s| {
+            s.check_names(&[user, group])?;
             s.user(user).ok_or_else(|| missing("user", user))?;
             s.group_id(group).ok_or_else(|| missing("group", group))?;
+            if s.net {
+                s.record_argv(&argv_net_add_member(user, group)?);
+            }
             if s.dscl {
                 s.record_argv(&argv_dseditgroup(true, user, group)?);
             }
@@ -1726,8 +2227,9 @@ impl Host for FakeHost {
     }
 
     fn delete_user(&self, name: &str) -> io::Result<()> {
-        check_names(&[name])?;
         self.update(|s| {
+            s.refuse_on_windows()?;
+            s.check_names(&[name])?;
             s.users.remove(name).ok_or_else(|| missing("user", name))?;
             if s.dscl {
                 s.record_argv(&argv_dscl_delete_user(name)?);
@@ -1741,11 +2243,15 @@ impl Host for FakeHost {
     }
 
     fn delete_group(&self, name: &str) -> io::Result<()> {
-        check_names(&[name])?;
         self.update(|s| {
+            s.check_names(&[name])?;
             s.groups
                 .remove(name)
                 .ok_or_else(|| missing("group", name))?;
+            if s.net {
+                s.record_argv(&argv_net_delete_group(name)?);
+                s.sids.remove(name);
+            }
             if s.dscl {
                 s.record_argv(&argv_dscl_delete_group(name)?);
             }
@@ -1755,9 +2261,12 @@ impl Host for FakeHost {
     }
 
     fn remove_from_group(&self, user: &str, group: &str) -> io::Result<()> {
-        check_names(&[user, group])?;
         self.update(|s| {
+            s.check_names(&[user, group])?;
             s.group_id(group).ok_or_else(|| missing("group", group))?;
+            if s.net {
+                s.record_argv(&argv_net_remove_member(user, group)?);
+            }
             if s.dscl {
                 s.record_argv(&argv_dseditgroup(false, user, group)?);
             }
@@ -1773,6 +2282,7 @@ impl Host for FakeHost {
         std::fs::symlink_metadata(path)
             .map_err(|e| io::Error::new(e.kind(), format!("chown {}: {e}", path.display())))?;
         self.update(|s| {
+            s.refuse_on_windows()?;
             if s.fail_chown.iter().any(|p| p == path) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -1788,6 +2298,7 @@ impl Host for FakeHost {
         })
     }
 
+    #[cfg(unix)]
     fn fchown(&self, fd: BorrowedFd<'_>, shown: &Path, uid: u32, gid: u32) -> io::Result<()> {
         // Like the real call: the descriptor must be open. Recorded under
         // `shown`, never applied.
@@ -1897,6 +2408,7 @@ impl Host for FakeHost {
             .collect();
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600)
@@ -1964,9 +2476,587 @@ impl Host for FakeHost {
             Ok(out)
         })
     }
+
+    fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()> {
+        self.fake_applies(path, sddl)?;
+        refuse_like_windows(&self.root, path)?;
+        self.update(|s| {
+            s.calls.push(format!("set_sddl {} {sddl}", path.display()));
+            s.sddl.insert(path.to_path_buf(), sddl.to_string());
+            Ok(())
+        })
+    }
+
+    fn get_sddl(&self, path: &Path) -> io::Result<String> {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is a reparse point", path.display()),
+            ));
+        }
+        self.update(|s| {
+            s.calls.push(format!("get_sddl {}", path.display()));
+            if s.sddl_denied.iter().any(|p| p == path) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            s.sddl
+                .get(path)
+                .cloned()
+                .ok_or_else(|| missing("descriptor of", &path.display().to_string()))
+        })
+    }
+
+    fn create_dir_sddl(&self, path: &Path, sddl: &str) -> io::Result<()> {
+        self.fake_applies(path, sddl)?;
+        std::fs::create_dir(path)?;
+        self.update(|s| {
+            s.calls
+                .push(format!("create_dir_sddl {} {sddl}", path.display()));
+            s.sddl.insert(path.to_path_buf(), sddl.to_string());
+            Ok(())
+        })
+    }
+
+    fn lookup_sid(&self, name: &str) -> Option<String> {
+        self.update(|s| {
+            s.calls.push(format!("lookup_sid {name}"));
+            Ok(s.sids.get(name).cloned())
+        })
+        .ok()?
+    }
+
+    fn reg_string(&self, key: &str, value: &str) -> Option<String> {
+        self.update(|s| {
+            s.calls.push(format!("reg_string {key} {value}"));
+            Ok(
+                match s.registry.get(&(key.to_string(), value.to_string())) {
+                    Some(RegValue::Str(v)) => Some(v.clone()),
+                    _ => None,
+                },
+            )
+        })
+        .ok()?
+    }
+
+    fn reg_dword(&self, key: &str, value: &str) -> Option<u32> {
+        self.update(|s| {
+            s.calls.push(format!("reg_dword {key} {value}"));
+            Ok(
+                match s.registry.get(&(key.to_string(), value.to_string())) {
+                    Some(RegValue::Dword(v)) => Some(*v),
+                    _ => None,
+                },
+            )
+        })
+        .ok()?
+    }
+
+    fn reg_value_present(&self, key: &str, value: &str) -> io::Result<bool> {
+        self.update(|s| {
+            s.calls.push(format!("reg_value_present {key} {value}"));
+            match &s.reg_probe_error {
+                Some(e) => Err(io::Error::other(e.clone())),
+                None => Ok(s
+                    .registry
+                    .contains_key(&(key.to_string(), value.to_string()))),
+            }
+        })
+    }
+
+    fn windows_build(&self) -> io::Result<WinBuild> {
+        self.update(|s| {
+            s.calls.push("windows_build".to_string());
+            Ok(s.build)
+        })
+    }
+
+    fn service(&self, op: ServiceOp) -> io::Result<ServiceState> {
+        use crate::layout::WIN_SERVICE;
+        self.update(|s| {
+            s.calls.push(match &op {
+                ServiceOp::Query => "service query".to_string(),
+                ServiceOp::Create(spec) => format!("service create {}", spec.fingerprint()),
+                ServiceOp::Update(spec) => format!("service update {}", spec.fingerprint()),
+                ServiceOp::Start => "service start".to_string(),
+                ServiceOp::Stop { .. } => "service stop".to_string(),
+                ServiceOp::Delete => "service delete".to_string(),
+                ServiceOp::SetSddl(sddl) => format!("service sdset {sddl}"),
+                ServiceOp::ParamChange => "service paramchange".to_string(),
+            });
+            if let (ServiceOp::Query, Some(e)) = (&op, &s.service_query_error) {
+                return Err(io::Error::other(e.clone()));
+            }
+            let exists = s.services.contains_key(WIN_SERVICE);
+            let gone = || missing("service", WIN_SERVICE);
+            match op {
+                ServiceOp::Query => {}
+                ServiceOp::Create(spec) => {
+                    if exists {
+                        return Err(already("service", WIN_SERVICE));
+                    }
+                    s.services.insert(WIN_SERVICE.to_string(), spec);
+                }
+                ServiceOp::Update(spec) => {
+                    if !exists {
+                        return Err(gone());
+                    }
+                    s.services.insert(WIN_SERVICE.to_string(), spec);
+                }
+                ServiceOp::Start | ServiceOp::Stop { .. } | ServiceOp::ParamChange if !exists => {
+                    return Err(gone());
+                }
+                ServiceOp::Start => s.service_running = true,
+                ServiceOp::Stop { .. } if s.service_will_not_stop => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{WIN_SERVICE} did not stop within 10 s"),
+                    ));
+                }
+                ServiceOp::Stop { .. } => s.service_running = false,
+                ServiceOp::ParamChange => {}
+                ServiceOp::Delete => {
+                    s.services.remove(WIN_SERVICE).ok_or_else(gone)?;
+                    s.service_running = false;
+                }
+                ServiceOp::SetSddl(sddl) => {
+                    s.services.get_mut(WIN_SERVICE).ok_or_else(gone)?.sddl = sddl;
+                }
+            }
+            Ok(if !s.services.contains_key(WIN_SERVICE) {
+                ServiceState::Missing
+            } else if s.service_running {
+                ServiceState::Running { pid: 4242 }
+            } else {
+                ServiceState::Stopped
+            })
+        })
+    }
+
+    fn elevated(&self) -> bool {
+        let s = self.state();
+        s.euid == 0 && !s.limited_token
+    }
+
+    fn lookup_local_group(&self, name: &str) -> io::Result<Option<String>> {
+        self.update(|s| {
+            s.calls.push(format!("lookup_local_group {name}"));
+            if s.not_local_groups.iter().any(|n| n == name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{name} is no local group"),
+                ));
+            }
+            Ok(s.sids.get(name).cloned())
+        })
+    }
+
+    fn hold_dir(&self, path: &Path) -> io::Result<Hold> {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is a reparse point", path.display()),
+            ));
+        }
+        self.update(|s| {
+            s.calls.push(format!("hold {}", path.display()));
+            Ok(())
+        })?;
+        Ok(Box::new(FakeDirHold {
+            root: self.root.clone(),
+            path: path.to_path_buf(),
+        }))
+    }
+
+    fn lock_file(&self, path: &Path) -> io::Result<Option<Hold>> {
+        // What the real open must get past first.
+        saiife_win::open_rules::LOCK_FILE.check()?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => Ok(Some(Box::new(FakeLockHold(path.to_path_buf())))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy {
+        use saiife_agents::claude::{hklm_policy, HklmReadError};
+        let s = self.state();
+        hklm_policy(&|key, value| {
+            match s.registry.get(&(key.to_string(), value.to_string())) {
+                Some(RegValue::Str(v)) => Ok(Some(v.clone())),
+                None => Ok(None),
+                // A value of the wrong type: the real read fails too.
+                Some(_) => Err(HklmReadError),
+            }
+        })
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)?;
+        self.update(|s| {
+            if let Some(sddl) = s.sddl.remove(from) {
+                s.sddl.insert(to.to_path_buf(), sddl);
+            }
+            Ok(())
+        })
+    }
+
+    fn wait_for_pipe(&self, _wait: Duration) -> io::Result<()> {
+        self.update(|s| {
+            s.calls.push("wait_for_pipe".to_string());
+            match &s.pipe_error {
+                Some(e) => Err(io::Error::new(io::ErrorKind::TimedOut, e.clone())),
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn service_spec(&self) -> io::Result<Option<ServiceSpec>> {
+        let s = self.state();
+        if s.service_spec_denied {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        match s.service_spec_error {
+            Some(e) => Err(io::Error::other(e)),
+            None => Ok(s.services.get(crate::layout::WIN_SERVICE).cloned()),
+        }
+    }
+
+    fn local_groups_of(&self, user: &str) -> io::Result<Vec<String>> {
+        let s = self.state();
+        if s.local_groups_denied {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        match s.local_groups_error {
+            Some(e) => Err(io::Error::other(e)),
+            None => Ok(s.local_groups.get(user).cloned().unwrap_or_default()),
+        }
+    }
+
+    fn own_token(&self) -> io::Result<OwnToken> {
+        let elevated = self.elevated();
+        self.update(|s| {
+            s.calls.push("own_token".to_string());
+            let sid = s
+                .own_sid
+                .clone()
+                .ok_or_else(|| io::Error::other("the token cannot be read"))?;
+            Ok(OwnToken { sid, elevated })
+        })
+    }
+
+    fn authenticode_status(&self, path: &Path) -> io::Result<i32> {
+        self.update(|s| {
+            s.calls.push(format!("authenticode {}", path.display()));
+            s.authenticode
+                .ok_or_else(|| io::Error::other("the trust provider did not answer"))
+        })
+    }
+
+    fn daemon_status(
+        &self,
+        _wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        self.state()
+            .daemon_status
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the daemon did not answer"))
+    }
+}
+
+/// What the fake's [`Host::hold_dir`] returns: says so in `calls` when dropped.
+struct FakeDirHold {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for FakeDirHold {
+    fn drop(&mut self) {
+        let _ = FakeHost::unopened(&self.root).update(|s| {
+            s.calls.push(format!("release {}", self.path.display()));
+            Ok(())
+        });
+    }
+}
+
+/// What the fake's [`Host::lock_file`] returns: the file goes when dropped, as the real
+/// one does when its handle closes.
+struct FakeLockHold(PathBuf);
+
+impl Drop for FakeLockHold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+impl FakeHost {
+    /// What the real calls refuse: a path outside the fake's tree, and a descriptor
+    /// with no owner or no protection.
+    fn fake_applies(&self, path: &Path, sddl: &str) -> io::Result<()> {
+        if !self.inside(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "fake host writes only below {}: {}",
+                    self.root.display(),
+                    path.display()
+                ),
+            ));
+        }
+        saiife_win::sddl::check_settable(sddl)
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
 }
 
 #[cfg(test)]
+mod windows_tests {
+    use super::*;
+    use crate::layout::Layout;
+    use crate::winservice::ServiceSpec;
+
+    fn fake() -> (tempfile::TempDir, FakeHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeHost::open(dir.path()).unwrap();
+        (dir, host)
+    }
+
+    const SD: &str = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    #[test]
+    fn fake_host_records_sddl_and_registry() {
+        let (dir, host) = fake();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let made = root.join("made");
+        host.create_dir_sddl(&made, SD).unwrap();
+        assert!(made.is_dir());
+        assert_eq!(host.get_sddl(&made).unwrap(), SD);
+        assert!(host.create_dir_sddl(&made, SD).is_err());
+
+        let other = "O:SYD:P(A;;FA;;;SY)";
+        host.set_sddl(&made, other).unwrap();
+        assert_eq!(host.get_sddl(&made).unwrap(), other);
+
+        // As the real calls refuse them.
+        assert!(host.set_sddl(&made, "D:P(A;;FA;;;SY)").is_err());
+        assert!(host.set_sddl(&made, "O:BAD:(A;;FA;;;SY)").is_err());
+        assert!(host.set_sddl(&root.join("missing"), SD).is_err());
+        assert!(host.set_sddl(Path::new("/outside"), SD).is_err());
+        assert!(host.get_sddl(&root.join("missing")).is_err());
+
+        host.set(|s| {
+            s.registry
+                .insert(("K".into(), "dw".into()), RegValue::Dword(7));
+            s.sids.insert("alice".into(), "S-1-5-21-9-9-9-1001".into());
+        });
+        assert_eq!(host.reg_dword("K", "dw"), Some(7));
+        assert_eq!(host.reg_string("K", "dw"), None);
+        assert_eq!(host.reg_dword("K", "none"), None);
+        assert_eq!(
+            host.lookup_sid("alice").as_deref(),
+            Some("S-1-5-21-9-9-9-1001")
+        );
+        assert_eq!(host.lookup_sid("bob"), None);
+        assert_eq!(
+            host.windows_build().unwrap(),
+            WinBuild {
+                build: 26100,
+                server: true
+            }
+        );
+
+        let calls = host.state().calls;
+        for line in [
+            format!("create_dir_sddl {} {SD}", made.display()),
+            format!("set_sddl {} {other}", made.display()),
+            format!("get_sddl {}", made.display()),
+            "reg_dword K dw".to_string(),
+            "reg_string K dw".to_string(),
+            "lookup_sid alice".to_string(),
+            "windows_build".to_string(),
+        ] {
+            assert!(calls.contains(&line), "{line}: {calls:?}");
+        }
+
+        // All of it survives the state file, tuple keys included.
+        let again = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(again.reg_dword("K", "dw"), Some(7));
+        assert_eq!(again.get_sddl(&made).unwrap(), other);
+    }
+
+    /// The folders above ours, as a real machine prints them
+    /// (`real_ancestors_pass_ancestor_ok` keeps reading them in CI). A refusal here would
+    /// stop install on every stock machine.
+    #[test]
+    fn ancestor_ok_reads_the_printed_letters() {
+        use crate::winacl::{ancestor_ok, protected_ok};
+        use saiife_win::sddl::{parse, stock};
+        for text in [stock::PROGRAM_DATA, stock::DRIVE_ROOT, stock::PROGRAM_FILES] {
+            ancestor_ok(&parse(text).unwrap()).unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
+        // Users may create entries there, so it is no fit for a path of ours.
+        assert!(protected_ok(&parse(stock::PROGRAM_DATA).unwrap(), &[]).is_err());
+        // What may not pass, in the same letters.
+        for rights in ["DT", "SD", "WD", "WO", "GA", "GW"] {
+            let text = format!("O:SYG:SYD:P(A;;FA;;;SY)(A;;{rights};;;BU)");
+            assert!(ancestor_ok(&parse(&text).unwrap()).is_err(), "{rights}");
+        }
+    }
+
+    #[test]
+    fn net_localgroup_argv() {
+        assert_eq!(
+            argv_net_create_group("saiife-audit").unwrap(),
+            [NET_EXE, "localgroup", "saiife-audit", "/add"]
+        );
+        assert_eq!(
+            argv_net_delete_group("saiife-audit").unwrap(),
+            [NET_EXE, "localgroup", "saiife-audit", "/delete"]
+        );
+        assert_eq!(
+            argv_net_add_member(r"ACME\some user", "saiife-audit").unwrap(),
+            [
+                NET_EXE,
+                "localgroup",
+                "saiife-audit",
+                r"ACME\some user",
+                "/add"
+            ]
+        );
+        assert_eq!(
+            argv_net_remove_member("alice", "saiife-audit").unwrap(),
+            [NET_EXE, "localgroup", "saiife-audit", "alice", "/delete"]
+        );
+        for bad in ["", "-x", "/delete", "a/b", "a\nb", "a\u{7f}"] {
+            assert!(argv_net_create_group(bad).is_err(), "{bad:?}");
+            assert!(argv_net_add_member(bad, "g").is_err(), "{bad:?}");
+            assert!(argv_net_add_member("u", bad).is_err(), "{bad:?}");
+        }
+        for argv in [
+            argv_net_create_group("g").unwrap(),
+            argv_sc_sdset("saiifed", crate::layout::WIN_SERVICE_SDDL).unwrap(),
+            argv_sc_paramchange("saiifed").unwrap(),
+        ] {
+            assert!(WIN_PROGRAMS.contains(&argv[0].as_str()), "{argv:?}");
+        }
+        assert!(argv_sc_sdset("saiifed", "not sddl").is_err());
+    }
+
+    /// A failing tool's text is localized, so an error never quotes it.
+    #[test]
+    fn check_exit_reads_the_code_only() {
+        let argv = argv_net_create_group("g").unwrap();
+        let out = |status: i32| CmdOutput {
+            status,
+            stdout: "Der Befehl ist fehlgeschlagen".into(),
+            stderr: "Systemfehler 5".into(),
+        };
+        check_exit(&argv, &out(0)).unwrap();
+        let text = check_exit(&argv, &out(2)).unwrap_err().to_string();
+        assert!(text.contains("exit 2"), "{text}");
+        assert!(
+            !text.contains("Befehl") && !text.contains("Systemfehler"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn parse_win_build_reads_the_registry_values() {
+        let s = |v: &str| Some(v.to_string());
+        for (kind, server) in [
+            ("Client", false),
+            ("Server", true),
+            ("Server Core", true),
+            ("Nano Server", true),
+        ] {
+            assert_eq!(
+                parse_win_build(s("22631"), s(kind)).unwrap(),
+                WinBuild {
+                    build: 22631,
+                    server
+                }
+            );
+        }
+        assert!(parse_win_build(None, s("Client")).is_err());
+        assert!(parse_win_build(s("22631"), None).is_err());
+        assert!(parse_win_build(s("22631.1"), s("Client")).is_err());
+        assert!(parse_win_build(s(""), s("Client")).is_err());
+        assert!(parse_win_build(s("22631"), s("Something new")).is_err());
+    }
+
+    #[test]
+    fn fake_net_mode_follows_windows() {
+        let (dir, host) = fake();
+        host.set(|s| s.net = true);
+        host.create_system_group("saiife-audit").unwrap();
+        let sid = host.lookup_sid("saiife-audit").unwrap();
+        assert!(saiife_win::sid::valid_sid(&sid), "{sid}");
+        host.add_to_group(r"ACME\some user", "saiife-audit")
+            .unwrap();
+        host.remove_from_group(r"ACME\some user", "saiife-audit")
+            .unwrap();
+        host.delete_group("saiife-audit").unwrap();
+        assert_eq!(host.lookup_sid("saiife-audit"), None);
+        let calls = host.state().calls;
+        for line in [
+            format!("{NET_EXE} localgroup saiife-audit /add"),
+            format!(r"{NET_EXE} localgroup saiife-audit ACME\some user /add"),
+            format!(r"{NET_EXE} localgroup saiife-audit ACME\some user /delete"),
+            format!("{NET_EXE} localgroup saiife-audit /delete"),
+        ] {
+            assert!(calls.contains(&line), "{line}: {calls:?}");
+        }
+        for e in [
+            host.create_system_user("u", "g").unwrap_err(),
+            host.delete_user("u").unwrap_err(),
+            host.chown(dir.path(), 1, 1).unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        }
+        assert!(host.create_system_group("/add").is_err());
+    }
+
+    #[test]
+    fn fake_service_lifecycle() {
+        let (dir, host) = fake();
+        let spec = ServiceSpec::saiifed(&Layout::under(dir.path()));
+        let wait = Duration::from_secs(1);
+        assert_eq!(
+            host.service(ServiceOp::Query).unwrap(),
+            ServiceState::Missing
+        );
+        assert!(host.service(ServiceOp::Start).is_err());
+        assert!(host.service(ServiceOp::Update(spec.clone())).is_err());
+        assert!(host.service(ServiceOp::Delete).is_err());
+        assert_eq!(
+            host.service(ServiceOp::Create(spec.clone())).unwrap(),
+            ServiceState::Stopped
+        );
+        assert!(host.service(ServiceOp::Create(spec.clone())).is_err());
+        assert_eq!(
+            host.service(ServiceOp::Start).unwrap(),
+            ServiceState::Running { pid: 4242 }
+        );
+        host.service(ServiceOp::ParamChange).unwrap();
+        host.service(ServiceOp::SetSddl("D:".into())).unwrap();
+        assert_eq!(host.state().services["saiifed"].sddl, "D:");
+        assert_eq!(
+            host.service(ServiceOp::Stop { wait }).unwrap(),
+            ServiceState::Stopped
+        );
+        assert_eq!(
+            host.service(ServiceOp::Delete).unwrap(),
+            ServiceState::Missing
+        );
+        let calls = host.state().calls;
+        assert!(calls.contains(&format!("service create {}", spec.fingerprint())));
+        assert!(calls.contains(&"service paramchange".to_string()));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

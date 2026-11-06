@@ -7,11 +7,13 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 use saiife_agents::Agent;
+#[cfg(unix)]
 use saiife_policy::Getent;
 use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::fleet::fleet_options;
 use saiife_system::install::{
-    install_locked, lock_install, InstallError, InstallOptions, NOTHING_CHANGED,
+    install_locked, lock_install, package_exit, write_package_log, InstallError, InstallOptions,
+    NOTHING_CHANGED,
 };
 use saiife_system::layout::Platform;
 use saiife_system::uninstall::{uninstall, UninstallOptions};
@@ -45,6 +47,11 @@ pub enum SystemAction {
         /// Read the install options from /etc/saiife/fleet/ (packages and MDM tools)
         #[arg(long, conflicts_with_all = ["config", "agents", "approvers"])]
         fleet: bool,
+        /// For a package's install action, with --fleet: installed with doctor findings
+        /// exits 0, not 1, so the package does not roll back; a failed install still exits 2.
+        /// On Windows the doctor's text also goes to the install log.
+        #[arg(long, requires = "fleet")]
+        package: bool,
         /// Install below this directory with a fake host (tests only).
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -92,6 +99,7 @@ fn report_error(cmd: &str, e: InstallError) -> ExitCode {
         InstallError::NotRoot => fail(format!(
             "saiife: system {cmd} needs root (run it with sudo)"
         )),
+        InstallError::NotElevated => fail(format!("saiife: {}", InstallError::NotElevated)),
         InstallError::Unsupported(why) => fail(refusal_line(&why)),
         InstallError::Refused { path, detail } => fail(format!(
             "saiife: {cmd} failed at check: {}: {detail}",
@@ -113,26 +121,29 @@ fn report_untouched(e: InstallError) -> ExitCode {
 }
 
 /// `doctor` after a successful install (spec §7): its text on stdout.
-/// True when it found a failure (the caller exits 1; the install itself
-/// stays done; install errors are exit 2).
-fn after_install_doctor(layout: &Layout, host: &dyn Host) -> bool {
-    let opts = DoctorOptions {
-        user: None,
-        home: std::env::var_os("HOME")
+/// Returns that text, and true when it found a failure (the caller exits 1;
+/// the install itself stays done; install errors are exit 2).
+fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
+    #[cfg(unix)]
+    let (dir, home) = (
+        Getent,
+        std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|h| h.is_absolute()),
-    };
-    let report = doctor::run(layout, host, &Getent, &opts);
+    );
+    // The profile comes from the registry by SID: the environment is the caller's.
+    #[cfg(windows)]
+    let (dir, home) = (saiife_policy::WinDirectory::system(), None);
+    let opts = DoctorOptions { user: None, home };
+    let (text, failed) = doctor::after_install(layout, host, &dir, &opts);
     outln!();
-    out!("{}", report.to_text());
-    if report.exit_code() == 2 {
+    out!("{text}");
+    if failed {
         eprintln!(
             "saiife: installed, but doctor found failures: fix them before relying on the lock"
         );
-        true
-    } else {
-        false
     }
+    (text, failed)
 }
 
 /// The command an admin runs to restart the daemon on `platform`.
@@ -140,7 +151,6 @@ fn restart_command(platform: Platform) -> &'static str {
     match platform {
         Platform::Linux => "systemctl restart saiifed",
         Platform::Macos => "launchctl kickstart -k system/com.saiife.saiifed",
-        // This module does not build on Windows; plan 19b's locked mode reads this.
         Platform::Windows => "Restart-Service saiifed",
     }
 }
@@ -153,6 +163,7 @@ pub fn run(action: SystemAction) -> ExitCode {
             approvers,
             non_interactive,
             fleet,
+            package,
             root,
             #[cfg(debug_assertions)]
             allow_test_build,
@@ -212,7 +223,14 @@ pub fn run(action: SystemAction) -> ExitCode {
                     if let Some(h) = &r.policy_hash {
                         println!("saiife: the daemon reloaded the new config (policy {h})");
                     }
-                    let doctor_failed = after_install_doctor(&layout, host.as_ref());
+                    let (doctor_text, doctor_failed) = after_install_doctor(&layout, host.as_ref());
+                    if package {
+                        // The install is done: a log that cannot be written is no reason
+                        // to roll it back.
+                        if let Err(e) = write_package_log(&layout, host.as_ref(), &doctor_text) {
+                            eprintln!("saiife: warning: the install log: {e}");
+                        }
+                    }
                     // Last, so it is the line an admin sees: the old policy
                     // may still be in force.
                     if let Some(p) = &r.reload_problem {
@@ -224,11 +242,10 @@ pub fn run(action: SystemAction) -> ExitCode {
                             restart_command(layout.platform())
                         );
                     }
-                    if doctor_failed || r.reload_problem.is_some() {
-                        ExitCode::from(1)
-                    } else {
-                        ExitCode::SUCCESS
+                    if let Some(p) = &r.policy_failure {
+                        eprintln!("saiife: error: {p}");
                     }
+                    ExitCode::from(package_exit(r.exit_code(doctor_failed), package))
                 }
                 Err(e) if began.get() => report_error("install", e),
                 Err(e) => report_untouched(e),

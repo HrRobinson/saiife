@@ -2,7 +2,7 @@
 
 use crate::load::{load_system, LoadedPolicy, PolicyError};
 use crate::system::{Scope, SystemConfig};
-use crate::users::Directory;
+use crate::users::{names_account, Directory};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -13,6 +13,7 @@ const GROUP_PREFIX: &str = "group:";
 /// Members whose only link to a group is their primary gid cannot be listed
 /// here; [`scope_for`] catches them per request.
 pub fn check_scopes(cfg: &SystemConfig, dir: &dyn Directory) -> Result<(), PolicyError> {
+    check_uid_collisions(cfg, dir)?;
     let mut by_uid: BTreeMap<u32, (String, BTreeSet<String>)> = BTreeMap::new();
     for scope in &cfg.scope {
         for entry in &scope.users {
@@ -42,6 +43,50 @@ pub fn check_scopes(cfg: &SystemConfig, dir: &dyn Directory) -> Result<(), Polic
     Ok(())
 }
 
+/// W12: two configured principals with one uid label and two SIDs are a load error, as
+/// the policy keys its principals by uid. Only a directory that knows SIDs can say so
+/// (Windows): on Linux and macOS two names with one uid are one identity, as ever.
+fn check_uid_collisions(cfg: &SystemConfig, dir: &dyn Directory) -> Result<(), PolicyError> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    names.insert(cfg.daemon.user.clone());
+    let entries = cfg
+        .scope
+        .iter()
+        .flat_map(|s| s.users.iter())
+        .chain(cfg.approval.approvers.iter());
+    for entry in entries {
+        match entry.strip_prefix(GROUP_PREFIX) {
+            Some(g) => {
+                if dir.sid_of(g).is_some() {
+                    names.extend(dir.group(g).map(|g| g.members).unwrap_or_default());
+                }
+            }
+            None => {
+                names.insert(entry.clone());
+            }
+        }
+    }
+    let mut seen: BTreeMap<u32, (String, String)> = BTreeMap::new();
+    for name in names {
+        let (Some(sid), Some(user)) = (dir.sid_of(&name), dir.user(&name)) else {
+            continue;
+        };
+        match seen.get(&user.uid) {
+            Some((first, known)) if *known != sid => {
+                return Err(PolicyError::UidCollision {
+                    a: first.clone(),
+                    b: name,
+                })
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(user.uid, (name, sid));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The per-request check: the scope `user` belongs to with its current
 /// groups (primary group included), or `ScopeConflict` if more than one.
 pub fn scope_for<'a>(
@@ -49,7 +94,7 @@ pub fn scope_for<'a>(
     dir: &dyn Directory,
     user: &str,
 ) -> Result<Option<&'a Scope>, PolicyError> {
-    scope_in(cfg, user, &dir.groups_of(user))
+    scope_in(cfg, dir, user, &dir.groups_of(user))
 }
 
 /// [`scope_for`] that fails when the group lookup does, but only when a
@@ -68,11 +113,15 @@ pub fn try_scope_for<'a>(
     } else {
         Vec::new()
     };
-    Ok(scope_in(cfg, user, &groups))
+    Ok(scope_in(cfg, dir, user, &groups))
 }
 
+/// A user entry names `user` as [`names_account`] says: as written on Linux and macOS,
+/// and on Windows also when both resolve to one SID (`agent` is the `HOST\agent` the
+/// daemon names a peer). Text alone would leave a Windows user in no scope.
 fn scope_in<'a>(
     cfg: &'a SystemConfig,
+    dir: &dyn Directory,
     user: &str,
     groups: &[String],
 ) -> Result<Option<&'a Scope>, PolicyError> {
@@ -82,7 +131,7 @@ fn scope_in<'a>(
         .filter(|s| {
             s.users.iter().any(|e| match e.strip_prefix(GROUP_PREFIX) {
                 Some(g) => groups.iter().any(|x| x == g),
-                None => e == user,
+                None => names_account(dir, e, user),
             })
         })
         .collect();
@@ -143,6 +192,64 @@ mod tests {
         }
     }
 
+    /// A directory that knows SIDs, as Windows' does, with labels that collide.
+    struct SidDirectory(Vec<(&'static str, u32, &'static str)>);
+
+    impl Directory for SidDirectory {
+        fn user(&self, name: &str) -> Option<crate::users::UserEntry> {
+            let e = self.0.iter().find(|e| e.0 == name)?;
+            Some(crate::users::UserEntry { uid: e.1, gid: 0 })
+        }
+        fn name_of(&self, _: u32) -> Option<String> {
+            None
+        }
+        fn group(&self, _: &str) -> Option<crate::users::GroupEntry> {
+            None
+        }
+        fn groups_of(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn sid_of(&self, name: &str) -> Option<String> {
+            Some(self.0.iter().find(|e| e.0 == name)?.2.to_string())
+        }
+    }
+
+    #[test]
+    fn uid_collision_is_load_error() {
+        let c = cfg("[[scope]]\nname = \"a\"\nusers = [\"alice\", \"bob\"]\n");
+        let dir = SidDirectory(vec![
+            ("alice", 0x4000_0001, "S-1-5-21-1-2-3-1001"),
+            ("bob", 0x4000_0001, "S-1-5-21-1-2-3-1002"),
+        ]);
+        let e = check_scopes(&c, &dir).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "uid collision between alice and bob; rename one or tell the saiife maintainers"
+        );
+    }
+
+    /// Two spellings of one account are one principal.
+    #[test]
+    fn two_names_of_one_sid_do_not_collide() {
+        let c = cfg("[[scope]]\nname = \"a\"\nusers = [\"alice\", \"PC\\\\alice\"]\n");
+        let dir = SidDirectory(vec![
+            ("alice", 0x4000_0001, "S-1-5-21-1-2-3-1001"),
+            ("PC\\alice", 0x4000_0001, "S-1-5-21-1-2-3-1001"),
+        ]);
+        check_scopes(&c, &dir).unwrap();
+    }
+
+    /// Unix: two names with one uid (`root`, `toor`) stay allowed.
+    #[test]
+    fn unix_aliases_of_one_uid_are_no_collision() {
+        let c = cfg("[[scope]]\nname = \"a\"\nusers = [\"alice\", \"alias\"]\n");
+        let dir = FixedDirectory::from_text(
+            "alice:x:1000:1000::/h:/bin/sh\nalias:x:1000:1000::/h:/bin/sh\n",
+            "",
+        );
+        check_scopes(&c, &dir).unwrap();
+    }
+
     #[test]
     fn scope_conflict_direct() {
         let d = FixedDirectory::from_text(PASSWD, "");
@@ -171,6 +278,76 @@ mod tests {
              [[scope]]\nname = \"b\"\nusers = [\"group:devs\", \"carol\"]\n",
         );
         check_scopes(&c, &d).unwrap();
+    }
+
+    /// Windows' accounts as the locked-windows CI has them: `agent` is `HOST\agent`.
+    struct CiAccounts;
+
+    impl crate::users::WinAccounts for CiAccounts {
+        fn lookup_name(&self, name: &str) -> Result<(String, String), String> {
+            let bare = name.rsplit('\\').next().unwrap_or(name);
+            match bare.to_ascii_lowercase().as_str() {
+                "agent" => Ok(("S-1-5-21-1-2-3-1003".into(), r"HOST\agent".into())),
+                "approver" => Ok(("S-1-5-21-1-2-3-1004".into(), r"HOST\approver".into())),
+                _ => Err(format!("no account {name}")),
+            }
+        }
+        fn lookup_sid(&self, sid: &str) -> Result<String, String> {
+            Err(format!("no SID {sid}"))
+        }
+        fn local_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
+            Ok(vec!["Users".into()])
+        }
+        fn local_group_members(&self, group: &str) -> Result<Vec<String>, String> {
+            Err(format!("no group {group}"))
+        }
+    }
+
+    /// The daemon names a Windows peer `HOST\agent`, a policy says `agent`: the scope
+    /// is that account's (by SID), and not another account's. As text it was nobody's.
+    #[test]
+    fn a_bare_scope_name_matches_its_windows_account() {
+        let c = cfg(
+            "[[scope]]\nname = \"shop\"\nusers = [\"agent\"]\nenv = \"prod\"\n\
+             [environments.prod]\n",
+        );
+        let d = crate::users::WinDirectory::new(CiAccounts);
+        let name = |u: &str| scope_for(&c, &d, u).unwrap().map(|s| s.name.clone());
+        assert_eq!(name(r"HOST\agent").as_deref(), Some("shop"));
+        assert_eq!(name(r"host\AGENT").as_deref(), Some("shop"));
+        assert_eq!(name(r"HOST\approver"), None);
+        assert_eq!(name(r"HOST\nobody"), None);
+        let tried = try_scope_for(&c, &d, r"HOST\agent").unwrap().unwrap();
+        assert_eq!(tried.map(|s| s.name.as_str()), Some("shop"));
+        assert!(try_scope_for(&c, &d, r"HOST\approver")
+            .unwrap()
+            .unwrap()
+            .is_none());
+        // The environment and the view go through the same match.
+        assert_eq!(
+            crate::environment::env_for(&c, &d, r"HOST\agent").unwrap(),
+            Some("prod")
+        );
+        assert_eq!(
+            crate::environment::env_for(&c, &d, r"HOST\approver").unwrap(),
+            None
+        );
+        let (_, env) = crate::environment::applied_for(&c, &d, r"HOST\agent").unwrap();
+        assert_eq!(env.as_deref(), Some("prod"));
+        let v = crate::view::user_view(&c, &d, r"HOST\agent");
+        assert_eq!(v["scope"]["name"], "shop", "{v}");
+        let v = crate::view::user_view(&c, &d, r"HOST\approver");
+        assert!(v["scope"].is_null(), "{v}");
+    }
+
+    /// Linux and macOS: names compare as written, as before.
+    #[test]
+    fn unix_scope_names_compare_as_written() {
+        let c = cfg("[[scope]]\nname = \"a\"\nusers = [\"alice\"]\n");
+        let d = FixedDirectory::from_text(PASSWD, "");
+        assert!(scope_for(&c, &d, "alice").unwrap().is_some());
+        assert!(scope_for(&c, &d, "ALICE").unwrap().is_none());
+        assert!(scope_for(&c, &d, "bob").unwrap().is_none());
     }
 
     #[test]

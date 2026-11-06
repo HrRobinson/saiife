@@ -25,7 +25,7 @@ const SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 const KEY_PREFIX: &str = "ed25519:";
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const SEED_LEN: u64 = 32;
 
 /// The daemon's checkpoint signing key. The secret is zeroized when the key
@@ -57,10 +57,20 @@ impl AuditKey {
         load_or_create_owned(path, rustix::process::geteuid().as_raw())
     }
 
-    /// The key file's owner and mode checks need Unix.
-    #[cfg(not(unix))]
+    /// Load the key at `path`, or create it, for this process's token: see
+    /// `windows_key`. W14 gives `state\\keys` to the service; the new file inherits that.
+    #[cfg(windows)]
     pub fn load_or_create(path: &Path) -> io::Result<(AuditKey, bool)> {
-        Err(problem(path, "the audit signing key needs a Unix system"))
+        windows_key::load_or_create(path)
+    }
+
+    /// Neither Unix nor Windows: there is no way to check the key file.
+    #[cfg(not(any(unix, windows)))]
+    pub fn load_or_create(path: &Path) -> io::Result<(AuditKey, bool)> {
+        Err(problem(
+            path,
+            "the audit signing key needs a Unix or Windows system",
+        ))
     }
 
     /// Write `key` to `path` for key rotation: a 0600 temp file next to it,
@@ -425,6 +435,115 @@ pub fn key_rotate_message(
 
 fn problem(path: &Path, what: &str) -> io::Error {
     io::Error::other(format!("audit key {}: {what}", path.display()))
+}
+
+/// The key file on Windows: never through a reparse point, 32 bytes, and private to this
+/// process's token and the system's own accounts. The first key is created as on Unix:
+/// synced under a temp name, then hard-linked to the final one, so it never exists
+/// half-written and a second creator loads the key that won.
+#[cfg(windows)]
+mod windows_key {
+    use super::{create_key_dir, create_new, problem, AuditKey, SEED_LEN};
+    use ed25519_dalek::SigningKey;
+    use saiife_win::ffi::{acl, token};
+    use saiife_win::sddl::private_problem;
+    use std::fs::{self, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+    use zeroize::Zeroizing;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    fn private(path: &Path, own: &str) -> io::Result<()> {
+        let text = acl::get_sddl(path).map_err(|e| problem(path, &format!("no ACL: {e}")))?;
+        match private_problem(&text, own, true) {
+            None => Ok(()),
+            Some(why) => Err(problem(path, &why)),
+        }
+    }
+
+    fn load(path: &Path, own: &str) -> io::Result<Option<AuditKey>> {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(problem(path, &format!("cannot open: {e}"))),
+        };
+        let md = file
+            .metadata()
+            .map_err(|e| problem(path, &format!("cannot stat: {e}")))?;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !md.is_file() {
+            return Err(problem(path, "is not a regular file"));
+        }
+        private(path, own)?;
+        if md.len() != SEED_LEN {
+            return Err(problem(path, "must be exactly 32 bytes"));
+        }
+        let mut seed = Zeroizing::new([0u8; 32]);
+        file.read_exact(&mut seed[..])
+            .map_err(|e| problem(path, &format!("cannot read: {e}")))?;
+        Ok(Some(AuditKey {
+            key: SigningKey::from_bytes(&seed),
+        }))
+    }
+
+    pub(super) fn load_or_create(path: &Path) -> io::Result<(AuditKey, bool)> {
+        let own = token::current()
+            .map_err(|e| problem(path, &format!("cannot read this process's token: {e}")))?
+            .sid;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        create_key_dir(parent)?;
+        let md = fs::symlink_metadata(parent)
+            .map_err(|e| problem(parent, &format!("cannot stat: {e}")))?;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !md.is_dir() {
+            return Err(problem(
+                parent,
+                "is not a directory (links are not followed)",
+            ));
+        }
+        private(parent, &own)?;
+        if let Some(k) = load(path, &own)? {
+            return Ok((k, false));
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| problem(path, "not a file path"))?;
+        let tmp = parent.join(format!(".{}.tmp", name.to_string_lossy()));
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(problem(&tmp, &format!("cannot remove: {e}"))),
+        }
+        let key = AuditKey::generate()?;
+        let written = (|| {
+            let mut f = create_new(&tmp)?;
+            let seed = Zeroizing::new(key.key.to_bytes());
+            f.write_all(&seed[..])?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(problem(path, &format!("cannot write the new key: {e}")));
+        }
+        let linked = fs::hard_link(&tmp, path);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok((key, true)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match load(path, &own)? {
+                Some(k) => Ok((k, false)),
+                None => Err(problem(path, "the key file keeps changing")),
+            },
+            Err(e) => Err(problem(path, &format!("cannot link the new key: {e}"))),
+        }
+    }
 }
 
 /// A new file at `path`, 0600, `O_EXCL` (and `O_NOFOLLOW`).

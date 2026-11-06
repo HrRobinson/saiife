@@ -147,13 +147,15 @@ CLI are restricted by the hook only". See [MCP](../mcp.md).
 
 ## Locked mode (v2)
 
-Lock label: **unverified**, on Linux and on macOS. The
+Lock label: **unverified**, on Linux, macOS and Windows. The
 [lock-check](../lock-check.md) for Gemini CLI has not been run with a
 logged-in account yet, so we do not know whether Gemini CLI can be locked.
-The managed file is `/etc/gemini-cli/settings.json` on Linux and
-`/Library/Application Support/GeminiCli/settings.json` on macOS; the macOS
-results will go to `crates/agents/tests/fixtures/lock-check/macos/gemini.tsv`.
-On macOS the daemon matches sessions by process name only, so a Gemini CLI
+The managed file is `/etc/gemini-cli/settings.json` on Linux,
+`/Library/Application Support/GeminiCli/settings.json` on macOS and
+`C:\ProgramData\gemini-cli\settings.json` on Windows, where locked mode is a preview
+([Windows](../windows.md#locked-mode)). The macOS and Windows results will go to
+`crates/agents/tests/fixtures/lock-check/macos/gemini.tsv` and `…/windows/gemini.tsv`.
+On macOS and Windows the daemon matches sessions by process name only, so a Gemini CLI
 running as `node` gets no session: its requests share the per-uid limits
 (attribution only). Until it has, treat Gemini CLI as running in the
 Developer setup even on a locked machine, and do not rely on the lock for it

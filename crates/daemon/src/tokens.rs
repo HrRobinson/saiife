@@ -10,7 +10,6 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
@@ -48,6 +47,7 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
 struct Entry {
     hash: [u8; 32],
     uid: u32,
+    sid: Option<String>,
     expires: u64,
 }
 
@@ -56,6 +56,9 @@ struct Entry {
 struct StoredEntry {
     sha256: String,
     uid: u32,
+    /// Windows: the SID the token is bound to; `uid` is its label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sid: Option<String>,
     expires: u64,
 }
 
@@ -184,6 +187,11 @@ impl Tokens {
     /// [`MAX_PER_UID`] live ones, the oldest of `uid`'s goes. Nothing is
     /// issued unless the file was written.
     pub fn issue(&self, uid: u32) -> io::Result<Issued> {
+        self.issue_for(uid, None)
+    }
+
+    /// [`Tokens::issue`], bound to a SID on Windows.
+    pub fn issue_for(&self, uid: u32, sid: Option<String>) -> io::Result<Issued> {
         let mut raw = Zeroizing::new([0u8; 32]);
         getrandom::fill(&mut raw[..]).map_err(|e| io::Error::other(e.to_string()))?;
         let token = Zeroizing::new(format!(
@@ -217,6 +225,7 @@ impl Tokens {
         next.push(Entry {
             hash: sha256(&token),
             uid,
+            sid,
             expires,
         });
         self.save(&next)?;
@@ -227,6 +236,11 @@ impl Tokens {
     /// The uid of a live `token`, or `None` (missing, expired, unknown).
     /// Every stored hash is compared, each in constant time.
     pub fn verify(&self, token: &str) -> Option<u32> {
+        self.verify_identity(token).map(|(uid, _)| uid)
+    }
+
+    /// [`Tokens::verify`], with the SID the token is bound to on Windows.
+    pub fn verify_identity(&self, token: &str) -> Option<(u32, Option<String>)> {
         if !token.starts_with(PREFIX) {
             return None;
         }
@@ -237,7 +251,7 @@ impl Tokens {
             // An expiry past now + TTL (a clock that went back, an edited
             // file) is not trusted.
             if ct_eq(&e.hash, &h) && e.expires > now && e.expires <= now.saturating_add(TTL_SECS) {
-                found = Some(e.uid);
+                found = Some((e.uid, e.sid.clone()));
             }
         }
         found
@@ -284,6 +298,7 @@ impl Tokens {
                 .map(|e| StoredEntry {
                     sha256: hex(&e.hash),
                     uid: e.uid,
+                    sid: e.sid.clone(),
                     expires: e.expires,
                 })
                 .collect(),
@@ -316,6 +331,7 @@ fn read(path: &Path) -> io::Result<Vec<Entry>> {
                     io::Error::new(io::ErrorKind::InvalidData, "corrupt: a bad sha256")
                 })?,
                 uid: t.uid,
+                sid: t.sid,
                 expires: t.expires,
             })
         })
@@ -332,11 +348,7 @@ fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!(".{FILE_NAME}.tmp"));
     let _ = std::fs::remove_file(&tmp);
     let staged = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = crate::fsx::new_private_file(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, file)
@@ -345,12 +357,16 @@ fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::File::open(dir)?.sync_all()
+    crate::fsx::sync_dir(dir)
 }
 
 /// [`Tokens::issue`] off the runtime thread (it writes and fsyncs).
-pub async fn issue_blocking(tokens: Arc<Tokens>, uid: u32) -> io::Result<Issued> {
-    tokio::task::spawn_blocking(move || tokens.issue(uid))
+pub async fn issue_blocking(
+    tokens: Arc<Tokens>,
+    uid: u32,
+    sid: Option<String>,
+) -> io::Result<Issued> {
+    tokio::task::spawn_blocking(move || tokens.issue_for(uid, sid))
         .await
         .unwrap_or_else(|e| Err(io::Error::other(e.to_string())))
 }
@@ -368,6 +384,7 @@ pub fn rfc3339(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -376,7 +393,7 @@ mod tests {
         Arc::new(move || at.load(Ordering::SeqCst))
     }
 
-    fn scratch() -> tempfile::TempDir {
+    fn scratch() -> crate::fsx::TestDir {
         let base = std::env::var_os("SAIIFE_TEST_TMP")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -386,7 +403,7 @@ mod tests {
                 ))
             });
         std::fs::create_dir_all(&base).unwrap();
-        tempfile::tempdir_in(base).unwrap()
+        crate::fsx::TestDir::new_in(&base)
     }
 
     #[test]
@@ -441,6 +458,7 @@ mod tests {
         assert_eq!(t.verify(&other.token), Some(6));
     }
 
+    #[cfg(unix)]
     #[test]
     fn token_hashed_on_disk() {
         let d = scratch();
@@ -477,6 +495,7 @@ mod tests {
         assert!(!text.contains(&hex(&sha256(&i.token))), "{text}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_file_resets() {
         let d = scratch();

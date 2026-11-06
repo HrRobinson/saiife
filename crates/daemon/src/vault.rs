@@ -10,7 +10,6 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -116,20 +115,32 @@ pub struct Vault {
 }
 
 fn real_dir_sync(dir: &Path) -> io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
+    crate::fsx::sync_dir(dir)
 }
 
 /// Open a regular file without following a symlink and without blocking on
 /// a FIFO; anything else is `InvalidData`.
 pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    let f = std::fs::File::from(fd);
-    if !f.metadata()?.file_type().is_file() {
+    #[cfg(unix)]
+    let f = {
+        use rustix::fs::{Mode, OFlags};
+        std::fs::File::from(rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    };
+    // `FILE_FLAG_OPEN_REPARSE_POINT`: the link itself opens, and is refused below.
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?
+    };
+    let md = f.metadata()?;
+    if crate::fsx::is_link(&md) || !md.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a regular file",
@@ -142,14 +153,10 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// mode 0700 (fixed when it is not). With `create`, a missing dir is made;
 /// otherwise a missing dir is `NotFound`.
 pub(crate) fn check_dir(dir: &Path, create: bool) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let md = match std::fs::symlink_metadata(dir) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
+            crate::fsx::create_private_dirs(dir)?;
             std::fs::symlink_metadata(dir)?
         }
         Err(e) => return Err(e),
@@ -160,15 +167,21 @@ pub(crate) fn check_dir(dir: &Path, create: bool) -> io::Result<()> {
             dir.display()
         )));
     }
-    if md.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::other(format!(
-            "{} is not owned by this user",
-            dir.display()
-        )));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if md.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::other(format!(
+                "{} is not owned by this user",
+                dir.display()
+            )));
+        }
+        if md.permissions().mode() & 0o7777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
-    if md.permissions().mode() & 0o7777 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    #[cfg(windows)]
+    crate::fsx::check_private_dir(dir)?;
     Ok(())
 }
 
@@ -200,15 +213,24 @@ pub fn valid_name(n: &str) -> bool {
 }
 
 fn read_key(key_file: &Path) -> Result<Zeroizing<[u8; 32]>, &'static str> {
-    use std::os::unix::fs::MetadataExt;
     let f = open_regular(key_file).map_err(|_| "no vault key")?;
-    let md = f.metadata().map_err(|_| "no vault key")?;
-    key_file_ok(
-        cfg!(target_os = "macos"),
-        md.uid(),
-        md.mode(),
-        rustix::process::geteuid().as_raw(),
-    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = f.metadata().map_err(|_| "no vault key")?;
+        key_file_ok(
+            cfg!(target_os = "macos"),
+            md.uid(),
+            md.mode(),
+            rustix::process::geteuid().as_raw(),
+        )?;
+    }
+    #[cfg(windows)]
+    {
+        let text = saiife_win::ffi::acl::get_sddl(key_file).map_err(|_| "no vault key")?;
+        let own = crate::fsx::own_sid().map_err(|_| "no vault key")?;
+        win_key_ok(&text, &own)?;
+    }
     let mut buf = Zeroizing::new(Vec::with_capacity(64));
     f.take(33)
         .read_to_end(&mut buf)
@@ -221,11 +243,35 @@ fn read_key(key_file: &Path) -> Result<Zeroizing<[u8; 32]>, &'static str> {
     Ok(key)
 }
 
+/// The vault key's descriptor on Windows (W15): it passes `protected_ok` with no extra
+/// writer, the daemon's SID may read it, and nobody else but the system's accounts may.
+/// The file's ACL is the barrier here, as its mode is on Unix.
+pub fn win_key_ok(text: &str, own_sid: &str) -> Result<(), &'static str> {
+    use saiife_win::sddl;
+    const FILE_READ_DATA: u32 = 0x1;
+    let refused = "the vault key file's ACL is not the one install sets";
+    let sd = sddl::parse(text).map_err(|_| refused)?;
+    saiife_system::winacl::protected_ok(&sd, &[]).map_err(|_| refused)?;
+    if sddl::private_problem(text, own_sid, true).is_some() {
+        return Err(refused);
+    }
+    let reads = sd
+        .aces
+        .iter()
+        .any(|a| a.allow && a.sid == own_sid && a.mask & FILE_READ_DATA != 0);
+    let denied = sd.aces.iter().any(|a| !a.allow && a.sid == own_sid);
+    if !reads || denied {
+        return Err(refused);
+    }
+    Ok(())
+}
+
 /// The key file's owner and mode. On Linux it is systemd's credential
 /// (`$CREDENTIALS_DIRECTORY`, root's to manage), so nothing more is asked.
 /// On macOS it is `/var/db/saiife/keys/vault.key`, which install writes
 /// 0400 for the daemon user: it must be the daemon's own (`euid`), and
 /// group and others must have no access.
+#[cfg_attr(windows, allow(dead_code))]
 fn key_file_ok(macos: bool, uid: u32, mode: u32, euid: u32) -> Result<(), &'static str> {
     if !macos {
         return Ok(());
@@ -790,11 +836,7 @@ fn write_atomic(
     let tmp = dir.join(".vault.bin.tmp");
     let _ = std::fs::remove_file(&tmp);
     let staged = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = crate::fsx::new_private_file(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, file)
@@ -807,6 +849,43 @@ fn write_atomic(
 }
 
 #[cfg(test)]
+mod win_key_tests {
+    use super::win_key_ok;
+    use saiife_win::sid::service_sid;
+
+    fn table(s: &str) -> String {
+        format!("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;{s})")
+    }
+
+    #[test]
+    fn the_table_row_is_accepted() {
+        let s = service_sid("saiifed");
+        win_key_ok(&table(&s), &s).unwrap();
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        let s = service_sid("saiifed");
+        // Another SID's key file: this daemon has no read.
+        win_key_ok(&table(&s), "S-1-5-21-1-2-3-1001").unwrap_err();
+        // The service may write it.
+        win_key_ok(&format!("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;{s})"), &s).unwrap_err();
+        // Users may read it.
+        win_key_ok(&format!("{}(A;;FR;;;BU)", table(&s)), &s).unwrap_err();
+        // A user owns it, so it can give itself anything.
+        win_key_ok(
+            &format!("O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;SY)(A;;FR;;;{s})"),
+            &s,
+        )
+        .unwrap_err();
+        // No read at all, a deny, and text that is no descriptor.
+        win_key_ok("O:BAG:SYD:P(A;;FA;;;SY)", &s).unwrap_err();
+        win_key_ok(&format!("O:BAG:SYD:P(D;;FR;;;{s})(A;;FR;;;{s})"), &s).unwrap_err();
+        win_key_ok("nonsense", &s).unwrap_err();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

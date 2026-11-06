@@ -3,7 +3,7 @@
 This page is for admins who roll saiife out to many machines. For Linux it
 covers the `.deb` and `.rpm` packages, an Ansible role and an Intune compliance
 policy. For macOS, see [macOS (v2.1)](#macos-v21): a `.pkg` with Jamf and Intune
-recipes. They all end in the same place: `saiife system install --fleet`, which
+recipes. For Windows, see [Windows](#windows): an MSI with Intune and GPO recipes. They all end in the same place: `saiife system install --fleet`, which
 sets up locked mode as described in [Install](install.md#locked-mode-linux).
 
 Supported systems are the same as for locked mode: Ubuntu 22.04+, Debian 12+
@@ -197,6 +197,8 @@ A release has these assets:
 - two `.pkg` files for macOS (`saiife-<version>-arm64.pkg`,
   `saiife-<version>-x86_64.pkg`), when the release has them. See
   [macOS](#macos-v21);
+- two `.msi` files for Windows and the two `.intunewin` files built from them
+  (`saiife-<version>-x64.msi`, `saiife-<version>-arm64.msi`). See [Windows](#windows);
 - `SHA256SUMS`, which lists all of these;
 - `SHA256SUMS.asc`, a detached signature of `SHA256SUMS`. It is there only when
   the release was signed.
@@ -490,3 +492,169 @@ just the subset, uninstall, then install again from the fleet files: run
   still say pass. saiife ships no PPPC profile.
 - **Syslog.** Long records lose verifiability over `unix:/var/run/syslog`. See
   [Forwarding](forwarding.md#syslog).
+
+## Windows
+
+Locked mode on Windows ships as an MSI, one per architecture
+(`saiife-<version>-x64.msi`, `saiife-<version>-arm64.msi`). For Intune each MSI also comes
+as an `.intunewin` file (`saiife-<version>-x64.intunewin` and the arm64 twin). They end
+in the same place as the other platforms: `saiife system install --fleet`, as described
+in [Windows](windows.md).
+
+### What the MSI owns
+
+The MSI is per-machine and installs to `C:\Program Files\saiife`:
+
+- `saiife.exe`, the staging copy of the binary;
+- `LICENSE` and `README.md`;
+- a system `PATH` entry for that folder.
+
+It owns nothing under `C:\ProgramData`. Its install action runs as SYSTEM, after the
+files are in place:
+
+```
+"C:\Program Files\saiife\saiife.exe" system install --fleet --package
+```
+
+That copies the binary to `C:\ProgramData\saiife\bin`, creates the `saiifed` service,
+writes the managed agent files and records all of it in `installed.toml`. With `--package`,
+an exit of 1 (installed, but `doctor` found warnings) counts as success, and `doctor`'s
+text goes to `C:\ProgramData\saiife\log\install.log`. An exit of 2 fails the action and
+the MSI rolls back, so `C:\Program Files\saiife` is gone afterwards. Read the MSI's own
+log (`msiexec /i ... /l*v msi.log`) for the reason.
+
+### Fleet files
+
+`--fleet` reads `C:\ProgramData\saiife\etc\fleet\config.toml` and `install.toml`. The
+formats are the ones in [Fleet files](#fleet-files). The config must say
+`locked = true`. **Write them before the MSI installs.**
+
+On a fresh machine `C:\ProgramData\saiife` does not exist, and a folder made the usual
+way would inherit entries from `C:\ProgramData` that let any user write to it. saiife
+refuses fleet files in a folder like that, because a user could have planted them. So do
+not copy the files in by hand. Use `deploy/intune-windows/fleet-files.ps1`: it creates
+`C:\ProgramData\saiife` and `etc` with the permissions saiife expects, then writes the
+files. It refuses (exit 2) to write through a junction or a symbolic link, or into a
+folder that a user made or can write to. Move such a folder away first.
+
+The script takes `-ConfigB64` (the base64 of `config.toml`) and `-Agents` (for example
+`claude,codex,gemini`). Intune runs scripts without parameters, so edit the two defaults
+at the top. It must run elevated, in 64-bit PowerShell.
+
+If the MSI runs with no fleet files, install writes the default config, and a later
+`fleet-files.ps1` does not apply until the next install. Apply it with:
+
+```powershell
+& "C:\Program Files\saiife\saiife.exe" system install --fleet --package
+```
+
+### Intune (Windows)
+
+1. Edit `deploy/intune-windows/fleet-files.ps1`: set `$ConfigB64` and `$Agents` in the
+   `param` defaults. Treat your copy as you would the config itself.
+2. Under **Devices > Windows > Scripts and remediations > Platform scripts**, add it.
+   Set **Run this script using the logged on credentials** to **No** and **Run script
+   in 64-bit PowerShell Host** to **Yes**.
+3. Under **Apps > Windows**, add an app of type **Windows app (Win32)** and upload each
+   `.intunewin` file. Use these values:
+   - Install command: `msiexec /i "saiife-<version>-x64.msi" /qn` (the file name of that
+     package);
+   - Uninstall command: `msiexec /x "{product code}" /qn`. The product code is on the app
+     once Intune has read the package;
+   - Install behavior: **System**; device restart behavior: **No specific action**;
+   - Requirements: the architecture of that package;
+   - Detection rules: **Use a custom detection script**, upload
+     `deploy/intune-windows/detect.ps1`, run it in 64-bit PowerShell, and do not
+     enforce a signature check unless you sign your copy.
+4. Assign each app to a group of devices with that architecture.
+5. For compliance, add a custom compliance policy for Windows: upload
+   `deploy/intune-windows/discovery.ps1` as the discovery script and
+   `deploy/intune-windows/rules.json` as the rules file. A device is compliant when
+   saiife is installed and `doctor` exits 0 or 1.
+
+Intune does not promise that the script runs before the app. If the app comes first,
+install writes the default config, and the machine stays on it until the next install
+(see above). The agents may differ too: install never removes a managed hook, so
+narrowing `Agents` later needs an uninstall first. Run
+`& "C:\Program Files\saiife\saiife.exe" system uninstall`, then install again.
+
+### GPO
+
+Group Policy's software installation can assign the MSI to computers, but a computer
+startup script may run before or after it, so the fleet files are not sure to be in place.
+Use one startup script that does both, in order. Put the MSI and `fleet-files.ps1` on a
+share that only administrators can write, and set the policy under **Computer
+Configuration > Policies > Windows Settings > Scripts > Startup > PowerShell Scripts**:
+
+```powershell
+$share = '\\fileserver\saiife'
+& "$share\fleet-files.ps1" -ConfigB64 '<base64>' -Agents 'claude,codex,gemini'
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', "$share\saiife-<version>-x64.msi", '/qn', '/l*v', 'C:\ProgramData\saiife\log\saiife-msi.log'
+exit $p.ExitCode
+```
+
+The log goes to `C:\ProgramData\saiife\log`, never to `C:\Windows\Temp`: the startup
+script runs as SYSTEM, and a user can plant a link in a folder like Temp. The script's
+first line already made that folder's parent, because `fleet-files.ps1` creates
+`C:\ProgramData\saiife` but not `log`. On a first install `log` does not exist yet, so
+`msiexec` cannot open the log and fails. Create it from the script first, with the
+permissions saiife expects, or drop `/l*v` on the first run: after the first install the
+folder is there. Do not create `log` by hand with `mkdir`, as it would inherit
+Users-writable entries and saiife would refuse it.
+
+The startup script runs as SYSTEM, so nobody has to be an administrator on the device. To
+change the fleet files, edit the script: every boot writes them and runs the MSI again.
+The same version is meant to run the install action again, which is safe to repeat, and
+that is what applies the new files. **Unverified:** whether Windows Installer runs a custom
+action for `msiexec /i` of the package that is already installed (it may only open
+maintenance mode). Test it in your rollout. If it does not run, use `msiexec /fa` (repair
+all files) or run `system install --fleet --package` from the script instead. To upgrade, replace the MSI on the share and change
+its name in the script.
+
+### Upgrades and removal on Windows
+
+Install a newer MSI the usual way (Intune supersedence, GPO, or `msiexec /i`). The new
+version installs first, then the old one is removed without its uninstall action, so the
+service is never uninstalled halfway. The install action then restarts the service once,
+and managed files whose content did not change keep their bytes. While it restarts, the
+hooks fail closed. Same-version reinstalls and repairs (`msiexec /f`) run the same install
+action and are safe to repeat.
+
+Uninstalling from **Settings > Apps**, or with `msiexec /x`, runs
+`saiife.exe system uninstall` as SYSTEM first, so the service is removed with the files.
+It is never silent: the line
+`saiife: removing the package uninstalls locked mode: agents on this machine will no longer be locked`
+is written to the MSI log. As on Linux, removal keeps the audit, the vault key, the
+state, the config and the fleet files, because the audit is evidence. For a full wipe,
+run `saiife system uninstall --purge` first, then remove the package.
+
+### Windows limits
+
+- **Signing.** A release is signed with Authenticode only when the owner has set the
+  signing secrets. Without them the MSIs are unsigned, and the release notes say so.
+  Windows then shows an unknown publisher, and some policies (AppLocker, WDAC) refuse the
+  MSI.
+- **Versions.** An MSI version is `major.minor.patch`. A prerelease suffix such as `-rc1`
+  is dropped, so `0.4.0-rc1` and `0.4.0` look equal to Windows Installer, and the final
+  release does not upgrade the candidate. Uninstall the candidate first; that keeps the
+  audit and the config.
+- **Install folder.** The folder is fixed at `C:\Program Files\saiife`. It is not a
+  property you can set: the install and uninstall actions run as SYSTEM and start
+  `[ProgramFiles64Folder]saiife\saiife.exe`, so a folder chosen on the command line cannot
+  make them run another binary.
+- **Preview.** Windows locked mode is a preview. See [Windows](windows.md). Every lock
+  label there is unverified until it has been tried on real machines. The Codex and
+  Gemini CLI hooks are preview on Windows too. Same-user approval is off, by the owner's
+  ruling, so approvals come from a second account in a separate session. Set approvers in
+  the fleet `config.toml`.
+- **Rollback.** A failed install, upgrade or removal is rolled back, with what
+  `system install` did: a failed first install runs `system uninstall` (unless locked mode
+  was there before the MSI ran), a failed upgrade installs the old version again, and a
+  failed removal installs again. CI forces each failure in `package-windows`. If a
+  rollback itself fails, run `saiife system uninstall` from
+  `C:\ProgramData\saiife\bin\saiife.exe`, then fix the cause and install again.
+- **CI coverage.** CI builds the MSI on a `windows-2025` runner and runs a refused fleet
+  file, install, upgrade, removal, `detect.ps1` and the `.intunewin` header. A signed MSI
+  and a real Intune or GPO rollout are not covered. Try one machine of each architecture
+  before you roll out.

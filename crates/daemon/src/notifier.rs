@@ -18,10 +18,12 @@ use saiife_broker::upstream::Upstream;
 use saiife_policy::{CommandCfg, Event, NotifyCfg, SmtpCfg, TargetCfg, WebhookCfg};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
 
@@ -143,6 +145,7 @@ impl Env for Ctx {
 /// another owner (the test seam, like plan 10's CA owner); then only the
 /// program and its directory are checked, as the test tree sits under a
 /// home directory.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Copy)]
 struct Trust {
     owner: u32,
@@ -150,6 +153,7 @@ struct Trust {
 }
 
 /// What delivery is configured with beyond the policy.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Copy)]
 struct Opts {
     trust: Trust,
@@ -638,6 +642,7 @@ async fn smtp(env: &dyn Env, s: &SmtpCfg, ev: &NotifyEvent) -> Result<(), Fail> 
 
 /// `path` must be a regular file, not a symlink, owned by the trusted owner
 /// and not writable by others, with the same true of every parent.
+#[cfg(unix)]
 fn check_command(path: &Path, trust: Trust) -> Result<(), String> {
     if trust.whole_chain {
         saiife_system::fsops::root_owned_chain(path)?;
@@ -662,6 +667,17 @@ fn check_command(path: &Path, trust: Trust) -> Result<(), String> {
     Ok(())
 }
 
+/// A command target needs a root-owned chain. W19's check for it on Windows comes with
+/// `run` (Task 10); until then nothing runs.
+#[cfg(not(unix))]
+async fn command(c: &CommandCfg, ev: &NotifyEvent, opts: Opts) -> Result<(), Fail> {
+    let _ = (c, ev, opts);
+    Err(Fail::Permanent(
+        "command notifications are not available on Windows yet".into(),
+    ))
+}
+
+#[cfg(unix)]
 async fn command(c: &CommandCfg, ev: &NotifyEvent, opts: Opts) -> Result<(), Fail> {
     use Fail::*;
     check_command(&c.path, opts.trust)
@@ -707,7 +723,7 @@ async fn command(c: &CommandCfg, ev: &NotifyEvent, opts: Opts) -> Result<(), Fai
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

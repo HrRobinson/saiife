@@ -23,8 +23,18 @@ rustix = { version = "1", features = ["net", "fs", "process", "event"] }
 nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] }
 saiife-darwin = { path = "../darwin" }
 
+[target.'cfg(windows)'.dependencies]
+# The pipe's calls and token facts. Without `pipe-server`: the hook path stays free of tokio.
+saiife-win = { path = "../win" }
+
 [dev-dependencies]
 tempfile = "3"
+# The pure rules behind the pipe, tested on every OS.
+saiife-win = { path = "../win" }
+
+[target.'cfg(windows)'.dev-dependencies]
+saiife-win = { path = "../win", features = ["pipe-server"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time"] }
 
 [lints]
 workspace = true

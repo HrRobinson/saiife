@@ -3,6 +3,8 @@
 //! as a comment holding its default.
 
 use crate::layout::{Layout, Platform, AUDIT_DIR, RUN_DIR};
+use saiife_policy::system::{WINDOWS_AUDIT_DIR, WINDOWS_SOCKET_DIR};
+use std::path::Path;
 
 /// One section: its header and `(key, default as TOML)` pairs.
 type Section = (&'static str, &'static [(&'static str, &'static str)]);
@@ -84,7 +86,15 @@ pub fn default_config(layout: &Layout, approvers: &[String], reauth: bool) -> St
     if !layout.is_system() {
         let at = |p: &str| toml_str(&layout.at(p).to_string_lossy());
         set.push(("daemon", "user", toml_str(&own_user_name())));
-        set.push(("daemon", "socket_dir", at(RUN_DIR)));
+        let socket_dir = match layout.platform() {
+            // No run dir on Windows; see `WINDOWS_SOCKET_DIR`.
+            Platform::Windows => layout
+                .try_at(Path::new(WINDOWS_SOCKET_DIR))
+                .map(|p| toml_str(&p.to_string_lossy()))
+                .unwrap_or_else(|e| panic!("{e}")),
+            Platform::Linux | Platform::Macos => at(RUN_DIR),
+        };
+        set.push(("daemon", "socket_dir", socket_dir));
         set.push(("audit", "dir", at(AUDIT_DIR)));
     }
     let mut out = String::from("version = 2\nlocked = true\n\n");
@@ -112,16 +122,27 @@ pub fn default_config(layout: &Layout, approvers: &[String], reauth: bool) -> St
 
 /// The default shown for `section.key`: the daemon user and socket dir are
 /// the layout's platform values (`_saiife`, `/var/db/saiife-run` on macOS),
-/// every other key the one in [`SECTIONS`].
+/// and on Windows the audit dir too. Every other key is the one in
+/// [`SECTIONS`].
 fn platform_default(layout: &Layout, section: &str, key: &str, default: &str) -> String {
     match (section, key, layout.platform()) {
         ("daemon", "user", Platform::Macos) => toml_str(layout.daemon_user()),
         ("daemon", "socket_dir", Platform::Macos) => toml_str(layout.logical(RUN_DIR)),
+        ("daemon", "user", Platform::Windows) => toml_str(layout.daemon_user()),
+        ("daemon", "socket_dir", Platform::Windows) => toml_str(WINDOWS_SOCKET_DIR),
+        ("audit", "dir", Platform::Windows) => toml_str(WINDOWS_AUDIT_DIR),
         _ => default.to_string(),
     }
 }
 
+/// This process's user name, for a test tree's config.
+#[cfg(not(unix))]
+fn own_user_name() -> String {
+    std::env::var("USERNAME").unwrap_or_else(|_| "nobody".to_string())
+}
+
 /// This process's user name from `/etc/passwd` (else `$USER`).
+#[cfg(unix)]
 fn own_user_name() -> String {
     let uid = rustix::process::getuid().as_raw();
     std::fs::read_to_string("/etc/passwd")
@@ -140,7 +161,6 @@ fn own_user_name() -> String {
 mod tests {
     use super::*;
     use saiife_policy::system::SystemConfig;
-    use std::path::Path;
 
     fn load(text: &str) -> SystemConfig {
         let d = tempfile::tempdir().unwrap();
@@ -215,27 +235,27 @@ mod tests {
     #[test]
     fn reauth_default_when_polkit_exists() {
         use saiife_policy::SameUser;
-        let t = default_config(&Layout::under_for("/", Platform::Linux), &[], true);
+        let t = default_config(&Layout::system_for(Platform::Linux), &[], true);
         assert_eq!(load(&t).approval.same_user, SameUser::Reauth);
         assert!(t.contains("same_user = \"reauth\"\n"), "{t}");
         let t = default_config(&Layout::system(), &[], false);
         assert_eq!(load(&t).approval.same_user, SameUser::Deny);
         // Never on macOS, even with the authorization right registered.
-        let t = default_config(&Layout::under_for("/", Platform::Macos), &[], true);
+        let t = default_config(&Layout::system_for(Platform::Macos), &[], true);
         assert_eq!(load(&t).approval.same_user, SameUser::Deny);
         assert!(!t.contains("same_user = \"reauth\""), "{t}");
     }
 
     #[test]
     fn macos_defaults_are_the_macos_daemon_values() {
-        let t = default_config(&Layout::under_for("/", Platform::Macos), &[], false);
+        let t = default_config(&Layout::system_for(Platform::Macos), &[], false);
         assert!(
             t.contains(
                 "\n# [daemon]\n# user = \"_saiife\"\n# socket_dir = \"/var/db/saiife-run\"\n"
             ),
             "{t}"
         );
-        let t = default_config(&Layout::under_for("/", Platform::Linux), &[], false);
+        let t = default_config(&Layout::system_for(Platform::Linux), &[], false);
         assert!(
             t.contains("\n# [daemon]\n# user = \"saiife\"\n# socket_dir = \"/run/saiife\"\n"),
             "{t}"
@@ -246,10 +266,45 @@ mod tests {
         let c = load(&default_config(&l, &[], false));
         assert_eq!(c.daemon.socket_dir, l.root().join("var/db/saiife-run"));
         // The policy crate's own defaults are this platform's layout values.
+        // Windows has no run dir (`RUN_DIR` has no Windows spelling), so its
+        // socket dir is `WINDOWS_SOCKET_DIR`; Linux and macOS use `RUN_DIR`.
         let sys = Layout::system();
         let d = saiife_policy::system::DaemonCfg::default();
         assert_eq!(d.user, sys.daemon_user());
-        assert_eq!(d.socket_dir, Path::new(sys.logical(RUN_DIR)));
+        let socket_dir = match sys.platform() {
+            Platform::Windows => WINDOWS_SOCKET_DIR,
+            Platform::Linux | Platform::Macos => sys.logical(RUN_DIR),
+        };
+        assert_eq!(d.socket_dir, Path::new(socket_dir));
+    }
+
+    #[test]
+    fn windows_defaults_are_the_windows_values() {
+        use crate::layout::{windows_path, WIN_DAEMON_ACCOUNT};
+        use saiife_policy::system::DaemonCfg;
+        let t = default_config(&Layout::system_for(Platform::Windows), &[], false);
+        // The commented defaults are the policy crate's Windows values, read
+        // back through TOML (the backslashes must survive).
+        let all = uncomment(&t);
+        let c = load(&all);
+        assert_eq!(c.daemon, DaemonCfg::windows_default());
+        assert_eq!(c.daemon.user, WIN_DAEMON_ACCOUNT);
+        assert_eq!(
+            c.audit.dir,
+            Path::new(windows_path(AUDIT_DIR).unwrap()),
+            "{all}"
+        );
+        assert!(c.locked);
+        // Under a test root, nothing points at the real machine.
+        let d = tempfile::tempdir().unwrap();
+        let l = Layout::under_for(d.path(), Platform::Windows);
+        let c = load(&default_config(&l, &[], false));
+        assert_eq!(
+            c.daemon.socket_dir,
+            l.root().join("C/ProgramData/saiife/run")
+        );
+        assert_eq!(c.audit.dir, l.at(AUDIT_DIR));
+        assert_ne!(c.daemon.user, WIN_DAEMON_ACCOUNT);
     }
 
     #[test]

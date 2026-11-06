@@ -46,6 +46,13 @@ pub fn run(agent: &str, system_config: &Path, event: Option<&str>) -> ExitCode {
     guarded(|| imp::run_with(agent, system_config, event, None))
 }
 
+/// A managed hook call that must be denied for `why` before anything is judged. It is
+/// recorded when the daemon can be reached.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn run_denied(agent: &str, system_config: &Path, event: Option<&str>, why: String) -> ExitCode {
+    guarded(|| imp::run_with(agent, system_config, event, Some(why.clone())))
+}
+
 /// `check --managed` got arguments it cannot parse: deny, and record that
 /// when the daemon can be reached (the agent and `--system-config` are
 /// taken from `args` if present).
@@ -83,7 +90,7 @@ pub(crate) fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> 
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod imp {
     use super::*;
 
@@ -99,29 +106,29 @@ mod imp {
     ) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-        #[cfg(windows)]
-        eprintln!("{}", crate::LOCKED_ON_WINDOWS_LATER);
-        #[cfg(not(windows))]
         crate::warn(saiife_system::NOT_SUPPORTED_OS);
         ExitCode::from(2)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod imp {
     use super::*;
 
     use std::io::{BufWriter, Read, Write};
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Mutex, MutexGuard, TryLockError};
     use std::time::{Duration, Instant};
 
     use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
     use saiife_audit::{DecisionKind, NewRecord, Record};
-    use saiife_ipc::client::{system_entry, system_uid, Client, ClientError};
+    #[cfg(unix)]
+    use saiife_ipc::client::{system_entry, system_uid};
+    use saiife_ipc::client::{Client, ClientError};
     use saiife_ipc::msg::{
         ErrorCode, MAX_RECORD_BYTES, OP_APPROVAL_CREATE, OP_AUDIT_APPEND, OP_GRANT_CONSUME,
     };
@@ -173,30 +180,81 @@ mod imp {
         "pack",
     ];
 
-    /// The running worker's pid (0: none), for the watchdog.
-    static WORKER_PID: AtomicU32 = AtomicU32::new(0);
+    /// The running worker, for the watchdog: Windows can stop a child through its
+    /// handle only, and the lock is held for a moment at a time, never across a wait.
+    static WORKER: Mutex<Option<Child>> = Mutex::new(None);
+
+    fn worker_slot() -> MutexGuard<'static, Option<Child>> {
+        WORKER.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The job every worker runs in on Windows: it kills them when its handle closes, so
+    /// a worker never outlives this process, whether the watchdog exits while the slot is
+    /// busy or the hook crashes.
+    #[cfg(windows)]
+    static JOB: std::sync::OnceLock<saiife_win::ffi::job::KillOnClose> = std::sync::OnceLock::new();
+
+    /// Puts `child` in [`JOB`], made at the first worker.
+    #[cfg(windows)]
+    fn join_job(child: &Child) -> std::io::Result<()> {
+        let job = match JOB.get() {
+            Some(job) => job,
+            None => {
+                let made = saiife_win::ffi::job::KillOnClose::new()?;
+                JOB.get_or_init(|| made)
+            }
+        };
+        job.assign(child)
+    }
+
+    /// Writes to stderr without its lock: a main thread blocked while holding that lock
+    /// cannot stop the watchdog.
+    #[cfg(unix)]
+    fn bare_stderr() -> impl FnOnce(&[u8]) {
+        |msg| {
+            use std::os::fd::AsFd;
+            let _ = rustix::io::write(std::io::stderr().as_fd(), msg);
+        }
+    }
+
+    /// Writes to stderr without its lock, through a copy of the handle taken now. No
+    /// stderr to copy costs the message only.
+    #[cfg(windows)]
+    fn bare_stderr() -> impl FnOnce(&[u8]) {
+        use std::os::windows::io::AsHandle;
+        let copy = std::io::stderr().as_handle().try_clone_to_owned().ok();
+        move |msg| {
+            if let Some(handle) = copy {
+                let _ = std::fs::File::from(handle).write_all(msg);
+            }
+        }
+    }
 
     /// After `OVERALL_TIMEOUT`, kill the worker if one runs, say why on
-    /// stderr and exit 2, wherever the main thread is stuck. The message is
-    /// written to the stderr fd directly: a main thread blocked while
-    /// holding the stderr lock cannot stop it. `false`: the thread could
-    /// not be started (`RLIMIT_NPROC`, `pids.max`).
+    /// stderr and exit 2, wherever the main thread is stuck. `false`: the
+    /// thread could not be started (`RLIMIT_NPROC`, `pids.max`).
     pub fn start_watchdog() -> bool {
         #[cfg(debug_assertions)]
         if eval::fault() == "watchdog_spawn" {
             return false;
         }
+        let say = bare_stderr();
         std::thread::Builder::new()
             .name("saiife-watchdog".into())
-            .spawn(|| {
+            .spawn(move || {
                 std::thread::sleep(OVERALL_TIMEOUT);
-                let pid = WORKER_PID.load(Ordering::SeqCst);
-                if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                // Busy: the main thread holds it to look at the worker for a moment.
+                // The process is about to exit either way, so never wait for it. On
+                // Windows the exit closes the worker's job, which kills it then.
+                let child = match WORKER.try_lock() {
+                    Ok(mut g) => g.take(),
+                    Err(TryLockError::Poisoned(p)) => p.into_inner().take(),
+                    Err(TryLockError::WouldBlock) => None,
+                };
+                if let Some(mut child) = child {
+                    let _ = child.kill();
                 }
-                use std::os::fd::AsFd;
-                let msg = b"saiife: BLOCKED (fail closed): saiife took too long\n";
-                let _ = rustix::io::write(std::io::stderr().as_fd(), msg);
+                say(b"saiife: BLOCKED (fail closed): saiife took too long\n");
                 std::process::exit(2);
             })
             .is_ok()
@@ -326,9 +384,13 @@ mod imp {
         // 2. The system policy. Without it there is no daemon to tell.
         let cfg = match load_locked(config) {
             Ok(c) => c,
-            Err(e) => return blocked(&format!("saiife policy could not be loaded: {e}")),
+            Err(e) => {
+                let why = format!("saiife policy could not be loaded: {e}");
+                record_failed_load(agent, event, &input, &why);
+                return blocked(&why);
+            }
         };
-        let Some(daemon_uid) = system_uid(&cfg.daemon.user) else {
+        let Some(daemon_uid) = daemon_owner(&cfg) else {
             return blocked(&format!(
                 "the saiife daemon user {:?} does not exist",
                 cfg.daemon.user
@@ -463,6 +525,61 @@ mod imp {
             }
             Outcome::Error(reason) => blocked(&reason),
         }
+    }
+
+    /// The record of a call denied because the system policy would not load.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn failed_load_record(
+        agent: &str,
+        event: Option<&str>,
+        input: &Result<String, String>,
+        why: &str,
+    ) -> Value {
+        let mut ctx = match input {
+            Ok(buf) => context_from_hook_json_bounded(buf, PARSE_MAX_BYTES),
+            Err(_) => HookContext::default(),
+        };
+        if event == Some(EVENT_CONFIG_CHANGE) {
+            ctx.tool = Some("ConfigChange".into());
+        }
+        let shown = input.as_deref().map(recorded_input).unwrap_or_default();
+        let judged = Judged::error(shown, why.to_string());
+        let mut rec = record(agent, &ctx, "unavailable", &judged);
+        if !fit(&mut rec) {
+            rec = minimal_record(agent, "unavailable");
+        }
+        rec
+    }
+
+    /// On Windows the control pipe and its owner come from the layout, never from the
+    /// config (W11), so a call denied over a config that fails its check can still reach
+    /// the audit log. The deny stands whether or not this gets through.
+    #[cfg(windows)]
+    fn record_failed_load(
+        agent: &str,
+        event: Option<&str>,
+        input: &Result<String, String>,
+        why: &str,
+    ) {
+        let connect = Instant::now() + CONNECT_TIMEOUT;
+        let Ok(mut client) = crate::broker::system_client(Path::new(""), 0, connect) else {
+            return;
+        };
+        if client.hello_answer().get("mode").and_then(Value::as_str) != Some("locked") {
+            return;
+        }
+        let rec = failed_load_record(agent, event, input, why);
+        let _ = append(&mut client, rec, Instant::now() + ACK_TIMEOUT);
+    }
+
+    /// Off Windows the socket's dir and owner are in the config that failed to load.
+    #[cfg(not(windows))]
+    fn record_failed_load(
+        _agent: &str,
+        _event: Option<&str>,
+        _input: &Result<String, String>,
+        _why: &str,
+    ) {
     }
 
     /// Steps 3 to 7: the project, the policy, the worker and the daemon
@@ -614,9 +731,17 @@ mod imp {
     fn claude_pin_ok() -> bool {
         #[cfg(debug_assertions)]
         if let Some(p) = std::env::var_os(CLAUDE_MCP_SEAM) {
-            return eval::claude_pin_ok(Path::new(&p), rustix::process::getuid().as_raw());
+            #[cfg(unix)]
+            let owner = rustix::process::getuid().as_raw();
+            #[cfg(windows)]
+            let owner = 0;
+            return eval::claude_pin_ok(Path::new(&p), owner);
         }
-        eval::claude_pin_ok(Path::new(saiife_system::layout::CLAUDE_MCP), 0)
+        #[cfg(unix)]
+        let real = PathBuf::from(saiife_system::layout::CLAUDE_MCP);
+        #[cfg(windows)]
+        let real = saiife_system::Layout::system().at(saiife_system::layout::CLAUDE_MCP);
+        eval::claude_pin_ok(&real, 0)
     }
 
     /// What the record names when the worker gave no answer: the command
@@ -657,8 +782,10 @@ mod imp {
         }
     }
 
-    /// `load_system`, which must say `locked = true`.
+    /// `load_system`, which must say `locked = true`. A config that fails Windows' DACL
+    /// check is no policy: the call is denied, whoever wrote the file.
     fn load_locked(config: &Path) -> Result<SystemConfig, String> {
+        crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, config)?;
         let loaded = load_system(config).map_err(|e| e.to_string())?;
         if !loaded.config.locked {
             return Err(format!("{}: locked is not true", config.display()));
@@ -678,24 +805,7 @@ mod imp {
         // hash. Nothing is read or spawned unless some scope binds one; an
         // environment that cannot be resolved denies the call.
         let (cfg_env, env) = if cfg.scope.iter().any(|s| s.env.is_some()) {
-            // macOS keeps its accounts in Directory Services, not in
-            // /etc/passwd and /etc/group: `nss` answers there.
-            let linux = cfg!(target_os = "linux");
-            let read = |p: &str| {
-                linux
-                    .then(|| std::fs::read_to_string(p).ok())
-                    .flatten()
-                    .unwrap_or_default()
-            };
-            let nsswitch = read("/etc/nsswitch.conf");
-            let nsswitch = (!nsswitch.is_empty()).then_some(nsswitch);
-            hook_env(
-                cfg,
-                rustix::process::getuid().as_raw(),
-                (&read("/etc/passwd"), &read("/etc/group")),
-                nsswitch.as_deref(),
-                &saiife_policy::Getent,
-            )?
+            own_env(cfg)?
         } else {
             (std::borrow::Cow::Borrowed(cfg), None)
         };
@@ -740,9 +850,58 @@ mod imp {
         Ok((packs.into_iter().map(|p| p.id).collect(), hash))
     }
 
+    /// The running user's scope environment. macOS keeps its accounts in Directory
+    /// Services, not in /etc/passwd and /etc/group: `nss` answers there.
+    #[cfg(unix)]
+    fn own_env(
+        cfg: &SystemConfig,
+    ) -> Result<(std::borrow::Cow<'_, SystemConfig>, Option<String>), String> {
+        let linux = cfg!(target_os = "linux");
+        let read = |p: &str| {
+            linux
+                .then(|| std::fs::read_to_string(p).ok())
+                .flatten()
+                .unwrap_or_default()
+        };
+        let nsswitch = read("/etc/nsswitch.conf");
+        let nsswitch = (!nsswitch.is_empty()).then_some(nsswitch);
+        hook_env(
+            cfg,
+            rustix::process::getuid().as_raw(),
+            (&read("/etc/passwd"), &read("/etc/group")),
+            nsswitch.as_deref(),
+            &saiife_policy::Getent,
+        )
+    }
+
+    /// The running user's scope environment, by the name the daemon has for this SID. A
+    /// failed lookup denies.
+    #[cfg(windows)]
+    fn own_env(
+        cfg: &SystemConfig,
+    ) -> Result<(std::borrow::Cow<'_, SystemConfig>, Option<String>), String> {
+        let name = crate::win_locked::own_account_name()
+            .ok_or("cannot tell which user this is: no environment")?;
+        applied_for(cfg, &saiife_policy::WinDirectory::system(), &name)
+            .map_err(|e| format!("environment: {e}"))
+    }
+
+    /// Whom the daemon's endpoint must belong to. On Windows the pipe's owner is the
+    /// service's SID whatever the config says, so there is nothing to look up.
+    #[cfg(unix)]
+    fn daemon_owner(cfg: &SystemConfig) -> Option<u32> {
+        system_uid(&cfg.daemon.user)
+    }
+
+    #[cfg(windows)]
+    fn daemon_owner(_cfg: &SystemConfig) -> Option<u32> {
+        Some(0)
+    }
+
     /// Whether `nsswitch.conf` takes groups from `files` alone (not compat or
     /// systemd, which can add groups `/etc/group` lacks), so
     /// `/etc/group` is the whole answer and no process needs to run.
+    #[cfg(unix)]
     fn groups_are_local(nsswitch: Option<&str>) -> bool {
         let Some(text) = nsswitch else {
             return false;
@@ -765,6 +924,7 @@ mod imp {
     /// too). Groups come from `/etc/group` when the user is local and
     /// `nsswitch.conf` has no other group source; otherwise `nss` answers,
     /// and a failed lookup denies.
+    #[cfg(unix)]
     fn hook_env<'a>(
         cfg: &'a SystemConfig,
         uid: u32,
@@ -782,9 +942,8 @@ mod imp {
         applied_for(cfg, dir, &name).map_err(|e| format!("environment: {e}"))
     }
 
-    /// The worker child, running.
+    /// The worker child, running: the child itself is in [`WORKER`].
     struct Worker {
-        child: Child,
         started: Instant,
         /// The payload, kept for the record if the worker fails.
         payload: String,
@@ -804,23 +963,16 @@ mod imp {
         /// never writes can outlast the deadline.
         fn spawn(req: EvalRequest) -> Result<Worker, (String, std::io::Error)> {
             let started = Instant::now();
-            let uid = rustix::process::getuid().as_raw();
-            let Some(account) = system_entry(uid) else {
-                let e = std::io::Error::other(format!("no /etc/passwd entry for uid {uid}"));
-                return Err((req.payload, e));
-            };
             let exe = match std::env::current_exe() {
                 Ok(e) => e,
                 Err(e) => return Err((req.payload, e)),
             };
             let mut cmd = Command::new(exe);
-            cmd.arg("__eval")
-                .env_clear()
-                .env("HOME", &account.home)
-                .env("USER", &account.name)
-                .env("PATH", "/usr/bin:/bin")
-                .env("LANG", "C")
-                .stdin(Stdio::piped())
+            cmd.arg("__eval").env_clear();
+            if let Err(e) = worker_account(&mut cmd) {
+                return Err((req.payload, e));
+            }
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             #[cfg(debug_assertions)]
@@ -831,12 +983,20 @@ mod imp {
                 Ok(c) => c,
                 Err(e) => return Err((req.payload, e)),
             };
-            WORKER_PID.store(child.id(), Ordering::SeqCst);
+            // A worker that cannot be tied to this process is not run: it could outlive
+            // the hook. Joined before it is sent the request, so it has judged nothing yet.
+            #[cfg(windows)]
+            if let Err(e) = join_job(&child) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err((req.payload, e));
+            }
             let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err((req.payload, std::io::Error::other("no pipes")));
             };
+            *worker_slot() = Some(child);
             // The parent keeps a copy for the record; the request owns the
             // one the writer thread sends.
             let payload = req.payload.clone();
@@ -851,7 +1011,6 @@ mod imp {
                 let _ = tx.send(read_bounded(stdout));
             });
             Ok(Worker {
-                child,
                 started,
                 payload,
                 out: rx,
@@ -860,9 +1019,11 @@ mod imp {
 
         /// Kill and reap (a no-op for a worker already reaped).
         fn kill(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            WORKER_PID.store(0, Ordering::SeqCst);
+            let child = worker_slot().take();
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
 
         /// The answer, or why there is none, within `WORKER_TIMEOUT` of the
@@ -888,7 +1049,11 @@ mod imp {
             };
             // Stdout is closed; the exit follows at once.
             let status = loop {
-                match self.child.try_wait() {
+                let looked = match worker_slot().as_mut() {
+                    Some(child) => child.try_wait(),
+                    None => return Err("it is gone".into()),
+                };
+                match looked {
                     Ok(Some(st)) => break st,
                     Ok(None) if Instant::now() >= deadline => return Err(timeout()),
                     Ok(None) => std::thread::sleep(Duration::from_micros(200)),
@@ -921,6 +1086,38 @@ mod imp {
         Ok(out)
     }
 
+    /// The worker's environment on Linux and macOS: only `HOME` and `USER` from the entry
+    /// of this process's real uid. See [`Worker::spawn`].
+    #[cfg(unix)]
+    fn worker_account(cmd: &mut Command) -> std::io::Result<()> {
+        let uid = rustix::process::getuid().as_raw();
+        let Some(account) = system_entry(uid) else {
+            return Err(std::io::Error::other(format!(
+                "no /etc/passwd entry for uid {uid}"
+            )));
+        };
+        cmd.env("HOME", &account.home)
+            .env("USER", &account.name)
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C");
+        Ok(())
+    }
+
+    /// The worker's environment on Windows: the machine's record of this SID, as
+    /// `/etc/passwd` is on Linux, never `USERPROFILE`.
+    #[cfg(windows)]
+    fn worker_account(cmd: &mut Command) -> std::io::Result<()> {
+        let env = crate::win_locked::worker_environment().map_err(std::io::Error::other)?;
+        cmd.envs(env);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn status_text(st: ExitStatus) -> String {
+        st.to_string()
+    }
+
+    #[cfg(unix)]
     fn status_text(st: ExitStatus) -> String {
         match (st.signal(), st.code()) {
             (Some(sig), _) => format!("signal {sig}"),
@@ -1210,9 +1407,10 @@ mod imp {
     }
 
     /// A connection to the daemon, which must be in locked mode (only it
-    /// may take the record). `Err` is the reason, for stderr.
+    /// may take the record). `Err` is the reason, for stderr. On Windows nothing reaches
+    /// a pipe owned by anyone but the service (W11).
     fn connect_locked(cfg: &SystemConfig, daemon_uid: u32) -> Result<Client, String> {
-        let c = Client::connect(
+        let c = crate::broker::system_client(
             &cfg.daemon.socket_dir,
             daemon_uid,
             Instant::now() + CONNECT_TIMEOUT,
@@ -1244,13 +1442,35 @@ mod imp {
         }
     }
 
-    #[cfg(test)]
+    // `hook_env` and its tests read passwd text; the rest is the same code on every OS.
+    #[cfg(all(test, unix))]
     mod tests {
         use super::*;
 
         use saiife_policy::{Directory, FixedDirectory};
 
         const PASSWD: &str = "alice:x:1000:1000::/h:/bin/sh\n";
+
+        #[test]
+        fn a_failed_load_is_recorded_as_error_denied() {
+            let payload = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+            let rec = failed_load_record(
+                "claude",
+                None,
+                &Ok(payload.to_string()),
+                "saiife policy could not be loaded: not protected",
+            );
+            assert_eq!(rec["decision"], "error_denied");
+            assert_eq!(rec["tool"], "Bash");
+            assert_eq!(rec["input"], "git status");
+            assert_eq!(rec["policy"], "unavailable");
+            assert!(rec["reason"].as_str().unwrap().contains("not protected"));
+
+            // No payload to read: still a record, with what is known.
+            let rec = failed_load_record("claude", None, &Err("too large".into()), "why");
+            assert_eq!(rec["decision"], "error_denied");
+            assert_eq!(rec["reason"], "why");
+        }
         const GROUP: &str = "alice:x:1000:\ndevs:x:2000:alice\n";
         const FILES: &str = "passwd: files\ngroup: files\n";
 

@@ -1,5 +1,5 @@
 //! `saiife secret add|list|rotate|remove`: the admin's way into the vault
-//! (spec §8.7), through the daemon. Linux and macOS. Exit codes: 0 ok, 2
+//! (spec §8.7), through the daemon. Exit codes: 0 ok, 2
 //! refused, 5 the daemon cannot be reached. A value comes from a file, an
 //! environment variable or a terminal prompt without echo; it is never
 //! printed and never part of an error message.
@@ -75,23 +75,24 @@ pub enum SecretAction {
     },
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(_config: Option<PathBuf>, _action: SecretAction) -> ExitCode {
     eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(config: Option<PathBuf>, action: SecretAction) -> ExitCode {
     linux::run(config, action)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod linux {
     use super::SecretAction;
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
-    use std::io::Read;
+    use std::io::{IsTerminal, Read};
+    #[cfg(unix)]
     use std::os::fd::AsFd;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -184,14 +185,15 @@ pub(crate) mod linux {
                 home,
             } => {
                 #[cfg(not(debug_assertions))]
-                let home = None;
+                let home: Option<PathBuf> = None;
                 // Import moves plaintext out of the agent's reach; the
                 // personal broker cannot (the same uid reads the key).
                 if !config.is_locked() {
                     let _ = (user, projects, yes_to, services, home);
                     return Err(Stop::Refused(PERSONAL_IMPORT.into()));
                 }
-                crate::import_cmd::run(
+                #[cfg(unix)]
+                return crate::import_cmd::run(
                     config.config(),
                     crate::import_cmd::ImportArgs {
                         user,
@@ -200,7 +202,15 @@ pub(crate) mod linux {
                         services,
                         home,
                     },
-                )
+                );
+                // It walks another user's tree by handle, which needs calls off W1's list.
+                #[cfg(windows)]
+                {
+                    let _ = (user, projects, yes_to, services, home);
+                    Err(Stop::Refused(
+                        "secret import is not available on Windows yet; use secret add".into(),
+                    ))
+                }
             }
             SecretAction::Remove { name } => {
                 call_to(config, "secret.remove", args([("name", json!(name))]))?;
@@ -396,7 +406,7 @@ pub(crate) mod linux {
         let mut f = Fields::new();
         match src {
             Source::Terminal => {
-                if !rustix::termios::isatty(std::io::stdin().as_fd()) {
+                if !std::io::stdin().is_terminal() {
                     return Err(Stop::Refused(
                         "saiife secret needs a terminal to read the value; use --from-file or --from-env"
                             .into(),
@@ -655,13 +665,36 @@ pub(crate) mod linux {
         Ok(buf)
     }
 
+    /// One line from the console without echo: `rpassword` reads `CONIN$`, never a piped
+    /// stdin. For the values of `secret add` and `connect`. Approvals never ask for a
+    /// password on Windows (W16). With no console it refuses and says what else works.
+    #[cfg(windows)]
+    fn prompt(label: &str) -> Result<Zeroizing<String>, Stop> {
+        let line = rpassword::prompt_password(label)
+            .map(Zeroizing::new)
+            .map_err(|e| {
+                Stop::Refused(format!(
+                    "cannot read the console ({e}); use --from-file or --from-env"
+                ))
+            })?;
+        if line.is_empty() {
+            return Err(Stop::Refused("no value read".into()));
+        }
+        if line.len() > MAX_VALUE_BYTES {
+            return Err(Stop::Refused("secret value is too long".into()));
+        }
+        Ok(line)
+    }
+
     /// Puts the terminal back as it was, on every path out (return, error,
     /// panic). Ctrl-C does not need a signal handler: `ISIG` is off while
     /// the prompt is up, so it arrives as a byte and ends the prompt here.
+    #[cfg(unix)]
     struct Restore {
         orig: rustix::termios::Termios,
     }
 
+    #[cfg(unix)]
     impl Drop for Restore {
         fn drop(&mut self) {
             let _ = rustix::termios::tcsetattr(
@@ -673,6 +706,7 @@ pub(crate) mod linux {
     }
 
     /// One line from the terminal without echo.
+    #[cfg(unix)]
     fn prompt(label: &str) -> Result<Zeroizing<String>, Stop> {
         use rustix::termios::{InputModes, LocalModes, OptionalActions, SpecialCodeIndex};
         let stdin = std::io::stdin();
@@ -721,6 +755,7 @@ pub(crate) mod linux {
         Ok(Zeroizing::new(v.to_string()))
     }
 
+    #[cfg(unix)]
     fn read_line(fd: std::os::fd::BorrowedFd<'_>) -> Result<Zeroizing<Vec<u8>>, Stop> {
         let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
         let mut b = [0u8; 1];

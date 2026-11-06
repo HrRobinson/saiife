@@ -8,10 +8,9 @@
 use std::io::Read;
 use std::path::Path;
 
-#[cfg(not(windows))]
 use saiife_agents::lock::replaces_project_hook;
-#[cfg(not(windows))]
 use saiife_policy::installed::read_installed;
+use saiife_system::wintrust::Trust;
 
 use crate::warn;
 
@@ -49,30 +48,67 @@ impl SystemView {
 /// as the v1 default (nothing managed, fail open). An invalid one reads as
 /// the v1 default too, with one warning in `warnings`.
 pub fn read(config: &Path) -> SystemView {
+    read_with(&crate::win_locked::system_file_trust, config)
+}
+
+/// [`read`] with the DACL check given. On Windows ProgramData is not root-owned, so a
+/// file there counts only once its descriptors say no non-admin could have written it:
+///
+/// - `config.toml` on a tree that is not ours is ignored, with a warning: anyone could
+///   have planted it, and it cannot make every other user's hook fail closed. On our
+///   tree it is damaged, so this reads as a locked host: fail closed, with a warning.
+/// - `installed.toml` that fails is ignored either way, with a warning: no agent is
+///   managed, so the project hooks stay on.
+fn read_with(trust: &dyn Fn(&Path) -> Trust, config: &Path) -> SystemView {
+    read_on(trust, config, cfg!(windows))
+}
+
+/// [`read_with`] with the OS given. Any user may read the config on Windows, and so may
+/// hold it open with no sharing: a read that fails there says nothing about what the file
+/// holds, and must not open the hook. A file that is not ours stays ignored, so a planted
+/// and locked one cannot fail every other user's hook closed.
+fn read_on(trust: &dyn Fn(&Path) -> Trust, config: &Path, windows: bool) -> SystemView {
     let mut view = SystemView::default();
-    // Windows too (spec §5.3a): `config.toml` is read there, because
-    // `parse_config` can only tighten (fail closed). Plan 19b adds the DACL
-    // check on the file before it is trusted.
-    match read_regular(config, false, MAX_BYTES).and_then(|b| b.map(parse_config).transpose()) {
-        Ok(Some(closed)) => view.fail_closed = closed,
+    match read_regular(config, false, MAX_BYTES) {
         Ok(None) => {}
-        Err(e) => view.warnings.push(ignored(config, &e)),
+        Err(e) => {
+            view.fail_closed =
+                windows && matches!(trust(config), Trust::Trusted | Trust::Damaged(_));
+            view.warnings.push(ignored(config, &e));
+        }
+        Ok(Some(bytes)) => match trust(config) {
+            Trust::NotOurs(why) => view.warnings.push(ignored(config, &unprotected(&why))),
+            Trust::Damaged(why) => {
+                view.fail_closed = true;
+                view.warnings.push(ignored(config, &unprotected(&why)));
+            }
+            Trust::Absent | Trust::Trusted => match parse_config(bytes) {
+                Ok(closed) => view.fail_closed = closed,
+                Err(e) => view.warnings.push(ignored(config, &e)),
+            },
+        },
     }
-    // Windows (plan 19a): no locked install exists, so no agent has a managed
-    // hook, and ProgramData is not root-owned: an `installed.toml` there must
-    // not silence the project hooks. Plan 19b reads it again behind a DACL
-    // check through `saiife-win`.
-    #[cfg(not(windows))]
-    read_installed_into(config, &mut view);
+    read_installed_into(trust, config, &mut view);
     view
 }
 
-#[cfg(not(windows))]
-fn read_installed_into(config: &Path, view: &mut SystemView) {
+fn unprotected(why: &str) -> String {
+    format!("not protected as a system file ({why})")
+}
+
+fn read_installed_into(trust: &dyn Fn(&Path) -> Trust, config: &Path, view: &mut SystemView) {
     let installed = config
         .parent()
         .unwrap_or(Path::new("/"))
         .join("installed.toml");
+    match trust(&installed) {
+        Trust::Absent => return,
+        Trust::Trusted => {}
+        Trust::NotOurs(why) | Trust::Damaged(why) => {
+            view.warnings.push(ignored(&installed, &unprotected(&why)));
+            return;
+        }
+    }
     match read_installed(&installed) {
         Ok(Some(i)) => {
             view.managed_agents = i
@@ -167,7 +203,7 @@ mod tests {
         if let Some(t) = config {
             std::fs::write(&c, t).unwrap();
         }
-        let v = read(&c);
+        let v = read_with(&|_: &Path| Trust::Trusted, &c);
         (d, v)
     }
 
@@ -211,6 +247,100 @@ mod tests {
             "not a regular file (symlinks are not followed)"
         );
         assert!(read_regular(&c, true, MAX_BYTES).unwrap().is_some());
+    }
+
+    const INSTALLED_ONE: &str = "[[agents]]\nagent = \"claude\"\nsha256 = \"ab\"\n";
+
+    /// `config` and `installed.toml` as files, read with `trust` as the DACL check.
+    fn view_with(trust: &dyn Fn(&Path) -> Trust) -> (SystemView, SystemView) {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        std::fs::write(&c, "version = 2\nlocked = true\n").unwrap();
+        let open = read_with(&|_: &Path| Trust::Trusted, &c);
+        (open, read_with(trust, &c))
+    }
+
+    /// A file held open with no sharing reads as an error on Windows, and is no reason to
+    /// open the hook. A directory in its place makes the read fail the same way here.
+    #[test]
+    fn an_unreadable_config_fails_closed_on_windows_only() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        std::fs::create_dir(&c).unwrap();
+        let trust = |t: Trust| move |_: &Path| t.clone();
+
+        for t in [Trust::Trusted, Trust::Damaged("users may write".into())] {
+            let v = read_on(&trust(t), &c, true);
+            assert!(v.fail_closed);
+            assert!(!v.warnings.is_empty());
+        }
+        // Linux and macOS stay as they were, and nothing planted closes anyone's hook.
+        let v = read_on(&trust(Trust::Trusted), &c, false);
+        assert!(!v.fail_closed);
+        let v = read_on(&trust(Trust::NotOurs("planted".into())), &c, true);
+        assert!(!v.fail_closed);
+        assert!(!v.warnings.is_empty());
+    }
+
+    /// A planted `locked = true` on a tree that is not ours tightens nothing.
+    #[test]
+    fn a_planted_config_is_ignored() {
+        let (open, v) = view_with(&|_: &Path| Trust::NotOurs("owned by me".into()));
+        assert!(open.fail_closed);
+        assert!(!v.fail_closed);
+        assert_eq!(v.warnings.len(), 2, "{:?}", v.warnings);
+        assert!(v.warnings[0].contains("owned by me"), "{:?}", v.warnings);
+    }
+
+    /// Our tree with a config open to the users is a locked host gone wrong.
+    #[test]
+    fn a_damaged_config_fails_closed_whatever_it_says() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        std::fs::write(&c, "version = 2\nlocked = false\n").unwrap();
+        let v = read_with(&|_: &Path| Trust::Damaged("users may write".into()), &c);
+        assert!(v.fail_closed);
+        assert!(
+            v.warnings[0].contains("users may write"),
+            "{:?}",
+            v.warnings
+        );
+    }
+
+    /// A planted install record must not make a project hook go quiet.
+    #[test]
+    fn a_planted_install_record_silences_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        let i = d.path().join("installed.toml");
+        std::fs::write(&i, INSTALLED_ONE).unwrap();
+        for bad in [
+            Trust::NotOurs("planted".into()),
+            Trust::Damaged("loose".into()),
+        ] {
+            let v = read_with(
+                &|p: &Path| {
+                    if p == i {
+                        bad.clone()
+                    } else {
+                        Trust::Absent
+                    }
+                },
+                &c,
+            );
+            assert!(v.managed_agents.is_empty(), "{v:?}");
+            assert_eq!(v.warnings.len(), 1, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn a_config_that_fails_the_check_is_not_even_parsed() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        std::fs::write(&c, "not = = toml").unwrap();
+        let v = read_with(&|_: &Path| Trust::NotOurs("planted".into()), &c);
+        assert_eq!(v.warnings.len(), 2, "{v:?}");
+        assert!(v.warnings.iter().all(|w| w.contains("planted")), "{v:?}");
     }
 
     #[test]

@@ -72,10 +72,10 @@ async fn on_store<T: Send + 'static>(
 /// Whether `uid` is listed in `[approval] approvers` (by name or a current
 /// group). Lookups are the context's cached, off-thread ones; any failure
 /// is no.
-pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
+pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
     // The personal broker: its own user approves (§6.10.2).
     if ctx.mode == crate::ops::Mode::Personal {
-        return uid == ctx.own_uid;
+        return ctx.peer_is_own(peer);
     }
     let approvers = match ctx.policy().system {
         Some(s) => s.approval.approvers.clone(),
@@ -84,9 +84,28 @@ pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
     if approvers.is_empty() {
         return false;
     }
-    let Some(name) = ctx.name_of(uid).await else {
+    let Some(name) = ctx.peer_name(peer).await else {
         return false;
     };
+    // Windows: a `group:` entry matches the token's groups, and a user entry the peer's
+    // SID (W12). `name` is the canonical `DOMAIN\name`, which a policy's `approver`
+    // never equals as text. Nothing else counts: a lookup of the name's groups would
+    // count the Administrators a non-elevated admin's token holds deny-only.
+    if let Some(sid) = peer.sid.as_deref() {
+        let (groups, users): (Vec<&String>, Vec<&String>) =
+            approvers.iter().partition(|a| a.starts_with("group:"));
+        let wanted: Vec<String> = groups
+            .iter()
+            .filter_map(|a| a.strip_prefix("group:").map(str::to_string))
+            .collect();
+        if ctx.token_in_any_group(&peer.group_sids, &wanted).await {
+            return true;
+        }
+        let users: Vec<String> = users.into_iter().cloned().collect();
+        return ctx
+            .token_in_any_group(std::slice::from_ref(&sid.to_string()), &users)
+            .await;
+    }
     let mut groups: Option<Vec<String>> = None;
     for a in &approvers {
         match a.strip_prefix("group:") {
@@ -140,6 +159,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
     let faithful = display_is_faithful(p);
     let new = NewRequest {
         uid: p.stored.uid,
+        sid: p.stored.sid.clone(),
         user: p.stored.user.clone(),
         session: p.stored.session.clone(),
         agent: agent.to_string(),
@@ -194,6 +214,7 @@ pub(crate) async fn create_mcp(
     );
     let new = NewRequest {
         uid: p.stored.uid,
+        sid: p.stored.sid.clone(),
         user: p.stored.user.clone(),
         session: p.stored.session.clone(),
         agent: agent.to_string(),
@@ -408,8 +429,9 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     // `own: true`: only the caller's requests (`saiife status`), even for
     // an approver.
     let own = req.args.get("own").and_then(Value::as_bool) == Some(true);
-    let uid = (own || !is_approver(ctx, peer.uid).await).then_some(peer.uid);
-    let Some(items) = on_store(ctx, move |_, s| s.list(Filter { uid, states })).await else {
+    let uid = (own || !is_approver(ctx, peer).await).then_some(peer.uid);
+    let sid = peer.sid.clone();
+    let Some(items) = on_store(ctx, move |_, s| s.list(Filter { uid, sid, states })).await else {
         return unavailable(id, ctx);
     };
     let mut m = Map::new();
@@ -435,11 +457,16 @@ fn request_id(req: &Request) -> Result<u64, Value> {
         })
 }
 
-/// Request `rid` when `uid` may see it.
-async fn visible(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Result<Option<ApprovalRequest>, ()> {
+/// Whether `peer` made request `r`.
+fn is_requester(r: &ApprovalRequest, peer: &PeerCred) -> bool {
+    crate::ops::same_principal(r.uid, r.sid.as_deref(), peer.uid, peer.sid.as_deref())
+}
+
+/// Request `rid` when `peer` may see it.
+async fn visible(ctx: &Arc<Ctx>, peer: &PeerCred, rid: u64) -> Result<Option<ApprovalRequest>, ()> {
     let r = on_store(ctx, move |_, s| s.get(rid)).await.ok_or(())?;
     match r {
-        Some(r) if r.uid == uid || is_approver(ctx, uid).await => Ok(Some(r)),
+        Some(r) if is_requester(&r, peer) || is_approver(ctx, peer).await => Ok(Some(r)),
         _ => Ok(None),
     }
 }
@@ -450,7 +477,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(r) => r,
         Err(v) => return v,
     };
-    match visible(ctx, peer.uid, rid).await {
+    match visible(ctx, peer, rid).await {
         Err(()) => unavailable(id, ctx),
         Ok(None) => unknown(id, rid),
         Ok(Some(r)) => {
@@ -468,6 +495,9 @@ pub(crate) struct NoStartTime<'a>(pub(crate) &'a dyn Reauth);
 impl Reauth for NoStartTime<'_> {
     fn available(&self) -> bool {
         self.0.available()
+    }
+    fn off_text(&self) -> Option<&'static str> {
+        self.0.off_text()
     }
     fn check(&self, _who: &Subject, _d: &str, _t: Duration) -> ReauthResult {
         ReauthResult::Error("the approver's process start time is unknown".into())
@@ -489,7 +519,7 @@ pub(crate) fn auth_arg(args: &Map<String, Value>) -> Result<Option<[u8; 32]>, St
 async fn refuse(
     ctx: &Arc<Ctx>,
     r: &ApprovalRequest,
-    by: u32,
+    by: &PeerCred,
     id: u64,
     rule: &str,
     why: &str,
@@ -514,15 +544,19 @@ async fn refuse(
 }
 
 /// An `approval` record of `action` for `r`, decided by `by`.
-fn decided_record(ctx: &Ctx, r: &ApprovalRequest, action: &str, by: u32) -> Record {
+fn decided_record(ctx: &Ctx, r: &ApprovalRequest, action: &str, by: &PeerCred) -> Record {
     let mut rec = ctx.approval_record(r, action);
-    rec.extra.insert("by_uid".into(), by.into());
+    rec.extra.insert("by_uid".into(), by.uid.into());
+    // Windows: every elevated admin's uid is 0, so `by_uid` alone names nobody.
+    if let Some(sid) = &by.sid {
+        rec.extra.insert("by_sid".into(), sid.clone().into());
+    }
     rec
 }
 
 async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
-    let peer = conn.peer;
+    let peer = conn.peer.clone();
     let rid = match request_id(&req) {
         Ok(r) => r,
         Err(v) => return v,
@@ -552,7 +586,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(a) => a,
         Err(e) => return err(id, ErrorCode::BadRequest, &e),
     };
-    let r = match visible(ctx, peer.uid, rid).await {
+    let r = match visible(ctx, &peer, rid).await {
         Err(()) => return unavailable(id, ctx),
         Ok(None) => return unknown(id, rid),
         Ok(Some(r)) => r,
@@ -574,12 +608,12 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         } else {
             "the body is over 1 MiB and shown cut; approve with ack_truncated (--accept-truncated)"
         };
-        return refuse(ctx, &r, peer.uid, id, "truncated_not_acknowledged", why).await;
+        return refuse(ctx, &r, &peer, id, "truncated_not_acknowledged", why).await;
     }
 
     // The requester may always withdraw its own request: a rejection that
     // lets nothing through needs no approver and no re-authentication.
-    let cancel = !approve && r.uid == peer.uid;
+    let cancel = !approve && is_requester(&r, &peer);
     let note = if cancel {
         Some(match note {
             // (Within the note limit; a note too long for the prefix is dropped.)
@@ -599,14 +633,19 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let refusal = if cancel {
         None
     } else if ctx.mode == crate::ops::Mode::Personal {
-        crate::approvers::personal_may_decide(ctx.own_uid, peer.uid).err()
+        match ctx.peer_is_own(&peer) {
+            true => None,
+            false => Some(Refusal::NotApprover),
+        }
     } else {
-        match ctx.name_of(peer.uid).await {
+        match ctx.peer_name(&peer).await {
             None => Some(Refusal::NotApprover),
             Some(name) => {
                 let c = Arc::clone(ctx);
+                let peer = peer.clone();
                 let start = conn.start_time;
                 let requester = r.uid;
+                let requester_sid = r.sid.clone();
                 let detail = crate::approvals::reauth_detail(&r);
                 tokio::task::spawn_blocking(move || {
                     // Re-authentication names the approver's process: without
@@ -620,7 +659,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                         &cfg,
                         c.directory.as_ref(),
                         &name,
-                        requester,
+                        (requester, requester_sid.as_deref()),
                         reauth,
                         &peer,
                         start.unwrap_or(0),
@@ -637,7 +676,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
     };
     if let Some(why) = refusal {
-        return refuse(ctx, &r, peer.uid, id, why.rule(), &why.to_string()).await;
+        return refuse(ctx, &r, &peer, id, why.rule(), &why.to_string()).await;
     }
 
     let to = if approve {
@@ -645,8 +684,9 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     } else {
         State::Rejected
     };
+    let by = (peer.uid, peer.sid.clone());
     let moved = on_store(ctx, move |_, s| {
-        s.transition(rid, &[State::Pending], to, Some(peer.uid), note, now())
+        s.transition_by(rid, &[State::Pending], to, Some(by), note, now())
     })
     .await;
     let r = match moved {
@@ -671,7 +711,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let action = if approve { "approved" } else { "rejected" };
     let recorded = ctx
         .writer
-        .append(decided_record(ctx, &r, action, peer.uid))
+        .append(decided_record(ctx, &r, action, &peer))
         .await;
     if let Err(e) = recorded {
         if approve {
@@ -732,11 +772,21 @@ struct CallFields {
 }
 
 impl CallFields {
-    /// The grant key for this call by `uid`: computed here, never taken
+    /// The grant key for this call by `peer`: computed here, never taken
     /// from the client.
-    fn key(&self, uid: u32) -> [u8; 32] {
+    fn key(&self, peer: &PeerCred) -> [u8; 32] {
+        if let Some(sid) = &peer.sid {
+            return crate::grants::grant_key_for_sid(
+                sid,
+                &self.agent,
+                &self.key_project,
+                &self.tool,
+                &self.input,
+                &self.raw_sha256,
+            );
+        }
         crate::grants::grant_key(
-            uid,
+            peer.uid,
             &self.agent,
             &self.key_project,
             &self.tool,
@@ -809,9 +859,51 @@ fn normal_absolute(p: &str) -> bool {
 /// canonicalizes both, and the daemon (another uid, `ProtectHome=`) does no
 /// filesystem access here.
 fn project_ok(f: &CallFields) -> bool {
+    if cfg!(windows) {
+        return windows_within(&f.project, &f.key_project);
+    }
     normal_absolute(&f.project)
         && normal_absolute(&f.key_project)
         && std::path::Path::new(&f.project).starts_with(&f.key_project)
+}
+
+/// No `.` or `..` component in `p`, past a device prefix (`\\?\`, `\\.\`, `\??\`).
+fn windows_no_dots(p: &str) -> bool {
+    let body = [r"\\?\", r"\\.\", r"\??\", "//?/", "//./"]
+        .iter()
+        .find_map(|pre| p.strip_prefix(pre))
+        .unwrap_or(p);
+    body.split(['\\', '/']).all(|c| c != "." && c != "..")
+}
+
+/// [`project_ok`] on Windows, where the hook sends `std::fs::canonicalize`'s paths
+/// (`\\?\C:\…`). Both sides are read by the guard's Windows path rules (W6): the verbatim
+/// prefix goes, the drive letter is one case and `\` and `/` are one separator, so the same
+/// directory compares equal however it was spelled. Neither may be relative or hold a `.`
+/// or `..`, and neither may be one the rules cannot read. A UNC or device path is taken only
+/// as exactly the project root: a share or device is never "below" a root here.
+fn windows_within(project: &str, root: &str) -> bool {
+    use saiifeguard::canon::PathVars;
+    use saiifeguard::winpath;
+    if !windows_no_dots(project) || !windows_no_dots(root) {
+        return false;
+    }
+    let vars = PathVars::new();
+    let (Ok(p), Ok(r)) = (
+        winpath::read(project, None, &vars),
+        winpath::read(root, None, &vars),
+    ) else {
+        // A device path (`\\?\Volume{…}`) has no form: only itself, spelled the same.
+        let device = |s: &str| s.starts_with(r"\\?\") || s.starts_with(r"\\.\");
+        return device(project) && project == root;
+    };
+    if p.starts_with("//") || r.starts_with("//") {
+        return p == r;
+    }
+    let base = r.trim_end_matches('/');
+    p == r
+        || p.strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Lockdown `all` answers every hook step with `lockdown`: no grant is
@@ -849,7 +941,7 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> (Value,
             None,
         );
     }
-    let key = f.key(peer.uid);
+    let key = f.key(peer);
     let c = Arc::clone(ctx);
     let used = tokio::task::spawn_blocking(move || c.grants.consume(&key, now()))
         .await
@@ -908,6 +1000,7 @@ async fn grant_used_record(
             rec.extra.insert("approval".into(), approval.into());
             rec.extra.insert("type".into(), "command".into());
             rec.uid = Some(peer.uid);
+            rec.sid = peer.sid.clone();
             rec.agent = f.agent.clone();
             rec.project = f.project.clone();
             rec
@@ -930,7 +1023,8 @@ async fn refuse_create(
 ) -> Value {
     let mut rec = ctx.record("approval", &f.input);
     rec.uid = Some(peer.uid);
-    rec.user = ctx.name_of(peer.uid).await;
+    rec.sid = peer.sid.clone();
+    rec.user = ctx.peer_name(peer).await;
     rec.agent = f.agent.clone();
     rec.project = f.project.clone();
     rec.session = f.session.clone();
@@ -1030,7 +1124,8 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
     }
     let new = NewRequest {
         uid: peer.uid,
-        user: ctx.name_of(peer.uid).await.unwrap_or_default(),
+        sid: peer.sid.clone(),
+        user: ctx.peer_name(peer).await.unwrap_or_default(),
         session: f.session.clone(),
         agent: f.agent.clone(),
         project: f.project.clone(),
@@ -1040,7 +1135,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         capability: None,
         params: Default::default(),
         input: Some(f.input.clone()),
-        grant_key: Some(crate::grants::hex(&f.key(peer.uid))),
+        grant_key: Some(crate::grants::hex(&f.key(peer))),
         scope: Some(f.key_project.clone()),
         ask_rule: f.ask(),
         send: SendDisplay::default(),
@@ -1245,9 +1340,6 @@ async fn finish(ctx: &Arc<Ctx>, r: &ApprovalRequest, to: State, result: Option<V
         _ => state_name(to),
     };
     let mut rec = ctx.approval_record(&r, action);
-    if let Some(by) = r.decided_by {
-        rec.extra.insert("by_uid".into(), by.into());
-    }
     rec.rule = d.rule;
     rec.reason = d.reason;
     if r.state != to {
@@ -1337,7 +1429,7 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     }
     let (g, env_name, groups) = match send_env(
         &ctx,
-        &stored.user,
+        (&stored.user, r.sid.as_deref()),
         stored.env.as_deref(),
         stored.env_recorded,
     )
@@ -1416,11 +1508,12 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
 /// rebound to another environment (or from the base config to one) since
 /// the ask, developer mode an environment no longer defined (never the
 /// base config instead). Only a request sealed before the environment was
-/// recorded (`env_recorded` false, no `env`) is not checked. `Err` is the
-/// failure's rule and message.
+/// recorded (`env_recorded` false, no `env`) is not checked. `sid` is the
+/// requester's on Windows, for a scope that names it (see [`Groups::of`]).
+/// `Err` is the failure's rule and message.
 async fn send_env(
     ctx: &Arc<Ctx>,
-    user: &str,
+    (user, sid): (&str, Option<&str>),
     env: Option<&str>,
     env_recorded: bool,
 ) -> Result<SendEnv, (&'static str, &'static str)> {
@@ -1433,7 +1526,7 @@ async fn send_env(
     } else {
         ctx.groups_of(user).await
     };
-    let groups = Groups(groups);
+    let groups = Groups::of(ctx, &g, user, sid, groups).await;
     let mode = crate::api_ops::gateway_mode(ctx);
     let env_name = match g.select_env(mode, &groups, user, env) {
         Ok((e, _)) => e.map(str::to_string),
@@ -1489,7 +1582,7 @@ async fn send_mcp(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32, exact: Zeroizing<V
     }
     let (g, env_name, groups) = match send_env(
         &ctx,
-        &stored.user,
+        (&stored.user, r.sid.as_deref()),
         stored.env.as_deref(),
         stored.env_recorded,
     )
@@ -1575,6 +1668,7 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
     let mut out = Vec::new();
     for r in store.list(Filter {
         uid: None,
+        sid: None,
         states: vec![State::Approved],
     }) {
         // A command's grant may or may not have been kept: revoke it, so
@@ -1616,9 +1710,6 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
                 rec.decision = DecisionKind::Deny;
                 rec.rule = Some(INTERRUPTED.into());
                 rec.reason = Some(message.into());
-                if let Some(by) = r.decided_by {
-                    rec.extra.insert("by_uid".into(), by.into());
-                }
                 out.push(rec);
             }
             Err(e) => eprintln!(
@@ -1645,10 +1736,16 @@ pub(crate) enum ResultView {
 
 /// Request `rid` as `uid` may see it: the requester only (decision 4).
 /// `Err` when the store is unavailable.
-pub(crate) async fn result_for(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Result<ResultView, ()> {
+pub(crate) async fn result_for(
+    ctx: &Arc<Ctx>,
+    uid: u32,
+    sid: Option<&str>,
+    rid: u64,
+) -> Result<ResultView, ()> {
+    let sid = sid.map(str::to_string);
     let got = on_store(ctx, move |c, s| {
         let r = s.get(rid)?;
-        if r.uid != uid {
+        if !crate::ops::same_principal(r.uid, r.sid.as_deref(), uid, sid.as_deref()) {
             return None;
         }
         let done = matches!(r.state, State::Sent | State::SendFailed);
@@ -1688,7 +1785,7 @@ pub(crate) async fn api_result(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) ->
         Ok(r) => r,
         Err(v) => return v,
     };
-    let view = match result_for(ctx, peer.uid, rid).await {
+    let view = match result_for(ctx, peer.uid, peer.sid.as_deref(), rid).await {
         Ok(v) => v,
         Err(()) => return unavailable(id, ctx),
     };
@@ -1710,6 +1807,115 @@ pub(crate) async fn api_result(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) ->
 }
 
 #[cfg(test)]
+mod requester_tests {
+    use super::*;
+
+    fn peer(uid: u32, sid: Option<&str>) -> PeerCred {
+        PeerCred {
+            uid,
+            gid: 0,
+            pid: 1,
+            sid: sid.map(str::to_string),
+            group_sids: Vec::new(),
+        }
+    }
+
+    fn request(uid: u32, sid: Option<&str>) -> ApprovalRequest {
+        serde_json::from_value(json!({
+            "id": 1, "created": "c", "expires": "e", "uid": uid, "sid": sid, "user": "u",
+            "session": null, "agent": "a", "project": "p", "type": "connector",
+            "service": null, "operation": null, "capability": null, "params": {},
+            "input": null, "grant_key": null, "state": "pending"
+        }))
+        .unwrap()
+    }
+
+    const A: &str = "S-1-5-21-1-2-3-1001";
+    const B: &str = "S-1-5-21-1-2-3-1002";
+
+    /// `visible` and withdraw: another admin, with the same uid 0, did not make it.
+    #[test]
+    fn the_requester_is_a_sid_on_windows() {
+        let r = request(0, Some(A));
+        assert!(is_requester(&r, &peer(0, Some(A))));
+        assert!(!is_requester(&r, &peer(0, Some(B))));
+        // The same SID elevated later: same person, another label.
+        assert!(is_requester(&r, &peer(0x4000_0001, Some(A))));
+    }
+
+    /// A label collision is no identity either.
+    #[test]
+    fn a_shared_label_is_not_the_requester() {
+        let r = request(0x4000_0001, Some(A));
+        assert!(!is_requester(&r, &peer(0x4000_0001, Some(B))));
+    }
+
+    /// What a Windows hook sends (`std::fs::canonicalize`) matches its project however
+    /// each side is spelled; a sibling with the same prefix does not.
+    #[test]
+    fn a_hook_shaped_windows_path_matches_its_project() {
+        let root = r"\\?\C:\Users\a\p";
+        for cwd in [
+            r"\\?\C:\Users\a\p",
+            r"\\?\C:\Users\a\p\sub\dir",
+            r"C:\Users\a\p\sub",
+            r"\\?\c:\Users\a\p\sub",
+            "C:/Users/a/p/sub",
+        ] {
+            assert!(windows_within(cwd, root), "{cwd}");
+        }
+        assert!(windows_within(r"\\?\C:\Users\a\p\sub", r"c:\Users\a\p"));
+        assert!(windows_within(r"\\?\C:\w\x", r"\\?\C:\"));
+        for cwd in [r"\\?\C:\Users\a\pp", r"\\?\C:\Users\a", r"\\?\D:\Users\a\p"] {
+            assert!(!windows_within(cwd, root), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn dots_and_relative_windows_paths_are_refused() {
+        let root = r"\\?\C:\Users\a\p";
+        for cwd in [
+            r"\\?\C:\Users\a\p\..\q",
+            r"\\?\C:\Users\a\p\sub\..",
+            r"C:\Users\a\p\.\sub",
+            r"p\sub",
+            r"sub",
+            r"C:p\sub",
+            "",
+        ] {
+            assert!(!windows_within(cwd, root), "{cwd:?}");
+        }
+        // A `..` in the root lets nothing in either.
+        assert!(!windows_within(r"\\?\C:\Users\x", r"\\?\C:\Users\a\.."));
+        assert!(!windows_within(r"\\?\C:\Users\a\p", r"Users\a\p"));
+    }
+
+    /// A share or a device is a project only as itself, never as a root with paths below.
+    #[test]
+    fn unc_and_device_windows_paths_only_as_themselves() {
+        let unc = r"\\?\UNC\server\share\p";
+        assert!(windows_within(unc, unc));
+        assert!(windows_within(r"\\server\share\p", unc));
+        assert!(!windows_within(r"\\?\UNC\server\share\p\sub", unc));
+        assert!(!windows_within(unc, r"\\?\C:\"));
+        assert!(!windows_within(r"\\?\C:\p", unc));
+        let dev = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\p";
+        assert!(windows_within(dev, dev));
+        assert!(!windows_within(&format!(r"{dev}\sub"), dev));
+        assert!(!windows_within(dev, r"\\?\C:\"));
+        assert!(!windows_within(r"\\.\PhysicalDrive0", r"\\?\C:\"));
+        assert!(!windows_within(r"\\?\C:\p", r"\\.\PhysicalDrive0"));
+    }
+
+    #[test]
+    fn unix_requesters_stay_uids() {
+        let r = request(1000, None);
+        assert!(is_requester(&r, &peer(1000, None)));
+        assert!(!is_requester(&r, &peer(1001, None)));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_broker::mask::Masker;
@@ -1762,6 +1968,311 @@ mod tests {
         }
     }
 
+    /// Windows' withdraw through `decide`, with peers that carry a SID as the pipe's do:
+    /// another SID with the same label 0 does not see the request and cannot withdraw
+    /// it; the requester's SID can. The end-to-end half is windows_daemon.rs's
+    /// `the_requester_withdraws_its_own_request`.
+    #[tokio::test]
+    async fn another_sid_with_the_same_label_cannot_withdraw() {
+        const A: &str = "S-1-5-21-1-2-3-1001";
+        const B: &str = "S-1-5-21-1-2-3-1002";
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().approvals = Ok(store);
+        let cfg: saiife_policy::SystemConfig =
+            toml::from_str("version = 2\nlocked = true\n").unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            system: Some(Arc::new(cfg)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        let new = NewRequest {
+            uid: 0,
+            sid: Some(A.into()),
+            user: "a".into(),
+            session: None,
+            agent: "claude".into(),
+            project: "/w".into(),
+            kind: ApprovalType::Command,
+            service: None,
+            operation: None,
+            capability: None,
+            params: Default::default(),
+            input: Some("git push --force".into()),
+            grant_key: None,
+            scope: None,
+            ask_rule: None,
+            send: SendDisplay::default(),
+        };
+        let rid = ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .create(new, |_| Ok(None), Duration::from_secs(600), now())
+            .unwrap()
+            .id;
+        let as_sid = |sid: &str| {
+            Conn::new(
+                PeerCred {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                    sid: Some(sid.into()),
+                    group_sids: Vec::new(),
+                },
+                Some(1),
+            )
+        };
+        let withdraw = || Request {
+            id: 4,
+            op: OP_APPROVAL_DECIDE.into(),
+            args: json!({"request": rid, "action": "reject"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let state = || ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+
+        let v = decide(&ctx, &as_sid(B), withdraw()).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v.to_string().contains("(or not yours)"), "{v}");
+        assert_eq!(state().state, State::Pending);
+
+        let v = decide(&ctx, &as_sid(A), withdraw()).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let r = state();
+        assert_eq!(r.state, State::Rejected);
+        assert_eq!(r.note.as_deref(), Some(CANCELLED));
+        assert_eq!(r.decided_by_sid.as_deref(), Some(A));
+    }
+
+    /// Windows' accounts as the locked-windows CI has them: a policy names `approver`,
+    /// and the daemon's lookup of the pipe peer's SID says `HOST\approver`.
+    struct CiAccounts;
+
+    const AGENT_SID: &str = "S-1-5-21-1-2-3-1003";
+    const APPROVER_SID: &str = "S-1-5-21-1-2-3-1004";
+
+    impl saiife_policy::WinAccounts for CiAccounts {
+        fn lookup_name(&self, name: &str) -> Result<(String, String), String> {
+            let bare = name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(name)
+                .to_ascii_lowercase();
+            match bare.as_str() {
+                "agent" => Ok((AGENT_SID.into(), r"HOST\agent".into())),
+                "approver" => Ok((APPROVER_SID.into(), r"HOST\approver".into())),
+                "administrators" => Ok((
+                    saiife_win::sid::ADMINISTRATORS.into(),
+                    r"BUILTIN\Administrators".into(),
+                )),
+                _ => Err(format!("no account {name}")),
+            }
+        }
+        fn lookup_sid(&self, sid: &str) -> Result<String, String> {
+            match sid {
+                AGENT_SID => Ok(r"HOST\agent".into()),
+                APPROVER_SID => Ok(r"HOST\approver".into()),
+                _ => Err(format!("no SID {sid}")),
+            }
+        }
+        /// The approver is a non-elevated admin: Windows lists it in Administrators by
+        /// name, while its token holds that group deny-only.
+        fn local_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
+            Ok(match user.to_ascii_lowercase().ends_with("approver") {
+                true => vec!["Users".into(), "Administrators".into()],
+                false => vec!["Users".into()],
+            })
+        }
+        fn local_group_members(&self, group: &str) -> Result<Vec<String>, String> {
+            Err(format!("no group {group}"))
+        }
+    }
+
+    fn sid_conn(sid: &str) -> Conn {
+        Conn::new(
+            PeerCred {
+                uid: saiife_win::sid::uid_of(sid, false),
+                gid: 0,
+                pid: 1,
+                sid: Some(sid.into()),
+                group_sids: Vec::new(),
+            },
+            Some(1),
+        )
+    }
+
+    fn windows_ctx(d: &std::path::Path) -> (Arc<Ctx>, std::thread::JoinHandle<()>) {
+        let (mut ctx, join) = crate::ops::test_ctx(d, crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.join("approvals")).unwrap();
+        let c = Arc::get_mut(&mut ctx).unwrap();
+        c.approvals = Ok(store);
+        c.directory = Arc::new(saiife_policy::WinDirectory::new(CiAccounts));
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[approval]\napprovers = [\"approver\"]\nsame_user = \"deny\"\n",
+        )
+        .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            system: Some(Arc::new(cfg)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        (ctx, join)
+    }
+
+    /// locked-windows CI run 9: `approvers = ["approver"]` never matched the daemon's
+    /// `HOST\approver`, so the second account saw no request ("or not yours") and was
+    /// no approver for lockdown. The entry names the account when the SIDs agree.
+    #[tokio::test]
+    async fn a_bare_approver_name_matches_its_windows_account() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = windows_ctx(d.path());
+        let new = NewRequest {
+            uid: saiife_win::sid::uid_of(AGENT_SID, false),
+            sid: Some(AGENT_SID.into()),
+            user: r"HOST\agent".into(),
+            session: None,
+            agent: "claude".into(),
+            project: "/w".into(),
+            kind: ApprovalType::Command,
+            service: None,
+            operation: None,
+            capability: None,
+            params: Default::default(),
+            input: Some("git push --force".into()),
+            grant_key: None,
+            scope: None,
+            ask_rule: None,
+            send: SendDisplay::default(),
+        };
+        let rid = ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .create(new, |_| Ok(None), Duration::from_secs(600), now())
+            .unwrap()
+            .id;
+        assert!(is_approver(&ctx, &sid_conn(APPROVER_SID).peer).await);
+        assert!(!is_approver(&ctx, &sid_conn(AGENT_SID).peer).await);
+        // A reject, as this request carries no grant key; both pass the same checks.
+        let reject = Request {
+            id: 4,
+            op: OP_APPROVAL_DECIDE.into(),
+            args: json!({"request": rid, "action": "reject"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let v = decide(&ctx, &sid_conn(APPROVER_SID), reject).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let r = ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+        assert_eq!(r.state, State::Rejected);
+        assert_eq!(r.decided_by_sid.as_deref(), Some(APPROVER_SID));
+    }
+
+    /// The same run's lockdown half: the approver is an approver, so `lockdown off`
+    /// meets same_user = "deny" (`reauth_required`), not `forbidden`.
+    #[tokio::test]
+    async fn a_bare_approver_name_is_an_approver_for_lockdown() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = windows_ctx(d.path());
+        let off = || Request {
+            id: 5,
+            op: saiife_ipc::msg::OP_LOCKDOWN_SET.into(),
+            args: json!({"on": false}).as_object().unwrap().clone(),
+        };
+        let v = crate::lockdown::set(&ctx, &sid_conn(APPROVER_SID), off()).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v.to_string().contains("reauth_required"), "{v}");
+        let v = crate::lockdown::set(&ctx, &sid_conn(AGENT_SID), off()).await;
+        assert!(v.to_string().contains("[approval] approvers"), "{v}");
+    }
+
+    /// Review finding 2: a non-elevated admin's token holds Administrators deny-only
+    /// (`peer_facts` leaves it out of `group_sids`), while its name's local groups list
+    /// it. On Windows only the token counts, so it is no approver for
+    /// `group:Administrators`: no request to see, and no lockdown off.
+    #[tokio::test]
+    async fn a_deny_only_administrators_is_no_group_approver() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = windows_ctx(d.path());
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[approval]\napprovers = [\"group:Administrators\"]\n\
+             same_user = \"deny\"\n",
+        )
+        .unwrap();
+        ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+        let lowered = sid_conn(APPROVER_SID);
+        assert!(!is_approver(&ctx, &lowered.peer).await);
+        let off = Request {
+            id: 6,
+            op: saiife_ipc::msg::OP_LOCKDOWN_SET.into(),
+            args: json!({"on": false}).as_object().unwrap().clone(),
+        };
+        let v = crate::lockdown::set(&ctx, &lowered, off.clone()).await;
+        assert!(v.to_string().contains("[approval] approvers"), "{v}");
+        // Elevated, the token holds the group: an approver.
+        let mut elevated = sid_conn(APPROVER_SID);
+        elevated.peer.group_sids = vec![saiife_win::sid::ADMINISTRATORS.into()];
+        assert!(is_approver(&ctx, &elevated.peer).await);
+    }
+
+    /// [`windows_ctx`] with `[[scope]] users = ["agent"]` bound to `prod`, as the
+    /// gateway's policy.
+    fn scoped_ctx(d: &std::path::Path) -> (Arc<Ctx>, std::thread::JoinHandle<()>) {
+        let (ctx, join) = windows_ctx(d);
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[[scope]]\nname = \"shop\"\nusers = [\"agent\"]\n\
+             env = \"prod\"\n[environments.prod]\n",
+        )
+        .unwrap();
+        let g = crate::ops::GatewayPolicy::build(
+            &cfg,
+            &[],
+            saiife_broker::Catalog::default(),
+            saiife_policy::Mode::Locked,
+        )
+        .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            ok: true,
+            system: Some(Arc::new(cfg)),
+            gateway: Some(Arc::new(g)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        (ctx, join)
+    }
+
+    /// locked-windows CI: `[[scope]] users = ["agent"]` never matched the daemon's
+    /// `HOST\agent`, so the scope's rules did not apply to it. It matches by SID, and
+    /// another account is still in no scope.
+    #[tokio::test]
+    async fn a_bare_scope_name_gives_its_windows_account_the_scope() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = scoped_ctx(d.path());
+        assert!(crate::api_ops::has_scope(&ctx, &sid_conn(AGENT_SID).peer).await);
+        assert!(!crate::api_ops::has_scope(&ctx, &sid_conn(APPROVER_SID).peer).await);
+    }
+
+    /// The scope's environment applies to an approved request of `HOST\agent` (the
+    /// request was asked under `prod`), and not to another account's.
+    #[tokio::test]
+    async fn a_bare_scope_name_binds_its_windows_account_to_the_scope_env() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = scoped_ctx(d.path());
+        let (_, env, _) = send_env(&ctx, (r"HOST\agent", Some(AGENT_SID)), Some("prod"), true)
+            .await
+            .unwrap();
+        assert_eq!(env.as_deref(), Some("prod"));
+        let other = send_env(
+            &ctx,
+            (r"HOST\approver", Some(APPROVER_SID)),
+            Some("prod"),
+            true,
+        )
+        .await;
+        assert_eq!(other.err().map(|e| e.0), Some(ENV_CHANGED));
+    }
+
     /// Bad `auth` hex is a bad request, before anything is looked up.
     #[tokio::test]
     async fn bad_auth_hex_is_bad_request() {
@@ -1772,6 +2283,8 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 pid: 1,
+                sid: None,
+                group_sids: Vec::new(),
             },
             Some(1),
         );

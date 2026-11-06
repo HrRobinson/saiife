@@ -21,20 +21,26 @@ pub fn free_mb(dir: &Path) -> io::Result<u64> {
             return Ok(*mb);
         }
     }
-    let st = rustix::fs::statvfs(dir)?;
-    let mb = st.f_bavail.saturating_mul(st.f_frsize) / (1024 * 1024);
+    let mb = free_bytes(dir)? / (1024 * 1024);
     *c = Some((dir.to_path_buf(), now, mb));
     Ok(mb)
 }
 
-/// Below the floor, appends from anyone but the daemon itself are refused.
-pub fn disk_gate(
-    free_mb: u64,
-    min_free_mb: u64,
-    peer_uid: u32,
-    daemon_uid: u32,
-) -> Result<(), ErrorCode> {
-    if free_mb < min_free_mb && peer_uid != daemon_uid {
+#[cfg(unix)]
+fn free_bytes(dir: &Path) -> io::Result<u64> {
+    let st = rustix::fs::statvfs(dir)?;
+    Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+#[cfg(windows)]
+fn free_bytes(dir: &Path) -> io::Result<u64> {
+    saiife_win::ffi::process::disk_free_bytes(dir)
+}
+
+/// Below the floor, appends from anyone but the daemon itself are refused. `is_own` comes
+/// from [`crate::ops::Ctx::is_own`]: on Windows a uid is a label two SIDs can share.
+pub fn disk_gate(free_mb: u64, min_free_mb: u64, is_own: bool) -> Result<(), ErrorCode> {
+    if free_mb < min_free_mb && !is_own {
         return Err(ErrorCode::LowDisk);
     }
     Ok(())
@@ -46,11 +52,11 @@ mod tests {
 
     #[test]
     fn floor_refuses_only_non_daemon_uids() {
-        assert_eq!(disk_gate(100, 512, 1000, 990), Err(ErrorCode::LowDisk));
-        assert_eq!(disk_gate(511, 512, 1000, 990), Err(ErrorCode::LowDisk));
-        assert_eq!(disk_gate(512, 512, 1000, 990), Ok(()));
-        assert_eq!(disk_gate(100, 512, 990, 990), Ok(()));
-        assert_eq!(disk_gate(0, 512, 990, 990), Ok(()));
+        assert_eq!(disk_gate(100, 512, false), Err(ErrorCode::LowDisk));
+        assert_eq!(disk_gate(511, 512, false), Err(ErrorCode::LowDisk));
+        assert_eq!(disk_gate(512, 512, false), Ok(()));
+        assert_eq!(disk_gate(100, 512, true), Ok(()));
+        assert_eq!(disk_gate(0, 512, true), Ok(()));
     }
 
     #[test]

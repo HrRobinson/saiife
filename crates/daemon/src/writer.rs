@@ -427,7 +427,7 @@ pub fn pending_key_path(key_path: &Path) -> PathBuf {
     key_path.with_file_name(format!(".{name}.rotating"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_audit::chain::ChainWriter;

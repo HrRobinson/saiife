@@ -29,6 +29,8 @@ pub enum Refusal {
     SameUserDenied,
     /// The re-authentication tool's answer, if any.
     ReauthUnavailable(String),
+    /// Same-user approval never runs on this host: the whole text (Windows, W16).
+    SameUserOff(&'static str),
     /// The re-authentication tool's answer, if any.
     ReauthFailed(String),
     ReauthError(String),
@@ -44,7 +46,7 @@ impl Refusal {
         match self {
             Refusal::NotApprover => "not_approver",
             Refusal::SameUserDenied => "same_user",
-            Refusal::ReauthUnavailable(_) => "reauth_unavailable",
+            Refusal::ReauthUnavailable(_) | Refusal::SameUserOff(_) => "reauth_unavailable",
             Refusal::ReauthFailed(_) => "reauth_failed",
             Refusal::ReauthError(_) => "reauth_error",
             Refusal::ReauthBusy => "reauth_busy",
@@ -60,6 +62,7 @@ impl fmt::Display for Refusal {
             Refusal::SameUserDenied => {
                 f.write_str("the requester cannot approve its own request (same_user = \"deny\")")
             }
+            Refusal::SameUserOff(text) => f.write_str(text),
             Refusal::ReauthUnavailable(d) if d.is_empty() => f.write_str(REAUTH_UNAVAILABLE),
             Refusal::ReauthUnavailable(d) => write!(f, "{REAUTH_UNAVAILABLE} ({TOOL}: {d})"),
             Refusal::ReauthFailed(d) if d.is_empty() => f.write_str("re-authentication failed"),
@@ -76,6 +79,8 @@ impl fmt::Display for Refusal {
 }
 
 /// Whether `user` is listed in `approvers`, directly or by a current group.
+/// Linux and macOS only decide this way; a Windows peer goes through
+/// [`peer_is_listed`].
 pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
     let mut groups: Option<Vec<String>> = None;
     cfg.approvers
@@ -85,7 +90,25 @@ pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
                 .get_or_insert_with(|| dir.groups_of(user))
                 .iter()
                 .any(|x| x == g),
-            None => e == user,
+            None => saiife_policy::names_account(dir, e, user),
+        })
+}
+
+/// Whether the peer named `user` is listed in `approvers`. A Windows peer (one with a
+/// SID) is in a `group:` only when its token's counting groups (`group_sids`: enabled,
+/// not deny-only) hold that group's SID, never by a lookup of the name's groups: that
+/// lookup counts the Administrators a non-elevated admin's token holds deny-only. A user
+/// entry names it by SID ([`saiife_policy::names_account`]). Elsewhere it is
+/// [`is_approver`].
+pub fn peer_is_listed(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str, peer: &PeerCred) -> bool {
+    let Some(sid) = peer.sid.as_deref() else {
+        return is_approver(cfg, dir, user);
+    };
+    cfg.approvers
+        .iter()
+        .any(|e| match e.strip_prefix(GROUP_PREFIX) {
+            Some(g) => dir.sid_of(g).is_some_and(|g| peer.group_sids.contains(&g)),
+            None => dir.sid_of(e).as_deref() == Some(sid),
         })
 }
 
@@ -97,6 +120,25 @@ pub fn personal_may_decide(own_uid: u32, peer_uid: u32) -> Result<(), Refusal> {
         Ok(())
     } else {
         Err(Refusal::NotApprover)
+    }
+}
+
+/// Who made a request: a uid on Linux and macOS, a SID with its uid label on Windows.
+#[derive(Debug, Clone, Copy)]
+pub struct Requester<'a> {
+    pub uid: u32,
+    pub sid: Option<&'a str>,
+}
+
+impl From<u32> for Requester<'_> {
+    fn from(uid: u32) -> Self {
+        Requester { uid, sid: None }
+    }
+}
+
+impl<'a> From<(u32, Option<&'a str>)> for Requester<'a> {
+    fn from((uid, sid): (u32, Option<&'a str>)) -> Self {
+        Requester { uid, sid }
     }
 }
 
@@ -125,11 +167,11 @@ pub fn personal_may_decide(own_uid: u32, peer_uid: u32) -> Result<(), Refusal> {
 ///   decides on it, never on `peer.pid`. Without it a macOS check is
 ///   unavailable. The start-time re-check after it only ever refuses.
 #[allow(clippy::too_many_arguments)]
-pub fn may_decide(
+pub fn may_decide<'r>(
     cfg: &ApprovalCfg,
     dir: &dyn Directory,
     approver_user: &str,
-    requester_uid: u32,
+    requester: impl Into<Requester<'r>>,
     reauth: &dyn Reauth,
     peer: &PeerCred,
     start_time: u64,
@@ -138,21 +180,36 @@ pub fn may_decide(
     detail: &str,
     auth: Option<[u8; 32]>,
 ) -> Result<(), Refusal> {
+    let requester = requester.into();
     let approver_uid = peer.uid;
-    if dir.user(approver_user).map(|u| u.uid) != Some(approver_uid) {
+    // The name was looked up from this peer. On Windows that is by SID, and an elevated
+    // admin's uid label is 0 whatever its name's label is, so the SIDs are compared.
+    let same_account = match peer.sid.as_deref() {
+        Some(sid) => dir.sid_of(approver_user).as_deref() == Some(sid),
+        None => dir.user(approver_user).map(|u| u.uid) == Some(approver_uid),
+    };
+    if !same_account {
         return Err(Refusal::ReauthError(MISMATCH.to_string()));
     }
-    if !is_approver(cfg, dir, approver_user) {
+    if !peer_is_listed(cfg, dir, approver_user, peer) {
         return Err(Refusal::NotApprover);
     }
-    if approver_uid != requester_uid {
+    if !crate::ops::same_principal(
+        approver_uid,
+        peer.sid.as_deref(),
+        requester.uid,
+        requester.sid,
+    ) {
         return Ok(());
     }
     match cfg.same_user {
         SameUser::Deny => Err(Refusal::SameUserDenied),
         SameUser::Reauth => {
             if !reauth.available() {
-                return Err(Refusal::ReauthUnavailable(String::new()));
+                return Err(match reauth.off_text() {
+                    Some(text) => Refusal::SameUserOff(text),
+                    None => Refusal::ReauthUnavailable(String::new()),
+                });
             }
             let Some(_slot) = InFlight::begin(approver_uid) else {
                 return Err(Refusal::ReauthBusy);
@@ -193,6 +250,19 @@ pub fn may_decide(
                 ReauthResult::Error(e) => Err(Refusal::ReauthError(e)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod requester_tests {
+    use super::*;
+
+    #[test]
+    fn a_uid_is_a_requester_without_a_sid() {
+        let r: Requester<'_> = 1000u32.into();
+        assert_eq!((r.uid, r.sid), (1000, None));
+        let r: Requester<'_> = (7u32, Some("S-1-5-18")).into();
+        assert_eq!(r.sid, Some("S-1-5-18"));
     }
 }
 
@@ -295,6 +365,8 @@ mod tests {
             uid,
             gid: uid,
             pid: PID,
+            sid: None,
+            group_sids: Vec::new(),
         }
     }
 
@@ -571,6 +643,74 @@ mod tests {
         assert_eq!(Refusal::ReauthCooldown(5).rule(), "reauth_cooldown");
     }
 
+    /// W16: on Windows `same_user = "reauth"` acts as `"deny"`. No prompt, no cooldown, and
+    /// the refusal says what to do. It names no tool, because none would have run.
+    #[test]
+    fn same_user_approval_is_off_on_windows() {
+        use crate::reauth::SecondAccountOnly;
+        use saiife_policy::SameUser;
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        struct D;
+        impl Directory for D {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn sid_of(&self, _: &str) -> Option<String> {
+                Some(SID.to_string())
+            }
+        }
+        let cfg = ApprovalCfg {
+            approvers: vec!["agent".into()],
+            same_user: SameUser::Reauth,
+            ..Default::default()
+        };
+        let peer = PeerCred {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            sid: Some(SID.to_string()),
+            group_sids: Vec::new(),
+        };
+        let proc = FakeProc {
+            starts: vec![Some(0)],
+            reads: AtomicU64::new(0),
+        };
+        let cooldowns = Mutex::new(Cooldowns::default());
+        let decide = |requester: Option<&'static str>| {
+            may_decide(
+                &cfg,
+                &D,
+                "agent",
+                (0, requester),
+                &SecondAccountOnly,
+                &peer,
+                0,
+                &proc,
+                &cooldowns,
+                "",
+                None,
+            )
+        };
+        let refused = decide(Some(SID)).unwrap_err();
+        assert_eq!(refused.rule(), "reauth_unavailable");
+        let text = refused.to_string();
+        assert!(text.contains("off on Windows"), "{text}");
+        assert!(text.contains("second account"), "{text}");
+        assert!(text.contains("separate session"), "{text}");
+        assert!(!text.contains("pkcheck"), "{text}");
+        // A second account, in the same `approvers`, is what works.
+        assert_eq!(decide(Some("S-1-5-21-1-2-3-1002")), Ok(()));
+    }
+
     #[test]
     fn rules_and_messages() {
         let all = [
@@ -604,8 +744,10 @@ mod tests {
 
     /// The macOS check with a fake `security`, made available (the real
     /// test needs a root-owned binary).
+    #[cfg(unix)]
     struct AvailableMac(crate::reauth::MacAuthorize);
 
+    #[cfg(unix)]
     impl Reauth for AvailableMac {
         fn available(&self) -> bool {
             true
@@ -615,12 +757,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn mac(dir: &std::path::Path, answer: &str, code: i32) -> AvailableMac {
         AvailableMac(crate::reauth::MacAuthorize::with_path(
             crate::reauth::fakes::security(dir, answer, false, code, 0),
         ))
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_auth_is_unavailable() {
         let d = tempfile::tempdir().unwrap();
@@ -670,6 +814,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unavailable_starts_no_cooldown() {
         let d = tempfile::tempdir().unwrap();
@@ -781,5 +926,66 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    /// A non-elevated admin's token holds Administrators deny-only, which `peer_facts`
+    /// leaves out of `group_sids`, while a lookup of its name's local groups lists the
+    /// group. On Windows only the token counts: no approver for `group:Administrators`.
+    #[test]
+    fn a_deny_only_administrators_is_no_group_approver_on_windows() {
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        struct D;
+        impl Directory for D {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                vec!["Users".into(), "Administrators".into()]
+            }
+            fn sid_of(&self, name: &str) -> Option<String> {
+                match name {
+                    "Administrators" => Some(saiife_win::sid::ADMINISTRATORS.into()),
+                    r"HOST\admin" | "admin" => Some(SID.into()),
+                    _ => None,
+                }
+            }
+        }
+        let c = cfg(&["group:Administrators"], SameUser::Deny);
+        let mut p = PeerCred {
+            uid: saiife_win::sid::uid_of(SID, false),
+            gid: 0,
+            pid: PID,
+            sid: Some(SID.into()),
+            group_sids: vec![saiife_win::sid::USERS.into()],
+        };
+        let decide = |p: &PeerCred| {
+            may_decide(
+                &c,
+                &D,
+                r"HOST\admin",
+                (0, Some("S-1-5-21-1-2-3-1002")),
+                &FakeReauth::new(false, ReauthResult::Authorized),
+                p,
+                START,
+                &FakeProc::steady(),
+                &Mutex::default(),
+                "#1 x",
+                None,
+            )
+        };
+        assert!(!peer_is_listed(&c, &D, r"HOST\admin", &p));
+        assert_eq!(decide(&p), Err(Refusal::NotApprover));
+        // Elevated, the token holds it, and the same account is an approver.
+        p.group_sids.push(saiife_win::sid::ADMINISTRATORS.into());
+        assert!(peer_is_listed(&c, &D, r"HOST\admin", &p));
+        assert_eq!(decide(&p), Ok(()));
+        // Linux and macOS: the name's groups, as before.
+        assert!(is_approver(&c, &D, "admin"));
     }
 }

@@ -123,9 +123,17 @@ pub fn expected_entry() -> String {
 /// hooks = true`. Everything else in the file is kept. Symlinks are
 /// refused; the file is written 0644.
 pub fn install_managed(file: &Path) -> Result<Change, AgentError> {
+    install_managed_for(file, cfg!(windows))
+}
+
+/// [`install_managed`] with the platform given. On Windows the handler has
+/// `command` only, with the W9 path: no `command_windows` (the owner's
+/// lock check must confirm Codex on Windows reads `command`).
+pub fn install_managed_for(file: &Path, windows: bool) -> Result<Change, AgentError> {
+    let entry = managed_entry_for(windows);
     let text = fsutil::read_managed(file)?;
     let mut doc = parse(file, text.as_deref().unwrap_or(""))?;
-    let entry_ok = fingerprints(file, &doc)? == [expected_managed()];
+    let entry_ok = fingerprints(file, &doc)? == [expected_managed(entry)];
     let features_ok = features_hooks(file, &doc)? == Some(true);
     if entry_ok && features_ok {
         return Ok(Change::Unchanged);
@@ -134,7 +142,7 @@ pub fn install_managed(file: &Path) -> Result<Change, AgentError> {
         set_features_hooks(file, &mut doc)?;
     }
     if !entry_ok {
-        add_group(file, &mut doc, &MANAGED)?;
+        add_group(file, &mut doc, entry)?;
     }
     fsutil::write_managed(file, &render(&doc))
 }
@@ -174,8 +182,8 @@ pub fn managed_entry(file: &Path) -> Result<Option<String>, AgentError> {
     }))))
 }
 
-fn expected_managed() -> String {
-    let g = table_to_json(&group_of(&MANAGED));
+fn expected_managed(entry: &Entry) -> String {
+    let g = table_to_json(&group_of(entry));
     entry_fingerprint(g.get("matcher"), &g["hooks"][0])
 }
 
@@ -429,12 +437,31 @@ const MANAGED: Entry = Entry {
     status: MANAGED_STATUS_MESSAGE,
 };
 
+/// The managed hook on Windows (spec W9).
+const MANAGED_WIN: Entry = Entry {
+    matcher: MANAGED_MATCHER,
+    command: managed_command_win,
+    status: MANAGED_STATUS_MESSAGE,
+};
+
+fn managed_entry_for(windows: bool) -> &'static Entry {
+    if windows {
+        &MANAGED_WIN
+    } else {
+        &MANAGED
+    }
+}
+
+fn managed_command_win() -> String {
+    Agent::Codex.managed_command_on(true)
+}
+
 fn project_command() -> String {
     Agent::Codex.hook_command()
 }
 
 fn managed_command() -> String {
-    Agent::Codex.managed_command()
+    Agent::Codex.managed_command_on(false)
 }
 
 /// The `[[hooks.PreToolUse]]` table `install` appends.

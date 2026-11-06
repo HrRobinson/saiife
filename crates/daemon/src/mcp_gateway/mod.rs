@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -623,7 +624,7 @@ impl Gateway {
     }
 
     /// Tests: count `pid` as a child.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn add_test_pid(&self, pid: u32) {
         lock(&self.inner.pids).insert(pid);
     }
@@ -826,9 +827,20 @@ impl Inner {
     }
 }
 
+#[cfg(unix)]
+fn exit_signal(s: &std::process::ExitStatus) -> Option<i32> {
+    s.signal()
+}
+
+/// Windows has no signals.
+#[cfg(not(unix))]
+fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 fn exit_text(st: std::io::Result<std::process::ExitStatus>) -> String {
     match st {
-        Ok(s) => match (s.code(), s.signal()) {
+        Ok(s) => match (s.code(), exit_signal(&s)) {
             (Some(c), _) => format!("exited with code {c}"),
             (None, Some(sig)) => format!("killed by signal {sig}"),
             _ => "exited".to_string(),
@@ -1200,7 +1212,7 @@ impl PeerSocket {
 /// daemon user, and gateway children do), in every mode a gateway child
 /// or a descendant of one.
 pub(crate) fn unix_peer_refused(ctx: &Ctx, peer: &saiife_ipc::peer::PeerCred) -> bool {
-    (ctx.refuse_own_uid_peers && peer.uid == ctx.own_uid)
+    (ctx.refuse_own_uid_peers && ctx.peer_is_own(peer))
         || (ctx.mcp.has_children() && ctx.mcp.is_child_or_descendant(peer.pid))
 }
 
@@ -1238,7 +1250,7 @@ pub(crate) async fn tcp_peer_refused(
     .unwrap_or(Some(crate::ops::UNKNOWN_UID))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

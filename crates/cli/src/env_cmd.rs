@@ -8,6 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,12 +17,12 @@ use clap::Subcommand;
 use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
 use saiife_policy::environment::valid_env_name;
 use saiife_policy::scope::try_scope_for;
-use saiife_policy::{load_system, parse_project, Directory, Getent, SystemConfig};
+#[cfg(unix)]
+use saiife_policy::Getent;
+use saiife_policy::{load_system, parse_project, Directory, SystemConfig};
 use serde_json::json;
 use toml_edit::{value, DocumentMut};
 
-#[cfg(not(unix))]
-use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
 use crate::text::sanitize;
 
 #[derive(Subcommand)]
@@ -70,6 +71,7 @@ fn resolve(system_config: Option<PathBuf>) -> Result<Place, String> {
 
 /// The `--system-config` file, which must say `locked = true`.
 fn locked_flag(config: PathBuf) -> Result<Place, String> {
+    crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, &config)?;
     let loaded = load_system(&config)
         .map_err(|e| format!("cannot read the system config {}: {e}", config.display()))?;
     if !loaded.config.locked {
@@ -78,7 +80,8 @@ fn locked_flag(config: PathBuf) -> Result<Place, String> {
     Ok(Place::Locked(config))
 }
 
-#[cfg(unix)]
+/// A system file on a tree that isn't ours is left out by the resolver, on Windows, with
+/// its warning; a damaged one is its error.
 fn resolve_default() -> Result<Place, String> {
     use crate::broker::{self, Target};
     Ok(match broker::resolve_here(None)? {
@@ -87,19 +90,6 @@ fn resolve_default() -> Result<Place, String> {
             system: config.is_file().then_some(config),
         },
     })
-}
-
-/// No personal broker off Linux in this version: the system config, as
-/// locked mode when it says so, else the developer-mode definitions.
-#[cfg(not(unix))]
-fn resolve_default() -> Result<Place, String> {
-    let config = PathBuf::from(SYSTEM_CONFIG);
-    match locked_audit_dir(&config)? {
-        Some(_) => Ok(Place::Locked(config)),
-        None => Ok(Place::Developer {
-            system: config.is_file().then_some(config),
-        }),
-    }
 }
 
 pub fn run(system_config: Option<PathBuf>, action: EnvAction) -> ExitCode {
@@ -176,7 +166,7 @@ fn list(place: &Place, as_json: bool) -> Result<Done, Failure> {
             let cfg = load(config)?;
             let user =
                 current_user_name().ok_or((2, "cannot tell which user you are".to_string()))?;
-            let applies = scope_env(&cfg, &Getent, &user)?;
+            let applies = scope_env(&cfg, &own_directory(), &user)?;
             (cfg, applies)
         }
         Place::Developer { system } => {
@@ -239,8 +229,24 @@ fn scope_env(
     Ok(scope.and_then(|s| s.env.clone()))
 }
 
+#[cfg(unix)]
 fn current_user_name() -> Option<String> {
     Getent.name_of(rustix::process::getuid().as_raw())
+}
+
+#[cfg(windows)]
+fn current_user_name() -> Option<String> {
+    crate::win_locked::own_account_name()
+}
+
+#[cfg(unix)]
+fn own_directory() -> Getent {
+    Getent
+}
+
+#[cfg(windows)]
+fn own_directory() -> saiife_policy::WinDirectory<saiife_policy::FfiAccounts> {
+    saiife_policy::WinDirectory::system()
 }
 
 fn load_empty() -> Result<SystemConfig, Failure> {
@@ -257,7 +263,7 @@ fn assume_root(seam_set: bool, debug: bool) -> bool {
 }
 
 fn is_root() -> bool {
-    rustix::process::geteuid().is_root()
+    crate::win_locked::own_is_root()
         || assume_root(
             std::env::var_os("SAIIFE_TEST_ASSUME_ROOT").is_some(),
             cfg!(debug_assertions),
@@ -400,6 +406,8 @@ fn validate_rewritten(config: &Path, file: &Path, text: &str) -> Result<(), Fail
     let result = (|| -> Result<(), String> {
         let io = |e: std::io::Error| e.to_string();
         fs::create_dir(&tmp).map_err(io)?;
+        // On Windows the user's own temp folder is private already.
+        #[cfg(unix)]
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).map_err(io)?;
         fs::create_dir(tmp.join("policy.d")).map_err(io)?;
         let copy = |from: &Path, to: PathBuf| -> Result<(), String> {
@@ -424,7 +432,7 @@ fn validate_rewritten(config: &Path, file: &Path, text: &str) -> Result<(), Fail
 }
 
 /// Ask the daemon to load the policy again. `Err` is an exit code and why.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reload_daemon(config: &Path) -> Result<(), Failure> {
     use crate::secret_cmd::linux::{call, Stop};
     match call(config, "policy.reload", serde_json::Map::new()) {
@@ -441,7 +449,7 @@ fn reload_daemon(config: &Path) -> Result<(), Failure> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn reload_daemon(_config: &Path) -> Result<(), Failure> {
     Err((5, saiife_system::NOT_SUPPORTED_OS.into()))
 }
@@ -476,6 +484,7 @@ fn use_project(system: Option<&Path>, name: &str) -> Result<Done, Failure> {
 
 /// Replace `path` with `bytes`: a temp file in the same directory, fsynced,
 /// renamed over it, keeping the mode and owner of the old file.
+#[cfg(unix)]
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let old = fs::metadata(path)?;
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -504,6 +513,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
         fs::rename(&tmp, path)?;
         File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Replace `path` with `bytes`: a temp file in the same directory, flushed, renamed over
+/// it. The temp file inherits the directory's descriptor, which on `etc` is W14's, and
+/// nothing else names an owner or a mode here.
+#[cfg(windows)]
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut f: File = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -586,6 +619,7 @@ mod tests {
         assert!(!fs::read_to_string(&config).unwrap().contains("nope"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_atomic_keeps_mode_and_content() {
         let d = tempfile::tempdir().unwrap();

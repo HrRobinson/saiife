@@ -429,6 +429,305 @@ pub fn inspect_macho(bytes: &[u8]) -> Result<MachInfo, String> {
     })
 }
 
+/// Allowed imports of a locked-mode Windows binary: System32 DLLs only,
+/// lowercase. API sets (`api-ms-win-*`, `ext-ms-win-*`) are allowed apart,
+/// since the loader maps them without a file search.
+pub const PE_IMPORT_ALLOWLIST: &[&str] = &[
+    "kernel32.dll",
+    "ntdll.dll",
+    "advapi32.dll",
+    "bcrypt.dll",
+    "bcryptprimitives.dll",
+    "ws2_32.dll",
+    "userenv.dll",
+    "crypt32.dll",
+    "wintrust.dll",
+    "secur32.dll",
+    "netapi32.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "shell32.dll",
+    "iphlpapi.dll",
+];
+
+/// What `WinVerifyTrust` said of a signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authenticode {
+    Valid,
+    /// Windows looked and refused it.
+    Rejected(String),
+    /// Windows could not look (a file error, no provider): seen neither good nor bad.
+    Unknown(String),
+}
+
+/// `WinVerifyTrust`'s answer, read. Only 0 is valid. A `HRESULT_FROM_WIN32` code and the
+/// provider and action errors say the check itself did not happen. Anything else, named or
+/// not, is a refusal.
+pub fn authenticode_verdict(status: i32) -> Authenticode {
+    const NAMED: [(u32, &str); 8] = [
+        (0x800B_0100, "TRUST_E_NOSIGNATURE"),
+        (0x8009_6010, "TRUST_E_BAD_DIGEST"),
+        (0x800B_0004, "TRUST_E_SUBJECT_NOT_TRUSTED"),
+        (0x800B_0111, "TRUST_E_EXPLICIT_DISTRUST"),
+        (0x800B_0109, "CERT_E_UNTRUSTEDROOT"),
+        (0x800B_010A, "CERT_E_CHAINING"),
+        (0x800B_0101, "CERT_E_EXPIRED"),
+        (0x800B_010C, "CERT_E_REVOKED"),
+    ];
+    let code = status as u32;
+    if code == 0 {
+        return Authenticode::Valid;
+    }
+    let could_not_look = code >> 16 == 0x8007 || (0x800B_0001..=0x800B_0003).contains(&code);
+    if could_not_look {
+        return Authenticode::Unknown(format!("0x{code:08X}"));
+    }
+    Authenticode::Rejected(match NAMED.iter().find(|(c, _)| *c == code) {
+        Some((_, name)) => (*name).to_string(),
+        None => format!("0x{code:08X}"),
+    })
+}
+
+/// `LOAD_LIBRARY_SEARCH_SYSTEM32`: with it in `DependentLoadFlags`, the
+/// loader finds import DLLs in System32 only, never next to the exe.
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u16 = 0x800;
+const PE_OPT_MAGIC_64: u16 = 0x20b;
+const PE_OPT_MAGIC_32: u16 = 0x10b;
+const DIR_IMPORT: usize = 1;
+const DIR_SECURITY: usize = 4;
+const DIR_LOAD_CONFIG: usize = 10;
+const DIR_DELAY_IMPORT: usize = 13;
+/// Caps so hostile counts cost bounded work.
+const PE_MAX_IMPORTS: u64 = 4096;
+const PE_MAX_NAME: usize = 260;
+const PE_MAX_SECTIONS: usize = 96;
+const PE_MAX_DIRS: u64 = 16;
+
+/// What locked mode needs to know about a Windows binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeInfo {
+    pub machine: u16,
+    /// A non-empty security directory. Whether the signature is valid is
+    /// checked by `signtool` in CI and [`authenticode_verdict`] in doctor.
+    pub signed: bool,
+    /// Imported DLL names (regular and delay-load), lowercased.
+    pub imports: Vec<String>,
+    pub dependent_load_flags: u16,
+    /// The build marker: only `Profile::Release` is fit for locked mode.
+    pub profile: Profile,
+}
+
+impl PeInfo {
+    /// The refusals, one phrase each; empty when the binary is fit.
+    /// `allow` lists the permitted import DLLs (lowercase).
+    pub fn problems(&self, allow: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.profile {
+            Profile::Release => {}
+            Profile::DebugAssertions => out.push(
+                "it is a test build (debug assertions on: test seams such as \
+                 SAIIFE_EVAL_FAULT are compiled in)"
+                    .to_string(),
+            ),
+            Profile::Unknown => out.push("it carries no saiife build marker".to_string()),
+        }
+        if self.dependent_load_flags & LOAD_LIBRARY_SEARCH_SYSTEM32 == 0 {
+            out.push(
+                "DependentLoadFlags lacks LOAD_LIBRARY_SEARCH_SYSTEM32, so the agent could \
+                 plant a DLL next to the binary"
+                    .to_string(),
+            );
+        }
+        for name in &self.imports {
+            let n = name.to_ascii_lowercase();
+            let plain = n.ends_with(".dll")
+                && !n.contains(|c: char| matches!(c, '/' | '\\' | ':') || c.is_whitespace());
+            let api_set = plain && (n.starts_with("api-ms-win-") || n.starts_with("ext-ms-win-"));
+            if !api_set && !allow.iter().any(|a| a.eq_ignore_ascii_case(&n)) {
+                out.push(format!(
+                    "it imports {name}, which is not an allowed system DLL"
+                ));
+            }
+        }
+        out
+    }
+
+    /// Things worth saying that do not refuse.
+    pub fn warnings(&self) -> Vec<String> {
+        if self.signed {
+            Vec::new()
+        } else {
+            vec!["not Authenticode-signed (spec 5.3a.6)".to_string()]
+        }
+    }
+}
+
+fn pe_slice(b: &[u8], at: u64, len: u64) -> Result<&[u8], String> {
+    let end = at.checked_add(len).ok_or("offset out of range")?;
+    let (a, e) = (usize::try_from(at), usize::try_from(end));
+    match (a, e) {
+        (Ok(a), Ok(e)) => b.get(a..e).ok_or_else(|| "truncated PE file".to_string()),
+        _ => Err("offset out of range".to_string()),
+    }
+}
+
+fn pe_u16(b: &[u8], at: u64) -> Result<u16, String> {
+    let s: [u8; 2] = pe_slice(b, at, 2)?
+        .try_into()
+        .map_err(|_| "truncated PE file".to_string())?;
+    Ok(u16::from_le_bytes(s))
+}
+
+fn pe_u32(b: &[u8], at: u64) -> Result<u32, String> {
+    let s: [u8; 4] = pe_slice(b, at, 4)?
+        .try_into()
+        .map_err(|_| "truncated PE file".to_string())?;
+    Ok(u32::from_le_bytes(s))
+}
+
+/// One section: virtual address, virtual size, raw pointer, raw size.
+type Section = (u64, u64, u64, u64);
+
+/// The file offset of `rva`, or `None` when no section holds it.
+fn rva_to_off(sections: &[Section], rva: u64) -> Option<u64> {
+    sections.iter().find_map(|&(va, vsize, raw, rsize)| {
+        let rel = rva.checked_sub(va)?;
+        if rel < vsize.min(rsize) {
+            raw.checked_add(rel)
+        } else {
+            None
+        }
+    })
+}
+
+/// A NUL-terminated name at `off`, at most `PE_MAX_NAME` bytes, lowercased.
+fn pe_name(b: &[u8], off: u64) -> Result<String, String> {
+    let start = usize::try_from(off).map_err(|_| "offset out of range".to_string())?;
+    let tail = b.get(start..).ok_or("truncated PE file")?;
+    let tail = &tail[..tail.len().min(PE_MAX_NAME)];
+    let n = tail
+        .iter()
+        .position(|&c| c == 0)
+        .ok_or("unterminated import name")?;
+    Ok(String::from_utf8_lossy(&tail[..n]).to_ascii_lowercase())
+}
+
+/// What locked mode needs to know about a 64-bit Windows binary, read from
+/// its bytes (no `signtool`, no `dumpbin`). PE32 is refused.
+///
+/// This reads what the file claims; it does not verify a signature. Every
+/// offset is bounds- and overflow-checked and every count is capped, so
+/// hostile input gives an `Err`, never a panic.
+pub fn inspect_pe(bytes: &[u8]) -> Result<PeInfo, String> {
+    let not_pe = || "not a PE file".to_string();
+    if bytes.get(..2) != Some(b"MZ".as_slice()) {
+        return Err(not_pe());
+    }
+    let pe = u64::from(pe_u32(bytes, 0x3c).map_err(|_| not_pe())?);
+    if pe_u32(bytes, pe).map_err(|_| not_pe())? != 0x0000_4550 {
+        return Err(not_pe());
+    }
+    let machine = pe_u16(bytes, pe + 4)?;
+    let nsections = usize::from(pe_u16(bytes, pe + 6)?);
+    let opt_size = u64::from(pe_u16(bytes, pe + 20)?);
+    let opt = pe + 24;
+    match pe_u16(bytes, opt)? {
+        PE_OPT_MAGIC_64 => {}
+        PE_OPT_MAGIC_32 => return Err("32-bit binaries are not supported".to_string()),
+        _ => return Err("not a PE32+ optional header".to_string()),
+    }
+    let ndirs = u64::from(pe_u32(bytes, opt + 108)?).min(PE_MAX_DIRS);
+    // A directory entry (rva or file offset, size); absent entries are zero.
+    let dir = |i: usize| -> Result<(u64, u64), String> {
+        let i = i as u64;
+        if i >= ndirs || 112 + 8 * i + 8 > opt_size {
+            return Ok((0, 0));
+        }
+        let at = opt + 112 + 8 * i;
+        Ok((
+            u64::from(pe_u32(bytes, at)?),
+            u64::from(pe_u32(bytes, at + 4)?),
+        ))
+    };
+    let sec_table = opt + opt_size;
+    let mut sections: Vec<Section> = Vec::new();
+    for i in 0..nsections.min(PE_MAX_SECTIONS) {
+        let at = sec_table + 40 * (i as u64);
+        sections.push((
+            u64::from(pe_u32(bytes, at + 12)?),
+            u64::from(pe_u32(bytes, at + 8)?),
+            u64::from(pe_u32(bytes, at + 20)?),
+            u64::from(pe_u32(bytes, at + 16)?),
+        ));
+    }
+
+    for (i, a) in sections.iter().enumerate() {
+        for b in &sections[i + 1..] {
+            if a.0 < b.0 + b.1.max(1) && b.0 < a.0 + a.1.max(1) {
+                return Err("overlapping sections".to_string());
+            }
+        }
+    }
+
+    let mut imports = Vec::new();
+    // Import descriptors are 20 bytes with the name RVA at +12; delay-load
+    // descriptors are 32 bytes with the name RVA at +4. Delay-loaded DLLs
+    // are searched for like any other, so they count.
+    for (idx, stride, name_at) in [(DIR_IMPORT, 20u64, 12u64), (DIR_DELAY_IMPORT, 32, 4)] {
+        // The loader ignores the directory's Size and walks from the RVA.
+        let (rva, _size) = dir(idx)?;
+        if rva == 0 {
+            continue;
+        }
+        let base = rva_to_off(&sections, rva).ok_or("import directory outside any section")?;
+        let mut terminated = false;
+        for n in 0..PE_MAX_IMPORTS {
+            let at = base.checked_add(n * stride).ok_or("offset out of range")?;
+            let desc = pe_slice(bytes, at, stride)?;
+            let name_rva = pe_u32(bytes, at + name_at)?;
+            if idx == DIR_DELAY_IMPORT
+                && !desc.iter().all(|&c| c == 0)
+                && pe_u32(bytes, at)? & 1 == 0
+            {
+                return Err("delay-load descriptor uses virtual addresses".to_string());
+            }
+            if name_rva == 0 || desc.iter().all(|&c| c == 0) {
+                terminated = true;
+                break;
+            }
+            let off = rva_to_off(&sections, u64::from(name_rva))
+                .ok_or("import name outside any section")?;
+            imports.push(pe_name(bytes, off)?);
+        }
+        if !terminated {
+            return Err("too many imports".to_string());
+        }
+    }
+
+    // The security directory holds a file offset, not an RVA.
+    let (sec_off, sec_len) = dir(DIR_SECURITY)?;
+    let signed = sec_len != 0 && sec_off != 0;
+
+    let (lc_rva, lc_size) = dir(DIR_LOAD_CONFIG)?;
+    let mut dependent_load_flags = 0;
+    if lc_rva != 0 && lc_size >= 80 {
+        let off = rva_to_off(&sections, lc_rva).ok_or("load config outside any section")?;
+        // The structure's own Size field says whether DependentLoadFlags
+        // (at +78) exists in this build's layout.
+        if pe_u32(bytes, off)? >= 80 {
+            dependent_load_flags = pe_u16(bytes, off + 78)?;
+        }
+    }
+
+    Ok(PeInfo {
+        machine,
+        signed,
+        imports,
+        dependent_load_flags,
+        profile: profile(bytes),
+    })
+}
+
 /// A minimal ELF64 little-endian executable for tests: a header, then a
 /// `PT_INTERP` or a `PT_DYNAMIC` with `needed` `DT_NEEDED` entries when
 /// asked, then the build marker (if `marker` is given).
@@ -548,7 +847,7 @@ pub fn fake_macho(sig: Option<(bool, bool, bool)>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -724,6 +1023,396 @@ mod tests {
     fn own_test_binary_parses() {
         let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         assert!(inspect_macho(&exe).is_ok());
+    }
+
+    // ---- PE ----
+
+    pub(crate) struct PeFixture {
+        pub(crate) pe32: bool,
+        pub(crate) flags: u16,
+        pub(crate) imports: Vec<&'static str>,
+        pub(crate) delay: Vec<&'static str>,
+        pub(crate) signed: bool,
+        pub(crate) marker: Option<bool>,
+    }
+
+    impl Default for PeFixture {
+        fn default() -> Self {
+            PeFixture {
+                pe32: false,
+                flags: 0x800,
+                imports: vec!["KERNEL32.dll"],
+                delay: vec![],
+                signed: true,
+                marker: Some(false),
+            }
+        }
+    }
+
+    fn w16(b: &mut [u8], at: usize, v: u16) {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn w32(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    const PE_AT: usize = 0x80;
+    const OPT_AT: usize = PE_AT + 24;
+    const SEC_AT: usize = OPT_AT + 240;
+    const RAW_AT: usize = 0x200;
+
+    /// Minimal PE32+: one section at RVA 0x1000 / file 0x200 holding the
+    /// import and delay-import tables, the names and a load config.
+    pub(crate) fn pe_fixture(f: PeFixture) -> Vec<u8> {
+        let mut b = vec![0u8; RAW_AT + 0x1000];
+        b[..2].copy_from_slice(b"MZ");
+        w32(&mut b, 0x3c, PE_AT as u32);
+        b[PE_AT..PE_AT + 4].copy_from_slice(b"PE\0\0");
+        w16(&mut b, PE_AT + 4, 0x8664);
+        w16(&mut b, PE_AT + 6, 1);
+        w16(&mut b, PE_AT + 20, 240);
+        w16(&mut b, OPT_AT, if f.pe32 { 0x10b } else { 0x20b });
+        w32(&mut b, OPT_AT + 108, 16);
+        b[SEC_AT..SEC_AT + 6].copy_from_slice(b".rdata");
+        w32(&mut b, SEC_AT + 8, 0x1000);
+        w32(&mut b, SEC_AT + 12, 0x1000);
+        w32(&mut b, SEC_AT + 16, 0x1000);
+        w32(&mut b, SEC_AT + 20, RAW_AT as u32);
+        // Inside the section: imports 0x000, delay 0x400, config 0x600,
+        // names from 0x800.
+        let mut name_at = 0x800usize;
+        let mut put =
+            |b: &mut Vec<u8>, names: &[&str], table: usize, stride: usize, field: usize| {
+                for (i, n) in names.iter().enumerate() {
+                    b[RAW_AT + name_at..RAW_AT + name_at + n.len()].copy_from_slice(n.as_bytes());
+                    w32(
+                        b,
+                        RAW_AT + table + i * stride + field,
+                        0x1000 + name_at as u32,
+                    );
+                    name_at += n.len() + 1;
+                }
+            };
+        put(&mut b, &f.imports, 0x000, 20, 12);
+        put(&mut b, &f.delay, 0x400, 32, 4);
+        for i in 0..f.delay.len() {
+            w32(&mut b, RAW_AT + 0x400 + i * 32, 1);
+        }
+        w32(&mut b, dir(1), 0x1000);
+        w32(&mut b, dir(1) + 4, 20 * (f.imports.len() as u32 + 1));
+        if !f.delay.is_empty() {
+            w32(&mut b, dir(13), 0x1400);
+            w32(&mut b, dir(13) + 4, 32 * (f.delay.len() as u32 + 1));
+        }
+        w32(&mut b, dir(10), 0x1600);
+        w32(&mut b, dir(10) + 4, 0x90);
+        w32(&mut b, RAW_AT + 0x600, 0x90);
+        w16(&mut b, RAW_AT + 0x600 + 78, f.flags);
+        if f.signed {
+            w32(&mut b, dir(4), 0x1200);
+            w32(&mut b, dir(4) + 4, 0x40);
+        }
+        if let Some(debug) = f.marker {
+            b.extend_from_slice(&build_marker(debug));
+        }
+        b
+    }
+
+    fn dir(i: usize) -> usize {
+        OPT_AT + 112 + 8 * i
+    }
+
+    #[test]
+    fn pe_reads_machine_and_imports() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            imports: vec!["KERNEL32.dll", "ntdll.dll"],
+            delay: vec!["Shell32.dll"],
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(i.machine, 0x8664);
+        assert_eq!(i.imports, ["kernel32.dll", "ntdll.dll", "shell32.dll"]);
+        assert_eq!(i.dependent_load_flags, 0x800);
+        assert!(i.signed && i.profile == Profile::Release);
+        assert!(i.problems(PE_IMPORT_ALLOWLIST).is_empty());
+        assert!(i.warnings().is_empty());
+    }
+
+    #[test]
+    fn pe32_refused() {
+        let e = inspect_pe(&pe_fixture(PeFixture {
+            pe32: true,
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert_eq!(e, "32-bit binaries are not supported");
+    }
+
+    #[test]
+    fn missing_dependent_load_flag_refused() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            flags: 0x100,
+            ..Default::default()
+        }))
+        .unwrap();
+        let p = i.problems(PE_IMPORT_ALLOWLIST);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("LOAD_LIBRARY_SEARCH_SYSTEM32"));
+    }
+
+    #[test]
+    fn foreign_import_refused() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            imports: vec!["kernel32.dll", "evil.dll"],
+            delay: vec!["sneaky.dll"],
+            ..Default::default()
+        }))
+        .unwrap();
+        let p = i.problems(PE_IMPORT_ALLOWLIST);
+        assert_eq!(p.len(), 2);
+        assert!(p[0].contains("evil.dll") && p[1].contains("sneaky.dll"));
+    }
+
+    #[test]
+    fn api_set_imports_allowed() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            imports: vec!["api-ms-win-core-synch-l1-2-0.dll", "EXT-MS-WIN-foo.dll"],
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(i.problems(PE_IMPORT_ALLOWLIST).is_empty());
+    }
+
+    #[test]
+    fn unsigned_warns() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            signed: false,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(!i.signed);
+        assert_eq!(i.warnings(), ["not Authenticode-signed (spec 5.3a.6)"]);
+        assert!(i.problems(PE_IMPORT_ALLOWLIST).is_empty());
+    }
+
+    #[test]
+    fn pe_debug_marker_refused() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            marker: Some(true),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(i.profile, Profile::DebugAssertions);
+        assert!(i.problems(PE_IMPORT_ALLOWLIST)[0].contains("test build"));
+    }
+
+    #[test]
+    fn pe_missing_or_contradicting_marker_refused() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            marker: None,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(i.profile, Profile::Unknown);
+        assert_eq!(
+            i.problems(PE_IMPORT_ALLOWLIST),
+            ["it carries no saiife build marker"]
+        );
+        let mut b = pe_fixture(PeFixture {
+            marker: Some(true),
+            ..Default::default()
+        });
+        b.extend_from_slice(&build_marker(false));
+        let i = inspect_pe(&b).unwrap();
+        assert_eq!(i.profile, Profile::Unknown);
+        assert_eq!(
+            i.problems(PE_IMPORT_ALLOWLIST),
+            ["it carries no saiife build marker"]
+        );
+    }
+
+    #[test]
+    fn elf_is_not_pe() {
+        assert!(inspect_pe(&fake_elf(None, 0, Some(false))).is_err());
+        assert!(inspect_pe(&fake_macho(None)).is_err());
+        assert!(inspect_pe(b"").is_err());
+        assert!(inspect_pe(b"MZ").is_err());
+    }
+
+    #[test]
+    fn pe_every_prefix_is_err_or_valid() {
+        let b = pe_fixture(PeFixture {
+            delay: vec!["a.dll"],
+            ..Default::default()
+        });
+        for n in 0..b.len() {
+            let _ = inspect_pe(&b[..n]);
+        }
+        assert!(inspect_pe(&b).is_ok());
+    }
+
+    #[test]
+    fn pe_hostile_mutations_do_not_panic() {
+        let good = pe_fixture(PeFixture {
+            delay: vec!["a.dll"],
+            ..Default::default()
+        });
+        let cases: &[(usize, u32)] = &[
+            (0x3c, u32::MAX),               // e_lfanew past the end
+            (0x3c, u32::MAX - 2),           // e_lfanew near overflow
+            (OPT_AT + 108, u32::MAX),       // huge directory count
+            (dir(1), u32::MAX),             // import table RVA outside sections
+            (dir(1), 0x1fff),               // import table straddles the end
+            (dir(1) + 4, u32::MAX),         // huge import size
+            (dir(13), u32::MAX),            // delay table outside sections
+            (dir(10), u32::MAX),            // load config outside sections
+            (dir(10), 0x1ffe),              // load config at the section end
+            (dir(4), u32::MAX),             // security offset huge
+            (dir(4) + 4, u32::MAX),         // security size huge
+            (SEC_AT + 8, u32::MAX),         // huge virtual size
+            (SEC_AT + 12, u32::MAX),        // huge virtual address
+            (SEC_AT + 16, u32::MAX),        // huge raw size
+            (SEC_AT + 20, u32::MAX),        // raw pointer past the end
+            (SEC_AT + 20, u32::MAX - 5),    // raw pointer near overflow
+            (RAW_AT + 12, u32::MAX),        // import name RVA huge
+            (RAW_AT + 12, 0x1fff),          // import name at the last byte
+            (RAW_AT + 12, 0x1ff0),          // name runs to the end
+            (RAW_AT + 0x600, u32::MAX),     // load config Size huge
+            (RAW_AT + 0x400 + 4, u32::MAX), // delay name RVA huge
+            (PE_AT + 4, 0),                 // machine zero
+            (PE_AT + 20, 0xffff),           // optional header size huge
+            (PE_AT + 6, 0xffff),            // section count huge
+        ];
+        for &(at, v) in cases {
+            let mut b = good.clone();
+            w32(&mut b, at, v);
+            let _ = inspect_pe(&b);
+        }
+        // An import table that never ends: every descriptor non-zero.
+        let mut b = good.clone();
+        for i in 0..0x1000 / 4 {
+            w32(&mut b, RAW_AT + i * 4, 0x1000 + 0x800);
+        }
+        let _ = inspect_pe(&b);
+        // A section table that lies past a short file.
+        let mut b = good.clone();
+        w16(&mut b, PE_AT + 6, 96);
+        b.truncate(SEC_AT + 100);
+        assert!(inspect_pe(&b).is_err());
+        // Every header byte set to a few extreme values.
+        for at in 0..RAW_AT + 0x20 {
+            for v in [0u8, 0x7f, 0xff] {
+                let mut b = good.clone();
+                b[at] = v;
+                let _ = inspect_pe(&b);
+            }
+        }
+    }
+
+    #[test]
+    fn pe_bad_signatures_refused() {
+        let good = pe_fixture(PeFixture::default());
+        let mut b = good.clone();
+        b[PE_AT] = b'X';
+        assert_eq!(inspect_pe(&b).unwrap_err(), "not a PE file");
+        let mut b = good.clone();
+        w16(&mut b, OPT_AT, 0x107);
+        assert!(inspect_pe(&b).is_err());
+        // An import table with no section to hold it.
+        let mut b = good;
+        w32(&mut b, dir(1), 0x9000);
+        assert!(inspect_pe(&b).is_err());
+    }
+
+    #[test]
+    fn pe_zero_size_directories_are_still_walked() {
+        let mut b = pe_fixture(PeFixture {
+            imports: vec!["evil.dll"],
+            delay: vec!["sneaky.dll"],
+            ..Default::default()
+        });
+        w32(&mut b, dir(1) + 4, 0);
+        w32(&mut b, dir(13) + 4, 0);
+        let i = inspect_pe(&b).unwrap();
+        assert_eq!(i.imports, ["evil.dll", "sneaky.dll"]);
+        assert_eq!(i.problems(PE_IMPORT_ALLOWLIST).len(), 2);
+    }
+
+    #[test]
+    fn pe_api_set_exemption_needs_a_plain_dll_name() {
+        for n in [
+            "api-ms-win-x\\..\\evil.dll",
+            "api-ms-win-x/evil.dll",
+            "api-ms-win-x:evil.dll",
+            "api-ms-win-x evil.dll",
+            "api-ms-win-core-foo",
+            "api-ms-win-core-foo.dll.",
+            "ext-ms-win-a\\b.dll",
+        ] {
+            let i = inspect_pe(&pe_fixture(PeFixture {
+                imports: vec![n],
+                ..Default::default()
+            }))
+            .unwrap();
+            assert_eq!(i.problems(PE_IMPORT_ALLOWLIST).len(), 1, "{n}");
+        }
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            imports: vec!["kernel32.dll."],
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(i.problems(PE_IMPORT_ALLOWLIST).len(), 1);
+    }
+
+    #[test]
+    fn pe_rva_past_raw_size_and_overlaps_are_refused() {
+        // Virtual size larger than raw size: the table RVA falls in the zero
+        // fill the loader sees, not in file bytes.
+        let mut b = pe_fixture(PeFixture::default());
+        w32(&mut b, SEC_AT + 16, 0x100); // raw size
+        w32(&mut b, SEC_AT + 8, 0x1000); // virtual size
+        w32(&mut b, dir(1), 0x1800);
+        assert!(inspect_pe(&b).is_err());
+        // Two sections that overlap.
+        let mut b = pe_fixture(PeFixture::default());
+        w16(&mut b, PE_AT + 6, 2);
+        b.copy_within(SEC_AT..SEC_AT + 40, SEC_AT + 40);
+        assert_eq!(inspect_pe(&b).unwrap_err(), "overlapping sections");
+    }
+
+    #[test]
+    fn pe_delay_descriptor_with_virtual_addresses_is_refused() {
+        let mut b = pe_fixture(PeFixture {
+            delay: vec!["a.dll"],
+            ..Default::default()
+        });
+        w32(&mut b, RAW_AT + 0x400, 0);
+        assert!(inspect_pe(&b).unwrap_err().contains("virtual addresses"));
+    }
+
+    #[test]
+    fn pe_unterminated_import_table_is_err() {
+        let mut b = pe_fixture(PeFixture::default());
+        for i in 0..0x1000 / 4 {
+            w32(&mut b, RAW_AT + i * 4, 0x1800);
+        }
+        assert!(inspect_pe(&b).is_err());
+    }
+
+    #[test]
+    fn pe_allowlist_is_system32_lowercase() {
+        for n in PE_IMPORT_ALLOWLIST {
+            assert!(n.ends_with(".dll") && *n == n.to_ascii_lowercase());
+            assert!(!n.contains(['/', '\\']));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn own_test_binary_parses() {
+        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let i = inspect_pe(&exe).unwrap();
+        assert_ne!(i.dependent_load_flags & 0x800, 0);
     }
 
     #[test]

@@ -1,0 +1,340 @@
+<#
+.SYNOPSIS
+  CI check of the Windows MSI and the Intune package (plan 19b Task 13). Runs only on a
+  GitHub Actions runner (or with SAIIFE_PACKAGE_CI=1 on a throwaway VM), elevated: it
+  installs and removes a real service and writes under C:\ProgramData and C:\Program Files.
+
+.DESCRIPTION
+  test.ps1 -Exe target\release\saiife.exe -Version 0.4.0 -LogDir target\package-windows-logs
+
+  The release build: the MSI's install action has no --allow-test-build, so it refuses a
+  test build (debug assertions on) and every install would roll back.
+
+  Checks, in this order, on a machine with no saiife:
+    1. a fleet config that saiife refuses: the MSI fails, rolls back, and
+       C:\Program Files\saiife is gone;
+   1b. a failure forced after the install action (SAIIFE_FORCE_FAIL=1): the MSI fails, and
+       its rollback removes locked mode and the files;
+    2. a good fleet config naming claude,codex,gemini: msiexec /i exits 0, the service
+       runs, doctor exits 1 or less, install.log holds doctor's text, detect.ps1 exits 0;
+   3a. a forced failure of the upgrade: the first build is back, in Program Files and in
+       ProgramData, and the service runs;
+    3. an upgrade to a second build with a bumped version: the service restarts once and
+       the managed files keep their SHA-256;
+   4a. a forced failure of msiexec /x after the files went: the files are back and the
+       machine is still locked;
+    4. msiexec /x: the warning is in the log, the service is gone, the audit and the fleet
+       files stay, detect.ps1 exits 1;
+    5. the .intunewin file exists and unpacks with its header.
+  Any failed check ends the run with a nonzero exit.
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)][string]$Exe,
+  [Parameter(Mandatory = $true)][string]$Version,
+  [string]$LogDir = 'target\package-windows-logs',
+  [string]$OutDir = 'dist'
+)
+
+Set-StrictMode -Version 3
+$ErrorActionPreference = 'Stop'
+
+if ($env:GITHUB_ACTIONS -ne 'true' -and $env:SAIIFE_PACKAGE_CI -ne '1') {
+  Write-Output 'test.ps1 installs a real service and writes under C:\ProgramData: it runs only in CI'
+  exit 2
+}
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) { Write-Output 'test.ps1 must run elevated'; exit 2 }
+
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+foreach ($p in 'LogDir', 'OutDir') {
+  $v = Get-Variable $p -ValueOnly
+  if (-not [IO.Path]::IsPathRooted($v)) { Set-Variable $p (Join-Path (Get-Location) $v) }
+}
+New-Item -ItemType Directory -Force -Path $LogDir, $OutDir | Out-Null
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
+
+$programFiles = Join-Path $env:ProgramW6432 'saiife'
+$programData = 'C:\ProgramData\saiife'
+$bin = Join-Path $programData 'bin\saiife.exe'
+$fleetFiles = Join-Path $root 'deploy\intune-windows\fleet-files.ps1'
+$detect = Join-Path $root 'deploy\intune-windows\detect.ps1'
+$build = Join-Path $PSScriptRoot 'build.ps1'
+$target = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+$arch = if ($target -like 'aarch64-*') { 'arm64' } else { 'x64' }
+
+$script:failures = 0
+function Check([bool]$ok, [string]$what) {
+  if ($ok) { Write-Output "ok   $what" } else { Write-Output "::error::FAIL $what"; $script:failures++ }
+}
+# install.log lives under C:\ProgramData, outside the workspace upload-artifact can take
+# files from, so a copy goes into the log dir, with its descriptor.
+function Save-InstallLog {
+  $log = 'C:\ProgramData\saiife\log\install.log'
+  if (-not (Test-Path -LiteralPath $log)) { return }
+  Copy-Item -LiteralPath $log -Destination (Join-Path $LogDir 'install.log') -Force -ErrorAction SilentlyContinue
+  try { (Get-Acl -LiteralPath $log).Sddl | Set-Content -LiteralPath (Join-Path $LogDir 'install.log.sddl') } catch { }
+}
+function Stop-IfFailed {
+  if ($script:failures -gt 0) {
+    Save-InstallLog
+    Write-Output "::error::$script:failures check(s) failed"
+    exit 1
+  }
+}
+function Group([string]$name) { Write-Output "::group::$name" }
+
+function Invoke-Msi([string[]]$msiArgs, [string]$log) {
+  $p = Start-Process -FilePath msiexec.exe -ArgumentList ($msiArgs + @('/qn', '/l*v', "`"$log`"")) -Wait -PassThru
+  return $p.ExitCode
+}
+# What failed, in the job output: the uploaded log is not where a reader looks first. The
+# program's own lines (WixQuietExec copies them to the log) and the lines before the first
+# failed action ("Return value 3").
+function Show-MsiFailure([string]$log) {
+  if (-not (Test-Path -LiteralPath $log)) { Write-Output "  (no msi log at $log)"; return }
+  $lines = @(Get-Content -LiteralPath $log)
+  Write-Output "  -- ${log}: the saiife lines"
+  $lines | Where-Object { $_ -match 'WixQuietExec|saiife:' } | Select-Object -First 60 | ForEach-Object { Write-Output "  $_" }
+  $at = -1
+  for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match 'Return value 3') { $at = $i; break } }
+  if ($at -ge 0) {
+    Write-Output "  -- ${log}: before 'Return value 3' (line $($at + 1))"
+    $lines[([Math]::Max(0, $at - 40))..$at] | ForEach-Object { Write-Output "  $_" }
+  } else {
+    Write-Output "  -- ${log}: no 'Return value 3'; the last lines"
+    $lines | Select-Object -Last 40 | ForEach-Object { Write-Output "  $_" }
+  }
+}
+function Service-Status {
+  $s = Get-Service -Name saiifed -ErrorAction SilentlyContinue
+  if ($null -eq $s) { return 'missing' }
+  return [string]$s.Status
+}
+function Invoke-Detect {
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $detect *> $null
+  return $LASTEXITCODE
+}
+function Config-B64([string]$text) {
+  [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($text))
+}
+function Service-Pid {
+  $s = Get-CimInstance Win32_Service -Filter "Name='saiifed'" -ErrorAction SilentlyContinue
+  if ($null -eq $s) { return $null }
+  return $s.ProcessId
+}
+function Service-Exists { [bool](Get-Service -Name saiifed -ErrorAction SilentlyContinue) }
+# Leaves the machine as it found it. Only on a CI runner: it removes the audit too.
+function Reset-Machine {
+  if (Service-Exists) {
+    Stop-Service -Name saiifed -Force -ErrorAction SilentlyContinue
+    & "$env:SystemRoot\System32\sc.exe" delete saiifed | Out-Null
+  }
+  foreach ($d in $programFiles, $programData, 'C:\Program Files\ClaudeCode', 'C:\ProgramData\OpenAI', 'C:\ProgramData\gemini-cli') {
+    if (Test-Path -LiteralPath $d) {
+      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+# --- the builds ----------------------------------------------------------------------------
+Group 'build the MSIs'
+if (Test-Path -LiteralPath $programFiles) { Write-Output "::error::$programFiles exists: this runner is not clean"; exit 2 }
+if (Service-Exists) { Write-Output '::error::saiifed exists: this runner is not clean'; exit 2 }
+
+$parts = $Version.Split('-')[0].Split('.')
+$v1 = $Version
+$v2 = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
+& $build -Target $target -Version $v1 -Exe $Exe -OutDir $OutDir
+# The second build differs in its bytes, so the daemon's copy changes and install restarts
+# the service. An overlay after the last section keeps the PE valid.
+$exe2 = Join-Path $LogDir 'saiife-v2.exe'
+Copy-Item -LiteralPath $Exe -Destination $exe2 -Force
+$fs = [IO.File]::Open($exe2, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+try { $x = [Text.Encoding]::ASCII.GetBytes('saiife-ci-upgrade'); $fs.Write($x, 0, $x.Length) } finally { $fs.Dispose() }
+$out2 = Join-Path $LogDir 'v2'
+& $build -Target $target -Version $v2 -Exe $exe2 -OutDir $out2 -Only msi
+$msi1 = Join-Path $OutDir "saiife-$v1-$arch.msi"
+$msi2 = Join-Path $out2 "saiife-$v2-$arch.msi"
+Check (Test-Path -LiteralPath $msi1) "the first MSI exists ($msi1)"
+Check (Test-Path -LiteralPath $msi2) "the second MSI exists ($msi2)"
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+$goodConfig = Config-B64 "version = 2`nlocked = true`n`n[approval]`napprovers = [`"group:Administrators`"]`n"
+$agents = 'claude,codex,gemini'
+
+# --- 1. a fleet file that saiife refuses ----------------------------------------------------
+Group 'a broken fleet file rolls back'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 (Config-B64 "version = 2`nlocked = false`n") -Agents $agents
+Check ($LASTEXITCODE -eq 0) 'fleet-files.ps1 wrote the broken config'
+$blog = Join-Path $LogDir 'msi-broken.log'
+$rc = Invoke-Msi @('/i', "`"$msi1`"") $blog
+Check ($rc -ne 0) "the MSI failed (exit $rc)"
+# Printed so a reader sees the refusal is the config's, not something else's.
+Show-MsiFailure $blog
+Check (-not (Test-Path -LiteralPath $programFiles)) "$programFiles is gone after the rollback"
+Check (-not (Service-Exists)) 'no service was left behind'
+Reset-Machine
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 1b. a failure after the install action ---------------------------------------------------
+# SAIIFE_FORCE_FAIL fails the MSI right after SaiifeInstall succeeded: the install's rollback
+# must take locked mode away again, or the machine is locked with no product to remove.
+Group 'a failure after the install action rolls locked mode back'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 $goodConfig -Agents $agents
+Check ($LASTEXITCODE -eq 0) 'fleet-files.ps1 wrote the fleet files'
+$flog = Join-Path $LogDir 'msi-forced-install.log'
+$rc = Invoke-Msi @('/i', "`"$msi1`"", 'SAIIFE_FORCE_FAIL=1') $flog
+Check ($rc -ne 0) "the MSI failed (exit $rc)"
+$text = if (Test-Path -LiteralPath $flog) { Get-Content -LiteralPath $flog -Raw } else { '' }
+Check ($text -match 'SaiifeInstallRollback') 'the install rollback ran'
+Check (-not (Test-Path -LiteralPath $programFiles)) "$programFiles is gone after the rollback"
+Check (-not (Service-Exists)) 'no service was left behind'
+Check (-not (Test-Path -LiteralPath 'C:\ProgramData\saiife\etc\installed.toml')) 'installed.toml is gone'
+Check ((Invoke-Detect) -eq 1) 'detect.ps1 exits 1 after the rollback'
+if ($script:failures -gt 0) { Show-MsiFailure $flog }
+Reset-Machine
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 2. install ------------------------------------------------------------------------------
+Group 'install'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 $goodConfig -Agents $agents
+Check ($LASTEXITCODE -eq 0) 'fleet-files.ps1 wrote the fleet files'
+Check ((Invoke-Detect) -eq 1) 'detect.ps1 exits 1 before the install'
+$ilog = Join-Path $LogDir 'msi-install.log'
+$rc = Invoke-Msi @('/i', "`"$msi1`"") $ilog
+Check ($rc -eq 0) "msiexec /i exits 0 (got $rc)"
+if ($rc -ne 0) { Show-MsiFailure $ilog }
+Check (Service-Exists) 'the service exists'
+Check ((Service-Status) -eq 'Running') "the service is running ($(Service-Status))"
+Check (Test-Path -LiteralPath (Join-Path $programFiles 'saiife.exe')) 'the staging copy is in Program Files'
+Check (Test-Path -LiteralPath $bin) 'the daemon copy is in ProgramData'
+$doctorOut = Join-Path $LogDir 'doctor-install.txt'
+& $bin doctor *> $doctorOut
+$doctorRc = $LASTEXITCODE
+Check ($doctorRc -le 1) "doctor exits 1 or less (got $doctorRc)"
+# In the job output too: the uploaded logs are not where a reader looks first.
+if ($doctorRc -gt 1) {
+  Get-Content -LiteralPath $doctorOut | Where-Object { $_ -notmatch '^(PASS|INFO) ' } | ForEach-Object { Write-Output "  $_" }
+}
+$installLog = 'C:\ProgramData\saiife\log\install.log'
+Check ((Test-Path -LiteralPath $installLog) -and ((Get-Item -LiteralPath $installLog).Length -gt 0)) 'install.log holds the doctor text'
+Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the install'
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 3a. a failed upgrade ----------------------------------------------------------------------
+# The upgrade fails after the new build's install action: its rollback puts the old staging
+# copy back and installs with it, so the old version's locked mode stays under the old product.
+Group 'a failed upgrade keeps the old version locked'
+$v1Hash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash
+$fglog = Join-Path $LogDir 'msi-forced-upgrade.log'
+$rc = Invoke-Msi @('/i', "`"$msi2`"", 'SAIIFE_FORCE_FAIL=1') $fglog
+Check ($rc -ne 0) "the upgrade failed (exit $rc)"
+$text = if (Test-Path -LiteralPath $fglog) { Get-Content -LiteralPath $fglog -Raw } else { '' }
+Check ($text -match 'SaiifeUpgradeRollback') 'the upgrade rollback ran'
+Check ((Service-Status) -eq 'Running') "the service runs after the rollback ($(Service-Status))"
+Check ((Get-FileHash -LiteralPath (Join-Path $programFiles 'saiife.exe') -Algorithm SHA256).Hash -eq $v1Hash) 'the staging copy is the first build again'
+Check ((Get-FileHash -LiteralPath $bin -Algorithm SHA256).Hash -eq $v1Hash) 'the daemon copy is the first build again'
+Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the rollback'
+if ($script:failures -gt 0) { Show-MsiFailure $fglog }
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 3. upgrade ------------------------------------------------------------------------------
+Group 'upgrade'
+$managed = @(
+  'C:\Program Files\ClaudeCode\managed-settings.d\50-saiife.json',
+  'C:\ProgramData\OpenAI\Codex\requirements.toml',
+  'C:\ProgramData\gemini-cli\settings.json'
+)
+$before = @{}
+foreach ($f in $managed) {
+  Check (Test-Path -LiteralPath $f) "managed file exists: $f"
+  if (Test-Path -LiteralPath $f) { $before[$f] = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash }
+}
+$pid1 = Service-Pid
+$since = Get-Date
+$glog = Join-Path $LogDir 'msi-upgrade.log'
+$rc = Invoke-Msi @('/i', "`"$msi2`"") $glog
+Check ($rc -eq 0) "the upgrade exits 0 (got $rc)"
+if ($rc -ne 0) { Show-MsiFailure $glog }
+Check ((Service-Status) -eq 'Running') "the service runs after the upgrade ($(Service-Status))"
+$pid2 = Service-Pid
+Check (($null -ne $pid1) -and ($null -ne $pid2) -and ($pid1 -ne $pid2)) "the service restarted ($pid1 -> $pid2)"
+# Service Control Manager event 7036 says "... entered the running state" once per start.
+$starts = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = $since } -ErrorAction SilentlyContinue |
+    Where-Object { $_.Message -match 'saiife' -and $_.Message -match 'running' })
+Check ($starts.Count -eq 1) "the service started once during the upgrade (saw $($starts.Count))"
+foreach ($f in $managed) {
+  if ($before.ContainsKey($f)) {
+    Check ((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash -eq $before[$f]) "unchanged by the upgrade: $f"
+  }
+}
+Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the upgrade'
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 4a. a failed removal ----------------------------------------------------------------------
+# The removal fails after the uninstall action and the file removal: its rollback puts the
+# files back and installs again, so the machine is still locked while the product is there.
+Group 'a failed removal leaves the machine locked'
+$fulog = Join-Path $LogDir 'msi-forced-uninstall.log'
+$rc = Invoke-Msi @('/x', "`"$msi2`"", 'SAIIFE_FORCE_FAIL=1') $fulog
+Check ($rc -ne 0) "the removal failed (exit $rc)"
+$text = if (Test-Path -LiteralPath $fulog) { Get-Content -LiteralPath $fulog -Raw } else { '' }
+Check ($text -match 'SaiifeUninstallRollback') 'the uninstall rollback ran'
+Check (Service-Exists) 'the service exists'
+Check ((Service-Status) -eq 'Running') "the service runs after the rollback ($(Service-Status))"
+Check (Test-Path -LiteralPath (Join-Path $programFiles 'saiife.exe')) 'the staging copy is back'
+Check (Test-Path -LiteralPath $bin) 'the daemon copy is there'
+Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the rollback'
+foreach ($f in $managed) { Check (Test-Path -LiteralPath $f) "managed file exists: $f" }
+if ($script:failures -gt 0) { Show-MsiFailure $fulog }
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 4. uninstall ----------------------------------------------------------------------------
+Group 'uninstall'
+$ulog = Join-Path $LogDir 'msi-uninstall.log'
+$rc = Invoke-Msi @('/x', "`"$msi2`"") $ulog
+Check ($rc -eq 0) "msiexec /x exits 0 (got $rc)"
+$text = if (Test-Path -LiteralPath $ulog) { Get-Content -LiteralPath $ulog -Raw } else { '' }
+Check ($text -match [regex]::Escape('removing the package uninstalls locked mode: agents on this machine will no longer be locked')) 'the warning is in msi.log'
+Check (-not (Service-Exists)) 'the service is gone'
+Check (-not (Test-Path -LiteralPath $programFiles)) 'Program Files\saiife is gone'
+Check (Test-Path -LiteralPath 'C:\ProgramData\saiife\log\audit') 'the audit is kept'
+Check (Test-Path -LiteralPath 'C:\ProgramData\saiife\etc\fleet\config.toml') 'the fleet files are kept'
+Check ((Invoke-Detect) -eq 1) 'detect.ps1 exits 1 after the removal'
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 5. the Intune package ---------------------------------------------------------------------
+Group 'the .intunewin file'
+& $build -Target $target -Version $v1 -OutDir $OutDir -Only intunewin
+$iw = Join-Path $OutDir "saiife-$v1-$arch.intunewin"
+Check (Test-Path -LiteralPath $iw) "the .intunewin exists ($iw)"
+if (Test-Path -LiteralPath $iw) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip = [IO.Compression.ZipFile]::OpenRead($iw)
+  try {
+    $names = @($zip.Entries | ForEach-Object { $_.FullName })
+    Check ($names -contains 'IntuneWinPackage/Metadata/Detection.xml') 'it unpacks with its Detection.xml header'
+    Check (@($names | Where-Object { $_ -like 'IntuneWinPackage/Contents/*.intunewin' }).Count -eq 1) 'it holds one encrypted content file'
+    $entry = $zip.GetEntry('IntuneWinPackage/Metadata/Detection.xml')
+    if ($null -ne $entry) {
+      $r = New-Object IO.StreamReader($entry.Open())
+      try { $xml = $r.ReadToEnd() } finally { $r.Dispose() }
+      Check ($xml -match "<SetupFile>saiife-$([regex]::Escape($v1))-$arch\.msi</SetupFile>") 'its header names the MSI as the setup file'
+    }
+  } finally { $zip.Dispose() }
+}
+Write-Output '::endgroup::'
+
+Reset-Machine
+Stop-IfFailed
+Write-Output 'package-windows: all checks passed'
+exit 0

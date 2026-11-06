@@ -14,19 +14,29 @@
 //! without following a symlink, of at most [`MAX_FLEET_FILE`] bytes.
 //! Anything else is refused before install changes anything. A missing
 //! [`FLEET_DIR`] means no fleet files.
+//!
+//! On Windows the dirs are `C:\ProgramData\saiife\etc\fleet` and above, and "root's, not
+//! writable" is `protected_ok` on each ([`crate::install_win::fleet_files`]). So the tool
+//! that lays the files down must give the tree its W14 descriptors first: an inherited
+//! `C:\ProgramData` ACL lets Users create entries, and is refused.
 
+#[cfg(unix)]
 use crate::fsops;
 use crate::host::Host;
-use crate::install::{
-    check_owner_mode_for, read_previous_record, refused, InstallError, InstallOptions,
-};
+#[cfg(unix)]
+use crate::install::{check_owner_mode_for, read_previous_record};
+use crate::install::{refused, InstallError, InstallOptions};
 use crate::layout::*;
 use saiife_agents::Agent;
 use saiife_policy::installed::read_installed;
 use serde::Deserialize;
+#[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Largest fleet file read (1 MiB).
 pub const MAX_FLEET_FILE: u64 = 1024 * 1024;
@@ -50,26 +60,16 @@ pub struct FleetInstall {
 /// hooks (install never removes them); `system uninstall` then `system
 /// install --fleet` does.
 pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions, InstallError> {
-    if layout.is_system() && host.euid() != 0 {
-        return Err(InstallError::NotRoot);
-    }
-    let root_uid = host
-        .user("root")
-        .map(|u| u.uid)
-        .ok_or_else(|| InstallError::Step {
-            step: "fleet".into(),
-            detail: "user root not found".into(),
-        })?;
-    let (config, install) = if fleet_dir_present(layout, host, root_uid)? {
-        (
-            read_fleet_file(layout, host, FLEET_CONFIG, root_uid)?,
-            read_fleet_file(layout, host, FLEET_INSTALL, root_uid)?,
-        )
+    let (config, install) = if layout.platform() == Platform::Windows {
+        crate::install_win::fleet_files(layout, host)?
     } else {
-        (None, None)
+        unix_fleet_files(layout, host)?
     };
+    // As the platform names them, in a refusal.
+    let (config_shown, install_shown) =
+        (layout.logical(FLEET_CONFIG), layout.logical(FLEET_INSTALL));
     let fleet = match install {
-        Some(bytes) => parse_install(&bytes)?,
+        Some(bytes) => parse_install(&bytes, install_shown)?,
         None => FleetInstall {
             agents: None,
             approvers: Vec::new(),
@@ -79,10 +79,10 @@ pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions,
     // without a word.
     if config.is_some() && !fleet.approvers.is_empty() {
         return Err(refused(
-            Path::new(FLEET_INSTALL),
+            Path::new(install_shown),
             format!(
-                "approvers is not used when {FLEET_CONFIG} exists; \
-                 set them as [approval] approvers in {FLEET_CONFIG} and drop approvers here"
+                "approvers is not used when {config_shown} exists; \
+                 set them as [approval] approvers in {config_shown} and drop approvers here"
             ),
         ));
     }
@@ -92,7 +92,7 @@ pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions,
             .map(|n| {
                 Agent::from_name(n).ok_or_else(|| {
                     refused(
-                        Path::new(FLEET_INSTALL),
+                        Path::new(install_shown),
                         format!("unknown agent {n:?} (claude, codex, gemini)"),
                     )
                 })
@@ -109,8 +109,39 @@ pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions,
     })
 }
 
-fn parse_install(bytes: &[u8]) -> Result<FleetInstall, InstallError> {
-    let p = Path::new(FLEET_INSTALL);
+/// The two fleet files, or `None` for one that is not there.
+pub(crate) type FleetFiles = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+#[cfg(unix)]
+fn unix_fleet_files(layout: &Layout, host: &dyn Host) -> Result<FleetFiles, InstallError> {
+    if layout.is_system() && host.euid() != 0 {
+        return Err(InstallError::NotRoot);
+    }
+    let root_uid = host
+        .user("root")
+        .map(|u| u.uid)
+        .ok_or_else(|| InstallError::Step {
+            step: "fleet".into(),
+            detail: "user root not found".into(),
+        })?;
+    Ok(if fleet_dir_present(layout, host, root_uid)? {
+        (
+            read_fleet_file(layout, host, FLEET_CONFIG, root_uid)?,
+            read_fleet_file(layout, host, FLEET_INSTALL, root_uid)?,
+        )
+    } else {
+        (None, None)
+    })
+}
+
+/// A non-Windows layout in a Windows build: only tests can make one, and none gets here.
+#[cfg(not(unix))]
+fn unix_fleet_files(_layout: &Layout, _host: &dyn Host) -> Result<FleetFiles, InstallError> {
+    Err(crate::install::wrong_platform())
+}
+
+fn parse_install(bytes: &[u8], shown: &str) -> Result<FleetInstall, InstallError> {
+    let p = Path::new(shown);
     let text = std::str::from_utf8(bytes).map_err(|e| refused(p, format!("not UTF-8: {e}")))?;
     toml::from_str(text).map_err(|e| refused(p, e.message().to_string()))
 }
@@ -120,9 +151,15 @@ fn parse_install(bytes: &[u8]) -> Result<FleetInstall, InstallError> {
 /// reinstalling the package keeps the admin's choice); `None` without
 /// either.
 fn recorded_agents(layout: &Layout, host: &dyn Host) -> Result<Option<Vec<Agent>>, InstallError> {
-    let rec =
-        read_installed(&layout.at(INSTALLED)).map_err(|e| refused(Path::new(INSTALLED), e))?;
-    let rec = rec.or_else(|| read_previous_record(layout, host));
+    let rec = read_installed(&layout.at(INSTALLED))
+        .map_err(|e| refused(Path::new(layout.logical(INSTALLED)), e))?;
+    let rec = rec.or_else(|| {
+        if layout.platform() == Platform::Windows {
+            crate::install_win::read_previous_record(layout, host)
+        } else {
+            unix_previous_record(layout, host)
+        }
+    });
     Ok(rec.map(|i| {
         i.agents
             .iter()
@@ -131,11 +168,28 @@ fn recorded_agents(layout: &Layout, host: &dyn Host) -> Result<Option<Vec<Agent>
     }))
 }
 
+#[cfg(unix)]
+fn unix_previous_record(
+    layout: &Layout,
+    host: &dyn Host,
+) -> Option<saiife_policy::installed::Installed> {
+    read_previous_record(layout, host)
+}
+
+#[cfg(not(unix))]
+fn unix_previous_record(
+    _layout: &Layout,
+    _host: &dyn Host,
+) -> Option<saiife_policy::installed::Installed> {
+    None
+}
+
 /// Walks every dir down to [`FLEET_DIR`]: each must be a directory (not a
 /// symlink) of root's, not writable by group or others; a sticky bit does
 /// not excuse a writable one. False when one is missing (no fleet files).
 /// On macOS the walk goes through the root-owned system link `/etc` to
 /// `/private/etc` ([`fleet_path`]); any other link is refused.
+#[cfg(unix)]
 fn fleet_dir_present(
     layout: &Layout,
     host: &dyn Host,
@@ -171,6 +225,7 @@ fn fleet_dir_present(
 /// to `/private/etc` ([`crate::install::beneath_links`],
 /// [`fsops::trusted_link_target`]); as it is on Linux, or when `/etc` is
 /// not that link (the walk then refuses it as no directory).
+#[cfg(unix)]
 fn fleet_path(layout: &Layout, host: &dyn Host, abs: &str) -> PathBuf {
     crate::install::beneath_links(layout, host, Path::new(layout.logical(abs)))
 }
@@ -179,6 +234,7 @@ fn fleet_path(layout: &Layout, host: &dyn Host, abs: &str) -> PathBuf {
 /// regular file of root's, not writable by group or others (checked on
 /// that open file), of at most [`MAX_FLEET_FILE`] bytes. `None` when it
 /// does not exist.
+#[cfg(unix)]
 fn read_fleet_file(
     layout: &Layout,
     host: &dyn Host,

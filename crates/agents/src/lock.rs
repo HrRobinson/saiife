@@ -113,8 +113,9 @@ pub fn label_for(agent: Agent, platform: LockPlatform) -> LockLabel {
     match platform {
         // No macOS recording yet (tests/fixtures/lock-check/macos/).
         LockPlatform::Macos => LockLabel::Unverified,
-        // No Windows recording yet (tests/fixtures/lock-check/windows/;
-        // plan 19b Task 14).
+        // No Windows recording yet (tests/fixtures/lock-check/windows/). The
+        // recordings come from scripts/lock-check/windows-vm.ps1, run in a
+        // throwaway VM; until then every agent stays unverified there.
         LockPlatform::Windows => LockLabel::Unverified,
         LockPlatform::Linux => match agent {
             // Plan 7 recording, claude.tsv.
@@ -196,7 +197,8 @@ mod tests {
     }
 
     /// Every Windows label is `unverified` until the owner records
-    /// `tests/fixtures/lock-check/windows/<agent>.tsv` (plan 19b Task 14).
+    /// `tests/fixtures/lock-check/windows/<agent>.tsv` with
+    /// `scripts/lock-check/windows-vm.ps1` (plan 19b Task 14).
     #[test]
     fn windows_labels_unverified_without_recordings() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

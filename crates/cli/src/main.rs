@@ -30,17 +30,15 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod broker;
 mod check;
 mod check_managed;
-// Used by `saiife api collection`, which needs Linux or macOS.
-#[cfg_attr(not(unix), allow(dead_code))]
 mod collection;
 mod connect_cmd;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod doctor_cmd;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod env_cmd;
 mod eval;
 #[cfg(debug_assertions)]
@@ -62,12 +60,12 @@ mod report;
 mod report_html;
 mod run_cmd;
 mod secret_cmd;
-#[cfg_attr(not(unix), allow(dead_code, unused_imports))] // the locked block is unix-only
 mod status_cmd;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod system_cmd;
 mod system_view;
 mod text;
+mod win_locked;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -203,6 +201,11 @@ enum Cmd {
         /// for this binary and exit (writes no file, runs no service manager).
         #[arg(long = "print-unit", value_name = "KIND", requires = "user", value_parser = ["systemd", "launchd"])]
         print_unit: Option<String>,
+        /// With --user (Windows): start the personal broker at logon (a value under
+        /// HKCU\...\Run) or stop doing so.
+        #[cfg(windows)]
+        #[arg(long, value_name = "on|off", requires = "user", conflicts_with = "print_unit", value_parser = ["on", "off"])]
+        autostart: Option<String>,
         /// Test seam (debug builds): the locked-host marker to check.
         #[cfg(debug_assertions)]
         #[arg(long = "locked-marker", value_name = "PATH", hide = true)]
@@ -364,7 +367,6 @@ enum Cmd {
     },
     /// Environments (`[environments.<name>]`): list them, or choose the
     /// one that applies (locked mode: root rebinds a scope).
-    #[cfg(unix)]
     Env {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true, global = true)]
@@ -372,23 +374,12 @@ enum Cmd {
         #[command(subcommand)]
         action: env_cmd::EnvAction,
     },
-    /// Locked mode (not on Windows until plan 19b): environments.
-    #[cfg(windows)]
-    Env {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Locked mode on Linux: install or uninstall the system setup (root).
-    #[cfg(unix)]
+    /// Locked mode: install or uninstall the system setup (root, or an elevated
+    /// administrator on Windows).
+    #[cfg(any(unix, windows))]
     System {
         #[command(subcommand)]
         action: system_cmd::SystemAction,
-    },
-    /// Locked mode (not on Windows until plan 19b): install or uninstall.
-    #[cfg(windows)]
-    System {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
     },
 }
 
@@ -409,81 +400,66 @@ enum AuditAction {
     },
 }
 
-/// What a locked-mode subcommand prints and exits 2 with on Windows, until
-/// plan 19b brings locked mode there. Developer mode (`init`, `status`,
-/// `check`, `test`, `explain`, `packs`, `audit`) works.
+/// What Windows still cannot do, as the spec's refusal says it. `None`: the command runs.
 #[cfg(windows)]
-pub const LOCKED_ON_WINDOWS_LATER: &str =
-    "saiife: locked mode on Windows arrives in plan 19b. Developer mode works.";
-
-/// The subcommands (and flags) that need locked mode or the personal broker,
-/// neither of which exists on Windows yet.
-#[cfg(windows)]
-fn locked_only(cmd: &Cmd) -> bool {
+fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
+    /// W18: no sandbox for a gateway's children.
+    const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
     match cmd {
-        Cmd::Check { managed, event, .. } => *managed || event.is_some(),
-        Cmd::Audit {
-            action,
-            broker,
-            system_config,
-            kind,
-            service,
-            ..
-        } => {
-            *broker
-                || system_config.is_some()
-                || kind.is_some()
-                || service.is_some()
-                || matches!(action, Some(AuditAction::Verify { broker: true, .. }))
-                || matches!(
-                    action,
-                    Some(AuditAction::Verify {
-                        system_config: Some(_),
-                        ..
-                    })
-                )
-        }
-        Cmd::Policy { action, .. } => matches!(
-            action,
-            policy_cmd::PolicyAction::Show { .. } | policy_cmd::PolicyAction::Reload
-        ),
-        Cmd::Daemon { .. }
+        Cmd::McpSpawn => Some(NO_GATEWAY),
+        // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
+        Cmd::Daemon { .. } => None,
+        // No wildcard: a new subcommand must be put on one side or the other here, or this
+        // does not compile.
+        Cmd::System { .. }
         | Cmd::Doctor { .. }
+        | Cmd::Audit { .. }
+        | Cmd::Approvals { .. }
+        | Cmd::Approve { .. }
+        | Cmd::Reject { .. }
+        | Cmd::Check { .. }
         | Cmd::Eval
-        | Cmd::McpSpawn
         | Cmd::Secret { .. }
         | Cmd::Connect(..)
         | Cmd::Run { .. }
         | Cmd::Api(_)
         | Cmd::Mcp(_)
-        | Cmd::Approvals { .. }
-        | Cmd::Approve { .. }
-        | Cmd::Reject { .. }
         | Cmd::Lockdown { .. }
         | Cmd::Env { .. }
-        | Cmd::System { .. } => true,
-        // Developer mode. No wildcard: a new subcommand must be put on one
-        // side or the other here, or this does not compile.
-        Cmd::Test { .. }
+        | Cmd::Policy { .. }
+        | Cmd::Test { .. }
         | Cmd::Explain { .. }
         | Cmd::Init { .. }
         | Cmd::Status { .. }
-        | Cmd::Packs { .. } => false,
+        | Cmd::Packs { .. } => None,
         #[cfg(debug_assertions)]
-        Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => false,
+        Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => None,
     }
 }
 
 fn main() -> ExitCode {
+    // W28: first thing, before anything can load a DLL. The hook denies without it; any
+    // other command says so and goes on.
+    #[cfg(windows)]
+    let dll_problem = saiife_win::ffi::process::harden_dll_search().err();
+    #[cfg(not(windows))]
+    let dll_problem: Option<std::io::Error> = None;
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return arg_error(e),
     };
 
     #[cfg(windows)]
-    if locked_only(&cli.command) {
-        eprintln!("{LOCKED_ON_WINDOWS_LATER}");
+    if let Some(line) = windows_refusal(&cli.command) {
+        eprintln!("{line}");
         return ExitCode::from(2);
+    }
+    if let Some(e) = &dll_problem {
+        let managed_hook = matches!(&cli.command, Cmd::Check { managed: true, .. });
+        if !managed_hook {
+            warn(&format!("cannot restrict the DLL search: {e}"));
+        }
     }
 
     // Hook mode compiles only the packs it needs (it runs on every agent
@@ -500,6 +476,10 @@ fn main() -> ExitCode {
             let config = system_config
                 .as_deref()
                 .unwrap_or(std::path::Path::new(check_managed::SYSTEM_CONFIG));
+            if let Some(e) = dll_problem {
+                let why = format!("cannot restrict the DLL search: {e}");
+                return check_managed::run_denied(agent, config, event.as_deref(), why);
+            }
             return check_managed::run(agent, config, event.as_deref());
         }
         return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
@@ -544,6 +524,41 @@ fn main() -> ExitCode {
             user,
             print_unit,
             locked_marker,
+            config,
+            state_dir,
+            credentials_dir,
+        });
+    }
+    #[cfg(windows)]
+    if let Cmd::Daemon {
+        system,
+        user,
+        print_unit,
+        autostart,
+        #[cfg(debug_assertions)]
+        locked_marker,
+        config,
+        state_dir,
+        credentials_dir,
+    } = cli.command
+    {
+        if user {
+            #[cfg(not(debug_assertions))]
+            let locked_marker: Option<std::path::PathBuf> = None;
+            return cmd_daemon_user(UserArgs {
+                print_unit,
+                autostart,
+                locked_marker,
+                paths_given: config.is_some() || state_dir.is_some() || credentials_dir.is_some(),
+            });
+        }
+        if !system {
+            eprintln!(
+                "saiife: use `saiife daemon --system` (locked mode) or `saiife daemon --user` (personal broker)"
+            );
+            return ExitCode::from(2);
+        }
+        return win_daemon::run(win_daemon::Paths {
             config,
             state_dir,
             credentials_dir,
@@ -625,7 +640,6 @@ fn main() -> ExitCode {
     {
         return policy_cmd::run(system_config, action);
     }
-    #[cfg(unix)]
     if let Cmd::Env {
         system_config,
         action,
@@ -633,11 +647,11 @@ fn main() -> ExitCode {
     {
         return env_cmd::run(system_config, action);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Cmd::Doctor { user, json, root } = cli.command {
         return doctor_cmd::run(user, json, root);
     }
@@ -741,6 +755,181 @@ fn main() -> ExitCode {
             },
             &packs,
         ),
+    }
+}
+
+/// `saiife daemon --system` on Windows (W10): inside the service dispatcher when the
+/// service manager started this process, else on its own, where Ctrl+C stops it.
+#[cfg(windows)]
+mod win_daemon {
+    use saiife_system::layout::{Layout, CONFIG, DAEMON_LOG, KEYS_DIR, STATE_DIR};
+    use saiife_win::ffi::service::{run_as_service, ServiceCtl, NOT_A_SERVICE};
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+    use std::sync::Mutex;
+
+    /// The flags; each default comes from the W9 layout, never from the environment.
+    pub struct Paths {
+        pub config: Option<PathBuf>,
+        pub state_dir: Option<PathBuf>,
+        pub credentials_dir: Option<PathBuf>,
+    }
+
+    /// `run_as_service` takes a plain function, so what it runs waits here.
+    static PATHS: Mutex<Option<Paths>> = Mutex::new(None);
+
+    fn options(paths: Paths) -> saiife_daemon::DaemonOptions {
+        let layout = Layout::system();
+        // Debug builds only: a test pipe, owned by this process's SID.
+        #[cfg(debug_assertions)]
+        let test_pipe = std::env::var("SAIIFE_TEST_PIPE").ok();
+        #[cfg(not(debug_assertions))]
+        let test_pipe = None;
+        saiife_daemon::DaemonOptions {
+            config: paths.config.unwrap_or_else(|| layout.at(CONFIG)),
+            state_dir: paths.state_dir.unwrap_or_else(|| layout.at(STATE_DIR)),
+            credentials_dir: Some(paths.credentials_dir.unwrap_or_else(|| layout.at(KEYS_DIR))),
+            catalog: super::daemon_catalog(),
+            directory: Box::new(saiife_policy::WinDirectory::system()),
+            mode: saiife_daemon::DaemonMode::System,
+            test_pipe,
+        }
+    }
+
+    fn take_paths() -> Option<Paths> {
+        PATHS.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn service_main(ctl: ServiceCtl) -> i32 {
+        let Some(paths) = take_paths() else {
+            return 2;
+        };
+        let log = Layout::system().at(DAEMON_LOG);
+        saiife_daemon::run_service(options(paths), &log, ctl)
+    }
+
+    pub fn run(paths: Paths) -> ExitCode {
+        *PATHS.lock().unwrap_or_else(|p| p.into_inner()) = Some(paths);
+        match run_as_service(saiife_system::layout::WIN_SERVICE, service_main) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.raw_os_error() == Some(NOT_A_SERVICE) => match take_paths() {
+                Some(paths) => saiife_daemon::run(options(paths)),
+                None => ExitCode::from(2),
+            },
+            Err(e) => {
+                eprintln!("saiife: the service dispatcher failed: {e}");
+                ExitCode::from(2)
+            }
+        }
+    }
+}
+
+/// The `saiife daemon --user` flags on Windows.
+#[cfg(windows)]
+struct UserArgs {
+    print_unit: Option<String>,
+    /// `--autostart on|off`.
+    autostart: Option<String>,
+    /// `--locked-marker` (debug builds); `None` is the real marker.
+    locked_marker: Option<std::path::PathBuf>,
+    /// A `--config`, `--state-dir` or `--credentials-dir` was given.
+    paths_given: bool,
+}
+
+/// `saiife daemon --user` on Windows (plan 19b, Task 11): the personal broker, as the
+/// logged-in user, with its vault key in Credential Manager and its control pipe named
+/// by the user's SID. `--autostart on|off` edits the logon `Run` value and exits.
+#[cfg(windows)]
+fn cmd_daemon_user(a: UserArgs) -> ExitCode {
+    use saiife_system::layout::{Layout, INSTALLED};
+    if a.print_unit.is_some() {
+        eprintln!(
+            "saiife: --print-unit is for systemd and launchd; on Windows use `saiife daemon --user --autostart on`"
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(v) = &a.autostart {
+        return user_autostart(v == "on");
+    }
+    if a.paths_given {
+        eprintln!(
+            "saiife: daemon --user takes no --config, --state-dir or --credentials-dir: its paths are fixed (%LOCALAPPDATA%\\saiife\\personal)"
+        );
+        return ExitCode::from(2);
+    }
+    let home = saiife_win::profile::home_dir();
+    let paths =
+        match saiife_system::personal::personal_paths(&|k| std::env::var_os(k), home.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("saiife: {e}");
+                return ExitCode::from(2);
+            }
+        };
+    // Debug builds only: a test pipe, owned by this process's SID.
+    #[cfg(debug_assertions)]
+    let test_pipe = std::env::var("SAIIFE_TEST_PIPE").ok();
+    #[cfg(not(debug_assertions))]
+    let test_pipe: Option<String> = None;
+    let locked_marker = a
+        .locked_marker
+        .unwrap_or_else(|| Layout::system().at(INSTALLED));
+    // An elevated admin, SYSTEM or a service account, a locked host or a locked config
+    // are refused before the keychain is touched.
+    if let Some(why) = saiife_daemon::personal_identity_problem(test_pipe.is_some()) {
+        eprintln!("saiife: {why}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) =
+        saiife_daemon::personal_preflight(&paths.config, &paths.socket_dir, &locked_marker)
+    {
+        eprintln!("saiife: {e}");
+        return ExitCode::from(2);
+    }
+    let keychain: Box<dyn saiife_keychain::Keychain> = match saiife_keychain::from_env() {
+        Ok(k) => k,
+        Err(e) => Box::new(saiife_daemon::UnavailableKeychain(e)),
+    };
+    saiife_daemon::run(saiife_daemon::DaemonOptions {
+        config: paths.config,
+        state_dir: paths.state_dir,
+        credentials_dir: None,
+        catalog: daemon_catalog(),
+        directory: Box::new(saiife_policy::WinDirectory::system()),
+        mode: saiife_daemon::DaemonMode::Personal {
+            socket_dir: paths.socket_dir,
+            audit_dir: paths.audit_dir,
+            keychain,
+            locked_marker,
+        },
+        test_pipe,
+    })
+}
+
+/// `saiife daemon --user --autostart on|off`: the logon `Run` value for this binary.
+#[cfg(windows)]
+fn user_autostart(on: bool) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("saiife: cannot find this binary: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match saiife_system::user_unit::autostart(&mut saiife_system::user_unit::HkcuRun, &exe, on) {
+        Ok(changed) => {
+            let what = match (on, changed) {
+                (true, _) => "on: the personal broker starts at logon",
+                (false, true) => "off",
+                (false, false) => "off (it was not on)",
+            };
+            println!("saiife: autostart {what}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("saiife: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -909,7 +1098,7 @@ fn print_unit(kind: &str) -> ExitCode {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// The built-in packs as the daemon's policy catalog.
 fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
     let (packs, warnings) = saiifeguard::builtins::builtin_packs_every_rule();

@@ -34,7 +34,9 @@ use saiife_policy::SyslogFormat;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpStream, UnixDatagram, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::{UnixDatagram, UnixStream};
 
 /// The largest local datagram; a longer message is cut.
 #[cfg(not(target_os = "macos"))]
@@ -175,7 +177,7 @@ impl SyslogTransport {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_send_timeout(mut self, t: std::time::Duration) -> Self {
         self.timeout = t;
         self
@@ -210,6 +212,16 @@ impl SyslogTransport {
         out
     }
 
+    /// The loader refuses a local socket on Windows; this is for a config read past it.
+    #[cfg(not(unix))]
+    async fn send_unix(&self, path: &std::path::Path, _: &[Bytes]) -> Result<(), SendError> {
+        Err(SendError::Retry(format!(
+            "{}: syslog to a local socket is not available on Windows",
+            path.display()
+        )))
+    }
+
+    #[cfg(unix)]
     async fn send_unix(&self, path: &std::path::Path, lines: &[Bytes]) -> Result<(), SendError> {
         let retry = |e: std::io::Error| SendError::Retry(format!("{}: {e}", path.display()));
         let sock = UnixDatagram::unbound().map_err(retry)?;
@@ -282,6 +294,7 @@ impl SyslogTransport {
 
 /// A datagram of at most [`MAX_DATAGRAM`] bytes: a longer message is cut at
 /// a character boundary and marked.
+#[cfg_attr(windows, allow(dead_code))]
 fn truncate(mut msg: Vec<u8>) -> Vec<u8> {
     if msg.len() <= MAX_DATAGRAM {
         return msg;
@@ -325,7 +338,7 @@ impl Transport for SyslogTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::forward_https::testing::{acceptor, pki, upstream, Pki, TEST_HOST};

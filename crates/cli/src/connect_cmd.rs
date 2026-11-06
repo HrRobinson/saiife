@@ -35,13 +35,13 @@ pub struct ConnectArgs {
     pub config: Option<PathBuf>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(_args: ConnectArgs) -> ExitCode {
     eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(args: ConnectArgs) -> ExitCode {
     use crate::secret_cmd::linux::Stop;
     match linux::go(args) {
@@ -61,11 +61,11 @@ pub fn run(args: ConnectArgs) -> ExitCode {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod linux {
     use std::collections::BTreeMap;
-    use std::io::BufRead;
-    use std::os::fd::AsFd;
+    use std::io::{BufRead, IsTerminal};
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     use std::path::{Path, PathBuf};
 
@@ -198,13 +198,7 @@ mod linux {
         }
 
         // 5. The policy file. If it fails, tell how to undo the secret.
-        let wrote = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(dir_mode)
-            .create(&dir)
-            .and_then(|()| {
-                saiife_system::fsops::write_new_file(&target, text.as_bytes(), file_mode)
-            });
+        let wrote = write_policy(&dir, &target, text.as_bytes(), dir_mode, file_mode);
         if let Err(e) = wrote {
             return refuse(format!(
                 "cannot write {}: {e}\n{}",
@@ -223,6 +217,46 @@ mod linux {
         }
         outln!("next: edit {}, then saiife policy reload", target.display());
         Ok(())
+    }
+
+    /// The drop-in, in `dir`, made if missing.
+    #[cfg(unix)]
+    fn write_policy(
+        dir: &Path,
+        target: &Path,
+        bytes: &[u8],
+        dir_mode: u32,
+        file_mode: u32,
+    ) -> std::io::Result<()> {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(dir_mode)
+            .create(dir)?;
+        saiife_system::fsops::write_new_file(target, bytes, file_mode)
+    }
+
+    /// The drop-in, in `dir`, made if missing. New entries inherit the descriptor above
+    /// them, so there are no modes to set: `etc`'s on a locked host (W14), where only an
+    /// admin can write, and the user's own profile's for the personal broker.
+    #[cfg(windows)]
+    fn write_policy(
+        dir: &Path,
+        target: &Path,
+        bytes: &[u8],
+        _dir_mode: u32,
+        _file_mode: u32,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(dir)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        let wrote = f.write_all(bytes).and_then(|()| f.sync_all());
+        if wrote.is_err() {
+            let _ = std::fs::remove_file(target);
+        }
+        wrote
     }
 
     fn valid_name(s: &str) -> bool {
@@ -271,7 +305,7 @@ mod linux {
                 return refuse(format!("--param {k} given twice"));
             }
         }
-        let tty = rustix::termios::isatty(std::io::stdin().as_fd());
+        let tty = std::io::stdin().is_terminal();
         for (name, spec) in &m.params {
             if spec.required && !out.contains_key(name) {
                 if !tty {
@@ -378,7 +412,14 @@ mod linux {
         } else {
             dir.parent().unwrap_or_else(|| Path::new("."))
         };
-        rustix::fs::access(probe, rustix::fs::Access::WRITE_OK)
+        #[cfg(unix)]
+        return rustix::fs::access(probe, rustix::fs::Access::WRITE_OK)
+            .map_err(|e| Stop::Refused(format!("cannot write to {}: {e}", probe.display())));
+        // Windows answers access by the ACL at the write: an elevated token must not be
+        // told here what only the write can tell. The write's refusal says how to undo it.
+        #[cfg(windows)]
+        std::fs::metadata(probe)
+            .map(|_| ())
             .map_err(|e| Stop::Refused(format!("cannot write to {}: {e}", probe.display())))
     }
 }

@@ -17,7 +17,6 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -105,6 +104,9 @@ pub struct Request {
     pub created: String,
     pub expires: String,
     pub uid: u32,
+    /// Windows: the requester's SID, the identity behind `uid`. `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub agent: String,
@@ -162,6 +164,9 @@ pub struct Request {
     pub request_sealed: Option<String>,
     pub state: State,
     pub decided_by: Option<u32>,
+    /// Windows: the SID behind `decided_by`, as every elevated admin's uid is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_sid: Option<String>,
     pub note: Option<String>,
     pub result_ref: Option<String>,
 }
@@ -171,6 +176,8 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewRequest {
     pub uid: u32,
+    /// See [`Request::sid`].
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub agent: String,
@@ -233,6 +240,8 @@ pub struct SendDisplay {
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub uid: Option<u32>,
+    /// With `uid`: the SID it is a label of (Windows). `None` elsewhere.
+    pub sid: Option<String>,
     pub states: Vec<State>,
 }
 
@@ -401,6 +410,7 @@ pub fn record_for(
     use saiife_audit::DecisionKind;
     base.kind = Some("approval".into());
     base.uid = Some(r.uid);
+    base.sid = r.sid.clone();
     base.user = Some(r.user.clone());
     base.agent = r.agent.clone();
     base.project = r.project.clone();
@@ -429,6 +439,9 @@ pub fn record_for(
     }
     if let Some(b) = r.decided_by {
         base.extra.insert("by_uid".into(), b.into());
+    }
+    if let Some(sid) = &r.decided_by_sid {
+        base.extra.insert("by_sid".into(), sid.clone().into());
     }
     if let Some(n) = &r.note {
         base.extra.insert("note".into(), n.clone().into());
@@ -542,7 +555,7 @@ fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn real_dir_sync(dir: &Path) -> io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
+    crate::fsx::sync_dir(dir)
 }
 
 impl Store {
@@ -594,12 +607,7 @@ impl Store {
         let tmp = self.dir.join(format!(".{name}.tmp"));
         let _ = std::fs::remove_file(&tmp);
         let staged = (|| {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-                .open(&tmp)?;
+            let mut f = crate::fsx::new_private_file(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
             std::fs::rename(&tmp, self.dir.join(name))
@@ -744,6 +752,7 @@ impl Store {
             let same = self
                 .list(Filter {
                     uid: Some(req.uid),
+                    sid: req.sid.clone(),
                     states: vec![State::Pending],
                 })
                 .into_iter()
@@ -757,6 +766,7 @@ impl Store {
             let pending = self
                 .list(Filter {
                     uid: Some(req.uid),
+                    sid: req.sid.clone(),
                     states: vec![State::Pending],
                 })
                 .iter()
@@ -778,6 +788,7 @@ impl Store {
             created: ts(now),
             expires: ts(now + ttl),
             uid: req.uid,
+            sid: req.sid,
             user: req.user,
             session: req.session,
             agent: req.agent,
@@ -802,6 +813,7 @@ impl Store {
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,
+            decided_by_sid: None,
             note: None,
             result_ref: None,
         };
@@ -828,7 +840,11 @@ impl Store {
         self.ids("json")
             .into_iter()
             .filter_map(|id| self.get(id))
-            .filter(|r| filter.uid.is_none_or(|u| r.uid == u))
+            .filter(|r| {
+                filter.uid.is_none_or(|u| {
+                    crate::ops::same_principal(r.uid, r.sid.as_deref(), u, filter.sid.as_deref())
+                })
+            })
             .filter(|r| filter.states.is_empty() || filter.states.contains(&r.state))
             .collect()
     }
@@ -845,6 +861,20 @@ impl Store {
         from: &[State],
         to: State,
         by: Option<u32>,
+        note: Option<String>,
+        now: SystemTime,
+    ) -> Result<Request, StoreError> {
+        self.transition_by(id, from, to, by.map(|uid| (uid, None)), note, now)
+    }
+
+    /// [`Store::transition`] with the decider's SID too, so later records of the request
+    /// still name them on Windows.
+    pub fn transition_by(
+        &self,
+        id: u64,
+        from: &[State],
+        to: State,
+        by: Option<(u32, Option<String>)>,
         note: Option<String>,
         now: SystemTime,
     ) -> Result<Request, StoreError> {
@@ -872,8 +902,9 @@ impl Store {
             });
         }
         r.state = to;
-        if by.is_some() {
-            r.decided_by = by;
+        if let Some((uid, sid)) = by {
+            r.decided_by = Some(uid);
+            r.decided_by_sid = sid;
         }
         if note.is_some() {
             r.note = note;
@@ -998,9 +1029,82 @@ impl Store {
 }
 
 #[cfg(test)]
+mod sid_tests {
+    use super::*;
+
+    /// All elevated admins share uid 0: the list goes by SID.
+    #[test]
+    fn a_filter_with_a_sid_ignores_the_shared_label() {
+        const A: &str = "S-1-5-21-1-2-3-1001";
+        const B: &str = "S-1-5-21-1-2-3-1002";
+        let mine =
+            |r_sid: &str, f_sid: &str| crate::ops::same_principal(0, Some(r_sid), 0, Some(f_sid));
+        assert!(mine(A, A));
+        assert!(!mine(A, B));
+    }
+
+    /// The decider's SID stays on the request, so `sent` and `send_failed` name them too.
+    #[test]
+    fn a_later_record_names_the_deciders_sid() {
+        const BY: &str = "S-1-5-21-1-2-3-500";
+        let mut r: Request = serde_json::from_value(serde_json::json!({
+            "id": 1, "created": "c", "expires": "e", "uid": 1000, "user": "u",
+            "session": null, "agent": "a", "project": "p", "type": "connector",
+            "service": null, "operation": null, "capability": null, "params": {},
+            "input": null, "grant_key": null, "state": "sent", "decided_by": 0
+        }))
+        .unwrap();
+        let base = || {
+            saiife_audit::Record::new(
+                saiife_audit::NewRecord {
+                    agent: "a",
+                    project: "p",
+                    session: None,
+                    tool: "t",
+                    input: "",
+                    decision: saiife_audit::DecisionKind::Allow,
+                    pack: None,
+                    rule: None,
+                    reason: None,
+                    mode: "locked",
+                    policy: None,
+                    permission_mode: None,
+                },
+                "0",
+            )
+        };
+        assert!(serde_json::to_value(&r)
+            .unwrap()
+            .get("decided_by_sid")
+            .is_none());
+        assert!(!record_for(base(), &r, "sent").extra.contains_key("by_sid"));
+        r.decided_by_sid = Some(BY.to_string());
+        let rec = record_for(base(), &r, "sent");
+        assert_eq!(rec.extra["by_uid"], 0);
+        assert_eq!(rec.extra["by_sid"], BY);
+    }
+
+    /// A record of a Windows requester names its SID; one of a Unix requester has none.
+    #[test]
+    fn the_requester_sid_stays_out_of_a_unix_file() {
+        let r: Request = serde_json::from_value(serde_json::json!({
+            "id": 1, "created": "c", "expires": "e", "uid": 1000, "user": "u",
+            "session": null, "agent": "a", "project": "p", "type": "connector",
+            "service": null, "operation": null, "capability": null, "params": {},
+            "input": null, "grant_key": null, "state": "pending"
+        }))
+        .unwrap();
+        assert_eq!(r.sid, None);
+        assert!(serde_json::to_value(&r).unwrap().get("sid").is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::vault::{Shared, VaultState};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1018,6 +1122,7 @@ mod tests {
         params.insert("id".into(), "42".into());
         NewRequest {
             uid,
+            sid: None,
             user: "agent-shop".into(),
             session: Some("s1".into()),
             agent: "claude".into(),
@@ -1040,17 +1145,18 @@ mod tests {
     }
 
     struct Env {
-        t: tempfile::TempDir,
+        t: crate::fsx::TestDir,
         store: Store,
     }
 
     fn env() -> Env {
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::fsx::TestDir::new();
         let store = Store::open(&dir_in(t.path())).unwrap();
         Env { t, store }
     }
 
-    fn vault(t: &tempfile::TempDir) -> Shared {
+    #[cfg(unix)]
+    fn vault(t: &crate::fsx::TestDir) -> Shared {
         let key = t.path().join("vault-key");
         std::fs::write(&key, [7u8; 32]).unwrap();
         // The key is the daemon's own and private (macOS checks it).
@@ -1064,6 +1170,7 @@ mod tests {
         Shared::new(s)
     }
 
+    #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
     }
@@ -1157,6 +1264,7 @@ mod tests {
         assert_ne!(p.id, q.id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn files_0600_dir_0700() {
         let t = tempfile::tempdir().unwrap();
@@ -1374,6 +1482,7 @@ mod tests {
         assert!(s.put_result(77, vec![1], t0()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sealed_request_is_what_is_sent() {
         let e = env();
@@ -1421,6 +1530,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn vault_unavailable_seal_fails_closed() {
         let e = env();
@@ -1576,6 +1686,7 @@ mod tests {
         assert_eq!(
             ids(Filter {
                 uid: Some(2),
+                sid: None,
                 states: vec![]
             }),
             vec![2]
@@ -1583,6 +1694,7 @@ mod tests {
         assert_eq!(
             ids(Filter {
                 uid: None,
+                sid: None,
                 states: vec![State::Pending]
             }),
             vec![1]

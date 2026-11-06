@@ -85,6 +85,76 @@ impl Proc for MacProc {
     }
 }
 
+/// How long one process snapshot answers for (Windows).
+const SNAPSHOT_FOR: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A process table as one list: the Toolhelp snapshot on Windows, a fixture in a test.
+type Snapshot = Box<dyn Fn() -> std::io::Result<Vec<saiife_win::proc::ProcEntry>> + Send + Sync>;
+
+/// Windows (W17): names and parents from one snapshot per lookup, cached for 200 ms, so
+/// one walk reads one table. There is no start time, so a reused pid goes unnoticed, and
+/// no command line, so a `node` ancestor never matches an agent: such a request gets no
+/// session. Attribution only; nothing is allowed because of it.
+pub struct WinProc {
+    snapshot: Snapshot,
+    cached: Mutex<Option<WinTable>>,
+}
+
+struct WinTable {
+    at: std::time::Instant,
+    procs: HashMap<u32, saiife_win::proc::ProcEntry>,
+}
+
+impl WinProc {
+    pub fn with_snapshot(snapshot: Snapshot) -> WinProc {
+        WinProc {
+            snapshot,
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+impl Proc for WinProc {
+    fn stat(&self, pid: u32) -> Option<ProcStat> {
+        let mut c = self.cached.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = |c: &mut Option<WinTable>| -> Option<()> {
+            let procs = (self.snapshot)().ok()?;
+            *c = Some(WinTable {
+                at: std::time::Instant::now(),
+                procs: procs.into_iter().map(|e| (e.pid, e)).collect(),
+            });
+            Some(())
+        };
+        let stale = c.as_ref().is_none_or(|t| t.at.elapsed() >= SNAPSHOT_FOR);
+        if stale {
+            fresh(&mut c)?;
+        }
+        // A process newer than the cached table: one more look, so it isn't attributed
+        // to nobody for the rest of the 200 ms.
+        if !stale && !c.as_ref()?.procs.contains_key(&pid) {
+            fresh(&mut c)?;
+        }
+        let e = c.as_ref()?.procs.get(&pid)?;
+        Some(ProcStat {
+            ppid: e.ppid,
+            comm: saiife_win::proc::comm_of(&e.exe),
+            start_time: 0,
+        })
+    }
+
+    fn cmdline(&self, _pid: u32) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// The host's process table: the Toolhelp snapshot on Windows.
+#[cfg(windows)]
+pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
+    Box::new(WinProc::with_snapshot(Box::new(
+        saiife_win::ffi::proc::snapshot,
+    )))
+}
+
 /// The host's process table: `/proc` on Linux, `KERN_PROC_PID` on macOS.
 #[cfg(target_os = "linux")]
 pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
@@ -98,7 +168,7 @@ pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
 }
 
 /// Other unix: no process table, so no session is ever attributed.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
     struct NoProc;
     impl Proc for NoProc {
@@ -182,9 +252,12 @@ pub fn agent_ancestor(p: &dyn Proc, pid: u32) -> Option<(u32, u64)> {
 
 #[derive(Default)]
 struct Inner {
-    map: HashMap<(u32, u64), String>,
-    order: VecDeque<(u32, u64)>,
+    map: HashMap<SessionKey, String>,
+    order: VecDeque<SessionKey>,
 }
+
+/// The peer's SID (Windows), and its agent ancestor's pid and start time.
+type SessionKey = (Option<String>, (u32, u64));
 
 /// Agent process -> its latest session id.
 #[derive(Default)]
@@ -198,15 +271,24 @@ impl Sessions {
     }
 
     /// The newest session wins. Beyond 4 096 entries the oldest goes.
+    #[cfg(test)]
     pub fn record(&self, ancestor: (u32, u64), session_id: &str) {
+        self.record_as(None, ancestor, session_id);
+    }
+
+    /// [`Sessions::record`] for the peer with this SID. Windows gives no start time, so a
+    /// reused pid looks like the same ancestor: the SID keeps another user's process from
+    /// taking this session over. `None` on Linux and macOS, where the start time does it.
+    pub fn record_as(&self, sid: Option<&str>, ancestor: (u32, u64), session_id: &str) {
         if session_id.len() > MAX_SESSION_ID {
             return;
         }
+        let key = (sid.map(str::to_string), ancestor);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if g.map.insert(ancestor, session_id.to_string()).is_some() {
-            g.order.retain(|k| *k != ancestor);
+        if g.map.insert(key.clone(), session_id.to_string()).is_some() {
+            g.order.retain(|k| *k != key);
         }
-        g.order.push_back(ancestor);
+        g.order.push_back(key);
         while g.map.len() > MAX_SESSIONS {
             if let Some(old) = g.order.pop_front() {
                 g.map.remove(&old);
@@ -216,9 +298,129 @@ impl Sessions {
         }
     }
 
+    #[cfg(test)]
     pub fn lookup(&self, ancestor: (u32, u64)) -> Option<String> {
+        self.lookup_as(None, ancestor)
+    }
+
+    /// The session of this ancestor, as the peer with this SID recorded it.
+    pub fn lookup_as(&self, sid: Option<&str>, ancestor: (u32, u64)) -> Option<String> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.map.get(&ancestor).cloned()
+        g.map.get(&(sid.map(str::to_string), ancestor)).cloned()
+    }
+}
+
+#[cfg(test)]
+mod win_tests {
+    use super::*;
+    use saiife_win::proc::ProcEntry;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    fn entry(pid: u32, ppid: u32, exe: &str) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            exe: exe.to_string(),
+        }
+    }
+
+    fn fixture(table: Vec<ProcEntry>) -> WinProc {
+        WinProc::with_snapshot(Box::new(move || Ok(table.clone())))
+    }
+
+    /// A process started after the cached table was read is found, at the cost of one
+    /// more snapshot; a pid that's still missing does not loop.
+    #[test]
+    fn a_miss_takes_one_more_snapshot() {
+        let reads = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&reads);
+        let p = WinProc::with_snapshot(Box::new(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            let mut table = vec![entry(100, 4, "a.exe")];
+            if n > 0 {
+                table.push(entry(200, 100, "b.exe"));
+            }
+            Ok(table)
+        }));
+        assert!(p.stat(100).is_some());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(p.stat(200).unwrap().comm, "b");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(p.stat(999).is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// With no start time on Windows, only the SID tells two users apart at one pid.
+    #[test]
+    fn sessions_are_keyed_by_sid() {
+        let s = Sessions::new();
+        s.record_as(Some("S-1-5-21-1"), (100, 0), "mine");
+        assert_eq!(
+            s.lookup_as(Some("S-1-5-21-1"), (100, 0)).as_deref(),
+            Some("mine")
+        );
+        assert_eq!(s.lookup_as(Some("S-1-5-21-2"), (100, 0)), None);
+        assert_eq!(s.lookup((100, 0)), None);
+    }
+
+    #[test]
+    fn win_proc_walks_names_from_fixture_snapshot() {
+        let p = fixture(vec![
+            entry(4, 0, "System"),
+            entry(100, 4, "Claude.EXE"),
+            entry(200, 100, "pwsh.exe"),
+            entry(300, 200, "saiife.exe"),
+        ]);
+        assert_eq!(agent_ancestor(&p, 300), Some((100, 0)));
+        let st = p.stat(200).unwrap();
+        assert_eq!(st.comm, "pwsh");
+        assert_eq!(st.ppid, 100);
+        assert_eq!(st.start_time, 0);
+        assert_eq!(p.cmdline(100), None);
+    }
+
+    #[test]
+    fn node_ancestor_has_no_session() {
+        let p = fixture(vec![
+            entry(100, 4, "node.exe"),
+            entry(200, 100, "pwsh.exe"),
+            entry(300, 200, "saiife.exe"),
+        ]);
+        assert_eq!(agent_ancestor(&p, 300), None);
+    }
+
+    /// A parent that is gone, as Windows keeps the pid of a dead parent, ends the walk.
+    #[test]
+    fn a_dead_parent_ends_the_walk() {
+        let p = fixture(vec![entry(300, 999, "saiife.exe")]);
+        assert_eq!(agent_ancestor(&p, 300), None);
+    }
+
+    /// Reused pids can make a parent cycle: the depth bound ends it.
+    #[test]
+    fn a_parent_cycle_ends_the_walk() {
+        let p = fixture(vec![entry(1, 2, "a.exe"), entry(2, 1, "b.exe")]);
+        assert_eq!(agent_ancestor(&p, 1), None);
+    }
+
+    /// One walk reads one table, however many levels it climbs.
+    #[test]
+    fn one_snapshot_per_lookup() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&calls);
+        let p = WinProc::with_snapshot(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![entry(100, 4, "claude.exe"), entry(200, 100, "x.exe")])
+        }));
+        assert!(agent_ancestor(&p, 200).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_no_process() {
+        let p = WinProc::with_snapshot(Box::new(|| Err(std::io::Error::other("no"))));
+        assert_eq!(p.stat(1), None);
     }
 }
 

@@ -72,9 +72,18 @@ fn defaults_when_sections_missing() {
     assert_eq!(c.audit.min_free_mb, 512);
     assert_eq!(c.audit.fsync, Fsync::Checkpoint);
     assert_eq!(c.audit.retention_months, 24);
-    assert_eq!(c.audit.dir, PathBuf::from("/var/log/saiife/audit"));
-    // The platform's daemon user and socket dir (spec §5.3 on macOS).
-    let (user, socket_dir) = if cfg!(target_os = "macos") {
+    // Windows has no `/var` to speak of: that path would resolve on the current drive,
+    // where any user could create it first (W9).
+    let audit_dir = if cfg!(windows) {
+        r"C:\ProgramData\saiife\log\audit"
+    } else {
+        "/var/log/saiife/audit"
+    };
+    assert_eq!(c.audit.dir, PathBuf::from(audit_dir));
+    // The platform's daemon user and socket dir (spec §5.3 on macOS, §5.3a on Windows).
+    let (user, socket_dir) = if cfg!(windows) {
+        (r"NT SERVICE\saiifed", r"C:\ProgramData\saiife\run")
+    } else if cfg!(target_os = "macos") {
         ("_saiife", "/var/db/saiife-run")
     } else {
         ("saiife", "/run/saiife")
@@ -895,7 +904,7 @@ fn policy_hash_changes_with_mode() {
     };
     // Absolute on this host; the hash does not care which program it is.
     let aws = if cfg!(windows) {
-        "C:/tools/aws.exe"
+        r"C:\\tools\\aws.exe"
     } else {
         "/usr/bin/aws"
     };
@@ -919,12 +928,33 @@ fn cloud_keys_keep_old_hashes() {
     // Computed on the tree before the cloud keys existed. The effective
     // policy holds the daemon defaults, which differ on macOS (`_saiife`,
     // `/var/db/saiife-run`): that value is the one a macOS runner computed.
-    let want = if cfg!(target_os = "macos") {
+    // Windows has its own too, with its audit dir as well: a Windows runner's value.
+    let want = if cfg!(windows) {
+        WINDOWS_OLD_CFG_HASH
+    } else if cfg!(target_os = "macos") {
         "sha256:5dcdac28a18de32ec594190ff9746a5f89005357a932690b78d671c3b8de2a34"
     } else {
         "sha256:79401deacbde1d240dbe27a75fd2545ddf4ee4b513a5af949c7265ada1be2b9b"
     };
     assert_eq!(h, want);
+}
+
+/// What a `windows-latest` runner computed for `OLD_CFG` (CI run 41998930399).
+const WINDOWS_OLD_CFG_HASH: &str =
+    "sha256:99b157b392138465ca8a299fc9dc9c19c5bae87f96fbd63ce2340df0435dabbe";
+
+/// The Windows pin, off Windows: its defaults on this OS's config give that very hash.
+/// So that value moved for the platform defaults and nothing else.
+#[test]
+fn windows_hash_differs_by_the_platform_defaults_alone() {
+    use saiife_policy::{active_packs, effective_policy, policy_hash, DaemonCfg};
+    let (_d, cfg) = etc(OLD_CFG, &[]);
+    let mut c = load_system(&cfg).unwrap().config;
+    c.daemon = DaemonCfg::windows_default();
+    c.audit.dir = PathBuf::from(saiife_policy::system::WINDOWS_AUDIT_DIR);
+    let (packs, _) = active_packs(&c, &[], None);
+    let h = policy_hash(&effective_policy(&c, &packs, None, None));
+    assert_eq!(h, WINDOWS_OLD_CFG_HASH);
 }
 
 // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows

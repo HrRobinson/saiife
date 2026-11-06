@@ -77,6 +77,29 @@ jobs:
         if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: powershell
         run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
+      # The locked-windows scripts (plan 19b): every .ps1 parses, and run.ps1 refuses
+      # (exit 2, nothing done) with SAIIFE_LOCKED_CI unset or outside Actions. The
+      # lock-check VM harness parses and refuses without SAIIFE_LOCKCHECK_WINDOWS_VM.
+      - name: locked-windows scripts parse, run.ps1 refuses
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          Remove-Item Env:SAIIFE_LOCKCHECK_WINDOWS_VM -ErrorAction SilentlyContinue
+          $out = pwsh -NoProfile -File ./scripts/lock-check/windows-vm.ps1 -Agent claude
+          if ($LASTEXITCODE -ne 2 -or "$out" -notlike 'refusing:*') { Write-Output "windows-vm.ps1: exit $LASTEXITCODE`: $out"; exit 1 }
+          foreach ($file in @(Get-ChildItem scripts/locked-windows/*.ps1) + @(Get-Item scripts/lock-check/windows-vm.ps1)) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+            if ($errors.Count) { $errors | ForEach-Object { Write-Output "$($file.Name): $_" }; exit 1 }
+          }
+          Remove-Item Env:SAIIFE_LOCKED_CI -ErrorAction SilentlyContinue
+          $out = pwsh -NoProfile -File ./scripts/locked-windows/run.ps1 -Binary "$PWD\README.md"
+          if ($LASTEXITCODE -ne 2 -or "$out" -notlike 'refusing:*') { Write-Output "exit $LASTEXITCODE`: $out"; exit 1 }
+          $env:SAIIFE_LOCKED_CI = '1'
+          $env:GITHUB_ACTIONS = 'false'
+          $out = pwsh -NoProfile -File ./scripts/locked-windows/run.ps1
+          if ($LASTEXITCODE -ne 2 -or "$out" -notlike 'refusing:*') { Write-Output "exit $LASTEXITCODE`: $out"; exit 1 }
+          exit 0
       # The macOS managed hook against a live `daemon --system` (plan 13):
       # p95 of 50 calls per payload within 40 ms. The script needs bash 5
       # (EPOCHREALTIME); the runner's /bin/bash is 3.2, so Homebrew's.
@@ -92,8 +115,8 @@ jobs:
         if: ${{ success() || (!cancelled() && matrix.os == 'windows-latest') }}
         shell: bash
         run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win | grep -c tokio)" = 0
-      # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
-      - name: unsafe only in saiife-darwin
+      # unsafe only in crates/darwin and crates/win/src/ffi; every other crate root forbids it (plan 13, decision 1; plan 19a, W1).
+      - name: unsafe only in saiife-darwin and saiife-win's ffi
         if: matrix.os != 'windows-latest'
         run: bash scripts/check-unsafe.sh
       # Windows code compile-checked from Linux, with a stand-in C compiler (plan 19a).
@@ -251,6 +274,57 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Locked mode on real Windows (plan 19b, W23): install, the service, the pipe, the hook,
+  # doctor, attacks from a second account, approvals, uninstall. Elevated on a throwaway
+  # runner; like locked-macos, run.ps1 refuses anywhere else. No secrets. The parse and the
+  # refusal run in `test (windows-latest)`. The measurements (T10 review: TerminateProcess
+  # on the hook, share mode 0 on saiife.exe, DefineDosDevice on C:) are reported, never
+  # asserted, and uploaded pass or fail.
+  locked-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Debug assertions on, like locked-macos; the static CRT and the load flag come from
+      # .cargo/config.toml.
+      - run: cargo build --locked --profile ci-locked --bin saiife
+      - name: install, ACLs, fail-closed, attacks, measurements, approvals, uninstall
+        env:
+          SAIIFE_LOCKED_LOGS: ${{ github.workspace }}\target\locked-windows-logs
+        run: |
+          $env:SAIIFE_LOCKED_CI = '1'
+          ./scripts/locked-windows/run.ps1 -Binary "$PWD\target\ci-locked\saiife.exe"
+      # What the owner reads, pass or fail: the measurements and the real descriptors.
+      - name: upload measurements
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: locked-windows-measurements-${{ matrix.os }}
+          path: target/locked-windows-logs/measurements.txt
+          if-no-files-found: warn
+          retention-days: 30
+      # log, etc, the audit, sc.exe qc and sdshow and the phase logs (run.ps1 copies them on a
+      # failure; never state, which holds the keys).
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: locked-windows-logs-${{ matrix.os }}
+          path: target/locked-windows-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
   # The pkg on real Macs (plan 18, Task 7): build, payload, the Jamf fleet
   # files, installer and its SIP refusal, the fleet install from the staging
   # copy, doctor, the MDM attributes, the Jamf uninstall and a reinstall. The
@@ -362,6 +436,41 @@ jobs:
         with:
           name: package-linux-logs-${{ matrix.os }}-${{ matrix.kind }}
           path: target/package-linux-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The Windows MSI and the Intune Win32 package (plan 19b Task 13): a refused fleet file
+  # rolls the MSI back, install, upgrade (one restart, managed files unchanged), the
+  # uninstall warning in msi.log, detect.ps1 and the .intunewin header. The runner is an
+  # administrator and throwaway, and scripts/package-windows/test.ps1 refuses to run
+  # anywhere else. No secrets: the MSI is unsigned. The release build, as package-linux
+  # uses: the MSI runs `system install` with no --allow-test-build, which refuses a
+  # ci-locked build (debug assertions on), so a test build could only test the rollback.
+  package-windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --release --locked --bin saiife
+      - name: build, install, upgrade and remove the MSI
+        shell: pwsh
+        run: |
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object { $_.name -eq 'saiife' } | Select-Object -ExpandProperty version
+          ./scripts/package-windows/test.ps1 -Exe target/release/saiife.exe -Version $ver `
+            -LogDir "$env:GITHUB_WORKSPACE/target/package-windows-logs" -OutDir "$env:GITHUB_WORKSPACE/target/package-windows-dist"
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-windows-logs
+          # test.ps1 copies C:\ProgramData\saiife\log\install.log in here: upload-artifact
+          # takes no path outside the workspace.
+          path: target/package-windows-logs
           if-no-files-found: ignore
           retention-days: 7
 

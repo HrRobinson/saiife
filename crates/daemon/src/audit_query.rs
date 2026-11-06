@@ -47,10 +47,12 @@ pub const USER_KINDS: [&str; 3] = ["guard", "connector", "approval"];
 const MAX_FILTER: usize = 4096;
 
 /// Whose records a query may see.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// The records of this uid, of [`USER_KINDS`].
     Uid(u32),
+    /// Windows: the records of this SID, of [`USER_KINDS`]. The uid is a label there.
+    Sid(String),
     /// Every record (auditors and root).
     All,
 }
@@ -119,6 +121,19 @@ pub fn may_read_all(dir: &dyn Directory, uid: u32) -> bool {
         || dir
             .name_of(uid)
             .is_some_and(|n| dir.groups_of(&n).iter().any(|g| g == AUDIT_GROUP))
+}
+
+/// [`may_read_all`] for a peer. On Windows the uid is a label, and the group is read from the
+/// token: that's what counts for a low-integrity or restricted child, and a group nested
+/// into the local one shows there. A name that can't be resolved is "no".
+pub fn peer_may_read_all(dir: &dyn Directory, peer: &saiife_ipc::peer::PeerCred) -> bool {
+    if peer.sid.is_none() {
+        return may_read_all(dir, peer.uid);
+    }
+    saiife_win::sid::token_is_admin(&peer.group_sids)
+        || dir
+            .sid_of(AUDIT_GROUP)
+            .is_some_and(|s| peer.group_sids.contains(&s))
 }
 
 /// The scope of a query by `uid`: its own records, or with `all` every
@@ -201,10 +216,11 @@ pub fn parse(args: &Map<String, Value>) -> Result<Query, String> {
 
 /// `r` is inside `scope`. A uid scope needs the record's own uid and one
 /// of [`USER_KINDS`]; a record without a uid is outside every uid scope.
-pub fn in_scope(r: &Record, scope: Scope) -> bool {
+pub fn in_scope(r: &Record, scope: &Scope) -> bool {
     match scope {
         Scope::All => true,
-        Scope::Uid(uid) => r.uid == Some(uid) && USER_KINDS.contains(&r.kind()),
+        Scope::Uid(uid) => r.uid == Some(*uid) && USER_KINDS.contains(&r.kind()),
+        Scope::Sid(sid) => r.sid.as_deref() == Some(sid) && USER_KINDS.contains(&r.kind()),
     }
 }
 
@@ -292,7 +308,7 @@ impl<'q> Pager<'q> {
             return true;
         }
         let q = self.q;
-        if !in_scope(r, self.scope)
+        if !in_scope(r, &self.scope)
             || q.after.as_ref().is_some_and(|a| pos <= a)
             || !r.seq.is_some_and(|s| q.after_seq.is_none_or(|a| s > a))
             || !matches(r, q)
@@ -418,7 +434,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let auditor = if q.all {
         // Decision 6: the current groups, looked up for this request.
         let dir = Arc::clone(&ctx.directory);
-        tokio::task::spawn_blocking(move || may_read_all(dir.as_ref(), uid))
+        let peer = peer.clone();
+        tokio::task::spawn_blocking(move || peer_may_read_all(dir.as_ref(), &peer))
             .await
             .unwrap_or(false)
     } else {
@@ -427,6 +444,10 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let scope = match scope_for(q.all, uid, || auditor) {
         Ok(s) => s,
         Err(m) => return err(id, ErrorCode::Forbidden, &m),
+    };
+    let scope = match (scope, &peer.sid) {
+        (Scope::Uid(_), Some(sid)) => Scope::Sid(sid.clone()),
+        (s, _) => s,
     };
     let Ok(_permit) = QUERIES.acquire().await else {
         return err(id, ErrorCode::Internal, "audit.query failed");
@@ -526,11 +547,64 @@ mod tests {
         assert_eq!(inputs(&p), ["other-guard", "other-conn", "other-approval"]);
     }
 
+    /// Windows: the token decides, and the label says nothing.
+    #[test]
+    fn a_peer_with_a_sid_is_judged_by_its_token() {
+        struct D;
+        impl Directory for D {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                Some("wrong".into())
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                vec![AUDIT_GROUP.to_string()]
+            }
+            fn sid_of(&self, name: &str) -> Option<String> {
+                (name == AUDIT_GROUP).then(|| "S-1-5-21-9-9-9-2000".to_string())
+            }
+        }
+        let peer = |uid: u32, groups: &[&str]| saiife_ipc::peer::PeerCred {
+            uid,
+            gid: 0,
+            pid: 1,
+            sid: Some("S-1-5-21-1-1-1-1001".into()),
+            group_sids: groups.iter().map(|g| g.to_string()).collect(),
+        };
+        assert!(!peer_may_read_all(&D, &peer(7, &[])));
+        // A uid of 0 with no token group behind it is no admin here.
+        assert!(!peer_may_read_all(&D, &peer(0, &[])));
+        assert!(peer_may_read_all(&D, &peer(7, &["S-1-5-21-9-9-9-2000"])));
+        assert!(peer_may_read_all(
+            &D,
+            &peer(7, &[saiife_win::sid::ADMINISTRATORS])
+        ));
+        // SYSTEM's SID alone is no admin: a low-integrity or restricted SYSTEM token has
+        // no Administrators left after `peer_facts`, and reads only its own records.
+        let mut lowered = peer(7, &[]);
+        lowered.sid = Some(saiife_win::sid::SYSTEM.into());
+        assert!(!peer_may_read_all(&D, &lowered));
+        lowered.group_sids = vec![saiife_win::sid::ADMINISTRATORS.into()];
+        assert!(peer_may_read_all(&D, &lowered));
+        // Unix: as it was.
+        let mut unix = peer(1002, &[]);
+        unix.sid = None;
+        let dir = FixedDirectory::from_text(
+            "aud:x:1002:1002::/:/bin/sh\n",
+            &format!("{AUDIT_GROUP}:x:1002:aud\n"),
+        );
+        assert!(peer_may_read_all(&dir, &unix));
+    }
+
     #[test]
     fn records_without_uid_excluded() {
         let records = mixed();
         for scope in [Scope::Uid(ME), Scope::Uid(OTHER), Scope::Uid(0)] {
-            let p = page(&records, scope, &q(json!({})));
+            let p = page(&records, scope.clone(), &q(json!({})));
             assert!(
                 !inputs(&p).iter().any(|i| i.starts_with("no-uid")),
                 "{scope:?}: {p:?}"
@@ -661,6 +735,24 @@ mod tests {
         assert!(parse(json!({"after_seq": "1"}).as_object().unwrap()).is_err());
     }
 
+    /// Windows: two SIDs with one uid label see their own records only.
+    #[test]
+    fn a_sid_scope_sees_only_that_sids_records() {
+        const A: &str = "S-1-5-21-1-2-3-1001";
+        const B: &str = "S-1-5-21-1-2-3-1002";
+        let mut mine = rec(1, "guard", Some(7), "mine");
+        mine.sid = Some(A.into());
+        let mut theirs = rec(2, "guard", Some(7), "theirs");
+        theirs.sid = Some(B.into());
+        let unlabeled = rec(3, "guard", Some(7), "no-sid");
+        let p = page(
+            &[mine, theirs, unlabeled],
+            Scope::Sid(A.into()),
+            &q(json!({})),
+        );
+        assert_eq!(inputs(&p), ["mine"]);
+    }
+
     /// Pages every record of `scope` out of `dir` by the `next` cursor.
     fn page_all(dir: &Path, scope: Scope, limit: u64) -> (Vec<String>, usize) {
         let (mut seen, mut pages, mut after) = (Vec::new(), 0, None::<String>);
@@ -669,7 +761,7 @@ mod tests {
             if let Some(c) = &after {
                 a["after"] = c.clone().into();
             }
-            let p = run(dir, scope, &q(a)).unwrap();
+            let p = run(dir, scope.clone(), &q(a)).unwrap();
             pages += 1;
             seen.extend(inputs(&p));
             if !p.more {

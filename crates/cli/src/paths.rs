@@ -382,6 +382,22 @@ mod tests {
         assert!(w
             .iter()
             .all(|(_, v)| v.starts_with(r"C:\ProgramData\saiife")));
+        // Each value is the layout's Windows path of the Linux constant; the
+        // two names with no Windows path bind what stands in for them.
+        use saiife_system::layout::{windows_path, BINARY, ETC_DIR, LOG_DIR, OPT_DIR, STATE_DIR};
+        for ((name, value), linux) in [
+            (w[0], ETC_DIR),
+            (w[1], STATE_DIR),
+            (w[2], LOG_DIR),
+            (w[4], OPT_DIR),
+        ] {
+            assert_eq!(windows_path(linux), Some(value), "{name}");
+        }
+        assert_eq!(
+            w[3],
+            ("SAIIFE_RUN", saiife_policy::system::WINDOWS_SOCKET_DIR)
+        );
+        assert_eq!(w[5], ("SAIIFE_UNIT", windows_path(BINARY).unwrap()));
         #[cfg(windows)]
         assert_eq!(SYSTEM_PATHS, w);
     }

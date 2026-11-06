@@ -74,15 +74,169 @@ pub fn managed_settings() -> &'static str {
     MANAGED_SETTINGS
 }
 
+/// [`managed_settings`] for a platform. On Windows only the binary path
+/// differs (spec W9), so the two files differ in the command alone.
+pub fn managed_settings_for(windows: bool) -> String {
+    if windows {
+        MANAGED_SETTINGS.replace(crate::UNIX_BINARY, crate::WINDOWS_BINARY)
+    } else {
+        MANAGED_SETTINGS.to_string()
+    }
+}
+
+/// Where Claude Code's Windows policy lives (spec W24).
+pub const HKLM_POLICY_KEY: &str = r"SOFTWARE\Policies\ClaudeCode";
+/// The value under [`HKLM_POLICY_KEY`] that holds the settings JSON.
+pub const HKLM_POLICY_VALUE: &str = "Settings";
+
+/// The `agents.claude.policy` failure (spec W24).
+pub const HKLM_OVERRIDES_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add \"managedSourcesBehavior\": \"merge\" there, or put saiife's hooks in it";
+
+/// The `agents.claude.policy` failure when a merged policy can still turn saiife's hooks off.
+pub const HKLM_WEAKENS_HOOKS_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode merges with saiife's drop-in, but its disableAllHooks or hooks value can turn saiife's hooks off; remove it, or put saiife's hooks in it";
+
+/// What the HKLM `Settings` value does to saiife's drop-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HklmPolicy {
+    /// No `Settings` value, or one with no policy key: Claude Code moves on
+    /// to the files.
+    Absent,
+    /// A policy source that merges with the files.
+    Merge,
+    /// A policy source that replaces the files: the drop-in is ignored.
+    Overrides,
+    /// It merges, and holds a value that can turn saiife's hooks off.
+    WeakensHooks,
+}
+
+/// A registry read that failed for a reason other than "not found".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HklmReadError;
+
+/// What a registry read gives [`hklm_policy`]: the value, none, or an error.
+pub type HklmRead = Result<Option<String>, HklmReadError>;
+
+/// Keys that steer how sources combine and are not policy themselves.
+const CONTROL_KEYS: &[&str] = &["managedSourcesBehavior", "wslInheritsWindowsSettings"];
+
+/// Reads the policy through `reg(key, value)` (the registry read is the
+/// caller's; on Windows see [`hklm_policy_live`]). A value that is not a
+/// JSON object but is not empty counts as `Overrides`: it fails closed.
+pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> HklmRead) -> HklmPolicy {
+    let text = match reg(HKLM_POLICY_KEY, HKLM_POLICY_VALUE) {
+        Ok(Some(t)) => t,
+        Ok(None) => return HklmPolicy::Absent,
+        // Access denied, a value of the wrong type, any read error: the
+        // policy may be there, so the drop-in may be ignored.
+        Err(HklmReadError) => return HklmPolicy::Overrides,
+    };
+    if text.trim().is_empty() {
+        return HklmPolicy::Absent;
+    }
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return HklmPolicy::Overrides;
+    };
+    if map.keys().all(|k| CONTROL_KEYS.contains(&k.as_str())) {
+        return HklmPolicy::Absent;
+    }
+    if map.get("managedSourcesBehavior").and_then(Value::as_str) != Some("merge") {
+        return HklmPolicy::Overrides;
+    }
+    if can_turn_hooks_off(&map) {
+        HklmPolicy::WeakensHooks
+    } else {
+        HklmPolicy::Merge
+    }
+}
+
+/// What in a merged policy could stop saiife's hooks. `disableAllHooks` set to anything but
+/// `false`; and a `hooks` value that does not itself carry saiife's, since how Claude Code
+/// merges that key is not documented here and it may replace the files' value.
+fn can_turn_hooks_off(policy: &serde_json::Map<String, Value>) -> bool {
+    if policy
+        .get("disableAllHooks")
+        .is_some_and(|v| v != &Value::Bool(false))
+    {
+        return true;
+    }
+    policy
+        .get("hooks")
+        .is_some_and(|h| !carries_saiife_hooks(h))
+}
+
+/// Every command of `hooks`, as settings nest them: event, entries, then each entry's `hooks`.
+fn hook_commands(entries: &Value) -> Vec<&str> {
+    entries
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|h| h.get("command")?.as_str())
+        .collect()
+}
+
+fn carries_saiife_hooks(theirs: &Value) -> bool {
+    let Ok(ours) = serde_json::from_str::<Value>(&managed_settings_for(true)) else {
+        return false;
+    };
+    let Some(ours) = ours.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    ours.iter().all(|(event, entries)| {
+        let held = theirs.get(event).map(hook_commands).unwrap_or_default();
+        hook_commands(entries).iter().all(|c| held.contains(c))
+    })
+}
+
+/// One registry read as [`hklm_policy`] wants it: only "not found" means
+/// absent. Every other error (access denied, a REG_DWORD or REG_BINARY
+/// value where a string is expected, ...) is `Err`.
+pub fn hklm_read(r: std::io::Result<String>) -> HklmRead {
+    match r {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(HklmReadError),
+    }
+}
+
+/// [`hklm_policy`] against the real registry (64-bit view of HKLM).
+#[cfg(windows)]
+pub fn hklm_policy_live() -> HklmPolicy {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+    hklm_policy(&|key, value| {
+        match RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(key, KEY_READ | KEY_WOW64_64KEY)
+        {
+            // A missing key is as absent as a missing value.
+            Err(e) => hklm_read(Err(e)),
+            Ok(k) => hklm_read(k.get_value::<String, _>(value)),
+        }
+    })
+}
+
 /// The managed drop-in `60-saiife-mcp.json`: Claude Code may start only
 /// what it names. The broker's own server is pinned by command, so a
 /// project `.mcp.json` cannot define its own `saiife` server; the admin's
 /// `allow_servers` (gateway servers) follow by name, in order, without
 /// repeats. `saiife` is never allowed by name.
 pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
-    let mut entries: Vec<Value> = vec![json!({ "serverCommand": [SAIIFE_BINARY, "mcp"] })];
+    managed_mcp_settings_for(cfg!(windows), allow_servers)
+}
+
+/// [`managed_mcp_settings`] for a platform. On Windows the pinned command
+/// is the W9 binary and no gateway names follow: W18 refuses the gateway
+/// there, so `allow_servers` is ignored.
+pub fn managed_mcp_settings_for(windows: bool, allow_servers: &[String]) -> String {
+    let bin = if windows {
+        crate::WINDOWS_BINARY
+    } else {
+        SAIIFE_BINARY
+    };
+    let mut entries: Vec<Value> = vec![json!({ "serverCommand": [bin, "mcp"] })];
     let mut seen: Vec<&str> = Vec::new();
-    for s in allow_servers {
+    for s in allow_servers.iter().filter(|_| !windows) {
         if s != "saiife" && !seen.contains(&s.as_str()) {
             seen.push(s);
             entries.push(json!({ "serverName": s }));
@@ -100,6 +254,11 @@ pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
 /// `serverUrl`, a `saiife` by name, another key) could let a server that
 /// is not saiife's own run under the name `saiife`.
 pub fn managed_mcp_pinned(text: &str) -> bool {
+    managed_mcp_pinned_for(cfg!(windows), text)
+}
+
+/// [`managed_mcp_pinned`] for a platform (on Windows: the pin alone).
+pub fn managed_mcp_pinned_for(windows: bool, text: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
     };
@@ -110,7 +269,8 @@ pub fn managed_mcp_pinned(text: &str) -> bool {
         .iter()
         .filter_map(|e| e.get("serverName")?.as_str().map(str::to_string))
         .collect();
-    serde_json::from_str::<Value>(&managed_mcp_settings(&names)).is_ok_and(|want| want == v)
+    serde_json::from_str::<Value>(&managed_mcp_settings_for(windows, &names))
+        .is_ok_and(|want| want == v)
 }
 
 /// The installed binary (the same path the hook command uses).
@@ -431,6 +591,153 @@ mod tests {
         assert!(!p.path().join(SETTINGS_REL).exists());
     }
 
+    fn reg(v: Option<&'static str>) -> impl Fn(&str, &str) -> HklmRead {
+        move |k, n| {
+            assert_eq!((k, n), (HKLM_POLICY_KEY, HKLM_POLICY_VALUE));
+            Ok(v.map(str::to_string))
+        }
+    }
+
+    /// Any read error except "not found" fails closed.
+    #[test]
+    fn hklm_read_errors_fail_closed() {
+        let failing = |_: &str, _: &str| Err(HklmReadError);
+        assert_eq!(hklm_policy(&failing), HklmPolicy::Overrides);
+    }
+
+    #[test]
+    fn hklm_only_not_found_is_absent() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(hklm_read(Err(Error::from(ErrorKind::NotFound))), Ok(None));
+        assert_eq!(hklm_read(Ok("{}".into())), Ok(Some("{}".to_string())));
+        for k in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData, // a REG_DWORD or REG_BINARY value
+            ErrorKind::Other,
+            ErrorKind::InvalidInput,
+        ] {
+            assert_eq!(hklm_read(Err(Error::from(k))), Err(HklmReadError), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn windows_mcp_dropin_pins_the_windows_binary() {
+        let w = managed_mcp_settings_for(true, &["github".into()]);
+        let v: Value = serde_json::from_str(&w).unwrap();
+        assert_eq!(
+            v,
+            json!({"allowedMcpServers": [
+                {"serverCommand": ["C:/ProgramData/saiife/bin/saiife.exe", "mcp"]}
+            ]})
+        );
+        assert!(managed_mcp_pinned_for(true, &w));
+        assert!(!managed_mcp_pinned_for(false, &w));
+        assert!(!w.contains("/opt/"));
+        // A gateway name on Windows is not what install writes.
+        let with_name = serde_json::to_string(&json!({"allowedMcpServers": [
+            {"serverCommand": ["C:/ProgramData/saiife/bin/saiife.exe", "mcp"]},
+            {"serverName": "github"}]}))
+        .unwrap();
+        assert!(!managed_mcp_pinned_for(true, &with_name));
+    }
+
+    #[test]
+    fn linux_mcp_dropin_unchanged() {
+        let a = managed_mcp_settings_for(false, &["x".into(), "saiife".into(), "x".into()]);
+        assert_eq!(
+            a,
+            "{\n  \"allowedMcpServers\": [\n    {\n      \"serverCommand\": [\n        \"/opt/saiife/bin/saiife\",\n        \"mcp\"\n      ]\n    },\n    {\n      \"serverName\": \"x\"\n    }\n  ]\n}\n"
+        );
+        assert!(managed_mcp_pinned_for(false, &a));
+        assert!(!managed_mcp_pinned_for(true, &a));
+    }
+
+    #[test]
+    fn hklm_settings_without_merge_fails() {
+        let r = reg(Some(r#"{"permissions":{"deny":["x"]}}"#));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Overrides);
+        let r = reg(Some(r#"{"hooks":{},"managedSourcesBehavior":"replace"}"#));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Overrides);
+        assert_eq!(hklm_policy(&reg(Some("not json"))), HklmPolicy::Overrides);
+    }
+
+    #[test]
+    fn hklm_merge_with_hooks_off_weakens() {
+        let read = |text: String| hklm_policy(&move |_, _| Ok(Some(text.clone())));
+        let m = |rest: &str| format!(r#"{{"managedSourcesBehavior":"merge"{rest}}}"#);
+        assert_eq!(
+            read(m(r#","disableAllHooks":true"#)),
+            HklmPolicy::WeakensHooks
+        );
+        assert_eq!(read(m(r#","disableAllHooks":1"#)), HklmPolicy::WeakensHooks);
+        assert_eq!(read(m(r#","disableAllHooks":false"#)), HklmPolicy::Merge);
+        assert_eq!(read(m(r#","hooks":{}"#)), HklmPolicy::WeakensHooks);
+        let ours: Value = serde_json::from_str(&managed_settings_for(true)).unwrap();
+        let hooks = format!(r#","hooks":{}"#, ours["hooks"]);
+        assert_eq!(read(m(&hooks)), HklmPolicy::Merge);
+        // Without merge the source replaces the files, whatever else it says.
+        assert_eq!(
+            read(r#"{"disableAllHooks":true}"#.to_string()),
+            HklmPolicy::Overrides
+        );
+    }
+
+    #[test]
+    fn hklm_merge_passes() {
+        let r = reg(Some(
+            r#"{"env":{"A":"1"},"managedSourcesBehavior":"merge"}"#,
+        ));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Merge);
+    }
+
+    #[test]
+    fn hklm_absent() {
+        assert_eq!(hklm_policy(&reg(None)), HklmPolicy::Absent);
+        assert_eq!(hklm_policy(&reg(Some(""))), HklmPolicy::Absent);
+    }
+
+    #[test]
+    fn hklm_only_control_keys_is_absent() {
+        let r = reg(Some(
+            r#"{"managedSourcesBehavior":"merge","wslInheritsWindowsSettings":true}"#,
+        ));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Absent);
+        assert_eq!(hklm_policy(&reg(Some("{}"))), HklmPolicy::Absent);
+    }
+
+    #[test]
+    fn hklm_text_is_the_spec_line() {
+        assert_eq!(
+            HKLM_OVERRIDES_TEXT,
+            "HKLM\\SOFTWARE\\Policies\\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add \"managedSourcesBehavior\": \"merge\" there, or put saiife's hooks in it"
+        );
+    }
+
+    /// Linux output is the pinned bytes; Windows differs in the command only.
+    #[test]
+    fn windows_claude_dropin_golden() {
+        assert_eq!(managed_settings_for(false), MANAGED_SETTINGS);
+        let w = managed_settings_for(true);
+        assert_eq!(
+            w.matches(
+                "C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent claude"
+            )
+            .count(),
+            2
+        );
+        assert_eq!(
+            w.replace(crate::WINDOWS_BINARY, crate::UNIX_BINARY),
+            MANAGED_SETTINGS
+        );
+        assert!(!w.contains("/opt/"));
+        let v: Value = serde_json::from_str(&w).unwrap();
+        assert_eq!(v["disableAllHooks"], false);
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+    }
+
     /// `status` reads Claude's managed file on Windows too.
     #[test]
     fn windows_managed_dir_is_pinned() {
@@ -649,12 +956,18 @@ mod mcp_tests {
 
     #[test]
     fn managed_mcp_settings_pins_saiife_by_command() {
-        let text = managed_mcp_settings(&[
-            "github".into(),
-            "saiife".into(),
-            "jira".into(),
-            "github".into(),
-        ]);
+        let servers = [
+            "github".to_string(),
+            "saiife".to_string(),
+            "jira".to_string(),
+            "github".to_string(),
+        ];
+        // What production calls follows the host.
+        assert_eq!(
+            managed_mcp_settings(&servers),
+            managed_mcp_settings_for(cfg!(windows), &servers)
+        );
+        let text = managed_mcp_settings_for(false, &servers);
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             v,

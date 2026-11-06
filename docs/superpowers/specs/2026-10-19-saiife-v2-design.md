@@ -401,6 +401,43 @@ layout is fixed now so that 19a does not block it. This section is numbered
 5.3a because §5.4–§5.6 are cited from about 400 places in code and docs.
 Windows follows the Linux design (§5.2) with the differences below.
 
+**Built (plan 19b).** Locked mode on Windows is built and ships **as a preview**
+(owner ruling 2026-11-06), because of A25 (§9.2): a process of the agent's own user
+can end the hook with `TerminateProcess(hook, 0)`, which every agent reads as allow,
+and nothing is recorded. CI measured it on `windows-2022` and `windows-2025`. `doctor`
+prints `locked.preview` on every locked run, and the docs say "preview" wherever they
+offer Windows locked mode. What changed from the design while it was built:
+
+- **Approvals (W16).** Same-user approval is off, as on macOS (owner ruling
+  2026-11-05): approvals need a second account, from a separate session. The planned
+  password re-authentication and its `LogonUserW` call were dropped.
+- **ACLs act on handles (W1).** `GetSecurityInfo` and `SetSecurityInfo` work on a
+  handle opened without following a reparse point; before a set,
+  `GetFileInformationByHandle` refuses a hard-linked file and `GetFinalPathNameByHandleW`
+  checks that the handle is the path asked for. CI showed that a set reaches inheriting
+  children but not protected ones, so install walks the tree (`set_sddl_tree`), and that
+  files drop `OI` and `CI` (`actual_file_ok`). `LA`, the built-in Administrator, counts
+  as an admin owner.
+- **Peers (W11, W12).** A pipe peer is an admin, uid 0, only at High integrity or above
+  with no restricted SIDs; the same holds for a lowered SYSTEM token. The pipe has at
+  most 254 instances. Approver names and `[[scope]] users` match by SID;
+  `group:` approvers count by the token's groups only.
+- **Service (W10).** The restart action repeats for every failure past the third, so
+  the restarts never run out.
+- **The eval worker** runs in a kill-on-close job object (`job.rs`, three more FFI
+  calls), so a killed hook leaves no worker behind.
+- **Personal broker (W25).** It runs only as a person's account (local, domain or
+  Entra ID); every virtual account and AppContainer is refused.
+- **MSI (W20).** Rollback actions undo the install, upgrade and removal actions.
+- **Measured, not holes:** `DefineDosDevice` on `C:` is refused to a standard user
+  (error 5); a DLL planted beside a copy of `saiife.exe` is not loaded; share-mode-0
+  opens of `saiife.exe` or `config.toml` do not stop hooks; a standard user cannot stop,
+  reconfigure or delete the service. The cross-user `TerminateProcess` seen in CI comes
+  from the test accounts sharing the runner's logon SID (§9.2, A25).
+- **Known limits, not verified:** OpenSSH sessions are probably denied by W11's `NU`
+  deny, so hooks deny there; restricted and low-integrity tokens keep their other
+  groups, so `group:` policy matches them.
+
 **Platform (W2).** Windows is a third value of `Platform`, with the name
 `windows`. Developer mode is v2.2 too, and needs no admin.
 
@@ -448,9 +485,10 @@ Rules:
 - **The service (W10).** Name `saiifed`, own process, auto start, logon
   account `NT SERVICE\saiifed`, binary
   `C:\ProgramData\saiife\bin\saiife.exe` with arguments `daemon --system`,
-  no password. Failure actions: restart after 1 s, three times, reset after
-  86 400 s, also on non-crash failures. This is `Restart=always`,
-  `RestartSec=1`. The service's own DACL is set with `sc.exe sdset saiifed
+  no password. Failure actions: three restart actions after 1 s each, reset
+  after 86 400 s, also on non-crash failures. The service manager repeats the
+  last action for every failure past the third, so the restarts never run out.
+  This is `Restart=always`, `RestartSec=1`. The service's own DACL is set with `sc.exe sdset saiifed
   D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLORC;;;AU)`.
   That is the Windows default plus query rights for Authenticated Users.
   Only SYSTEM and Administrators can stop, pause, reconfigure or delete it.
@@ -508,11 +546,15 @@ configuration (geminicli.com/docs/reference/configuration).
     When it passes, the hook denies and exits.
   - **Server.** After `connect().await`, one synchronous call does
     `ImpersonateNamedPipeClient`, `OpenThreadToken(TOKEN_QUERY, OpenAsSelf =
-    TRUE)`, `GetTokenInformation(TokenUser)`, `GetTokenInformation(TokenGroups)`
+    TRUE)`, `GetTokenInformation(TokenUser)`, `GetTokenInformation(TokenGroups)`,
+    `GetTokenInformation(TokenIntegrityLevel)`,
+    `GetTokenInformation(TokenRestrictedSids)`
     and `RevertToSelf`. There is no `.await` inside. It also reads
     `GetNamedPipeClientProcessId`, for attribution only. If `RevertToSelf`
     ever fails, the process aborts. It must never go on running as the
-    client.
+    client. A pipe peer counts as an elevated admin only at High integrity or
+    above with no restricted SIDs: a low-integrity or restricted child of an
+    elevated admin holds `Administrators` enabled, and is not uid 0.
   - **Why not AF_UNIX.** Windows supports AF_UNIX sockets but gives no peer
     credentials. `SIO_AF_UNIX_GETPEERPID` gives only a pid, and opening
     another user's process from a service account is denied, so a pid
@@ -543,8 +585,8 @@ configuration (geminicli.com/docs/reference/configuration).
 - **Personal broker (W25).**
   - The state dir is `%LOCALAPPDATA%\saiife\personal`.
   - The pipe is `\\.\pipe\saiife-user-<SID>`, owned by the user's SID, with
-    a DACL for that SID and SYSTEM only. The client checks that the owner
-    is its own SID.
+    a DACL for that SID only (ruling: SYSTEM needs no access to a user's
+    broker). The client checks that the owner is its own SID.
   - The vault key is a Credential Manager generic credential. Target
     `saiife:vault-key`, persist `CRED_PERSIST_LOCAL_MACHINE` (never
     roaming), blob 32 bytes.
@@ -581,6 +623,18 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
 | `…\log\daemon` and everything below it | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;FR;;;<A>)` |
 | the managed files and every dir install creates for them | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)` |
 
+- **Setting a descriptor propagates only to children that inherit.** `set_sddl`
+  (`SetSecurityInfo` on an open handle, which is not a reparse point or a
+  hard-linked file) reaches an existing child that inherits: CI read one back as
+  `AI(A;ID;FA;;;LA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)`, its old inherited entries
+  plus the new Users entry. It does not reach a child with `P` set, nor an
+  explicit entry a child holds. So a pre-existing tree (a protected child, or one
+  an old ACL left user-writable by an explicit entry) is fixed only by setting
+  each entry: install walks the tree
+  top-down without following reparse points and sets every entry
+  (`winacl::set_sddl_tree`), refusing a reparse point or a hard link. On a
+  file, Windows drops `OI` and `CI`, so an `OICI` row reads back without them
+  (`winacl::actual_file_ok`); a directory keeps them.
 - **New dirs are created with their descriptor** (`CreateDirectoryW` with
   security attributes). So there is no moment where a user could add a file
   through the inherited `C:\ProgramData` ACL, which lets Users create
@@ -588,12 +642,31 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
 - **Our own paths** must satisfy `protected_ok`. The owner is SYSTEM,
   Administrators or TrustedInstaller. There is no reparse point. The
   `writers` are a subset of SYSTEM, Administrators, TrustedInstaller, plus
-  `<S>` where the table grants it.
+  `<S>` where the table grants it. Inherit-only grants count here, since new
+  children would get them; only `CREATOR OWNER` is exempt, as a placeholder.
+- **Files the service creates.** On a row the service may write, a file or
+  dir it created reads back with `<S>` as owner, its token's group, and the
+  parent's ACEs marked inherited (`AI`, `ID`). So on those rows `<S>` may be
+  the owner, and the comparison ignores the group and the inheritance flags.
+  The grants must still be exactly the row's, so a file another account owns,
+  or that Users or `<A>` can write, still fails. Every other row is compared
+  exactly. To be confirmed on a real machine in `locked-windows`.
 - **An existing path that fails `protected_ok`** is refused with exit 2
   naming the path. Examples: a `C:\ProgramData\saiife`,
   `C:\ProgramData\OpenAI` or `C:\ProgramData\gemini-cli` created by a user,
   and so owned by them. Install never takes over a dir someone else may
   still control.
+- **The dirs an agent reads its policy from** (`ClaudeCode`,
+  `managed-settings.d`, `OpenAI\Codex`, `gemini-cli`) must pass `protected_ok`
+  even when an admin made them (ruling, plan 19b Task 7's review). A stock child
+  of `C:\ProgramData` lets Users create entries, so a user could plant a settings
+  file that install would merge and re-ACL, or that the agent would read. The
+  refusal tells the admin to correct that dir's ACL. Only `C:\ProgramData\OpenAI`
+  holds no policy, so it needs `ancestor_ok` alone, with a warning.
+- **`--purge` keeps the root while a managed file still names the binary.** With
+  the root gone any user could recreate `C:\ProgramData\saiife\bin\saiife.exe`,
+  and a hook left behind would run it for every user. It warns instead. A plain
+  uninstall warns that the hook stays, and that Claude then blocks every tool.
 - **Ancestors** (`C:\`, `C:\ProgramData`, `C:\Program Files`) must satisfy
   `ancestor_ok`. The owner is SYSTEM, Administrators or TrustedInstaller
   (`C:\Program Files` is owned by TrustedInstaller by default). There is no
@@ -618,41 +691,32 @@ References: Microsoft Learn, "Security Descriptor String Format".
 
 #### 5.3a.4 Approvals
 
-Same-user approvals re-authenticate with the account password (W16).
+Same-user approval is off on Windows (W16, owner ruling 2026-11-05), as on macOS.
+Approvals need a second account. `same_user = "reauth"` acts as `"deny"`: a same-user
+decision is refused with `reauth_unavailable` and the text `same-user approval is off on
+Windows: approvals need a second account, from a separate session`. There is no prompt, no
+cooldown and no password anywhere: not in `approval.decide`, not in the CLI, not in the
+daemon. `LogonUserW` is not called. A requester can still withdraw its own request. Only
+SYSTEM, an elevated admin and `[admin]` users can lift or narrow lockdown.
 
-- The CLI prompts on the console with no echo: `saiife: approving request
-  #<n> as <DOMAIN\user>. Windows password: `. It sends the password as
-  `password` in `approval.decide`. The password is held in `Zeroizing` and
-  never logged.
-- The daemon takes the account from the **peer's SID** (`LookupAccountSidW`),
-  never from the client. It calls `LogonUserW(LOGON32_LOGON_NETWORK,
-  LOGON32_PROVIDER_DEFAULT)` on a blocking thread with a 10 s limit. On
-  success, it checks that the new token's `TokenUser` equals the peer SID,
-  then closes the token.
+- **Why.** The agent runs as the human's user. As that user it can capture a console prompt
+  (a global hook covers the whole desktop, and `AttachConsole` reads the input queue), read
+  or inject into the CLI that holds the password, print a prompt of its own, or put another
+  `saiife` first on the user's `PATH`. One capture is enough, and what it captures is the
+  human's Windows password, which is good for far more than saiife. `CREDUIWIN_SECURE_PROMPT`
+  doesn't help: the blob still returns to a process of the same user. Windows Hello doesn't
+  either: the answer reaches only the CLI, and the daemon can't verify it.
+- **The second account must approve from a separate session.** `runas /user:approver` on the
+  agent's desktop can be captured by the same means, so it does not count.
+  - OpenSSH is probably refused: W11's pipe DACL denies `NU` (network logons), and an SSH
+    logon is probably a network logon. This is not verified.
+  - Switching user and RDP should give a separate session. **Neither is verified.** The
+    owner's VM checks them before the docs may recommend one.
+- A later daemon-verified factor outside the agent's reach (a phone code, a hardware key
+  signing a challenge built from the request) could bring same-user approval back. It is new
+  design work and is not planned.
 
-| Win32 error | Result |
-|---|---|
-| success with a matching SID | `Authorized` |
-| `ERROR_LOGON_FAILURE` (1326), `ERROR_ACCOUNT_LOCKED_OUT` (1909), `ERROR_PASSWORD_EXPIRED` (1330), `ERROR_PASSWORD_MUST_CHANGE` (1907), `ERROR_ACCOUNT_DISABLED` (1331) | `Denied` |
-| `ERROR_ACCOUNT_RESTRICTION` (1327, for example a blank password), `ERROR_LOGON_TYPE_NOT_GRANTED` (1385) | `Unavailable` |
-| any other code, the timeout, or a SID mismatch | `Error` |
-
-- **Failure limit.** After 3 `Denied` for one uid within 15 minutes, further
-  same-user approvals are `Unavailable("too many failed re-authentications;
-  wait 15 minutes")`, without calling `LogonUserW`. Each failed `LogonUserW`
-  counts toward the Windows account-lockout policy, so this stops an agent
-  from locking its user out.
-- **Windows Hello is not used.** `UserConsentVerifier` proves presence only
-  to the process that asked. Here that is the CLI, running as the same user
-  as the agent. The daemon cannot verify that answer, so the agent could
-  forge it. Accounts that sign in only with Hello (no known password) get
-  `Unavailable` and use a second account, the Linux fallback
-  (`REAUTH_UNAVAILABLE`).
-- **`CredUIPromptForWindowsCredentials` is not used either.** A console
-  prompt needs no FFI. The password still ends up in a process of the same
-  user, as with Linux `pkttyagent`.
-
-References: Microsoft Learn, `LogonUserW`, `UserConsentVerifier`.
+References: Microsoft Learn, "Hooks Overview", `AttachConsole`, `CredUIPromptForWindowsCredentialsW`.
 
 #### 5.3a.5 Guard: shell dialects, paths and rules
 
@@ -868,12 +932,13 @@ geminicli.com/docs/tools/shell/; code.claude.com/docs/en/settings.
 - The FFI dependency is `windows-sys = "=0.61.2"`, a target dependency under
   `cfg(windows)` only.
 - Why our own crate: no safe crate covers named-pipe client identity, SDDL
-  ACLs, local group lookups and `LogonUserW` together. Two needs have safe
+  ACLs and local group lookups together. Two needs have safe
   crates, and those are used instead of FFI: `windows-service` (the service
   manager) and `winreg` (registry reads). `std` covers the pipe client open
   (`OpenOptionsExt::security_qos_flags`), reparse-point checks
-  (`MetadataExt::file_attributes`) and `fs::canonicalize`. `rpassword` reads
-  the console password.
+  (`MetadataExt::file_attributes`) and `fs::canonicalize`. `rpassword` reads a
+  console value without echo, for `secret add` and `connect` only. Approvals
+  never ask for a password (W16).
 - `scripts/check-unsafe.sh` allows `unsafe` in `crates/darwin/` and in
   `crates/win/src/ffi/`, and nowhere else. `unsafe` that a dependency's macro
   expands into is not caught.
@@ -886,17 +951,18 @@ updating this list and this section.
 | Area (file) | Calls |
 |---|---|
 | Security descriptors (`sd.rs`) | `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `ConvertSecurityDescriptorToStringSecurityDescriptorW`, `GetSecurityDescriptorOwner`, `GetSecurityDescriptorDacl`, `LocalFree` |
-| File ACLs (`acl.rs`) | `GetNamedSecurityInfoW`, `SetNamedSecurityInfoW`, `CreateDirectoryW` (with a descriptor) |
+| File ACLs (`acl.rs`) | `GetSecurityInfo`, `SetSecurityInfo` (each on a handle opened with `FILE_FLAG_OPEN_REPARSE_POINT` and checked, so a final reparse point swapped in cannot redirect them), `GetFileInformationByHandle` (on the same handle before `SetSecurityInfo`: a non-directory with `nNumberOfLinks != 1` is refused, so a hard link cannot redirect a set to its target), `GetFinalPathNameByHandleW` (on the same handle before `SetSecurityInfo`: the path Windows opened must be the path asked for, so a junction swapped in higher up cannot redirect a set), `CreateDirectoryW` (with a descriptor) |
 | SIDs, accounts, local groups (`account.rs`) | `ConvertSidToStringSidW`, `ConvertStringSidToSidW`, `LookupAccountNameW`, `LookupAccountSidW`, `NetUserGetLocalGroups`, `NetLocalGroupGetMembers`, `NetApiBufferFree` |
-| Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`), `CloseHandle` |
+| Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
 | Pipes (`pipe.rs`) | `ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
 | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
-| Re-authentication (`logon.rs`) | `LogonUserW` |
+| Signature check (`trust.rs`) | `WinVerifyTrust` |
 | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
+| Worker job (`job.rs`) | `CreateJobObjectW`, `SetInformationJobObject` (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), `AssignProcessToJobObject`: the managed hook's eval worker dies with the hook |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 37 functions and one macro. The tokio call needs the crate feature
+That is 41 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 40 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 
@@ -918,6 +984,15 @@ tokio-free on the hook path.
 - On removal (`REMOVE="ALL"` and not `UPGRADINGPRODUCTCODE`), a deferred
   action runs `system uninstall` before the files go. Plan 18's removal
   warning goes to the MSI log and `install.log`.
+- Rollback actions undo both, so the machine is never unlocked while the
+  MSI says saiife is installed, nor locked with no product to remove it by.
+  A first install that fails after its files are in runs `system uninstall`
+  (not when `installed.toml` was there before the MSI ran: that locked mode
+  is kept). A failed upgrade runs `system install --fleet --package` with the
+  old staging copy, which the rollback has put back. A failed removal runs
+  `system install --fleet --package` again. `SAIIFE_FORCE_FAIL=1` on the
+  msiexec line forces a failure after the install action and after the file
+  removal, for the package test.
 - The fleet files are `C:\ProgramData\saiife\etc\fleet\config.toml` and
   `install.toml` (plan 18 formats). The deployment tool writes them before
   the MSI runs.
@@ -994,10 +1069,15 @@ docs.firegiant.com/wix/osmf/; docs.rs `windows-service` 0.8.1.
 - **`run --secret` and `run --cloud` (W19).**
   - A `run_allow` entry must be an absolute `X:\…\name.exe` path on a local
     fixed drive. UNC paths and relative paths are load errors.
-  - The file must pass `protected_ok` with writers limited to SYSTEM,
-    Administrators and TrustedInstaller. Every ancestor must pass
-    `ancestor_ok`. There may be no reparse point anywhere in the chain. This
-    check runs where the Linux `root_owned_chain` check runs.
+  - The file and the folder that holds it must pass `protected_ok` with
+    writers limited to SYSTEM, Administrators and TrustedInstaller. A stock
+    `C:\ProgramData` is not enough for that folder: Users could drop a DLL
+    beside the exe. Every ancestor above it must pass `ancestor_ok`. There may
+    be no reparse point anywhere in the chain. This check runs where the Linux
+    `root_owned_chain` check runs.
+  - The list of refused interpreters also holds `py`, `pyw`, `wsl`, `dotnet`,
+    `msiexec`, `conhost`, `wmic` and `javaw`. These count only for a `.exe` or
+    on Windows, so `run_allow` on Linux and macOS means what it did.
   - The loader-variable scrub gains `COR_ENABLE_PROFILING`, `COR_PROFILER`,
     `COR_PROFILER_PATH`, `COR_PROFILER_PATH_32`, `COR_PROFILER_PATH_64`,
     `CORECLR_ENABLE_PROFILING`, `CORECLR_PROFILER`, `CORECLR_PROFILER_PATH*`,
@@ -1135,6 +1215,15 @@ warn or fail, for each agent user named in a scope:
 - `/proc` is not mounted with `hidepid` in a way that hides agent processes
   from the daemon (session attribution, §6.9.3).
 - No plaintext credentials remain in the agent user's reach (§6.16).
+
+**Note (plan 19b, W27): Windows.** An agent user in Administrators, Backup
+Operators, Server Operators, Hyper-V Administrators or Account Operators is a
+`doctor` fail, matched by the groups' well-known SIDs, since their names are
+localized. It drops to a warning only for Administrators with
+`ConsentPromptBehaviorAdmin = 1` and `PromptOnSecureDesktop = 1`. `doctor` reads the
+service, the descriptors of §5.3a.3 and the binary instead of the Unix modes, and it
+names the Linux checks with no Windows form yet (plaintext credentials, model logins,
+leftover project hooks, hard links in the tree, the members of `saiife-audit`).
 
 ## 6. Components
 
@@ -1308,6 +1397,17 @@ gateway children (§6.15) and the daemon's own uid cannot mint the bearer
 token: the control socket refuses own-uid peers in locked mode. The token
 is still required.
 
+**Note (plan 19b, W11, W13): Windows.** The control endpoint is the pipe
+`\\.\pipe\saiife`, with the same frames. The caller's identity is its token's SID
+and groups, read by the daemon while it impersonates at identification level; the
+pid (`GetNamedPipeClientProcessId`) is attribution only. A client with no security
+quality of service keeps its real identity, so it cannot pose as someone else. The
+pipe has at most 254 instances. CI confirmed that the daemon, as `NT
+SERVICE\saiifed`, reads another user's SID from a client's token. There is no
+`gateway.sock`; the loopback TCP listener is opt-in and needs the bearer token, and
+`tcp_peer_refused` returns `None`, as on macOS. The 401 matrix, the token expiry and
+the `peer.tcp` record run on Windows in `windows_daemon.rs`.
+
 ### 6.4 Tamper-evident audit
 
 #### 6.4.1 Chain
@@ -1417,7 +1517,16 @@ least once, to each target. Targets:
   `XDG_RUNTIME_DIR` the runtime dir is `~/Library/Caches/saiife` (0700,
   created if missing) with the sockets in `run/`; a purge of the caches
   needs a broker restart. A socket path over 103 bytes is refused with a
-  clear line.
+  clear line. Built (plan 19b, W25): on Windows the key is a Credential Manager
+  generic credential (`saiife:vault-key`, `CRED_PERSIST_LOCAL_MACHINE`), the state is
+  under `%LOCALAPPDATA%\saiife\personal`, and the endpoint is the pipe
+  `\\.\pipe\saiife-user-<SID>`, owned by and open to that SID only. The broker runs
+  only as a person's account: a local or domain account (`S-1-5-21-…`) or a
+  Microsoft Entra ID account (`S-1-12-1-…`); virtual accounts, AppContainers and
+  groups are refused.
+- **Locked mode on Windows (plan 19b, W15):** the vault key is
+  `C:\ProgramData\saiife\state\keys\vault.key`, readable by the service SID, SYSTEM
+  and Administrators only (§5.3a.3). DPAPI is not used.
 - `saiife secret add <name> --kind token [--service shopify]` reads the value
   from the terminal without echo, or from `--from-file <path>` /
   `--from-env <VAR>`. The value goes to the daemon over the socket (admin
@@ -1662,6 +1771,11 @@ from `LOCAL_PEERPID` (the socket's last pid); a pid that is gone or was
 reused gives no session, never another one. Attribution only: nothing is
 allowed because of it.
 
+**Note (plan 19b, W17): Windows.** The walk uses `CreateToolhelp32Snapshot`, which
+gives each pid's parent and exe name for every user. It gives no start time
+(`start_time` is 0) and no command line, so pid reuse cannot be detected and a
+`node.exe` ancestor gets `session = null`, as on macOS. Attribution only.
+
 #### 6.9.4 Amount caps (proposed addition; in v2.0, owner decision 1)
 
 Manifests mark operations that move money with `amount = { field =
@@ -1739,6 +1853,14 @@ that does not depend on the agent's judgment.
   still registers the right. Spec departure, for the owner to confirm; the
   follow-up is a daemon-side prompt that carries the request (a small
   audited FFI in `saiife-darwin`, owner decision).
+- **Note (plan 19b, W16): same-user approval is off on Windows.** See §5.3a.4.
+  `same_user = "reauth"` acts as `"deny"`, with no password handling at all. The
+  second account must approve from a separate session; `runas` on the agent's
+  desktop can be captured. Built as designed (owner ruling 2026-11-05): there is no
+  `LogonUserW` call and no password re-authentication. Approver names and `[[scope]]
+  users` match by the account's SID, and a `group:` approver counts by the token's
+  groups only, never by a name lookup that would count a deny-only Administrators
+  entry. CI ran an approval with a third account (`approver-hook`).
 - **Fallback without polkit** (owner decision 3). When `pkcheck` or the
   polkit daemon is missing (common on minimal servers), `same_user =
   "reauth"` behaves as `same_user = "deny"`: only a second uid in
@@ -1932,6 +2054,15 @@ with a hint: "run_allow entry /var/x goes through the /var symlink on
 macOS; write /private/var/x instead". The root-owned-chain checks accept
 exactly those three root-owned links to `private/<same name>`.
 
+**Note (plan 19b, W19): Windows.** Built as §5.3a.7 says: a `run_allow` entry is an
+absolute `X:\…\name.exe` on a local fixed drive; the file and its folder must pass
+`protected_ok` with writers limited to SYSTEM, Administrators and TrustedInstaller,
+every ancestor `ancestor_ok`, with no reparse point in the chain; the refused
+interpreters gain `py`, `pyw`, `wsl`, `dotnet`, `msiexec`, `conhost`, `wmic` and
+`javaw`; and the loader scrub gains the .NET profiler variables,
+`DOTNET_STARTUP_HOOKS` and `__COMPAT_LAYER`, on every platform. The value reaches
+the client over the control pipe.
+
 ### 6.15 MCP (proposed additions, after v2.0)
 
 Both parts ship after v2.0 (owner decision 1). Until then, locked mode
@@ -1971,6 +2102,12 @@ Linux (Landlock) in this version"), the same mechanism as the personal
 broker refusal above. `saiife mcp` (the connector tools) works on macOS.
 The follow-up is a macOS sandbox for gateway children (Endpoint Security
 or a separate uid).
+
+**Note (plan 19b, W18): Windows.** The gateway is refused on Windows too, with the
+same `MCP_NEEDS_LINUX` load error; `doctor` prints `mcp.landlock` as Info. `saiife
+mcp` works over the control pipe, with the connector tools. Claude Code's managed MCP
+allowlist (`60-saiife-mcp.json`) pins `C:/ProgramData/saiife/bin/saiife.exe mcp`. An
+AppContainer or job-object sandbox for gateway children is a follow-up.
 
 ### 6.16 `saiife doctor` (proposed addition; in v2.0, owner decision 1)
 
@@ -2104,6 +2241,15 @@ v2.0: `saiife daemon --user`, the personal-broker side of `secret` and
 | `saiife audit [filters]` | anyone | Through the daemon for non-auditors (§6.4.5). New filters: `--kind connector\|approval\|guard`, `--service <s>`. |
 | `saiife lockdown on\|off` | admin / approver | §6.18 (proposed; in v2.0). |
 | `saiife mcp` | agent config | §6.15 (proposed; after v2.0). |
+
+**Note (plan 19b, W25, W26): Windows.** "root" in this table is an elevated
+Administrators token (or SYSTEM); `system install` and `uninstall` refuse from a
+terminal that is not elevated (exit 2). `system install` there creates the service
+`saiifed`, the local group `saiife-audit` and the tree of §5.3a.1; `--package` is for
+the MSI's custom actions. `saiife daemon --user --autostart on|off` sets or removes
+the `HKCU\…\Run` value `saiife-broker`; `--print-unit` is refused on Windows. `secret
+add` and `connect` read a value without echo with `rpassword`; no approval command asks
+for a password.
 
 ## 8. Config and data formats
 
@@ -2396,6 +2542,12 @@ Other kinds carry their own fields (`approval`: `id`, `action`, `by_uid`,
 `sig`; `genesis`: `chain`, `key`). Readers must accept unknown kinds and
 fields.
 
+**Note (plan 19b, W12): `sid`.** On Windows every daemon-written record also
+carries `"sid"`, the caller's exact SID (`"S-1-5-21-…-1003"`), next to `uid`, which
+there is only a label: 0 for SYSTEM and an elevated admin, else a 30-bit hash of the
+SID (§5.3a.2). An approval record names the approver's SID the same way. Linux and
+macOS records have no `sid`; readers that do not know it ignore it.
+
 ### 8.6 Checkpoint and genesis
 
 ```json
@@ -2507,7 +2659,7 @@ is out of scope (§9.5).
 | A1 | Delete or edit the hook in the agent's settings | Managed files are root-owned (`EACCES`). User and project files cannot turn off managed hooks (verified in plan 7). `ConfigChange` records the attempt (Claude Code). |
 | A2 | `disableAllHooks` / `--settings` / `codex -c features.hooks=false` | Managed settings outrank them. `core.self` denies the command lines. Plan 7 test per agent. |
 | A3 | Replace or shadow the `saiife` binary (`PATH`, alias, a file named `saiife`) | The hook uses an absolute path under root-owned directories. `PATH` is not used. |
-| A4 | Inject code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | Linux binary is static musl (ignores `LD_PRELOAD`). macOS (v2.1) binary uses the hardened runtime (ignores `DYLD_*`). A running session's environment cannot be changed by a script. |
+| A4 | Inject code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | Linux binary is static musl (ignores `LD_PRELOAD`). macOS (v2.1) binary uses the hardened runtime (ignores `DYLD_*`). A running session's environment cannot be changed by a script. Windows (v2.2, W28): no `LD_PRELOAD`; the attack is a planted DLL. Release builds link the CRT statically, set `/DEPENDENTLOADFLAG:0x800` and call `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`; `inspect_pe` refuses a build without them. `locked-windows` planted DLLs beside a copy of `saiife.exe`: none loaded. |
 | A5 | Stop or kill the daemon | Another uid: `EPERM`. systemd/launchd restart it if it crashes. While it is down, hooks deny. |
 | A6 | Fake the daemon (own socket) | The socket directory belongs to the daemon user; the client checks the owner; the path is fixed in locked mode. |
 | A7 | Edit, delete or truncate the audit | Files belong to the daemon user (0640, dir 2750). The agent's user cannot write them. Root edits are caught by `verify` with forwarded checkpoints. |
@@ -2528,6 +2680,7 @@ is out of scope (§9.5).
 | A21 | Run its own code outside the hook (script, patched agent, nested agent with other settings) | **Not prevented in v2.** That code runs as the user with no keys, cannot touch saiife, and is not audited. v3. `doctor` warns when agent binaries are user-writable. |
 | A22 | Send data it can read to any host | **Not prevented in v2.** v3 egress control. Egress recipe (proposed, §6.20) for dedicated accounts on Linux. |
 | A23 | Plant persistence that runs later outside a session (cron, user units, login items) | `core.lock` denies the common ways (proposed). A script can still do it: that code is as in A21. |
+| A25 | Forge the hook's verdict: end the hook with `TerminateProcess(hook, 0)` (Windows) | **Not prevented in v2.2; the reason Windows locked mode is a preview** (owner ruling 2026-11-06). A process of the agent's user has full access to its own processes, so it can end the hook with exit 0, which every agent reads as allow; the call runs and no record is written (measured on `windows-2022` and `windows-2025`: the audit's size did not change). It needs the agent's own code running beside it, so it is in the A21 class. On Linux and macOS a kill cannot choose the exit code. In CI a second account could do it too, but only because both test accounts were started with `CreateProcessWithLogonW` from one runner session and so carry its logon SID (`S-1-5-5-0-…`), which the hook's default DACL grants: a test artifact, not a cross-user hole. Next plan: a Claude Code HTTP co-signer hook, exit-watch detection that records a forged exit (a record and a `doctor` warning, no automatic lockdown), and the Linux binary at 0711. |
 
 ### 9.3 Fail-closed matrix
 
@@ -2539,6 +2692,7 @@ is out of scope (§9.5).
 | hook timeout (10 s) | blocked | **runs** | **runs** |
 | daemon down or not answering in 2 s | blocked (saiife denies) | blocked | blocked |
 | binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway | **runs** | possibly blocked (exit 127, unverified) |
+| `check` ended with exit 0 by a process of the agent's user (Windows, A25; A21 class) | **runs** | **runs** | **runs** |
 
 saiife answers well inside the timeout (an internal deadline of 3 s), so the
 "runs" cells need the parent process itself to die or hang. These are the
@@ -2571,7 +2725,9 @@ Legend: **covered**, **partly**, **not covered**.
 Platforms in v2.0: the two locked columns apply to supported Linux systems
 only (Ubuntu 22.04+, Debian 12+, RHEL 9+). Macs, Alpine and containers are
 in the Developer column until v2.1 (macOS) or for good (Alpine,
-containers). Windows is in the Developer column until v2.2 (§5.3a). The Personal broker column describes the mode that ships after
+containers). Windows is in the Developer column until v2.2 (§5.3a); from v2.2 its
+locked columns are a preview, and hold against mistakes and helpful bypasses but not
+against A25 (§9.2). The Personal broker column describes the mode that ships after
 v2.0 (decision 7). An agent labelled "not lockable" by the plan 7 gate
 (decision 9) falls back to the Developer column for the first two rows,
 even on a locked machine.
@@ -2709,6 +2865,31 @@ Developer mode keeps every other v1 behavior unchanged.
 - **Performance:** `scripts/bench-check.sh` extended for locked mode: p95 of
   a full hook call (worker + ack) under 40 ms.
 
+**Note (plan 19b, W23): Windows jobs.** All Windows logic is a pure function or
+sits behind a trait (`Host`), so the Linux suite runs it; the FFI runs only on
+Windows. Three jobs run it there:
+
+- `test` on `windows-latest`: the workspace tests with the FFI round trips,
+  `install.ps1` on PowerShell 7 and 5.1,
+  the reader differential, the developer hook bench (130 ms p95), and the parse and
+  refusal of `scripts/locked-windows/*.ps1` and `scripts/lock-check/windows-vm.ps1`.
+- `locked-windows` on `windows-2022` and `windows-2025`, elevated (the runners are
+  admins with UAC off): `scripts/locked-windows/run.ps1` makes local users, squats both
+  pipes before install, installs the ci-locked build, reads every descriptor back,
+  runs hooks as a standard user, checks fail-closed (daemon stopped, pipe squatted),
+  runs the attacks (DLL planting, `DefineDosDevice`, share-mode-0 opens,
+  `TerminateProcess` on the hook and across users, service control), approves from a
+  third account, turns lockdown on and off, and reinstalls and uninstalls. The
+  measurements are printed as `READBACK` lines for the owner. Its first fully green run
+  is the source of the A25 row (§9.2).
+- `package-windows` on `windows-2025`: builds the MSI with WiX 5, installs, upgrades
+  and removes it, forces a failure after each custom action (`SAIIFE_FORCE_FAIL=1`) to
+  check the rollbacks, runs `detect.ps1`, and checks the `.intunewin` header.
+
+The live lock check on Windows is `scripts/lock-check/windows-vm.ps1`, run by hand
+in a throwaway VM; it has not run yet, so every Windows lock label is `unverified`.
+ARM64 locked mode is owner handwork until a `windows-11-arm` cell is added.
+
 ## 14. Definition of done (v2.0)
 
 1. `sudo saiife system install` works on Ubuntu 22.04 and 24.04, Debian 12
@@ -2776,6 +2957,24 @@ macOS binary with the hardened runtime, always:
 ad-hoc signature only warns, because A4 still holds. On macOS, point 7 is
 met with a second uid only: same-user approval is off (§6.10.2).
 
+**Note (plan 19b, W20, W21): Windows release artifacts and signing modes.** A
+release adds, per architecture (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`):
+the zip that `install.ps1` installs, the MSI (`saiife-<version>-x64.msi`,
+`saiife-<version>-arm64.msi`) and its `.intunewin`, all in `SHA256SUMS`.
+`scripts/release/windows-sign-mode.sh` picks the mode from six Azure Artifact Signing
+variables, which the workflow passes on `v*` tag pushes only:
+
+- all six set: `artifact-signing`. Both `saiife.exe` builds, then both MSIs, are
+  signed, and `signtool verify /pa` runs after each.
+- none set: `unsigned`, with a warning, never a failure; the release notes say so.
+- some set: the run fails and names the missing ones.
+
+`system install` on Windows requires a release build (the PE checks of W28); a
+missing signature only warns. **v2.2** is done as a preview: locked mode meets points
+1, 4 and 7 on Windows Server 2022 and 2025 x64 in CI, with a second account for
+point 7. Point 2 waits for the Windows lock check, and point 3 is not met while A25
+stands.
+
 ## 15. Delivery plans
 
 The v1 track already uses plan 6 (v0.1.1, v1 gaps), so v2 starts at plan 7.
@@ -2809,7 +3008,7 @@ costs about the same, so the total stays close to the first draft.
 | 16 | Personal broker mode | v2.x | `saiife daemon --user`, keychain vault (macOS Keychain, Secret Service), developer-mode `connect`/`secret` (decision 7) | 1 |
 | 17 | MCP (proposed) | v2.x | `saiife mcp` server, MCP gateway for third-party servers, managed MCP restrictions moved behind the broker | 1.5 |
 | 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible). Built (plan 18): Linux packages, Ansible, Intune Linux; `.pkg`, Jamf and Intune macOS after plan 13 | 1 |
-| 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, password re-authentication, MSI, Intune and GPO recipes, a `locked-windows` CI job | 4 |
+| 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, same-user approval off (a second account approves), MSI, Intune and GPO recipes, a `locked-windows` CI job. Built (plan 19b): all of it, shipped as a **preview** (A25, §9.2); the `locked-windows` (Server 2022 and 2025) and `package-windows` jobs; the Windows lock-check harness, not run yet. Next: a Claude Code HTTP co-signer hook, exit-watch detection (record only), the Linux binary at 0711 | 4 |
 
 **Full v2 series (plans 7–18): about 20.5 weeks of evenings.** Plans 14–18
 can be reordered by customer demand. Plan 13 comes first after v2.0 because

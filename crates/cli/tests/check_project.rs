@@ -331,7 +331,8 @@ fn dev_check(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, audit);
     cmd.args(["check", "--agent", agent, "--system-config"])
-        .arg(etc.config());
+        .arg(etc.config())
+        .env("SAIIFE_TEST_TRUST_BELOW", etc.dir.path());
     if hook_exit {
         cmd.arg("--hook-exit");
     }
@@ -530,6 +531,7 @@ fn developer_bad_args_fail_closed_when_opted_in() {
             "--system-config",
         ])
         .arg(etc.config())
+        .env("SAIIFE_TEST_TRUST_BELOW", etc.dir.path())
         .stdin(Stdio::null())
         .output()
         .unwrap();

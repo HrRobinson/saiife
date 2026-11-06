@@ -10,7 +10,10 @@
 //!   a failing target, retried with backoff.
 //! - The directory is opened without following a symlink (its last
 //!   component) and refused when group or others may write to it, unless it
-//!   has the sticky bit. Month files are opened relative to it (`openat`),
+//!   has the sticky bit. On Windows it is held open so it cannot be renamed,
+//!   its final path must be the one configured (no junction above it), and a
+//!   month file must be in it before it is written. On Unix, month files are
+//!   opened relative to it (`openat`),
 //!   without following a symlink and without blocking on a FIFO, and
 //!   refused unless they are regular files with one link, owned by the
 //!   daemon's user: a file someone planted (a hard link to another file, a
@@ -26,8 +29,10 @@
 
 use crate::forwarder::{SendError, SendFuture, Transport};
 use bytes::Bytes;
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,12 +43,30 @@ pub const MAX_RECORDS: usize = 500;
 /// Bytes per batch.
 pub const MAX_BYTES: usize = 1 << 20;
 
+/// Who must own a month file: the daemon's effective uid.
+#[cfg(unix)]
+type Owner = u32;
+/// Who must own a month file: the daemon's SID.
+#[cfg(windows)]
+type Owner = String;
+
+#[cfg(unix)]
+fn own_owner() -> Owner {
+    rustix::process::geteuid().as_raw()
+}
+
+/// A token that cannot be read owns nothing: every month file is refused.
+#[cfg(windows)]
+fn own_owner() -> Owner {
+    crate::fsx::own_sid().unwrap_or_default()
+}
+
 /// Appends to `<dir>/<host>-YYYY-MM.jsonl`.
 pub struct FileTransport {
     dir: PathBuf,
     host: String,
-    /// The owner a month file must have: the daemon's effective uid.
-    owner: u32,
+    /// The owner a month file must have.
+    owner: Owner,
     /// A blocking write is running (possibly hung).
     busy: Arc<AtomicBool>,
     /// Test seam: runs in the blocking write before anything else.
@@ -66,7 +89,7 @@ impl FileTransport {
         FileTransport {
             dir,
             host,
-            owner: rustix::process::geteuid().as_raw(),
+            owner: own_owner(),
             busy: Arc::default(),
             #[cfg(test)]
             before_write: None,
@@ -98,8 +121,125 @@ fn this_month() -> String {
     format!("{:04}-{:02}", now.year(), u8::from(now.month()))
 }
 
+/// The target directory on Windows, held open: no reparse point, and only the system's
+/// accounts and this daemon may write in it. The same rule as on Unix: someone else's
+/// file there is someone else's to plant. There is no sticky bit to look for.
+///
+/// Windows has no `openat` short of `NtCreateFile`, which is not on the W1 list. So the
+/// directory is held instead, and every check reads that handle, never the path again:
+/// - It is opened without following a reparse point and without `FILE_SHARE_DELETE`, so
+///   while the batch runs nobody can rename or delete it to put another in its place.
+/// - Its final path must be `dir` ([`saiife_win::ffi::acl::refuse_redirect`]): a junction
+///   anywhere above it would show there. So `dir` must be the full, long path.
+/// - Its descriptor is read from the handle.
+///
+/// [`open_month`] then checks that the file it opened is in this directory.
+#[cfg(windows)]
+fn open_dir(dir: &Path, owner: &Owner) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_LIST_DIRECTORY: u32 = 0x0001;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let held = std::fs::OpenOptions::new()
+        // FILE_LIST_DIRECTORY, not attributes alone: a handle that asks only for those is
+        // left out of the sharing checks, and would keep nobody from renaming the dir.
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "directory {} does not exist (saiife does not create it)",
+                dir.display()
+            ),
+            _ => format!("{}: {e}", dir.display()),
+        })?;
+    let md = held
+        .metadata()
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    if crate::fsx::is_link(&md) || !md.is_dir() {
+        return Err(format!(
+            "{} is not a directory (a link is not followed)",
+            dir.display()
+        ));
+    }
+    saiife_win::ffi::acl::refuse_redirect(&held, dir).map_err(|e| {
+        format!(
+            "directory {}: {e} (give its full, long path); refused",
+            dir.display()
+        )
+    })?;
+    let text =
+        saiife_win::ffi::acl::get_sddl_of(&held).map_err(|e| format!("{}: {e}", dir.display()))?;
+    match saiife_win::sddl::private_problem(&text, owner, false) {
+        None => Ok(held),
+        Some(why) => Err(format!("directory {}: {why}; refused", dir.display())),
+    }
+}
+
+/// Opens `name` in `dir` for appending, creating it when it is not there. Refuses
+/// anything but a regular file, never through a reparse point, owned by `owner` or a SID
+/// [`saiife_win::sddl::trusted_for`] it (the system's accounts: an elevated admin's new
+/// files are owned by Administrators). A hard
+/// link cannot be counted without a call off the W1 list; [`open_dir`] keeps out anyone
+/// who could plant one.
+///
+/// The open goes by path, so before a byte is written the file must really be
+/// `dir_path\name`, and `held`, the checked directory, must still be at `dir_path`: the
+/// file is then in the directory checked, with no junction on the way. The owner is read
+/// from the opened handle.
+#[cfg(windows)]
+fn open_month(
+    held: &std::fs::File,
+    dir_path: &Path,
+    name: &str,
+    owner: &Owner,
+) -> Result<std::fs::File, String> {
+    use saiife_win::ffi::acl;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let path = dir_path.join(name);
+    let what = |e: std::io::Error| format!("{}: {e}", path.display());
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(what)?;
+    let md = f.metadata().map_err(what)?;
+    if crate::fsx::is_link(&md) || !md.is_file() {
+        return Err(format!("{} is not a regular file; refused", path.display()));
+    }
+    let moved = |e: std::io::Error| format!("{}: {e}; refused", path.display());
+    acl::refuse_redirect(&f, &path).map_err(moved)?;
+    acl::refuse_redirect(held, dir_path).map_err(moved)?;
+    // GENERIC_READ, which `read(true)` asks for, holds READ_CONTROL.
+    let text = acl::get_sddl_of(&f).map_err(what)?;
+    let actual = saiife_win::sddl::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The owners the directory's own check trusts: the system's accounts or this daemon. A
+    // file this process creates as an elevated admin is owned by Administrators.
+    let trusted = actual
+        .owner
+        .as_deref()
+        .is_some_and(|o| saiife_win::sddl::trusted_for(o, owner));
+    if owner.is_empty() || !trusted {
+        return Err(format!(
+            "{} is owned by {}, not by {owner} or the system's accounts (a planted file?); refused",
+            path.display(),
+            actual.owner.as_deref().unwrap_or("nobody"),
+        ));
+    }
+    Ok(f)
+}
+
 /// The target directory: no symlink, not writable by group or others
 /// unless sticky.
+#[cfg(unix)]
 fn open_dir(dir: &Path) -> Result<OwnedFd, String> {
     let fd = rustix::fs::open(
         dir,
@@ -136,6 +276,7 @@ fn open_dir(dir: &Path) -> Result<OwnedFd, String> {
 /// busy loop.
 pub const OPEN_TRIES: usize = 5;
 
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum OpenError {
     Errno(rustix::io::Errno),
@@ -146,6 +287,7 @@ enum OpenError {
 /// Open an existing file with `open`, else create it with `create`
 /// (exclusive). When it was created by someone else in between (EEXIST),
 /// open that one, at most [`OPEN_TRIES`] rounds. `true` when we created it.
+#[cfg(unix)]
 fn open_or_create(
     mut open: impl FnMut() -> rustix::io::Result<OwnedFd>,
     mut create: impl FnMut() -> rustix::io::Result<OwnedFd>,
@@ -166,6 +308,7 @@ fn open_or_create(
     Err(OpenError::Raced)
 }
 
+#[cfg(unix)]
 fn open_month(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -236,8 +379,11 @@ fn append(mut f: std::fs::File, path: &Path, body: &[u8]) -> Result<(), String> 
     f.sync_all().map_err(what)
 }
 
-fn write_batch(dir: &Path, host: &str, owner: u32, lines: &[Bytes]) -> Result<(), String> {
+fn write_batch(dir: &Path, host: &str, owner: &Owner, lines: &[Bytes]) -> Result<(), String> {
+    #[cfg(unix)]
     let dfd = open_dir(dir)?;
+    #[cfg(windows)]
+    let held = open_dir(dir, owner)?;
     // Consecutive runs of one month, in order; each file fsynced once.
     let mut month: Option<String> = None;
     let mut runs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -260,7 +406,10 @@ fn write_batch(dir: &Path, host: &str, owner: u32, lines: &[Bytes]) -> Result<()
     }
     for (m, body) in runs {
         let name = format!("{host}-{m}.jsonl");
-        let f = open_month(&dfd, dir, &name, owner)?;
+        #[cfg(unix)]
+        let f = open_month(&dfd, dir, &name, *owner)?;
+        #[cfg(windows)]
+        let f = open_month(&held, dir, &name, owner)?;
         append(f, &dir.join(&name), &body)?;
     }
     Ok(())
@@ -287,7 +436,9 @@ impl Transport for FileTransport {
             let busy = Busy(Arc::clone(&self.busy));
             let dir = self.dir.clone();
             let host = self.host.clone();
-            let owner = self.owner;
+            // A uid on Unix, a SID on Windows.
+            #[cfg_attr(unix, allow(clippy::clone_on_copy))]
+            let owner = self.owner.clone();
             let lines = lines.to_vec();
             #[cfg(test)]
             let before = self.before_write.clone();
@@ -299,7 +450,7 @@ impl Transport for FileTransport {
                 if let Some(f) = before {
                     f();
                 }
-                write_batch(&dir, &host, owner, &lines)
+                write_batch(&dir, &host, &owner, &lines)
             })
             .await
             .map_err(|e| SendError::Retry(format!("file target: {e}")))?
@@ -312,7 +463,7 @@ impl Transport for FileTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -537,6 +688,151 @@ mod tests {
                 Err(e) => assert!(std::time::Instant::now() < end, "{e:?}"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// Run in CI's `test` job on windows-latest only: no Windows machine builds this crate
+/// locally. The runner is an elevated admin there, so the files it creates are owned by
+/// Administrators.
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+    use saiife_win::ffi::acl;
+
+    fn me() -> String {
+        crate::fsx::own_sid().unwrap()
+    }
+
+    fn line(seq: u64, ts: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"v":1,"seq":{seq},"ts":"{ts}","kind":"guard"}}"#
+        ))
+    }
+
+    /// A target dir only the runner and SYSTEM may use, as `open_dir` wants, in a temp
+    /// root that holds it. Canonical: `set_sddl` compares the path with where the handle
+    /// really is, and the runner's %TEMP% can hold an 8.3 name.
+    fn share() -> (tempfile::TempDir, PathBuf) {
+        let base = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
+        let me = me();
+        let dir = root.path().join("share");
+        let sddl = format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+        acl::create_dir_with_sddl(&dir, &sddl).unwrap();
+        (root, dir)
+    }
+
+    /// The month file is made at the first send and appended to at the next, whichever of
+    /// this process and the system's accounts Windows made its owner.
+    #[tokio::test]
+    async fn the_month_file_is_created_then_appended_to() {
+        let (_root, dir) = share();
+        let t = FileTransport::new(dir.clone(), "h".into());
+        let a = line(1, "2026-10-01T00:00:00.000Z");
+        t.send(std::slice::from_ref(&a)).await.unwrap();
+        let month = dir.join("h-2026-10.jsonl");
+        assert_eq!(std::fs::read(&month).unwrap(), [&a[..], b"\n"].concat());
+        let text = acl::get_sddl(&month).unwrap();
+        let _ = writeln!(std::io::stderr(), "a new month file reads {text}");
+        let b = line(2, "2026-10-02T00:00:00.000Z");
+        t.send(std::slice::from_ref(&b)).await.unwrap();
+        assert_eq!(
+            std::fs::read(&month).unwrap(),
+            [&a[..], b"\n", &b[..], b"\n"].concat()
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    /// A symlink planted as the month file is a reparse point: refused, and its target
+    /// is not written.
+    #[tokio::test]
+    async fn a_reparse_point_month_file_is_refused() {
+        let (root, dir) = share();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"keep\n").unwrap();
+        let planted = dir.join("h-2026-10.jsonl");
+        if let Err(e) = std::os::windows::fs::symlink_file(&elsewhere, &planted) {
+            assert!(
+                std::env::var_os("RUNNER_TEMP").is_none(),
+                "the CI runner should be able to make a link: {e}"
+            );
+            return;
+        }
+        let t = FileTransport::new(dir, "h".into());
+        let err = t
+            .send(&[line(1, "2026-10-01T00:00:00.000Z")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Retry(w) if w.contains("not a regular file")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"keep\n");
+    }
+
+    /// A link above the target dir is followed by a path open, so the dir checked and the
+    /// dir written would be wherever it points: refused by the final path, and nothing is
+    /// written. Then the same dir by its real path delivers.
+    #[tokio::test]
+    async fn a_link_above_the_dir_is_refused() {
+        let (root, dir) = share();
+        let link = root.path().join("link");
+        if let Err(e) = std::os::windows::fs::symlink_dir(root.path(), &link) {
+            assert!(
+                std::env::var_os("RUNNER_TEMP").is_none(),
+                "the CI runner should be able to make a link: {e}"
+            );
+            return;
+        }
+        let t = FileTransport::new(link.join("share"), "h".into());
+        let err = t
+            .send(&[line(1, "2026-10-01T00:00:00.000Z")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Retry(w) if w.contains("full, long path")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let t = FileTransport::new(dir.clone(), "h".into());
+        t.send(&[line(1, "2026-10-01T00:00:00.000Z")])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    /// A month file owned by `Users` (no account the dir check trusts) is refused and left
+    /// as it is. Without `SeRestorePrivilege` a token may name as owner only itself or a
+    /// group it holds with the owner attribute (Administrators, elevated): Windows refuses
+    /// `BU` with `ERROR_INVALID_OWNER`, and then only the predicate's refusal of a plain
+    /// owner is testable (saiife-win's `trusted_for_is_the_system_accounts_and_own`).
+    #[tokio::test]
+    async fn a_month_file_owned_by_users_is_refused() {
+        const ERROR_INVALID_OWNER: i32 = 1307;
+        let (_root, dir) = share();
+        let month = dir.join("h-2026-10.jsonl");
+        std::fs::write(&month, b"").unwrap();
+        let me = me();
+        match acl::set_sddl(&month, &format!("O:BUD:P(A;;FA;;;{me})(A;;FA;;;SY)")) {
+            Ok(()) => {
+                let t = FileTransport::new(dir, "h".into());
+                let err = t
+                    .send(&[line(1, "2026-10-01T00:00:00.000Z")])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, SendError::Retry(w) if w.contains("owned by")),
+                    "{err:?}"
+                );
+                assert_eq!(std::fs::read(&month).unwrap(), b"");
+            }
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "BU as owner refused: {e}");
+                assert_eq!(e.raw_os_error(), Some(ERROR_INVALID_OWNER), "{e}");
+            }
         }
     }
 }

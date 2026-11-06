@@ -3,11 +3,14 @@
 use crate::ops::{self, Ctx, Notice};
 use saiife_ipc::frame::{body_len, decode, encode_max, FrameError, MAX_ANSWER_FRAME};
 use saiife_ipc::msg::{err, ErrorCode, Request, OP_HELLO, PROTO};
-use saiife_ipc::peer::peer_cred;
+use saiife_ipc::peer::PeerCred;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
@@ -29,7 +32,9 @@ enum ReadError {
 
 /// The next frame, `None` at a clean EOF between frames. No timeout while
 /// idle between frames.
-async fn read_frame(s: &mut UnixStream) -> Result<Option<Map<String, Value>>, ReadError> {
+async fn read_frame<S: AsyncRead + Unpin>(
+    s: &mut S,
+) -> Result<Option<Map<String, Value>>, ReadError> {
     let mut h = [0u8; 4];
     match s.read(&mut h[..1]).await {
         Ok(0) => return Ok(None),
@@ -51,22 +56,45 @@ async fn read_frame(s: &mut UnixStream) -> Result<Option<Map<String, Value>>, Re
     }
 }
 
-async fn write(s: &mut UnixStream, v: &Value) -> bool {
+async fn write<S: AsyncWrite + Unpin>(s: &mut S, v: &Value) -> bool {
     write_within(s, v, WRITE_TIMEOUT).await
 }
 
-async fn write_within(s: &mut UnixStream, v: &Value, limit: Duration) -> bool {
+async fn write_within<S: AsyncWrite + Unpin>(s: &mut S, v: &Value, limit: Duration) -> bool {
     let Ok(bytes) = encode_max(v, MAX_ANSWER_FRAME) else {
         return false;
     };
     matches!(timeout(limit, s.write_all(&bytes)).await, Ok(Ok(())))
 }
 
-pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
-    let accepted = tokio::time::Instant::now();
-    let Ok(peer) = peer_cred(&s) else {
+#[cfg(unix)]
+pub async fn connection(s: UnixStream, ctx: Arc<Ctx>) {
+    let Ok(peer) = saiife_ipc::peer::peer_cred(&s) else {
         return;
     };
+    serve_peer(s, peer, ctx).await
+}
+
+/// A connected instance of the control pipe. Its identity is read first, with nothing read
+/// from the client: the pipe's static tracking captured the client's token at open.
+///
+/// `pipe_peer` impersonates, reads the token and reverts with no yield point, so no other
+/// task can run on this thread as the client. Keep it that way: never an `.await` inside
+/// it, and it stays a synchronous call here. A failed revert aborts the process.
+///
+/// A client whose identity cannot be read gets nothing.
+#[cfg(windows)]
+pub async fn connection(s: NamedPipeServer, ctx: Arc<Ctx>) {
+    let Ok(peer) = saiife_ipc::peer::pipe_peer(&s) else {
+        return;
+    };
+    serve_peer(s, peer, ctx).await
+}
+
+/// Serves one identified peer. The caps are taken before any frame is read: a connection
+/// over its uid's cap is closed at once, so it cannot hold a pipe instance or a descriptor.
+async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, peer: PeerCred, ctx: Arc<Ctx>) {
+    let accepted = tokio::time::Instant::now();
     // A gateway MCP child (decision 12), or in locked mode any process of
     // the daemon's own uid: closed before a byte is read or answered.
     if crate::mcp_gateway::unix_peer_refused(&ctx, &peer) {
@@ -78,7 +106,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     }
     // The personal broker talks to its own uid only (decision 3): any
     // other uid, root included, is closed before a byte is answered.
-    if ctx.mode == ops::Mode::Personal && !crate::personal::admits(ctx.own_uid, peer.uid) {
+    if ctx.mode == ops::Mode::Personal && !ctx.peer_is_own(&peer) {
         return;
     }
     // Open-connection caps, before any frame is read: idle connections
@@ -86,17 +114,23 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     let _slot = match ctx.conns.try_open(peer.uid) {
         Ok(slot) => slot,
         Err(code) => {
-            ctx.notice(peer.uid, Notice::Connections);
+            ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Connections);
             let msg = "too many open connections";
             write_within(&mut s, &err(0, code, msg), REFUSE_WRITE_TIMEOUT).await;
             return;
         }
     };
+    // Windows: the first sight of a SID asks Windows for its name, off the runtime, and
+    // lets `Ctx::name_of` answer for its label. Costs nothing once known.
+    if let Some(sid) = peer.sid.clone() {
+        let dir = Arc::clone(&ctx.directory);
+        let _ = tokio::task::spawn_blocking(move || dir.name_of_sid(&sid)).await;
+    }
     // The peer's start time, read now (one small `/proc` read): a same-user
     // approval's re-authentication names this process, and polkit and the
     // daemon check it was not replaced by another with the same pid.
     let conn = ops::Conn::new(
-        peer,
+        peer.clone(),
         crate::reauth::start_time_of(ctx.proc.as_ref(), peer.pid),
     );
     let mut greeted = false;
@@ -148,7 +182,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
         let answer = match ctx.limits.try_begin(peer.uid, Instant::now()) {
             Ok(_in_flight) => ops::dispatch_conn(&ctx, &conn, req).await,
             Err(code) => {
-                ctx.notice(peer.uid, Notice::Requests);
+                ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Requests);
                 err(req.id, code, "too many requests from this uid")
             }
         };
@@ -158,7 +192,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_ipc::frame::encode_max;
@@ -238,5 +272,75 @@ mod tests {
         let (mut ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, me.wrapping_add(1));
         Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
         assert!(hello_answer_bytes(ctx).await.len() > 4);
+    }
+
+    fn windows_peer(uid: u32, sid: &str) -> PeerCred {
+        PeerCred {
+            uid,
+            gid: 0,
+            pid: std::process::id(),
+            sid: Some(sid.to_string()),
+            group_sids: Vec::new(),
+        }
+    }
+
+    /// `serve_peer` over a socket pair, as a Windows pipe peer: what came back.
+    async fn peer_answer(ctx: Arc<Ctx>, peer: PeerCred) -> Vec<u8> {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(serve_peer(theirs, peer, ctx));
+        let hello = json!({"id": 1, "op": OP_HELLO, "proto": PROTO});
+        let _ = ours
+            .write_all(&encode_max(&hello, MAX_ANSWER_FRAME).unwrap())
+            .await;
+        let _ = ours.shutdown().await;
+        let mut got = Vec::new();
+        let read = timeout(Duration::from_secs(5), ours.read_to_end(&mut got)).await;
+        assert!(read.is_ok(), "the connection was not closed");
+        let _ = task.await;
+        got
+    }
+
+    const OWN: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER: &str = "S-1-5-21-1-2-3-1002";
+
+    /// The SID is the identity: a stranger with the daemon's uid label is no own-uid peer,
+    /// and the daemon's own SID is, whatever its label.
+    #[tokio::test]
+    async fn own_peer_is_decided_on_the_sid() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, 7);
+        {
+            let c = Arc::get_mut(&mut ctx).unwrap();
+            c.refuse_own_uid_peers = true;
+            c.own_sid = Some(OWN.to_string());
+        }
+        assert!(
+            peer_answer(Arc::clone(&ctx), windows_peer(7, OTHER))
+                .await
+                .len()
+                > 4
+        );
+        assert!(peer_answer(ctx, windows_peer(9, OWN)).await.is_empty());
+    }
+
+    /// The per-uid cap holds before a frame is read: one over gets `busy` and is closed,
+    /// and another uid still gets in.
+    #[tokio::test]
+    async fn over_the_uid_cap_is_refused_at_accept() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, 7);
+        let held: Vec<_> = (0..crate::limits::MAX_CONNS_PER_UID)
+            .map(|_| ctx.conns.try_open(1000).unwrap())
+            .collect();
+        let got = peer_answer(Arc::clone(&ctx), windows_peer(1000, OTHER)).await;
+        let body: Value = serde_json::from_slice(&got[4..]).unwrap();
+        assert_eq!(body["error"], "busy", "{body}");
+        assert!(
+            peer_answer(Arc::clone(&ctx), windows_peer(1001, OWN))
+                .await
+                .len()
+                > 4
+        );
+        drop(held);
     }
 }

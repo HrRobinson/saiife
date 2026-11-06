@@ -65,12 +65,35 @@ pub struct DaemonCfg {
     pub socket_dir: PathBuf,
 }
 
+/// The daemon's account on Windows (§5.3a, W10). `saiife_system::layout`,
+/// which this crate cannot depend on, checks it against `WIN_DAEMON_ACCOUNT`.
+pub const WINDOWS_DAEMON_USER: &str = r"NT SERVICE\saiifed";
+/// `[daemon] socket_dir` on Windows. Nothing listens here (the endpoint is a
+/// pipe, W11); the name stays bound inside the protected tree, so `core.lock`'s
+/// `$SAIIFE_RUN` rules still have a value.
+pub const WINDOWS_SOCKET_DIR: &str = r"C:\ProgramData\saiife\run";
+/// `[audit] dir` on Windows (W9).
+pub const WINDOWS_AUDIT_DIR: &str = r"C:\ProgramData\saiife\log\audit";
+
+impl DaemonCfg {
+    /// The defaults on Windows, whatever OS this runs on.
+    pub fn windows_default() -> Self {
+        DaemonCfg {
+            user: WINDOWS_DAEMON_USER.to_string(),
+            socket_dir: PathBuf::from(WINDOWS_SOCKET_DIR),
+        }
+    }
+}
+
 impl Default for DaemonCfg {
     /// The §5.2 values; on macOS the §5.3 ones (`_saiife`, and the socket
-    /// dir `/var/db/saiife-run`, plan 13 decision 2). Kept in step with
-    /// `saiife_system::layout` (`MACOS_DAEMON_USER`, `RUN_DIR`), which this
-    /// crate cannot depend on.
+    /// dir `/var/db/saiife-run`, plan 13 decision 2); on Windows the §5.3a
+    /// ones. Kept in step with `saiife_system::layout` (`MACOS_DAEMON_USER`,
+    /// `RUN_DIR`), which this crate cannot depend on.
     fn default() -> Self {
+        if cfg!(windows) {
+            return DaemonCfg::windows_default();
+        }
         let (user, socket_dir) = if cfg!(target_os = "macos") {
             ("_saiife", "/var/db/saiife-run")
         } else {
@@ -133,7 +156,13 @@ pub struct AuditCfg {
 impl Default for AuditCfg {
     fn default() -> Self {
         AuditCfg {
-            dir: PathBuf::from("/var/log/saiife/audit"),
+            // On Windows `\var\log` would be on the current drive, in a dir
+            // any user could have created first.
+            dir: PathBuf::from(if cfg!(windows) {
+                WINDOWS_AUDIT_DIR
+            } else {
+                "/var/log/saiife/audit"
+            }),
             retention_months: 24,
             checkpoint_every: 1000,
             checkpoint_interval: Duration::from_secs(15 * 60),
@@ -259,6 +288,19 @@ pub fn facility_code(name: Option<&str>) -> Option<u8> {
     }
 }
 
+/// What a platform refuses in a `command` notification target. Windows has no check yet of
+/// who can replace the file, so every delivery would fail: a load error says so at once.
+pub fn command_target_problem(windows: bool) -> Option<&'static str> {
+    windows.then_some("command notifications are not available on Windows yet")
+}
+
+/// What a platform refuses in a syslog address: Windows has no local syslog socket.
+pub fn syslog_address_problem(address: &str, windows: bool) -> Option<&'static str> {
+    (windows && address.starts_with("unix:")).then_some(
+        "syslog to a local socket is not available on Windows; use a udp, tcp or tls target",
+    )
+}
+
 impl AuditCfg {
     /// The checks a parse cannot make; `Err` names the target.
     pub fn validate(&self) -> Result<(), String> {
@@ -280,6 +322,9 @@ impl AuditCfg {
                     ca,
                     ..
                 } => {
+                    if let Some(why) = syslog_address_problem(address, cfg!(windows)) {
+                        return bad(why);
+                    }
                     let unix = address.starts_with("unix:");
                     let ok = match address.strip_prefix("unix:") {
                         Some(p) => p.starts_with('/') && p.len() > 1 && !has_ws(p),
@@ -639,6 +684,9 @@ impl NotifyCfg {
                     if !c.path.is_absolute() {
                         return bad("command path must be absolute");
                     }
+                    if let Some(why) = command_target_problem(cfg!(windows)) {
+                        return bad(why);
+                    }
                 }
             }
         }
@@ -679,7 +727,20 @@ mod tests {
         assert_eq!(d.socket_dir, PathBuf::from("/var/db/saiife-run"));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn daemon_cfg_default_windows() {
+        let d = DaemonCfg::windows_default();
+        assert_eq!(d.user, r"NT SERVICE\saiifed");
+        assert_eq!(d.socket_dir, PathBuf::from(r"C:\ProgramData\saiife\run"));
+        assert_eq!(WINDOWS_AUDIT_DIR, r"C:\ProgramData\saiife\log\audit");
+        #[cfg(windows)]
+        {
+            assert_eq!(DaemonCfg::default(), d);
+            assert_eq!(AuditCfg::default().dir, PathBuf::from(WINDOWS_AUDIT_DIR));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn daemon_cfg_default_linux() {
         let d = DaemonCfg::default();
@@ -810,6 +871,34 @@ mod tests {
     }
 
     #[test]
+    fn command_target_refused_on_windows() {
+        assert!(command_target_problem(true).is_some());
+        assert_eq!(command_target_problem(false), None);
+    }
+
+    #[test]
+    fn local_syslog_refused_on_windows() {
+        assert_eq!(
+            syslog_address_problem("unix:/dev/log", true),
+            Some(
+                "syslog to a local socket is not available on Windows; use a udp, tcp or tls target"
+            )
+        );
+        assert_eq!(syslog_address_problem("tls://log.test:6514", true), None);
+        assert_eq!(syslog_address_problem("unix:/dev/log", false), None);
+    }
+
+    /// W13: Windows serves the gateway on loopback TCP only. No `socket` key exists in
+    /// `[gateway]`, so a config that sets one fails to parse, on every OS.
+    #[test]
+    fn gateway_socket_setting_refused_on_windows() {
+        let e = toml::from_str::<GatewayCfg>("socket = \"/run/saiife/gateway.sock\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
+    #[test]
     fn bad_syslog_address_refused() {
         for a in [
             "tls://h",
@@ -828,15 +917,12 @@ mod tests {
             let b = format!("[audit.forward.a]\ntype = \"syslog\"\naddress = \"{a}\"\n");
             assert!(fwd_valid(&b).is_err(), "{a}");
         }
-        for a in [
-            "tls://[::1]:6514",
-            "tls://h.test:6514",
-            "tls://h:65535",
-            "unix:/dev/log",
-        ] {
+        for a in ["tls://[::1]:6514", "tls://h.test:6514", "tls://h:65535"] {
             let b = format!("[audit.forward.a]\ntype = \"syslog\"\naddress = \"{a}\"\n");
             assert!(fwd_valid(&b).is_ok(), "{a}");
         }
+        let local = "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\n";
+        assert_eq!(fwd_valid(local).is_ok(), cfg!(unix));
         let b =
             "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nca = \"/x.pem\"\n";
         assert!(fwd_valid(b).is_err());
@@ -877,7 +963,7 @@ mod tests {
         }
         for f in ["local0", "local7", "user", "daemon"] {
             let b = format!(
-                "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nfacility = \"{f}\"\n"
+                "[audit.forward.a]\ntype = \"syslog\"\naddress = \"tls://h.test:6514\"\nfacility = \"{f}\"\n"
             );
             assert!(fwd_valid(&b).is_ok(), "{f}");
         }

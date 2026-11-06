@@ -19,8 +19,8 @@ use saiife_policy::{load_system, PackInfo};
 #[cfg(unix)]
 use saiife_system::doctor::system::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use saiife_system::layout::{CONFIG, INSTALLED};
+use saiife_system::wintrust::Trust;
 use saiife_system::Layout;
-#[cfg(unix)]
 use saiife_system::{host_for, Host};
 use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
@@ -68,7 +68,7 @@ struct Problem {
 
 /// One line when the personal broker answers hello on its own socket
 /// (plan 16); nothing otherwise. Never on a locked host.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn personal_broker_line() {
     let up = crate::broker::personal(&|k| std::env::var_os(k)).is_ok_and(|t| {
         crate::broker::connect(&t, std::time::Instant::now() + Duration::from_millis(500)).is_ok()
@@ -78,7 +78,7 @@ fn personal_broker_line() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn personal_broker_line() {}
 
 /// `system_root`: the hidden `--root` (tests); the real `/` otherwise.
@@ -803,25 +803,59 @@ struct LockedState {
 /// Spec section 10, verbatim.
 const WORDING_RULE: &str = "note: the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model";
 
-/// Windows: no locked mode exists until plan 19b, so there is no install
-/// record to read and `status` reports developer mode only.
-#[cfg(not(unix))]
-fn locked_block(_layout: &Layout, _builtin: &[Pack]) -> Option<LockedState> {
-    None
+/// The text an administrator runs to mend an install.
+#[cfg(not(windows))]
+const INSTALL_FIX: &str = "`sudo saiife system install`";
+#[cfg(not(windows))]
+const INSTALL_OR_DOCTOR_FIX: &str = "`sudo saiife system install` (or `sudo saiife doctor`)";
+#[cfg(windows)]
+const INSTALL_FIX: &str = "`saiife system install` from an elevated terminal";
+#[cfg(windows)]
+const INSTALL_OR_DOCTOR_FIX: &str =
+    "`saiife system install` (or `saiife doctor`) from an elevated terminal";
+
+/// The doctor's rule, until doctor runs on Windows (Task 8).
+#[cfg(windows)]
+const SAIIFE_LISTED_UNPINNED: &str = "MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command";
+#[cfg(windows)]
+fn unpinned_saiife(agent: &str) -> bool {
+    agent != "claude"
 }
 
-#[cfg(unix)]
+/// Whether `status` has a locked block to print, and what fails in it. On Windows a record
+/// on a tree that is not ours is no install: developer mode, with a warning. On our tree
+/// one that fails the DACL check is locked mode, failed.
+fn record_gate(trust: Trust, path: &Path) -> Option<Option<String>> {
+    match trust {
+        Trust::Absent | Trust::Trusted => Some(None),
+        Trust::Damaged(why) => Some(Some(why)),
+        Trust::NotOurs(why) => {
+            let line = crate::win_locked::not_protected(path, &why);
+            crate::warn(&format!("{}; ignored", sanitize(&line)));
+            None
+        }
+    }
+}
+
 fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
     let installed_path = layout.at(INSTALLED);
     // A dangling or symlinked record still means locked mode (and fails).
     std::fs::symlink_metadata(&installed_path).ok()?;
+    let damaged = record_gate(
+        crate::win_locked::system_file_trust(&installed_path),
+        &installed_path,
+    )?;
     let mut st = LockedState {
         failed: false,
         managed: Vec::new(),
     };
     outln!("\nLocked mode");
     outln!("  {WORDING_RULE}");
-    let installed = match read_installed(&installed_path) {
+    let read = match damaged {
+        Some(why) => Err(crate::win_locked::not_protected(&installed_path, &why)),
+        None => read_installed(&installed_path),
+    };
+    let installed = match read {
         Ok(Some(i)) => {
             outln!(
                 "  mode: locked (installed {}, saiife {})",
@@ -834,22 +868,24 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         Err(e) => {
             st.failed = true;
             outln!(
-                "  mode: locked (the install record cannot be read: {}); ask your administrator to run `sudo saiife system install`",
+                "  mode: locked (the install record cannot be read: {}); ask your administrator to run {INSTALL_FIX}",
                 sanitize(&e)
             );
             None
         }
     };
 
-    let config = load_system(&layout.at(CONFIG))
-        .map_err(|e| e.to_string())
-        .and_then(|l| {
-            if l.config.locked {
-                Ok(l)
-            } else {
-                Err(format!("{CONFIG}: locked is not true"))
-            }
-        });
+    let config_path = layout.at(CONFIG);
+    let config =
+        crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, &config_path)
+            .and_then(|()| load_system(&config_path).map_err(|e| e.to_string()))
+            .and_then(|l| {
+                if l.config.locked {
+                    Ok(l)
+                } else {
+                    Err(format!("{CONFIG}: locked is not true"))
+                }
+            });
     let host = host_for(layout);
     let daemon = match &host {
         Ok(h) => daemon_status(layout, h.as_ref(), config.as_ref().ok().map(|l| &l.config)),
@@ -927,7 +963,7 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         for problem in fingerprint_problems(layout, i) {
             st.failed = true;
             outln!(
-                "  WARNING: {}\n    Fix: ask your administrator to run `sudo saiife system install` (or `sudo saiife doctor`)",
+                "  WARNING: {}\n    Fix: ask your administrator to run {INSTALL_OR_DOCTOR_FIX}",
                 sanitize(&problem)
             );
         }
@@ -1015,38 +1051,16 @@ type DaemonStatus = (
 
 /// `status`, its lockdown flag and the caller's pending requests, or why
 /// it did not answer.
-#[cfg(unix)]
 fn daemon_status(
     layout: &Layout,
     host: &dyn Host,
     cfg: Option<&saiife_policy::SystemConfig>,
 ) -> Result<DaemonStatus, String> {
-    use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
-    use saiife_system::layout::RUN_DIR;
     use serde_json::{Map, Value};
     use std::time::Instant;
-    // The §5.2 (§5.3 on macOS) default lies under the layout's root;
-    // any other value is taken as written (as `doctor` does).
-    let configured = |value: &Path, default: &str| {
-        if value == Path::new(layout.logical(default)) {
-            layout.at(default)
-        } else {
-            value.to_path_buf()
-        }
-    };
-    let (user, dir) = match cfg {
-        Some(c) => (
-            c.daemon.user.clone(),
-            configured(&c.daemon.socket_dir, RUN_DIR),
-        ),
-        None => (layout.daemon_user().to_string(), layout.at(RUN_DIR)),
-    };
-    let Some(uid) = host.user(&user).map(|u| u.uid) else {
-        return Err(format!("the daemon user {user} does not exist"));
-    };
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut c = Client::connect(&dir, uid, deadline).map_err(|e| e.to_string())?;
+    let mut c = status_client(layout, host, cfg, deadline)?;
     let m = c
         .call(OP_STATUS, Map::new(), deadline)
         .map_err(|e| e.to_string())?;
@@ -1080,6 +1094,49 @@ fn daemon_status(
         pending,
         m.get("mcp").cloned().unwrap_or(Value::Null),
     ))
+}
+
+/// The pipe, whatever the config says (W11).
+#[cfg(windows)]
+fn status_client(
+    _layout: &Layout,
+    _host: &dyn Host,
+    _cfg: Option<&saiife_policy::SystemConfig>,
+    deadline: std::time::Instant,
+) -> Result<saiife_ipc::client::Client, String> {
+    crate::broker::system_client(Path::new(""), 0, deadline).map_err(|e| e.to_string())
+}
+
+/// The socket the config names.
+#[cfg(not(windows))]
+fn status_client(
+    layout: &Layout,
+    host: &dyn Host,
+    cfg: Option<&saiife_policy::SystemConfig>,
+    deadline: std::time::Instant,
+) -> Result<saiife_ipc::client::Client, String> {
+    use saiife_ipc::client::Client;
+    use saiife_system::layout::RUN_DIR;
+    // The §5.2 (§5.3 on macOS) default lies under the layout's root;
+    // any other value is taken as written (as `doctor` does).
+    let configured = |value: &Path, default: &str| {
+        if value == Path::new(layout.logical(default)) {
+            layout.at(default)
+        } else {
+            value.to_path_buf()
+        }
+    };
+    let (user, dir) = match cfg {
+        Some(c) => (
+            c.daemon.user.clone(),
+            configured(&c.daemon.socket_dir, RUN_DIR),
+        ),
+        None => (layout.daemon_user().to_string(), layout.at(RUN_DIR)),
+    };
+    let Some(uid) = host.user(&user).map(|u| u.uid) else {
+        return Err(format!("the daemon user {user} does not exist"));
+    };
+    Client::connect(&dir, uid, deadline).map_err(|e| e.to_string())
 }
 
 /// Installed files whose fingerprint differs from `installed.toml`: the

@@ -51,6 +51,8 @@ pub enum PolicyError {
     ScopeConflict { user: String, scopes: Vec<String> },
     #[error("environment {env}: {detail}")]
     Environment { env: String, detail: String },
+    #[error("uid collision between {a} and {b}; rename one or tell the saiife maintainers")]
+    UidCollision { a: String, b: String },
 }
 
 /// Largest config file or drop-in read (1 MiB).
@@ -368,9 +370,16 @@ fn validate_services(
 /// manifest are the daemon's.
 /// What is wrong with a `run_allow` entry.
 enum RunAllowBad {
-    Relative,
+    /// Not absolute. `windows`: the Windows wording (W19).
+    Relative {
+        windows: bool,
+    },
     NoName,
     Interpreter,
+    /// Windows: a drive path that is no plain `X:\...\name.exe`.
+    NotWindowsExe,
+    /// Windows: `\\srv\share\...`, or any other path that names no local drive.
+    Unc,
     /// macOS: the entry starts with `/etc`, `/var` or `/tmp`, root-owned
     /// symlinks into `/private` there (plan 13 decision 10). The daemon
     /// matches the command's canonical path, so such an entry never
@@ -384,7 +393,12 @@ impl RunAllowBad {
     fn describe(&self, entry: &Path) -> String {
         let e = entry.display();
         match self {
-            Self::Relative => format!("run_allow entry {e} must be an absolute path"),
+            Self::Relative { windows: false } => {
+                format!("run_allow entry {e} must be an absolute path")
+            }
+            Self::Relative { windows: true } | Self::NotWindowsExe | Self::Unc => {
+                format!("run_allow entry {e} must be an absolute path to an .exe on a local drive")
+            }
             Self::NoName => format!("run_allow entry {e} names no program (no file name)"),
             Self::Interpreter => format!("run_allow entry {e} is an interpreter or shell"),
             Self::ThroughSystemLink { link } => {
@@ -425,7 +439,55 @@ fn system_link_of(p: &Path) -> Option<&'static str> {
 /// `[services.*.cloud]`: not absolute, no file name (`/`, `/usr/bin/..`),
 /// or an interpreter; on macOS also one through a system symlink.
 fn run_allow_problem(list: &[PathBuf]) -> Option<(RunAllowBad, &PathBuf)> {
+    if cfg!(windows) {
+        return windows_run_allow_problem(list);
+    }
     run_allow_problem_for(list, cfg!(target_os = "macos"))
+}
+
+/// What is wrong with a `run_allow` entry on Windows (W19): it must be `X:\...\name.exe`.
+/// Read as text, so Linux tests cover it. Whether a drive is local and fixed needs a call
+/// off W1's list; at lease time every folder above the file must pass the ACL check.
+fn windows_entry_problem(entry: &str) -> Option<RunAllowBad> {
+    if entry.starts_with(r"\\") || entry.starts_with("//") {
+        return Some(RunAllowBad::Unc);
+    }
+    let bytes = entry.as_bytes();
+    let drive = bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':');
+    if !(drive && bytes.get(2) == Some(&b'\\')) {
+        return Some(RunAllowBad::Relative { windows: true });
+    }
+    let names: Vec<&str> = entry[3..].split('\\').collect();
+    // The forms Windows would rewrite. The daemon compares text, so an entry must be the
+    // path as Windows spells it: `:` is a data stream, a trailing dot or space vanishes.
+    let plain = |n: &str| {
+        !n.is_empty()
+            && n != "."
+            && n != ".."
+            && !n.ends_with(['.', ' '])
+            && !n.contains([':', '/', '*', '?', '"', '<', '>', '|'])
+    };
+    let is_exe = names.last().is_some_and(|n| {
+        n.len() > 4
+            && n.get(n.len() - 4..)
+                .is_some_and(|x| x.eq_ignore_ascii_case(".exe"))
+    });
+    (!is_exe || !names.iter().all(|n| plain(n))).then_some(RunAllowBad::NotWindowsExe)
+}
+
+/// The first bad entry on Windows. An interpreter is as bad as on any OS; its name is the
+/// entry's last one, since off Windows a `\` is no separator.
+fn windows_run_allow_problem(list: &[PathBuf]) -> Option<(RunAllowBad, &PathBuf)> {
+    list.iter().find_map(|p| {
+        let Some(text) = p.to_str() else {
+            return Some((RunAllowBad::NotWindowsExe, p));
+        };
+        if let Some(bad) = windows_entry_problem(text) {
+            return Some((bad, p));
+        }
+        let name = text.rsplit('\\').next().unwrap_or(text);
+        is_interpreter(Path::new(name)).then_some((RunAllowBad::Interpreter, p))
+    })
 }
 
 /// [`run_allow_problem`] for macOS (`macos`) or Linux. The policy crate
@@ -433,7 +495,7 @@ fn run_allow_problem(list: &[PathBuf]) -> Option<(RunAllowBad, &PathBuf)> {
 fn run_allow_problem_for(list: &[PathBuf], macos: bool) -> Option<(RunAllowBad, &PathBuf)> {
     list.iter().find_map(|p| {
         if !p.is_absolute() {
-            Some((RunAllowBad::Relative, p))
+            Some((RunAllowBad::Relative { windows: false }, p))
         } else if p.file_name().is_none() {
             Some((RunAllowBad::NoName, p))
         } else if is_interpreter(p) {
@@ -824,5 +886,91 @@ mod tests {
         assert!(problem(&["var/x"], true)
             .unwrap()
             .contains("must be an absolute path"));
+    }
+
+    /// W19, as text, so it runs anywhere.
+    #[test]
+    fn run_allow_windows_forms() {
+        let text = |e: &str| {
+            format!("run_allow entry {e} must be an absolute path to an .exe on a local drive")
+        };
+        let problem = |e: &str| {
+            let list = [PathBuf::from(e)];
+            windows_run_allow_problem(&list).map(|(b, p)| b.describe(p))
+        };
+        for ok in [
+            r"C:\Tools\aws.exe",
+            r"D:\a b\aws.EXE",
+            r"c:\x.exe",
+            r"C:\Program Files\Amazon\AWSCLIV2\aws.exe",
+        ] {
+            assert_eq!(problem(ok), None, "{ok}");
+        }
+        for bad in [
+            r"\\srv\share\x.exe",
+            r"\\?\C:\Tools\aws.exe",
+            r"\\.\C:\aws.exe",
+            "//srv/share/x.exe",
+            r"tools\aws.exe",
+            r"aws.exe",
+            r"\Tools\aws.exe",
+            r"C:aws.exe",
+            r"C:\Tools\aws",
+            r"C:\Tools\aws.bat",
+            r"C:\Tools\aws.exe.",
+            r"C:\Tools\aws.exe ",
+            r"C:\Tools\aws.exe:stream",
+            r"C:\Tools\..\aws.exe",
+            r"C:\Tools\.\aws.exe",
+            r"C:\Tools\\aws.exe",
+            r"C:\Tools\.exe",
+            "C:/Tools/aws.exe",
+            r"C:\To*ls\aws.exe",
+        ] {
+            assert_eq!(problem(bad), Some(text(bad)), "{bad}");
+        }
+    }
+
+    /// These names mean the same only on Windows: `run_allow` elsewhere is as it was.
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_interpreters_do_not_touch_a_posix_path() {
+        for name in ["py", "wsl", "dotnet", "msiexec", "conhost", "wmic", "javaw"] {
+            let path = format!("/usr/bin/{name}");
+            assert!(!is_interpreter(Path::new(&path)), "{path}");
+            let exe = format!("{name}.exe");
+            assert!(is_interpreter(Path::new(&exe)), "{exe}");
+        }
+    }
+
+    #[test]
+    fn run_allow_windows_refuses_interpreters() {
+        for bad in [
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Windows\System32\CMD.EXE",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Python312\python3.12.exe",
+            r"C:\Windows\System32\wscript.exe",
+            r"C:\Windows\System32\rundll32.exe",
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Windows\py.exe",
+            r"C:\Windows\pyw.exe",
+            r"C:\Windows\System32\wsl.exe",
+            r"C:\Program Files\dotnet\dotnet.exe",
+            r"C:\Windows\System32\msiexec.exe",
+            r"C:\Windows\System32\conhost.exe",
+            r"C:\Windows\System32\wbem\WMIC.exe",
+            r"C:\Program Files\Java\jdk\bin\javaw.exe",
+        ] {
+            let list = [PathBuf::from(bad)];
+            assert!(
+                matches!(
+                    windows_run_allow_problem(&list),
+                    Some((RunAllowBad::Interpreter, _))
+                ),
+                "{bad}"
+            );
+        }
     }
 }

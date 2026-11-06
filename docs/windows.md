@@ -1,10 +1,10 @@
 # saiife on Windows
 
-**Nothing here has run on a real Windows machine yet.** The code was compiled for
-Windows and its pure logic was tested on Linux. The first real run is the
-`windows-latest` CI job, including the check of the readers against real
-PowerShell and cmd. Until that job is green, treat all of this page as designed
-behaviour, not observed behaviour.
+**What has run, and where.** saiife on Windows has run only on throwaway CI runners:
+GitHub's `windows-latest`, `windows-2022` and `windows-2025`. They are Windows Server,
+x64, with an administrator and UAC off. Nothing here has run on a person's Windows 11
+machine or on ARM64. **Windows locked mode is a preview**: see
+[Locked mode](#locked-mode) for why.
 
 Supported: Windows 11 23H2 (build 22631) or later and Windows Server 2022 (build
 20348) or later, on x64 and ARM64. Windows 10 is not supported.
@@ -88,7 +88,36 @@ What happens when the guard cannot judge something:
 
 ## Limits
 
-- **Nothing has run on real Windows until CI does.** The readers' grammar comes from
+### In locked mode
+
+- **Windows locked mode is a preview.** A process of the agent's own user can end a
+  hook with `TerminateProcess(hook, 0)`, and the agent runs the call as allowed, with no
+  record (see [Locked mode](#locked-mode)). This is the same class as running its own
+  code outside the hook ([threats](threats.md), A21 and A25).
+- **Codex and Gemini CLI.** Their fail-open gaps (the
+  [fail-closed matrix](threats.md#fail-closed-matrix)) apply on Windows too, and their
+  Windows hook shells come from their docs, not a run. Their Windows hooks are preview.
+- **Lock labels.** Every Windows lock label is `unverified` until
+  `scripts/lock-check/windows-vm.ps1` has run in a VM ([lock checks](lock-check.md#windows-in-a-throwaway-vm)).
+  Until then each agent falls back to the Developer column for the hook rows.
+- **OpenSSH sessions are probably denied.** The control pipe denies network logons
+  (`NU`), and an OpenSSH logon is probably a network logon. An agent or an approver in
+  an OpenSSH session then cannot reach the daemon, and its hooks deny. Not verified.
+- **Restricted and low-integrity tokens keep their other groups.** Such a token is
+  never counted as an admin. But it still holds the user's other groups, so a
+  `group:<name>` rule in the policy (approvers, admins, scopes) still matches it.
+- **Switching user and RDP** for approvals are not verified.
+- **Session attribution** is by process name only. Windows gives no start time for a
+  process, so a reused pid cannot be told apart. Nothing is allowed because of it.
+- **Not on Windows:** the MCP gateway, the egress recipe and `syslog` to a local
+  socket.
+- **Where it ran.** Only on GitHub's Windows Server runners, x64, elevated, UAC off.
+  ARM64 is built but its locked flow is not tested. A signed MSI and a real Intune or
+  GPO rollout are not tested.
+
+### In the guard
+
+- **The readers come from documentation.** The readers' grammar comes from
   documentation and reasoning. `scripts/differential-windows.ps1` compares them
   with `[System.Management.Automation.Language.Parser]::ParseInput` and with
   harmless `cmd.exe` probes on `windows-latest`. It covers the assumptions listed
@@ -134,8 +163,6 @@ What happens when the guard cannot judge something:
   (`[IO.File]::Delete(…)`) and COM objects. Under the PowerShell reading these are
   denied rather than read. Under cmd only, on a Codex or Gemini CLI call, they
   are recorded.
-- **Agents.** Every Windows lock label is `unverified`, and which shells Codex and
-  Gemini CLI use comes from their docs, not a run.
 
 ## Speed
 
@@ -148,5 +175,149 @@ planned speed-up should tighten it; no figure is promised.
 
 ## Locked mode
 
-Locked mode on Windows is plan 19b. It is not available yet: `saiife system install`
-is refused on Windows. The design is in the v2 spec, section 5.3a.
+Locked mode on Windows is plan 19b (v2.2). The design is in the v2 spec, section
+5.3a.
+
+**Windows locked mode is a preview.** A process that runs as the agent's own user can
+end the hook with `TerminateProcess(hook, 0)`. The agent reads exit 0 as allow, so the
+call the hook was judging runs. Nothing is recorded: on `windows-2022` and
+`windows-2025` the audit had the same size before and after. The agent's user may do
+this because Windows gives a user full access to its own processes. On Linux and macOS
+a kill cannot choose the exit code, so a killed hook does not read as allow there. Use
+Windows locked mode against mistakes and helpful bypasses. Do not rely on it against an
+agent that writes and runs its own code to get past the hook. The next plan adds a
+Claude Code HTTP hook that the daemon co-signs, and a check that records a hook that
+ended without its answer (a record and a `doctor` warning, no automatic lockdown).
+
+### Install
+
+Install from an elevated terminal (Run as administrator), or with the MSI
+([fleet](fleet.md#windows)):
+
+```powershell
+saiife system install
+```
+
+From a terminal that is not elevated it refuses: `run this from an elevated terminal
+(Run as administrator)`, exit 2. It also refuses when the registry does not put the
+system folders at `C:\Program Files` and `C:\ProgramData`, and it installs only a
+release build. It changes nothing until every check has passed.
+
+What it makes:
+
+| What | Where |
+|---|---|
+| The binary the hooks run | `C:\ProgramData\saiife\bin\saiife.exe` |
+| Config, policy and the install record | `C:\ProgramData\saiife\etc\config.toml`, `…\etc\policy.d`, `…\etc\installed.toml` |
+| State and keys | `C:\ProgramData\saiife\state`, `…\state\keys\vault.key`, `…\state\keys\audit.ed25519` |
+| Audit and the daemon's log | `C:\ProgramData\saiife\log\audit`, `…\log\daemon\daemon.log` |
+| The service | `saiifed` ("saiife daemon"), auto start, as the virtual account `NT SERVICE\saiifed` |
+| The control endpoint | the named pipe `\\.\pipe\saiife` |
+| Claude Code's managed hooks | `C:\Program Files\ClaudeCode\managed-settings.d\50-saiife.json` (and `60-saiife-mcp.json`) |
+| Codex's managed hooks | `C:\ProgramData\OpenAI\Codex\requirements.toml` |
+| Gemini CLI's managed hooks | `C:\ProgramData\gemini-cli\settings.json` |
+
+The managed hook command is
+`C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent <agent>`. It
+has forward slashes and no spaces, so Git Bash, PowerShell and cmd all run it as
+written. That is why the binary is not under `C:\Program Files`.
+
+### How the lock holds
+
+- **Files.** Every path install makes gets an owner and a protected access list, so
+  nothing is inherited from `C:\ProgramData`. Only SYSTEM and Administrators can write.
+  Users can read and run the binary and the config. The service can write its state and
+  the audit. `saiife doctor` reads each list back and compares it with the spec.
+- **The service.** It runs as `NT SERVICE\saiifed`, which has its own SID, no password
+  and no interactive logon. It restarts one second after any failure, without end.
+  Only SYSTEM and Administrators can stop, reconfigure or delete it: CI checked that a
+  plain user cannot. While it is down, every hook denies.
+- **The pipe.** Its access list denies network logons and lets users connect, but not
+  add a server instance. The daemon creates the first instance. If someone else holds
+  the name, the daemon refuses to start and logs `pipe \\.\pipe\saiife exists and is not
+  ours; refusing to start`, and the hooks deny meanwhile. A client checks that the
+  pipe's owner is the service before it sends a byte.
+- **Who is calling.** The daemon reads the caller's SID and groups from its token. A
+  caller counts as an admin only at High integrity or above with no restricted SIDs.
+  Every audit record carries the caller's `sid`. The `uid` in records and policy is a
+  label made from the SID: 0 for SYSTEM and elevated admins, a hash otherwise. Policy
+  names users as `name` or `DOMAIN\name`, matched by SID.
+- **Code injected into the hook.** Release builds link the C runtime statically and load
+  DLLs only from System32, and `doctor` checks that. CI planted DLLs beside a copy of
+  `saiife.exe`; none was loaded.
+- **The gateway.** There is no `gateway.sock`. The loopback TCP gateway is opt-in with
+  `[gateway] tcp`, as on Linux. `saiife api` and `saiife mcp` use the pipe. The MCP
+  gateway is Linux only ([MCP](mcp.md)).
+
+### Doctor, uninstall, upgrades
+
+- `saiife doctor`, from an elevated terminal, checks the service, the access lists, the
+  binary (build, load flag, imports, signature), the managed files, Claude Code's
+  `HKLM\SOFTWARE\Policies\ClaudeCode` key, UAC and the agent users. It prints
+  `locked.preview` on every locked run. Some Linux checks have no Windows form yet, and
+  `doctor` lists them.
+- `saiife system uninstall` removes the service and the managed files and keeps the
+  audit and the config. `--purge` removes the rest, but keeps `C:\ProgramData\saiife` while
+  a managed file still names the binary, so that no user can put a file there that a
+  hook would run.
+- The MSI, Intune and GPO: see [fleet](fleet.md#windows).
+
+### What CI tests
+
+The `locked-windows` job runs on `windows-2022` and `windows-2025`, elevated. It
+installs, reads every access list back, runs hooks as a second, standard user, checks
+that hooks fail closed when the daemon is down or the pipe is squatted, approves from a
+third account, turns lockdown on and off, and uninstalls. It also runs the attacks
+below as the standard user, and records what they did. The `package-windows` job
+installs, upgrades and removes the MSI, and forces a failure to check the rollback.
+
+What the attacks did on both runners:
+
+| Attack, as the agent's user | Result |
+|---|---|
+| `TerminateProcess(hook, 0)` on a hook it started | the call is allowed; nothing is recorded |
+| `DefineDosDevice` to point `C:` at its own folder | refused (error 5) |
+| A DLL planted beside a copy of `saiife.exe` | not loaded |
+| Open `saiife.exe` or `config.toml` with share mode 0 | the open works; hooks still work |
+| Stop, reconfigure or delete the service | refused |
+
+In CI the second test account could also end the agent's hook. That is a property of
+the test, not a hole: both accounts were started with `CreateProcessWithLogonW` from
+one runner session, so both carry that session's logon SID (`S-1-5-5-0-…`), and the
+hook's default access list grants that SID the right to end it. Two people logged in
+separately do not share a logon SID.
+
+## Approvals
+
+**Same-user approval is off on Windows, as on macOS. Approvals need a second account,
+from a separate session.** `same_user = "reauth"` acts as `"deny"`. There is no password
+prompt and no re-authentication: saiife never asks for or handles your Windows password.
+See [approvals](approvals.md#windows).
+
+`runas /user:approver` on the agent's desktop does not count: anything the agent's user
+runs can capture what is typed there. OpenSSH is probably refused, because the control
+pipe denies network logons. Switching user and RDP should work, but **neither has been
+verified**.
+
+## Personal broker
+
+`saiife daemon --user` runs on Windows too, as your own account. It is not a security
+boundary, as on the other platforms: see [personal broker](personal-broker.md).
+
+| What | Where |
+|---|---|
+| Config, state and audit | `%LOCALAPPDATA%\saiife\personal\config.toml`, `…\state`, `…\audit` |
+| The endpoint | the pipe `\\.\pipe\saiife-user-<your SID>`, owned by your SID, open to your SID only |
+| The vault key | a Credential Manager generic credential, `saiife:vault-key`, kept on this machine only (never roaming) |
+| Start at logon | `saiife daemon --user --autostart on` sets the value `saiife-broker` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; `off` removes it |
+
+There is no `gateway.sock`: use `saiife api` or `saiife mcp`. `--print-unit` is for
+systemd and launchd only. The broker refuses to run as a virtual or service account.
+
+## Disk encryption
+
+The vault key (`C:\ProgramData\saiife\state\keys\vault.key`) and the audit are protected
+on a running machine by their access lists. Turn on BitLocker to protect them in backups,
+disk images and on a stolen disk. `doctor` does not check BitLocker; it prints one
+`disk.encryption` line that points here. DPAPI is not used, because install runs as an
+admin and cannot seal a key for the service account.

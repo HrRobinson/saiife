@@ -30,6 +30,10 @@ export AR_x86_64_pc_windows_msvc="$PWD/scripts/fake-cc.sh"
 RUSTFLAGS="-D warnings" \
     cargo check --all-targets --target "$target" --target-dir target/check-windows "$@"
 
+# The release profile too: code behind `debug_assertions` hides what a release build sees.
+RUSTFLAGS="-D warnings" \
+    cargo check --release --target "$target" --target-dir target/check-windows "$@"
+
 # Clippy too (CI runs it on windows-latest); --keep-going reports every crate.
 cargo clippy --all-targets --target "$target" --target-dir target/check-windows \
     --keep-going "$@" -- -D warnings

@@ -5,27 +5,49 @@
 //! Every step is idempotent. Whatever a step creates is recorded in
 //! `installed.toml` before the next step runs, so a failure part-way leaves
 //! an accurate list for `uninstall`.
+//!
+//! This file is Linux and macOS, and what all three share. `install` branches on
+//! `layout.platform()`: Windows is [`crate::install_win`].
 
+#[cfg(unix)]
 use crate::authright;
+#[cfg(unix)]
 use crate::default_config::default_config;
+#[cfg(unix)]
 use crate::fsops;
-use crate::host::{valid_name, Host, DSCL, SECURITY};
+use crate::host::Hold;
+use crate::host::Host;
+#[cfg(unix)]
+use crate::host::{valid_name, DSCL, SECURITY};
+use crate::install_win;
+#[cfg(unix)]
 use crate::launchd;
 use crate::layout::*;
+#[cfg(unix)]
 use crate::polkit::polkit_present;
+#[cfg(unix)]
 use crate::supported::{check_supported, Support};
+#[cfg(unix)]
 use crate::unit::{unit_text, vault_key_mode};
-use saiife_agents::{claude, codex, gemini, Agent, AgentError, Change};
+use saiife_agents::Agent;
+#[cfg(unix)]
+use saiife_agents::{claude, codex, gemini, AgentError, Change};
+#[cfg(unix)]
 use saiife_policy::installed::{
     read_installed, write_installed, FileKind, Installed, InstalledFile, ManagedAgent, Membership,
     VaultKeyMode, INSTALLED_VERSION,
 };
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
+#[cfg(unix)]
 use zeroize::Zeroizing;
 
+#[derive(Debug)]
 pub struct InstallOptions {
     pub config: Option<PathBuf>,
     pub agents: Vec<Agent>,
@@ -53,6 +75,42 @@ pub struct InstallReport {
     /// config (it rejected it, or did not answer). Installed, but the old
     /// policy may still be in force: the CLI exits 1.
     pub reload_problem: Option<String>,
+    /// Installed, but something else keeps saiife's hooks from counting (W24): the CLI
+    /// exits 1 with this line.
+    pub policy_failure: Option<String>,
+}
+
+impl InstallReport {
+    /// What `system install` exits with when it installed: 1 when it is not known to be
+    /// in force. Install errors are exit 2.
+    pub fn exit_code(&self, doctor_failed: bool) -> u8 {
+        if doctor_failed || self.reload_problem.is_some() || self.policy_failure.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// `--package` (W20): installed with something to look at is no failure of the package,
+/// so exit 1 becomes 0, and an MSI does not roll back. Exit 2 stays.
+pub fn package_exit(code: u8, package: bool) -> u8 {
+    if package && code == 1 {
+        0
+    } else {
+        code
+    }
+}
+
+/// Appends the doctor's text to the install log, on Windows (W20). Elsewhere it stays on
+/// stdout, where the package's own log has it.
+pub fn write_package_log(layout: &Layout, host: &dyn Host, text: &str) -> Result<(), InstallError> {
+    if layout.platform() == Platform::Windows {
+        install_win::append_install_log(layout, host, text)?;
+    } else {
+        let _ = host;
+    }
+    Ok(())
 }
 
 /// The start of [`InstallReport::reload_problem`] (the Ansible role and
@@ -63,6 +121,9 @@ pub const RELOAD_NOT_TAKEN: &str = "the daemon did not take the new config";
 pub enum InstallError {
     #[error("needs root")]
     NotRoot,
+    /// Windows (W26): not an elevated administrator's token.
+    #[error("{}", crate::supported::NOT_ELEVATED)]
+    NotElevated,
     #[error("{0}")]
     Unsupported(String),
     #[error("{}: {detail}", path.display())]
@@ -75,6 +136,7 @@ pub enum InstallError {
 }
 
 /// Shells that mean "no login" for an existing `saiife` user.
+#[cfg(unix)]
 const NOLOGIN_SHELLS: &[&str] = &[
     "/usr/sbin/nologin",
     "/sbin/nologin",
@@ -83,22 +145,29 @@ const NOLOGIN_SHELLS: &[&str] = &[
 ];
 
 /// A managed writer and its fingerprint (Codex, Gemini CLI).
-type InstallFn = fn(&Path) -> Result<Change, AgentError>;
+#[cfg(unix)]
+type InstallFn = fn(&Path, bool) -> Result<Change, AgentError>;
+#[cfg(unix)]
 type EntryFn = fn(&Path) -> Result<Option<String>, AgentError>;
 
 /// How long a system install waits for the daemon's socket.
+#[cfg(unix)]
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
 /// How long install waits for the daemon to confirm a reload.
+#[cfg(unix)]
 const RELOAD_WAIT: Duration = Duration::from_secs(15);
 
 /// How long a `security authorizationdb` or `dscl` call may take.
+#[cfg(unix)]
 pub(crate) const MACOS_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The shell of the macOS daemon user (spec §5.3).
+#[cfg(unix)]
 const MACOS_FALSE_SHELL: &str = "/usr/bin/false";
 
 /// macOS hands out uids and gids from 500 up to login accounts; a hidden
 /// system account is below.
+#[cfg(unix)]
 const MACOS_FIRST_LOGIN_ID: u32 = 500;
 
 pub(crate) fn step(name: &str) -> impl Fn(io::Error) -> InstallError + '_ {
@@ -108,6 +177,7 @@ pub(crate) fn step(name: &str) -> impl Fn(io::Error) -> InstallError + '_ {
     }
 }
 
+#[cfg(unix)]
 fn agent_step(name: &str) -> impl Fn(AgentError) -> InstallError + '_ {
     move |e| InstallError::Step {
         step: name.to_string(),
@@ -124,7 +194,9 @@ pub(crate) fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
 
 /// The last line of a failed install that had not begun to change anything
 /// (the pkg's `postinstall` matches on it). True except for the lock file,
-/// [`INSTALL_LOCK`], which is empty and protects nothing but install itself.
+/// [`INSTALL_LOCK`], which is empty and protects nothing but install itself. On Windows
+/// nothing at all stays: the lock file goes with its handle, and an empty root the lock
+/// made goes with it ([`crate::install_win`]).
 pub const NOTHING_CHANGED: &str = "saiife: nothing was changed";
 
 /// How long install waits for another install to finish.
@@ -135,18 +207,58 @@ pub(crate) const INSTALL_LOCK_WAIT: Duration = Duration::from_millis(300);
 
 /// Held for one `system install`: an MDM can overlap the pkg's postinstall
 /// and its own fleet script. Released when dropped, or when the process ends.
-#[derive(Debug)]
 pub struct InstallLock {
+    /// The `flock`ed file. For a Windows layout on Unix, which only tests have, the root
+    /// dir: `_hold` is what excludes there.
+    #[cfg(unix)]
     _file: std::fs::File,
+    /// Windows: the lock file in the checked root.
+    _hold: Option<Hold>,
+}
+
+impl std::fmt::Debug for InstallLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstallLock")
+    }
+}
+
+impl InstallLock {
+    fn windows(layout: &Layout, hold: Hold) -> Result<InstallLock, InstallError> {
+        #[cfg(not(unix))]
+        let _ = layout;
+        Ok(InstallLock {
+            #[cfg(unix)]
+            _file: std::fs::File::open(layout.root()).map_err(step("lock"))?,
+            _hold: Some(hold),
+        })
+    }
 }
 
 /// Takes [`INSTALL_LOCK`], waiting up to [`INSTALL_LOCK_WAIT`]. The file must
 /// be a regular file of root's, with no access for group or others. The
 /// `flock` is on the file checked, through one `O_NOFOLLOW` open.
+///
+/// On Windows it is [`WIN_INSTALL_LOCK`], inside a root whose descriptor is checked first.
 pub fn lock_install(layout: &Layout, host: &dyn Host) -> Result<InstallLock, InstallError> {
-    lock_install_within(layout, host, crate::sip::seam_set(), INSTALL_LOCK_WAIT)
+    if layout.platform() == Platform::Windows {
+        let hold = install_win::lock(layout, host, INSTALL_LOCK_WAIT)?;
+        return InstallLock::windows(layout, hold);
+    }
+    #[cfg(unix)]
+    {
+        lock_install_within(layout, host, crate::sip::seam_set(), INSTALL_LOCK_WAIT)
+    }
+    #[cfg(not(unix))]
+    Err(wrong_platform())
 }
 
+/// A non-Windows layout in a Windows build: only tests can make one, and none gets here.
+#[cfg(not(unix))]
+pub(crate) fn wrong_platform() -> InstallError {
+    InstallError::Unsupported(crate::supported::NOT_SUPPORTED_OS.to_string())
+}
+
+#[cfg(unix)]
 fn lock_install_within(
     layout: &Layout,
     host: &dyn Host,
@@ -159,6 +271,7 @@ fn lock_install_within(
 
 /// Takes [`INSTALL_LOCK`] with no host checks: `system uninstall --purge`
 /// must work on a host install would refuse. The caller checked it is root.
+#[cfg(unix)]
 pub(crate) fn take_install_lock(
     layout: &Layout,
     host: &dyn Host,
@@ -203,12 +316,16 @@ pub(crate) fn take_install_lock(
             .map_err(|e| refused(shown, format!("cannot stat: {e}")))?;
         let current = std::fs::symlink_metadata(&path).ok();
         if current.is_some_and(|m| m.dev() == held.dev() && m.ino() == held.ino()) {
-            return Ok(InstallLock { _file: file });
+            return Ok(InstallLock {
+                _file: file,
+                _hold: None,
+            });
         }
     }
 }
 
 /// The lock file, opened with `O_NOFOLLOW` and made if it is missing.
+#[cfg(unix)]
 fn open_install_lock(
     host: &dyn Host,
     shown: &Path,
@@ -270,7 +387,17 @@ pub fn install(
     opts: &InstallOptions,
     binary: &Path,
 ) -> Result<InstallReport, InstallError> {
-    install_with(layout, host, opts, binary, crate::sip::seam_set())
+    if layout.platform() == Platform::Windows {
+        let began = std::cell::Cell::new(false);
+        let lock = lock_install(layout, host)?;
+        return install_locked(&lock, layout, host, opts, binary, &began);
+    }
+    #[cfg(unix)]
+    {
+        install_with(layout, host, opts, binary, crate::sip::seam_set())
+    }
+    #[cfg(not(unix))]
+    Err(wrong_platform())
 }
 
 /// [`install`] for a caller that took the lock itself: it read the fleet
@@ -284,11 +411,20 @@ pub fn install_locked(
     binary: &Path,
     began: &std::cell::Cell<bool>,
 ) -> Result<InstallReport, InstallError> {
-    install_unlocked(layout, host, opts, binary, crate::sip::seam_set(), began)
+    if layout.platform() == Platform::Windows {
+        return install_win::install(layout, host, opts, binary, began);
+    }
+    #[cfg(unix)]
+    {
+        install_unlocked(layout, host, opts, binary, crate::sip::seam_set(), began)
+    }
+    #[cfg(not(unix))]
+    Err(wrong_platform())
 }
 
 /// [`install`] with the SIP test seam given ([`crate::sip::seam_set`]: a
 /// release build always passes false).
+#[cfg(unix)]
 pub(crate) fn install_with(
     layout: &Layout,
     host: &dyn Host,
@@ -312,6 +448,7 @@ pub(crate) fn install_with(
 ///
 /// macOS: SIP on, or the hardened runtime does not keep an injected library
 /// out of the hook (A4). Returns the systemd version and any SIP warning.
+#[cfg(unix)]
 fn host_refusals(
     layout: &Layout,
     host: &dyn Host,
@@ -340,6 +477,7 @@ fn host_refusals(
     Ok((systemd, sip_warning))
 }
 
+#[cfg(unix)]
 fn install_unlocked(
     layout: &Layout,
     host: &dyn Host,
@@ -571,6 +709,7 @@ fn install_unlocked(
 /// Why the binary `bytes` is unfit for locked mode (spec §9.2 A4): not a
 /// static ELF, or a build with debug assertions. `None` for the static
 /// release build.
+#[cfg(unix)]
 fn binary_problem(bytes: &[u8]) -> Option<String> {
     let problems = match crate::binary::inspect(bytes) {
         Ok(info) => info.problems(),
@@ -581,6 +720,7 @@ fn binary_problem(bytes: &[u8]) -> Option<String> {
 
 /// `strict` (the real system without `--allow-test-build`): an unfit
 /// binary is refused. Otherwise it is a warning.
+#[cfg(unix)]
 fn check_binary(path: &Path, bytes: &[u8], strict: bool) -> Result<Option<String>, InstallError> {
     let Some(problem) = binary_problem(bytes) else {
         return Ok(None);
@@ -603,6 +743,7 @@ fn check_binary(path: &Path, bytes: &[u8], strict: bool) -> Result<Option<String
 /// claims ([`crate::binary::inspect_macho`] verifies nothing), so a
 /// `Signed` result is never taken as proof of who built it. Returns the
 /// warnings.
+#[cfg(unix)]
 fn check_macho(path: &Path, bytes: &[u8], strict: bool) -> Result<Vec<String>, InstallError> {
     let (problems, notes) = match crate::binary::inspect_macho(bytes) {
         Ok(info) => (info.problems(), info.warnings()),
@@ -632,6 +773,7 @@ fn check_macho(path: &Path, bytes: &[u8], strict: bool) -> Result<Vec<String>, I
 
 /// An existing macOS vault key must be a regular file of 32 bytes; it is
 /// never replaced.
+#[cfg(unix)]
 fn check_macos_key(layout: &Layout) -> Result<(), InstallError> {
     let p = layout.at(VAULT_KEY);
     match fsops::lstat(&p).map_err(|e| refused(&p, e.to_string()))? {
@@ -652,6 +794,7 @@ fn check_macos_key(layout: &Layout) -> Result<(), InstallError> {
 /// either of dscl's layouts ([`crate::host::parse_dscl_attrs`]). A real
 /// Mac names it `dsAttrTypeNative:IsHidden` (it is no standard attribute;
 /// seen on the macos-15 runners); exactly that prefix is accepted too.
+#[cfg(unix)]
 pub(crate) fn dscl_is_hidden(out: &str) -> bool {
     let attrs = crate::host::parse_dscl_attrs(out);
     ["IsHidden", "dsAttrTypeNative:IsHidden"]
@@ -665,6 +808,7 @@ pub(crate) fn dscl_is_hidden(out: &str) -> bool {
 /// refuses (fail closed). Unless the live installed.toml says install
 /// created it, it must also be hidden, have the shell `/usr/bin/false` and
 /// a uid below 500. It is reused as it is, never created again.
+#[cfg(unix)]
 fn check_macos_daemon_user(
     layout: &Layout,
     host: &dyn Host,
@@ -723,6 +867,7 @@ fn check_macos_daemon_user(
 /// ([`fsops::trusted_link_target`]). Any other path, and every path on
 /// Linux, is returned as it is. For fd-relative walks that refuse every
 /// symlink.
+#[cfg(unix)]
 pub(crate) fn beneath_links(layout: &Layout, host: &dyn Host, logical: &Path) -> PathBuf {
     use std::os::unix::fs::MetadataExt;
     if layout.platform() != Platform::Macos {
@@ -756,6 +901,7 @@ pub(crate) fn beneath_links(layout: &Layout, host: &dyn Host, logical: &Path) ->
 /// link, owned by one of `allowed`, of `len` bytes when given. `None` when
 /// it is missing. A symlink or a hard link (say to a root-owned file the
 /// daemon user linked there) is refused, so root never chowns it.
+#[cfg(unix)]
 fn open_daemon_file(
     dir: &OwnedFd,
     name: &std::ffi::OsStr,
@@ -792,6 +938,7 @@ fn open_daemon_file(
 
 /// What [`open_daemon_file`] requires of the open file's `stat`.
 #[allow(clippy::unnecessary_cast)] // st_nlink and st_size differ per OS
+#[cfg(unix)]
 fn check_daemon_file(
     shown: &Path,
     st: &fsops::Stat,
@@ -832,6 +979,7 @@ fn check_daemon_file(
 
 /// A new file `name` in the open `dir`: `O_CREAT|O_EXCL|O_NOFOLLOW` with
 /// `mode`, so nothing planted there is opened.
+#[cfg(unix)]
 fn create_daemon_file(
     dir: &OwnedFd,
     name: &std::ffi::OsStr,
@@ -849,12 +997,13 @@ fn create_daemon_file(
 }
 
 /// `fchmod` on the open file.
+#[cfg(unix)]
 fn set_mode_fd(fd: &OwnedFd, shown: &Path, mode: u32) -> Result<(), InstallError> {
     rustix::fs::fchmod(fd, rustix::fs::Mode::from_raw_mode(mode as _))
         .map_err(|e| refused(shown, io::Error::from(e).to_string()))
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
@@ -862,6 +1011,7 @@ fn now() -> String {
 
 /// An existing `saiife` user must be a system account without a login,
 /// unless an earlier install created it.
+#[cfg(unix)]
 fn check_daemon_user(host: &dyn Host, previous: Option<&Installed>) -> Result<(), InstallError> {
     let Some(u) = host.user(DAEMON_USER) else {
         return Ok(());
@@ -888,6 +1038,7 @@ fn check_daemon_user(host: &dyn Host, previous: Option<&Installed>) -> Result<()
 /// < 250 the plain vault key is readable by that group (§5.2). This always
 /// runs. Its gid must also be a system gid (below 1000), unless the live
 /// installed.toml says install created the group.
+#[cfg(unix)]
 fn check_daemon_group(host: &dyn Host, live: Option<&Installed>) -> Result<(), InstallError> {
     check_group_for(
         host,
@@ -901,6 +1052,7 @@ fn check_daemon_group(host: &dyn Host, live: Option<&Installed>) -> Result<(), I
 
 /// [`check_daemon_group`] for the daemon group `group` and user `user`,
 /// with system gids below `first_regular`; refusals name `shown`.
+#[cfg(unix)]
 fn check_group_for(
     host: &dyn Host,
     live: Option<&Installed>,
@@ -956,6 +1108,7 @@ fn check_group_for(
 /// The vault-key mode of an existing key file: 32 raw bytes are a plain
 /// key (`File`), anything else an encrypted credential. `None` when there
 /// is no key.
+#[cfg(unix)]
 fn key_file_mode(layout: &Layout) -> Result<Option<VaultKeyMode>, InstallError> {
     let p = layout.at(VAULT_KEY);
     match fsops::lstat(&p).map_err(|e| refused(&p, e.to_string()))? {
@@ -968,9 +1121,11 @@ fn key_file_mode(layout: &Layout) -> Result<Option<VaultKeyMode>, InstallError> 
 
 /// Where a plain uninstall keeps a copy of installed.toml: root:root 0600
 /// in the root-owned `/etc/saiife`, never in the daemon's state dir.
+#[cfg(unix)]
 pub(crate) const PREVIOUS: &str = "/etc/saiife/installed.previous.toml";
 
 /// Largest copy read.
+#[cfg(unix)]
 const MAX_PREVIOUS: u64 = 1024 * 1024;
 
 /// The copy a plain uninstall left, read through one `O_NOFOLLOW` open: it
@@ -980,6 +1135,7 @@ const MAX_PREVIOUS: u64 = 1024 * 1024;
 /// never decides the vault-key mode (the key file does). Removed files
 /// (binary, unit, managed configs) are not taken over; their `created`
 /// flags are found again on the next write.
+#[cfg(unix)]
 pub(crate) fn read_previous(layout: &Layout, host: &dyn Host) -> Option<Installed> {
     let mut i = read_previous_record(layout, host)?;
     let (user, group, audit) = (
@@ -1026,6 +1182,7 @@ pub(crate) fn read_previous(layout: &Layout, host: &dyn Host) -> Option<Installe
 /// without following a symlink, at most 1 MiB) but none on its content.
 /// For what it says about the admin's choices (the agents), never for
 /// what install may take over.
+#[cfg(unix)]
 pub(crate) fn read_previous_record(layout: &Layout, host: &dyn Host) -> Option<Installed> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -1049,6 +1206,7 @@ pub(crate) fn read_previous_record(layout: &Layout, host: &dyn Host) -> Option<I
 /// A directory root writes into must be root's and not writable by group
 /// or others (sticky dirs excepted), so no other user can swap what is
 /// below it while install or uninstall works there.
+#[cfg(unix)]
 pub(crate) fn check_trusted_dir(
     p: &Path,
     m: &std::fs::Metadata,
@@ -1059,6 +1217,7 @@ pub(crate) fn check_trusted_dir(
 }
 
 /// [`check_trusted_dir`] from an owner and permission bits.
+#[cfg(unix)]
 pub(crate) fn check_trusted_owner_mode(
     p: &Path,
     uid: u32,
@@ -1070,6 +1229,7 @@ pub(crate) fn check_trusted_owner_mode(
 
 /// [`check_trusted_owner_mode`] with the consequence the refusal names
 /// (`saiife does not ...`).
+#[cfg(unix)]
 pub(crate) fn check_owner_mode_for(
     p: &Path,
     uid: u32,
@@ -1096,6 +1256,7 @@ pub(crate) fn check_owner_mode_for(
 /// existing dir on the way (from `/usr`) that is not a directory, not
 /// root's or writable by group or others, as `<path> is ...`. Dirs that do
 /// not exist yet would be created by install, so the walk stops there.
+#[cfg(unix)]
 fn polkit_dir_problem(layout: &Layout, host: &dyn Host) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let root_uid = host.user("root").map(|u| u.uid)?;
@@ -1127,6 +1288,7 @@ fn polkit_dir_problem(layout: &Layout, host: &dyn Host) -> Option<String> {
 
 /// An existing state dir, key dir or audit key must be the daemon user's,
 /// with the spec modes. They are never adopted otherwise.
+#[cfg(unix)]
 fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
     use std::os::unix::fs::MetadataExt;
     let daemon_user = layout.daemon_user();
@@ -1184,6 +1346,7 @@ fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallErro
 
 /// The `--config` file: it loads and checks (unknown keys, scopes) and says
 /// `locked = true`. Returns its text.
+#[cfg(unix)]
 fn validated_config(path: &Path, dropins: &Path) -> Result<String, InstallError> {
     let text = std::fs::read_to_string(path).map_err(|e| refused(path, e.to_string()))?;
     let loaded = saiife_policy::load_and_check_with(path, dropins, &saiife_policy::Getent)
@@ -1202,6 +1365,7 @@ fn validated_config(path: &Path, dropins: &Path) -> Result<String, InstallError>
 }
 
 /// Root's group: `root` on Linux, `wheel` (gid 0) on macOS.
+#[cfg(unix)]
 pub(crate) fn root_group(layout: &Layout) -> &'static str {
     match layout.platform() {
         Platform::Linux | Platform::Windows => "root",
@@ -1210,6 +1374,7 @@ pub(crate) fn root_group(layout: &Layout) -> &'static str {
 }
 
 /// One install run: the record so far and what was written last.
+#[cfg(unix)]
 struct Run<'a> {
     layout: &'a Layout,
     host: &'a dyn Host,
@@ -1221,6 +1386,7 @@ struct Run<'a> {
     report: InstallReport,
 }
 
+#[cfg(unix)]
 impl Run<'_> {
     fn at(&self, abs: &str) -> PathBuf {
         self.layout.at(abs)
@@ -1573,6 +1739,7 @@ impl Run<'_> {
             Agent::Codex => (CODEX_DIR, CODEX_REQUIREMENTS),
             Agent::Gemini => (GEMINI_DIR, GEMINI_SETTINGS),
         };
+        let windows = self.layout.platform() == Platform::Windows;
         self.dir(dir_abs, 0o755, false)?;
         let p = self.at(file_abs);
         let shown = self.layout.logical(file_abs);
@@ -1585,7 +1752,8 @@ impl Run<'_> {
         self.save()?;
         let (sha, whole) = match a {
             Agent::Claude => {
-                let bytes = claude::managed_settings().as_bytes();
+                let text = claude::managed_settings_for(windows);
+                let bytes = text.as_bytes();
                 let current = fsops::sha256_file(&p).map_err(|e| refused(&p, e.to_string()))?;
                 let want = fsops::sha256_hex(bytes);
                 if current.as_deref() != Some(want.as_str()) {
@@ -1598,11 +1766,11 @@ impl Run<'_> {
             }
             Agent::Codex | Agent::Gemini => {
                 let (install, entry): (InstallFn, EntryFn) = if a == Agent::Codex {
-                    (codex::install_managed, codex::managed_entry)
+                    (codex::install_managed_for, codex::managed_entry)
                 } else {
-                    (gemini::install_managed, gemini::managed_entry)
+                    (gemini::install_managed_for, gemini::managed_entry)
                 };
-                match install(&p).map_err(agent_step("managed"))? {
+                match install(&p, windows).map_err(agent_step("managed"))? {
                     Change::Unchanged => self.unchanged(shown),
                     _ => self.changed(shown),
                 }
@@ -1650,7 +1818,8 @@ impl Run<'_> {
                 Vec::new()
             }
         };
-        let text = claude::managed_mcp_settings(&allow);
+        let windows = self.layout.platform() == Platform::Windows;
+        let text = claude::managed_mcp_settings_for(windows, &allow);
         self.file(
             CLAUDE_MCP,
             text.as_bytes(),

@@ -13,6 +13,7 @@ on:
       - 'scripts/release/**'
       - 'packaging/**'
       - 'scripts/package-linux/**'
+      - 'scripts/package-windows/**'
   workflow_dispatch:
 
 permissions:
@@ -441,8 +442,98 @@ jobs:
           path: pkg-out/*.pkg
           if-no-files-found: error
 
+  # The MSIs and the Intune Win32 packages (plan 19b Task 13). The MSI wraps the exe the
+  # build job already signed, then is signed itself in artifact-signing mode (the same gate
+  # and action as the exe: secrets exist only on v* tag refs). The .intunewin is built from
+  # the signed MSI. Without the secrets the MSI is unsigned, the job stays green, and the
+  # release notes say so.
+  windows-msi:
+    needs: [check-version, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+    runs-on: windows-2025
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+      # The packaged bytes are the zip's bytes, signed exe included.
+      - name: unpack saiife.exe from the zip
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'p19b-msi-exe'
+          Expand-Archive -LiteralPath "dist/saiife-$env:VERSION-$env:TARGET.zip" -DestinationPath $dest
+          $exe = Get-ChildItem -Recurse -Filter saiife.exe $dest | Select-Object -First 1
+          if ($null -eq $exe) { Write-Output '::error::no saiife.exe in the zip'; exit 1 }
+          "SAIIFE_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
+      - name: build the MSI
+        shell: pwsh
+        run: ./scripts/package-windows/build.ps1 -Target $env:TARGET -Version $env:VERSION -Exe $env:SAIIFE_EXE -OutDir dist -Only msi
+      - name: signing mode (MSI)
+        id: msisign
+        shell: bash
+        env:
+          WINDOWS_SIGN_AZURE_TENANT_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_TENANT_ID || '' }}
+          WINDOWS_SIGN_AZURE_CLIENT_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_ID || '' }}
+          WINDOWS_SIGN_AZURE_CLIENT_SECRET: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_SECRET || '' }}
+          WINDOWS_SIGN_ENDPOINT: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ENDPOINT || '' }}
+          WINDOWS_SIGN_ACCOUNT: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ACCOUNT || '' }}
+          WINDOWS_SIGN_PROFILE: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_PROFILE || '' }}
+          MSI_ARCH: ${{ matrix.arch }}
+        # Writes dist/SIGNING-msi-<arch>.txt, which the publish job reads.
+        run: bash scripts/release/windows-sign-mode.sh "msi-$MSI_ARCH"
+      - name: sign (MSI)
+        if: steps.msisign.outputs.mode == 'artifact-signing'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_TENANT_ID || '' }}
+          azure-client-id: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_ID || '' }}
+          azure-client-secret: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_SECRET || '' }}
+          endpoint: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ENDPOINT || '' }}
+          signing-account-name: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ACCOUNT || '' }}
+          certificate-profile-name: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_PROFILE || '' }}
+          cache-dependencies: 'false'
+          files: ${{ github.workspace }}\dist\saiife-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: signtool verify (MSI)
+        if: steps.msisign.outputs.mode == 'artifact-signing'
+        shell: pwsh
+        env:
+          MSI_ARCH: ${{ matrix.arch }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if ($null -eq $signtool) { Write-Output '::error::signtool.exe not found'; exit 1 }
+          & $signtool.FullName verify /pa /v "dist/saiife-$env:VERSION-$env:MSI_ARCH.msi"
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::signtool verify failed'; exit 1 }
+      - name: build the .intunewin from the MSI
+        shell: pwsh
+        run: ./scripts/package-windows/build.ps1 -Target $env:TARGET -Version $env:VERSION -OutDir dist -Only intunewin
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pkg-windows-msi-${{ matrix.arch }}
+          path: |
+            dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.msi
+            dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.intunewin
+            dist/SIGNING-msi-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
   publish:
-    needs: [check-version, build, linux-packages, macos-pkg]
+    needs: [check-version, build, linux-packages, macos-pkg, windows-msi]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -496,13 +587,19 @@ jobs:
             echo "::error::expected 2 Windows zips, found $zips"
             exit 1
           fi
+          msis="$(ls -1 saiife-*.msi | wc -l)"
+          intunewins="$(ls -1 saiife-*.intunewin | wc -l)"
+          if [ "$msis" -ne 2 ] || [ "$intunewins" -ne 2 ]; then
+            echo "::error::expected 2 MSIs and 2 .intunewin files, found $msis and $intunewins"
+            exit 1
+          fi
           want_pkgs=0
           if [ "$PKG_SIGNED" = true ]; then want_pkgs=2; fi
           if [ "${#pkgs[@]}" -ne "$want_pkgs" ]; then
             echo "::error::expected $want_pkgs signed pkgs, found ${#pkgs[@]}"
             exit 1
           fi
-          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm saiife-*.zip ${pkgs[@]+"${pkgs[@]}"} | LC_ALL=C sort -k2 > SHA256SUMS
+          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm saiife-*.zip saiife-*.msi saiife-*.intunewin ${pkgs[@]+"${pkgs[@]}"} | LC_ALL=C sort -k2 > SHA256SUMS
           cat SHA256SUMS
       - name: sign SHA256SUMS
         shell: bash
@@ -551,6 +648,7 @@ jobs:
           shopt -s nullglob
           signing=(dist/SIGNING-*-apple-darwin.txt)
           wsigning=(dist/SIGNING-*-windows-msvc.txt)
+          msisigning=(dist/SIGNING-msi-*.txt)
           shopt -u nullglob
           if [ "${#signing[@]}" -ne 2 ]; then
             echo "::error::expected 2 macOS SIGNING-*.txt files, found ${#signing[@]}: ${signing[*]}"
@@ -568,6 +666,19 @@ jobs:
           done
           if grep -qx 'unsigned' "${wsigning[@]}"; then
             printf '\nWindows binaries in this release are not Authenticode-signed; SmartScreen will warn on first run.\n' >> notes.md
+          fi
+          if [ "${#msisigning[@]}" -ne 2 ]; then
+            echo "::error::expected 2 MSI SIGNING-msi-*.txt files, found ${#msisigning[@]}: ${msisigning[*]}"
+            exit 1
+          fi
+          for f in "${msisigning[@]}"; do
+            case "$(cat "$f")" in
+              unsigned | artifact-signing) ;;
+              *) echo "::error::$f holds '$(cat "$f")', want unsigned or artifact-signing"; exit 1 ;;
+            esac
+          done
+          if grep -qx 'unsigned' "${msisigning[@]}"; then
+            printf '\nThe Windows MSIs (and the .intunewin files built from them) in this release are not Authenticode-signed; Windows will show an unknown publisher.\n' >> notes.md
           fi
           for f in "${signing[@]}"; do
             case "$(cat "$f")" in
@@ -587,7 +698,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=(dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/SHA256SUMS install.sh install.ps1)
+          files=(dist/*.tar.gz dist/*.zip dist/*.msi dist/*.intunewin dist/*.deb dist/*.rpm dist/SHA256SUMS install.sh install.ps1)
           if [ -f dist/SHA256SUMS.asc ]; then
             files+=(dist/SHA256SUMS.asc)
           fi

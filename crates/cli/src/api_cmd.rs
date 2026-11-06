@@ -42,18 +42,18 @@ pub struct ApiArgs {
     pub args: Vec<String>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(_a: ApiArgs) -> ExitCode {
     eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(a: ApiArgs) -> ExitCode {
     linux::run(a)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod linux {
     use super::ApiArgs;
     use crate::broker::{self, Target};

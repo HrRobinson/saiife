@@ -67,14 +67,13 @@ If you do not want to pipe a script into your shell:
 | Linux, ARM 64-bit | `aarch64-unknown-linux-musl` |
 | macOS, Intel | `x86_64-apple-darwin` |
 | macOS, Apple silicon | `aarch64-apple-darwin` |
-
 | Windows 11 23H2 or later, Server 2022 or later, x64 | `x86_64-pc-windows-msvc` |
 | Windows 11 23H2 or later, Server 2022 or later, ARM64 | `aarch64-pc-windows-msvc` |
 
-On Windows, use `install.ps1`, not `install.sh`:
-`powershell -ExecutionPolicy Bypass -File .\install.ps1`. Developer mode only;
-locked mode is not available there yet. It has not run on real Windows outside CI.
-See [Windows](windows.md).
+On Windows, use `install.ps1`, not `install.sh`, for developer mode:
+`powershell -ExecutionPolicy Bypass -File .\install.ps1`. For locked mode, see
+[Locked mode (Windows)](#locked-mode-windows). Neither has run on Windows outside CI's
+runners. See [Windows](windows.md).
 
 ## Build from source
 
@@ -438,6 +437,25 @@ right, and removes what `installed.toml` lists. It keeps `/etc/saiife`,
 `/var/db/saiife` (with the vault key), `/var/log/saiife/audit` and the
 `_saiife` user and groups. `--purge` also removes those, `/var/db/saiife-run`
 and `daemon.log`, and deletes the accounts with `dscl`.
+
+## Locked mode (Windows)
+
+**Windows locked mode is a preview** (v2.2, Windows 11 23H2+ and Server 2022+). A
+process running as the agent's own user can end a hook with exit 0, which the agent
+reads as allow. The details, the paths and the limits are in
+[Windows: locked mode](windows.md#locked-mode).
+
+From an elevated terminal (Run as administrator):
+
+```powershell
+saiife system install
+saiife doctor
+```
+
+Uninstall with `saiife system uninstall` from an elevated terminal (add `--purge` to
+remove the audit and the config too). For the MSI, Intune and GPO, see
+[fleet](fleet.md#windows). Same-user approval is off on Windows: approvals need a
+second account, from a separate session ([approvals](approvals.md#windows)).
 
 ## Network use
 

@@ -1448,6 +1448,134 @@ test_macos_vm_refuses_outside_darwin() {
   [[ "$rc" != 0 ]] || fail "lib.sh accepted macOS without a VM"
 }
 
+# Windows (plan 19b Task 14): the W9 paths under $LC_ROOT/C/, the hooks as
+# Windows commands, and the C:/ form the agent sees.
+test_windows_platform_paths() {
+  LOCKCHECK_PLATFORM=windows new_root
+  LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  assert_eq "$LC_PLATFORM" windows
+  assert_eq "$LC_HOME" "$LC_ROOT/C/Users/agent" "LC_HOME"
+  assert_eq "$LC_PROJECT" "$LC_ROOT/C/lockcheck/work/project" "LC_PROJECT"
+  assert_eq "$LC_RUN" "$LC_ROOT/C/lockcheck/run" "LC_RUN"
+  assert_eq "$LC_STUB" "$LC_ROOT/C/ProgramData/saiife/bin/saiife" "LC_STUB"
+  assert_eq "$LC_WITNESS_CMD" "C:/lockcheck/bin/witness.exe" "LC_WITNESS_CMD"
+  assert_eq "$(lc_real "$LC_PROJECT/markers/x")" "C:/lockcheck/work/project/markers/x" "lc_real"
+  assert_eq "$(lc_real /elsewhere/x)" /elsewhere/x "lc_real outside"
+  assert_eq "$(lc_real_posix "$LC_RUN")" /c/lockcheck/run "lc_real_posix"
+  assert_eq "$(printf 'a %s/C/b\n' "$LC_ROOT" | lc_real_text)" "a C:/b" "lc_real_text"
+  (
+    # shellcheck source=/dev/null
+    source "$HERE/checks-claude.sh"
+    assert_eq "$CLAUDE_MANAGED_DIR" "$LC_ROOT/C/Program Files/ClaudeCode/managed-settings.d"
+    assert_eq "$LC_WIN_SHELL" posix "Claude Code's Bash is Git Bash"
+    mkdir -p "$LC_PROJECT"
+    lc_reset
+    local f="$CLAUDE_MANAGED_DIR/50-saiife.json"
+    grep -qF '"C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent claude"' "$f" ||
+      fail "the drop-in does not run the W9 command: $(cat "$f")"
+    if grep -q /opt/saiife "$f"; then fail "the drop-in names /opt/saiife"; fi
+    grep -qF '"C:/lockcheck/bin/witness.exe"' "$CLAUDE_MANAGED_DIR/60-lockcheck-witness.json" ||
+      fail "the witness is not its launcher"
+    [[ -f "$LC_ROOT/C/lockcheck/bin/lc-touch" ]] || fail "no lc-touch"
+    grep -qF /c/lockcheck/run "$LC_STUB" || fail "the stub does not log to /c/lockcheck/run"
+    [[ ! -e "$LC_ROOT/etc/claude-code" ]] || fail "wrote the Linux Claude path"
+    [[ "$(lc_prompt_touch abc)" == *": touch C:/lockcheck/work/project/markers/abc" ]] ||
+      fail "prompt: $(lc_prompt_touch abc)"
+    LC_NONCE=n1
+    [[ "$(claude_user_hook_json)" == *'"C:/lockcheck/bin/lc-touch.exe C:/lockcheck/work/project/markers/n1"'* ]] ||
+      fail "user hook: $(claude_user_hook_json)"
+  ) || exit 1
+  (
+    # shellcheck source=/dev/null
+    source "$HERE/checks-codex.sh"
+    assert_eq "$CODEX_REQUIREMENTS" "$LC_ROOT/C/ProgramData/OpenAI/Codex/requirements.toml"
+    [[ "$(lc_prompt_touch abc)" == *": New-Item -ItemType File -Force -Path C:/lockcheck/work/project/markers/abc" ]] ||
+      fail "PowerShell prompt: $(lc_prompt_touch abc)"
+    mkdir -p "$LC_PROJECT"
+    lc_reset
+    grep -qF 'command = "C:/lockcheck/bin/witness.exe"' "$CODEX_REQUIREMENTS" || fail "codex witness"
+    grep -qF 'C:/ProgramData/saiife/bin/saiife.exe check --managed' "$CODEX_REQUIREMENTS" ||
+      fail "codex hook: $(cat "$CODEX_REQUIREMENTS")"
+  ) || exit 1
+  (
+    LOCKCHECK_CODEX_REQUIREMENTS=/etc/codex/requirements.toml
+    # shellcheck source=/dev/null
+    source "$HERE/checks-codex.sh"
+    if codex_require_managed_path 2>/dev/null; then fail "a Linux Codex path was accepted on Windows"; fi
+  ) || exit 1
+  (
+    # shellcheck source=/dev/null
+    source "$HERE/checks-gemini.sh"
+    GEMINI_TOGGLES_LOADED=1
+    mkdir -p "$LC_PROJECT"
+    gemini_write_managed nopin
+    local g="$LC_ROOT/C/ProgramData/gemini-cli/settings.json"
+    assert_eq "$(jq -r '.hooks.BeforeTool[0].hooks[0].command' "$g")" C:/lockcheck/bin/witness.exe "gemini witness"
+    if grep -q /opt/saiife "$g"; then fail "the Gemini settings name /opt/saiife"; fi
+    [[ ! -e "$LC_ROOT/etc/gemini-cli" ]] || fail "wrote the Linux Gemini path"
+  ) || exit 1
+  # Windows without a staging dir is refused.
+  local rc=0
+  LC_ROOT='' LOCKCHECK_PLATFORM=windows bash -c 'source "$1"' lc "$HERE/lib.sh" >/dev/null 2>&1 || rc=$?
+  [[ "$rc" != 0 ]] || fail "lib.sh accepted windows without LC_ROOT"
+}
+
+# A Windows run is a plan in LC_WIN_XCHG that windows-vm.ps1 answers. A
+# stand-in answers it here as an agent that ran the command.
+test_windows_plan_handoff() {
+  LOCKCHECK_PLATFORM=windows new_root
+  LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  LC_WIN_XCHG="$LC_ROOT/xchg"
+  mkdir -p "$LC_WIN_XCHG"
+  # shellcheck source=/dev/null
+  source "$HERE/checks-claude.sh"
+  LC_RESULTS="$LC_ROOT/r.tsv"
+  : >"$LC_RESULTS"
+  mkdir -p "$LC_MARKERS"
+  (
+    d="$LC_WIN_XCHG/0001"
+    for _ in $(seq 1 300); do
+      [[ -e "$d/ready" ]] && break
+      sleep 0.1
+    done
+    [[ -e "$d/ready" ]] || exit 1
+    cp -R "$d" "$LC_ROOT/seen"
+    nonce="$(tr '\0' '\n' <"$d/argv" | grep -o 'markers/[0-9a-f]\{12\}' | head -n1 | cut -d/ -f2)"
+    mkdir -p "$d/back"
+    printf '%s\r\n' "$nonce" >"$d/back/markers"
+    printf '1\tpre-tool\tallow\t{"tool_name":"Bash","x":"%s"}\n' "$nonce" >"$d/back/calls.log"
+    printf '1\t{"tool_name":"Bash","x":"%s"}\n' "$nonce" >"$d/back/witness.log"
+    printf 'DONE\r\n' >"$d/back/output"
+    printf '0\n' >"$d/back/exit"
+    : >"$d/done"
+  ) &
+  local responder=$! seen="$LC_ROOT/seen"
+  lc_check claude.control control ran allow - >/dev/null
+  wait "$responder" || fail "the stand-in got no plan"
+  assert_eq "$(row_of "$LC_RESULTS" claude.control)" "control ran ran PASS" "row"
+  assert_eq "$(cat "$seen/kind")" run "kind"
+  assert_eq "$(cat "$seen/cwd")" C:/lockcheck/work/project "cwd"
+  local want
+  for want in $'admin\tProgram Files/ClaudeCode/managed-settings.d' \
+    $'gone\tProgram Files/ClaudeCode/managed-settings.json' \
+    $'admin\tProgramData/saiife/bin' $'admin\tlockcheck/bin' $'admin\tlockcheck/run/mode' \
+    $'log\tlockcheck/run/calls.log' $'log\tlockcheck/run/witness.log' \
+    $'gone\tUsers/agent/.claude/settings.json' $'agent\tlockcheck/work' $'gone\tUsers/agent/alt'; do
+    grep -qxF "$want" "$seen/mirror" || fail "mirror lacks '$want': $(cat "$seen/mirror")"
+  done
+  grep -qF C:/ProgramData/saiife/bin/saiife.exe "$seen/files/Program Files/ClaudeCode/managed-settings.d/50-saiife.json" ||
+    fail "the staged drop-in"
+  [[ -f "$seen/files/ProgramData/saiife/bin/saiife" ]] || fail "the staged stub"
+  [[ -d "$seen/files/lockcheck/work/project/markers" ]] || fail "the staged markers dir"
+  # No staging path reaches the machine.
+  if grep -rqF "$LC_ROOT" "$seen/files" "$seen/argv" "$seen/env" "$seen/cwd"; then
+    fail "a staging path in the plan: $(grep -rlF "$LC_ROOT" "$seen")"
+  fi
+  assert_eq "$(tr '\0' '\n' <"$seen/argv" | head -n1)" -c "argv starts with -c"
+  tr '\0' '\n' <"$seen/argv" | grep -qF 'touch C:/lockcheck/work/project/markers/' || fail "the prompt"
+  grep -q DONE "$LC_RUN/last-output" || fail "the output was not collected"
+}
+
 # --- runner ------------------------------------------------------------------
 
 main() {

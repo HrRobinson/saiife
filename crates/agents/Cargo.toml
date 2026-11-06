@@ -25,5 +25,8 @@ tempfile = "3"
 # on Linux, open flags and fd paths elsewhere. No unsafe in this crate.
 rustix = { version = "1", features = ["fs"] }
 
+[target."cfg(windows)".dependencies]
+winreg = "=0.56.0"
+
 [lints]
 workspace = true

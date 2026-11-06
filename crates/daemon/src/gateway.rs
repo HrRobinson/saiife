@@ -31,7 +31,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use saiife_broker::pipeline::{strict_json, Outcome, Via};
-use saiife_ipc::peer::{peer_cred, PeerCred};
+#[cfg(unix)]
+use saiife_ipc::peer::peer_cred;
+use saiife_ipc::peer::PeerCred;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -42,8 +44,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, UnixListener};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
@@ -68,6 +74,7 @@ pub const MAX_TCP_PRE_AUTH: usize = 16;
 /// A TCP connection's request head must be in within this.
 pub const PRE_AUTH_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a refused connection gets to take its answer.
+#[cfg_attr(windows, allow(dead_code))]
 const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Request headers never passed to the pipeline: identity and credentials
@@ -124,11 +131,13 @@ impl Default for Opts {
 }
 
 /// Serve `listener` until the task is dropped.
+#[cfg(unix)]
 pub async fn serve(listener: UnixListener, ctx: Arc<Ctx>) {
     serve_with(listener, ctx, Opts::default()).await
 }
 
 /// [`serve`] with other timeouts.
+#[cfg(unix)]
 pub async fn serve_with(listener: UnixListener, ctx: Arc<Ctx>, opts: Opts) {
     loop {
         match listener.accept().await {
@@ -147,7 +156,8 @@ pub async fn serve_with(listener: UnixListener, ctx: Arc<Ctx>, opts: Opts) {
 /// Where a connection came from, which says where its identity comes from.
 #[derive(Clone)]
 enum Source {
-    /// `gateway.sock`: the peer's uid, from the kernel.
+    /// `gateway.sock`: the peer's uid, from the kernel. Never on Windows (W13).
+    #[cfg_attr(windows, allow(dead_code))]
     Unix(PeerCred),
     /// The loopback TCP listener: no peer uid; the bearer token decides.
     Tcp(Arc<TcpConn>),
@@ -166,6 +176,7 @@ struct TcpConn {
 }
 
 /// The answer to a connection refused at accept.
+#[cfg(unix)]
 async fn refuse_busy<S: AsyncWrite + Unpin>(mut s: S) {
     let body = r#"{"error":"busy","reason":"too many open connections"}"#;
     let raw = format!(
@@ -175,6 +186,7 @@ async fn refuse_busy<S: AsyncWrite + Unpin>(mut s: S) {
     let _ = tokio::time::timeout(REFUSE_WRITE_TIMEOUT, s.write_all(raw.as_bytes())).await;
 }
 
+#[cfg(unix)]
 async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     let Ok(peer) = peer_cred(&s) else {
         return;
@@ -198,7 +210,7 @@ async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     let _slot = match ctx.conns.try_open(peer.uid) {
         Ok(slot) => slot,
         Err(_) => {
-            ctx.notice(peer.uid, Notice::Connections);
+            ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Connections);
             refuse_busy(s).await;
             return;
         }
@@ -580,8 +592,8 @@ async fn admit_inner(
                 ctx.notice(UNKNOWN_UID, Notice::Gateway(GatewayRefusal::Origin));
                 return json_resp(StatusCode::FORBIDDEN, json!({"error": "origin"}));
             }
-            let uid = bearer(req.headers()).and_then(|t| ctx.tokens.verify(&t));
-            let Some(uid) = uid else {
+            let who = bearer(req.headers()).and_then(|t| ctx.tokens.verify_identity(&t));
+            let Some((uid, sid)) = who else {
                 ctx.notice(UNKNOWN_UID, Notice::Gateway(GatewayRefusal::Token));
                 return unauthorized();
             };
@@ -591,7 +603,7 @@ async fn admit_inner(
             let slot = match ctx.conns.try_open(uid) {
                 Ok(slot) => slot,
                 Err(_) => {
-                    ctx.notice(uid, Notice::Connections);
+                    ctx.notice_sid(uid, sid.as_deref(), Notice::Connections);
                     return busy("too many open connections");
                 }
             };
@@ -604,6 +616,7 @@ async fn admit_inner(
             );
             Caller::Token {
                 uid,
+                sid,
                 addr: conn.peer,
             }
         }
@@ -615,7 +628,7 @@ async fn admit_inner(
     match ctx.limits.try_begin(uid, Instant::now()) {
         Ok(in_flight) => route(ctx, &caller, req, raw, opts, in_flight).await,
         Err(_) => {
-            ctx.notice(uid, Notice::Requests);
+            ctx.notice_sid(uid, caller.sid(), Notice::Requests);
             busy("too many requests from this uid")
         }
     }
@@ -640,27 +653,30 @@ async fn route(
     match classify(req.method(), req.uri(), raw.as_deref()) {
         Target::BadRequest(m) => refused(
             ctx,
-            uid,
+            caller,
             GatewayRefusal::BadRequest,
             error(StatusCode::BAD_REQUEST, "bad_request", m),
         ),
         Target::Services => {
-            let services = api_ops::services_for(ctx, uid, &BTreeMap::new()).await;
+            let services = api_ops::services_for(ctx, (uid, caller.sid()), &BTreeMap::new()).await;
             json_resp(StatusCode::OK, json!({"services": services}))
         }
-        Target::MethodNotAllowed(allow) => {
-            refused(ctx, uid, GatewayRefusal::Method, method_not_allowed(allow))
-        }
+        Target::MethodNotAllowed(allow) => refused(
+            ctx,
+            caller,
+            GatewayRefusal::Method,
+            method_not_allowed(allow),
+        ),
         Target::Api { service, op } => {
             let body = match read_body(req, opts).await {
                 Ok((_, b)) => b,
-                Err(r) => return body_refused(ctx, uid, *r),
+                Err(r) => return body_refused(ctx, caller, *r),
             };
             match api_args(&service, &op, &body) {
                 Ok(args) => call(ctx, caller, args, Route::Api, in_flight).await,
                 Err(m) => refused(
                     ctx,
-                    uid,
+                    caller,
                     GatewayRefusal::BadRequest,
                     error(StatusCode::BAD_REQUEST, "bad_request", m),
                 ),
@@ -670,31 +686,31 @@ async fn route(
             let method = req.method().as_str().to_string();
             let (parts, body) = match read_body(req, opts).await {
                 Ok(x) => x,
-                Err(r) => return body_refused(ctx, uid, *r),
+                Err(r) => return body_refused(ctx, caller, *r),
             };
             let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
             call(ctx, caller, args, Route::Proxy, in_flight).await
         }
-        Target::Request(id) => request_result(ctx, uid, id).await,
+        Target::Request(id) => request_result(ctx, caller, id).await,
         Target::NotFound => not_found(),
     }
 }
 
 /// `r`, a refusal before the pipeline: no `connector` record, only a
 /// `gateway_refused` notice (at most one per uid and kind a minute).
-fn refused(ctx: &Ctx, uid: u32, why: GatewayRefusal, r: Resp) -> Resp {
-    ctx.notice(uid, Notice::Gateway(why));
+fn refused(ctx: &Ctx, caller: &Caller, why: GatewayRefusal, r: Resp) -> Resp {
+    ctx.notice_sid(caller.uid(), caller.sid(), Notice::Gateway(why));
     r
 }
 
 /// [`refused`] for a body [`read_body`] would not take.
-fn body_refused(ctx: &Ctx, uid: u32, r: Resp) -> Resp {
+fn body_refused(ctx: &Ctx, caller: &Caller, r: Resp) -> Resp {
     let why = if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
         GatewayRefusal::TooLarge
     } else {
         GatewayRefusal::BadRequest
     };
-    refused(ctx, uid, why, r)
+    refused(ctx, caller, why, r)
 }
 
 /// Where a request goes, decided from its method and target alone (no IO).
@@ -955,7 +971,7 @@ async fn call(
         Err(m) => {
             return refused(
                 ctx,
-                caller.uid(),
+                caller,
                 GatewayRefusal::BadRequest,
                 error(StatusCode::BAD_REQUEST, "bad_request", m),
             )
@@ -969,7 +985,7 @@ async fn call(
     // the slot back while its call still runs.
     let task = {
         let ctx = Arc::clone(ctx);
-        let caller = *caller;
+        let caller = caller.clone();
         tokio::spawn(async move {
             let _in_flight = in_flight;
             api_ops::execute(&ctx, &caller, call).await
@@ -1095,10 +1111,10 @@ fn respond(outcome: Outcome, route: Route) -> Resp {
 /// with the result body and `X-Saiife-Upstream-Status` once it was sent,
 /// 202 while it waits, 404 for an unknown id or another uid's request, 410
 /// once it was rejected, expired or failed to send.
-async fn request_result(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Resp {
+async fn request_result(ctx: &Arc<Ctx>, caller: &Caller, id: u64) -> Resp {
     use crate::approval_ops::ResultView;
     use crate::approvals::{state_name, State};
-    let view = match crate::approval_ops::result_for(ctx, uid, id).await {
+    let view = match crate::approval_ops::result_for(ctx, caller.uid(), caller.sid(), id).await {
         Ok(v) => v,
         Err(()) => {
             return error(
@@ -1261,7 +1277,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod personal_tests {
     use super::*;
     use tokio::io::AsyncReadExt;

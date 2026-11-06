@@ -31,13 +31,8 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 type Refusal = (ErrorCode, String);
 
 /// The audit-volume gate; an unknown free space counts as too little.
-fn gate(
-    free: std::io::Result<u64>,
-    min_free_mb: u64,
-    peer_uid: u32,
-    own_uid: u32,
-) -> Result<(), ErrorCode> {
-    crate::disk::disk_gate(free.unwrap_or(0), min_free_mb, peer_uid, own_uid)
+fn gate(free: std::io::Result<u64>, min_free_mb: u64, is_own: bool) -> Result<(), ErrorCode> {
+    crate::disk::disk_gate(free.unwrap_or(0), min_free_mb, is_own)
 }
 
 fn bad(m: impl Into<String>) -> Refusal {
@@ -79,11 +74,11 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     // Whatever writes a record (every op but an admin's list) is refused
     // before it changes anything when the audit volume is below the floor
     // (same gate as audit.append).
-    let admin = ctx.is_admin(peer.uid).await;
+    let admin = ctx.peer_is_admin(peer).await;
     if event != "secret_list" || !admin {
         let free = crate::disk::free_mb(&ctx.audit_dir);
-        if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
-            ctx.notice(peer.uid, Notice::LowDisk);
+        if let Err(code) = gate(free, ctx.policy().min_free_mb, ctx.peer_is_own(peer)) {
+            ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
             return err(id, code, "the audit volume is below [audit] min_free_mb");
         }
     }
@@ -165,7 +160,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 async fn record(ctx: &Ctx, peer: &PeerCred, event: &str, name: &str) -> saiife_audit::Record {
     let mut r = ctx.record("secret", &format!("{event} {name}"));
     r.uid = Some(peer.uid);
-    r.user = ctx.name_of(peer.uid).await;
+    r.sid = peer.sid.clone();
+    r.user = ctx.peer_name(peer).await;
     r.extra.insert("event".into(), event.into());
     r.extra.insert("name".into(), name.into());
     r.extra.insert(
@@ -651,15 +647,15 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         _ => return err(id, ErrorCode::BadRequest, "secret.lease takes an exe path"),
     };
     let free = crate::disk::free_mb(&ctx.audit_dir);
-    if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
-        ctx.notice(peer.uid, Notice::LowDisk);
+    if let Err(code) = gate(free, ctx.policy().min_free_mb, ctx.peer_is_own(peer)) {
+        ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
     // Under any lockdown scope no secret value is handed out.
     let verdict = if let Some(l) = ctx.lockdown.get() {
         Err(deny("lockdown", crate::lockdown::message(&l)))
     } else {
-        match check_lease(ctx, peer.uid, &name, &exe).await {
+        match check_lease(ctx, peer, &name, &exe).await {
             Ok(services) => take_value(ctx, &name, services).await,
             Err(d) => Err(d),
         }
@@ -716,7 +712,8 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 async fn use_record(ctx: &Ctx, peer: &PeerCred, name: &str, exe: &str) -> saiife_audit::Record {
     let mut r = ctx.record("secret", &format!("run {name} {exe}"));
     r.uid = Some(peer.uid);
-    r.user = ctx.name_of(peer.uid).await;
+    r.sid = peer.sid.clone();
+    r.user = ctx.peer_name(peer).await;
     r.extra.insert("event".into(), "secret_use".into());
     r.extra.insert("name".into(), name.into());
     r.extra.insert(
@@ -742,11 +739,16 @@ fn out_of_scope() -> Deny {
 
 /// Scope (the caller's, and the secret's services within it), then the
 /// executable. Returns the scope's services.
-async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<Vec<String>, Deny> {
+async fn check_lease(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    name: &str,
+    exe: &str,
+) -> Result<Vec<String>, Deny> {
     let Some(sys) = ctx.policy().system else {
         return Err(deny("run_not_allowed", "no valid policy is loaded"));
     };
-    let Some(user) = ctx.name_of(uid).await else {
+    let Some(user) = ctx.peer_name(peer).await else {
         return Err(deny("no_scope", "the caller has no user name"));
     };
     let dir = Arc::clone(&ctx.directory);
@@ -811,7 +813,9 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     if !allow.iter().any(|a| a == exe) {
         // Say why when an entry resolves to this file by another path.
         for a in allow {
-            if std::fs::canonicalize(a).is_ok_and(|c| c == exe) {
+            if std::fs::canonicalize(a)
+                .is_ok_and(|c| saiife_system::wintrust::plain_path(&c) == exe)
+            {
                 if let Err(why) = entry_is_canonical(a, exe) {
                     return Err(no(why));
                 }
@@ -819,7 +823,8 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
         }
         return Err(no("the executable is not in run_allow for this secret"));
     }
-    match std::fs::canonicalize(exe) {
+    // `plain_path`: Windows answers `\\?\C:\...`, and a policy says `C:\...`.
+    match std::fs::canonicalize(exe).map(|c| saiife_system::wintrust::plain_path(&c)) {
         Ok(c) if c == exe => {}
         _ => return Err(no("the executable path is not canonical")),
     }
@@ -830,7 +835,27 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
         Ok(m) if m.is_file() => {}
         _ => return Err(no("the executable is not a regular file")),
     }
-    saiife_system::fsops::root_owned_chain(exe).map_err(|e| no(&format!("not root-owned: {e}")))
+    #[cfg(unix)]
+    {
+        saiife_system::fsops::root_owned_chain(exe).map_err(|e| no(&format!("not root-owned: {e}")))
+    }
+    // W19: no writer but the admins, on the file, and no one else who can replace it.
+    #[cfg(windows)]
+    {
+        use saiife_system::host::{Host, RealHost};
+        saiife_system::wintrust::exe_chain(
+            exe,
+            &|p| RealHost.get_sddl(p),
+            saiife_system::wintrust::test_trust_sid().as_deref(),
+        )
+        .map_err(|e| no(&format!("not protected: {e}")))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(no(
+            "run_allow's ownership check is not available on this OS",
+        ))
+    }
 }
 
 /// The value for the answer, and the use noted in the vault.
@@ -886,7 +911,7 @@ async fn take_value(
     .map_err(|_| deny("run_not_allowed", "vault read failed"))?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1129,9 +1154,9 @@ mod tests {
     #[test]
     fn gate_refuses_below_the_floor_and_fails_closed() {
         let io_err = || Err(std::io::Error::other("x"));
-        assert_eq!(gate(Ok(10), 512, 1000, 990), Err(ErrorCode::LowDisk));
-        assert_eq!(gate(Ok(512), 512, 1000, 990), Ok(()));
-        assert_eq!(gate(io_err(), 512, 1000, 990), Err(ErrorCode::LowDisk));
+        assert_eq!(gate(Ok(10), 512, false), Err(ErrorCode::LowDisk));
+        assert_eq!(gate(Ok(512), 512, false), Ok(()));
+        assert_eq!(gate(io_err(), 512, false), Err(ErrorCode::LowDisk));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! `saiife run --secret <name>[:ENV] -- <cmd> [args]` (spec §6.14): the
 //! daemon leases the secret for one allowed, root-owned command; this puts
 //! it in that command's environment and masks both of its output streams.
-//! Linux and macOS. Exit codes: the command's own (128 + signal when a signal
+//! Exit codes: the command's own (128 + signal when a signal
 //! ended it), 2 refused, 5 the daemon cannot be reached, 127 the command
-//! was not found.
+//! was not found. On Windows too (W19): only an `.exe` runs, and what stands in for a
+//! root-owned path is [`win::chain_ok`].
 //!
 //! The command runs as the calling user, so the agent's code holds the
 //! value while it runs; masking only hides what the command prints. That is
@@ -29,7 +30,7 @@ pub struct RunArgs {
     pub command: Vec<String>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(args: RunArgs) -> ExitCode {
     let RunArgs {
         system_config,
@@ -42,12 +43,54 @@ pub fn run(args: RunArgs) -> ExitCode {
     ExitCode::from(5)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(args: RunArgs) -> ExitCode {
     linux::run(args)
 }
 
-#[cfg(any(unix, test))]
+/// W19's checks on Windows. Linux tests run them on `FakeHost`'s descriptors.
+#[cfg(any(windows, test))]
+pub(crate) mod win {
+    use saiife_system::host::Host;
+    use std::path::Path;
+
+    /// The file has no writer beyond SYSTEM, Administrators and TrustedInstaller, and no
+    /// folder above it can have its contents replaced by anyone else. The daemon decides
+    /// by the same rule before any lease; asking first spares the user a refused lease.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn chain_ok(path: &Path, host: &dyn Host) -> Result<(), String> {
+        chain_ok_trusting(
+            path,
+            host,
+            saiife_system::wintrust::test_trust_sid().as_deref(),
+        )
+    }
+
+    pub(super) fn chain_ok_trusting(
+        path: &Path,
+        host: &dyn Host,
+        trust_sid: Option<&str>,
+    ) -> Result<(), String> {
+        saiife_system::wintrust::exe_chain(path, &|p| host.get_sddl(p), trust_sid)
+    }
+
+    /// Is `path` something `run` may start on Windows: a regular file named `.exe`? Windows
+    /// has no execute bit to read; the daemon's list is what allows a program.
+    pub(crate) fn runnable(path: &Path) -> bool {
+        let named_exe = path
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("exe"));
+        named_exe && std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
+
+    /// The candidates for `cmd` in one `PATH` folder. W19 runs only an `.exe`, so `.bat`,
+    /// `.cmd` and other `PATHEXT` entries are never tried.
+    pub(crate) fn candidates(dir: &Path, cmd: &str) -> [std::path::PathBuf; 2] {
+        [dir.join(cmd), dir.join(format!("{cmd}.exe"))]
+    }
+}
+
+#[cfg(any(unix, windows, test))]
 /// `NAME` or `NAME:ENV_VAR` into the name and the variable. The default
 /// variable is the name upper-cased with `-` and `.` turned into `_`.
 pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
@@ -76,7 +119,7 @@ pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), env))
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 /// Copy `r` to `w`, replacing every form of a masked value with
 /// `[MASKED]`. The bytes held back between reads (`max_span - 1`) make a
 /// value split across two reads masked whole. A write error stops the
@@ -113,7 +156,7 @@ pub(crate) fn pump(
 /// The variables the dynamic loader and libc read that could make the
 /// command load or run other code: `LD_*`, `DYLD_*` and a few more. They are removed
 /// before the command starts.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const LOADER_EXTRA: &[&str] = &[
     "GCONV_PATH",
     "LOCPATH",
@@ -130,14 +173,37 @@ const LOADER_EXTRA: &[&str] = &[
     "TZDIR",
 ];
 
+/// What loads code into a .NET program or changes how Windows starts one (W19). On every
+/// platform: harmless elsewhere. Windows ignores case in these names, so this does too.
+#[cfg(any(unix, windows, test))]
+const WINDOWS_LOADER: &[&str] = &[
+    "COR_ENABLE_PROFILING",
+    "COR_PROFILER",
+    "COR_PROFILER_PATH",
+    "COR_PROFILER_PATH_32",
+    "COR_PROFILER_PATH_64",
+    "CORECLR_ENABLE_PROFILING",
+    "CORECLR_PROFILER",
+    "DOTNET_STARTUP_HOOKS",
+    "__COMPAT_LAYER",
+];
+/// `CORECLR_PROFILER_PATH`, `_32`, `_64`, `_ARM64` and any other it may grow.
+#[cfg(any(unix, windows, test))]
+const WINDOWS_LOADER_PREFIX: &str = "CORECLR_PROFILER_PATH";
+
 /// `LD_*`, macOS dyld's `DYLD_*` (on every platform: harmless on Linux),
-/// and [`LOADER_EXTRA`].
-#[cfg(any(unix, test))]
+/// [`LOADER_EXTRA`], and W19's [`WINDOWS_LOADER`].
+#[cfg(any(unix, windows, test))]
 pub(crate) fn is_loader_var(n: &str) -> bool {
-    n.starts_with("LD_") || n.starts_with("DYLD_") || LOADER_EXTRA.contains(&n)
+    let upper = n.to_ascii_uppercase();
+    n.starts_with("LD_")
+        || n.starts_with("DYLD_")
+        || LOADER_EXTRA.contains(&n)
+        || WINDOWS_LOADER.contains(&upper.as_str())
+        || upper.starts_with(WINDOWS_LOADER_PREFIX)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn loader_vars<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
     names.into_iter().filter(|n| is_loader_var(n)).collect()
 }
@@ -151,7 +217,7 @@ pub(crate) fn argv0_for(exe: &std::path::Path) -> std::ffi::OsString {
 
 /// The values to mask for a lease: the value, and for a `basic` secret
 /// (`user:password`) the password on its own when it is long enough.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<String>> {
     let mut out = vec![zeroize::Zeroizing::new(value.to_string())];
     if kind == "basic" {
@@ -177,7 +243,7 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
 /// (fix round 1): `AWS_ENDPOINT_URL`, every `AWS_ENDPOINT_URL_*` and
 /// `AWS_CA_BUNDLE`, so an inherited environment cannot send the leased
 /// credentials to another endpoint.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const AWS_SCRUB: &[&str] = &[
     "AWS_PROFILE",
     "AWS_DEFAULT_PROFILE",
@@ -191,12 +257,12 @@ const AWS_SCRUB: &[&str] = &[
 ];
 
 /// Prefixes of the inherited variables `run --cloud` removes.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const AWS_SCRUB_PREFIXES: &[&str] = &["AWS_CONTAINER_", "AWS_ENDPOINT_URL_"];
 
 /// Prepares `cmd`'s environment: the loader variables of `inherited` and
 /// `remove` taken out, `values` put in.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn prepare_env(
     cmd: &mut std::process::Command,
     inherited: Vec<String>,
@@ -215,7 +281,7 @@ pub(crate) fn prepare_env(
 }
 
 /// The lease variables whose values are credentials (masked).
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const AWS_CREDENTIALS: [&str; 3] = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -223,18 +289,31 @@ const AWS_CREDENTIALS: [&str; 3] = [
 ];
 
 /// The inherited variables `run --cloud` removes from the command.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn aws_scrub<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    aws_scrub_for(names, cfg!(windows))
+}
+
+/// [`aws_scrub`] for a host. Windows ignores case in a variable's name, so
+/// `aws_endpoint_url` reaches a program that asks for `AWS_ENDPOINT_URL`.
+#[cfg(any(unix, windows, test))]
+fn aws_scrub_for<I: IntoIterator<Item = String>>(names: I, any_case: bool) -> Vec<String> {
     names
         .into_iter()
         .filter(|n| {
-            AWS_SCRUB.contains(&n.as_str()) || AWS_SCRUB_PREFIXES.iter().any(|p| n.starts_with(p))
+            let name = if any_case {
+                n.to_ascii_uppercase()
+            } else {
+                n.clone()
+            };
+            AWS_SCRUB.contains(&name.as_str())
+                || AWS_SCRUB_PREFIXES.iter().any(|p| name.starts_with(p))
         })
         .collect()
 }
 
 /// What `run --cloud` sets from a `cloud.lease` answer.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) struct CloudEnv {
     /// The variables to set: the three credentials, the region pair, and
     /// the shared files pointed at `/dev/null`.
@@ -245,7 +324,7 @@ pub(crate) struct CloudEnv {
 
 /// The environment of a `cloud.lease` answer's `env` (decision 16). Only
 /// the five expected variables are taken, and each must be there.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn cloud_env(
     env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<CloudEnv, String> {
@@ -268,14 +347,15 @@ pub(crate) fn cloud_env(
         }
         sets.push((name.to_string(), v));
     }
+    let nothing = if cfg!(windows) { "NUL" } else { "/dev/null" };
     for name in ["AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE"] {
-        sets.push((name.to_string(), Zeroizing::new("/dev/null".to_string())));
+        sets.push((name.to_string(), Zeroizing::new(nothing.to_string())));
     }
     Ok(CloudEnv { sets, masked })
 }
 
 /// The one line `run --cloud` prints to stderr before the command starts.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
     format!(
         "saiife: AWS credentials for {} (STS mode) expire at {}; this command and anything it starts can read them",
@@ -284,16 +364,26 @@ pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
     )
 }
 
-#[cfg(unix)]
+/// The command's exit code as this process can pass it on. Only 0 to 255 fit. A Windows
+/// crash is a large code such as `0xC0000005`, negative as an `i32`, and must never read
+/// as success.
+#[cfg(any(unix, windows))]
+fn exit_byte(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(1)
+}
+
+#[cfg(any(unix, windows))]
 mod linux {
+    #[cfg(unix)]
+    use super::argv0_for;
     use super::{
-        argv0_for, aws_scrub, cloud_env, cloud_notice, mask_values, parse_spec, prepare_env, pump,
-        RunArgs,
+        aws_scrub, cloud_env, cloud_notice, mask_values, parse_spec, prepare_env, pump, RunArgs,
     };
     use crate::broker::Target;
     use crate::secret_cmd::linux::{call_to, call_within, target, Stop};
     use saiife_broker::mask::Masker;
     use serde_json::{json, Map};
+    #[cfg(unix)]
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode, Stdio};
@@ -343,6 +433,7 @@ mod linux {
             ));
         };
         let exe = resolve(argv0)?;
+        check_chain(&exe)?;
         let exe_s = exe
             .to_str()
             .ok_or_else(|| Stop::Refused("the command's path is not valid UTF-8".into()))?;
@@ -375,6 +466,7 @@ mod linux {
             return Err(Stop::Refused("run --cloud needs a command after --".into()));
         };
         let exe = resolve(argv0)?;
+        check_chain(&exe)?;
         let exe_s = exe
             .to_str()
             .ok_or_else(|| Stop::Refused("the command's path is not valid UTF-8".into()))?;
@@ -420,6 +512,19 @@ mod linux {
         spawn_masked(&exe, rest, &remove, &lease.sets, &lease.masked)
     }
 
+    /// W19's check before any lease. Linux has it in the daemon alone: its refusal there
+    /// is the same words, and an agent can skip this client anyway.
+    #[cfg(windows)]
+    fn check_chain(exe: &Path) -> Result<(), Stop> {
+        super::win::chain_ok(exe, &saiife_system::host::RealHost)
+            .map_err(|e| Stop::Refused(format!("{}: not protected: {e}", exe.display())))
+    }
+
+    #[cfg(unix)]
+    fn check_chain(_exe: &Path) -> Result<(), Stop> {
+        Ok(())
+    }
+
     /// Runs `exe` with `args`, the loader variables and `remove` taken out
     /// of its environment and `sets` put in, both output streams masked
     /// for `masked`. The command's exit code (128 + signal).
@@ -436,8 +541,9 @@ mod linux {
         let mut cmd = Command::new(exe);
         // The multi-call binaries (busybox, coreutils) pick their applet
         // from argv[0]: it is the canonical file's name, not the typed one.
-        cmd.arg0(argv0_for(exe))
-            .args(rest)
+        #[cfg(unix)]
+        cmd.arg0(argv0_for(exe));
+        cmd.args(rest)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -465,35 +571,61 @@ mod linux {
         let status = child
             .wait()
             .map_err(|e| Stop::Unavailable(format!("cannot wait for the command: {e}")))?;
-        Ok(match (status.code(), status.signal()) {
-            (Some(c), _) => ExitCode::from(c.clamp(0, 255) as u8),
+        #[cfg(unix)]
+        let signal = status.signal();
+        #[cfg(windows)]
+        let signal: Option<i32> = None;
+        Ok(match (status.code(), signal) {
+            (Some(c), _) => ExitCode::from(super::exit_byte(c)),
             (None, Some(sig)) => ExitCode::from((128 + sig).clamp(0, 255) as u8),
             (None, None) => ExitCode::from(1),
         })
     }
 
+    /// The canonical form, as the policy spells a path: `run_allow` matches text.
+    fn canonical(p: &Path) -> std::io::Result<PathBuf> {
+        std::fs::canonicalize(p).map(|c| saiife_system::wintrust::plain_path(&c))
+    }
+
     /// `cmd` through `PATH` (or as a path) to its canonical form.
     fn resolve(cmd: &str) -> Result<PathBuf, Stop> {
         let miss = || Stop::NotFound(format!("{cmd}: command not found"));
-        let candidate: PathBuf = if cmd.contains('/') {
+        let has_folder = cmd.contains('/') || (cfg!(windows) && cmd.contains(['\\', ':']));
+        let candidate: PathBuf = if has_folder {
             PathBuf::from(cmd)
         } else {
             let path = std::env::var_os("PATH").unwrap_or_default();
             std::env::split_paths(&path)
                 .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(cmd))
+                .flat_map(|d| in_folder(&d, cmd))
                 .find(|p| is_exec(p))
                 .ok_or_else(miss)?
         };
         if !is_exec(&candidate) {
             return Err(miss());
         }
-        std::fs::canonicalize(&candidate).map_err(|_| miss())
+        canonical(&candidate).map_err(|_| miss())
     }
 
+    #[cfg(unix)]
+    fn in_folder(dir: &Path, cmd: &str) -> Vec<PathBuf> {
+        vec![dir.join(cmd)]
+    }
+
+    #[cfg(windows)]
+    fn in_folder(dir: &Path, cmd: &str) -> Vec<PathBuf> {
+        super::win::candidates(dir, cmd).to_vec()
+    }
+
+    #[cfg(unix)]
     fn is_exec(p: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+
+    #[cfg(windows)]
+    fn is_exec(p: &Path) -> bool {
+        super::win::runnable(p)
     }
 }
 
@@ -502,6 +634,17 @@ mod tests {
     use super::*;
     use saiife_broker::mask::Masker;
     use std::io::Read;
+
+    #[test]
+    fn a_crash_is_never_exit_zero() {
+        // STATUS_ACCESS_VIOLATION, as Windows reports it through an i32.
+        assert_eq!(exit_byte(0xC000_0005_u32 as i32), 1);
+        assert_eq!(exit_byte(-1), 1);
+        assert_eq!(exit_byte(256), 1);
+        assert_eq!(exit_byte(0), 0);
+        assert_eq!(exit_byte(7), 7);
+        assert_eq!(exit_byte(255), 255);
+    }
 
     /// Hands out `parts` one read at a time.
     struct Parts(std::collections::VecDeque<Vec<u8>>);
@@ -657,6 +800,135 @@ mod tests {
     }
 
     #[test]
+    fn loader_vars_include_dotnet_profilers() {
+        for n in [
+            "COR_ENABLE_PROFILING",
+            "COR_PROFILER",
+            "COR_PROFILER_PATH",
+            "COR_PROFILER_PATH_32",
+            "COR_PROFILER_PATH_64",
+            "CORECLR_ENABLE_PROFILING",
+            "CORECLR_PROFILER",
+            "CORECLR_PROFILER_PATH",
+            "CORECLR_PROFILER_PATH_32",
+            "CORECLR_PROFILER_PATH_ARM64",
+            "DOTNET_STARTUP_HOOKS",
+            "__COMPAT_LAYER",
+            // Windows ignores case in a variable's name.
+            "cor_profiler",
+            "Dotnet_Startup_Hooks",
+            "__compat_layer",
+            "coreclr_profiler_path_64",
+        ] {
+            assert!(is_loader_var(n), "{n}");
+            assert!(parse_spec(&format!("tok:{n}")).is_err(), "{n}");
+        }
+        for n in ["DOTNET_ROOT", "COR", "PATH", "COMPAT_LAYER", "AWS_REGION"] {
+            assert!(!is_loader_var(n), "{n}");
+        }
+    }
+
+    /// On Windows `aws_endpoint_url` is `AWS_ENDPOINT_URL`, so it must go too; elsewhere
+    /// a lowercase name is another variable.
+    #[test]
+    fn aws_scrub_ignores_case_on_windows() {
+        let names = || {
+            ["aws_endpoint_url", "Aws_Container_X", "AWS_PROFILE", "keep"]
+                .map(String::from)
+                .to_vec()
+        };
+        assert_eq!(
+            aws_scrub_for(names(), true),
+            ["aws_endpoint_url", "Aws_Container_X", "AWS_PROFILE"]
+        );
+        assert_eq!(aws_scrub_for(names(), false), ["AWS_PROFILE"]);
+    }
+
+    mod chain {
+        use super::super::win::chain_ok_trusting;
+        use saiife_system::host::{FakeHost, Host};
+        use std::path::{Path, PathBuf};
+
+        const ADMIN_EXE: &str = "O:BAG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
+        const STOCK_DIR: &str =
+            "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+
+        /// A fake host whose descriptors cover the whole chain above `tool`.
+        fn host_for(tool: &Path, leaf: &str, dir: &str) -> (tempfile::TempDir, FakeHost) {
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeHost::open(root.path()).unwrap();
+            let chain: Vec<PathBuf> = tool.ancestors().skip(1).map(Path::to_path_buf).collect();
+            let (tool, leaf, dir) = (tool.to_path_buf(), leaf.to_string(), dir.to_string());
+            host.set(|s| {
+                s.sddl.insert(tool, leaf);
+                for (i, p) in chain.into_iter().enumerate() {
+                    let text = if i == 0 {
+                        dir.clone()
+                    } else {
+                        STOCK_DIR.into()
+                    };
+                    s.sddl.insert(p, text);
+                }
+            });
+            (root, host)
+        }
+
+        #[test]
+        fn chain_ok_refuses_user_writable_dir() {
+            let tool = Path::new("/w/tools/aws.exe");
+            let open_dir = format!("O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{USER})");
+            let (_r, host) = host_for(tool, ADMIN_EXE, &open_dir);
+            let e = chain_ok_trusting(tool, &host, None).unwrap_err();
+            assert!(e.contains(USER), "{e}");
+            assert!(e.contains("/w/tools"), "{e}");
+        }
+
+        #[test]
+        fn chain_ok_takes_an_admin_chain_and_refuses_a_user_file() {
+            let tool = Path::new("/w/tools/aws.exe");
+            let (_r, host) = host_for(tool, ADMIN_EXE, STOCK_DIR);
+            assert_eq!(chain_ok_trusting(tool, &host, None), Ok(()));
+
+            let user_owned = format!("O:{USER}G:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)");
+            let (_r, host) = host_for(tool, &user_owned, STOCK_DIR);
+            assert!(chain_ok_trusting(tool, &host, None).is_err());
+        }
+
+        /// The debug seam adds one SID, for the suite's temp dirs.
+        #[test]
+        fn the_trust_seam_covers_only_its_sid() {
+            let tool = Path::new("/w/tools/aws.exe");
+            let runner = format!("O:{USER}G:{USER}D:PAI(A;;FA;;;{USER})(A;;FA;;;SY)");
+            let (_r, host) = host_for(tool, &runner, STOCK_DIR);
+            assert_eq!(chain_ok_trusting(tool, &host, Some(USER)), Ok(()));
+            assert!(chain_ok_trusting(tool, &host, Some("S-1-5-21-9")).is_err());
+            assert!(chain_ok_trusting(tool, &host, None).is_err());
+            // A file the host has no descriptor for, as a reparse point would read.
+            assert!(host.get_sddl(Path::new("/w/other.exe")).is_err());
+            assert!(chain_ok_trusting(Path::new("/w/other.exe"), &host, None).is_err());
+        }
+    }
+
+    #[test]
+    fn only_an_exe_can_run_on_windows() {
+        use super::win::{candidates, runnable};
+        let d = tempfile::tempdir().unwrap();
+        for name in ["a.exe", "b.EXE", "c.bat", "d.cmd", "e"] {
+            std::fs::write(d.path().join(name), "").unwrap();
+        }
+        assert!(runnable(&d.path().join("a.exe")));
+        assert!(runnable(&d.path().join("b.EXE")));
+        for name in ["c.bat", "d.cmd", "e", "missing.exe"] {
+            assert!(!runnable(&d.path().join(name)), "{name}");
+        }
+        std::fs::create_dir(d.path().join("dir.exe")).unwrap();
+        assert!(!runnable(&d.path().join("dir.exe")));
+        let got = candidates(std::path::Path::new("/p"), "aws");
+        assert_eq!(got, ["/p/aws", "/p/aws.exe"].map(std::path::PathBuf::from));
+    }
+
+    #[test]
     fn argv0_is_the_canonical_basename() {
         assert_eq!(
             argv0_for(std::path::Path::new("/usr/bin/coreutils")),
@@ -796,8 +1068,14 @@ mod tests {
         assert_eq!(sets["AWS_SESSION_TOKEN"], LEASE_TOKEN);
         assert_eq!(sets["AWS_REGION"], "eu-west-1");
         assert_eq!(sets["AWS_DEFAULT_REGION"], "eu-west-1");
-        assert_eq!(sets["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
-        assert_eq!(sets["AWS_CONFIG_FILE"], "/dev/null");
+        assert_eq!(
+            sets["AWS_SHARED_CREDENTIALS_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
+        assert_eq!(
+            sets["AWS_CONFIG_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
         // Every credential is masked; the region is not a secret.
         let masked: Vec<&str> = env.masked.iter().map(|v| v.as_str()).collect();
         assert_eq!(masked, [LEASE_AK, LEASE_SK, LEASE_TOKEN]);
@@ -905,8 +1183,14 @@ mod tests {
         }
         assert_eq!(vars["AWS_REGION"], "eu-west-1");
         assert_eq!(vars["AWS_DEFAULT_REGION"], "eu-west-1");
-        assert_eq!(vars["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
-        assert_eq!(vars["AWS_CONFIG_FILE"], "/dev/null");
+        assert_eq!(
+            vars["AWS_SHARED_CREDENTIALS_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
+        assert_eq!(
+            vars["AWS_CONFIG_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
         assert!(
             !text.contains("inherited-"),
             "an inherited credential reached the child"

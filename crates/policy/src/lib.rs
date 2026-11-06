@@ -46,4 +46,9 @@ pub use system::{
     McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SyslogFormat, SystemConfig, TargetCfg, WebhookCfg,
     RESERVED_SERVICES,
 };
-pub use users::{Directory, FixedDirectory, Getent, GroupEntry, UserEntry};
+#[cfg(windows)]
+pub use users::FfiAccounts;
+pub use users::{
+    names_account, Directory, FixedDirectory, Getent, GroupEntry, UserEntry, WinAccounts,
+    WinDirectory,
+};

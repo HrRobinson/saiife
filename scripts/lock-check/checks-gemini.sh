@@ -12,7 +12,10 @@
 # What it touches (inside the container; under $LC_ROOT in the offline
 # tests; in the macOS VM the system settings are /Library/Application
 # Support/GeminiCli/settings.json, spec 5.3, and /work is
-# /opt/lockcheck/work): the system settings /etc/gemini-cli/settings.json
+# /opt/lockcheck/work; in the Windows VM they are
+# C:\ProgramData\gemini-cli\settings.json, spec 5.3a, staged under
+# $LC_ROOT/C/ and written by windows-vm.ps1): the system settings
+# /etc/gemini-cli/settings.json
 # (root 0644),
 # /work/empty-settings.json, and as `agent` ~/.gemini/settings.json,
 # ~/.gemini/trustedFolders.json, /work/project/.gemini/settings.json and
@@ -33,6 +36,8 @@ GEMINI_KEY=""
 GEMINI_TOGGLES=()
 if [[ "$LC_PLATFORM" == macos ]]; then
   GEMINI_SYSTEM_DIR="$LC_ROOT/Library/Application Support/GeminiCli"
+elif [[ "$LC_PLATFORM" == windows ]]; then
+  GEMINI_SYSTEM_DIR="$LC_ROOT/C/ProgramData/gemini-cli"
 else
   GEMINI_SYSTEM_DIR="$LC_ROOT/etc/gemini-cli"
 fi
@@ -67,11 +72,18 @@ agent_login_files() {
   printf '%s\n' "$LC_HOME/.gemini/oauth_creds.json" "$LC_HOME/.gemini/google_accounts.json"
 }
 
+agent_managed_paths() {
+  printf '%s\n' "$GEMINI_SYSTEM_DIR/settings.json"
+}
+
 # --- the hooks on/off key ----------------------------------------------------
 
-# The global node_modules that holds @google/gemini-cli*.
+# The global node_modules that holds @google/gemini-cli*. In the Windows VM,
+# windows-vm.ps1 names the agent's own (LOCKCHECK_NODE_MODULES).
 gemini_node_modules() {
-  if [[ -n "$LC_ROOT" ]]; then
+  if [[ "$LC_PLATFORM" == windows && -n "${LOCKCHECK_NODE_MODULES:-}" ]]; then
+    printf '%s\n' "$LOCKCHECK_NODE_MODULES"
+  elif [[ -n "$LC_ROOT" ]]; then
     printf '%s\n' "$LC_ROOT/usr/local/lib/node_modules"
   else
     npm root -g 2>/dev/null || printf '%s\n' /usr/local/lib/node_modules
@@ -251,9 +263,9 @@ gemini_write_managed() {
   fi
   mkdir -p "$dir"
   chmod 0755 "$dir"
-  new="$(jq --arg w "$LC_WITNESS" '.hooks.BeforeTool[0].hooks = [{type: "command",
+  new="$(jq --arg w "$LC_WITNESS_CMD" '.hooks.BeforeTool[0].hooks = [{type: "command",
       command: $w, name: "lockcheck-witness", timeout: 10000}] + .hooks.BeforeTool[0].hooks' \
-    "$LC_MANAGED/gemini/settings.json" | gemini_json_set_toggles on "${keys[@]}")"
+    "$(lc_managed_file gemini/settings.json)" | gemini_json_set_toggles on "${keys[@]}")"
   printf '%s\n' "$new" >"$dir/settings.json"
   chmod 0644 "$dir/settings.json"
 }

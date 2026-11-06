@@ -17,6 +17,47 @@ pub const TRUSTED_INSTALLER: &str =
 /// `NT AUTHORITY\NETWORK`.
 pub const NETWORK: &str = "S-1-5-2";
 
+/// `SidTypeAlias`: what `LookupAccountNameW` says of a local group.
+pub const SID_TYPE_ALIAS: i32 = 4;
+
+/// `SE_GROUP_ENABLED`, an attribute of a group in a token.
+pub const SE_GROUP_ENABLED: u32 = 0x4;
+/// `SE_GROUP_USE_FOR_DENY_ONLY`: the group can only deny. This is how a
+/// UAC-filtered token holds `Administrators`.
+pub const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+
+/// What a token says about who it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenFacts {
+    /// The user's SID: the identity. [`uid_of`] is only a label.
+    pub sid: String,
+    /// The groups that count: enabled and not deny-only.
+    pub group_sids: Vec<String>,
+    /// `Administrators` is among [`TokenFacts::group_sids`].
+    pub elevated_admin: bool,
+}
+
+impl TokenFacts {
+    /// From a token's user and its groups with their attributes. A group that is
+    /// disabled or deny-only is no membership at all, so a non-elevated admin
+    /// neither is elevated nor counts as in `Administrators`.
+    pub fn from_groups(sid: String, groups: Vec<(String, u32)>) -> TokenFacts {
+        let group_sids: Vec<String> = groups
+            .into_iter()
+            .filter(|(_, attrs)| {
+                attrs & SE_GROUP_ENABLED != 0 && attrs & SE_GROUP_USE_FOR_DENY_ONLY == 0
+            })
+            .map(|(group, _)| group)
+            .collect();
+        let elevated_admin = group_sids.iter().any(|g| g == ADMINISTRATORS);
+        TokenFacts {
+            sid,
+            group_sids,
+            elevated_admin,
+        }
+    }
+}
+
 /// The SID Windows derives for a service: `S-1-5-80-` and the five
 /// little-endian `u32`s of `SHA-1(UTF-16LE(upper(service_name)))`.
 ///
@@ -56,11 +97,30 @@ pub fn service_sid(service_name: &str) -> String {
 /// The uid is a display label, and two SIDs can collide. The SID is the
 /// identity: never use the uid as a security key.
 pub fn uid_of(sid: &str, elevated_admin: bool) -> u32 {
-    if sid == SYSTEM || elevated_admin {
+    if sid == SYSTEM {
+        return 0;
+    }
+    peer_uid(sid, elevated_admin)
+}
+
+/// The uid of a named pipe peer: as [`uid_of`], but 0 only when `elevated_admin`, even
+/// for SYSTEM. A low-integrity or restricted SYSTEM token is not root. A real SYSTEM
+/// token holds `Administrators` enabled at System integrity, so it still gets 0.
+pub fn peer_uid(sid: &str, elevated_admin: bool) -> u32 {
+    if elevated_admin {
         return 0;
     }
     let hash = Sha256::digest(sid.as_bytes());
     0x4000_0000 | (u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) & 0x3fff_ffff)
+}
+
+/// Whether a pipe peer is an admin by its token alone: `Administrators` among the groups
+/// [`crate::pipe::peer_facts`] left it. That is the fact [`peer_uid`] gives 0 for, so a
+/// low-integrity or restricted token, SYSTEM's included, is no admin; a real SYSTEM token
+/// holds the group enabled at System integrity and is one. The SID is not looked at: it
+/// says SYSTEM for a lowered SYSTEM token too.
+pub fn token_is_admin(group_sids: &[String]) -> bool {
+    group_sids.iter().any(|g| g == ADMINISTRATORS)
 }
 
 /// Whether `s` is a SID in canonical text: `S-1-<authority>(-<u32>){1,15}`.
@@ -143,6 +203,17 @@ mod tests {
         assert_eq!(uid_of("S-1-5-21-1-2-3-1001", true), 0);
     }
 
+    #[test]
+    fn peer_uid_is_0_only_when_elevated() {
+        assert_eq!(peer_uid(SYSTEM, true), 0);
+        assert_eq!(peer_uid("S-1-5-21-1-2-3-1001", true), 0);
+        assert_ne!(peer_uid(SYSTEM, false), 0);
+        assert_eq!(
+            peer_uid("S-1-5-21-1-2-3-1001", false),
+            uid_of("S-1-5-21-1-2-3-1001", false)
+        );
+    }
+
     /// Computed independently with Python's hashlib.
     #[test]
     fn uid_of_vector() {
@@ -211,5 +282,33 @@ mod tests {
         ] {
             assert!(!valid_sid(s), "{s:?}");
         }
+    }
+
+    #[test]
+    fn token_facts_count_only_enabled_groups() {
+        const ENABLED: u32 = SE_GROUP_ENABLED;
+        const DENY: u32 = SE_GROUP_USE_FOR_DENY_ONLY;
+        let sid = "S-1-5-21-1-2-3-1001".to_string();
+        let facts = |groups: &[(&str, u32)]| {
+            let groups = groups.iter().map(|(g, a)| (g.to_string(), *a)).collect();
+            TokenFacts::from_groups(sid.clone(), groups)
+        };
+
+        let elevated = facts(&[(ADMINISTRATORS, ENABLED | 0x3), (USERS, ENABLED)]);
+        assert!(elevated.elevated_admin);
+        assert_eq!(elevated.group_sids, [ADMINISTRATORS, USERS]);
+
+        // UAC's filtered token: Administrators is there, for denying only.
+        let filtered = facts(&[(ADMINISTRATORS, DENY), (USERS, ENABLED)]);
+        assert!(!filtered.elevated_admin);
+        assert_eq!(filtered.group_sids, [USERS]);
+
+        // Both bits at once still deny only.
+        assert!(!facts(&[(ADMINISTRATORS, ENABLED | DENY)]).elevated_admin);
+        // Present but disabled.
+        assert!(!facts(&[(ADMINISTRATORS, 0)]).elevated_admin);
+        // An integrity label has neither bit.
+        assert!(facts(&[("S-1-16-8192", 0x60)]).group_sids.is_empty());
+        assert_eq!(facts(&[]).sid, sid);
     }
 }

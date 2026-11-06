@@ -1,43 +1,51 @@
 //! Startup, the serve loop, reload and stop (spec §6.2).
 
+#[cfg(unix)]
+use crate::notify;
 use crate::ops::{check_services_owned, Ctx, CtxInit, Mode, PolicyState, VERSION};
 use crate::personal::{self, PersonalCfg};
 use crate::tokens::{self, Tokens};
 use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
-use crate::{gateway, notify, server, DaemonMode, DaemonOptions};
+use crate::{gateway, server, DaemonMode, DaemonOptions};
 use saiife_audit::sign::AuditKey;
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_broker::limits::Limiter;
 use saiife_broker::pipeline::limit_event;
 use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
+#[cfg(unix)]
 use saiife_ipc::msg::{GATEWAY_SOCKET_NAME, SOCKET_NAME};
 use saiife_policy::PackInfo;
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
 use serde_json::{json, Value};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::signal::unix::{signal, SignalKind};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, Signal, SignalKind};
 
 /// Records re-verified at start (spec §6.2).
 const STARTUP_CHECK_RECORDS: usize = 1000;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// The group that may read the audit log (spec §5.2).
+#[cfg(unix)]
 use crate::audit_query::AUDIT_GROUP;
 
 /// The vault key's name in the credentials dir: systemd's `LoadCredential`
 /// name on Linux, `/var/db/saiife/keys/vault.key` on macOS (spec §5.3).
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub const VAULT_KEY_FILE: &str = "vault-key";
 /// The vault key's name in the credentials dir: systemd's `LoadCredential`
-/// name on Linux, `/var/db/saiife/keys/vault.key` on macOS (spec §5.3).
-#[cfg(target_os = "macos")]
+/// name on Linux, `/var/db/saiife/keys/vault.key` on macOS (spec §5.3),
+/// `state\\keys\\vault.key` on Windows (W15).
+#[cfg(any(target_os = "macos", windows))]
 pub const VAULT_KEY_FILE: &str = "vault.key";
 
 /// No core dumps: `PR_SET_DUMPABLE` 0 on Linux (which also keeps other
@@ -49,7 +57,14 @@ fn no_core_dumps() -> rustix::io::Result<()> {
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: a service account's crash goes to Windows Error Reporting, which an admin
+/// configures. There is no per-process limit to set without a call off the W1 list.
+#[cfg(windows)]
+fn no_core_dumps() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn no_core_dumps() -> rustix::io::Result<()> {
     use rustix::process::{setrlimit, Resource, Rlimit};
     setrlimit(
@@ -70,13 +85,184 @@ impl<T: Into<String>> From<T> for Refuse {
     }
 }
 
+#[cfg(unix)]
 pub fn run(opts: DaemonOptions) -> ExitCode {
-    match start(opts) {
+    finish(start(opts, ()))
+}
+
+/// `ctl`: the service manager's controls; without it, Ctrl+C stops the daemon.
+#[cfg(windows)]
+pub fn run(opts: DaemonOptions, ctl: Option<saiife_win::ffi::service::ServiceCtl>) -> ExitCode {
+    finish(start(opts, ctl))
+}
+
+fn finish(r: Result<ExitCode, Refuse>) -> ExitCode {
+    match r {
         Ok(code) => code,
         Err(Refuse(msg)) => {
             eprintln!("saiife: {msg}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// What stops and reloads the serve loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeEvent {
+    Reload,
+    Stop,
+}
+
+/// Where stops and reloads come from: signals here, so nothing to pass in.
+#[cfg(unix)]
+type Service = ();
+
+/// SIGHUP reloads; SIGTERM and SIGINT stop.
+#[cfg(unix)]
+struct Events {
+    hup: Signal,
+    term: Signal,
+    int: Signal,
+}
+
+#[cfg(unix)]
+impl Events {
+    fn install(_: Service) -> std::io::Result<Events> {
+        Ok(Events {
+            hup: signal(SignalKind::hangup())?,
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn next(&mut self) -> ServeEvent {
+        tokio::select! {
+            _ = self.hup.recv() => ServeEvent::Reload,
+            _ = self.term.recv() => ServeEvent::Stop,
+            _ = self.int.recv() => ServeEvent::Stop,
+        }
+    }
+
+    fn ready(&self) {
+        notify::ready();
+    }
+}
+
+/// Where stops and reloads come from: the service manager, or Ctrl+C without one.
+#[cfg(windows)]
+type Service = Option<saiife_win::ffi::service::ServiceCtl>;
+
+/// The service manager's controls, or Ctrl+C outside it (W10).
+#[cfg(windows)]
+struct Events {
+    rx: tokio::sync::mpsc::UnboundedReceiver<ServeEvent>,
+    status: Option<saiife_win::ffi::service::StatusPort>,
+}
+
+#[cfg(windows)]
+impl Events {
+    fn install(service: Service) -> std::io::Result<Events> {
+        use saiife_win::ffi::service::Control;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let status = match service {
+            Some(ctl) => {
+                let status = ctl.status;
+                let control = ctl.control;
+                // `recv` blocks, so a thread of its own. It ends with the process.
+                std::thread::Builder::new()
+                    .name("saiife-control".into())
+                    .spawn(move || {
+                        while let Ok(c) = control.recv() {
+                            let event = match c {
+                                Control::Stop => ServeEvent::Stop,
+                                Control::Reload => ServeEvent::Reload,
+                            };
+                            if tx.send(event).is_err() {
+                                return;
+                            }
+                        }
+                    })?;
+                Some(status)
+            }
+            None => {
+                tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        let _ = tx.send(ServeEvent::Stop);
+                    }
+                });
+                None
+            }
+        };
+        Ok(Events { rx, status })
+    }
+
+    /// A channel nobody can send on any more can never stop the daemon: that is a stop.
+    async fn next(&mut self) -> ServeEvent {
+        self.rx.recv().await.unwrap_or(ServeEvent::Stop)
+    }
+
+    fn ready(&self) {
+        if let Some(s) = &self.status {
+            s.set_running();
+        }
+    }
+}
+
+/// Whether a peer's daemon may run as this token on Windows: never as an admin, whose
+/// uid is 0 (W12), and never as other than the service. A debug build's test pipe runs
+/// as the runner, which is an elevated admin on CI (W23).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_start_problem(sid: &str, elevated: bool, test_pipe: bool) -> Option<String> {
+    use saiife_system::layout::{WIN_DAEMON_ACCOUNT, WIN_SERVICE};
+    use saiife_win::sid::{service_sid, uid_of};
+    if test_pipe {
+        return None;
+    }
+    if uid_of(sid, elevated) == 0 {
+        return Some("the daemon must run as the daemon user, not an administrator".into());
+    }
+    (sid != service_sid(WIN_SERVICE))
+        .then(|| format!("the daemon runs as {WIN_DAEMON_ACCOUNT}, not {sid}"))
+}
+
+/// The control pipe's name and descriptor (W11). A debug build's test pipe has the
+/// runner's SID where the service's would be.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pipe_spec(test_pipe: Option<&str>, own_sid: &str) -> (String, String) {
+    use saiife_system::layout::{WIN_PIPE, WIN_SERVICE};
+    use saiife_win::pipe::control_sddl;
+    match test_pipe {
+        Some(name) => (name.to_string(), control_sddl(own_sid)),
+        None => (
+            WIN_PIPE.to_string(),
+            control_sddl(&saiife_win::sid::service_sid(WIN_SERVICE)),
+        ),
+    }
+}
+
+/// Whether this process is the account `[daemon] user` names: by SID where the directory
+/// knows SIDs (Windows), by uid elsewhere. The `Err` says why not.
+fn daemon_user_check(
+    dir: &dyn saiife_policy::Directory,
+    name: &str,
+    euid: u32,
+    own_sid: Option<&str>,
+) -> Result<(), String> {
+    let Some(u) = dir.user(name) else {
+        return Err(format!(
+            "the daemon runs as {name} per [daemon] user, and there is no such user (this is uid {euid})"
+        ));
+    };
+    let same = match own_sid {
+        Some(own) => dir.sid_of(name).as_deref() == Some(own),
+        None => u.uid == euid,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "the daemon runs as {name} per [daemon] user, not uid {euid}"
+        ))
     }
 }
 
@@ -154,9 +340,126 @@ struct PersonalStart {
 
 /// The lock file in the personal state dir that keeps a second broker of
 /// the same user from starting (and from making a second vault key).
+#[cfg(any(unix, windows))]
 const PERSONAL_LOCK: &str = "broker.lock";
 
+/// Whether the personal broker may run as this token on Windows (Task 11). Never as an
+/// administrator or SYSTEM, whose uid label is 0 and would read as root; never as a
+/// service, virtual, AppContainer or other account that is not a person's, which has no
+/// profile or credential store of its own; never as anonymous or the machine's guest
+/// account, which are nobody's own. A debug build's test pipe runs as the runner, an
+/// elevated admin on CI (W23).
+///
+/// The accounts a person signs in with are allow-listed by authority, so an authority
+/// Windows adds later is refused, not let through: a local or domain account
+/// (`S-1-5-21-<domain>-<rid>`) and a Microsoft Entra ID account (`S-1-12-1-…`). Every
+/// virtual account (`S-1-5-80` services, `-82` app pools, `-83` VMs, `-90` window
+/// managers, `-96` font drivers) is outside both.
+///
+/// With UAC off, or as the built-in Administrator, every token of that user is elevated,
+/// so that user can never run it. This fails closed, and the line says so.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn personal_start_problem(sid: &str, elevated: bool, test_pipe: bool) -> Option<String> {
+    use saiife_win::sid::uid_of;
+    /// Anonymous, SYSTEM, LocalService and NetworkService.
+    const NOT_A_PERSON: [&str; 4] = ["S-1-5-7", "S-1-5-18", "S-1-5-19", "S-1-5-20"];
+    if test_pipe {
+        return None;
+    }
+    if NOT_A_PERSON.contains(&sid) {
+        return Some(format!(
+            "the personal broker runs as your own user, not the system account {sid}"
+        ));
+    }
+    if sid.starts_with("S-1-5-21-") && sid.ends_with("-501") {
+        return Some(format!(
+            "the personal broker runs as your own user, not the guest account {sid}"
+        ));
+    }
+    if uid_of(sid, elevated) == 0 {
+        return Some(
+            "the personal broker runs as your own user, not an administrator: this token is \
+             elevated. Start it from a shell that is not elevated. With UAC off, or as the \
+             built-in Administrator, every shell is elevated, so use another account"
+                .into(),
+        );
+    }
+    let person = saiife_win::sid::valid_sid(sid)
+        && ((sid.starts_with("S-1-5-21-") && sid.split('-').count() == 8)
+            || sid.starts_with("S-1-12-1-"));
+    (!person).then(|| {
+        format!("the personal broker runs as a user, not the service or virtual account {sid}")
+    })
+}
+
+/// The personal broker's pipe name and descriptor: a name per user SID, and a descriptor
+/// that owns the pipe as that user and admits that user alone. A test pipe has its own
+/// name and the same descriptor.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn personal_pipe_spec(test_pipe: Option<&str>, own_sid: &str) -> Result<(String, String), String> {
+    let name = match test_pipe {
+        Some(n) => n.to_string(),
+        None => saiife_system::personal::personal_pipe_name(own_sid)?,
+    };
+    Ok((name, saiife_win::pipe::personal_sddl(own_sid)))
+}
+
+/// What the locked-host marker says of a personal broker. Anyone may create the path on a
+/// machine with no install, so a file on a tree that isn't ours marks nothing: it must not
+/// keep another user's broker from starting while the CLI, which ignores it too, tells them
+/// to start one. On our tree, trusted or damaged, this is a locked host.
+#[cfg(any(windows, test))]
+pub(crate) fn locked_marker_problem(
+    trust: saiife_system::wintrust::Trust,
+    marker: &Path,
+) -> Result<(), String> {
+    use saiife_system::wintrust::Trust;
+    match trust {
+        Trust::Absent => Ok(()),
+        Trust::NotOurs(why) => {
+            eprintln!(
+                "saiife: warning: {} ignored: not protected as a system file ({why})",
+                marker.display()
+            );
+            Ok(())
+        }
+        Trust::Trusted | Trust::Damaged(_) => Err(format!(
+            "this host is in locked mode ({} exists): connectors go through the system daemon, not daemon --user",
+            marker.display()
+        )),
+    }
+}
+
+/// See [`crate::personal_preflight`]. Windows: the locked-host marker and a locked config;
+/// who this process is, is [`personal_start_problem`]'s, read from the token.
+#[cfg(windows)]
+pub(crate) fn personal_preflight(
+    config: &Path,
+    _socket_dir: &Path,
+    locked_marker: &Path,
+) -> Result<(), String> {
+    use saiife_system::host::RealHost;
+    use saiife_system::wintrust::{service_registered, system_file, test_trust_sid};
+    // Decision 10: a locked host wins, when it is one.
+    let trust = system_file(
+        &saiife_system::Layout::system(),
+        locked_marker,
+        &|p| saiife_win::ffi::acl::get_sddl(p),
+        test_trust_sid().as_deref(),
+        &|| service_registered(&RealHost),
+    );
+    locked_marker_problem(trust, locked_marker)?;
+    if bootstrap(config).locked == Some(true) {
+        return Err(format!(
+            "{}: locked = true is a locked-mode config; the personal broker does not serve it",
+            config.display()
+        ));
+    }
+    Ok(())
+}
+
 /// See [`crate::personal_preflight`].
+#[cfg(unix)]
 pub(crate) fn personal_preflight(
     config: &Path,
     socket_dir: &Path,
@@ -190,9 +493,53 @@ pub(crate) fn personal_preflight(
     Ok(())
 }
 
+/// Windows: a dir of the personal broker's own is created with its parent's ACL (the
+/// user's profile), and must then have no writer but this user, SYSTEM and
+/// Administrators ([`crate::fsx::check_private_dir`]).
+#[cfg(windows)]
+fn private_dir(dir: &Path, _euid: u32) -> Result<(), String> {
+    crate::fsx::create_private_dirs(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::fsx::check_private_dir(dir).map_err(|e| e.to_string())
+}
+
+/// Windows: the single-instance lock is a file opened with no sharing, so a second broker
+/// of this state dir cannot open it, and Windows drops it when this process ends. A
+/// reparse point is not followed.
+#[cfg(windows)]
+fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let path = state_dir.join(PERSONAL_LOCK);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|e| match e.raw_os_error() {
+            // ERROR_SHARING_VIOLATION
+            Some(32) => format!(
+                "another personal broker of this user is running (it holds {})",
+                path.display()
+            ),
+            _ => format!("{}: {e}", path.display()),
+        })?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if md.file_attributes() & 0x400 != 0 {
+        return Err(format!("{}: a link, not a lock file", path.display()));
+    }
+    Ok(f)
+}
+
 /// A dir of the personal broker's own (state, audit): created 0700 when
 /// missing; an existing one must be a real dir of this user that group
 /// and others cannot use.
+#[cfg(unix)]
 fn private_dir(dir: &Path, euid: u32) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     std::fs::DirBuilder::new()
@@ -235,6 +582,7 @@ fn private_dir(dir: &Path, euid: u32) -> Result<(), String> {
 /// each may store its own and the last write wins; the other's vault is then
 /// left under a key the keychain no longer holds. One broker per user is the
 /// supported setup.
+#[cfg(unix)]
 fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = state_dir.join(PERSONAL_LOCK);
@@ -261,21 +609,30 @@ fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
 /// security order of Task 5): the refusals, the config, the state dir and
 /// its lock, then the key from the keychain. The keychain is dropped here,
 /// before any runtime exists.
+#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn personal_start(
     config: &Path,
     state_dir: &Path,
     directory: &dyn saiife_policy::Directory,
     euid: u32,
+    own_sid: Option<&str>,
     socket_dir: PathBuf,
     audit_dir: PathBuf,
     keychain: Box<dyn saiife_keychain::Keychain>,
     locked_marker: &Path,
 ) -> Result<PersonalStart, Refuse> {
     personal_preflight(config, &socket_dir, locked_marker)?;
-    let own_user = directory
-        .name_of(euid)
-        .ok_or_else(|| format!("uid {euid} has no user name"))?;
+    // Windows: the SID is the identity, so the name comes from the SID, never from a uid
+    // label that two accounts could share.
+    let own_user = match own_sid {
+        Some(sid) => directory
+            .name_of_sid(sid)
+            .ok_or_else(|| format!("cannot find the account name of {sid}"))?,
+        None => directory
+            .name_of(euid)
+            .ok_or_else(|| format!("uid {euid} has no user name"))?,
+    };
     match personal::ensure_config(config) {
         Ok(true) => eprintln!("saiife: created {}", config.display()),
         Ok(false) => {}
@@ -361,6 +718,7 @@ pub(crate) fn load_policy(
 /// The socket dir and socket modes: the locked daemon's dir is 0755 and
 /// its sockets 0666 (the peer check decides); the personal broker's are
 /// 0700 and 0600, owned by the user (root's is not accepted).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 struct SocketPerms {
     dir: u32,
@@ -368,18 +726,20 @@ struct SocketPerms {
     root_dir_ok: bool,
 }
 
+#[cfg(unix)]
 const SYSTEM_SOCKETS: SocketPerms = SocketPerms {
     dir: 0o755,
     sock: 0o666,
     root_dir_ok: true,
 };
+#[cfg(unix)]
 const PERSONAL_SOCKETS: SocketPerms = SocketPerms {
     dir: 0o700,
     sock: 0o600,
     root_dir_ok: false,
 };
 
-fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
+fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     let DaemonOptions {
         config,
         state_dir,
@@ -387,40 +747,66 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         directory,
         credentials_dir,
         mode: daemon_mode,
+        #[cfg(windows)]
+        test_pipe,
     } = opts;
     // 1. Who and what may run.
-    let euid = rustix::process::geteuid().as_raw();
-    if euid == 0 {
-        return Err(match daemon_mode {
-            DaemonMode::System => "the daemon must run as the daemon user, not root",
-            DaemonMode::Personal { .. } => "the personal broker runs as your own user, not root",
+    #[cfg(unix)]
+    let (euid, own_sid): (u32, Option<String>) = {
+        let euid = rustix::process::geteuid().as_raw();
+        if euid == 0 {
+            return Err(match daemon_mode {
+                DaemonMode::System => "the daemon must run as the daemon user, not root",
+                DaemonMode::Personal { .. } => {
+                    "the personal broker runs as your own user, not root"
+                }
+            }
+            .into());
         }
-        .into());
-    }
+        (euid, None)
+    };
+    // The SID is the identity, and the uid its label: a token's own label, not 0, even
+    // for a debug build's elevated runner.
+    #[cfg(windows)]
+    let (euid, own_sid): (u32, Option<String>) = {
+        let token = saiife_win::ffi::token::current()
+            .map_err(|e| format!("cannot read this process's token: {e}"))?;
+        let problem = match daemon_mode {
+            DaemonMode::System => {
+                windows_start_problem(&token.sid, token.elevated_admin, test_pipe.is_some())
+            }
+            DaemonMode::Personal { .. } => {
+                personal_start_problem(&token.sid, token.elevated_admin, test_pipe.is_some())
+            }
+        };
+        if let Some(why) = problem {
+            return Err(why.into());
+        }
+        (saiife_win::sid::uid_of(&token.sid, false), Some(token.sid))
+    };
+    // The personal broker's pipe: a name per SID, owned by and open to that user alone.
+    // Worked out here so a bad SID refuses before anything is created.
+    #[cfg(windows)]
+    let personal_place = match (&daemon_mode, own_sid.as_deref()) {
+        (DaemonMode::Personal { .. }, Some(sid)) => {
+            Some(personal_pipe_spec(test_pipe.as_deref(), sid)?)
+        }
+        _ => None,
+    };
     let boot = bootstrap(&config);
     let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(directory);
     // 2. No core dumps (the signing key or the vault key is in memory).
     if let Err(e) = no_core_dumps() {
         eprintln!("saiife: warning: cannot turn off core dumps: {e}");
     }
-    let (mode, personal) = match daemon_mode {
+    let (mode, personal): (Mode, Option<PersonalStart>) = match daemon_mode {
         DaemonMode::System => {
-            let name = &boot.daemon.user;
-            match directory.user(name) {
-                Some(u) if u.uid == euid => {}
-                Some(_) => {
-                    return Err(format!(
-                        "the daemon runs as {name} per [daemon] user, not uid {euid}"
-                    )
-                    .into())
-                }
-                None => {
-                    return Err(format!(
-                        "the daemon runs as {name} per [daemon] user, and there is no such user (this is uid {euid})"
-                    )
-                    .into())
-                }
-            }
+            daemon_user_check(
+                directory.as_ref(),
+                &boot.daemon.user,
+                euid,
+                own_sid.as_deref(),
+            )?;
             if boot.locked == Some(false) {
                 return Err(format!(
                     "{}: the daemon serves a locked config only; set locked = true",
@@ -442,6 +828,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
                 &state_dir,
                 directory.as_ref(),
                 euid,
+                own_sid.as_deref(),
                 socket_dir,
                 audit_dir,
                 keychain,
@@ -508,6 +895,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     };
 
     // 5. The chain: one writer, checked at start.
+    #[cfg(any(unix, windows))]
     if mode == Mode::Personal {
         private_dir(&audit_cfg.dir, euid)?;
     }
@@ -520,6 +908,8 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         },
     )
     .map_err(|e| format!("{}: {e}", audit_cfg.dir.display()))?;
+    // Windows: the audit group's read is in the dir's ACL (W14), and nothing resets it.
+    #[cfg(unix)]
     if mode == Mode::Locked {
         regroup_audit_dir(&audit_cfg.dir, directory.as_ref());
     }
@@ -591,11 +981,6 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
-    // Their `approval`/`expired` records go with the start records.
-    let expired_at_start = match &approvals {
-        Ok(store) => store.sweep(crate::import_backup::now()),
-        Err(_) => Vec::new(),
-    };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
@@ -647,12 +1032,18 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         },
     ));
 
+    // A debug build's test pipe: its clients run as the daemon does, as the runner.
+    #[cfg(windows)]
+    let test_pipe_in_use = test_pipe.is_some();
+    #[cfg(unix)]
+    let test_pipe_in_use = false;
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
         writer_cfg,
         directory,
         mode,
         own_uid: euid,
+        own_sid: own_sid.clone(),
         own_user: name,
         audit_dir: audit_cfg.dir.clone(),
         socket_dir: daemon_cfg.socket_dir.clone(),
@@ -671,7 +1062,9 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         lockdown,
         grants,
         mcp,
-        refuse_own_uid_peers: mode == Mode::Locked && !crate::mcp_gateway::own_uid_peers_allowed(),
+        refuse_own_uid_peers: mode == Mode::Locked
+            && !crate::mcp_gateway::own_uid_peers_allowed()
+            && !test_pipe_in_use,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
@@ -707,13 +1100,40 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     .chain(rebuild_note)
     .chain(capped_note)
     .collect();
+    // W11: a name someone else holds ends the start here, before any record, so the service
+    // manager's restarts every second can't grow the log, and nothing below is taken as done
+    // (an interrupted approval's state, say) with its record unwritten.
+    #[cfg(windows)]
+    let place = {
+        let place = personal_place.unwrap_or_else(|| {
+            pipe_spec(test_pipe.as_deref(), own_sid.as_deref().unwrap_or_default())
+        });
+        match rt.block_on(Endpoints::open(&ctx, place)) {
+            Ok(endpoints) => endpoints,
+            Err(code) => {
+                drop(ctx);
+                let _ = join.join();
+                return Ok(code);
+            }
+        }
+    };
+    // The start sweep, once the name is ours: a start that ends above must leave every
+    // request as it was, as no `expired` record could follow. Their `approval`/`expired`
+    // records go with the start records (on Unix before the sockets, as before).
+    let expired_at_start = match &ctx.approvals {
+        Ok(store) => store.sweep(crate::import_backup::now()),
+        Err(_) => Vec::new(),
+    };
     let mut more = start_notes(&ctx, notes, &expired_at_start);
     // Requests approved but not sent when the daemon stopped become
     // `send_failed` (`interrupted`); none is sent again by itself.
     more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
+    #[cfg(unix)]
+    let place = daemon_cfg.socket_dir.clone();
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
-        daemon_cfg.socket_dir.clone(),
+        service,
+        place,
         check,
         policy_err,
         loaded_files,
@@ -737,6 +1157,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
 /// the unit's `Group=saiife` before every command it spawns for the unit,
 /// `ExecReload=` (`/bin/kill -HUP`) included, not only before `ExecStart=`.
 /// `None` when there is no such group.
+#[cfg(unix)]
 fn regroup_audit_dir(dir: &Path, directory: &dyn saiife_policy::Directory) -> Option<u32> {
     let g = directory.group(AUDIT_GROUP)?;
     match adopt_audit_group(dir, g.gid) {
@@ -758,6 +1179,7 @@ fn regroup_audit_dir(dir: &Path, directory: &dyn saiife_policy::Directory) -> Op
 /// systemd's `LogsDirectory=` gives the dir to the unit's `Group=saiife`
 /// before every command it spawns for the unit (start and reload), and
 /// §5.2 wants it in `saiife-audit` (readers of the log).
+#[cfg(unix)]
 fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
     use rustix::fs::{AtFlags, Gid, Mode, OFlags};
     use std::os::unix::fs::MetadataExt;
@@ -790,6 +1212,7 @@ fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
 /// directory: owned by `owner`, not writable by group or others, no
 /// symlinks, and every `*.pem` a regular file with the same owner and mode
 /// rules. A missing directory is fine (no extra CAs).
+#[cfg(unix)]
 fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let err = |p: &Path, why: &str| format!("{}: {why}", p.display());
@@ -819,6 +1242,47 @@ fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
         if m.uid() != owner || m.mode() & 0o022 != 0 {
             return Err(err(&p, &owned));
         }
+    }
+    Ok(())
+}
+
+/// [`check_ca_dir`] on Windows: no reparse point, and only SYSTEM, Administrators and
+/// TrustedInstaller may change the dir or a `*.pem` in it (W14's `etc` row). With a
+/// non-zero `owner` (the personal broker, a debug build's seam), this process too.
+#[cfg(windows)]
+fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
+    let err = |p: &Path, why: &str| format!("{}: {why}", p.display());
+    let own = match owner {
+        0 => String::new(),
+        _ => crate::fsx::own_sid().map_err(|e| err(dir, &e.to_string()))?,
+    };
+    let acl_ok = |p: &Path| -> Result<(), String> {
+        let text = saiife_win::ffi::acl::get_sddl(p).map_err(|e| err(p, &e.to_string()))?;
+        match saiife_win::sddl::private_problem(&text, &own, false) {
+            None => Ok(()),
+            Some(why) => Err(err(p, &why)),
+        }
+    };
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(dir, &e.to_string())),
+    };
+    if crate::fsx::is_link(&meta) || !meta.is_dir() {
+        return Err(err(dir, "not a directory (links are not followed)"));
+    }
+    acl_ok(dir)?;
+    for e in std::fs::read_dir(dir).map_err(|e| err(dir, &e.to_string()))? {
+        let e = e.map_err(|e| err(dir, &e.to_string()))?;
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "pem") {
+            continue;
+        }
+        let m = std::fs::symlink_metadata(&p).map_err(|e| err(&p, &e.to_string()))?;
+        if crate::fsx::is_link(&m) || !m.file_type().is_file() {
+            return Err(err(&p, "not a regular file (links are not followed)"));
+        }
+        acl_ok(&p)?;
     }
     Ok(())
 }
@@ -938,6 +1402,7 @@ fn policy_record(
 /// (or root's): the client trusts whatever socket is in it.
 /// The personal broker's dir must be its own (not root's) and closed to
 /// group and others.
+#[cfg(unix)]
 fn check_socket_dir(
     st: &rustix::fs::Stat,
     dir: &Path,
@@ -985,6 +1450,7 @@ fn check_socket_dir(
 /// anything else there is left alone. The dir is held open (`O_NOFOLLOW`)
 /// and every later step works relative to it, without following a symlink
 /// at `name`.
+#[cfg(unix)]
 fn bind(
     socket_dir: &Path,
     name: &str,
@@ -1074,7 +1540,7 @@ fn chmod_socket(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn chmod_socket(
     dirfd: &rustix::fd::OwnedFd,
     name: &str,
@@ -1086,6 +1552,7 @@ fn chmod_socket(
 
 /// The no-`/proc` branch of [`chmod_socket`]: `statat` (no follow) checks
 /// the name is this uid's socket, then `chmodat` changes it in the held dir.
+#[cfg(unix)]
 fn chmod_socket_at(
     dirfd: &rustix::fd::OwnedFd,
     name: &str,
@@ -1153,9 +1620,147 @@ fn start_notes(
     out
 }
 
+/// The control endpoint and the unix gateway beside it, while they accept.
+#[cfg(unix)]
+struct Endpoints {
+    listener: UnixListener,
+    sock_path: PathBuf,
+    rest: UnixGateway,
+}
+
+/// What is left to stop once the control socket stopped accepting.
+#[cfg(unix)]
+struct UnixGateway {
+    task: tokio::task::JoinHandle<()>,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnixGateway {
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+impl Endpoints {
+    /// Step 7: the sockets, control and the HTTP gateway (§8.8), side by side.
+    async fn open(ctx: &Arc<Ctx>, socket_dir: PathBuf) -> Result<Endpoints, ExitCode> {
+        let perms = match ctx.mode {
+            Mode::Locked => SYSTEM_SOCKETS,
+            Mode::Personal => PERSONAL_SOCKETS,
+        };
+        let (listener, sock_path) = match bind(&socket_dir, SOCKET_NAME, ctx.own_uid, perms) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("saiife: {e}");
+                let _ = ctx.writer.stop(None).await;
+                return Err(ExitCode::from(2));
+            }
+        };
+        let (gw_listener, gw_path) =
+            match bind(&socket_dir, GATEWAY_SOCKET_NAME, ctx.own_uid, perms) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("saiife: {e}");
+                    drop(listener);
+                    let _ = std::fs::remove_file(&sock_path);
+                    let _ = ctx.writer.stop(None).await;
+                    return Err(ExitCode::from(2));
+                }
+            };
+        let task = tokio::spawn(gateway::serve(gw_listener, Arc::clone(ctx)));
+        Ok(Endpoints {
+            listener,
+            sock_path,
+            rest: UnixGateway {
+                task,
+                path: gw_path,
+            },
+        })
+    }
+
+    async fn accept(&mut self) -> std::io::Result<tokio::net::UnixStream> {
+        self.listener.accept().await.map(|(s, _)| s)
+    }
+
+    /// No new connections.
+    fn stop_accepting(self) -> UnixGateway {
+        drop(self.listener);
+        let _ = std::fs::remove_file(&self.sock_path);
+        self.rest
+    }
+}
+
+/// An accept failure the daemon cannot go on from.
+#[cfg(unix)]
+fn accept_is_fatal(_: &std::io::Error) -> bool {
+    false
+}
+
+/// The control pipe (W11). No gateway socket on Windows: loopback TCP only (W13).
+#[cfg(windows)]
+struct Endpoints {
+    listener: crate::pipe_listener::PipeListener,
+}
+
+/// Nothing is left to stop once the pipe stopped accepting.
+#[cfg(windows)]
+struct UnixGateway;
+
+#[cfg(windows)]
+impl UnixGateway {
+    async fn stop(self) {}
+}
+
+#[cfg(windows)]
+impl Endpoints {
+    /// Step 7: the first instance of the control pipe. A name someone else holds is
+    /// W11's line in the log and exit 1. The service manager retries, and the hooks deny.
+    async fn open(ctx: &Arc<Ctx>, (name, sddl): (String, String)) -> Result<Endpoints, ExitCode> {
+        match crate::pipe_listener::PipeListener::bind(&name, &sddl) {
+            Ok(listener) => Ok(Endpoints { listener }),
+            Err(e) => {
+                let code = if accept_is_fatal(&e) {
+                    eprintln!("{e}");
+                    1
+                } else {
+                    eprintln!("saiife: {name}: {e}");
+                    2
+                };
+                let _ = ctx.writer.stop(None).await;
+                Err(ExitCode::from(code))
+            }
+        }
+    }
+
+    async fn accept(
+        &mut self,
+    ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        self.listener.accept().await
+    }
+
+    /// No new connections.
+    fn stop_accepting(mut self) -> UnixGateway {
+        self.listener.close();
+        UnixGateway
+    }
+}
+
+/// `create_server`'s text for a name that is not ours: the daemon must not go on.
+#[cfg(windows)]
+fn accept_is_fatal(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     ctx: Arc<Ctx>,
-    socket_dir: PathBuf,
+    service: Service,
+    #[cfg(unix)] place: PathBuf,
+    #[cfg(windows)] place: Endpoints,
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
@@ -1163,16 +1768,7 @@ async fn serve(
     more: Vec<saiife_audit::Record>,
     tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
-    let perms = match ctx.mode {
-        Mode::Locked => SYSTEM_SOCKETS,
-        Mode::Personal => PERSONAL_SOCKETS,
-    };
-    let signals = (
-        signal(SignalKind::hangup()),
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    );
-    let (Ok(mut hup), Ok(mut term), Ok(mut int)) = signals else {
+    let Ok(mut events) = Events::install(service) else {
         eprintln!("saiife: cannot install signal handlers");
         return ExitCode::from(2);
     };
@@ -1218,26 +1814,13 @@ async fn serve(
         }
     }
 
-    // 7. The sockets: control and the HTTP gateway (§8.8), side by side.
-    let (listener, sock_path) = match bind(&socket_dir, SOCKET_NAME, ctx.own_uid, perms) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("saiife: {e}");
-            let _ = ctx.writer.stop(None).await;
-            return ExitCode::from(2);
-        }
+    #[cfg(unix)]
+    let mut endpoints = match Endpoints::open(&ctx, place).await {
+        Ok(e) => e,
+        Err(code) => return code,
     };
-    let (gw_listener, gw_path) = match bind(&socket_dir, GATEWAY_SOCKET_NAME, ctx.own_uid, perms) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("saiife: {e}");
-            drop(listener);
-            let _ = std::fs::remove_file(&sock_path);
-            let _ = ctx.writer.stop(None).await;
-            return ExitCode::from(2);
-        }
-    };
-    let gateway = tokio::spawn(gateway::serve(gw_listener, Arc::clone(&ctx)));
+    #[cfg(windows)]
+    let mut endpoints = place;
     // The optional loopback TCP listener: a bind failure is a record and
     // no listener; the Unix sockets stay.
     let gateway_tcp = match tcp {
@@ -1263,8 +1846,9 @@ async fn serve(
     }
 
     // 8. Ready.
-    notify::ready();
+    events.ready();
     let mut writer_died = false;
+    let mut pipe_lost = false;
     // `last_used` marks reach the vault file from here, on a blocking
     // thread, never from a connector request on the runtime thread.
     let mut vault_tick = tokio::time::interval(Duration::from_secs(60));
@@ -1327,9 +1911,14 @@ async fn serve(
                     }
                 });
             }
-            r = listener.accept() => match r {
-                Ok((s, _)) => {
+            r = endpoints.accept() => match r {
+                Ok(s) => {
                     tokio::spawn(server::connection(s, Arc::clone(&ctx)));
+                }
+                Err(e) if accept_is_fatal(&e) => {
+                    eprintln!("{e}");
+                    pipe_lost = true;
+                    break;
                 }
                 Err(e) => {
                     // EMFILE and friends: back off instead of spinning.
@@ -1337,7 +1926,10 @@ async fn serve(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            _ = hup.recv() => { let _ = reload(&ctx).await; }
+            event = events.next() => match event {
+                ServeEvent::Reload => { let _ = reload(&ctx).await; }
+                ServeEvent::Stop => break,
+            },
             // Outside a stop the writer never ends on its own: without it
             // every append fails, so exit and let the service manager
             // restart the daemon.
@@ -1345,28 +1937,23 @@ async fn serve(
                 writer_died = true;
                 break;
             }
-            _ = term.recv() => break,
-            _ = int.recv() => break,
         }
     }
 
     // No new connections; connector calls in flight (which a client that
     // went away no longer holds) finish and are recorded first, for at
     // most the upstream timeout.
-    drop(listener);
-    let _ = std::fs::remove_file(&sock_path);
+    let unix_gateway = endpoints.stop_accepting();
     // Gateway children: EOF, 2 s, then killed; never waited on longer.
     ctx.mcp.stop().await;
     // The forwarders stop first: the stop record waits for the next start
     // (the cursors are on disk).
     ctx.forwarders.stop_all().await;
-    gateway.abort();
-    let _ = gateway.await;
+    unix_gateway.stop().await;
     if let Some(t) = gateway_tcp {
         t.abort();
         let _ = t.await;
     }
-    let _ = std::fs::remove_file(&gw_path);
     if !writer_died {
         let limit = ctx
             .upstream
@@ -1395,6 +1982,8 @@ async fn serve(
         return ExitCode::from(1);
     }
     match ctx.writer.stop(Some(ctx.event("stop"))).await {
+        // A clean stop on record, and the service manager restarts the daemon.
+        Ok(()) if pipe_lost => ExitCode::from(1),
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("saiife: stop: {e}");
@@ -1468,6 +2057,7 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
             audit_dir: c.audit_dir.clone(),
         });
         if c.mode == Mode::Locked {
+            #[cfg(unix)]
             regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
         }
         load_policy(
@@ -1556,6 +2146,187 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod windows_start_tests {
+    use super::*;
+    use saiife_win::sid::{service_sid, SYSTEM};
+
+    const RUNNER: &str = "S-1-5-21-1-2-3-1001";
+
+    #[test]
+    fn only_the_service_account_may_run_the_real_daemon() {
+        let s = service_sid("saiifed");
+        assert_eq!(windows_start_problem(&s, false, false), None);
+        assert!(windows_start_problem(SYSTEM, false, false).is_some());
+        // An elevated admin's uid is 0.
+        assert!(windows_start_problem(RUNNER, true, false).is_some());
+        // A non-elevated user is still not the service.
+        assert!(windows_start_problem(RUNNER, false, false).is_some());
+    }
+
+    #[test]
+    fn a_planted_marker_stops_no_broker() {
+        use saiife_system::wintrust::Trust;
+        let m = Path::new("installed.toml");
+        assert_eq!(locked_marker_problem(Trust::Absent, m), Ok(()));
+        assert_eq!(
+            locked_marker_problem(Trust::NotOurs("owned by me".into()), m),
+            Ok(())
+        );
+        for t in [Trust::Trusted, Trust::Damaged("loose".into())] {
+            assert!(locked_marker_problem(t, m)
+                .unwrap_err()
+                .contains("locked mode"));
+        }
+    }
+
+    #[test]
+    fn a_test_pipe_runs_as_the_runner() {
+        assert_eq!(windows_start_problem(RUNNER, true, true), None);
+    }
+
+    #[test]
+    fn the_personal_broker_runs_as_a_plain_user() {
+        assert_eq!(personal_start_problem(RUNNER, false, false), None);
+        // An elevated admin, SYSTEM and a service account are refused.
+        assert!(personal_start_problem(RUNNER, true, false).is_some());
+        assert!(personal_start_problem(SYSTEM, false, false).is_some());
+        assert!(personal_start_problem(&service_sid("saiifed"), false, false).is_some());
+        // Anonymous, SYSTEM, LocalService, NetworkService, and this machine's guest, elevated
+        // or not: none is anyone's own account.
+        for sid in [
+            "S-1-5-7",
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-21-1-2-3-501",
+        ] {
+            for elevated in [false, true] {
+                let why = personal_start_problem(sid, elevated, false)
+                    .unwrap_or_else(|| panic!("{sid} was let through"));
+                assert!(why.contains(sid), "{why}");
+            }
+        }
+        // Only the exact SIDs and the guest's RID: a person whose SID merely starts alike runs.
+        assert_eq!(
+            personal_start_problem("S-1-5-21-1-2-3-1501", false, false),
+            None
+        );
+        // A Microsoft Entra ID account is a person's too.
+        assert_eq!(
+            personal_start_problem(
+                "S-1-12-1-1111111111-2222222222-3333333333-444444444",
+                false,
+                false
+            ),
+            None
+        );
+        // Every virtual account, and anything else that is not a person's account, is
+        // refused and named: services, app pools, VMs, window managers, font drivers, an
+        // AppContainer, a well-known group, a malformed or short domain SID.
+        for sid in [
+            "S-1-5-80-1-2-3-4-5",
+            "S-1-5-82-1-2-3-4-5",
+            "S-1-5-83-1-2-3-4-5",
+            "S-1-5-90-0-1",
+            "S-1-5-96-0-1",
+            "S-1-15-2-1-2-3-4-5-6-7",
+            "S-1-5-32-544",
+            "S-1-5-21-1-2-3",
+            "S-1-5-21-1-2-3-4-1001",
+            "S-1-5-21-01-2-3-1001",
+            "not a sid",
+        ] {
+            let why = personal_start_problem(sid, false, false)
+                .unwrap_or_else(|| panic!("{sid} was let through"));
+            assert!(why.contains(sid), "{why}");
+        }
+        // An always-elevated user is refused, and the line says why and what to do.
+        let why = personal_start_problem(RUNNER, true, false).unwrap();
+        assert!(why.contains("elevated") && why.contains("UAC"), "{why}");
+        assert!(why.contains("use another account"), "{why}");
+        // A debug build's test pipe runs as the CI runner.
+        assert_eq!(personal_start_problem(RUNNER, true, true), None);
+    }
+
+    #[test]
+    fn the_personal_pipe_is_per_user_and_owned_by_that_user() {
+        let other = "S-1-5-21-1-2-3-1002";
+        let (name, sddl) = personal_pipe_spec(None, RUNNER).unwrap();
+        assert_eq!(name, format!(r"\\.\pipe\saiife-user-{RUNNER}"));
+        assert!(
+            sddl.starts_with(&format!("O:{RUNNER}G:{RUNNER}D:P(D;;GA;;;NU)")),
+            "{sddl}"
+        );
+        // Nobody else is named, and not the service, SYSTEM or Users either.
+        assert!(!sddl.contains(other) && !sddl.contains("SY") && !sddl.contains("BU"));
+        assert_ne!(name, personal_pipe_spec(None, other).unwrap().0);
+        // A test pipe keeps the descriptor, and a bad SID makes no pipe at all.
+        let (n, s) = personal_pipe_spec(Some(r"\\.\pipe\saiife-test-1"), RUNNER).unwrap();
+        assert_eq!((n.as_str(), s), (r"\\.\pipe\saiife-test-1", sddl));
+        assert!(personal_pipe_spec(None, "not-a-sid").is_err());
+    }
+
+    #[test]
+    fn the_personal_broker_admits_only_its_own_sid() {
+        // The peer check is `same_principal`: SIDs decide when both sides have one, and a
+        // uid label shared by two accounts decides nothing.
+        let other = "S-1-5-21-1-2-3-1002";
+        assert!(crate::ops::same_principal(7, Some(RUNNER), 7, Some(RUNNER)));
+        assert!(!crate::ops::same_principal(7, Some(other), 7, Some(RUNNER)));
+        assert!(!crate::ops::same_principal(7, None, 7, Some(RUNNER)));
+    }
+
+    #[test]
+    fn the_real_pipe_is_w11_and_is_the_services() {
+        let s = service_sid("saiifed");
+        let (name, sddl) = pipe_spec(None, RUNNER);
+        assert_eq!(name, r"\\.\pipe\saiife");
+        assert!(
+            sddl.starts_with(&format!("O:{s}G:{s}D:P(D;;GA;;;NU)")),
+            "{sddl}"
+        );
+        assert!(!sddl.contains(RUNNER), "{sddl}");
+    }
+
+    #[test]
+    fn a_test_pipe_has_the_runner_as_owner() {
+        let (name, sddl) = pipe_spec(Some(r"\\.\pipe\saiife-test-1"), RUNNER);
+        assert_eq!(name, r"\\.\pipe\saiife-test-1");
+        assert!(sddl.starts_with(&format!("O:{RUNNER}G:{RUNNER}")), "{sddl}");
+    }
+
+    struct Dir(Option<&'static str>);
+
+    impl saiife_policy::Directory for Dir {
+        fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+            Some(saiife_policy::UserEntry { uid: 7, gid: 0 })
+        }
+        fn name_of(&self, _: u32) -> Option<String> {
+            None
+        }
+        fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+            None
+        }
+        fn groups_of(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn sid_of(&self, _: &str) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    /// The label decides nothing where there is a SID.
+    #[test]
+    fn the_daemon_user_is_checked_by_sid_when_there_is_one() {
+        daemon_user_check(&Dir(Some(RUNNER)), "x", 7, Some(RUNNER)).unwrap();
+        daemon_user_check(&Dir(Some("S-1-5-21-9")), "x", 7, Some(RUNNER)).unwrap_err();
+        daemon_user_check(&Dir(None), "x", 7, Some(RUNNER)).unwrap_err();
+        daemon_user_check(&Dir(None), "x", 7, None).unwrap();
+        daemon_user_check(&Dir(None), "x", 8, None).unwrap_err();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;

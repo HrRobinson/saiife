@@ -114,6 +114,21 @@ impl GatewayPolicy {
         })
     }
 
+    /// Every `[[scope]] users` entry that names a user (not a `group:`), in the
+    /// base snapshot and each environment's, once each.
+    pub fn scope_user_entries(&self) -> Vec<String> {
+        let mut out: Vec<String> = std::iter::once(&self.snap)
+            .chain(self.by_env.values())
+            .flat_map(|s| s.config.scope.iter())
+            .flat_map(|s| s.users.iter())
+            .filter(|e| !e.starts_with("group:"))
+            .cloned()
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The snapshot of environment `env`; the base one for `None` or a
     /// name with no snapshot. Callers take the name from [`select_env`],
     /// which never hands a locked caller a name without a snapshot.
@@ -298,6 +313,8 @@ pub struct Ctx {
     /// Locked daemon or personal broker.
     pub mode: Mode,
     pub own_uid: u32,
+    /// Windows: this process's SID, the identity behind `own_uid`. `None` elsewhere.
+    pub own_sid: Option<String>,
     pub own_user: String,
     pub audit_dir: PathBuf,
     pub socket_dir: PathBuf,
@@ -377,6 +394,8 @@ pub struct CtxInit {
     /// Locked daemon or personal broker.
     pub mode: Mode,
     pub own_uid: u32,
+    /// Windows: this process's SID, the identity behind `own_uid`. `None` elsewhere.
+    pub own_sid: Option<String>,
     pub own_user: String,
     pub audit_dir: PathBuf,
     pub socket_dir: PathBuf,
@@ -420,7 +439,8 @@ impl CtxInit {
             writer_cfg,
             directory,
             mode: Mode::Locked,
-            own_uid: rustix::process::getuid().as_raw(),
+            own_uid: crate::fsx::process_uid(),
+            own_sid: None,
             own_user: String::new(),
             audit_dir: state_dir.join("audit"),
             socket_dir: state_dir.join("run"),
@@ -531,6 +551,7 @@ impl Ctx {
             directory: i.directory,
             mode: i.mode,
             own_uid: i.own_uid,
+            own_sid: i.own_sid,
             own_user: i.own_user,
             audit_dir: i.audit_dir,
             socket_dir: i.socket_dir,
@@ -620,6 +641,7 @@ impl Ctx {
         );
         r.kind = Some(kind.to_string());
         r.uid = Some(self.own_uid);
+        r.sid = self.own_sid.clone();
         r.user = Some(self.own_user.clone());
         r
     }
@@ -657,6 +679,11 @@ impl Ctx {
 
     /// `name_of(uid)`, cached per uid: a name for good, a miss for 60 s.
     pub async fn name_of(&self, uid: u32) -> Option<String> {
+        // Windows: a label, which two SIDs can share. The directory knows which it has
+        // seen and answers nothing for a shared one, so nothing here may remember it.
+        if cfg!(windows) {
+            return self.directory.name_of(uid);
+        }
         if uid == self.own_uid {
             return Some(self.own_user.clone());
         }
@@ -698,6 +725,72 @@ impl Ctx {
         Ok(v)
     }
 
+    /// The name of a principal: from its SID on Windows, from its uid elsewhere.
+    pub(crate) async fn principal_name(&self, uid: u32, sid: Option<&str>) -> Option<String> {
+        let Some(sid) = sid else {
+            return self.name_of(uid).await;
+        };
+        let dir = Arc::clone(&self.directory);
+        let sid = sid.to_string();
+        tokio::task::spawn_blocking(move || dir.name_of_sid(&sid))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// The name of a peer, which only the daemon's own lookups give.
+    pub(crate) async fn peer_name(&self, peer: &PeerCred) -> Option<String> {
+        self.principal_name(peer.uid, peer.sid.as_deref()).await
+    }
+
+    /// Whether `peer` is this daemon's own identity.
+    pub(crate) fn peer_is_own(&self, peer: &PeerCred) -> bool {
+        self.is_own(peer.uid, peer.sid.as_deref())
+    }
+
+    /// Whether this uid and SID are this daemon's own identity.
+    pub(crate) fn is_own(&self, uid: u32, sid: Option<&str>) -> bool {
+        same_principal(uid, sid, self.own_uid, self.own_sid.as_deref())
+    }
+
+    /// [`Ctx::is_admin`] for a peer. On Windows the uid is a label, so this decides on
+    /// the token: `Administrators` where it counts (`peer_facts` removes it from a
+    /// low-integrity or restricted token, SYSTEM's included, and a real SYSTEM token holds
+    /// it), or an `[admin] groups` group's SID. Any lookup failure denies. Elsewhere it is
+    /// [`Ctx::is_admin`].
+    pub async fn peer_is_admin(&self, peer: &PeerCred) -> bool {
+        if peer.sid.is_none() {
+            return self.is_admin(peer.uid).await;
+        }
+        if self.mode == Mode::Personal {
+            return self.peer_is_own(peer);
+        }
+        saiife_win::sid::token_is_admin(&peer.group_sids)
+            || self
+                .token_in_any_group(&peer.group_sids, &self.policy().admin_groups)
+                .await
+    }
+
+    /// Whether a token's groups hold the SID of any of the local groups `names` (W12).
+    /// A name that cannot be resolved matches nothing. With the peer's own SID as
+    /// `token` and user names as `names`, it says whether one of them is the peer.
+    pub(crate) async fn token_in_any_group(&self, token: &[String], names: &[String]) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        let dir = Arc::clone(&self.directory);
+        let names = names.to_vec();
+        let sids = tokio::task::spawn_blocking(move || {
+            names
+                .iter()
+                .filter_map(|n| dir.sid_of(n))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        sids.iter().any(|s| token.contains(s))
+    }
+
     /// Who must own `<config dir>/ca` and `connectors/`: root for the
     /// locked daemon, the user for the personal broker. A debug build of
     /// the locked daemon (the test suite) honours
@@ -731,12 +824,18 @@ impl Ctx {
     /// Write the record of notice `n` for `uid`, at most once per uid and
     /// notice per minute, without waiting for it.
     pub fn notice(&self, uid: u32, n: Notice) {
+        self.notice_sid(uid, None, n)
+    }
+
+    /// [`Ctx::notice`], naming the SID behind the label on Windows.
+    pub fn notice_sid(&self, uid: u32, sid: Option<&str>, n: Notice) {
         if !notice_due(&mut lock(&self.notices), uid, n, Instant::now()) {
             return;
         }
         let event = n.event();
         let mut r = self.event(event);
         r.reason = Some(n.reason(uid));
+        r.sid = sid.map(str::to_string);
         let writer = self.writer.clone();
         tokio::spawn(async move {
             if let Err(e) = writer.append(r).await {
@@ -861,6 +960,22 @@ pub fn now_ts() -> String {
 }
 
 /// [`Ctx::trusted_owner`] before there is a context.
+/// Whether two principals are one: by SID when they have them (Windows, where the uid is
+/// a label two SIDs can share), by uid when neither has (Linux, macOS). One with a SID and
+/// one without are not known to be the same, so they are not.
+pub(crate) fn same_principal(
+    a_uid: u32,
+    a_sid: Option<&str>,
+    b_uid: u32,
+    b_sid: Option<&str>,
+) -> bool {
+    match (a_sid, b_sid) {
+        (None, None) => a_uid == b_uid,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 pub(crate) fn trusted_owner_in(mode: Mode, own_uid: u32) -> u32 {
     if mode == Mode::Personal {
         return own_uid;
@@ -932,7 +1047,7 @@ impl Conn {
 /// Every op but `hello` (which the connection handles itself), for a
 /// caller whose process start time is not known.
 pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
-    dispatch_conn(ctx, &Conn::new(*peer, None), req).await
+    dispatch_conn(ctx, &Conn::new(peer.clone(), None), req).await
 }
 
 /// Every op but `hello`.
@@ -952,7 +1067,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             crate::secret_ops::handle(ctx, peer, req).await
         }
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
-        OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
+        OP_API_TOKEN => crate::api_ops::token(ctx, peer, req.id).await,
         OP_MCP_LIST | OP_MCP_CALL => crate::mcp_ops::handle(ctx, peer, req).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
@@ -1041,19 +1156,20 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     }
     let min_free = ctx.policy().min_free_mb;
     let gate = match disk::free_mb(&ctx.audit_dir) {
-        Ok(mb) => disk::disk_gate(mb, min_free, peer.uid, ctx.own_uid),
+        Ok(mb) => disk::disk_gate(mb, min_free, ctx.peer_is_own(peer)),
         // Fail closed: an unknown free space counts as too little.
-        Err(_) => disk::disk_gate(0, min_free, peer.uid, ctx.own_uid),
+        Err(_) => disk::disk_gate(0, min_free, ctx.peer_is_own(peer)),
     };
     if let Err(code) = gate {
-        ctx.notice(peer.uid, Notice::LowDisk);
+        ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
     rec.v = saiife_audit::record::RECORD_VERSION;
     rec.kind = Some("guard".into());
     rec.mode = Some(ctx.mode.as_str().into());
     rec.uid = Some(peer.uid);
-    rec.user = ctx.name_of(peer.uid).await;
+    rec.sid = peer.sid.clone();
+    rec.user = ctx.peer_name(peer).await;
     rec.seq = None;
     rec.prev = None;
     rec.host = None;
@@ -1093,7 +1209,7 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(seq) => {
             if let Some(sid) = session {
                 if let Some(a) = agent_ancestor(ctx.proc.as_ref(), peer.pid) {
-                    ctx.sessions.record(a, &sid);
+                    ctx.sessions.record_as(peer.sid.as_deref(), a, &sid);
                 }
             }
             let mut m = Map::new();
@@ -1150,7 +1266,7 @@ async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
             "personal broker: the audit chain has no signing key to rotate",
         );
     }
-    if !ctx.is_admin(peer.uid).await {
+    if !ctx.peer_is_admin(peer).await {
         return err(
             id,
             ErrorCode::Forbidden,
@@ -1171,7 +1287,7 @@ async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
 /// A context for unit tests: a real chain writer in `dir/audit`, every
 /// other part from [`CtxInit::minimal`], with `mode` and `own_uid`. The
 /// join handle ends when the context (its writer handle) is dropped.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_ctx(
     dir: &std::path::Path,
     mode: Mode,
@@ -1203,6 +1319,34 @@ pub(crate) fn test_ctx(
 }
 
 #[cfg(test)]
+mod principal_tests {
+    use super::*;
+
+    const A: &str = "S-1-5-21-1-2-3-1001";
+    const B: &str = "S-1-5-21-1-2-3-1002";
+
+    #[test]
+    fn unix_principals_are_their_uids() {
+        assert!(same_principal(1000, None, 1000, None));
+        assert!(!same_principal(1000, None, 1001, None));
+    }
+
+    /// All elevated admins share uid 0, and any two SIDs may share a label.
+    #[test]
+    fn windows_principals_are_their_sids() {
+        assert!(!same_principal(0, Some(A), 0, Some(B)));
+        assert!(!same_principal(7, Some(A), 7, Some(B)));
+        assert!(same_principal(0, Some(A), 7, Some(A)));
+    }
+
+    #[test]
+    fn a_sid_and_no_sid_are_not_the_same() {
+        assert!(!same_principal(7, Some(A), 7, None));
+        assert!(!same_principal(7, None, 7, Some(A)));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1219,6 +1363,8 @@ mod tests {
             uid,
             gid: uid,
             pid: std::process::id(),
+            sid: None,
+            group_sids: Vec::new(),
         }
     }
 
@@ -1247,8 +1393,8 @@ mod tests {
         assert!(ctx.is_admin(4242).await);
         assert!(!ctx.is_admin(0).await);
         assert!(!ctx.is_admin(4243).await);
-        assert!(crate::approval_ops::is_approver(&ctx, 4242).await);
-        assert!(!crate::approval_ops::is_approver(&ctx, 0).await);
+        assert!(crate::approval_ops::is_approver(&ctx, &peer(4242)).await);
+        assert!(!crate::approval_ops::is_approver(&ctx, &peer(0)).await);
         let a = dispatch(&ctx, &peer(4242), req(OP_STATUS)).await;
         assert_eq!(a["mode"], "personal", "{a}");
         assert_eq!(hello_in(1, ctx.mode.as_str())["mode"], "personal");

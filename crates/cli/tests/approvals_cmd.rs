@@ -491,6 +491,8 @@ impl World {
                 uid,
                 gid: uid,
                 pid: std::process::id(),
+                sid: None,
+                group_sids: Vec::new(),
             },
             None,
         )
@@ -799,6 +801,7 @@ fn show_prints_the_scope_of_a_command_request() {
         .create(
             NewRequest {
                 uid: own_uid(),
+                sid: None,
                 user: own_user(),
                 session: None,
                 agent: "claude".into(),
@@ -838,6 +841,7 @@ fn show_and_list_print_the_env_of_a_connector_request() {
     let w = world();
     let new = |env: Option<&str>, env_base: bool| NewRequest {
         uid: own_uid(),
+        sid: None,
         user: own_user(),
         session: None,
         agent: "claude".into(),
@@ -920,6 +924,7 @@ fn show_prints_server_tool_and_masked_arguments_of_an_mcp_request() {
     let store = w.ctx.approvals.as_ref().unwrap();
     let new = |truncated: bool| NewRequest {
         uid: own_uid(),
+        sid: None,
         user: own_user(),
         session: None,
         agent: "claude".into(),

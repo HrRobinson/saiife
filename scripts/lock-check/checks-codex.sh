@@ -15,7 +15,10 @@
 # under $LC_ROOT, also the paths written into the config files. The macOS VM
 # (LOCKCHECK_PLATFORM=macos) uses the same /etc/codex path (spec 5.3; /etc
 # is a link to /private/etc there), ~ is /Users/agent and /work is
-# /opt/lockcheck/work.
+# /opt/lockcheck/work. The Windows VM (LOCKCHECK_PLATFORM=windows) uses
+# C:\ProgramData\OpenAI\Codex\requirements.toml (spec 5.3a), staged as
+# $LC_ROOT/C/ProgramData/OpenAI/Codex/requirements.toml; an override there
+# must stay under /C/ProgramData/.
 #
 # Unverified keys can be overridden from the host (live-check-locked.sh
 # passes these through):
@@ -27,7 +30,13 @@
 #
 #   bash /lockcheck/in-container.sh run codex
 
-CODEX_REQ_PATH="${LOCKCHECK_CODEX_REQUIREMENTS:-/etc/codex/requirements.toml}"
+if [[ "$LC_PLATFORM" == windows ]]; then
+  CODEX_REQ_PATH="${LOCKCHECK_CODEX_REQUIREMENTS:-/C/ProgramData/OpenAI/Codex/requirements.toml}"
+  CODEX_REQ_RE='^/C/ProgramData/[A-Za-z0-9._/-]+$'
+else
+  CODEX_REQ_PATH="${LOCKCHECK_CODEX_REQUIREMENTS:-/etc/codex/requirements.toml}"
+  CODEX_REQ_RE='^/etc/[A-Za-z0-9._/-]+$'
+fi
 CODEX_REQUIREMENTS="$LC_ROOT$CODEX_REQ_PATH"
 CODEX_FIXTURE="$LC_MANAGED/codex/requirements.toml"
 CODEX_USER_CONFIG="$LC_HOME/.codex/config.toml"
@@ -72,8 +81,8 @@ codex_user_config() {
 # The managed file must stay a plain path under /etc (it is written as root),
 # and offline under $LC_ROOT: an override with `..` could leave either.
 codex_require_managed_path() {
-  if [[ ! "$CODEX_REQ_PATH" =~ ^/etc/[A-Za-z0-9._/-]+$ || "/$CODEX_REQ_PATH/" == */../* ]]; then
-    echo "checks-codex.sh: LOCKCHECK_CODEX_REQUIREMENTS must be a path under /etc without '..': $CODEX_REQ_PATH" >&2
+  if [[ ! "$CODEX_REQ_PATH" =~ $CODEX_REQ_RE || "/$CODEX_REQ_PATH/" == */../* ]]; then
+    echo "checks-codex.sh: LOCKCHECK_CODEX_REQUIREMENTS must be a path matching $CODEX_REQ_RE without '..': $CODEX_REQ_PATH" >&2
     return 1
   fi
   if [[ -n "$LC_ROOT" ]]; then
@@ -93,8 +102,12 @@ agent_baseline() {
   # that refuses (no tool call) never reads as `blocked`.
   {
     printf '[[hooks.PreToolUse]]\nmatcher = ".*"\n\n'
-    printf '[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "%s"\ntimeout = 10\n\n' "$LC_WITNESS"
-    cat "$CODEX_FIXTURE"
+    printf '[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "%s"\ntimeout = 10\n\n' "$LC_WITNESS_CMD"
+    if [[ "$LC_PLATFORM" == windows ]]; then
+      cat "$(lc_managed_file codex/requirements.toml)"
+    else
+      cat "$CODEX_FIXTURE"
+    fi
   } >"$CODEX_REQUIREMENTS"
   chmod 0644 "$CODEX_REQUIREMENTS"
   codex_user_config
@@ -115,8 +128,12 @@ codex_managed_append() {
 
 # A user PreToolUse hook on every tool that touches this check's marker.
 codex_user_marker_hook() {
-  printf '[[hooks.PreToolUse]]\nmatcher = ".*"\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "touch %s/%s"\ntimeout = 10' \
-    "$LC_MARKERS" "$LC_NONCE"
+  printf '[[hooks.PreToolUse]]\nmatcher = ".*"\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "%s"\ntimeout = 10' \
+    "$(lc_touch_cmd "$LC_MARKERS/$LC_NONCE")"
+}
+
+agent_managed_paths() {
+  printf '%s\n' "$CODEX_REQUIREMENTS"
 }
 
 codex_mcp_server() {
@@ -216,6 +233,10 @@ codex_mcp_allowlist() {
 # managed file's basename is one of them.
 codex_path_probe() {
   local nm="$LC_ROOT/usr/local/lib/node_modules" want paths n
+  if [[ "$LC_PLATFORM" == windows ]]; then
+    lc_probe codex.managed.path-probe not-found "not run on Windows: the binary names no /etc path there"
+    return 0
+  fi
   if [[ -z "$LC_ROOT" ]] && command -v npm >/dev/null 2>&1; then
     nm="$(npm root -g 2>/dev/null || echo "$nm")"
   fi

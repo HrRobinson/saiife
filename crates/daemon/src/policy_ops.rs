@@ -37,7 +37,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Some(Value::Bool(b)) => *b,
         Some(_) => return bad("effective is true|false"),
     };
-    let Some(own) = ctx.name_of(peer.uid).await else {
+    let Some(own) = ctx.peer_name(peer).await else {
         return err(
             id,
             ErrorCode::Forbidden,
@@ -45,7 +45,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         );
     };
     let other = target.as_deref().is_some_and(|t| t != own);
-    if (other || effective) && !ctx.is_admin(peer.uid).await {
+    if (other || effective) && !ctx.peer_is_admin(peer).await {
         return err(
             id,
             ErrorCode::Forbidden,
@@ -97,7 +97,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     // The hash of each environment, so an admin can tell which one a
     // record's `policy` belongs to.
     // Admins see every environment's hash; anyone else only their own.
-    let admin = ctx.is_admin(peer.uid).await;
+    let admin = ctx.peer_is_admin(peer).await;
     let own_env = env.as_ref().ok().cloned().flatten();
     let hashes: Map<String, Value> = env_hashes(&system, &ctx.catalog)
         .into_iter()
@@ -144,7 +144,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 }
 
 async fn reload(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
-    if !ctx.is_admin(peer.uid).await {
+    if !ctx.peer_is_admin(peer).await {
         return err(
             id,
             ErrorCode::Forbidden,

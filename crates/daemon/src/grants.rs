@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -47,10 +46,33 @@ pub fn grant_key(
     input: &str,
     raw_sha256: &[u8; 32],
 ) -> [u8; 32] {
+    key_of(&uid.to_be_bytes(), agent, project, tool, input, raw_sha256)
+}
+
+/// [`grant_key`] for a Windows caller: bound to its SID, as every elevated admin shares
+/// uid 0 and any two SIDs may share a label.
+pub fn grant_key_for_sid(
+    sid: &str,
+    agent: &str,
+    project: &str,
+    tool: &str,
+    input: &str,
+    raw_sha256: &[u8; 32],
+) -> [u8; 32] {
+    key_of(sid.as_bytes(), agent, project, tool, input, raw_sha256)
+}
+
+fn key_of(
+    who: &[u8],
+    agent: &str,
+    project: &str,
+    tool: &str,
+    input: &str,
+    raw_sha256: &[u8; 32],
+) -> [u8; 32] {
     let mut h = Sha256::new();
-    let uid = uid.to_be_bytes();
     for part in [
-        &uid[..],
+        who,
         agent.as_bytes(),
         project.as_bytes(),
         tool.as_bytes(),
@@ -270,11 +292,7 @@ fn write(file: &Path, m: &HashMap<[u8; 32], Grant>) -> io::Result<()> {
     let tmp = dir.join(format!(".{FILE_NAME}.tmp"));
     let _ = std::fs::remove_file(&tmp);
     let staged = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = crate::fsx::new_private_file(&tmp)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, file)
@@ -283,7 +301,7 @@ fn write(file: &Path, m: &HashMap<[u8; 32], Grant>) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::File::open(dir)?.sync_all()
+    crate::fsx::sync_dir(dir)
 }
 
 #[cfg(test)]
@@ -368,7 +386,7 @@ mod tests {
 
     #[test]
     fn revoke_drops_the_grant() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         let (g, _) = Grants::open(p.clone(), t0());
         g.insert(key(UID, CMD), 42, t0() + ttl()).unwrap();
@@ -390,10 +408,11 @@ mod tests {
         assert_eq!(g.consume(&key(UID, CMD), inside).unwrap(), Some(43));
     }
 
+    #[cfg(unix)]
     #[test]
     fn grants_survive_restart() {
         use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         let (g, why) = Grants::open(p.clone(), t0());
         assert!(why.is_none() && g.is_empty());
@@ -419,7 +438,7 @@ mod tests {
 
     #[test]
     fn unreadable_file_is_no_grants() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"{not json").unwrap();
@@ -428,10 +447,11 @@ mod tests {
         assert!(why.unwrap().contains("corrupt"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsafe_dir_is_no_grants() {
         use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::fsx::TestDir::new();
         let p = path_in(d.path());
         let (g, _) = Grants::open(p.clone(), t0());
         g.insert(key(UID, CMD), 42, t0() + ttl()).unwrap();
