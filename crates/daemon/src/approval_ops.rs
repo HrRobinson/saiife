@@ -89,7 +89,8 @@ pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
     };
     // Windows: a `group:` entry matches the token's groups, and a user entry the peer's
     // SID (W12). `name` is the canonical `DOMAIN\name`, which a policy's `approver`
-    // never equals as text. A later lookup of the name's groups can only add to that.
+    // never equals as text. Nothing else counts: a lookup of the name's groups would
+    // count the Administrators a non-elevated admin's token holds deny-only.
     if let Some(sid) = peer.sid.as_deref() {
         let (groups, users): (Vec<&String>, Vec<&String>) =
             approvers.iter().partition(|a| a.starts_with("group:"));
@@ -101,12 +102,9 @@ pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
             return true;
         }
         let users: Vec<String> = users.into_iter().cloned().collect();
-        if ctx
+        return ctx
             .token_in_any_group(std::slice::from_ref(&sid.to_string()), &users)
-            .await
-        {
-            return true;
-        }
+            .await;
     }
     let mut groups: Option<Vec<String>> = None;
     for a in &approvers {
@@ -2065,6 +2063,10 @@ mod tests {
             match bare.as_str() {
                 "agent" => Ok((AGENT_SID.into(), r"HOST\agent".into())),
                 "approver" => Ok((APPROVER_SID.into(), r"HOST\approver".into())),
+                "administrators" => Ok((
+                    saiife_win::sid::ADMINISTRATORS.into(),
+                    r"BUILTIN\Administrators".into(),
+                )),
                 _ => Err(format!("no account {name}")),
             }
         }
@@ -2075,8 +2077,13 @@ mod tests {
                 _ => Err(format!("no SID {sid}")),
             }
         }
-        fn local_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
-            Ok(vec!["Users".into()])
+        /// The approver is a non-elevated admin: Windows lists it in Administrators by
+        /// name, while its token holds that group deny-only.
+        fn local_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
+            Ok(match user.to_ascii_lowercase().ends_with("approver") {
+                true => vec!["Users".into(), "Administrators".into()],
+                false => vec!["Users".into()],
+            })
         }
         fn local_group_members(&self, group: &str) -> Result<Vec<String>, String> {
             Err(format!("no group {group}"))
@@ -2179,6 +2186,35 @@ mod tests {
         assert!(v.to_string().contains("reauth_required"), "{v}");
         let v = crate::lockdown::set(&ctx, &sid_conn(AGENT_SID), off()).await;
         assert!(v.to_string().contains("[approval] approvers"), "{v}");
+    }
+
+    /// Review finding 2: a non-elevated admin's token holds Administrators deny-only
+    /// (`peer_facts` leaves it out of `group_sids`), while its name's local groups list
+    /// it. On Windows only the token counts, so it is no approver for
+    /// `group:Administrators`: no request to see, and no lockdown off.
+    #[tokio::test]
+    async fn a_deny_only_administrators_is_no_group_approver() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = windows_ctx(d.path());
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[approval]\napprovers = [\"group:Administrators\"]\n\
+             same_user = \"deny\"\n",
+        )
+        .unwrap();
+        ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+        let lowered = sid_conn(APPROVER_SID);
+        assert!(!is_approver(&ctx, &lowered.peer).await);
+        let off = Request {
+            id: 6,
+            op: saiife_ipc::msg::OP_LOCKDOWN_SET.into(),
+            args: json!({"on": false}).as_object().unwrap().clone(),
+        };
+        let v = crate::lockdown::set(&ctx, &lowered, off.clone()).await;
+        assert!(v.to_string().contains("[approval] approvers"), "{v}");
+        // Elevated, the token holds the group: an approver.
+        let mut elevated = sid_conn(APPROVER_SID);
+        elevated.peer.group_sids = vec![saiife_win::sid::ADMINISTRATORS.into()];
+        assert!(is_approver(&ctx, &elevated.peer).await);
     }
 
     /// [`windows_ctx`] with `[[scope]] users = ["agent"]` bound to `prod`, as the

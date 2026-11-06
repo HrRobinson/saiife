@@ -79,6 +79,8 @@ impl fmt::Display for Refusal {
 }
 
 /// Whether `user` is listed in `approvers`, directly or by a current group.
+/// Linux and macOS only decide this way; a Windows peer goes through
+/// [`peer_is_listed`].
 pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
     let mut groups: Option<Vec<String>> = None;
     cfg.approvers
@@ -89,6 +91,24 @@ pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
                 .iter()
                 .any(|x| x == g),
             None => saiife_policy::names_account(dir, e, user),
+        })
+}
+
+/// Whether the peer named `user` is listed in `approvers`. A Windows peer (one with a
+/// SID) is in a `group:` only when its token's counting groups (`group_sids`: enabled,
+/// not deny-only) hold that group's SID, never by a lookup of the name's groups: that
+/// lookup counts the Administrators a non-elevated admin's token holds deny-only. A user
+/// entry names it by SID ([`saiife_policy::names_account`]). Elsewhere it is
+/// [`is_approver`].
+pub fn peer_is_listed(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str, peer: &PeerCred) -> bool {
+    let Some(sid) = peer.sid.as_deref() else {
+        return is_approver(cfg, dir, user);
+    };
+    cfg.approvers
+        .iter()
+        .any(|e| match e.strip_prefix(GROUP_PREFIX) {
+            Some(g) => dir.sid_of(g).is_some_and(|g| peer.group_sids.contains(&g)),
+            None => dir.sid_of(e).as_deref() == Some(sid),
         })
 }
 
@@ -171,7 +191,7 @@ pub fn may_decide<'r>(
     if !same_account {
         return Err(Refusal::ReauthError(MISMATCH.to_string()));
     }
-    if !is_approver(cfg, dir, approver_user) {
+    if !peer_is_listed(cfg, dir, approver_user, peer) {
         return Err(Refusal::NotApprover);
     }
     if !crate::ops::same_principal(
@@ -906,5 +926,66 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    /// A non-elevated admin's token holds Administrators deny-only, which `peer_facts`
+    /// leaves out of `group_sids`, while a lookup of its name's local groups lists the
+    /// group. On Windows only the token counts: no approver for `group:Administrators`.
+    #[test]
+    fn a_deny_only_administrators_is_no_group_approver_on_windows() {
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        struct D;
+        impl Directory for D {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                vec!["Users".into(), "Administrators".into()]
+            }
+            fn sid_of(&self, name: &str) -> Option<String> {
+                match name {
+                    "Administrators" => Some(saiife_win::sid::ADMINISTRATORS.into()),
+                    r"HOST\admin" | "admin" => Some(SID.into()),
+                    _ => None,
+                }
+            }
+        }
+        let c = cfg(&["group:Administrators"], SameUser::Deny);
+        let mut p = PeerCred {
+            uid: saiife_win::sid::uid_of(SID, false),
+            gid: 0,
+            pid: PID,
+            sid: Some(SID.into()),
+            group_sids: vec![saiife_win::sid::USERS.into()],
+        };
+        let decide = |p: &PeerCred| {
+            may_decide(
+                &c,
+                &D,
+                r"HOST\admin",
+                (0, Some("S-1-5-21-1-2-3-1002")),
+                &FakeReauth::new(false, ReauthResult::Authorized),
+                p,
+                START,
+                &FakeProc::steady(),
+                &Mutex::default(),
+                "#1 x",
+                None,
+            )
+        };
+        assert!(!peer_is_listed(&c, &D, r"HOST\admin", &p));
+        assert_eq!(decide(&p), Err(Refusal::NotApprover));
+        // Elevated, the token holds it, and the same account is an approver.
+        p.group_sids.push(saiife_win::sid::ADMINISTRATORS.into());
+        assert!(peer_is_listed(&c, &D, r"HOST\admin", &p));
+        assert_eq!(decide(&p), Ok(()));
+        // Linux and macOS: the name's groups, as before.
+        assert!(is_approver(&c, &D, "admin"));
     }
 }
