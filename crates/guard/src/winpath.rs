@@ -254,7 +254,9 @@ pub(crate) fn value_forms(value: &Path, vars: &PathVars) -> Vec<String> {
 /// symlinks resolved in the longest prefix that exists. The path itself
 /// when nothing does, and always on a host that is not Windows.
 pub(crate) fn resolved(canon: &str, vars: &PathVars) -> String {
-    resolved_with(canon, vars, os_canonicalize)
+    resolved_with(canon, vars, |path| {
+        crate::canon::fs_os_name(path, os_canonicalize)
+    })
 }
 
 #[cfg(windows)]

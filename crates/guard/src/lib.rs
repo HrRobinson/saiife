@@ -36,3 +36,22 @@ pub mod wrappers;
 
 pub use engine::{AllowTrace, Decision, Engine};
 pub use pack::{Pack, PackWarning};
+
+/// Words and bytes the segment-stripping path has touched, so a test can pin
+/// how the work grows without reading a clock.
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WORK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add(n: usize) {
+        WORK.with(|w| w.set(w.get() + n));
+    }
+
+    pub(crate) fn take() -> usize {
+        WORK.with(|w| w.replace(0))
+    }
+}

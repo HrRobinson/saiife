@@ -288,6 +288,12 @@ pub fn dialects_for(agent: Option<&str>, tool: Option<&str>, windows_host: bool)
 /// Gemini `run_shell_command`.
 const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "run_shell_command"];
 
+/// Is this a tool whose input is a shell line? `PowerShell` in any case; the POSIX
+/// tools keep their exact names.
+pub fn is_shell_tool(tool: &str) -> bool {
+    SHELL_TOOLS.contains(&tool) || tool.eq_ignore_ascii_case("PowerShell")
+}
+
 /// File tools that only read or list.
 const READ_TOOLS: &[&str] = &[
     "Read",
@@ -344,9 +350,7 @@ pub fn classify_for(
     let Some(tool) = env.tool() else {
         return env.command().map(shell);
     };
-    // `dialects_for` reads `PowerShell` in any case; the POSIX tools keep their
-    // exact names.
-    if SHELL_TOOLS.contains(&tool) || tool.eq_ignore_ascii_case("PowerShell") {
+    if is_shell_tool(tool) {
         return env.command().map(shell);
     }
     let empty = ToolInput::default();

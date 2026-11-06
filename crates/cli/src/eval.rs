@@ -26,8 +26,8 @@ use crate::paths::{path_vars_locked, LockedPaths};
 /// Memory-safety cap on what is read from stdin. Parsing skips the content
 /// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
 /// file calls are judged at any size up to this cap; a shell command above
-/// `MAX_PAYLOAD_BYTES` is not judged but its command goes into the audit
-/// record. Above this cap nothing is parsed.
+/// `MAX_PAYLOAD_BYTES` is not judged and is denied, and its command goes into the
+/// audit record. Above this cap nothing is parsed.
 pub const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Largest `EvalRequest` the worker reads, and largest `EvalAnswer` the
@@ -148,35 +148,45 @@ impl FileCall {
     }
 }
 
-/// Does this call have to fail closed whatever the config says? Only a broken
-/// payload whose tool is `PowerShell`: its command reaches no reader, and that
-/// reader's unreadable is a deny (`Engine::evaluate_call`). A budget, a panic and
-/// a size follow `Fail` in every dialect: `error_allowed` in developer mode,
-/// `error_denied` in locked.
+/// Does this call have to fail closed whatever the config says? A shell line over
+/// the size limit (owner's ruling): padding must not be a way past the guard. And a
+/// broken payload whose tool is `PowerShell`: its command reaches no reader, and that
+/// reader's unreadable is a deny (`Engine::evaluate_call`). A budget and a panic
+/// follow `Fail` in every dialect: `error_allowed` in developer mode, `error_denied`
+/// in locked.
 pub fn must_fail_closed(plan: &Plan, buf: &str) -> bool {
     match plan {
         Plan::Unusable(PayloadError::TooLarge { .. }) => false,
         Plan::Unusable(_) => names_powershell(buf),
-        Plan::Shell { .. } | Plan::TooLarge { .. } => false,
+        Plan::TooLarge { .. } => true,
+        Plan::Shell { .. } => false,
         Plan::Files(_) | Plan::NoPath | Plan::Other => false,
     }
 }
 
-/// The payload's first `tool_name` is `PowerShell`, in any case, read off the
-/// text because it may not parse. Inside a command's string the key's quotes are
-/// escaped, so a command cannot spell it.
-fn names_powershell(buf: &str) -> bool {
+/// The answer for a shell line over the limit: what happened, and what to do.
+pub fn too_large_reason(limit: usize) -> String {
+    format!("shell command over {limit} bytes, not judged: split it into smaller commands")
+}
+
+/// The payload's first `tool_name`, read off the text because it may not parse.
+/// Inside a command's string the key's quotes are escaped, so a command cannot
+/// spell it.
+fn first_tool_name(buf: &str) -> Option<&str> {
     const KEY: &str = "\"tool_name\"";
-    const TOOL: &str = "powershell";
-    let tool = buf.find(KEY).and_then(|at| {
-        let rest = buf[at + KEY.len()..].trim_start();
-        rest.strip_prefix(':')?.trim_start().strip_prefix('"')
-    });
-    tool.is_some_and(|t| {
-        t.get(..TOOL.len())
-            .is_some_and(|name| name.eq_ignore_ascii_case(TOOL))
-            && t[TOOL.len()..].starts_with('"')
-    })
+    let at = buf.find(KEY)?;
+    let rest = buf[at + KEY.len()..].trim_start();
+    let name = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    name.split('"').next()
+}
+
+fn names_powershell(buf: &str) -> bool {
+    first_tool_name(buf).is_some_and(|t| t.eq_ignore_ascii_case("powershell"))
+}
+
+/// Past `PARSE_MAX_BYTES` nothing is parsed, but the text still says a shell tool.
+pub fn names_shell_tool(buf: &str) -> bool {
+    first_tool_name(buf).is_some_and(saiifeguard::payload::is_shell_tool)
 }
 
 /// Classify `buf` (a payload of at most `PARSE_MAX_BYTES`) into what the
@@ -349,16 +359,11 @@ pub fn judge_with(
     }
     let engine = || engine_for(packs, ctx.cwd.as_deref(), budget, locked);
     match plan(payload, agent) {
-        Plan::TooLarge { command, .. } => {
-            let e = PayloadError::TooLarge {
-                limit: MAX_PAYLOAD_BYTES,
-            };
-            answer(
-                Verdict::Unjudged,
-                command,
-                &format!("hook payload not usable: {e}"),
-            )
-        }
+        Plan::TooLarge { command, .. } => answer(
+            Verdict::Unjudged,
+            command,
+            &too_large_reason(MAX_PAYLOAD_BYTES),
+        ),
         Plan::Unusable(e) => answer(
             Verdict::Unjudged,
             String::new(),
@@ -1046,14 +1051,14 @@ mod tests {
         assert_eq!(shell("PowerShell", Some("claude")), ps);
         assert_eq!(shell("PowerShell", None), ps);
         assert!(!shell("Bash", Some("claude")).has_reader());
-        // Over the size limit no reader runs, and it follows `Fail`.
+        // Over the size limit no reader runs, and it is denied.
         let big = format!(
             r#"{{"tool_name":"PowerShell","tool_input":{{"command":"{}"}}}}"#,
             "x".repeat(MAX_PAYLOAD_BYTES)
         );
         let large = plan(&big, None);
         assert!(matches!(large, Plan::TooLarge { .. }));
-        assert!(!must_fail_closed(&large, &big));
+        assert!(must_fail_closed(&large, &big));
     }
 
     /// Fail policy. Only a broken payload whose tool is `PowerShell` always
@@ -1073,7 +1078,7 @@ mod tests {
         let large = Plan::TooLarge {
             command: "x".to_string(),
         };
-        assert!(!must_fail_closed(&large, ""));
+        assert!(must_fail_closed(&large, ""));
         for broken in [
             r#"{"tool_name":"PowerShell""#,
             r#"{"tool_name": "powershell", "tool_input":"#,
@@ -1183,7 +1188,9 @@ mod tests {
         );
         assert_eq!(a.verdict, Verdict::Unjudged);
         assert_eq!(a.input, cmd);
-        assert!(a.reason.unwrap().contains("exceeds"));
+        let reason = a.reason.unwrap();
+        assert!(reason.contains("not judged"), "{reason}");
+        assert!(reason.contains("split"), "{reason}");
     }
 
     #[test]
@@ -1220,11 +1227,7 @@ mod tests {
     #[test]
     fn over_budget_is_unjudged() {
         let a = judge(
-            &payload(
-                "/",
-                "Bash",
-                serde_json::json!({ "command": "rm -rf /tmp/x" }),
-            ),
+            &payload("/", "Bash", serde_json::json!({ "command": "ls -la" })),
             &defaults(),
             Duration::ZERO,
         );
@@ -1233,6 +1236,24 @@ mod tests {
             a.reason.as_deref(),
             Some("guard exceeded its latency budget")
         );
+    }
+
+    /// What is left when the budget runs out is still judged: a rule that
+    /// denies is an ordinary deny, with its pack and pattern.
+    #[test]
+    fn over_budget_still_denies_by_rule() {
+        let a = judge(
+            &payload(
+                "/",
+                "Bash",
+                serde_json::json!({ "command": "ls; rm -rf /" }),
+            ),
+            &defaults(),
+            Duration::ZERO,
+        );
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+        assert_eq!(a.pack.as_deref(), Some("core.filesystem"), "{a:?}");
+        assert!(a.rule.is_some(), "{a:?}");
     }
 
     #[test]

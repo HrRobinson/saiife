@@ -113,6 +113,14 @@ pub fn run(
         // Drain the rest so the agent gets no EPIPE.
         let _ = std::io::copy(&mut stdin, &mut std::io::sink());
         let audit = Audit::new(agent, HookContext::default(), cli_packs);
+        if eval::names_shell_tool(&buf) {
+            let fail = Fail {
+                closed: true,
+                ..fail
+            };
+            let reason = eval::too_large_reason(PARSE_MAX_BYTES);
+            return fail.unjudged(&audit, "", &reason, None);
+        }
         let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
         let warning = format!("{reason}; failing open (allow)");
         return fail.unjudged(&audit, "", &reason, Some(&warning));
@@ -138,13 +146,11 @@ pub fn run(
         ..fail
     };
     match plan {
-        Plan::TooLarge { command, .. } => unusable(
-            fail,
+        Plan::TooLarge { command, .. } => fail.unjudged(
             &audit,
             &command,
-            &PayloadError::TooLarge {
-                limit: MAX_PAYLOAD_BYTES,
-            },
+            &eval::too_large_reason(MAX_PAYLOAD_BYTES),
+            None,
         ),
         Plan::Shell { command, dialects } => {
             // Built inside `decide`'s unwind guard: a panic while reading

@@ -135,8 +135,8 @@ fn a_broken_powershell_payload_is_blocked() {
     }
 }
 
-/// Fail policy, through the real binary, in both modes: what is too large to
-/// judge follows `Fail`, what the reader cannot read denies, and the record says
+/// Fail policy, through the real binary, in both modes: a line too large to judge
+/// denies (owner's ruling), what the reader cannot read denies, and the record says
 /// which.
 #[test]
 fn fail_policy_in_developer_and_locked() {
@@ -167,20 +167,10 @@ fn fail_policy_in_developer_and_locked() {
         std::fs::write(&config, text).unwrap();
         let audit = dir.path().join("audit");
         std::fs::create_dir(&audit).unwrap();
-        let (code, kind) = if locked {
-            (2, DecisionKind::ErrorDenied)
-        } else {
-            (0, DecisionKind::ErrorAllowed)
-        };
         for payload in [large.as_bytes(), huge.as_bytes()] {
             let (got, stderr) = check_as(dir.path(), &audit, payload, &config);
-            assert_eq!(
-                got,
-                code,
-                "locked {locked}, {} bytes: {stderr}",
-                payload.len()
-            );
-            assert_eq!(last(&audit), kind, "locked {locked}");
+            assert_eq!(got, 2, "locked {locked}, {} bytes: {stderr}", payload.len());
+            assert_eq!(last(&audit), DecisionKind::ErrorDenied, "locked {locked}");
         }
         let call = serde_json::json!({
             "tool_name": "PowerShell",

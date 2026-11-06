@@ -43,7 +43,7 @@
 //! literal argv[0] left to judge), then falls through to the more general
 //! any-position scan only when this one found nothing.
 
-use crate::lexer::{pure_substitution_body, Word};
+use crate::lexer::{find_all_substitution_kinds, pure_substitution_body, Word};
 
 /// If `seg`'s effective command position is filled by a command
 /// substitution, return its raw, unevaluated inner text so the caller can
@@ -82,6 +82,102 @@ pub fn command_position_substitution_kind(seg: &[Word]) -> Option<(String, bool)
         }
     }
     None
+}
+
+/// Can this word vanish when the shell expands it? An unquoted word made
+/// entirely of substitutions and parameters (`$(true)`, `` `true` ``, `$x`,
+/// `${x:-${y}}`, `$1`, `$!`, `$x$(y)`): word splitting removes an empty
+/// result, and the next word becomes the command. A word a brace expansion
+/// left empty (`{,}`) is removed too. Quoted, only `"$@"` and `"${a[@]}"` can
+/// vanish; `"$x"` stays an empty word (`'$@'` counts as vanishing as well,
+/// since the text does not tell the quotes apart, which only over-denies).
+/// Literal text beside the expansion keeps the word.
+pub fn may_expand_to_nothing(word: &Word) -> bool {
+    #[cfg(test)]
+    crate::work::add(1 + word.text.len());
+    if word.redirect || word.assignment {
+        return false;
+    }
+    if word.text.is_empty() {
+        return !word.quoted;
+    }
+    if !word.text.starts_with(['$', '`']) {
+        return false;
+    }
+    let vanishes = |rest: &str| only_parameters(rest) && (!word.quoted || expands_a_list(rest));
+    if word.has_substitution {
+        without_substitutions(&word.text).is_some_and(|rest| vanishes(&rest))
+    } else {
+        vanishes(&word.text)
+    }
+}
+
+/// `text` with its substitutions cut out, in one pass over it. `None` if one
+/// of them is not written the way it was found.
+fn without_substitutions(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pos = 0;
+    for (inner, dollar) in find_all_substitution_kinds(text) {
+        let written = if dollar {
+            format!("$({inner})")
+        } else {
+            format!("`{inner}`")
+        };
+        let at = pos + text[pos..].find(&written)?;
+        out.push_str(&text[pos..at]);
+        pos = at + written.len();
+    }
+    out.push_str(&text[pos..]);
+    Some(out)
+}
+
+/// Is `text` nothing but `$NAME`, `${…}` (nested braces matched) and the
+/// `$1`, `$@`, `$*`, `$!` forms?
+fn only_parameters(mut text: &str) -> bool {
+    while !text.is_empty() {
+        let Some(len) = parameter_len(text) else {
+            return false;
+        };
+        text = &text[len..];
+    }
+    true
+}
+
+/// The length of the parameter expansion `text` starts with, if it does.
+fn parameter_len(text: &str) -> Option<usize> {
+    let after = text.strip_prefix('$')?;
+    let len = match after.chars().next()? {
+        '{' => {
+            let mut open = 0usize;
+            let close = after.char_indices().find_map(|(i, c)| {
+                match c {
+                    '{' => open += 1,
+                    '}' => open -= 1,
+                    _ => {}
+                }
+                (open == 0).then_some(i)
+            })?;
+            close + 1
+        }
+        '@' | '*' | '!' | '0'..='9' => 1,
+        _ => after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len()),
+    };
+    (len > 0).then_some(len + 1)
+}
+
+/// Do the parameters in `text` hold one that expands to no word at all even
+/// inside double quotes: `$@`, `${@}`, `${a[@]}`, with any slice or default?
+fn expands_a_list(mut text: &str) -> bool {
+    while let Some(len) = parameter_len(text) {
+        let (p, rest) = text.split_at(len);
+        if p == "$@" || p.starts_with("${@") || p.contains("[@]") {
+            return true;
+        }
+        text = rest;
+    }
+    false
 }
 
 /// If `tok` is a `NAME=value` shell-assignment word, return `value` (the

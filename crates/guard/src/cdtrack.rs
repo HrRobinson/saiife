@@ -202,7 +202,9 @@ pub(crate) struct RuleCwd {
 
 /// Leading words that make a segment a condition or time it (`if cd /;
 /// then …`, `while cd x; do …`, `! cd /`, `time -p cd /`): the command
-/// after them still runs in this shell.
+/// after them still runs in this shell. The POSIX lexer drops all of these but a
+/// `time` before a plain command (`time -p cd /`), which it keeps for the wrapper
+/// table; the PowerShell and cmd readers keep them all, and `!` runs `cd` there too.
 const CONDITION_WORDS: &[&str] = &["if", "elif", "while", "until", "!", "time"];
 
 /// How many leading words of `argv` are `CONDITION_WORDS` (unquoted), with
@@ -242,6 +244,12 @@ impl RuleCwd {
             overflowed: false,
             windows,
         }
+    }
+
+    /// About what copying or rewriting through these directories costs, in
+    /// bytes, without reading each part.
+    pub(crate) fn weight(&self) -> usize {
+        self.dirs.iter().map(|d| 24 * d.parts.len()).sum()
     }
 
     /// A segment ran: the target of a `cd`/`pushd` (`argv` normalized,
@@ -676,6 +684,36 @@ mod tests {
             r(&["! time -p cd /"], "rm -rf *").as_deref(),
             Some("rm -rf /*")
         );
+    }
+
+    /// A reader keeps these words in its segments, which the POSIX lexer drops.
+    #[test]
+    fn a_condition_word_a_reader_kept_still_moves() {
+        let mut cwd = RuleCwd::start(Some(Path::new("/p")));
+        let argv: Vec<String> = ["!", "time", "-p", "cd", "/"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let words: Vec<Word> = argv
+            .iter()
+            .map(|a| Word {
+                text: a.clone(),
+                ..Word::default()
+            })
+            .collect();
+        cwd.command(&argv, &words, None);
+        assert!(cwd.moved);
+        // Quoted, it is a command's name.
+        let mut cwd = RuleCwd::start(Some(Path::new("/p")));
+        let quoted: Vec<Word> = words
+            .iter()
+            .map(|w| Word {
+                quoted: true,
+                ..w.clone()
+            })
+            .collect();
+        cwd.command(&argv, &quoted, None);
+        assert!(!cwd.moved);
     }
 
     /// `x:` is a directory like any other in POSIX style.
