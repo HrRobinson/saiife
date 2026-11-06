@@ -10,13 +10,13 @@
 //! [`Host`]: crate::host::Host
 
 use super::common::{
-    agent_label, allow_server_warnings, cloud_sts, config_valid, entry_fingerprint,
-    forwarding_detail, health_check, install_record, mcp_restrictions, NOT_INSTALLED,
+    agent_label, allow_server_warnings, cloud_sts, config_valid, entry_fingerprint, fmt_version,
+    forwarding_detail, health_check, install_record, mcp_restrictions, parse_agent_version,
+    CLAUDE_MIN, NOT_INSTALLED,
 };
 use super::report::{Check, Status};
 use super::Ctx;
-use crate::binary::{inspect_pe, PE_IMPORT_ALLOWLIST};
-use crate::host::POWERSHELL_EXE;
+use crate::binary::{authenticode_verdict, inspect_pe, Authenticode, PE_IMPORT_ALLOWLIST};
 use crate::layout::*;
 use crate::supported::{check_supported, Support, NOT_ELEVATED, REG_PROFILE_LIST};
 use crate::winacl::{
@@ -42,23 +42,26 @@ const MAX_BINARY: u64 = 256 * 1024 * 1024;
 const MAX_FINGERPRINT: u64 = 16 * 1024 * 1024;
 const VAULT_KEY_LEN: u64 = 32;
 const HEALTH_WAIT: Duration = Duration::from_secs(2);
-const SIGNATURE_WAIT: Duration = Duration::from_secs(30);
+const VERSION_WAIT: Duration = Duration::from_secs(5);
+const AUDIT_KEY_LEN: u64 = 32;
 
-/// Owner ruling: same-user approval is off, as on macOS.
+/// Owner ruling: same-user approval is off, as on macOS. The plan's W16 and Task 8 text.
+/// `layout.rs` has no Windows form of `MAC_SAME_USER_OFF` on this base.
 const WIN_SAME_USER_OFF: &str =
-    "same-user approval is off on Windows: approvals need a second account";
+    "same-user approval is off on Windows: approvals need a second account, from a separate session";
 
 /// What the lock does not do yet. It is said on every locked run, and fails nothing: an admin
 /// who reads only PASS lines must still have been told.
 const PREVIEW_LIMITS: &str = "Windows locked mode is preview: an agent running code as the same \
      user can forge a hook's exit, block the hook from starting, or redirect its path. This is \
-     unverified, and tested by hand on a VM. Codex and Gemini CLI on Windows locked mode are \
-     preview too";
+     unverified: it has not been tested on a Windows machine yet. Codex and Gemini CLI on \
+     Windows locked mode are preview too";
 
 /// The Linux checks with no Windows form in this version. Said, so that their absence does
 /// not read as "fine".
-const NOT_PORTED: &str = "not checked on Windows in this version: the audit signing key, \
-     plaintext credentials, agent versions, model logins and leftover project hooks";
+const NOT_PORTED: &str = "not checked on Windows in this version: plaintext credentials, \
+     model logins, leftover project hooks, hard links in the install's tree, and who is in the \
+     local group saiife-audit, who may read the audit log";
 
 /// W27: the local groups whose members can become an administrator, by SID. Their names are
 /// localized, so a name says nothing.
@@ -105,6 +108,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     }
     out.push(files_binary(ctx));
     out.extend(files_package(ctx));
+    out.push(keys(ctx));
     out.push(daemon_unit(ctx));
     out.push(health_check(
         ctx.host
@@ -533,8 +537,46 @@ impl Acl<'_, '_> {
         }
     }
 
+    /// Everything from a moved audit dir down: no row covers it, so each entry is asked who
+    /// may write it.
+    fn moved_tree(&mut self, logical: &str, real: &Path) {
+        let meta = match std::fs::symlink_metadata(real) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => return self.t.error(self.ctx, logical, "look at it", &e),
+        };
+        if refuse_reparse(real, &meta).is_err() {
+            return self.t.bad(format!("{logical}: is a reparse point"));
+        }
+        if let Some(sd) = self.read(logical, real) {
+            let service = service_sid(WIN_SERVICE);
+            if let Err(e) = protected_ok(&sd, &[service.as_str()]) {
+                self.t.bad(format!("{logical}: {e}"));
+            }
+        }
+        if !meta.is_dir() {
+            return;
+        }
+        let entries = match std::fs::read_dir(real) {
+            Ok(rd) => rd,
+            Err(e) => return self.t.error(self.ctx, logical, "list it", &e),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => names.push(entry.file_name()),
+                Err(e) => self.t.error(self.ctx, logical, "list it", &e),
+            }
+        }
+        names.sort();
+        for name in names {
+            let child = format!("{logical}\\{}", name.to_string_lossy());
+            self.moved_tree(&child, &real.join(&name));
+        }
+    }
+
     /// An audit dir the config moved out of the tree has no row, and must still be the
-    /// service's and the admins' alone.
+    /// service's and the admins' alone: it, what is in it, and the folders above it.
     fn moved_audit_dir(&mut self) {
         let layout = self.ctx.layout;
         let Ok(p) = &self.ctx.config else {
@@ -550,15 +592,23 @@ impl Acl<'_, '_> {
         {
             return;
         }
-        let Some(real) = self.at(&shown) else {
+        let Some((drive, names)) = layout.windows_location(dir) else {
+            return self
+                .t
+                .bad(format!("{shown}: not plainly a path of this machine"));
+        };
+        let logical = format!("{drive}:\\{}", names.join("\\"));
+        let Some(real) = self.at(&logical) else {
             return;
         };
-        if let Some(sd) = self.read(&shown, &real) {
-            let service = service_sid(WIN_SERVICE);
-            if let Err(e) = protected_ok(&sd, &[service.as_str()]) {
-                self.t.bad(format!("{shown}: {e}"));
-            }
+        self.required(&logical, true);
+        let mut above = parent_of(&logical);
+        while above.len() > 2 {
+            self.ancestor(above);
+            above = parent_of(above);
         }
+        self.ancestor(&format!("{above}\\"));
+        self.moved_tree(&logical, &real);
     }
 }
 
@@ -600,7 +650,7 @@ fn files_acl(ctx: &Ctx) -> Check {
     ] {
         acl.required(dir, true);
     }
-    for file in [BINARY, CONFIG, INSTALLED, VAULT_KEY, DAEMON_LOG] {
+    for file in [BINARY, CONFIG, INSTALLED, VAULT_KEY, AUDIT_KEY, DAEMON_LOG] {
         acl.required(layout.logical(file), false);
     }
     if let Some(real) = acl.at(root) {
@@ -686,20 +736,14 @@ fn files_installed(ctx: &Ctx, i: &Installed) -> Check {
     t.check("files.installed", "installed files")
 }
 
-/// What Windows says of the signature, by the fixed path: nothing here comes from the caller.
-/// `Status` prints an enum's name, which is not localized.
-fn authenticode_args(binary: &str) -> [String; 4] {
-    [
-        "-NoProfile".to_string(),
-        "-NonInteractive".to_string(),
-        "-Command".to_string(),
-        format!("(Get-AuthenticodeSignature -LiteralPath {binary}).Status"),
-    ]
-}
-
 /// W28. `inspect_pe`'s problems fail and its warnings warn. A file that says it is signed
-/// must be `Valid` by Windows' own reading: another answer fails, and no answer warns, since
-/// the signature was then seen neither good nor bad.
+/// must be valid by Windows' own reading: a refusal fails, and no answer warns, since the
+/// signature was then seen neither good nor bad.
+///
+/// Read in this process, with `WinVerifyTrust`, not by asking PowerShell. An elevated doctor
+/// holds the full token, and the caller's user controls `HKCU`: clearing PowerShell's
+/// environment does not reach the CLR's settings there or the user's own module folder, so
+/// an agent running as that user could have run its code with that token.
 fn files_binary(ctx: &Ctx) -> Check {
     const ID: &str = "files.binary";
     const TITLE: &str = "installed binary";
@@ -723,20 +767,20 @@ fn files_binary(ctx: &Ctx) -> Check {
     }
     let mut notes = info.warnings();
     if info.signed {
-        let args = authenticode_args(shown);
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        match ctx.host.run(POWERSHELL_EXE, &args, SIGNATURE_WAIT) {
-            Ok(o) if o.status == 0 && o.stdout.trim() == "Valid" => {}
-            Ok(o) if o.status == 0 && !o.stdout.trim().is_empty() => {
+        match ctx
+            .host
+            .authenticode_status(&ctx.layout.at(BINARY))
+            .map(authenticode_verdict)
+        {
+            Ok(Authenticode::Valid) => {}
+            Ok(Authenticode::Rejected(why)) => {
                 return fail(format!(
-                    "{shown}: its Authenticode signature is {}, not Valid",
-                    o.stdout.trim()
+                    "{shown}: Windows refuses its Authenticode signature: {why}"
                 ))
             }
-            Ok(o) => notes.push(format!(
-                "could not read its Authenticode signature (exit {})",
-                o.status
-            )),
+            Ok(Authenticode::Unknown(why)) => {
+                notes.push(format!("could not read its Authenticode signature: {why}"))
+            }
             Err(e) => notes.push(format!("could not read its Authenticode signature: {e}")),
         }
     }
@@ -757,24 +801,54 @@ fn files_binary(ctx: &Ctx) -> Check {
     }
 }
 
+/// What is unsafe about `logical` as a place SYSTEM runs a program from.
+fn package_path_problem(
+    ctx: &Ctx,
+    logical: &str,
+    fit: &dyn Fn(&Sd) -> Result<(), String>,
+) -> Option<String> {
+    let judged = ctx
+        .layout
+        .try_at(Path::new(logical))
+        .map_err(|e| e.to_string())
+        .and_then(|real| ctx.host.get_sddl(&real).map_err(|e| e.to_string()))
+        .and_then(|text| parse(&text))
+        .and_then(|sd| fit(&sd));
+    judged.err().map(|e| format!("{logical}: {e}"))
+}
+
 /// The MSI's copy (W20), when there is one: it must be what install copied, and SYSTEM runs
-/// it on the next package install, so only admins may change it.
+/// it on the next package install. So only admins may change it, or its folder, and the
+/// folders above must not let anyone replace that. As `package_path_problem` on Linux, a
+/// finding warns. Only a copy that is not there drops the check.
 fn files_package(ctx: &Ctx) -> Option<Check> {
     const ID: &str = "files.package";
     const TITLE: &str = "package binary";
     let package = ctx.layout.at(PACKAGE_BINARY);
-    std::fs::symlink_metadata(&package).ok()?;
     let shown = ctx.layout.logical(PACKAGE_BINARY);
     let warn = |d: String| Some(Check::new(ID, Status::Warn, TITLE, d));
-    let judged = ctx
-        .host
-        .get_sddl(&package)
-        .map_err(|e| e.to_string())
-        .and_then(|text| parse(&text))
-        .and_then(|sd| protected_ok(&sd, &[]));
-    if let Err(e) = judged {
+    match std::fs::symlink_metadata(&package) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return warn(format!("{shown}: cannot look at it: {e}")),
+    }
+    let own = |sd: &Sd| protected_ok(sd, &[]);
+    let folder = parent_of(shown);
+    let above = parent_of(folder);
+    let drive = format!("{}\\", parent_of(above));
+    let problems: Vec<String> = [
+        package_path_problem(ctx, shown, &own),
+        package_path_problem(ctx, folder, &own),
+        package_path_problem(ctx, above, &ancestor_ok),
+        package_path_problem(ctx, &drive, &ancestor_ok),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !problems.is_empty() {
         return warn(format!(
-            "{shown}: {e}: SYSTEM runs this copy on the next package install"
+            "{}: SYSTEM runs this copy on the next package install",
+            problems.join("; ")
         ));
     }
     let read = |p: &Path| read_plain(p, MAX_BINARY).map(|b| sha256_hex(&b));
@@ -785,6 +859,30 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
             ctx.layout.logical(BINARY)
         )),
         (Err(e), _) | (_, Err(e)) => warn(format!("cannot compare: {e}")),
+    }
+}
+
+/// The key the daemon signs the audit log with, which it makes at its first start. Who may
+/// write it is `files.acl`'s matter; this says it is there and whole.
+fn keys(ctx: &Ctx) -> Check {
+    const ID: &str = "keys";
+    const TITLE: &str = "audit signing key";
+    let shown = ctx.layout.logical(AUDIT_KEY);
+    let real = ctx.layout.at(AUDIT_KEY);
+    let fail = |d: String| Check::new(ID, Status::Fail, TITLE, d);
+    match std::fs::symlink_metadata(&real) {
+        Ok(m) if refuse_reparse(&real, &m).is_err() => fail(format!("{shown}: is a reparse point")),
+        Ok(m) if !m.is_file() => fail(format!("{shown}: is not a regular file")),
+        Ok(m) if m.len() != AUDIT_KEY_LEN => fail(format!(
+            "{shown}: is {} bytes, must be {AUDIT_KEY_LEN} bytes",
+            m.len()
+        )),
+        Ok(_) => Check::new(ID, Status::Pass, TITLE, ""),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fail(format!("{shown}: missing")),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
+            Check::new(ID, Status::Info, TITLE, format!("{NOT_CHECKED}: {shown}"))
+        }
+        Err(e) => fail(format!("{shown}: cannot look at it: {e}")),
     }
 }
 
@@ -964,6 +1062,9 @@ fn claude_policy(ctx: &Ctx) -> Check {
         HklmPolicy::Overrides => Check::new(ID, Status::Fail, TITLE, claude::HKLM_OVERRIDES_TEXT),
         HklmPolicy::Merge => Check::new(ID, Status::Pass, TITLE, "merged with saiife's drop-in"),
         HklmPolicy::Absent => Check::new(ID, Status::Pass, TITLE, ""),
+        HklmPolicy::WeakensHooks => {
+            Check::new(ID, Status::Fail, TITLE, claude::HKLM_WEAKENS_HOOKS_TEXT)
+        }
     }
 }
 
@@ -1071,9 +1172,10 @@ fn users(ctx: &Ctx) -> Vec<Check> {
     if names.is_empty() {
         out.push(Check::new(
             "users.none",
-            Status::Info,
+            Status::Warn,
             "agent users",
-            "no agent user to check: a [[scope]] names them, or use --user",
+            "no agent user was checked, so W27 went unevaluated: an agent user who can become \
+             an administrator would not show here. A [[scope]] names them, or use --user",
         ));
     }
     for name in &names {
@@ -1091,6 +1193,7 @@ fn users(ctx: &Ctx) -> Vec<Check> {
         out.push(Check::new(id("passwd"), Status::Pass, title, ""));
         out.push(elevation(ctx, name, &sid, id("root")));
         out.push(agent_binaries(ctx, name, &sid, id("agent-binaries")));
+        out.push(agent_version(ctx, name, &sid, id("agent-version")));
         out.push(Check::new(
             id("egress"),
             Status::Info,
@@ -1223,16 +1326,26 @@ fn agent_binaries(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
     for dir in USER_BIN_DIRS {
         let dir = format!(r"{profile}\{dir}");
         let mut any = false;
+        // One line for a folder doctor may not read, not one per name in it.
+        let mut denied = false;
         for program in AGENT_PROGRAMS {
             for suffix in PROGRAM_SUFFIXES {
                 let logical = format!(r"{dir}\{program}{suffix}");
                 let Ok(real) = ctx.layout.try_at(Path::new(&logical)) else {
                     continue;
                 };
-                if std::fs::symlink_metadata(&real).is_ok() {
-                    any = true;
-                    risks.extend(change_risk(ctx, &logical, name));
-                    found.push(logical);
+                match std::fs::symlink_metadata(&real) {
+                    Ok(_) => {
+                        any = true;
+                        risks.extend(change_risk(ctx, &logical, name));
+                        found.push(logical);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) if !denied => {
+                        denied = true;
+                        risks.push(format!("{dir}: cannot look in it: {e}"));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -1241,12 +1354,66 @@ fn agent_binaries(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
             risks.extend(change_risk(ctx, &dir, name));
         }
     }
-    if found.is_empty() {
-        Check::new(id, Status::Info, TITLE, "no agent binary found")
-    } else if risks.is_empty() {
-        Check::new(id, Status::Pass, TITLE, found.join(", "))
-    } else {
+    if !risks.is_empty() {
         Check::new(id, Status::Warn, TITLE, risks.join("; "))
+    } else if found.is_empty() {
+        Check::new(id, Status::Info, TITLE, "no agent binary found")
+    } else {
+        Check::new(id, Status::Pass, TITLE, found.join(", "))
+    }
+}
+
+/// `claude.exe --version`, from a plain shell only. The agent's own binary may be whatever
+/// its user made it, so it never runs with an elevated token. A plain shell checks only its
+/// caller, and holds nothing that user does not.
+fn agent_version(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
+    const TITLE: &str = "agent versions";
+    if ctx.as_root {
+        return Check::new(
+            id,
+            Status::Info,
+            TITLE,
+            format!("not checked elevated: an agent's binary never runs elevated (run saiife doctor as {name})"),
+        );
+    }
+    let not_found = || Check::new(id.clone(), Status::Info, TITLE, "Claude Code not found");
+    let Some(profile) = profile_dir(ctx, sid) else {
+        return not_found();
+    };
+    let Ok(exe) = ctx
+        .layout
+        .try_at(Path::new(&format!(r"{profile}\.local\bin\claude.exe")))
+    else {
+        return not_found();
+    };
+    if std::fs::symlink_metadata(&exe).is_err() {
+        return not_found();
+    }
+    let program = exe.display().to_string();
+    let warn = |d: String| Check::new(id.clone(), Status::Warn, TITLE, d);
+    let out = match ctx.host.run(&program, &["--version"], VERSION_WAIT) {
+        Ok(o) if o.status == 0 => o.stdout,
+        Ok(o) => return warn(format!("{program} --version failed (exit {})", o.status)),
+        Err(e) => return warn(format!("{program} --version: {e}")),
+    };
+    match parse_agent_version(&out) {
+        None => warn(format!("no version in the output of {program} --version")),
+        Some(v) if v < CLAUDE_MIN => Check::new(
+            id,
+            Status::Fail,
+            TITLE,
+            format!(
+                "Claude Code {} is older than {} (onFailure: \"block\")",
+                fmt_version(v),
+                fmt_version(CLAUDE_MIN)
+            ),
+        ),
+        Some(v) => Check::new(
+            id,
+            Status::Pass,
+            TITLE,
+            format!("Claude Code {}", fmt_version(v)),
+        ),
     }
 }
 

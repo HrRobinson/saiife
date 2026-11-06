@@ -92,6 +92,9 @@ pub const HKLM_POLICY_VALUE: &str = "Settings";
 /// The `agents.claude.policy` failure (spec W24).
 pub const HKLM_OVERRIDES_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add \"managedSourcesBehavior\": \"merge\" there, or put saiife's hooks in it";
 
+/// The `agents.claude.policy` failure when a merged policy can still turn saiife's hooks off.
+pub const HKLM_WEAKENS_HOOKS_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode merges with saiife's drop-in, but its disableAllHooks or hooks value can turn saiife's hooks off; remove it, or put saiife's hooks in it";
+
 /// What the HKLM `Settings` value does to saiife's drop-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HklmPolicy {
@@ -102,6 +105,8 @@ pub enum HklmPolicy {
     Merge,
     /// A policy source that replaces the files: the drop-in is ignored.
     Overrides,
+    /// It merges, and holds a value that can turn saiife's hooks off.
+    WeakensHooks,
 }
 
 /// A registry read that failed for a reason other than "not found".
@@ -134,11 +139,54 @@ pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> HklmRead) -> HklmPolicy {
     if map.keys().all(|k| CONTROL_KEYS.contains(&k.as_str())) {
         return HklmPolicy::Absent;
     }
-    if map.get("managedSourcesBehavior").and_then(Value::as_str) == Some("merge") {
-        HklmPolicy::Merge
-    } else {
-        HklmPolicy::Overrides
+    if map.get("managedSourcesBehavior").and_then(Value::as_str) != Some("merge") {
+        return HklmPolicy::Overrides;
     }
+    if can_turn_hooks_off(&map) {
+        HklmPolicy::WeakensHooks
+    } else {
+        HklmPolicy::Merge
+    }
+}
+
+/// What in a merged policy could stop saiife's hooks. `disableAllHooks` set to anything but
+/// `false`; and a `hooks` value that does not itself carry saiife's, since how Claude Code
+/// merges that key is not documented here and it may replace the files' value.
+fn can_turn_hooks_off(policy: &serde_json::Map<String, Value>) -> bool {
+    if policy
+        .get("disableAllHooks")
+        .is_some_and(|v| v != &Value::Bool(false))
+    {
+        return true;
+    }
+    policy
+        .get("hooks")
+        .is_some_and(|h| !carries_saiife_hooks(h))
+}
+
+/// Every command of `hooks`, as settings nest them: event, entries, then each entry's `hooks`.
+fn hook_commands(entries: &Value) -> Vec<&str> {
+    entries
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|h| h.get("command")?.as_str())
+        .collect()
+}
+
+fn carries_saiife_hooks(theirs: &Value) -> bool {
+    let Ok(ours) = serde_json::from_str::<Value>(&managed_settings_for(true)) else {
+        return false;
+    };
+    let Some(ours) = ours.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    ours.iter().all(|(event, entries)| {
+        let held = theirs.get(event).map(hook_commands).unwrap_or_default();
+        hook_commands(entries).iter().all(|c| held.contains(c))
+    })
 }
 
 /// One registry read as [`hklm_policy`] wants it: only "not found" means
@@ -611,6 +659,27 @@ mod tests {
         let r = reg(Some(r#"{"hooks":{},"managedSourcesBehavior":"replace"}"#));
         assert_eq!(hklm_policy(&r), HklmPolicy::Overrides);
         assert_eq!(hklm_policy(&reg(Some("not json"))), HklmPolicy::Overrides);
+    }
+
+    #[test]
+    fn hklm_merge_with_hooks_off_weakens() {
+        let read = |text: String| hklm_policy(&move |_, _| Ok(Some(text.clone())));
+        let m = |rest: &str| format!(r#"{{"managedSourcesBehavior":"merge"{rest}}}"#);
+        assert_eq!(
+            read(m(r#","disableAllHooks":true"#)),
+            HklmPolicy::WeakensHooks
+        );
+        assert_eq!(read(m(r#","disableAllHooks":1"#)), HklmPolicy::WeakensHooks);
+        assert_eq!(read(m(r#","disableAllHooks":false"#)), HklmPolicy::Merge);
+        assert_eq!(read(m(r#","hooks":{}"#)), HklmPolicy::WeakensHooks);
+        let ours: Value = serde_json::from_str(&managed_settings_for(true)).unwrap();
+        let hooks = format!(r#","hooks":{}"#, ours["hooks"]);
+        assert_eq!(read(m(&hooks)), HklmPolicy::Merge);
+        // Without merge the source replaces the files, whatever else it says.
+        assert_eq!(
+            read(r#"{"disableAllHooks":true}"#.to_string()),
+            HklmPolicy::Overrides
+        );
     }
 
     #[test]

@@ -41,11 +41,12 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   - **token.rs:** `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle`;
   - **pipe.rs:** `tokio::net::windows::named_pipe::ServerOptions::create_with_security_attributes_raw`, `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side);
   - **proc.rs:** `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`;
+  - **trust.rs:** `WinVerifyTrust` (doctor's signature check: in-process, so an elevated doctor starts no PowerShell whose environment and HKCU settings the caller's user controls);
   - **cred.rs:** `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`;
   - **process.rs:** `SetDefaultDllDirectories` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), `SetStdHandle` (`STD_ERROR_HANDLE`, for the service log), `GetDiskFreeSpaceExW`;
   - **service.rs:** the one `extern "system"` service entry that `windows_service::define_windows_service!` expands to. The macro's expansion contains `unsafe`, so it must live in `saiife-win` and nowhere else.
 
-  That is 37 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. If a failure of `RevertToSelf` is ever seen, the process calls `std::process::abort()`: it must never go on running as the client.
+  That is 38 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 37 `windows-sys` calls and the tokio call. If a failure of `RevertToSelf` is ever seen, the process calls `std::process::abort()`: it must never go on running as the client.
 - **Decisions this plan makes** (W1–W8 are in plan 19a; each one here is restated in its task, and plan 19a Task 1 copies all of them into spec §5.3a):
   9. **W9. The Windows layout.** `windows_path(linux: &str) -> Option<&'static str>` maps:
 
@@ -408,7 +409,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   - `system.supported`: the build and edition;
   - `daemon.unit`: the service spec matches the fingerprint in `installed.toml`, its SDDL equals `WIN_SERVICE_SDDL` (parsed, compared as `Sd`), and it is running;
   - `daemon.health`: as on Linux, over the pipe;
-  - `files.binary`: `inspect_pe` problems fail and warnings warn. When signed, `Get-AuthenticodeSignature -LiteralPath C:\ProgramData\saiife\bin\saiife.exe` (run through `Host::run` with `powershell.exe -NoProfile -NonInteractive -Command`, the path fixed) must report `Valid`;
+  - `files.binary`: `inspect_pe` problems fail and warnings warn. When signed, `WinVerifyTrust` must accept it, in-process: an elevated doctor starts no PowerShell, whose environment and HKCU settings the caller's user controls;
   - `files.acl` (new): every path in the W14 table has its expected descriptor; ancestors pass `ancestor_ok`;
   - `vault.key`: `daemon key file, readable only by NT SERVICE\saiifed`;
   - `reauth`: Info `same-user approval is off on Windows: approvals need a second account, from a separate session`;

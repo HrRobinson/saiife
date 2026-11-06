@@ -913,11 +913,12 @@ updating this list and this section.
 | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
 | Pipes (`pipe.rs`) | `ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
 | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
+| Signature check (`trust.rs`) | `WinVerifyTrust` |
 | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 37 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
+That is 38 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 37 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 

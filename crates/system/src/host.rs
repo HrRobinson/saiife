@@ -40,9 +40,6 @@ pub const SECURITY: &str = "/usr/bin/security";
 // Windows (plan 19b). `exec` runs them by this path, never through `PATH`.
 pub const NET_EXE: &str = r"C:\Windows\System32\net.exe";
 pub const SC_EXE: &str = r"C:\Windows\System32\sc.exe";
-/// Windows PowerShell, which ships with every supported build. Doctor asks it for a
-/// binary's Authenticode status.
-pub const POWERSHELL_EXE: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 /// The registry key of `CurrentBuildNumber` and `InstallationType`, below HKLM.
 pub const REG_NT_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
@@ -51,7 +48,7 @@ pub const REG_NT_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\Current
 pub const MACOS_ID_RANGE: RangeInclusive<u32> = 200..=400;
 
 /// Every program locked mode runs on Windows.
-pub const WIN_PROGRAMS: &[&str] = &[NET_EXE, SC_EXE, POWERSHELL_EXE];
+pub const WIN_PROGRAMS: &[&str] = &[NET_EXE, SC_EXE];
 
 /// Every program locked mode runs (plan 9b global constraints), always by
 /// absolute path.
@@ -272,6 +269,12 @@ pub trait Host: Send + Sync {
     /// compare it with W10. `Ok(None)` when it does not exist. Its `sddl` is what
     /// `sc.exe sdshow` prints, which may hold a SACL.
     fn service_spec(&self) -> io::Result<Option<crate::winservice::ServiceSpec>> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Windows: `WinVerifyTrust`'s answer for the file's embedded signature, in this
+    /// process: see [`crate::binary::authenticode_verdict`].
+    fn authenticode_status(&self, path: &Path) -> io::Result<i32> {
+        let _ = path;
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
     /// Windows: the local groups `user` is in, nested ones included. Names only, and
@@ -1409,8 +1412,27 @@ fn check_status(argv: &[String], out: &CmdOutput) -> io::Result<()> {
     )))
 }
 
+/// The whole environment of a program Windows' [`RealHost`] runs, and its working
+/// directory. Nothing is inherited. Doctor and install run elevated, and an agent running
+/// as the admin's own user can set `HKCU\\Environment`, which the next shell inherits:
+/// `PATH` decides what `net.exe` starts as `net1.exe`, `__COMPAT_LAYER` applies shims to any
+/// program, and a dir the caller chose must not be where a program looks for a DLL.
+pub const WINDOWS_CHILD_ENV: [(&str, &str); 8] = [
+    ("SystemRoot", r"C:\Windows"),
+    ("windir", r"C:\Windows"),
+    ("SystemDrive", "C:"),
+    ("Path", r"C:\Windows\System32;C:\Windows"),
+    ("PATHEXT", ".COM;.EXE"),
+    ("ComSpec", r"C:\Windows\System32\cmd.exe"),
+    ("TEMP", r"C:\Windows\Temp"),
+    ("TMP", r"C:\Windows\Temp"),
+];
+/// See [`WINDOWS_CHILD_ENV`].
+pub const WINDOWS_CHILD_DIR: &str = r"C:\Windows\System32";
+
 /// Spawns `program` (absolute) with `stdin` (or none), collects its output
-/// and kills it after `timeout`.
+/// and kills it after `timeout`. On Windows it inherits no environment and no working
+/// directory: [`WINDOWS_CHILD_ENV`].
 fn exec(
     program: &str,
     args: &[&str],
@@ -1439,6 +1461,10 @@ fn exec_with(
     for v in remove_env {
         cmd.env_remove(v);
     }
+    #[cfg(windows)]
+    cmd.env_clear()
+        .envs(WINDOWS_CHILD_ENV)
+        .current_dir(WINDOWS_CHILD_DIR);
     let mut child = cmd
         .args(args)
         .stdin(if stdin.is_some() {
@@ -1731,6 +1757,15 @@ pub struct FakeState {
     pub service_spec_error: Option<String>,
     /// Paths whose `get_sddl` is access denied, as a plain user's is on `state`.
     pub sddl_denied: Vec<PathBuf>,
+    /// `service_spec` is access denied.
+    pub service_spec_denied: bool,
+    /// `local_groups_of` is access denied.
+    pub local_groups_denied: bool,
+    /// When set, `service(Query)` fails with this error: the service manager cannot be
+    /// asked.
+    pub service_query_error: Option<String>,
+    /// What `authenticode_status` answers; `None` fails the call.
+    pub authenticode: Option<i32>,
 }
 
 /// JSON maps need string keys, so the registry is saved as a list.
@@ -1817,6 +1852,10 @@ impl Default for FakeState {
             daemon_status: None,
             service_spec_error: None,
             sddl_denied: Vec::new(),
+            service_spec_denied: false,
+            local_groups_denied: false,
+            service_query_error: None,
+            authenticode: None,
         }
     }
 }
@@ -2525,6 +2564,9 @@ impl Host for FakeHost {
                 ServiceOp::SetSddl(sddl) => format!("service sdset {sddl}"),
                 ServiceOp::ParamChange => "service paramchange".to_string(),
             });
+            if let (ServiceOp::Query, Some(e)) = (&op, &s.service_query_error) {
+                return Err(io::Error::other(e.clone()));
+            }
             let exists = s.services.contains_key(WIN_SERVICE);
             let gone = || missing("service", WIN_SERVICE);
             match op {
@@ -2655,6 +2697,9 @@ impl Host for FakeHost {
 
     fn service_spec(&self) -> io::Result<Option<ServiceSpec>> {
         let s = self.state();
+        if s.service_spec_denied {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         match s.service_spec_error {
             Some(e) => Err(io::Error::other(e)),
             None => Ok(s.services.get(crate::layout::WIN_SERVICE).cloned()),
@@ -2663,10 +2708,21 @@ impl Host for FakeHost {
 
     fn local_groups_of(&self, user: &str) -> io::Result<Vec<String>> {
         let s = self.state();
+        if s.local_groups_denied {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         match s.local_groups_error {
             Some(e) => Err(io::Error::other(e)),
             None => Ok(s.local_groups.get(user).cloned().unwrap_or_default()),
         }
+    }
+
+    fn authenticode_status(&self, path: &Path) -> io::Result<i32> {
+        self.update(|s| {
+            s.calls.push(format!("authenticode {}", path.display()));
+            s.authenticode
+                .ok_or_else(|| io::Error::other("the trust provider did not answer"))
+        })
     }
 
     fn daemon_status(

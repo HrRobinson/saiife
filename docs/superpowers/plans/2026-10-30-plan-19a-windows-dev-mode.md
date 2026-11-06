@@ -69,11 +69,12 @@ Plan 13 (macOS) sets the style and the patterns.
     | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
     | Pipes (`pipe.rs`) | `tokio::net::windows::named_pipe::ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
     | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
+    | Signature check (`trust.rs`) | `WinVerifyTrust` |
     | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
     | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
     | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to (its expansion contains `unsafe`, so the macro may be used only here) |
 
-    That is 37 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. The tokio call needs the crate feature `pipe-server` (`tokio` with `net`), which only `saiife-daemon` enables. So `saiife-win` stays tokio-free on the hook path.
+    That is 38 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 37 `windows-sys` calls and the tokio call. The tokio call needs the crate feature `pipe-server` (`tokio` with `net`), which only `saiife-daemon` enables. So `saiife-win` stays tokio-free on the hook path.
   - `scripts/check-unsafe.sh` (plan 13) is extended: `unsafe` is allowed in `crates/darwin/` and in `crates/win/src/ffi/`, nowhere else. The crate-root rule accepts `crates/win/src/lib.rs` with its `cfg_attr` form. On Windows the crate denies `unsafe_code`, and one `#![allow(unsafe_code)]` at the top of `crates/win/src/ffi/mod.rs` covers `ffi`.
 - **Tokio-free:** `guard`, `audit`, `policy`, `ipc`, `system`, `mcp`, `darwin` and `win` (without `pipe-server`) stay tokio-free. The CI gate `no tokio in hook crates` adds `-p saiife-win` and also runs on `windows-latest`.
 - **Hook budget:** the hook path may cost at most +1 ms against `main` on Linux (`scripts/bench-check.sh`). On `windows-latest`, the developer hook's p95 must be under the 50 ms budget (D10), measured with `BENCH_MAX_P95_MS=50` (Task 10). If the runner cannot meet it, that is an owner decision, not a silent raise.

@@ -14,6 +14,7 @@ pub mod process;
 pub mod sd;
 pub mod service;
 pub mod token;
+pub mod trust;
 
 #[cfg(test)]
 mod windows_tests;

@@ -15,7 +15,8 @@ use super::{
 };
 use crate::layout::WIN_SERVICE;
 use crate::winservice::{
-    parse_command_line, FailurePolicy, ServiceOp, ServiceSpec, ServiceState, SidType, StartKind,
+    failure_policy_from, live_spec_from, sdshow_text, FailurePolicy, LiveService, ServiceOp,
+    ServiceSpec, ServiceState, SidType, StartKind,
 };
 use saiife_ipc::client::Client;
 use saiife_win::ffi::{account, acl, token};
@@ -210,35 +211,27 @@ fn stop(wait: Duration) -> io::Result<ServiceState> {
 /// mix of actions say, reads as no restarts at all, which doctor reports.
 fn failure_policy(service: &Service) -> io::Result<FailurePolicy> {
     let actions = service.get_failure_actions().map_err(scm_error)?;
-    let list = actions.actions.unwrap_or_default();
-    let restart = |a: &ServiceAction| a.action_type == ServiceActionType::Restart;
-    let same = list.first().map(|a| a.delay);
-    let uniform = list.iter().all(|a| restart(a) && Some(a.delay) == same);
-    Ok(FailurePolicy {
-        restart_delay: same.unwrap_or_default(),
-        restarts: if uniform { list.len() as u32 } else { 0 },
-        reset_after: match actions.reset_period {
-            ServiceFailureResetPeriod::After(d) => d,
-            ServiceFailureResetPeriod::Never => Duration::ZERO,
-        },
-        on_non_crash: service
-            .get_failure_actions_on_non_crash_failures()
-            .map_err(scm_error)?,
-    })
+    let list: Vec<(bool, Duration)> = actions
+        .actions
+        .unwrap_or_default()
+        .iter()
+        .map(|a| (a.action_type == ServiceActionType::Restart, a.delay))
+        .collect();
+    let reset = match actions.reset_period {
+        ServiceFailureResetPeriod::After(d) => d,
+        ServiceFailureResetPeriod::Never => Duration::ZERO,
+    };
+    let on_non_crash = service
+        .get_failure_actions_on_non_crash_failures()
+        .map_err(scm_error)?;
+    Ok(failure_policy_from(&list, reset, on_non_crash))
 }
 
 /// `sc.exe sdshow saiifed`: W10 grants Authenticated Users `RC`, so a plain shell may
 /// ask. An exit code is all that is read of a failure: its text is localized.
 fn sdshow() -> io::Result<String> {
-    const ERROR_ACCESS_DENIED: i32 = 5;
     let out = exec(SC_EXE, &["sdshow", WIN_SERVICE], None, ADMIN_TIMEOUT)?;
-    match out.status {
-        0 => Ok(out.stdout.trim().to_string()),
-        ERROR_ACCESS_DENIED => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-        code => Err(io::Error::other(format!(
-            "{SC_EXE} sdshow {WIN_SERVICE} exited {code}"
-        ))),
-    }
+    sdshow_text(out.status, &out.stdout)
 }
 
 fn live_spec() -> io::Result<Option<ServiceSpec>> {
@@ -248,12 +241,9 @@ fn live_spec() -> io::Result<Option<ServiceSpec>> {
         Err(e) => return Err(e),
     };
     let config = service.query_config().map_err(scm_error)?;
-    let (binary, args) = parse_command_line(&config.executable_path.to_string_lossy());
-    Ok(Some(ServiceSpec {
-        name: WIN_SERVICE.to_string(),
+    Ok(Some(live_spec_from(LiveService {
         display: config.display_name.to_string_lossy().into_owned(),
-        binary,
-        args,
+        command_line: config.executable_path.to_string_lossy().into_owned(),
         account: config
             .account_name
             .map(|a| a.to_string_lossy().into_owned())
@@ -272,7 +262,7 @@ fn live_spec() -> io::Result<Option<ServiceSpec>> {
         },
         failure: failure_policy(&service)?,
         sddl: sdshow()?,
-    }))
+    })))
 }
 
 impl Host for RealHost {
@@ -512,6 +502,10 @@ impl Host for RealHost {
         account::local_groups_of(user)
     }
 
+    fn authenticode_status(&self, path: &Path) -> io::Result<i32> {
+        saiife_win::ffi::trust::authenticode_status(path)
+    }
+
     fn daemon_status(
         &self,
         wait: Duration,
@@ -635,5 +629,44 @@ mod tests {
             RealHost.service(ServiceOp::Query).unwrap(),
             ServiceState::Missing
         );
+        assert_eq!(RealHost.service_spec().unwrap(), None);
+    }
+
+    /// A program run here sees what is in the table, and nothing this process holds.
+    #[test]
+    fn a_child_inherits_no_environment_and_no_working_directory() {
+        let cmd = r"C:\Windows\System32\cmd.exe";
+        let out = RealHost
+            .run(cmd, &["/c", "set"], Duration::from_secs(30))
+            .unwrap();
+        let _ = writeln!(std::io::stderr(), "the child's environment: {}", out.stdout);
+        // Set on every machine, and not in the table.
+        let upper = out.stdout.to_ascii_uppercase();
+        for name in ["USERNAME=", "USERPROFILE=", "PSMODULEPATH="] {
+            assert!(!upper.contains(name), "{name}: {}", out.stdout);
+        }
+        let out = RealHost
+            .run(cmd, &["/c", "cd"], Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            out.stdout
+                .trim()
+                .eq_ignore_ascii_case(super::super::WINDOWS_CHILD_DIR),
+            "{}",
+            out.stdout
+        );
+    }
+
+    /// The test binary is not Authenticode-signed, and notepad's own bytes differ.
+    #[test]
+    fn an_unsigned_file_is_not_valid() {
+        use crate::binary::{authenticode_verdict, Authenticode};
+        let exe = std::env::current_exe().unwrap();
+        let status = RealHost.authenticode_status(&exe).unwrap();
+        let _ = writeln!(
+            std::io::stderr(),
+            "WinVerifyTrust on the test exe: 0x{status:08X}"
+        );
+        assert_ne!(authenticode_verdict(status), Authenticode::Valid);
     }
 }

@@ -659,8 +659,14 @@ pub(crate) fn install(
     let claude_listed = agents.contains(&Agent::Claude);
     if claude_listed {
         run.mcp_allowlist()?;
-        if run.host.claude_hklm_policy() == HklmPolicy::Overrides {
-            run.report.policy_failure = Some(claude::HKLM_OVERRIDES_TEXT.to_string());
+        match run.host.claude_hklm_policy() {
+            HklmPolicy::Overrides => {
+                run.report.policy_failure = Some(claude::HKLM_OVERRIDES_TEXT.to_string());
+            }
+            HklmPolicy::WeakensHooks => {
+                run.report.policy_failure = Some(claude::HKLM_WEAKENS_HOOKS_TEXT.to_string());
+            }
+            HklmPolicy::Absent | HklmPolicy::Merge => {}
         }
     } else {
         run.drop_stale_mcp()?;

@@ -24,6 +24,22 @@ pub fn unpinned_saiife(agent: &str) -> bool {
     agent != "claude"
 }
 
+/// Claude Code needs `onFailure: "block"` (spec §5.6).
+pub const CLAUDE_MIN: (u32, u32, u32) = (2, 1, 295);
+
+/// The first `N.N.N` in `out`.
+pub fn parse_agent_version(out: &str) -> Option<(u32, u32, u32)> {
+    out.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find_map(|word| {
+            let mut n = word.split('.').map(|p| p.parse::<u32>().ok());
+            Some((n.next()??, n.next()??, n.next()??))
+        })
+}
+
+pub(super) fn fmt_version((a, b, c): (u32, u32, u32)) -> String {
+    format!("{a}.{b}.{c}")
+}
+
 /// The lock-label platform of the layout being checked.
 fn lock_platform(ctx: &Ctx) -> LockPlatform {
     match ctx.layout.platform() {

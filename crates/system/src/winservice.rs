@@ -152,6 +152,62 @@ pub fn parse_command_line(line: &str) -> (PathBuf, Vec<String>) {
     )
 }
 
+/// What the service manager gives back of the service, before it is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveService {
+    pub display: String,
+    pub command_line: String,
+    pub account: String,
+    pub start: StartKind,
+    pub sid_type: SidType,
+    pub failure: FailurePolicy,
+    pub sddl: String,
+}
+
+/// The service as it is, in the form W10's spec takes.
+pub fn live_spec_from(live: LiveService) -> ServiceSpec {
+    let (binary, args) = parse_command_line(&live.command_line);
+    ServiceSpec {
+        name: WIN_SERVICE.to_string(),
+        display: live.display,
+        binary,
+        args,
+        account: live.account,
+        start: live.start,
+        sid_type: live.sid_type,
+        failure: live.failure,
+        sddl: live.sddl,
+    }
+}
+
+/// The failure actions as W10 writes them, each as (it is a restart, its delay). Anything
+/// else, a mix of actions say, reads as no restarts at all, which doctor reports.
+pub fn failure_policy_from(
+    actions: &[(bool, Duration)],
+    reset_after: Duration,
+    on_non_crash: bool,
+) -> FailurePolicy {
+    let same = actions.first().map(|a| a.1);
+    let uniform = actions.iter().all(|a| a.0 && Some(a.1) == same);
+    FailurePolicy {
+        restart_delay: same.unwrap_or_default(),
+        restarts: if uniform { actions.len() as u32 } else { 0 },
+        reset_after,
+        on_non_crash,
+    }
+}
+
+/// `sc.exe sdshow`'s result, by exit code only: a failure's text is localized.
+pub fn sdshow_text(status: i32, stdout: &str) -> std::io::Result<String> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    match status {
+        0 if stdout.trim().is_empty() => Err(std::io::Error::other("sdshow printed nothing")),
+        0 => Ok(stdout.trim().to_string()),
+        ERROR_ACCESS_DENIED => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        code => Err(std::io::Error::other(format!("sdshow exited {code}"))),
+    }
+}
+
 /// One operation on the service, as a service host performs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceOp {

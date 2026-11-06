@@ -135,18 +135,15 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
     #[cfg(windows)]
     let (dir, home) = (saiife_policy::WinDirectory::system(), None);
     let opts = DoctorOptions { user: None, home };
-    let report = doctor::run(layout, host, &dir, &opts);
-    let text = report.to_text();
+    let (text, failed) = doctor::after_install(layout, host, &dir, &opts);
     outln!();
     out!("{text}");
-    if report.exit_code() == 2 {
+    if failed {
         eprintln!(
             "saiife: installed, but doctor found failures: fix them before relying on the lock"
         );
-        (text, true)
-    } else {
-        (text, false)
     }
+    (text, failed)
 }
 
 /// The command an admin runs to restart the daemon on `platform`.

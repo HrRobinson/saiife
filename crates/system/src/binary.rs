@@ -441,6 +441,7 @@ pub const PE_IMPORT_ALLOWLIST: &[&str] = &[
     "ws2_32.dll",
     "userenv.dll",
     "crypt32.dll",
+    "wintrust.dll",
     "secur32.dll",
     "netapi32.dll",
     "ole32.dll",
@@ -448,6 +449,44 @@ pub const PE_IMPORT_ALLOWLIST: &[&str] = &[
     "shell32.dll",
     "iphlpapi.dll",
 ];
+
+/// What `WinVerifyTrust` said of a signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authenticode {
+    Valid,
+    /// Windows looked and refused it.
+    Rejected(String),
+    /// Windows could not look (a file error, no provider): seen neither good nor bad.
+    Unknown(String),
+}
+
+/// `WinVerifyTrust`'s answer, read. Only 0 is valid. A `HRESULT_FROM_WIN32` code and the
+/// provider and action errors say the check itself did not happen. Anything else, named or
+/// not, is a refusal.
+pub fn authenticode_verdict(status: i32) -> Authenticode {
+    const NAMED: [(u32, &str); 8] = [
+        (0x800B_0100, "TRUST_E_NOSIGNATURE"),
+        (0x8009_6010, "TRUST_E_BAD_DIGEST"),
+        (0x800B_0004, "TRUST_E_SUBJECT_NOT_TRUSTED"),
+        (0x800B_0111, "TRUST_E_EXPLICIT_DISTRUST"),
+        (0x800B_0109, "CERT_E_UNTRUSTEDROOT"),
+        (0x800B_010A, "CERT_E_CHAINING"),
+        (0x800B_0101, "CERT_E_EXPIRED"),
+        (0x800B_010C, "CERT_E_REVOKED"),
+    ];
+    let code = status as u32;
+    if code == 0 {
+        return Authenticode::Valid;
+    }
+    let could_not_look = code >> 16 == 0x8007 || (0x800B_0001..=0x800B_0003).contains(&code);
+    if could_not_look {
+        return Authenticode::Unknown(format!("0x{code:08X}"));
+    }
+    Authenticode::Rejected(match NAMED.iter().find(|(c, _)| *c == code) {
+        Some((_, name)) => (*name).to_string(),
+        None => format!("0x{code:08X}"),
+    })
+}
 
 /// `LOAD_LIBRARY_SEARCH_SYSTEM32`: with it in `DependentLoadFlags`, the
 /// loader finds import DLLs in System32 only, never next to the exe.
@@ -469,7 +508,7 @@ const PE_MAX_DIRS: u64 = 16;
 pub struct PeInfo {
     pub machine: u16,
     /// A non-empty security directory. Whether the signature is valid is
-    /// checked by `signtool` in CI and `Get-AuthenticodeSignature` in doctor.
+    /// checked by `signtool` in CI and [`authenticode_verdict`] in doctor.
     pub signed: bool,
     /// Imported DLL names (regular and delay-load), lowercased.
     pub imports: Vec<String>,

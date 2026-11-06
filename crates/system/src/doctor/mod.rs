@@ -96,6 +96,18 @@ pub fn run(layout: &Layout, host: &dyn Host, dir: &dyn Directory, opts: &DoctorO
     }
 }
 
+/// What `system install` runs last (spec §7): the report's text, and true on a failure,
+/// which the CLI turns into exit 1 (`--package` then logs the text and exits 0, W20).
+pub fn after_install(
+    layout: &Layout,
+    host: &dyn Host,
+    dir: &dyn Directory,
+    opts: &DoctorOptions,
+) -> (String, bool) {
+    let report = run(layout, host, dir, opts);
+    (report.to_text(), report.exit_code() == 2)
+}
+
 #[cfg(unix)]
 fn unix_config(
     layout: &Layout,

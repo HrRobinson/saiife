@@ -4,6 +4,8 @@
 //! model login and leftover project hooks; once per host, `hidepid`.
 //! Read-only. Agent binaries never run as root.
 
+use super::common::fmt_version;
+pub use super::common::{parse_agent_version, CLAUDE_MIN};
 use super::report::{Check, Status};
 use super::secrets::{self, read_at, read_under};
 use super::Ctx;
@@ -33,9 +35,6 @@ pub struct AgentUser {
 /// Groups whose members can get root (spec §5.6 item 1).
 pub const ROOT_EQUIVALENT_GROUPS: [&str; 5] = ["docker", "lxd", "incus", "libvirt", "disk"];
 
-/// Claude Code needs `onFailure: "block"` (spec §5.6).
-pub const CLAUDE_MIN: (u32, u32, u32) = (2, 1, 295);
-
 /// The agent programs doctor looks for.
 const AGENT_BINARIES: [&str; 3] = ["claude", "codex", "gemini"];
 /// Where user-level installers put them, below the home.
@@ -53,15 +52,6 @@ const SUDO_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_MODEL: &str = "local model";
 const OWN_LOGIN: &str = "the agent holds its own model-provider login (not brokered in v2)";
 const NO_SECRETS: &str = "no plaintext credentials found";
-
-/// The first `N.N.N` in `out`.
-pub fn parse_agent_version(out: &str) -> Option<(u32, u32, u32)> {
-    out.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .find_map(|word| {
-            let mut n = word.split('.').map(|p| p.parse::<u32>().ok());
-            Some((n.next()??, n.next()??, n.next()??))
-        })
-}
 
 fn passwd_text(ctx: &Ctx) -> String {
     let mut text = String::new();
@@ -569,10 +559,6 @@ fn binaries_check(u: &AgentUser, b: &Bins, id: String) -> Check {
     } else {
         Check::new(id, Status::Warn, TITLE, warn.join("; "))
     }
-}
-
-fn fmt_version((a, b, c): (u32, u32, u32)) -> String {
-    format!("{a}.{b}.{c}")
 }
 
 /// `claude --version`, only when the caller checks itself: doctor never

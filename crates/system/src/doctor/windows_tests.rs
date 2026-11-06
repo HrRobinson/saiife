@@ -22,15 +22,6 @@ const USER: &str = "S-1-5-21-9-9-9-1001";
 const ALICE: &str = "alice";
 const SYSTEM_CONFIG_USERS: &str = "alice:x:1000:1000::/home/alice:/bin/sh\n";
 
-/// The line [`signature`] runs.
-fn powershell_line() -> String {
-    format!(
-        "{POWERSHELL_EXE} -NoProfile -NonInteractive -Command \
-         (Get-AuthenticodeSignature -LiteralPath {}).Status",
-        windows_path(BINARY).unwrap()
-    )
-}
-
 fn canned(stdout: &str, status: i32) -> crate::host::CmdOutput {
     crate::host::CmdOutput {
         status,
@@ -185,6 +176,16 @@ impl Env {
         });
     }
 
+    /// The daemon makes this at its first start, which a fake install has none of.
+    fn audit_key_as_the_daemon_left_it(&self) {
+        let s = service_sid(WIN_SERVICE);
+        self.plant(
+            AUDIT_KEY_FILE,
+            &format!("O:{s}G:{s}D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{s})"),
+        );
+        fs::write(self.at(AUDIT_KEY_FILE), [7u8; 32]).unwrap();
+    }
+
     /// Doctor's verdict on one check.
     fn status(&self, r: &Report, id: &str) -> Status {
         get(r, id).status
@@ -197,8 +198,9 @@ fn installed() -> Env {
     e.install(&Agent::ALL);
     e.host.set(|s| {
         s.daemon_status = Some(answer());
-        s.run.insert(powershell_line(), canned("Valid\r\n", 0));
+        s.authenticode = Some(0);
     });
+    e.audit_key_as_the_daemon_left_it();
     e
 }
 
@@ -225,6 +227,7 @@ const ROOT: &str = r"C:\ProgramData\saiife";
 const EXE: &str = r"C:\ProgramData\saiife\bin\saiife.exe";
 const CONFIG_FILE: &str = r"C:\ProgramData\saiife\etc\config.toml";
 const KEY: &str = r"C:\ProgramData\saiife\state\keys\vault.key";
+const AUDIT_KEY_FILE: &str = r"C:\ProgramData\saiife\state\keys\audit.ed25519";
 const STATE_DB: &str = r"C:\ProgramData\saiife\state\sessions.db";
 const DROP_IN: &str = r"C:\ProgramData\saiife\etc\policy.d\10-admin.toml";
 const MCP: &str = r"C:\Program Files\ClaudeCode\managed-settings.d\60-saiife-mcp.json";
@@ -275,6 +278,7 @@ fn every_windows_check_id_is_there_and_no_unix_one() {
         "files.binary",
         "files.acl",
         "files.installed",
+        "keys",
         "vault.key",
         "reauth",
         "peer.pidfd",
@@ -287,7 +291,7 @@ fn every_windows_check_id_is_there_and_no_unix_one() {
     ] {
         get(&r, id);
     }
-    for id in ["paths.owner", "files.modes", "keys", "daemon.group"] {
+    for id in ["paths.owner", "files.modes", "daemon.group"] {
         assert!(!r.checks.iter().any(|c| c.id == id), "{id}");
     }
 }
@@ -318,10 +322,11 @@ fn info_lines_say_what_the_brief_fixes() {
         "disk.encryption",
         "see docs/windows.md#disk-encryption for BitLocker",
     );
-    // Owner ruling: not W16's password text.
+    // W16 as the owner ruling rewrote it: no password text.
     says(
         "reauth",
-        "same-user approval is off on Windows: approvals need a second account",
+        "same-user approval is off on Windows: approvals need a second account, from a \
+         separate session",
     );
 }
 
@@ -342,6 +347,9 @@ fn the_preview_limits_are_said_and_fail_nothing() {
     ] {
         assert!(c.detail.contains(word), "{word}: {}", c.detail);
     }
+    // Nobody has run it on a VM yet, and it must not claim so.
+    assert!(!c.detail.contains("tested by hand"), "{}", c.detail);
+    assert!(c.detail.contains("has not been tested"), "{}", c.detail);
 }
 
 #[test]
@@ -520,6 +528,7 @@ fn acl_drift_fails_files_acl() {
 fn a_missing_path_of_the_table_fails() {
     for logical in [
         r"C:\ProgramData\saiife\state\keys\vault.key",
+        AUDIT_KEY_FILE,
         r"C:\ProgramData\saiife\log\daemon\daemon.log",
         CONFIG_FILE,
         EXE,
@@ -728,8 +737,9 @@ fn a_foreign_parent_needs_only_ancestor_ok() {
     e.install(&Agent::ALL);
     e.host.set(|s| {
         s.daemon_status = Some(answer());
-        s.run.insert(powershell_line(), canned("Valid", 0));
+        s.authenticode = Some(0);
     });
+    e.audit_key_as_the_daemon_left_it();
     let r = e.doctor();
     assert_eq!(get(&r, "files.acl").status, Status::Pass, "{}", r.to_text());
 
@@ -743,6 +753,7 @@ fn an_agent_not_listed_is_not_looked_at() {
     let e = stock_machine(PeFixture::default());
     e.install(&[Agent::Claude]);
     e.host.set(|s| s.daemon_status = Some(answer()));
+    e.audit_key_as_the_daemon_left_it();
     let leaf = e.at(GEMINI);
     fs::create_dir_all(&leaf).unwrap();
     e.host.set(|s| {
@@ -867,6 +878,138 @@ fn a_service_that_is_stopped_missing_or_unreadable_fails() {
 }
 
 #[test]
+fn a_service_a_plain_shell_may_not_read_is_not_checked() {
+    let e = installed();
+    e.host.set(|s| {
+        s.euid = 1000;
+        s.service_spec_denied = true;
+    });
+    let r = e.doctor();
+    let c = get(&r, "daemon.unit");
+    assert_eq!(c.status, Status::Info);
+    assert!(c.detail.contains("not checked"), "{}", c.detail);
+    assert_ne!(r.exit_code(), 0);
+
+    let e = installed();
+    e.host.set(|s| s.service_spec_denied = true);
+    assert_eq!(get(&e.doctor(), "daemon.unit").status, Status::Fail);
+}
+
+/// No record, and the service manager will not say whether there is a service.
+#[test]
+fn a_service_manager_that_cannot_be_asked_is_no_developer_mode() {
+    let e = stock_machine(PeFixture::default());
+    e.host.set(|s| s.service_query_error = Some("no".into()));
+    let c = e.doctor();
+    let c = get(&c, "install.record");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains("could not"), "{}", c.detail);
+
+    let e = installed();
+    e.host.set(|s| s.service_query_error = Some("no".into()));
+    assert_eq!(get(&e.doctor(), "daemon.unit").status, Status::Fail);
+}
+
+/// What the real host builds from the service manager's answers.
+#[test]
+fn the_live_spec_reads_back_as_w10() {
+    use crate::winservice::{failure_policy_from, live_spec_from, sdshow_text, LiveService};
+    use std::time::Duration as D;
+    let want = ServiceSpec::saiifed(&Layout::system_for(Platform::Windows));
+    let restart = (true, D::from_secs(1));
+    let live = |command: &str, failure| {
+        live_spec_from(LiveService {
+            display: "saiife daemon".to_string(),
+            command_line: command.to_string(),
+            account: r"NT Service\saiifed".to_string(),
+            start: StartKind::Auto,
+            sid_type: SidType::Unrestricted,
+            failure,
+            sddl: format!("\r\n{WIN_SERVICE_SDDL}\r\n"),
+        })
+    };
+    let good = failure_policy_from(&[restart; 3], D::from_secs(86_400), true);
+    for command in [
+        r"C:\ProgramData\saiife\bin\saiife.exe daemon --system",
+        r#""C:\ProgramData\saiife\bin\saiife.exe" daemon --system"#,
+    ] {
+        let d = service_drift(&want, &live(command, good.clone()));
+        assert!(d.is_empty(), "{command}: {d:?}");
+    }
+    let command = r"C:\ProgramData\saiife\bin\saiife.exe daemon --system";
+    for (word, actions, reset, non_crash) in [
+        ("two restarts", vec![restart; 2], 86_400, true),
+        ("no actions", vec![], 86_400, true),
+        (
+            "a mix",
+            vec![restart, (false, D::from_secs(1)), restart],
+            86_400,
+            true,
+        ),
+        (
+            "uneven delays",
+            vec![restart, restart, (true, D::from_secs(9))],
+            86_400,
+            true,
+        ),
+        ("never resets", vec![restart; 3], 0, true),
+        ("not on a clean exit", vec![restart; 3], 86_400, false),
+    ] {
+        let f = failure_policy_from(&actions, D::from_secs(reset), non_crash);
+        let d = service_drift(&want, &live(command, f));
+        assert!(d.iter().any(|x| x.contains("failure")), "{word}: {d:?}");
+    }
+
+    assert_eq!(
+        sdshow_text(0, "\r\nD:(A;;RC;;;SY)\r\n").unwrap(),
+        "D:(A;;RC;;;SY)"
+    );
+    assert!(sdshow_text(0, " \r\n").is_err());
+    assert_eq!(
+        sdshow_text(5, "").unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_ne!(
+        sdshow_text(1060, "").unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+#[test]
+fn authenticode_codes_read_as_they_mean() {
+    use crate::binary::{authenticode_verdict as v, Authenticode as A};
+    assert_eq!(v(0), A::Valid);
+    assert!(matches!(v(0x800B_0100u32 as i32), A::Rejected(_)));
+    assert!(matches!(v(1), A::Rejected(_)));
+    assert!(matches!(v(0x8007_0002u32 as i32), A::Unknown(_)));
+    assert!(matches!(v(0x800B_0003u32 as i32), A::Unknown(_)));
+}
+
+/// What `system install` does with the report: the failure, then what `--package` makes of
+/// it, on a Windows layout.
+#[test]
+fn after_install_reports_logs_and_exits_as_the_package_needs() {
+    use crate::install::{package_exit, write_package_log, InstallReport};
+    let e = installed();
+    let opts = DoctorOptions::default();
+    let dir = FixedDirectory::from_text(SYSTEM_CONFIG_USERS, "");
+    let (text, failed) = crate::doctor::after_install(&e.layout, &e.host, &dir, &opts);
+    assert!(!failed, "{text}");
+
+    e.host.set(|s| s.daemon_status = None);
+    let (text, failed) = crate::doctor::after_install(&e.layout, &e.host, &dir, &opts);
+    assert!(failed);
+    assert!(text.contains("FAIL  daemon.health"), "{text}");
+    let exit = InstallReport::default().exit_code(failed);
+    assert_eq!(exit, 1);
+    assert_eq!(package_exit(exit, false), 1);
+    assert_eq!(package_exit(exit, true), 0);
+    write_package_log(&e.layout, &text).unwrap();
+    let log = fs::read_to_string(e.at(WIN_INSTALL_LOG)).unwrap();
+    assert!(log.contains("FAIL  daemon.health"), "{log}");
+}
+
+#[test]
 fn a_daemon_with_no_policy_fails_health() {
     let e = installed();
     e.host.set(|s| {
@@ -930,15 +1073,19 @@ fn an_unsigned_binary_warns_and_powershell_is_not_asked() {
         .state()
         .calls
         .iter()
-        .any(|l| l.contains("Get-Authenticode")));
+        .any(|l| l.starts_with("authenticode")));
 }
 
 #[test]
 fn a_signature_windows_rejects_fails() {
-    for word in ["HashMismatch", "NotTrusted", "NotSigned", "UnknownError"] {
+    for (code, word) in [
+        (0x800B_0100u32, "TRUST_E_NOSIGNATURE"),
+        (0x8009_6010, "TRUST_E_BAD_DIGEST"),
+        (0x800B_0109, "CERT_E_UNTRUSTEDROOT"),
+        (0x800B_0999, "0x800B0999"),
+    ] {
         let e = installed();
-        e.host
-            .set(|s| drop(s.run.insert(powershell_line(), canned(word, 0))));
+        e.host.set(|s| s.authenticode = Some(code as i32));
         let c = e.doctor();
         let c = get(&c, "files.binary");
         assert_eq!(c.status, Status::Fail, "{word}");
@@ -949,24 +1096,59 @@ fn a_signature_windows_rejects_fails() {
 /// The signature was not seen to be good, so this is not a pass, and not seen to be bad.
 #[test]
 fn a_signature_that_cannot_be_read_warns() {
-    for out in [canned("", 0), canned("Valid", 1)] {
+    for code in [
+        None,
+        Some(0x8007_0005u32 as i32),
+        Some(0x800B_0001u32 as i32),
+    ] {
         let e = installed();
-        e.host
-            .set(|s| drop(s.run.insert(powershell_line(), out.clone())));
+        e.host.set(|s| s.authenticode = code);
         let c = e.doctor();
         let c = get(&c, "files.binary");
-        assert_eq!(c.status, Status::Warn, "{out:?}");
+        assert_eq!(c.status, Status::Warn, "{code:?}");
         assert!(c.detail.contains("could not"), "{}", c.detail);
     }
 }
 
+/// An elevated doctor starts no program to read a signature: the caller's user controls what
+/// such a program finds in its environment and in HKCU, and it would run with the full token.
 #[test]
-fn powershell_is_asked_with_the_fixed_path_and_no_profile() {
+fn the_signature_is_read_in_process_and_no_program_runs() {
     let e = installed();
     e.host.set(|s| s.calls.clear());
     let r = e.doctor();
     assert_eq!(get(&r, "files.binary").status, Status::Pass);
-    assert!(e.host.state().calls.contains(&powershell_line()));
+    let calls = e.host.state().calls;
+    let asked = format!("authenticode {}", e.at(EXE).display());
+    assert!(calls.contains(&asked), "{calls:?}");
+    for c in &calls {
+        assert!(
+            !c.to_ascii_lowercase().contains("powershell"),
+            "{c}: {calls:?}"
+        );
+        assert!(!c.starts_with(r"C:\"), "an elevated doctor ran {c}");
+    }
+}
+
+#[test]
+fn a_child_gets_a_fixed_environment_and_no_powershell_is_on_the_list() {
+    use crate::host::{WINDOWS_CHILD_DIR, WINDOWS_CHILD_ENV, WIN_PROGRAMS};
+    let names: Vec<&str> = WINDOWS_CHILD_ENV.iter().map(|(n, _)| *n).collect();
+    for needed in ["SystemRoot", "Path"] {
+        assert!(names.contains(&needed), "{names:?}");
+    }
+    for (name, value) in WINDOWS_CHILD_ENV {
+        let upper = name.to_ascii_uppercase();
+        assert!(
+            !upper.starts_with("PS") && !upper.starts_with("COR") && !upper.starts_with("__"),
+            "{name}"
+        );
+        assert!(!value.contains('%'), "{name}={value}");
+    }
+    assert_eq!(WINDOWS_CHILD_DIR, r"C:\Windows\System32");
+    assert!(!WIN_PROGRAMS
+        .iter()
+        .any(|p| p.to_ascii_lowercase().contains("powershell")));
 }
 
 #[test]
@@ -984,28 +1166,94 @@ fn a_changed_file_fails_files_installed() {
     assert_eq!(get(&e.doctor(), "files.installed").status, Status::Fail);
 }
 
-#[test]
-fn a_package_copy_that_differs_warns() {
-    let e = installed();
+/// The MSI's copy, in a folder as Windows leaves it.
+fn package_copy(e: &Env) -> PathBuf {
     let copy = e.at(windows_path(PACKAGE_BINARY).unwrap());
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(e.at(EXE), &copy).unwrap();
-    e.host.set(|s| {
-        s.sddl.insert(
-            copy.clone(),
-            "O:BAG:SYD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)".to_string(),
-        );
-    });
+    let inherited = "O:BAG:SYD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)";
+    e.set_sddl(PACKAGE_DIR, inherited);
+    e.set_sddl(windows_path(PACKAGE_BINARY).unwrap(), inherited);
+    copy
+}
+
+const PACKAGE_DIR: &str = r"C:\Program Files\saiife";
+
+#[test]
+fn a_package_copy_that_differs_warns() {
+    let e = installed();
+    let copy = package_copy(&e);
     assert_eq!(get(&e.doctor(), "files.package").status, Status::Pass);
 
     fs::write(&copy, b"older").unwrap();
     assert_eq!(get(&e.doctor(), "files.package").status, Status::Warn);
 
     fs::copy(e.at(EXE), &copy).unwrap();
-    e.host.set(|s| {
-        s.sddl.insert(copy.clone(), user_owned());
-    });
+    e.set_sddl(windows_path(PACKAGE_BINARY).unwrap(), &user_owned());
     assert_eq!(get(&e.doctor(), "files.package").status, Status::Warn);
+}
+
+/// SYSTEM runs this copy, and whoever may write the folder may swap it, as on Linux.
+#[test]
+fn a_package_folder_others_can_write_warns() {
+    let e = installed();
+    package_copy(&e);
+    let drifted = format!("{}(A;;FW;;;BU)", e.sddl(PACKAGE_DIR));
+    e.set_sddl(PACKAGE_DIR, &drifted);
+    let c = e.doctor();
+    let c = get(&c, "files.package");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains(PACKAGE_DIR), "{}", c.detail);
+
+    let e = installed();
+    package_copy(&e);
+    e.set_sddl(r"C:\Program Files", "O:BAG:SYD:P(A;;FA;;;BU)");
+    let c = e.doctor();
+    let c = get(&c, "files.package");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains(r"C:\Program Files"), "{}", c.detail);
+}
+
+/// Only a copy that is not there drops the check. Not being able to look is no absence.
+#[test]
+fn a_package_copy_doctor_cannot_look_at_is_said() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = installed();
+    package_copy(&e);
+    let dir = e.at(PACKAGE_DIR);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let r = e.doctor();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        get(&r, "files.package").status,
+        Status::Warn,
+        "{}",
+        r.to_text()
+    );
+    assert!(!installed()
+        .doctor()
+        .checks
+        .iter()
+        .any(|c| c.id == "files.package"));
+}
+
+// ----------------------------------------------------------------- the audit key
+
+#[test]
+fn the_audit_key_is_checked() {
+    let e = installed();
+    assert_eq!(get(&e.doctor(), "keys").status, Status::Pass);
+
+    fs::write(e.at(AUDIT_KEY_FILE), b"short").unwrap();
+    let c = e.doctor();
+    let c = get(&c, "keys");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("32 bytes"), "{}", c.detail);
+
+    fs::remove_file(e.at(AUDIT_KEY_FILE)).unwrap();
+    let r = e.doctor();
+    assert_eq!(get(&r, "keys").status, Status::Fail);
+    assert_eq!(get(&r, "files.acl").status, Status::Fail);
 }
 
 // ----------------------------------------------------------------- the vault key
@@ -1060,6 +1308,51 @@ fn hklm_overrides_fails_claude_policy() {
         get(&e.doctor(), "agents.claude.policy").status,
         Status::Pass
     );
+}
+
+/// `merge` is no pass by itself: what it merges can still turn the hooks off.
+#[test]
+fn a_merged_policy_that_can_turn_hooks_off_fails() {
+    let ours = saiife_agents::claude::managed_settings_for(true);
+    let ours: serde_json::Value = serde_json::from_str(&ours).unwrap();
+    let keeps = json!({"managedSourcesBehavior": "merge", "hooks": ours["hooks"]}).to_string();
+    for (settings, status) in [
+        (
+            r#"{"managedSourcesBehavior":"merge","disableAllHooks":true}"#,
+            Status::Fail,
+        ),
+        // Whatever else it may mean, it does not say false.
+        (
+            r#"{"managedSourcesBehavior":"merge","disableAllHooks":"true"}"#,
+            Status::Fail,
+        ),
+        (
+            r#"{"managedSourcesBehavior":"merge","disableAllHooks":false}"#,
+            Status::Pass,
+        ),
+        (
+            r#"{"managedSourcesBehavior":"merge","hooks":{}}"#,
+            Status::Fail,
+        ),
+        (
+            r#"{"managedSourcesBehavior":"merge","hooks":null}"#,
+            Status::Fail,
+        ),
+        (
+            r#"{"managedSourcesBehavior":"merge","hooks":{"PreToolUse":[]}}"#,
+            Status::Fail,
+        ),
+        (keeps.as_str(), Status::Pass),
+    ] {
+        let e = installed();
+        hklm(&e, settings);
+        let r = e.doctor();
+        let c = get(&r, "agents.claude.policy");
+        assert_eq!(c.status, status, "{settings}");
+        if status == Status::Fail {
+            assert_eq!(c.detail, saiife_agents::claude::HKLM_WEAKENS_HOOKS_TEXT);
+        }
+    }
 }
 
 /// W24's read fails closed, and doctor must too.
@@ -1363,11 +1656,36 @@ fn a_scope_group_that_cannot_be_listed_fails() {
     assert!(c.detail.contains("without a name"), "{}", c.detail);
 }
 
+/// W27 went unevaluated, so an admin agent user would never fail: not fine, and not a fact.
 #[test]
-fn no_user_to_check_is_said_and_is_no_pass() {
+fn no_user_to_check_warns_and_names_w27() {
     let r = installed().doctor();
     let c = get(&r, "users.none");
-    assert_eq!(c.status, Status::Info);
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains("W27"), "{}", c.detail);
+    assert!(c.detail.contains("administrator"), "{}", c.detail);
+}
+
+/// A plain shell's denial of what a user's groups are is not a verdict on them.
+#[test]
+fn groups_a_plain_shell_may_not_read_warn() {
+    let e = installed();
+    e.user_in(ALICE, USER, &[]);
+    e.host.set(|s| {
+        s.euid = 1000;
+        s.local_groups_denied = true;
+    });
+    let c = e.doctor_as(Some(ALICE));
+    let c = get(&c, "user.alice.root");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains("not checked"), "{}", c.detail);
+
+    // Elevated there is no excuse.
+    let e = installed();
+    e.user_in(ALICE, USER, &[]);
+    e.host.set(|s| s.local_groups_denied = true);
+    let c = e.doctor_as(Some(ALICE));
+    assert_eq!(get(&c, "user.alice.root").status, Status::Fail);
 }
 
 // ----------------------------------------------------------------- agent binaries
@@ -1474,11 +1792,7 @@ fn checks_not_ported_are_named() {
     let r = e.doctor_as(Some(ALICE));
     let c = get(&r, "host.not-ported");
     assert_eq!(c.status, Status::Info);
-    for word in [
-        "plaintext credentials",
-        "agent versions",
-        "audit signing key",
-    ] {
+    for word in ["plaintext credentials", "hard links", "saiife-audit"] {
         assert!(c.detail.contains(word), "{word}: {}", c.detail);
     }
     assert_eq!(
@@ -1500,4 +1814,173 @@ fn the_service_compare_is_by_field() {
     live.sid_type = SidType::Restricted;
     let drift = service_drift(&want, &live);
     assert_eq!(drift.len(), 2, "{drift:?}");
+}
+
+// ----------------------------------------------------------------- a moved audit dir
+
+const MOVED: &str = r"C:\ProgramData\elsewhere\audit";
+
+/// The config names the audit dir out of the tree, where no row covers it.
+fn moved_audit(e: &Env) {
+    let text = fs::read_to_string(e.at(CONFIG_FILE)).unwrap();
+    let default = e
+        .at(r"C:\ProgramData\saiife\log\audit")
+        .display()
+        .to_string();
+    assert!(text.contains(&default), "{text}");
+    let moved = e.at(MOVED);
+    fs::write(
+        e.at(CONFIG_FILE),
+        text.replace(&default, &moved.display().to_string()),
+    )
+    .unwrap();
+    fs::create_dir_all(&moved).unwrap();
+    let locked = "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+    e.set_sddl(r"C:\ProgramData\elsewhere", locked);
+    e.set_sddl(MOVED, locked);
+}
+
+#[test]
+fn a_moved_audit_dir_must_hold_up_all_the_way() {
+    let e = installed();
+    moved_audit(&e);
+    let r = e.doctor();
+    assert_eq!(get(&r, "files.acl").status, Status::Pass, "{}", r.to_text());
+
+    // What is in it.
+    let month = r"C:\ProgramData\elsewhere\audit\2026\11.jsonl";
+    e.plant(month, "O:BAG:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)");
+    e.set_sddl(
+        r"C:\ProgramData\elsewhere\audit\2026",
+        "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+    );
+    let c = e.doctor();
+    let c = get(&c, "files.acl");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains(month), "{}", c.detail);
+
+    // The folder above it.
+    let e = installed();
+    moved_audit(&e);
+    e.set_sddl(r"C:\ProgramData\elsewhere", &user_owned());
+    let c = e.doctor();
+    let c = get(&c, "files.acl");
+    assert_eq!(c.status, Status::Fail);
+    assert!(
+        c.detail.contains(r"C:\ProgramData\elsewhere"),
+        "{}",
+        c.detail
+    );
+
+    // Not there at all.
+    let e = installed();
+    moved_audit(&e);
+    fs::remove_dir(e.at(MOVED)).unwrap();
+    let c = e.doctor();
+    let c = get(&c, "files.acl");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("missing"), "{}", c.detail);
+
+    // A link in it.
+    let e = installed();
+    moved_audit(&e);
+    std::os::unix::fs::symlink(e.layout.root(), e.at(r"C:\ProgramData\elsewhere\audit\l")).unwrap();
+    let c = e.doctor();
+    let c = get(&c, "files.acl");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("reparse point"), "{}", c.detail);
+}
+
+// ----------------------------------------------------------------- denied, not absent
+
+#[test]
+fn a_folder_of_binaries_doctor_may_not_read_is_no_absence() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = installed();
+    e.user_in(ALICE, USER, &[]);
+    profile(&e, USER, r"C:\Users\alice");
+    let dir = e.at(r"C:\Users\alice\.local\bin");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let r = e.doctor_as(Some(ALICE));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let c = get(&r, "user.alice.agent-binaries");
+    assert_eq!(c.status, Status::Warn, "{}", r.to_text());
+    assert!(c.detail.contains("cannot look"), "{}", c.detail);
+    assert!(!c.detail.contains("no agent binary"), "{}", c.detail);
+}
+
+// ----------------------------------------------------------------- agent versions
+
+fn claude_exe(e: &Env, version: Option<(&str, i32)>) -> String {
+    e.user_in(ALICE, USER, &[]);
+    profile(e, USER, r"C:\Users\alice");
+    let exe = r"C:\Users\alice\.local\bin\claude.exe";
+    let locked = "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+    e.plant(exe, locked);
+    e.set_sddl(r"C:\Users\alice\.local\bin", locked);
+    let line = format!("{} --version", e.at(exe).display());
+    if let Some((out, status)) = version {
+        e.host
+            .set(|s| drop(s.run.insert(line.clone(), canned(out, status))));
+    }
+    line
+}
+
+#[test]
+fn a_plain_shell_reads_the_agent_version() {
+    let plain = |version: Option<(&str, i32)>| {
+        let e = installed();
+        claude_exe(&e, version);
+        e.host.set(|s| s.euid = 1000);
+        let r = e.doctor_as(Some(ALICE));
+        get(&r, "user.alice.agent-version").clone()
+    };
+    let c = plain(Some(("2.1.300 (Claude Code)\n", 0)));
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.detail, "Claude Code 2.1.300");
+    let c = plain(Some(("2.0.1\n", 0)));
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("older than"), "{}", c.detail);
+    assert_eq!(plain(Some(("nonsense", 0))).status, Status::Warn);
+    assert_eq!(plain(Some(("2.1.300", 1))).status, Status::Warn);
+    // The fake's default: exit 1, no output.
+    assert_eq!(plain(None).status, Status::Warn);
+}
+
+/// The agent's own binary, which its user may have changed, never runs with a full token.
+#[test]
+fn an_elevated_doctor_never_runs_an_agent() {
+    let e = installed();
+    let line = claude_exe(&e, Some(("2.1.300", 0)));
+    e.host.set(|s| s.calls.clear());
+    let r = e.doctor_as(Some(ALICE));
+    let c = get(&r, "user.alice.agent-version");
+    assert_eq!(c.status, Status::Info);
+    assert!(c.detail.contains("elevated"), "{}", c.detail);
+    let calls = e.host.state().calls;
+    assert!(!calls.contains(&line), "{calls:?}");
+    assert!(!calls.iter().any(|l| l.contains("--version")), "{calls:?}");
+
+    // A limited token of an admin is a plain shell, and holds nothing to steal.
+    let e = installed();
+    let line = claude_exe(&e, Some(("2.1.300", 0)));
+    e.host.set(|s| s.limited_token = true);
+    let r = e.doctor_as(Some(ALICE));
+    assert_eq!(get(&r, "user.alice.agent-version").status, Status::Pass);
+    assert!(e.host.state().calls.contains(&line));
+}
+
+#[test]
+fn no_binary_or_no_profile_reads_as_not_found() {
+    let e = installed();
+    e.user_in(ALICE, USER, &[]);
+    e.host.set(|s| s.euid = 1000);
+    let r = e.doctor_as(Some(ALICE));
+    assert_eq!(get(&r, "user.alice.agent-version").status, Status::Info);
+    profile(&e, USER, r"C:\Users\alice");
+    let r = e.doctor_as(Some(ALICE));
+    let c = get(&r, "user.alice.agent-version");
+    assert_eq!(c.status, Status::Info);
+    assert!(c.detail.contains("not found"), "{}", c.detail);
 }
