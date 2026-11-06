@@ -90,12 +90,94 @@
     <CustomAction Id="SaiifeUninstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
 
+    <!--
+      Rollback (whole-branch review finding 4). A rollback action is scheduled before the
+      action it undoes, and rollback runs the script backwards, so each one below runs
+      only if the transaction got that far, and at the point where the files it needs are
+      there. The rule: the machine never ends up unlocked while Windows says saiife is
+      installed, and never locked with no product to remove it by.
+
+      SaiifeInstallRollback: a first install that fails after the files are in (in
+      SaiifeInstall or later) runs `system uninstall` with the new staging copy, before
+      the files go. Not when an upgrade (WIX_UPGRADE_DETECTED: the old product stays
+      registered) or when the machine was locked before the MSI ran (SAIIFELOCKEDBEFORE:
+      installed.toml was there; its locked mode is kept, not removed).
+
+      SaiifeUpgradeRollback: an upgrade that fails runs `system install` again with the old
+      staging copy, which the rollback of InstallFiles has put back by then (this action is
+      sequenced before InstallFiles), so the old version's locked mode is what stays, under
+      the old product.
+
+      SaiifeUninstallRollback: a removal that fails after SaiifeUninstall started runs
+      `system install` again. The rollback of RemoveFiles has put the staging copy back,
+      and uninstall keeps the fleet files, so this is the install the package did.
+
+      Rollback actions ignore their result: a failure in rollback cannot be rolled back,
+      and the program's output in msi.log says what happened.
+    -->
+    <Property Id="SAIIFELOCKEDBEFORE" Secure="yes">
+      <DirectorySearch Id="SaiifeEtcSearch" Path="C:\ProgramData\saiife\etc" Depth="0">
+        <FileSearch Id="SaiifeInstalledToml" Name="installed.toml" />
+      </DirectorySearch>
+    </Property>
+
+    <SetProperty Id="SaiifeInstallRollback"
+                 Value="&quot;[ProgramFiles64Folder]saiife\saiife.exe&quot; system uninstall"
+                 Before="SaiifeInstallRollback" Sequence="execute"
+                 Condition="NOT REMOVE AND NOT WIX_UPGRADE_DETECTED AND NOT SAIIFELOCKEDBEFORE" />
+    <CustomAction Id="SaiifeInstallRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <SetProperty Id="SaiifeUpgradeRollback"
+                 Value="&quot;[ProgramFiles64Folder]saiife\saiife.exe&quot; system install --fleet --package"
+                 Before="SaiifeUpgradeRollback" Sequence="execute"
+                 Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED" />
+    <CustomAction Id="SaiifeUpgradeRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <SetProperty Id="SaiifeUninstallRollback"
+                 Value="&quot;[ProgramFiles64Folder]saiife\saiife.exe&quot; system install --fleet --package"
+                 Before="SaiifeUninstallRollback" Sequence="execute"
+                 Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="SaiifeUninstallRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <!--
+      A forced failure, for scripts/package-windows/test.ps1: with SAIIFE_FORCE_FAIL=1 on
+      the msiexec line, the install fails right after SaiifeInstall and the removal right
+      after RemoveFiles, so the rollbacks above are tested. Only an administrator can run
+      the MSI, and an administrator can fail an install anyway.
+    -->
+    <Property Id="SAIIFE_FORCE_FAIL" Secure="yes" />
+    <SetProperty Id="SaiifeForceFailInstall"
+                 Value="&quot;[System64Folder]cmd.exe&quot; /c exit 1"
+                 Before="SaiifeForceFailInstall" Sequence="execute"
+                 Condition="SAIIFE_FORCE_FAIL AND NOT REMOVE" />
+    <CustomAction Id="SaiifeForceFailInstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+    <SetProperty Id="SaiifeForceFailUninstall"
+                 Value="&quot;[System64Folder]cmd.exe&quot; /c exit 1"
+                 Before="SaiifeForceFailUninstall" Sequence="execute"
+                 Condition="SAIIFE_FORCE_FAIL AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="SaiifeForceFailUninstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
     <InstallExecuteSequence>
-      <Custom Action="SaiifeInstall" After="InstallFiles" Condition="NOT REMOVE" />
-      <Custom Action="SaiifeUninstallWarn" Before="SaiifeUninstall"
+      <Custom Action="SaiifeUpgradeRollback" Before="InstallFiles"
+              Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="SaiifeInstallRollback" After="InstallFiles"
+              Condition="NOT REMOVE AND NOT WIX_UPGRADE_DETECTED AND NOT SAIIFELOCKEDBEFORE" />
+      <Custom Action="SaiifeInstall" After="SaiifeInstallRollback" Condition="NOT REMOVE" />
+      <Custom Action="SaiifeForceFailInstall" After="SaiifeInstall"
+              Condition="SAIIFE_FORCE_FAIL AND NOT REMOVE" />
+      <Custom Action="SaiifeUninstallWarn" Before="SaiifeUninstallRollback"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="SaiifeUninstallRollback" Before="SaiifeUninstall"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="SaiifeUninstall" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="SaiifeForceFailUninstall" After="RemoveFiles"
+              Condition="SAIIFE_FORCE_FAIL AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

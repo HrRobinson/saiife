@@ -13,10 +13,16 @@
   Checks, in this order, on a machine with no saiife:
     1. a fleet config that saiife refuses: the MSI fails, rolls back, and
        C:\Program Files\saiife is gone;
+   1b. a failure forced after the install action (SAIIFE_FORCE_FAIL=1): the MSI fails, and
+       its rollback removes locked mode and the files;
     2. a good fleet config naming claude,codex,gemini: msiexec /i exits 0, the service
        runs, doctor exits 1 or less, install.log holds doctor's text, detect.ps1 exits 0;
+   3a. a forced failure of the upgrade: the first build is back, in Program Files and in
+       ProgramData, and the service runs;
     3. an upgrade to a second build with a bumped version: the service restarts once and
        the managed files keep their SHA-256;
+   4a. a forced failure of msiexec /x after the files went: the files are back and the
+       machine is still locked;
     4. msiexec /x: the warning is in the log, the service is gone, the audit and the fleet
        files stay, detect.ps1 exits 1;
     5. the .intunewin file exists and unpacks with its header.
@@ -173,6 +179,26 @@ Reset-Machine
 Stop-IfFailed
 Write-Output '::endgroup::'
 
+# --- 1b. a failure after the install action ---------------------------------------------------
+# SAIIFE_FORCE_FAIL fails the MSI right after SaiifeInstall succeeded: the install's rollback
+# must take locked mode away again, or the machine is locked with no product to remove.
+Group 'a failure after the install action rolls locked mode back'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 $goodConfig -Agents $agents
+Check ($LASTEXITCODE -eq 0) 'fleet-files.ps1 wrote the fleet files'
+$flog = Join-Path $LogDir 'msi-forced-install.log'
+$rc = Invoke-Msi @('/i', "`"$msi1`"", 'SAIIFE_FORCE_FAIL=1') $flog
+Check ($rc -ne 0) "the MSI failed (exit $rc)"
+$text = if (Test-Path -LiteralPath $flog) { Get-Content -LiteralPath $flog -Raw } else { '' }
+Check ($text -match 'SaiifeInstallRollback') 'the install rollback ran'
+Check (-not (Test-Path -LiteralPath $programFiles)) "$programFiles is gone after the rollback"
+Check (-not (Service-Exists)) 'no service was left behind'
+Check (-not (Test-Path -LiteralPath 'C:\ProgramData\saiife\etc\installed.toml')) 'installed.toml is gone'
+Check ((Invoke-Detect) -eq 1) 'detect.ps1 exits 1 after the rollback'
+if ($script:failures -gt 0) { Show-MsiFailure $flog }
+Reset-Machine
+Stop-IfFailed
+Write-Output '::endgroup::'
+
 # --- 2. install ------------------------------------------------------------------------------
 Group 'install'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 $goodConfig -Agents $agents
@@ -197,6 +223,24 @@ if ($doctorRc -gt 1) {
 $installLog = 'C:\ProgramData\saiife\log\install.log'
 Check ((Test-Path -LiteralPath $installLog) -and ((Get-Item -LiteralPath $installLog).Length -gt 0)) 'install.log holds the doctor text'
 Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the install'
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 3a. a failed upgrade ----------------------------------------------------------------------
+# The upgrade fails after the new build's install action: its rollback puts the old staging
+# copy back and installs with it, so the old version's locked mode stays under the old product.
+Group 'a failed upgrade keeps the old version locked'
+$v1Hash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash
+$fglog = Join-Path $LogDir 'msi-forced-upgrade.log'
+$rc = Invoke-Msi @('/i', "`"$msi2`"", 'SAIIFE_FORCE_FAIL=1') $fglog
+Check ($rc -ne 0) "the upgrade failed (exit $rc)"
+$text = if (Test-Path -LiteralPath $fglog) { Get-Content -LiteralPath $fglog -Raw } else { '' }
+Check ($text -match 'SaiifeUpgradeRollback') 'the upgrade rollback ran'
+Check ((Service-Status) -eq 'Running') "the service runs after the rollback ($(Service-Status))"
+Check ((Get-FileHash -LiteralPath (Join-Path $programFiles 'saiife.exe') -Algorithm SHA256).Hash -eq $v1Hash) 'the staging copy is the first build again'
+Check ((Get-FileHash -LiteralPath $bin -Algorithm SHA256).Hash -eq $v1Hash) 'the daemon copy is the first build again'
+Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the rollback'
+if ($script:failures -gt 0) { Show-MsiFailure $fglog }
 Stop-IfFailed
 Write-Output '::endgroup::'
 
@@ -231,6 +275,25 @@ foreach ($f in $managed) {
   }
 }
 Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the upgrade'
+Stop-IfFailed
+Write-Output '::endgroup::'
+
+# --- 4a. a failed removal ----------------------------------------------------------------------
+# The removal fails after the uninstall action and the file removal: its rollback puts the
+# files back and installs again, so the machine is still locked while the product is there.
+Group 'a failed removal leaves the machine locked'
+$fulog = Join-Path $LogDir 'msi-forced-uninstall.log'
+$rc = Invoke-Msi @('/x', "`"$msi2`"", 'SAIIFE_FORCE_FAIL=1') $fulog
+Check ($rc -ne 0) "the removal failed (exit $rc)"
+$text = if (Test-Path -LiteralPath $fulog) { Get-Content -LiteralPath $fulog -Raw } else { '' }
+Check ($text -match 'SaiifeUninstallRollback') 'the uninstall rollback ran'
+Check (Service-Exists) 'the service exists'
+Check ((Service-Status) -eq 'Running') "the service runs after the rollback ($(Service-Status))"
+Check (Test-Path -LiteralPath (Join-Path $programFiles 'saiife.exe')) 'the staging copy is back'
+Check (Test-Path -LiteralPath $bin) 'the daemon copy is there'
+Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the rollback'
+foreach ($f in $managed) { Check (Test-Path -LiteralPath $f) "managed file exists: $f" }
+if ($script:failures -gt 0) { Show-MsiFailure $fulog }
 Stop-IfFailed
 Write-Output '::endgroup::'
 
