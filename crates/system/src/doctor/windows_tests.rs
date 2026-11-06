@@ -697,16 +697,17 @@ fn an_audit_group_of_well_known_sid_fails() {
 
 /// Ruling on W14: an agent's own leaf dir must pass `protected_ok`, so a stock
 /// inherited one, where Users may create entries, fails: a user could plant settings.
+/// Install refuses such a dir, so here it is loosened after a clean install.
 #[test]
 fn a_leaf_dir_users_can_add_to_fails() {
     let e = stock_machine(PeFixture::default());
+    e.install(&Agent::ALL);
     let leaf = e.at(GEMINI);
-    fs::create_dir_all(&leaf).unwrap();
+    assert!(leaf.is_dir());
     e.host.set(|s| {
         s.sddl.insert(leaf.clone(), stock::PROGRAM_DATA.to_string());
+        s.daemon_status = Some(answer());
     });
-    e.install(&Agent::ALL);
-    e.host.set(|s| s.daemon_status = Some(answer()));
     let c = e.doctor();
     let c = get(&c, "files.acl");
     assert_eq!(c.status, Status::Fail);
