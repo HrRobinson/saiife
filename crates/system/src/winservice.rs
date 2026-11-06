@@ -53,10 +53,17 @@ impl SidType {
 
 /// What the service manager does when the service fails: the analogue of
 /// `Restart=always`, `RestartSec=1`.
+///
+/// The restarts never run out. The service manager takes the Nth failure since the last
+/// reset to action N, and past the end of the list it repeats the last action
+/// (`SERVICE_FAILURE_ACTIONSW`, `lpsaActions`). Every action is a restart, so every
+/// failure, the fourth and the hundredth too, restarts after `restart_delay`. Only an
+/// empty list (`restarts: 0`) would leave the service down.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailurePolicy {
-    /// Restart after this delay, `restarts` times.
+    /// Each restart waits this long.
     pub restart_delay: Duration,
+    /// The length of the list of restart actions, the last of which repeats. Not a limit.
     pub restarts: u32,
     /// The failure count resets after this long without a failure.
     pub reset_after: Duration,
@@ -259,9 +266,28 @@ mod tests {
         assert_eq!(s.start, StartKind::Auto);
         assert_eq!(s.sid_type, SidType::Unrestricted);
         assert_eq!(s.failure.restart_delay, Duration::from_secs(1));
+        // Three restart actions, and the service manager repeats the last for every later
+        // failure: a restart every second without end (W10, W11). An empty list would stop.
         assert_eq!(s.failure.restarts, 3);
         assert_eq!(s.failure.reset_after, Duration::from_secs(86_400));
         assert!(s.failure.on_non_crash);
+        // What the service manager reads back is these three restarts, which doctor takes
+        // for the policy; a list that ends in anything but a restart reads as none.
+        let live = failure_policy_from(
+            &[(true, Duration::from_secs(1)); 3],
+            Duration::from_secs(86_400),
+            true,
+        );
+        assert_eq!(live, s.failure);
+        let ends_otherwise = failure_policy_from(
+            &[
+                (true, Duration::from_secs(1)),
+                (false, Duration::from_secs(1)),
+            ],
+            Duration::from_secs(86_400),
+            true,
+        );
+        assert_eq!(ends_otherwise.restarts, 0);
         assert_eq!(
             s.sddl,
             "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
