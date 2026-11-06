@@ -200,6 +200,10 @@ fn write(file: &Path, l: &Lockdown) -> io::Result<()> {
     crate::fsx::sync_dir(dir)
 }
 
+/// Removes the flag file. `Err` keeps the flag on. Syncing the dir goes through
+/// [`crate::fsx::sync_dir`]: on Windows, opening a directory as a file fails with
+/// "Access is denied" even for its owner, which kept a removed flag on (CI run
+/// 42188746371).
 fn remove(file: &Path) -> io::Result<()> {
     match std::fs::remove_file(file) {
         Ok(()) => {}
@@ -207,7 +211,7 @@ fn remove(file: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     match file.parent() {
-        Some(d) => std::fs::File::open(d)?.sync_all(),
+        Some(d) => crate::fsx::sync_dir(d),
         None => Ok(()),
     }
 }
@@ -525,6 +529,27 @@ mod tests {
         let l = s.get().unwrap();
         assert_eq!((l.scope, l.reason.as_str()), (LockScope::All, UNREADABLE));
         assert!(why.unwrap().starts_with(UNREADABLE));
+    }
+
+    /// Off happens only once the file is gone: a removal the OS refuses keeps
+    /// the flag on, in memory and on disk.
+    #[test]
+    fn failed_removal_keeps_the_flag_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp();
+        let p = path_in(d.path());
+        let (s, _) = Store::open(p.clone());
+        s.set(Some(flag(LockScope::All))).unwrap();
+        let dir = p.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = s.set(None);
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.is_err(), "removing from a read-only dir must fail");
+        assert_eq!(s.get(), Some(flag(LockScope::All)));
+        assert!(p.exists());
+        // Once the dir is writable again, off works.
+        s.set(None).unwrap();
+        assert!(s.get().is_none() && !p.exists());
     }
 
     #[test]

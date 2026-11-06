@@ -895,6 +895,41 @@ mod tests {
         actual_ok(&state, &file).unwrap();
     }
 
+    /// The lockdown flag (`<state>\state\lockdown.json`): the service creates it
+    /// and must be able to delete it (`lockdown off`, CI run 42188746371), and
+    /// nobody but it, SYSTEM and Administrators holds any right on it or its dir.
+    #[test]
+    fn lockdown_flag_is_deletable_by_the_service_only() {
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+        let (_d, l) = test_layout();
+        let dir = want(&l, r"C:\ProgramData\saiife\state\state");
+        let file = want(&l, r"C:\ProgramData\saiife\state\state\lockdown.json");
+        assert_eq!(dir, STATE.replace("<S>", S));
+        assert_eq!(file, dir);
+        for (row, bit) in [(&file, DELETE), (&dir, FILE_DELETE_CHILD)] {
+            let sd = parse(row).unwrap();
+            let sids: Vec<&str> = sd.aces.iter().map(|a| a.sid.as_str()).collect();
+            assert_eq!(sids, [SYSTEM, ADMINISTRATORS, S], "{row}");
+            for ace in &sd.aces {
+                assert_eq!(ace.mask & bit, bit, "{} lacks {bit:#x}: {row}", ace.sid);
+            }
+        }
+        // The file as the service writes it (a renamed temp file, with the dir's
+        // ACEs inherited) matches its row.
+        let written = parse(&format!(
+            "O:{S}G:{S}D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})"
+        ))
+        .unwrap();
+        actual_file_ok(&file, &written).unwrap();
+        // One more holder of any right on it does not.
+        let widened = parse(&format!(
+            "O:{S}G:{S}D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})(A;;0x10000;;;BU)"
+        ))
+        .unwrap();
+        assert!(actual_file_ok(&file, &widened).is_err());
+    }
+
     #[test]
     fn service_owner_needs_the_table_to_grant_the_service() {
         assert!(protected_ok(&inherited_daemon_log(S, ""), &[]).is_err());
