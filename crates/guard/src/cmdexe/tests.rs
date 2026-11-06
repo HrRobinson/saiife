@@ -84,13 +84,23 @@ fn windows_vars() -> PathVars {
         .with_cwd(r"C:\p")
 }
 
+/// A budget no reading here comes near on an idle machine or a loaded one.
+/// The tests that are about the budget set their own (`Duration::ZERO`);
+/// with the default 50 ms, a loaded machine made `pwsh -e !!notbase64` a
+/// `FailedOpenTimeout` allow instead of the deny it is.
+const UNHURRIED: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn engine() -> Engine {
-    Engine::new(packs()).with_paths(windows_vars())
+    Engine::new(packs())
+        .with_paths(windows_vars())
+        .with_budget(UNHURRIED)
 }
 
 fn default_engine() -> Engine {
     let (packs, _) = Catalog::builtin_for(PathStyle::Windows).load_active(&[]);
-    Engine::new(packs).with_paths(windows_vars())
+    Engine::new(packs)
+        .with_paths(windows_vars())
+        .with_budget(UNHURRIED)
 }
 
 fn is_unjudged(d: &Decision) -> bool {
