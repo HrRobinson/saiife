@@ -227,7 +227,7 @@ pub fn run(action: SystemAction) -> ExitCode {
                     if package {
                         // The install is done: a log that cannot be written is no reason
                         // to roll it back.
-                        if let Err(e) = write_package_log(&layout, &doctor_text) {
+                        if let Err(e) = write_package_log(&layout, host.as_ref(), &doctor_text) {
                             eprintln!("saiife: warning: the install log: {e}");
                         }
                     }

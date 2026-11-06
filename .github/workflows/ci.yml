@@ -464,9 +464,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-windows-logs
-          path: |
-            target/package-windows-logs
-            C:/ProgramData/saiife/log/install.log
+          # test.ps1 copies C:\ProgramData\saiife\log\install.log in here: upload-artifact
+          # takes no path outside the workspace.
+          path: target/package-windows-logs
           if-no-files-found: ignore
           retention-days: 7
 

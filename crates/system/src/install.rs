@@ -104,9 +104,11 @@ pub fn package_exit(code: u8, package: bool) -> u8 {
 
 /// Appends the doctor's text to the install log, on Windows (W20). Elsewhere it stays on
 /// stdout, where the package's own log has it.
-pub fn write_package_log(layout: &Layout, text: &str) -> Result<(), InstallError> {
+pub fn write_package_log(layout: &Layout, host: &dyn Host, text: &str) -> Result<(), InstallError> {
     if layout.platform() == Platform::Windows {
-        install_win::append_install_log(layout, text)?;
+        install_win::append_install_log(layout, host, text)?;
+    } else {
+        let _ = host;
     }
     Ok(())
 }

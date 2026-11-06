@@ -61,8 +61,20 @@ $script:failures = 0
 function Check([bool]$ok, [string]$what) {
   if ($ok) { Write-Output "ok   $what" } else { Write-Output "::error::FAIL $what"; $script:failures++ }
 }
+# install.log lives under C:\ProgramData, outside the workspace upload-artifact can take
+# files from, so a copy goes into the log dir, with its descriptor.
+function Save-InstallLog {
+  $log = 'C:\ProgramData\saiife\log\install.log'
+  if (-not (Test-Path -LiteralPath $log)) { return }
+  Copy-Item -LiteralPath $log -Destination (Join-Path $LogDir 'install.log') -Force -ErrorAction SilentlyContinue
+  try { (Get-Acl -LiteralPath $log).Sddl | Set-Content -LiteralPath (Join-Path $LogDir 'install.log.sddl') } catch { }
+}
 function Stop-IfFailed {
-  if ($script:failures -gt 0) { Write-Output "::error::$script:failures check(s) failed"; exit 1 }
+  if ($script:failures -gt 0) {
+    Save-InstallLog
+    Write-Output "::error::$script:failures check(s) failed"
+    exit 1
+  }
 }
 function Group([string]$name) { Write-Output "::group::$name" }
 
@@ -174,8 +186,14 @@ Check (Service-Exists) 'the service exists'
 Check ((Service-Status) -eq 'Running') "the service is running ($(Service-Status))"
 Check (Test-Path -LiteralPath (Join-Path $programFiles 'saiife.exe')) 'the staging copy is in Program Files'
 Check (Test-Path -LiteralPath $bin) 'the daemon copy is in ProgramData'
-& $bin doctor *> (Join-Path $LogDir 'doctor-install.txt')
-Check ($LASTEXITCODE -le 1) "doctor exits 1 or less (got $LASTEXITCODE)"
+$doctorOut = Join-Path $LogDir 'doctor-install.txt'
+& $bin doctor *> $doctorOut
+$doctorRc = $LASTEXITCODE
+Check ($doctorRc -le 1) "doctor exits 1 or less (got $doctorRc)"
+# In the job output too: the uploaded logs are not where a reader looks first.
+if ($doctorRc -gt 1) {
+  Get-Content -LiteralPath $doctorOut | Where-Object { $_ -notmatch '^(PASS|INFO) ' } | ForEach-Object { Write-Output "  $_" }
+}
 $installLog = 'C:\ProgramData\saiife\log\install.log'
 Check ((Test-Path -LiteralPath $installLog) -and ((Get-Item -LiteralPath $installLog).Length -gt 0)) 'install.log holds the doctor text'
 Check ((Invoke-Detect) -eq 0) 'detect.ps1 exits 0 after the install'

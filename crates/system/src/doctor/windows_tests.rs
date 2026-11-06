@@ -1004,9 +1004,25 @@ fn after_install_reports_logs_and_exits_as_the_package_needs() {
     assert_eq!(exit, 1);
     assert_eq!(package_exit(exit, false), 1);
     assert_eq!(package_exit(exit, true), 0);
-    write_package_log(&e.layout, &text).unwrap();
+    write_package_log(&e.layout, &e.host, &text).unwrap();
     let log = fs::read_to_string(e.at(WIN_INSTALL_LOG)).unwrap();
     assert!(log.contains("FAIL  daemon.health"), "{log}");
+}
+
+/// package-windows, CI run 9: the doctor after `msiexec /i` exited 2 where install's own
+/// doctor, run before the log existed, did not. The log has no row and its dir passes on no
+/// entries, so only the descriptor install gives it keeps doctor's walk clean.
+#[test]
+fn the_install_log_keeps_files_acl_clean() {
+    use crate::install::write_package_log;
+    let e = installed();
+    assert_eq!(get(&e.doctor(), "files.acl").status, Status::Pass);
+    write_package_log(&e.layout, &e.host, "doctor text\n").unwrap();
+    let report = e.doctor();
+    let after = get(&report, "files.acl");
+    assert_eq!(after.status, Status::Pass, "{}", after.detail);
+    write_package_log(&e.layout, &e.host, "again\n").unwrap();
+    assert_eq!(get(&e.doctor(), "files.acl").status, Status::Pass);
 }
 
 #[test]

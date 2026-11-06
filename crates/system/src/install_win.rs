@@ -1459,10 +1459,20 @@ pub(crate) fn fleet_files(
 
 // ---------------------------------------------------------------- the install log
 
+/// The descriptor of [`WIN_INSTALL_LOG`]: the admins' alone to write, readable by users as
+/// its dir is. The `log` row has no inheritable entries, so a file made there without one
+/// gets its creator's default DACL. Under the MSI that is the custom action server's token,
+/// which can grant its own service SID, and doctor's walk then fails the file.
+const INSTALL_LOG_SDDL: &str = "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
+
 /// Appends the doctor's text to [`WIN_INSTALL_LOG`] (W20). The file has no row in the
-/// table, by ruling: only admin tools write it, in a dir only admins can write. A reparse
-/// point is refused.
-pub(crate) fn append_install_log(layout: &Layout, text: &str) -> Result<(), InstallError> {
+/// table, by ruling: only admin tools write it, in a dir only admins can write. It gets
+/// [`INSTALL_LOG_SDDL`] before anything is written. A reparse point is refused.
+pub(crate) fn append_install_log(
+    layout: &Layout,
+    host: &dyn Host,
+    text: &str,
+) -> Result<(), InstallError> {
     let shown = Path::new(WIN_INSTALL_LOG);
     let real = layout.try_at(shown).map_err(|e| io_refused(shown, e))?;
     plain_meta(&real).map_err(|e| io_refused(shown, e))?;
@@ -1470,6 +1480,8 @@ pub(crate) fn append_install_log(layout: &Layout, text: &str) -> Result<(), Inst
         .append(true)
         .create(true)
         .open(&real)
+        .map_err(|e| io_refused(shown, e))?;
+    host.set_sddl(&real, INSTALL_LOG_SDDL)
         .map_err(|e| io_refused(shown, e))?;
     f.write_all(text.as_bytes())
         .map_err(|e| io_refused(shown, e))
@@ -3046,8 +3058,8 @@ mod windows_tests {
     fn install_log_is_appended() {
         let e = env();
         e.run().unwrap();
-        append_install_log(&e.layout, "first\n").unwrap();
-        append_install_log(&e.layout, "second\n").unwrap();
+        append_install_log(&e.layout, &e.host, "first\n").unwrap();
+        append_install_log(&e.layout, &e.host, "second\n").unwrap();
         assert_eq!(
             fs::read_to_string(e.at(WIN_INSTALL_LOG)).unwrap(),
             "first\nsecond\n"
