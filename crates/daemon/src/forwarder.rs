@@ -1481,9 +1481,21 @@ mod tests {
         let fw = h.forwarders(make_with(t.clone()));
         fw.apply(&one("a")).await;
         h.append(5).await;
-        until("every line forwarded", || {
-            t.got().len() == h.file_lines().len()
-        })
+        // The worker's own `connected` record is appended after its first
+        // confirmed send, by a task of its own: until it is in the log and
+        // forwarded, the log can still grow. Once it is, nothing more comes,
+        // so the file read below is the file the target got.
+        until(
+            "every line forwarded, the connected record included",
+            || {
+                let got = t.got();
+                got.iter().any(|l| {
+                    std::str::from_utf8(l)
+                        .unwrap()
+                        .contains("\"event\":\"connected\"")
+                }) && as_vecs(&got) == h.file_lines()
+            },
+        )
         .await;
         let mut raw = Vec::new();
         for f in store::month_files(&h.audit).unwrap() {

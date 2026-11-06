@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 pub use super::daemon::{dl, own_uid, wait_for};
+use super::daemon::{wait_up, Start, HANG_GUARD};
 
 pub struct TestBroker {
     pub tmp: TempDir,
@@ -216,12 +217,29 @@ impl TestBroker {
         self.child = Some(child);
     }
 
+    /// Spawn, then wait until the socket answers or the broker exits.
     pub fn spawn_and_wait(&mut self) {
         self.spawn();
-        let up = wait_for(Duration::from_secs(10), || self.try_client().is_ok());
-        if !up {
-            self.stop();
-            panic!("broker did not come up in 10 s: {}", self.stderr_text());
+        let mut child = self.child.take().unwrap();
+        let start = wait_up(&mut child, || self.try_client().is_ok());
+        self.child = Some(child);
+        match start {
+            Start::Up => {}
+            Start::Exited(st) => {
+                self.child = None;
+                panic!(
+                    "broker exited before it came up ({st}): {}",
+                    self.stderr_text()
+                );
+            }
+            Start::Hung => {
+                self.stop();
+                panic!(
+                    "broker neither came up nor exited in {} s: {}",
+                    HANG_GUARD.as_secs(),
+                    self.stderr_text()
+                );
+            }
         }
     }
 

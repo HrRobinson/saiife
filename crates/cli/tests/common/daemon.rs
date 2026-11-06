@@ -66,8 +66,43 @@ pub fn wait_for(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// How long a wait goes on before it calls the other side hung. A wait here
+/// ends on what it waits for (an answer, a closed connection, a socket, an
+/// exit); this bound only stops a hung test, and is never a test of speed.
+/// A loaded machine (several agents building, load 65 on 12 CPUs) made a
+/// broker's start take more than 10 s and a `secret.add` more than 3 s.
+pub const HANG_GUARD: Duration = Duration::from_secs(120);
+
+/// The deadline of one IPC call. The daemon answers or its connection
+/// closes (a daemon that died closes it at once): the deadline is
+/// [`HANG_GUARD`] only.
 pub fn dl() -> Instant {
-    Instant::now() + Duration::from_secs(3)
+    Instant::now() + HANG_GUARD
+}
+
+/// How a spawned daemon's start ended.
+pub enum Start {
+    Up,
+    Exited(ExitStatus),
+    Hung,
+}
+
+/// Wait until `up()` holds or `child` exits, whichever comes first;
+/// [`HANG_GUARD`] only for a child that does neither.
+pub fn wait_up(child: &mut Child, mut up: impl FnMut() -> bool) -> Start {
+    let end = Instant::now() + HANG_GUARD;
+    loop {
+        if up() {
+            return Start::Up;
+        }
+        if let Some(st) = child.try_wait().unwrap() {
+            return Start::Exited(st);
+        }
+        if Instant::now() > end {
+            return Start::Hung;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A guard record as the managed hook would send it.
@@ -243,16 +278,26 @@ impl TestDaemon {
             .stderr(Stdio::from(log))
             .spawn()
             .unwrap();
-        self.child = Some(child);
+        let mut child = child;
         let sock = self.socket();
-        let up = wait_for(Duration::from_secs(15), || {
+        let start = wait_up(&mut child, || {
             fs::symlink_metadata(&sock).is_ok() && self.try_client().is_ok()
         });
-        if !up {
-            let mut child = self.child.take().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("daemon did not come up in 15 s: {}", self.stderr_text());
+        match start {
+            Start::Up => self.child = Some(child),
+            Start::Exited(st) => panic!(
+                "daemon exited before it came up ({st}): {}",
+                self.stderr_text()
+            ),
+            Start::Hung => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "daemon neither came up nor exited in {} s: {}",
+                    HANG_GUARD.as_secs(),
+                    self.stderr_text()
+                );
+            }
         }
     }
 
