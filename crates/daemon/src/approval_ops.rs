@@ -1431,7 +1431,7 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     }
     let (g, env_name, groups) = match send_env(
         &ctx,
-        &stored.user,
+        (&stored.user, r.sid.as_deref()),
         stored.env.as_deref(),
         stored.env_recorded,
     )
@@ -1510,11 +1510,12 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
 /// rebound to another environment (or from the base config to one) since
 /// the ask, developer mode an environment no longer defined (never the
 /// base config instead). Only a request sealed before the environment was
-/// recorded (`env_recorded` false, no `env`) is not checked. `Err` is the
-/// failure's rule and message.
+/// recorded (`env_recorded` false, no `env`) is not checked. `sid` is the
+/// requester's on Windows, for a scope that names it (see [`Groups::of`]).
+/// `Err` is the failure's rule and message.
 async fn send_env(
     ctx: &Arc<Ctx>,
-    user: &str,
+    (user, sid): (&str, Option<&str>),
     env: Option<&str>,
     env_recorded: bool,
 ) -> Result<SendEnv, (&'static str, &'static str)> {
@@ -1527,7 +1528,7 @@ async fn send_env(
     } else {
         ctx.groups_of(user).await
     };
-    let groups = Groups(groups);
+    let groups = Groups::of(ctx, &g, user, sid, groups).await;
     let mode = crate::api_ops::gateway_mode(ctx);
     let env_name = match g.select_env(mode, &groups, user, env) {
         Ok((e, _)) => e.map(str::to_string),
@@ -1583,7 +1584,7 @@ async fn send_mcp(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32, exact: Zeroizing<V
     }
     let (g, env_name, groups) = match send_env(
         &ctx,
-        &stored.user,
+        (&stored.user, r.sid.as_deref()),
         stored.env.as_deref(),
         stored.env_recorded,
     )
@@ -2178,6 +2179,62 @@ mod tests {
         assert!(v.to_string().contains("reauth_required"), "{v}");
         let v = crate::lockdown::set(&ctx, &sid_conn(AGENT_SID), off()).await;
         assert!(v.to_string().contains("[approval] approvers"), "{v}");
+    }
+
+    /// [`windows_ctx`] with `[[scope]] users = ["agent"]` bound to `prod`, as the
+    /// gateway's policy.
+    fn scoped_ctx(d: &std::path::Path) -> (Arc<Ctx>, std::thread::JoinHandle<()>) {
+        let (ctx, join) = windows_ctx(d);
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[[scope]]\nname = \"shop\"\nusers = [\"agent\"]\n\
+             env = \"prod\"\n[environments.prod]\n",
+        )
+        .unwrap();
+        let g = crate::ops::GatewayPolicy::build(
+            &cfg,
+            &[],
+            saiife_broker::Catalog::default(),
+            saiife_policy::Mode::Locked,
+        )
+        .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            ok: true,
+            system: Some(Arc::new(cfg)),
+            gateway: Some(Arc::new(g)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        (ctx, join)
+    }
+
+    /// locked-windows CI: `[[scope]] users = ["agent"]` never matched the daemon's
+    /// `HOST\agent`, so the scope's rules did not apply to it. It matches by SID, and
+    /// another account is still in no scope.
+    #[tokio::test]
+    async fn a_bare_scope_name_gives_its_windows_account_the_scope() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = scoped_ctx(d.path());
+        assert!(crate::api_ops::has_scope(&ctx, &sid_conn(AGENT_SID).peer).await);
+        assert!(!crate::api_ops::has_scope(&ctx, &sid_conn(APPROVER_SID).peer).await);
+    }
+
+    /// The scope's environment applies to an approved request of `HOST\agent` (the
+    /// request was asked under `prod`), and not to another account's.
+    #[tokio::test]
+    async fn a_bare_scope_name_binds_its_windows_account_to_the_scope_env() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = scoped_ctx(d.path());
+        let (_, env, _) = send_env(&ctx, (r"HOST\agent", Some(AGENT_SID)), Some("prod"), true)
+            .await
+            .unwrap();
+        assert_eq!(env.as_deref(), Some("prod"));
+        let other = send_env(
+            &ctx,
+            (r"HOST\approver", Some(APPROVER_SID)),
+            Some("prod"),
+            true,
+        )
+        .await;
+        assert_eq!(other.err().map(|e| e.0), Some(ENV_CHANGED));
     }
 
     /// Bad `auth` hex is a bad request, before anything is looked up.

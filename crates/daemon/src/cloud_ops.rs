@@ -269,7 +269,14 @@ async fn decide(
     let Some(user) = ctx.peer_name(peer).await else {
         return Err(deny("no_scope", "the caller has no user name"));
     };
-    let groups = Groups(ctx.groups_of(&user).await);
+    let groups = Groups::of(
+        ctx,
+        g,
+        &user,
+        peer.sid.as_deref(),
+        ctx.groups_of(&user).await,
+    )
+    .await;
     let (env_name, warning) = g
         .select_env(gateway_mode(ctx), &groups, &user, project_env)
         .map_err(|rule| deny(rule, "the caller's environment has no policy"))?;

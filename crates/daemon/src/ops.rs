@@ -114,6 +114,21 @@ impl GatewayPolicy {
         })
     }
 
+    /// Every `[[scope]] users` entry that names a user (not a `group:`), in the
+    /// base snapshot and each environment's, once each.
+    pub fn scope_user_entries(&self) -> Vec<String> {
+        let mut out: Vec<String> = std::iter::once(&self.snap)
+            .chain(self.by_env.values())
+            .flat_map(|s| s.config.scope.iter())
+            .flat_map(|s| s.users.iter())
+            .filter(|e| !e.starts_with("group:"))
+            .cloned()
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The snapshot of environment `env`; the base one for `None` or a
     /// name with no snapshot. Callers take the name from [`select_env`],
     /// which never hands a locked caller a name without a snapshot.

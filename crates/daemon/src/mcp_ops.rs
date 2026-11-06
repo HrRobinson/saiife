@@ -940,9 +940,12 @@ pub(crate) async fn execute(
     call.user = who.user;
     call.session = who.session;
     let agent = who.agent;
-    let groups = Groups(who.groups);
 
     let state = ctx.policy();
+    let groups = match &state.gateway {
+        Some(g) => Groups::of(ctx, g, &call.user, call.sid.as_deref(), who.groups).await,
+        None => Groups::plain(who.groups),
+    };
     let (outcome, trace, gw, env_name) = match &state.gateway {
         Some(g) => match g.select_env(api_ops::gateway_mode(ctx), &groups, &call.user, None) {
             Ok((env_name, _)) => {
@@ -1055,7 +1058,14 @@ pub(crate) async fn servers_for(
     let (Some(g), Some(user)) = (&state.gateway, ctx.peer_name(peer).await) else {
         return out;
     };
-    let groups = Groups(ctx.groups_of(&user).await);
+    let groups = Groups::of(
+        ctx,
+        g,
+        &user,
+        peer.sid.as_deref(),
+        ctx.groups_of(&user).await,
+    )
+    .await;
     let Ok((env, _)) = g.select_env(api_ops::gateway_mode(ctx), &groups, &user, None) else {
         return out;
     };

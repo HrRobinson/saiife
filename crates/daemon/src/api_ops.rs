@@ -49,8 +49,54 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 }
 
 /// The caller's directory view for one request: its groups, looked up
-/// (cached, off the runtime thread) before the pipeline runs.
-pub(crate) struct Groups(pub(crate) Vec<String>);
+/// (cached, off the runtime thread) before the pipeline runs, and on Windows
+/// the SIDs a `[[scope]] users` match needs (see [`Groups::of`]).
+pub(crate) struct Groups {
+    groups: Vec<String>,
+    /// Windows: the caller's name and each scope user entry of the policy that
+    /// resolved, by SID. [`saiife_policy::names_account`] matches `agent` to the
+    /// daemon's `HOST\agent` through it. Empty on Linux and macOS.
+    sids: BTreeMap<String, String>,
+}
+
+impl Groups {
+    /// The view of `user` with `groups`, for a caller with no SID (Linux, macOS).
+    pub(crate) fn plain(groups: Vec<String>) -> Groups {
+        Groups {
+            groups,
+            sids: BTreeMap::new(),
+        }
+    }
+
+    /// The view of `user`, whose SID is `sid` (Windows; `None` elsewhere), under
+    /// the policy `g`. With a SID, every `[[scope]] users` entry of `g`'s
+    /// snapshots is resolved off the runtime thread here, so a scope match by
+    /// SID asks nothing of Windows while the pipeline runs. An entry that does
+    /// not resolve matches only as text.
+    pub(crate) async fn of(
+        ctx: &Ctx,
+        g: &GatewayPolicy,
+        user: &str,
+        sid: Option<&str>,
+        groups: Vec<String>,
+    ) -> Groups {
+        let Some(sid) = sid else {
+            return Groups::plain(groups);
+        };
+        let entries = g.scope_user_entries();
+        let dir = Arc::clone(&ctx.directory);
+        let mut sids: BTreeMap<String, String> = tokio::task::spawn_blocking(move || {
+            entries
+                .into_iter()
+                .filter_map(|e| dir.sid_of(&e).map(|s| (e, s)))
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        sids.insert(user.to_string(), sid.to_string());
+        Groups { groups, sids }
+    }
+}
 
 impl Directory for Groups {
     fn user(&self, _name: &str) -> Option<UserEntry> {
@@ -63,7 +109,10 @@ impl Directory for Groups {
         None
     }
     fn groups_of(&self, _user: &str) -> Vec<String> {
-        self.0.clone()
+        self.groups.clone()
+    }
+    fn sid_of(&self, name: &str) -> Option<String> {
+        self.sids.get(name).cloned()
     }
 }
 
@@ -650,7 +699,7 @@ pub(crate) async fn execute_in(
     let (outcome, trace, gw, env_name): (Outcome, Trace, Arc<GatewayPolicy>, Option<String>) =
         match &state.gateway {
             Some(g) => {
-                let groups = Groups(groups);
+                let groups = Groups::of(ctx, g, &call.user, call.sid.as_deref(), groups).await;
                 // The environment snapshot this call runs under (spec §6.11).
                 match g.select_env(gateway_mode(ctx), &groups, &call.user, project_env) {
                     Ok((env_name, w)) => {
@@ -882,12 +931,19 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
 
 /// Whether `uid` has a scope in the policy in force (a scope conflict or no
 /// valid policy: no).
-async fn has_scope(ctx: &Arc<Ctx>, peer: &PeerCred) -> bool {
+pub(crate) async fn has_scope(ctx: &Arc<Ctx>, peer: &PeerCred) -> bool {
     let state = ctx.policy();
     let (Some(g), Some(user)) = (&state.gateway, ctx.peer_name(peer).await) else {
         return false;
     };
-    let groups = Groups(ctx.groups_of(&user).await);
+    let groups = Groups::of(
+        ctx,
+        g,
+        &user,
+        peer.sid.as_deref(),
+        ctx.groups_of(&user).await,
+    )
+    .await;
     matches!(scope_for(&g.snap.config, &groups, &user), Ok(Some(_)))
 }
 
@@ -983,7 +1039,7 @@ pub(crate) async fn services_in(
     let state = ctx.policy();
     let user = ctx.principal_name(uid, sid).await;
     if let (Some(g), Some(user)) = (&state.gateway, user) {
-        let groups = Groups(ctx.groups_of(&user).await);
+        let groups = Groups::of(ctx, g, &user, sid, ctx.groups_of(&user).await).await;
         // A locked scope env with no snapshot lists nothing (a call is
         // denied `policy_invalid`).
         let chosen = g.select_env(gateway_mode(ctx), &groups, &user, project_env);
