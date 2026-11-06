@@ -7,8 +7,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use saiifeguard::builtins::builtin_packs;
-use saiifeguard::canon::PathVars;
+use saiifeguard::builtins::{builtin_packs, builtin_packs_for};
+use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{Decision, Engine};
 use saiifeguard::profile::select_active;
 
@@ -233,32 +233,65 @@ fn zsh_and_fish_prefixes() {
     ]);
 }
 
-#[test]
-fn here_documents_read_by_a_shell_after_a_reserved_word() {
-    let f = Fixture::new();
-    let e = f.engine();
-    for cmd in [
-        "! bash <<EOF\nrm -rf /\nEOF",
-        "time ! bash <<EOF\nrm -rf /\nEOF",
-        "if bash <<EOF\nrm -rf /\nEOF\nthen x; fi",
-        "while ! sh <<EOF\nrm -rf /\nEOF\ndo x; done",
-        "if a; then bash <<EOF\nrm -rf /\nEOF\nfi",
-        "for i in 1; do bash <<EOF\nrm -rf /\nEOF\ndone",
-        "coproc bash <<EOF\nrm -rf /\nEOF",
+/// The engine a Windows host builds for Bash on Windows, on any host: the Windows
+/// packs and path style, with paths that need no files.
+fn windows_engine() -> Engine {
+    let (packs, warnings) = builtin_packs_for(PathStyle::Windows);
+    assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+    Engine::new(select_active(packs, &[]))
+        .with_budget(TEST_BUDGET)
+        .with_paths(
+            PathVars::new()
+                .with_style(PathStyle::Windows)
+                .with_cwd(r"C:\r\home\app")
+                .with_var("HOME", r"C:\r\home")
+                .with_var("USERPROFILE", r"C:\r\home")
+                .with_var("PROJECT", r"C:\r\home\app"),
+        )
+}
+
+/// A shell fed a here-document, behind a reserved word or not, is judged as the
+/// same shell with no reserved word. On a POSIX host the document is read as the
+/// shell's line, so its `rm -rf /` is the deny. On a Windows host `bash` or `sh` with
+/// no command goes to the Windows readers, which do not read a fed stdin: it is
+/// closed as unreadable (`reader-could-not-judge`) before the document is looked at.
+fn check_here_documents(e: &Engine, windows: bool) {
+    let want = if windows {
+        "saiifeguard.core"
+    } else {
+        "core.filesystem"
+    };
+    for (cmd, alone) in [
+        ("! bash <<EOF\nrm -rf /\nEOF", "bash"),
+        ("time ! bash <<EOF\nrm -rf /\nEOF", "bash"),
+        ("if bash <<EOF\nrm -rf /\nEOF\nthen x; fi", "bash"),
+        ("while ! sh <<EOF\nrm -rf /\nEOF\ndo x; done", "sh"),
+        ("if a; then bash <<EOF\nrm -rf /\nEOF\nfi", "bash"),
+        ("for i in 1; do bash <<EOF\nrm -rf /\nEOF\ndone", "bash"),
+        ("coproc bash <<EOF\nrm -rf /\nEOF", "bash"),
     ] {
-        assert_eq!(
-            deny_pack(&e, cmd).as_deref(),
-            Some("core.filesystem"),
-            "{cmd:?}"
-        );
+        let alone = format!("{alone} <<EOF\nrm -rf /\nEOF");
+        assert_eq!(deny_pack(e, &alone).as_deref(), Some(want), "{alone:?}");
+        assert_eq!(deny_pack(e, cmd).as_deref(), Some(want), "{cmd:?}");
     }
     // Still data for a command that does not run it.
     for cmd in [
         "! cat <<EOF\nrm -rf /\nEOF",
         "if cat <<EOF\nrm -rf /\nEOF\nthen x; fi",
     ] {
-        assert_eq!(deny_pack(&e, cmd), None, "{cmd:?}");
+        assert_eq!(deny_pack(e, cmd), None, "{cmd:?}");
     }
+}
+
+#[test]
+fn here_documents_read_by_a_shell_after_a_reserved_word() {
+    let f = Fixture::new();
+    check_here_documents(&f.engine(), cfg!(windows));
+}
+
+#[test]
+fn here_documents_read_by_a_shell_after_a_reserved_word_on_windows() {
+    check_here_documents(&windows_engine(), true);
 }
 
 #[test]
@@ -534,10 +567,17 @@ fn zsh_short_forms_after_a_test_or_arithmetic() {
     }
 }
 
-#[test]
-fn ordinary_lines_with_a_leading_expansion_stay_allowed() {
-    let f = Fixture::new();
-    let e = f.engine();
+/// Lines a Windows host denies, for what is not a leading expansion. `cmd` is
+/// cmd.exe there, and with no command it runs its stdin, or whatever `"$@"` holds.
+/// A write to a path through a variable with no known value (`>"$work/out"`) is a
+/// Windows path the guard cannot read, so it is closed.
+const DENIED_ON_WINDOWS: &[&str] = &[
+    "cmd \"$@\"",
+    "sudo -n -u \"$user\" env -C \"$home\" \"$@\" >\"$work/out\" 2>&1 || code=$?",
+];
+
+fn check_ordinary_leading_expansions(e: &Engine, windows: bool) {
+    let mut wrong = Vec::new();
     for cmd in [
         "$EDITOR notes.txt",
         "$PAGER README.md",
@@ -588,8 +628,23 @@ fn ordinary_lines_with_a_leading_expansion_stay_allowed() {
         "function greet() { echo hi; }; greet",
         "greet() { echo hi; }",
     ] {
-        assert_eq!(deny_pack(&e, cmd), None, "{cmd:?}");
+        let denied = deny_pack(e, cmd).is_some();
+        if denied != (windows && DENIED_ON_WINDOWS.contains(&cmd)) {
+            wrong.push(format!("{cmd:?}: {:?}", e.evaluate(cmd)));
+        }
     }
+    assert!(wrong.is_empty(), "wrong:\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn ordinary_lines_with_a_leading_expansion_stay_allowed() {
+    let f = Fixture::new();
+    check_ordinary_leading_expansions(&f.engine(), cfg!(windows));
+}
+
+#[test]
+fn ordinary_lines_with_a_leading_expansion_stay_allowed_on_windows() {
+    check_ordinary_leading_expansions(&windows_engine(), true);
 }
 
 #[test]

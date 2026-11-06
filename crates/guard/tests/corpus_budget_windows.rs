@@ -48,6 +48,15 @@ fn posix(budget: Duration) -> Engine {
         .with_budget(budget)
 }
 
+/// `posix(budget)` where the host reads POSIX paths, for what depends on its working
+/// directory or home. A Windows host's `std::path` does not take `/home/a/p` as
+/// absolute, so there this engine has neither, and its path verdicts say nothing:
+/// production never builds it there (`PathStyle::host()`). The Windows half of each
+/// such test is the engine a Windows host builds.
+fn posix_host(budget: Duration) -> Option<Engine> {
+    (!cfg!(windows)).then(|| posix(budget))
+}
+
 fn timeout() -> Decision {
     Decision::Allow {
         trace: AllowTrace::FailedOpenTimeout,
@@ -561,7 +570,9 @@ fn a_cd_behind_a_word_keeps_the_slots_of_plain_ones() {
         }
     }
     assert_denied(&windows(FULL), BASH, &lines);
-    let e = posix(FULL);
+    let Some(e) = posix_host(FULL) else {
+        return;
+    };
     for line in &lines {
         let got = e.evaluate(line);
         let shown: String = line.chars().rev().take(40).collect();
@@ -623,7 +634,9 @@ fn long_cd_targets_do_not_spend_what_a_later_rule_needs() {
     }
     for budget in [Duration::ZERO, FULL] {
         assert_denied(&windows(budget), BASH, &lines);
-        let e = posix(budget);
+        let Some(e) = posix_host(budget) else {
+            continue;
+        };
         for line in &lines {
             let got = e.evaluate(line);
             let shown: String = line.chars().rev().take(30).collect();
@@ -662,7 +675,8 @@ fn a_moved_profile_closes_the_line_at_any_budget() {
 }
 
 /// The padded shapes on a POSIX host, each ending in a command a rule denies, at no
-/// budget, at the default budget and at full time.
+/// budget, at the default budget and at full time. On every host, Bash on Windows
+/// denies them too.
 #[test]
 fn padded_shapes_end_in_a_deny_on_posix() {
     let shapes: &[(&str, usize)] = &[
@@ -675,17 +689,24 @@ fn padded_shapes_end_in_a_deny_on_posix() {
         ("eval ", 8000),
         ("cat <<A ", 5000),
     ];
+    let mut wrong = Vec::new();
     for budget in [Duration::ZERO, saiifeguard::engine::DEFAULT_BUDGET, FULL] {
-        let e = posix(budget);
-        let mut wrong = Vec::new();
+        let on_windows = windows(budget);
+        let on_posix = posix_host(budget);
         for (part, times) in shapes {
             for tail in ["x; rm -rf /", "x; cat .env", "x; ! rm -rf /"] {
-                let got = e.evaluate(&padded(part, *times, tail));
-                if !got.is_deny() {
-                    wrong.push(format!("{budget:?} {part:?} + {tail}: {got:?}"));
+                let line = padded(part, *times, tail);
+                let mut got = vec![("windows", on_windows.evaluate_call(&line, BASH))];
+                if let Some(e) = &on_posix {
+                    got.push(("posix", e.evaluate(&line)));
+                }
+                for (host, d) in got {
+                    if !d.is_deny() {
+                        wrong.push(format!("{host} {budget:?} {part:?} + {tail}: {d:?}"));
+                    }
                 }
             }
         }
-        assert!(wrong.is_empty(), "not denied:\n{}", wrong.join("\n"));
     }
+    assert!(wrong.is_empty(), "not denied:\n{}", wrong.join("\n"));
 }
