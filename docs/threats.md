@@ -292,10 +292,11 @@ not see:
 Under the PowerShell reading, a line holding these is denied instead of read. Some
 writers (`Start-BitsTransfer -Destination`, `Export-Certificate`, `Save-Module`) are
 judged only as reads. A budget overrun that no rule denies on its last look (rules
-and lexical paths, no system call) and a panic stay `error_allowed` in developer
-mode. A shell line over 256 KiB is denied in every mode, with a message telling the
-agent to split it. So is a line that costs too much to judge even on that last look,
-or that makes more than 64 Ki words by brace expansion.
+and paths, symlinks and globs included, for a fixed count of system calls) and a
+panic stay `error_allowed` in developer mode. A shell line over 256 KiB is denied in
+every mode, with a message telling the agent to split it. So is a line that costs too
+much to judge even on that last look, or that makes more than 64 Ki words by brace
+expansion. A long generated script or brace line can reach those limits too.
 
 ## Limits of the guard as a whole
 

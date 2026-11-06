@@ -536,6 +536,29 @@ fn payload(tool: &str, cwd: &Path, input: serde_json::Value) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Padding that main skips spends the budget here, and what is left of the line is
+/// named only by the filesystem. The real hook still blocks it.
+#[cfg(unix)]
+#[test]
+fn a_padded_line_ending_in_a_link_or_a_glob_is_denied() {
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(root.path().join(".ssh")).unwrap();
+    std::fs::write(app.join(".env"), "TOKEN=1\n").unwrap();
+    std::fs::write(root.path().join(".ssh/id_rsa"), "x").unwrap();
+    std::os::unix::fs::symlink(".env", app.join("link")).unwrap();
+    std::os::unix::fs::symlink("../.ssh", app.join("keys")).unwrap();
+    let pad = "$(true) X=1 ".repeat(20_000);
+    for tail in ["cat link", "cat .en*", "cat keys/id_rsa"] {
+        let line = format!("<{pad}>x; {tail}");
+        let audit = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({"command": line});
+        let (out, _) = check_bytes(audit.path(), "claude", &payload("Bash", &app, input));
+        assert_eq!(out.code, 2, "{tail}: {}", out.stderr);
+    }
+}
+
 /// Controller ruling C2/I1: patterns are expanded and every match judged.
 #[test]
 fn glob_patterns_are_expanded_and_every_match_judged() {

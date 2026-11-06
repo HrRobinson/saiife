@@ -632,6 +632,35 @@ fn long_cd_targets_do_not_spend_what_a_later_rule_needs() {
     }
 }
 
+/// Bash on Windows closes itself when a profile variable moves before a read through
+/// it. That check must not be skipped because the budget ran out on the way.
+#[test]
+fn a_moved_profile_closes_the_line_at_any_budget() {
+    let tails = [
+        "x; HOME=/x; cat ~/y",
+        "x; USERPROFILE=/x; cat ~/y",
+        "x; export HOME=/x; cat ~/y",
+    ];
+    for budget in [Duration::ZERO, FULL] {
+        let e = windows(budget);
+        for tail in tails {
+            for line in [
+                tail.trim_start_matches("x; ").to_string(),
+                padded("$(true) ", 16 * 1024, tail),
+            ] {
+                let got = e.evaluate_call(&line, BASH);
+                let shown: String = line.chars().rev().take(30).collect();
+                assert!(got.is_deny(), "{budget:?} …{shown:?}: {got:?}");
+            }
+        }
+    }
+    // Moving it with no read through it judges nothing, in time or not.
+    let e = windows(Duration::ZERO);
+    for line in ["HOME=/tmp/x cargo test", "HOME=/x; ls"] {
+        assert_eq!(e.evaluate_call(line, BASH), timeout(), "{line}");
+    }
+}
+
 /// The padded shapes on a POSIX host, each ending in a command a rule denies, at no
 /// budget, at the default budget and at full time.
 #[test]

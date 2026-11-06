@@ -16,9 +16,11 @@
 //! by what it points to AND by its own name: `notes.txt -> .env` reads a
 //! secret, and so does `.env -> vars/dev`.
 
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use crate::winpath;
 
@@ -299,6 +301,176 @@ fn resolve(abs: &Path) -> Option<PathBuf> {
     }
 }
 
+/// What one system call, or one directory entry read, costs the last look
+/// (`Engine::out_of_budget`), out of its `paths_left`. With its limit that makes
+/// 16 Ki at most in one reading of a line, whatever the clock says.
+pub(crate) const FS_CALL_COST: usize = 4096;
+
+/// What looking one path up costs the last look before its bytes, called or not.
+const FS_LOOKUP_COST: usize = 16;
+
+/// The last look's filesystem access on this thread: what it may still spend, and
+/// what it was told, so the same path never makes a second call.
+struct FsMeter {
+    left: Rc<Cell<usize>>,
+    over: bool,
+    entries: HashMap<PathBuf, FsEntry>,
+    os_names: HashMap<String, Option<String>>,
+}
+
+#[derive(Clone)]
+enum FsEntry {
+    Missing,
+    Plain,
+    /// A symlink, and its target if it could be read.
+    Link(Option<PathBuf>),
+}
+
+thread_local! {
+    static FS_METER: RefCell<Option<FsMeter>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// System calls and directory entries charged on this thread.
+    static FS_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Take the count of what was charged so far on this thread.
+#[cfg(all(test, unix))]
+pub(crate) fn take_fs_calls() -> usize {
+    FS_CALLS.with(|n| n.replace(0))
+}
+
+/// While this lives, the thread's path resolution and glob expansion are charged to
+/// `left`. Once it cannot pay, no more calls are made, and what they would have told
+/// reads as missing: the caller must then not trust the outcome (`fs_over`).
+pub(crate) struct FsMeterScope;
+
+pub(crate) fn meter_fs(left: Rc<Cell<usize>>) -> FsMeterScope {
+    FS_METER.with_borrow_mut(|m| {
+        *m = Some(FsMeter {
+            left,
+            over: false,
+            entries: HashMap::new(),
+            os_names: HashMap::new(),
+        });
+    });
+    FsMeterScope
+}
+
+impl Drop for FsMeterScope {
+    fn drop(&mut self) {
+        FS_METER.with_borrow_mut(|m| *m = None);
+    }
+}
+
+/// The meter ran out, so something was not resolved.
+pub(crate) fn fs_over() -> bool {
+    FS_METER.with_borrow(|m| m.as_ref().is_some_and(|m| m.over))
+}
+
+/// Pay `cost`. Without a meter there is nothing to pay.
+fn fs_pay(cost: usize) -> bool {
+    FS_METER.with_borrow_mut(|meter| {
+        let Some(m) = meter else {
+            return true;
+        };
+        if m.over {
+            return false;
+        }
+        match m.left.get().checked_sub(cost) {
+            Some(rest) => {
+                m.left.set(rest);
+                true
+            }
+            None => {
+                m.over = true;
+                false
+            }
+        }
+    })
+}
+
+/// Pay for one system call or directory entry; false when none may be made.
+fn fs_call() -> bool {
+    let paid = fs_pay(FS_CALL_COST);
+    #[cfg(test)]
+    if paid && FS_METER.with_borrow(Option::is_some) {
+        FS_CALLS.with(|n| n.set(n.get() + 1));
+    }
+    paid
+}
+
+/// What is at `path`, without following a last symlink.
+fn fs_entry(path: &Path) -> FsEntry {
+    let looked_up = FS_METER.with_borrow(|m| m.as_ref().map(|m| m.entries.get(path).cloned()));
+    if looked_up.is_some() && !fs_pay(FS_LOOKUP_COST + path.as_os_str().len()) {
+        return FsEntry::Missing;
+    }
+    if let Some(Some(known)) = looked_up {
+        return known;
+    }
+    if !fs_call() {
+        return FsEntry::Missing;
+    }
+    let entry = match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            if !fs_call() {
+                return FsEntry::Missing;
+            }
+            FsEntry::Link(std::fs::read_link(path).ok())
+        }
+        Ok(_) => FsEntry::Plain,
+        Err(_) => FsEntry::Missing,
+    };
+    FS_METER.with_borrow_mut(|m| {
+        if let Some(m) = m {
+            m.entries.insert(path.to_path_buf(), entry.clone());
+        }
+    });
+    entry
+}
+
+/// `read_dir`, paid for.
+pub(crate) fn fs_read_dir(path: &Path) -> Option<std::fs::ReadDir> {
+    if !fs_call() {
+        return None;
+    }
+    std::fs::read_dir(path).ok()
+}
+
+/// One directory entry read, paid for: false when the listing must stop.
+pub(crate) fn fs_next_entry() -> bool {
+    fs_call()
+}
+
+/// `Path::is_dir`, paid for.
+pub(crate) fn fs_is_dir(path: &Path) -> bool {
+    fs_call() && path.is_dir()
+}
+
+/// `os(path)` of a Windows host's path resolution, paid for and asked once.
+pub(crate) fn fs_os_name(path: &str, os: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let known = FS_METER.with_borrow(|m| m.as_ref().map(|m| m.os_names.get(path).cloned()));
+    if known.is_some() && !fs_pay(FS_LOOKUP_COST + path.len()) {
+        return None;
+    }
+    if let Some(Some(name)) = known {
+        return name;
+    }
+    if !fs_call() {
+        return None;
+    }
+    let name = os(path);
+    FS_METER.with_borrow_mut(|m| {
+        if let Some(m) = m {
+            m.os_names.insert(path.to_string(), name.clone());
+        }
+    });
+    name
+}
+
 /// Longest path the OS accepts; anything longer cannot exist on disk.
 const PATH_MAX: usize = 4096;
 /// Symlinks followed in one resolution, like the OS's ELOOP limit.
@@ -325,13 +497,13 @@ fn resolve_once(abs: &Path) -> Option<PathBuf> {
         match c {
             Some(n) => {
                 let next = base.join(n);
-                match std::fs::symlink_metadata(&next) {
-                    Ok(md) if md.file_type().is_symlink() => {
+                match fs_entry(&next) {
+                    FsEntry::Link(target) => {
                         hops += 1;
                         if hops > MAX_HOPS {
                             return None;
                         }
-                        let target = std::fs::read_link(&next).ok()?;
+                        let target = target?;
                         if target.is_absolute() {
                             base = PathBuf::from("/");
                         }
@@ -339,8 +511,8 @@ fn resolve_once(abs: &Path) -> Option<PathBuf> {
                             queue.push_front(tc);
                         }
                     }
-                    Ok(_) => base = next,
-                    Err(_) => {
+                    FsEntry::Plain => base = next,
+                    FsEntry::Missing => {
                         base = next;
                         break;
                     }
@@ -855,7 +1027,7 @@ fn walk(
                             seen: next,
                         };
                     }
-                    let Ok(entries) = std::fs::read_dir(b) else {
+                    let Some(entries) = fs_read_dir(b) else {
                         continue;
                     };
                     for e in entries.flatten() {
@@ -864,6 +1036,9 @@ fn walk(
                                 at: idx,
                                 seen: next,
                             };
+                        }
+                        if !fs_next_entry() {
+                            break;
                         }
                         let n = e.file_name();
                         let name = n.to_string_lossy();
@@ -891,7 +1066,7 @@ fn walk(
         }
     }
     if literal_tail {
-        bases.retain(|b| std::fs::symlink_metadata(b).is_ok());
+        bases.retain(|b| !matches!(fs_entry(b), FsEntry::Missing));
     }
     Walk::Done(bases)
 }
@@ -906,7 +1081,7 @@ fn descend(
     limit: usize,
     out: &mut Vec<PathBuf>,
 ) -> Option<()> {
-    if !base.is_dir() {
+    if !fs_is_dir(base) {
         return Some(());
     }
     out.push(base.to_path_buf());
@@ -915,12 +1090,15 @@ fn descend(
         if !budget.take(limit) {
             return None;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Some(entries) = fs_read_dir(&dir) else {
             continue;
         };
         for e in entries.flatten() {
             if !budget.take(limit) {
                 return None;
+            }
+            if !fs_next_entry() {
+                break;
             }
             let n = e.file_name();
             if !budget.dots && n.to_string_lossy().starts_with('.') {

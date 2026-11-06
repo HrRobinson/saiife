@@ -820,9 +820,9 @@ and a hive, `Environment::` or `Certificate::`.
 
 The budget (D10) is no way past these: when it runs out on a Windows host, or on
 a line a PowerShell or cmd reader read, the rest of the line still gets the rules
-and the path rules on lexical forms, with no system call. Only a deny comes of
-that; otherwise the answer stays the timeout. A POSIX line on Linux or macOS
-keeps its order and its record.
+and the path rules, symlinks and globs included, for a fixed count of system calls;
+past it the line is denied. Only a deny comes of that; otherwise the answer stays
+the timeout. A POSIX line on Linux or macOS keeps its order and its record.
 
 Windows-style hosts only:
 

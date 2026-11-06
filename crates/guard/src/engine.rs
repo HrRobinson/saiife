@@ -17,14 +17,15 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexSet};
 
 use crate::canon::{
-    canonicalize, expand_operand_glob_dots, lexical_form, path_forms, GlobExpansion, PathStyle,
-    PathVars, GLOB_SCAN_LIMIT,
+    canonicalize, expand_operand_glob_dots, fs_is_dir, fs_next_entry, fs_over, fs_read_dir,
+    lexical_form, meter_fs, path_forms, GlobExpansion, PathStyle, PathVars, GLOB_SCAN_LIMIT,
 };
 use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
@@ -603,9 +604,9 @@ impl Engine {
         let clock = Clock {
             start,
             spent: Cell::default(),
-            lexical: false,
+            last_look: false,
             lines_left: Cell::new(0),
-            paths_left: Cell::new(0),
+            paths_left: Rc::default(),
             #[cfg(test)]
             runs: Cell::default(),
         };
@@ -695,14 +696,16 @@ impl Engine {
 
         for (at, seg) in segments.iter().enumerate() {
             if start.elapsed() > self.budget {
-                return self.out_of_budget(&segments[at..], &cx, &mut state, &mut found);
+                let rest = &segments[at..];
+                return self.out_of_budget(rest, &cx, &mut state, &mut found, profile_moved);
             }
             if seg.is_empty() {
                 continue;
             }
             if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found) {
                 if is_timed_out(&d) {
-                    return self.out_of_budget(&segments[at..], &cx, &mut state, &mut found);
+                    let rest = &segments[at..];
+                    return self.out_of_budget(rest, &cx, &mut state, &mut found, profile_moved);
                 }
                 return d;
             }
@@ -720,26 +723,30 @@ impl Engine {
     /// The budget ran out with `segments` left to judge. That must not be a way
     /// past the rules, in any dialect or path style: padding, or a reader whose
     /// cost grows with the line, could spend the budget before `rm -rf /` or
-    /// `rd /s /q C:\` is reached. So what is left still gets the rules and the
-    /// path rules on its lexical forms, with no budget and no system call. Only
-    /// a deny comes of it; otherwise the answer is the timeout it was.
+    /// `rd /s /q C:\` is reached. So what is left still gets the rules and the path
+    /// rules, symlinks and globs included, with no clock. Only a deny comes of it,
+    /// and a line that closes itself still closes (`profile_moved`); otherwise the
+    /// answer is the timeout it was.
     ///
     /// A nested line only reports the timeout: the outermost one starts again
     /// from its current segment, which holds the nested line, so nothing is
     /// judged once per level. Every segment of the line is judged, at a cost
     /// linear in its words. What multiplies that cost has `MAX_CHEAP_WORK`
     /// (`Clock::afford_line`, `Clock::afford_paths`), and brace expansion, the
-    /// one way to many more words than bytes, has its limit in the lexer. Past
-    /// either the line is denied (`too_costly`): dropping a directory or a nested
-    /// line to save the time could allow what a rule would deny.
+    /// one way to many more words than bytes, has its limit in the lexer. System
+    /// calls are paid from `paths_left` too, `canon::FS_CALL_COST` each, so they
+    /// come to a fixed count, the same on every run. Past any of these the line is
+    /// denied (`too_costly`): dropping a directory, a nested line or a path to save
+    /// the time could allow what a rule would deny.
     fn out_of_budget(
         &self,
         segments: &[Vec<Word>],
         cx: &Ctx,
         state: &mut ShellState,
         found: &mut Findings,
+        profile_moved: bool,
     ) -> Decision {
-        if cx.clock.lexical || cx.depth > 0 {
+        if cx.clock.last_look || cx.depth > 0 {
             return timed_out();
         }
         // An `Instant` ahead of now has no time elapsed: nothing is over budget.
@@ -749,12 +756,13 @@ impl Engine {
         let clock = Clock {
             start,
             spent: Cell::default(),
-            lexical: true,
+            last_look: true,
             lines_left: Cell::new(max_cheap_work()),
-            paths_left: Cell::new(max_cheap_work()),
+            paths_left: Rc::new(Cell::new(max_cheap_work())),
             #[cfg(test)]
             runs: Cell::default(),
         };
+        let _metered = meter_fs(Rc::clone(&clock.paths_left));
         let cx = Ctx {
             start,
             depth: cx.depth,
@@ -767,6 +775,16 @@ impl Engine {
             match self.evaluate_segment(seg, &cx, state, found) {
                 Some(d) if d.is_deny() => return d,
                 _ => {}
+            }
+            if fs_over() {
+                return too_costly(PATHS_PAST_LIMIT);
+            }
+        }
+        // As `evaluate_inner` ends: this line's reads went through a moved profile.
+        if profile_moved {
+            let closed = closed_reading(std::mem::take(found).finish());
+            if closed.is_deny() {
+                return closed;
             }
         }
         timed_out()
@@ -1111,7 +1129,7 @@ impl Engine {
                 return Some(too_costly(PATHS_PAST_LIMIT));
             };
             let judged =
-                self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.lexical);
+                self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.last_look);
             if let Some(d) = found.operands(judged) {
                 return Some(d);
             }
@@ -1259,7 +1277,8 @@ impl Engine {
         let Some(dirs) = Self::dirs_to_judge(&ops, state, cx) else {
             return Some(too_costly(PATHS_PAST_LIMIT));
         };
-        let judged = self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.lexical);
+        let judged =
+            self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.last_look);
         if let Some(d) = found.operands(judged) {
             return Some(d);
         }
@@ -1294,7 +1313,7 @@ impl Engine {
                 return Some(too_costly(PATHS_PAST_LIMIT));
             };
             let judged =
-                self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.lexical);
+                self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.last_look);
             if let Some(d) = found.operands(judged) {
                 return Some(d);
             }
@@ -1380,11 +1399,8 @@ impl Engine {
                     return d;
                 }
             }
-            // Out of budget the target is worked out on paper, with no system
-            // call (`cd`), so `cd ~/.ssh; cat id_rsa` still denies.
             let behind = view.seg.first().is_some_and(|w| w.behind_reserved);
-            let lexical = cx.clock.lexical;
-            state.cwd_unknown |= self.cd(&argv, &words, state, behind, lexical);
+            state.cwd_unknown |= self.cd(&argv, &words, state, behind);
         }
         None
     }
@@ -1466,14 +1482,14 @@ impl Engine {
         found.nested(nested)
     }
 
-    /// The directories to judge `ops` in: all of them. `None` when the lexical
-    /// pass has spent its work on paths, and judging fewer could miss a rule.
+    /// The directories to judge `ops` in: all of them. `None` when the last
+    /// look has spent its work on paths, and judging fewer could miss a rule.
     fn dirs_to_judge<'a>(
         ops: &[Operand],
         state: &'a ShellState,
         cx: &Ctx,
     ) -> Option<&'a [PathBuf]> {
-        if !cx.clock.lexical {
+        if !cx.clock.last_look {
             return Some(&state.cwds);
         }
         let dirs = state.cwds.len().max(1);
@@ -1566,15 +1582,15 @@ impl Engine {
     /// Two passes: first the paths as spelled, made absolute lexically (no
     /// filesystem access, so `cat f1 … f5000 .env` is denied before the
     /// budget is spent on syscalls); then the resolved forms (symlinks),
-    /// glob matches and copy targets that are directories. `lexical`: the
-    /// first pass only (`out_of_budget`).
+    /// glob matches and copy targets that are directories. `last_look`
+    /// (`out_of_budget`): the first pass also judges a copy target both ways.
     fn judge_operands(
         &self,
         ops: Vec<Operand>,
         cwds: &[PathBuf],
         cwd_unknown: bool,
         start: Instant,
-        lexical: bool,
+        last_look: bool,
     ) -> Option<Decision> {
         if !self.has_path_rules || ops.is_empty() {
             return None;
@@ -1609,24 +1625,25 @@ impl Engine {
         };
 
         for op in &ops {
-            // A copy target that may be a directory waits for pass 2. With no
-            // pass 2 it is judged both as a directory and as the file.
+            // A copy target that may be a directory waits for pass 2. In the last
+            // look, which may not get there, it is judged as a directory and as
+            // the file here too.
             let plain = op.into.iter().all(|s| !s.glob && !s.contents);
             let mut landing = if op.into.is_empty() {
                 vec![op.path.clone()]
-            } else if (lexical || op.path.ends_with('/')) && plain {
+            } else if (last_look || op.path.ends_with('/')) && plain {
                 let names: Vec<String> = op
                     .into
                     .iter()
                     .filter_map(|s| base_name(&s.path, self.vars.style()))
                     .collect();
                 into_dir(&op.path, &names)
-            } else if lexical {
+            } else if last_look {
                 Vec::new()
             } else {
                 continue;
             };
-            if lexical && !op.into.is_empty() && !op.path.ends_with('/') {
+            if last_look && !op.into.is_empty() && !op.path.ends_with('/') {
                 landing.push(op.path.clone());
             }
             for raw in &landing {
@@ -1651,9 +1668,6 @@ impl Engine {
         }
 
         // What follows reaches the filesystem.
-        if lexical {
-            return None;
-        }
         let mut unjudged = None;
         for op in &ops {
             for cwd in anchors(&op.path) {
@@ -1805,7 +1819,7 @@ impl Engine {
                 if self.is_remote(&dir) {
                     continue;
                 }
-                let Ok(list) = std::fs::read_dir(&dir) else {
+                let Some(list) = fs_read_dir(&dir) else {
                     continue;
                 };
                 for e in list.flatten() {
@@ -1814,13 +1828,16 @@ impl Engine {
                         err = Some("copy source too large to judge".to_string());
                         break;
                     }
+                    if !fs_next_entry() {
+                        break;
+                    }
                     entries.push(e.file_name());
                 }
             }
         }
         let is_dir = target.ends_with('/')
             || canonicalize(target, cwd, &self.vars)
-                .is_some_and(|p| !self.is_remote(&p) && p.is_dir());
+                .is_some_and(|p| !self.is_remote(&p) && fs_is_dir(&p));
         let mut full = Vec::new();
         if is_dir {
             full.extend(into_dir(target, &names));
@@ -1843,8 +1860,7 @@ impl Engine {
     /// directories always stay. Returns true when the shell may now be
     /// somewhere `cwds` does not hold: `cd -`, a target with a substitution,
     /// one that cannot be resolved, or more directories than `MAX_CWDS` in its
-    /// tier, where nothing more is resolved. `lexical`: the target is worked out
-    /// without the filesystem (`out_of_budget`), so a symlink is not followed.
+    /// tier, where nothing more is resolved.
     ///
     /// `behind`: the `cd` stands behind a reserved word or a word that may vanish.
     /// What it reaches, and what a plain `cd` reaches from there, goes in the second
@@ -1856,7 +1872,6 @@ impl Engine {
         effective: &[Word],
         state: &mut ShellState,
         behind: bool,
-        lexical: bool,
     ) -> bool {
         let arg = argv
             .iter()
@@ -1901,12 +1916,7 @@ impl Engine {
                 CD_RESOLVES.with(|n| n.set(n.get() + anchors.len()));
                 let mut new = Vec::with_capacity(anchors.len());
                 for (c, plain) in anchors {
-                    let dir = if lexical {
-                        lexical_form(a, c, &self.vars)
-                    } else {
-                        canonicalize(a, c, &self.vars)
-                    };
-                    match dir {
+                    match canonicalize(a, c, &self.vars) {
                         Some(d) => new.push((d, plain)),
                         None => unknown = true,
                     }
@@ -2967,14 +2977,15 @@ struct Clock {
     /// Time spent compiling operand patterns so far
     /// (`pack::MAX_PATTERN_COMPILE`).
     spent: Cell<Duration>,
-    /// The budget ran out: paths are judged by their lexical forms, with no
-    /// system call (`Engine::out_of_budget`).
-    lexical: bool,
-    /// What the lexical pass may still spend on nested lines, in bytes.
+    /// The budget ran out: this clock is the last look's, and its work is counted
+    /// rather than timed (`Engine::out_of_budget`).
+    last_look: bool,
+    /// What the last look may still spend on nested lines, in bytes.
     lines_left: Cell<usize>,
-    /// What it may still spend on paths in more than one directory, in bytes.
-    /// Apart from `lines_left`, so paths cannot use up what nested lines need.
-    paths_left: Cell<usize>,
+    /// What it may still spend on paths, in bytes and in system calls
+    /// (`canon::FS_CALL_COST`, paid by `canon` itself). Apart from `lines_left`, so
+    /// paths cannot use up what nested lines need.
+    paths_left: Rc<Cell<usize>>,
     /// Lines evaluated and segment views judged, so a test can bound the
     /// work without reading a clock.
     #[cfg(test)]
@@ -2982,15 +2993,15 @@ struct Clock {
 }
 
 impl Clock {
-    /// May the lexical pass judge a nested line of this cost? Always before
+    /// May the last look judge a nested line of this cost? Always before
     /// the budget runs out: that part has its clock.
     fn afford_line(&self, cost: usize) -> bool {
-        !self.lexical || spend(&self.lines_left, CHEAP_LINE_COST + cost)
+        !self.last_look || spend(&self.lines_left, CHEAP_LINE_COST + cost)
     }
 
-    /// May the lexical pass spend `cost` on paths? As `afford_line`.
+    /// May the last look spend `cost` on paths? As `afford_line`.
     fn afford_paths(&self, cost: usize) -> bool {
-        !self.lexical || spend(&self.paths_left, cost)
+        !self.last_look || spend(&self.paths_left, cost)
     }
 }
 
@@ -3005,23 +3016,25 @@ fn spend(left: &Cell<usize>, cost: usize) -> bool {
     }
 }
 
-/// What a nested line costs the lexical pass before its bytes: setting it up
+/// What a nested line costs the last look before its bytes: setting it up
 /// takes as long as judging about this many bytes.
 const CHEAP_LINE_COST: usize = 1024;
 
-/// What judging one word of a line costs the lexical pass, measured the same way:
+/// What judging one word of a line costs the last look, measured the same way:
 /// about 1.5 µs, against about a second for `MAX_CHEAP_WORK`.
 const CHEAP_WORD_COST: usize = 256;
 
-/// What judging one path in one directory costs the lexical pass before its
+/// What judging one path in one directory costs the last look before its
 /// bytes, measured the same way.
 const CHEAP_PATH_COST: usize = 256;
 
-/// How much the lexical pass may spend on each of what multiplies its work,
-/// once the budget has run out: nested lines, and paths in more than one
-/// directory. Each comes to about a second in an optimized build, measured on the
-/// worst shapes a 256 KiB line can have. Past it the line is denied (`too_costly`).
-/// Only a hostile line gets there: this is about 200,000 short paths.
+/// How much the last look may spend on each of what multiplies its work, once the
+/// budget has run out: nested lines, and paths and their system calls. Each comes to
+/// about a second in an optimized build, measured on the worst shapes a 256 KiB line
+/// can have. Past it the line is denied (`too_costly`). That is 16 Ki system calls or
+/// about 200,000 short paths in one directory, and an ordinary line can get there
+/// when it is a whole script or a long brace expansion: a build script of
+/// `cd pkgN; cp a b c d; cd ../..` 1600 times (92 KB) does, through its directories.
 const MAX_CHEAP_WORK: usize = 64 * 1024 * 1024;
 
 const PATHS_PAST_LIMIT: &str = "paths in too many long directories";
@@ -4245,7 +4258,7 @@ reason = "other pack says no"
     }
 
     /// The default packs and path rules, with no budget: everything goes
-    /// through the lexical pass.
+    /// through the last look.
     fn cheap_engine(root: &Path) -> Engine {
         let (packs, _) = crate::builtins::builtin_packs();
         Engine::new(crate::profile::select_active(packs, &[]))
@@ -4263,7 +4276,7 @@ reason = "other pack says no"
         (0..MAX_CWDS).map(|i| format!("cd /d{i}; ")).collect()
     }
 
-    /// The work the lexical pass does on a line must double with the line,
+    /// The work the last look does on a line must double with the line,
     /// on what is slow in the budgeted pass and with every directory tracked.
     #[test]
     fn the_lexical_pass_grows_linearly_with_the_line() {
@@ -4382,6 +4395,105 @@ reason = "other pack says no"
         let line = format!("{}cat {}; $(rm -rf /)", all_the_dirs(), "a ".repeat(4096));
         assert!(e.evaluate(&line).is_deny(), "after spent paths");
         CHEAP_WORK_LIMIT.with(|l| l.set(None));
+    }
+
+    /// A project of `n` files and a link to `.env`, with the default rules.
+    #[cfg(unix)]
+    fn project_with_a_link(n: usize) -> (tempfile::TempDir, PathBuf, Engine) {
+        let (d, root) = canonical_tmp();
+        let app = root.join("home/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join(".env"), "x").unwrap();
+        std::os::unix::fs::symlink(".env", app.join("link")).unwrap();
+        for i in 0..n {
+            std::fs::write(app.join(format!("f{i}")), "x").unwrap();
+        }
+        let e = cheap_engine(&root);
+        (d, root, e)
+    }
+
+    #[cfg(unix)]
+    fn is_too_costly(d: &Decision) -> bool {
+        matches!(d, Decision::Deny { pattern, .. } if pattern == "line-too-costly-to-judge")
+    }
+
+    /// The system calls of one evaluation, and its verdict.
+    #[cfg(unix)]
+    fn counted(e: &Engine, line: &str) -> (usize, Decision) {
+        crate::canon::take_fs_calls();
+        let d = e.evaluate(line);
+        (crate::canon::take_fs_calls(), d)
+    }
+
+    /// Bounded means a count of system calls: past it, a path that cannot be
+    /// resolved denies. The same line makes the same calls and gets the same verdict.
+    #[cfg(unix)]
+    #[test]
+    fn the_last_look_makes_a_fixed_count_of_system_calls() {
+        let (_d, _root, e) = project_with_a_link(0);
+        let names: Vec<String> = (0..20_000).map(|i| format!("cat n{i}")).collect();
+        for ending in ["cat link", "ls"] {
+            let line = format!("{}; {ending}", names.join("; "));
+            let (calls, verdict) = counted(&e, &line);
+            assert!(is_too_costly(&verdict), "{ending}: {verdict:?}");
+            assert!(
+                calls <= MAX_CHEAP_WORK / crate::canon::FS_CALL_COST,
+                "{calls}"
+            );
+            assert!(calls > 1000, "{calls}");
+            assert_eq!(counted(&e, &line), (calls, verdict), "{ending}");
+        }
+    }
+
+    /// One call of each kind counts: a `cd`, a glob and a copy target, each past the
+    /// bound on its own.
+    #[cfg(unix)]
+    #[test]
+    fn past_the_bound_a_link_a_glob_and_a_cd_deny() {
+        let (_d, _root, e) = project_with_a_link(64);
+        for (line, calls) in [
+            ("cat link", 4),
+            ("cat .en*", 4),
+            ("cat f*", 4),
+            ("cd link; ls", 4),
+            ("cp a link", 4),
+        ] {
+            CHEAP_WORK_LIMIT.with(|l| l.set(Some(calls * crate::canon::FS_CALL_COST)));
+            let (spent, d) = counted(&e, line);
+            CHEAP_WORK_LIMIT.with(|l| l.set(None));
+            assert!(is_too_costly(&d), "{line}: {d:?}");
+            assert!(spent <= calls, "{line}: {spent}");
+        }
+    }
+
+    /// Asking again costs nothing: a padded line of one path does not use up the bound
+    /// on what follows it.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_path_again_makes_no_system_call() {
+        let (_d, _root, e) = project_with_a_link(0);
+        let (once, _) = counted(&e, "cat a");
+        let (many, d) = counted(&e, &"cat a; ".repeat(10_000));
+        assert_eq!(d, timed_out());
+        assert!(once > 0, "{once}");
+        assert_eq!(many, once);
+        let (_, d) = counted(&e, &format!("{}cat link", "cat a; ".repeat(10_000)));
+        assert!(d.is_deny() && !is_too_costly(&d), "{d:?}");
+    }
+
+    /// A path long enough to cost more to look up than a call makes is charged too.
+    #[cfg(unix)]
+    #[test]
+    fn long_paths_cannot_outrun_the_bound() {
+        let (_d, root, e) = project_with_a_link(0);
+        let deep = "d/".repeat(300);
+        std::fs::create_dir_all(root.join("home/app").join(&deep)).unwrap();
+        let (calls, d) = counted(
+            &e,
+            &format!("{}cat link", format!("cat {deep}x; ").repeat(1000)),
+        );
+        assert!(is_too_costly(&d), "{d:?}");
+        assert!(calls < 1000, "known answers make no call: {calls}");
     }
 
     /// Past `MAX_CWDS` in its tier a `cd` is not resolved at all: each one before

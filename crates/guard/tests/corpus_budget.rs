@@ -1,7 +1,7 @@
 //! Running out of the latency budget is not a way past the rules. The segments
-//! left when it runs out still get the pack rules and the path rules on their
-//! lexical forms, with no system call. A deny found there is a deny; only when
-//! nothing denies does the line stay `FailedOpenTimeout`.
+//! left when it runs out still get the pack rules and the path rules, symlinks and
+//! globs included, for a fixed count of system calls. A deny found there is a deny;
+//! only when nothing denies does the line stay `FailedOpenTimeout`.
 //!
 //! A zero budget takes that path without reading a clock: the first check
 //! fails, whatever the machine's speed.
@@ -170,9 +170,9 @@ fn the_verdict_with_no_budget_agrees_with_the_full_one() {
     }
 }
 
-/// `cd` resolves through the filesystem, so the cheap pass follows it on paper.
+/// `cd` is followed with no budget.
 #[test]
-fn a_cd_is_followed_lexically_with_no_budget() {
+fn a_cd_is_followed_with_no_budget() {
     let f = Fixture::new();
     let e = f.engine(Duration::ZERO);
     for cmd in ["cd ~/.ssh; cat id_rsa", "cd ../.ssh && cat id_rsa"] {
@@ -219,18 +219,119 @@ fn a_copy_target_is_judged_both_ways_with_no_budget() {
     }
 }
 
-/// No system call: a symlink is not followed and a glob is not expanded, so
-/// neither can deny here. Both still deny with time to spare.
+/// A project holding a link to `.env` and a link to the directory of the keys.
 #[cfg(unix)]
-#[test]
-fn the_cheap_pass_reads_no_filesystem() {
+fn with_links() -> Fixture {
     let f = Fixture::new();
     let app = f.root.join("home/app");
-    std::os::unix::fs::symlink(app.join(".env"), app.join("harmless")).unwrap();
-    let cheap = f.engine(Duration::ZERO);
-    let full = f.engine(Duration::from_secs(60));
-    for cmd in ["cat harmless", "cat .en?"] {
-        assert_eq!(cheap.evaluate(cmd), timeout(), "{cmd}");
-        assert!(full.evaluate(cmd).is_deny(), "{cmd}");
+    std::os::unix::fs::symlink(".env", app.join("link")).unwrap();
+    std::os::unix::fs::symlink("../.ssh", app.join("keys")).unwrap();
+    std::os::unix::fs::symlink("notes.md", app.join("plain")).unwrap();
+    fs::write(app.join("notes.md"), "x").unwrap();
+    fs::create_dir_all(app.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(".claude", app.join("conf")).unwrap();
+    f
+}
+
+/// What only the filesystem can name, each denied on main: padding that main
+/// skips must not spend the budget and leave these to a look that cannot see it.
+#[cfg(unix)]
+const NAMED_BY_THE_FILESYSTEM: &[&str] = &[
+    "cat link",
+    "cat .en*",
+    "cat .en?",
+    "cat .e[n]v",
+    "cat keys/id_rsa",
+    "cat kez*/id_rsa ke?s/id_rsa",
+    "cd keys; cat id_rsa",
+    "cd keys && cat id*",
+    "! cd keys; cat id_rsa",
+    "cat < link",
+    "cp link /tmp/out",
+    "echo x > conf/settings.json",
+    "cp /tmp/settings.json conf",
+];
+
+/// The padding of the finding: main skips the rest of the segment after `$(true)`.
+#[cfg(unix)]
+fn behind_the_padding(tail: &str) -> String {
+    format!("<{}>x; {tail}", "$(true) X=1 ".repeat(20_000))
+}
+
+/// The last look follows symlinks and expands globs, with no budget at all.
+#[cfg(unix)]
+#[test]
+fn the_last_look_follows_symlinks_and_globs() {
+    let f = with_links();
+    let mut wrong = Vec::new();
+    for budget in [Duration::ZERO, Duration::from_secs(60)] {
+        let e = f.engine(budget);
+        for tail in NAMED_BY_THE_FILESYSTEM {
+            for line in [tail.to_string(), behind_the_padding(tail)] {
+                let got = e.evaluate(&line);
+                if !got.is_deny() {
+                    let shown: String = line.chars().rev().take(40).collect();
+                    wrong.push(format!("{budget:?} {tail:?} …{shown:?}: {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "not denied:\n{}", wrong.join("\n"));
+}
+
+/// Every padding of `SHAPES` in front of them, with no budget.
+#[cfg(unix)]
+#[test]
+fn every_padding_leaves_the_filesystem_to_the_last_look() {
+    let f = with_links();
+    let e = f.engine(Duration::ZERO);
+    let mut wrong = Vec::new();
+    for (part, size) in SHAPES {
+        for tail in ["cat link", "cat .en*", "cat keys/id_rsa"] {
+            let got = e.evaluate(&padded(part, *size, tail));
+            if !got.is_deny() {
+                wrong.push(format!("{part:?} + {tail}: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "not denied:\n{}", wrong.join("\n"));
+}
+
+/// A link or a glob to nothing a rule guards stays the timeout it was, and a
+/// directory link is judged by where it goes.
+#[cfg(unix)]
+#[test]
+fn what_resolves_to_nothing_guarded_stays_a_recorded_timeout() {
+    let f = with_links();
+    let e = f.engine(Duration::ZERO);
+    for cmd in [
+        "cat plain",
+        "cat not*",
+        "cat missing*",
+        "cat keys/nothing",
+        "ls keys",
+    ] {
+        let want = f.engine(Duration::from_secs(60)).evaluate(cmd);
+        assert!(!want.is_deny(), "{cmd}: {want:?}");
+        assert_eq!(e.evaluate(cmd), timeout(), "{cmd}");
+        assert_eq!(
+            e.evaluate(&behind_the_padding(cmd)),
+            timeout(),
+            "padded {cmd}"
+        );
+    }
+}
+
+/// `pwsh` on a POSIX host reads the line itself, and the same look follows it.
+#[cfg(unix)]
+#[test]
+fn the_last_look_follows_them_under_a_reader() {
+    use saiifeguard::payload::Dialects;
+    use saiifeguard::wintable::Dialect::PowerShell;
+    let f = with_links();
+    let e = f.engine(Duration::ZERO);
+    for cmd in ["Get-Content link", "Get-Content .en*", "gc keys/id_rsa"] {
+        let got = e.evaluate_call(cmd, Dialects::One(PowerShell));
+        assert!(got.is_deny(), "{cmd}: {got:?}");
     }
 }
