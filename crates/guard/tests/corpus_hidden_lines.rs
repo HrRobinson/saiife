@@ -422,6 +422,64 @@ fn a_pipe_into_a_compound_command_feeds_every_command_in_it() {
     assert_unjudged(&["echo 'ls' | if true; then sh"]);
 }
 
+/// A compound command after `time -p`, `coproc [NAME]` or `function NAME
+/// [()]` opens a block of its own: its closer must not close the block the
+/// pipe feeds. Nor does a `}` that is an argument (`echo }`).
+#[test]
+fn a_block_after_time_coproc_or_function_keeps_the_pipe_fed() {
+    assert_judged_as_inner(&[
+        "echo 'CMD' | { time -p if true; then :; fi; sh; }",
+        "echo 'CMD' | if true; then time -p if true; then :; fi; sh; fi",
+        "echo 'CMD' | if true; then time -p -- if true; then :; fi; sh; fi",
+        "echo 'CMD' | while true; do time -p while false; do :; done; sh; break; done",
+        "echo 'CMD' | if true; then coproc if true; then :; fi; sh; fi",
+        "echo 'CMD' | if true; then coproc C if true; then :; fi; sh; fi",
+        "echo 'CMD' | while true; do coproc while false; do :; done; sh; break; done",
+        "echo 'CMD' | while true; do coproc W while false; do :; done; sh; break; done",
+        "echo 'CMD' | case a in a) coproc case b in b) :;; esac; sh;; esac",
+        "echo 'CMD' | if true; then function f () if true; then :; fi; sh; fi",
+        "echo 'CMD' | if true; then function f if true; then :; fi; sh; fi",
+        "echo 'CMD' | if true; then function f () { :; }; sh; fi",
+        "echo 'CMD' | { echo }; sh; }",
+        "echo 'CMD' | { echo 'if'; sh; }",
+        "echo 'CMD' | { echo \"if\"; sh; }",
+    ]);
+}
+
+/// Fail closed: inside a block a pipe feeds, an opener word anywhere opens a
+/// block, and a closer that would end a block whose openers and closers do
+/// not balance keeps the line fed, with a shell in it recorded as unjudged.
+#[test]
+fn an_unbalanced_block_keeps_the_pipe_fed() {
+    assert_judged_as_inner(&[
+        "echo 'CMD' | if true; then echo if; fi; sh",
+        "echo 'CMD' | while true; do echo done; break; done; sh",
+    ]);
+    assert_unjudged(&[
+        "echo 'ls' | if true; then echo if; fi; sh",
+        "echo 'ls' | { echo }; sh; }",
+        "echo 'ls' | while true; do echo done; break; done; sh",
+    ]);
+}
+
+/// The ordinary lines around those shapes: nothing in them reads the pipe as
+/// a script, and a quoted opener word is data.
+#[test]
+fn ordinary_blocks_after_time_coproc_or_function_stay_allowed() {
+    assert_clean(&[
+        "echo hi | { time -p cat; }",
+        "echo hi | time -p cat",
+        "printf x | while read l; do if [ -n \"$l\" ]; then echo \"$l\"; fi; done",
+        "printf x | while read l; do echo done; done",
+        "echo hi | { echo if; }",
+        "echo 'rm -rf /' | { echo 'if'; }; sh",
+        "echo 'rm -rf /' | { time -p if true; then cat; fi; }; sh",
+        "echo 'rm -rf /' | if true; then coproc C { cat; }; fi; sh",
+        "echo 'rm -rf /' | if true; then function f () { cat; }; fi; sh",
+        "time -p if true; then :; fi; sh -c ls",
+    ]);
+}
+
 #[test]
 fn a_compound_command_reading_a_pipe_stays_allowed() {
     assert_clean(&[

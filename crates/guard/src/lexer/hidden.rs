@@ -85,6 +85,11 @@ struct Group {
     open: Opener,
     source: Source,
     start: usize,
+    /// The openers and closers seen on this line when it opened, its own
+    /// opener counted. Inside a fed frame every opener opens a frame, so
+    /// while this one is on top they balance unless a closer since closed
+    /// nothing; then where it ends is not known.
+    seen: (usize, usize),
 }
 
 /// A reserved word that opens or closes a compound command, where a command
@@ -101,12 +106,66 @@ fn compound_word(text: &str) -> Option<(Opener, bool)> {
     })
 }
 
-/// A reserved word after which a command still starts (`then if`, `! while`).
-fn keeps_command_start(text: &str) -> bool {
-    matches!(
-        text,
-        "!" | "time" | "then" | "do" | "else" | "elif" | "if" | "while" | "until"
-    )
+/// Where the current segment's words so far leave the next word: at a
+/// command start, or after the words of `time`, `coproc` or `function` that
+/// a command or a compound command may still follow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Head {
+    /// A command starts here (`then if`, `! while`).
+    Start,
+    /// After `time` and its `-p` or `--`.
+    Time,
+    /// After `coproc`: its NAME, a command or a compound command.
+    Coproc,
+    /// After `coproc WORD`: WORD was its NAME when a compound command
+    /// follows, else the command, so only an opener counts here.
+    CoprocName,
+    /// After `function`: its NAME.
+    Function,
+    /// No command starts here.
+    No,
+}
+
+impl Head {
+    /// Where the word `w` leaves the next word.
+    fn next(self, w: &Word) -> Head {
+        if w.quoted {
+            return Head::No;
+        }
+        let t = w.text.as_str();
+        match self {
+            Head::Time if matches!(t, "-p" | "--") => Head::Time,
+            Head::Start | Head::Time => match t {
+                "!" | "then" | "do" | "else" | "elif" | "if" | "while" | "until" => Head::Start,
+                "time" => Head::Time,
+                "coproc" => Head::Coproc,
+                "function" => Head::Function,
+                _ => Head::No,
+            },
+            Head::Coproc if compound_word(t).is_some() => Head::Start.next(w),
+            Head::Coproc => Head::CoprocName,
+            Head::CoprocName if compound_word(t).is_some_and(|(_, open)| open) => {
+                Head::Start.next(w)
+            }
+            // `function NAME`: its body comes next (`function f if …`), or
+            // `()`, which ends the segment.
+            Head::Function => Head::Start,
+            Head::CoprocName | Head::No => Head::No,
+        }
+    }
+
+    /// A compound word here opens a block.
+    fn opens(self) -> bool {
+        matches!(
+            self,
+            Head::Start | Head::Time | Head::Coproc | Head::CoprocName
+        )
+    }
+
+    /// A compound word here closes a block.
+    fn closes(self) -> bool {
+        matches!(self, Head::Start | Head::Time | Head::Coproc)
+    }
 }
 
 /// How a shell fed by a pipe or a here-string runs it.
@@ -141,14 +200,17 @@ impl Out {
         let mut pipe: Option<Source> = None;
         // What the current segment reads.
         let mut fed: Option<Source> = None;
-        // The current segment so far is reserved words a command may follow.
-        let mut head = true;
+        // Where the current segment's words so far leave the next word.
+        let mut head = Head::Start;
         // The current segment comes right after a group's `)` or `}`.
         let mut after_group = false;
         // Frames a pipe feeds, innermost last: until each closes, every
         // command in it reads that pipe. No allocation until a pipe feeds a
         // group or a compound command.
         let mut groups: Vec<Group> = Vec::new();
+        // The unquoted openers and closers of blocks seen so far, wherever
+        // they stand: a frame closes only if they balance since it opened.
+        let mut seen = (0usize, 0usize);
         for tok in toks {
             match tok {
                 LexTok::Word(w) => {
@@ -157,40 +219,50 @@ impl Out {
                             .take()
                             .or_else(|| groups.last().map(|g| g.source.clone()))
                             .or_else(|| outer.clone());
-                        head = true;
+                        head = Head::Start;
                     }
-                    if head && !w.quoted {
+                    if !w.quoted {
                         match compound_word(&w.text) {
+                            // Inside a fed frame, an opener anywhere opens
+                            // one: one that is an argument (`echo if`)
+                            // only keeps the pipe fed for longer.
                             Some((open, true)) => {
-                                if let Some(source) = fed.clone() {
-                                    groups.push(Group {
-                                        open,
-                                        source,
-                                        start: self.segments.len(),
-                                    });
+                                seen.0 += 1;
+                                if head.opens() || !groups.is_empty() {
+                                    if let Some(source) = fed.clone() {
+                                        groups.push(Group {
+                                            open,
+                                            source,
+                                            start: self.segments.len(),
+                                            seen,
+                                        });
+                                    }
                                 }
                             }
-                            Some((close, false))
-                                if groups.last().is_some_and(|g| g.open == close) =>
-                            {
-                                groups.pop();
+                            Some((close, false)) if head.closes() => {
+                                close_frame(&mut groups, close, &mut seen);
                             }
-                            _ => {}
+                            // An argument (`echo done`): it closes nothing.
+                            Some(_) => seen.1 += 1,
+                            None => {}
                         }
                     }
-                    head &= !w.quoted && keeps_command_start(&w.text);
+                    head = head.next(&w);
                     current.push(w);
                 }
                 LexTok::Operator(op) => {
                     let ended = !current.is_empty();
+                    // The segment it ends is a compound command's last
+                    // (`fi`), or comes right after a group's: a `}` here
+                    // still closes a group, as one with no command before.
+                    let closes = after_group
+                        || current.first().is_some_and(|w| {
+                            !w.quoted && matches!(w.text.as_str(), "fi" | "done" | "esac")
+                        });
                     let source = ended.then(|| {
                         let seg = std::mem::take(&mut current);
                         // `fi <<< 'x'`, `} <<< 'x'`: the compound command
                         // before reads the here-string.
-                        let closes = after_group
-                            || seg.first().is_some_and(|w| {
-                                !w.quoted && matches!(w.text.as_str(), "fi" | "done" | "esac")
-                            });
                         let at = self.finish(seg, fed.take(), ctx, depth, false);
                         if closes {
                             self.compound_here_string(first, at, ctx, depth);
@@ -199,6 +271,7 @@ impl Out {
                     });
                     match op {
                         Operator::LParen | Operator::LBrace => {
+                            seen.0 += 1;
                             let feeds = pipe
                                 .take()
                                 .filter(|_| !ended)
@@ -212,19 +285,18 @@ impl Out {
                                     },
                                     source,
                                     start: self.segments.len(),
+                                    seen,
                                 });
                             }
                         }
-                        Operator::RParen | Operator::RBrace => {
-                            let opens = if op == Operator::RParen {
-                                Opener::Paren
-                            } else {
-                                Opener::Brace
-                            };
-                            if groups.last().is_some_and(|g| g.open == opens) {
-                                groups.pop();
-                            }
-                        }
+                        // A `case` pattern's `)` closes nothing.
+                        Operator::RParen
+                            if groups.last().is_some_and(|g| g.open == Opener::Case) => {}
+                        Operator::RParen => close_frame(&mut groups, Opener::Paren, &mut seen),
+                        // `}` after a command's words is one of them, as in
+                        // bash (`echo }`): it closes nothing.
+                        Operator::RBrace if ended && !closes => seen.1 += 1,
+                        Operator::RBrace => close_frame(&mut groups, Opener::Brace, &mut seen),
                         _ => {}
                     }
                     after_group = matches!(op, Operator::RParen | Operator::RBrace);
@@ -247,8 +319,10 @@ impl Out {
                 self.compound_here_string(first, at, ctx, depth);
             }
         }
-        // A frame that never closed (an unbalanced block): what is in it was
-        // judged as fed, but where the pipe goes is not known.
+        // A frame that never closed (an unbalanced block, or one a closer
+        // could not end because its openers and closers did not balance):
+        // what is in it and after it was judged as fed, but where the pipe
+        // goes is not known.
         if let Some(open) = groups.first() {
             let start = open.start.min(self.segments.len());
             if self.segments[start..]
@@ -411,6 +485,20 @@ impl Out {
         let toks = lex_in(&mut Chars::new(text), ctx, depth + 1, false, false, false).toks;
         self.collect(toks, ctx, depth + 1, outer);
     }
+}
+
+/// A closer of a `kind` block: it ends the innermost frame if that is one,
+/// and only if the openers and closers since it opened balance. Otherwise
+/// the frame stays and keeps feeding the rest of the line, fail closed: the
+/// line is then recorded as unjudged where a shell reads it.
+fn close_frame(groups: &mut Vec<Group>, kind: Opener, seen: &mut (usize, usize)) {
+    if groups
+        .last()
+        .is_some_and(|g| g.open == kind && seen.0 - g.seen.0 == seen.1 - g.seen.1)
+    {
+        groups.pop();
+    }
+    seen.1 += 1;
 }
 
 /// Pay `bytes` from the line's hidden-line bytes; false, and the line is
