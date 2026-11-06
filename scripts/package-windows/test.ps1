@@ -5,7 +5,10 @@
   installs and removes a real service and writes under C:\ProgramData and C:\Program Files.
 
 .DESCRIPTION
-  test.ps1 -Exe target\ci-locked\saiife.exe -Version 0.4.0 -LogDir target\package-windows-logs
+  test.ps1 -Exe target\release\saiife.exe -Version 0.4.0 -LogDir target\package-windows-logs
+
+  The release build: the MSI's install action has no --allow-test-build, so it refuses a
+  test build (debug assertions on) and every install would roll back.
 
   Checks, in this order, on a machine with no saiife:
     1. a fleet config that saiife refuses: the MSI fails, rolls back, and
@@ -67,6 +70,29 @@ function Invoke-Msi([string[]]$msiArgs, [string]$log) {
   $p = Start-Process -FilePath msiexec.exe -ArgumentList ($msiArgs + @('/qn', '/l*v', "`"$log`"")) -Wait -PassThru
   return $p.ExitCode
 }
+# What failed, in the job output: the uploaded log is not where a reader looks first. The
+# program's own lines (WixQuietExec copies them to the log) and the lines before the first
+# failed action ("Return value 3").
+function Show-MsiFailure([string]$log) {
+  if (-not (Test-Path -LiteralPath $log)) { Write-Output "  (no msi log at $log)"; return }
+  $lines = @(Get-Content -LiteralPath $log)
+  Write-Output "  -- ${log}: the saiife lines"
+  $lines | Where-Object { $_ -match 'WixQuietExec|saiife:' } | Select-Object -First 60 | ForEach-Object { Write-Output "  $_" }
+  $at = -1
+  for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match 'Return value 3') { $at = $i; break } }
+  if ($at -ge 0) {
+    Write-Output "  -- ${log}: before 'Return value 3' (line $($at + 1))"
+    $lines[([Math]::Max(0, $at - 40))..$at] | ForEach-Object { Write-Output "  $_" }
+  } else {
+    Write-Output "  -- ${log}: no 'Return value 3'; the last lines"
+    $lines | Select-Object -Last 40 | ForEach-Object { Write-Output "  $_" }
+  }
+}
+function Service-Status {
+  $s = Get-Service -Name saiifed -ErrorAction SilentlyContinue
+  if ($null -eq $s) { return 'missing' }
+  return [string]$s.Status
+}
 function Invoke-Detect {
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $detect *> $null
   return $LASTEXITCODE
@@ -124,8 +150,11 @@ $agents = 'claude,codex,gemini'
 Group 'a broken fleet file rolls back'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 (Config-B64 "version = 2`nlocked = false`n") -Agents $agents
 Check ($LASTEXITCODE -eq 0) 'fleet-files.ps1 wrote the broken config'
-$rc = Invoke-Msi @('/i', "`"$msi1`"") (Join-Path $LogDir 'msi-broken.log')
+$blog = Join-Path $LogDir 'msi-broken.log'
+$rc = Invoke-Msi @('/i', "`"$msi1`"") $blog
 Check ($rc -ne 0) "the MSI failed (exit $rc)"
+# Printed so a reader sees the refusal is the config's, not something else's.
+Show-MsiFailure $blog
 Check (-not (Test-Path -LiteralPath $programFiles)) "$programFiles is gone after the rollback"
 Check (-not (Service-Exists)) 'no service was left behind'
 Reset-Machine
@@ -137,10 +166,12 @@ Group 'install'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fleetFiles -ConfigB64 $goodConfig -Agents $agents
 Check ($LASTEXITCODE -eq 0) 'fleet-files.ps1 wrote the fleet files'
 Check ((Invoke-Detect) -eq 1) 'detect.ps1 exits 1 before the install'
-$rc = Invoke-Msi @('/i', "`"$msi1`"") (Join-Path $LogDir 'msi-install.log')
+$ilog = Join-Path $LogDir 'msi-install.log'
+$rc = Invoke-Msi @('/i', "`"$msi1`"") $ilog
 Check ($rc -eq 0) "msiexec /i exits 0 (got $rc)"
+if ($rc -ne 0) { Show-MsiFailure $ilog }
 Check (Service-Exists) 'the service exists'
-Check ((Get-Service -Name saiifed -ErrorAction SilentlyContinue).Status -eq 'Running') 'the service is running'
+Check ((Service-Status) -eq 'Running') "the service is running ($(Service-Status))"
 Check (Test-Path -LiteralPath (Join-Path $programFiles 'saiife.exe')) 'the staging copy is in Program Files'
 Check (Test-Path -LiteralPath $bin) 'the daemon copy is in ProgramData'
 & $bin doctor *> (Join-Path $LogDir 'doctor-install.txt')
@@ -165,9 +196,11 @@ foreach ($f in $managed) {
 }
 $pid1 = Service-Pid
 $since = Get-Date
-$rc = Invoke-Msi @('/i', "`"$msi2`"") (Join-Path $LogDir 'msi-upgrade.log')
+$glog = Join-Path $LogDir 'msi-upgrade.log'
+$rc = Invoke-Msi @('/i', "`"$msi2`"") $glog
 Check ($rc -eq 0) "the upgrade exits 0 (got $rc)"
-Check ((Get-Service -Name saiifed -ErrorAction SilentlyContinue).Status -eq 'Running') 'the service runs after the upgrade'
+if ($rc -ne 0) { Show-MsiFailure $glog }
+Check ((Service-Status) -eq 'Running') "the service runs after the upgrade ($(Service-Status))"
 $pid2 = Service-Pid
 Check (($null -ne $pid1) -and ($null -ne $pid2) -and ($pid1 -ne $pid2)) "the service restarted ($pid1 -> $pid2)"
 # Service Control Manager event 7036 says "... entered the running state" once per start.

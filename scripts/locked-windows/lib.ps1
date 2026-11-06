@@ -307,12 +307,29 @@ function Get-DaemonLogTail {
   return '(no daemon.log)'
 }
 
+# The lines of a file another process may hold open for writing, such as the month file the
+# daemon appends to. [IO.File]::ReadLines asks for FileShare.Read, which refuses to coexist
+# with that writer (a sharing violation); this one shares read, write and delete, as the
+# daemon's own open does (std's default share mode).
+function Read-SharedLines([string]$Path) {
+  $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+  $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+  try {
+    $reader = [System.IO.StreamReader]::new($fs, [System.Text.UTF8Encoding]::new($false))
+    try {
+      $lines = [System.Collections.Generic.List[string]]::new()
+      while ($null -ne ($line = $reader.ReadLine())) { $lines.Add($line) }
+      return , $lines.ToArray()
+    } finally { $reader.Dispose() }
+  } finally { $fs.Dispose() }
+}
+
 # Every audit record, month files in order.
 function Get-Records {
   if (-not (Test-Path -LiteralPath $Script:AuditDir)) { return @() }
   $files = Get-ChildItem -LiteralPath $Script:AuditDir -Filter '*.jsonl' -File | Sort-Object Name
   $out = foreach ($f in $files) {
-    foreach ($line in [System.IO.File]::ReadLines($f.FullName)) {
+    foreach ($line in (Read-SharedLines $f.FullName)) {
       if ($line) { $line | ConvertFrom-Json -Depth 32 }
     }
   }
@@ -585,9 +602,14 @@ function Test-Row([string]$Path, [string]$Row, [string]$ActualText) {
     if (((Get-Grants $got) -join ',') -ne ((Get-Grants $want) -join ',')) { return "grants differ: $ActualText, want $Row" }
     return ''
   }
+  # Each ACE exact, but as a set: Get-Acl's .Sddl comes from .NET's CommonAcl, which sorts
+  # explicit ACEs of one kind by SID (S-1-5-32-545 before S-1-5-80-...), so the order on disk
+  # cannot be seen here (CI round 8: `log` read BU before the service, the row says the
+  # reverse, and doctor's files.acl, which reads the raw descriptor in order, passed). Every
+  # row is allow-only, so a deny ACE still differs. doctor checks the order.
+  $aceSet = { param($sd) (@($sd.Aces | ForEach-Object { "$($_.Type) $($_.Flags -join '') $($_.Sid) $($_.Mask)" } | Sort-Object) -join ',') }
   $exact = $got.Owner -eq $want.Owner -and $got.Group -eq $want.Group -and $got.Protected -eq $want.Protected -and
-  ((@($got.Aces | ForEach-Object { "$($_.Type) $($_.Flags -join '') $($_.Sid) $($_.Mask)" }) -join ',') -ceq
-    (@($want.Aces | ForEach-Object { "$($_.Type) $($_.Flags -join '') $($_.Sid) $($_.Mask)" }) -join ','))
+  ((& $aceSet $got) -ceq (& $aceSet $want))
   if ($exact) { return '' }
   # Below `etc`, what an admin added may inherit and be owned by Administrators (ruling).
   if ($Path.ToLowerInvariant().StartsWith("$($Script:EtcDir.ToLowerInvariant())\")) {

@@ -439,8 +439,9 @@ jobs:
   # rolls the MSI back, install, upgrade (one restart, managed files unchanged), the
   # uninstall warning in msi.log, detect.ps1 and the .intunewin header. The runner is an
   # administrator and throwaway, and scripts/package-windows/test.ps1 refuses to run
-  # anywhere else. No secrets: the MSI is unsigned. The ci-locked build, as for the other
-  # package jobs.
+  # anywhere else. No secrets: the MSI is unsigned. The release build, as package-linux
+  # uses: the MSI runs `system install` with no --allow-test-build, which refuses a
+  # ci-locked build (debug assertions on), so a test build could only test the rollback.
   package-windows:
     runs-on: windows-2025
     timeout-minutes: 45
@@ -450,13 +451,13 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo build --locked --profile ci-locked --bin saiife
+      - run: cargo build --release --locked --bin saiife
       - name: build, install, upgrade and remove the MSI
         shell: pwsh
         run: |
           $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object { $_.name -eq 'saiife' } | Select-Object -ExpandProperty version
-          ./scripts/package-windows/test.ps1 -Exe target/ci-locked/saiife.exe -Version $ver `
+          ./scripts/package-windows/test.ps1 -Exe target/release/saiife.exe -Version $ver `
             -LogDir "$env:GITHUB_WORKSPACE/target/package-windows-logs" -OutDir "$env:GITHUB_WORKSPACE/target/package-windows-dist"
       - name: upload logs
         if: failure()
