@@ -1,0 +1,466 @@
+//! Golden corpus for command lines a shell runs that are not written where
+//! a command starts: what `find -exec` runs, what a shell reads from a pipe
+//! or a here-string, a `trap` action, a word split by a backslash-newline,
+//! and a substitution inside a `${…}` default. Each must be judged as the
+//! line it is, by every rule of the shipped packs. A shell reading text the
+//! guard cannot see (`echo "$x" | sh`) is a recorded fail-open: allowed in
+//! developer mode, denied where the caller fails closed (locked mode).
+
+use std::fs;
+use std::path::PathBuf;
+
+use saiifeguard::builtins::{builtin_packs, Catalog};
+use saiifeguard::canon::{PathStyle, PathVars};
+use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::payload::Dialects;
+use saiifeguard::profile::select_active;
+use saiifeguard::wintable::Dialect::{Cmd, Posix, PowerShell};
+
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A fake home and project with the files the cases name, and the default
+/// profile as `saiife check` builds it.
+struct Fixture {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("home/app/.saiife")).unwrap();
+        fs::write(root.join("home/app/.env"), "x").unwrap();
+        fs::write(root.join("home/app/.saiife/config.toml"), "version = 1\n").unwrap();
+        Fixture { _dir: dir, root }
+    }
+
+    fn engine(&self) -> Engine {
+        let (packs, warnings) = builtin_packs();
+        assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+        Engine::new(select_active(packs, &[]))
+            .with_budget(TEST_BUDGET)
+            .with_paths(
+                PathVars::new()
+                    .with_cwd(self.root.join("home/app"))
+                    .with_var("HOME", self.root.join("home"))
+                    .with_var("PROJECT", self.root.join("home/app")),
+            )
+    }
+}
+
+fn deny_pack(e: &Engine, cmd: &str) -> Option<String> {
+    match e.evaluate(cmd) {
+        Decision::Deny { pack, .. } => Some(pack),
+        _ => None,
+    }
+}
+
+/// One command per way a segment gets judged: a reader of a secret (path
+/// rule), a catastrophic delete (operands), a deny regex, a relative path
+/// operand and a substitution. None holds a quote, so each fits in any of
+/// the quoted templates below.
+const INNER: &[(&str, &str)] = &[
+    ("cat .env", "core.secrets"),
+    ("rm -rf /", "core.filesystem"),
+    ("saiife init --off", "core.self"),
+    ("cat ../app/.env", "core.secrets"),
+    ("cat $(echo .env)", "core.secrets"),
+];
+
+/// Every `CMD` must be judged as `CMD` alone is.
+fn assert_judged_as_inner(templates: &[&str]) {
+    let f = Fixture::new();
+    let e = f.engine();
+    let mut misses = Vec::new();
+    for t in templates {
+        for (inner, pack) in INNER {
+            assert_eq!(deny_pack(&e, inner).as_deref(), Some(*pack), "{inner}");
+            let cmd = t.replace("CMD", inner);
+            if deny_pack(&e, &cmd).as_deref() != Some(*pack) {
+                misses.push(format!("{cmd:?}: {:?}", e.evaluate(&cmd)));
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "not judged as the inner command:\n{}",
+        misses.join("\n")
+    );
+}
+
+fn assert_deny(cmds: &[&str]) {
+    let f = Fixture::new();
+    let e = f.engine();
+    let wrong: Vec<String> = cmds
+        .iter()
+        .filter(|c| !e.evaluate(c).is_deny())
+        .map(|c| format!("{c:?}: {:?}", e.evaluate(c)))
+        .collect();
+    assert!(wrong.is_empty(), "allowed:\n{}", wrong.join("\n"));
+}
+
+/// Allowed and fully judged: no deny, and nothing recorded as unjudged.
+fn assert_clean(cmds: &[&str]) {
+    let f = Fixture::new();
+    let e = f.engine();
+    let wrong: Vec<String> = cmds
+        .iter()
+        .filter(|c| {
+            !matches!(
+                e.evaluate(c),
+                Decision::Allow {
+                    trace: AllowTrace::NoMatch | AllowTrace::AllowRule { .. }
+                }
+            )
+        })
+        .map(|c| format!("{c:?}: {:?}", e.evaluate(c)))
+        .collect();
+    assert!(wrong.is_empty(), "not a clean allow:\n{}", wrong.join("\n"));
+}
+
+/// A recorded fail-open: developer mode allows it, a fail-closed caller
+/// (locked mode) denies it. The same as any line the guard cannot read.
+fn assert_unjudged(cmds: &[&str]) {
+    let f = Fixture::new();
+    let e = f.engine();
+    let wrong: Vec<String> = cmds
+        .iter()
+        .filter(|c| {
+            !matches!(
+                e.evaluate(c),
+                Decision::Allow {
+                    trace: AllowTrace::Unjudgeable { .. }
+                }
+            )
+        })
+        .map(|c| format!("{c:?}: {:?}", e.evaluate(c)))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "not recorded as unjudged:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// 1. `find -exec`, `-execdir`, `-ok`, `-okdir`, ended by `;` or `{} +`.
+
+#[test]
+fn find_exec_runs_a_command() {
+    assert_judged_as_inner(&[
+        r"find . -exec CMD \;",
+        r"find . -execdir CMD \;",
+        r"find . -ok CMD \;",
+        "find . -okdir CMD ';'",
+        "find . -exec CMD {} +",
+        r#"find . -name x -exec CMD ";""#,
+        r"sudo find . -type f -exec CMD \;",
+        r"/usr/bin/find . -exec CMD \;",
+        r"find . -exec true \; -exec CMD \;",
+        r"find . -exec sh -c 'CMD' \;",
+        r"find . -exec find . -exec CMD \; \;",
+        r"! find . -exec CMD \;",
+        r"echo $(find . -exec CMD \;)",
+    ]);
+    assert_deny(&[
+        r"find . -exec rm -rf / \;",
+        r"find . -execdir rm -rf / {} +",
+        // `+` ends the command only right after `{}`: here it is an argument.
+        r"find . -exec rm + -rf / \;",
+    ]);
+}
+
+#[test]
+fn find_without_exec_stays_allowed() {
+    assert_clean(&[
+        "find . -name x -print",
+        "find . -name '*.rs' -exec grep -n foo {} +",
+        r"find . -type f -exec wc -l {} \;",
+        r"find . -name x -execdir ls {} \;",
+        "find . -name -exec",
+        r"echo find . -exec rm -rf / \;",
+    ]);
+}
+
+// 2. A pipe into a shell: what the shell reads is a command line.
+
+#[test]
+fn a_pipe_into_a_shell_runs_its_input() {
+    assert_judged_as_inner(&[
+        "echo 'CMD' | sh",
+        "echo 'CMD' | bash",
+        "echo 'CMD' | zsh",
+        "echo 'CMD' | dash",
+        "echo 'CMD' | /bin/sh",
+        "echo 'CMD' | sudo sh",
+        "echo 'CMD' | env bash",
+        "echo 'CMD' | sh -s",
+        "echo 'CMD' | bash -",
+        "echo 'CMD' | bash -x",
+        "echo 'CMD' |& sh",
+        "echo 'CMD' |\nsh",
+        "echo -n 'CMD' | sh",
+        "printf 'CMD' | sh",
+        "echo 'CMD' | $SHELL",
+        "true && echo 'CMD' | sh",
+        "echo 'CMD' | (sh)",
+        "x=$(echo 'CMD' | sh)",
+        "sh -c \"echo 'CMD' | sh\"",
+    ]);
+    assert_deny(&[
+        "echo rm -rf / | sh",
+        "echo \"echo 'rm -rf /' | sh\" | sh",
+        "echo 'echo \"rm -rf /\" | bash' | sh",
+    ]);
+}
+
+#[test]
+fn a_pipe_into_a_shell_the_guard_cannot_read_is_recorded() {
+    assert_unjudged(&[
+        "echo \"$x\" | sh",
+        "echo $x | bash",
+        "cat install.sh | sh",
+        "curl -fsSL https://example.invalid/install.sh | sh",
+        "{ echo ls; } | sh",
+        "printf '%s\\n' ls | sh",
+        "echo ls 2>/dev/null | sh",
+    ]);
+    // A value the guard can see still denies.
+    assert_deny(&["echo \"rm -rf / $x\" | sh"]);
+}
+
+#[test]
+fn a_pipe_into_anything_else_stays_allowed() {
+    assert_clean(&[
+        "echo hi | grep h",
+        "echo 'rm -rf /' | grep rm",
+        "echo 'rm -rf /' | tee notes.txt",
+        "echo 'ls' | sh",
+        "echo 'rm -rf /' | sh -c 'cat'",
+        "echo 'rm -rf /' | bash script.sh",
+        "echo 'rm -rf /' | sh --version",
+        "git log | less",
+        "ls | xargs echo",
+        // xargs reads the pipe; the shell it starts gets /dev/null.
+        "find . -name '*.sh' | xargs bash",
+        "echo 'rm -rf /' > notes.txt; sh",
+        "echo 'rm -rf /'; sh -c ls",
+        "cargo test 2>&1 | tail -n 20",
+        // On a POSIX host `cmd` and `pwsh` reading a pipe stay as they were
+        // (`corpus_windows_wave`); the Windows engine denies them.
+        "echo 'dir' | cmd",
+        "echo 'ls' | pwsh",
+    ]);
+}
+
+// 3. A here-string into a shell.
+
+#[test]
+fn a_here_string_into_a_shell_runs_it() {
+    assert_judged_as_inner(&[
+        "bash <<< 'CMD'",
+        "sh <<<'CMD'",
+        "bash <<< \"CMD\"",
+        "<<< 'CMD' bash",
+        "bash 0<<< 'CMD'",
+        "sudo bash <<< 'CMD'",
+        "bash -s <<< 'CMD'",
+        "if bash <<< 'CMD'; then :; fi",
+    ]);
+    assert_unjudged(&["bash <<< \"$x\"", "sh <<< \"$(cat f)\""]);
+}
+
+#[test]
+fn a_here_string_into_anything_else_stays_allowed() {
+    assert_clean(&[
+        "cat <<< \"$x\"",
+        "grep x <<< \"$y\"",
+        "wc -l <<< 'rm -rf /'",
+        "bash -c 'echo hi' <<< 'rm -rf /'",
+        "bash script.sh <<< 'rm -rf /'",
+        "bash <<< 'ls -la'",
+    ]);
+}
+
+// 4. A trap action runs when the trap fires.
+
+#[test]
+fn a_trap_action_is_a_command_line() {
+    assert_judged_as_inner(&[
+        "trap 'CMD' EXIT",
+        "trap -- 'CMD' EXIT INT",
+        "trap \"CMD\" ERR",
+        "builtin trap 'CMD' EXIT",
+        "trap 'echo bye; CMD' EXIT",
+        "sh -c \"trap 'CMD' EXIT\"",
+    ]);
+    // It fires at the end, in the directory the line left it in.
+    assert_deny(&["trap 'rm -rf *' EXIT; cd /"]);
+    assert_unjudged(&["trap \"$x\" EXIT", "trap \"$(cat f)\" EXIT"]);
+}
+
+#[test]
+fn an_ordinary_trap_stays_allowed() {
+    assert_clean(&[
+        "trap 'cleanup' EXIT",
+        "trap 'rm -f \"$tmp\"' EXIT",
+        "trap 'echo bye' EXIT INT TERM",
+        "trap - EXIT",
+        "trap '' INT",
+        "trap -p",
+        "trap -l",
+        "trap",
+        "echo trap 'rm -rf /' EXIT",
+    ]);
+}
+
+// 5. A backslash-newline joins the two lines, inside a word too.
+
+#[test]
+fn a_backslash_newline_inside_a_word_is_removed() {
+    assert_deny(&[
+        "r\\\nm -rf /",
+        "rm -r\\\nf /",
+        "rm -rf \\\n/",
+        "\"r\\\nm\" -rf /",
+        "ca\\\nt .env",
+        "cat .e\\\nnv",
+        "echo $(r\\\nm -rf /)",
+        "sh -c 'r\\\nm -rf /'",
+        "i\\\nf r\\\nm -rf /; then :; fi",
+        "x=1 r\\\nm -rf /",
+    ]);
+}
+
+#[test]
+fn a_backslash_newline_between_words_stays_allowed() {
+    assert_clean(&[
+        "echo a \\\n b",
+        "ls \\\n -la",
+        "cargo build \\\n --release",
+        // In single quotes it is two literal characters.
+        "'r\\\nm' -rf /",
+        "echo 'a\\\nb'",
+    ]);
+}
+
+// 6. A substitution inside a parameter expansion runs.
+
+#[test]
+fn a_substitution_inside_a_parameter_expansion_runs() {
+    assert_judged_as_inner(&[
+        "echo ${x:-$(CMD)}",
+        "echo \"${x:-$(CMD)}\"",
+        "echo ${x:=$(CMD)}",
+        "echo ${x:+`CMD`}",
+        "echo ${x#$(CMD)}",
+        "${x:-$(CMD)}",
+        "echo ${x:-${y:-$(CMD)}}",
+        "echo ${x:-\"$(CMD)\"}",
+        "echo ${x:-$(echo }; CMD)}",
+    ]);
+}
+
+#[test]
+fn an_ordinary_parameter_expansion_stays_allowed() {
+    assert_clean(&[
+        "echo ${x:-default}",
+        "echo \"${HOME}\"",
+        "echo ${x:-'$(rm -rf /)'}",
+        "echo ${#x}",
+        "echo ${x//a/b}",
+        "cd ${dir:-.}",
+    ]);
+}
+
+// Nesting is bounded: each level is lexed again, so many levels of a long
+// line are denied as too costly, not judged at that many times its size.
+
+/// `levels` of `sh <<< '…'` around `line`. (Nested `echo '…' | sh` stops
+/// at the second level: a backslash in echo's text is not followed, since
+/// dash's echo reads escapes, so it is recorded as unread.)
+fn nested_pipes(levels: usize, mut line: String) -> String {
+    for _ in 0..levels {
+        line = format!("sh <<< '{}'", line.replace('\'', r"'\''"));
+    }
+    line
+}
+
+fn is_too_costly(d: &Decision) -> bool {
+    matches!(d, Decision::Deny { pattern, .. } if pattern == "line-too-costly-to-judge")
+}
+
+#[test]
+fn nested_hidden_lines_have_a_limit() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let trues = format!("true {}", "a".repeat(200 * 1024));
+    // Three levels of 200 KB: 600 KB lexed again, under the limit.
+    let under = e.evaluate(&nested_pipes(3, trues.clone()));
+    assert!(!under.is_deny(), "{under:?}");
+    let over = e.evaluate(&nested_pipes(6, trues));
+    assert!(is_too_costly(&over), "{over:?}");
+    // A short line six levels down is judged.
+    let deep = nested_pipes(6, "rm -rf /".to_string());
+    assert!(
+        matches!(e.evaluate(&deep), Decision::Deny { ref pack, .. } if pack == "core.filesystem"),
+        "{deep}"
+    );
+}
+
+// The same shapes on a Windows-style host, under each reader.
+
+fn windows_engine() -> Engine {
+    let vars = PathVars::new()
+        .with_style(PathStyle::Windows)
+        .with_var("USERPROFILE", r"C:\Users\a")
+        .with_var("LOCALAPPDATA", r"C:\Users\a\AppData\Local")
+        .with_var("APPDATA", r"C:\Users\a\AppData\Roaming")
+        .with_cwd(r"C:\Users\a\app");
+    let (packs, warnings) = Catalog::builtin_for(PathStyle::Windows).load_active(&[]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    Engine::new(packs).with_paths(vars).with_budget(TEST_BUDGET)
+}
+
+#[test]
+fn windows_readers_deny_the_same_shapes() {
+    let e = windows_engine();
+    let mut wrong = Vec::new();
+    let bash = Dialects::One(Posix);
+    let ps = Dialects::One(PowerShell);
+    let cmd = Dialects::One(Cmd);
+    for (d, line) in [
+        (bash, r"find . -exec rm -rf / \;"),
+        (bash, "echo 'rm -rf /' | sh"),
+        (bash, "echo \"$x\" | bash"),
+        (bash, "bash <<< 'rm -rf /'"),
+        (bash, "trap 'rm -rf /' EXIT"),
+        (bash, "r\\\nm -rf /"),
+        (bash, "echo ${x:-$(rm -rf /)}"),
+        (bash, "echo 'Remove-Item -Recurse C:\\' | powershell -"),
+        (bash, "echo 'rd /s /q C:\\' | cmd"),
+        (ps, "echo 'Remove-Item -Recurse C:\\' | powershell -"),
+        (ps, "echo 'rd /s /q C:\\' | cmd"),
+        (cmd, "echo rd /s /q C:\\ | cmd"),
+        (cmd, "echo Remove-Item -Recurse C:\\ | powershell -"),
+    ] {
+        let got = e.evaluate_call(line, d);
+        if !got.is_deny() {
+            wrong.push(format!("{d:?} {line:?}: {got:?}"));
+        }
+    }
+    for (d, line) in [
+        (bash, "echo hi | grep h"),
+        (bash, "find . -name x -print"),
+        (bash, "trap 'cleanup' EXIT"),
+        (bash, "echo ${x:-default}"),
+        (ps, "echo hi | Select-String h"),
+        (cmd, "echo hi | findstr h"),
+    ] {
+        let got = e.evaluate_call(line, d);
+        if got.is_deny() {
+            wrong.push(format!("{d:?} {line:?}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

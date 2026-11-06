@@ -31,7 +31,7 @@ use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
 use crate::lexer::{
     find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted,
-    Word, BRACES_PAST_LINE_LIMIT,
+    Word, BRACES_PAST_LINE_LIMIT, HIDDEN_PAST_LINE_LIMIT,
 };
 use crate::normalize::{build_argv, windows_program_names};
 use crate::operands::{operands, Operand, Source};
@@ -650,8 +650,8 @@ impl Engine {
             Dialect::Posix if sub_body => split_substitution_noted(raw_cmd),
             Dialect::Posix => split_segments_noted(raw_cmd),
         };
-        if lex_note == Some(BRACES_PAST_LINE_LIMIT) {
-            return too_costly(BRACES_PAST_LINE_LIMIT);
+        if let Some(limit @ (BRACES_PAST_LINE_LIMIT | HIDDEN_PAST_LINE_LIMIT)) = lex_note {
+            return too_costly(limit);
         }
         // What the line made is what it costs: each nested line has its own brace
         // limit, and 14,000 of `eval '{1..1000}'` fit in one 256 KiB line.

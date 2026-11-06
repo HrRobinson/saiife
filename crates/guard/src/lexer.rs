@@ -161,32 +161,24 @@ pub fn split_substitution_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str
 
 fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>) {
     let mut ctx = Ctx::new();
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut current: Segment = Vec::new();
     let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false, false, body_top).toks;
-
-    for tok in toks {
-        match tok {
-            LexTok::Word(w) => current.push(w),
-            LexTok::Operator(_) => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
-                }
-            }
-        }
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
+    // Segments, and after each one the command lines it runs that are not
+    // where a command starts (`hidden`).
+    let segments = hidden::segments(toks, &mut ctx);
     (
-        segments.into_iter().map(strip_leading_keywords).collect(),
+        segments,
         if ctx.braces_spent {
             Some(BRACES_PAST_LINE_LIMIT)
+        } else if ctx.hidden_spent {
+            Some(HIDDEN_PAST_LINE_LIMIT)
         } else {
             ctx.note
         },
     )
 }
+
+mod hidden;
+pub use hidden::{HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT};
 
 /// Shell keywords that only ever *introduce* a real command inside a
 /// compound construct (`if X; then CMD; fi`, `for i in 1; do CMD; done`) —
@@ -306,6 +298,10 @@ struct Ctx {
     brace_bytes: usize,
     /// The line went past that: what is left stays as written.
     braces_spent: bool,
+    /// Bytes of hidden command lines (`hidden`) still to lex on this line,
+    /// and whether the line went past them.
+    hidden_bytes: usize,
+    hidden_spent: bool,
 }
 
 /// The most words brace expansion makes on one line, far past any command a person
@@ -328,6 +324,8 @@ impl Ctx {
             brace_words: BRACE_LINE_WORDS,
             brace_bytes: BRACE_LINE_BYTES,
             braces_spent: false,
+            hidden_bytes: hidden::LINE_BYTES,
+            hidden_spent: false,
         }
     }
 
@@ -932,6 +930,11 @@ impl Lexer<'_, '_> {
                     w.dq_sub_end = Some(w.text.len());
                 }
             }
+            // A backslash-newline joins the lines: both go, and the word
+            // (if any) goes on, so `r\<newline>m` is `rm`.
+            '\\' if self.chars.peek() == Some('\n') => {
+                self.chars.next();
+            }
             '\\' => {
                 w.in_word = true;
                 w.quoted = true;
@@ -1011,7 +1014,13 @@ impl Lexer<'_, '_> {
                 self.chars.next(); // consume '{'
                 w.in_word = true;
                 w.text.push_str("${");
-                w.text.push_str(&scan_brace_balanced(self.chars));
+                w.text.push_str(&scan_brace_balanced(
+                    self.chars,
+                    self.ctx,
+                    self.depth,
+                    &mut self.pending_docs,
+                    &mut w.has_sub,
+                ));
                 w.text.push('}');
             }
             _ => return self.word_char(c),
@@ -1489,6 +1498,10 @@ fn scan_double_quoted(
             '\\' => {
                 other = true;
                 match chars.peek() {
+                    // A backslash-newline joins the lines, here too.
+                    Some('\n') => {
+                        chars.next();
+                    }
                     Some(e @ ('"' | '\\' | '$' | '`')) => {
                         out.push(e);
                         chars.next();
@@ -1737,6 +1750,12 @@ fn echo_value(inner: &str) -> Option<String> {
     let [seg] = segs.as_slice() else {
         return None;
     };
+    printed(seg)
+}
+
+/// What the command `seg`, `echo [-neE…] ARGS` or `printf FORMAT`, prints,
+/// when all of it is literal.
+fn printed(seg: &[Word]) -> Option<String> {
     if seg
         .iter()
         .any(|w| w.has_substitution || w.glob || w.redirect || w.brace_overflow)
@@ -2041,36 +2060,79 @@ fn push_escaped_digits(chars: &mut Chars, out: &mut String, radix: u32, max_digi
     }
 }
 
+/// `c`, just read inside a `${…}`, opens a `$(…)` or a backtick body: scan it
+/// whole onto `out` and say so.
+fn brace_substitution(
+    c: char,
+    chars: &mut Chars,
+    out: &mut String,
+    ctx: &mut Ctx,
+    depth: usize,
+    docs: &mut Vec<PendingDoc>,
+) -> bool {
+    match c {
+        '$' if chars.peek() == Some('(') => {
+            chars.next();
+            out.push_str("$(");
+            out.push_str(scan_substitution(chars, ctx, depth, docs));
+            out.push(')');
+            true
+        }
+        '`' => {
+            out.push('`');
+            out.push_str(&scan_backtick(chars));
+            out.push('`');
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Scan a `${...}` body. The opening `${` has already been consumed; this
 /// consumes up to and including the matching `}` and returns the inner text
 /// (delimiters excluded). Never evaluated — parameter expansion is out of
 /// scope (see the design doc) — this exists solely so `${HOME}` survives as
 /// one contiguous literal token instead of having its `{`/`}` mistaken for a
-/// grouping boundary. Mirrors `scan_paren_flat`'s quote/escape/nesting
-/// handling so a `}` inside a nested quote or a nested `${...}` doesn't
-/// prematurely end it.
-fn scan_brace_balanced(chars: &mut Chars) -> String {
-    let mut depth = 1u32;
+/// grouping boundary. A `}` inside a quote, a nested `${...}` or a `$(…)`
+/// does not end it. A `$(…)` or backtick body in it (`${x:-$(cmd)}`), bare
+/// or in double quotes, runs when the default is used: it is scanned as one
+/// (`brace_substitution`) and `has_sub` is set, so the engine judges it. One
+/// in single quotes is data.
+fn scan_brace_balanced(
+    chars: &mut Chars,
+    ctx: &mut Ctx,
+    depth: usize,
+    docs: &mut Vec<PendingDoc>,
+    has_sub: &mut bool,
+) -> String {
+    let mut braces = 1u32;
     let mut out = String::new();
     while let Some(c) = chars.next() {
+        if brace_substitution(c, chars, &mut out, ctx, depth, docs) {
+            *has_sub = true;
+            continue;
+        }
         match c {
             '{' => {
-                depth += 1;
+                braces += 1;
                 out.push(c);
             }
             '}' => {
-                depth -= 1;
-                if depth == 0 {
+                braces -= 1;
+                if braces == 0 {
                     return out;
                 }
                 out.push(c);
             }
-            '\\' => {
-                out.push(c);
-                if let Some(n) = chars.next() {
+            '\\' => match chars.next() {
+                // A backslash-newline joins the lines.
+                Some('\n') => {}
+                Some(n) => {
+                    out.push(c);
                     out.push(n);
                 }
-            }
+                None => out.push(c),
+            },
             '\'' => {
                 out.push(c);
                 for n in chars.by_ref() {
@@ -2094,7 +2156,13 @@ fn scan_brace_balanced(chars: &mut Chars) -> String {
                             out.push('"');
                             break;
                         }
-                        Some(n) => out.push(n),
+                        Some(n) => {
+                            if brace_substitution(n, chars, &mut out, ctx, depth, docs) {
+                                *has_sub = true;
+                            } else {
+                                out.push(n);
+                            }
+                        }
                         None => break,
                     }
                 }
