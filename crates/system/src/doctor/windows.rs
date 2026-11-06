@@ -45,11 +45,6 @@ const HEALTH_WAIT: Duration = Duration::from_secs(2);
 const VERSION_WAIT: Duration = Duration::from_secs(5);
 const AUDIT_KEY_LEN: u64 = 32;
 
-/// Owner ruling: same-user approval is off, as on macOS. The plan's W16 and Task 8 text.
-/// `layout.rs` has no Windows form of `MAC_SAME_USER_OFF` on this base.
-const WIN_SAME_USER_OFF: &str =
-    "same-user approval is off on Windows: approvals need a second account, from a separate session";
-
 /// What the lock does not do yet. It is said on every locked run, and fails nothing: an admin
 /// who reads only PASS lines must still have been told.
 const PREVIEW_LIMITS: &str = "Windows locked mode is preview: an agent running code as the same \
@@ -1363,18 +1358,21 @@ fn agent_binaries(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
     }
 }
 
-/// `claude.exe --version`, from a plain shell only. The agent's own binary may be whatever
-/// its user made it, so it never runs with an elevated token. A plain shell checks only its
-/// caller, and holds nothing that user does not.
+/// `claude.exe --version`, run only by the agent user itself from a plain shell. The agent's
+/// own binary may be whatever its user made it, so it never runs with an elevated token, nor
+/// as anyone else. A token that cannot be read counts as elevated.
 fn agent_version(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
     const TITLE: &str = "agent versions";
-    if ctx.as_root {
-        return Check::new(
-            id,
+    let elevated = || {
+        Check::new(
+            id.clone(),
             Status::Info,
             TITLE,
             format!("not checked elevated: an agent's binary never runs elevated (run saiife doctor as {name})"),
-        );
+        )
+    };
+    if ctx.as_root {
+        return elevated();
     }
     let not_found = || Check::new(id.clone(), Status::Info, TITLE, "Claude Code not found");
     let Some(profile) = profile_dir(ctx, sid) else {
@@ -1388,6 +1386,26 @@ fn agent_version(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
     };
     if std::fs::symlink_metadata(&exe).is_err() {
         return not_found();
+    }
+    match ctx.host.own_token() {
+        Ok(t) if t.elevated => return elevated(),
+        Ok(t) if t.sid != sid => {
+            return Check::new(
+                id,
+                Status::Info,
+                TITLE,
+                format!("not checked: an agent's binary runs only as its own user (run saiife doctor as {name})"),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Check::new(
+                id,
+                Status::Info,
+                TITLE,
+                format!("not checked: this shell's token cannot be read ({e}), so it counts as elevated (run saiife doctor as {name})"),
+            )
+        }
     }
     let program = exe.display().to_string();
     let warn = |d: String| Check::new(id.clone(), Status::Warn, TITLE, d);

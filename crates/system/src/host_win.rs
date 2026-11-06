@@ -10,8 +10,8 @@
 use super::{
     argv_net_add_member, argv_net_create_group, argv_net_delete_group, argv_net_remove_member,
     argv_sc_paramchange, argv_sc_sdset, check_exit, exec, parse_win_build, windows_only, CmdOutput,
-    Hold, Host, RealHost, ReloadAnswer, UserInfo, WinBuild, ADMIN_TIMEOUT, REG_NT_CURRENT_VERSION,
-    SC_EXE,
+    Hold, Host, OwnToken, RealHost, ReloadAnswer, UserInfo, WinBuild, ADMIN_TIMEOUT,
+    REG_NT_CURRENT_VERSION, SC_EXE,
 };
 use crate::layout::WIN_SERVICE;
 use crate::winservice::{
@@ -504,6 +504,16 @@ impl Host for RealHost {
 
     fn authenticode_status(&self, path: &Path) -> io::Result<i32> {
         saiife_win::ffi::trust::authenticode_status(path)
+    }
+
+    /// The raw token: `Administrators` enabled counts as elevated at any integrity, which
+    /// is wider than [`Host::elevated`], so a caller that must not run elevated is safe.
+    fn own_token(&self) -> io::Result<OwnToken> {
+        let t = token::current()?;
+        Ok(OwnToken {
+            sid: t.sid,
+            elevated: t.elevated_admin || self.elevated(),
+        })
     }
 
     fn daemon_status(

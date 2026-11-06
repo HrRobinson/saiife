@@ -129,6 +129,16 @@ pub struct UserInfo {
 }
 
 /// A Windows build, from `CurrentBuildNumber` and `InstallationType`.
+/// This process's own token, as [`Host::own_token`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnToken {
+    /// The token's user SID: the identity.
+    pub sid: String,
+    /// The token holds `Administrators` enabled, at any integrity level, or
+    /// [`Host::elevated`] says so.
+    pub elevated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WinBuild {
     pub build: u32,
@@ -295,6 +305,11 @@ pub trait Host: Send + Sync {
     /// Renames a file. Its descriptor goes with it, which the fake must be told.
     fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+    /// Windows: this process's own token. A token that cannot be read is an `Err`, which
+    /// callers must treat as elevated.
+    fn own_token(&self) -> io::Result<OwnToken> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
@@ -1766,6 +1781,9 @@ pub struct FakeState {
     pub service_query_error: Option<String>,
     /// What `authenticode_status` answers; `None` fails the call.
     pub authenticode: Option<i32>,
+    /// The SID `own_token` answers with; `None` is a token that cannot be read. Whether
+    /// it is elevated is what `elevated` answers.
+    pub own_sid: Option<String>,
 }
 
 /// JSON maps need string keys, so the registry is saved as a list.
@@ -1856,6 +1874,7 @@ impl Default for FakeState {
             local_groups_denied: false,
             service_query_error: None,
             authenticode: None,
+            own_sid: None,
         }
     }
 }
@@ -2715,6 +2734,18 @@ impl Host for FakeHost {
             Some(e) => Err(io::Error::other(e)),
             None => Ok(s.local_groups.get(user).cloned().unwrap_or_default()),
         }
+    }
+
+    fn own_token(&self) -> io::Result<OwnToken> {
+        let elevated = self.elevated();
+        self.update(|s| {
+            s.calls.push("own_token".to_string());
+            let sid = s
+                .own_sid
+                .clone()
+                .ok_or_else(|| io::Error::other("the token cannot be read"))?;
+            Ok(OwnToken { sid, elevated })
+        })
     }
 
     fn authenticode_status(&self, path: &Path) -> io::Result<i32> {

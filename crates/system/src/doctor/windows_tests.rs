@@ -1912,8 +1912,10 @@ fn a_folder_of_binaries_doctor_may_not_read_is_no_absence() {
 
 // ----------------------------------------------------------------- agent versions
 
+/// Alice's `claude.exe`, with doctor run from alice's own token unless a test says otherwise.
 fn claude_exe(e: &Env, version: Option<(&str, i32)>) -> String {
     e.user_in(ALICE, USER, &[]);
+    e.host.set(|s| s.own_sid = Some(USER.to_string()));
     profile(e, USER, r"C:\Users\alice");
     let exe = r"C:\Users\alice\.local\bin\claude.exe";
     let locked = "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
@@ -1969,6 +1971,51 @@ fn an_elevated_doctor_never_runs_an_agent() {
     let r = e.doctor_as(Some(ALICE));
     assert_eq!(get(&r, "user.alice.agent-version").status, Status::Pass);
     assert!(e.host.state().calls.contains(&line));
+}
+
+/// Audit-gaps item 7: only alice's own plain token runs alice's binary.
+#[test]
+fn the_agent_binary_runs_only_as_its_own_user() {
+    let ran = |e: &Env, line: &str| e.host.state().calls.iter().any(|l| l == line);
+
+    // Another user's plain shell: alice may have made the binary anything.
+    let e = installed();
+    let line = claude_exe(&e, Some(("2.1.300", 0)));
+    e.host.set(|s| {
+        s.euid = 1000;
+        s.own_sid = Some("S-1-5-21-1-2-3-1002".to_string());
+        s.calls.clear();
+    });
+    let r = e.doctor_as(Some(ALICE));
+    let c = get(&r, "user.alice.agent-version");
+    assert_eq!(c.status, Status::Info, "{}", r.to_text());
+    assert!(c.detail.contains("its own user"), "{}", c.detail);
+    assert!(!ran(&e, &line), "{:?}", e.host.state().calls);
+
+    // A token that cannot be read counts as elevated.
+    let e = installed();
+    let line = claude_exe(&e, Some(("2.1.300", 0)));
+    e.host.set(|s| {
+        s.euid = 1000;
+        s.own_sid = None;
+        s.calls.clear();
+    });
+    let r = e.doctor_as(Some(ALICE));
+    let c = get(&r, "user.alice.agent-version");
+    assert_eq!(c.status, Status::Info, "{}", r.to_text());
+    assert!(c.detail.contains("cannot be read"), "{}", c.detail);
+    assert!(!ran(&e, &line), "{:?}", e.host.state().calls);
+
+    // Alice herself, not elevated: it runs.
+    let e = installed();
+    let line = claude_exe(&e, Some(("2.1.300", 0)));
+    e.host.set(|s| {
+        s.euid = 1000;
+        s.calls.clear();
+    });
+    let r = e.doctor_as(Some(ALICE));
+    assert_eq!(get(&r, "user.alice.agent-version").status, Status::Pass);
+    assert!(ran(&e, &line));
 }
 
 #[test]
