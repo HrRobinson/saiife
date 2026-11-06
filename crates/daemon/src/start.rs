@@ -970,11 +970,6 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
-    // Their `approval`/`expired` records go with the start records.
-    let expired_at_start = match &approvals {
-        Ok(store) => store.sweep(crate::import_backup::now()),
-        Err(_) => Vec::new(),
-    };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
@@ -1110,6 +1105,13 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
                 return Ok(code);
             }
         }
+    };
+    // The start sweep, once the name is ours: a start that ends above must leave every
+    // request as it was, as no `expired` record could follow. Their `approval`/`expired`
+    // records go with the start records (on Unix before the sockets, as before).
+    let expired_at_start = match &ctx.approvals {
+        Ok(store) => store.sweep(crate::import_backup::now()),
+        Err(_) => Vec::new(),
     };
     let mut more = start_notes(&ctx, notes, &expired_at_start);
     // Requests approved but not sent when the daemon stopped become

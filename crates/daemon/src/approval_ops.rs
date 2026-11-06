@@ -1860,6 +1860,84 @@ mod tests {
         }
     }
 
+    /// Windows' withdraw through `decide`, with peers that carry a SID as the pipe's do:
+    /// another SID with the same label 0 does not see the request and cannot withdraw
+    /// it; the requester's SID can. The end-to-end half is windows_daemon.rs's
+    /// `the_requester_withdraws_its_own_request`.
+    #[tokio::test]
+    async fn another_sid_with_the_same_label_cannot_withdraw() {
+        const A: &str = "S-1-5-21-1-2-3-1001";
+        const B: &str = "S-1-5-21-1-2-3-1002";
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().approvals = Ok(store);
+        let cfg: saiife_policy::SystemConfig =
+            toml::from_str("version = 2\nlocked = true\n").unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            system: Some(Arc::new(cfg)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        let new = NewRequest {
+            uid: 0,
+            sid: Some(A.into()),
+            user: "a".into(),
+            session: None,
+            agent: "claude".into(),
+            project: "/w".into(),
+            kind: ApprovalType::Command,
+            service: None,
+            operation: None,
+            capability: None,
+            params: Default::default(),
+            input: Some("git push --force".into()),
+            grant_key: None,
+            scope: None,
+            ask_rule: None,
+            send: SendDisplay::default(),
+        };
+        let rid = ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .create(new, |_| Ok(None), Duration::from_secs(600), now())
+            .unwrap()
+            .id;
+        let as_sid = |sid: &str| {
+            Conn::new(
+                PeerCred {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                    sid: Some(sid.into()),
+                    group_sids: Vec::new(),
+                },
+                Some(1),
+            )
+        };
+        let withdraw = || Request {
+            id: 4,
+            op: OP_APPROVAL_DECIDE.into(),
+            args: json!({"request": rid, "action": "reject"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let state = || ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+
+        let v = decide(&ctx, &as_sid(B), withdraw()).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v.to_string().contains("(or not yours)"), "{v}");
+        assert_eq!(state().state, State::Pending);
+
+        let v = decide(&ctx, &as_sid(A), withdraw()).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let r = state();
+        assert_eq!(r.state, State::Rejected);
+        assert_eq!(r.note.as_deref(), Some(CANCELLED));
+        assert_eq!(r.decided_by_sid.as_deref(), Some(A));
+    }
+
     /// Bad `auth` hex is a bad request, before anything is looked up.
     #[tokio::test]
     async fn bad_auth_hex_is_bad_request() {
