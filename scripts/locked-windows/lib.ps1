@@ -1329,6 +1329,20 @@ function measure_terminate {
   $kill = Invoke-As -User $Script:Approver -Exe $m -Arguments @('terminate', $hookPid, '0') -Cwd $Script:Approver.Project
   $r = Wait-As -Handle $parent -TimeoutSec 30
   Measure-Result 'TerminateProcess-cross-user' "approver against agent's hook: $(Format-Probe $kill). Parent saw (control, the hook's own ending if the kill was refused): $(Format-Probe $r)"
+
+  # Why the cross-user kill went as it did: the two accounts' groups as `whoami /groups`
+  # sees them, started the way the hook's parent and the killer were. The probes above
+  # already printed the hook's and the killer's own tokens (hook_group, killer_group, the
+  # logon SID marked) and the hook's process descriptor (hook_sddl, target_sddl). A logon
+  # SID both hold would explain it. Report-only: nothing here may fail the job.
+  foreach ($who in @(@{ Tag = 'agent'; User = $Script:Agent }, @{ Tag = 'approver'; User = $Script:Approver })) {
+    try {
+      $g = Invoke-As -User $who.User -Exe "$env:SystemRoot\System32\whoami.exe" -Arguments @('/groups', '/fo', 'csv', '/nh') -Cwd $who.User.Project -TimeoutSec 30
+      Measure-Result "TerminateProcess-cross-user-groups-$($who.Tag)" "whoami /groups as $($who.User.Name): $(Format-Probe $g)"
+    } catch {
+      Measure-Result "TerminateProcess-cross-user-groups-$($who.Tag)" "whoami /groups as $($who.User.Name) did not run: $($_.Exception.Message)"
+    }
+  }
 }
 
 # The attacks the T10 review named, from the non-admin agent, on this runner only. Nothing

@@ -13,20 +13,28 @@
  *   measure hold <path> <ready file> <stop file> <max seconds>
  *       Opens <path> for reading with share mode 0, until <stop file> exists.
  *   measure spawn-hold <hook> <agent> <pid file> <wait seconds>
- *       Starts the hook with a stdin that stays open; prints how it ended. Another
- *       process does the killing.
+ *       Starts the hook with a stdin that stays open; prints the hook's token (user,
+ *       groups, the logon SID marked) and its process descriptor as SDDL, then how it
+ *       ended. Another process does the killing.
  *   measure spawn-kill <hook> <agent> <exit code>
  *       The same, and ends the hook itself with TerminateProcess(hook, <exit code>).
  *   measure terminate <pid> <exit code>
- *       OpenProcess(PROCESS_TERMINATE) and TerminateProcess on someone else's pid.
+ *       Prints its own token (the killer's user and groups, the logon SID marked) and
+ *       the target's descriptor as far as it may read it, then OpenProcess(
+ *       PROCESS_TERMINATE) and TerminateProcess on someone else's pid. A logon SID the
+ *       killer shares with the hook would explain a cross-user kill.
  *
  * Output: key=value lines.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <sddl.h>
+#include <aclapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+
+#pragma comment(lib, "advapi32.lib")
 
 static void say_err(const char *key) {
     printf("%s_error=%lu\n", key, GetLastError());
@@ -36,6 +44,90 @@ static void say_err(const char *key) {
 static void say_w(const char *key, const wchar_t *value) {
     printf("%s=%ls\n", key, value);
     fflush(stdout);
+}
+
+static void say_err_of(const char *key, const char *what) {
+    printf("%s_%s_error=%lu\n", key, what, GetLastError());
+    fflush(stdout);
+}
+
+/* A token's information `class`, in a buffer the caller frees; NULL on failure. */
+static void *token_info(HANDLE token, TOKEN_INFORMATION_CLASS class) {
+    DWORD len = 0;
+    void *buf;
+    GetTokenInformation(token, class, NULL, 0, &len);
+    if (len == 0 || (buf = malloc(len)) == NULL) {
+        return NULL;
+    }
+    if (!GetTokenInformation(token, class, buf, len, &len)) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+/* `<key>_user=<SID>` and one `<key>_group=<SID> <attributes> [logon]` line per group of
+ * the token of `process`. Report-only: a failure is a `_error` line. */
+static void say_token(const char *key, HANDLE process) {
+    HANDLE token;
+    TOKEN_USER *user;
+    TOKEN_GROUPS *groups;
+    wchar_t *text;
+    DWORD i;
+
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        say_err_of(key, "token");
+        return;
+    }
+    user = (TOKEN_USER *)token_info(token, TokenUser);
+    if (user == NULL) {
+        say_err_of(key, "token_user");
+    } else {
+        if (ConvertSidToStringSidW(user->User.Sid, &text)) {
+            printf("%s_user=%ls\n", key, text);
+            LocalFree(text);
+        }
+        free(user);
+    }
+    groups = (TOKEN_GROUPS *)token_info(token, TokenGroups);
+    if (groups == NULL) {
+        say_err_of(key, "token_groups");
+    } else {
+        for (i = 0; i < groups->GroupCount; i++) {
+            DWORD a = groups->Groups[i].Attributes;
+            if (ConvertSidToStringSidW(groups->Groups[i].Sid, &text)) {
+                printf("%s_group=%ls 0x%lx%s\n", key, text, a,
+                       (a & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID ? " logon" : "");
+                LocalFree(text);
+            }
+        }
+        free(groups);
+    }
+    fflush(stdout);
+    CloseHandle(token);
+}
+
+/* `<key>_sddl=<owner, group, DACL and label of the process object>`, read here. */
+static void say_sddl(const char *key, HANDLE process) {
+    const SECURITY_INFORMATION info = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                                      DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    wchar_t *text = NULL;
+    DWORD e = GetSecurityInfo(process, SE_KERNEL_OBJECT, info, NULL, NULL, NULL, NULL, &sd);
+
+    if (e != ERROR_SUCCESS) {
+        printf("%s_sddl_error=%lu\n", key, e);
+        fflush(stdout);
+        return;
+    }
+    if (ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, info, &text, NULL)) {
+        printf("%s_sddl=%ls\n", key, text);
+        LocalFree(text);
+    } else {
+        say_err_of(key, "sddl_text");
+    }
+    fflush(stdout);
+    LocalFree(sd);
 }
 
 static void touch(const wchar_t *path) {
@@ -168,6 +260,9 @@ static int spawn_hold(const wchar_t *hook, const wchar_t *agent, const wchar_t *
     if (!spawn_hook(hook, agent, &pi)) {
         return 3;
     }
+    /* Before the pid is out, so the killer cannot end the hook first. */
+    say_token("hook", pi.hProcess);
+    say_sddl("hook", pi.hProcess);
     f = CreateFileW(pid_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) {
         say_err("pid_file");
@@ -204,7 +299,17 @@ static int spawn_kill(const wchar_t *hook, const wchar_t *agent, UINT exit_code)
 }
 
 static int terminate(DWORD pid, UINT exit_code) {
-    HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    HANDLE p, seen;
+
+    say_token("killer", GetCurrentProcess());
+    seen = OpenProcess(READ_CONTROL, FALSE, pid);
+    if (seen == NULL) {
+        say_err("target_read_control");
+    } else {
+        say_sddl("target", seen);
+        CloseHandle(seen);
+    }
+    p = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
     if (p == NULL) {
         say_err("open_process");
         return 0;
