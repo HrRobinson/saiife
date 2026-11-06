@@ -1,0 +1,16 @@
+# The system config the locked-windows CI job installs (scripts/locked-windows/
+# run.ps1). Locked, with the CI's unprivileged agent user in one scope and the
+# second account as the approver (same-user approval is off on Windows, W16).
+version = 2
+locked = true
+
+[audit]
+min_free_mb = 512
+
+[approval]
+approvers = ["approver"]
+same_user = "deny"
+
+[[scope]]
+name = "ci"
+users = ["agent"]
