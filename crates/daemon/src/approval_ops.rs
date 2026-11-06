@@ -851,9 +851,51 @@ fn normal_absolute(p: &str) -> bool {
 /// canonicalizes both, and the daemon (another uid, `ProtectHome=`) does no
 /// filesystem access here.
 fn project_ok(f: &CallFields) -> bool {
+    if cfg!(windows) {
+        return windows_within(&f.project, &f.key_project);
+    }
     normal_absolute(&f.project)
         && normal_absolute(&f.key_project)
         && std::path::Path::new(&f.project).starts_with(&f.key_project)
+}
+
+/// No `.` or `..` component in `p`, past a device prefix (`\\?\`, `\\.\`, `\??\`).
+fn windows_no_dots(p: &str) -> bool {
+    let body = [r"\\?\", r"\\.\", r"\??\", "//?/", "//./"]
+        .iter()
+        .find_map(|pre| p.strip_prefix(pre))
+        .unwrap_or(p);
+    body.split(['\\', '/']).all(|c| c != "." && c != "..")
+}
+
+/// [`project_ok`] on Windows, where the hook sends `std::fs::canonicalize`'s paths
+/// (`\\?\C:\…`). Both sides are read by the guard's Windows path rules (W6): the verbatim
+/// prefix goes, the drive letter is one case and `\` and `/` are one separator, so the same
+/// directory compares equal however it was spelled. Neither may be relative or hold a `.`
+/// or `..`, and neither may be one the rules cannot read. A UNC or device path is taken only
+/// as exactly the project root: a share or device is never "below" a root here.
+fn windows_within(project: &str, root: &str) -> bool {
+    use saiifeguard::canon::PathVars;
+    use saiifeguard::winpath;
+    if !windows_no_dots(project) || !windows_no_dots(root) {
+        return false;
+    }
+    let vars = PathVars::new();
+    let (Ok(p), Ok(r)) = (
+        winpath::read(project, None, &vars),
+        winpath::read(root, None, &vars),
+    ) else {
+        // A device path (`\\?\Volume{…}`) has no form: only itself, spelled the same.
+        let device = |s: &str| s.starts_with(r"\\?\") || s.starts_with(r"\\.\");
+        return device(project) && project == root;
+    };
+    if p.starts_with("//") || r.starts_with("//") {
+        return p == r;
+    }
+    let base = r.trim_end_matches('/');
+    p == r
+        || p.strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Lockdown `all` answers every hook step with `lockdown`: no grant is
@@ -1797,6 +1839,63 @@ mod requester_tests {
     fn a_shared_label_is_not_the_requester() {
         let r = request(0x4000_0001, Some(A));
         assert!(!is_requester(&r, &peer(0x4000_0001, Some(B))));
+    }
+
+    /// What a Windows hook sends (`std::fs::canonicalize`) matches its project however
+    /// each side is spelled; a sibling with the same prefix does not.
+    #[test]
+    fn a_hook_shaped_windows_path_matches_its_project() {
+        let root = r"\\?\C:\Users\a\p";
+        for cwd in [
+            r"\\?\C:\Users\a\p",
+            r"\\?\C:\Users\a\p\sub\dir",
+            r"C:\Users\a\p\sub",
+            r"\\?\c:\Users\a\p\sub",
+            "C:/Users/a/p/sub",
+        ] {
+            assert!(windows_within(cwd, root), "{cwd}");
+        }
+        assert!(windows_within(r"\\?\C:\Users\a\p\sub", r"c:\Users\a\p"));
+        assert!(windows_within(r"\\?\C:\w\x", r"\\?\C:\"));
+        for cwd in [r"\\?\C:\Users\a\pp", r"\\?\C:\Users\a", r"\\?\D:\Users\a\p"] {
+            assert!(!windows_within(cwd, root), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn dots_and_relative_windows_paths_are_refused() {
+        let root = r"\\?\C:\Users\a\p";
+        for cwd in [
+            r"\\?\C:\Users\a\p\..\q",
+            r"\\?\C:\Users\a\p\sub\..",
+            r"C:\Users\a\p\.\sub",
+            r"p\sub",
+            r"sub",
+            r"C:p\sub",
+            "",
+        ] {
+            assert!(!windows_within(cwd, root), "{cwd:?}");
+        }
+        // A `..` in the root lets nothing in either.
+        assert!(!windows_within(r"\\?\C:\Users\x", r"\\?\C:\Users\a\.."));
+        assert!(!windows_within(r"\\?\C:\Users\a\p", r"Users\a\p"));
+    }
+
+    /// A share or a device is a project only as itself, never as a root with paths below.
+    #[test]
+    fn unc_and_device_windows_paths_only_as_themselves() {
+        let unc = r"\\?\UNC\server\share\p";
+        assert!(windows_within(unc, unc));
+        assert!(windows_within(r"\\server\share\p", unc));
+        assert!(!windows_within(r"\\?\UNC\server\share\p\sub", unc));
+        assert!(!windows_within(unc, r"\\?\C:\"));
+        assert!(!windows_within(r"\\?\C:\p", unc));
+        let dev = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\p";
+        assert!(windows_within(dev, dev));
+        assert!(!windows_within(&format!(r"{dev}\sub"), dev));
+        assert!(!windows_within(dev, r"\\?\C:\"));
+        assert!(!windows_within(r"\\.\PhysicalDrive0", r"\\?\C:\"));
+        assert!(!windows_within(r"\\?\C:\p", r"\\.\PhysicalDrive0"));
     }
 
     #[test]

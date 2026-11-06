@@ -122,7 +122,7 @@ fn an_expired_request(t: &Tree) -> u64 {
         user: "runner".into(),
         session: None,
         agent: "claude".into(),
-        project: "/w".into(),
+        project: r"\\?\C:\w".into(),
         kind: ApprovalType::Command,
         service: None,
         operation: None,
@@ -546,20 +546,21 @@ fn an_expired_token_is_refused_after_a_restart() {
 /// The rule of `[guard] ask` that `approval.create` takes the call under.
 const ASK: &str = "[guard]\nask = [\"core.git/force-push\"]\n";
 
-/// What the hook sends with `approval.create` for `FORCE_PUSH` in `/w`. The daemon checks
-/// the project lexically, so a forward-slash path does here.
+/// What the hook sends with `approval.create` for `FORCE_PUSH`, as `std::fs::canonicalize`
+/// spells Windows paths: the cwd `\\?\C:\w\sub` in the project root `\\?\C:\w`. The daemon
+/// checks them lexically (no file needs to exist).
 fn create_args() -> Value {
     use sha2::Digest;
     let raw: [u8; 32] = sha2::Sha256::digest(FORCE_PUSH.as_bytes()).into();
     let rec = json!({
         "v": 1, "ts": "2026-11-06T00:00:00.000Z", "kind": "guard", "agent": "claude",
-        "project": "/w", "tool": "Bash", "input": FORCE_PUSH, "decision": "deny",
+        "project": r"\\?\C:\w\sub", "tool": "Bash", "input": FORCE_PUSH, "decision": "deny",
         "pack": "core.git", "rule_id": "force-push", "mode": "locked",
     });
     json!({
         "rec": rec,
         "raw_sha256": saiife_daemon::grants::hex(&raw),
-        "project": "/w",
+        "project": r"\\?\C:\w",
     })
 }
 
