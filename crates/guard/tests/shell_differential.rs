@@ -366,7 +366,70 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
         true,
     ),
     ("if true; then sh; fi <<< 'touch ran'", true),
+    // A block after `time -p`, `coproc [NAME]` or `function NAME [()]`, or
+    // a `}` that is an argument, leaves the pipe feeding the block around.
+    (
+        "echo 'touch ran' | { time -p if true; then :; fi; sh; }",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then time -p if true; then :; fi; sh; fi",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then time -p -- if true; then :; fi; sh; fi",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then coproc if true; then :; fi; sh; fi",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then coproc C if true; then :; fi; sh; fi",
+        true,
+    ),
+    (
+        "echo 'touch ran' | while true; do coproc while false; do :; done; sh; break; done",
+        true,
+    ),
+    (
+        "echo 'touch ran' | while true; do coproc W while false; do :; done; sh; break; done",
+        true,
+    ),
+    (
+        "echo 'touch ran' | case a in a) coproc case b in b) :;; esac; sh;; esac",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then function f () if true; then :; fi; sh; fi",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then function f if true; then :; fi; sh; fi",
+        true,
+    ),
+    (
+        "echo 'touch ran' | if true; then function f () { :; }; sh; fi",
+        true,
+    ),
+    ("echo 'touch ran' | { echo }; sh; }", true),
+    ("echo 'touch ran' | { echo 'if'; sh; }", true),
     // These do not.
+    ("echo 'touch ran' | { time -p cat; }", false),
+    (
+        "printf 'touch ran' | while read l; do if [ -n \"$l\" ]; then echo \"$l\"; fi; done",
+        false,
+    ),
+    ("echo 'touch ran' | { echo 'if'; }; sh", false),
+    (
+        "echo 'touch ran' | { time -p if true; then cat; fi; }; sh",
+        false,
+    ),
+    ("echo 'touch ran' | if true; then echo if; fi; sh", false),
+    (
+        "echo 'touch ran' | while true; do echo done; break; done; sh",
+        false,
+    ),
     ("echo 'touch ran' | (cat >/dev/null; sh)", false),
     ("echo 'touch ran' | { cat; }; sh -c 'echo hi'", false),
     ("echo 'touch ran' | bash -c 'cat'", false),
@@ -391,10 +454,14 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
 
 /// A trap for a signal that never comes: its action does not run here, but
 /// it could. A shell in a group after a command that may read the pipe
-/// first (`cat`): what is left for it is not known. Denied, on the safe side.
+/// first (`cat`): what is left for it is not known. A block whose openers and
+/// closers do not balance (an argument `if` or `done`): the pipe is taken to
+/// feed the rest of the line. Denied, on the safe side.
 const HIDDEN_LINE_OVER_DENIES: &[&str] = &[
     "trap 'touch ran' INT",
     "echo 'touch ran' | (cat >/dev/null; sh)",
+    "echo 'touch ran' | if true; then echo if; fi; sh",
+    "echo 'touch ran' | while true; do echo done; break; done; sh",
 ];
 
 #[test]
