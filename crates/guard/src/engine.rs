@@ -30,8 +30,9 @@ use crate::canon::{
 use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
 use crate::lexer::{
-    find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted,
-    Word, BRACES_PAST_LINE_LIMIT,
+    fed_script_in, fed_script_may_be_stdin, find_all_substitution_kinds, literal_word,
+    split_segments_noted, split_substitution_noted, FedScript, PathKind, Word,
+    BRACES_PAST_LINE_LIMIT, HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT,
 };
 use crate::normalize::{build_argv, windows_program_names};
 use crate::operands::{operands, Operand, Source};
@@ -650,8 +651,8 @@ impl Engine {
             Dialect::Posix if sub_body => split_substitution_noted(raw_cmd),
             Dialect::Posix => split_segments_noted(raw_cmd),
         };
-        if lex_note == Some(BRACES_PAST_LINE_LIMIT) {
-            return too_costly(BRACES_PAST_LINE_LIMIT);
+        if let Some(limit @ (BRACES_PAST_LINE_LIMIT | HIDDEN_PAST_LINE_LIMIT)) = lex_note {
+            return too_costly(limit);
         }
         // What the line made is what it costs: each nested line has its own brace
         // limit, and 14,000 of `eval '{1..1000}'` fit in one 256 KiB line.
@@ -819,6 +820,11 @@ impl Engine {
             }
             if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
                 return Some(d);
+            }
+            if let Some(fed) = seg.first().and_then(|w| w.fed_script.as_deref()) {
+                if let Some(d) = self.fed_script_phase(fed, cx, state, found) {
+                    return Some(d);
+                }
             }
         }
         // `$x rm -rf /`, `$(true) rm -rf /`: if a word in command position
@@ -1088,6 +1094,50 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// A POSIX shell fed by a pipe or a here-string runs a relative script
+    /// path (`cd /dev; … | sh stdin`): joined to each directory the shell may
+    /// be in, it is read as an absolute path (`lexer::fed_script_in`). Where
+    /// it is the shell's stdin, what the shell reads is judged as a command
+    /// line. Where it may be and the guard cannot tell, or a directory is not
+    /// known and the path could lead there, the line is not fully judged.
+    fn fed_script_phase(
+        &self,
+        fed: &FedScript,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        let mut stdin = false;
+        let mut unread =
+            (state.cwd_unknown || state.cwds.is_empty()) && fed_script_may_be_stdin(&fed.path);
+        for dir in &state.cwds {
+            let Some(dir) = dir.to_str() else {
+                unread |= fed_script_may_be_stdin(&fed.path);
+                continue;
+            };
+            match fed_script_in(dir, &fed.path) {
+                PathKind::Stdin => stdin = true,
+                PathKind::Unread | PathKind::Relative => unread = true,
+                PathKind::Other => {}
+            }
+        }
+        if !stdin {
+            if unread {
+                found.unjudged(UNREAD_SCRIPT);
+            }
+            return None;
+        }
+        let Some(text) = &fed.text else {
+            found.unjudged(UNREAD_SCRIPT);
+            return None;
+        };
+        if !fed.readable {
+            found.unjudged(UNREAD_SCRIPT);
+        }
+        let nested = self.recurse_in(Dialect::Posix, text, cx, state, false, "piped script", None);
+        found.nested(nested)
     }
 
     /// A bare wrapper (`env`, `sudo -l`) or bare redirection

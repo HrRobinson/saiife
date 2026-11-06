@@ -312,3 +312,125 @@ fn reserved_words_match_bash() {
     }
     assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
 }
+
+/// Lines a shell runs that are not where a command starts, against bash
+/// itself: `find -exec`, a pipe or a here-string into a shell, a `trap`
+/// action, a backslash-newline inside a word, a substitution in a `${…}`
+/// default. The flag says whether bash runs the marker; the engine must deny
+/// exactly those, except the listed over-denies.
+const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
+    // These run the marker.
+    (r"find . -maxdepth 0 -exec touch ran \;", true),
+    ("find . -maxdepth 0 -execdir touch ran ';'", true),
+    ("find . -maxdepth 0 -exec touch ran {} +", true),
+    (r"echo y | find . -maxdepth 0 -ok touch ran \;", true),
+    (r"find . -maxdepth 0 -exec sh -c 'touch ran' \;", true),
+    ("echo 'touch ran' | sh", true),
+    ("echo 'touch ran' | bash", true),
+    ("echo touch ran | bash -s", true),
+    ("printf 'touch ran' | sh", true),
+    ("echo 'touch ran' |& sh", true),
+    ("echo \"echo 'touch ran' | sh\" | sh", true),
+    ("bash <<< 'touch ran'", true),
+    ("<<< 'touch ran' bash", true),
+    ("trap 'touch ran' EXIT", true),
+    ("trap -- 'touch ran' EXIT", true),
+    ("tou\\\nch ran", true),
+    ("\"tou\\\nch\" ran", true),
+    ("touch \\\nran", true),
+    ("echo ${x:-$(touch ran)}", true),
+    ("echo \"${x:-$(touch ran)}\"", true),
+    ("echo ${x:-`touch ran`}", true),
+    ("echo ${x:-${y:-$(touch ran)}}", true),
+    ("echo ${x:-\"$(touch ran)\"}", true),
+    ("echo \"${x:-'$(touch ran)'}\"", true),
+    (r"find . -maxdepth 0 -exec sh -c -exec 'touch ran' \;", true),
+    (r"find . -maxdepth 0 -exec env X=-exec touch ran \;", true),
+    ("echo 'touch ran' | { true; sh; }", true),
+    ("echo 'touch ran' | ( case a in a) sh;; esac )", true),
+    ("echo 'touch ran' | bash /dev/stdin", true),
+    ("echo 'touch ran' | sh /proc/self/fd/0", true),
+    ("echo 'touch ran' | sh //dev/stdin", true),
+    ("echo 'touch ran' | sh /dev/./stdin", true),
+    ("echo 'touch ran' | sh /dev/fd//0", true),
+    ("echo 'touch ran' | sh -", true),
+    ("echo 'touch ran' | bash -c 'sh'", true),
+    ("bash -c 'sh' <<< 'touch ran'", true),
+    (r"echo 'touch ran' | find . -maxdepth 0 -exec sh \;", true),
+    ("echo 'touch ran' | if true; then sh; fi", true),
+    ("echo 'touch ran' | case a in a) sh;; esac", true),
+    ("echo 'touch ran' | until false; do sh; break; done", true),
+    ("echo 'touch ran' | for i in 1; do sh; done", true),
+    (
+        "echo 'touch ran' | if true; then if true; then :; fi; sh; fi",
+        true,
+    ),
+    ("if true; then sh; fi <<< 'touch ran'", true),
+    // These do not.
+    ("echo 'touch ran' | (cat >/dev/null; sh)", false),
+    ("echo 'touch ran' | { cat; }; sh -c 'echo hi'", false),
+    ("echo 'touch ran' | bash -c 'cat'", false),
+    (
+        "printf '%s\\n' a b | while read l; do echo \"$l\"; done",
+        false,
+    ),
+    ("echo 'touch ran' | if true; then cat; fi", false),
+    (r"find . -maxdepth 0 -exec echo touch ran \;", false),
+    ("find . -maxdepth 0 -exec touch ran", false),
+    ("echo 'echo touch ran' | sh", false),
+    ("echo 'touch ran' | sh -c 'cat'", false),
+    ("echo 'touch ran' | grep touch", false),
+    ("bash -c 'echo hi' <<< 'touch ran'", false),
+    ("cat <<< 'touch ran'", false),
+    ("trap 'touch ran'", false),
+    ("trap 'touch ran' INT", false),
+    ("'tou\\\nch' ran", false),
+    ("echo ${x:-'$(touch ran)'}", false),
+    ("echo '${x:-$(touch ran)}'", false),
+];
+
+/// A trap for a signal that never comes: its action does not run here, but
+/// it could. A shell in a group after a command that may read the pipe
+/// first (`cat`): what is left for it is not known. Denied, on the safe side.
+const HIDDEN_LINE_OVER_DENIES: &[&str] = &[
+    "trap 'touch ran' INT",
+    "echo 'touch ran' | (cat >/dev/null; sh)",
+];
+
+#[test]
+fn hidden_lines_match_bash() {
+    let e = engine();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let mut failures = Vec::new();
+    for shell in candidate_shells() {
+        let version = version_line(&shell);
+        // bash 4 and later: `|&` and here-strings in the forms used here.
+        if !version.contains("bash") || version.contains("version 3.") {
+            continue;
+        }
+        for (case, runs) in HIDDEN_LINE_CASES {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let run = Command::new(&shell)
+                .arg("-c")
+                .arg(case)
+                .current_dir(tmp.path())
+                .env("HOME", home.path())
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
+                .output();
+            if let Err(err) = run {
+                println!("note: {shell} cannot be executed ({err}); skipped");
+                break;
+            }
+            let ran = tmp.path().join("ran").exists();
+            let denied = matches!(e.evaluate(case), Decision::Deny { .. });
+            let over_deny = HIDDEN_LINE_OVER_DENIES.contains(case) && denied && !ran;
+            if ran != *runs || (ran != denied && !over_deny) {
+                failures.push(format!(
+                    "{shell} ({version}): ran={ran} (listed {runs}) denied={denied}\n  case: {case:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
+}
