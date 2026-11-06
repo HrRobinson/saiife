@@ -756,11 +756,10 @@ fn files_binary(ctx: &Ctx) -> Check {
         Ok(i) => i,
         Err(e) => return fail(format!("{shown}: not a PE executable ({e})")),
     };
-    let problems = info.problems(PE_IMPORT_ALLOWLIST);
+    let (problems, mut notes) = pe_findings(&info, cfg!(debug_assertions));
     if !problems.is_empty() {
         return fail(format!("{shown}: {}", problems.join("; ")));
     }
-    let mut notes = info.warnings();
     if info.signed {
         match ctx
             .host
@@ -794,6 +793,35 @@ fn files_binary(ctx: &Ctx) -> Check {
             format!("{shown}: {}", notes.join("; ")),
         )
     }
+}
+
+/// `files.binary`'s problems (they fail) and notes (they warn) for `info`.
+///
+/// A test build (debug assertions on) fails when the doctor is a release build: a real
+/// install never has one. A doctor that is itself a test build is the `ci-locked` binary
+/// that `locked-windows` installs with `--allow-test-build`, and there it warns, as
+/// doctor's Linux and macOS check always does. Only a test build carries the test seams,
+/// so a release doctor cannot be talked into the warning.
+fn pe_findings(
+    info: &crate::binary::PeInfo,
+    doctor_is_test_build: bool,
+) -> (Vec<String>, Vec<String>) {
+    use crate::binary::{PeInfo, Profile};
+    let tolerated = doctor_is_test_build && info.profile == Profile::DebugAssertions;
+    if !tolerated {
+        return (info.problems(PE_IMPORT_ALLOWLIST), info.warnings());
+    }
+    let as_release = PeInfo {
+        profile: Profile::Release,
+        ..info.clone()
+    };
+    let mut notes = vec![
+        "test build installed: debug assertions are on (the SAIIFE_EVAL_FAULT test seam can \
+         hang the guard); install the release build"
+            .to_string(),
+    ];
+    notes.extend(as_release.warnings());
+    (as_release.problems(PE_IMPORT_ALLOWLIST), notes)
 }
 
 /// What is unsafe about `logical` as a place SYSTEM runs a program from.

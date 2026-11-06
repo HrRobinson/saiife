@@ -70,12 +70,14 @@ $isAdmin = ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Princip
 if (-not ($isAdmin -or $me.User.Value -eq 'S-1-5-18')) { Refuse 'must run elevated (administrator or SYSTEM)' }
 
 # --- the rows ----------------------------------------------------------------------------
-# NT SERVICE\saiifed is a virtual account: its SID is derived from the name, so the
-# lookup works before the service exists.
-try {
-  $svc = (New-Object Security.Principal.NTAccount('NT SERVICE\saiifed')).Translate([Security.Principal.SecurityIdentifier]).Value
-} catch { Refuse "cannot find the SID of NT SERVICE\saiifed: $($_.Exception.Message)" }
-if ($svc -notmatch '^S-1-5-80-[0-9-]+$') { Refuse "NT SERVICE\saiifed has an unexpected SID: $svc" }
+# NT SERVICE\saiifed's SID is derived from the name, but Windows translates the name only
+# once the service exists, and this script runs before the MSI makes it. So it is computed
+# here as crates/win/src/sid.rs service_sid does: S-1-5-80- and the five little-endian
+# UInt32s of SHA-1(UTF-16LE("SAIIFED")), which is
+# S-1-5-80-1485410291-497971702-176010752-1662630379-411534723.
+$sha1 = [Security.Cryptography.SHA1]::Create()
+try { $digest = $sha1.ComputeHash([Text.Encoding]::Unicode.GetBytes('SAIIFED')) } finally { $sha1.Dispose() }
+$svc = 'S-1-5-80-' + ((0..4 | ForEach-Object { [BitConverter]::ToUInt32($digest, 4 * $_) }) -join '-')
 
 # winacl.rs: ROOT, and PROGRAM_AND_CONFIG (the row of etc and everything below it).
 $rootSddl = "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)(A;;0x1200a9;;;$svc)"

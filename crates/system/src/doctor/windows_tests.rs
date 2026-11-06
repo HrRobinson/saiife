@@ -1026,13 +1026,65 @@ fn swap_binary(e: &Env, pe: PeFixture) {
     fs::write(e.at(EXE), pe_fixture(pe)).unwrap();
 }
 
+/// A release doctor fails a test build; a test-build doctor (the `ci-locked` binary that
+/// `locked-windows` installs with `--allow-test-build`) warns, as on Linux and macOS. Other
+/// problems fail either way.
+#[test]
+fn a_test_build_fails_under_a_release_doctor_and_warns_under_a_test_one() {
+    let info = |pe| crate::binary::inspect_pe(&pe_fixture(pe)).unwrap();
+    let debug = info(PeFixture {
+        marker: Some(true),
+        ..PeFixture::default()
+    });
+    let (problems, notes) = pe_findings(&debug, false);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("test build"), "{problems:?}");
+    assert!(notes.is_empty(), "{notes:?}");
+    let (problems, notes) = pe_findings(&debug, true);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(notes[0].starts_with("test build installed"), "{notes:?}");
+
+    let both = info(PeFixture {
+        marker: Some(true),
+        flags: 0,
+        signed: false,
+        ..PeFixture::default()
+    });
+    let (problems, notes) = pe_findings(&both, true);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("DependentLoadFlags"), "{problems:?}");
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[1].contains("Authenticode"), "{notes:?}");
+
+    let release = info(PeFixture::default());
+    assert_eq!(pe_findings(&release, true), pe_findings(&release, false));
+    assert_eq!(pe_findings(&release, false), (Vec::new(), Vec::new()));
+    let unknown = info(PeFixture {
+        marker: None,
+        ..PeFixture::default()
+    });
+    assert!(!pe_findings(&unknown, true).0.is_empty());
+}
+
 #[test]
 fn a_debug_or_unhardened_binary_fails() {
-    for pe in [
+    let e = installed();
+    swap_binary(
+        &e,
         PeFixture {
             marker: Some(true),
             ..PeFixture::default()
         },
+    );
+    let r = e.doctor();
+    let c = get(&r, "files.binary");
+    if cfg!(debug_assertions) {
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("test build installed"), "{}", c.detail);
+    } else {
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+    }
+    for pe in [
         PeFixture {
             flags: 0,
             ..PeFixture::default()

@@ -83,8 +83,11 @@ fn options(t: &Tree, pipe: &str) -> DaemonOptions {
 }
 
 fn start(t: &Tree, pipe: &str) -> (Sender<Control>, JoinHandle<i32>) {
+    start_with(options(t, pipe))
+}
+
+fn start_with(opts: DaemonOptions) -> (Sender<Control>, JoinHandle<i32>) {
     let (tx, ctl) = ServiceCtl::detached();
-    let opts = options(t, pipe);
     let daemon = std::thread::spawn(move || run_controlled(opts, ctl));
     (tx, daemon)
 }
@@ -551,6 +554,21 @@ fn an_expired_token_is_refused_after_a_restart() {
 /// The rule of `[guard] ask` that `approval.create` takes the call under.
 const ASK: &str = "[guard]\nask = [\"core.git/force-push\"]\n";
 
+/// The built-in packs as the policy catalog, as `saiife daemon` passes them: a `[guard]
+/// ask` entry must name a rule of an active pack, or the policy does not load.
+fn builtin_catalog() -> Vec<saiife_policy::PackInfo> {
+    let (packs, _) = saiifeguard::builtins::builtin_packs_every_rule();
+    packs
+        .iter()
+        .map(|p| saiife_policy::PackInfo {
+            id: p.id.clone(),
+            version: p.version,
+            default_on: p.default_on,
+            rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+        })
+        .collect()
+}
+
 /// What the hook sends with `approval.create` for `FORCE_PUSH`, as `std::fs::canonicalize`
 /// spells Windows paths: the cwd `\\?\C:\w\sub` in the project root `\\?\C:\w`. The daemon
 /// checks them lexically (no file needs to exist).
@@ -580,7 +598,10 @@ fn the_requester_withdraws_its_own_request() {
     let t = tree();
     let pipe = pipe_name("withdraw");
     with_tcp(&t, ASK);
-    let (tx, join) = start(&t, &pipe);
+    let (tx, join) = start_with(DaemonOptions {
+        catalog: builtin_catalog(),
+        ..options(&t, &pipe)
+    });
     let mut c = connect(&pipe);
     let made = call(&mut c, "approval.create", create_args());
     let rid = made["request"].as_u64().unwrap();
