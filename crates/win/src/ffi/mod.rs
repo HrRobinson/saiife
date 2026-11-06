@@ -8,6 +8,7 @@
 pub mod account;
 pub mod acl;
 pub mod cred;
+pub mod job;
 pub mod pipe;
 pub mod proc;
 pub mod process;

@@ -448,9 +448,10 @@ Rules:
 - **The service (W10).** Name `saiifed`, own process, auto start, logon
   account `NT SERVICE\saiifed`, binary
   `C:\ProgramData\saiife\bin\saiife.exe` with arguments `daemon --system`,
-  no password. Failure actions: restart after 1 s, three times, reset after
-  86 400 s, also on non-crash failures. This is `Restart=always`,
-  `RestartSec=1`. The service's own DACL is set with `sc.exe sdset saiifed
+  no password. Failure actions: three restart actions after 1 s each, reset
+  after 86 400 s, also on non-crash failures. The service manager repeats the
+  last action for every failure past the third, so the restarts never run out.
+  This is `Restart=always`, `RestartSec=1`. The service's own DACL is set with `sc.exe sdset saiifed
   D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLORC;;;AU)`.
   That is the Windows default plus query rights for Authenticated Users.
   Only SYSTEM and Administrators can stop, pause, reconfigure or delete it.
@@ -921,9 +922,10 @@ updating this list and this section.
 | Signature check (`trust.rs`) | `WinVerifyTrust` |
 | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
+| Worker job (`job.rs`) | `CreateJobObjectW`, `SetInformationJobObject` (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), `AssignProcessToJobObject`: the managed hook's eval worker dies with the hook |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 38 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 37 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
+That is 41 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 40 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 
@@ -945,6 +947,15 @@ tokio-free on the hook path.
 - On removal (`REMOVE="ALL"` and not `UPGRADINGPRODUCTCODE`), a deferred
   action runs `system uninstall` before the files go. Plan 18's removal
   warning goes to the MSI log and `install.log`.
+- Rollback actions undo both, so the machine is never unlocked while the
+  MSI says saiife is installed, nor locked with no product to remove it by.
+  A first install that fails after its files are in runs `system uninstall`
+  (not when `installed.toml` was there before the MSI ran: that locked mode
+  is kept). A failed upgrade runs `system install --fleet --package` with the
+  old staging copy, which the rollback has put back. A failed removal runs
+  `system install --fleet --package` again. `SAIIFE_FORCE_FAIL=1` on the
+  msiexec line forces a failure after the install action and after the file
+  removal, for the package test.
 - The fleet files are `C:\ProgramData\saiife\etc\fleet\config.toml` and
   `install.toml` (plan 18 formats). The deployment tool writes them before
   the MSI runs.

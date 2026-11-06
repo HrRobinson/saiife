@@ -188,6 +188,25 @@ mod imp {
         WORKER.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The job every worker runs in on Windows: it kills them when its handle closes, so
+    /// a worker never outlives this process, whether the watchdog exits while the slot is
+    /// busy or the hook crashes.
+    #[cfg(windows)]
+    static JOB: std::sync::OnceLock<saiife_win::ffi::job::KillOnClose> = std::sync::OnceLock::new();
+
+    /// Puts `child` in [`JOB`], made at the first worker.
+    #[cfg(windows)]
+    fn join_job(child: &Child) -> std::io::Result<()> {
+        let job = match JOB.get() {
+            Some(job) => job,
+            None => {
+                let made = saiife_win::ffi::job::KillOnClose::new()?;
+                JOB.get_or_init(|| made)
+            }
+        };
+        job.assign(child)
+    }
+
     /// Writes to stderr without its lock: a main thread blocked while holding that lock
     /// cannot stop the watchdog.
     #[cfg(unix)]
@@ -225,7 +244,8 @@ mod imp {
             .spawn(move || {
                 std::thread::sleep(OVERALL_TIMEOUT);
                 // Busy: the main thread holds it to look at the worker for a moment.
-                // The process is about to exit either way, so never wait for it.
+                // The process is about to exit either way, so never wait for it. On
+                // Windows the exit closes the worker's job, which kills it then.
                 let child = match WORKER.try_lock() {
                     Ok(mut g) => g.take(),
                     Err(TryLockError::Poisoned(p)) => p.into_inner().take(),
@@ -963,6 +983,14 @@ mod imp {
                 Ok(c) => c,
                 Err(e) => return Err((req.payload, e)),
             };
+            // A worker that cannot be tied to this process is not run: it could outlive
+            // the hook. Joined before it is sent the request, so it has judged nothing yet.
+            #[cfg(windows)]
+            if let Err(e) = join_job(&child) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err((req.payload, e));
+            }
             let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                 let _ = child.kill();
                 let _ = child.wait();
