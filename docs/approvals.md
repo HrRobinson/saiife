@@ -177,6 +177,11 @@ password. So on Windows:
   - `runas /user:approver` on the agent's desktop does not count: it can be captured.
   - OpenSSH is probably refused, because the control pipe denies network logons.
   - Switching user and RDP should work. **Neither has been verified yet.**
+- A name in `approvers` is matched by its account's SID. A `group:<name>` approver
+  counts by the groups in the caller's token only. A
+  restricted or low-integrity token still holds the user's other groups, so it still
+  matches a `group:` approver.
+- Windows locked mode is a preview: see [Windows](windows.md#locked-mode).
 - Only an elevated admin, SYSTEM and `[admin]` users can lift or narrow `saiife lockdown`.
 
 ## Command grants

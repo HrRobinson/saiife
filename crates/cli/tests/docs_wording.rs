@@ -114,8 +114,11 @@ fn windows_page_states_its_facts_and_limits() {
         "## Shells and the guard",
         "## Limits",
         "## Locked mode",
+        "## Disk encryption",
+        "## Approvals",
+        "## Personal broker",
         // Honest about what has run.
-        "has run on a real Windows machine yet",
+        "throwaway CI runners",
         // The limits the rulings named.
         "export HOME=",
         "eval 'cd",
@@ -131,6 +134,107 @@ fn windows_page_states_its_facts_and_limits() {
     }
     let locked = text.split("## Locked mode").nth(1).unwrap();
     assert!(locked.contains("plan 19b"), "the locked section names 19b");
+}
+
+// ---- Windows locked mode (plan 19b) ----
+
+/// The section of `text` that starts at heading `h`, up to the next `## `.
+fn section<'a>(text: &'a str, h: &str) -> &'a str {
+    let start = text
+        .find(&format!("\n{h}\n"))
+        .unwrap_or_else(|| panic!("no heading {h:?}"));
+    let rest = &text[start + 1..];
+    let end = rest[3..].find("\n## ").map_or(rest.len(), |i| i + 3);
+    &rest[..end]
+}
+
+#[test]
+fn windows_page_has_the_locked_mode_facts() {
+    let t = page_text("docs/windows.md");
+    let locked = section(&t, "## Locked mode");
+    for want in [
+        r"NT SERVICE\saiifed",
+        r"\\.\pipe\saiife",
+        r"C:\ProgramData\saiife",
+        r"C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent",
+        r"C:\Program Files\ClaudeCode\managed-settings.d",
+        r"C:\ProgramData\OpenAI\Codex\requirements.toml",
+        r"C:\ProgramData\gemini-cli\settings.json",
+    ] {
+        assert!(
+            locked.contains(want),
+            "docs/windows.md#locked-mode lacks {want:?}"
+        );
+    }
+    assert!(
+        flat(section(&t, "## Approvals")).contains("approvals need a second account"),
+        "docs/windows.md#approvals must say approvals need a second account"
+    );
+    assert!(
+        section(&t, "## Disk encryption").contains("BitLocker"),
+        "docs/windows.md#disk-encryption names BitLocker"
+    );
+    let broker = section(&t, "## Personal broker");
+    for want in [
+        r"%LOCALAPPDATA%\saiife\personal",
+        "Credential Manager",
+        "saiife-broker",
+    ] {
+        assert!(
+            broker.contains(want),
+            "docs/windows.md#personal-broker lacks {want:?}"
+        );
+    }
+}
+
+/// Owner ruling 2026-11-06: Windows locked mode ships as preview, because a
+/// process of the agent's own user can end the hook with exit 0, which the
+/// agent reads as allow. Each page that sells locked mode says so.
+#[test]
+fn windows_locked_mode_is_documented_as_preview() {
+    let t = page_text("docs/windows.md");
+    for h in ["## Locked mode", "## Limits"] {
+        let s = flat(section(&t, h));
+        assert!(
+            s.contains("preview"),
+            "docs/windows.md {h} must say locked mode is preview"
+        );
+    }
+    let locked = flat(section(&t, "## Locked mode"));
+    for want in ["terminateprocess", "exit 0", "allow"] {
+        assert!(
+            locked.contains(want),
+            "docs/windows.md#locked-mode must name the reason ({want})"
+        );
+    }
+    for rel in ["README.md", "CHANGELOG.md", "docs/threats.md"] {
+        let s = flat(&page_text(rel));
+        assert!(
+            s.contains("windows locked mode is a preview"),
+            "{rel} must say Windows locked mode is a preview"
+        );
+    }
+    let threats = page_text("docs/threats.md");
+    assert!(threats.contains("A25"), "docs/threats.md has the A25 row");
+    assert!(
+        flat(&threats).contains("terminateprocess(hook, 0)"),
+        "the A25 row names the forged exit"
+    );
+}
+
+/// The limits the owner confirmed for the docs (progress note, 2026-11-06).
+#[test]
+fn windows_limits_name_the_session_and_token_facts() {
+    let t = flat(section(&page_text("docs/windows.md"), "## Limits"));
+    for want in [
+        "openssh",
+        "network logon",
+        "restricted",
+        "low-integrity",
+        "group:",
+    ] {
+        assert!(t.contains(want), "docs/windows.md#limits lacks {want:?}");
+    }
 }
 
 #[test]
@@ -356,6 +460,11 @@ fn mcp_page_says_the_gateway_is_linux_only() {
     assert!(
         t.contains(saiife_policy::mcp::MCP_NEEDS_LINUX),
         "docs/mcp.md must quote the macOS load error"
+    );
+    // Plan 19b, W18: Windows has no gateway either.
+    assert!(
+        flat(&t).contains("on windows too"),
+        "docs/mcp.md must say the gateway is Linux only on Windows too"
     );
 }
 

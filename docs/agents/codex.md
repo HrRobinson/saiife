@@ -132,12 +132,14 @@ restricted by the hook only". See [MCP](../mcp.md).
 
 ## Locked mode (v2)
 
-Lock label: **unverified**, on Linux and on macOS. The
+Lock label: **unverified**, on Linux, macOS and Windows. The
 [lock-check](../lock-check.md) for Codex has not been run with a logged-in
 account yet, so we do not know whether Codex can be locked. The managed
-file is `/etc/codex/requirements.toml` on both (on macOS `/etc` is
-`/private/etc`). The macOS results will go to
-`crates/agents/tests/fixtures/lock-check/macos/codex.tsv`. Until it has, treat Codex as running in the Developer
+file is `/etc/codex/requirements.toml` on Linux and macOS (on macOS `/etc` is
+`/private/etc`), and `C:\ProgramData\OpenAI\Codex\requirements.toml` on Windows, where
+locked mode is a preview ([Windows](../windows.md#locked-mode)). The macOS and Windows
+results will go to `crates/agents/tests/fixtures/lock-check/macos/codex.tsv` and
+`…/windows/codex.tsv`. Until it has, treat Codex as running in the Developer
 setup even on a locked machine, and do not rely on the lock for it
 ([threats](../threats.md)).
 

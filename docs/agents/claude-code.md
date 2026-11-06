@@ -106,6 +106,16 @@ Lock label on Linux: **lockable** (checked live with Claude Code 2.1.308 on
 2026-10-22, see [lock-check](../lock-check.md); results in
 `crates/agents/tests/fixtures/lock-check/claude.tsv`).
 
+Lock label on Windows: **unverified**, and Windows locked mode is a preview
+([Windows](../windows.md#locked-mode)). saiife installs the managed hook in
+`C:\Program Files\ClaudeCode\managed-settings.d\` (`50-saiife.json` and
+`60-saiife-mcp.json`), with the command
+`C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent claude`.
+A `Settings` value under `HKLM\SOFTWARE\Policies\ClaudeCode` replaces those files
+unless it says `"managedSourcesBehavior": "merge"`; install and `doctor` fail then.
+The lock check has not run in a Windows VM yet; the results will go to
+`crates/agents/tests/fixtures/lock-check/windows/claude.tsv`.
+
 Lock label on macOS: **unverified**. saiife installs the same managed hook
 in `/Library/Application Support/ClaudeCode/managed-settings.d/`
 (`50-saiife.json` and `60-saiife-mcp.json`), but the lock check has not

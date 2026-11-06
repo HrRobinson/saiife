@@ -13,7 +13,9 @@
 #
 # What it touches (container paths; under $LC_ROOT in the offline tests;
 # in the macOS VM the managed dir is /Library/Application Support/ClaudeCode/
-# instead of /etc/claude-code/, spec 5.3, and /work is /opt/lockcheck/work):
+# instead of /etc/claude-code/, spec 5.3, and /work is /opt/lockcheck/work;
+# in the Windows VM it is C:\Program Files\ClaudeCode\, spec 5.3a, staged
+# under $LC_ROOT/C/ and written by windows-vm.ps1):
 #   /etc/claude-code/managed-settings.d/   rebuilt by every reset (root 0755,
 #                                          files root 0644); 50-saiife.json,
 #                                          60-lockcheck-witness.json, and the
@@ -33,6 +35,10 @@
 
 if [[ "$LC_PLATFORM" == macos ]]; then
   CLAUDE_MANAGED_BASE="$LC_ROOT/Library/Application Support/ClaudeCode"
+elif [[ "$LC_PLATFORM" == windows ]]; then
+  # Spec 5.3a: C:\Program Files\ClaudeCode. Claude Code's Bash tool is Git Bash.
+  CLAUDE_MANAGED_BASE="$LC_ROOT/C/Program Files/ClaudeCode"
+  LC_WIN_SHELL=posix
 else
   CLAUDE_MANAGED_BASE="$LC_ROOT/etc/claude-code"
 fi
@@ -56,8 +62,8 @@ agent_baseline() {
   rm -rf "$CLAUDE_MANAGED_DIR"
   mkdir -p "$CLAUDE_MANAGED_DIR"
   chmod 0755 "$etc" "$CLAUDE_MANAGED_DIR"
-  install -m 0644 "$LC_MANAGED/claude/50-saiife.json" "$CLAUDE_MANAGED_DIR/50-saiife.json"
-  claude_managed_dropin 60-lockcheck-witness.json "$(jq -n --arg cmd "$LC_WITNESS" \
+  install -m 0644 "$(lc_managed_file claude/50-saiife.json)" "$CLAUDE_MANAGED_DIR/50-saiife.json"
+  claude_managed_dropin 60-lockcheck-witness.json "$(jq -n --arg cmd "$LC_WITNESS_CMD" \
     '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $cmd, timeout: 10}]}]}}')"
   rm -f "$CLAUDE_MCP_CONFIG"
 }
@@ -70,6 +76,10 @@ agent_settings_files() {
 
 agent_login_files() {
   printf '%s\n' "$LC_HOME/.claude/.credentials.json" "$LC_HOME/.claude.json"
+}
+
+agent_managed_paths() {
+  printf '%s\n' "$CLAUDE_MANAGED_DIR" "$CLAUDE_MANAGED_BASE/managed-settings.json"
 }
 
 # --- helpers -----------------------------------------------------------------
@@ -87,7 +97,7 @@ claude_managed_dropin() {
 # Settings JSON with a PreToolUse hook (matcher *) that touches this check's
 # marker: it runs only if user hooks run.
 claude_user_hook_json() {
-  jq -nc --arg cmd "touch $LC_MARKERS/$LC_NONCE" \
+  jq -nc --arg cmd "$(lc_touch_cmd "$LC_MARKERS/$LC_NONCE")" \
     '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $cmd}]}]}}'
 }
 

@@ -13,8 +13,9 @@ locked-mode claim. In this mode it is not guaranteed, because an agent
 running as the same user can reach the key; that is a workflow aid, not a
 control.
 
-It runs on Linux and macOS (v2.1). On Linux the key is in the Secret
-Service; on macOS it is in your login Keychain ([macOS](#macos)).
+It runs on Linux, macOS (v2.1) and Windows (v2.2). On Linux the key is in the
+Secret Service; on macOS it is in your login Keychain ([macOS](#macos)); on Windows it
+is in Credential Manager ([Windows](#windows)).
 
 ## Set up
 
@@ -139,6 +140,24 @@ What differs from locked mode:
   it gets a prompt you may click through.
 - The config, state and audit paths are the XDG ones in the table above
   (`~/.config`, `~/.local/state`, `~/.local/share` by default), on macOS too.
+
+## Windows
+
+- **Paths.** Everything is under `%LOCALAPPDATA%\saiife\personal`: `config.toml`,
+  `state\` and `audit\`. The `XDG_*` variables do not count on Windows.
+- **The pipe.** There are no sockets. The endpoint is the named pipe
+  `\\.\pipe\saiife-user-<your SID>`, owned by your SID, with an access list for that
+  SID only. A client checks the owner before it sends anything. There is no
+  `gateway.sock`: use `saiife api` or `saiife mcp`.
+- **Credential Manager.** The key is a generic credential with the target
+  `saiife:vault-key`, kept on this machine only (never roaming). Any program you run
+  can read it, as on the other platforms.
+- **Start at logon.** `saiife daemon --user --autostart on` writes the value
+  `saiife-broker` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and
+  `--autostart off` removes it. `--print-unit` is for systemd and launchd only.
+- **Accounts.** The broker runs only as a person's account. It refuses virtual and
+  service accounts (`NT SERVICE\...` and the like).
+- It has run only on CI's Windows runners. See [Windows](windows.md#personal-broker).
 
 ## What protects the key, and what does not
 

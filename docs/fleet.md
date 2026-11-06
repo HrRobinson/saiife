@@ -648,10 +648,12 @@ run `saiife system uninstall --purge` first, then remove the package.
   Gemini CLI hooks are preview on Windows too. Same-user approval is off, by the owner's
   ruling, so approvals come from a second account in a separate session. Set approvers in
   the fleet `config.toml`.
-- **Rollback.** The MSI rolls back its files when the install action fails, but it does
-  not undo what `system install` already did (the service, the managed files). Run
-  `saiife system uninstall` from the daemon's copy,
-  `C:\ProgramData\saiife\bin\saiife.exe`, to clean up, then fix the cause and install again.
+- **Rollback.** A failed install, upgrade or removal is rolled back, with what
+  `system install` did: a failed first install runs `system uninstall` (unless locked mode
+  was there before the MSI ran), a failed upgrade installs the old version again, and a
+  failed removal installs again. CI forces each failure in `package-windows`. If a
+  rollback itself fails, run `saiife system uninstall` from
+  `C:\ProgramData\saiife\bin\saiife.exe`, then fix the cause and install again.
 - **CI coverage.** CI builds the MSI on a `windows-2025` runner and runs a refused fleet
   file, install, upgrade, removal, `detect.ps1` and the `.intunewin` header. A signed MSI
   and a real Intune or GPO rollout are not covered. Try one machine of each architecture

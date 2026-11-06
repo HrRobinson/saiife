@@ -338,18 +338,20 @@ fn the_preview_limits_are_said_and_fail_nothing() {
     assert_eq!(c.status, Status::Info);
     for word in [
         "preview",
-        "forge a hook's exit",
-        "block the hook",
-        "redirect its path",
+        "TerminateProcess(hook, 0)",
+        "reads as allow",
+        "nothing is recorded",
+        "measured in CI",
         "unverified",
         "Codex",
         "Gemini",
+        "docs/windows.md#locked-mode",
     ] {
         assert!(c.detail.contains(word), "{word}: {}", c.detail);
     }
-    // Nobody has run it on a VM yet, and it must not claim so.
+    // Only CI has run it, and it must not claim more.
     assert!(!c.detail.contains("tested by hand"), "{}", c.detail);
-    assert!(c.detail.contains("has not been tested"), "{}", c.detail);
+    assert!(!c.detail.contains("has not been tested"), "{}", c.detail);
 }
 
 #[test]

@@ -78,12 +78,16 @@ jobs:
         shell: powershell
         run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
       # The locked-windows scripts (plan 19b): every .ps1 parses, and run.ps1 refuses
-      # (exit 2, nothing done) with SAIIFE_LOCKED_CI unset or outside Actions.
+      # (exit 2, nothing done) with SAIIFE_LOCKED_CI unset or outside Actions. The
+      # lock-check VM harness parses and refuses without SAIIFE_LOCKCHECK_WINDOWS_VM.
       - name: locked-windows scripts parse, run.ps1 refuses
         if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
-          foreach ($file in Get-ChildItem scripts/locked-windows/*.ps1) {
+          Remove-Item Env:SAIIFE_LOCKCHECK_WINDOWS_VM -ErrorAction SilentlyContinue
+          $out = pwsh -NoProfile -File ./scripts/lock-check/windows-vm.ps1 -Agent claude
+          if ($LASTEXITCODE -ne 2 -or "$out" -notlike 'refusing:*') { Write-Output "windows-vm.ps1: exit $LASTEXITCODE`: $out"; exit 1 }
+          foreach ($file in @(Get-ChildItem scripts/locked-windows/*.ps1) + @(Get-Item scripts/lock-check/windows-vm.ps1)) {
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
             if ($errors.Count) { $errors | ForEach-Object { Write-Output "$($file.Name): $_" }; exit 1 }

@@ -30,16 +30,18 @@ Legend: **covered**, **partly**, **not covered**.
 | Setup | Platform | Section |
 | --- | --- | --- |
 | Developer: hooks in your own account | any | [Developer](#setup-developer) |
-| Personal broker | Linux, macOS | [Personal broker](#setup-personal-broker) |
-| Locked, on a person's account | supported Linux, macOS 15+ | [Locked, person's account](#setup-locked-on-a-persons-account) |
-| Locked, on a dedicated agent account (recommended for unattended work) | supported Linux, macOS 15+ | [Locked, dedicated account](#setup-locked-on-a-dedicated-account) |
+| Personal broker | Linux, macOS, Windows | [Personal broker](#setup-personal-broker) |
+| Locked, on a person's account | supported Linux, macOS 15+, Windows (preview) | [Locked, person's account](#setup-locked-on-a-persons-account) |
+| Locked, on a dedicated agent account (recommended for unattended work) | supported Linux, macOS 15+, Windows (preview) | [Locked, dedicated account](#setup-locked-on-a-dedicated-account) |
 
 Supported Linux means Ubuntu 22.04+, Debian 12+ and RHEL 9+. Locked mode on
 macOS (v2.1) needs macOS 15 or later; its differences are listed in
-[Locked mode on macOS](#locked-mode-on-macos). Alpine and containers fall
+[Locked mode on macOS](#locked-mode-on-macos). Windows locked mode is a preview
+(v2.2, Windows 11 23H2+ and Server 2022+); its differences are listed in
+[Locked mode on Windows](#locked-mode-on-windows-preview). Alpine and containers fall
 under Developer. An agent whose lock label is not "lockable" falls back to
 the Developer column for the first two rows, even on a locked machine. Lock
-labels are per platform, and on macOS every agent is unverified for now. The label of each agent is on its page:
+labels are per platform, and on macOS and Windows every agent is unverified for now. The label of each agent is on its page:
 [Claude Code](agents/claude-code.md), [Codex](agents/codex.md),
 [Gemini CLI](agents/gemini.md).
 
@@ -205,6 +207,40 @@ tables say, with these differences:
   macOS VM. Until then every agent falls back to the Developer column for
   the hook rows, as above.
 
+## Locked mode on Windows (preview)
+
+Windows locked mode is a preview (v2.2, plan 19b). It covers what the two locked
+tables say, with the differences below. The main one is A25: a process of the
+agent's own user can forge a hook's allow. On Windows, rely on the "Mistake" and
+"Helpful bypass" rows. Do not rely on a row that needs the agent to be unable to get
+past its own hook. See [Windows: locked mode](windows.md#locked-mode).
+
+The rows below were measured by the `locked-windows` CI job on `windows-2022` and
+`windows-2025`, as a standard user, unless they say otherwise.
+
+| # | Attack, as the agent's user | Result on Windows |
+| --- | --- | --- |
+| A25 | End the hook with `TerminateProcess(hook, 0)` | **Not prevented.** The agent reads exit 0 as allow, so the call runs, and nothing is recorded (the audit's size did not change). Windows gives a user full access to its own processes. On Linux and macOS a kill cannot pick the exit code. This is the A21 class: the agent's own code, outside the hook. In CI a second test account could do it too, but only because both accounts were started with `CreateProcessWithLogonW` from one runner session: both carry that session's logon SID (`S-1-5-5-0-…`), which the hook's default access list grants. That is the test's setup, not a hole. The next plan adds a Claude Code HTTP hook that the daemon co-signs, and a check that records a hook that ended without its answer (a record and a `doctor` warning, no automatic lockdown). |
+| A3 | Point `C:` somewhere else with `DefineDosDevice`, so the hook path runs another binary | Refused: `DefineDosDevice` on `C:` failed with error 5 (access denied). |
+| A4 | Plant a DLL beside the hook (the Windows form of `LD_PRELOAD`) | **Covered.** Release builds load DLLs only from System32 (`/DEPENDENTLOADFLAG:0x800`, a static C runtime, `SetDefaultDllDirectories`). A planted DLL beside a copy of `saiife.exe` was not loaded. `doctor` checks the build. |
+| A5 | Stop, reconfigure or delete the service | Refused: only SYSTEM and Administrators may. The service restarts one second after any failure. While it is down, hooks deny. |
+| A6 | Fake the daemon on the pipe `\\.\pipe\saiife` | **Covered.** The daemon makes the first instance and refuses to start if someone else holds the name; clients check the pipe's owner before they send a byte; users cannot add an instance. While the name is squatted, hooks deny. |
+| | Lock `saiife.exe` or `config.toml` (open with share mode 0) so hooks cannot start | Not a block: the open works, and hooks kept working. |
+| A16 | Become an admin through UAC | Host precondition. An agent user in Administrators, Backup Operators, Server Operators, Hyper-V Administrators or Account Operators is a `doctor` **fail**. It drops to a warning only for Administrators with `ConsentPromptBehaviorAdmin = 1` and `PromptOnSecureDesktop = 1` (elevation then needs the password). |
+| A1 | A machine policy that switches the managed hooks off (`HKLM\SOFTWARE\Policies\ClaudeCode`) | A `Settings` value there replaces Claude Code's managed files. Install exits 1 and `doctor` fails `agents.claude.policy` unless it has `"managedSourcesBehavior": "merge"`. Writing `HKLM` needs an admin. |
+| A15 | Approve its own request | **Covered.** Same-user approval is off on Windows: approvals need a second account, from a separate session. There is no password prompt to capture. |
+
+Also different on Windows:
+
+- **Identity.** The daemon reads the caller's SID and groups from its token. The pid is
+  attribution only. Records carry the `sid`.
+- **OpenSSH and tokens.** OpenSSH sessions are probably denied by the pipe's network
+  logon deny. A restricted or low-integrity token is never an admin, but keeps its
+  other groups, so `group:` rules still match it. See
+  [Windows: limits](windows.md#limits).
+- **Not on Windows:** the MCP gateway and the egress recipe.
+- **Lock labels** on Windows are unverified until the lock check runs in a Windows VM.
+
 ## Fail-closed matrix
 
 In locked mode saiife fails closed. These are the cases where an agent's own
@@ -279,8 +315,8 @@ process itself to die or hang.
 
 ## Limits of the guard on Windows
 
-Developer mode only; locked mode on Windows is not built yet. None of this has run
-on real Windows until CI does. The full list is in
+These apply in developer mode and in locked mode. They have run only on CI's Windows
+runners. The full list is in
 [Windows: limits](windows.md#limits). Most of all, the PowerShell and cmd readers do
 not see:
 

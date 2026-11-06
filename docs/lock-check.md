@@ -15,7 +15,9 @@ You run this yourself. CI never runs it, and neither do tests or agents.
 Lock labels are per platform. The Docker run gives the Linux labels. The
 macOS labels come from the same checks run in a throwaway macOS VM
 ([macOS, in a throwaway VM](#macos-in-a-throwaway-vm)); until that has been
-done, every agent is `unverified` on macOS.
+done, every agent is `unverified` on macOS. The Windows labels come from a
+throwaway Windows VM ([Windows, in a throwaway VM](#windows-in-a-throwaway-vm));
+that harness has not run yet, so every agent is `unverified` on Windows.
 
 ## What it touches on your machine
 
@@ -216,6 +218,77 @@ and the `claude.deny` row show whether Claude Code reads drop-ins there. If
 they do not fire, say so: install then switches to the whole file
 `managed-settings.json`.
 
+## Windows, in a throwaway VM
+
+`scripts/lock-check/windows-vm.ps1` runs the same check tables against the
+Windows paths of spec §5.3a:
+
+| Agent | Managed path on Windows |
+|---|---|
+| Claude Code | `C:\Program Files\ClaudeCode\managed-settings.d\` |
+| Codex | `C:\ProgramData\OpenAI\Codex\requirements.toml` |
+| Gemini CLI | `C:\ProgramData\gemini-cli\settings.json` |
+
+**It has not run yet.** No Windows recording exists. The first run in a VM
+will show which of its assumptions hold. Expect to fix the harness on that
+first run.
+
+It writes those system-wide files and runs the agents as a standard user, so
+it runs only inside a throwaway Windows VM, elevated. It refuses (exit 2)
+before it touches anything unless the OS is Windows and
+`SAIIFE_LOCKCHECK_WINDOWS_VM=1` is set. It also refuses when the `saiifed`
+service exists, when `HKLM\SOFTWARE\Policies\ClaudeCode` exists (Claude Code
+would ignore the files), or when any managed file, `C:\ProgramData\saiife` or
+`C:\lockcheck` already exists. At exit it removes what it wrote.
+
+How it works:
+
+- Git Bash runs the check tables (`lib.sh` with `LOCKCHECK_PLATFORM=windows`)
+  against a staging dir, where `C/Program Files/ClaudeCode/...` stands for
+  `C:\Program Files\ClaudeCode\...`.
+- Git Bash cannot start a program as another user. So each agent run is a
+  plan: the managed files, the settings files, the project and the prompt.
+  The script writes the plan's files to `C:\`, starts the agent through Git
+  Bash as the local user `agent`, and hands the logs and markers back. The
+  tables then observe and record as on Linux.
+- The managed hooks run the real W9 command,
+  `C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent <a>`.
+  That `saiife.exe` is a small launcher, compiled in the VM with the .NET
+  Framework's `csc.exe`, that runs the stub in Git Bash. The witness is a
+  launcher too.
+- Prompts for Codex and Gemini CLI use `New-Item`, as their shell is
+  PowerShell. Claude Code's prompts use `touch`, as its `Bash` tool is Git
+  Bash.
+
+Steps:
+
+1. Make a Windows 11 23H2 or Server 2022 VM, and a standard (not admin)
+   local user `agent`.
+2. As an admin, install PowerShell 7, Git for Windows, `jq` (on the admin's
+   `PATH`) and Node 22.
+3. Log in as `agent`, install the agents for that user
+   (`npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli`),
+   sign in to each, then log `agent` off.
+4. Copy a checkout of this repository into the VM. From its root, in an
+   elevated PowerShell 7:
+   `$env:SAIIFE_LOCKCHECK_WINDOWS_VM = '1'; pwsh -File scripts\lock-check\windows-vm.ps1 -Agent all`.
+   It asks for `agent`'s password once.
+
+Results go to `target\lock-check\windows-<agent>-<UTC time>.tsv` and the
+matching `.log`. Their header has `# platform=windows`.
+
+What the first run must settle:
+
+- Which shell each agent uses for hooks on Windows. The launchers do not care,
+  but a user hook that `touch`es a marker does.
+- How the stub's crash modes (`segv`, `kill9`, `hang`) look through the
+  launcher, and whether a hung stub is ended with the agent's hook.
+- Whether `ln -s` in Git Bash makes the login links that the alternate config
+  dir checks need. If it does not, those rows read `inconclusive`.
+- The trust key Codex writes for the project on Windows.
+- The agent's settings files are replaced by the harness's and are not kept.
+  Use a fresh VM clone.
+
 ## What to send back
 
 Send the newest `target/lock-check/<agent>-*.tsv` for each agent. Add the
@@ -224,7 +297,8 @@ results become the fixtures under `crates/agents/tests/fixtures/lock-check/`
 and the "Locked mode" line on each agent page. The macOS results
 (`macos-<agent>-*.tsv`) become
 `crates/agents/tests/fixtures/lock-check/macos/<agent>.tsv`, and the macOS
-labels follow them.
+labels follow them. The Windows results (`windows-<agent>-*.tsv`) become
+`crates/agents/tests/fixtures/lock-check/windows/<agent>.tsv` in the same way.
 
 When you are done, `--forget` removes the logins. The image stays until you
 remove it with `docker image rm saiife-lockcheck:local`.

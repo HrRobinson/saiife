@@ -1,6 +1,6 @@
 # MCP: `saiife mcp` and the MCP gateway
 
-Locked mode (Linux; on macOS `saiife mcp` only, see below). Two parts, both
+Locked mode (Linux; on macOS and Windows `saiife mcp` only, see below). Two parts, both
 about the Model Context Protocol (MCP):
 
 - **`saiife mcp`** is a stdio MCP server that the agent's own config starts.
@@ -22,6 +22,12 @@ is not used. On macOS `[mcp.<name>]` is a load error in every mode:
 "the MCP gateway needs Linux (Landlock) in this version". `saiife mcp` works on macOS
 (locked daemon or personal broker), with the connector tools; it lists no
 gateway tools there.
+
+The gateway is Linux only on Windows too (v2.2, plan 19b). Windows has no
+Landlock, and saiife uses no AppContainer or job-object sandbox yet, so
+`[mcp.<name>]` is the same load error there. `saiife mcp` works on Windows over
+the control pipe, against the locked daemon or the personal broker, with the
+connector tools only.
 
 ## `saiife mcp`: connectors as tools
 

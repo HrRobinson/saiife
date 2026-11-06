@@ -16,8 +16,8 @@ The script verifies the SHA-256 checksum and installs `saiife` to `~/.local/bin`
 More options (pinned version, all users, manual install, uninstall):
 [docs/install.md](docs/install.md).
 
-On Windows, use `install.ps1` (developer mode only, and not yet run outside CI):
-see [docs/windows.md](docs/windows.md).
+On Windows, use `install.ps1` for developer mode (run only on CI's Windows runners so
+far): see [docs/windows.md](docs/windows.md).
 
 To build from source instead, with Rust installed:
 `cargo install --path crates/cli` (this puts `saiife` in `~/.cargo/bin`, which
@@ -52,7 +52,7 @@ and it does not notice that the newest records were removed (see
 
 ## Brokered services
 
-In locked mode (Linux and macOS), saiife can make API calls for the agent. You store a
+In locked mode (Linux, macOS and, as a preview, Windows), saiife can make API calls for the agent. You store a
 credential in saiife's vault (`saiife secret add`, or `saiife secret import`
 to move plaintext credentials out of the home), connect a service with
 `saiife connect shopify|hubspot|github|aws-s3|...`, and the agent calls it through
@@ -85,7 +85,15 @@ Claude Code, on Linux) the agent cannot turn the guard off, the audit is
 written by a daemon the agent cannot touch, and locked mode fails closed.
 On macOS every agent is still unverified (the macOS lock check has not been
 recorded), same-user approval is off (approvals need a second account), and
-the MCP gateway and the egress recipe are Linux only. The agent never holds a credential for a brokered
+the MCP gateway and the egress recipe are Linux only.
+
+Windows locked mode is a preview (v2.2): `saiife system install` from an elevated
+terminal, or the MSI ([Windows](docs/windows.md#locked-mode)). A process running as the
+agent's own user can end a hook with exit 0, which the agent reads as allow, so it does
+not hold against an agent that runs its own code to get past the hook. Every Windows
+lock label is unverified, and approvals need a second account.
+
+The agent never holds a credential for a brokered
 service; it holds its own model-provider login unless you run a local
 model.
 
@@ -120,10 +128,10 @@ model.
   protects and what it does not.
 - [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
   the [egress recipe](docs/egress.md).
-- [Windows](docs/windows.md): developer mode, how each shell is read, and the
-  limits.
-- [Fleet install](docs/fleet.md): `.deb`, `.rpm` and macOS `.pkg` packages, with
-  Ansible, Jamf and Intune recipes.
+- [Windows](docs/windows.md): developer mode, locked mode (preview), how each shell
+  is read, and the limits.
+- [Fleet install](docs/fleet.md): `.deb`, `.rpm`, macOS `.pkg` and Windows `.msi`
+  packages, with Ansible, Jamf, Intune and GPO recipes.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
   and [collections](docs/collections.md).

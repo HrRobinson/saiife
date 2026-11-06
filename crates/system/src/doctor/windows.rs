@@ -47,10 +47,11 @@ const AUDIT_KEY_LEN: u64 = 32;
 
 /// What the lock does not do yet. It is said on every locked run, and fails nothing: an admin
 /// who reads only PASS lines must still have been told.
-const PREVIEW_LIMITS: &str = "Windows locked mode is preview: an agent running code as the same \
-     user can forge a hook's exit, block the hook from starting, or redirect its path. This is \
-     unverified: it has not been tested on a Windows machine yet. Codex and Gemini CLI on \
-     Windows locked mode are preview too";
+const PREVIEW_LIMITS: &str = "Windows locked mode is a preview: a process running as the \
+     agent's user can end a hook with TerminateProcess(hook, 0), which the agent reads as \
+     allow, and nothing is recorded (measured in CI on Windows Server 2022 and 2025). Codex \
+     and Gemini CLI on Windows are preview too, and every Windows lock label is unverified; \
+     see docs/windows.md#locked-mode";
 
 /// The Linux checks with no Windows form in this version. Said, so that their absence does
 /// not read as "fine".
