@@ -2840,7 +2840,7 @@ costs about the same, so the total stays close to the first draft.
 | 16 | Personal broker mode | v2.x | `saiife daemon --user`, keychain vault (macOS Keychain, Secret Service), developer-mode `connect`/`secret` (decision 7) | 1 |
 | 17 | MCP (proposed) | v2.x | `saiife mcp` server, MCP gateway for third-party servers, managed MCP restrictions moved behind the broker | 1.5 |
 | 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible). Built (plan 18): Linux packages, Ansible, Intune Linux; `.pkg`, Jamf and Intune macOS after plan 13 | 1 |
-| 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, password re-authentication, MSI, Intune and GPO recipes, a `locked-windows` CI job | 4 |
+| 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, same-user approval off (a second account approves), MSI, Intune and GPO recipes, a `locked-windows` CI job | 4 |
 
 **Full v2 series (plans 7–18): about 20.5 weeks of evenings.** Plans 14–18
 can be reordered by customer demand. Plan 13 comes first after v2.0 because
