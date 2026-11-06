@@ -243,4 +243,29 @@ mod tests {
         // No enabled Administrators at all: elevated_admin is false, so not 0 either.
         assert_ne!(cred(SYSTEM, &[]).uid, 0);
     }
+
+    /// The daemon's admin checks (`peer_is_admin`, `peer_may_read_all`) decide on the same
+    /// facts: a lowered SYSTEM token is no admin, though its SID says SYSTEM, and a real
+    /// one is.
+    #[test]
+    fn a_lowered_system_token_is_not_an_admin() {
+        use saiife_win::sid::token_is_admin;
+        for lowered in [
+            system_cred("S-1-16-4096", 0),
+            system_cred("S-1-16-8192", 0),
+            system_cred("S-1-16-16384", 1),
+        ] {
+            assert!(!token_is_admin(&lowered.group_sids), "{lowered:?}");
+        }
+        assert!(token_is_admin(&system_cred("S-1-16-16384", 0).group_sids));
+        assert!(!token_is_admin(&cred(SYSTEM, &[]).group_sids));
+        // An elevated admin is one; a filtered one is not.
+        let admin = cred("S-1-5-21-1-2-3-500", &[(ADMINISTRATORS, SE_GROUP_ENABLED)]);
+        assert!(token_is_admin(&admin.group_sids));
+        let filtered = cred(
+            "S-1-5-21-1-2-3-500",
+            &[(ADMINISTRATORS, SE_GROUP_USE_FOR_DENY_ONLY)],
+        );
+        assert!(!token_is_admin(&filtered.group_sids));
+    }
 }

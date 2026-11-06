@@ -754,17 +754,18 @@ impl Ctx {
     }
 
     /// [`Ctx::is_admin`] for a peer. On Windows the uid is a label, so this decides on
-    /// the token: SYSTEM, `Administrators` where it counts (`peer_facts` removes it from
-    /// a low-integrity or restricted token), or an `[admin] groups` group's SID. Any
-    /// lookup failure denies. Elsewhere it is [`Ctx::is_admin`].
+    /// the token: `Administrators` where it counts (`peer_facts` removes it from a
+    /// low-integrity or restricted token, SYSTEM's included, and a real SYSTEM token holds
+    /// it), or an `[admin] groups` group's SID. Any lookup failure denies. Elsewhere it is
+    /// [`Ctx::is_admin`].
     pub async fn peer_is_admin(&self, peer: &PeerCred) -> bool {
-        let Some(sid) = peer.sid.as_deref() else {
+        if peer.sid.is_none() {
             return self.is_admin(peer.uid).await;
-        };
+        }
         if self.mode == Mode::Personal {
             return self.peer_is_own(peer);
         }
-        token_is_admin(sid, &peer.group_sids)
+        saiife_win::sid::token_is_admin(&peer.group_sids)
             || self
                 .token_in_any_group(&peer.group_sids, &self.policy().admin_groups)
                 .await
@@ -973,14 +974,6 @@ pub(crate) fn same_principal(
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
-}
-
-/// A token that is an admin by itself: SYSTEM, or `Administrators` among its groups.
-pub(crate) fn token_is_admin(sid: &str, group_sids: &[String]) -> bool {
-    sid == saiife_win::sid::SYSTEM
-        || group_sids
-            .iter()
-            .any(|g| g == saiife_win::sid::ADMINISTRATORS)
 }
 
 pub(crate) fn trusted_owner_in(mode: Mode, own_uid: u32) -> u32 {
@@ -1350,15 +1343,6 @@ mod principal_tests {
     fn a_sid_and_no_sid_are_not_the_same() {
         assert!(!same_principal(7, Some(A), 7, None));
         assert!(!same_principal(7, None, 7, Some(A)));
-    }
-
-    #[test]
-    fn an_admin_token_is_system_or_holds_administrators() {
-        use saiife_win::sid::{ADMINISTRATORS, SYSTEM, USERS};
-        assert!(token_is_admin(SYSTEM, &[]));
-        assert!(token_is_admin(A, &[ADMINISTRATORS.to_string()]));
-        assert!(!token_is_admin(A, &[USERS.to_string()]));
-        assert!(!token_is_admin(A, &[]));
     }
 }
 

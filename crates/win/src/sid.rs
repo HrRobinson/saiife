@@ -114,6 +114,15 @@ pub fn peer_uid(sid: &str, elevated_admin: bool) -> u32 {
     0x4000_0000 | (u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) & 0x3fff_ffff)
 }
 
+/// Whether a pipe peer is an admin by its token alone: `Administrators` among the groups
+/// [`crate::pipe::peer_facts`] left it. That is the fact [`peer_uid`] gives 0 for, so a
+/// low-integrity or restricted token, SYSTEM's included, is no admin; a real SYSTEM token
+/// holds the group enabled at System integrity and is one. The SID is not looked at: it
+/// says SYSTEM for a lowered SYSTEM token too.
+pub fn token_is_admin(group_sids: &[String]) -> bool {
+    group_sids.iter().any(|g| g == ADMINISTRATORS)
+}
+
 /// Whether `s` is a SID in canonical text: `S-1-<authority>(-<u32>){1,15}`.
 ///
 /// Numbers are plain decimal with no sign or leading zero, since SIDs are

@@ -127,10 +127,10 @@ pub fn may_read_all(dir: &dyn Directory, uid: u32) -> bool {
 /// token: that's what counts for a low-integrity or restricted child, and a group nested
 /// into the local one shows there. A name that can't be resolved is "no".
 pub fn peer_may_read_all(dir: &dyn Directory, peer: &saiife_ipc::peer::PeerCred) -> bool {
-    let Some(sid) = peer.sid.as_deref() else {
+    if peer.sid.is_none() {
         return may_read_all(dir, peer.uid);
-    };
-    crate::ops::token_is_admin(sid, &peer.group_sids)
+    }
+    saiife_win::sid::token_is_admin(&peer.group_sids)
         || dir
             .sid_of(AUDIT_GROUP)
             .is_some_and(|s| peer.group_sids.contains(&s))
@@ -583,6 +583,13 @@ mod tests {
             &D,
             &peer(7, &[saiife_win::sid::ADMINISTRATORS])
         ));
+        // SYSTEM's SID alone is no admin: a low-integrity or restricted SYSTEM token has
+        // no Administrators left after `peer_facts`, and reads only its own records.
+        let mut lowered = peer(7, &[]);
+        lowered.sid = Some(saiife_win::sid::SYSTEM.into());
+        assert!(!peer_may_read_all(&D, &lowered));
+        lowered.group_sids = vec![saiife_win::sid::ADMINISTRATORS.into()];
+        assert!(peer_may_read_all(&D, &lowered));
         // Unix: as it was.
         let mut unix = peer(1002, &[]);
         unix.sid = None;
