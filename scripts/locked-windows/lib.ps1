@@ -24,6 +24,8 @@ $Script:InstalledPath = "$Script:EtcDir\installed.toml"
 $Script:StateDir = "$Script:Root\state"
 $Script:VaultKey = "$Script:StateDir\keys\vault.key"
 $Script:AuditKey = "$Script:StateDir\keys\audit.ed25519"
+# daemon lockdown::path_in: <state>\state\lockdown.json.
+$Script:LockdownFlag = "$Script:StateDir\state\lockdown.json"
 $Script:LogDir = "$Script:Root\log"
 $Script:AuditDir = "$Script:LogDir\audit"
 $Script:DaemonLog = "$Script:LogDir\daemon\daemon.log"
@@ -105,7 +107,10 @@ function Invoke-Phase {
   if ($error_text) {
     if ($Fatal) { throw "$Name failed, and the phases after it need it" }
     # The next phase starts from a known host.
-    try { Restore-Baseline } catch { Write-Host "restoring after ${Name}: $($_.Exception.Message)" }
+    try { Restore-Baseline } catch {
+      $Script:PhaseLines.Add("FAILED  restoring after ${Name}: $($_.Exception.Message)")
+      Write-Host "::error title=restoring after ${Name}::$($_.Exception.Message)"
+    }
   }
 }
 
@@ -660,13 +665,17 @@ function Restore-Config {
     # In place, so the file keeps its descriptor.
     [System.IO.File]::WriteAllText($Script:ConfigPath, $Script:ConfigBackup)
     $Script:ConfigBackup = $null
-    if ((Get-ServiceState) -eq 'Running') { [void](Invoke-As -User $null -Exe "$env:SystemRoot\System32\sc.exe" -Arguments @('control', $Script:ServiceName, 'paramchange')) }
+    # The next step starts only once the daemon has read it back (its `policy` record).
+    if ((Get-ServiceState) -eq 'Running') { Invoke-ReloadChecked }
   }
 }
 
+# A lockdown left on would deny every hook of the phases after it: a failed `off` fails.
 function Restore-Lockdown {
   if ($Script:LockdownOn) {
-    [void](Invoke-As -User $null -Exe $Script:Hook -Arguments @('lockdown', 'off'))
+    $r = Invoke-As -User $null -Exe $Script:Hook -Arguments @('lockdown', 'off')
+    if ($r.StartError) { Fail "restoring: lockdown off could not start: $($r.StartError)" }
+    if ($r.Code -ne 0) { Fail "restoring: lockdown off exited $($r.Code): $($r.Out)$($r.Err)" }
     $Script:LockdownOn = $false
   }
 }
@@ -676,8 +685,7 @@ function Restore-Baseline {
   Restore-UserGroups
   if ((Get-ServiceState) -ne 'Missing') {
     Start-Saiifed
-    Restore-Lockdown
-    Restore-Config
+    try { Restore-Lockdown } finally { Restore-Config }
   }
 }
 
@@ -1613,6 +1621,28 @@ function Test-HookLockedOut([string]$Payload) {
   return $Script:HookCode -eq 2 -and $Script:HookErr -like '*saiife lockdown is on*'
 }
 
+# The newest lockdown record is the elevated runner's change: allowed, and the SID the
+# daemon read from the runner's token. Read right after the command, before any hook.
+function Assert-AdminLockdown([string]$Action) {
+  $rec = Get-LastLockdown
+  if ($null -eq $rec) { Fail "elevated: lockdown ${Action}: no lockdown record" }
+  $json = $rec | ConvertTo-Json -Compress -Depth 8
+  $runner = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+  if ($rec.action -ne $Action -or $rec.decision -ne 'allow') { Fail "elevated: lockdown $Action record: $json" }
+  if ($rec.sid -ne $runner) { Fail "elevated: lockdown $Action record's sid is '$($rec.sid)', want the runner's ${runner}: $json" }
+  if ($Action -eq 'on' -and $rec.scope -ne 'all') { Fail "elevated: lockdown on record's scope is '$($rec.scope)', want all: $json" }
+  Ok "audit record: lockdown $Action allow by the runner (sid $($rec.sid))"
+}
+
+# `saiife lockdown`, no subcommand: the daemon's view of the flag.
+function Assert-LockdownStatusOff([string]$What) {
+  $r = Invoke-Admin -Exe $Script:Hook -Arguments @('lockdown')
+  $text = "$($r.Out)".Trim()
+  if ($r.Code -ne 0 -or $text -ne 'lockdown: off') { Fail "${What}: saiife lockdown exited $($r.Code): $text $($r.Err)" }
+  if (Test-Path -LiteralPath $Script:LockdownFlag) { Fail "${What}: $($Script:LockdownFlag) exists" }
+  Ok "${What}: lockdown: off, no flag file"
+}
+
 function phase_lockdown {
   $allow = Get-Payload 'claude\bash-allow.json'
   Set-ConfigTables 'approval' "`n[approval]`napprovers = [`"$Script:ApproverName`"]`nsame_user = `"deny`"`n"
@@ -1628,6 +1658,16 @@ function phase_lockdown {
   $Script:LockdownOn = $true
   $r = Invoke-Admin -Exe $Script:Hook -Arguments @('lockdown', 'on', '--scope', 'all', '--reason', 'locked-windows CI')
   if ($r.Code -ne 0) { Fail "elevated: lockdown on exited $($r.Code): $($r.Err)" }
+  Assert-AdminLockdown 'on'
+  if (-not (Test-Path -LiteralPath $Script:LockdownFlag -PathType Leaf)) { Fail "lockdown on: no flag file $($Script:LockdownFlag)" }
+  # phase_acls ran before this file existed: W14's STATE row, read back here.
+  $text = (Get-Acl -LiteralPath $Script:LockdownFlag).Sddl
+  Read-Back 'descriptor' "$($Script:LockdownFlag) $text"
+  $row = Get-W14Row $Script:LockdownFlag
+  if (-not $row) { Fail "no W14 row for $($Script:LockdownFlag)" }
+  $wrong = Test-Row $Script:LockdownFlag $row $text
+  if ($wrong) { Fail "$($Script:LockdownFlag) differs from W14: $wrong" }
+  Ok "flag file $($Script:LockdownFlag), its descriptor matches W14"
   Wait-Until 30 'the hook to be locked out' { Test-HookLockedOut $allow }
   Ok "lockdown on (all): hook denied ($($Script:HookErr))"
 
@@ -1651,9 +1691,12 @@ function phase_lockdown {
   $r = Invoke-Admin -Exe $Script:Hook -Arguments @('lockdown', 'off')
   if ($r.Code -ne 0) { Fail "elevated: lockdown off exited $($r.Code): $($r.Err)" }
   $Script:LockdownOn = $false
+  Assert-AdminLockdown 'off'
+  if (Test-Path -LiteralPath $Script:LockdownFlag) { Fail "lockdown off: the flag file $($Script:LockdownFlag) is still there" }
+  Ok 'lockdown off: the flag file is gone'
   Assert-Hook 0 '' 'hook after lockdown was lifted' claude $allow
+  # Waits for the daemon's policy record: the next phase starts on the restored config.
   Restore-Config
-  Wait-DaemonReady
   Ok 'config restored'
 }
 
@@ -1682,9 +1725,18 @@ function Get-ListedPaths([string]$Text) {
 
 function phase_reinstall_uninstall {
   $before = Get-DaemonPid
+  $tomlBefore = [System.IO.File]::ReadAllText($Script:InstalledPath)
+  $shaBefore = Get-Sha $Script:Hook
   Invoke-Install -Allowed 0
   if ((Get-DaemonPid) -ne $before) { Fail "a second install restarted the daemon: pid $before -> $(Get-DaemonPid)" }
-  Ok "a reinstall over our own tree changes nothing (pid $before)"
+  $tomlAfter = [System.IO.File]::ReadAllText($Script:InstalledPath)
+  if ($tomlAfter -cne $tomlBefore) { Fail "a second install changed installed.toml:`n$tomlBefore`n->`n$tomlAfter" }
+  $shaAfter = Get-Sha $Script:Hook
+  if ($shaAfter -ne $shaBefore) { Fail "a second install changed $($Script:Hook): $shaBefore -> $shaAfter" }
+  $shaBin = Get-Sha $Script:Bin
+  if ($shaAfter -ne $shaBin) { Fail "$($Script:Hook) is $shaAfter, the installed build is $shaBin" }
+  Ok "a reinstall over our own tree changes nothing (pid $before, installed.toml, binary $shaAfter)"
+  Assert-LockdownStatusOff 'after the reinstall'
 
   $listedText = [System.IO.File]::ReadAllText($Script:InstalledPath)
   $listed = Get-ListedPaths $listedText
@@ -1711,6 +1763,8 @@ function phase_reinstall_uninstall {
 
   Invoke-Install -Allowed 0, 1
   Wait-DaemonReady
+  # phase_lockdown lifted the flag, and a plain uninstall keeps state: none comes back.
+  Assert-LockdownStatusOff 'after the uninstall and an install'
   $listedAgain = Get-ListedPaths ([System.IO.File]::ReadAllText($Script:InstalledPath))
   $r = Invoke-Admin -Exe $Script:Bin -Arguments @('system', 'uninstall', '--purge')
   Write-Host "$($r.Out)$($r.Err)"
