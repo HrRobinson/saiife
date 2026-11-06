@@ -1115,12 +1115,17 @@ fn the_last_look_at_a_long_line_is_linear() {
     eprintln!("p19a-t7 last look: {:?}", started.elapsed());
 }
 
-/// On Linux and macOS a POSIX line keeps its order: the budget is checked first,
-/// and the record says so.
+/// Linux and macOS share that last look: there is one budget path, whatever the
+/// dialect or the host. A rule still denies, and with nothing to deny the record
+/// says the line timed out.
 #[test]
-fn a_posix_host_keeps_its_budget_order() {
+fn a_posix_host_has_the_same_last_look() {
     let e = posix_host(false).with_budget(Duration::ZERO);
-    for cmd in ["rm -rf /", "git status", "echo x & rm -rf /"] {
+    for cmd in ["rm -rf /", "echo x & rm -rf /", "! rm -rf /"] {
+        let got = e.evaluate(cmd);
+        assert!(got.is_deny(), "{cmd}: {got:?}");
+    }
+    for cmd in ["git status", "echo x & ls"] {
         assert!(timed_out(&e.evaluate(cmd)), "{cmd}");
     }
 }

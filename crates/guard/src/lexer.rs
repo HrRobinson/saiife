@@ -117,6 +117,10 @@ pub struct Word {
     /// in `$'…'` or escaped. False for a word with no `$`, and for a word not
     /// built by this lexer: a `$` counts as live unless shown otherwise.
     pub literal_dollars: bool,
+    /// The first word of a segment that had more in front of it than `then`, `do`,
+    /// `else` or `elif` (`! cd x`, `if cd x`), or a word that may vanish: its `cd`
+    /// has directory slots of its own (`engine::ShellState::plain_cwds`).
+    pub behind_reserved: bool,
 }
 
 impl AsRef<str> for Word {
@@ -176,29 +180,91 @@ fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>
     }
     (
         segments.into_iter().map(strip_leading_keywords).collect(),
-        ctx.note,
+        if ctx.braces_spent {
+            Some(BRACES_PAST_LINE_LIMIT)
+        } else {
+            ctx.note
+        },
     )
 }
 
 /// Shell keywords that only ever *introduce* a real command inside a
 /// compound construct (`if X; then CMD; fi`, `for i in 1; do CMD; done`) —
 /// stripping a leading run of them off a segment reveals the actual
-/// command at argv[0]. Deliberately narrow: `if`/`for`/`while`/`until`
-/// themselves are left alone, since they head their own condition/list
-/// segment (harmless as an argv[0] no pack cares about), not the guarded
-/// command.
+/// command at argv[0]. Matched quoted or not: judging what follows a quoted
+/// one (a command of that name) can only over-deny.
 const LEADING_KEYWORDS: &[&str] = &["then", "do", "else", "elif"];
 
-/// Drop a leading run of `LEADING_KEYWORDS` words from a segment. One pass,
-/// one `drain` — bounded by the segment's own length, so this can't turn an
-/// adversarially long segment into quadratic work.
-fn strip_leading_keywords(mut seg: Segment) -> Segment {
+/// Unquoted words that run the command after them, where a command starts:
+/// `!`, the condition heads `if`/`while`/`until` and `coproc`; zsh's
+/// precommand modifiers `noglob`, `nocorrect` and `-`; fish's `not`, `and`,
+/// `or` and `begin`. Quoted (`"!" cmd`, `\! cmd`) it is a command of that
+/// name, with `cmd` an argument. In a shell without the word it is an unknown
+/// command, so stripping it only over-denies.
+const RESERVED_PREFIXES: &[&str] = &[
+    "!",
+    "if",
+    "while",
+    "until",
+    "coproc",
+    "noglob",
+    "nocorrect",
+    "-",
+    "not",
+    "and",
+    "or",
+    "begin",
+];
+
+/// How many leading words of a segment are reserved words in front of its
+/// command: `RESERVED_PREFIXES` and `LEADING_KEYWORDS`; `for NAME do` and
+/// `select NAME do` with no separator before `do`; `function NAME`, whose
+/// body need not have braces (`function f if …`); zsh's `repeat N`.
+/// `time [-p] [--]` counts only in front of another such
+/// word (`time ! cmd`): before a plain command it stays for `wrappers`, which
+/// also knows GNU time's options. This only looks at the front of the
+/// segment, so a word after a wrapper, an assignment or a redirection is an
+/// argument, as in bash (`env ! cmd`, `FOO=1 ! cmd`, `echo !`).
+pub(crate) fn reserved_prefix_len(seg: &[Word]) -> usize {
+    let bare = |i: usize, s: &str| seg.get(i).is_some_and(|w| !w.quoted && w.text == s);
+    let mut stripped = 0;
     let mut i = 0;
-    while i < seg.len() && LEADING_KEYWORDS.contains(&seg[i].text.as_str()) {
-        i += 1;
+    while let Some(w) = seg.get(i) {
+        #[cfg(test)]
+        crate::work::add(1);
+        let t = w.text.as_str();
+        if LEADING_KEYWORDS.contains(&t) || (!w.quoted && RESERVED_PREFIXES.contains(&t)) {
+            i += 1;
+        } else if bare(i, "time") {
+            i += 1;
+            i += usize::from(bare(i, "-p"));
+            i += usize::from(bare(i, "--"));
+            continue;
+        } else if (bare(i, "for") || bare(i, "select")) && bare(i + 2, "do") {
+            i += 3;
+        } else if (bare(i, "repeat") || bare(i, "function")) && i + 1 < seg.len() {
+            i += 2;
+        } else {
+            break;
+        }
+        stripped = i;
     }
+    stripped
+}
+
+/// Drop the leading reserved words from a segment. One pass, one `drain` —
+/// bounded by the segment's own length, so this can't turn an adversarially
+/// long segment into quadratic work.
+fn strip_leading_keywords(mut seg: Segment) -> Segment {
+    let i = reserved_prefix_len(&seg);
     if i > 0 {
+        let behind = seg[..i]
+            .iter()
+            .any(|w| !LEADING_KEYWORDS.contains(&w.text.as_str()));
         seg.drain(0..i);
+        if let (true, Some(first)) = (behind, seg.first_mut()) {
+            first.behind_reserved = true;
+        }
     }
     seg
 }
@@ -235,13 +301,47 @@ struct Ctx {
     arith_budget: usize,
     /// Why part of the line could not be lexed exactly (the first reason).
     note: Option<&'static str>,
+    /// Words and bytes brace expansion may still make on this line.
+    brace_words: usize,
+    brace_bytes: usize,
+    /// The line went past that: what is left stays as written.
+    braces_spent: bool,
 }
+
+/// The most words brace expansion makes on one line, far past any command a person
+/// or an agent writes, and the bytes. One word's expansion has its own limits
+/// (`canon::BRACE_LIMIT`), but dense braces on a 256 KiB line would otherwise make
+/// millions of words and hundreds of megabytes. A line past these is denied
+/// (`engine`), since bash would expand what stays as written here.
+const BRACE_LINE_WORDS: usize = 64 * 1024;
+const BRACE_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The note for a line past those limits. Nothing else can stand in for it: the
+/// engine denies on it.
+pub const BRACES_PAST_LINE_LIMIT: &str = "brace expansions past what one line may make";
 
 impl Ctx {
     fn new() -> Ctx {
         Ctx {
             arith_budget: ARITH_LOOKAHEAD_TOTAL,
             note: None,
+            brace_words: BRACE_LINE_WORDS,
+            brace_bytes: BRACE_LINE_BYTES,
+            braces_spent: false,
+        }
+    }
+
+    fn spend_braces(&mut self, words: &[String]) {
+        let bytes: usize = words.iter().map(String::len).sum();
+        match (
+            self.brace_words.checked_sub(words.len()),
+            self.brace_bytes.checked_sub(bytes),
+        ) {
+            (Some(w), Some(b)) => {
+                self.brace_words = w;
+                self.brace_bytes = b;
+            }
+            _ => self.braces_spent = true,
         }
     }
 
@@ -306,6 +406,11 @@ fn lex_in(
         case_depth: 0,
         case_await_in: false,
         case_pattern: false,
+        start: CommandStart {
+            seen: 0,
+            open: true,
+            after_time: false,
+        },
     };
     while let Some(c) = lx.chars.next() {
         if !lx.step(c) {
@@ -380,6 +485,19 @@ struct Lexer<'s, 'c> {
     case_depth: usize,
     case_await_in: bool,
     case_pattern: bool,
+    /// What `starts_a_command` has read of `toks` so far.
+    start: CommandStart,
+}
+
+/// Whether the next word is where a command starts: first in its segment, or
+/// after reserved words that are themselves in one (`if`, `while`, `!`,
+/// `time [-p]`, …). Kept up to date as tokens arrive, so a line of many
+/// `[[` or `case` words costs one pass.
+struct CommandStart {
+    /// Tokens already read.
+    seen: usize,
+    open: bool,
+    after_time: bool,
 }
 
 impl Lexer<'_, '_> {
@@ -421,6 +539,7 @@ impl Lexer<'_, '_> {
             quoted: w.quoted,
             dq_substitution,
             literal_dollars: !w.live_dollar && !w.has_sub && text_has_dollar,
+            behind_reserved: false,
         };
         // Brace expansion happens before anything else looks at
         // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
@@ -435,19 +554,34 @@ impl Lexer<'_, '_> {
                 commands: None,
             });
         }
+        // zsh runs what follows a test with no separator (`if [[ x ]] cmd`).
+        let closes_test = self.in_test && !w.quoted && word.text == "]]";
         if !w.quoted {
             self.keyword(&word.text);
+        }
+        if closes_test {
+            self.toks.push(LexTok::Word(word));
+            self.toks.push(LexTok::Operator(Operator::Semi));
+            return;
         }
         if w.brace_marks.is_empty() {
             self.toks.push(LexTok::Word(word));
         } else {
-            match crate::canon::expand_marked(&word.text, &w.brace_marks) {
-                Some(words) => self.toks.extend(words.into_iter().map(|text| {
-                    LexTok::Word(Word {
-                        text,
-                        ..word.clone()
-                    })
-                })),
+            let expanded = if self.ctx.braces_spent {
+                None
+            } else {
+                crate::canon::expand_marked(&word.text, &w.brace_marks)
+            };
+            match expanded {
+                Some(words) => {
+                    self.ctx.spend_braces(&words);
+                    self.toks.extend(words.into_iter().map(|text| {
+                        LexTok::Word(Word {
+                            text,
+                            ..word.clone()
+                        })
+                    }));
+                }
                 None => self.toks.push(LexTok::Word(Word {
                     brace_overflow: true,
                     ..word
@@ -456,11 +590,45 @@ impl Lexer<'_, '_> {
         }
     }
 
+    /// See `CommandStart`.
+    fn starts_a_command(&mut self) -> bool {
+        let start = &mut self.start;
+        for tok in &self.toks[start.seen..] {
+            #[cfg(test)]
+            crate::work::add(1);
+            match tok {
+                LexTok::Operator(_) => {
+                    start.open = true;
+                    start.after_time = false;
+                }
+                LexTok::Word(w) => {
+                    let reserved = !w.quoted
+                        && (matches!(
+                            w.text.as_str(),
+                            "!" | "time"
+                                | "if"
+                                | "elif"
+                                | "while"
+                                | "until"
+                                | "then"
+                                | "do"
+                                | "else"
+                                | "coproc"
+                        ) || (start.after_time && w.text == "-p"));
+                    start.open &= reserved;
+                    start.after_time = w.text == "time";
+                }
+            }
+        }
+        start.seen = self.toks.len();
+        start.open
+    }
+
     /// An unquoted word just completed: track `case … in … esac` and
     /// `[[ … ]]`.
     fn keyword(&mut self, text: &str) {
         match text {
-            "case" if starts_a_command(&current_segment(&self.toks)) => {
+            "case" if self.starts_a_command() => {
                 self.case_depth += 1;
                 self.case_await_in = true;
             }
@@ -468,10 +636,7 @@ impl Lexer<'_, '_> {
                 self.case_await_in = false;
                 self.case_pattern = true;
             }
-            "esac"
-                if self.case_depth > 0
-                    && (self.case_pattern || starts_a_command(&current_segment(&self.toks))) =>
-            {
+            "esac" if self.case_depth > 0 && (self.case_pattern || self.starts_a_command()) => {
                 self.case_depth -= 1;
                 self.case_pattern = false;
             }
@@ -482,7 +647,7 @@ impl Lexer<'_, '_> {
             // or after reserved words that start one (`if`, `!`,
             // `time`, …). `echo [[`, `env [[`, `sudo [[` and (as
             // in bash) `FOO=1 [[` are a command and its arguments.
-            self.in_test = starts_a_command(&current_segment(&self.toks));
+            self.in_test = self.starts_a_command();
         } else if text == "]]" {
             self.in_test = false;
         }
@@ -532,6 +697,7 @@ impl Lexer<'_, '_> {
     fn newline(&mut self) {
         self.flush_word();
         self.toks.push(LexTok::Operator(Operator::Newline));
+        let mut pipeline = None;
         for doc in std::mem::take(&mut self.pending_docs) {
             // The body is commands when a shell in its pipeline
             // reads it (or that cannot be known); otherwise data,
@@ -546,7 +712,7 @@ impl Lexer<'_, '_> {
             );
             let commands = doc
                 .commands
-                .unwrap_or_else(|| body_is_commands(&self.toks, doc.op));
+                .unwrap_or_else(|| body_is_commands(&self.toks, doc.op, &mut pipeline));
             if commands && self.depth + 1 >= MAX_FRAME_DEPTH {
                 self.ctx.note(TOO_DEEP);
             } else if commands {
@@ -702,6 +868,8 @@ impl Lexer<'_, '_> {
                 w.text.push_str(body);
                 w.text.push_str("))");
                 self.flush_word();
+                // zsh runs what follows with no separator (`if (( 1 )) cmd`).
+                self.toks.push(LexTok::Operator(Operator::Semi));
             }
             other => {
                 // Too long to tell: judged as the subshells it may
@@ -919,9 +1087,10 @@ impl Lexer<'_, '_> {
         // their consumer decided from this frame's tokens.
         if !pending_docs.is_empty() {
             toks.push(LexTok::Operator(Operator::Newline));
+            let mut pipeline = None;
             for doc in &mut pending_docs {
                 if doc.commands.is_none() {
-                    doc.commands = Some(body_is_commands(&toks, doc.op));
+                    doc.commands = Some(body_is_commands(&toks, doc.op, &mut pipeline));
                 }
             }
             toks.pop();
@@ -1042,22 +1211,6 @@ fn arith_body(
     None
 }
 
-/// Does a `[[` after these words (the current command so far) start a
-/// test? Only in a reserved word's position: first, or after reserved
-/// words that are themselves in one (`if`, `while`, `!`, `time [-p]`, …).
-fn starts_a_command(words: &[Word]) -> bool {
-    let mut after_time = false;
-    words.iter().all(|w| {
-        let reserved = !w.quoted
-            && (matches!(
-                w.text.as_str(),
-                "!" | "time" | "if" | "elif" | "while" | "until" | "then" | "do" | "else"
-            ) || (after_time && w.text == "-p"));
-        after_time = w.text == "time";
-        reserved
-    })
-}
-
 /// Commands that run what they read on stdin as commands (or pass it to
 /// something that does).
 const STDIN_RUNNERS: &[&str] = &[
@@ -1070,8 +1223,13 @@ const STDIN_RUNNERS: &[&str] = &[
 /// (its consumer comes later), or when a command of its pipeline, with
 /// wrappers, assignments, redirections and `exec` peeled, is a shell (see
 /// `STDIN_RUNNERS`) or cannot be known (none left: `sudo -s`; a variable
-/// or substitution: `$SHELL`).
-fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
+/// or substitution: `$SHELL`). `pipeline` holds the last pipeline judged, so
+/// many here-documents on one line (`cat <<A <<A …`) judge it once.
+fn body_is_commands(
+    toks: &[LexTok],
+    op: usize,
+    pipeline: &mut Option<(std::ops::Range<usize>, bool)>,
+) -> bool {
     // A list operator ends the pipeline; `|` does not.
     let ends_pipeline = |t: &LexTok| matches!(t, LexTok::Operator(o) if *o != Operator::Pipe);
     // `toks` ends with the newline of the heredoc's line.
@@ -1084,6 +1242,11 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
     ) {
         return true;
     }
+    if let Some((range, commands)) = pipeline {
+        if range.contains(&op) {
+            return *commands;
+        }
+    }
     let start = toks[..op]
         .iter()
         .rposition(ends_pipeline)
@@ -1092,7 +1255,9 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
         .iter()
         .position(ends_pipeline)
         .map_or(end, |i| op + i);
-    toks[start..stop]
+    #[cfg(test)]
+    crate::work::add(stop - start);
+    let commands = toks[start..stop]
         .split(|t| matches!(t, LexTok::Operator(_)))
         .any(|seg| {
             let words: Vec<Word> = seg
@@ -1103,27 +1268,17 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
                 })
                 .collect();
             runs_stdin(&words)
-        })
-}
-
-/// The words of the segment being lexed (after the last operator).
-fn current_segment(toks: &[LexTok]) -> Vec<Word> {
-    let start = toks
-        .iter()
-        .rposition(|t| matches!(t, LexTok::Operator(_)))
-        .map_or(0, |i| i + 1);
-    toks[start..]
-        .iter()
-        .filter_map(|t| match t {
-            LexTok::Word(w) => Some(w.clone()),
-            LexTok::Operator(_) => None,
-        })
-        .collect()
+        });
+    *pipeline = Some((start..stop, commands));
+    commands
 }
 
 /// Does this command (one pipeline segment) run its stdin as commands, or
 /// is it unknown?
 fn runs_stdin(words: &[Word]) -> bool {
+    // These words are still in front of the command here (`! bash <<EOF`,
+    // `if bash <<EOF`, `then bash <<EOF`).
+    let words = &words[reserved_prefix_len(words)..];
     // After a compound command's end (`done <<EOF`, `fi <<EOF`): the body
     // feeds the whole compound command; judge it as commands.
     if words
@@ -1218,6 +1373,7 @@ fn redirect_tok(text: String) -> LexTok {
         quoted: false,
         dq_substitution: false,
         literal_dollars: false,
+        behind_reserved: false,
     })
 }
 
@@ -2191,7 +2347,7 @@ mod tests {
     fn leading_then_do_else_elif_are_stripped_revealing_the_real_command() {
         assert_eq!(
             segs("if true; then rm -rf /; fi"),
-            vec![vec!["if", "true"], vec!["rm", "-rf", "/"], vec!["fi"]]
+            vec![vec!["true"], vec!["rm", "-rf", "/"], vec!["fi"]]
         );
         assert_eq!(
             segs("for i in 1; do rm -rf /; done"),
@@ -2203,8 +2359,44 @@ mod tests {
         );
         assert_eq!(
             segs("while true; do rm -rf /; done"),
-            vec![vec!["while", "true"], vec!["rm", "-rf", "/"], vec!["done"]]
+            vec![vec!["true"], vec!["rm", "-rf", "/"], vec!["done"]]
         );
+    }
+
+    #[test]
+    fn reserved_words_are_stripped_only_where_a_command_starts() {
+        let first = |cmd: &str| segs(cmd).remove(0);
+        assert_eq!(first("! rm -rf /"), ["rm", "-rf", "/"]);
+        assert_eq!(first("! ! time ! if rm"), ["rm"]);
+        assert_eq!(first("time -p -- ! rm"), ["rm"]);
+        assert_eq!(first("for i do rm"), ["rm"]);
+        assert_eq!(
+            segs("for ((i=0;i<1;i++)) do rm"),
+            [vec!["for", "((i=0;i<1;i++))"], vec!["rm"]]
+        );
+        assert_eq!(first("function f if rm"), ["rm"]);
+        assert_eq!(segs("if [[ x ]] rm"), [vec!["[[", "x", "]]"], vec!["rm"]]);
+        assert_eq!(segs("if (( 1 )) rm"), [vec!["(( 1 ))"], vec!["rm"]]);
+        assert_eq!(first("echo ]] rm"), ["echo", "]]", "rm"]);
+        // A test after `coproc`: `<` compares, it does not redirect.
+        assert!(!split_segments("coproc [[ a < b ]]")[0][2].redirect);
+        assert!(split_segments("coproc x < b")[0][1].redirect);
+        assert_eq!(first("repeat 3 rm"), ["rm"]);
+        assert_eq!(first("coproc rm"), ["rm"]);
+        // `time` alone is left to the wrapper table.
+        assert_eq!(first("time -p rm"), ["time", "-p", "rm"]);
+        assert_eq!(first("time -o f rm"), ["time", "-o", "f", "rm"]);
+        assert_eq!(first("time time rm"), ["time", "time", "rm"]);
+        // Not reserved here.
+        assert_eq!(first("echo ! rm"), ["echo", "!", "rm"]);
+        assert_eq!(first("\"!\" rm"), ["!", "rm"]);
+        assert_eq!(first("\\! rm"), ["!", "rm"]);
+        assert_eq!(first("!rm"), ["!rm"]);
+        assert_eq!(first("FOO=1 ! rm"), ["FOO=1", "!", "rm"]);
+        assert_eq!(first("env ! rm"), ["env", "!", "rm"]);
+        assert_eq!(first("for i in a"), ["for", "i", "in", "a"]);
+        // Nothing left.
+        assert!(segs("! !").is_empty() || segs("! !")[0].is_empty());
     }
 
     #[test]

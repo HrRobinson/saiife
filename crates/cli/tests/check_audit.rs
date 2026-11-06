@@ -107,19 +107,34 @@ fn garbage_payload_is_audited_as_error_allowed() {
 }
 
 #[test]
-fn oversize_payload_is_error_allowed() {
+fn oversize_payload_is_error_denied() {
     let dir = tempfile::tempdir().unwrap();
     let big = payload(&format!("echo {}", "a".repeat(300 * 1024)));
-    assert_eq!(check(dir.path(), &["--hook-exit"], &big), 0);
+    assert_eq!(check(dir.path(), &["--hook-exit"], &big), 2);
     let r = &guard_records(dir.path())[0];
-    assert_eq!(r.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(r.decision, DecisionKind::ErrorDenied);
     assert!(
         r.input.starts_with("echo "),
         "command kept: {:.40}",
         r.input
     );
     assert!(r.input.ends_with("…[truncated]"));
-    assert!(r.reason.as_deref().unwrap().contains("payload"));
+    assert!(r.reason.as_deref().unwrap().contains("not judged"));
+}
+
+/// The owner's pin: 300 KiB ending in `rm -rf /` and in `ls`, developer mode.
+#[test]
+fn a_line_over_the_limit_is_denied_whatever_it_ends_in() {
+    for tail in ["rm -rf /", "ls"] {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}; {tail}", "a".repeat(300 * 1024));
+        assert_eq!(check(dir.path(), &["--hook-exit"], &payload(&line)), 2);
+        let r = &guard_records(dir.path())[0];
+        assert_eq!(r.decision, DecisionKind::ErrorDenied, "{tail}");
+        let reason = r.reason.as_deref().unwrap();
+        assert!(reason.contains("not judged"), "{reason}");
+        assert!(reason.contains("split"), "{reason}");
+    }
 }
 
 #[test]
@@ -137,6 +152,44 @@ fn secrets_never_reach_the_audit_file() {
         .collect();
     assert!(!raw.contains(&tok), "token leaked: {raw}");
     assert!(raw.contains("[MASKED]"));
+}
+
+#[test]
+fn a_negated_command_is_denied_and_recorded_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        check(dir.path(), &["--hook-exit"], &payload("! rm -rf /")),
+        2
+    );
+    let r = &guard_records(dir.path())[0];
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
+    assert_eq!(r.input, "! rm -rf /");
+
+    let dir = tempfile::tempdir().unwrap();
+    let tok = format!("ghp_{}", "z".repeat(36));
+    check(
+        dir.path(),
+        &["--hook-exit"],
+        &payload(&format!("! GH_TOKEN={tok} rm -rf /")),
+    );
+    let r = &guard_records(dir.path())[0];
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.input, "! GH_TOKEN=[MASKED] rm -rf /");
+}
+
+/// A line this long overruns the budget in a debug build, and the rule at its
+/// end is still a normal deny with its pack and rule, whatever the machine's
+/// speed: judged in full or in the cheap pass, the record is the same.
+#[test]
+fn a_rule_after_a_padded_line_is_recorded_as_a_deny() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}x; rm -rf /", "$(true) ".repeat(20_000));
+    assert_eq!(check(dir.path(), &["--hook-exit"], &payload(&line)), 2);
+    let r = &guard_records(dir.path())[0];
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
+    assert!(r.rule.is_some(), "{r:?}");
 }
 
 #[test]

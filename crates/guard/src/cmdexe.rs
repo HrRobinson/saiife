@@ -175,9 +175,13 @@ impl Reader {
         self.note.get_or_insert(why);
     }
     fn peek(&self) -> Option<char> {
+        #[cfg(test)]
+        crate::work::add(1);
         self.c.get(self.i).copied()
     }
     fn at(&self, n: usize) -> Option<char> {
+        #[cfg(test)]
+        crate::work::add(1);
         self.c.get(self.i + n).copied()
     }
 

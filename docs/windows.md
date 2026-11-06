@@ -80,7 +80,8 @@ What happens when the guard cannot judge something:
 |---|---|
 | The PowerShell or cmd reader cannot read the line (`$x` as a path, `.ps1` scripts, .NET calls, `Set-Alias`), under the PowerShell tool or the PowerShell reading of a Codex or Gemini CLI call | denied, and recorded as a deny |
 | A broken payload from the PowerShell tool | `error_denied` |
-| Out of time, a panic, or an oversize line | `error_allowed`. A rule that matches the remaining segments of a reader's line still denies it |
+| Out of time, or a panic | `error_allowed`. A rule that matches the remaining segments of a line still denies it |
+| A shell line over 256 KiB | `error_denied`, and the agent is told to split it |
 | From Git Bash, a nested `powershell`, `pwsh` or `cmd` the reader cannot read (`-File x.ps1`, `-enc` that does not decode, a .NET call) | denied, and recorded as a deny |
 | A shell with no command to read, so it runs its stdin (`echo x \| cmd`, `cat f \| bash`, `cmd < f`), or `wsl` with an option the guard does not know | denied, and recorded as a deny |
 | A note from the POSIX reading itself, or from the cmd reading under Codex and Gemini CLI | `error_allowed` |

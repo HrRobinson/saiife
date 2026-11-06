@@ -125,7 +125,8 @@ three; `guard`, `audit` and `agents` do not depend on each other except that
 Carried-over invariants:
 
 - **Fail open.** Any internal error, parse failure or exceeded latency budget
-  allows the command. The event is still audited (§6).
+  allows the command. The event is still audited (§6). A shell line over the
+  size limit is the exception: it is denied (owner's ruling, v2 §5.3a).
 - **Latency budget.** 50 ms per evaluation (existing `DEFAULT_BUDGET`).
 - **No network.** The binary makes no network calls of any kind (§8).
 

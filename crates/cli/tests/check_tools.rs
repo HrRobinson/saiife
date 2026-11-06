@@ -536,6 +536,29 @@ fn payload(tool: &str, cwd: &Path, input: serde_json::Value) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Padding that main skips spends the budget here, and what is left of the line is
+/// named only by the filesystem. The real hook still blocks it.
+#[cfg(unix)]
+#[test]
+fn a_padded_line_ending_in_a_link_or_a_glob_is_denied() {
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(root.path().join(".ssh")).unwrap();
+    std::fs::write(app.join(".env"), "TOKEN=1\n").unwrap();
+    std::fs::write(root.path().join(".ssh/id_rsa"), "x").unwrap();
+    std::os::unix::fs::symlink(".env", app.join("link")).unwrap();
+    std::os::unix::fs::symlink("../.ssh", app.join("keys")).unwrap();
+    let pad = "$(true) X=1 ".repeat(20_000);
+    for tail in ["cat link", "cat .en*", "cat keys/id_rsa"] {
+        let line = format!("<{pad}>x; {tail}");
+        let audit = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({"command": line});
+        let (out, _) = check_bytes(audit.path(), "claude", &payload("Bash", &app, input));
+        assert_eq!(out.code, 2, "{tail}: {}", out.stderr);
+    }
+}
+
 /// Controller ruling C2/I1: patterns are expanded and every match judged.
 #[test]
 fn glob_patterns_are_expanded_and_every_match_judged() {
@@ -652,19 +675,80 @@ fn huge_write_is_judged_by_its_path() {
     }
 }
 
-/// A shell command above the payload cap stays a recorded fail-open, and
-/// its reason names the real limit.
+/// Owner's ruling: a shell line over the size limit is denied in every mode,
+/// whatever it ends in, and the record and the agent are told why and what to do.
 #[test]
-fn oversize_shell_payload_names_its_real_limit() {
+fn an_oversize_shell_line_is_denied_for_every_agent_and_shell_tool() {
+    for (agent, tool) in [
+        ("claude", "Bash"),
+        ("claude", "PowerShell"),
+        ("codex", "Bash"),
+        ("gemini", "run_shell_command"),
+    ] {
+        for tail in ["rm -rf /", "ls"] {
+            let cmd = format!("{}{tail}", "echo x; ".repeat(300 * 1024 / 7));
+            let stdin = serde_json::json!({
+                "tool_name": tool, "cwd": "/home/u/app",
+                "tool_input": {"command": cmd}
+            })
+            .to_string();
+            let (out, rec) = run_bytes(agent, stdin.as_bytes());
+            assert_eq!(out.code, 2, "{agent} {tool} {tail}: {}", out.stderr);
+            assert_eq!(rec.decision, DecisionKind::ErrorDenied, "{agent} {tool}");
+            assert!(rec.input.starts_with("echo x; "), "{:.40}", rec.input);
+            let reason = rec.reason.as_deref().unwrap_or("");
+            for said in [reason, out.stderr.as_str()] {
+                assert!(said.contains("262144"), "{said}");
+                assert!(said.contains("split"), "{said}");
+                assert!(said.contains("not judged"), "{said}");
+            }
+        }
+    }
+}
+
+/// A file tool is judged at any size up to the parse cap: the ruling is for shell
+/// lines.
+#[test]
+fn an_oversize_write_is_still_judged() {
     let stdin = serde_json::json!({
-        "tool_name": "Bash", "cwd": "/home/u/app",
-        "tool_input": {"command": format!("echo {}", "a".repeat(300 * 1024))}
+        "tool_name": "Write", "cwd": "/home/u/app",
+        "tool_input": {"file_path": "/home/u/app/src/big.rs", "content": "a".repeat(300 * 1024)}
     })
     .to_string();
     let (out, rec) = run_bytes("claude", stdin.as_bytes());
     assert_eq!(out.code, 0);
+    assert_eq!(rec.decision, DecisionKind::Allow);
+}
+
+/// Past the parse cap nothing is parsed, but the first `tool_name` still says it is
+/// a shell line. A file tool past it stays what it was.
+#[test]
+fn a_shell_line_past_the_parse_cap_is_denied_and_a_write_stays_open() {
+    let big = "a".repeat(65 * 1024 * 1024);
+    let shell =
+        format!(r#"{{"tool_name":"Bash","cwd":"/home/u/app","tool_input":{{"command":"{big}"}}}}"#);
+    let (out, rec) = run_bytes("claude", shell.as_bytes());
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorDenied);
+    assert!(out.stderr.contains("split"), "{}", out.stderr);
+    let write = format!(
+        r#"{{"tool_name":"Write","cwd":"/home/u/app","tool_input":{{"file_path":"/home/u/app/x","content":"{big}"}}}}"#
+    );
+    let (out, rec) = run_bytes("claude", write.as_bytes());
+    assert_eq!(out.code, 0);
     assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
-    assert!(out.stderr.contains("262144"), "{}", out.stderr);
+}
+
+/// A broken payload stays as it was, small or large.
+#[test]
+fn a_broken_payload_is_not_the_size_ruling() {
+    let (out, rec) = run_bytes("claude", br#"{"tool_name":"Bash""#);
+    assert_eq!(out.code, 0);
+    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    let large = format!(r#"{{"tool_name":"Bash","x":"{}"#, "a".repeat(300 * 1024));
+    let (out, rec) = run_bytes("claude", large.as_bytes());
+    assert_eq!(out.code, 0);
+    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
 }
 
 /// Minor 1: a write with no path is not a judged allow of the cwd.

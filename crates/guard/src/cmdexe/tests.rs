@@ -1019,9 +1019,8 @@ fn delimiters_before_a_cmd_switch() {
 }
 
 /// Lines built to make the reader rewind or rescan: `(name, line)`.
-fn hostile_lines() -> Vec<(&'static str, String)> {
-    // The most a hook payload holds, whatever the unit's length.
-    let r = |s: &str| s.repeat(256 * 1024 / s.len());
+fn hostile_lines(size: usize) -> Vec<(&'static str, String)> {
+    let r = |s: &str| s.repeat(size / s.len());
     vec![
         ("for", r("for ")),
         ("for tab", r("for\t")),
@@ -1078,17 +1077,35 @@ fn hostile_lines() -> Vec<(&'static str, String)> {
 }
 
 /// The reader runs before any budget is checked, and past the hook's timeout
-/// Codex and Gemini run the command (§9.3). So it stays linear on any line.
+/// Codex and Gemini run the command (§9.3). So it stays linear on any line: the
+/// characters it looks at, counted, double with the line, up to the most a hook
+/// payload holds, and no clock is read.
 #[test]
 fn hostile_lines_stay_linear() {
-    for (name, line) in hostile_lines() {
-        let start = std::time::Instant::now();
-        let _ = split_segments_noted(&line);
-        let took = start.elapsed();
-        println!("{name}: {took:?}");
-        assert!(took < std::time::Duration::from_secs(5), "{name}: {took:?}");
+    let work = |size: usize| -> Vec<(&'static str, usize, usize)> {
+        hostile_lines(size)
+            .into_iter()
+            .map(|(name, line)| {
+                crate::work::take();
+                let _ = split_segments_noted(&line);
+                (name, line.len(), crate::work::take())
+            })
+            .collect()
+    };
+    let (quarter, half, full) = (work(64 * 1024), work(128 * 1024), work(256 * 1024));
+    let mut failures = Vec::new();
+    for ((a, b), c) in quarter.iter().zip(&half).zip(&full) {
+        let (name, w64, w128, w256) = (a.0, a.2, b.2, c.2);
+        if w128 > w64 * 5 / 2 || w256 > w128 * 5 / 2 || w256 > c.1 * MAX_LOOKS_PER_CHAR {
+            failures.push(format!("{name}: {w64} {w128} {w256}"));
+        }
     }
+    assert!(failures.is_empty(), "superlinear:\n{}", failures.join("\n"));
 }
+
+/// How often the reader may look at one character, on the worst line above.
+/// Measured at 256 KiB: `else(` about 65 times, the next worst (`if else`) 22.
+const MAX_LOOKS_PER_CHAR: usize = 80;
 
 /// The attack the line above is for: what comes first is still judged, in time.
 #[test]
