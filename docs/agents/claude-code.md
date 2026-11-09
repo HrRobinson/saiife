@@ -145,6 +145,8 @@ On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d
   So a hook that is killed, or that exits 0 without recording a verdict, is a
   deny. The drop-in also lists `http://127.0.0.1:7433/*` in
   `allowedHttpHookUrls`, so your own list cannot skip the co-signer.
+- A single tool call whose input is over 16 MiB is blocked in locked mode
+  (the co-signer's body cap).
 - If nothing listens on `127.0.0.1:7433`, every call is blocked and `doctor`
   fails `cosign.listen`. With a proxy set for Claude Code, add `127.0.0.1` to
   `NO_PROXY` ([install](../install.md#the-co-signer-and-proxies)).

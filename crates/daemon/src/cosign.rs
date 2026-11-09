@@ -46,9 +46,11 @@ pub const COSIGN_PATH: &str = "/v1/cosign/claude";
 /// How long a request waits for the command hook's verdict, from its
 /// arrival. Under the drop-in's `"timeout": 10`.
 pub const COSIGN_WAIT: Duration = Duration::from_secs(8);
-/// The body cap. Claude Code's payloads are far smaller (the largest
-/// recorded fixture, an `Edit`, is 325 bytes); a larger body is denied.
-pub const MAX_BODY: usize = 1024 * 1024;
+/// The body cap: a single tool call whose payload is larger (a `Write` of a
+/// file over 16 MiB) is denied. Recorded payloads are far smaller (the
+/// largest fixture, an `Edit`, is 325 bytes); at the global in-flight cap
+/// the bodies stay under 256 MiB.
+pub const MAX_BODY: usize = 16 * 1024 * 1024;
 /// Requests in flight; one more is answered `503`.
 pub const MAX_INFLIGHT: usize = 16;
 /// Requests in flight from one uid, where the uid is known.
@@ -805,7 +807,7 @@ mod tests {
         assert_eq!(MAX_INFLIGHT, 16);
         assert_eq!(MAX_INFLIGHT_PER_UID, 8);
         assert_eq!(MAX_CONNS_PER_UID, 32);
-        assert_eq!(Opts::default().max_body, 1024 * 1024);
+        assert_eq!(Opts::default().max_body, 16 * 1024 * 1024);
         assert_eq!(MAX_RECORDED_SESSION, 128);
         assert_eq!(MAX_RECORDED_TOOL, 64);
         assert_eq!(COSIGN_PATH, "/v1/cosign/claude");

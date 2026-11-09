@@ -559,11 +559,28 @@ async fn bind_gets_past_time_wait() {
 }
 
 #[tokio::test]
-async fn default_body_cap_is_one_mib() {
+async fn just_over_the_16_mib_cap_is_too_large() {
+    assert_eq!(cosign::MAX_BODY, 16 * 1024 * 1024);
     let d = daemon(Some(Opts::default())).await;
-    let pad = 1024 * 1024 - payload("toolu_cap", "").len() + 1;
-    let a = post(d.addr.unwrap(), payload("toolu_cap", &"a".repeat(pad))).await;
+    let pad = cosign::MAX_BODY - payload("toolu_cap", "").len() + 1;
+    let p = payload("toolu_cap", &"a".repeat(pad));
+    assert_eq!(p.len(), cosign::MAX_BODY + 1);
+    let a = post(d.addr.unwrap(), p).await;
     assert_deny(&a, CosignDeny::TooLarge);
+}
+
+/// A call whose payload is just under the cap (a large `Write`) is read,
+/// parsed and co-signed.
+#[tokio::test]
+async fn near_the_cap_is_accepted() {
+    let d = daemon(Some(Opts::default())).await;
+    let pad = cosign::MAX_BODY - payload("toolu_near", "").len() - 64;
+    let command = "a".repeat(pad);
+    let p = payload("toolu_near", &command);
+    assert!(p.len() < cosign::MAX_BODY && p.len() > cosign::MAX_BODY - 128);
+    let mut h = Client::hook(&d.sock, &p).await;
+    h.verdict(DecisionKind::Allow, "a").await;
+    assert_no_opinion(&post(d.addr.unwrap(), p).await);
 }
 
 /// An asker whose socket is not found is denied before its body is read.
