@@ -13,9 +13,9 @@ use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
     OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_CLOUD_LEASE, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_MCP_CALL,
-    OP_MCP_LIST, OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
-    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_AUDIT_ROTATE_KEY, OP_CLOUD_LEASE, OP_GRANT_CONSUME, OP_HELLO, OP_HOOK_BEGIN, OP_HOOK_BIND,
+    OP_LOCKDOWN_SET, OP_MCP_CALL, OP_MCP_LIST, OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD,
+    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::Mode as PolicyMode;
@@ -322,7 +322,9 @@ pub struct Ctx {
     pub config_path: PathBuf,
     pub catalog: Vec<PackInfo>,
     pub started: Instant,
-    pub policy: Mutex<PolicyState>,
+    /// Shared with the hook table's record sink, which checks the disk
+    /// floor against it.
+    pub policy: Arc<Mutex<PolicyState>>,
     /// Agent process -> session, for attributing connector requests.
     pub sessions: Sessions,
     pub proc: Box<dyn Proc + Send + Sync>,
@@ -382,10 +384,19 @@ pub struct Ctx {
     /// before it is read (no client runs as the daemon user; gateway
     /// children do). Set by the daemon's start; off in test contexts.
     pub refuse_own_uid_peers: bool,
+    /// The managed hooks' connections and verdicts (plan 20).
+    pub hooks: Arc<crate::hooks::HookTable>,
+    /// The Claude Code co-signer's address or bind error, and its record
+    /// folding (plan 20).
+    pub cosign: Mutex<crate::cosign::CosignState>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
-    notices: Mutex<HashMap<(u32, Notice), Instant>>,
+    notices: Notices,
 }
+
+/// When each (uid, kind) notice was last written; shared with the hook
+/// table's record sink.
+type Notices = Arc<Mutex<HashMap<(u32, Notice), Instant>>>;
 
 pub struct CtxInit {
     pub writer: WriterHandle,
@@ -540,9 +551,125 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// A `daemon` record of this daemon's own identity, as [`Ctx::record`]
+/// makes it.
+fn daemon_record(
+    policy: &Mutex<PolicyState>,
+    mode: Mode,
+    own: (u32, Option<&str>, &str),
+    kind: &str,
+    input: &str,
+) -> Record {
+    let hash = lock(policy).hash.clone();
+    let mut r = Record::new(
+        NewRecord {
+            agent: "",
+            project: "",
+            session: None,
+            tool: kind,
+            input,
+            decision: DecisionKind::Allow,
+            pack: None,
+            rule: None,
+            reason: None,
+            mode: mode.as_str(),
+            policy: hash.as_deref(),
+            permission_mode: None,
+        },
+        VERSION,
+    );
+    r.kind = Some(kind.to_string());
+    r.uid = Some(own.0);
+    r.sid = own.1.map(str::to_string);
+    r.user = Some(own.2.to_string());
+    r
+}
+
+/// Where the hook table's hooks without a verdict go: a `hook` record,
+/// written off the caller, with the peer's name looked up as
+/// [`Ctx::peer_name`] does (uncached: these are rare).
+///
+/// The record is the peer's, so it passes the disk floor as an
+/// `audit.append` of that peer would: below `[audit] min_free_mb` only the
+/// table's in-memory count keeps it, and a `low_disk` notice (once a
+/// minute per uid) says so.
+fn no_verdict_sink(
+    i: &CtxInit,
+    policy: &Arc<Mutex<PolicyState>>,
+    notices: &Notices,
+) -> crate::hooks::Sink {
+    let writer = i.writer.clone();
+    let directory = Arc::clone(&i.directory);
+    let mode = i.mode;
+    let (own_uid, own_sid, own_user) = (i.own_uid, i.own_sid.clone(), i.own_user.clone());
+    let audit_dir = i.audit_dir.clone();
+    let (policy, notices) = (Arc::clone(policy), Arc::clone(notices));
+    Box::new(move |nv: crate::hooks::NoVerdict| {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            eprintln!("saiifed: warning: cannot record a hook without a verdict: no runtime");
+            return;
+        };
+        let (writer, directory, own_user, own_sid) = (
+            writer.clone(),
+            Arc::clone(&directory),
+            own_user.clone(),
+            own_sid.clone(),
+        );
+        let (audit_dir, policy, notices) =
+            (audit_dir.clone(), Arc::clone(&policy), Arc::clone(&notices));
+        rt.spawn(async move {
+            let peer = nv.peer.clone();
+            let min_free = lock(&policy).min_free_mb;
+            let is_own = same_principal(peer.uid, peer.sid.as_deref(), own_uid, own_sid.as_deref());
+            // Fail closed: an unknown free space counts as too little.
+            let free = disk::free_mb(&audit_dir).unwrap_or(0);
+            if disk::disk_gate(free, min_free, is_own).is_err() {
+                if notice_due(
+                    &mut lock(&notices),
+                    peer.uid,
+                    Notice::LowDisk,
+                    Instant::now(),
+                ) {
+                    let n = Notice::LowDisk;
+                    let own = (own_uid, own_sid.as_deref(), own_user.as_str());
+                    let mut r = daemon_record(&policy, mode, own, "daemon", n.event());
+                    r.extra.insert("event".into(), n.event().into());
+                    r.reason = Some(n.reason(peer.uid));
+                    r.sid = peer.sid.clone();
+                    if let Err(e) = writer.append(r).await {
+                        eprintln!("saiifed: warning: cannot write low_disk record: {e}");
+                    }
+                }
+                return;
+            }
+            let mode = mode.as_str();
+            let user = match peer.sid {
+                None if !cfg!(windows) && peer.uid == own_uid => Some(own_user),
+                None => tokio::task::spawn_blocking(move || directory.name_of(peer.uid))
+                    .await
+                    .ok()
+                    .flatten(),
+                Some(sid) => tokio::task::spawn_blocking(move || directory.name_of_sid(&sid))
+                    .await
+                    .ok()
+                    .flatten(),
+            };
+            let rec = crate::hooks::no_verdict_record(&nv, mode, user, VERSION);
+            if let Err(e) = writer.append(rec).await {
+                eprintln!("saiifed: warning: cannot write a hook no_verdict record: {e}");
+            }
+        });
+    })
+}
+
 impl Ctx {
     pub fn new(i: CtxInit) -> Ctx {
         let tool_caller: Arc<dyn crate::mcp_gateway::ToolCaller> = i.mcp.clone();
+        let policy = Arc::new(Mutex::new(i.policy.clone()));
+        let notices: Notices = Arc::default();
+        let hooks = Arc::new(crate::hooks::HookTable::new(no_verdict_sink(
+            &i, &policy, &notices,
+        )));
         Ctx {
             writer: i.writer,
             writer_cfg: i.writer_cfg,
@@ -559,7 +686,7 @@ impl Ctx {
             config_path: i.config_path,
             catalog: i.catalog,
             started: Instant::now(),
-            policy: Mutex::new(i.policy),
+            policy,
             sessions: Sessions::new(),
             proc: i.proc,
             vault: crate::vault::Shared::new(i.vault),
@@ -585,9 +712,11 @@ impl Ctx {
             mcp: i.mcp,
             tool_caller,
             refuse_own_uid_peers: i.refuse_own_uid_peers,
+            hooks,
+            cosign: Mutex::default(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
-            notices: Mutex::new(HashMap::new()),
+            notices,
         }
     }
 
@@ -621,29 +750,12 @@ impl Ctx {
     /// A record the daemon writes about itself: `tool` = kind, `input` =
     /// a short summary, its own uid and user, the current policy hash.
     pub fn record(&self, kind: &str, input: &str) -> Record {
-        let hash = self.policy().hash;
-        let mut r = Record::new(
-            NewRecord {
-                agent: "",
-                project: "",
-                session: None,
-                tool: kind,
-                input,
-                decision: DecisionKind::Allow,
-                pack: None,
-                rule: None,
-                reason: None,
-                mode: self.mode.as_str(),
-                policy: hash.as_deref(),
-                permission_mode: None,
-            },
-            VERSION,
+        let own = (
+            self.own_uid,
+            self.own_sid.as_deref(),
+            self.own_user.as_str(),
         );
-        r.kind = Some(kind.to_string());
-        r.uid = Some(self.own_uid);
-        r.sid = self.own_sid.clone();
-        r.user = Some(self.own_user.clone());
-        r
+        daemon_record(&self.policy, self.mode, own, kind, input)
     }
 
     /// An `approval` record of `action` for request `r` (§6.10.1): the
@@ -1014,6 +1126,10 @@ pub struct Conn {
     pub start_time: Option<u64>,
     /// What this connection's hook steps answered, for `audit.append`.
     pub steps: Arc<Mutex<HookSteps>>,
+    /// This connection in the hook table.
+    pub id: crate::hooks::ConnId,
+    /// Fired when the hook table closes this connection (a hook overrun).
+    pub close: Arc<tokio::sync::Notify>,
 }
 
 impl Conn {
@@ -1022,6 +1138,8 @@ impl Conn {
             peer,
             start_time,
             steps: Arc::default(),
+            id: crate::server::next_conn_id(),
+            close: Arc::default(),
         }
     }
 }
@@ -1058,6 +1176,8 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello_in(req.id, ctx.mode.as_str()),
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
+        OP_HOOK_BEGIN => hook_begin(ctx, conn, req),
+        OP_HOOK_BIND => hook_bind(ctx, conn, req),
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
         saiife_ipc::msg::OP_AUDIT_QUERY => crate::audit_query::handle(ctx, peer, req).await,
@@ -1077,6 +1197,96 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             &format!("unknown op {other:?}"),
         ),
     }
+}
+
+/// The longest `agent`, `event` or `tool` that `hook.begin` and `hook.bind`
+/// take.
+const MAX_HOOK_NAME: usize = 64;
+/// The longest `tool_use_id` that `hook.bind` takes.
+const MAX_TOOL_USE_ID: usize = 256;
+
+/// A string argument of at most `max` bytes: `Ok(None)` when absent or
+/// null, `Err` when it is something else or longer.
+fn short_str(args: &Map<String, Value>, name: &str, max: usize) -> Result<Option<String>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.len() <= max => Ok(Some(s.clone())),
+        Some(_) => Err(format!("{name} must be a string of at most {max} bytes")),
+    }
+}
+
+/// `hook.begin {agent, event}` (plan 20): the hook table follows this
+/// connection from here.
+fn hook_begin(ctx: &Ctx, conn: &Conn, req: Request) -> Value {
+    let bad = |m: &str| err(req.id, ErrorCode::BadRequest, m);
+    let agent = match short_str(&req.args, "agent", MAX_HOOK_NAME) {
+        Ok(Some(a)) if !a.is_empty() => a,
+        Ok(_) => return bad("hook.begin needs an agent"),
+        Err(e) => return bad(&e),
+    };
+    let event = match short_str(&req.args, "event", MAX_HOOK_NAME) {
+        Ok(e) => e,
+        Err(e) => return bad(&e),
+    };
+    let close = Some(Arc::clone(&conn.close));
+    if !ctx
+        .hooks
+        .begin_closing(conn.id, &conn.peer, &agent, event.as_deref(), close)
+    {
+        return bad("hook.begin was already sent on this connection");
+    }
+    ok(req.id, Map::new())
+}
+
+/// `hook.bind` with the fields of a `HookKey` (and an optional `tool`):
+/// names the call this connection's verdict is for.
+fn hook_bind(ctx: &Ctx, conn: &Conn, req: Request) -> Value {
+    let bad = |m: &str| err(req.id, ErrorCode::BadRequest, m);
+    let key = match serde_json::from_value::<saiife_ipc::hookkey::HookKey>(Value::Object(
+        req.args.clone(),
+    )) {
+        Ok(k) => k,
+        Err(e) => return bad(&format!("hook.bind: {e}")),
+    };
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if key.agent.is_empty() || key.agent.len() > MAX_HOOK_NAME {
+        return bad("hook.bind needs an agent of at most 64 bytes");
+    }
+    if key
+        .session
+        .as_ref()
+        .is_some_and(|s| s.len() > crate::sessions::MAX_SESSION_ID)
+        || key
+            .tool_use_id
+            .as_ref()
+            .is_some_and(|s| s.len() > MAX_TOOL_USE_ID)
+    {
+        return bad("hook.bind: session or tool_use_id is too long");
+    }
+    if !hex(&key.input_sha256) {
+        return bad("hook.bind: input_sha256 must be 64 lowercase hex digits");
+    }
+    let tool = match short_str(&req.args, "tool", MAX_HOOK_NAME) {
+        Ok(t) => t,
+        Err(e) => return bad(&e),
+    };
+    if let Err(why) = ctx.hooks.bind_tool(conn.id, key, tool) {
+        return bad(why.message());
+    }
+    ok(req.id, Map::new())
+}
+
+/// The `tool_use_id` and `input_sha256` arguments of `audit.append`, each
+/// optional: `None` when one is malformed (not a string, an id over
+/// `hook.bind`'s limit, a hash that is not 64 lowercase hex digits).
+fn verdict_key_args(args: &Map<String, Value>) -> Option<(Option<String>, Option<String>)> {
+    let tool_use_id = short_str(args, "tool_use_id", MAX_TOOL_USE_ID).ok()?;
+    let input_sha256 = short_str(args, "input_sha256", 64).ok()?;
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if input_sha256.as_deref().is_some_and(|h| !hex(h)) {
+        return None;
+    }
+    Some((tool_use_id, input_sha256))
 }
 
 /// A client-supplied session id over the cap is not remembered (the
@@ -1126,6 +1336,13 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if rec.kind() != "guard" {
         return forbidden("audit.append takes only kind \"guard\"");
     }
+    // The key the verdict is for: the append's own `tool_use_id` and
+    // `input_sha256` arguments (plan 20), never written. A plain hash of
+    // the input in the log would let a reader test guesses for short
+    // secrets, so one a client put in the record goes too. A malformed
+    // argument names no call: the record is written, nothing is settled.
+    rec.extra.remove("input_sha256");
+    let key_args = verdict_key_args(&req.args);
     if let Some(t) = client_ts {
         rec.extra.insert(
             "client_ts".into(),
@@ -1204,7 +1421,13 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if rec.decision == DecisionKind::ErrorDenied {
         ctx.note_error_denied(peer.uid);
     }
-    match ctx.writer.append(rec).await {
+    let verdict = key_args.map(|(t, h)| crate::hooks::Verdict::of_append(&rec, t, h));
+    let written = ctx.writer.append(rec).await;
+    // The verdict of a hook connection, once its record is written.
+    if let (Ok(_), Some(v)) = (&written, &verdict) {
+        ctx.hooks.verdict(conn.id, v);
+    }
+    match written {
         Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),
         Ok(seq) => {
             if let Some(sid) = session {
@@ -1254,6 +1477,15 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     );
     // The MCP gateway's servers: `[{name, state, tools, since, last_error}]`.
     m.insert("mcp".into(), ctx.mcp.status());
+    // Hooks that ended without a verdict since start (plan 20).
+    let (n, last) = ctx.hooks.no_verdict_count();
+    m.insert(
+        "hooks_no_verdict".into(),
+        json!({"since_start": n, "last_ts": last}),
+    );
+    // The co-signer: `{"addr": "127.0.0.1:7433", "error": null}`, or the
+    // bind error with `addr: null`.
+    m.insert("cosign".into(), lock(&ctx.cosign).status());
     ok(id, m)
 }
 

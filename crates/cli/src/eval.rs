@@ -357,7 +357,11 @@ pub fn judge_with(
     if let Err(reason) = check_cwd(ctx.cwd.as_deref()) {
         return answer(Verdict::Unjudged, String::new(), &reason);
     }
-    let engine = || engine_for(packs, ctx.cwd.as_deref(), budget, locked);
+    let engine = || {
+        crate::hook_timing::time("worker.engine", || {
+            engine_for(packs, ctx.cwd.as_deref(), budget, locked)
+        })
+    };
     match plan(payload, agent) {
         Plan::TooLarge { command, .. } => answer(
             Verdict::Unjudged,
@@ -825,15 +829,33 @@ pub fn mcp_identity(payload: &str) -> McpIdentity {
 /// `EvalAnswer` to stdout, exit 0. Any other exit is a worker failure,
 /// which the parent turns into `error_denied`.
 pub fn worker_main() -> ExitCode {
+    // SAIIFE_HOOK_TIMING (debug builds only): from the hook's spawn to here.
+    if crate::hook_timing::on() {
+        if let Some(us) = std::env::var(crate::hook_timing::SPAWNED_VAR)
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            crate::hook_timing::add_since_us("worker.started", us);
+        }
+    }
+    let code = crate::hook_timing::time("worker.run", worker_run);
+    crate::hook_timing::flush();
+    code
+}
+
+fn worker_run() -> ExitCode {
     #[cfg(debug_assertions)]
     if fault() == "noread" {
         std::thread::sleep(Duration::from_secs(10));
     }
     let mut buf = Vec::new();
-    let read = std::io::stdin()
-        .lock()
-        .take(MAX_EVAL_BYTES as u64 + 1)
-        .read_to_end(&mut buf);
+    // The hook starts the worker before it has the payload: this waits for it.
+    let read = crate::hook_timing::time("worker.request", || {
+        std::io::stdin()
+            .lock()
+            .take(MAX_EVAL_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+    });
     if read.is_err() || buf.len() > MAX_EVAL_BYTES {
         return ExitCode::from(1);
     }
@@ -843,6 +865,7 @@ pub fn worker_main() -> ExitCode {
     drop(buf);
     #[cfg(debug_assertions)]
     fault_seam();
+    let judging = std::time::Instant::now();
     let answer = match req.event.as_deref() {
         None => judge_with(
             &req.payload,
@@ -864,6 +887,7 @@ pub fn worker_main() -> ExitCode {
             askable: false,
         },
     };
+    crate::hook_timing::add("worker.judge", judging.elapsed());
     let mut out = std::io::stdout().lock();
     if serde_json::to_writer(&mut out, &answer)
         .map_err(std::io::Error::from)

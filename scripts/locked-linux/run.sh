@@ -3,6 +3,9 @@
 # Task 8): `system install` as root, the §5.2 owners and modes, managed
 # hooks as an unprivileged agent user, the fail-closed matrix (§9.3),
 # attacks on the installed files, `doctor`, reinstall, uninstall and purge.
+# Plan 20: the binary at 0711 and a ptrace probe against the hook
+# (ptrace-probe.py), and the Claude Code co-signer on 127.0.0.1:7433 with a
+# hook killed by its own user (`no_verdict`).
 #
 # CI ONLY. This creates system users, writes /etc, /opt, /var and /run,
 # installs and kills a systemd service. It runs in the GitHub Actions job
@@ -63,7 +66,9 @@ phase_mcp_sandbox
 prepare_host
 phase_install
 phase_modes
+phase_ptrace
 phase_hooks
+phase_cosign
 phase_fail_closed
 phase_attacks
 phase_doctor

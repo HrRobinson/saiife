@@ -93,9 +93,35 @@ pub fn mask(input: &str) -> String {
     out
 }
 
+/// [`mask`], then cut to at most `max` bytes on a character boundary (no
+/// marker): for a short id field such as a tool call id.
+pub fn mask_cut(input: &str, max: usize) -> String {
+    let mut s = mask(input);
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_cut_masks_then_cuts_on_a_boundary() {
+        assert_eq!(mask_cut("toolu_1", 256), "toolu_1");
+        let long = "é".repeat(200);
+        let cut = mask_cut(&long, 256);
+        assert_eq!(cut.len(), 256);
+        assert!(long.starts_with(&cut));
+        assert_eq!(mask_cut(&"é".repeat(200), 255).len(), 254);
+        let tok = format!("ghp_{}", "a".repeat(36));
+        assert_eq!(mask_cut(&tok, 256), "[MASKED]");
+    }
 
     #[test]
     fn github_tokens() {

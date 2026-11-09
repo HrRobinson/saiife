@@ -479,3 +479,95 @@ fn macos_same_user_approval_is_documented_as_off() {
         );
     }
 }
+
+// ---- Plan 20: a killed or crashed hook never counts as an allow ----
+
+/// The first fenced block of `lang` after the line `marker` in `text`.
+fn block_after<'a>(text: &'a str, marker: &str, lang: &str) -> &'a str {
+    let at = text.find(marker).unwrap_or_else(|| panic!("no {marker:?}"));
+    let fence = format!("```{lang}\n");
+    let start = at + text[at..].find(&fence).expect("no fence") + fence.len();
+    let end = start + text[start..].find("```").expect("no closing fence");
+    &text[start..end]
+}
+
+/// Spec §8.3 shows the Claude Code drop-in saiife writes, byte for byte.
+#[test]
+fn spec_83_matches_the_drop_in() {
+    let spec = page_text("docs/superpowers/specs/2026-10-19-saiife-v2-design.md");
+    let shown = block_after(
+        &spec,
+        "**Claude Code** `/etc/claude-code/managed-settings.d/50-saiife.json`:",
+        "json",
+    );
+    assert_eq!(shown, saiife_agents::claude::managed_settings());
+}
+
+#[test]
+fn threats_names_the_cosigner_and_the_no_verdict_record() {
+    let t = page_text("docs/threats.md");
+    for want in ["co-signer", "127.0.0.1:7433", "no_verdict"] {
+        assert!(t.contains(want), "docs/threats.md lacks {want:?}");
+    }
+    let s = flat(&t);
+    assert!(
+        s.contains("injected into the hook"),
+        "docs/threats.md must say code injected into the hook is not prevented on Windows"
+    );
+    // Whole-branch review 2026-11-09: forging the allow needs no injection.
+    assert!(
+        s.contains("forged allow, with no code injection"),
+        "docs/threats.md must say a same-user forged allow needs no injection"
+    );
+}
+
+/// Owner ruling 2026-11-09: no managed NO_PROXY; the docs tell admins to add
+/// 127.0.0.1, and doctor warns.
+#[test]
+fn install_page_has_the_no_proxy_note() {
+    let t = page_text("docs/install.md");
+    for want in ["NO_PROXY", "127.0.0.1", "HTTPS_PROXY"] {
+        assert!(t.contains(want), "docs/install.md lacks {want:?}");
+    }
+}
+
+#[test]
+fn windows_limits_keep_preview_and_name_the_cosigner() {
+    let t = page_text("docs/windows.md");
+    let limits = flat(section(&t, "## Limits"));
+    for want in [
+        "preview",
+        "co-signer",
+        "no_verdict",
+        "with no code injection",
+    ] {
+        assert!(
+            limits.contains(want),
+            "docs/windows.md#limits lacks {want:?}"
+        );
+    }
+}
+
+/// The co-signer is for Claude Code only; Codex and Gemini CLI get detection.
+#[test]
+fn agent_pages_say_who_gets_the_cosigner() {
+    let claude = page_text("docs/agents/claude-code.md");
+    assert!(claude.contains("co-signer") && claude.contains("127.0.0.1:7433"));
+    for f in ["codex", "gemini"] {
+        let t = page_text(&format!("docs/agents/{f}.md"));
+        assert!(t.contains("no_verdict"), "{f}.md lacks no_verdict");
+        assert!(
+            flat(&t).contains("no co-signer"),
+            "{f}.md must say it has no co-signer"
+        );
+    }
+}
+
+/// The live lock check needs a stand-in co-signer, or every Claude Code call
+/// is blocked by `onFailure`.
+#[test]
+fn lock_check_page_names_the_stand_in_cosigner() {
+    let t = page_text("docs/lock-check.md");
+    assert!(t.contains("127.0.0.1:7433"));
+    assert!(flat(&t).contains("stand-in co-signer"));
+}

@@ -4,7 +4,9 @@
 # managed hooks as an unprivileged agent user, the fail-closed matrix
 # (§9.3), attacks on the installed files including DYLD_INSERT_LIBRARIES
 # (A4), `doctor`, approvals from a second account, lockdown, reinstall,
-# uninstall and purge. The phases mirror scripts/locked-linux/lib.sh.
+# uninstall and purge, and (plan 20) the Claude Code co-signer on
+# 127.0.0.1:7433 with a hook killed by its own user (`no_verdict`). The
+# phases mirror scripts/locked-linux/lib.sh.
 #
 # CI ONLY. This creates local accounts with dscl, writes /etc, /opt,
 # /Library and /var, registers an authorization right, and loads, kills
@@ -54,6 +56,7 @@ prepare_host
 phase_install
 phase_modes
 phase_hooks
+phase_cosign
 phase_fail_closed
 phase_attacks
 phase_doctor

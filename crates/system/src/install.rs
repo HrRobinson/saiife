@@ -1620,8 +1620,13 @@ impl Run<'_> {
             fsops::write_file_atomic(&p, bytes, mode).map_err(step(step_name))?;
             self.changed(shown);
         } else {
+            let before = fsops::mode_of(&p).map_err(step(step_name))?;
             fsops::set_file_mode(&p, mode).map_err(step(step_name))?;
-            self.unchanged(shown);
+            if before != Some(mode) {
+                self.changed(format!("{shown} (mode {mode:o})"));
+            } else {
+                self.unchanged(shown);
+            }
         }
         self.chown_root(&p, step_name)?;
         self.record_file(abs, kind, Some(want), current.is_none());
@@ -1632,7 +1637,8 @@ impl Run<'_> {
     fn binary(&mut self, bytes: &[u8]) -> Result<bool, InstallError> {
         self.dir(OPT_DIR, 0o755, true)?;
         self.dir(BIN_DIR, 0o755, true)?;
-        self.file(BINARY, bytes, 0o755, FileKind::Binary, "binary")
+        let mode = binary_mode(self.layout.platform());
+        self.file(BINARY, bytes, mode, FileKind::Binary, "binary")
     }
 
     /// True when config.toml was written.
@@ -2625,7 +2631,7 @@ pub(crate) mod tests {
     const ROOT_OWNED: &[(&str, u32)] = &[
         ("/opt/saiife", 0o755),
         ("/opt/saiife/bin", 0o755),
-        ("/opt/saiife/bin/saiife", 0o755),
+        ("/opt/saiife/bin/saiife", 0o711),
         ("/etc/saiife", 0o755),
         ("/etc/saiife/policy.d", 0o755),
         ("/etc/saiife/config.toml", 0o644),
@@ -2958,6 +2964,62 @@ pub(crate) mod tests {
         assert!(!calls.iter().any(|c| c.contains("enable --now")));
         assert_eq!(fs::read(e.at(BINARY)).unwrap(), v2);
         assert_eq!(r.changed, vec!["/opt/saiife/bin/saiife".to_string()]);
+    }
+
+    #[test]
+    fn binary_is_0711_on_linux() {
+        assert_eq!(binary_mode(Platform::Linux), 0o711);
+        let e = env(255);
+        e.install();
+        let p = e.at(BINARY);
+        assert_eq!(mode(&p), 0o711, "mode {:o}", mode(&p));
+        assert_eq!(chowned(&e.host, &p).last(), Some(&root_ids(&e.host)));
+    }
+
+    #[test]
+    fn reinstall_moves_0755_to_0711() {
+        let e = env(255);
+        e.install();
+        set_active(&e.host);
+        // An install from before plan 20: the same bytes, at 0755.
+        fs::set_permissions(e.at(BINARY), fs::Permissions::from_mode(0o755)).unwrap();
+        e.host.set(|s| s.calls.clear());
+        let r = e.install();
+        assert_eq!(mode(&e.at(BINARY)), 0o711);
+        assert_eq!(
+            r.changed,
+            vec!["/opt/saiife/bin/saiife (mode 711)".to_string()]
+        );
+        // Only the mode changed: the running daemon keeps running.
+        let calls = e.host.state().calls;
+        assert!(!calls.iter().any(|c| c.contains("restart")), "{calls:?}");
+        // Already 0711: unchanged.
+        let r = e.install();
+        assert!(r.changed.is_empty(), "{:?}", r.changed);
+        assert!(r.unchanged.iter().any(|u| u == BINARY), "{:?}", r.unchanged);
+    }
+
+    /// installed.toml has no mode field: it records the binary (path and
+    /// digest), and the mode it is checked against is [`binary_mode`].
+    #[test]
+    fn installed_toml_records_0711() {
+        let e = env(255);
+        e.install();
+        let want = fsops::sha256_hex(&fs::read(&e.binary).unwrap());
+        let i = e.installed();
+        let f = i
+            .files
+            .iter()
+            .find(|f| f.kind == FileKind::Binary)
+            .expect("binary recorded");
+        assert_eq!(f.path, Path::new(BINARY));
+        assert_eq!(f.sha256.as_deref(), Some(want.as_str()));
+        assert_eq!(mode(&e.at(BINARY)), binary_mode(e.layout.platform()));
+        // A re-mode keeps the same record.
+        fs::set_permissions(e.at(BINARY), fs::Permissions::from_mode(0o755)).unwrap();
+        e.install();
+        assert_eq!(e.installed().files, i.files);
+        assert_eq!(mode(&e.at(BINARY)), 0o711);
     }
 
     fn config_file(e: &Env, name: &str, budget: u32) -> InstallOptions {
@@ -4549,6 +4611,19 @@ pub(crate) mod macos_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn binary_is_0755_on_macos() {
+        // The hardened runtime refuses `task_for_pid` (owner ruling 4).
+        assert_eq!(binary_mode(Platform::Macos), 0o755);
+        let e = mac_env();
+        e.install();
+        assert_eq!(mode(&e.at(BINARY)), 0o755);
+        e.settle();
+        let r = e.install();
+        assert!(r.changed.is_empty(), "{:?}", r.changed);
+        assert_eq!(mode(&e.at(BINARY)), 0o755);
     }
 
     #[test]

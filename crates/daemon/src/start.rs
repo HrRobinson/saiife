@@ -750,6 +750,12 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         #[cfg(windows)]
         test_pipe,
     } = opts;
+    // The Claude Code co-signer (plan 20): the system daemon only.
+    #[cfg(windows)]
+    let cosign_test = test_pipe.is_some();
+    #[cfg(not(windows))]
+    let cosign_test = false;
+    let cosign = crate::cosign::target(matches!(daemon_mode, DaemonMode::System), cosign_test);
     // 1. Who and what may run.
     #[cfg(unix)]
     let (euid, own_sid): (u32, Option<String>) = {
@@ -1139,6 +1145,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         loaded_files,
         more,
         tcp,
+        cosign,
     ));
     // An oauth2 refresh in flight finishes first: its rotated refresh token
     // may be the only valid one, and it must reach the vault.
@@ -1767,6 +1774,8 @@ async fn serve(
     // More start records, after the vault's ([`start_notes`]).
     more: Vec<saiife_audit::Record>,
     tcp: Option<std::net::SocketAddr>,
+    // Where the co-signer listens; `None` for the personal broker.
+    cosign: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let Ok(mut events) = Events::install(service) else {
         eprintln!("saiife: cannot install signal handlers");
@@ -1825,6 +1834,13 @@ async fn serve(
     // no listener; the Unix sockets stay.
     let gateway_tcp = match tcp {
         Some(addr) => start_tcp(&ctx, addr).await,
+        None => None,
+    };
+    // The co-signer, once the control endpoint is open (its answers wait
+    // on the hooks' verdicts there). A bind failure is a record, and the
+    // task tries the bind again; the daemon runs on for the other agents.
+    let cosign_task = match cosign {
+        Some(addr) => Some(crate::cosign::start_cosign(&ctx, addr).await),
         None => None,
     };
 
@@ -1951,6 +1967,10 @@ async fn serve(
     ctx.forwarders.stop_all().await;
     unix_gateway.stop().await;
     if let Some(t) = gateway_tcp {
+        t.abort();
+        let _ = t.await;
+    }
+    if let Some(t) = cosign_task {
         t.abort();
         let _ = t.await;
     }

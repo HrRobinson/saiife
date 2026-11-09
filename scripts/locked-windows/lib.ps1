@@ -1049,6 +1049,7 @@ function phase_fail_closed {
   Wait-Until 30 'the start record after Stop-Process' { @(Get-StartRecords).Count -gt $before -and (Test-DaemonReady) }
   Assert-LastStart $false 'after Stop-Process and the restart'
   Assert-Hook 0 '' 'allow after the restart' claude (Get-Payload 'claude\bash-allow.json')
+  Assert-CosignAfterRestart 'after the restart'
 }
 
 function attack_files {
@@ -1308,6 +1309,8 @@ function measure_share_mode {
   Measure-Result "share-mode-0-$Tag" "as non-admin agent, CreateFile($Target, GENERIC_READ, share 0). $(Format-Probe $r). $($lines -join '; ')"
 }
 
+# Unchanged since CI 11, so its numbers compare. With plan 20 each killed hook here also
+# leaves a no_verdict record; phase_cosign asserts what the co-signer makes of a kill.
 function measure_terminate {
   $m = "$Script:Work\native\measure.exe"
   $sizeBefore = Get-AuditSize
@@ -1383,6 +1386,478 @@ function phase_measurements {
   # Reported, never failed: the owner asked for these to be measured, not gated. A probe
   # that could not run says so in measurements.txt and as a warning.
   foreach ($f in $failures) { Write-Host "::warning title=phase_measurements::probe did not run: $f" }
+}
+
+# ------------------------------------------------------------ the co-signer (plan 20)
+
+$Script:CosignUrl = 'http://127.0.0.1:7433/v1/cosign/claude'
+$Script:CosignPattern = 'http://127.0.0.1:7433/*'
+$Script:CosignPort = 7433
+# cosign.rs CosignDeny::text, and hooks.rs NO_VERDICT_REASON.
+$Script:CosignNoVerdict = 'the saiife hook ended without a verdict'
+$Script:CosignNoReport = 'no saiife hook reported a verdict for this call'
+$Script:CosignDenied = 'saiife denied this call'
+
+# The co-signer's deny body for $Reason, byte for byte (cosign.rs deny_body).
+function Get-CosignDenyBody([string]$Reason) {
+  return '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"saiife: BLOCKED (fail closed): ' + $Reason + '"}}'
+}
+
+# Claude Code's HTTP hook, simulated: one POST of a payload. Params only, so it also runs as a
+# job (Start-Cosign). Status 0 is a request that failed (Error says why). At is when the
+# answer came, as a UTC file time, to set against measure.exe's kill_at_filetime.
+$Script:CosignPost = {
+  param([string]$Url, [string]$Body, [hashtable]$Headers, [string]$Ready)
+  $ErrorActionPreference = 'Stop'
+  $ProgressPreference = 'SilentlyContinue'
+  $sw = $null
+  try {
+    if ($Ready) { [System.IO.File]::WriteAllText($Ready, 'ready') }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-WebRequest -Method Post -Uri $Url -ContentType 'application/json' -Body $Body -Headers $Headers `
+      -SkipHttpErrorCheck -TimeoutSec 12 -NoProxy
+    $content = $r.Content
+    if ($content -is [byte[]]) { $content = [System.Text.Encoding]::UTF8.GetString($content) }
+    if ($null -eq $content) { $content = '' }
+    return [pscustomobject]@{ Status = [int]$r.StatusCode; Body = [string]$content; Ms = [int]$sw.ElapsedMilliseconds
+      At = [DateTime]::UtcNow.ToFileTimeUtc(); Error = '' }
+  } catch {
+    $ms = if ($sw) { [int]$sw.ElapsedMilliseconds } else { 0 }
+    return [pscustomobject]@{ Status = 0; Body = ''; Ms = $ms; At = [DateTime]::UtcNow.ToFileTimeUtc(); Error = $_.Exception.Message }
+  }
+}
+
+# One co-sign request, now. Returns Status, Body, Ms, At, Error.
+function Invoke-Cosign {
+  param([string]$PayloadJson, [hashtable]$Headers = @{})
+  return & $Script:CosignPost $Script:CosignUrl $PayloadJson $Headers ''
+}
+
+# The same request in a job, as Claude Code sends it beside the command hook. Returns once
+# the job is about to send it.
+function Start-Cosign([string]$PayloadJson) {
+  $ready = "$Script:Work\out\cosign-ready-$([guid]::NewGuid().ToString('N')).txt"
+  $job = Start-Job -ScriptBlock $Script:CosignPost -ArgumentList $Script:CosignUrl, $PayloadJson, @{}, $ready
+  Wait-Until 60 'the co-sign job to start' { (Test-Path -LiteralPath $ready) -or ([string]$job.State -in 'Failed', 'Completed', 'Stopped') }
+  return $job
+}
+
+function Receive-Cosign($Job) {
+  $done = Wait-Job -Job $Job -Timeout 30
+  if (-not $done) {
+    Remove-Job -Job $Job -Force
+    Fail 'the co-sign job did not finish in 30 s'
+  }
+  $out = @(Receive-Job -Job $Job)
+  $state = [string]$Job.State
+  Remove-Job -Job $Job -Force
+  $last = @($out | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Status'] })
+  if ($last.Count -eq 0) { Fail "the co-sign job ($state) returned no answer: $($out -join ' ')" }
+  return $last[-1]
+}
+
+function Format-Cosign($Answer) {
+  if ($Answer.Error) { return "request failed after $($Answer.Ms) ms: $($Answer.Error)" }
+  $shown = if ($Answer.Body) { $Answer.Body } else { '(empty)' }
+  return "$($Answer.Status) in $($Answer.Ms) ms, body $shown"
+}
+
+function Assert-CosignDeny($Answer, [string]$Reason, [string]$What) {
+  if ($Answer.Status -ne 200 -or $Answer.Body -cne (Get-CosignDenyBody $Reason)) {
+    Fail "${What}: co-sign answer $(Format-Cosign $Answer), want 200 with the deny body '$Reason'; daemon.log: $(Get-DaemonLogTail)"
+  }
+  Ok "${What}: co-signer denied in $($Answer.Ms) ms ($Reason)"
+}
+
+# A recorded payload with a tool_use_id of its own: the co-signer keeps a verdict per key for
+# 60 s, and every earlier hook of the fixture shares its id.
+function Get-CosignPayload([string]$Fixture, [string]$ToolUseId) {
+  $change = { param($p) $p.tool_use_id = $ToolUseId }.GetNewClosure()
+  return Get-Payload $Fixture $change
+}
+
+function New-ToolUseId { return "toolu_ci_$([guid]::NewGuid().ToString('N'))" }
+
+function Write-Utf8File([string]$Path, [string]$Text) {
+  [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
+}
+
+# A key=value line of measure.exe's output; $null when it printed none.
+function Get-ProbeValue([string]$Out, [string]$Key) {
+  $m = [regex]::Match($Out, '(?m)^' + [regex]::Escape($Key) + '=(.*?)\r?$')
+  if ($m.Success) { return $m.Groups[1].Value.Trim() }
+  return $null
+}
+
+# The hook records (hooks.rs no_verdict_record, cosign.rs record) of one event.
+function Get-HookRecords([string]$HookEvent) {
+  return @(Get-Records | Where-Object { $_.kind -eq 'hook' -and $_.event -eq $HookEvent })
+}
+
+# The no_verdict records among those after the first $After (month files in order, so new
+# records come last) of the hook with this pid: its `pid` is the pipe client's. Pids are
+# reused, and phase_measurements leaves no_verdict records of its own.
+function Find-NoVerdictRecords([int]$After, [string]$HookPid) {
+  $all = @(Get-Records)
+  if ($all.Count -le $After) { return @() }
+  return @($all[$After..($all.Count - 1)] | Where-Object { $_.kind -eq 'hook' -and $_.event -eq 'no_verdict' -and "$($_.pid)" -eq $HookPid })
+}
+
+function Wait-NoVerdictRecord([int]$After, [string]$HookPid, [int]$Seconds) {
+  Wait-Until $Seconds "the no_verdict record of hook pid $HookPid" { @(Find-NoVerdictRecords $After $HookPid).Count -gt 0 }
+  return @(Find-NoVerdictRecords $After $HookPid)[-1]
+}
+
+function Assert-NoVerdictRecord($Record, [bool]$Bound, [string]$ToolUseId, [string]$What) {
+  $json = $Record | ConvertTo-Json -Compress -Depth 8
+  if ($Record.decision -ne 'no_verdict') { Fail "${What}: the hook record's decision is '$($Record.decision)': $json" }
+  if ($Record.bound -ne $Bound) { Fail "${What}: the no_verdict record has bound=$($Record.bound), want ${Bound}: $json" }
+  if ($Record.sid -ne $Script:Agent.Sid) { Fail "${What}: the no_verdict record's sid is '$($Record.sid)', want the agent's $($Script:Agent.Sid): $json" }
+  if ($Record.agent -ne 'claude') { Fail "${What}: the no_verdict record's agent is '$($Record.agent)': $json" }
+  if ($ToolUseId -and $Record.tool_use_id -ne $ToolUseId) { Fail "${What}: the no_verdict record's tool_use_id is '$($Record.tool_use_id)', want ${ToolUseId}: $json" }
+  Ok "${What}: no_verdict record, bound $Bound, sid $($Record.sid), elapsed $($Record.elapsed_ms) ms"
+}
+
+# Who listens on 7433, the drop-in's HTTP hook, a squat by the agent, a browser's request.
+function cosign_listen {
+  $j = Get-Content -LiteralPath $Script:ClaudeManaged -Raw | ConvertFrom-Json -Depth 32
+  $http = @($j.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { $_.type -eq 'http' })
+  if ($http.Count -ne 1 -or $http[0].url -ne $Script:CosignUrl -or $http[0].onFailure -ne 'block') {
+    Fail "the drop-in's PreToolUse hooks lack the co-signer ($Script:CosignUrl, onFailure block): $($j.hooks.PreToolUse | ConvertTo-Json -Compress -Depth 8)"
+  }
+  if (@($j.allowedHttpHookUrls) -notcontains $Script:CosignPattern) { Fail "the drop-in's allowedHttpHookUrls lacks ${Script:CosignPattern}: $(@($j.allowedHttpHookUrls) -join ', ')" }
+  Ok "the drop-in posts to $Script:CosignUrl (onFailure block) and allows $Script:CosignPattern"
+
+  $daemonPid = Get-DaemonPid
+  $rows = @(Get-NetTCPConnection -LocalPort $Script:CosignPort -State Listen -ErrorAction SilentlyContinue)
+  $shown = ($rows | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid $($_.OwningProcess)" }) -join ', '
+  Read-Back 'cosign-listener' "listening on ${Script:CosignPort}: $shown; the service's pid $daemonPid"
+  if ($rows.Count -ne 1) { Fail "want one listener on port $Script:CosignPort, got $($rows.Count): $shown; daemon.log: $(Get-DaemonLogTail)" }
+  if ($rows[0].LocalAddress -ne '127.0.0.1') { Fail "the co-signer listens on $($rows[0].LocalAddress), want 127.0.0.1" }
+  if ([int]$rows[0].OwningProcess -ne $daemonPid) { Fail "port $Script:CosignPort is owned by pid $($rows[0].OwningProcess), not the service's $daemonPid" }
+  Ok "127.0.0.1:$Script:CosignPort is the service's (pid $daemonPid)"
+
+  # D6: SO_EXCLUSIVEADDRUSE. A plain bind, and one with SO_REUSEADDR, the squat it stops.
+  $code = @'
+foreach ($reuse in $false, $true) {
+  $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 7433)
+  try {
+    if ($reuse) { $l.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true) }
+    $l.Start()
+    "reuse=$reuse BOUND"
+    $l.Stop()
+  } catch {
+    $e = $_.Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    $why = if ($e -is [System.Net.Sockets.SocketException]) { [string]$e.SocketErrorCode } else { $e.GetType().Name }
+    "reuse=$reuse refused $why"
+  }
+}
+'@
+  $r = Invoke-PwshAs -User $Script:Agent -Code $code
+  $text = "$($r.Out)$($r.Err)".Trim()
+  Read-Back 'cosign-squat-as-agent' ($text -replace '\s*\r?\n\s*', '; ')
+  if ($text -match 'BOUND') { Fail "the agent bound 127.0.0.1:$Script:CosignPort beside the service: $text" }
+  if (([regex]::Matches($text, 'refused')).Count -ne 2) { Fail "the agent's bind attempts did not both report a refusal (exit $($r.Code)): $text" }
+  Ok "the agent cannot bind 127.0.0.1:$Script:CosignPort, with or without SO_REUSEADDR ($($text -replace '\s*\r?\n\s*', '; '))"
+
+  $a = Invoke-Cosign -PayloadJson (Get-CosignPayload 'claude\bash-allow.json' (New-ToolUseId)) -Headers @{ Origin = 'http://example.com' }
+  if ($a.Status -ne 403) { Fail "a request with Origin: $(Format-Cosign $a), want 403" }
+  Ok 'a request with an Origin header gets 403'
+}
+
+# The controls: an honest allow gets an empty 200, a deny the deny body. The request is sent
+# first, as Claude Code may (Review Focus 2), and the hook runs beside it.
+function cosign_controls {
+  $allow = Get-CosignPayload 'claude\bash-allow.json' (New-ToolUseId)
+  $job = Start-Cosign $allow
+  Invoke-Hook -AgentKind claude -Payload $allow
+  $hookCode = $Script:HookCode
+  $hookErr = $Script:HookErr
+  $a = Receive-Cosign $job
+  if ($hookCode -ne 0) { Fail "the allow fixture's hook exited $hookCode, want 0: $hookErr" }
+  if ($a.Status -ne 200 -or $a.Body -ne '') { Fail "allow: co-sign answer $(Format-Cosign $a), want 200 with an empty body; daemon.log: $(Get-DaemonLogTail)" }
+  Ok "allow fixture: hook exit 0, co-signer 200 with an empty body in $($a.Ms) ms"
+
+  $deny = Get-CosignPayload 'claude\bash-deny.json' (New-ToolUseId)
+  $job = Start-Cosign $deny
+  Invoke-Hook -AgentKind claude -Payload $deny
+  $hookCode = $Script:HookCode
+  $hookErr = $Script:HookErr
+  $a = Receive-Cosign $job
+  if ($hookCode -ne 2) { Fail "the deny fixture's hook exited $hookCode, want 2: $hookErr" }
+  Assert-CosignDeny $a $Script:CosignDenied 'deny fixture'
+}
+
+# A25 with the co-signer on: the hook is bound and its worker hangs; another process of the
+# agent ends it with TerminateProcess(hook, 0). The forged 0 still happens; the co-signer
+# denies, and the daemon records the hook without a verdict.
+function cosign_kill_bound {
+  $m = "$Script:Work\native\measure.exe"
+  $toolUseId = New-ToolUseId
+  $payload = Get-CosignPayload 'claude\bash-allow.json' $toolUseId
+  $payloadFile = "$Script:Work\out\cosign-kill-payload.json"
+  $pidFile = "$Script:Work\out\cosign-kill-pid.txt"
+  Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+  Write-Utf8File $payloadFile $payload
+  $countBefore = @(Get-Records).Count
+  $sizeBefore = Get-AuditSize
+
+  $hold = Start-As -User $Script:Agent -Exe $m -Cwd $Script:Agent.Project -ExtraEnv @{ SAIIFE_EVAL_FAULT = 'hang' } -Arguments @(
+    'spawn-fed-hold', $Script:Hook, 'claude', $payloadFile, $pidFile, '20')
+  if ($hold.StartError) { Fail "measure spawn-fed-hold could not start: $($hold.StartError)" }
+  $killer = Start-As -User $Script:Agent -Exe $m -Cwd $Script:Agent.Project -Arguments @('terminate-bound', $pidFile, '0', '20')
+  if ($killer.StartError) { Fail "measure terminate-bound could not start: $($killer.StartError)" }
+  $job = Start-Cosign $payload
+  $kill = Wait-As -Handle $killer -TimeoutSec 40
+  $held = Wait-As -Handle $hold -TimeoutSec 40
+  $answer = Receive-Cosign $job
+  $hookPid = Get-ProbeValue $held.Out 'hook_pid'
+  $childExit = Get-ProbeValue $held.Out 'child_exit'
+  $killAt = Get-ProbeValue $kill.Out 'kill_at_filetime'
+  $afterKill = if ($killAt) { [int](([long]$answer.At - [long]$killAt) / 10000) } else { $null }
+  $facts = "child_exit=$childExit (0 is the forged allow); co-signer $(Format-Cosign $answer), $afterKill ms after the kill; killer: $(Format-Probe $kill); hook's parent: $(Format-Probe $held)"
+
+  $record = $null
+  try {
+    if ((Get-ProbeValue $kill.Out 'terminate') -ne 'succeeded') { Fail "the kill did not happen: $facts" }
+    if (-not $hookPid) { Fail "spawn-fed-hold printed no hook pid: $facts" }
+    if ($childExit -ne '0') { Fail "the killed hook's exit is $childExit, want the forged 0: $facts" }
+    Ok 'TerminateProcess(hook, 0) by another process of the agent: the hook''s parent sees exit 0'
+    Assert-CosignDeny $answer $Script:CosignNoVerdict 'the killed hook''s call'
+    # RECONNECT_GRACE (5 s) after the kill, not COSIGN_WAIT (8 s) after the request.
+    if ($null -eq $afterKill -or $afterKill -gt 7000) { Fail "the co-signer answered $afterKill ms after the kill, want within 7000: $facts" }
+    Ok "the co-signer answered $afterKill ms after the kill"
+    $record = Wait-NoVerdictRecord $countBefore $hookPid 15
+    Assert-NoVerdictRecord $record $true $toolUseId 'the killed bound hook'
+    $cosigned = @(Get-HookRecords 'cosign_denied' | Where-Object { $_.tool_use_id -eq $toolUseId -and $_.reason -eq $Script:CosignNoVerdict })
+    if ($cosigned.Count -eq 0) { Fail "no cosign_denied record for $toolUseId with reason '$Script:CosignNoVerdict'" }
+    Ok 'a cosign_denied record names the call'
+    $countAfter = @(Get-Records).Count
+    if ($countAfter -le $countBefore) { Fail "the audit did not grow: $countBefore -> $countAfter records" }
+    Ok "the audit grew: $countBefore -> $countAfter records ($sizeBefore -> $(Get-AuditSize))"
+  } finally {
+    $shownRecord = if ($record) { $record | ConvertTo-Json -Compress -Depth 8 } else { '(none)' }
+    Measure-Result 'TerminateProcess-cosign' "as non-admin agent, a bound hook (worker hung) ended by another process with TerminateProcess(hook, 0): $facts. no_verdict record: $shownRecord. Audit $sizeBefore -> $(Get-AuditSize)"
+  }
+}
+
+# The CI 11 spawn-hold case: the hook has said hook.begin and waits on stdin when it is
+# ended, so it never bound a key (D5). The record says bound false; the co-signer cannot
+# match the call and denies at its cap.
+function cosign_kill_stdin {
+  $m = "$Script:Work\native\measure.exe"
+  $pidFile = "$Script:Work\out\cosign-stdin-pid.txt"
+  Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+  $countBefore = @(Get-Records).Count
+  $parent = Start-As -User $Script:Agent -Exe $m -Arguments @('spawn-hold', $Script:Hook, 'claude', $pidFile, '20') -Cwd $Script:Agent.Project
+  if ($parent.StartError) { Fail "measure spawn-hold could not start: $($parent.StartError)" }
+  # spawn-hold creates the file before it writes the pid.
+  Wait-Until 10 'the hook''s pid' { (Test-Path -LiteralPath $pidFile) -and "$(Get-Content -LiteralPath $pidFile -Raw)".Trim() }
+  $hookPid = "$(Get-Content -LiteralPath $pidFile -Raw)".Trim()
+  # hook.begin comes before stdin is read; the hook's own watchdog ends it at 7 s.
+  Start-Sleep -Seconds 2
+  $kill = Invoke-As -User $Script:Agent -Exe $m -Arguments @('terminate', $hookPid, '0') -Cwd $Script:Agent.Project
+  $held = Wait-As -Handle $parent -TimeoutSec 30
+  $childExit = Get-ProbeValue $held.Out 'child_exit'
+  if ((Get-ProbeValue $kill.Out 'terminate') -ne 'succeeded') { Fail "the kill did not happen: $(Format-Probe $kill); parent: $(Format-Probe $held)" }
+  if ($childExit -ne '0') { Fail "the hook killed on stdin exited $childExit, want the forged 0: $(Format-Probe $held)" }
+  Ok 'the hook waiting on stdin, ended with TerminateProcess(hook, 0): its parent sees exit 0'
+  $record = Wait-NoVerdictRecord $countBefore $hookPid 10
+  Assert-NoVerdictRecord $record $false '' 'the hook killed on stdin'
+
+  $toolUseId = New-ToolUseId
+  $answer = Invoke-Cosign -PayloadJson (Get-CosignPayload 'claude\bash-allow.json' $toolUseId)
+  Assert-CosignDeny $answer $Script:CosignNoReport 'the call whose hook never read it'
+  # COSIGN_WAIT is 8 s from the request's arrival.
+  if ($answer.Ms -lt 7000) { Fail "the co-signer answered in $($answer.Ms) ms, want about 8000 (its cap)" }
+  Ok "the co-signer waited its cap: $($answer.Ms) ms"
+  Measure-Result 'TerminateProcess-cosign-stdin' "as non-admin agent, a hook waiting on stdin ended with TerminateProcess(hook, 0): child_exit=$childExit; no_verdict record $($record | ConvertTo-Json -Compress -Depth 8); co-signer for its call: $(Format-Cosign $answer)"
+}
+
+# Doctor as the elevated runner, after the kills (plan 20 Task 6).
+function cosign_doctor {
+  $d = Get-DoctorSummary $null $Script:Hook
+  $nv = Get-CheckStatus $d 'hooks.no-verdict'
+  $cl = Get-CheckStatus $d 'cosign.listen'
+  Read-Back 'doctor-cosign' "hooks.no-verdict=$nv ($(Get-CheckDetail $d 'hooks.no-verdict')); cosign.listen=$cl ($(Get-CheckDetail $d 'cosign.listen'))"
+  $problems = [System.Collections.Generic.List[string]]::new()
+  if ($nv -ne 'warn') { $problems.Add("hooks.no-verdict is $nv, want warn") }
+  if ($cl -ne 'pass') { $problems.Add("cosign.listen is $cl, want pass") }
+  if ($problems.Count) { Fail ($problems -join '; ') }
+  Ok 'doctor: hooks.no-verdict warns, cosign.listen passes'
+}
+
+# After a restart: the co-signer binds again (SO_EXCLUSIVEADDRUSE refuses a bind over the last
+# daemon's TIME_WAIT, so the daemon retries it), and co-signs an honest allow.
+function Assert-CosignAfterRestart([string]$When) {
+  Wait-Until 300 "doctor cosign.listen to pass $When" { (Get-CheckStatus (Get-DoctorSummary $null $Script:Hook) 'cosign.listen') -eq 'pass' }
+  Ok "doctor cosign.listen: pass $When"
+  $allow = Get-CosignPayload 'claude\bash-allow.json' (New-ToolUseId)
+  $job = Start-Cosign $allow
+  Invoke-Hook -AgentKind claude -Payload $allow
+  $hookCode = $Script:HookCode
+  $hookErr = $Script:HookErr
+  $a = Receive-Cosign $job
+  if ($hookCode -ne 0) { Fail "${When}: the allow fixture's hook exited $hookCode, want 0: $hookErr" }
+  if ($a.Status -ne 200 -or $a.Body -ne '') { Fail "${When}: co-sign answer $(Format-Cosign $a), want 200 with an empty body; daemon.log: $(Get-DaemonLogTail)" }
+  Ok "${When}: hook exit 0, co-signer 200 with an empty body in $($a.Ms) ms"
+}
+
+# The managed hook's budget on Windows: p95 of 50 allow calls as the agent within 130 ms
+# (Global Constraints), report-only until plan 21, timed in one pwsh of the agent so no logon is counted. p95 is the
+# value at rank ceil(0.95 n), as scripts/bench-check.sh takes it.
+function bench_managed {
+  $runs = 50
+  $budget = 130
+  $payloadFile = "$Script:Work\out\bench-payload.json"
+  Write-Utf8File $payloadFile (Get-Payload 'claude\bash-allow.json')
+  $extra = 10
+  $head = "`$Hook = '$Script:Hook'; `$PayloadFile = '$payloadFile'; `$Runs = $runs; `$Extra = $extra; `$Cwd = '$($Script:Agent.Project)'"
+  $body = @'
+$ErrorActionPreference = 'Stop'
+$payload = [System.IO.File]::ReadAllText($PayloadFile)
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$inv = [System.Globalization.CultureInfo]::InvariantCulture
+# Run 0 warms the file cache and is not counted.
+foreach ($i in 0..$Runs) {
+  $psi = [System.Diagnostics.ProcessStartInfo]::new($Hook)
+  foreach ($a in 'check', '--managed', '--hook-exit', '--agent', 'claude') { [void]$psi.ArgumentList.Add($a) }
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.StandardInputEncoding = $utf8
+  $psi.WorkingDirectory = $Cwd
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync()
+  $err = $p.StandardError.ReadToEndAsync()
+  $p.StandardInput.Write($payload)
+  $p.StandardInput.Close()
+  $p.WaitForExit()
+  $sw.Stop()
+  [void]$out.Wait(5000)
+  [void]$err.Wait(5000)
+  if ($i -gt 0) { [string]::Format($inv, 'run {0:F1} {1}', $sw.Elapsed.TotalMilliseconds, $p.ExitCode) }
+  $p.Dispose()
+}
+# Where the time goes, untimed by the budget: the floor (saiife.exe --version, a process
+# start and exit with nothing judged), then calls with the hook's step trace
+# (SAIIFE_HOOK_TIMING=1, honoured by this ci-locked build only), each line passed on.
+foreach ($i in 0..$Extra) {
+  $psi = [System.Diagnostics.ProcessStartInfo]::new($Hook)
+  [void]$psi.ArgumentList.Add('--version')
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync()
+  $p.WaitForExit()
+  $sw.Stop()
+  [void]$out.Wait(5000)
+  if ($i -gt 0) { [string]::Format($inv, 'floor {0:F1}', $sw.Elapsed.TotalMilliseconds) }
+  $p.Dispose()
+}
+foreach ($i in 1..$Extra) {
+  $psi = [System.Diagnostics.ProcessStartInfo]::new($Hook)
+  foreach ($a in 'check', '--managed', '--hook-exit', '--agent', 'claude') { [void]$psi.ArgumentList.Add($a) }
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.StandardInputEncoding = $utf8
+  $psi.WorkingDirectory = $Cwd
+  $psi.Environment['SAIIFE_HOOK_TIMING'] = '1'
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync()
+  $err = $p.StandardError.ReadToEndAsync()
+  $p.StandardInput.Write($payload)
+  $p.StandardInput.Close()
+  $p.WaitForExit()
+  $sw.Stop()
+  [void]$out.Wait(5000)
+  [void]$err.Wait(5000)
+  [string]::Format($inv, 'traced {0:F1} {1}', $sw.Elapsed.TotalMilliseconds, $p.ExitCode)
+  foreach ($line in ($err.Result -split "`r?`n")) { if ($line -match '^saiife-timing ') { $line } }
+  $p.Dispose()
+}
+'@
+  $r = Invoke-PwshAs -User $Script:Agent -Code "$head`n$body" -Cwd $Script:Agent.Project -TimeoutSec 300
+  if ($r.Code -ne 0) { Fail "the bench as the agent exited $($r.Code): $($r.Out) $($r.Err)" }
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  $times = [System.Collections.Generic.List[double]]::new()
+  $bad = [System.Collections.Generic.List[string]]::new()
+  # Step name -> its times over the traced calls, in first-seen order.
+  $steps = [ordered]@{}
+  $floor = [System.Collections.Generic.List[double]]::new()
+  $traced = [System.Collections.Generic.List[double]]::new()
+  foreach ($line in ($r.Out -split "`r?`n")) {
+    if ($line -match '^run (\S+) (-?\d+)$') {
+      $times.Add([double]::Parse($Matches[1], $inv))
+      if ($Matches[2] -ne '0') { $bad.Add($Matches[2]) }
+    } elseif ($line -match '^floor (\S+)$') {
+      $floor.Add([double]::Parse($Matches[1], $inv))
+    } elseif ($line -match '^traced (\S+) (-?\d+)$') {
+      $traced.Add([double]::Parse($Matches[1], $inv))
+      if ($Matches[2] -ne '0') { $bad.Add("traced $($Matches[2])") }
+    } elseif ($line -match '^saiife-timing (\S+) (\S+)$') {
+      if (-not $steps.Contains($Matches[1])) { $steps[$Matches[1]] = [System.Collections.Generic.List[double]]::new() }
+      $steps[$Matches[1]].Add([double]::Parse($Matches[2], $inv))
+    }
+  }
+  # Reported before the budget is judged, pass or fail: where the time goes.
+  $median = {
+    param($xs)
+    $s = @($xs | Sort-Object)
+    if ($s.Count -eq 0) { return [double]::NaN }
+    if ($s.Count % 2) { return $s[($s.Count - 1) / 2] }
+    return ($s[$s.Count / 2 - 1] + $s[$s.Count / 2]) / 2
+  }
+  $parts = [System.Collections.Generic.List[string]]::new()
+  $parts.Add([string]::Format($inv, 'floor (saiife.exe --version) {0:F1}', (& $median $floor)))
+  $parts.Add([string]::Format($inv, 'traced call {0:F1}', (& $median $traced)))
+  foreach ($name in $steps.Keys) {
+    $parts.Add([string]::Format($inv, '{0} {1:F2}', $name, (& $median $steps[$name])))
+  }
+  Measure-Result 'managed-hook-steps' ("medians in ms over $extra calls each (helper-thread and worker steps overlap the hook's own; total is the hook's main without its process start and exit): " + ($parts -join '; '))
+  if ($times.Count -ne $runs) { Fail "the bench printed $($times.Count) runs, want ${runs}: $($r.Out) $($r.Err)" }
+  if ($bad.Count) { Fail "$($bad.Count) bench runs did not allow (exits $($bad -join ', ')): $($r.Err)" }
+  $sorted = @($times | Sort-Object)
+  $k = [int][math]::Floor(($runs * 95 + 99) / 100)
+  $p95 = $sorted[$k - 1]
+  $median = if ($runs % 2) { $sorted[($runs - 1) / 2] } else { ($sorted[$runs / 2 - 1] + $sorted[$runs / 2]) / 2 }
+  $line = [string]::Format($inv, 'managed hook, allow fixture as the agent, {0} runs: median {1:F1} ms, p95 {2:F1} ms, max {3:F1} ms (budget {4} ms)', $runs, $median, $p95, $sorted[-1], $budget)
+  Measure-Result 'managed-hook-p95' $line
+  # Report-only until plan 21 sets real budgets (owner ruling 2026-11-09): over budget is
+  # printed, not failed. Runs that did not allow still fail above.
+  if ($p95 -gt $budget) { Write-Host "  over budget (report-only): $line" } else { Ok $line }
+}
+
+# Plan 20 Task 9: the co-signer on a real Windows. Unlike phase_measurements these steps are
+# asserted; each runs even when one before it failed.
+function phase_cosign {
+  Build-Native
+  $failures = [System.Collections.Generic.List[string]]::new()
+  try {
+    foreach ($step in 'cosign_listen', 'cosign_controls', 'cosign_kill_bound', 'cosign_kill_stdin', 'cosign_doctor', 'bench_managed') {
+      Write-Host "-- $step"
+      try {
+        & $step
+      } catch {
+        $failures.Add("${step}: $($_.Exception.Message)")
+        Write-Host "  FAILED ${step}: $($_.Exception.Message)"
+        Restore-Baseline
+      }
+    }
+  } finally {
+    Get-Job | Remove-Job -Force
+  }
+  if ($failures.Count) { Fail ($failures -join ' || ') }
 }
 
 function Get-CheckStatus($Doctor, [string]$Id) {

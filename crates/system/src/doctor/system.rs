@@ -5,8 +5,9 @@
 //! [`super::windows`] instead, where `Layout::at` has no run dir, unit or credstore.
 
 use super::common::{
-    agent_label, allow_server_warnings, cloud_sts, config_valid, entry_fingerprint, health_check,
-    install_record, mcp_restrictions, HEALTH_TITLE, NOT_INSTALLED,
+    agent_label, allow_server_warnings, claude_installed, cloud_sts, config_valid, cosign_listen,
+    entry_fingerprint, health_check, hooks_no_verdict, install_record, mcp_restrictions,
+    DaemonStatus, NOT_INSTALLED,
 };
 pub use super::common::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use super::report::{Check, Status};
@@ -25,6 +26,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 const NOT_CHECKED: &str = "not checked (run as root)";
+/// `files.binary` as a plain user on Linux, where the binary is `0711` (plan 20).
+const NOT_READABLE_0711: &str =
+    "not readable by this user (mode 0711, so no process of the user can trace a hook)";
 /// Largest file `files.installed` fingerprints (16 MiB), the binary
 /// excepted ([`MAX_BINARY`]).
 const MAX_FINGERPRINT: u64 = 16 * 1024 * 1024;
@@ -63,12 +67,15 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.push(audit_group(ctx));
     out.push(daemon_group(ctx));
     out.push(daemon_unit(ctx));
-    out.push(daemon_health(ctx));
+    out.extend(daemon_health(ctx));
     if let Some(i) = &ctx.installed {
         if i.agents.is_empty() {
             out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
         }
         out.extend(i.agents.iter().map(|a| agent_label(ctx, &a.agent)));
+        if i.agents.iter().any(|a| a.agent == "claude") {
+            out.push(claude_policy(ctx));
+        }
     }
     out.extend(allow_server_warnings(ctx));
     out.extend(mcp_checks(ctx));
@@ -143,6 +150,49 @@ fn claude_mdm(ctx: &Ctx, i: &Installed) -> Option<Check> {
              Claude Code may ignore saiife's managed-settings.d drop-in"
         ),
     ))
+}
+
+/// `agents.claude.policy`: the installed drop-in carries the co-signer HTTP hook and its URL
+/// allow-list (plan 20). A drop-in from an older saiife only has the command hook, and
+/// `files.installed` passes it while its record is the old one.
+fn claude_policy(ctx: &Ctx) -> Check {
+    const ID: &str = "agents.claude.policy";
+    const TITLE: &str = "Claude Code drop-in";
+    let shown = shown(ctx, CLAUDE_MANAGED);
+    let at = ctx.layout.at(CLAUDE_MANAGED);
+    let read = match fs::symlink_metadata(&at) {
+        Ok(m) if m.is_file() && m.len() <= 1 << 20 => fs::read_to_string(&at),
+        Ok(_) => {
+            return Check::new(
+                ID,
+                Status::Fail,
+                TITLE,
+                format!("{shown}: not a regular file of sane size"),
+            )
+        }
+        Err(e) => Err(e),
+    };
+    match read {
+        Ok(text) if saiife_agents::claude::carries_cosign(&text) => {
+            Check::new(ID, Status::Pass, TITLE, "carries the saiife co-signer hook")
+        }
+        Ok(_) => Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            saiife_agents::claude::COSIGN_MISSING_TEXT,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            saiife_agents::claude::COSIGN_MISSING_TEXT,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
+            Check::new(ID, Status::Info, TITLE, format!("{shown}: {NOT_CHECKED}"))
+        }
+        Err(e) => Check::new(ID, Status::Fail, TITLE, format!("{shown}: {e}")),
+    }
 }
 
 /// `system.sip` (macOS): Pass with System Integrity Protection on, Fail
@@ -436,8 +486,34 @@ fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, max: u64, t: &mut T
 
 /// The installed binary must be the static release build (spec §9.2 A4): a
 /// dynamic one honours `LD_PRELOAD` from an environment the agent shapes, a
-/// debug-assertions build the `SAIIFE_EVAL_FAULT` test seam.
+/// debug-assertions build the `SAIIFE_EVAL_FAULT` test seam. On Linux its mode must be
+/// [`binary_mode`] (`0711`, plan 20): a binary its user cannot read runs not dumpable, so
+/// no process of that user can trace the hook. A wrong mode warns, unless the build fails.
 fn files_binary(ctx: &Ctx) -> Check {
+    let c = files_binary_build(ctx);
+    if mac(ctx) || c.status == Status::Fail {
+        return c;
+    }
+    let want = binary_mode(ctx.layout.platform());
+    match fs::symlink_metadata(ctx.layout.at(BINARY)) {
+        Ok(md) if md.mode() & 0o7777 != want => {
+            let mode = format!(
+                "{BINARY} is {:04o}, expected {want:04o}; run saiife system install",
+                md.mode() & 0o7777
+            );
+            let detail = if c.status == Status::Warn {
+                format!("{mode}; {}", c.detail)
+            } else {
+                mode
+            };
+            Check::new(c.id, Status::Warn, c.title, detail)
+        }
+        _ => c,
+    }
+}
+
+/// [`files_binary`] without the mode: what the bytes say.
+fn files_binary_build(ctx: &Ctx) -> Check {
     use crate::binary::{inspect, Linking, Profile};
     const ID: &str = "files.binary";
     const TITLE: &str = "installed binary";
@@ -456,7 +532,12 @@ fn files_binary(ctx: &Ctx) -> Check {
     let bytes = match read {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
-            return Check::new(ID, Status::Info, TITLE, format!("{NOT_CHECKED}: {BINARY}"))
+            let why = if mac(ctx) {
+                format!("{NOT_CHECKED}: {BINARY}")
+            } else {
+                NOT_READABLE_0711.to_string()
+            };
+            return Check::new(ID, Status::Info, TITLE, why);
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return fail(format!("{BINARY}: missing")),
         Err(e) => return fail(format!("{BINARY}: cannot read: {e}")),
@@ -1105,25 +1186,27 @@ fn launchd_unit(ctx: &Ctx) -> Check {
     }
 }
 
-#[cfg(unix)]
-fn daemon_health(ctx: &Ctx) -> Check {
-    use saiife_ipc::client::Client;
-    use saiife_ipc::msg::OP_STATUS;
-    use serde_json::Map;
-    use std::time::{Duration, Instant};
-    let fail = |d: String| Check::new("daemon.health", Status::Fail, HEALTH_TITLE, d);
+/// `daemon.health`, `cosign.listen` and `hooks.no-verdict`, from one `status` call.
+fn daemon_health(ctx: &Ctx) -> Vec<Check> {
+    use std::time::Duration;
     let user = match &ctx.config {
         Ok(p) => p.config.daemon.user.clone(),
         Err(_) => ctx.layout.daemon_user().to_string(),
     };
-    let Some(uid) = ctx.host.user(&user).map(|u| u.uid) else {
-        return fail(format!("daemon user {user} is not in /etc/passwd"));
+    let status: DaemonStatus = match ctx.host.user(&user).map(|u| u.uid) {
+        None => Err(format!("daemon user {user} is not in /etc/passwd")),
+        Some(uid) => {
+            let (_, dir) = socket_dir(ctx);
+            ctx.host
+                .daemon_status_at(&dir, uid, Duration::from_secs(2))
+                .map_err(|e| e.to_string())
+        }
     };
-    let (_, dir) = socket_dir(ctx);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = Client::connect(&dir, uid, deadline)
-        .and_then(|mut c| c.call(OP_STATUS, Map::new(), deadline));
-    health_check(status.map_err(|e| e.to_string()))
+    vec![
+        health_check(status.clone()),
+        cosign_listen(claude_installed(ctx), &status),
+        hooks_no_verdict(&status),
+    ]
 }
 
 // ------------------------------------------------------------ MCP gateway
@@ -1968,6 +2051,251 @@ mod tests {
         assert!(d.contains(&format!("{BINARY}: missing")), "{d}");
     }
 
+    /// A drop-in from before the co-signer, even one on record, fails `agents.claude.policy`.
+    #[test]
+    fn drop_in_without_cosign_fails_policy() {
+        let t = T::installed();
+        assert_status(&t.doctor(), "agents.claude.policy", Status::Pass);
+        let old = saiife_agents::claude::managed_settings()
+            .replace(
+                ",\n                   { \"type\": \"http\",\n                     \"url\": \"http://127.0.0.1:7433/v1/cosign/claude\",\n                     \"timeout\": 10, \"onFailure\": \"block\" }",
+                "",
+            )
+            .replace("  \"allowedHttpHookUrls\": [\"http://127.0.0.1:7433/*\"],\n", "");
+        assert!(!old.contains("http://"), "{old}");
+        fs::write(t.at(CLAUDE_MANAGED), &old).unwrap();
+        // As an older saiife recorded it: `files.installed` has no complaint.
+        t.edit_installed(|i| {
+            i.agents[0].sha256 = crate::fsops::sha256_hex(old.as_bytes());
+        });
+        let r = t.doctor();
+        assert_status(&r, "files.installed", Status::Pass);
+        assert_status(&r, "agents.claude.policy", Status::Fail);
+        assert_eq!(
+            get(&r, "agents.claude.policy").detail,
+            saiife_agents::claude::COSIGN_MISSING_TEXT
+        );
+        assert_eq!(
+            saiife_agents::claude::COSIGN_MISSING_TEXT,
+            "the Claude Code drop-in has no saiife co-signer hook; run saiife system install"
+        );
+
+        fs::remove_file(t.at(CLAUDE_MANAGED)).unwrap();
+        assert_status(&t.doctor(), "agents.claude.policy", Status::Fail);
+    }
+
+    // ------------------------------------------------------------ plan 20
+
+    /// A daemon's `status` answer with this `cosign` value and `n` hooks without a verdict.
+    fn answer(cosign: serde_json::Value, n: u64) -> serde_json::Map<String, serde_json::Value> {
+        let last = (n > 0).then_some("2026-11-09T10:00:00Z");
+        let v = serde_json::json!({
+            "policy_ok": true, "chain": "c", "head_seq": 1, "last_checkpoint_seq": null,
+            "cosign": cosign,
+            "hooks_no_verdict": {"since_start": n, "last_ts": last},
+        });
+        v.as_object().unwrap().clone()
+    }
+
+    fn listening() -> serde_json::Value {
+        serde_json::json!({"addr": "127.0.0.1:7433", "error": null})
+    }
+
+    #[test]
+    fn cosign_not_listening_fails() {
+        let t = T::installed();
+        let down = serde_json::json!({"addr": null, "error": "Address in use (os error 98)"});
+        t.host.set(|s| s.daemon_status = Some(answer(down, 0)));
+        let r = t.doctor();
+        assert_status(&r, "daemon.health", Status::Pass);
+        assert_status(&r, "cosign.listen", Status::Fail);
+        assert_eq!(
+            get(&r, "cosign.listen").detail,
+            "the co-signer is not listening on 127.0.0.1:7433 (Address in use (os error 98)), \
+             so Claude Code blocks every call"
+        );
+        // A daemon that says nothing of a co-signer, or listens elsewhere, fails too.
+        let mut old = answer(listening(), 0);
+        old.remove("cosign");
+        t.host.set(|s| s.daemon_status = Some(old));
+        assert_status(&t.doctor(), "cosign.listen", Status::Fail);
+        let elsewhere = serde_json::json!({"addr": "127.0.0.1:7434", "error": null});
+        t.host.set(|s| s.daemon_status = Some(answer(elsewhere, 0)));
+        assert_status(&t.doctor(), "cosign.listen", Status::Fail);
+    }
+
+    #[test]
+    fn cosign_listening_passes() {
+        let t = T::installed();
+        t.host
+            .set(|s| s.daemon_status = Some(answer(listening(), 0)));
+        let r = t.doctor();
+        assert_status(&r, "cosign.listen", Status::Pass);
+        assert_eq!(
+            get(&r, "cosign.listen").detail,
+            "listening on 127.0.0.1:7433"
+        );
+    }
+
+    #[test]
+    fn cosign_info_without_claude() {
+        let t = T::installed();
+        t.edit_installed(|i| i.agents.retain(|a| a.agent != "claude"));
+        let down = serde_json::json!({"addr": null, "error": "x"});
+        t.host.set(|s| s.daemon_status = Some(answer(down, 0)));
+        assert_status(&t.doctor(), "cosign.listen", Status::Info);
+    }
+
+    /// No answer: `daemon.health` fails, and the two checks that read the same answer say
+    /// they could not look, without a second failure.
+    #[test]
+    fn cosign_and_no_verdict_without_an_answer_are_info() {
+        let r = T::installed().doctor();
+        assert_status(&r, "daemon.health", Status::Fail);
+        assert_status(&r, "cosign.listen", Status::Info);
+        assert_status(&r, "hooks.no-verdict", Status::Info);
+    }
+
+    #[test]
+    fn no_verdict_warns_with_count() {
+        let t = T::installed();
+        t.host
+            .set(|s| s.daemon_status = Some(answer(listening(), 3)));
+        let r = t.doctor();
+        assert_status(&r, "hooks.no-verdict", Status::Warn);
+        assert_eq!(
+            get(&r, "hooks.no-verdict").detail,
+            "3 hook call(s) ended without a verdict since the daemon started (last \
+             2026-11-09T10:00:00Z): a hook was killed, crashed or timed out; see saiife audit \
+             --kind hook"
+        );
+        // Record only: never a failure, whatever the count.
+        t.host
+            .set(|s| s.daemon_status = Some(answer(listening(), 100_000)));
+        assert_status(&t.doctor(), "hooks.no-verdict", Status::Warn);
+    }
+
+    #[test]
+    fn no_verdict_zero_passes() {
+        let t = T::installed();
+        t.host
+            .set(|s| s.daemon_status = Some(answer(listening(), 0)));
+        assert_status(&t.doctor(), "hooks.no-verdict", Status::Pass);
+    }
+
+    #[test]
+    fn binary_unreadable_is_info_for_non_root() {
+        if rustix::process::geteuid().is_root() {
+            return; // Root reads it whatever the mode.
+        }
+        let t = T::installed();
+        // The test user owns the fake binary, so take the search right on its folder.
+        t.chmod(BIN_DIR, 0o600);
+        let r = t.doctor();
+        t.chmod(BIN_DIR, 0o755);
+        assert_status(&r, "files.binary", Status::Info);
+        assert_eq!(
+            get(&r, "files.binary").detail,
+            "not readable by this user (mode 0711, so no process of the user can trace a hook)"
+        );
+    }
+
+    #[test]
+    fn binary_0755_warns_on_linux() {
+        let t = T::installed();
+        assert_status(&t.doctor(), "files.binary", Status::Pass);
+        t.chmod(BINARY, 0o755);
+        let r = t.doctor();
+        assert_status(&r, "files.binary", Status::Warn);
+        assert_eq!(
+            get(&r, "files.binary").detail,
+            "/opt/saiife/bin/saiife is 0755, expected 0711; run saiife system install"
+        );
+        // A build failure stays a failure.
+        put_binary(
+            &t,
+            &crate::binary::fake_elf(Some("/lib64/ld-linux-x86-64.so.2"), 3, Some(false)),
+        );
+        assert_status(&t.doctor(), "files.binary", Status::Fail);
+    }
+
+    /// Doctor run as the agent user itself, with this home.
+    fn doctor_as_self(t: &T, home: &std::path::Path) -> Report {
+        run(
+            &t.layout,
+            &t.host,
+            &FixedDirectory::from_text("", ""),
+            &DoctorOptions {
+                user: None,
+                home: Some(home.to_path_buf()),
+            },
+        )
+    }
+
+    fn proxy_of(r: &Report) -> &super::Check {
+        r.checks
+            .iter()
+            .find(|c| c.id.starts_with("user.") && c.id.ends_with(".proxy"))
+            .unwrap_or_else(|| panic!("no proxy check in\n{}", r.to_text()))
+    }
+
+    #[test]
+    fn proxy_without_no_proxy_warns() {
+        if rustix::process::geteuid().is_root() {
+            return; // The caller's environment counts on a self-check only.
+        }
+        let t = T::installed();
+        let home = t.at("/home/agent");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        assert_eq!(proxy_of(&doctor_as_self(&t, &home)).status, Status::Pass);
+        t.host.set(|s| {
+            s.env
+                .insert("HTTPS_PROXY".into(), "http://proxy.test:3128".into());
+        });
+        let r = doctor_as_self(&t, &home);
+        let c = proxy_of(&r);
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(c.detail.contains("(in the environment)"), "{c:?}");
+        assert!(!r
+            .checks
+            .iter()
+            .any(|c| c.status == Status::Fail && c.id.ends_with(".proxy")));
+        // The user's settings `env` exempts 127.0.0.1.
+        fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"env":{"NO_PROXY":"localhost,127.0.0.1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(proxy_of(&doctor_as_self(&t, &home)).status, Status::Pass);
+        // A proxy set only in the settings warns too, and names the file.
+        t.host.set(|s| s.env.clear());
+        fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"env":{"HTTP_PROXY":"http://proxy.test:3128"}}"#,
+        )
+        .unwrap();
+        let r = doctor_as_self(&t, &home);
+        assert_eq!(proxy_of(&r).status, Status::Warn);
+        assert!(proxy_of(&r).detail.contains("~/.claude/settings.json"));
+        // Not for an install without Claude Code.
+        t.edit_installed(|i| i.agents.retain(|a| a.agent != "claude"));
+        assert!(!doctor_as_self(&t, &home)
+            .checks
+            .iter()
+            .any(|c| c.id.ends_with(".proxy")));
+    }
+
+    #[test]
+    fn claude_policy_is_only_for_claude_on_unix() {
+        let t = T::installed();
+        t.edit_installed(|i| i.agents.retain(|a| a.agent != "claude"));
+        assert!(!t
+            .doctor()
+            .checks
+            .iter()
+            .any(|c| c.id == "agents.claude.policy"));
+    }
+
     #[test]
     fn edited_config_is_not_a_changed_file() {
         let t = T::installed();
@@ -2594,6 +2922,18 @@ mod macos_tests {
         let p = e.layout.at(BINARY);
         fs::write(&p, bytes).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// macOS keeps `0755` and the hardened runtime (owner ruling 4): its mode is not
+    /// `files.binary`'s business.
+    #[test]
+    fn binary_mode_not_checked_on_macos() {
+        let e = installed();
+        for mode in [0o711, 0o700, 0o755] {
+            fs::set_permissions(e.layout.at(BINARY), fs::Permissions::from_mode(mode)).unwrap();
+            let r = doctor(&e);
+            assert_status(&r, "files.binary", Status::Pass);
+        }
     }
 
     #[test]

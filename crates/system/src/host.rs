@@ -302,6 +302,21 @@ pub trait Host: Send + Sync {
         let _ = wait;
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
+    /// Linux and macOS: the daemon's answer to `status` over its socket in `dir`, whose
+    /// owner must be `uid`, within `wait`.
+    fn daemon_status_at(
+        &self,
+        dir: &Path,
+        uid: u32,
+        wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        let _ = (dir, uid, wait);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// A variable of this process's environment; `None` when unset or not UTF-8.
+    fn env_var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
     /// Renames a file. Its descriptor goes with it, which the fake must be told.
     fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
@@ -383,6 +398,21 @@ pub fn host_kind(canonical_root: &Path, euid: u32) -> Result<HostKind, String> {
     } else {
         Ok(HostKind::Fake)
     }
+}
+
+/// The daemon's answer to `status` over its socket in `dir`, owned by `uid`.
+#[cfg(unix)]
+fn socket_status(
+    dir: &Path,
+    uid: u32,
+    wait: Duration,
+) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+    use saiife_ipc::client::Client;
+    use saiife_ipc::msg::OP_STATUS;
+    let deadline = Instant::now() + wait;
+    Client::connect(dir, uid, deadline)
+        .and_then(|mut c| c.call(OP_STATUS, serde_json::Map::new(), deadline))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// The host for `layout`: the machine itself for the real root, a
@@ -640,6 +670,15 @@ impl Host for RealHost {
 
     fn reg_value_present(&self, _key: &str, _value: &str) -> io::Result<bool> {
         Err(windows_only())
+    }
+
+    fn daemon_status_at(
+        &self,
+        dir: &Path,
+        uid: u32,
+        wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        socket_status(dir, uid, wait)
     }
 
     fn windows_build(&self) -> io::Result<WinBuild> {
@@ -1766,8 +1805,11 @@ pub struct FakeState {
     pub local_groups: BTreeMap<String, Vec<String>>,
     /// When set, `local_groups_of` fails with this error.
     pub local_groups_error: Option<String>,
-    /// What `daemon_status` answers; `None` is a daemon that does not answer.
+    /// What `daemon_status` and `daemon_status_at` answer. `None`: `daemon_status` says the
+    /// daemon does not answer, and `daemon_status_at` asks the socket in the test tree.
     pub daemon_status: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What `env_var` answers (default: nothing set, whatever the test's own environment).
+    pub env: BTreeMap<String, String>,
     /// When set, `service_spec` fails with this error.
     pub service_spec_error: Option<String>,
     /// Paths whose `get_sddl` is access denied, as a plain user's is on `state`.
@@ -1868,6 +1910,7 @@ impl Default for FakeState {
             local_groups: BTreeMap::new(),
             local_groups_error: None,
             daemon_status: None,
+            env: BTreeMap::new(),
             service_spec_error: None,
             sddl_denied: Vec::new(),
             service_spec_denied: false,
@@ -2763,6 +2806,33 @@ impl Host for FakeHost {
         self.state()
             .daemon_status
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the daemon did not answer"))
+    }
+
+    /// What `daemon_status` holds when set; else the socket in the test tree, so a test
+    /// daemon started under the fake root answers (none there is a daemon that does not).
+    fn daemon_status_at(
+        &self,
+        dir: &Path,
+        uid: u32,
+        wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        if let Some(a) = self.state().daemon_status {
+            return Ok(a);
+        }
+        #[cfg(unix)]
+        return socket_status(dir, uid, wait);
+        #[cfg(not(unix))]
+        {
+            let _ = (dir, uid, wait);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the daemon did not answer",
+            ))
+        }
+    }
+
+    fn env_var(&self, name: &str) -> Option<String> {
+        self.state().env.get(name).cloned()
     }
 }
 

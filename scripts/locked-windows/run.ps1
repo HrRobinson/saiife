@@ -57,6 +57,7 @@ try {
   Invoke-Phase phase_fail_closed { phase_fail_closed }
   Invoke-Phase phase_attacks { phase_attacks }
   Invoke-Phase phase_measurements { phase_measurements }
+  Invoke-Phase phase_cosign { phase_cosign }
   Invoke-Phase phase_doctor { phase_doctor }
   Invoke-Phase phase_approvals { phase_approvals }
   Invoke-Phase phase_lockdown { phase_lockdown }

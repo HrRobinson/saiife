@@ -10,8 +10,9 @@
 //! [`Host`]: crate::host::Host
 
 use super::common::{
-    agent_label, allow_server_warnings, cloud_sts, config_valid, entry_fingerprint, fmt_version,
-    forwarding_detail, health_check, install_record, mcp_restrictions, parse_agent_version,
+    agent_label, allow_server_warnings, claude_installed, cloud_sts, config_valid, cosign_listen,
+    entry_fingerprint, fmt_version, forwarding_detail, health_check, hooks_no_verdict,
+    install_record, mcp_restrictions, parse_agent_version, proxy_check, DaemonStatus, EnvLayer,
     CLAUDE_MIN, NOT_INSTALLED,
 };
 use super::report::{Check, Status};
@@ -106,11 +107,14 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.extend(files_package(ctx));
     out.push(keys(ctx));
     out.push(daemon_unit(ctx));
-    out.push(health_check(
-        ctx.host
-            .daemon_status(HEALTH_WAIT)
-            .map_err(|e| e.to_string()),
-    ));
+    // `daemon.health`, `cosign.listen` and `hooks.no-verdict` read one `status` answer.
+    let status: DaemonStatus = ctx
+        .host
+        .daemon_status(HEALTH_WAIT)
+        .map_err(|e| e.to_string());
+    out.push(health_check(status.clone()));
+    out.push(cosign_listen(claude_installed(ctx), &status));
+    out.push(hooks_no_verdict(&status));
     if let Some(i) = &ctx.installed {
         if i.agents.is_empty() {
             out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
@@ -1078,10 +1082,15 @@ fn vault_key(ctx: &Ctx, i: &Installed) -> Check {
 // ---------------------------------------------------------------- Claude Code
 
 /// W24: HKLM's settings win over saiife's drop-in unless they say to merge. The read fails
-/// closed (`hklm_policy_live`).
+/// closed (`hklm_policy_live`). Before that, the drop-in itself must carry the co-signer
+/// HTTP hook and its URL allow-list (plan 20): one from an older saiife does not.
 fn claude_policy(ctx: &Ctx) -> Check {
     const ID: &str = "agents.claude.policy";
     const TITLE: &str = "Claude Code machine policy";
+    let drop_in = read_plain(&ctx.layout.at(CLAUDE_MANAGED), 1 << 20);
+    if !drop_in.is_ok_and(|b| std::str::from_utf8(&b).is_ok_and(claude::carries_cosign)) {
+        return Check::new(ID, Status::Fail, TITLE, claude::COSIGN_MISSING_TEXT);
+    }
     match ctx.host.claude_hklm_policy() {
         HklmPolicy::Overrides => Check::new(ID, Status::Fail, TITLE, claude::HKLM_OVERRIDES_TEXT),
         HklmPolicy::Merge => Check::new(ID, Status::Pass, TITLE, "merged with saiife's drop-in"),
@@ -1218,6 +1227,9 @@ fn users(ctx: &Ctx) -> Vec<Check> {
         out.push(elevation(ctx, name, &sid, id("root")));
         out.push(agent_binaries(ctx, name, &sid, id("agent-binaries")));
         out.push(agent_version(ctx, name, &sid, id("agent-version")));
+        if claude_installed(ctx) {
+            out.push(proxy(ctx, &sid, id("proxy")));
+        }
         out.push(Check::new(
             id("egress"),
             Status::Info,
@@ -1299,6 +1311,34 @@ fn elevation(ctx: &Ctx, name: &str, sid: &str, id: String) -> Check {
     } else {
         Check::new(id, Status::Pass, TITLE, "")
     }
+}
+
+/// Where Windows keeps the machine's environment variables, below HKLM.
+pub(crate) const REG_MACHINE_ENV: &str =
+    r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+
+/// The proxy Claude Code would use for the co-sign request (plan 20): the machine's
+/// environment, then the `env` of the user's `.claude\settings.json`, which overwrites it.
+/// Never this process's environment, which is the caller's.
+fn proxy(ctx: &Ctx, sid: &str, id: String) -> Check {
+    let mut layers = vec![EnvLayer::from_lookup(
+        "the machine environment".into(),
+        |k| ctx.host.reg_string(REG_MACHINE_ENV, k),
+    )];
+    let settings = profile_dir(ctx, sid)
+        .and_then(|p| {
+            ctx.layout
+                .try_at(Path::new(&format!(r"{p}\.claude\settings.json")))
+                .ok()
+        })
+        .and_then(|p| read_plain(&p, 1 << 20).ok());
+    if let Some(b) = settings {
+        layers.push(EnvLayer::from_settings(
+            r"%USERPROFILE%\.claude\settings.json".into(),
+            &b,
+        ));
+    }
+    proxy_check(id, &layers)
 }
 
 /// The user's profile, from the registry by SID. Never from the environment, which is the

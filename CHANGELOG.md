@@ -33,11 +33,19 @@ the MCP server and gateway, the personal broker and fleet packages.
 
 - New `sudo saiife system install` and `sudo saiife system uninstall` set up or remove locked mode on Ubuntu 22.04+, Debian 12+ and RHEL 9+ (Rocky, Alma) with systemd.
 - Install creates the `saiife` user and groups, puts the binary in `/opt/saiife/bin`, and writes `/etc/saiife`, the vault key and the `saiifed` unit. It adds managed hooks for Claude Code, Codex and Gemini CLI, starts the daemon and runs `saiife doctor`. It exits 2 on an install error or an unsupported system, and 1 when installed but `doctor` found a failure.
+- The binary `/opt/saiife/bin/saiife` is installed at `0711`, so no process of the agent's user can trace or read a running hook. A reinstall moves a `0755` binary to `0711`, and `doctor` warns on any other mode.
 - Uninstall removes exactly what install listed. `--purge` also removes the state, the audit and the users.
 - New `saiife daemon --system`: the locked-mode daemon. It is the single writer of the audit log, stamps every record's time and identity, and signs checkpoints with an Ed25519 key.
 - New `saiife check --managed`: the locked-mode hook. The guard runs in a separate worker process, and the call is allowed only after the daemon has recorded it. Every error blocks the call (it fails closed): a worker crash or hang, a daemon that is down, slow or refuses, or a policy that cannot be loaded.
 - New `saiife check --managed --event config-change`: Claude Code's ConfigChange hook. A change to user, project or local settings that sets a locked key is denied.
 - Under a managed hook, the project hook of that agent goes quiet: no double judging, no second record. In locked mode `saiife init` writes no project hook for an agent with a managed hook, and `saiife init --off` keeps the project config.
+- A killed or crashed hook never counts as an allow without a trace (plan 20).
+- Claude Code: the managed drop-in gains a second `PreToolUse` hook, the co-signer. It is an `http` hook to `http://127.0.0.1:7433/v1/cosign/claude`, with `onFailure: "block"`. The drop-in also sets `"allowedHttpHookUrls": ["http://127.0.0.1:7433/*"]`.
+- The daemon answers the co-signer with an empty `200` only when the command hook recorded an allow for the same session, tool call id and input hash. Otherwise it answers deny. It never answers allow.
+- The co-signer port is fixed. If the daemon cannot bind it, the daemon keeps running and records `cosign_bind_failed`, and `doctor` fails `cosign.listen`. Claude Code then blocks every call.
+- With `HTTPS_PROXY` or `HTTP_PROXY` set for Claude Code, add `127.0.0.1` to `NO_PROXY`. saiife does not set it, and `doctor` warns.
+- Exit watch, for every agent: the hook registers with the daemon (`hook.begin`) before it reads its input, and names the call (`hook.bind`) once it has. A hook that ends without a verdict becomes a `hook` record with decision `no_verdict`, and `doctor` warns (`hooks.no-verdict`). This is a record only; there is no automatic lockdown.
+- Codex and Gemini CLI get this detection and no co-signer, so their calls still run.
 - New `core.lock` pack, on in locked mode. It protects saiife's own install: `/etc/saiife`, `/opt/saiife`, the state, audit and socket dirs, the unit and the managed agent settings.
 - New `saiife doctor [--user <name>] [--json]` checks what locked mode relies on: files, owners and modes, keys, the daemon, agent users, sudo and root-equivalent groups, and plaintext credentials. Exit 0 all pass, 1 a warning, 2 a failure. It also warns when re-authentication is unavailable.
 - `saiife status` shows a Locked mode block: mode, daemon health and chain head, policy hash, each managed agent's lock label and the MCP warnings.
@@ -66,6 +74,7 @@ the MCP server and gateway, the personal broker and fleet packages.
 - State is in `/var/db/saiife`, the vault key in `/var/db/saiife/keys/vault.key` (`daemon_file`, 0400), and the sockets in `/var/db/saiife-run`.
 - It writes the managed hooks for Claude Code (`/Library/Application Support/ClaudeCode/managed-settings.d/`), Codex and Gemini CLI, and registers the authorization right `com.saiife.approve`.
 - The daemon reads the peer uid with `LOCAL_PEERCRED`. The pid (`LOCAL_PEERPID`) and the process names (`sysctl(KERN_PROC_PID)`) are attribution only. They live in the new `saiife-darwin` crate, the only crate allowed `unsafe`.
+- The macOS binary keeps mode `0755` and the hardened runtime.
 - Install requires the hardened runtime and warns on an ad-hoc signature. Tagged releases with the signing secrets are signed with a Developer ID and notarized. Other builds are ad-hoc signed, and the release notes say so.
 - `doctor` gains the macOS checks: launchd, the signature, the auth right, `_saiifeaudit` and the Claude MDM profile.
 - `saiife mcp` works on macOS. `run --secret` and `run --cloud` work. `DYLD_*` is removed from the command's environment on every platform. A `run_allow` entry through `/etc`, `/var` or `/tmp` is refused on macOS, with a `/private` hint.
@@ -88,6 +97,7 @@ the MCP server and gateway, the personal broker and fleet packages.
 - Every path it makes has a protected access list, which `doctor` reads back.
 - The daemon listens on the named pipe `\\.\pipe\saiife` and refuses to start when the name is taken. It reads each caller's SID and groups from its token; records carry `sid`.
 - Release builds load DLLs only from System32. `doctor` checks the build, its imports and its signature. It also fails when Claude Code's `HKLM\SOFTWARE\Policies\ClaudeCode` would replace the managed files, and when an agent user can become an admin.
+- With the co-signer (plan 20), a hook ended with `TerminateProcess(hook, 0)` is a deny for Claude Code. Windows locked mode is still a preview: code injected into the hook can make it record an allow, and the co-signer then accepts it.
 - CI's new `locked-windows` and `package-windows` jobs run it on throwaway runners. `windows-latest` checks the readers against real PowerShell and cmd.
 
 ### Connectors, MCP and the personal broker
@@ -138,8 +148,13 @@ the MCP server and gateway, the personal broker and fleet packages.
 
 ### Known limits
 
-- Windows locked mode is a preview. A process running as the agent's own user can end a hook with `TerminateProcess(hook, 0)`. The agent reads exit 0 as allow, and nothing is recorded (measured on `windows-2022` and `windows-2025`). `doctor` says so on every locked run (`locked.preview`).
-- Plan 20 (not merged yet): the Claude Code HTTP hook that the daemon co-signs arrives with plan 20, with a check that records a hook that ended without its answer.
+- Windows locked mode is a preview. A process running as the agent's own user can end a hook with `TerminateProcess(hook, 0)`. Before plan 20 the agent read that exit 0 as allow, and nothing was recorded (measured on `windows-2022` and `windows-2025`). `doctor` says so on every locked run (`locked.preview`).
+- It stays a preview after plan 20. The co-signer blocks a forged exit 0 for Claude Code, but code injected into the hook can still make it record an allow.
+- On macOS and Windows the co-signer cannot identify the TCP peer.
+- Codex and Gemini CLI get detection only: a hook that ends without a verdict is recorded, but the call still runs.
+- In locked mode, a Claude Code tool call whose input is over 16 MiB is blocked (the co-signer's body cap).
+- Behind a proxy, add `127.0.0.1` to `NO_PROXY` for Claude Code, or the co-signer blocks every call.
+- The managed hook costs about 90 ms on Linux, and 104 to 139 ms on Windows. Plan 21 targets that.
 - Nothing has run on real Windows outside CI.
 - Every macOS lock label is `unverified` until the new `scripts/lock-check/macos-vm.sh` has run in a macOS VM. Every Windows lock label is `unverified` until the new `scripts/lock-check/windows-vm.ps1` has run in a VM.
 - Same-user approval is off on macOS and Windows; approvals need a second account. On macOS the prompt cannot show what is approved, so `same_user = "reauth"` acts as `"deny"`. On Windows the approver needs a separate session, and saiife never handles a Windows password.

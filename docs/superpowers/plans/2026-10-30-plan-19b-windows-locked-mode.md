@@ -45,9 +45,10 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   - **cred.rs:** `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`;
   - **process.rs:** `SetDefaultDllDirectories` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), `SetStdHandle` (`STD_ERROR_HANDLE`, for the service log), `GetDiskFreeSpaceExW`;
   - **job.rs:** `CreateJobObjectW`, `SetInformationJobObject` (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), `AssignProcessToJobObject` (the managed hook's eval worker sits in a kill-on-close job, so it never outlives the hook; whole-branch review finding 8);
+  - **net.rs** (plan 20): `setsockopt` (`SO_EXCLUSIVEADDRUSE`, on the Claude Code co-signer's listener before it binds `127.0.0.1:7433`, so no other process can bind that address beside it);
   - **service.rs:** the one `extern "system"` service entry that `windows_service::define_windows_service!` expands to. The macro's expansion contains `unsafe`, so it must live in `saiife-win` and nowhere else.
 
-  That is 41 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 40 `windows-sys` calls and the tokio call. If a failure of `RevertToSelf` is ever seen, the process calls `std::process::abort()`: it must never go on running as the client.
+  That is 42 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 41 `windows-sys` calls and the tokio call. If a failure of `RevertToSelf` is ever seen, the process calls `std::process::abort()`: it must never go on running as the client.
 - **Decisions this plan makes** (W1–W8 are in plan 19a; each one here is restated in its task, and plan 19a Task 1 copies all of them into spec §5.3a):
   9. **W9. The Windows layout.** `windows_path(linux: &str) -> Option<&'static str>` maps:
 

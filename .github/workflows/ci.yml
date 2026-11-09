@@ -108,7 +108,8 @@ jobs:
         run: |
           bash5="$(brew --prefix)/bin/bash"
           [ -x "$bash5" ] || brew install bash
-          BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
+          # Report-only until plan 21 sets real budgets: prints the numbers, fails only when a call does not allow.
+          BENCH_REPORT_ONLY=1 BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
       # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin and saiife-win must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
@@ -217,11 +218,21 @@ jobs:
       # SAIIFE_EVAL_FAULT test seam exists only there. run.sh installs it
       # with --allow-test-build (spec §9.2 A4: never in production).
       - run: cargo build --locked --profile ci-locked --target x86_64-unknown-linux-musl --bin saiife
-      - name: install, fail-closed matrix, uninstall (sudo inside, this job only)
+      # Plan 20 phases need python3 (ptrace-probe.py) and curl (the co-signer):
+      # both are on the ubuntu runner images.
+      - name: install, 0711 and ptrace, co-signer, fail-closed matrix, uninstall (sudo inside, this job only)
         env:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
         run: bash scripts/locked-linux/run.sh "$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife"
+      # The managed hook's p95 (plan 20 adds the hook.begin round trip to it),
+      # with macOS's budget. It times the ci-locked build above (only a build
+      # with debug assertions lets a daemon serve a hook of its own user),
+      # starts its own daemon in a scratch dir, fails unless every call
+      # allows, and prints the median and p95 per payload and each step's median.
+      # Report-only until plan 21 sets real budgets: over budget prints, a call that does not allow fails.
+      - name: managed hook bench (Linux, p95 budget)
+        run: BENCH_REPORT_ONLY=1 SAIIFE_BENCH_BIN="$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife" BENCH_MAX_P95_MS=40 bash scripts/bench-check.sh --managed 50
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -258,7 +269,7 @@ jobs:
       # hook. run.sh installs it with --allow-test-build (never production).
       - name: sign ad hoc with the hardened runtime
         run: codesign --force --options runtime --sign - target/ci-locked/saiife
-      - name: install, fail-closed matrix, attacks, uninstall (sudo inside, this job only)
+      - name: install, co-signer, fail-closed matrix, attacks, uninstall (sudo inside, this job only)
         env:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-macos-logs
@@ -299,7 +310,7 @@ jobs:
       # Debug assertions on, like locked-macos; the static CRT and the load flag come from
       # .cargo/config.toml.
       - run: cargo build --locked --profile ci-locked --bin saiife
-      - name: install, ACLs, fail-closed, attacks, measurements, approvals, uninstall
+      - name: install, ACLs, fail-closed, attacks, measurements, co-signer, approvals, uninstall
         env:
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}\target\locked-windows-logs
         run: |

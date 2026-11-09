@@ -138,6 +138,32 @@ loads a settings file or switches hooks off; only settings files and
 environment variables do. The `gemini.cli.settings-flag` probe rechecks this
 against `gemini --help`. If it reads `found`, a command-line gate row is due.
 
+## Claude Code needs a stand-in co-signer
+
+The Claude Code checks install the managed fixture
+`crates/agents/tests/fixtures/managed/claude/50-saiife.json`. Since plan 20
+it has a second `PreToolUse` hook: an HTTP hook to
+`http://127.0.0.1:7433/v1/cosign/claude`, with `onFailure: "block"`. The
+checks run a stub, not the saiife daemon, so nothing listens on
+`127.0.0.1:7433`. The HTTP hook then fails, and Claude Code blocks every tool
+call, so the control row cannot pass and the Claude results mean nothing.
+
+So the Claude Code table starts a stand-in co-signer,
+`scripts/lock-check/cosign-stub.js` (Node, which every run already needs),
+on `127.0.0.1:7433` before its first check and stops it after its last, in
+the container and in both VMs. It answers every `POST /v1/cosign/claude`
+with `200` and an empty body. An empty `200` is "no opinion" to Claude Code,
+so the stub's verdict decides each row, as before plan 20. Each request is a
+line in `cosign.log` in the run dir. The stand-in stops by itself when the
+harness removes its run file or dies; the harness never signals it. If the
+port is taken (saiife installed, or another program), the Claude run stops
+before its first check and says so. The offline tests start it on a free
+port, never on 7433. It has not been run against a real Claude Code yet.
+
+With the stand-in, the Claude rows test the command hook only. They say
+nothing about the real co-signer: CI's `locked-*` jobs test that against the
+real daemon. Codex and Gemini CLI have no co-signer and need nothing.
+
 ## Knobs (`LOCKCHECK_*`)
 
 Some agent keys and paths are not verified yet. If a hint points at one, set

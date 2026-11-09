@@ -32,6 +32,9 @@ pub enum DecisionKind {
     Approved,
     Rejected,
     Expired,
+    /// The managed hook ended without a verdict (killed, crashed or timed
+    /// out): written by the daemon in a `hook` record (plan 20).
+    NoVerdict,
     /// A decision value this version does not know. Readers keep the record
     /// instead of dropping it.
     #[serde(other)]
@@ -392,6 +395,33 @@ mod tests {
             let got: DecisionKind = serde_json::from_str(&format!("\"{s}\"")).unwrap();
             assert_eq!(got, k, "{s}");
         }
+    }
+
+    #[test]
+    fn record_round_trips_no_verdict() {
+        let mut nr = base("");
+        nr.decision = DecisionKind::NoVerdict;
+        let json = serde_json::to_string(&Record::new(nr, "0.1.0")).unwrap();
+        assert!(json.contains(r#""decision":"no_verdict""#), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.decision, DecisionKind::NoVerdict);
+        // A reader from before plan 20 keeps the record as `Unknown`.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Older {
+            Allow,
+            Deny,
+            ErrorAllowed,
+            ErrorDenied,
+            Ask,
+            Approved,
+            Rejected,
+            Expired,
+            #[serde(other)]
+            Unknown,
+        }
+        let old: Older = serde_json::from_str("\"no_verdict\"").unwrap();
+        assert_eq!(old, Older::Unknown);
     }
 
     #[test]

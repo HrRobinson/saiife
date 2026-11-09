@@ -52,3 +52,20 @@ debug-assertions = true
 overflow-checks = true
 opt-level = 1
 lto = false
+
+# The CI benches time the managed hook in this build (bench-check.sh --managed,
+# locked-windows bench_managed). At opt-level 1 the regex crates compile the
+# packs and the audit masks slowly: on Linux the worker's judging took 34 ms
+# against 26 ms with them optimized as release has them (the dev profile does
+# the same above). Only the regex crates: optimizing every dependency or the
+# guard crate itself changed nothing measurable.
+[profile.ci-locked.package.regex]
+opt-level = 3
+[profile.ci-locked.package.regex-automata]
+opt-level = 3
+[profile.ci-locked.package.regex-syntax]
+opt-level = 3
+[profile.ci-locked.package.aho-corasick]
+opt-level = 3
+[profile.ci-locked.package.memchr]
+opt-level = 3
