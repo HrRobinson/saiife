@@ -128,6 +128,12 @@ mod imp {
     }
 }
 
+#[cfg(unix)]
+pub(crate) use imp::{hook_env, uid_env};
+/// What the service's re-judge pool shares with the hook (plan 21).
+#[cfg(any(unix, windows))]
+pub(crate) use imp::{load_locked, locked_paths, policy_with, Applied, ScopeEnv};
+
 #[cfg(any(unix, windows))]
 mod imp {
     use super::*;
@@ -735,6 +741,8 @@ mod imp {
                     event: event.map(str::to_string),
                     ask: cfg.guard.ask.clone(),
                     agent: Some(agent.to_string()),
+                    view: eval::View::Host,
+                    vars: None,
                 };
                 if in_process(agent) {
                     drop(early);
@@ -990,7 +998,7 @@ mod imp {
 
     /// The paths `core.lock` guards beyond the §5.2 defaults: the system
     /// config's own dir, the audit dir and the socket dir it names.
-    fn locked_paths(cfg: &SystemConfig, config: &Path) -> LockedPaths {
+    pub(crate) fn locked_paths(cfg: &SystemConfig, config: &Path) -> LockedPaths {
         LockedPaths {
             etc: config.parent().unwrap_or(Path::new("/")).to_path_buf(),
             audit_dir: cfg.audit.dir.clone(),
@@ -1000,7 +1008,7 @@ mod imp {
 
     /// `load_system`, which must say `locked = true`. A config that fails Windows' DACL
     /// check is no policy: the call is denied, whoever wrote the file.
-    fn load_locked(config: &Path) -> Result<SystemConfig, String> {
+    pub(crate) fn load_locked(config: &Path) -> Result<SystemConfig, String> {
         crate::hook_timing::time("config.trust", || {
             crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, config)
         })?;
@@ -1019,11 +1027,39 @@ mod imp {
         cfg: &SystemConfig,
         start: Option<&Path>,
     ) -> Result<(Vec<String>, String), String> {
+        policy_with(cfg, start, &OwnEnv)
+    }
+
+    /// A config with the scope environment of some user applied, and its name.
+    pub(crate) type Applied<'a> = (std::borrow::Cow<'a, SystemConfig>, Option<String>);
+
+    /// Whose scope environment a policy is resolved for: this process's user
+    /// (the hook), or the asking user (the service's re-judgment, plan 21).
+    pub(crate) trait ScopeEnv {
+        fn applied<'a>(&self, cfg: &'a SystemConfig) -> Result<Applied<'a>, String>;
+    }
+
+    /// This process's user.
+    struct OwnEnv;
+
+    impl ScopeEnv for OwnEnv {
+        fn applied<'a>(&self, cfg: &'a SystemConfig) -> Result<Applied<'a>, String> {
+            own_env(cfg)
+        }
+    }
+
+    /// [`policy_for`] with the scope environment of `who`. `start: None` reads
+    /// no project config.
+    pub(crate) fn policy_with(
+        cfg: &SystemConfig,
+        start: Option<&Path>,
+        who: &dyn ScopeEnv,
+    ) -> Result<(Vec<String>, String), String> {
         // The caller's scope environment adds its packs and is part of the
         // hash. Nothing is read or spawned unless some scope binds one; an
         // environment that cannot be resolved denies the call.
         let (cfg_env, env) = if cfg.scope.iter().any(|s| s.env.is_some()) {
-            own_env(cfg)?
+            who.applied(cfg)?
         } else {
             (std::borrow::Cow::Borrowed(cfg), None)
         };
@@ -1074,6 +1110,13 @@ mod imp {
     fn own_env(
         cfg: &SystemConfig,
     ) -> Result<(std::borrow::Cow<'_, SystemConfig>, Option<String>), String> {
+        uid_env(cfg, rustix::process::getuid().as_raw())
+    }
+
+    /// The scope environment of `uid`, from this host's account files (and
+    /// `nss` where they are not the whole answer), as the daemon finds it.
+    #[cfg(unix)]
+    pub(crate) fn uid_env(cfg: &SystemConfig, uid: u32) -> Result<Applied<'_>, String> {
         let linux = cfg!(target_os = "linux");
         let read = |p: &str| {
             linux
@@ -1085,7 +1128,7 @@ mod imp {
         let nsswitch = (!nsswitch.is_empty()).then_some(nsswitch);
         hook_env(
             cfg,
-            rustix::process::getuid().as_raw(),
+            uid,
             (&read("/etc/passwd"), &read("/etc/group")),
             nsswitch.as_deref(),
             &saiife_policy::Getent,
@@ -1143,7 +1186,7 @@ mod imp {
     /// `nsswitch.conf` has no other group source; otherwise `nss` answers,
     /// and a failed lookup denies.
     #[cfg(unix)]
-    fn hook_env<'a>(
+    pub(crate) fn hook_env<'a>(
         cfg: &'a SystemConfig,
         uid: u32,
         (passwd, group): (&str, &str),

@@ -78,6 +78,7 @@ fn options(t: &Tree, pipe: &str) -> DaemonOptions {
         directory: Box::new(WinDirectory::system()),
         credentials_dir: None,
         mode: DaemonMode::System,
+        rejudge: None,
         test_pipe: Some(pipe.to_string()),
     }
 }

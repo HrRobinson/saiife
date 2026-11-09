@@ -37,6 +37,7 @@ pub mod personal;
 pub mod pipe_listener;
 pub mod policy_ops;
 pub mod reauth;
+pub mod rejudge;
 pub mod secret_ops;
 pub mod server;
 pub mod service_log;
@@ -89,6 +90,10 @@ pub struct DaemonOptions {
     /// vault key. Always `None` for the personal broker.
     pub credentials_dir: Option<PathBuf>,
     pub mode: DaemonMode,
+    /// The service's own judgment of each co-signed call (plan 21). The CLI
+    /// passes `Some` in system mode; `None` there means the co-signer denies
+    /// every call. Unused by the personal broker.
+    pub rejudge: Option<std::sync::Arc<dyn rejudge::Rejudge>>,
     /// A debug build's test: this pipe, owned by this process's SID, instead of W11's.
     /// Release builds of the CLI always pass `None`.
     #[cfg(windows)]

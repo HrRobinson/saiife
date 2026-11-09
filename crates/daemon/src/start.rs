@@ -747,6 +747,8 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         directory,
         credentials_dir,
         mode: daemon_mode,
+        // The co-signer takes it once it re-judges (plan 21, Task 3).
+        rejudge: _rejudge,
         #[cfg(windows)]
         test_pipe,
     } = opts;

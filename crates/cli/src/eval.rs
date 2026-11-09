@@ -5,6 +5,7 @@
 //! or a stack overflow in the engine becomes a clean `error_denied` in the
 //! parent instead of a dead hook (spec §6.1.2).
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use saiifeguard::builtins::Catalog;
-use saiifeguard::canon::{expand_glob_partial, PathVars};
+use saiifeguard::canon::{expand_glob_partial, fs_view, with_fs_view, FsView, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
@@ -76,6 +77,24 @@ pub struct EvalRequest {
     /// dialect of a shell command (`payload::dialects_for`).
     #[serde(default)]
     pub agent: Option<String>,
+    /// How the guard sees the file system: `host` (the hook's) or `lexical`
+    /// (the service's re-judgment, plan 21: no file system call at all).
+    #[serde(default)]
+    pub view: View,
+    /// The whole environment the path rules read, in place of this process's
+    /// (the service builds it from the asking user's account record). `None`:
+    /// this process's own.
+    #[serde(default)]
+    pub vars: Option<Vec<(String, String)>>,
+}
+
+/// [`EvalRequest::view`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum View {
+    #[default]
+    Host,
+    Lexical,
 }
 
 /// What the worker answers on stdout.
@@ -349,7 +368,21 @@ pub fn judge_with(
 /// What the worker answers `req`. `env`: the environment a worker would be started
 /// with, which the path rules then read instead of this process's (the locked hook's
 /// in-process judgment, plan 21).
+/// The request's own `vars`, when it has them, win over `env`.
 pub fn answer(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
+    let vars: Option<Vec<(OsString, OsString)>> = req
+        .vars
+        .as_ref()
+        .map(|v| v.iter().map(|(k, v)| (k.into(), v.into())).collect());
+    let env = vars.as_deref().or(env);
+    match req.view {
+        View::Lexical => with_fs_view(FsView::Lexical, || judged(req, env)),
+        View::Host => judged(req, env),
+    }
+}
+
+/// [`answer`] in the view already set on this thread.
+fn judged(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
     match req.event.as_deref() {
         None => judge_in(
             &req.payload,
@@ -478,16 +511,25 @@ fn engine_for(
     budget: Duration,
     (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
 ) -> (Engine, PathVars) {
+    // Lexical (the service): nothing is looked up, neither this process's
+    // directory nor a project root above the payload's cwd.
+    let lexical = fs_view() == FsView::Lexical;
     let start = match cwd {
-        Some(c) => PathBuf::from(c),
-        None => std::env::current_dir().unwrap_or_default(),
+        Some(c) => Some(PathBuf::from(c)),
+        None if lexical => None,
+        None => Some(std::env::current_dir().unwrap_or_default()),
     };
-    let project = saiife_agents::config::find_project_root(&start);
+    let project = match lexical {
+        true => None,
+        false => start
+            .as_deref()
+            .and_then(saiife_agents::config::find_project_root),
+    };
     // Broken built-ins are skipped; their rules are not in force.
     let (packs, _warnings) = Catalog::builtin().load_active(packs);
     let vars = match env {
-        Some(env) => path_vars_locked_env(Some(&start), project.as_deref(), locked, env),
-        None => path_vars_locked(Some(&start), project.as_deref(), locked),
+        Some(env) => path_vars_locked_env(start.as_deref(), project.as_deref(), locked, env),
+        None => path_vars_locked(start.as_deref(), project.as_deref(), locked),
     };
     let engine = Engine::new(packs)
         .with_paths(vars.clone())
@@ -920,6 +962,84 @@ fn worker_run() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// `saiife __eval --serve`: the service's warm worker (plan 21). It reads
+/// length-prefixed `EvalRequest` frames from stdin (a u32 big-endian length,
+/// at most `MAX_EVAL_BYTES`, then the JSON) and writes one `EvalAnswer` frame
+/// to stdout for each, until EOF (exit 0). A frame it cannot read or parse
+/// ends it with exit 1. Every request is judged lexically, whatever it asks:
+/// the service never reads the agent user's files.
+pub fn serve_main() -> ExitCode {
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    serve(&mut input, &mut output)
+}
+
+/// [`serve_main`] on any pair of streams.
+pub fn serve(input: &mut impl Read, output: &mut impl Write) -> ExitCode {
+    loop {
+        let mut req = match read_frame(input) {
+            Ok(Some(buf)) => match serde_json::from_slice::<EvalRequest>(&buf) {
+                Ok(req) => req,
+                Err(_) => return ExitCode::from(1),
+            },
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(_) => return ExitCode::from(1),
+        };
+        #[cfg(debug_assertions)]
+        fault_seam();
+        req.view = View::Lexical;
+        let answer = answer(&req, None);
+        drop(req);
+        let Ok(body) = serde_json::to_vec(&answer) else {
+            return ExitCode::from(1);
+        };
+        if write_frame(output, &body).is_err() {
+            return ExitCode::from(1);
+        }
+    }
+}
+
+/// One frame of `__eval --serve`: `None` at EOF before its first byte. A
+/// length over `MAX_EVAL_BYTES`, or a stream that ends inside the frame, is an
+/// error.
+pub fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    let mut got = 0;
+    while got < len.len() {
+        match r.read(&mut len[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_EVAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// Writes `body` as one frame and flushes.
+pub fn write_frame(w: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
+    if body.len() > MAX_EVAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
+    }
+    let len = u32::try_from(body.len()).map_err(std::io::Error::other)?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(body)?;
+    w.flush()
 }
 
 /// The `SAIIFE_EVAL_FAULT` test seam's value (debug builds only).
