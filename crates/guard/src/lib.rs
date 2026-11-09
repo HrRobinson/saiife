@@ -34,6 +34,7 @@ pub mod winpath;
 pub mod wintable;
 pub mod wrappers;
 
+pub use canon::{with_fs_view, FsView};
 pub use engine::{AllowTrace, Decision, Engine};
 pub use pack::{Pack, PackWarning};
 
