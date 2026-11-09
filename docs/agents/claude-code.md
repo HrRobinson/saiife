@@ -114,7 +114,10 @@ Lock label on Windows: **unverified**, and Windows locked mode is a preview
 A `Settings` value under `HKLM\SOFTWARE\Policies\ClaudeCode` replaces those files
 unless it says `"managedSourcesBehavior": "merge"`; install and `doctor` fail then.
 The lock check has not run in a Windows VM yet; the results will go to
-`crates/agents/tests/fixtures/lock-check/windows/claude.tsv`.
+`crates/agents/tests/fixtures/lock-check/windows/claude.tsv`. On Windows the
+co-signer denies a call whose hook was ended with `TerminateProcess(hook, 0)`.
+It does not stop code injected into the hook, which is why Windows locked
+mode is still a preview.
 
 Lock label on macOS: **unverified**. saiife installs the same managed hook
 in `/Library/Application Support/ClaudeCode/managed-settings.d/`
@@ -133,6 +136,20 @@ On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d
   and `--setting-sources user` all still ran it.
 - If saiife fails (crash, `kill -9`, hang past the timeout, exit 1, or the
   binary is missing), the tool call is blocked.
+- The drop-in has a second `PreToolUse` hook, the co-signer: an HTTP hook to
+  `http://127.0.0.1:7433/v1/cosign/claude`, with `onFailure: "block"`. The
+  daemon answers it with an empty `200` only when the command hook has
+  recorded an allow for the same session, tool call id and input; otherwise
+  it answers deny. It never answers allow, so your permission prompts still
+  apply. Claude Code runs both hooks at once and takes the stricter answer.
+  So a hook that is killed, or that exits 0 without recording a verdict, is a
+  deny. The drop-in also lists `http://127.0.0.1:7433/*` in
+  `allowedHttpHookUrls`, so your own list cannot skip the co-signer.
+- If nothing listens on `127.0.0.1:7433`, every call is blocked and `doctor`
+  fails `cosign.listen`. With a proxy set for Claude Code, add `127.0.0.1` to
+  `NO_PROXY` ([install](../install.md#the-co-signer-and-proxies)).
+- A hook that ends without a verdict is also recorded: a `hook` record with
+  decision `no_verdict`, and a `doctor` warning (`hooks.no-verdict`).
 - An edit to a settings file during a session is caught by the
   `ConfigChange` hook and blocked.
   - The check is presence-based. A user, project or local settings file
@@ -192,6 +209,8 @@ On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d
 | hook timeout (10 s) | blocked |
 | daemon down or not answering in 2 s | blocked (saiife denies) |
 | binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway |
+| `check` ended with exit 0 by a process of the agent's user (Windows) | blocked (co-signer) |
+| co-signer not listening on `127.0.0.1:7433` | blocked (`onFailure`) |
 
 saiife answers well inside the timeout (an internal deadline of 3 s). The
 full matrix for all three agents is in [threats](../threats.md#fail-closed-matrix).

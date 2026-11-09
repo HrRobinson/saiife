@@ -140,7 +140,7 @@ agent cannot write. The agent runs as you.
 | Agent reads your other files and logins (SSH keys, browser data, git credentials) | **Not covered** beyond `core.secrets` | |
 | Data exfiltration to arbitrary hosts | Not covered | |
 | Nested or patched agent without hooks | Not covered | It has no keys and writes no audit. |
-| Agent injects code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | **Covered** | Linux installs only the static release build. macOS installs only a binary with the hardened runtime, which ignores `DYLD_*` (an ad-hoc signed build keeps that, but is not notarized). See [install](install.md). |
+| Agent injects code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | **Covered** | Linux installs only the static release build, at mode `0711`: your user can run it but not read it, so the kernel lets no process of your user trace a running hook or open its memory. macOS installs only a binary with the hardened runtime, which ignores `DYLD_*` (an ad-hoc signed build keeps that, but is not notarized). See [install](install.md). |
 | Agent gets you to approve its own request (`same_user = "reauth"`) | **Covered** on Linux; on macOS and Windows the option is off | Linux: polkit asks for your password and shows the request. Same-user approval is off on macOS: the prompt cannot show the request, so approvals need a second account. See [approvals](approvals.md#macos). It is off on Windows too, as the agent could capture the password, and the second account must approve from a separate session. See [approvals](approvals.md#windows). |
 | Model-provider login used or copied by the agent | **Not covered, by design** | The agent holds its own model login. |
 | MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
@@ -211,16 +211,19 @@ tables say, with these differences:
 
 Windows locked mode is a preview (v2.2, plan 19b). It covers what the two locked
 tables say, with the differences below. The main one is A25: a process of the
-agent's own user can forge a hook's allow. On Windows, rely on the "Mistake" and
-"Helpful bypass" rows. Do not rely on a row that needs the agent to be unable to get
-past its own hook. See [Windows: locked mode](windows.md#locked-mode).
+agent's own user has full access to the hook. For Claude Code a killed hook is now
+denied by the co-signer, but code injected into the hook can still forge its allow.
+For Codex and Gemini CLI a killed hook still lets the call run; it is recorded. On
+Windows, rely on the "Mistake" and "Helpful bypass" rows. Do not rely on a row that
+needs the agent to be unable to get past its own hook. See
+[Windows: locked mode](windows.md#locked-mode).
 
 The rows below were measured by the `locked-windows` CI job on `windows-2022` and
 `windows-2025`, as a standard user, unless they say otherwise.
 
 | # | Attack, as the agent's user | Result on Windows |
 | --- | --- | --- |
-| A25 | End the hook with `TerminateProcess(hook, 0)` | **Not prevented.** The agent reads exit 0 as allow, so the call runs, and nothing is recorded (the audit's size did not change). Windows gives a user full access to its own processes. On Linux and macOS a kill cannot pick the exit code. This is the A21 class: the agent's own code, outside the hook. In CI a second test account could do it too, but only because both accounts were started with `CreateProcessWithLogonW` from one runner session: both carry that session's logon SID (`S-1-5-5-0-…`), which the hook's default access list grants. That is the test's setup, not a hole. The next plan adds a Claude Code HTTP hook that the daemon co-signs, and a check that records a hook that ended without its answer (a record and a `doctor` warning, no automatic lockdown). |
+| A25 | End the hook with `TerminateProcess(hook, 0)` | The kill still works, and the agent still reads exit 0. What happens next depends on the agent. **Claude Code: denied.** Its second managed hook, an HTTP hook to the daemon's co-signer on `127.0.0.1:7433`, finds no recorded allow for the call and answers deny ("the saiife hook ended without a verdict"). Claude Code takes the stricter of the two answers. CI checks this with Claude Code's request simulated. **Codex and Gemini CLI: runs, and is recorded.** They have no co-signer. The daemon sees the hook end without a verdict and writes a `hook` record with decision `no_verdict`, and `doctor` warns (`hooks.no-verdict`). There is no automatic lockdown. **Not prevented:** code injected into the hook (Windows gives a user full access to its own processes, so its code can make the hook record an allow, which the co-signer then accepts), and a program that takes `127.0.0.1:7433` while the service restarts. Both are the A21 class: the agent's own code, outside the hook. That is why Windows locked mode is still a preview. Before this change the call ran and nothing was recorded (the audit's size did not change). On Linux and macOS a kill cannot pick the exit code. In CI a second test account could end the hook too, but only because both accounts were started with `CreateProcessWithLogonW` from one runner session: both carry that session's logon SID (`S-1-5-5-0-…`), which the hook's default access list grants. That is the test's setup, not a hole. |
 | A3 | Point `C:` somewhere else with `DefineDosDevice`, so the hook path runs another binary | Refused: `DefineDosDevice` on `C:` failed with error 5 (access denied). |
 | A4 | Plant a DLL beside the hook (the Windows form of `LD_PRELOAD`) | **Covered.** Release builds load DLLs only from System32 (`/DEPENDENTLOADFLAG:0x800`, a static C runtime, `SetDefaultDllDirectories`). A planted DLL beside a copy of `saiife.exe` was not loaded. `doctor` checks the build. |
 | A5 | Stop, reconfigure or delete the service | Refused: only SYSTEM and Administrators may. The service restarts one second after any failure. While it is down, hooks deny. |
@@ -252,10 +255,26 @@ process itself to die or hang.
 |---|---|---|---|
 | saiife reports an error (exit 2 and a reason) | blocked | blocked | blocked |
 | guard engine crash | blocked (a worker isolates it; the parent denies) | blocked (same) | blocked (same) |
-| `check` parent killed or crashes | blocked (`onFailure`) | **runs** | blocked if the exit code is not 0 or 1 (unverified for signals) |
+| `check` parent killed or crashes | blocked (`onFailure`) | **runs**; recorded | blocked if the exit code is not 0 or 1 (unverified for signals); recorded |
 | hook timeout (10 s) | blocked | **runs** | **runs** |
 | daemon down or not answering in 2 s | blocked (saiife denies) | blocked | blocked |
 | binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway | **runs** | possibly blocked (exit 127, unverified) |
+| `check` ended with exit 0 by a process of the agent's user (Windows, A25) | blocked (co-signer) | **runs**; recorded | **runs**; recorded |
+| co-signer not listening (`127.0.0.1:7433` taken, or the daemon down) | blocked (`onFailure`) | n/a | n/a |
+
+"Recorded" means the daemon writes a `hook` record with decision `no_verdict`
+(see `saiife audit --kind hook`) and `doctor` warns (`hooks.no-verdict`). The
+call still runs, and nothing locks down by itself.
+
+**The co-signer (Claude Code only).** The managed drop-in has a second
+`PreToolUse` hook, of type `http`, that posts the call to the daemon at
+`http://127.0.0.1:7433/v1/cosign/claude`. The daemon answers with an empty
+`200` only when the command hook has recorded an allow for the same session,
+tool call id and input. Otherwise it answers deny. It never answers allow, so
+Claude Code's own permission prompts still apply. If nothing listens on the
+port, `onFailure` blocks every Claude Code call and `doctor` fails
+`cosign.listen`. With a proxy set for Claude Code, add `127.0.0.1` to
+`NO_PROXY` ([install](install.md#the-co-signer-and-proxies)).
 
 ## How much a record proves
 

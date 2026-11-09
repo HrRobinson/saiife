@@ -90,10 +90,18 @@ What happens when the guard cannot judge something:
 
 ### In locked mode
 
-- **Windows locked mode is a preview.** A process of the agent's own user can end a
-  hook with `TerminateProcess(hook, 0)`, and the agent runs the call as allowed, with no
-  record (see [Locked mode](#locked-mode)). This is the same class as running its own
-  code outside the hook ([threats](threats.md), A21 and A25).
+- **Windows locked mode is a preview.** A process of the agent's own user has full
+  access to the hook. It can end it with `TerminateProcess(hook, 0)`. For Claude Code
+  the co-signer then denies the call. For Codex and Gemini CLI the call runs, and the
+  daemon writes a `no_verdict` record. It can also inject code into the hook, and make
+  the hook record an allow for a call the guard would deny. Nothing stops that, not even
+  the co-signer (see [Locked mode](#locked-mode)). This is the same class as running its
+  own code outside the hook ([threats](threats.md), A21 and A25). Locked mode stays a
+  preview until a later plan has the service judge each input itself.
+- **The co-signer port.** The co-signer listens on `127.0.0.1:7433`, a fixed port. If
+  another program holds it, Claude Code blocks every call and `doctor` fails
+  `cosign.listen`. The service binds it so that no other program can share it, but
+  while the service restarts (one second) a process of the agent's user could take it.
 - **Codex and Gemini CLI.** Their fail-open gaps (the
   [fail-closed matrix](threats.md#fail-closed-matrix)) apply on Windows too, and their
   Windows hook shells come from their docs, not a run. Their Windows hooks are preview.
@@ -179,15 +187,26 @@ Locked mode on Windows is plan 19b (v2.2). The design is in the v2 spec, section
 5.3a.
 
 **Windows locked mode is a preview.** A process that runs as the agent's own user can
-end the hook with `TerminateProcess(hook, 0)`. The agent reads exit 0 as allow, so the
-call the hook was judging runs. Nothing is recorded: on `windows-2022` and
-`windows-2025` the audit had the same size before and after. The agent's user may do
-this because Windows gives a user full access to its own processes. On Linux and macOS
-a kill cannot choose the exit code, so a killed hook does not read as allow there. Use
-Windows locked mode against mistakes and helpful bypasses. Do not rely on it against an
-agent that writes and runs its own code to get past the hook. The next plan adds a
-Claude Code HTTP hook that the daemon co-signs, and a check that records a hook that
-ended without its answer (a record and a `doctor` warning, no automatic lockdown).
+end the hook with `TerminateProcess(hook, 0)`. The agent reads exit 0 as allow. Before
+plan 20 the call the hook was judging then ran, and nothing was recorded: on
+`windows-2022` and `windows-2025` the audit had the same size before and after. The
+agent's user may do this because Windows gives a user full access to its own processes.
+On Linux and macOS a kill cannot choose the exit code, so a killed hook does not read as
+allow there. Use Windows locked mode against mistakes and helpful bypasses. Do not rely
+on it against an agent that writes and runs its own code to get past the hook.
+
+Plan 20 narrows this, and does not close it:
+
+- **Claude Code** has a second managed hook, an HTTP hook to the daemon's co-signer on
+  `127.0.0.1:7433`. The co-signer denies the call unless the command hook recorded an
+  allow for it. A killed hook records nothing, so the call is denied.
+- **Every agent:** the daemon notices a hook that ends without a verdict and writes a
+  `hook` record with decision `no_verdict`. `doctor` warns (`hooks.no-verdict`). There is
+  no automatic lockdown. For Codex and Gemini CLI that is all: the call still runs.
+- **Not prevented:** code injected into the hook. The agent's user may write to the
+  hook's memory, so its code can make the hook record an allow for a denied call, and
+  the co-signer then accepts it. Windows locked mode stays a preview until the service
+  judges each co-signed input itself.
 
 ### Install
 
@@ -275,7 +294,7 @@ What the attacks did on both runners:
 
 | Attack, as the agent's user | Result |
 |---|---|
-| `TerminateProcess(hook, 0)` on a hook it started | the call is allowed; nothing is recorded |
+| `TerminateProcess(hook, 0)` on a hook it started | before plan 20: the call is allowed; nothing is recorded. With the co-signer: the co-sign request gets a deny, and a `no_verdict` record is written |
 | `DefineDosDevice` to point `C:` at its own folder | refused (error 5) |
 | A DLL planted beside a copy of `saiife.exe` | not loaded |
 | Open `saiife.exe` or `config.toml` with share mode 0 | the open works; hooks still work |

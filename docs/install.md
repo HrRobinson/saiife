@@ -136,7 +136,12 @@ sudo /usr/local/bin/saiife system install --agents claude,codex,gemini
 ```
 
 (or download and extract the tarball as root.) Install copies the binary it
-runs to `/opt/saiife/bin/saiife`.
+runs to `/opt/saiife/bin/saiife`, at mode `0711` (`root:root`). Every user
+can run it, but only root can read it. The kernel then lets no process of the
+agent's user trace a running hook or open its memory. A reinstall moves an
+older `0755` binary to `0711`, and `doctor` warns when the mode is
+different. On macOS the binary stays `0755`; the hardened runtime protects
+it there.
 
 Install refuses to write below a directory that is not root's or that
 group or others can write (sticky directories excepted): another user
@@ -198,6 +203,33 @@ finish, the project hook keeps judging and `saiife status` says so. In a project
 `saiife init` then writes only `.saiife/config.toml` (packs can be added,
 never removed), and `saiife init --off` removes leftover project hooks and
 keeps the config.
+
+### The co-signer and proxies
+
+For Claude Code, the managed drop-in has two `PreToolUse` hooks: the command
+hook, and an HTTP hook that posts each call to the daemon's co-signer at
+`http://127.0.0.1:7433/v1/cosign/claude`. The co-signer answers deny unless
+the command hook recorded an allow for the same call, so a killed hook does
+not count as an allow. The port is fixed. `doctor` fails `cosign.listen` when
+the daemon could not bind it, and Claude Code then blocks every call.
+
+Claude Code follows the usual proxy variables. If `HTTPS_PROXY` or
+`HTTP_PROXY` is set for Claude Code, add `127.0.0.1` to `NO_PROXY`:
+
+```sh
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1"
+```
+
+Without it, Claude Code may send the co-sign request to the proxy, and every
+Claude Code call is blocked. saiife does not set `NO_PROXY` for you: a
+managed value would replace your own entries. `doctor` warns when a proxy is
+set and `NO_PROXY` does not include `127.0.0.1`.
+
+Codex and Gemini CLI have no co-signer. For them, and for Claude Code, a
+hook that ends without a verdict (killed, crashed or timed out) becomes a
+`hook` record with decision `no_verdict`, and `doctor` warns
+(`hooks.no-verdict`). Nothing locks down by itself. Look at them with
+`saiife audit --kind hook`.
 
 Once it runs, you can forward the audit elsewhere
 ([forwarding](forwarding.md)), give auditors read access ([auditors](auditors.md))
@@ -460,3 +492,5 @@ second account, from a separate session ([approvals](approvals.md#windows)).
 ## Network use
 
 saiife makes no network calls. Only `install.sh` downloads files, and only when you run it.
+In locked mode the daemon also listens on `127.0.0.1:7433`, loopback only, for
+Claude Code's co-sign requests.

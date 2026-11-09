@@ -276,7 +276,7 @@ uid can never approve requests created by itself, unless
 | Path | Owner:group | Mode | Contents |
 |---|---|---|---|
 | `/opt/saiife/` and `/opt/saiife/bin/` | root:root | 0755 | |
-| `/opt/saiife/bin/saiife` | root:root | 0755 | the binary (static musl) |
+| `/opt/saiife/bin/saiife` | root:root | 0711 | the binary (static musl); execute only for others (plan 20), so no process of the agent's user can trace or read a running hook |
 | `/usr/local/bin/saiife` | root:root | symlink | optional, for people's shells; hooks never use it |
 | `/etc/saiife/` | root:root | 0755 | |
 | `/etc/saiife/config.toml` | root:root | 0644 | system config (§8.1) |
@@ -437,6 +437,9 @@ offer Windows locked mode. What changed from the design while it was built:
 - **Known limits, not verified:** OpenSSH sessions are probably denied by W11's `NU`
   deny, so hooks deny there; restricted and low-integrity tokens keep their other
   groups, so `group:` policy matches them.
+- **Plan 20.** For Claude Code a killed hook is now denied by the co-signer, and for
+  every agent it is recorded (`no_verdict`). Code injected into the hook is still not
+  prevented, so Windows locked mode stays a preview. See A25 (§9.2).
 
 **Platform (W2).** Windows is a third value of `Platform`, with the name
 `windows`. Developer mode is v2.2 too, and needs no admin.
@@ -1242,6 +1245,53 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
   saiife" gap for visibility. Tools the guard does not judge are recorded as
   `allow` with reason `tool not judged`, except for MCP tools (§6.1.4).
 - **Fail closed:** Claude Code entries set `onFailure: "block"`.
+- **Claude Code co-signer (plan 20):** a second `PreToolUse` hook, of type
+  `http`, posts the same hook input to the daemon at
+  `http://127.0.0.1:7433/v1/cosign/claude` (`timeout: 10`,
+  `onFailure: "block"`, no `headers`). The drop-in also lists
+  `http://127.0.0.1:7433/*` in `allowedHttpHookUrls`; the lists merge across
+  settings files, so a user's own list cannot skip it. Claude Code runs both
+  hooks in parallel and takes the strictest answer
+  (`deny` > `defer` > `ask` > `allow`). The daemon keys the call by `HookKey { agent, session,
+  tool_use_id, input_sha256 }`, where `input_sha256` is the SHA-256 of
+  `tool_input` in a canonical JSON form (keys sorted at every level,
+  compact), and waits up to 8 s from the request's arrival (`COSIGN_WAIT`)
+  for the command hook's verdict on that key:
+  - a recorded `allow` (or `approved`): `200` with an empty body, which is no
+    opinion, so the command hook's verdict and Claude Code's own permission
+    prompts stand. The co-signer never answers `allow`;
+  - anything else: `200` with the deny body
+    `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"saiife: BLOCKED (fail closed): <reason>"}}`.
+    `<reason>` is one of: `no saiife hook reported a verdict for this call`
+    (nothing by 8 s), `the saiife hook ended without a verdict`, `saiife
+    denied this call`, `the call has no session or tool use id`, `the payload
+    is too large` (over 64 MiB), `the payload is not JSON`.
+  Only `POST /v1/cosign/claude` is served (else `404`). A request with an
+  `Origin` header gets `403`, a `Content-Type` other than `application/json`
+  gets `415`, and more than 16 requests in flight get `503`. Each of these
+  blocks only the request it answers, through `onFailure`. Every deny except
+  `saiife denied this call` writes a `hook` record with `event:
+  "cosign_denied"`, at most one per reason per 10 s, the next one carrying
+  `suppressed: <n>`. The co-signer has no token: its answer can only take
+  away. It binds in system mode only, on Linux, macOS and Windows (on Windows
+  with `SO_EXCLUSIVEADDRUSE`). If the port is taken, the daemon keeps
+  running, writes a `daemon` record with `event: "cosign_bind_failed"`,
+  `status` shows `"cosign": {"addr": null, "error": "<error>"}`, `doctor`
+  fails `cosign.listen`, and Claude Code blocks every call through
+  `onFailure`. The port is fixed (owner ruling 2026-11-09). Codex and Gemini
+  CLI have no co-signer; they get detection only (below).
+- **Hello first (plan 20):** `check --managed` connects to the daemon and
+  sends `hook.begin {agent, event}` before it reads its input, and
+  `hook.bind` with the call's `HookKey` once it has. The `audit.append` on
+  that connection is the verdict. A begun connection that ends without a
+  verdict, or that runs 10 s past `hook.begin` (`HOOK_OVERRUN`, after which
+  the daemon closes it), becomes a `hook` record with decision `no_verdict`,
+  unless another connection for the same key delivers the verdict within 5 s
+  (`RECONNECT_GRACE`, the approval step's reconnect). This holds for every
+  agent. It is a record and a `doctor` warning (`hooks.no-verdict`), with no
+  automatic lockdown (owner ruling 2026-11-06). A hook killed before it read
+  its input has no key (`bound: false`); the co-signer then cannot match it
+  and denies at its 8 s cap.
 - **Claude Code `ConfigChange` hook:** records every settings change made
   during a session and denies changes that touch `hooks`, `disableAllHooks`,
   `permissions`, `env` or `apiKeyHelper` in user, project or local settings.
@@ -1258,16 +1308,24 @@ no managed hook, the project hook keeps working as in v1.
 #### 6.1.2 `check` in locked mode
 
 ```
+load /etc/saiife/config.toml (on Windows the pipe is fixed)
+  fails to load                               → deny, error_denied (no socket to register with)
+connect to saiife.sock, send hook.begin {agent, event}   (plan 20: before stdin is read)
 read stdin (no size cap for path fields, as v1; a shell payload over 1 MiB → deny, error_denied)
-load /etc/saiife/config.toml + policy.d + project .saiife/config.toml (add-only merge, §8.2)
+load policy.d + project .saiife/config.toml (add-only merge, §8.2)
 if lockdown == "all"                         → deny, record
 spawn worker: /opt/saiife/bin/saiife __eval  (payload on a pipe; worker has the 50 ms budget)
+  while it runs: hook.bind {HookKey}           (a payload that gives no key: no bind, nothing else changes)
   worker crash / signal / no answer in 3 s    → deny, error_denied
 if decision == ask (proposed, §6.10.4)       → grant.consume or approval.create → allow or deny
-build Record v2 (masked)                      → audit.append over saiife.sock
+  connection lost (approval timed out)        → new connection: hook.begin, hook.bind (same key)
+build Record v2 (masked)                      → audit.append on the same connection (the verdict)
   no ack in 2 s, or daemon refuses           → deny, error_denied (record left with the client: stderr only)
 answer the agent: exit 0 silent (allow) | exit 2 + stderr reason (deny)
 ```
+
+A begun connection that ends with no `audit.append` is the daemon's
+`no_verdict` record (§6.1.1, §8.5).
 
 The worker costs a fork and exec (about 2–5 ms). It turns an abort or a
 stack overflow in the engine, which v1 cannot catch, into a clean
@@ -1278,9 +1336,9 @@ bench machine (v1 is about 16 ms).
 
 | Agent | Managed location | Can the user switch the managed hook off? | Fail closed on saiife error | v2 status |
 |---|---|---|---|---|
-| Claude Code | `managed-settings.d/50-saiife.json` | No, managed outranks all (confirm for `disableAllHooks` in plan 7) | Yes (`onFailure: "block"`, ≥ 2.1.295) | **lockable** |
-| Codex | `requirements.toml` | No, `[features] hooks = true` pin; managed hooks skip trust review | Only for errors saiife reports (exit 2 + stderr). Timeout, crash or missing binary fail open in Codex. | **lockable, fail-open gaps listed** |
-| Gemini CLI | system `settings.json` | No by settings, but `GEMINI_CLI_SYSTEM_SETTINGS_PATH` lets a **new** Gemini process skip the system file | Exit 2 blocks; a timeout fails open | **lockable with caveats** if it passes the plan 7 checks, otherwise "not lockable" (decision 9) |
+| Claude Code | `managed-settings.d/50-saiife.json` | No, managed outranks all (confirm for `disableAllHooks` in plan 7) | Yes (`onFailure: "block"`, ≥ 2.1.295). Plan 20: the co-signer HTTP hook on `127.0.0.1:7433` denies a call the command hook did not record as allowed, so a hook killed with a forged exit 0 is denied too | **lockable** |
+| Codex | `requirements.toml` | No, `[features] hooks = true` pin; managed hooks skip trust review | Only for errors saiife reports (exit 2 + stderr). Timeout, crash or missing binary fail open in Codex. Plan 20: no co-signer; a hook that ends without a verdict is recorded (`no_verdict`) | **lockable, fail-open gaps listed** |
+| Gemini CLI | system `settings.json` | No by settings, but `GEMINI_CLI_SYSTEM_SETTINGS_PATH` lets a **new** Gemini process skip the system file | Exit 2 blocks; a timeout fails open. Plan 20: no co-signer; a hook that ends without a verdict is recorded (`no_verdict`) | **lockable with caveats** if it passes the plan 7 checks, otherwise "not lockable" (decision 9) |
 
 **Gate rule (builder's call 9).** Plan 7 runs the live lock checks for each
 agent on a supported Linux system: the managed hook fires; user, project and
@@ -2143,6 +2201,33 @@ Further checks that come from the review decisions (§0):
   agent holds its own model-provider login (not brokered in v2)", or "local
   model" when the agent's config points to a local endpoint (decision 5).
 
+Checks added by plan 20 (both values come from the one `status` call doctor
+already makes):
+
+- **`cosign.listen`:** fail when Claude Code is installed and
+  `status.cosign.addr` is null: "the co-signer is not listening on
+  127.0.0.1:7433 (<error>), so Claude Code blocks every call". Pass with the
+  address. Info when Claude Code is not installed.
+- **`hooks.no-verdict`:** warn when `status.hooks_no_verdict.since_start` is
+  above 0: "<n> hook call(s) ended without a verdict since the daemon started
+  (last <ts>): a hook was killed, crashed or timed out; see saiife audit
+  --kind hook". Pass at 0. The count starts again when the daemon restarts;
+  the records stay in the audit.
+- **`files.binary` on Linux:** a mode other than `0711` warns
+  "/opt/saiife/bin/saiife is <mode>, expected 0711; run saiife system
+  install". Run as a user other than root, a read that fails with `EACCES` is
+  info: the binary is not readable by that user, which is the point. macOS
+  keeps `0755` and is not checked for mode.
+- **`agents.claude.policy`** also fails when the installed drop-in lacks the
+  co-signer hook or its `allowedHttpHookUrls` entry: "the Claude Code drop-in
+  has no saiife co-signer hook; run saiife system install".
+- **Proxy:** a warning when a proxy variable (`HTTPS_PROXY`, `HTTP_PROXY`) is
+  set for Claude Code and `NO_PROXY` does not include `127.0.0.1`. Claude
+  Code may send the co-sign request to the proxy, which blocks every call.
+  saiife does not set `NO_PROXY` in managed settings: an `env` value there
+  would replace the user's and the admin's own entries (owner ruling
+  2026-11-09).
+
 `--json` gives machine-readable output, and the exit code is 0 (all pass),
 1 (a warning), or 2 (a failure). Fleet tools can run it on a schedule.
 
@@ -2388,6 +2473,9 @@ a secret, or change the environment. A v1 file (`version = 1`) stays valid.
       { "matcher": "*",
         "hooks": [ { "type": "command",
                      "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" },
+                   { "type": "http",
+                     "url": "http://127.0.0.1:7433/v1/cosign/claude",
                      "timeout": 10, "onFailure": "block" } ] }
     ],
     "ConfigChange": [
@@ -2396,9 +2484,18 @@ a secret, or change the environment. A v1 file (`version = 1`) stays valid.
                      "timeout": 10, "onFailure": "block" } ] }
     ]
   },
+  "allowedHttpHookUrls": ["http://127.0.0.1:7433/*"],
   "disableAllHooks": false
 }
 ```
+
+The `http` hook is the co-signer (§6.1.1, plan 20). `allowedHttpHookUrls`
+lists its URL so that a user's or project's own list, which merges with this
+one, cannot skip it. The HTTP hook sends no `headers`, so
+`httpHookAllowedEnvVars` does not affect it. On Windows the file differs in
+the command path only (W9). `ConfigChange` has no co-signer: managed settings
+outrank whatever it lets through. A test checks that this block equals the
+file saiife writes.
 
 `allowManagedHooksOnly` is not set by saiife: it would switch off the
 company's and users' other hooks. `system install --managed-hooks-only` sets
@@ -2495,7 +2592,7 @@ Common fields (all kinds):
 | `seq` | int | chain position |
 | `prev` | hex | SHA-256 of the previous line's bytes |
 | `ts` | string | UTC, ms, as v1 |
-| `kind` | string | `guard`, `connector`, `approval`, `secret`, `policy`, `daemon`, `forward`, `notify`, `lockdown`, `checkpoint`, `key_rotate`, `genesis` |
+| `kind` | string | `guard`, `connector`, `approval`, `secret`, `policy`, `daemon`, `forward`, `notify`, `lockdown`, `checkpoint`, `key_rotate`, `genesis`, `hook` (plan 20) |
 | `host` | hex | host id (§6.4.1) |
 | `uid`, `user` | int, string | from peer credentials (daemon-written) or the process (developer mode) |
 | `mode` | string | `developer`, `personal`, `locked` |
@@ -2506,8 +2603,8 @@ Common fields (all kinds):
 | `permission_mode` | string | optional, the agent's permission mode from the hook payload (shows unattended runs) |
 
 `decision` values: v1's `allow`, `deny`, `error_allowed`, plus `error_denied`,
-`ask`, `approved`, `rejected`, `expired`. 0.1.0 readers keep unknown values
-(`DecisionKind::Unknown`).
+`ask`, `approved`, `rejected`, `expired`, and `no_verdict` (plan 20). 0.1.0
+readers keep unknown values (`DecisionKind::Unknown`).
 
 Guard record:
 
@@ -2547,6 +2644,36 @@ carries `"sid"`, the caller's exact SID (`"S-1-5-21-…-1003"`), next to `uid`, 
 there is only a label: 0 for SYSTEM and an elevated admin, else a 30-bit hash of the
 SID (§5.3a.2). An approval record names the approver's SID the same way. Linux and
 macOS records have no `sid`; readers that do not know it ignore it.
+
+**Note (plan 20): the `hook` kind.** The daemon writes it from its own
+knowledge of the hook connections (§6.1.1). Two events:
+
+- `event: "no_verdict"`, decision `no_verdict`: a hook that began
+  (`hook.begin`) and ended without an `audit.append`, after the reconnect
+  grace. `agent` from `hook.begin`; `uid`, `user` (and `sid` on Windows)
+  from the peer; `session` from the bound key; `tool` is `""` (the hook does
+  not send it); `project` and `input` are `""`; there is no `policy`; `reason`
+  is "the hook ended without a verdict (killed, crashed or timed out)".
+  Extra fields: `bound` (whether `hook.bind` came), `tool_use_id` and
+  `input_sha256` (null when unbound), `elapsed_ms` (from `hook.begin` to the
+  end), `pid` (the peer's, attribution only), `hook_event` (the `event` of
+  `hook.begin`, when it sent one) and `overrun: true` when the daemon closed
+  the connection at `HOOK_OVERRUN`. These records are not folded.
+- `event: "cosign_denied"`, decision `error_denied`: a co-signer deny other
+  than `saiife denied this call` (the guard record already says why).
+  `agent: "claude"`, `tool` from `tool_name`, `input` the command or path the
+  guard would show (masked), `session`, `reason` the deny reason, and extra
+  `tool_use_id` and `input_sha256`. No `uid`: a TCP peer is not identified
+  on Windows (W13). At most one per reason per 10 s; the next one carries
+  `suppressed: <n>`.
+
+```json
+{"v":2,"seq":2210,"prev":"41ab…","ts":"…","kind":"hook","host":"5ab1…","uid":1001,"user":"agent-shop",
+ "mode":"locked","agent":"claude","project":"","session":"c-1","tool":"","input":"",
+ "decision":"no_verdict","reason":"the hook ended without a verdict (killed, crashed or timed out)",
+ "event":"no_verdict","bound":true,"tool_use_id":"toolu_02","input_sha256":"9c1e…","elapsed_ms":5214,
+ "pid":4242,"hook_event":"PreToolUse","saiife":"0.2.0"}
+```
 
 ### 8.6 Checkpoint and genesis
 
@@ -2677,10 +2804,10 @@ is out of scope (§9.5).
 | A19 | Use an MCP server with its own token | v2.0: tools of MCP servers not listed in `[guard.mcp] allow_servers` are denied. Listed servers are an admin-accepted, unbrokered gap: their calls are hooked and audited, and `status` and `doctor` warn about them (decision 10). After v2.0, the MCP gateway (proposed) moves their tokens into the vault. |
 | A24 | Use the agent's own model-provider login (read it, or call the provider directly) | **Not prevented, by design** (owner decision 5). `core.secrets` still blocks the obvious reads of the login files (v1). The answer for companies that need it is a local model. |
 | A20 | Read the response of a request with secrets in it | The response is masked for vault values and v1 patterns before it leaves the daemon. |
-| A21 | Run its own code outside the hook (script, patched agent, nested agent with other settings) | **Not prevented in v2.** That code runs as the user with no keys, cannot touch saiife, and is not audited. v3. `doctor` warns when agent binaries are user-writable. |
+| A21 | Run its own code outside the hook (script, patched agent, nested agent with other settings) | **Not prevented in v2.** That code runs as the user with no keys, cannot touch saiife, and is not audited. v3. `doctor` warns when agent binaries are user-writable. A hook such code kills is recorded (`no_verdict`, plan 20). |
 | A22 | Send data it can read to any host | **Not prevented in v2.** v3 egress control. Egress recipe (proposed, §6.20) for dedicated accounts on Linux. |
 | A23 | Plant persistence that runs later outside a session (cron, user units, login items) | `core.lock` denies the common ways (proposed). A script can still do it: that code is as in A21. |
-| A25 | Forge the hook's verdict: end the hook with `TerminateProcess(hook, 0)` (Windows) | **Not prevented in v2.2; the reason Windows locked mode is a preview** (owner ruling 2026-11-06). A process of the agent's user has full access to its own processes, so it can end the hook with exit 0, which every agent reads as allow; the call runs and no record is written (measured on `windows-2022` and `windows-2025`: the audit's size did not change). It needs the agent's own code running beside it, so it is in the A21 class. On Linux and macOS a kill cannot choose the exit code. In CI a second account could do it too, but only because both test accounts were started with `CreateProcessWithLogonW` from one runner session and so carry its logon SID (`S-1-5-5-0-…`), which the hook's default DACL grants: a test artifact, not a cross-user hole. Next plan: a Claude Code HTTP co-signer hook, exit-watch detection that records a forged exit (a record and a `doctor` warning, no automatic lockdown), and the Linux binary at 0711. |
+| A25 | Forge the hook's verdict on Windows: end the hook with `TerminateProcess(hook, 0)` | A process of the agent's user can still end the hook with exit 0 (it has full access to its own processes), but since plan 20: **Claude Code:** the co-signer (§6.1.1) finds no recorded allow and denies the call, with "the saiife hook ended without a verdict" (asserted by `locked-windows` on `windows-2022` and `windows-2025`, with Claude Code's request simulated). **Codex and Gemini CLI:** the call runs; the daemon writes a `no_verdict` record and `doctor` warns (`hooks.no-verdict`). No automatic lockdown. **Not prevented:** code injected into the hook (the user has full access to its own processes, so its code can make the hook record an allow, which the co-signer then accepts), and a squat of `127.0.0.1:7433` while the service restarts (the daemon binds with `SO_EXCLUSIVEADDRUSE`, a failed bind is recorded and fails `doctor`). Both need the agent's own code running beside it, so they are in the A21 class. **Windows locked mode stays a preview** until a later plan has the service judge each co-signed input itself (owner ruling 2026-11-09). Before plan 20 the call ran and no record was written (measured on both runners: the audit's size did not change). On Linux the binary is `0711`, so the hook cannot be traced by its own user, and a kill cannot choose an exit code; on macOS the hardened runtime refuses `task_for_pid` and the binary stays `0755`. In CI a second account could end the hook too, but only because both test accounts were started with `CreateProcessWithLogonW` from one runner session and so carry its logon SID (`S-1-5-5-0-…`), which the hook's default DACL grants: a test artifact, not a cross-user hole. |
 
 ### 9.3 Fail-closed matrix
 
@@ -2688,20 +2815,25 @@ is out of scope (§9.5).
 |---|---|---|---|
 | saiife reports an error (exit 2 + reason) | blocked | blocked | blocked |
 | guard engine crash | blocked (worker isolates it; parent denies) | blocked (same) | blocked (same) |
-| `check` parent killed or crashes | blocked (`onFailure`) | **runs** | blocked if exit code is not 0 or 1 (unverified for signals) |
+| `check` parent killed or crashes | blocked (`onFailure`) | **runs**; recorded | blocked if exit code is not 0 or 1 (unverified for signals); recorded |
 | hook timeout (10 s) | blocked | **runs** | **runs** |
 | daemon down or not answering in 2 s | blocked (saiife denies) | blocked | blocked |
 | binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway | **runs** | possibly blocked (exit 127, unverified) |
-| `check` ended with exit 0 by a process of the agent's user (Windows, A25; A21 class) | **runs** | **runs** | **runs** |
+| `check` ended with exit 0 by a process of the agent's user (Windows, A25; A21 class) | blocked (co-signer) | **runs**; recorded | **runs**; recorded |
+| co-signer not listening (`127.0.0.1:7433` taken, or the daemon down) | blocked (`onFailure`) | n/a | n/a |
 
 saiife answers well inside the timeout (an internal deadline of 3 s), so the
 "runs" cells need the parent process itself to die or hang. These are the
-fail-open gaps listed per agent in the docs and in `doctor`.
+fail-open gaps listed per agent in the docs and in `doctor`. "Recorded"
+(plan 20) means the daemon writes a `hook` record with decision
+`no_verdict` and `doctor` warns (`hooks.no-verdict`); the call still runs.
 
 ### 9.4 How much a record proves
 
-- **Connector, approval, secret, policy, daemon and checkpoint records** are
-  written by the daemon from its own knowledge. They are authoritative.
+- **Connector, approval, secret, policy, daemon, hook and checkpoint records**
+  are written by the daemon from its own knowledge. They are authoritative.
+  A `hook` record (plan 20) proves that a hook connection ended without a
+  verdict; it cannot say why.
 - **Guard records** are a claim by a process running as the agent's uid
   that it judged a payload. In honest operation that process is the real
   `saiife check` started by the agent. A determined agent can add records
@@ -2886,6 +3018,33 @@ Windows. Three jobs run it there:
   and removes it, forces a failure after each custom action (`SAIIFE_FORCE_FAIL=1`) to
   check the rollbacks, runs `detect.ps1`, and checks the `.intunewin` header.
 
+**Note (plan 20): the co-signer, `no_verdict` and `0711` in CI.** No new job; new
+phases in the existing ones:
+
+- `locked-linux` and `locked-macos`, `phase_cosign` (after `phase_hooks`): an allow
+  fixture through the hook and POSTed to `http://127.0.0.1:7433/v1/cosign/claude`
+  gets `200` with an empty body; a deny fixture gets the deny body with `saiife denied
+  this call`; a hook held in its worker (`SAIIFE_EVAL_FAULT=hang`) and then ended with
+  `kill -KILL` gets the deny body with `the saiife hook ended without a verdict` in
+  under 7 s, one `hook` record with `event == "no_verdict"` and `bound == true`, and
+  `hooks.no-verdict` = warn in `doctor --json`; a POST with no hook gets `no saiife hook
+  reported a verdict for this call` after about 8 s; a POST with an `Origin` header
+  gets `403`.
+- `locked-linux`, `phase_modes` checks `root:root 711` on the binary and that the
+  agent cannot read it; `phase_ptrace` (`scripts/locked-linux/ptrace-probe.py`) shows
+  that the agent's `PTRACE_ATTACH` and `/proc/<pid>/mem` open on its own hook child
+  fail with `EPERM`, while a `0755` copy in its home attaches (the control).
+- `locked-windows`, `measure_terminate` keeps its three report-only measurements and
+  adds asserted steps: `TerminateProcess(hook, 0)` on a hook held in its worker gives
+  `child_exit=0` and a co-sign deny with `the saiife hook ended without a verdict`
+  within 7 s, plus a `no_verdict` record with `bound == true` and the agent's SID; a
+  hook killed while it waits on stdin gives `no saiife hook reported a verdict for this
+  call` (about 8 s) and a record with `bound == false`; the allow and deny controls;
+  `doctor --json` has `hooks.no-verdict` = warn and `cosign.listen` = pass.
+  `phase_cosign` checks that the service owns the listening port and that the agent
+  cannot bind it. A managed hook bench asserts p95 ≤ 130 ms.
+- `test (windows-latest)`: `exclusive_addr_blocks_a_second_bind`.
+
 The live lock check on Windows is `scripts/lock-check/windows-vm.ps1`, run by hand
 in a throwaway VM; it has not run yet, so every Windows lock label is `unverified`.
 ARM64 locked mode is owner handwork until a `windows-11-arm` cell is added.
@@ -3008,7 +3167,8 @@ costs about the same, so the total stays close to the first draft.
 | 16 | Personal broker mode | v2.x | `saiife daemon --user`, keychain vault (macOS Keychain, Secret Service), developer-mode `connect`/`secret` (decision 7) | 1 |
 | 17 | MCP (proposed) | v2.x | `saiife mcp` server, MCP gateway for third-party servers, managed MCP restrictions moved behind the broker | 1.5 |
 | 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible). Built (plan 18): Linux packages, Ansible, Intune Linux; `.pkg`, Jamf and Intune macOS after plan 13 | 1 |
-| 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, same-user approval off (a second account approves), MSI, Intune and GPO recipes, a `locked-windows` CI job. Built (plan 19b): all of it, shipped as a **preview** (A25, §9.2); the `locked-windows` (Server 2022 and 2025) and `package-windows` jobs; the Windows lock-check harness, not run yet. Next: a Claude Code HTTP co-signer hook, exit-watch detection (record only), the Linux binary at 0711 | 4 |
+| 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, same-user approval off (a second account approves), MSI, Intune and GPO recipes, a `locked-windows` CI job. Built (plan 19b): all of it, shipped as a **preview** (A25, §9.2); the `locked-windows` (Server 2022 and 2025) and `package-windows` jobs; the Windows lock-check harness, not run yet. Next: plan 20 | 4 |
+| 20 | A killed or crashed hook never counts as an allow | v2.2 | The Claude Code co-signer HTTP hook on `127.0.0.1:7433` (§6.1.1, §8.3); hello-first hooks and the `hook` record with decision `no_verdict` for every agent (§8.5), record only; the Linux binary at `0711` (§5.2); `doctor` checks `cosign.listen` and `hooks.no-verdict`; CI phases in `locked-linux`, `locked-macos` and `locked-windows` (§13). Codex and Gemini CLI get detection only. Windows locked mode stays a preview: code injected into the hook is not prevented (A25). Next: the service judges each co-signed input itself | — |
 
 **Full v2 series (plans 7–18): about 20.5 weeks of evenings.** Plans 14–18
 can be reordered by customer demand. Plan 13 comes first after v2.0 because

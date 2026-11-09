@@ -149,14 +149,22 @@ Fail-closed matrix (Codex column, from the design; unverified live):
 |---|---|
 | saiife reports an error (exit 2 and a reason) | blocked |
 | guard engine crash | blocked (a worker isolates it; the parent denies) |
-| `check` parent killed or crashes | **runs** |
+| `check` parent killed or crashes | **runs**; recorded |
+| `check` ended with exit 0 by a process of the agent's user (Windows) | **runs**; recorded |
 | hook timeout (10 s) | **runs** |
 | daemon down or not answering in 2 s | blocked |
 | binary missing | **runs** |
 
-The three "runs" rows need the hook process itself to die, hang or be gone;
+The "runs" rows need the hook process itself to die, hang or be gone;
 saiife answers well inside the timeout (an internal deadline of 3 s).
 `saiife doctor` lists these gaps.
+
+Codex has no co-signer: saiife uses no HTTP hook for it, so it gets
+detection only. A hook that ends without a verdict (killed, crashed, or ended
+with exit 0 by another process) becomes a `hook` record with decision
+`no_verdict`, and `doctor` warns (`hooks.no-verdict`). The call itself still
+runs, and nothing locks down by itself. "Recorded" in the table means this.
+See `saiife audit --kind hook`.
 
 ## Not yet verified live
 
