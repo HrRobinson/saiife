@@ -21,7 +21,7 @@ use saiifeguard::payload::{
     MAX_PAYLOAD_BYTES,
 };
 
-use crate::paths::{path_vars_locked, LockedPaths};
+use crate::paths::{path_vars_locked, path_vars_locked_env, EnvList, LockedPaths};
 
 /// Memory-safety cap on what is read from stdin. Parsing skips the content
 /// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
@@ -343,6 +343,45 @@ pub fn judge_with(
     ask: &[String],
     agent: Option<&str>,
 ) -> EvalAnswer {
+    judge_in(payload, packs, budget, (locked, None), ask, agent)
+}
+
+/// What the worker answers `req`. `env`: the environment a worker would be started
+/// with, which the path rules then read instead of this process's (the locked hook's
+/// in-process judgment, plan 21).
+pub fn answer(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
+    match req.event.as_deref() {
+        None => judge_in(
+            &req.payload,
+            &req.packs,
+            Duration::from_millis(req.budget_ms),
+            (req.locked.as_ref(), env),
+            &req.ask,
+            req.agent.as_deref(),
+        ),
+        Some("config-change") => judge_config_change(&req.payload),
+        Some(other) => EvalAnswer {
+            verdict: Verdict::Unjudged,
+            input: String::new(),
+            tool: None,
+            pack: None,
+            rule: None,
+            reason: Some(format!("unknown hook event {other:?}")),
+            rule_id: None,
+            askable: false,
+        },
+    }
+}
+
+/// [`judge_with`], with the path rules read from `env` when it is given.
+fn judge_in(
+    payload: &str,
+    packs: &[String],
+    budget: Duration,
+    (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
+    ask: &[String],
+    agent: Option<&str>,
+) -> EvalAnswer {
     let ctx = context_from_hook_json_bounded(payload, PARSE_MAX_BYTES);
     let answer = |verdict, input: String, reason: &str| EvalAnswer {
         verdict,
@@ -359,7 +398,7 @@ pub fn judge_with(
     }
     let engine = || {
         crate::hook_timing::time("worker.engine", || {
-            engine_for(packs, ctx.cwd.as_deref(), budget, locked)
+            engine_for(packs, ctx.cwd.as_deref(), budget, (locked, env))
         })
     };
     match plan(payload, agent) {
@@ -431,12 +470,13 @@ fn askable(
 
 /// The engine with exactly `packs` compiled (every default-on pack is
 /// compiled as well), path rules bound to `cwd` (else this process's
-/// directory), its project and the locked host's system paths.
+/// directory), its project and the locked host's system paths. The rule
+/// variables come from `env` when it is given, else from this process.
 fn engine_for(
     packs: &[String],
     cwd: Option<&str>,
     budget: Duration,
-    locked: Option<&LockedPaths>,
+    (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
 ) -> (Engine, PathVars) {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
@@ -445,7 +485,10 @@ fn engine_for(
     let project = saiife_agents::config::find_project_root(&start);
     // Broken built-ins are skipped; their rules are not in force.
     let (packs, _warnings) = Catalog::builtin().load_active(packs);
-    let vars = path_vars_locked(Some(&start), project.as_deref(), locked);
+    let vars = match env {
+        Some(env) => path_vars_locked_env(Some(&start), project.as_deref(), locked, env),
+        None => path_vars_locked(Some(&start), project.as_deref(), locked),
+    };
     let engine = Engine::new(packs)
         .with_paths(vars.clone())
         .with_budget(budget);
@@ -866,27 +909,7 @@ fn worker_run() -> ExitCode {
     #[cfg(debug_assertions)]
     fault_seam();
     let judging = std::time::Instant::now();
-    let answer = match req.event.as_deref() {
-        None => judge_with(
-            &req.payload,
-            &req.packs,
-            Duration::from_millis(req.budget_ms),
-            req.locked.as_ref(),
-            &req.ask,
-            req.agent.as_deref(),
-        ),
-        Some("config-change") => judge_config_change(&req.payload),
-        Some(other) => EvalAnswer {
-            verdict: Verdict::Unjudged,
-            input: String::new(),
-            tool: None,
-            pack: None,
-            rule: None,
-            reason: Some(format!("unknown hook event {other:?}")),
-            rule_id: None,
-            askable: false,
-        },
-    };
+    let answer = answer(&req, None);
     crate::hook_timing::add("worker.judge", judging.elapsed());
     let mut out = std::io::stdout().lock();
     if serde_json::to_writer(&mut out, &answer)

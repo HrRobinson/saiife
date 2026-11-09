@@ -179,57 +179,101 @@ fn managed_allow_is_silent_and_recorded() {
     assert!(sb.is_untouched());
 }
 
-/// SAIIFE_HOOK_TIMING=1 (debug builds, as the tests and ci-locked are): each
-/// step's time on stderr, the worker's included, and the call as it was.
-#[test]
-fn hook_timing_names_each_step() {
+/// The steps of a `SAIIFE_HOOK_TIMING=1` trace of an allowed `agent` call of
+/// `rel`, each line checked for its form.
+fn timing_steps(agent: &str, rel: &str) -> (Vec<String>, String) {
     let d = TestDaemon::start(Opts::default());
     let home = common::FixtureHome::new();
-    let payload = home.real(&fixture("claude/bash-allow.json"));
-    let (o, _, _sb) = managed_with(&d.config(), &payload, &[("SAIIFE_HOOK_TIMING", "1")], &[]);
+    let payload = home.real(&fixture(rel));
+    let (o, _, _sb) = managed_as(
+        agent,
+        &d.config(),
+        &payload,
+        &[("SAIIFE_HOOK_TIMING", "1")],
+        &[],
+    );
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
     let err = stderr(&o);
-    let steps: Vec<&str> = err
+    let steps = err
         .lines()
         .map(|l| {
             let mut f = l.split(' ');
             assert_eq!(f.next(), Some("saiife-timing"), "{l}");
-            let step = f.next().unwrap();
+            let step = f.next().unwrap().to_string();
             let ms: f64 = f.next().unwrap().parse().unwrap();
             assert!(ms >= 0.0, "{l}");
             assert_eq!(f.next(), None, "{l}");
             step
         })
         .collect();
-    for want in [
-        "config",
-        "worker.start",
-        "begin.connect",
-        "begin.call",
-        "stdin",
-        "policy",
-        "bind",
-        "worker.started",
-        "worker.request",
-        "worker.engine",
-        "worker.judge",
-        "worker.wait",
-        "record",
-        "append",
-        "total",
-    ] {
-        assert!(steps.contains(&want), "no {want} in {err}");
-    }
     assert_eq!(last_guard(&d)["decision"], "allow");
+    (steps, err)
+}
+
+const COMMON_STEPS: [&str; 9] = [
+    "config",
+    "begin.connect",
+    "begin.call",
+    "stdin",
+    "policy",
+    "bind",
+    "record",
+    "append",
+    "total",
+];
+
+/// SAIIFE_HOOK_TIMING=1 (debug builds, as the tests and ci-locked are): each
+/// step's time on stderr, the judgment in the hook included (Claude Code),
+/// and the call as it was. No worker is started.
+#[test]
+fn hook_timing_names_each_step() {
+    let (steps, err) = timing_steps("claude", "claude/bash-allow.json");
+    let here = [
+        "judge.env",
+        "judge.start",
+        "judge.run",
+        "worker.engine",
+        "judge.wait",
+    ];
+    for want in COMMON_STEPS.iter().chain(&here) {
+        assert!(steps.iter().any(|s| s == want), "no {want} in {err}");
+    }
+    assert!(
+        !steps
+            .iter()
+            .any(|s| s == "worker.start" || s == "worker.started"),
+        "{err}"
+    );
 
     // Anything else is no trace.
+    let d = TestDaemon::start(Opts::default());
+    let payload = common::FixtureHome::new().real(&fixture("claude/bash-allow.json"));
     let (o, _, _sb) = managed_with(&d.config(), &payload, &[("SAIIFE_HOOK_TIMING", "0")], &[]);
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
     assert!(o.stderr.is_empty(), "{}", stderr(&o));
 }
 
+/// The worker's steps, for an agent that keeps it.
+#[test]
+fn hook_timing_names_the_worker_steps() {
+    let (steps, err) = timing_steps("codex", "codex/bash-allow.json");
+    let worker = [
+        "worker.start",
+        "worker.started",
+        "worker.request",
+        "worker.engine",
+        "worker.judge",
+        "worker.wait",
+    ];
+    for want in COMMON_STEPS.iter().chain(&worker) {
+        assert!(steps.iter().any(|s| s == want), "no {want} in {err}");
+    }
+    assert!(!steps.iter().any(|s| s.starts_with("judge.")), "{err}");
+}
+
 /// A call with nothing to judge (a cwd with a NUL byte) drops the worker
 /// started before the payload was read, unsent, and is denied as before.
+/// Codex: Claude Code's calls start no worker.
 #[test]
 fn an_early_worker_with_nothing_to_judge_is_dropped() {
     let d = TestDaemon::start(Opts::default());
@@ -241,7 +285,7 @@ fn an_early_worker_with_nothing_to_judge_is_dropped() {
         "tool_input": {"command": "ls"}
     })
     .to_string();
-    let (o, elapsed, _sb) = managed(&d.config(), &payload);
+    let (o, elapsed, _sb) = managed_as("codex", &d.config(), &payload, &[], &[]);
     assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
     assert!(stderr(&o).contains("NUL byte"), "{}", stderr(&o));
     assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
@@ -445,19 +489,25 @@ fn socket_owner_mismatch_denies() {
     );
 }
 
+/// A worker `fault` on a Codex call: Claude Code's calls start no worker.
 fn worker_fault(fault: &str) -> (Output, Duration, TestDaemon) {
     let home = common::FixtureHome::new();
     worker_fault_with(
         fault,
-        &home.real(&fixture("claude/bash-allow.json")),
-        "ls -la",
+        &home.real(&fixture("codex/bash-allow.json")),
+        "cargo test",
     )
 }
 
 fn worker_fault_with(fault: &str, payload: &str, input: &str) -> (Output, Duration, TestDaemon) {
     let d = TestDaemon::start(Opts::default());
-    let (o, elapsed, _sb) =
-        managed_with(&d.config(), payload, &[("SAIIFE_EVAL_FAULT", fault)], &[]);
+    let (o, elapsed, _sb) = managed_as(
+        "codex",
+        &d.config(),
+        payload,
+        &[("SAIIFE_EVAL_FAULT", fault)],
+        &[],
+    );
     assert_eq!(code(&o), 2, "{fault}: stderr: {}", stderr(&o));
     assert!(o.stdout.is_empty());
     let err = stderr(&o);
@@ -501,6 +551,113 @@ fn worker_hang_denies_after_3s() {
         elapsed >= Duration::from_millis(3000) && elapsed <= Duration::from_millis(4500),
         "{elapsed:?}"
     );
+}
+
+/// Claude Code's calls are judged in the hook (plan 21, option B): with no
+/// worker to be had, they are still judged, allowed and denied as before.
+#[test]
+fn claude_judges_in_process() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let no_worker = [("SAIIFE_EVAL_FAULT", "worker_spawn")];
+    let allow = home.real(&fixture("claude/bash-allow.json"));
+    let (o, _, _sb) = managed_with(&d.config(), &allow, &no_worker, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(last_guard(&d)["decision"], "allow");
+    let deny = home.real(&fixture("claude/bash-deny.json"));
+    let (o, _, _sb) = managed_with(&d.config(), &deny, &no_worker, &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).starts_with("BLOCKED by "), "{}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny", "{r}");
+    assert!(r["rule"].is_string(), "{r}");
+}
+
+/// Codex keeps the worker: a dead hook would let its call run.
+#[test]
+fn codex_still_uses_the_worker() {
+    let (o, _, d) = worker_fault("worker_spawn");
+    assert!(stderr(&o).contains("could not start"), "{}", stderr(&o));
+    assert_eq!(last_guard(&d)["agent"], "codex");
+}
+
+/// The in-hook judgment of a Claude Code call that fails, recorded as
+/// `error_denied`: `(output, elapsed, daemon, record)`.
+fn in_process_fault(fault: &str) -> (Output, Duration, TestDaemon, Value) {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let payload = home.real(&fixture("claude/bash-allow.json"));
+    let (o, elapsed, _sb) =
+        managed_with(&d.config(), &payload, &[("SAIIFE_EVAL_FAULT", fault)], &[]);
+    assert_eq!(code(&o), 2, "{fault}: stderr: {}", stderr(&o));
+    assert!(o.stdout.is_empty());
+    assert!(
+        stderr(&o).contains("saiife: BLOCKED (fail closed): the guard failed in the hook ("),
+        "{fault}: {}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "error_denied", "{fault}: {r}");
+    assert_eq!(r["input"], "ls -la", "{fault}: {r}");
+    assert_eq!(r["tool"], "Bash", "{fault}: {r}");
+    (o, elapsed, d, r)
+}
+
+#[test]
+fn claude_in_process_timeout_denies() {
+    let (_, elapsed, _, r) = in_process_fault("hang");
+    assert_eq!(
+        r["reason"],
+        "the guard failed in the hook (no answer within 3 s)"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(3000) && elapsed <= Duration::from_millis(4500),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn claude_in_process_panic_denies() {
+    let (o, elapsed, _, r) = in_process_fault("panic");
+    assert_eq!(r["reason"], "the guard failed in the hook (it panicked)");
+    // The reason Claude Code shows is the deny alone, as a worker's panic is.
+    assert!(stderr(&o).starts_with("saiife: BLOCKED"), "{}", stderr(&o));
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+/// A crash of the judgment in the hook kills the hook: no guard record, and
+/// the daemon's plan 20 `no_verdict` record of the bound call. Claude Code's
+/// `onFailure: "block"` blocks the call, and its co-signer denies it.
+#[test]
+fn claude_in_process_crash_is_no_verdict() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let payload = home.real(&fixture("claude/bash-allow.json"));
+    let (o, _, _sb) = managed_with(
+        &d.config(),
+        &payload,
+        &[("SAIIFE_EVAL_FAULT", "abort")],
+        &[],
+    );
+    assert_eq!(o.status.code(), None, "killed by a signal: {o:?}");
+    let until = Instant::now() + Duration::from_secs(15);
+    let r = loop {
+        if let Some(r) = d.of_kind("hook").pop() {
+            break r;
+        }
+        assert!(
+            Instant::now() < until,
+            "no hook record: {}",
+            d.stderr_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(r["decision"], "no_verdict", "{r}");
+    assert_eq!(r["event"], "no_verdict", "{r}");
+    assert_eq!(r["bound"], true, "{r}");
+    assert_eq!(r["tool"], "Bash", "{r}");
+    assert_eq!(r["tool_use_id"], "toolu_02", "{r}");
+    assert!(guard_records(&d).is_empty());
 }
 
 #[test]
