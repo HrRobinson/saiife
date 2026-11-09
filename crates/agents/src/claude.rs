@@ -93,10 +93,15 @@ pub fn carries_cosign(text: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
     };
-    let listed = v["allowedHttpHookUrls"]
-        .as_array()
+    cosign_in(v.get("allowedHttpHookUrls"), &v["hooks"])
+}
+
+/// [`carries_cosign`] on a parsed file: its `allowedHttpHookUrls` and `hooks` values.
+fn cosign_in(allowed: Option<&Value>, hooks: &Value) -> bool {
+    let listed = allowed
+        .and_then(Value::as_array)
         .is_some_and(|l| l.iter().any(|u| u == COSIGN_URL_PATTERN));
-    let hooked = v["hooks"]["PreToolUse"]
+    let hooked = hooks["PreToolUse"]
         .as_array()
         .into_iter()
         .flatten()
@@ -130,7 +135,7 @@ pub const HKLM_POLICY_VALUE: &str = "Settings";
 pub const HKLM_OVERRIDES_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add \"managedSourcesBehavior\": \"merge\" there, or put saiife's hooks in it";
 
 /// The `agents.claude.policy` failure when a merged policy can still turn saiife's hooks off.
-pub const HKLM_WEAKENS_HOOKS_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode merges with saiife's drop-in, but its disableAllHooks or hooks value can turn saiife's hooks off; remove it, or put saiife's hooks in it";
+pub const HKLM_WEAKENS_HOOKS_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode merges with saiife's drop-in, but its disableAllHooks or hooks value can turn saiife's hooks off; remove it, or put saiife's hooks and its allowedHttpHookUrls entry in it";
 
 /// What the HKLM `Settings` value does to saiife's drop-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,8 +192,9 @@ pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> HklmRead) -> HklmPolicy {
 }
 
 /// What in a merged policy could stop saiife's hooks. `disableAllHooks` set to anything but
-/// `false`; and a `hooks` value that does not itself carry saiife's, since how Claude Code
-/// merges that key is not documented here and it may replace the files' value.
+/// `false`; and a `hooks` value that does not itself carry saiife's whole handlers and the
+/// co-signer with its allow-list entry ([`carries_cosign`]), since how Claude Code merges
+/// that key is not documented here and it may replace the files' value.
 fn can_turn_hooks_off(policy: &serde_json::Map<String, Value>) -> bool {
     if policy
         .get("disableAllHooks")
@@ -196,23 +202,45 @@ fn can_turn_hooks_off(policy: &serde_json::Map<String, Value>) -> bool {
     {
         return true;
     }
-    policy
-        .get("hooks")
-        .is_some_and(|h| !carries_saiife_hooks(h))
+    policy.get("hooks").is_some_and(|h| {
+        !carries_saiife_hooks(h) || !cosign_in(policy.get("allowedHttpHookUrls"), h)
+    })
 }
 
-/// Every command of `hooks`, as settings nest them: event, entries, then each entry's `hooks`.
-fn hook_commands(entries: &Value) -> Vec<&str> {
-    entries
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.get("hooks")?.as_array())
-        .flatten()
-        .filter_map(|h| h.get("command")?.as_str())
-        .collect()
+/// The fields of a handler that decide what runs and what a failure does: its type, its
+/// command or URL, and `onFailure`.
+fn handler_core(h: &Value) -> [&Value; 4] {
+    [&h["type"], &h["command"], &h["url"], &h["onFailure"]]
 }
 
+/// A matcher that runs on every call: absent, empty or `*`.
+fn matches_all(m: &Value) -> bool {
+    m.is_null() || m == "" || m == "*"
+}
+
+/// `theirs` (one event's entries) has an entry whose matcher covers `matcher` and whose
+/// handlers include `handler`, field for field ([`handler_core`]).
+fn holds_handler(theirs: &Value, matcher: &Value, handler: &Value) -> bool {
+    let want = handler_core(handler);
+    theirs.as_array().into_iter().flatten().any(|e| {
+        let m = &e["matcher"];
+        let covers = if matches_all(matcher) {
+            matches_all(m)
+        } else {
+            m == matcher
+        };
+        covers
+            && e["hooks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|h| handler_core(h) == want)
+    })
+}
+
+/// Every handler of saiife's drop-in, in each of its events, under a matcher that covers
+/// saiife's. A handler that keeps its command but drops `onFailure`, or a `hooks` value
+/// without the co-signer's HTTP handler, does not carry them.
 fn carries_saiife_hooks(theirs: &Value) -> bool {
     let Ok(ours) = serde_json::from_str::<Value>(&managed_settings_for(true)) else {
         return false;
@@ -221,8 +249,14 @@ fn carries_saiife_hooks(theirs: &Value) -> bool {
         return false;
     };
     ours.iter().all(|(event, entries)| {
-        let held = theirs.get(event).map(hook_commands).unwrap_or_default();
-        hook_commands(entries).iter().all(|c| held.contains(c))
+        let held = theirs.get(event).unwrap_or(&Value::Null);
+        entries.as_array().into_iter().flatten().all(|e| {
+            e["hooks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|h| holds_handler(held, &e["matcher"], h))
+        })
     })
 }
 
@@ -710,13 +744,72 @@ mod tests {
         assert_eq!(read(m(r#","disableAllHooks":false"#)), HklmPolicy::Merge);
         assert_eq!(read(m(r#","hooks":{}"#)), HklmPolicy::WeakensHooks);
         let ours: Value = serde_json::from_str(&managed_settings_for(true)).unwrap();
-        let hooks = format!(r#","hooks":{}"#, ours["hooks"]);
+        let hooks = format!(
+            r#","hooks":{},"allowedHttpHookUrls":["{COSIGN_URL_PATTERN}"]"#,
+            ours["hooks"]
+        );
         assert_eq!(read(m(&hooks)), HklmPolicy::Merge);
         // Without merge the source replaces the files, whatever else it says.
         assert_eq!(
             read(r#"{"disableAllHooks":true}"#.to_string()),
             HklmPolicy::Overrides
         );
+    }
+
+    /// A merged policy whose `hooks` keeps saiife's commands but not its whole handlers
+    /// (plan 20, the Task 5 security review): each of these can let a killed hook pass.
+    #[test]
+    fn hklm_hooks_without_the_whole_handlers_weaken() {
+        let ours: Value = serde_json::from_str(&managed_settings_for(true)).unwrap();
+        let read = |hooks: &Value, listed: bool| {
+            let mut p = json!({"managedSourcesBehavior": "merge", "hooks": hooks});
+            if listed {
+                p["allowedHttpHookUrls"] = json!([COSIGN_URL_PATTERN]);
+            }
+            let text = p.to_string();
+            hklm_policy(&move |_, _| Ok(Some(text.clone())))
+        };
+        assert_eq!(read(&ours["hooks"], true), HklmPolicy::Merge);
+        // The same handlers in another order, and an admin hook beside them, still carry.
+        let mut more = ours["hooks"].clone();
+        more["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        more["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "x"}]}));
+        assert_eq!(read(&more, true), HklmPolicy::Merge);
+        // The commands, without the co-signer's HTTP handler.
+        let mut no_http = ours["hooks"].clone();
+        no_http["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|h| h["type"] != "http");
+        assert_eq!(read(&no_http, true), HklmPolicy::WeakensHooks);
+        // The HTTP handler at another URL.
+        let mut moved = ours["hooks"].clone();
+        moved["PreToolUse"][0]["hooks"][1]["url"] = json!("http://127.0.0.1:9/x");
+        assert_eq!(read(&moved, true), HklmPolicy::WeakensHooks);
+        // A handler whose failure no longer blocks.
+        for i in 0..2 {
+            let mut open = ours["hooks"].clone();
+            open["PreToolUse"][0]["hooks"][i]
+                .as_object_mut()
+                .unwrap()
+                .remove("onFailure");
+            assert_eq!(read(&open, true), HklmPolicy::WeakensHooks, "{i}");
+        }
+        let mut open = ours["hooks"].clone();
+        open["ConfigChange"][0]["hooks"][0]["onFailure"] = json!("allow");
+        assert_eq!(read(&open, true), HklmPolicy::WeakensHooks);
+        // A narrower matcher.
+        let mut narrow = ours["hooks"].clone();
+        narrow["PreToolUse"][0]["matcher"] = json!("Bash");
+        assert_eq!(read(&narrow, true), HklmPolicy::WeakensHooks);
+        // The handlers without the allow-list entry.
+        assert_eq!(read(&ours["hooks"], false), HklmPolicy::WeakensHooks);
     }
 
     #[test]

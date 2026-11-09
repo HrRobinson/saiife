@@ -31,10 +31,12 @@ fn canned(stdout: &str, status: i32) -> crate::host::CmdOutput {
 }
 
 fn answer() -> Map<String, serde_json::Value> {
-    json!({"policy_ok": true, "chain": "ok", "head_seq": 7, "last_checkpoint_seq": 6})
-        .as_object()
-        .unwrap()
-        .clone()
+    json!({"policy_ok": true, "chain": "ok", "head_seq": 7, "last_checkpoint_seq": 6,
+        "cosign": {"addr": "127.0.0.1:7433", "error": null},
+        "hooks_no_verdict": {"since_start": 0, "last_ts": null}})
+    .as_object()
+    .unwrap()
+    .clone()
 }
 
 struct Env {
@@ -1385,8 +1387,21 @@ fn hklm_overrides_fails_claude_policy() {
 fn a_merged_policy_that_can_turn_hooks_off_fails() {
     let ours = saiife_agents::claude::managed_settings_for(true);
     let ours: serde_json::Value = serde_json::from_str(&ours).unwrap();
-    let keeps = json!({"managedSourcesBehavior": "merge", "hooks": ours["hooks"]}).to_string();
+    let pattern = saiife_agents::claude::COSIGN_URL_PATTERN;
+    let keeps = json!({"managedSourcesBehavior": "merge", "hooks": ours["hooks"],
+        "allowedHttpHookUrls": [pattern]})
+    .to_string();
+    // The commands kept, the co-signer's HTTP handler dropped (plan 20).
+    let mut commands = ours["hooks"].clone();
+    commands["PreToolUse"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|h| h["type"] == "command");
+    let commands_only = json!({"managedSourcesBehavior": "merge", "hooks": commands,
+        "allowedHttpHookUrls": [pattern]})
+    .to_string();
     for (settings, status) in [
+        (commands_only.as_str(), Status::Fail),
         (
             r#"{"managedSourcesBehavior":"merge","disableAllHooks":true}"#,
             Status::Fail,
@@ -2128,4 +2143,110 @@ fn no_binary_or_no_profile_reads_as_not_found() {
     let c = get(&r, "user.alice.agent-version");
     assert_eq!(c.status, Status::Info);
     assert!(c.detail.contains("not found"), "{}", c.detail);
+}
+
+// ----------------------------------------------------------------- plan 20
+
+fn answer_with(cosign: serde_json::Value, n: u64) -> Map<String, serde_json::Value> {
+    let mut a = answer();
+    a.insert("cosign".into(), cosign);
+    let last = (n > 0).then_some("2026-11-09T10:00:00Z");
+    a.insert(
+        "hooks_no_verdict".into(),
+        json!({"since_start": n, "last_ts": last}),
+    );
+    a
+}
+
+#[test]
+fn cosign_not_listening_fails() {
+    let e = installed();
+    let down = json!({"addr": null, "error": "only one usage of each socket address"});
+    e.host.set(|s| s.daemon_status = Some(answer_with(down, 0)));
+    let r = e.doctor();
+    assert_eq!(get(&r, "daemon.health").status, Status::Pass);
+    let c = get(&r, "cosign.listen");
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(
+        c.detail,
+        "the co-signer is not listening on 127.0.0.1:7433 (only one usage of each socket \
+         address), so Claude Code blocks every call"
+    );
+    // No answer at all: daemon.health fails, and this says it could not look.
+    e.host.set(|s| s.daemon_status = None);
+    let r = e.doctor();
+    assert_eq!(get(&r, "daemon.health").status, Status::Fail);
+    assert_eq!(get(&r, "cosign.listen").status, Status::Info);
+    assert_eq!(get(&r, "hooks.no-verdict").status, Status::Info);
+}
+
+#[test]
+fn cosign_listening_passes() {
+    let r = installed().doctor();
+    let c = get(&r, "cosign.listen");
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.detail, "listening on 127.0.0.1:7433");
+}
+
+#[test]
+fn cosign_info_without_claude() {
+    let e = stock_machine(PeFixture::default());
+    e.install(&[Agent::Codex]);
+    let down = json!({"addr": null, "error": "x"});
+    e.host.set(|s| s.daemon_status = Some(answer_with(down, 0)));
+    assert_eq!(get(&e.doctor(), "cosign.listen").status, Status::Info);
+}
+
+#[test]
+fn no_verdict_warns_with_count() {
+    let e = installed();
+    let up = json!({"addr": "127.0.0.1:7433", "error": null});
+    e.host.set(|s| s.daemon_status = Some(answer_with(up, 2)));
+    let c = get(&e.doctor(), "hooks.no-verdict").clone();
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(
+        c.detail,
+        "2 hook call(s) ended without a verdict since the daemon started (last \
+         2026-11-09T10:00:00Z): a hook was killed, crashed or timed out; see saiife audit \
+         --kind hook"
+    );
+}
+
+#[test]
+fn no_verdict_zero_passes() {
+    assert_eq!(
+        get(&installed().doctor(), "hooks.no-verdict").status,
+        Status::Pass
+    );
+}
+
+/// The machine environment sets a proxy; the agent user's settings `env` may exempt
+/// 127.0.0.1 from it. Never this process's environment.
+#[test]
+fn proxy_without_no_proxy_warns() {
+    let e = installed();
+    e.user_in(ALICE, USER, &[]);
+    profile(&e, USER, r"C:\Users\alice");
+    assert_eq!(
+        get(&e.doctor_as(Some(ALICE)), "user.alice.proxy").status,
+        Status::Pass
+    );
+    e.host.set(|s| {
+        s.registry.insert(
+            (REG_MACHINE_ENV.to_string(), "HTTPS_PROXY".to_string()),
+            RegValue::Str("http://proxy.test:3128".into()),
+        );
+        // The caller's own environment says nothing of the agent user.
+        s.env.insert("NO_PROXY".into(), "127.0.0.1".into());
+    });
+    let c = get(&e.doctor_as(Some(ALICE)), "user.alice.proxy").clone();
+    assert_eq!(c.status, Status::Warn, "{c:?}");
+    assert!(c.detail.contains("(in the machine environment)"), "{c:?}");
+    let settings = e.at(r"C:\Users\alice\.claude\settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, r#"{"env":{"NO_PROXY":"127.0.0.0/8"}}"#).unwrap();
+    assert_eq!(
+        get(&e.doctor_as(Some(ALICE)), "user.alice.proxy").status,
+        Status::Pass
+    );
 }

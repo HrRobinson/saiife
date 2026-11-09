@@ -121,7 +121,7 @@ pub fn fake_install(root: &Path) -> Installed {
     dir(&l(CLAUDE_MANAGED_DIR), 0o755);
 
     let binary = fake_binary();
-    file(&l(BINARY), &binary, 0o755);
+    file(&l(BINARY), &binary, binary_mode(layout.platform()));
     let config = fake_config(&layout);
     file(&l(CONFIG), config.as_bytes(), 0o644);
     let vault = b"fake encrypted credential\n";
