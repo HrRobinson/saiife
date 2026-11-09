@@ -12,6 +12,7 @@ pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
 pub mod cloud_ops;
+pub mod cosign;
 pub mod disk;
 pub mod forward_file;
 pub mod forward_https;

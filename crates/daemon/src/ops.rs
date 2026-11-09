@@ -386,6 +386,9 @@ pub struct Ctx {
     pub refuse_own_uid_peers: bool,
     /// The managed hooks' connections and verdicts (plan 20).
     pub hooks: Arc<crate::hooks::HookTable>,
+    /// The Claude Code co-signer's address or bind error, and its record
+    /// folding (plan 20).
+    pub cosign: Mutex<crate::cosign::CosignState>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -710,6 +713,7 @@ impl Ctx {
             tool_caller,
             refuse_own_uid_peers: i.refuse_own_uid_peers,
             hooks,
+            cosign: Mutex::default(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
@@ -1459,6 +1463,9 @@ fn status(ctx: &Ctx, id: u64) -> Value {
         "hooks_no_verdict".into(),
         json!({"since_start": n, "last_ts": last}),
     );
+    // The co-signer: `{"addr": "127.0.0.1:7433", "error": null}`, or the
+    // bind error with `addr: null`.
+    m.insert("cosign".into(), lock(&ctx.cosign).status());
     ok(id, m)
 }
 

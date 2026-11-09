@@ -222,6 +222,9 @@ impl TestDaemon {
             .env("SAIIFE_TEST_OWN_UID_PEERS", "allow")
             // The MCP gateway runs this binary's `__mcp-spawn`.
             .env("SAIIFE_TEST_MCP_SPAWN", env!("CARGO_BIN_EXE_saiife"))
+            // Many test daemons run at once: each binds its co-signer on
+            // a free port, not the fixed 127.0.0.1:7433.
+            .env("SAIIFE_TEST_COSIGN_ADDR", "127.0.0.1:0")
             .env_remove("NOTIFY_SOCKET")
             .env_remove("STATE_DIRECTORY")
             .env_remove("CREDENTIALS_DIRECTORY")

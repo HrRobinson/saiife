@@ -963,9 +963,10 @@ updating this list and this section.
 | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
 | Worker job (`job.rs`) | `CreateJobObjectW`, `SetInformationJobObject` (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), `AssignProcessToJobObject`: the managed hook's eval worker dies with the hook |
+| Sockets (`net.rs`, plan 20) | `setsockopt` (`SO_EXCLUSIVEADDRUSE`): the Claude Code co-signer's listener takes `127.0.0.1:7433` for itself before it binds |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 41 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 40 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
+That is 42 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 41 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 
