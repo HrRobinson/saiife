@@ -595,6 +595,197 @@ phase_cosign() {
     audit_verify
 }
 
+# ------------------------------------------- a forged allow (plan 21)
+
+# cosign.rs CosignDeny::Rejudged, before the guard's reason (spec §6.1.1).
+REJUDGED_TEXT="the saiife service's own judgment denies this call"
+
+# Microseconds since the epoch (bash 5).
+now_us() {
+    echo "${EPOCHREALTIME/[.,]/}"
+}
+
+# `forge <payload file> <tag> [hold seconds]`: forge-allow.py as the agent
+# user: hello, hook.begin, hook.bind with the payload's key and an
+# audit.append of an allow, over the control socket. The probe goes in on
+# stdin and the payload as an argument: the agent user may not be able to
+# read the checkout or $WORK. Fails unless every step was answered ok.
+forge() {
+    local file="$1" tag="$2" hold="${3:-0}" code=0
+    # The runner opens the probe and the output file on purpose.
+    # shellcheck disable=SC2024
+    sudo -n -u "$AGENT_USER" env -C "$AGENT_HOME" python3 -I - forge "$SOCKET" "$(cat "$file")" "$hold" \
+        <"$HERE/forge-allow.py" >"$WORK/forge-$tag.out" 2>&1 || code=$?
+    sed 's/^/  forge: /' "$WORK/forge-$tag.out"
+    [[ "$code" == 0 ]] || fail "forge-allow ($tag) exited $code (1: the daemon refused a step, 3: the forger could not run)"
+    grep -q '^append=ok' "$WORK/forge-$tag.out" || fail "forge-allow ($tag) printed no append=ok"
+}
+
+# `expect_rejudged <tag> <what>`: the co-sign answer is the deny body with
+# the Rejudged reason (any guard reason after it).
+expect_rejudged() {
+    local tag="$1" what="$2" want
+    cosign_result "$tag"
+    want="$(cosign_deny_body "$REJUDGED_TEXT: @@")"
+    want="${want%%@@*}"
+    [[ "$CO_CODE" == 200 ]] ||
+        fail "$what: co-sign status $CO_CODE, want 200; body: $CO_BODY; curl: $(cat "$WORK/cosign-$tag.err")"
+    [[ "$CO_BODY" == "$want"* && "$CO_BODY" == *'"}}' ]] ||
+        fail "$what: co-sign body '$CO_BODY', want the deny body with '$REJUDGED_TEXT: <reason>'"
+    ok "$what: $CO_CODE $CO_BODY in ${CO_TIME}s"
+}
+
+# The hook records of this event and tool_use_id, counted.
+hook_record_count() {
+    records | jq -c --arg e "$1" --arg id "$2" \
+        'select(.kind == "hook" and .event == $e and .tool_use_id == $id)' | wc -l
+}
+
+# `expect_doctor <file> <id:status>...`: doctor --json as root, each check
+# at its status ("absent" for a check that must not be there).
+expect_doctor() {
+    local file="$1" spec status
+    shift
+    as_root "$OPT_BIN" doctor --json >"$file" 2>"$file.err" || true
+    for spec in "$@"; do
+        status="$(jq -r --arg id "${spec%%:*}" '[.checks[] | select(.id == $id) | .status] | first // "absent"' "$file")"
+        [[ "$status" == "${spec#*:}" ]] ||
+            fail "doctor ${spec%%:*}: $status, want ${spec#*:}: $(jq -c --arg id "${spec%%:*}" '.checks[] | select(.id == $id)' "$file")"
+        ok "doctor ${spec%%:*}: $status"
+    done
+}
+
+# Plan 21 (spec §13 phase_forge): a process of the agent's user forges the
+# hook's allow, and the co-signer's own judgment of the body still denies.
+# Linux has no exit code to forge (the 0711 hook is a kill away from a
+# signal, never a 0), so the real hook ends with its own deny, after the
+# forger's append. The kill is phase_cosign's (plan 20), kept there.
+phase_forge() {
+    phase "3c. a forged allow: the service's own judgment (plan 21)"
+    local p id rec hook_job code=0 n i t_hook t_end post_job lat=() bad=0 line
+
+    # 1. The forged append. The real hook binds the call and hangs in its
+    # judgment (it denies itself at 3 s); the forger binds the same key, so
+    # the daemon counts only the forger's verdict from then, and appends an
+    # allow; the hook exits 2; then Claude Code's request.
+    p="$(cosign_payload claude/bash-deny.json forge)"
+    id="$(jq -r .tool_use_id "$p")"
+    # shellcheck disable=SC2024
+    sudo -n -u "$AGENT_USER" env -C "$AGENT_HOME" SAIIFE_EVAL_FAULT=hang \
+        "$OPT_BIN" check --managed --hook-exit --agent claude \
+        <"$p" >"$WORK/forge-hook.out" 2>"$WORK/forge-hook.err" &
+    hook_job=$!
+    # Bound well before this (the bind comes before the judgment, whose 3 s
+    # deadline the hang runs into).
+    sleep 1.5
+    forge "$p" deny
+    wait "$hook_job" || code=$?
+    [[ "$code" == 2 ]] || fail "the real hook exited $code, want 2 (its own deny at the 3 s deadline): $(cat "$WORK/forge-hook.err")"
+    ok "the real hook ended with its own deny, after the forger's allow (exit $code)"
+    cosign_post "$p" forge-deny ""
+    expect_rejudged forge-deny "a forged allow of a denied call (rm -rf /)"
+    wait_until 10 "the rejudge_denied record of $id" hook_record_exists rejudge_denied "$id"
+    rec="$(hook_record rejudge_denied "$id")"
+    # The binder is the forger: its pid is the record's hook_pid.
+    jq -e --argjson u "$(id -u "$AGENT_USER")" --argjson fp "$(sed -n 's/^forger_pid=//p' "$WORK/forge-deny.out")" \
+        '.decision == "deny" and .agent == "claude" and .uid == $u and .hook_pid == $fp' \
+        <<<"$rec" >/dev/null || fail "the rejudge_denied record is not deny, claude, uid of $AGENT_USER, hook_pid of the forger: $rec"
+    n="$(hook_record_count rejudge_denied "$id")"
+    [[ "$n" -eq 1 ]] || fail "$n rejudge_denied records for $id, want 1 (one per call)"
+    ok "one rejudge_denied record: $rec"
+
+    # 3. The residual, pinned: a forged allow of a call the policy allows
+    # anyway gets no opinion, and no record.
+    p="$(cosign_payload claude/bash-allow.json forge-allow)"
+    id="$(jq -r .tool_use_id "$p")"
+    forge "$p" allow
+    cosign_post "$p" forge-allow ""
+    cosign_result forge-allow
+    echo "  MEASUREMENT [forged-allow-of-an-allowed-call]: $CO_CODE ${CO_BODY:-(empty)} in ${CO_TIME}s"
+    expect_cosign forge-allow 200 "" "a forged allow of an allowed call (ls -la): no opinion, as the policy allows it"
+    [[ "$(hook_record_count rejudge_denied "$id")" -eq 0 ]] || fail "a forged allow of an allowed call wrote a rejudge_denied record"
+
+    # 4. A foreign asker: the agent's hook is bound (and hangs); the request
+    # comes from another uid (the runner). The key is the agent's, so the
+    # co-signer denies at once (Foreign), long before its 8 s cap.
+    p="$(cosign_payload claude/bash-allow.json foreign-bound)"
+    # shellcheck disable=SC2024
+    sudo -n -u "$AGENT_USER" env -C "$AGENT_HOME" SAIIFE_EVAL_FAULT=hang \
+        "$OPT_BIN" check --managed --hook-exit --agent claude \
+        <"$p" >"$WORK/foreign-hook.out" 2>"$WORK/foreign-hook.err" &
+    hook_job=$!
+    sleep 1
+    cosign_post "$p" foreign-bound "$(id -un)"
+    code=0
+    wait "$hook_job" || code=$?
+    expect_cosign foreign-bound 200 "$(cosign_deny_body "no saiife hook reported a verdict for this call")" \
+        "the agent's bound call, asked by another uid ($(id -un))" 3
+
+    # 5. The honest path's latency: the allow fixture, the request sent
+    # first and the hook beside it, as Claude Code may. Every answer must be
+    # the empty 200; the time from the hook's exit to the answer is printed
+    # (report-only; the target is 300 ms p95).
+    for ((i = 1; i <= 50; i++)); do
+        p="$(cosign_payload claude/bash-allow.json "lat$i")"
+        (
+            cosign_post "$p" "lat$i" ""
+            now_us >"$WORK/cosign-lat$i.end"
+        ) &
+        post_job=$!
+        hook claude "$p"
+        t_hook="$(now_us)"
+        wait "$post_job"
+        [[ "$HOOK_CODE" == 0 ]] || fail "honest allow $i: the hook exited $HOOK_CODE: $HOOK_ERR"
+        cosign_result "lat$i"
+        if [[ "$CO_CODE" != 200 || -n "$CO_BODY" ]]; then
+            echo "  honest allow $i: $CO_CODE ${CO_BODY:-(empty)}"
+            bad=$((bad + 1))
+        fi
+        t_end="$(cat "$WORK/cosign-lat$i.end")"
+        lat+=($(((t_end - t_hook) / 1000)))
+    done
+    line="$(printf '%s\n' "${lat[@]}" | sort -n | awk '
+        { a[NR] = $1 }
+        END { k = int((NR * 95 + 99) / 100); m = (NR % 2) ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2
+              printf "%d runs: median %d ms, p95 %d ms, max %d ms after the hook exit (target 300 ms, report-only)", NR, m, a[k], a[NR] }')"
+    echo "  MEASUREMENT [cosign-after-hook]: $line"
+    ((bad == 0)) || fail "$bad of 50 honest allows got a co-sign deny"
+    ok "50 honest allows: no opinion each"
+
+    # 5b. A burst: 8 honest allows of one user at once (REJUDGE_PER_PRINCIPAL
+    # = 1 queues them on one worker, each within REJUDGE_TIMEOUT = 3 s).
+    # Report-only: how many got no opinion, and the slowest answer.
+    local burst_jobs=() empty=0 other="" slowest=0
+    for ((i = 1; i <= 8; i++)); do
+        p="$(cosign_payload claude/bash-allow.json "burst$i")"
+        (
+            cosign_post "$p" "burst$i" "" &
+            # shellcheck disable=SC2024
+            sudo -n -u "$AGENT_USER" env -C "$AGENT_HOME" "$OPT_BIN" check --managed --hook-exit --agent claude \
+                <"$p" >"$WORK/burst$i.out" 2>"$WORK/burst$i.err" || true
+            wait
+        ) &
+        burst_jobs+=($!)
+    done
+    wait "${burst_jobs[@]}"
+    for ((i = 1; i <= 8; i++)); do
+        cosign_result "burst$i"
+        if [[ "$CO_CODE" == 200 && -z "$CO_BODY" ]]; then
+            empty=$((empty + 1))
+        else
+            other+=" [$i: $CO_CODE ${CO_BODY:-(empty)}]"
+        fi
+        slowest="$(awk -v a="$slowest" -v b="$CO_TIME" 'BEGIN { print (b > a) ? b : a }')"
+    done
+    echo "  MEASUREMENT [cosign-burst-one-user]: 8 parallel honest allows: $empty no opinion, slowest ${slowest}s${other:+; others:$other} (report-only)"
+
+    # 6. doctor: the re-judge, the asker, and the forged call's warning.
+    # Linux has no locked.preview.
+    expect_doctor "$WORK/doctor-forge.json" cosign.rejudge:pass cosign.asker:pass \
+        hooks.rejudge-denied:warn locked.preview:absent
+    audit_verify
+}
+
 phase_fail_closed() {
     phase "4. fail closed (spec §9.3)"
     local spec agent fixture before p

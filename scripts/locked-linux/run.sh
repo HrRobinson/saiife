@@ -5,7 +5,8 @@
 # attacks on the installed files, `doctor`, reinstall, uninstall and purge.
 # Plan 20: the binary at 0711 and a ptrace probe against the hook
 # (ptrace-probe.py), and the Claude Code co-signer on 127.0.0.1:7433 with a
-# hook killed by its own user (`no_verdict`).
+# hook killed by its own user (`no_verdict`). Plan 21: a forged allow over the
+# control socket (forge-allow.py), which the co-signer's own judgment denies.
 #
 # CI ONLY. This creates system users, writes /etc, /opt, /var and /run,
 # installs and kills a systemd service. It runs in the GitHub Actions job
@@ -69,6 +70,7 @@ phase_modes
 phase_ptrace
 phase_hooks
 phase_cosign
+phase_forge
 phase_fail_closed
 phase_attacks
 phase_doctor
