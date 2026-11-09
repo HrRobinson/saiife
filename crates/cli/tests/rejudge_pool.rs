@@ -13,13 +13,37 @@ fn frame(body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The asking user's home, shaped as the service's pool sends it: from the
+/// uid's account entry on Unix, from the SID's `ProfileImagePath` on Windows.
+#[cfg(unix)]
+const HOME: &str = "/home/other";
+#[cfg(windows)]
+const HOME: &str = r"C:\Users\other";
+
+/// The path variables the pool sends for `HOME`'s owner, as
+/// `HostAccounts::environment` builds them: `HOME` and `USER` on Unix; on
+/// Windows the profile's variables (`win_locked::worker_env`), where the
+/// guard reads the home from `USERPROFILE`, as the hook's worker does.
+fn vars() -> Value {
+    if cfg!(windows) {
+        json!([
+            ["USERPROFILE", HOME],
+            ["HOME", HOME],
+            ["LOCALAPPDATA", format!(r"{HOME}\AppData\Local")],
+            ["SYSTEMROOT", r"C:\Windows"],
+        ])
+    } else {
+        json!([["HOME", HOME], ["USER", "other"], ["LANG", "C"]])
+    }
+}
+
 fn request(payload: &str) -> Vec<u8> {
     let req = json!({
         "payload": payload,
         "packs": ["core.secrets", "core.filesystem", "core.git", "core.lock", "core.self"],
         "budget_ms": 1000,
         "agent": "claude",
-        "vars": [["HOME", "/home/other"], ["USER", "other"], ["LANG", "C"]],
+        "vars": vars(),
     });
     frame(&serde_json::to_vec(&req).unwrap())
 }
@@ -69,20 +93,25 @@ fn answers(mut out: &[u8]) -> Vec<Value> {
 #[test]
 fn serve_answers_many_frames() {
     let mut input = Vec::new();
+    let cwd = format!("{HOME}{}app", std::path::MAIN_SEPARATOR);
     for cmd in ["ls -la", "cat ~/.ssh/id_rsa", "git status", "rm -rf /"] {
-        input.extend(request(&bash("/home/other/app", cmd)));
+        input.extend(request(&bash(&cwd, cmd)));
     }
     let out = serve(&input);
     assert!(out.status.success(), "{out:?}");
     let got = answers(&out.stdout);
     let verdicts: Vec<&str> = got.iter().map(|a| a["verdict"].as_str().unwrap()).collect();
     assert_eq!(verdicts, ["allow", "deny", "allow", "deny"]);
-    // `~` is the HOME the request carries.
+    // `~` is the home the request carries, so the secrets rule denies, not
+    // an unreadable path. On Windows a rule names the path folded
+    // (`c:/Users/other/...`).
+    assert_eq!(got[1]["pack"], "core.secrets", "{}", got[1]);
+    let reason = got[1]["reason"].as_str().unwrap().replace('\\', "/");
+    let want = format!("{}/.ssh/id_rsa", HOME.replace('\\', "/"));
     assert!(
-        got[1]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("/home/other/.ssh/id_rsa"),
+        reason
+            .to_ascii_lowercase()
+            .contains(&want.to_ascii_lowercase()),
         "{}",
         got[1]
     );
