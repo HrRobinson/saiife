@@ -454,7 +454,9 @@ impl HookTable {
     }
 
     /// `hook.bind` on `conn`; `false` when it did not begin, already
-    /// ended, or the key is bound by another principal.
+    /// ended, already bound another key, or the key is bound by another
+    /// principal. The first bind of a connection on a key that already has
+    /// an outcome clears it: the key waits for this connection's verdict.
     pub fn bind(&self, conn: ConnId, key: HookKey) -> bool {
         self.bind_tool(conn, key, None)
     }
@@ -466,8 +468,12 @@ impl HookTable {
         // Expired keys go first: an old slot of another principal must not
         // refuse a fresh bind.
         st.prune(now);
-        let principal = match st.conns.get(&conn) {
-            Some(o) if !o.done => o.principal.clone(),
+        let (principal, first) = match st.conns.get(&conn) {
+            // One key per connection: a second key would let one
+            // connection add slots and evict other users' keys.
+            Some(o) if !o.done && o.key.as_ref().is_none_or(|k| *k == key) => {
+                (o.principal.clone(), o.key.is_none())
+            }
             _ => return false,
         };
         if st.keys.get(&key).is_some_and(|s| s.principal != principal) {
@@ -477,6 +483,13 @@ impl HookTable {
             o.key = Some(key.clone());
             if tool.is_some() {
                 o.tool = tool;
+            }
+        }
+        // A new connection on a known key asks again: the old outcome no
+        // longer answers it, and waiters wait for this connection's verdict.
+        if first {
+            if let Some(s) = st.keys.get_mut(&key) {
+                s.outcome = None;
             }
         }
         if !st.keys.contains_key(&key) {
@@ -1016,6 +1029,63 @@ mod tests {
         tokio::time::sleep(RECONNECT_GRACE).await;
         settle().await;
         assert_eq!(got(&seen).len(), mismatched.len());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_connection_binds_one_key() {
+        let (t, _seen) = table();
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.begin(ConnId(2), &other(), "claude", None);
+        assert!(t.bind(ConnId(2), key(0)), "another user's slot");
+        // Every other key is refused on conn 1, and adds no slot: it can
+        // neither fill the table nor evict another user's slot.
+        for n in 2..=MAX_KEYS + 1 {
+            assert!(!t.bind(ConnId(1), key(n)), "key {n}");
+        }
+        {
+            let st = t.inner.lock();
+            assert_eq!(st.keys.len(), 2);
+            assert!(st
+                .keys
+                .get(&key(0))
+                .is_some_and(|s| s.principal == Principal::of(&other())));
+            assert_eq!(st.conns[&ConnId(1)].key, Some(key(1)));
+        }
+        // The same key again is fine, and the verdict still settles it.
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        let them = Principal::of(&other());
+        t.verdict(ConnId(2), &Verdict::for_key(&key(0), DecisionKind::Deny));
+        assert_eq!(t.wait(&key(0), Some(&them), until).await, Waited::Deny);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_bind_clears_the_old_outcome() {
+        let (t, _seen) = table();
+        t.begin(ConnId(1), &peer(), "claude", None);
+        t.bind(ConnId(1), key(1));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        t.ended(ConnId(1));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        // A new connection binds the key: the old allow is gone.
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        let start = Instant::now();
+        let until = start + Duration::from_secs(1);
+        assert_eq!(t.wait_me(&key(1), until).await, Waited::Timeout);
+        // The waiter gets the new verdict when it comes, not before.
+        let waiter = async { t.wait_me(&key(1), start + Duration::from_secs(8)).await };
+        let hook = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Deny));
+        };
+        let (w, ()) = tokio::join!(waiter, hook);
+        assert_eq!(w, Waited::Deny);
+        assert_eq!(start.elapsed(), Duration::from_millis(1500));
     }
 
     #[test]

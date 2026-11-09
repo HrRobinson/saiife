@@ -367,6 +367,58 @@ async fn only_an_append_naming_the_key_settles_it() {
         .contains("\"tool_use_id\":\"toolu_4\""));
 }
 
+/// A connection binds one key: a second key is refused and adds no slot.
+/// A new connection that binds a key clears its old outcome.
+#[tokio::test]
+async fn one_key_per_connection_and_a_rebind_clears_the_outcome() {
+    let d = daemon();
+    let short = || tokio::time::Instant::now() + Duration::from_millis(300);
+    let h0f = "0f".repeat(32);
+    let mut c = Client::hello(&d.sock).await;
+    c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
+    let bind = |n| serde_json::to_value(key(n)).unwrap();
+    let a = c.call(OP_HOOK_BIND, bind(11)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = c.call(OP_HOOK_BIND, bind(12)).await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let a = c.call(OP_HOOK_BIND, bind(11)).await;
+    assert_eq!(a["ok"], true, "the same key again: {a}");
+    let a = c
+        .call(
+            OP_AUDIT_APPEND,
+            append_args(DecisionKind::Allow, "toolu_11", &h0f),
+        )
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(
+        d.ctx.hooks.wait(&key(11), Some(&me()), short()).await,
+        Waited::Allow
+    );
+    assert_eq!(
+        d.ctx.hooks.wait(&key(12), Some(&me()), short()).await,
+        Waited::Timeout
+    );
+    drop(c);
+    let mut c = Client::hello(&d.sock).await;
+    c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
+    let a = c.call(OP_HOOK_BIND, bind(11)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(
+        d.ctx.hooks.wait(&key(11), Some(&me()), short()).await,
+        Waited::Timeout,
+        "the old allow no longer answers"
+    );
+    c.call(
+        OP_AUDIT_APPEND,
+        append_args(DecisionKind::Deny, "toolu_11", &h0f),
+    )
+    .await;
+    assert_eq!(
+        d.ctx.hooks.wait(&key(11), Some(&me()), short()).await,
+        Waited::Deny
+    );
+}
+
 #[tokio::test]
 async fn cli_connections_are_not_tracked_and_ops_are_checked() {
     let d = daemon();
