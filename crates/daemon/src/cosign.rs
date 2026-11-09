@@ -2009,9 +2009,11 @@ mod tests {
             assert_eq!(rec.session, None);
             assert_eq!(rec.input, "");
         }
-        // A process table that cannot be read ties nothing.
+        // A process table that cannot be read at the bind ties nothing.
         ctx.hooks
             .set_tree(Arc::new(|| Err(io::Error::other("no table"))));
+        let body = payload("toolu_2", "ls");
+        hook_says(&ctx, 2, 777, &body, DecisionKind::Allow);
         let r = ask(&ctx, Instant::now(), body.clone(), &Asker::Process(100)).await;
         assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
     }

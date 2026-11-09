@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -41,6 +41,16 @@ pub const MAX_KEYS: usize = 4096;
 /// Windows (plan 21, D2): the hook that bound a call is at most this many
 /// parent steps under the process that sent the co-sign request (Claude Code,
 /// then Git Bash or PowerShell, then `saiife.exe`; 1 in exec form).
+///
+/// The hook's chain (its own entry and those of up to this many ancestors) is
+/// read once, at its bind, while its connection is open and so the hook is
+/// alive: a fast hook has often bound, given its verdict and exited by the
+/// time the co-sign request is waited on (CI-2). The co-sign request is then
+/// checked against that stored chain. Residual: an ancestor that exits within
+/// [`VERDICT_TTL`] of the bind can have its pid reused, and a request from
+/// the new owner of that pid ties, as a later table read would also have
+/// let it. The service cannot read the creation times that would tell them
+/// apart; the re-judge still stands behind the tie.
 pub const ASKER_MAX_DEPTH: usize = 3;
 /// The `reason` of a `no_verdict` record.
 pub const NO_VERDICT_REASON: &str =
@@ -248,27 +258,77 @@ pub struct NoVerdict {
 /// table's lock held, from a tokio task or a connection's end.
 pub type Sink = Box<dyn Fn(NoVerdict) + Send + Sync>;
 
-/// The process table [`HookTable::wait`] walks to tie a binder to its asker
+/// The process table read at each hook's bind to tie it to its asker later
 /// (Windows: `saiife_win::ffi::proc::snapshot`). Tests give a fake one.
 pub type Tree = Arc<dyn Fn() -> std::io::Result<Vec<ProcEntry>> + Send + Sync>;
 
 /// The process table of this system: a Toolhelp snapshot on Windows, with the
-/// creation times and sessions the service may read. No
-/// other system ties a co-sign request to a process, so there it is an
-/// error, and a wait that needs it sees [`Waited::Foreign`].
+/// creation times and sessions the service may read. No other system ties a
+/// co-sign request to a process, so there is none (no read at a bind), and a
+/// wait that needs one sees [`Waited::Foreign`].
 #[cfg(windows)]
-fn system_tree() -> Tree {
-    Arc::new(saiife_win::ffi::proc::snapshot_timed)
+fn system_tree() -> Option<Tree> {
+    Some(Arc::new(saiife_win::ffi::proc::snapshot_timed))
 }
 
 #[cfg(not(windows))]
-fn system_tree() -> Tree {
-    Arc::new(|| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no process tree check on this system",
-        ))
-    })
+fn system_tree() -> Option<Tree> {
+    None
+}
+
+/// A binder's chain, read at its bind ([`ASKER_MAX_DEPTH`]).
+#[derive(Debug, Clone)]
+enum Chain {
+    /// The read runs on a blocking thread.
+    Reading,
+    /// The binder's entry and those of its ancestors, as the table had them.
+    Read(Arc<[ProcEntry]>),
+    /// No table, or it could not be read: ties nothing.
+    Failed,
+}
+
+/// `pid`'s entry, then its parent's, up to `depth` parent steps: every entry
+/// [`is_descendant`]`(snap, _, pid, depth)` looks at, so the walk over these
+/// alone gives the same answer for any ancestor as over all of `snap`.
+fn chain_of(snap: &[ProcEntry], pid: u32, depth: usize) -> Vec<ProcEntry> {
+    let mut out: Vec<ProcEntry> = Vec::new();
+    let mut at = pid;
+    for _ in 0..=depth {
+        if out.iter().any(|e| e.pid == at) {
+            break;
+        }
+        let Some(e) = snap.iter().find(|e| e.pid == at) else {
+            break;
+        };
+        out.push(e.clone());
+        at = e.ppid;
+    }
+    out
+}
+
+/// A chain read, started by calling it (outside the table's lock).
+type ChainJob = Box<dyn FnOnce()>;
+
+/// Start reading `pid`'s chain: [`Chain::Failed`] at once without a table.
+/// The read itself runs when the returned job is called: on a blocking
+/// thread when there is a runtime, else in place.
+fn chain_read(tree: Option<Tree>, pid: u32) -> (watch::Receiver<Chain>, Option<ChainJob>) {
+    let Some(tree) = tree else {
+        return (watch::channel(Chain::Failed).1, None);
+    };
+    let (tx, rx) = watch::channel(Chain::Reading);
+    let job = move || {
+        let chain = match tree() {
+            Ok(snap) => Chain::Read(chain_of(&snap, pid, ASKER_MAX_DEPTH).into()),
+            Err(_) => Chain::Failed,
+        };
+        tx.send_replace(chain);
+    };
+    let run = move || match tokio::runtime::Handle::try_current() {
+        Ok(h) => drop(h.spawn_blocking(job)),
+        Err(_) => job(),
+    };
+    (rx, Some(Box::new(run)))
 }
 
 /// The longest `tool_use_id` kept in a record, in bytes (`hook.bind`'s own
@@ -337,6 +397,8 @@ struct Open {
     tool: Option<String>,
     /// The grant this connection used up.
     grant: Option<UsedGrant>,
+    /// Its chain, read at its first bind.
+    chain: Option<watch::Receiver<Chain>>,
     /// A verdict came, or the overrun already ended it.
     done: bool,
     /// Fired at the overrun: the connection's server closes it.
@@ -356,6 +418,8 @@ struct Slot {
     conn: ConnId,
     /// That connection's pid. Windows ties it to the asker's process tree.
     pid: u32,
+    /// That connection's chain, read at its bind: what the tie checks.
+    chain: watch::Receiver<Chain>,
     /// That connection's token groups (Windows), for the service's own
     /// judgment.
     groups: Vec<String>,
@@ -422,7 +486,7 @@ struct Inner {
     sink: Sink,
     /// Fired whenever a key is added, for waiters on a key not seen yet.
     added: Arc<Notify>,
-    tree: Mutex<Tree>,
+    tree: Mutex<Option<Tree>>,
 }
 
 impl Inner {
@@ -527,11 +591,32 @@ impl Inner {
             key: o.key.clone(),
             tool: o.tool.clone(),
             grant: o.grant.clone(),
+            chain: o.chain.clone(),
             done: true,
             close: None,
             overrun: None,
         };
         self.ended_without_verdict(st, conn, copy, true);
+    }
+}
+
+/// Whether `binder` ran under `asker` ([`ASKER_MAX_DEPTH`]) in its `chain`
+/// read at its bind, once that read is done; `None` past `until`. A read
+/// that failed or never finished ties nothing.
+async fn tie(
+    asker: u32,
+    binder: u32,
+    mut chain: watch::Receiver<Chain>,
+    until: Instant,
+) -> Option<bool> {
+    let read = chain.wait_for(|c| !matches!(c, Chain::Reading));
+    match tokio::time::timeout_at(until, read).await {
+        Err(_) => None,
+        Ok(Err(_)) => Some(false),
+        Ok(Ok(c)) => Some(match &*c {
+            Chain::Read(entries) => is_descendant(entries, asker, binder, ASKER_MAX_DEPTH),
+            Chain::Reading | Chain::Failed => false,
+        }),
     }
 }
 
@@ -555,7 +640,7 @@ impl HookTable {
     /// Tests only: walk `tree` in place of the system's process table.
     #[doc(hidden)]
     pub fn set_tree(&self, tree: Tree) {
-        *self.inner.tree.lock().unwrap_or_else(|p| p.into_inner()) = tree;
+        *self.inner.tree.lock().unwrap_or_else(|p| p.into_inner()) = Some(tree);
     }
 
     /// `hook.begin` on `conn`; `false` when the connection already sent it.
@@ -597,6 +682,7 @@ impl HookTable {
                 key: None,
                 tool: None,
                 grant: None,
+                chain: None,
                 done: false,
                 close,
                 overrun,
@@ -615,6 +701,11 @@ impl HookTable {
 
     /// [`HookTable::bind`], naming the tool for the record, and saying why
     /// a refused bind was refused.
+    ///
+    /// A connection's first bind reads the process table once, for the
+    /// hook's chain ([`ASKER_MAX_DEPTH`]): on a blocking thread, so the bind
+    /// answers at once, while the connection is open. A wait that ties waits
+    /// for that read before it takes any outcome of this binder.
     pub fn bind_tool(
         &self,
         conn: ConnId,
@@ -645,11 +736,20 @@ impl HookTable {
         if st.keys.get(&key).is_some_and(|s| s.principal != principal) {
             return Err(BindRefused::OtherPrincipal);
         }
+        let mut read = None;
+        let mut chain = watch::channel(Chain::Failed).1;
         if let Some(o) = st.conns.get_mut(&conn) {
             o.key = Some(key.clone());
             if tool.is_some() {
                 o.tool = tool;
             }
+            let rx = o.chain.get_or_insert_with(|| {
+                let tree = self.inner.tree.lock().unwrap_or_else(|p| p.into_inner());
+                let (rx, job) = chain_read(tree.clone(), pid);
+                read = job;
+                rx
+            });
+            chain = rx.clone();
         }
         // A new connection on a known key asks again: the old outcome no
         // longer answers it, and waiters wait for this connection's verdict.
@@ -658,6 +758,7 @@ impl HookTable {
                 s.outcome = None;
                 s.conn = conn;
                 s.pid = pid;
+                s.chain = chain.clone();
                 s.groups = groups.clone();
                 s.grant = grant.clone();
             }
@@ -669,6 +770,7 @@ impl HookTable {
                     principal,
                     conn,
                     pid,
+                    chain,
                     groups,
                     grant,
                     outcome: None,
@@ -681,6 +783,10 @@ impl HookTable {
             self.inner.added.notify_waiters();
         }
         st.prune(now);
+        drop(st);
+        if let Some(read) = read {
+            read();
+        }
         Ok(())
     }
 
@@ -767,10 +873,11 @@ impl HookTable {
     /// `asker_pid` (Windows, plan 21 D2): the pid that owns the co-sign
     /// request's socket. The key's binder must then be a descendant of it,
     /// at most [`ASKER_MAX_DEPTH`] parent steps down, or the wait is
-    /// [`Waited::Foreign`]. The process table is read once per binder (so
-    /// once per wait, unless the key is bound again), on a blocking thread,
-    /// as soon as the key is bound: while the hook still runs. A table that
-    /// cannot be read ties nothing.
+    /// [`Waited::Foreign`]. The tie checks the binder's chain read at its
+    /// bind ([`HookTable::bind_tool`]), never a later table: the hook may
+    /// have exited by now. It waits for that read (until `until`) before it
+    /// takes any outcome of the binder. A table that could not be read ties
+    /// nothing.
     pub async fn wait(
         &self,
         key: &HookKey,
@@ -779,15 +886,15 @@ impl HookTable {
         until: Instant,
     ) -> Waited {
         let foreign = |s: &Slot| principal.is_some_and(|p| s.principal != *p);
-        // The binder this wait has tied to the asker.
-        let mut tied: Option<u32> = None;
+        // The binder (connection) this wait has tied to the asker.
+        let mut tied: Option<ConnId> = None;
         loop {
-            let untied = |s: &Slot| asker_pid.is_some() && tied != Some(s.pid);
+            let untied = |s: &Slot| asker_pid.is_some() && tied != Some(s.conn);
             let notify = {
                 let st = self.inner.lock();
                 match st.keys.get(key) {
                     Some(s) if foreign(s) => return Waited::Foreign,
-                    Some(s) if untied(s) => Err(s.pid),
+                    Some(s) if untied(s) => Err((s.conn, s.pid, s.chain.clone())),
                     Some(s) if s.outcome.is_some() => return s.waited(),
                     Some(s) => Ok(Arc::clone(&s.notify)),
                     None => Ok(Arc::clone(&self.inner.added)),
@@ -796,14 +903,16 @@ impl HookTable {
             let notify = match notify {
                 Ok(n) => n,
                 // Only a wait with an asker pid ties (pid 0 is no one's).
-                Err(binder) => match self.tie(asker_pid.unwrap_or(0), binder, until).await {
-                    Some(true) => {
-                        tied = Some(binder);
-                        continue;
+                Err((conn, binder, chain)) => {
+                    match tie(asker_pid.unwrap_or(0), binder, chain, until).await {
+                        Some(true) => {
+                            tied = Some(conn);
+                            continue;
+                        }
+                        Some(false) => return Waited::Foreign,
+                        None => return Waited::Timeout,
                     }
-                    Some(false) => return Waited::Foreign,
-                    None => return Waited::Timeout,
-                },
+                }
             };
             let woken = notify.notified();
             tokio::pin!(woken);
@@ -828,19 +937,6 @@ impl HookTable {
                     _ => Waited::Timeout,
                 };
             }
-        }
-    }
-
-    /// Whether `binder` runs under `asker` ([`ASKER_MAX_DEPTH`]), from one
-    /// read of the process table on a blocking thread; `None` past `until`.
-    async fn tie(&self, asker: u32, binder: u32, until: Instant) -> Option<bool> {
-        let tree = Arc::clone(&self.inner.tree.lock().unwrap_or_else(|p| p.into_inner()));
-        let walk = tokio::task::spawn_blocking(move || {
-            tree().is_ok_and(|snap| is_descendant(&snap, asker, binder, ASKER_MAX_DEPTH))
-        });
-        match tokio::time::timeout_at(until, walk).await {
-            Ok(r) => Some(r.unwrap_or(false)),
-            Err(_) => None,
         }
     }
 
@@ -1337,16 +1433,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_superseded_connection_cannot_settle_the_key() {
         let (t, _seen) = table();
-        let forger = PeerCred { pid: 900, ..peer() };
-        t.begin(ConnId(1), &forger, "claude", None);
-        assert!(t.bind(ConnId(1), key(1)));
-        // The real hook binds the same key after it.
-        t.begin(ConnId(2), &peer(), "claude", None);
-        assert!(t.bind(ConnId(2), key(1)));
-        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
-        let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout);
-        // Nor does the forger tied to an asker: the binder is the hook (777).
         t.set_tree(Arc::new(|| {
             let e = |pid, ppid| ProcEntry {
                 pid,
@@ -1357,6 +1443,16 @@ mod tests {
             };
             Ok(vec![e(100, 50), e(777, 100), e(900, 100)])
         }));
+        let forger = PeerCred { pid: 900, ..peer() };
+        t.begin(ConnId(1), &forger, "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        // The real hook binds the same key after it.
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout);
+        // Nor does the forger tied to an asker: the binder is the hook (777).
         let until = Instant::now() + Duration::from_secs(1);
         assert_eq!(
             t.wait(&key(1), None, Some(100), until).await.outcome(),
@@ -1394,6 +1490,212 @@ mod tests {
         t.ended(ConnId(3));
         let until = Instant::now() + Duration::from_secs(8);
         assert_eq!(t.wait_me(&key(2), until).await, Outcome::NoVerdict);
+    }
+
+    /// Until the chain read at the bind of `k`'s binder is done.
+    async fn read_done(t: &HookTable, k: &HookKey) {
+        let mut chain = t.inner.lock().keys[k].chain.clone();
+        let _ = chain.wait_for(|c| !matches!(c, Chain::Reading)).await;
+    }
+
+    fn pe(pid: u32, ppid: u32) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            exe: format!("p{pid}.exe"),
+            created: None,
+            session: None,
+        }
+    }
+
+    /// A process table the test changes as processes come and go: Claude
+    /// Code (100) under 50 under 10, its shell (200), the hook (777);
+    /// another branch (900).
+    fn live_tree(t: &HookTable) -> Arc<Mutex<Option<Vec<ProcEntry>>>> {
+        let table = Arc::new(Mutex::new(Some(vec![
+            pe(10, 4),
+            pe(50, 10),
+            pe(100, 50),
+            pe(200, 100),
+            pe(777, 200),
+            pe(900, 50),
+        ])));
+        let read = Arc::clone(&table);
+        t.set_tree(Arc::new(move || {
+            read.lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| std::io::Error::other("no table"))
+        }));
+        table
+    }
+
+    /// CI-2 race: a fast hook binds, appends its allow and exits before the
+    /// co-sign request reaches `wait`. Its chain was read at the bind, so
+    /// the call still ties to its live asker.
+    #[tokio::test(start_paused = true)]
+    async fn a_hook_gone_before_the_request_still_ties() {
+        let (t, _seen) = table();
+        let procs = live_tree(&t);
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        t.ended(ConnId(1));
+        read_done(&t, &key(1)).await;
+        // The hook and its shell exit; Claude Code still runs.
+        procs
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .retain(|e| e.pid != 777 && e.pid != 200);
+        for asker in [100, 50] {
+            let until = Instant::now() + Duration::from_secs(1);
+            assert_eq!(
+                t.wait(&key(1), None, Some(asker), until).await.outcome(),
+                Outcome::Allow,
+                "{asker}"
+            );
+        }
+    }
+
+    /// The asker is checked against the chain read at the bind: a process
+    /// outside it is foreign, even when a later table says otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn an_asker_outside_the_stored_chain_is_foreign() {
+        let (t, _seen) = table();
+        let procs = live_tree(&t);
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        read_done(&t, &key(1)).await;
+        // Another branch, 4 steps up, the hook itself, System.
+        for asker in [900, 10, 777, 4] {
+            let until = Instant::now() + Duration::from_secs(1);
+            assert_eq!(
+                t.wait(&key(1), None, Some(asker), until).await.outcome(),
+                Outcome::Foreign,
+                "{asker}"
+            );
+        }
+        // The hook's pid now names a process under 900: not read again.
+        procs.lock().unwrap().as_mut().unwrap().push(pe(777, 900));
+        procs
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .retain(|e| !(e.pid == 777 && e.ppid == 200));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            t.wait(&key(1), None, Some(900), until).await.outcome(),
+            Outcome::Foreign
+        );
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Allow
+        );
+    }
+
+    /// A chain that could not be read at the bind ties nothing, even when
+    /// the table can be read by the time of the request.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_chain_read_is_foreign() {
+        let (t, _seen) = table();
+        let procs = live_tree(&t);
+        let full = procs.lock().unwrap().take();
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        read_done(&t, &key(1)).await;
+        *procs.lock().unwrap() = full;
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Foreign
+        );
+        // A new binder of the key is read afresh, at its bind.
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Allow
+        );
+    }
+
+    /// The relation over the stored chain is the relation over the whole
+    /// table: only the time of the read changed.
+    #[test]
+    fn the_chain_ties_as_the_whole_table() {
+        let et = |pid, ppid, created, session| ProcEntry {
+            created: Some(created),
+            session: Some(session),
+            ..pe(pid, ppid)
+        };
+        let tables = [
+            vec![
+                pe(4, 0),
+                pe(10, 4),
+                pe(50, 10),
+                pe(100, 50),
+                pe(200, 100),
+                pe(777, 200),
+                pe(800, 777),
+                pe(900, 50),
+            ],
+            // A loop, and a process that is its own parent.
+            vec![pe(10, 20), pe(20, 30), pe(30, 10), pe(40, 40)],
+            // A reused parent pid, another session, a parent not listed.
+            vec![
+                et(100, 50, 10, 1),
+                et(200, 100, 40, 1),
+                et(300, 200, 30, 1),
+                et(400, 300, 50, 2),
+                et(500, 999, 60, 1),
+            ],
+        ];
+        for snap in &tables {
+            let mut pids: Vec<u32> = snap.iter().flat_map(|e| [e.pid, e.ppid]).collect();
+            pids.extend([0, 4, 999, 12345]);
+            for &binder in &pids {
+                let chain = chain_of(snap, binder, ASKER_MAX_DEPTH);
+                assert!(chain.len() <= ASKER_MAX_DEPTH + 1);
+                for &asker in &pids {
+                    assert_eq!(
+                        is_descendant(&chain, asker, binder, ASKER_MAX_DEPTH),
+                        is_descendant(snap, asker, binder, ASKER_MAX_DEPTH),
+                        "{asker} {binder} {snap:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bind answers before the read is done, and an allow is not taken
+    /// until it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allow_waits_for_the_chain_read() {
+        let (t, _seen) = table();
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        t.set_tree(Arc::new(move || {
+            gate.lock().unwrap().recv().ok();
+            Ok(vec![pe(100, 50), pe(200, 100), pe(777, 200)])
+        }));
+        let t = Arc::new(t);
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)), "not held by the read");
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        let t2 = Arc::clone(&t);
+        let w = tokio::spawn(async move {
+            let until = Instant::now() + Duration::from_secs(30);
+            t2.wait(&key(1), None, Some(100), until).await.outcome()
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!w.is_finished(), "the allow waits for the read");
+        go.send(()).unwrap();
+        assert_eq!(w.await.unwrap(), Outcome::Allow);
     }
 
     #[test]
