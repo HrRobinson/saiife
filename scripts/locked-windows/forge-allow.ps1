@@ -32,6 +32,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 1
+# An error outside the try below (the payload, the key): said on stderr, which claude-sim
+# passes on as forge_stderr_b64, and exit 3 (the forger could not run), never a bare 1.
+trap {
+  try { [Console]::Error.WriteLine("forge-allow.ps1 failed: $($_.Exception.GetType().Name): $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage -replace '\s*\r?\n\s*', ' ')"); [Console]::Error.Flush() } catch { }
+  exit 3
+}
 
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 
@@ -242,7 +248,7 @@ try {
 } catch {
   $m = $_.Exception.Message
   if ($m -like 'refused: *') { Say 'refused' $m.Substring(9); $code = 1 } else { Say 'error' "$($_.Exception.GetType().Name): $m"; $code = 3 }
-  Set-Ready "failed: $m"
+  try { Set-Ready "failed: $m" } catch { Say 'ready_error' $_.Exception.Message }
 } finally {
   if ($Script:PipeStream) { $Script:PipeStream.Dispose() }
   $doc.Dispose()

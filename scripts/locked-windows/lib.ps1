@@ -213,12 +213,15 @@ function Wait-As {
     try { $p.Kill($true) } catch { Write-Host "  could not end pid $($p.Id): $($_.Exception.Message)" }
     [void]$p.WaitForExit(5000)
   }
-  # A child still holding the pipes must not hang the job.
-  $out = if ($Handle.OutTask.Wait(5000)) { $Handle.OutTask.Result } else { '' }
-  $err = if ($Handle.ErrTask.Wait(5000)) { $Handle.ErrTask.Result } else { '' }
+  # A child still holding the pipes must not hang the job. Held: a descendant kept them
+  # open, so what the program wrote is lost (claude-sim's forger, CI run 2).
+  $outDone = $Handle.OutTask.Wait(5000)
+  $errDone = $Handle.ErrTask.Wait(5000)
+  $out = if ($outDone) { $Handle.OutTask.Result } else { '' }
+  $err = if ($errDone) { $Handle.ErrTask.Result } else { '' }
   $code = if ($timedOut) { 124 } else { $p.ExitCode }
   [void]$Script:Spawned.Remove($Handle)
-  return [pscustomobject]@{ Code = $code; Out = $out; Err = $err; TimedOut = $timedOut; StartError = $null }
+  return [pscustomobject]@{ Code = $code; Out = $out; Err = $err; TimedOut = $timedOut; StartError = $null; Held = -not ($outDone -and $errDone) }
 }
 
 function Invoke-As {
@@ -1571,7 +1574,10 @@ function Invoke-ClaudeSim {
   param([string]$Mode, [string]$PayloadJson, [int]$Runs = 1, [switch]$WithHook, [int]$TimeoutSec = 120)
   $h = Start-ClaudeSim -Mode $Mode -PayloadJson $PayloadJson -Runs $Runs -WithHook:$WithHook
   $r = Wait-As -Handle $h -TimeoutSec $TimeoutSec
-  if ($r.Code -ne 0) { Fail "claude-sim ($Mode) exited $($r.Code): $($r.Out) $($r.Err)" }
+  if ($r.Code -ne 0) {
+    $held = if ($r.Held) { ' (its output pipes were still held 5 s after it ended: a child of it kept them open)' } else { '' }
+    Fail "claude-sim ($Mode) exited $($r.Code)${held}: $($r.Out) $($r.Err)"
+  }
   return $r
 }
 
@@ -1611,11 +1617,31 @@ function Get-SimRuns([string]$Out, [string]$Prefix = 'run') {
   return , $runs.ToArray()
 }
 
-# One honest call through claude-sim: its run, or a failure when it printed none.
+# The cosign_denied records after the first $After, and the pids claude-sim printed
+# ($SimOut), so a NoReport deny tells its cause: asker_pid claude-sim's pid is the tie
+# failing (Foreign: the hook was no longer in the process table when the service read it);
+# no asker_pid is an asker the TCP table did not name (Unknown).
+function Format-CosignDenied([int]$After, [string]$SimOut) {
+  $all = @(Get-Records)
+  $recs = if ($all.Count -gt $After) { @($all[$After..($all.Count - 1)] | Where-Object { $_.kind -eq 'hook' -and $_.event -eq 'cosign_denied' }) } else { @() }
+  $shown = '(none)'
+  if ($recs.Count) {
+    $shown = ($recs | ForEach-Object {
+        $asker = if ($_.PSObject.Properties['asker_pid']) { $_.asker_pid } else { 'none' }
+        "{reason: $($_.reason); asker_pid: $asker; tool_use_id: $($_.tool_use_id)}"
+      }) -join ' '
+  }
+  $pids = @(($SimOut -split "`r?`n") | Where-Object { $_ -match '^(sim_pid|[a-z]+_\d+_hook_pid)=' } | ForEach-Object { $_.Trim() }) -join ', '
+  return "cosign_denied records since: $shown; claude-sim: $pids"
+}
+
+# One honest call through claude-sim: its run (with SimOut, all claude-sim printed), or a
+# failure when it printed none.
 function Invoke-HonestCall([string]$Fixture) {
   $r = Invoke-ClaudeSim -Mode together -PayloadJson (Get-CosignPayload $Fixture (New-ToolUseId))
   $runs = Get-SimRuns $r.Out
   if ($runs.Count -ne 1) { Fail "claude-sim printed $($runs.Count) runs for ${Fixture}: $($r.Out) $($r.Err)" }
+  $runs[0] | Add-Member -NotePropertyName SimOut -NotePropertyValue $r.Out
   return $runs[0]
 }
 
@@ -1733,10 +1759,13 @@ function cosign_doctor {
 function Assert-CosignAfterRestart([string]$When) {
   Wait-Until 300 "doctor cosign.listen to pass $When" { (Get-CheckStatus (Get-DoctorSummary $null $Script:Hook) 'cosign.listen') -eq 'pass' }
   Ok "doctor cosign.listen: pass $When"
+  $countBefore = @(Get-Records).Count
   $run = Invoke-HonestCall 'claude\bash-allow.json'
   $a = $run.Answer
   if ($run.HookExit -ne '0') { Fail "${When}: the allow fixture's hook exited $($run.HookExit), want 0: $($run.HookErr)" }
-  if ($a.Status -ne 200 -or $a.Body -ne '') { Fail "${When}: co-sign answer $(Format-Cosign $a), want 200 with an empty body; daemon.log: $(Get-DaemonLogTail)" }
+  if ($a.Status -ne 200 -or $a.Body -ne '') {
+    Fail "${When}: co-sign answer $(Format-Cosign $a) ($($run.After) ms after the hook's exit), want 200 with an empty body; $(Format-CosignDenied $countBefore $run.SimOut); daemon.log: $(Get-DaemonLogTail)"
+  }
   Ok "${When}: hook exit 0, co-signer 200 with an empty body in $($a.Ms) ms"
 }
 
@@ -2050,12 +2079,14 @@ function forge_honest_latency {
   Ok "$runs honest allows: hook exit 0 and no opinion each"
 
   $burst = 8
+  $countBefore = @(Get-Records).Count
   $r = Invoke-ClaudeSim -Mode burst -Runs $burst -PayloadJson (Get-CosignPayload 'claude\bash-allow.json' (New-ToolUseId)) -TimeoutSec 120
   $all = Get-SimRuns $r.Out 'burst'
   $empty = @($all | Where-Object { $_.Answer.Status -eq 200 -and $_.Answer.Body -eq '' }).Count
   $slowest = (@($all | ForEach-Object { $_.Answer.Ms }) | Measure-Object -Maximum).Maximum
   $others = ($all | Where-Object { -not ($_.Answer.Status -eq 200 -and $_.Answer.Body -eq '') } | ForEach-Object { "[$($_.I): hook $($_.HookExit), $(Format-Cosign $_.Answer)]" }) -join ' '
-  Measure-Result 'cosign-burst-one-user' "$burst honest allows of the agent at once: $empty no opinion, slowest $slowest ms$(if ($others) { "; others: $others" }) (report-only)"
+  $why = if ($others) { "; $(Format-CosignDenied $countBefore $r.Out)" } else { '' }
+  Measure-Result 'cosign-burst-one-user' "$burst honest allows of the agent at once: $empty no opinion, slowest $slowest ms$(if ($others) { "; others: $others" })$why (report-only)"
 }
 
 # 6. doctor. CI installs Claude Code, Codex and Gemini CLI. locked.preview says Claude Code

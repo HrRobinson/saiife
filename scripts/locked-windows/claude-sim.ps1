@@ -38,6 +38,21 @@ if ($env:SAIIFE_LOCKED_CI -ne '1') {
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 1
 
+# Every child this process started (hooks, the forger, measure). A child inherits this
+# process's stdout and stderr, so while one runs the runner reads neither to its end: an
+# error here would reach it as an empty exit 1 (CI run 2). On any error: say it on both
+# streams, end the children, exit 1.
+# Variable names are case-insensitive in PowerShell: a variable named like a parameter IS
+# that parameter, typed as it ($forger = <a Process> made it a [string]$Forger).
+$Script:Children = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+trap {
+  $why = "$($_.Exception.GetType().Name): $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage -replace '\s*\r?\n\s*', ' ')"
+  try { [Console]::Out.WriteLine("sim_error=$why"); [Console]::Out.Flush() } catch { }
+  try { [Console]::Error.WriteLine("claude-sim.ps1 failed: $why"); [Console]::Error.WriteLine($_.ScriptStackTrace); [Console]::Error.Flush() } catch { }
+  foreach ($c in $Script:Children) { try { if (-not $c.HasExited) { $c.Kill() } } catch { } }
+  exit 1
+}
+
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
 $handler = [System.Net.Http.SocketsHttpHandler]::new()
@@ -85,6 +100,7 @@ function Start-Hook([string]$Body, [hashtable]$ExtraEnv = @{}) {
   $psi.WorkingDirectory = $Cwd
   foreach ($k in $ExtraEnv.Keys) { $psi.Environment[$k] = $ExtraEnv[$k] }
   $p = [System.Diagnostics.Process]::Start($psi)
+  $Script:Children.Add($p)
   $h = [pscustomobject]@{ P = $p; OutTask = $p.StandardOutput.ReadToEndAsync(); ErrTask = $p.StandardError.ReadToEndAsync(); ExitMs = $null }
   $p.StandardInput.Write($Body)
   $p.StandardInput.Close()
@@ -134,6 +150,7 @@ if ($Mode -eq 'together') {
     $after = if ($null -ne $post.DoneMs -and $null -ne $h.ExitMs) { $post.DoneMs - $h.ExitMs } else { 'none' }
     $total = if ($null -ne $post.DoneMs) { $post.DoneMs - $post.SentMs } else { 'none' }
     Say "run_$i" "$(Get-ExitCode $h) $($r.Status) $after $total $($r.Body.Length)"
+    Say "run_${i}_hook_pid" $h.P.Id
     if ($r.Body) { Say "run_${i}_body_b64" (B64 $r.Body) }
     if ($r.Error) { Say "run_${i}_error" $r.Error }
     $err = Get-HookErr $h
@@ -155,6 +172,7 @@ if ($Mode -eq 'together') {
     $r = Get-PostResult $q
     $total = if ($null -ne $q.DoneMs) { $q.DoneMs - $q.SentMs } else { 'none' }
     Say "burst_$i" "$(Get-ExitCode $h) $($r.Status) $total $($r.Body.Length)"
+    Say "burst_${i}_hook_pid" $h.P.Id
     if ($r.Body) { Say "burst_${i}_body_b64" (B64 $r.Body) }
     if ($r.Error) { Say "burst_${i}_error" $r.Error }
   }
@@ -185,16 +203,17 @@ if ($Mode -eq 'together') {
   $fpsi.RedirectStandardOutput = $true
   $fpsi.RedirectStandardError = $true
   $fpsi.WorkingDirectory = $Cwd
-  $forger = [System.Diagnostics.Process]::Start($fpsi)
-  $fout = $forger.StandardOutput.ReadToEndAsync()
-  $ferr = $forger.StandardError.ReadToEndAsync()
-  Say 'forger_pid' $forger.Id
+  $forgerProc = [System.Diagnostics.Process]::Start($fpsi)
+  $Script:Children.Add($forgerProc)
+  $fout = $forgerProc.StandardOutput.ReadToEndAsync()
+  $ferr = $forgerProc.StandardError.ReadToEndAsync()
+  Say 'forger_pid' $forgerProc.Id
   $readText = {
     if (Test-Path -LiteralPath $ready) { try { return [System.IO.File]::ReadAllText($ready) } catch { return '' } }
     return ''
   }
   $end = (Now-Ms) + 60000
-  while ((& $readText) -notmatch '^(begun|appended|failed)' -and -not $forger.HasExited -and (Now-Ms) -lt $end) { Start-Sleep -Milliseconds 10 }
+  while ((& $readText) -notmatch '^(begun|appended|failed)' -and -not $forgerProc.HasExited -and (Now-Ms) -lt $end) { Start-Sleep -Milliseconds 10 }
   $h = $null
   if ($WithHook) {
     $h = Start-Hook $text @{ SAIIFE_EVAL_FAULT = 'hang' }
@@ -205,7 +224,7 @@ if ($Mode -eq 'together') {
   }
   [System.IO.File]::WriteAllText($go, 'go')
   $end = (Now-Ms) + 30000
-  while ((& $readText) -notmatch '^(appended|failed)' -and -not $forger.HasExited -and (Now-Ms) -lt $end) { Start-Sleep -Milliseconds 10 }
+  while ((& $readText) -notmatch '^(appended|failed)' -and -not $forgerProc.HasExited -and (Now-Ms) -lt $end) { Start-Sleep -Milliseconds 10 }
   Say 'forger_state' (& $readText)
   if ($h) {
     Say 'hook_running_at_kill' (-not $h.P.HasExited)
@@ -215,6 +234,7 @@ if ($Mode -eq 'together') {
     $kpsi.CreateNoWindow = $true
     $kpsi.RedirectStandardOutput = $true
     $k = [System.Diagnostics.Process]::Start($kpsi)
+    $Script:Children.Add($k)
     $kout = $k.StandardOutput.ReadToEnd()
     $k.WaitForExit()
     foreach ($line in ($kout -split "`r?`n")) { if ($line -match '^terminate') { Say "kill_$($line.Split('=')[0])" $line.Substring($line.IndexOf('=') + 1) } }
@@ -229,8 +249,8 @@ if ($Mode -eq 'together') {
   Say 'cosign_error' $r.Error
   Say 'cosign_ms' $(if ($null -ne $post.DoneMs) { $post.DoneMs - $post.SentMs } else { 'none' })
   # The forger is this process's child: ended through its handle.
-  try { if (-not $forger.HasExited) { $forger.Kill() } } catch { Say 'forger_kill_error' $_.Exception.Message }
-  [void]$forger.WaitForExit(10000)
+  try { if (-not $forgerProc.HasExited) { $forgerProc.Kill() } } catch { Say 'forger_kill_error' $_.Exception.Message }
+  [void]$forgerProc.WaitForExit(10000)
   foreach ($line in ((& { if ($fout.Wait(5000)) { $fout.Result } else { '' } }) -split "`r?`n")) {
     if ($line) { Say 'forge' $line }
   }
