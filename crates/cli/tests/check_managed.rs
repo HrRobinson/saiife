@@ -1270,3 +1270,249 @@ fn unknown_event_with_managed_fails_closed() {
     assert!(stderr(&o).contains("fail closed"), "{}", stderr(&o));
     assert_eq!(last_guard(&d)["decision"], "error_denied");
 }
+
+// Plan 20, Task 3: the hook registers with the daemon (`hook.begin`) before
+// it reads its input, and names the call (`hook.bind`) once it has.
+
+/// One frame a [`FakeDaemon`] read: the connection's index, the op and its args.
+#[derive(Debug, Clone)]
+struct Seen {
+    conn: usize,
+    op: String,
+    args: Value,
+}
+
+/// A locked-mode daemon that answers every op `ok` (an append with a
+/// `seq`, `grant.consume` with no grant) and logs what it reads. With
+/// `hang_approval`, it never answers `approval.create`.
+struct FakeDaemon {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+    begun: std::sync::mpsc::Receiver<()>,
+}
+
+impl FakeDaemon {
+    fn start(d: &TestDaemon, hang_approval: bool) -> FakeDaemon {
+        let l = fake_socket_dir(d);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
+        let (tx, begun) = std::sync::mpsc::channel();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for (conn, s) in l.incoming().enumerate() {
+                let Ok(mut s) = s else { return };
+                let log = log.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(mut m) = read_frame(&mut s) {
+                        // A request's args sit beside its `id` and `op`.
+                        let id = m.remove("id").unwrap_or(Value::Null);
+                        let op = m.remove("op");
+                        let op = op.as_ref().and_then(Value::as_str).unwrap_or_default();
+                        let op = op.to_string();
+                        log.lock().unwrap().push(Seen {
+                            conn,
+                            op: op.clone(),
+                            args: Value::Object(m),
+                        });
+                        let ans = match op.as_str() {
+                            "hello" => json!({"id": id, "ok": true, "proto": 1, "mode": "locked"}),
+                            "audit.append" => json!({"id": id, "ok": true, "seq": 1}),
+                            "grant.consume" => json!({"id": id, "ok": true, "granted": false}),
+                            "approval.create" if hang_approval => {
+                                std::thread::sleep(Duration::from_secs(10));
+                                return;
+                            }
+                            "approval.create" => json!({"id": id, "ok": true, "request": 7}),
+                            _ => json!({"id": id, "ok": true}),
+                        };
+                        if op == "hook.begin" {
+                            let _ = tx.send(());
+                        }
+                        if write_frame(&mut s, &ans).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        FakeDaemon { seen, begun }
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn ops(&self) -> Vec<(usize, String)> {
+        self.seen().into_iter().map(|s| (s.conn, s.op)).collect()
+    }
+}
+
+fn ops_of(list: &[(usize, &str)]) -> Vec<(usize, String)> {
+    list.iter().map(|(c, o)| (*c, o.to_string())).collect()
+}
+
+#[test]
+fn begin_comes_before_stdin_is_read() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let sb = Sandbox::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--managed", "--agent", "claude", "--system-config"])
+        .arg(d.config())
+        .env("HOME", sb.dir.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_DATA_DIR", sb.data())
+        .env("SAIIFE_AUDIT_DIR", sb.audit())
+        .env_remove("SAIIFE_EVAL_FAULT")
+        .env(
+            "SAIIFE_TEST_CLAUDE_MCP_DROPIN",
+            sb.dir.path().join("no-dropin"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Not a byte written yet, stdin still open: the begin must arrive.
+    let mut sin = child.stdin.take().unwrap();
+    let begun = fake.begun.recv_timeout(common::daemon::HANG_GUARD);
+    let before = fake.ops();
+    let home = common::FixtureHome::new();
+    sin.write_all(home.real(&fixture("claude/bash-allow.json")).as_bytes())
+        .unwrap();
+    drop(sin);
+    let o = child.wait_with_output().unwrap();
+    assert!(begun.is_ok(), "no hook.begin; stderr: {}", stderr(&o));
+    assert_eq!(before, ops_of(&[(0, "hello"), (0, "hook.begin")]));
+    let begin = &fake.seen()[1].args;
+    assert_eq!(begin["agent"], "claude");
+    assert!(begin["event"].is_null(), "{begin}");
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+}
+
+#[test]
+fn begin_names_the_event() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let home = common::FixtureHome::new();
+    let (o, _, _sb) = managed_with(
+        &d.config(),
+        &home.real(&fixture("claude/config-change.json")),
+        &[],
+        &["--event", "config-change"],
+    );
+    let seen = fake.seen();
+    let begin = seen.iter().find(|s| s.op == "hook.begin").unwrap();
+    assert_eq!(
+        begin.args["event"],
+        "config-change",
+        "stderr: {}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn bind_carries_the_key() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let home = common::FixtureHome::new();
+    let payload = home.real(&fixture("claude/bash-allow.json"));
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let seen = fake.seen();
+    let bind = seen.iter().find(|s| s.op == "hook.bind").unwrap();
+    let key: saiife_ipc::hookkey::HookKey = serde_json::from_value(bind.args.clone()).unwrap();
+    assert_eq!(
+        key,
+        saiife_ipc::hookkey::hook_key("claude", &payload).unwrap()
+    );
+    assert_eq!(key.session.as_deref(), Some("c-1"));
+    assert_eq!(key.tool_use_id.as_deref(), Some("toolu_02"));
+}
+
+#[test]
+fn bind_precedes_append_on_one_connection() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let home = common::FixtureHome::new();
+    let (o, _, _sb) = managed(&d.config(), &home.real(&fixture("claude/bash-allow.json")));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(
+        fake.ops(),
+        ops_of(&[
+            (0, "hello"),
+            (0, "hook.begin"),
+            (0, "hook.bind"),
+            (0, "audit.append")
+        ])
+    );
+}
+
+/// The approval step times out and poisons the connection: the append goes
+/// out on a new one, which registers and binds the same key first.
+#[test]
+fn poisoned_client_rebinds_on_the_new_connection() {
+    let d = TestDaemon::prepare(&Opts {
+        extra: "[guard]\nask = [\"core.git/force-push\"]\nbudget_ms = 10000\n".into(),
+        ..Opts::default()
+    });
+    let fake = FakeDaemon::start(&d, true);
+    let project = tempfile::tempdir().unwrap();
+    let payload = bash(project.path(), "git push --force origin main");
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("approval step failed"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        fake.ops(),
+        ops_of(&[
+            (0, "hello"),
+            (0, "hook.begin"),
+            (0, "hook.bind"),
+            (0, "grant.consume"),
+            (0, "approval.create"),
+            (1, "hello"),
+            (1, "hook.begin"),
+            (1, "hook.bind"),
+            (1, "audit.append"),
+        ])
+    );
+    let seen = fake.seen();
+    let binds: Vec<&Value> = seen
+        .iter()
+        .filter(|s| s.op == "hook.bind")
+        .map(|s| &s.args)
+        .collect();
+    assert_eq!(binds[0], binds[1]);
+    let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
+    assert_eq!(binds[0], &serde_json::to_value(&key).unwrap());
+    let append = seen.iter().find(|s| s.op == "audit.append").unwrap();
+    assert_eq!(append.args["rec"]["decision"], "error_denied");
+}
+
+#[test]
+fn unparseable_payload_still_appends_error_denied_without_bind() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let (o, _, _sb) = managed(&d.config(), "{nope");
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        fake.ops(),
+        ops_of(&[(0, "hello"), (0, "hook.begin"), (0, "audit.append")])
+    );
+    let append = &fake.seen()[2].args;
+    assert_eq!(append["rec"]["decision"], "error_denied");
+}
+
+/// The real daemon, whether it takes the hook ops or refuses them (one
+/// that predates them): the call is judged and recorded as before.
+#[test]
+fn hook_ops_on_the_real_daemon_change_nothing() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let (o, _, _sb) = managed(&d.config(), &home.real(&fixture("claude/bash-allow.json")));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(last_guard(&d)["decision"], "allow");
+}

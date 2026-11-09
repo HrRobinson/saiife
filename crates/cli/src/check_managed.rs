@@ -9,6 +9,11 @@
 //! record. When it cannot, the reason goes to stderr only: nobody could
 //! write the record.
 //!
+//! The hook connects and says `hook.begin` before it reads its input, and
+//! binds the call's key (`hook.bind`) while the worker runs (plan 20): the
+//! daemon records a hook that ends without its `audit.append`. A connection
+//! made again after an error registers and binds the same key first.
+//!
 //! A deny by a rule listed in `[guard] ask` (spec §6.10.4) takes one or
 //! two more round trips, inside the same 2 s ack budget: `grant.consume`
 //! (an approved grant for this exact call: allowed once, record
@@ -129,8 +134,10 @@ mod imp {
     #[cfg(unix)]
     use saiife_ipc::client::{system_entry, system_uid};
     use saiife_ipc::client::{Client, ClientError};
+    use saiife_ipc::hookkey::{hook_key_bounded, HookKey};
     use saiife_ipc::msg::{
         ErrorCode, MAX_RECORD_BYTES, OP_APPROVAL_CREATE, OP_AUDIT_APPEND, OP_GRANT_CONSUME,
+        OP_HOOK_BEGIN, OP_HOOK_BIND,
     };
     use saiife_policy::{
         active_packs, applied_for, effective_policy, load_system, merge_project, parse_project,
@@ -374,28 +381,41 @@ mod imp {
         event: Option<&str>,
         forced: Option<String>,
     ) -> ExitCode {
-        // 1. The payload, bounded.
-        let input = read_stdin();
-        #[cfg(debug_assertions)]
-        if eval::fault() == "parent_hang" {
-            std::thread::sleep(Duration::from_secs(20));
-        }
-
-        // 2. The system policy. Without it there is no daemon to tell.
+        // 1. The system policy. Without it there is no daemon to tell.
         let cfg = match load_locked(config) {
             Ok(c) => c,
             Err(e) => {
+                let input = read_stdin();
                 let why = format!("saiife policy could not be loaded: {e}");
                 record_failed_load(agent, event, &input, &why);
                 return blocked(&why);
             }
         };
         let Some(daemon_uid) = daemon_owner(&cfg) else {
+            drain_stdin();
             return blocked(&format!(
                 "the saiife daemon user {:?} does not exist",
                 cfg.daemon.user
             ));
         };
+
+        // 2. Register with the daemon before reading the payload (plan 20):
+        // from here on, a hook that ends without a verdict is recorded.
+        let mut client = match connect_begun(&cfg, daemon_uid, agent, event) {
+            Ok(c) => c,
+            // The daemon cannot be reached: stderr only.
+            Err(reason) => {
+                drain_stdin();
+                return blocked(&reason);
+            }
+        };
+
+        // 3. The payload, bounded.
+        let input = read_stdin();
+        #[cfg(debug_assertions)]
+        if eval::fault() == "parent_hang" {
+            std::thread::sleep(Duration::from_secs(20));
+        }
 
         let mut ctx = match &input {
             Ok(buf) => context_from_hook_json_bounded(buf, PARSE_MAX_BYTES),
@@ -406,34 +426,37 @@ mod imp {
             ctx.tool = Some("ConfigChange".into());
         }
         // A panic from here until the record is built still gets an
-        // `error_denied` record, as long as the daemon was reached.
-        let mut client: Option<Client> = None;
+        // `error_denied` record.
         let mut policy: Option<String> = None;
         // The canonical cwd and project root, for a grant's scope.
         let mut key_project: Option<(String, String)> = None;
+        // The call's key, bound while the worker runs.
+        let mut key: Option<HookKey> = None;
         let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             judge_call(
                 (&cfg, config),
-                daemon_uid,
                 (agent, event),
                 &ctx,
                 input,
                 forced,
                 &mut client,
-                (&mut policy, &mut key_project),
+                (&mut policy, &mut key_project, &mut key),
             )
         }));
-        let judged = match judged {
-            Ok(Ok(j)) => j,
-            // The daemon cannot be reached: stderr only.
-            Ok(Err(reason)) => return blocked(&reason),
-            Err(_) => Judged::error(String::new(), "saiife crashed".into()),
-        };
-        let Some(mut client) = client else {
-            return blocked("saiife crashed before reaching the audit daemon");
-        };
+        let judged =
+            judged.unwrap_or_else(|_| Judged::error(String::new(), "saiife crashed".into()));
+        // A bind that broke the connection must not cost the approval step
+        // or the record.
+        if client.is_poisoned() {
+            match connect_bound(&cfg, daemon_uid, (agent, event), key.as_ref()) {
+                Ok(c) => client = c,
+                Err(e) => {
+                    return blocked(&format!("the audit daemon did not record this call ({e})"))
+                }
+            }
+        }
 
-        // 8. The record, within the daemon's size limit; 9. its ack.
+        // 6. The record, within the daemon's size limit, and its ack.
         let policy = policy.unwrap_or_else(|| "unavailable".into());
         let mut judged = judged;
         let mut rec = record(agent, &ctx, &policy, &judged);
@@ -489,10 +512,11 @@ mod imp {
         }
         // An approval step that broke the connection (a timeout) must not
         // also cost the record: one fresh connection, with its own
-        // deadlines, for the append. Its error, if any, is what is shown.
+        // deadlines, for the append, registered and bound as the first was.
+        // Its error, if any, is what is shown.
         let mut deadline = deadline;
         if client.is_poisoned() {
-            match connect_locked(&cfg, daemon_uid) {
+            match connect_bound(&cfg, daemon_uid, (agent, event), key.as_ref()) {
                 Ok(c) => {
                     client = c;
                     deadline = Instant::now() + ACK_TIMEOUT;
@@ -516,7 +540,7 @@ mod imp {
             ));
         }
 
-        // 10. The answer.
+        // 7. The answer.
         match judged.outcome {
             Outcome::Allow => ExitCode::SUCCESS,
             Outcome::Deny(msg) => {
@@ -582,22 +606,24 @@ mod imp {
     ) {
     }
 
-    /// Steps 3 to 7: the project, the policy, the worker and the daemon
-    /// connection (made while the worker runs). `Err` is a reason for
-    /// stderr only: the daemon could not be reached. `cfg` was loaded from
+    /// Steps 4 and 5: the project, the policy and the worker, and the
+    /// call's key, bound on `client` while the worker runs (`key` is set to
+    /// it; a payload that gives no key binds nothing). `cfg` was loaded from
     /// `config`. An MCP tool whose server `[guard.mcp]` does not list is
     /// denied without a worker.
-    #[allow(clippy::too_many_arguments)]
     fn judge_call(
         (cfg, config): (&SystemConfig, &Path),
-        daemon_uid: u32,
         (agent, event): (&str, Option<&str>),
         ctx: &HookContext,
         input: Result<String, String>,
         forced: Option<String>,
-        client: &mut Option<Client>,
-        (policy, key_project): (&mut Option<String>, &mut Option<(String, String)>),
-    ) -> Result<Judged, String> {
+        client: &mut Client,
+        (policy, key_project, key): (
+            &mut Option<String>,
+            &mut Option<(String, String)>,
+            &mut Option<HookKey>,
+        ),
+    ) -> Judged {
         // An unusable cwd is never looked up: no project, no worker.
         let cwd = eval::check_cwd(ctx.cwd.as_deref());
         let start = match (&cwd, &ctx.cwd) {
@@ -642,36 +668,39 @@ mod imp {
             (None, Ok(payload), None) => mcp_judgement(agent, ctx, payload, cfg),
             _ => None,
         };
-        let mut worker = match (&failed, &mcp_judged, input) {
-            (None, None, Ok(payload)) => Some(Worker::spawn(EvalRequest {
-                payload,
-                // A settings change is judged without packs.
-                packs: if event.is_some() { Vec::new() } else { packs },
-                budget_ms: cfg.guard.budget_ms,
-                locked: Some(locked_paths(cfg, config)),
-                event: event.map(str::to_string),
-                ask: cfg.guard.ask.clone(),
-                agent: Some(agent.to_string()),
-            })),
-            _ => None,
+        let (worker, unspawned) = match (&failed, &mcp_judged, input) {
+            (None, None, Ok(payload)) => (
+                Some(Worker::spawn(EvalRequest {
+                    payload,
+                    // A settings change is judged without packs.
+                    packs: if event.is_some() { Vec::new() } else { packs },
+                    budget_ms: cfg.guard.budget_ms,
+                    locked: Some(locked_paths(cfg, config)),
+                    event: event.map(str::to_string),
+                    ask: cfg.guard.ask.clone(),
+                    agent: Some(agent.to_string()),
+                })),
+                None,
+            ),
+            (_, _, input) => (None, input.ok()),
         };
 
-        let c = match connect_locked(cfg, daemon_uid) {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(Ok(w)) = &mut worker {
-                    w.kill();
-                }
-                return Err(e);
-            }
+        // While the worker runs: the key, and its bind. A bind error leaves
+        // the call as it is; one that broke the connection is mended by the
+        // caller.
+        let payload = match (&worker, &unspawned) {
+            (Some(Ok(w)), _) => Some(w.payload.as_str()),
+            (Some(Err((p, _))), _) => Some(p.as_str()),
+            (None, p) => p.as_deref(),
         };
-        *client = Some(c);
+        *key = payload.and_then(|p| hook_key_bounded(agent, p, PARSE_MAX_BYTES).ok());
+        bind(client, key.as_ref(), Instant::now() + ACK_TIMEOUT);
 
         if let Some(reason) = failed {
-            return Ok(Judged::error(String::new(), reason));
+            return Judged::error(String::new(), reason);
         }
         if let Some(judged) = mcp_judged {
-            return Ok(judged);
+            return judged;
         }
         let (payload, answer) = match worker {
             Some(Ok(w)) => w.finish(),
@@ -679,13 +708,13 @@ mod imp {
             // A worker is spawned whenever nothing failed; deny regardless.
             None => (String::new(), Err("not started".into())),
         };
-        Ok(match answer {
+        match answer {
             Ok(a) => Judged::from_answer(a),
             Err(why) => Judged::error(
                 recorded_input(&payload),
                 format!("guard worker failed ({why})"),
             ),
-        })
+        }
     }
 
     /// The `guard.mcp` judgement of this call without a worker, if its tool
@@ -1409,17 +1438,74 @@ mod imp {
     /// A connection to the daemon, which must be in locked mode (only it
     /// may take the record). `Err` is the reason, for stderr. On Windows nothing reaches
     /// a pipe owned by anyone but the service (W11).
-    fn connect_locked(cfg: &SystemConfig, daemon_uid: u32) -> Result<Client, String> {
-        let c = crate::broker::system_client(
-            &cfg.daemon.socket_dir,
-            daemon_uid,
-            Instant::now() + CONNECT_TIMEOUT,
-        )
-        .map_err(|e| format!("cannot reach the audit daemon ({})", describe(&e)))?;
+    fn connect_locked(
+        cfg: &SystemConfig,
+        daemon_uid: u32,
+        deadline: Instant,
+    ) -> Result<Client, String> {
+        let c = crate::broker::system_client(&cfg.daemon.socket_dir, daemon_uid, deadline)
+            .map_err(|e| format!("cannot reach the audit daemon ({})", describe(&e)))?;
         if c.hello_answer().get("mode").and_then(Value::as_str) != Some("locked") {
             return Err("the audit daemon is not in locked mode".into());
         }
         Ok(c)
+    }
+
+    /// [`connect_locked`], then `hook.begin {agent, event}` (plan 20), all
+    /// within `CONNECT_TIMEOUT`. From the begin on, the daemon records a
+    /// connection that ends without an `audit.append`. A refusal of the
+    /// begin (a daemon that does not know the op) changes nothing else; a
+    /// begin that breaks the connection is a daemon that cannot be reached.
+    fn connect_begun(
+        cfg: &SystemConfig,
+        daemon_uid: u32,
+        agent: &str,
+        event: Option<&str>,
+    ) -> Result<Client, String> {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut c = connect_locked(cfg, daemon_uid, deadline)?;
+        let mut args = Map::new();
+        args.insert("agent".into(), agent.into());
+        args.insert("event".into(), event.map_or(Value::Null, Value::from));
+        if let Err(e) = c.call(OP_HOOK_BEGIN, args, deadline) {
+            if c.is_poisoned() {
+                return Err(format!("cannot reach the audit daemon ({})", describe(&e)));
+            }
+        }
+        Ok(c)
+    }
+
+    /// `hook.bind` with `key`, if there is one. Its result is not looked
+    /// at: a refusal leaves the connection in step, and one that broke it
+    /// leaves it poisoned, which the caller checks. A key with a session or
+    /// tool call id over `MAX_FIELD_CHARS` is not sent: it could pass the
+    /// frame limit and cost the record; the call stays unbound.
+    fn bind(client: &mut Client, key: Option<&HookKey>, deadline: Instant) {
+        let fits = |s: &Option<String>| s.as_ref().is_none_or(|s| s.len() <= MAX_FIELD_CHARS);
+        let key = key.filter(|k| fits(&k.session) && fits(&k.tool_use_id));
+        let Some(Value::Object(args)) = key.and_then(|k| serde_json::to_value(k).ok()) else {
+            return;
+        };
+        let _ = client.call(OP_HOOK_BIND, args, deadline);
+    }
+
+    /// A fresh connection for a call whose first one broke: registered
+    /// ([`connect_begun`]) and bound with the same `key` as the first.
+    fn connect_bound(
+        cfg: &SystemConfig,
+        daemon_uid: u32,
+        (agent, event): (&str, Option<&str>),
+        key: Option<&HookKey>,
+    ) -> Result<Client, String> {
+        let mut c = connect_begun(cfg, daemon_uid, agent, event)?;
+        bind(&mut c, key, Instant::now() + ACK_TIMEOUT);
+        Ok(c)
+    }
+
+    /// Reads and drops stdin, so an agent still writing the payload of a
+    /// call denied before it was read gets no EPIPE.
+    fn drain_stdin() {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
     }
 
     /// `audit.append`, acknowledged with a `seq` by `deadline` (at most
