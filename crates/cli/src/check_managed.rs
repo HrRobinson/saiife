@@ -11,8 +11,10 @@
 //!
 //! The hook connects and says `hook.begin` before it reads its input, and
 //! binds the call's key (`hook.bind`) while the worker runs (plan 20): the
-//! daemon records a hook that ends without its `audit.append`. A connection
-//! made again after an error registers and binds the same key first.
+//! daemon records a hook that ends without its `audit.append`. The bind
+//! names the tool; the record names the key (`tool_use_id`, `input_sha256`),
+//! so it settles that key only. A connection made again after an error
+//! registers and binds the same key first.
 //!
 //! A deny by a rule listed in `[guard] ask` (spec §6.10.4) takes one or
 //! two more round trips, inside the same 2 s ack budget: `grant.consume`
@@ -171,6 +173,8 @@ mod imp {
     /// `\u00XX`), so `fit` then cuts by serialized bytes.
     const MAX_FIELD_CHARS: usize = 4096;
     const TRUNCATED_MARK: &str = "…[truncated]";
+    /// The longest `tool` that `hook.bind` takes (the daemon's limit).
+    const MAX_BIND_TOOL: usize = 64;
     /// The reason recorded when even the shrunk record does not fit.
     const TOO_LARGE: &str = "record too large";
     /// The fields `fit` may cut: everything the agent or the project
@@ -448,7 +452,13 @@ mod imp {
         // A bind that broke the connection must not cost the approval step
         // or the record.
         if client.is_poisoned() {
-            match connect_bound(&cfg, daemon_uid, (agent, event), key.as_ref()) {
+            match connect_bound(
+                &cfg,
+                daemon_uid,
+                (agent, event),
+                key.as_ref(),
+                ctx.tool.as_deref(),
+            ) {
                 Ok(c) => client = c,
                 Err(e) => {
                     return blocked(&format!("the audit daemon did not record this call ({e})"))
@@ -459,7 +469,7 @@ mod imp {
         // 6. The record, within the daemon's size limit, and its ack.
         let policy = policy.unwrap_or_else(|| "unavailable".into());
         let mut judged = judged;
-        let mut rec = record(agent, &ctx, &policy, &judged);
+        let mut rec = record(agent, &ctx, &policy, &judged, key.as_ref());
         if !fit(&mut rec) {
             // Fail closed: the record says error_denied, so must the call.
             judged = Judged::error(String::new(), TOO_LARGE.into());
@@ -502,7 +512,7 @@ mod imp {
                 Err(e) => {
                     let why = format!("the approval step failed ({})", describe(&e));
                     judged = Judged::error(judged.input.clone(), why);
-                    rec = record(agent, &ctx, &policy, &judged);
+                    rec = record(agent, &ctx, &policy, &judged, key.as_ref());
                     if !fit(&mut rec) {
                         judged = Judged::error(String::new(), TOO_LARGE.into());
                         rec = minimal_record(agent, &policy);
@@ -516,7 +526,13 @@ mod imp {
         // Its error, if any, is what is shown.
         let mut deadline = deadline;
         if client.is_poisoned() {
-            match connect_bound(&cfg, daemon_uid, (agent, event), key.as_ref()) {
+            match connect_bound(
+                &cfg,
+                daemon_uid,
+                (agent, event),
+                key.as_ref(),
+                ctx.tool.as_deref(),
+            ) {
                 Ok(c) => {
                     client = c;
                     deadline = Instant::now() + ACK_TIMEOUT;
@@ -568,7 +584,7 @@ mod imp {
         }
         let shown = input.as_deref().map(recorded_input).unwrap_or_default();
         let judged = Judged::error(shown, why.to_string());
-        let mut rec = record(agent, &ctx, "unavailable", &judged);
+        let mut rec = record(agent, &ctx, "unavailable", &judged, None);
         if !fit(&mut rec) {
             rec = minimal_record(agent, "unavailable");
         }
@@ -694,7 +710,12 @@ mod imp {
             (None, p) => p.as_deref(),
         };
         *key = payload.and_then(|p| hook_key_bounded(agent, p, PARSE_MAX_BYTES).ok());
-        bind(client, key.as_ref(), Instant::now() + ACK_TIMEOUT);
+        bind(
+            client,
+            key.as_ref(),
+            ctx.tool.as_deref(),
+            Instant::now() + ACK_TIMEOUT,
+        );
 
         if let Some(reason) = failed {
             return Judged::error(String::new(), reason);
@@ -1157,8 +1178,16 @@ mod imp {
 
     /// The masked record as the daemon takes it. `ts` is left out: the
     /// daemon stamps the time itself, and it sets `uid`, `user`, `host`,
-    /// `seq` and `prev`.
-    fn record(agent: &str, ctx: &HookContext, policy: &str, j: &Judged) -> Value {
+    /// `seq` and `prev`. With a bound `key`, the record names it
+    /// (`tool_use_id` when it has one, and `input_sha256`), so the daemon
+    /// settles that key only.
+    fn record(
+        agent: &str,
+        ctx: &HookContext,
+        policy: &str,
+        j: &Judged,
+        key: Option<&HookKey>,
+    ) -> Value {
         let project = ctx.cwd.clone().unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|d| d.display().to_string())
@@ -1203,6 +1232,12 @@ mod imp {
             // A pack's own short name for the rule (`force-push`).
             if let Some(id) = &j.rule_id {
                 m.insert("rule_id".into(), id.clone().into());
+            }
+            if let Some(k) = bindable(key) {
+                if let Some(id) = &k.tool_use_id {
+                    m.insert("tool_use_id".into(), id.clone().into());
+                }
+                m.insert("input_sha256".into(), k.input_sha256.clone().into());
             }
         }
         v
@@ -1475,17 +1510,29 @@ mod imp {
         Ok(c)
     }
 
-    /// `hook.bind` with `key`, if there is one. Its result is not looked
-    /// at: a refusal leaves the connection in step, and one that broke it
-    /// leaves it poisoned, which the caller checks. A key with a session or
-    /// tool call id over `MAX_FIELD_CHARS` is not sent: it could pass the
-    /// frame limit and cost the record; the call stays unbound.
-    fn bind(client: &mut Client, key: Option<&HookKey>, deadline: Instant) {
+    /// `key`, if it can be bound: a key with a session or tool call id
+    /// over `MAX_FIELD_CHARS` is not sent (it could pass the frame limit
+    /// and cost the record), and the record does not name it either.
+    fn bindable(key: Option<&HookKey>) -> Option<&HookKey> {
         let fits = |s: &Option<String>| s.as_ref().is_none_or(|s| s.len() <= MAX_FIELD_CHARS);
-        let key = key.filter(|k| fits(&k.session) && fits(&k.tool_use_id));
-        let Some(Value::Object(args)) = key.and_then(|k| serde_json::to_value(k).ok()) else {
+        key.filter(|k| fits(&k.session) && fits(&k.tool_use_id))
+    }
+
+    /// `hook.bind` with `key`, if there is one ([`bindable`]), and `tool`
+    /// when it is at most `MAX_BIND_TOOL` bytes. Its result is not looked
+    /// at: a refusal leaves the connection in step, and one that broke it
+    /// leaves it poisoned, which the caller checks. An unbound call stays
+    /// unbound.
+    fn bind(client: &mut Client, key: Option<&HookKey>, tool: Option<&str>, deadline: Instant) {
+        let Some(Value::Object(mut args)) =
+            bindable(key).and_then(|k| serde_json::to_value(k).ok())
+        else {
             return;
         };
+        // A longer tool would cost the bind: the daemon refuses it whole.
+        if let Some(t) = tool.filter(|t| t.len() <= MAX_BIND_TOOL) {
+            args.insert("tool".into(), t.into());
+        }
         let _ = client.call(OP_HOOK_BIND, args, deadline);
     }
 
@@ -1496,9 +1543,10 @@ mod imp {
         daemon_uid: u32,
         (agent, event): (&str, Option<&str>),
         key: Option<&HookKey>,
+        tool: Option<&str>,
     ) -> Result<Client, String> {
         let mut c = connect_begun(cfg, daemon_uid, agent, event)?;
-        bind(&mut c, key, Instant::now() + ACK_TIMEOUT);
+        bind(&mut c, key, tool, Instant::now() + ACK_TIMEOUT);
         Ok(c)
     }
 

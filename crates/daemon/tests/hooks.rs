@@ -278,6 +278,62 @@ async fn a_verdict_writes_no_hook_record() {
     assert_eq!(d.ctx.hooks.no_verdict_count().0, 0);
 }
 
+/// A guard record naming `tool_use_id` and `input_sha256`, as the managed
+/// hook writes it.
+fn guard_rec_for(decision: DecisionKind, tool_use_id: &str, input_sha256: &str) -> Value {
+    let mut v = guard_rec(decision);
+    v["tool_use_id"] = tool_use_id.into();
+    v["input_sha256"] = input_sha256.into();
+    v
+}
+
+/// An appended record whose `tool_use_id` or input hash is another call's
+/// settles nothing; one that names the bound key settles it.
+#[tokio::test]
+async fn only_a_record_naming_the_key_settles_it() {
+    let d = daemon();
+    let short = || tokio::time::Instant::now() + Duration::from_millis(300);
+    // Each on its own key, and kept open, so one's end cannot touch the next.
+    let mismatched = [
+        (
+            5,
+            guard_rec_for(DecisionKind::Allow, "toolu_9", &"0f".repeat(32)),
+        ),
+        (
+            6,
+            guard_rec_for(DecisionKind::Allow, "toolu_6", &"cd".repeat(32)),
+        ),
+    ];
+    let mut open = Vec::new();
+    for (n, rec) in mismatched {
+        let mut c = Client::hello(&d.sock).await;
+        c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
+        let a = c
+            .call(OP_HOOK_BIND, serde_json::to_value(key(n)).unwrap())
+            .await;
+        assert_eq!(a["ok"], true, "{a}");
+        let a = c.call(OP_AUDIT_APPEND, json!({ "rec": rec })).await;
+        assert_eq!(a["ok"], true, "the record is still written: {a}");
+        assert_eq!(
+            d.ctx.hooks.wait(&key(n), Some(&me()), short()).await,
+            Waited::Timeout,
+            "{rec}"
+        );
+        open.push(c);
+    }
+    let mut c = Client::hello(&d.sock).await;
+    c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
+    c.call(OP_HOOK_BIND, serde_json::to_value(key(4)).unwrap())
+        .await;
+    let rec = guard_rec_for(DecisionKind::Allow, "toolu_4", &"0f".repeat(32));
+    let a = c.call(OP_AUDIT_APPEND, json!({ "rec": rec })).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(
+        d.ctx.hooks.wait(&key(4), Some(&me()), short()).await,
+        Waited::Allow
+    );
+}
+
 #[tokio::test]
 async fn cli_connections_are_not_tracked_and_ops_are_checked() {
     let d = daemon();

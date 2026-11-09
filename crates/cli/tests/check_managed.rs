@@ -1429,6 +1429,43 @@ fn bind_carries_the_key() {
     assert_eq!(key.tool_use_id.as_deref(), Some("toolu_02"));
 }
 
+/// The record names the bound key (its `tool_use_id` and input hash), so
+/// the daemon settles that key and no other; the bind names the tool.
+#[test]
+fn record_names_the_bound_key() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let home = common::FixtureHome::new();
+    let payload = home.real(&fixture("claude/bash-allow.json"));
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
+    let seen = fake.seen();
+    let bind = seen.iter().find(|s| s.op == "hook.bind").unwrap();
+    assert_eq!(bind.args["tool"], "Bash", "{}", bind.args);
+    let rec = &seen.iter().find(|s| s.op == "audit.append").unwrap().args["rec"];
+    assert_eq!(rec["tool_use_id"], "toolu_02", "{rec}");
+    assert_eq!(rec["input_sha256"], key.input_sha256.as_str(), "{rec}");
+}
+
+/// A payload without a tool call id: the record carries the hash, and a
+/// null id is left out (the daemon then matches agent, session and hash).
+#[test]
+fn record_without_tool_use_id_carries_the_hash_only() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let project = tempfile::tempdir().unwrap();
+    let payload = bash(project.path(), "ls");
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
+    assert!(key.tool_use_id.is_none());
+    let seen = fake.seen();
+    let rec = &seen.iter().find(|s| s.op == "audit.append").unwrap().args["rec"];
+    assert!(rec.get("tool_use_id").is_none(), "{rec}");
+    assert_eq!(rec["input_sha256"], key.input_sha256.as_str(), "{rec}");
+}
+
 #[test]
 fn bind_precedes_append_on_one_connection() {
     let d = TestDaemon::prepare(&Opts::default());
@@ -1487,9 +1524,16 @@ fn poisoned_client_rebinds_on_the_new_connection() {
         .collect();
     assert_eq!(binds[0], binds[1]);
     let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
-    assert_eq!(binds[0], &serde_json::to_value(&key).unwrap());
+    let mut want = serde_json::to_value(&key).unwrap();
+    want["tool"] = "Bash".into();
+    assert_eq!(binds[0], &want);
     let append = seen.iter().find(|s| s.op == "audit.append").unwrap();
     assert_eq!(append.args["rec"]["decision"], "error_denied");
+    // The record on the new connection still names the key.
+    assert_eq!(
+        append.args["rec"]["input_sha256"],
+        key.input_sha256.as_str()
+    );
 }
 
 #[test]
@@ -1504,6 +1548,50 @@ fn unparseable_payload_still_appends_error_denied_without_bind() {
     );
     let append = &fake.seen()[2].args;
     assert_eq!(append["rec"]["decision"], "error_denied");
+}
+
+/// The co-signer's raw answer to `payload`: status line and body.
+fn cosign_post(addr: &str, payload: &str) -> (String, String) {
+    use std::io::Read;
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    write!(
+        s,
+        "POST /v1/cosign/claude HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    )
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    (
+        head.lines().next().unwrap_or("").to_string(),
+        body.to_string(),
+    )
+}
+
+/// Tasks 3 and 4 together: the hook's record names its key in full, and
+/// the real daemon's co-signer then has no objection to that call.
+#[test]
+fn an_allowed_call_is_not_denied_by_the_cosigner() {
+    let d = TestDaemon::start(Opts::default());
+    let s = d.status();
+    let addr = s["cosign"]["addr"]
+        .as_str()
+        .expect("cosign addr")
+        .to_string();
+    assert!(s["cosign"]["error"].is_null(), "{s:?}");
+    let home = common::FixtureHome::new();
+    let payload = home.real(&fixture("claude/bash-allow.json"));
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let rec = last_guard(&d);
+    assert_eq!(rec["tool_use_id"], "toolu_02", "{rec}");
+    let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
+    assert_eq!(rec["input_sha256"], key.input_sha256.as_str(), "{rec}");
+    let (status, body) = cosign_post(&addr, &payload);
+    assert!(status.contains(" 200 "), "{status}");
+    assert!(!body.contains("deny"), "{body}");
 }
 
 /// The real daemon, whether it takes the hook ops or refuses them (one
