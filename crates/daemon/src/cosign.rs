@@ -41,6 +41,8 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
+mod win;
+
 /// The one route.
 pub const COSIGN_PATH: &str = "/v1/cosign/claude";
 /// How long a request waits for the command hook's verdict, from its
@@ -172,12 +174,16 @@ pub struct CosignState {
     pub addr: Option<SocketAddr>,
     /// Why the bind fails (the latest try), until a retry binds it.
     pub error: Option<String>,
+    /// How the asker is found, when that worked at the start on a
+    /// connection to itself: `"proc_net"` (Linux), `"tcp_table"` (Windows).
+    /// `None`: not checked yet, or it failed (every call is denied).
+    pub asker: Option<&'static str>,
     fold: Folder,
 }
 
 impl CosignState {
     pub fn status(&self) -> serde_json::Value {
-        json!({"addr": self.addr.map(|a| a.to_string()), "error": self.error})
+        json!({"addr": self.addr.map(|a| a.to_string()), "error": self.error, "asker": self.asker})
     }
 }
 
@@ -304,6 +310,11 @@ pub async fn start_cosign_with(
     opts: Opts,
     retry: Retry,
 ) -> tokio::task::JoinHandle<()> {
+    let source = tokio::task::spawn_blocking(asker_source)
+        .await
+        .ok()
+        .flatten();
+    ctx.cosign.lock().unwrap_or_else(|p| p.into_inner()).asker = source;
     let e = match bind_cosign(addr) {
         Ok(l) => {
             set_bound(ctx, &l);
@@ -508,12 +519,18 @@ fn is_json(h: &http::HeaderMap) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
 }
 
-/// Who asks: the uid of the client's socket, on Linux from `/proc/net`,
-/// on macOS from `net.inet.tcp.pcblist_n` (`asker_macos`). Elsewhere a
-/// TCP peer is not identified (W13), and every principal's verdict counts.
+/// Who asks: on Linux the uid of the client's socket, from `/proc/net`; on
+/// macOS from `net.inet.tcp.pcblist_n` (`asker_macos`); on Windows the pid
+/// that owns it ([`Asker::Process`]). Elsewhere a TCP peer is not identified
+/// (W13), and every principal's verdict counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Asker {
     Known(Principal),
+    /// Windows: the pid that owns the client's socket (`GetExtendedTcpTable`).
+    /// The service cannot read that process's token (plan 21, D2), so the
+    /// principal is the binding hook connection's, and the binder must run
+    /// under this pid ([`crate::hooks::ASKER_MAX_DEPTH`]).
+    Process(u32),
     Unscoped,
     /// The socket could not be found: denied.
     Unknown,
@@ -540,6 +557,9 @@ async fn asker(opts: Opts, local: Option<SocketAddr>, peer: SocketAddr) -> Asker
     if let Some(f) = opts.peer_uid {
         let _ = local;
         return known(f(peer));
+    }
+    if cfg!(windows) {
+        return win::asker(local, peer).await;
     }
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Asker::Unscoped;
@@ -610,6 +630,38 @@ pub mod asker_macos {
         let me = saiife_darwin::proc_info(std::process::id())?.uid;
         let got = saiife_darwin::tcp_peer_uid_checked(server, peer).ok()??;
         (got == me).then_some(SOURCE)
+/// How this system finds the asker, when that works on a connection the
+/// daemon makes to itself; `None` when it does not (or there is none here).
+fn asker_source() -> Option<&'static str> {
+    if cfg!(windows) {
+        let me = std::process::id();
+        return self_connection(|local, peer| win::owner_pid(local, peer) == Some(me))
+            .then_some("tcp_table");
+    }
+    if cfg!(target_os = "linux") {
+        return self_connection(|local, peer| {
+            crate::mcp_gateway::tcp_peer_socket(local, peer).is_some()
+        })
+        .then_some("proc_net");
+    }
+    None
+}
+
+/// `check(local, peer)` on a loopback connection of this process to itself,
+/// as the co-signer sees one it accepted.
+fn self_connection(check: impl FnOnce(SocketAddr, SocketAddr) -> bool) -> bool {
+    let Ok(l) = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) else {
+        return false;
+    };
+    let Ok(local) = l.local_addr() else {
+        return false;
+    };
+    let Ok(_client) = std::net::TcpStream::connect(local) else {
+        return false;
+    };
+    match l.accept() {
+        Ok((_server, peer)) => check(local, peer),
+        Err(_) => false,
     }
 }
 
@@ -707,14 +759,15 @@ async fn judge(ctx: &Arc<Ctx>, opts: Opts, arrival: Instant, call: &Call, who: &
     if !call.key.cosignable() {
         return denied(ctx, CosignDeny::NotCosignable, who, Some(call)).await;
     }
-    let principal = match who {
-        Asker::Known(p) => Some(p),
-        Asker::Unscoped => None,
+    let (principal, asker_pid) = match who {
+        Asker::Known(p) => (Some(p), None),
+        Asker::Process(pid) => (None, Some(*pid)),
+        Asker::Unscoped => (None, None),
         Asker::Unknown => return denied(ctx, CosignDeny::NoReport, who, Some(call)).await,
     };
     match ctx
         .hooks
-        .wait(&call.key, principal, arrival + opts.wait)
+        .wait(&call.key, principal, asker_pid, arrival + opts.wait)
         .await
     {
         Waited::Allow => no_opinion(),
@@ -1223,6 +1276,137 @@ mod tests {
         ask(&ctx, Instant::now(), a, &Asker::Unscoped).await;
         ask(&ctx, Instant::now(), b, &Asker::Unscoped).await;
         assert_eq!(wait_records(t.path(), 5).len(), 5);
+    }
+
+    /// A hook connection of `pid`, as a Windows pipe client: begins, binds
+    /// `body`'s key and records `decision`.
+    #[cfg(unix)]
+    fn hook_says(ctx: &Ctx, conn: u64, pid: u32, body: &str, decision: DecisionKind) {
+        use crate::hooks::{ConnId, Verdict};
+        let peer = saiife_ipc::peer::PeerCred {
+            uid: 4242,
+            gid: 4242,
+            pid,
+            sid: Some("S-1-5-21-1-2-3-1001".into()),
+            group_sids: Vec::new(),
+        };
+        let key = parse(body.as_bytes()).unwrap().key;
+        assert!(ctx
+            .hooks
+            .begin(ConnId(conn), &peer, "claude", Some("PreToolUse")));
+        assert!(ctx.hooks.bind(ConnId(conn), key.clone()));
+        ctx.hooks
+            .verdict(ConnId(conn), &Verdict::for_key(&key, decision));
+    }
+
+    /// Claude Code (100) under 50 under 10, its shell (200), the hook (777);
+    /// another branch (900).
+    #[cfg(unix)]
+    fn fake_tree() -> crate::hooks::Tree {
+        use saiife_win::proc::ProcEntry;
+        let e = |pid, ppid| ProcEntry {
+            pid,
+            ppid,
+            exe: format!("p{pid}.exe"),
+        };
+        let t = vec![
+            e(10, 4),
+            e(50, 10),
+            e(100, 50),
+            e(200, 100),
+            e(777, 200),
+            e(900, 50),
+        ];
+        Arc::new(move || Ok(t.clone()))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn foreign_tree_is_denied() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        ctx.hooks.set_tree(fake_tree());
+        let body = payload("toolu_1", "ls");
+        hook_says(&ctx, 1, 777, &body, DecisionKind::Allow);
+        // Another branch, and an ancestor 4 steps up: the hook is not theirs.
+        for asker in [900, 10, 777, 4] {
+            let start = Instant::now();
+            let r = ask(&ctx, start, body.clone(), &Asker::Process(asker)).await;
+            assert!(start.elapsed() < Duration::from_secs(1), "at once");
+            assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport), "{asker}");
+        }
+        let got = wait_records(t.path(), 1);
+        assert_eq!(got.len(), 1, "folded per reason: {got:?}");
+        assert_eq!(got[0].reason.as_deref(), Some(CosignDeny::NoReport.text()));
+        // The asker is a pid, not a principal: no session or input kept.
+        assert_eq!(got[0].session, None);
+        assert_eq!(got[0].input, "");
+        // A process table that cannot be read ties nothing.
+        ctx.hooks
+            .set_tree(Arc::new(|| Err(io::Error::other("no table"))));
+        let r = ask(&ctx, Instant::now(), body.clone(), &Asker::Process(100)).await;
+        assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn hook_under_the_asker_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        ctx.hooks.set_tree(fake_tree());
+        let allowed = payload("toolu_1", "ls");
+        hook_says(&ctx, 1, 777, &allowed, DecisionKind::Allow);
+        // Claude Code, 2 steps up; its parent, 3 steps up (the depth cap).
+        for asker in [100, 50] {
+            let r = ask(
+                &ctx,
+                Instant::now(),
+                allowed.clone(),
+                &Asker::Process(asker),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(body_of(r).await, "", "{asker}");
+        }
+        let denied = payload("toolu_2", "rm -rf /");
+        hook_says(&ctx, 2, 777, &denied, DecisionKind::Deny);
+        let r = ask(&ctx, Instant::now(), denied, &Asker::Process(100)).await;
+        assert_eq!(body_of(r).await, deny_body(CosignDeny::Denied));
+        // The request may come before the bind: it waits, then ties.
+        let later = payload("toolu_3", "ls");
+        let ctx2 = Arc::clone(&ctx);
+        let l2 = later.clone();
+        let w = tokio::spawn(async move {
+            body_of(ask(&ctx2, Instant::now(), l2, &Asker::Process(100)).await).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hook_says(&ctx, 3, 777, &later, DecisionKind::Allow);
+        assert_eq!(w.await.unwrap(), "");
+    }
+
+    #[test]
+    fn self_connection_sees_both_ends() {
+        let mut seen = None;
+        assert!(self_connection(|local, peer| {
+            seen = Some((local, peer));
+            true
+        }));
+        let (local, peer) = seen.unwrap();
+        assert!(local.ip().is_loopback() && peer.ip().is_loopback());
+        assert_ne!(local.port(), peer.port());
+        assert!(!self_connection(|_, _| false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn asker_source_on_linux_is_proc_net() {
+        assert_eq!(asker_source(), Some("proc_net"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn asker_source_on_windows_is_tcp_table() {
+        assert_eq!(asker_source(), Some("tcp_table"));
     }
 
     #[cfg(windows)]

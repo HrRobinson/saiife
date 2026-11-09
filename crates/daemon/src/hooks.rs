@@ -19,6 +19,7 @@
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::hookkey::HookKey;
 use saiife_ipc::peer::PeerCred;
+use saiife_win::proc::{is_descendant, ProcEntry};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,6 +38,10 @@ pub const HOOK_OVERRUN: Duration = Duration::from_secs(10);
 pub const VERDICT_TTL: Duration = Duration::from_secs(60);
 /// The most keys kept; the oldest is dropped first.
 pub const MAX_KEYS: usize = 4096;
+/// Windows (plan 21, D2): the hook that bound a call is at most this many
+/// parent steps under the process that sent the co-sign request (Claude Code,
+/// then Git Bash or PowerShell, then `saiife.exe`; 1 in exec form).
+pub const ASKER_MAX_DEPTH: usize = 3;
 /// The `reason` of a `no_verdict` record.
 pub const NO_VERDICT_REASON: &str =
     "the hook ended without a verdict (killed, crashed or timed out)";
@@ -83,8 +88,9 @@ pub enum Waited {
     NoVerdict,
     /// Nothing by the deadline.
     Timeout,
-    /// The key was bound by another principal than the one waiting: no
-    /// allow for the waiter.
+    /// The key was bound by another principal than the one waiting, or
+    /// (Windows) by a process that is not under the asker: no allow for the
+    /// waiter.
     Foreign,
 }
 
@@ -195,6 +201,28 @@ pub struct NoVerdict {
 /// table's lock held, from a tokio task or a connection's end.
 pub type Sink = Box<dyn Fn(NoVerdict) + Send + Sync>;
 
+/// The process table [`HookTable::wait`] walks to tie a binder to its asker
+/// (Windows: `saiife_win::ffi::proc::snapshot`). Tests give a fake one.
+pub type Tree = Arc<dyn Fn() -> std::io::Result<Vec<ProcEntry>> + Send + Sync>;
+
+/// The process table of this system: a Toolhelp snapshot on Windows. No
+/// other system ties a co-sign request to a process, so there it is an
+/// error, and a wait that needs it sees [`Waited::Foreign`].
+#[cfg(windows)]
+fn system_tree() -> Tree {
+    Arc::new(saiife_win::ffi::proc::snapshot)
+}
+
+#[cfg(not(windows))]
+fn system_tree() -> Tree {
+    Arc::new(|| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no process tree check on this system",
+        ))
+    })
+}
+
 /// The longest `tool_use_id` kept in a record, in bytes (`hook.bind`'s own
 /// limit).
 pub const MAX_RECORDED_ID: usize = 256;
@@ -271,6 +299,10 @@ struct Slot {
     /// Who bound it first; only connections of this principal may bind
     /// it again or settle it, and only its waiters may see its outcome.
     principal: Principal,
+    /// The pid of the connection that bound it last (each connection's
+    /// first bind sets it, and clears the outcome): the hook whose verdict
+    /// counts. Windows ties it to the asker's process tree.
+    pid: u32,
     outcome: Option<Waited>,
     /// Verdicts given on this key, so a grace period sees a later one.
     verdicts: u64,
@@ -314,6 +346,7 @@ struct Inner {
     sink: Sink,
     /// Fired whenever a key is added, for waiters on a key not seen yet.
     added: Arc<Notify>,
+    tree: Mutex<Tree>,
 }
 
 impl Inner {
@@ -430,8 +463,15 @@ impl HookTable {
                 state: Mutex::default(),
                 sink,
                 added: Arc::new(Notify::new()),
+                tree: Mutex::new(system_tree()),
             }),
         }
+    }
+
+    /// Tests only: walk `tree` in place of the system's process table.
+    #[doc(hidden)]
+    pub fn set_tree(&self, tree: Tree) {
+        *self.inner.tree.lock().unwrap_or_else(|p| p.into_inner()) = tree;
     }
 
     /// `hook.begin` on `conn`; `false` when the connection already sent it.
@@ -501,14 +541,14 @@ impl HookTable {
         // Expired keys go first: an old slot of another principal must not
         // refuse a fresh bind.
         st.prune(now);
-        let (principal, first) = match st.conns.get(&conn) {
+        let (principal, pid, first) = match st.conns.get(&conn) {
             // One key per connection: a second key would let one
             // connection add slots and evict other users' keys.
             Some(o) if o.done => return Err(BindRefused::Ended),
             Some(o) if o.key.as_ref().is_some_and(|k| *k != key) => {
                 return Err(BindRefused::OtherKey)
             }
-            Some(o) => (o.principal.clone(), o.key.is_none()),
+            Some(o) => (o.principal.clone(), o.peer.pid, o.key.is_none()),
             None => return Err(BindRefused::NotBegun),
         };
         if st.keys.get(&key).is_some_and(|s| s.principal != principal) {
@@ -525,6 +565,7 @@ impl HookTable {
         if first {
             if let Some(s) = st.keys.get_mut(&key) {
                 s.outcome = None;
+                s.pid = pid;
             }
         }
         if !st.keys.contains_key(&key) {
@@ -532,6 +573,7 @@ impl HookTable {
                 key.clone(),
                 Slot {
                     principal,
+                    pid,
                     outcome: None,
                     verdicts: 0,
                     at: now,
@@ -600,24 +642,49 @@ impl HookTable {
     /// (tokio's clock). A key bound by another principal is
     /// [`Waited::Foreign`] at once. `None` takes any principal's verdict:
     /// for a caller that cannot tell who asks.
+    ///
+    /// `asker_pid` (Windows, plan 21 D2): the pid that owns the co-sign
+    /// request's socket. The key's binder must then be a descendant of it,
+    /// at most [`ASKER_MAX_DEPTH`] parent steps down, or the wait is
+    /// [`Waited::Foreign`]. The process table is read once per binder (so
+    /// once per wait, unless the key is bound again), on a blocking thread,
+    /// as soon as the key is bound: while the hook still runs. A table that
+    /// cannot be read ties nothing.
     pub async fn wait(
         &self,
         key: &HookKey,
         principal: Option<&Principal>,
+        asker_pid: Option<u32>,
         until: Instant,
     ) -> Waited {
         let foreign = |s: &Slot| principal.is_some_and(|p| s.principal != *p);
+        // The binder this wait has tied to the asker.
+        let mut tied: Option<u32> = None;
         loop {
+            let untied = |s: &Slot| asker_pid.is_some() && tied != Some(s.pid);
             let notify = {
                 let st = self.inner.lock();
                 match st.keys.get(key) {
                     Some(s) if foreign(s) => return Waited::Foreign,
+                    Some(s) if untied(s) => Err(s.pid),
                     Some(Slot {
                         outcome: Some(o), ..
                     }) => return *o,
-                    Some(s) => Arc::clone(&s.notify),
-                    None => Arc::clone(&self.inner.added),
+                    Some(s) => Ok(Arc::clone(&s.notify)),
+                    None => Ok(Arc::clone(&self.inner.added)),
                 }
+            };
+            let notify = match notify {
+                Ok(n) => n,
+                // Only a wait with an asker pid ties (pid 0 is no one's).
+                Err(binder) => match self.tie(asker_pid.unwrap_or(0), binder, until).await {
+                    Some(true) => {
+                        tied = Some(binder);
+                        continue;
+                    }
+                    Some(false) => return Waited::Foreign,
+                    None => return Waited::Timeout,
+                },
             };
             let woken = notify.notified();
             tokio::pin!(woken);
@@ -627,7 +694,7 @@ impl HookTable {
                 let st = self.inner.lock();
                 woken.as_mut().enable();
                 match st.keys.get(key) {
-                    Some(s) if foreign(s) => return Waited::Foreign,
+                    Some(s) if foreign(s) || untied(s) => continue,
                     Some(Slot {
                         outcome: Some(o), ..
                     }) => return *o,
@@ -639,10 +706,23 @@ impl HookTable {
             if tokio::time::timeout_at(until, woken).await.is_err() {
                 let st = self.inner.lock();
                 return match st.keys.get(key) {
-                    Some(s) if foreign(s) => Waited::Foreign,
+                    Some(s) if foreign(s) || untied(s) => Waited::Foreign,
                     s => s.and_then(|s| s.outcome).unwrap_or(Waited::Timeout),
                 };
             }
+        }
+    }
+
+    /// Whether `binder` runs under `asker` ([`ASKER_MAX_DEPTH`]), from one
+    /// read of the process table on a blocking thread; `None` past `until`.
+    async fn tie(&self, asker: u32, binder: u32, until: Instant) -> Option<bool> {
+        let tree = Arc::clone(&self.inner.tree.lock().unwrap_or_else(|p| p.into_inner()));
+        let walk = tokio::task::spawn_blocking(move || {
+            tree().is_ok_and(|snap| is_descendant(&snap, asker, binder, ASKER_MAX_DEPTH))
+        });
+        match tokio::time::timeout_at(until, walk).await {
+            Ok(r) => Some(r.unwrap_or(false)),
+            Err(_) => None,
         }
     }
 
@@ -709,7 +789,8 @@ mod tests {
     impl HookTable {
         /// [`HookTable::wait`] as the principal of [`peer`].
         async fn wait_me(&self, key: &HookKey, until: Instant) -> Waited {
-            self.wait(key, Some(&Principal::of(&peer())), until).await
+            self.wait(key, Some(&Principal::of(&peer())), None, until)
+                .await
         }
     }
 
@@ -1008,13 +1089,13 @@ mod tests {
         let start = Instant::now();
         let them = Principal::of(&other());
         let w = t
-            .wait(&key(1), Some(&them), start + Duration::from_secs(8))
+            .wait(&key(1), Some(&them), None, start + Duration::from_secs(8))
             .await;
         assert_eq!(w, Waited::Foreign);
         assert_eq!(start.elapsed(), Duration::ZERO, "at once");
         // A waiter on a key not bound yet sees foreign once it is bound.
         let waiter = async {
-            t.wait(&key(2), Some(&them), start + Duration::from_secs(8))
+            t.wait(&key(2), Some(&them), None, start + Duration::from_secs(8))
                 .await
         };
         let hook = async {
@@ -1025,7 +1106,9 @@ mod tests {
         let (w, ()) = tokio::join!(waiter, hook);
         assert_eq!(w, Waited::Foreign);
         // `None` takes any principal's verdict.
-        let w = t.wait(&key(1), None, start + Duration::from_secs(8)).await;
+        let w = t
+            .wait(&key(1), None, None, start + Duration::from_secs(8))
+            .await;
         assert_eq!(w, Waited::Allow);
     }
 
@@ -1094,7 +1177,10 @@ mod tests {
         assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
         let them = Principal::of(&other());
         t.verdict(ConnId(2), &Verdict::for_key(&key(0), DecisionKind::Deny));
-        assert_eq!(t.wait(&key(0), Some(&them), until).await, Waited::Deny);
+        assert_eq!(
+            t.wait(&key(0), Some(&them), None, until).await,
+            Waited::Deny
+        );
     }
 
     #[tokio::test(start_paused = true)]

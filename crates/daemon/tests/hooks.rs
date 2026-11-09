@@ -223,7 +223,7 @@ async fn bound_hook_that_drops_is_recorded_after_the_grace() {
     let start = tokio::time::Instant::now();
     let until = start + RECONNECT_GRACE + Duration::from_secs(2);
     assert_eq!(
-        d.ctx.hooks.wait(&key(1), Some(&me()), until).await,
+        d.ctx.hooks.wait(&key(1), Some(&me()), None, until).await,
         Waited::NoVerdict
     );
     assert!(start.elapsed() >= RECONNECT_GRACE - Duration::from_millis(100));
@@ -255,7 +255,7 @@ async fn a_verdict_writes_no_hook_record() {
     drop(c);
     let until = tokio::time::Instant::now() + Duration::from_secs(1);
     assert_eq!(
-        d.ctx.hooks.wait(&key(2), Some(&me()), until).await,
+        d.ctx.hooks.wait(&key(2), Some(&me()), None, until).await,
         Waited::Allow
     );
     // A denied call on another connection settles its key as a deny.
@@ -270,7 +270,7 @@ async fn a_verdict_writes_no_hook_record() {
     .await;
     drop(c);
     assert_eq!(
-        d.ctx.hooks.wait(&key(3), Some(&me()), until).await,
+        d.ctx.hooks.wait(&key(3), Some(&me()), None, until).await,
         Waited::Deny
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -334,7 +334,7 @@ async fn only_an_append_naming_the_key_settles_it() {
         let a = c.call(OP_AUDIT_APPEND, args.clone()).await;
         assert_eq!(a["ok"], true, "the record is still written: {a}");
         assert_eq!(
-            d.ctx.hooks.wait(&key(n), Some(&me()), short()).await,
+            d.ctx.hooks.wait(&key(n), Some(&me()), None, short()).await,
             Waited::Timeout,
             "{args}"
         );
@@ -352,7 +352,7 @@ async fn only_an_append_naming_the_key_settles_it() {
         .await;
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(
-        d.ctx.hooks.wait(&key(4), Some(&me()), short()).await,
+        d.ctx.hooks.wait(&key(4), Some(&me()), None, short()).await,
         Waited::Allow
     );
     let written = guard_texts(&d.audit);
@@ -414,11 +414,11 @@ async fn one_key_per_connection_and_a_rebind_clears_the_outcome() {
         .await;
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(
-        d.ctx.hooks.wait(&key(11), Some(&me()), short()).await,
+        d.ctx.hooks.wait(&key(11), Some(&me()), None, short()).await,
         Waited::Allow
     );
     assert_eq!(
-        d.ctx.hooks.wait(&key(12), Some(&me()), short()).await,
+        d.ctx.hooks.wait(&key(12), Some(&me()), None, short()).await,
         Waited::Timeout
     );
     drop(c);
@@ -427,7 +427,7 @@ async fn one_key_per_connection_and_a_rebind_clears_the_outcome() {
     let a = c.call(OP_HOOK_BIND, bind(11)).await;
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(
-        d.ctx.hooks.wait(&key(11), Some(&me()), short()).await,
+        d.ctx.hooks.wait(&key(11), Some(&me()), None, short()).await,
         Waited::Timeout,
         "the old allow no longer answers"
     );
@@ -437,7 +437,7 @@ async fn one_key_per_connection_and_a_rebind_clears_the_outcome() {
     )
     .await;
     assert_eq!(
-        d.ctx.hooks.wait(&key(11), Some(&me()), short()).await,
+        d.ctx.hooks.wait(&key(11), Some(&me()), None, short()).await,
         Waited::Deny
     );
 }
