@@ -66,12 +66,19 @@
 //!
 //! The two ways to load treat a rule for another OS differently:
 //! - The shipped packs ([`crate::builtins::Catalog`]) skip it unread, so its
-//!   regex is not compiled. A hook compiles its packs on every call. Tests pin
+//!   regex is not compiled. A hook loads its packs on every call. Tests pin
 //!   exactly which shipped rules are marked.
 //! - Anything else ([`load_pack_str`], [`load_pack_for`], [`load_packs_dir`])
 //!   checks it like any other rule, compiling it, and then leaves it out with a
 //!   [`PackWarning`] that names it. So a marker cannot hide a broken rule, and
 //!   a deny that is not in force on this host is never left out silently.
+//!
+//! The built-in packs are not parsed at run time: `build.rs` turns
+//! `packs/*.toml` into Rust data (`crate::pack_raw`). On a hook's path
+//! (`Catalog::load_active`) their rule regexes are compiled when a command
+//! first reaches the rule (`Compile::OnFirstUse`), and that compile time is
+//! not counted against the engine's budget (`budget_elapsed`). A pack from
+//! `policy.d` is parsed and fully compiled at load, as before.
 
 use std::cell::Cell;
 use std::fs;
@@ -83,16 +90,11 @@ use serde::Deserialize;
 
 use crate::canon::PathStyle;
 use crate::getopt::{Opt, OwnedSpec};
-use crate::pathrule::{validate_ancestors, validate_glob, PathRule, RuleAccess};
+use crate::pathrule::{validate_ancestors, validate_glob, PathRule};
 use crate::prefilter::Prefilter;
 
-/// `platform` of a rule: the one kind of host it applies on. A value not
-/// listed here fails the pack's load; it never means "everywhere" or "nowhere".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RulePlatform {
-    Windows,
-}
+pub use crate::pack_raw::{OperandSyntax, RulePlatform};
+use crate::pack_raw::{RawPackFile, RawPathRule, RawRule, Str};
 
 impl RulePlatform {
     fn applies_on(self, style: PathStyle) -> bool {
@@ -116,7 +118,9 @@ pub struct Rule {
     /// Optional; a rule without one cannot be put under `ask`.
     pub id: Option<String>,
     pub pattern: String,
-    pub regex: Regex,
+    /// `pattern` compiled: at load, or on the first match for a built-in
+    /// pack on a hook's path ([`Compile::OnFirstUse`]).
+    pub(crate) regex: RuleRegex,
     pub reason: String,
     /// Match against the whole segment (wrappers such as `env`/`sudo` and
     /// leading `NAME=value` assignments included) instead of the effective
@@ -145,6 +149,112 @@ pub struct Rule {
     /// reads the operands with getopt, so option values (`pkill -u 0
     /// node`, `--signal 9`) are not operands.
     pub table: Option<WhenOption>,
+}
+
+impl Rule {
+    /// Does the rule's pattern match `line`? A pattern compiled on first use
+    /// that does not compile never matches, as a rule dropped at load would
+    /// not (the tests compile every built-in rule).
+    pub fn is_match(&self, line: &str) -> bool {
+        self.regex
+            .get(&self.pattern)
+            .is_some_and(|re| re.is_match(line))
+    }
+
+    /// The compiled pattern (compiled now, if it was not yet); `None` if it
+    /// does not compile.
+    pub fn regex(&self) -> Option<&Regex> {
+        self.regex.get(&self.pattern)
+    }
+
+    /// The pattern is compiled already.
+    pub fn is_compiled(&self) -> bool {
+        self.regex.0.get().is_some()
+    }
+}
+
+/// When a pack's rule regexes are compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Compile {
+    /// At load: a pattern that does not compile drops its rule, with a
+    /// warning.
+    Now,
+    /// On the rule's first match: only the rules a command reaches are
+    /// compiled. For the built-in packs on a hook's path only, whose every
+    /// pattern the tests compile (`all_builtins_load_clean`).
+    OnFirstUse,
+}
+
+/// A rule's regex, compiled once; clones share it (a pack copied for
+/// `[guard] ask` does not compile its rules again).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuleRegex(std::sync::Arc<std::sync::OnceLock<Option<Regex>>>);
+
+impl RuleRegex {
+    fn compiled(re: Regex) -> Self {
+        Self(std::sync::Arc::new(std::sync::OnceLock::from(Some(re))))
+    }
+
+    /// The regex of `pattern`, compiled now if it was not yet. The time a
+    /// compile takes is not the engine's: see [`budget_elapsed`].
+    fn get(&self, pattern: &str) -> Option<&Regex> {
+        self.0
+            .get_or_init(|| {
+                let began = Instant::now();
+                let re = Regex::new(pattern).ok();
+                note_compile(began, began.elapsed());
+                re
+            })
+            .as_ref()
+    }
+}
+
+/// Most compiles [`budget_elapsed`] remembers on one thread. One evaluation
+/// compiles each built-in rule at most once, far fewer than this.
+const COMPILE_LOG: usize = 4096;
+
+type CompileLog = std::cell::RefCell<std::collections::VecDeque<(Instant, Duration)>>;
+
+thread_local! {
+    /// The regexes compiled on first use on this thread: when each began,
+    /// and the total compile time before it. Oldest first.
+    static COMPILES: CompileLog = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    /// The total compile time of [`COMPILES`] so far.
+    static COMPILED_FOR: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+/// Remember that a regex compiled on first use took `took` from `began`.
+pub(crate) fn note_compile(began: Instant, took: Duration) {
+    let before = COMPILED_FOR.with(|t| t.replace(t.get() + took));
+    COMPILES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() == COMPILE_LOG {
+            c.pop_front();
+        }
+        c.push_back((began, before));
+    });
+}
+
+/// The time since `start` that counts against an engine's latency budget:
+/// all of it but what this thread spent since then compiling rule regexes on
+/// first use. Compiling a rule at load never counted, so compiling it later
+/// must not either: a command is judged as it was when every rule was
+/// compiled up front.
+pub(crate) fn budget_elapsed(start: Instant) -> Duration {
+    let elapsed = start.elapsed();
+    let total = COMPILED_FOR.with(Cell::get);
+    if total.is_zero() {
+        return elapsed;
+    }
+    let before = COMPILES.with(|c| {
+        let c = c.borrow();
+        let at = c.partition_point(|(began, _)| *began < start);
+        c.get(at).map(|(_, before)| *before)
+    });
+    match before {
+        Some(before) => elapsed.saturating_sub(total - before),
+        None => elapsed,
+    }
 }
 
 /// `when_option`, `command_options` and `command_long_options` of a rule.
@@ -446,17 +556,6 @@ impl WhenOption {
     }
 }
 
-/// How a command reads its operands as patterns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OperandSyntax {
-    /// A regular expression searched in the name (`pkill`, `killall -r`).
-    Regex,
-    /// A shell glob matched against the whole name (`systemctl`); only
-    /// operands with `*`, `?` or `[` are read as patterns.
-    Glob,
-}
-
 /// `operand_match` and `operand_targets` of a rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperandMatch {
@@ -733,8 +832,9 @@ pub struct Pack {
 #[derive(Debug)]
 struct LazyRules {
     source: &'static str,
-    toml: &'static str,
+    src: Shipped,
     style: PathStyle,
+    compile: Compile,
     has_deny: bool,
     rules: std::sync::OnceLock<(Vec<Rule>, Vec<Rule>)>,
 }
@@ -746,12 +846,27 @@ impl LazyRules {
             // `load_all` (eager) reports it, and the tests keep every
             // built-in loading clean.
             let mut warnings = Vec::new();
-            match load_shipped(self.source, self.toml, self.style, &mut warnings) {
+            match load_shipped(
+                self.source,
+                self.src,
+                self.style,
+                self.compile,
+                &mut warnings,
+            ) {
                 Ok(p) => (p.allow, p.deny),
                 Err(_) => (Vec::new(), Vec::new()),
             }
         })
     }
+}
+
+/// A shipped pack, as a catalog holds it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Shipped {
+    /// TOML text (a test's catalog), parsed on each load.
+    Toml(&'static str),
+    /// A built-in pack: the data `build.rs` made from `packs/*.toml`.
+    Data(&'static RawPackFile),
 }
 
 impl Pack {
@@ -867,105 +982,7 @@ pub enum PackError {
     NoRules,
 }
 
-// ---- Raw (deserialized) shape ------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct RawPackFile {
-    pack: RawMeta,
-    #[serde(default)]
-    allow: Vec<RawRule>,
-    #[serde(default)]
-    deny: Vec<RawRule>,
-    #[serde(default)]
-    allow_path: Vec<RawPathRule>,
-    #[serde(default)]
-    deny_path: Vec<RawPathRule>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawMeta {
-    id: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default = "default_true")]
-    default_on: bool,
-    #[serde(default = "default_version")]
-    version: u32,
-    #[serde(default)]
-    triggers: Vec<String>,
-    #[serde(default)]
-    windows_triggers: Vec<String>,
-    #[serde(default = "default_true")]
-    substitution_failsafe: bool,
-    /// Compile the rules on first use (a catalog load; see [`Pack::lazy`]).
-    #[serde(default)]
-    #[allow(dead_code)] // read by `peek_header`
-    lazy: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRule {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    platform: Option<RulePlatform>,
-    pattern: String,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    whole_segment: bool,
-    #[serde(default)]
-    after_env_change: bool,
-    #[serde(default)]
-    peeled_wrappers: bool,
-    #[serde(default)]
-    operand_match: Option<OperandSyntax>,
-    #[serde(default)]
-    operand_targets: Vec<String>,
-    #[serde(default)]
-    when_option: Vec<String>,
-    #[serde(default)]
-    command_options: Option<String>,
-    #[serde(default)]
-    command_long_options: Vec<String>,
-    #[serde(default)]
-    command_signal_word: bool,
-    #[serde(default)]
-    command_long_only: bool,
-    #[serde(default)]
-    when_no_operand: bool,
-    #[serde(default)]
-    target_options: Vec<String>,
-    #[serde(default)]
-    operand_match_share: Option<f64>,
-    #[serde(default)]
-    operand_min_len: usize,
-    #[serde(default)]
-    operand_substitution: bool,
-    #[serde(default)]
-    no_redirections: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPathRule {
-    #[serde(default)]
-    platform: Option<RulePlatform>,
-    glob: String,
-    #[serde(default = "default_access")]
-    access: RuleAccess,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    ancestors: bool,
-}
-
-fn default_access() -> RuleAccess {
-    RuleAccess::Any
-}
+// ---- Raw (deserialized) shape: `crate::pack_raw` ---------------------------
 
 fn default_true() -> bool {
     true
@@ -982,6 +999,9 @@ struct HostFilter {
     /// A shipped pack on a hook's path: skip the rule unread. Otherwise check
     /// it in full and warn that it was left out.
     shipped: bool,
+    /// When the rule regexes are compiled ([`Compile::OnFirstUse`] for a
+    /// built-in pack only).
+    compile: Compile,
     /// Rules left out for another OS, so far.
     left_out: usize,
     /// Rules with a `platform` marker, so far.
@@ -1026,7 +1046,7 @@ fn warn_left_out(
 /// without telling the user why). `require_reason` distinguishes deny vs allow.
 fn compile_rules(
     source: &str,
-    raw: Vec<RawRule>,
+    raw: &[RawRule],
     require_reason: bool,
     filter: &mut HostFilter,
     warnings: &mut Vec<PackWarning>,
@@ -1038,7 +1058,7 @@ fn compile_rules(
     } else {
         "allow rule"
     };
-    for mut r in raw {
+    for r in raw {
         let platform = r.platform;
         let here = filter.notes(platform);
         if !here && filter.shipped {
@@ -1046,8 +1066,9 @@ fn compile_rules(
         }
         // A bad or repeated id is dropped, never the rule (that would
         // fail open).
-        if let Some(id) = r.id.take() {
-            if !valid_rule_id(&id) {
+        let mut rule_id = None;
+        if let Some(id) = &r.id {
+            if !valid_rule_id(id) {
                 warnings.push(PackWarning {
                     source: source.to_string(),
                     message: format!(
@@ -1061,11 +1082,11 @@ fn compile_rules(
                     message: format!("rule {:?}: id {id:?} ignored (used twice)", r.pattern),
                 });
             } else {
-                r.id = Some(id);
+                rule_id = Some(id.to_string());
             }
         }
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
-            return Err(PackError::MissingReason(r.pattern));
+            return Err(PackError::MissingReason(r.pattern.to_string()));
         }
         let share_ok = r.operand_match_share.is_none_or(|x| x > 0.0 && x <= 1.0);
         let extras =
@@ -1078,7 +1099,7 @@ fn compile_rules(
                     .map_or(1, |x| ((x * n as f64).ceil() as usize).clamp(1, n));
                 Some(OperandMatch {
                     syntax,
-                    targets: r.operand_targets,
+                    targets: owned(&r.operand_targets),
                     need,
                     min_len: r.operand_min_len,
                     substitution: r.operand_substitution,
@@ -1107,22 +1128,22 @@ fn compile_rules(
         let table = match (gates, has_table) {
             (false, false) if r.target_options.is_empty() => None,
             (_, true) if table_use_ok => {
-                let names_ok = r.when_option.iter().chain(&r.target_options).all(|n| {
+                let names_ok = r.when_option.iter().chain(&*r.target_options).all(|n| {
                     n.strip_prefix("--").is_some_and(|l| !l.is_empty())
                         || n.strip_prefix('-').is_some_and(|s| s.chars().count() == 1)
                 });
                 let spec = OwnedSpec::parse(
                     r.command_options.as_deref().unwrap_or(""),
-                    &r.command_long_options,
+                    &owned(&r.command_long_options),
                 );
                 match spec {
                     Ok(spec) if names_ok => Some(WhenOption {
                         spec,
-                        names: r.when_option,
+                        names: owned(&r.when_option),
                         signal_word: r.command_signal_word,
                         long_only: r.command_long_only,
                         no_operand: r.when_no_operand,
-                        targets: r.target_options,
+                        targets: owned(&r.target_options),
                     }),
                     Ok(_) => {
                         warnings.push(PackWarning {
@@ -1158,28 +1179,43 @@ fn compile_rules(
             }
         };
         let when_option = table.clone().filter(|_| gates);
-        match Regex::new(&r.pattern) {
-            Ok(_) if !here => warn_left_out(source, kind, &r.pattern, platform, warnings),
-            Ok(regex) => out.push(Rule {
-                id: r.id,
-                when_option,
-                table,
-                pattern: r.pattern,
-                regex,
-                reason: r.reason.unwrap_or_default(),
-                whole_segment: r.whole_segment,
-                after_env_change: r.after_env_change,
-                peeled_wrappers: r.peeled_wrappers,
-                no_redirections: r.no_redirections,
-                operands,
-            }),
-            Err(e) => warnings.push(PackWarning {
-                source: source.to_string(),
-                message: format!("skipping uncompilable regex {:?}: {e}", r.pattern),
-            }),
-        }
+        let regex = match filter.compile {
+            // A rule for another OS is never compiled here (`shipped`).
+            Compile::OnFirstUse => RuleRegex::default(),
+            Compile::Now => match Regex::new(&r.pattern) {
+                Ok(_) if !here => {
+                    warn_left_out(source, kind, &r.pattern, platform, warnings);
+                    continue;
+                }
+                Ok(regex) => RuleRegex::compiled(regex),
+                Err(e) => {
+                    warnings.push(PackWarning {
+                        source: source.to_string(),
+                        message: format!("skipping uncompilable regex {:?}: {e}", r.pattern),
+                    });
+                    continue;
+                }
+            },
+        };
+        out.push(Rule {
+            id: rule_id,
+            when_option,
+            table,
+            pattern: r.pattern.to_string(),
+            regex,
+            reason: r.reason.as_deref().unwrap_or_default().to_string(),
+            whole_segment: r.whole_segment,
+            after_env_change: r.after_env_change,
+            peeled_wrappers: r.peeled_wrappers,
+            no_redirections: r.no_redirections,
+            operands,
+        });
     }
     Ok(out)
+}
+
+fn owned(list: &[Str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
 }
 
 /// A rule id: 1 to 64 of `a-z`, `0-9` and `-`, not starting with `-`.
@@ -1195,7 +1231,7 @@ pub fn valid_rule_id(id: &str) -> bool {
 /// a deny rule without a reason is a hard error (as for `[[deny]]`).
 fn check_path_rules(
     source: &str,
-    raw: Vec<RawPathRule>,
+    raw: &[RawPathRule],
     require_reason: bool,
     filter: &mut HostFilter,
     warnings: &mut Vec<PackWarning>,
@@ -1212,7 +1248,7 @@ fn check_path_rules(
             continue;
         }
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
-            return Err(PackError::MissingReason(r.glob));
+            return Err(PackError::MissingReason(r.glob.to_string()));
         }
         let valid = if r.ancestors {
             validate_ancestors(&r.glob, r.access)
@@ -1222,9 +1258,9 @@ fn check_path_rules(
         match valid {
             Ok(()) if !here => warn_left_out(source, kind, &r.glob, r.platform, warnings),
             Ok(()) => out.push(PathRule {
-                glob: r.glob,
+                glob: r.glob.to_string(),
                 access: r.access,
-                reason: r.reason.unwrap_or_default(),
+                reason: r.reason.as_deref().unwrap_or_default().to_string(),
                 ancestors: r.ancestors,
             }),
             Err(e) => warnings.push(PackWarning {
@@ -1334,13 +1370,44 @@ pub(crate) fn peek_header(
     Some(((h.pack.id, h.pack.default_on, h.pack.version), lazy))
 }
 
+/// [`peek_header`] of a built-in pack's data: nothing to parse.
+pub(crate) fn data_header(
+    raw: &RawPackFile,
+    style: PathStyle,
+) -> Option<((String, bool, u32), Option<LazyMeta>)> {
+    let p = &raw.pack;
+    if p.id.trim().is_empty() {
+        return None;
+    }
+    let lazy =
+        (p.lazy && !p.triggers.is_empty() && raw.allow_path.is_empty() && raw.deny_path.is_empty())
+            .then(|| LazyMeta {
+                name: p.name.to_string(),
+                description: p.description.to_string(),
+                triggers: triggers_for(owned(&p.triggers), owned(&p.windows_triggers), style),
+                substitution_failsafe: p.substitution_failsafe,
+                has_deny: raw
+                    .deny
+                    .iter()
+                    .any(|r| r.platform.is_none_or(|p| p.applies_on(style))),
+                marked: raw
+                    .allow
+                    .iter()
+                    .chain(&*raw.deny)
+                    .filter(|r| r.platform.is_some())
+                    .count(),
+            });
+    Some(((p.id.to_string(), p.default_on, p.version), lazy))
+}
+
 /// A pack whose rules are compiled on first use, from its peeked header.
 pub(crate) fn lazy_pack(
     source: &'static str,
-    toml: &'static str,
+    src: Shipped,
     (id, default_on, version): &(String, bool, u32),
     meta: &LazyMeta,
     style: PathStyle,
+    compile: Compile,
 ) -> Pack {
     Pack {
         prefilter: Prefilter::new(meta.triggers.clone()),
@@ -1359,8 +1426,9 @@ pub(crate) fn lazy_pack(
         deny_path: Vec::new(),
         lazy: Some(std::sync::Arc::new(LazyRules {
             source,
-            toml,
+            src,
             style,
+            compile,
             has_deny: meta.has_deny,
             rules: std::sync::OnceLock::new(),
         })),
@@ -1396,43 +1464,84 @@ pub fn load_pack_for(
     style: PathStyle,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Pack, PackError> {
-    load_filtered(source, toml_str, style, false, warnings)
+    #[cfg(test)]
+    COMPILED.with(|c| c.set(c.get() + 1));
+    let raw = parse_pack(toml_str)?;
+    load_raw(source, &raw, style, false, Compile::Now, warnings)
 }
 
 /// A shipped pack for a host of `style`: a rule for another OS is skipped
-/// unread, which is what keeps it off a hook's clock.
+/// unread, which is what keeps it off a hook's clock. TOML text is parsed
+/// here; a built-in pack's data is not parsed at all, and with
+/// [`Compile::OnFirstUse`] its regexes are compiled as rules are reached.
 pub(crate) fn load_shipped(
     source: &str,
-    toml_str: &str,
+    src: Shipped,
     style: PathStyle,
-    warnings: &mut Vec<PackWarning>,
-) -> Result<Pack, PackError> {
-    load_filtered(source, toml_str, style, true, warnings)
-}
-
-fn load_filtered(
-    source: &str,
-    toml_str: &str,
-    style: PathStyle,
-    shipped: bool,
+    compile: Compile,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Pack, PackError> {
     #[cfg(test)]
     COMPILED.with(|c| c.set(c.get() + 1));
-    let raw: RawPackFile = toml::from_str(toml_str).map_err(|e| PackError::Toml(e.to_string()))?;
+    match src {
+        // A test's catalog: compiled at load, so its warnings are reported.
+        Shipped::Toml(text) => load_raw(
+            source,
+            &parse_pack(text)?,
+            style,
+            true,
+            Compile::Now,
+            warnings,
+        ),
+        Shipped::Data(raw) => load_raw(source, raw, style, true, compile, warnings),
+    }
+}
+
+/// [`load_shipped`] of TOML text of any lifetime, for the tests.
+#[cfg(test)]
+pub(crate) fn load_shipped_toml(
+    source: &str,
+    toml_str: &str,
+    style: PathStyle,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Pack, PackError> {
+    COMPILED.with(|c| c.set(c.get() + 1));
+    load_raw(
+        source,
+        &parse_pack(toml_str)?,
+        style,
+        true,
+        Compile::Now,
+        warnings,
+    )
+}
+
+fn parse_pack(toml_str: &str) -> Result<RawPackFile, PackError> {
+    toml::from_str(toml_str).map_err(|e| PackError::Toml(e.to_string()))
+}
+
+fn load_raw(
+    source: &str,
+    raw: &RawPackFile,
+    style: PathStyle,
+    shipped: bool,
+    compile: Compile,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Pack, PackError> {
     if raw.pack.id.trim().is_empty() {
         return Err(PackError::MissingId);
     }
     let mut filter = HostFilter {
         style,
         shipped,
+        compile,
         left_out: 0,
         marked: 0,
     };
-    let allow = compile_rules(source, raw.allow, false, &mut filter, warnings)?;
-    let deny = compile_rules(source, raw.deny, true, &mut filter, warnings)?;
-    let allow_path = check_path_rules(source, raw.allow_path, false, &mut filter, warnings)?;
-    let deny_path = check_path_rules(source, raw.deny_path, true, &mut filter, warnings)?;
+    let allow = compile_rules(source, &raw.allow, false, &mut filter, warnings)?;
+    let deny = compile_rules(source, &raw.deny, true, &mut filter, warnings)?;
+    let allow_path = check_path_rules(source, &raw.allow_path, false, &mut filter, warnings)?;
+    let deny_path = check_path_rules(source, &raw.deny_path, true, &mut filter, warnings)?;
     // A pack with rules for another OS only is not broken; its warnings say so.
     if allow.is_empty()
         && deny.is_empty()
@@ -1442,14 +1551,18 @@ fn load_filtered(
     {
         return Err(PackError::NoRules);
     }
-    let triggers = triggers_for(raw.pack.triggers, raw.pack.windows_triggers, style);
+    let triggers = triggers_for(
+        owned(&raw.pack.triggers),
+        owned(&raw.pack.windows_triggers),
+        style,
+    );
     Ok(Pack {
         prefilter: Prefilter::new(triggers.clone()),
         loaded_for: style,
         marked: filter.marked,
-        id: raw.pack.id,
-        name: raw.pack.name,
-        description: raw.pack.description,
+        id: raw.pack.id.to_string(),
+        name: raw.pack.name.to_string(),
+        description: raw.pack.description.to_string(),
         default_on: raw.pack.default_on,
         version: raw.pack.version,
         triggers,
@@ -1522,6 +1635,41 @@ pub fn load_packs_dir(dir: &Path) -> (Vec<Pack>, Vec<PackWarning>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pathrule::RuleAccess;
+
+    /// A compile on first use that began after an evaluation's start is
+    /// taken off its clock; one before it is not.
+    #[test]
+    fn first_use_compiles_are_off_the_budget() {
+        let earlier = Instant::now();
+        let start = Instant::now();
+        assert!(budget_elapsed(start) < Duration::from_secs(60));
+        note_compile(earlier, Duration::from_secs(3600));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            budget_elapsed(start) >= Duration::from_millis(20),
+            "a compile before the start is not this evaluation's"
+        );
+        note_compile(Instant::now(), Duration::from_secs(3600));
+        assert_eq!(budget_elapsed(start), Duration::ZERO);
+        // A later evaluation's clock is its own again.
+        let later = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(budget_elapsed(later) >= Duration::from_millis(20));
+    }
+
+    /// A rule copied for `[guard] ask` shares its regex: compiled once.
+    #[test]
+    fn a_first_use_regex_is_shared_by_clones() {
+        let r = RuleRegex::default();
+        let copy = r.clone();
+        assert!(r.get("^a+$").is_some_and(|re| re.is_match("aa")));
+        assert!(copy.0.get().is_some(), "the clone sees the compile");
+        assert!(
+            RuleRegex::default().get("(").is_none(),
+            "a bad pattern never matches"
+        );
+    }
 
     #[test]
     fn glob_regex_translates_shell_globs() {
@@ -2210,7 +2358,7 @@ reason = "r"
                 for style in [PathStyle::Posix, PathStyle::Windows] {
                     for got in [
                         load_pack_for("<t>", &toml, style, &mut w),
-                        load_shipped("<t>", &toml, style, &mut w),
+                        load_shipped_toml("<t>", &toml, style, &mut w),
                     ] {
                         assert!(matches!(got, Err(PackError::Toml(_))), "{value} {rule}");
                     }
@@ -2285,19 +2433,19 @@ reason = "r"
     fn a_shipped_rule_for_another_os_is_not_compiled() {
         let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"ok\"\nreason = \"r\"\n[[deny]]\nplatform = \"windows\"\npattern = \"(\"\nreason = \"r\"\n";
         let mut w = Vec::new();
-        let p = load_shipped("<t>", toml, PathStyle::Posix, &mut w).unwrap();
+        let p = load_shipped_toml("<t>", toml, PathStyle::Posix, &mut w).unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(p.deny.len(), 1);
-        load_shipped("<t>", toml, PathStyle::Windows, &mut w).unwrap();
+        load_shipped_toml("<t>", toml, PathStyle::Windows, &mut w).unwrap();
         assert!(w[0].message.contains("uncompilable"), "{w:?}");
     }
 
     #[test]
     fn a_pack_fits_the_style_it_was_loaded_for() {
         let mut w = Vec::new();
-        let posix = load_shipped("<t>", MARKED, PathStyle::Posix, &mut w).unwrap();
+        let posix = load_shipped_toml("<t>", MARKED, PathStyle::Posix, &mut w).unwrap();
         assert!(posix.fits(PathStyle::Posix) && !posix.fits(PathStyle::Windows));
-        let win = load_shipped("<t>", MARKED, PathStyle::Windows, &mut w).unwrap();
+        let win = load_shipped_toml("<t>", MARKED, PathStyle::Windows, &mut w).unwrap();
         assert!(win.fits(PathStyle::Windows) && !win.fits(PathStyle::Posix));
         // No marker: nothing to choose, so it fits both.
         let plain = load_pack_for("<t>", VALID, PathStyle::Posix, &mut w).unwrap();

@@ -444,7 +444,7 @@ impl Engine {
         let text = real.to_string_lossy();
         let mut carved: Option<Decision> = None;
         for pp in self.path_rules() {
-            if start.elapsed() > self.budget {
+            if self.over_budget(start) {
                 return JudgeOutcome::TimedOut;
             }
             let hit = |rules: &[BoundPathRule], set: &Option<RegexSet>| match set {
@@ -487,6 +487,12 @@ impl Engine {
     pub fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
         self
+    }
+
+    /// Has an evaluation that began at `start` spent its budget? Compiling a
+    /// rule regex on first use is not counted (`pack::budget_elapsed`).
+    fn over_budget(&self, start: Instant) -> bool {
+        crate::pack::budget_elapsed(start) > self.budget
     }
 
     /// Number of loaded packs.
@@ -696,7 +702,7 @@ impl Engine {
         };
 
         for (at, seg) in segments.iter().enumerate() {
-            if start.elapsed() > self.budget {
+            if self.over_budget(start) {
                 let rest = &segments[at..];
                 return self.out_of_budget(rest, &cx, &mut state, &mut found, profile_moved);
             }
@@ -988,7 +994,7 @@ impl Engine {
         if depth >= MAX_INLINE_DEPTH {
             return Nested::Unjudged(format!("{what} nested too deeply to judge"));
         }
-        if start.elapsed() > self.budget {
+        if self.over_budget(start) {
             return Nested::TimedOut;
         }
         if !cx.clock.afford_line(inner.len() + state.weight()) {
@@ -1780,7 +1786,7 @@ impl Engine {
         let mut unjudged = None;
         for op in &ops {
             for cwd in anchors(&op.path) {
-                if start.elapsed() > self.budget {
+                if self.over_budget(start) {
                     return timed_out();
                 }
                 let words = if op.glob {
@@ -2115,12 +2121,12 @@ impl Engine {
         // rule asks for (and has no operand, when the rule asks for that),
         // and an operand names a target when the rule asks
         // for one.
-        let over_budget = || start.elapsed() > self.budget;
+        let over_budget = || self.over_budget(start);
         let matches = |rule: &crate::pack::Rule| -> Hit {
             if !line(rule).is_some_and(|l| {
                 #[cfg(test)]
                 crate::work::add(1 + l.len());
-                rule.regex.is_match(l)
+                rule.is_match(l)
             }) {
                 return Hit::No;
             }
@@ -2148,7 +2154,7 @@ impl Engine {
         };
         let mut allowed: Option<AllowTrace> = None;
         for pack in &self.packs {
-            if start.elapsed() > self.budget {
+            if self.over_budget(start) {
                 return JudgeOutcome::TimedOut;
             }
             if only.is_some_and(|id| id != pack.id) {

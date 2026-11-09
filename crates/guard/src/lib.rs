@@ -24,6 +24,7 @@ pub mod lexer;
 pub mod normalize;
 pub mod operands;
 pub mod pack;
+mod pack_raw;
 pub mod pathrule;
 pub mod payload;
 pub mod prefilter;
