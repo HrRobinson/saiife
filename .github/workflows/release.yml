@@ -788,8 +788,14 @@ jobs:
           if ls dist/saiife-*.pkg >/dev/null 2>&1; then
             files+=(dist/saiife-*.pkg)
           fi
+          # A version with '-' (0.2.0-rc.1) is a prerelease, so it never becomes Latest.
+          pre=()
+          case "$VERSION" in
+            *-*) pre=(--prerelease) ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             --draft \
+            ${pre[@]+"${pre[@]}"} \
             --title "saiife $GITHUB_REF_NAME" \
             --notes-file notes.md \
             "${files[@]}"
