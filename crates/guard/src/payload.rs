@@ -166,6 +166,10 @@ struct Envelope {
     #[serde(default, rename = "sessionId", deserialize_with = "lenient_string")]
     session_id_camel: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
+    tool_use_id: Option<String>,
+    #[serde(default, rename = "toolUseId", deserialize_with = "lenient_string")]
+    tool_use_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
     cwd: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
     permission_mode: Option<String>,
@@ -462,6 +466,8 @@ fn patch_paths(patch: &str) -> Vec<String> {
 pub struct HookContext {
     pub tool: Option<String>,
     pub session: Option<String>,
+    /// The agent's id for this one tool call (Claude Code's `tool_use_id`).
+    pub tool_use_id: Option<String>,
     pub cwd: Option<String>,
     /// The agent's permission mode (`default`, `plan`, ...), when it sends one.
     pub permission_mode: Option<String>,
@@ -488,6 +494,7 @@ pub fn context_from_hook_json_bounded(input: &str, max_bytes: usize) -> HookCont
     HookContext {
         tool: field(&env.tool_name, &env.tool_name_camel),
         session: field(&env.session_id, &env.session_id_camel),
+        tool_use_id: field(&env.tool_use_id, &env.tool_use_id_camel),
         cwd: env.cwd.clone().filter(|c| !c.is_empty()),
         permission_mode: env.permission_mode.clone().filter(|c| !c.is_empty()),
     }
@@ -1323,6 +1330,24 @@ mod tests {
         assert_eq!(ctx.tool.as_deref(), Some("Bash"));
         assert_eq!(ctx.session.as_deref(), Some("abc"));
         assert_eq!(ctx.cwd.as_deref(), Some("/home/u/app"));
+    }
+
+    #[test]
+    fn context_reads_tool_use_id() {
+        let json = include_str!("../../cli/tests/fixtures/claude/bash-allow.json");
+        assert_eq!(
+            context_from_hook_json(json).tool_use_id.as_deref(),
+            Some("toolu_02")
+        );
+        let ctx = context_from_hook_json(r#"{"toolUseId":"t-9"}"#);
+        assert_eq!(ctx.tool_use_id.as_deref(), Some("t-9"));
+        // As `session`: the snake-case field wins when present, even empty.
+        let ctx = context_from_hook_json(r#"{"tool_use_id":"","toolUseId":"t-9"}"#);
+        assert_eq!(ctx.tool_use_id, None);
+        assert_eq!(
+            context_from_hook_json(r#"{"tool_use_id":7}"#).tool_use_id,
+            None
+        );
     }
 
     #[test]
