@@ -78,10 +78,11 @@ impl Principal {
     }
 }
 
-/// What an appended record says about the call it is the verdict for.
-/// It settles the connection's key only when it names that key: the same
+/// What an `audit.append` says about the call it is the verdict for. It
+/// settles the connection's key only when it names that key: the record's
 /// agent and session, and the same `tool_use_id` and `input_sha256` when
-/// the record carries them (in its extra fields).
+/// the append carries them (as arguments beside `rec`, never written: a
+/// plain hash of the input in the log would let a reader test guesses).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     pub decision: DecisionKind,
@@ -97,15 +98,21 @@ fn present(s: Option<&str>) -> Option<&str> {
 }
 
 impl Verdict {
-    /// The verdict facts of an appended guard record.
-    pub fn of_record(r: &Record) -> Verdict {
-        let text = |k: &str| r.extra.get(k).and_then(Value::as_str).map(str::to_string);
+    /// The verdict facts of an appended guard record and the append's own
+    /// `tool_use_id` and `input_sha256` arguments. The record's fields of
+    /// those names are not read: they are not what the hook bound (the id
+    /// in the record is masked and cut).
+    pub fn of_append(
+        r: &Record,
+        tool_use_id: Option<String>,
+        input_sha256: Option<String>,
+    ) -> Verdict {
         Verdict {
             decision: r.decision,
             agent: r.agent.clone(),
             session: r.session.clone(),
-            tool_use_id: text("tool_use_id"),
-            input_sha256: text("input_sha256"),
+            tool_use_id,
+            input_sha256,
         }
     }
 
@@ -161,8 +168,19 @@ pub struct NoVerdict {
 /// table's lock held, from a tokio task or a connection's end.
 pub type Sink = Box<dyn Fn(NoVerdict) + Send + Sync>;
 
+/// The longest `tool_use_id` kept in a record, in bytes (`hook.bind`'s own
+/// limit).
+pub const MAX_RECORDED_ID: usize = 256;
+
+/// A tool call id as a record shows it: masked, then cut to at most
+/// [`MAX_RECORDED_ID`] bytes on a character boundary.
+pub fn recorded_id(id: &str) -> String {
+    saiife_audit::mask::mask_cut(id, MAX_RECORDED_ID)
+}
+
 /// The `hook` record of `nv`, with the peer's `user` name. `mode` is the
-/// daemon's record mode.
+/// daemon's record mode. It names the call by `tool_use_id` only: no hash
+/// of the input (see [`Verdict`]).
 pub fn no_verdict_record(nv: &NoVerdict, mode: &str, user: Option<String>, saiife: &str) -> Record {
     let key = nv.key.as_ref();
     let mut r = Record::new(
@@ -192,11 +210,7 @@ pub fn no_verdict_record(nv: &NoVerdict, mode: &str, user: Option<String>, saiif
     x.insert("bound".into(), key.is_some().into());
     x.insert(
         "tool_use_id".into(),
-        json!(key.and_then(|k| k.tool_use_id.as_deref())),
-    );
-    x.insert(
-        "input_sha256".into(),
-        json!(key.map(|k| k.input_sha256.as_str())),
+        json!(key.and_then(|k| k.tool_use_id.as_deref()).map(recorded_id)),
     );
     x.insert("elapsed_ms".into(), nv.elapsed_ms.into());
     x.insert("pid".into(), nv.peer.pid.into());
@@ -708,7 +722,7 @@ mod tests {
         assert_eq!(r.extra["event"], "no_verdict");
         assert_eq!(r.extra["bound"], true);
         assert_eq!(r.extra["tool_use_id"], "toolu_1");
-        assert_eq!(r.extra["input_sha256"], "ab".repeat(32).as_str());
+        assert!(!r.extra.contains_key("input_sha256"), "no plain input hash");
         assert_eq!(r.extra["elapsed_ms"], 250);
         assert_eq!(r.extra["pid"], 777);
         assert_eq!(r.extra["hook_event"], "PreToolUse");
@@ -729,7 +743,7 @@ mod tests {
         let r = no_verdict_record(&all[0], "locked", None, "9.9.9");
         assert_eq!(r.extra["bound"], false);
         assert_eq!(r.extra["tool_use_id"], Value::Null);
-        assert_eq!(r.extra["input_sha256"], Value::Null);
+        assert!(!r.extra.contains_key("input_sha256"));
         assert_eq!(r.session, None);
         assert_eq!(r.tool, "");
         assert_eq!(r.agent, "codex");
@@ -1035,15 +1049,32 @@ mod tests {
             },
             "test",
         );
-        assert!(Verdict::of_record(&r).names(&k));
+        let v = |id: Option<&str>, h: Option<&str>| {
+            Verdict::of_append(&r, id.map(str::to_string), h.map(str::to_string))
+        };
+        let ab = "ab".repeat(32);
+        assert!(v(None, None).names(&k));
+        assert!(!v(Some("toolu_9"), None).names(&k));
+        assert!(v(Some("toolu_1"), None).names(&k));
+        assert!(v(Some("toolu_1"), Some(&ab)).names(&k));
+        assert!(!v(Some("toolu_1"), Some(&"cd".repeat(32))).names(&k));
+        // The record's own fields of those names are not read.
         let mut r2 = r.clone();
         r2.extra.insert("tool_use_id".into(), "toolu_9".into());
-        assert!(!Verdict::of_record(&r2).names(&k));
-        r2.extra.insert("tool_use_id".into(), "toolu_1".into());
-        assert!(Verdict::of_record(&r2).names(&k));
         r2.extra
             .insert("input_sha256".into(), "cd".repeat(32).into());
-        assert!(!Verdict::of_record(&r2).names(&k));
+        assert!(Verdict::of_append(&r2, Some("toolu_1".into()), Some(ab)).names(&k));
+    }
+
+    #[test]
+    fn recorded_id_is_masked_and_cut() {
+        assert_eq!(recorded_id("toolu_1"), "toolu_1");
+        let long = "é".repeat(200);
+        let cut = recorded_id(&long);
+        assert!(cut.len() <= MAX_RECORDED_ID && cut.len() >= MAX_RECORDED_ID - 1);
+        assert!(long.starts_with(&cut));
+        let secret = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
+        assert!(!recorded_id(secret).contains("abcdefghij"), "masked");
     }
 
     #[tokio::test(start_paused = true)]

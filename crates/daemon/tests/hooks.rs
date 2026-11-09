@@ -235,7 +235,7 @@ async fn bound_hook_that_drops_is_recorded_after_the_grace() {
     assert_eq!(r.tool, "Bash");
     assert_eq!(r.input, "");
     assert_eq!(r.extra["tool_use_id"], "toolu_1");
-    assert_eq!(r.extra["input_sha256"], "0f".repeat(32).as_str());
+    assert!(!r.extra.contains_key("input_sha256"), "no plain input hash");
 }
 
 #[tokio::test]
@@ -278,46 +278,65 @@ async fn a_verdict_writes_no_hook_record() {
     assert_eq!(d.ctx.hooks.no_verdict_count().0, 0);
 }
 
-/// A guard record naming `tool_use_id` and `input_sha256`, as the managed
-/// hook writes it.
-fn guard_rec_for(decision: DecisionKind, tool_use_id: &str, input_sha256: &str) -> Value {
-    let mut v = guard_rec(decision);
-    v["tool_use_id"] = tool_use_id.into();
-    v["input_sha256"] = input_sha256.into();
-    v
+/// `audit.append` args as the managed hook sends them: the record (with
+/// the call's id in it) and, beside it, the key's `tool_use_id` and
+/// `input_sha256`.
+fn append_args(decision: DecisionKind, tool_use_id: &str, input_sha256: &str) -> Value {
+    let mut rec = guard_rec(decision);
+    rec["tool_use_id"] = tool_use_id.into();
+    json!({"rec": rec, "tool_use_id": tool_use_id, "input_sha256": input_sha256})
 }
 
-/// An appended record whose `tool_use_id` or input hash is another call's
-/// settles nothing; one that names the bound key settles it.
+/// Every guard record written, as text.
+fn guard_texts(audit: &Path) -> Vec<String> {
+    saiife_audit::store::read_all(audit)
+        .records
+        .into_iter()
+        .filter(|r| r.kind() == "guard")
+        .map(|r| serde_json::to_string(&r).unwrap())
+        .collect()
+}
+
+/// An append whose `tool_use_id` or input hash argument is another call's,
+/// or malformed, settles nothing; one that names the bound key settles it.
+/// The record's own fields of those names count for nothing, and no input
+/// hash is ever written.
 #[tokio::test]
-async fn only_a_record_naming_the_key_settles_it() {
+async fn only_an_append_naming_the_key_settles_it() {
     let d = daemon();
     let short = || tokio::time::Instant::now() + Duration::from_millis(300);
+    let h0f = "0f".repeat(32);
+    let hcd = "cd".repeat(32);
+    let mut lying = append_args(DecisionKind::Allow, "toolu_9", &hcd);
+    // A record that names key(8) itself, with arguments for another call.
+    lying["rec"]["tool_use_id"] = "toolu_8".into();
+    lying["rec"]["input_sha256"] = h0f.clone().into();
+    let mut bad_hash = append_args(DecisionKind::Allow, "toolu_7", &h0f);
+    bad_hash["input_sha256"] = "XYZ".into();
+    let mut long_id = append_args(DecisionKind::Allow, "toolu_10", &h0f);
+    long_id["tool_use_id"] = "t".repeat(257).into();
     // Each on its own key, and kept open, so one's end cannot touch the next.
     let mismatched = [
-        (
-            5,
-            guard_rec_for(DecisionKind::Allow, "toolu_9", &"0f".repeat(32)),
-        ),
-        (
-            6,
-            guard_rec_for(DecisionKind::Allow, "toolu_6", &"cd".repeat(32)),
-        ),
+        (5, append_args(DecisionKind::Allow, "toolu_9", &h0f)),
+        (6, append_args(DecisionKind::Allow, "toolu_6", &hcd)),
+        (7, bad_hash),
+        (8, lying),
+        (10, long_id),
     ];
     let mut open = Vec::new();
-    for (n, rec) in mismatched {
+    for (n, args) in mismatched {
         let mut c = Client::hello(&d.sock).await;
         c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
         let a = c
             .call(OP_HOOK_BIND, serde_json::to_value(key(n)).unwrap())
             .await;
         assert_eq!(a["ok"], true, "{a}");
-        let a = c.call(OP_AUDIT_APPEND, json!({ "rec": rec })).await;
+        let a = c.call(OP_AUDIT_APPEND, args.clone()).await;
         assert_eq!(a["ok"], true, "the record is still written: {a}");
         assert_eq!(
             d.ctx.hooks.wait(&key(n), Some(&me()), short()).await,
             Waited::Timeout,
-            "{rec}"
+            "{args}"
         );
         open.push(c);
     }
@@ -325,13 +344,27 @@ async fn only_a_record_naming_the_key_settles_it() {
     c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
     c.call(OP_HOOK_BIND, serde_json::to_value(key(4)).unwrap())
         .await;
-    let rec = guard_rec_for(DecisionKind::Allow, "toolu_4", &"0f".repeat(32));
-    let a = c.call(OP_AUDIT_APPEND, json!({ "rec": rec })).await;
+    let a = c
+        .call(
+            OP_AUDIT_APPEND,
+            append_args(DecisionKind::Allow, "toolu_4", &h0f),
+        )
+        .await;
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(
         d.ctx.hooks.wait(&key(4), Some(&me()), short()).await,
         Waited::Allow
     );
+    let written = guard_texts(&d.audit);
+    assert_eq!(written.len(), 6);
+    for r in &written {
+        assert!(!r.contains("input_sha256"), "{r}");
+        assert!(!r.contains(&h0f) && !r.contains(&hcd), "{r}");
+    }
+    assert!(written
+        .last()
+        .unwrap()
+        .contains("\"tool_use_id\":\"toolu_4\""));
 }
 
 #[tokio::test]

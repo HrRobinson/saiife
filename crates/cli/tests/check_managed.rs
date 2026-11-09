@@ -1429,10 +1429,11 @@ fn bind_carries_the_key() {
     assert_eq!(key.tool_use_id.as_deref(), Some("toolu_02"));
 }
 
-/// The record names the bound key (its `tool_use_id` and input hash), so
-/// the daemon settles that key and no other; the bind names the tool.
+/// The append names the bound key beside the record (`tool_use_id`,
+/// `input_sha256`), so the daemon settles that key and no other; the
+/// record shows the id but never the input hash; the bind names the tool.
 #[test]
-fn record_names_the_bound_key() {
+fn append_names_the_bound_key_beside_the_record() {
     let d = TestDaemon::prepare(&Opts::default());
     let fake = FakeDaemon::start(&d, false);
     let home = common::FixtureHome::new();
@@ -1443,15 +1444,23 @@ fn record_names_the_bound_key() {
     let seen = fake.seen();
     let bind = seen.iter().find(|s| s.op == "hook.bind").unwrap();
     assert_eq!(bind.args["tool"], "Bash", "{}", bind.args);
-    let rec = &seen.iter().find(|s| s.op == "audit.append").unwrap().args["rec"];
+    let append = &seen.iter().find(|s| s.op == "audit.append").unwrap().args;
+    assert_eq!(append["tool_use_id"], "toolu_02", "{append}");
+    assert_eq!(
+        append["input_sha256"],
+        key.input_sha256.as_str(),
+        "{append}"
+    );
+    let rec = &append["rec"];
     assert_eq!(rec["tool_use_id"], "toolu_02", "{rec}");
-    assert_eq!(rec["input_sha256"], key.input_sha256.as_str(), "{rec}");
+    assert!(rec.get("input_sha256").is_none(), "{rec}");
+    assert!(!rec.to_string().contains(&key.input_sha256), "{rec}");
 }
 
-/// A payload without a tool call id: the record carries the hash, and a
-/// null id is left out (the daemon then matches agent, session and hash).
+/// A payload without a tool call id: the append carries the hash only,
+/// and neither the append nor the record has an id.
 #[test]
-fn record_without_tool_use_id_carries_the_hash_only() {
+fn append_without_tool_use_id_carries_the_hash_only() {
     let d = TestDaemon::prepare(&Opts::default());
     let fake = FakeDaemon::start(&d, false);
     let project = tempfile::tempdir().unwrap();
@@ -1461,9 +1470,35 @@ fn record_without_tool_use_id_carries_the_hash_only() {
     let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
     assert!(key.tool_use_id.is_none());
     let seen = fake.seen();
-    let rec = &seen.iter().find(|s| s.op == "audit.append").unwrap().args["rec"];
+    let append = &seen.iter().find(|s| s.op == "audit.append").unwrap().args;
+    assert!(append.get("tool_use_id").is_none(), "{append}");
+    assert_eq!(
+        append["input_sha256"],
+        key.input_sha256.as_str(),
+        "{append}"
+    );
+    let rec = &append["rec"];
     assert!(rec.get("tool_use_id").is_none(), "{rec}");
-    assert_eq!(rec["input_sha256"], key.input_sha256.as_str(), "{rec}");
+    assert!(rec.get("input_sha256").is_none(), "{rec}");
+}
+
+/// The id in the record is masked and cut to 256 bytes; the append's own
+/// argument is the id as bound.
+#[test]
+fn recorded_tool_use_id_is_masked() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start(&d, false);
+    let project = tempfile::tempdir().unwrap();
+    let id = concat!("toolu_ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
+    let mut v: Value = serde_json::from_str(&bash(project.path(), "ls")).unwrap();
+    v["tool_use_id"] = id.into();
+    let (o, _, _sb) = managed(&d.config(), &v.to_string());
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let seen = fake.seen();
+    let append = &seen.iter().find(|s| s.op == "audit.append").unwrap().args;
+    assert_eq!(append["tool_use_id"], id);
+    let shown = append["rec"]["tool_use_id"].as_str().unwrap();
+    assert!(!shown.contains("abcdefghij"), "{shown}");
 }
 
 #[test]
@@ -1529,11 +1564,9 @@ fn poisoned_client_rebinds_on_the_new_connection() {
     assert_eq!(binds[0], &want);
     let append = seen.iter().find(|s| s.op == "audit.append").unwrap();
     assert_eq!(append.args["rec"]["decision"], "error_denied");
-    // The record on the new connection still names the key.
-    assert_eq!(
-        append.args["rec"]["input_sha256"],
-        key.input_sha256.as_str()
-    );
+    // The append on the new connection still names the key.
+    assert_eq!(append.args["input_sha256"], key.input_sha256.as_str());
+    assert!(append.args["rec"].get("input_sha256").is_none());
 }
 
 #[test]
@@ -1570,8 +1603,9 @@ fn cosign_post(addr: &str, payload: &str) -> (String, String) {
     )
 }
 
-/// Tasks 3 and 4 together: the hook's record names its key in full, and
-/// the real daemon's co-signer then has no objection to that call.
+/// Tasks 3 and 4 together: the hook's append names its key in full, and
+/// the real daemon's co-signer then has no objection to that call. The
+/// written record has no input hash anywhere.
 #[test]
 fn an_allowed_call_is_not_denied_by_the_cosigner() {
     let d = TestDaemon::start(Opts::default());
@@ -1588,7 +1622,8 @@ fn an_allowed_call_is_not_denied_by_the_cosigner() {
     let rec = last_guard(&d);
     assert_eq!(rec["tool_use_id"], "toolu_02", "{rec}");
     let key = saiife_ipc::hookkey::hook_key("claude", &payload).unwrap();
-    assert_eq!(rec["input_sha256"], key.input_sha256.as_str(), "{rec}");
+    assert!(rec.get("input_sha256").is_none(), "{rec}");
+    assert!(!rec.to_string().contains(&key.input_sha256), "{rec}");
     let (status, body) = cosign_post(&addr, &payload);
     assert!(status.contains(" 200 "), "{status}");
     assert!(!body.contains("deny"), "{body}");

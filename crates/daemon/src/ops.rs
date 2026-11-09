@@ -1276,6 +1276,19 @@ fn hook_bind(ctx: &Ctx, conn: &Conn, req: Request) -> Value {
     ok(req.id, Map::new())
 }
 
+/// The `tool_use_id` and `input_sha256` arguments of `audit.append`, each
+/// optional: `None` when one is malformed (not a string, an id over
+/// `hook.bind`'s limit, a hash that is not 64 lowercase hex digits).
+fn verdict_key_args(args: &Map<String, Value>) -> Option<(Option<String>, Option<String>)> {
+    let tool_use_id = short_str(args, "tool_use_id", MAX_TOOL_USE_ID).ok()?;
+    let input_sha256 = short_str(args, "input_sha256", 64).ok()?;
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if input_sha256.as_deref().is_some_and(|h| !hex(h)) {
+        return None;
+    }
+    Some((tool_use_id, input_sha256))
+}
+
 /// A client-supplied session id over the cap is not remembered (the
 /// record is still accepted).
 fn storable_session(s: Option<&str>) -> Option<String> {
@@ -1323,6 +1336,13 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if rec.kind() != "guard" {
         return forbidden("audit.append takes only kind \"guard\"");
     }
+    // The key the verdict is for: the append's own `tool_use_id` and
+    // `input_sha256` arguments (plan 20), never written. A plain hash of
+    // the input in the log would let a reader test guesses for short
+    // secrets, so one a client put in the record goes too. A malformed
+    // argument names no call: the record is written, nothing is settled.
+    rec.extra.remove("input_sha256");
+    let key_args = verdict_key_args(&req.args);
     if let Some(t) = client_ts {
         rec.extra.insert(
             "client_ts".into(),
@@ -1401,11 +1421,11 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if rec.decision == DecisionKind::ErrorDenied {
         ctx.note_error_denied(peer.uid);
     }
-    let verdict = crate::hooks::Verdict::of_record(&rec);
+    let verdict = key_args.map(|(t, h)| crate::hooks::Verdict::of_append(&rec, t, h));
     let written = ctx.writer.append(rec).await;
     // The verdict of a hook connection, once its record is written.
-    if written.is_ok() {
-        ctx.hooks.verdict(conn.id, &verdict);
+    if let (Ok(_), Some(v)) = (&written, &verdict) {
+        ctx.hooks.verdict(conn.id, v);
     }
     match written {
         Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),

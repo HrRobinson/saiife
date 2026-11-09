@@ -509,13 +509,12 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, key: Option<&HookKey>, payload:
     r.kind = Some("hook".into());
     let x = &mut r.extra;
     x.insert("event".into(), "cosign_denied".into());
+    // The call by its id only: no hash of the input (see `hooks::Verdict`).
     x.insert(
         "tool_use_id".into(),
-        json!(key.and_then(|k| k.tool_use_id.as_deref())),
-    );
-    x.insert(
-        "input_sha256".into(),
-        json!(key.map(|k| k.input_sha256.as_str())),
+        json!(key
+            .and_then(|k| k.tool_use_id.as_deref())
+            .map(crate::hooks::recorded_id)),
     );
     if suppressed > 0 {
         x.insert("suppressed".into(), suppressed.into());
@@ -663,7 +662,10 @@ mod tests {
         assert_eq!(rec.reason.as_deref(), Some(CosignDeny::NoReport.text()));
         assert_eq!(rec.uid, None);
         assert_eq!(rec.extra["tool_use_id"], "toolu_1");
-        assert_eq!(rec.extra["input_sha256"].as_str().map(str::len), Some(64));
+        assert!(
+            !rec.extra.contains_key("input_sha256"),
+            "no plain input hash"
+        );
         assert!(!rec.extra.contains_key("suppressed"));
     }
 

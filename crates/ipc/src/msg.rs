@@ -88,7 +88,10 @@ pub const OP_MCP_CALL: &str = "mcp.call";
 pub const OP_HOOK_BEGIN: &str = "hook.begin";
 /// The managed hook, once it has read its input: the fields of
 /// [`crate::hookkey::HookKey`] (`agent`, `session`, `tool_use_id`,
-/// `input_sha256`) -> `{}`. Names the call the connection's verdict is for.
+/// `input_sha256`) and an optional `tool` -> `{}`. Names the call the
+/// connection's verdict is for. The verdict, `audit.append`, names the
+/// same call with its own optional `tool_use_id` and `input_sha256`
+/// arguments beside `rec`; the daemon never writes those two.
 pub const OP_HOOK_BIND: &str = "hook.bind";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON

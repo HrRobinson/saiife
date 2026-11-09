@@ -12,8 +12,9 @@
 //! The hook connects and says `hook.begin` before it reads its input, and
 //! binds the call's key (`hook.bind`) while the worker runs (plan 20): the
 //! daemon records a hook that ends without its `audit.append`. The bind
-//! names the tool; the record names the key (`tool_use_id`, `input_sha256`),
-//! so it settles that key only. A connection made again after an error
+//! names the tool; the append names the key beside the record
+//! (`tool_use_id`, `input_sha256`, never written), so it settles that key
+//! only. A connection made again after an error
 //! registers and binds the same key first.
 //!
 //! A deny by a rule listed in `[guard] ask` (spec §6.10.4) takes one or
@@ -175,6 +176,9 @@ mod imp {
     const TRUNCATED_MARK: &str = "…[truncated]";
     /// The longest `tool` that `hook.bind` takes (the daemon's limit).
     const MAX_BIND_TOOL: usize = 64;
+    /// The longest `tool_use_id` a record shows, in bytes (the daemon's
+    /// `hook.bind` limit).
+    const MAX_RECORDED_ID: usize = 256;
     /// The reason recorded when even the shrunk record does not fit.
     const TOO_LARGE: &str = "record too large";
     /// The fields `fit` may cut: everything the agent or the project
@@ -542,7 +546,7 @@ mod imp {
                 }
             }
         }
-        if let Err(e) = append(&mut client, rec, deadline) {
+        if let Err(e) = append(&mut client, rec, key.as_ref(), deadline) {
             // Lockdown `all`: the daemon wrote the record as a deny.
             if let ClientError::Refused { code, message } = &e {
                 if code == ErrorCode::Lockdown.as_str() {
@@ -609,7 +613,7 @@ mod imp {
             return;
         }
         let rec = failed_load_record(agent, event, input, why);
-        let _ = append(&mut client, rec, Instant::now() + ACK_TIMEOUT);
+        let _ = append(&mut client, rec, None, Instant::now() + ACK_TIMEOUT);
     }
 
     /// Off Windows the socket's dir and owner are in the config that failed to load.
@@ -1178,9 +1182,9 @@ mod imp {
 
     /// The masked record as the daemon takes it. `ts` is left out: the
     /// daemon stamps the time itself, and it sets `uid`, `user`, `host`,
-    /// `seq` and `prev`. With a bound `key`, the record names it
-    /// (`tool_use_id` when it has one, and `input_sha256`), so the daemon
-    /// settles that key only.
+    /// `seq` and `prev`. With a bound `key`, it shows the call's
+    /// `tool_use_id` (masked and cut); the key itself goes beside the
+    /// record ([`append`]).
     fn record(
         agent: &str,
         ctx: &HookContext,
@@ -1233,11 +1237,15 @@ mod imp {
             if let Some(id) = &j.rule_id {
                 m.insert("rule_id".into(), id.clone().into());
             }
-            if let Some(k) = bindable(key) {
-                if let Some(id) = &k.tool_use_id {
-                    m.insert("tool_use_id".into(), id.clone().into());
-                }
-                m.insert("input_sha256".into(), k.input_sha256.clone().into());
+            // The call's id, masked and cut like any agent-controlled
+            // field. Never the input hash: that goes beside the record
+            // (`append`), as a plain hash in the log would let a reader
+            // test guesses.
+            if let Some(id) = bindable(key).and_then(|k| k.tool_use_id.as_deref()) {
+                m.insert(
+                    "tool_use_id".into(),
+                    saiife_audit::mask::mask_cut(id, MAX_RECORDED_ID).into(),
+                );
             }
         }
         v
@@ -1557,10 +1565,23 @@ mod imp {
     }
 
     /// `audit.append`, acknowledged with a `seq` by `deadline` (at most
-    /// `ACK_TIMEOUT` from the first send).
-    fn append(client: &mut Client, rec: Value, deadline: Instant) -> Result<(), ClientError> {
+    /// `ACK_TIMEOUT` from the first send). A bound `key` goes beside the
+    /// record as `tool_use_id` and `input_sha256`: the daemon settles that
+    /// key with them and writes neither.
+    fn append(
+        client: &mut Client,
+        rec: Value,
+        key: Option<&HookKey>,
+        deadline: Instant,
+    ) -> Result<(), ClientError> {
         let mut args = Map::new();
         args.insert("rec".into(), rec);
+        if let Some(k) = bindable(key) {
+            if let Some(id) = &k.tool_use_id {
+                args.insert("tool_use_id".into(), id.clone().into());
+            }
+            args.insert("input_sha256".into(), k.input_sha256.clone().into());
+        }
         let ans = client.call(OP_AUDIT_APPEND, args, deadline)?;
         match ans.get("seq").and_then(Value::as_u64) {
             Some(_) => Ok(()),
