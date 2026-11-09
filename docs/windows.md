@@ -93,9 +93,11 @@ What happens when the guard cannot judge something:
 - **Windows locked mode is a preview.** A process of the agent's own user has full
   access to the hook. It can end it with `TerminateProcess(hook, 0)`. For Claude Code
   the co-signer then denies the call. For Codex and Gemini CLI the call runs, and the
-  daemon writes a `no_verdict` record. It can also inject code into the hook, and make
-  the hook record an allow for a call the guard would deny. Nothing stops that, not even
-  the co-signer (see [Locked mode](#locked-mode)). This is the same class as running its
+  daemon writes a `no_verdict` record. It can also forge the hook's allow, with no code
+  injection: any process of the agent's user can open the pipe, send `hook.begin`, bind
+  the call's key and append an allow, then end the real hook. The co-signer sees a
+  recorded allow and accepts it. Code injected into the hook can do the same. Nothing
+  stops that, not even the co-signer (see [Locked mode](#locked-mode)). This is the same class as running its
   own code outside the hook ([threats](threats.md), A21 and A25). Locked mode stays a
   preview until a later plan has the service judge each input itself.
 - **The co-signer port.** The co-signer listens on `127.0.0.1:7433`, a fixed port. If
@@ -203,9 +205,11 @@ Plan 20 narrows this, and does not close it:
 - **Every agent:** the daemon notices a hook that ends without a verdict and writes a
   `hook` record with decision `no_verdict`. `doctor` warns (`hooks.no-verdict`). There is
   no automatic lockdown. For Codex and Gemini CLI that is all: the call still runs.
-- **Not prevented:** code injected into the hook. The agent's user may write to the
-  hook's memory, so its code can make the hook record an allow for a denied call, and
-  the co-signer then accepts it. Windows locked mode stays a preview until the service
+- **Not prevented:** a forged allow. It needs no code injection: any process of the
+  agent's user can open the pipe, send `hook.begin`, bind the call's key and append an
+  allow, then end the real hook. Code injected into the hook (the agent's user may write
+  to the hook's memory) can do the same. Either way the co-signer sees a recorded allow
+  and accepts it. Windows locked mode stays a preview until the service
   judges each co-signed input itself.
 
 ### Install

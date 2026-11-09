@@ -514,6 +514,11 @@ fn threats_names_the_cosigner_and_the_no_verdict_record() {
         s.contains("injected into the hook"),
         "docs/threats.md must say code injected into the hook is not prevented on Windows"
     );
+    // Whole-branch review 2026-11-09: forging the allow needs no injection.
+    assert!(
+        s.contains("forged allow, with no code injection"),
+        "docs/threats.md must say a same-user forged allow needs no injection"
+    );
 }
 
 /// Owner ruling 2026-11-09: no managed NO_PROXY; the docs tell admins to add
@@ -530,7 +535,12 @@ fn install_page_has_the_no_proxy_note() {
 fn windows_limits_keep_preview_and_name_the_cosigner() {
     let t = page_text("docs/windows.md");
     let limits = flat(section(&t, "## Limits"));
-    for want in ["preview", "co-signer", "no_verdict"] {
+    for want in [
+        "preview",
+        "co-signer",
+        "no_verdict",
+        "with no code injection",
+    ] {
         assert!(
             limits.contains(want),
             "docs/windows.md#limits lacks {want:?}"
