@@ -82,6 +82,9 @@ pub const RUN_DIR: &str = "/run/saiife";
 pub const SOCKET: &str = "/run/saiife/saiife.sock";
 pub const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code/managed-settings.d";
 pub const CLAUDE_MANAGED: &str = "/etc/claude-code/managed-settings.d/50-saiife.json";
+/// The Claude Code co-signer's loopback address (plan 20; fixed, not configurable). The
+/// managed drop-in's HTTP hook names it in `saiife_agents::claude::COSIGN_URL`.
+pub const COSIGN_ADDR: &str = "127.0.0.1:7433";
 /// The managed MCP allowlist drop-in, derived from `[guard.mcp]` policy.
 pub const CLAUDE_MCP: &str = "/etc/claude-code/managed-settings.d/60-saiife-mcp.json";
 pub const CODEX_DIR: &str = "/etc/codex";
@@ -837,6 +840,21 @@ mod tests {
     use super::*;
     use saiife_agents::Agent;
     use std::path::Path;
+
+    /// The daemon listens where the drop-in's HTTP hook posts, and the allow-list admits it.
+    #[test]
+    fn cosign_addr_matches_the_claude_url() {
+        assert_eq!(COSIGN_ADDR, "127.0.0.1:7433");
+        assert_eq!(
+            saiife_agents::claude::COSIGN_URL,
+            format!("http://{COSIGN_ADDR}/v1/cosign/claude")
+        );
+        assert_eq!(
+            saiife_agents::claude::COSIGN_URL_PATTERN,
+            format!("http://{COSIGN_ADDR}/*")
+        );
+        assert!(COSIGN_ADDR.parse::<std::net::SocketAddr>().is_ok());
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

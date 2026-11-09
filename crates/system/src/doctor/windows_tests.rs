@@ -1454,6 +1454,34 @@ fn claude_policy_is_only_for_claude() {
     assert!(!r.checks.iter().any(|c| c.id == "mcp.claude.allowlist"));
 }
 
+/// A drop-in from before the co-signer fails `agents.claude.policy`, whatever HKLM says.
+#[test]
+fn drop_in_without_cosign_fails_policy() {
+    let e = installed();
+    assert_eq!(
+        get(&e.doctor(), "agents.claude.policy").status,
+        Status::Pass
+    );
+    let old = saiife_agents::claude::managed_settings_for(true)
+        .replace(
+            ",\n                   { \"type\": \"http\",\n                     \"url\": \"http://127.0.0.1:7433/v1/cosign/claude\",\n                     \"timeout\": 10, \"onFailure\": \"block\" }",
+            "",
+        )
+        .replace("  \"allowedHttpHookUrls\": [\"http://127.0.0.1:7433/*\"],\n", "");
+    assert!(!old.contains("http://"), "{old}");
+    fs::write(e.at(CLAUDE_SETTINGS), &old).unwrap();
+    let r = e.doctor();
+    let c = get(&r, "agents.claude.policy");
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.detail, saiife_agents::claude::COSIGN_MISSING_TEXT);
+
+    hklm(&e, r#"{"managedSourcesBehavior":"merge","permissions":{}}"#);
+    assert_eq!(
+        get(&e.doctor(), "agents.claude.policy").status,
+        Status::Fail
+    );
+}
+
 // ----------------------------------------------------------------- the MCP drop-in
 
 /// Task 6 owes this: `claude_pin_ok` is the hook's, and doctor checks the owner and ACL.

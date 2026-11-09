@@ -19,8 +19,11 @@ use std::path::Path;
 pub fn fake_binary() -> Vec<u8> {
     crate::binary::fake_elf(None, 0, Some(false))
 }
-/// What the fake Claude Code managed file holds.
-pub const FAKE_CLAUDE_MANAGED: &str = "{\"hooks\":{}}\n";
+/// What the fake Claude Code managed file holds: the real drop-in, so doctor's
+/// `agents.claude.policy` finds the co-signer in it.
+pub fn fake_claude_managed() -> &'static str {
+    saiife_agents::claude::managed_settings()
+}
 /// The systemd version of the fake install.
 pub const FAKE_SYSTEMD: u32 = 255;
 
@@ -125,7 +128,7 @@ pub fn fake_install(root: &Path) -> Installed {
     file(&l(VAULT_KEY), vault, 0o600);
     let unit = unit_text(FAKE_SYSTEMD);
     file(&l(UNIT), unit.as_bytes(), 0o644);
-    file(&l(CLAUDE_MANAGED), FAKE_CLAUDE_MANAGED.as_bytes(), 0o644);
+    file(&l(CLAUDE_MANAGED), fake_claude_managed().as_bytes(), 0o644);
     // The allowlist drop-in an install writes for the fake config's policy
     // (no `allow_servers`); not on the install record.
     file(
@@ -180,7 +183,7 @@ pub fn fake_install(root: &Path) -> Installed {
         agents: vec![ManagedAgent {
             agent: "claude".to_string(),
             path: CLAUDE_MANAGED.into(),
-            sha256: sha256_hex(FAKE_CLAUDE_MANAGED.as_bytes()),
+            sha256: sha256_hex(fake_claude_managed().as_bytes()),
             whole_file: true,
             created_file: true,
         }],

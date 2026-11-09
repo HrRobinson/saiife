@@ -1078,10 +1078,15 @@ fn vault_key(ctx: &Ctx, i: &Installed) -> Check {
 // ---------------------------------------------------------------- Claude Code
 
 /// W24: HKLM's settings win over saiife's drop-in unless they say to merge. The read fails
-/// closed (`hklm_policy_live`).
+/// closed (`hklm_policy_live`). Before that, the drop-in itself must carry the co-signer
+/// HTTP hook and its URL allow-list (plan 20): one from an older saiife does not.
 fn claude_policy(ctx: &Ctx) -> Check {
     const ID: &str = "agents.claude.policy";
     const TITLE: &str = "Claude Code machine policy";
+    let drop_in = read_plain(&ctx.layout.at(CLAUDE_MANAGED), 1 << 20);
+    if !drop_in.is_ok_and(|b| std::str::from_utf8(&b).is_ok_and(claude::carries_cosign)) {
+        return Check::new(ID, Status::Fail, TITLE, claude::COSIGN_MISSING_TEXT);
+    }
     match ctx.host.claude_hklm_policy() {
         HklmPolicy::Overrides => Check::new(ID, Status::Fail, TITLE, claude::HKLM_OVERRIDES_TEXT),
         HklmPolicy::Merge => Check::new(ID, Status::Pass, TITLE, "merged with saiife's drop-in"),

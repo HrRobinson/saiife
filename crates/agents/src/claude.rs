@@ -57,6 +57,9 @@ const MANAGED_SETTINGS: &str = r#"{
       { "matcher": "*",
         "hooks": [ { "type": "command",
                      "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" },
+                   { "type": "http",
+                     "url": "http://127.0.0.1:7433/v1/cosign/claude",
                      "timeout": 10, "onFailure": "block" } ] }
     ],
     "ConfigChange": [
@@ -65,9 +68,43 @@ const MANAGED_SETTINGS: &str = r#"{
                      "timeout": 10, "onFailure": "block" } ] }
     ]
   },
+  "allowedHttpHookUrls": ["http://127.0.0.1:7433/*"],
   "disableAllHooks": false
 }
 "#;
+
+/// Where the drop-in's second `PreToolUse` hook posts: the saiife daemon's co-signer on
+/// loopback (plan 20). It answers deny unless the command hook recorded an allow for the
+/// same call, so a killed hook (exit 0 forged by `TerminateProcess`) is still a deny.
+pub const COSIGN_URL: &str = "http://127.0.0.1:7433/v1/cosign/claude";
+
+/// The drop-in's `allowedHttpHookUrls` entry. The lists merge across settings files, so a
+/// user's own list cannot skip the co-signer.
+pub const COSIGN_URL_PATTERN: &str = "http://127.0.0.1:7433/*";
+
+/// The `agents.claude.policy` failure for a drop-in without the co-signer.
+pub const COSIGN_MISSING_TEXT: &str =
+    "the Claude Code drop-in has no saiife co-signer hook; run saiife system install";
+
+/// Whether a Claude Code drop-in carries the co-signer: a `PreToolUse` hook of type `http`
+/// at [`COSIGN_URL`] with `onFailure: "block"`, and [`COSIGN_URL_PATTERN`] in
+/// `allowedHttpHookUrls`. Text that is not JSON carries nothing.
+pub fn carries_cosign(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let listed = v["allowedHttpHookUrls"]
+        .as_array()
+        .is_some_and(|l| l.iter().any(|u| u == COSIGN_URL_PATTERN));
+    let hooked = v["hooks"]["PreToolUse"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("hooks")?.as_array())
+        .flatten()
+        .any(|h| h["type"] == "http" && h["url"] == COSIGN_URL && h["onFailure"] == "block");
+    listed && hooked
+}
 
 /// The whole managed drop-in saiife writes for Claude Code (spec §8.3).
 pub fn managed_settings() -> &'static str {
@@ -736,6 +773,134 @@ mod tests {
             v["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
             "block"
         );
+    }
+
+    /// The drop-in of plan 20 Task 5, byte for byte (spec §8.3).
+    #[test]
+    fn managed_settings_bytes() {
+        const WANT: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*",
+        "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" },
+                   { "type": "http",
+                     "url": "http://127.0.0.1:7433/v1/cosign/claude",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ],
+    "ConfigChange": [
+      { "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude --event config-change",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ]
+  },
+  "allowedHttpHookUrls": ["http://127.0.0.1:7433/*"],
+  "disableAllHooks": false
+}
+"#;
+        assert_eq!(managed_settings_for(false), WANT);
+        assert_eq!(MANAGED_SETTINGS, WANT);
+        assert!(carries_cosign(WANT));
+    }
+
+    /// The co-signer's URL holds no binary path, so Windows keeps it as is.
+    #[test]
+    fn windows_differs_in_the_command_only() {
+        let (l, w) = (managed_settings_for(false), managed_settings_for(true));
+        let differ: Vec<(&str, &str)> = l.lines().zip(w.lines()).filter(|(a, b)| a != b).collect();
+        assert_eq!(l.lines().count(), w.lines().count());
+        assert_eq!(differ.len(), 2, "{differ:?}");
+        assert!(differ.iter().all(|(a, _)| a.contains("\"command\"")));
+        let v: Value = serde_json::from_str(&w).unwrap();
+        let http = &v["hooks"]["PreToolUse"][0]["hooks"][1];
+        assert_eq!(http["url"], COSIGN_URL);
+        assert_eq!(v["allowedHttpHookUrls"], json!([COSIGN_URL_PATTERN]));
+        assert!(carries_cosign(&w));
+    }
+
+    /// saiife sends no headers, so `httpHookAllowedEnvVars` cannot touch it.
+    #[test]
+    fn http_hook_has_no_headers() {
+        for windows in [false, true] {
+            let v: Value = serde_json::from_str(&managed_settings_for(windows)).unwrap();
+            let http = v["hooks"]["PreToolUse"][0]["hooks"][1].as_object().unwrap();
+            let keys: Vec<&str> = http.keys().map(String::as_str).collect();
+            assert_eq!(keys, ["type", "url", "timeout", "onFailure"]);
+            assert_eq!(http["type"], "http");
+            assert_eq!(http["timeout"], 10);
+            assert_eq!(http["onFailure"], "block");
+            assert!(!managed_settings_for(windows).contains("headers"));
+            assert!(!managed_settings_for(windows).contains("allowedEnvVars"));
+        }
+    }
+
+    /// `*` matches any run of characters, as Claude Code's allow-list reads it.
+    fn glob(pattern: &str, s: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == s,
+            Some((head, rest)) => {
+                let Some(tail) = s.strip_prefix(head) else {
+                    return false;
+                };
+                (0..=tail.len())
+                    .filter(|&i| tail.is_char_boundary(i))
+                    .any(|i| glob(rest, &tail[i..]))
+            }
+        }
+    }
+
+    #[test]
+    fn allow_list_admits_the_url() {
+        assert!(glob(COSIGN_URL_PATTERN, COSIGN_URL));
+        assert!(!glob(
+            COSIGN_URL_PATTERN,
+            "http://127.0.0.1:7434/v1/cosign/claude"
+        ));
+        assert!(!glob(
+            COSIGN_URL_PATTERN,
+            "http://localhost:7433/v1/cosign/claude"
+        ));
+        assert_eq!(COSIGN_URL, "http://127.0.0.1:7433/v1/cosign/claude");
+        assert_eq!(COSIGN_URL_PATTERN, "http://127.0.0.1:7433/*");
+    }
+
+    /// What doctor's `agents.claude.policy` asks of an installed drop-in.
+    #[test]
+    fn a_drop_in_without_the_cosigner_is_not_enough() {
+        let old = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*",
+        "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ]
+  },
+  "disableAllHooks": false
+}
+"#;
+        assert!(!carries_cosign(old));
+        let ours = managed_settings();
+        assert!(carries_cosign(ours));
+        let no_list = ours.replace(
+            "\n  \"allowedHttpHookUrls\": [\"http://127.0.0.1:7433/*\"],",
+            "",
+        );
+        assert_ne!(no_list, ours);
+        assert!(!carries_cosign(&no_list));
+        let fails_open = ours.replacen(
+            "\"url\": \"http://127.0.0.1:7433/v1/cosign/claude\",\n                     \"timeout\": 10, \"onFailure\": \"block\"",
+            "\"url\": \"http://127.0.0.1:7433/v1/cosign/claude\",\n                     \"timeout\": 10",
+            1,
+        );
+        assert_ne!(fails_open, ours);
+        assert!(!carries_cosign(&fails_open));
+        assert!(!carries_cosign(
+            &ours.replace(COSIGN_URL, "http://127.0.0.1:9/x")
+        ));
+        assert!(!carries_cosign("not json"));
+        assert!(!carries_cosign("{}"));
     }
 
     /// `status` reads Claude's managed file on Windows too.

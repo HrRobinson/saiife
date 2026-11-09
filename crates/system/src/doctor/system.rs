@@ -69,6 +69,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
         }
         out.extend(i.agents.iter().map(|a| agent_label(ctx, &a.agent)));
+        if i.agents.iter().any(|a| a.agent == "claude") {
+            out.push(claude_policy(ctx));
+        }
     }
     out.extend(allow_server_warnings(ctx));
     out.extend(mcp_checks(ctx));
@@ -143,6 +146,49 @@ fn claude_mdm(ctx: &Ctx, i: &Installed) -> Option<Check> {
              Claude Code may ignore saiife's managed-settings.d drop-in"
         ),
     ))
+}
+
+/// `agents.claude.policy`: the installed drop-in carries the co-signer HTTP hook and its URL
+/// allow-list (plan 20). A drop-in from an older saiife only has the command hook, and
+/// `files.installed` passes it while its record is the old one.
+fn claude_policy(ctx: &Ctx) -> Check {
+    const ID: &str = "agents.claude.policy";
+    const TITLE: &str = "Claude Code drop-in";
+    let shown = shown(ctx, CLAUDE_MANAGED);
+    let at = ctx.layout.at(CLAUDE_MANAGED);
+    let read = match fs::symlink_metadata(&at) {
+        Ok(m) if m.is_file() && m.len() <= 1 << 20 => fs::read_to_string(&at),
+        Ok(_) => {
+            return Check::new(
+                ID,
+                Status::Fail,
+                TITLE,
+                format!("{shown}: not a regular file of sane size"),
+            )
+        }
+        Err(e) => Err(e),
+    };
+    match read {
+        Ok(text) if saiife_agents::claude::carries_cosign(&text) => {
+            Check::new(ID, Status::Pass, TITLE, "carries the saiife co-signer hook")
+        }
+        Ok(_) => Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            saiife_agents::claude::COSIGN_MISSING_TEXT,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            saiife_agents::claude::COSIGN_MISSING_TEXT,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
+            Check::new(ID, Status::Info, TITLE, format!("{shown}: {NOT_CHECKED}"))
+        }
+        Err(e) => Check::new(ID, Status::Fail, TITLE, format!("{shown}: {e}")),
+    }
 }
 
 /// `system.sip` (macOS): Pass with System Integrity Protection on, Fail
@@ -1966,6 +2012,50 @@ mod tests {
             "{d}"
         );
         assert!(d.contains(&format!("{BINARY}: missing")), "{d}");
+    }
+
+    /// A drop-in from before the co-signer, even one on record, fails `agents.claude.policy`.
+    #[test]
+    fn drop_in_without_cosign_fails_policy() {
+        let t = T::installed();
+        assert_status(&t.doctor(), "agents.claude.policy", Status::Pass);
+        let old = saiife_agents::claude::managed_settings()
+            .replace(
+                ",\n                   { \"type\": \"http\",\n                     \"url\": \"http://127.0.0.1:7433/v1/cosign/claude\",\n                     \"timeout\": 10, \"onFailure\": \"block\" }",
+                "",
+            )
+            .replace("  \"allowedHttpHookUrls\": [\"http://127.0.0.1:7433/*\"],\n", "");
+        assert!(!old.contains("http://"), "{old}");
+        fs::write(t.at(CLAUDE_MANAGED), &old).unwrap();
+        // As an older saiife recorded it: `files.installed` has no complaint.
+        t.edit_installed(|i| {
+            i.agents[0].sha256 = crate::fsops::sha256_hex(old.as_bytes());
+        });
+        let r = t.doctor();
+        assert_status(&r, "files.installed", Status::Pass);
+        assert_status(&r, "agents.claude.policy", Status::Fail);
+        assert_eq!(
+            get(&r, "agents.claude.policy").detail,
+            saiife_agents::claude::COSIGN_MISSING_TEXT
+        );
+        assert_eq!(
+            saiife_agents::claude::COSIGN_MISSING_TEXT,
+            "the Claude Code drop-in has no saiife co-signer hook; run saiife system install"
+        );
+
+        fs::remove_file(t.at(CLAUDE_MANAGED)).unwrap();
+        assert_status(&t.doctor(), "agents.claude.policy", Status::Fail);
+    }
+
+    #[test]
+    fn claude_policy_is_only_for_claude_on_unix() {
+        let t = T::installed();
+        t.edit_installed(|i| i.agents.retain(|a| a.agent != "claude"));
+        assert!(!t
+            .doctor()
+            .checks
+            .iter()
+            .any(|c| c.id == "agents.claude.policy"));
     }
 
     #[test]

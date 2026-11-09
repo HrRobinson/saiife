@@ -35,6 +35,17 @@ fn claude_managed_matches_spec() {
     );
     assert_eq!(h["timeout"], 10);
     assert_eq!(h["onFailure"], "block");
+    // The co-signer (plan 20): an HTTP hook beside the command hook, and its URL allowed.
+    let http = &pre["hooks"][1];
+    assert_eq!(http["type"], "http");
+    assert_eq!(http["url"], "http://127.0.0.1:7433/v1/cosign/claude");
+    assert_eq!(http["timeout"], 10);
+    assert_eq!(http["onFailure"], "block");
+    assert_eq!(pre["hooks"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        v["allowedHttpHookUrls"],
+        serde_json::json!(["http://127.0.0.1:7433/*"])
+    );
     let cc = &v["hooks"]["ConfigChange"][0]["hooks"][0];
     assert!(cc["command"]
         .as_str()
