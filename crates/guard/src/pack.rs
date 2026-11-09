@@ -241,7 +241,15 @@ pub(crate) fn note_compile(began: Instant, took: Duration) {
 /// must not either: a command is judged as it was when every rule was
 /// compiled up front.
 pub(crate) fn budget_elapsed(start: Instant) -> Duration {
-    let elapsed = start.elapsed();
+    budget_elapsed_at(start, Instant::now())
+}
+
+/// [`budget_elapsed`] read at `now`. A compile that began on the same clock
+/// tick as `start` counts as the evaluation's: on a coarse clock (macOS,
+/// Windows) one that ended before `start` was read can share its tick, but
+/// then it took no time on that clock, so nothing extra comes off.
+fn budget_elapsed_at(start: Instant, now: Instant) -> Duration {
+    let elapsed = now.saturating_duration_since(start);
     let total = COMPILED_FOR.with(Cell::get);
     if total.is_zero() {
         return elapsed;
@@ -1638,24 +1646,37 @@ mod tests {
     use crate::pathrule::RuleAccess;
 
     /// A compile on first use that began after an evaluation's start is
-    /// taken off its clock; one before it is not.
+    /// taken off its clock; one before it is not. The instants are built,
+    /// not read: two `Instant::now()` in a row can share a tick on macOS and
+    /// Windows, and a sleep is not a measured duration there.
     #[test]
     fn first_use_compiles_are_off_the_budget() {
-        let earlier = Instant::now();
-        let start = Instant::now();
-        assert!(budget_elapsed(start) < Duration::from_secs(60));
-        note_compile(earlier, Duration::from_secs(3600));
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(
-            budget_elapsed(start) >= Duration::from_millis(20),
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let start = t0 + ms(1);
+        assert_eq!(budget_elapsed_at(start, start + ms(20)), ms(20));
+        // Before the start: not this evaluation's.
+        note_compile(t0, Duration::from_secs(3600));
+        assert_eq!(
+            budget_elapsed_at(start, start + ms(20)),
+            ms(20),
             "a compile before the start is not this evaluation's"
         );
-        note_compile(Instant::now(), Duration::from_secs(3600));
-        assert_eq!(budget_elapsed(start), Duration::ZERO);
+        // After the start: off the clock, and only it.
+        note_compile(start + ms(2), ms(7));
+        assert_eq!(budget_elapsed_at(start, start + ms(20)), ms(13));
+        // It cannot take the clock below zero.
+        note_compile(start + ms(10), Duration::from_secs(3600));
+        assert_eq!(budget_elapsed_at(start, start + ms(20)), Duration::ZERO);
         // A later evaluation's clock is its own again.
-        let later = Instant::now();
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(budget_elapsed(later) >= Duration::from_millis(20));
+        let later = start + ms(30);
+        assert_eq!(budget_elapsed_at(later, later + ms(20)), ms(20));
+        // A compile on the start's own tick counts as the evaluation's.
+        note_compile(later, ms(4));
+        assert_eq!(budget_elapsed_at(later, later + ms(20)), ms(16));
+        // The wall-clock entry point reads the same log: a start ahead of
+        // now has nothing elapsed.
+        assert!(budget_elapsed(Instant::now() + ms(100)).is_zero());
     }
 
     /// A rule copied for `[guard] ask` shares its regex: compiled once.
