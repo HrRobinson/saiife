@@ -15,7 +15,9 @@
 //! refusal that blocks only that request (`onFailure: "block"`). Where the
 //! asker's uid is known (Linux, macOS), each uid has its own share of the
 //! connection and in-flight caps, so one user's flood leaves room for
-//! another's calls; the global caps stay as the backstop.
+//! another's calls; on Windows each asking pid has its own share, and its
+//! `cosign_denied` records fold per pid and carry `asker_pid`. The global
+//! caps stay as the backstop.
 
 use crate::hooks::{Principal, Waited};
 use crate::ops::{Ctx, VERSION};
@@ -55,11 +57,13 @@ pub const COSIGN_WAIT: Duration = Duration::from_secs(8);
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 /// Requests in flight; one more is answered `503`.
 pub const MAX_INFLIGHT: usize = 16;
-/// Requests in flight from one uid, where the uid is known.
+/// Requests in flight from one uid, where the uid is known; on Windows,
+/// from one pid ([`Asker::Process`]).
 pub const MAX_INFLIGHT_PER_UID: usize = 8;
 /// Open connections; one more is closed at once.
 pub const MAX_CONNS: usize = 64;
-/// Open connections from one uid, where the uid is known.
+/// Open connections from one uid, where the uid is known; on Windows, from
+/// one pid.
 pub const MAX_CONNS_PER_UID: usize = 32;
 /// The longest session id a `cosign_denied` record keeps, in bytes
 /// (`hook.bind`'s own limit).
@@ -73,6 +77,9 @@ pub const FOLD_EVERY: Duration = Duration::from_secs(10);
 /// The fold windows kept at once. When they are all live, a new session
 /// folds with the others of its reason and asker.
 const MAX_FOLD_KEYS: usize = 256;
+/// The fold windows one pid asker (Windows) may hold. A pid is cheap to
+/// come by (another process), so past this its sessions fold together.
+const MAX_FOLD_KEYS_PER_PID: usize = 16;
 /// Debug builds only: `SAIIFE_TEST_COSIGN_ADDR=<addr>` binds the co-signer
 /// there instead of [`saiife_system::layout::COSIGN_ADDR`], and `off` binds
 /// none. The test suite runs many system daemons at once; release builds
@@ -86,8 +93,10 @@ pub struct Opts {
     pub max_body: usize,
     pub wait: Duration,
     pub max_inflight: usize,
+    /// Per uid, or per pid on Windows ([`MAX_INFLIGHT_PER_UID`]).
     pub max_inflight_per_uid: usize,
     pub max_conns: usize,
+    /// Per uid, or per pid on Windows ([`MAX_CONNS_PER_UID`]).
     pub max_conns_per_uid: usize,
     pub header_read_timeout: Duration,
     pub body_read_timeout: Duration,
@@ -188,18 +197,21 @@ impl CosignState {
     }
 }
 
-/// What one fold window is for: a reason, who asked, and the call's
-/// session when the payload names one. So a flood of decoys folds only
-/// with itself, never over another asker's or another session's record.
+/// What one fold window is for: a reason, who asked (a principal, or on
+/// Windows a pid), and the call's session when the payload names one. So a
+/// flood of decoys folds only with itself, never over another asker's or
+/// another session's record.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FoldKey {
     why: CosignDeny,
     principal: Option<Principal>,
+    pid: Option<u32>,
     session: Option<String>,
 }
 
 /// One `cosign_denied` record per [`FoldKey`] per [`FOLD_EVERY`], with at
-/// most [`MAX_FOLD_KEYS`] windows.
+/// most [`MAX_FOLD_KEYS`] windows (and [`MAX_FOLD_KEYS_PER_PID`] per pid)
+/// that carry a session.
 #[derive(Debug, Default)]
 struct Folder {
     /// The start of each window, and the records held back in it.
@@ -211,21 +223,7 @@ impl Folder {
     /// count held back in the window before; `None` when it is held back.
     fn admit(&mut self, key: FoldKey, now: Instant) -> Option<u64> {
         let live = |start: &Instant| now.saturating_duration_since(*start) < FOLD_EVERY;
-        let key = if self.windows.contains_key(&key) || self.windows.len() < MAX_FOLD_KEYS {
-            key
-        } else {
-            // Ended windows go (with any count they held back); if every
-            // window is live, the session folds with its reason and asker.
-            self.windows.retain(|_, (start, _)| live(start));
-            if self.windows.len() < MAX_FOLD_KEYS {
-                key
-            } else {
-                FoldKey {
-                    session: None,
-                    ..key
-                }
-            }
-        };
+        let key = self.place(key, now);
         match self.windows.get_mut(&key) {
             Some((start, held)) if live(start) => {
                 *held += 1;
@@ -242,6 +240,44 @@ impl Folder {
                 Some(0)
             }
         }
+    }
+
+    /// The window `key` folds into. Ended windows go first (with any count
+    /// they held back) when a cap is reached. Past [`MAX_FOLD_KEYS_PER_PID`]
+    /// a pid's sessions fold together; when every window is live, a session
+    /// folds with its reason and asker, and a pid asker's into the one
+    /// pid-less window of its reason, so new pids add no windows.
+    fn place(&mut self, key: FoldKey, now: Instant) -> FoldKey {
+        if self.windows.contains_key(&key) {
+            return key;
+        }
+        let live = |start: &Instant| now.saturating_duration_since(*start) < FOLD_EVERY;
+        let mut key = key;
+        if let Some(pid) = key.pid {
+            let of_pid = |w: &HashMap<FoldKey, (Instant, u64)>| {
+                w.keys().filter(|k| k.pid == Some(pid)).count()
+            };
+            if of_pid(&self.windows) >= MAX_FOLD_KEYS_PER_PID {
+                self.windows.retain(|_, (start, _)| live(start));
+                if of_pid(&self.windows) >= MAX_FOLD_KEYS_PER_PID {
+                    key.session = None;
+                    if self.windows.contains_key(&key) {
+                        return key;
+                    }
+                }
+            }
+        }
+        if self.windows.len() >= MAX_FOLD_KEYS {
+            self.windows.retain(|_, (start, _)| live(start));
+        }
+        if self.windows.len() < MAX_FOLD_KEYS {
+            return key;
+        }
+        key.session = None;
+        if key.pid.is_some() && !self.windows.contains_key(&key) {
+            key.pid = None;
+        }
+        key
     }
 }
 
@@ -373,14 +409,14 @@ pub async fn serve_cosign(listener: TcpListener, ctx: Arc<Ctx>) {
 #[derive(Clone)]
 struct Limits {
     inflight: Arc<Semaphore>,
-    per_uid: Arc<PerUid>,
+    per_asker: Arc<PerAsker>,
 }
 
 /// [`serve_cosign`] with `opts`.
 pub async fn serve_cosign_with(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
     let lim = Limits {
         inflight: Arc::new(Semaphore::new(opts.max_inflight)),
-        per_uid: Arc::default(),
+        per_asker: Arc::default(),
     };
     let conns = Arc::new(Semaphore::new(opts.max_conns));
     loop {
@@ -413,8 +449,8 @@ pub async fn serve_cosign_with(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts)
 /// asker's connection slot, then the one request.
 async fn connection(s: TcpStream, peer: SocketAddr, ctx: Arc<Ctx>, lim: Limits, opts: Opts) {
     let who = asker(opts, s.local_addr().ok(), peer).await;
-    let _uid_slot = match who.uid() {
-        Some(uid) => match lim.per_uid.take(uid, Slot::Conn, opts.max_conns_per_uid) {
+    let _asker_slot = match who.cap_key() {
+        Some(k) => match lim.per_asker.take(k, Slot::Conn, opts.max_conns_per_uid) {
             Some(g) => Some(g),
             None => return,
         },
@@ -433,10 +469,18 @@ async fn connection(s: TcpStream, peer: SocketAddr, ctx: Arc<Ctx>, lim: Limits, 
         .await;
 }
 
-/// The connections and requests in flight per uid.
+/// Whose share of the caps a connection takes: a uid's, or on Windows a
+/// pid's (security review of task 4, finding 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CapKey {
+    Uid(u32),
+    Pid(u32),
+}
+
+/// The connections and requests in flight per uid or pid.
 #[derive(Debug, Default)]
-struct PerUid {
-    counts: Mutex<HashMap<u32, [usize; 2]>>,
+struct PerAsker {
+    counts: Mutex<HashMap<CapKey, [usize; 2]>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,39 +489,39 @@ enum Slot {
     Inflight = 1,
 }
 
-/// A held [`PerUid`] slot, given back on drop.
-struct UidSlot {
-    table: Arc<PerUid>,
-    uid: u32,
+/// A held [`PerAsker`] slot, given back on drop.
+struct AskerSlot {
+    table: Arc<PerAsker>,
+    key: CapKey,
     slot: Slot,
 }
 
-impl PerUid {
-    fn take(self: &Arc<Self>, uid: u32, slot: Slot, max: usize) -> Option<UidSlot> {
+impl PerAsker {
+    fn take(self: &Arc<Self>, key: CapKey, slot: Slot, max: usize) -> Option<AskerSlot> {
         let mut m = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let c = m.entry(uid).or_default();
+        let c = m.entry(key).or_default();
         if c[slot as usize] >= max {
             if *c == [0, 0] {
-                m.remove(&uid);
+                m.remove(&key);
             }
             return None;
         }
         c[slot as usize] += 1;
-        Some(UidSlot {
+        Some(AskerSlot {
             table: Arc::clone(self),
-            uid,
+            key,
             slot,
         })
     }
 }
 
-impl Drop for UidSlot {
+impl Drop for AskerSlot {
     fn drop(&mut self) {
         let mut m = self.table.counts.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(c) = m.get_mut(&self.uid) {
+        if let Some(c) = m.get_mut(&self.key) {
             c[self.slot as usize] = c[self.slot as usize].saturating_sub(1);
             if *c == [0, 0] {
-                m.remove(&self.uid);
+                m.remove(&self.key);
             }
         }
     }
@@ -538,9 +582,20 @@ enum Asker {
 }
 
 impl Asker {
-    fn uid(&self) -> Option<u32> {
+    /// The share of the caps this asker takes: its uid, or (Windows) its
+    /// pid. An asker that is not identified takes the global caps only.
+    fn cap_key(&self) -> Option<CapKey> {
         match self {
-            Asker::Known(Principal::Uid(u)) => Some(*u),
+            Asker::Known(Principal::Uid(u)) => Some(CapKey::Uid(*u)),
+            Asker::Process(pid) => Some(CapKey::Pid(*pid)),
+            _ => None,
+        }
+    }
+
+    /// The pid of an [`Asker::Process`].
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Asker::Process(pid) => Some(*pid),
             _ => None,
         }
     }
@@ -697,10 +752,10 @@ async fn handle(
     if who == Asker::Unknown {
         return denied(ctx, CosignDeny::NoReport, &who, None).await;
     }
-    let _uid_permit = match who.uid() {
-        Some(uid) => match lim
-            .per_uid
-            .take(uid, Slot::Inflight, opts.max_inflight_per_uid)
+    let _asker_permit = match who.cap_key() {
+        Some(k) => match lim
+            .per_asker
+            .take(k, Slot::Inflight, opts.max_inflight_per_uid)
         {
             Some(g) => Some(g),
             None => return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n"),
@@ -835,6 +890,7 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call
     let fold = FoldKey {
         why,
         principal: who.principal().cloned(),
+        pid: who.pid(),
         session: session.clone(),
     };
     let suppressed = {
@@ -886,6 +942,10 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call
             .and_then(|c| c.key.tool_use_id.as_deref())
             .map(crate::hooks::recorded_id)),
     );
+    // A pid asker (Windows) is no principal, but its pid tells floods apart.
+    if let Some(pid) = who.pid() {
+        x.insert("asker_pid".into(), pid.into());
+    }
     if suppressed > 0 {
         x.insert("suppressed".into(), suppressed.into());
     }
@@ -972,8 +1032,53 @@ mod tests {
         FoldKey {
             why,
             principal: uid.map(Principal::Uid),
+            pid: None,
             session: session.map(str::to_string),
         }
+    }
+
+    /// A fold key of a pid asker (Windows).
+    fn fp(why: CosignDeny, pid: u32, session: &str) -> FoldKey {
+        FoldKey {
+            pid: Some(pid),
+            ..fk(why, None, Some(session))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fold_windows_are_bounded_per_pid() {
+        let mut f = Folder::default();
+        let t0 = Instant::now();
+        let why = CosignDeny::NoReport;
+        for n in 0..MAX_FOLD_KEYS_PER_PID {
+            assert_eq!(f.admit(fp(why, 7, &format!("s-{n}")), t0), Some(0));
+        }
+        // Past its share, the pid's new sessions fold together.
+        assert_eq!(f.admit(fp(why, 7, "new-1"), t0), Some(0));
+        assert_eq!(f.admit(fp(why, 7, "new-2"), t0), None);
+        assert_eq!(f.windows.len(), MAX_FOLD_KEYS_PER_PID + 1);
+        // Another pid, and a pid-less asker with the same session, have their own.
+        assert_eq!(f.admit(fp(why, 8, "new-1"), t0), Some(0));
+        assert_eq!(f.admit(fk(why, None, Some("new-1")), t0), Some(0));
+        // Once the windows end, the pid has room again.
+        assert_eq!(f.admit(fp(why, 7, "new-3"), t0 + FOLD_EVERY), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_pids_add_no_windows_when_all_are_live() {
+        let mut f = Folder::default();
+        let t0 = Instant::now();
+        let why = CosignDeny::NoReport;
+        for n in 0..MAX_FOLD_KEYS {
+            let k = fk(why, Some(1), Some(&format!("s-{n}")));
+            assert_eq!(f.admit(k, t0), Some(0));
+        }
+        // Every window is live: new pids share one pid-less window.
+        assert_eq!(f.admit(fp(why, 100, "a"), t0), Some(0));
+        for pid in 101..1000 {
+            assert_eq!(f.admit(fp(why, pid, "a"), t0), None, "{pid}");
+        }
+        assert_eq!(f.windows.len(), MAX_FOLD_KEYS + 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1048,18 +1153,42 @@ mod tests {
 
     #[test]
     fn per_uid_slots_are_given_back() {
-        let t = Arc::new(PerUid::default());
+        let t = Arc::new(PerAsker::default());
+        let u = CapKey::Uid;
         let a: Vec<_> = (0..3)
-            .map(|_| t.take(1, Slot::Inflight, 3).unwrap())
+            .map(|_| t.take(u(1), Slot::Inflight, 3).unwrap())
             .collect();
-        assert!(t.take(1, Slot::Inflight, 3).is_none());
-        assert!(t.take(2, Slot::Inflight, 3).is_some(), "another uid");
-        let c = t.take(1, Slot::Conn, 3).unwrap();
+        assert!(t.take(u(1), Slot::Inflight, 3).is_none());
+        assert!(t.take(u(2), Slot::Inflight, 3).is_some(), "another uid");
+        let p = t.take(CapKey::Pid(1), Slot::Inflight, 3);
+        assert!(p.is_some(), "a pid is not the uid");
+        drop(p);
+        let c = t.take(u(1), Slot::Conn, 3).unwrap();
         drop(a);
-        assert!(t.take(1, Slot::Inflight, 3).is_some());
+        assert!(t.take(u(1), Slot::Inflight, 3).is_some());
         drop(c);
         assert!(t.counts.lock().unwrap().is_empty());
-        assert!(t.take(9, Slot::Conn, 0).is_none());
+        assert!(t.take(u(9), Slot::Conn, 0).is_none());
+        assert!(t.counts.lock().unwrap().is_empty());
+    }
+
+    /// A pid asker (Windows) has its own share of the caps; an asker that
+    /// is not identified has none.
+    #[test]
+    fn pid_askers_take_their_own_share() {
+        assert_eq!(Asker::Process(77).cap_key(), Some(CapKey::Pid(77)));
+        let me = Asker::Known(Principal::Uid(4242));
+        assert_eq!(me.cap_key(), Some(CapKey::Uid(4242)));
+        assert_eq!(Asker::Unscoped.cap_key(), None);
+        assert_eq!(Asker::Unknown.cap_key(), None);
+        let t = Arc::new(PerAsker::default());
+        let max = MAX_CONNS_PER_UID;
+        let held: Vec<_> = (0..max)
+            .map(|_| t.take(CapKey::Pid(77), Slot::Conn, max).unwrap())
+            .collect();
+        assert!(t.take(CapKey::Pid(77), Slot::Conn, max).is_none());
+        assert!(t.take(CapKey::Pid(78), Slot::Conn, max).is_some());
+        drop(held);
         assert!(t.counts.lock().unwrap().is_empty());
     }
 
@@ -1344,12 +1473,15 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(1), "at once");
             assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport), "{asker}");
         }
-        let got = wait_records(t.path(), 1);
-        assert_eq!(got.len(), 1, "folded per reason: {got:?}");
-        assert_eq!(got[0].reason.as_deref(), Some(CosignDeny::NoReport.text()));
-        // The asker is a pid, not a principal: no session or input kept.
-        assert_eq!(got[0].session, None);
-        assert_eq!(got[0].input, "");
+        let got = wait_records(t.path(), 4);
+        assert_eq!(got.len(), 4, "one window per pid: {got:?}");
+        for (rec, pid) in got.iter().zip([900, 10, 777, 4]) {
+            assert_eq!(rec.reason.as_deref(), Some(CosignDeny::NoReport.text()));
+            assert_eq!(rec.extra["asker_pid"], pid);
+            // The asker is a pid, not a principal: no session or input kept.
+            assert_eq!(rec.session, None);
+            assert_eq!(rec.input, "");
+        }
         // A process table that cannot be read ties nothing.
         ctx.hooks
             .set_tree(Arc::new(|| Err(io::Error::other("no table"))));
@@ -1391,6 +1523,35 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         hook_says(&ctx, 3, 777, &later, DecisionKind::Allow);
         assert_eq!(w.await.unwrap(), "");
+    }
+
+    /// Security review of task 4, finding 2: a pid asker (Windows) folds
+    /// with its own pid only, and its record names that pid.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn process_askers_fold_apart_and_record_their_pid() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        ctx.hooks.set_tree(fake_tree());
+        let start = Instant::now();
+        // The same session and reason from two pids: neither hides the other.
+        for (n, pid) in [(1, 900), (2, 901), (3, 900)] {
+            let p = payload(&format!("toolu_{n}"), "ls");
+            let r = ask(&ctx, start, p, &Asker::Process(pid)).await;
+            assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
+        }
+        let got = wait_records(t.path(), 2);
+        assert_eq!(got.len(), 2, "{got:?}");
+        let pids: Vec<_> = got.iter().map(|r| r.extra["asker_pid"].clone()).collect();
+        assert_eq!(pids, [json!(900), json!(901)]);
+        // Still no principal: no session or input kept.
+        assert!(got
+            .iter()
+            .all(|r| r.session.is_none() && r.input.is_empty()));
+        // A uid asker's record has no asker pid.
+        ask(&ctx, Instant::now(), payload("toolu_9", "ls"), &ME).await;
+        let got = wait_records(t.path(), 3);
+        assert!(!got[2].extra.contains_key("asker_pid"), "{:?}", got[2]);
     }
 
     #[test]
