@@ -410,19 +410,17 @@ mod imp {
             ));
         };
 
-        // 2. Register with the daemon before reading the payload (plan 20):
-        // from here on, a hook that ends without a verdict is recorded.
-        let mut client = match connect_begun(&cfg, daemon_uid, agent, event) {
+        // 2. Register with the daemon (plan 20) while 3. the payload is read,
+        // bounded: a helper thread connects, says hello and sends
+        // `hook.begin`, and nothing looks at the payload until it is done, so
+        // the daemon has the begin before the hook acts on its input. From
+        // the begin on, a hook that ends without a verdict is recorded.
+        let (begun, input) = begin_while_reading(&cfg, daemon_uid, agent, event);
+        let mut client = match begun {
             Ok(c) => c,
             // The daemon cannot be reached: stderr only.
-            Err(reason) => {
-                drain_stdin();
-                return blocked(&reason);
-            }
+            Err(reason) => return blocked(&reason),
         };
-
-        // 3. The payload, bounded.
-        let input = read_stdin();
         #[cfg(debug_assertions)]
         if eval::fault() == "parent_hang" {
             std::thread::sleep(Duration::from_secs(20));
@@ -1519,6 +1517,38 @@ mod imp {
             }
         }
         Ok(c)
+    }
+
+    /// [`connect_begun`] on a helper thread, started first, and the payload
+    /// ([`read_stdin`]) on this one meanwhile; both are done when this
+    /// returns. Before plan 20 the connect overlapped the worker; this keeps
+    /// it off the hook's serial path. A begin that failed, or a helper that
+    /// panicked, is an `Err`: the call fails closed. If no thread can be
+    /// started, the begin runs here first.
+    fn begin_while_reading(
+        cfg: &SystemConfig,
+        daemon_uid: u32,
+        agent: &str,
+        event: Option<&str>,
+    ) -> (Result<Client, String>, Result<String, String>) {
+        std::thread::scope(|s| {
+            let helper = std::thread::Builder::new()
+                .name("saiife-begin".into())
+                .spawn_scoped(s, || connect_begun(cfg, daemon_uid, agent, event));
+            match helper {
+                Ok(h) => {
+                    let input = read_stdin();
+                    let begun = h.join().unwrap_or_else(|_| {
+                        Err("cannot reach the audit daemon (saiife crashed)".into())
+                    });
+                    (begun, input)
+                }
+                Err(_) => {
+                    let begun = connect_begun(cfg, daemon_uid, agent, event);
+                    (begun, read_stdin())
+                }
+            }
+        })
     }
 
     /// `key`, if the daemon's `hook.bind` takes it: a session over

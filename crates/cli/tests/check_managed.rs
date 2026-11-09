@@ -1274,12 +1274,23 @@ fn unknown_event_with_managed_fails_closed() {
 // Plan 20, Task 3: the hook registers with the daemon (`hook.begin`) before
 // it reads its input, and names the call (`hook.bind`) once it has.
 
-/// One frame a [`FakeDaemon`] read: the connection's index, the op and its args.
+/// One frame a [`FakeDaemon`] read: the connection's index, the op, its args, and when.
 #[derive(Debug, Clone)]
 struct Seen {
     conn: usize,
     op: String,
     args: Value,
+    at: Instant,
+}
+
+/// How a [`FakeDaemon`] answers `hook.begin`.
+#[derive(Debug, Clone, Copy)]
+enum Begin {
+    Answer,
+    /// `ok`, this long after it arrived.
+    After(Duration),
+    /// No answer: the connection is closed.
+    Break,
 }
 
 /// A locked-mode daemon that answers every op `ok` (an append with a
@@ -1292,6 +1303,10 @@ struct FakeDaemon {
 
 impl FakeDaemon {
     fn start(d: &TestDaemon, hang_approval: bool) -> FakeDaemon {
+        FakeDaemon::start_with(d, hang_approval, Begin::Answer)
+    }
+
+    fn start_with(d: &TestDaemon, hang_approval: bool, begin: Begin) -> FakeDaemon {
         let l = fake_socket_dir(d);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
         let (tx, begun) = std::sync::mpsc::channel();
@@ -1312,7 +1327,15 @@ impl FakeDaemon {
                             conn,
                             op: op.clone(),
                             args: Value::Object(m),
+                            at: Instant::now(),
                         });
+                        if op == "hook.begin" {
+                            match begin {
+                                Begin::Answer => {}
+                                Begin::After(t) => std::thread::sleep(t),
+                                Begin::Break => return,
+                            }
+                        }
                         let ans = match op.as_str() {
                             "hello" => json!({"id": id, "ok": true, "proto": 1, "mode": "locked"}),
                             "audit.append" => json!({"id": id, "ok": true, "seq": 1}),
@@ -1408,6 +1431,91 @@ fn begin_names_the_event() {
         "stderr: {}",
         stderr(&o)
     );
+}
+
+/// The payload is read while the begin is on its way (a helper thread
+/// sends it), but nothing acts on it before the begin is answered: a
+/// payload larger than a pipe's buffer is taken in whole while the daemon
+/// holds the begin, and the bind comes only after the begin's answer.
+#[test]
+fn payload_is_read_while_the_begin_waits_but_not_acted_on() {
+    let hold = Duration::from_millis(800);
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start_with(&d, false, Begin::After(hold));
+    let sb = Sandbox::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--managed", "--agent", "claude", "--system-config"])
+        .arg(d.config())
+        .env("HOME", sb.dir.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_DATA_DIR", sb.data())
+        .env("SAIIFE_AUDIT_DIR", sb.audit())
+        .env_remove("SAIIFE_EVAL_FAULT")
+        .env(
+            "SAIIFE_TEST_CLAUDE_MCP_DROPIN",
+            sb.dir.path().join("no-dropin"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let home = common::FixtureHome::new();
+    let mut v: Value =
+        serde_json::from_str(&home.real(&fixture("claude/bash-allow.json"))).unwrap();
+    // Over a pipe's 64 KiB buffer, under the 256 KiB a judged call may hold.
+    v["padding"] = "p".repeat(200 * 1024).into();
+    let data = v.to_string();
+    let mut sin = child.stdin.take().unwrap();
+    let w = std::thread::spawn(move || {
+        sin.write_all(data.as_bytes()).unwrap();
+        drop(sin);
+        Instant::now()
+    });
+    let o = child.wait_with_output().unwrap();
+    let written = w.join().unwrap();
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let seen = fake.seen();
+    let ops: Vec<(usize, String)> = seen.iter().map(|s| (s.conn, s.op.clone())).collect();
+    assert_eq!(
+        ops,
+        ops_of(&[
+            (0, "hello"),
+            (0, "hook.begin"),
+            (0, "hook.bind"),
+            (0, "audit.append")
+        ])
+    );
+    let begin = seen[1].at;
+    assert!(
+        written < begin + hold,
+        "the payload was not read while the begin waited"
+    );
+    assert!(
+        seen[2].at >= begin + hold,
+        "the bind came before the begin's answer"
+    );
+}
+
+/// A begin that breaks the connection fails the call closed, with no
+/// record and no bind, though the payload was read meanwhile.
+#[test]
+fn a_broken_begin_fails_closed() {
+    let d = TestDaemon::prepare(&Opts::default());
+    let fake = FakeDaemon::start_with(&d, false, Begin::Break);
+    let home = common::FixtureHome::new();
+    let mut v: Value =
+        serde_json::from_str(&home.real(&fixture("claude/bash-allow.json"))).unwrap();
+    // Over a pipe's 64 KiB buffer, under the 256 KiB a judged call may hold.
+    v["padding"] = "p".repeat(200 * 1024).into();
+    let (o, _, _sb) = managed(&d.config(), &v.to_string());
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("saiife: BLOCKED (fail closed): cannot reach the audit daemon"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(fake.ops(), ops_of(&[(0, "hello"), (0, "hook.begin")]));
 }
 
 #[test]
