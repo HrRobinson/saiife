@@ -97,7 +97,7 @@ the MCP server and gateway, the personal broker and fleet packages.
 - Every path it makes has a protected access list, which `doctor` reads back.
 - The daemon listens on the named pipe `\\.\pipe\saiife` and refuses to start when the name is taken. It reads each caller's SID and groups from its token; records carry `sid`.
 - Release builds load DLLs only from System32. `doctor` checks the build, its imports and its signature. It also fails when Claude Code's `HKLM\SOFTWARE\Policies\ClaudeCode` would replace the managed files, and when an agent user can become an admin.
-- With the co-signer (plan 20), a hook ended with `TerminateProcess(hook, 0)` is a deny for Claude Code. Windows locked mode is still a preview: code injected into the hook can make it record an allow, and the co-signer then accepts it.
+- With the co-signer (plan 20), a hook ended with `TerminateProcess(hook, 0)` is a deny for Claude Code. Windows locked mode is still a preview. A forged allow needs no code injection: any process of the agent's user can open the service's pipe, send `hook.begin`, bind the call's key, append an allow, and then end the real hook. The co-signer sees a recorded allow and accepts it. Code injected into the hook can do the same. Plan 21 closes this; see Known limits.
 - CI's new `locked-windows` and `package-windows` jobs run it on throwaway runners. `windows-latest` checks the readers against real PowerShell and cmd.
 
 ### Connectors, MCP and the personal broker
@@ -149,7 +149,7 @@ the MCP server and gateway, the personal broker and fleet packages.
 ### Known limits
 
 - Windows locked mode is a preview. A process running as the agent's own user can end a hook with `TerminateProcess(hook, 0)`. Before plan 20 the agent read that exit 0 as allow, and nothing was recorded (measured on `windows-2022` and `windows-2025`). `doctor` says so on every locked run (`locked.preview`).
-- It stays a preview after plan 20. The co-signer blocks a forged exit 0 for Claude Code, but code injected into the hook can still make it record an allow.
+- It stays a preview after plan 20. The co-signer blocks a forged exit 0 for Claude Code, but not a forged allow. That needs no code injection: any process of the agent's user can open the service's pipe, send `hook.begin`, bind the call's key, append an allow, and then end the real hook with `TerminateProcess`. The co-signer sees a recorded allow and accepts it. Code injected into the hook can do the same, as Windows gives a user full access to its own processes. A program that takes `127.0.0.1:7433` while the service restarts is not prevented either. Plan 21 is what closes this.
 - On macOS and Windows the co-signer cannot identify the TCP peer.
 - Codex and Gemini CLI get detection only: a hook that ends without a verdict is recorded, but the call still runs.
 - In locked mode, a Claude Code tool call whose input is over 16 MiB is blocked (the co-signer's body cap).
