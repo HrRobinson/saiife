@@ -16,6 +16,7 @@ use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{classify_for, Dialects, ToolCall, MAX_PAYLOAD_BYTES};
+#[cfg(unix)]
 use saiifeguard::profile::select_active;
 use saiifeguard::wintable::Dialect;
 
@@ -165,47 +166,56 @@ pub struct Config {
 /// - `posix-all`: every POSIX built-in pack, bound to `tree`;
 /// - `windows-all`: every Windows built-in pack, a Windows profile, read by
 ///   PowerShell, cmd and the strictest of PowerShell and POSIX.
+///
+/// The POSIX engines are Unix only: their tree must be a POSIX path, and on
+/// Windows the tree is `\\?\D:\…` (a POSIX engine judges POSIX paths, which a
+/// Windows host's file system does not hold). `windows-all` runs everywhere.
 pub fn configs(tree: &Tree) -> Vec<Config> {
-    let posix = |enabled: bool| {
-        let (packs, warnings) = builtin_packs_for(PathStyle::Posix);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        let packs = if enabled {
-            packs
-        } else {
-            select_active(packs, &[])
+    let mut out = Vec::new();
+    #[cfg(unix)]
+    {
+        let posix = |enabled: bool| {
+            let (packs, warnings) = builtin_packs_for(PathStyle::Posix);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let packs = if enabled {
+                packs
+            } else {
+                select_active(packs, &[])
+            };
+            Engine::new(packs)
+                .with_budget(BUDGET)
+                .with_pattern_allowance(std::time::Duration::MAX)
+                .with_paths(tree.vars())
         };
-        Engine::new(packs)
-            .with_budget(BUDGET)
-            .with_pattern_allowance(std::time::Duration::MAX)
-            .with_paths(tree.vars())
-    };
+        out.push(Config {
+            name: "posix-default",
+            engine: posix(false),
+            dialects: vec![Dialects::One(Dialect::Posix)],
+        });
+        out.push(Config {
+            name: "posix-all",
+            engine: posix(true),
+            dialects: vec![Dialects::One(Dialect::Posix)],
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = tree;
     let (wpacks, warnings) = builtin_packs_for(PathStyle::Windows);
     assert!(warnings.is_empty(), "{warnings:?}");
     let windows = Engine::new(wpacks)
         .with_budget(BUDGET)
         .with_pattern_allowance(std::time::Duration::MAX)
         .with_paths(windows_vars());
-    vec![
-        Config {
-            name: "posix-default",
-            engine: posix(false),
-            dialects: vec![Dialects::One(Dialect::Posix)],
-        },
-        Config {
-            name: "posix-all",
-            engine: posix(true),
-            dialects: vec![Dialects::One(Dialect::Posix)],
-        },
-        Config {
-            name: "windows-all",
-            engine: windows,
-            dialects: vec![
-                Dialects::One(Dialect::PowerShell),
-                Dialects::One(Dialect::Cmd),
-                Dialects::Strictest(Dialect::PowerShell, Dialect::Posix),
-            ],
-        },
-    ]
+    out.push(Config {
+        name: "windows-all",
+        engine: windows,
+        dialects: vec![
+            Dialects::One(Dialect::PowerShell),
+            Dialects::One(Dialect::Cmd),
+            Dialects::Strictest(Dialect::PowerShell, Dialect::Posix),
+        ],
+    });
+    out
 }
 
 /// A Windows profile, as the Windows corpora bind it.
@@ -225,6 +235,20 @@ pub fn rehome(payload: &str, home: &Path) -> String {
     let home = home.to_string_lossy();
     assert!(!home.contains(['"', '\\']), "{home}");
     payload.replace("/home/u", &home)
+}
+
+/// The Claude Code fixtures moved into `tree` ([`rehome`]), as `(file name,
+/// payload)`. None on Windows: the fixtures are POSIX hook payloads, and a
+/// Windows tree's home (`\\?\D:\…`) is no POSIX path to move them to.
+pub fn fixtures_in(tree: &Tree) -> Vec<(String, String)> {
+    if cfg!(unix) {
+        claude_fixtures()
+            .into_iter()
+            .map(|(name, p)| (name, rehome(&p, &tree.home())))
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Judge one hook payload as the hook does on a POSIX host: a shell command

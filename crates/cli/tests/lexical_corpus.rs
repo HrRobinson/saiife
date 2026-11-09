@@ -10,7 +10,7 @@ mod corpus;
 use saiifeguard::canon::{with_fs_view, FsView};
 use saiifeguard::pathrule::Access;
 
-use corpus::{claude_fixtures, configs, corpus_cases, judge_payload, rehome, Tree};
+use corpus::{configs, corpus_cases, fixtures_in, judge_payload, Tree};
 
 /// Cases the lexical view may deny although the host allows them, each
 /// approved by the owner by name (ruling of 2026-11-09), as `(label suffix,
@@ -27,7 +27,7 @@ const KNOWN_STRICTER: &[(&str, &str)] = &[(
 
 /// What is judged, as `(case label, denied)`, in a fixed order.
 fn verdicts(view: FsView, tree: &Tree, cases: &[String]) -> Vec<(String, bool)> {
-    let fixtures = claude_fixtures();
+    let fixtures = fixtures_in(tree);
     with_fs_view(view, || {
         let mut out = Vec::new();
         for c in configs(tree) {
@@ -48,7 +48,7 @@ fn verdicts(view: FsView, tree: &Tree, cases: &[String]) -> Vec<(String, bool)> 
             for (name, payload) in &fixtures {
                 out.push((
                     format!("{} fixture: {name}", c.name),
-                    judge_payload(&c.engine, &rehome(payload, &tree.home())).is_deny(),
+                    judge_payload(&c.engine, payload).is_deny(),
                 ));
             }
         }
@@ -70,8 +70,9 @@ fn lexical_never_stricter_on_the_corpora() {
         .filter(|((_, h), (_, l))| !*h && *l)
         .map(|((label, _), _)| label.as_str())
         .collect();
-    // Every accepted entry is still needed.
-    for (k, why) in KNOWN_STRICTER {
+    // Every accepted entry is still needed. They are POSIX cases, judged only
+    // on Unix (`corpus::configs`: Windows runs the Windows engine alone).
+    for (k, why) in KNOWN_STRICTER.iter().filter(|_| cfg!(unix)) {
         assert!(
             all_stricter.iter().any(|label| label.ends_with(k)),
             "KNOWN_STRICTER{k:?} ({why}) no longer applies"

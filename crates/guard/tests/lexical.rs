@@ -1,18 +1,26 @@
 //! The lexical file system view (plan 21, Task 1): under `FsView::Lexical`
 //! the guard judges a call with no file system access at all, as the saiife
 //! service does when it re-judges a co-signed call.
+//!
+//! A POSIX engine is checked against a POSIX tree on disk, so those tests are
+//! Unix only (on Windows the tree is `\\?\D:\…`, no POSIX path); the Windows
+//! engine's checks run on every host.
 
 #[path = "support/corpus.rs"]
 mod corpus;
 
-use saiifeguard::canon::{fs_calls_made, with_fs_view, FsView, PathStyle, PathVars};
+#[cfg(unix)]
+use saiifeguard::canon::PathStyle;
+use saiifeguard::canon::{fs_calls_made, with_fs_view, FsView, PathVars};
 use saiifeguard::engine::Engine;
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::Dialects;
 use saiifeguard::profile::select_active;
 use saiifeguard::wintable::Dialect;
 
-use corpus::{claude_fixtures, configs, corpus_cases, judge_payload, rehome, Tree};
+#[cfg(unix)]
+use corpus::{claude_fixtures, rehome};
+use corpus::{configs, corpus_cases, fixtures_in, judge_payload, Tree};
 
 const BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -22,7 +30,7 @@ fn calls_judging_everything(view: FsView) -> u64 {
     let tree = Tree::new();
     let cases = corpus_cases();
     assert!(cases.len() > 1000, "only {} corpus cases", cases.len());
-    let fixtures = claude_fixtures();
+    let fixtures = fixtures_in(&tree);
     with_fs_view(view, || {
         let before = fs_calls_made();
         for c in configs(&tree) {
@@ -34,7 +42,7 @@ fn calls_judging_everything(view: FsView) -> u64 {
                 let _ = c.engine.evaluate_path(Access::Write, cmd);
             }
             for (_, payload) in &fixtures {
-                let _ = judge_payload(&c.engine, &rehome(payload, &tree.home()));
+                let _ = judge_payload(&c.engine, payload);
             }
         }
         fs_calls_made() - before
@@ -98,6 +106,7 @@ fn lexical_symlink_is_literal() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn lexical_home_rules_still_deny() {
     let tree = Tree::new();
@@ -114,7 +123,14 @@ fn lexical_home_rules_still_deny() {
             home = tree.home().display(),
         );
         assert!(judge_payload(&posix, &read).is_deny());
+    });
+}
 
+/// The Windows half of `lexical_home_rules_still_deny`, on every host: the
+/// Windows engine binds a Windows profile and needs no tree on disk.
+#[test]
+fn lexical_windows_home_rules_still_deny() {
+    with_fs_view(FsView::Lexical, || {
         let windows = default_engine(corpus::windows_vars());
         let d = windows.evaluate_in(
             r"type %USERPROFILE%\.ssh\id_rsa",
@@ -135,6 +151,7 @@ fn lexical_home_rules_still_deny() {
 /// A glob matches nothing, so it is judged as spelled: as the host judges it
 /// in a project where it matches nothing. (`cat .env*` with a `.env` on disk
 /// is the hook's to deny; the lexical view is never stricter, not as strict.)
+#[cfg(unix)]
 #[test]
 fn lexical_globs_are_judged_as_spelled() {
     let tree = Tree::new();
@@ -169,6 +186,7 @@ fn lexical_globs_are_judged_as_spelled() {
 /// A move or copy target the view cannot see may be a file or a directory,
 /// so it is judged as both: `mv evil ~/.aws/credentials` reads and replaces
 /// the credentials when they are a file, as the host sees they are.
+#[cfg(unix)]
 #[test]
 fn lexical_target_is_judged_as_the_file_and_the_directory() {
     let tree = Tree::new();
@@ -209,6 +227,7 @@ fn lexical_target_is_judged_as_the_file_and_the_directory() {
 
 /// `-t DIR` and `--target-directory[=]DIR` always name a directory, in both
 /// views: what lands is `DIR/<name>`, never `DIR` itself.
+#[cfg(unix)]
 #[test]
 fn target_directory_is_a_directory_in_both_views() {
     let tree = Tree::new();
@@ -250,6 +269,7 @@ fn target_directory_is_a_directory_in_both_views() {
 /// What the lexical view may deny that the host allows: a copy into a
 /// protected directory spelled with no trailing `/` and no `-t`, which the
 /// view cannot tell from a copy onto that name (`KNOWN_STRICTER`).
+#[cfg(unix)]
 #[test]
 fn lexical_copy_into_a_bare_protected_directory_is_stricter() {
     let tree = Tree::new();
@@ -285,6 +305,7 @@ fn windows_style_values_are_not_resolved() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn every_fixture_judges_alike_in_both_views_here() {
     // The fixtures name nothing a symlink changes, so both views agree.

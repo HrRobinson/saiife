@@ -11,7 +11,7 @@ use saiifeguard::canon::PathStyle;
 use saiifeguard::engine::Engine;
 use saiifeguard::pathrule::Access;
 
-use corpus::{claude_fixtures, configs, corpus_cases, judge_payload, rehome, windows_vars, Tree};
+use corpus::{configs, corpus_cases, fixtures_in, judge_payload, windows_vars, Tree};
 
 const BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -41,7 +41,7 @@ fn first_use_regexes_judge_every_corpus_case_alike() {
     let tree = Tree::new();
     let cases = corpus_cases();
     assert!(cases.len() > 1000, "only {} corpus cases", cases.len());
-    let fixtures = claude_fixtures();
+    let fixtures = fixtures_in(&tree);
     let mut judged = 0usize;
     for c in configs(&tree) {
         let hook = hook_engine(c.name, &tree);
@@ -66,10 +66,9 @@ fn first_use_regexes_judge_every_corpus_case_alike() {
             }
         }
         for (name, payload) in &fixtures {
-            let payload = rehome(payload, &tree.home());
             let (a, b) = (
-                judge_payload(&c.engine, &payload),
-                judge_payload(&hook, &payload),
+                judge_payload(&c.engine, payload),
+                judge_payload(&hook, payload),
             );
             if format!("{a:?}") != format!("{b:?}") {
                 differ.push(format!("{name}: eager {a:?}, first use {b:?}"));
