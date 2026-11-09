@@ -108,7 +108,8 @@ jobs:
         run: |
           bash5="$(brew --prefix)/bin/bash"
           [ -x "$bash5" ] || brew install bash
-          BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
+          # Report-only until plan 21 sets real budgets: prints the numbers, fails only when a call does not allow.
+          BENCH_REPORT_ONLY=1 BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
       # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin and saiife-win must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
@@ -229,8 +230,9 @@ jobs:
       # with debug assertions lets a daemon serve a hook of its own user),
       # starts its own daemon in a scratch dir, fails unless every call
       # allows, and prints the median and p95 per payload and each step's median.
+      # Report-only until plan 21 sets real budgets: over budget prints, a call that does not allow fails.
       - name: managed hook bench (Linux, p95 budget)
-        run: SAIIFE_BENCH_BIN="$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife" BENCH_MAX_P95_MS=40 bash scripts/bench-check.sh --managed 50
+        run: BENCH_REPORT_ONLY=1 SAIIFE_BENCH_BIN="$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife" BENCH_MAX_P95_MS=40 bash scripts/bench-check.sh --managed 50
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

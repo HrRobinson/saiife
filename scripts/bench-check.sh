@@ -21,7 +21,9 @@
 # With BENCH_MAX_P95_MS=<ms> it exits 1 when a payload's p95 is above that
 # budget (the macOS CI test job uses 40 for --managed; the windows-latest test
 # job uses 130 for the developer hook, which allows for slow runners; the planned
-# speed-up should tighten it).
+# speed-up should tighten it). With BENCH_REPORT_ONLY=1 a p95 over budget prints
+# "over budget (report-only)" and exits 0; a call that does not allow still fails.
+# The managed benches use it until plan 21 sets real budgets.
 #
 # On Windows (or with BENCH_SPLIT=1 anywhere) the same N calls of cheaper things
 # come first, so a number over budget can be read: a program of Git Bash's own, the
@@ -32,7 +34,7 @@
 # builds can be compared with the same script. SAIIFE_BENCH_TMP=<dir> is where
 # the scratch dir goes (default: next to the repo, then the system's).
 #
-# Usage: [BENCH_MAX_P95_MS=<ms>] scripts/bench-check.sh [--managed] [N]   (default N = 50)
+# Usage: [BENCH_MAX_P95_MS=<ms>] [BENCH_REPORT_ONLY=1] scripts/bench-check.sh [--managed] [N]   (default N = 50)
 set -euo pipefail
 
 managed=0
@@ -189,6 +191,10 @@ report() {
   done
   if [[ -n "$max_p95" ]]; then
     if [[ "$over" == 1 ]]; then
+      if [[ "${BENCH_REPORT_ONLY:-0}" == 1 ]]; then
+        echo "over budget (report-only)"
+        return 0
+      fi
       exit 1
     fi
     echo "p95 within the budget of $max_p95 ms"

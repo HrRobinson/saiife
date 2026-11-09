@@ -1705,7 +1705,7 @@ function Assert-CosignAfterRestart([string]$When) {
 }
 
 # The managed hook's budget on Windows: p95 of 50 allow calls as the agent within 130 ms
-# (Global Constraints), timed in one pwsh of the agent so no logon is counted. p95 is the
+# (Global Constraints), report-only until plan 21, timed in one pwsh of the agent so no logon is counted. p95 is the
 # value at rank ceil(0.95 n), as scripts/bench-check.sh takes it.
 function bench_managed {
   $runs = 50
@@ -1833,8 +1833,9 @@ foreach ($i in 1..$Extra) {
   $median = if ($runs % 2) { $sorted[($runs - 1) / 2] } else { ($sorted[$runs / 2 - 1] + $sorted[$runs / 2]) / 2 }
   $line = [string]::Format($inv, 'managed hook, allow fixture as the agent, {0} runs: median {1:F1} ms, p95 {2:F1} ms, max {3:F1} ms (budget {4} ms)', $runs, $median, $p95, $sorted[-1], $budget)
   Measure-Result 'managed-hook-p95' $line
-  if ($p95 -gt $budget) { Fail "the managed hook's p95 is over its budget: $line" }
-  Ok $line
+  # Report-only until plan 21 sets real budgets (owner ruling 2026-11-09): over budget is
+  # printed, not failed. Runs that did not allow still fail above.
+  if ($p95 -gt $budget) { Write-Host "  over budget (report-only): $line" } else { Ok $line }
 }
 
 # Plan 20 Task 9: the co-signer on a real Windows. Unlike phase_measurements these steps are
