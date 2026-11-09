@@ -300,9 +300,12 @@ struct Slot {
     /// Who bound it first; only connections of this principal may bind
     /// it again or settle it, and only its waiters may see its outcome.
     principal: Principal,
-    /// The pid of the connection that bound it last (each connection's
-    /// first bind sets it, and clears the outcome): the hook whose verdict
-    /// counts. Windows ties it to the asker's process tree.
+    /// The connection that bound it last (each connection's first bind
+    /// sets it, and clears the outcome): the hook whose verdict counts. A
+    /// connection it superseded settles nothing, neither by a verdict nor
+    /// by ending without one.
+    conn: ConnId,
+    /// That connection's pid. Windows ties it to the asker's process tree.
     pid: u32,
     outcome: Option<Waited>,
     /// Verdicts given on this key, so a grace period sees a later one.
@@ -356,8 +359,9 @@ impl Inner {
     }
 
     /// Count a hook without a verdict and send it to the sink; settles the
-    /// key's waiters on `NoVerdict` unless a verdict came after `seen`.
-    fn record(&self, mut nv: NoVerdict, seen: Option<u64>) {
+    /// key's waiters on `NoVerdict` unless a verdict came after `seen`, and
+    /// only while `conn` is still the key's binder.
+    fn record(&self, mut nv: NoVerdict, seen: Option<u64>, conn: ConnId) {
         {
             let mut st = self.lock();
             let principal = Principal::of(&nv.peer);
@@ -376,7 +380,7 @@ impl Inner {
                 .key
                 .as_ref()
                 .and_then(|k| st.keys.get_mut(k))
-                .filter(|s| s.principal == principal)
+                .filter(|s| s.principal == principal && s.conn == conn)
             {
                 slot.outcome = Some(Waited::NoVerdict);
                 slot.notify.notify_waiters();
@@ -390,7 +394,13 @@ impl Inner {
 
     /// A connection that ended (or overran) without a verdict: recorded at
     /// once when unbound, after [`RECONNECT_GRACE`] when bound.
-    fn ended_without_verdict(self: &Arc<Self>, st: MutexGuard<'_, State>, o: Open, overrun: bool) {
+    fn ended_without_verdict(
+        self: &Arc<Self>,
+        st: MutexGuard<'_, State>,
+        conn: ConnId,
+        o: Open,
+        overrun: bool,
+    ) {
         let seen = o
             .key
             .as_ref()
@@ -407,18 +417,18 @@ impl Inner {
             ts: String::new(),
         };
         if nv.key.is_none() {
-            return self.record(nv, None);
+            return self.record(nv, None, conn);
         }
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 let inner = Arc::clone(self);
                 h.spawn(async move {
                     tokio::time::sleep(RECONNECT_GRACE).await;
-                    inner.record(nv, seen);
+                    inner.record(nv, seen, conn);
                 });
             }
             // No runtime (a shutdown): record without the grace.
-            Err(_) => self.record(nv, seen),
+            Err(_) => self.record(nv, seen, conn),
         }
     }
 
@@ -448,7 +458,7 @@ impl Inner {
             close: None,
             overrun: None,
         };
-        self.ended_without_verdict(st, copy, true);
+        self.ended_without_verdict(st, conn, copy, true);
     }
 }
 
@@ -566,6 +576,7 @@ impl HookTable {
         if first {
             if let Some(s) = st.keys.get_mut(&key) {
                 s.outcome = None;
+                s.conn = conn;
                 s.pid = pid;
             }
         }
@@ -574,6 +585,7 @@ impl HookTable {
                 key.clone(),
                 Slot {
                     principal,
+                    conn,
                     pid,
                     outcome: None,
                     verdicts: 0,
@@ -592,7 +604,8 @@ impl HookTable {
     /// `allow` and `approved` settle its key as [`Waited::Allow`]; every
     /// other decision as [`Waited::Deny`]. A record that does not name the
     /// bound key ([`Verdict::names`]) settles nothing, and the connection
-    /// stays without a verdict.
+    /// stays without a verdict. A connection whose key a later connection
+    /// bound has its verdict, but settles nothing: only the binder's counts.
     pub fn verdict(&self, conn: ConnId, v: &Verdict) {
         let mut st = self.inner.lock();
         let Some(o) = st.conns.get_mut(&conn) else {
@@ -616,7 +629,11 @@ impl HookTable {
             DecisionKind::Allow | DecisionKind::Approved => Waited::Allow,
             _ => Waited::Deny,
         };
-        if let Some(slot) = st.keys.get_mut(&key).filter(|s| s.principal == principal) {
+        if let Some(slot) = st
+            .keys
+            .get_mut(&key)
+            .filter(|s| s.principal == principal && s.conn == conn)
+        {
             slot.outcome = Some(outcome);
             slot.verdicts += 1;
             slot.notify.notify_waiters();
@@ -636,7 +653,7 @@ impl HookTable {
         if o.done {
             return;
         }
-        self.inner.ended_without_verdict(st, o, false);
+        self.inner.ended_without_verdict(st, conn, o, false);
     }
 
     /// The verdict on `key` for `principal`, waiting for it until `until`
@@ -1208,6 +1225,71 @@ mod tests {
         let (w, ()) = tokio::join!(waiter, hook);
         assert_eq!(w, Waited::Deny);
         assert_eq!(start.elapsed(), Duration::from_millis(1500));
+    }
+
+    /// A connection superseded by a later bind of its key (security review
+    /// of T4, finding 1): its verdict no longer settles the key, so a
+    /// forger that bound first cannot allow the real hook's call.
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_connection_cannot_settle_the_key() {
+        let (t, _seen) = table();
+        let forger = PeerCred { pid: 900, ..peer() };
+        t.begin(ConnId(1), &forger, "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        // The real hook binds the same key after it.
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(t.wait_me(&key(1), until).await, Waited::Timeout);
+        // Nor does the forger tied to an asker: the binder is the hook (777).
+        t.set_tree(Arc::new(|| {
+            let e = |pid, ppid| ProcEntry {
+                pid,
+                ppid,
+                exe: String::new(),
+                created: None,
+                session: None,
+            };
+            Ok(vec![e(100, 50), e(777, 100), e(900, 100)])
+        }));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await,
+            Waited::Timeout
+        );
+        // The binder's own verdict settles it.
+        t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Deny));
+        assert_eq!(t.wait_me(&key(1), until).await, Waited::Deny);
+    }
+
+    /// A superseded connection that ends without a verdict is recorded, but
+    /// does not settle the binder's key as `NoVerdict`.
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_end_does_not_settle_no_verdict() {
+        let (t, seen) = table();
+        t.begin(ConnId(1), &peer(), "claude", None);
+        t.bind(ConnId(1), key(1));
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.ended(ConnId(1));
+        let start = Instant::now();
+        let waiter = async { t.wait_me(&key(1), start + Duration::from_secs(8)).await };
+        let hook = async {
+            tokio::time::sleep(RECONNECT_GRACE + Duration::from_secs(1)).await;
+            t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        };
+        let (w, ()) = tokio::join!(waiter, hook);
+        assert_eq!(w, Waited::Allow);
+        settle().await;
+        assert_eq!(got(&seen).len(), 1, "conn 1 is still recorded");
+        assert_eq!(t.no_verdict_count().0, 1);
+        // The binder's own end without a verdict does settle it.
+        t.begin(ConnId(3), &peer(), "claude", None);
+        t.bind(ConnId(3), key(2));
+        t.ended(ConnId(3));
+        let until = Instant::now() + Duration::from_secs(8);
+        assert_eq!(t.wait_me(&key(2), until).await, Waited::NoVerdict);
     }
 
     #[test]
