@@ -499,13 +499,15 @@ function Build-Native {
     'cl /nologo /W3 /MT /O1 /DCONTROL plant.c /Fe:control.exe /Fo:control.obj /link saiife-plant-probe.lib',
     'cl /nologo /W3 /MT /O1 /DCONTROL plant.c /Fe:control-flagged.exe /Fo:control-flagged.obj /link saiife-plant-probe.lib /DEPENDENTLOADFLAG:0x800',
     'cl /nologo /W3 /MT /O1 /DFAKE_HOOK plant.c /Fe:fake-hook.exe /Fo:fake-hook.obj',
+    'cl /nologo /W3 /MT /O1 /DFAKE_CLAUDE plant.c /Fe:fake-claude.exe /Fo:fake-claude.obj',
+    # Last: measure.exe is what says the whole set is built.
     'cl /nologo /W3 /MT /O1 measure.c /Fe:measure.exe /Fo:measure.obj'
   )
   foreach ($b in $builds) {
     $r = Invoke-Msvc $b $n
     if ($r.Code -ne 0) { Fail "${b}: exit $($r.Code): $($r.Out) $($r.Err)" }
   }
-  Ok 'built plant.c (DLL, control, flagged control, fake hook) and measure.c'
+  Ok 'built plant.c (DLL, control, flagged control, fake hook, fake claude) and measure.c'
 }
 
 # `dumpbin`'s names of the DLLs a PE imports.
@@ -826,8 +828,8 @@ function Assert-SquatterGotNothing($Squatter, [switch]$RequireConnection) {
   Ok "the fake pipe got no bytes ($($lines.Count) log lines)"
 }
 
-function Get-DoctorSummary($Who, [string]$Exe) {
-  $r = Invoke-As -User $Who -Exe $Exe -Arguments @('doctor', '--json') -TimeoutSec 120
+function Get-DoctorSummary($Who, [string]$Exe, [string[]]$Extra = @()) {
+  $r = Invoke-As -User $Who -Exe $Exe -Arguments (@('doctor', '--json') + $Extra) -TimeoutSec 120
   if ($r.StartError) { Fail "doctor could not start: $($r.StartError)" }
   try { $j = $r.Out | ConvertFrom-Json -Depth 32 } catch { Fail "doctor's output is not JSON (exit $($r.Code)): $($r.Out) $($r.Err)" }
   return [pscustomobject]@{ Code = $r.Code; Json = $j; Lines = @($j.checks | ForEach-Object { "$($_.id)=$($_.status)" } | Sort-Object) }
@@ -2056,24 +2058,52 @@ function forge_honest_latency {
   Measure-Result 'cosign-burst-one-user' "$burst honest allows of the agent at once: $empty no opinion, slowest $slowest ms$(if ($others) { "; others: $others" }) (report-only)"
 }
 
-# 6. doctor as the elevated runner. CI installs Claude Code, Codex and Gemini CLI, so
-# locked.preview stays info, names Codex and Gemini CLI only, and says Claude Code is not a
-# preview (which it says only when cosign.listen, cosign.rejudge and cosign.asker all pass).
+# 6. doctor. CI installs Claude Code, Codex and Gemini CLI. locked.preview says Claude Code
+# is not a preview only when cosign.listen, cosign.rejudge, cosign.asker and
+# agents.claude.policy pass and an agent-version check showed Claude Code new enough. An
+# elevated doctor never runs an agent's binary, so as the elevated runner locked.preview is
+# the preview text plus the hint to run doctor --user as the agent; as the agent, with a
+# stand-in claude.exe in its profile (the runner has no Claude Code), it names Codex and
+# Gemini CLI only.
 function forge_doctor {
-  $d = Get-DoctorSummary $null $Script:Hook
-  $shown = foreach ($id in 'cosign.rejudge', 'cosign.asker', 'hooks.rejudge-denied', 'locked.preview') { "$id=$(Get-CheckStatus $d $id) ($(Get-CheckDetail $d $id))" }
-  Read-Back 'doctor-forge' ($shown -join '; ')
   $problems = [System.Collections.Generic.List[string]]::new()
+  $ids = 'cosign.listen', 'cosign.rejudge', 'cosign.asker', 'hooks.rejudge-denied', 'agents.claude.policy', "user.$Script:AgentName.agent-version", 'locked.preview'
+
+  $d = Get-DoctorSummary $null $Script:Hook
+  Read-Back 'doctor-forge-elevated' (($ids | ForEach-Object { "$_=$(Get-CheckStatus $d $_) ($(Get-CheckDetail $d $_))" }) -join '; ')
   foreach ($want in 'cosign.rejudge=pass', 'cosign.asker=pass', 'hooks.rejudge-denied=warn', 'locked.preview=info') {
     $id, $status = $want -split '='
     $got = Get-CheckStatus $d $id
-    if ($got -ne $status) { $problems.Add("$id is $got, want $status") }
+    if ($got -ne $status) { $problems.Add("elevated: $id is $got, want $status") }
   }
   $preview = "$(Get-CheckDetail $d 'locked.preview')"
-  if ($preview -notlike 'Windows locked mode is a preview for Codex and Gemini CLI:*') { $problems.Add("locked.preview does not name Codex and Gemini CLI only: $preview") }
-  if ($preview -notlike '*Claude Code is not: each call is judged by the hook and by the service.*') { $problems.Add("locked.preview does not say Claude Code is no preview: $preview") }
+  if ($preview -notlike 'Windows locked mode is a preview:*') { $problems.Add("elevated: locked.preview is not the preview text: $preview") }
+  if ($preview -notlike '*run saiife doctor --user*') { $problems.Add("elevated: locked.preview does not say to run doctor --user as the agent: $preview") }
+
+  # As the agent, from its own logon, with a stand-in claude.exe where doctor looks for it.
+  $bin = "$($Script:Agent.Home)\.local\bin"
+  $exe = "$bin\claude.exe"
+  if (Test-Path -LiteralPath $exe) { Fail "$exe exists before forge_doctor put its stand-in there" }
+  $madeBin = -not (Test-Path -LiteralPath $bin)
+  try {
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    Copy-Item -LiteralPath "$Script:Work\native\fake-claude.exe" -Destination $exe
+    $a = Get-DoctorSummary $Script:Agent $Script:Hook @('--user', $Script:AgentName)
+  } finally {
+    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+    if ($madeBin) { Remove-Item -LiteralPath $bin -Force -ErrorAction SilentlyContinue }
+  }
+  Read-Back 'doctor-forge-as-agent' (($ids | ForEach-Object { "$_=$(Get-CheckStatus $a $_) ($(Get-CheckDetail $a $_))" }) -join '; ')
+  foreach ($want in "user.$Script:AgentName.agent-version=pass", 'locked.preview=info') {
+    $id, $status = $want -split '='
+    $got = Get-CheckStatus $a $id
+    if ($got -ne $status) { $problems.Add("as ${Script:AgentName}: $id is $got, want $status ($(Get-CheckDetail $a $id))") }
+  }
+  $preview = "$(Get-CheckDetail $a 'locked.preview')"
+  if ($preview -notlike 'Windows locked mode is a preview for Codex and Gemini CLI:*') { $problems.Add("as ${Script:AgentName}: locked.preview does not name Codex and Gemini CLI only: $preview") }
+  if ($preview -notlike '*Claude Code is not: each call is judged by the hook and by the service.*') { $problems.Add("as ${Script:AgentName}: locked.preview does not say Claude Code is no preview: $preview") }
   if ($problems.Count) { Fail ($problems -join '; ') }
-  Ok 'doctor: cosign.rejudge and cosign.asker pass, hooks.rejudge-denied warns, locked.preview names Codex and Gemini CLI only'
+  Ok 'doctor: elevated, cosign.rejudge and cosign.asker pass, hooks.rejudge-denied warns, locked.preview is info with the doctor --user hint; as the agent with Claude Code shown new enough, locked.preview names Codex and Gemini CLI only'
 }
 
 # Report-only (the T4 tie depends on it): can the service read the start time and the session
