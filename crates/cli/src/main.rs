@@ -43,6 +43,7 @@ mod env_cmd;
 mod eval;
 #[cfg(debug_assertions)]
 mod fake_mcp;
+mod hook_timing;
 #[cfg(unix)]
 mod import_cmd;
 mod init_cmd;

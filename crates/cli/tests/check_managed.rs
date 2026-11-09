@@ -77,6 +77,7 @@ fn managed_as(
         .env("SAIIFE_DATA_DIR", sb.data())
         .env("SAIIFE_AUDIT_DIR", sb.audit())
         .env_remove("SAIIFE_EVAL_FAULT")
+        .env_remove("SAIIFE_HOOK_TIMING")
         // Never the real /etc drop-in: none, unless a test writes one.
         .env(
             "SAIIFE_TEST_CLAUDE_MCP_DROPIN",
@@ -176,6 +177,77 @@ fn managed_allow_is_silent_and_recorded() {
     assert_eq!(r["session"], "c-1");
     assert_eq!(r["permission_mode"], "default");
     assert!(sb.is_untouched());
+}
+
+/// SAIIFE_HOOK_TIMING=1 (debug builds, as the tests and ci-locked are): each
+/// step's time on stderr, the worker's included, and the call as it was.
+#[test]
+fn hook_timing_names_each_step() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let payload = home.real(&fixture("claude/bash-allow.json"));
+    let (o, _, _sb) = managed_with(&d.config(), &payload, &[("SAIIFE_HOOK_TIMING", "1")], &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    let steps: Vec<&str> = err
+        .lines()
+        .map(|l| {
+            let mut f = l.split(' ');
+            assert_eq!(f.next(), Some("saiife-timing"), "{l}");
+            let step = f.next().unwrap();
+            let ms: f64 = f.next().unwrap().parse().unwrap();
+            assert!(ms >= 0.0, "{l}");
+            assert_eq!(f.next(), None, "{l}");
+            step
+        })
+        .collect();
+    for want in [
+        "config",
+        "worker.start",
+        "begin.connect",
+        "begin.call",
+        "stdin",
+        "policy",
+        "bind",
+        "worker.started",
+        "worker.request",
+        "worker.engine",
+        "worker.judge",
+        "worker.wait",
+        "record",
+        "append",
+        "total",
+    ] {
+        assert!(steps.contains(&want), "no {want} in {err}");
+    }
+    assert_eq!(last_guard(&d)["decision"], "allow");
+
+    // Anything else is no trace.
+    let (o, _, _sb) = managed_with(&d.config(), &payload, &[("SAIIFE_HOOK_TIMING", "0")], &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert!(o.stderr.is_empty(), "{}", stderr(&o));
+}
+
+/// A call with nothing to judge (a cwd with a NUL byte) drops the worker
+/// started before the payload was read, unsent, and is denied as before.
+#[test]
+fn an_early_worker_with_nothing_to_judge_is_dropped() {
+    let d = TestDaemon::start(Opts::default());
+    let payload = json!({
+        "session_id": "s-m",
+        "cwd": "/tmp/a\u{0}b",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"}
+    })
+    .to_string();
+    let (o, elapsed, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("NUL byte"), "{}", stderr(&o));
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "error_denied");
+    assert_eq!(r["input"], "", "{r}");
 }
 
 #[test]

@@ -1712,7 +1712,8 @@ function bench_managed {
   $budget = 130
   $payloadFile = "$Script:Work\out\bench-payload.json"
   Write-Utf8File $payloadFile (Get-Payload 'claude\bash-allow.json')
-  $head = "`$Hook = '$Script:Hook'; `$PayloadFile = '$payloadFile'; `$Runs = $runs; `$Cwd = '$($Script:Agent.Project)'"
+  $extra = 10
+  $head = "`$Hook = '$Script:Hook'; `$PayloadFile = '$payloadFile'; `$Runs = $runs; `$Extra = $extra; `$Cwd = '$($Script:Agent.Project)'"
   $body = @'
 $ErrorActionPreference = 'Stop'
 $payload = [System.IO.File]::ReadAllText($PayloadFile)
@@ -1742,18 +1743,88 @@ foreach ($i in 0..$Runs) {
   if ($i -gt 0) { [string]::Format($inv, 'run {0:F1} {1}', $sw.Elapsed.TotalMilliseconds, $p.ExitCode) }
   $p.Dispose()
 }
+# Where the time goes, untimed by the budget: the floor (saiife.exe --version, a process
+# start and exit with nothing judged), then calls with the hook's step trace
+# (SAIIFE_HOOK_TIMING=1, honoured by this ci-locked build only), each line passed on.
+foreach ($i in 0..$Extra) {
+  $psi = [System.Diagnostics.ProcessStartInfo]::new($Hook)
+  [void]$psi.ArgumentList.Add('--version')
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync()
+  $p.WaitForExit()
+  $sw.Stop()
+  [void]$out.Wait(5000)
+  if ($i -gt 0) { [string]::Format($inv, 'floor {0:F1}', $sw.Elapsed.TotalMilliseconds) }
+  $p.Dispose()
+}
+foreach ($i in 1..$Extra) {
+  $psi = [System.Diagnostics.ProcessStartInfo]::new($Hook)
+  foreach ($a in 'check', '--managed', '--hook-exit', '--agent', 'claude') { [void]$psi.ArgumentList.Add($a) }
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.StandardInputEncoding = $utf8
+  $psi.WorkingDirectory = $Cwd
+  $psi.Environment['SAIIFE_HOOK_TIMING'] = '1'
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync()
+  $err = $p.StandardError.ReadToEndAsync()
+  $p.StandardInput.Write($payload)
+  $p.StandardInput.Close()
+  $p.WaitForExit()
+  $sw.Stop()
+  [void]$out.Wait(5000)
+  [void]$err.Wait(5000)
+  [string]::Format($inv, 'traced {0:F1} {1}', $sw.Elapsed.TotalMilliseconds, $p.ExitCode)
+  foreach ($line in ($err.Result -split "`r?`n")) { if ($line -match '^saiife-timing ') { $line } }
+  $p.Dispose()
+}
 '@
   $r = Invoke-PwshAs -User $Script:Agent -Code "$head`n$body" -Cwd $Script:Agent.Project -TimeoutSec 300
   if ($r.Code -ne 0) { Fail "the bench as the agent exited $($r.Code): $($r.Out) $($r.Err)" }
   $inv = [System.Globalization.CultureInfo]::InvariantCulture
   $times = [System.Collections.Generic.List[double]]::new()
   $bad = [System.Collections.Generic.List[string]]::new()
+  # Step name -> its times over the traced calls, in first-seen order.
+  $steps = [ordered]@{}
+  $floor = [System.Collections.Generic.List[double]]::new()
+  $traced = [System.Collections.Generic.List[double]]::new()
   foreach ($line in ($r.Out -split "`r?`n")) {
     if ($line -match '^run (\S+) (-?\d+)$') {
       $times.Add([double]::Parse($Matches[1], $inv))
       if ($Matches[2] -ne '0') { $bad.Add($Matches[2]) }
+    } elseif ($line -match '^floor (\S+)$') {
+      $floor.Add([double]::Parse($Matches[1], $inv))
+    } elseif ($line -match '^traced (\S+) (-?\d+)$') {
+      $traced.Add([double]::Parse($Matches[1], $inv))
+      if ($Matches[2] -ne '0') { $bad.Add("traced $($Matches[2])") }
+    } elseif ($line -match '^saiife-timing (\S+) (\S+)$') {
+      if (-not $steps.Contains($Matches[1])) { $steps[$Matches[1]] = [System.Collections.Generic.List[double]]::new() }
+      $steps[$Matches[1]].Add([double]::Parse($Matches[2], $inv))
     }
   }
+  # Reported before the budget is judged, pass or fail: where the time goes.
+  $median = {
+    param($xs)
+    $s = @($xs | Sort-Object)
+    if ($s.Count -eq 0) { return [double]::NaN }
+    if ($s.Count % 2) { return $s[($s.Count - 1) / 2] }
+    return ($s[$s.Count / 2 - 1] + $s[$s.Count / 2]) / 2
+  }
+  $parts = [System.Collections.Generic.List[string]]::new()
+  $parts.Add([string]::Format($inv, 'floor (saiife.exe --version) {0:F1}', (& $median $floor)))
+  $parts.Add([string]::Format($inv, 'traced call {0:F1}', (& $median $traced)))
+  foreach ($name in $steps.Keys) {
+    $parts.Add([string]::Format($inv, '{0} {1:F2}', $name, (& $median $steps[$name])))
+  }
+  Measure-Result 'managed-hook-steps' ("medians in ms over $extra calls each (helper-thread and worker steps overlap the hook's own; total is the hook's main without its process start and exit): " + ($parts -join '; '))
   if ($times.Count -ne $runs) { Fail "the bench printed $($times.Count) runs, want ${runs}: $($r.Out) $($r.Err)" }
   if ($bad.Count) { Fail "$($bad.Count) bench runs did not allow (exits $($bad -join ', ')): $($r.Err)" }
   $sorted = @($times | Sort-Object)

@@ -81,10 +81,14 @@ fn guarded(f: impl FnOnce() -> ExitCode) -> ExitCode {
     if !imp::start_watchdog() {
         return blocked("cannot start the watchdog");
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+    let run = || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(code) => code,
         Err(_) => blocked("saiife crashed"),
-    }
+    };
+    // Debug builds with SAIIFE_HOOK_TIMING=1 only: each step's time on stderr.
+    let code = crate::hook_timing::time("total", run);
+    crate::hook_timing::flush();
+    code
 }
 
 /// The value of `<name> <value>` or `<name>=<value>` in `args`.
@@ -127,7 +131,7 @@ mod imp {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
-    use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
     use std::sync::mpsc;
     use std::sync::{Mutex, MutexGuard, TryLockError};
     use std::time::{Duration, Instant};
@@ -392,8 +396,9 @@ mod imp {
         event: Option<&str>,
         forced: Option<String>,
     ) -> ExitCode {
+        use crate::hook_timing::time;
         // 1. The system policy. Without it there is no daemon to tell.
-        let cfg = match load_locked(config) {
+        let cfg = match time("config", || load_locked(config)) {
             Ok(c) => c,
             Err(e) => {
                 let input = read_stdin();
@@ -410,12 +415,23 @@ mod imp {
             ));
         };
 
+        // The worker process starts now, so that its start (a large part of
+        // the call on Windows) overlaps the steps below. It judges nothing
+        // until it is sent the request, after the begin. A call denied before
+        // it is judged (bad arguments) starts none.
+        let early = match forced {
+            None => Some(time("worker.start", Worker::start)),
+            Some(_) => None,
+        };
+
         // 2. Register with the daemon (plan 20) while 3. the payload is read,
         // bounded: a helper thread connects, says hello and sends
         // `hook.begin`, and nothing looks at the payload until it is done, so
         // the daemon has the begin before the hook acts on its input. From
         // the begin on, a hook that ends without a verdict is recorded.
-        let (begun, input) = begin_while_reading(&cfg, daemon_uid, agent, event);
+        let (begun, input) = time("begin_and_stdin", || {
+            begin_while_reading(&cfg, daemon_uid, agent, event)
+        });
         let mut client = match begun {
             Ok(c) => c,
             // The daemon cannot be reached: stderr only.
@@ -446,7 +462,7 @@ mod imp {
                 (&cfg, config),
                 (agent, event),
                 &ctx,
-                input,
+                (input, early),
                 forced,
                 &mut client,
                 (&mut policy, &mut key_project, &mut key),
@@ -474,12 +490,15 @@ mod imp {
         // 6. The record, within the daemon's size limit, and its ack.
         let policy = policy.unwrap_or_else(|| "unavailable".into());
         let mut judged = judged;
-        let mut rec = record(agent, &ctx, &policy, &judged, key.as_ref());
-        if !fit(&mut rec) {
-            // Fail closed: the record says error_denied, so must the call.
-            judged = Judged::error(String::new(), TOO_LARGE.into());
-            rec = minimal_record(agent, &policy);
-        }
+        let mut rec = time("record", || {
+            let mut rec = record(agent, &ctx, &policy, &judged, key.as_ref());
+            if !fit(&mut rec) {
+                // Fail closed: the record says error_denied, so must the call.
+                judged = Judged::error(String::new(), TOO_LARGE.into());
+                rec = minimal_record(agent, &policy);
+            }
+            rec
+        });
         // One budget for the approval steps and the ack.
         let deadline = Instant::now() + ACK_TIMEOUT;
         if asked(&cfg, &judged) {
@@ -547,7 +566,9 @@ mod imp {
                 }
             }
         }
-        if let Err(e) = append(&mut client, rec, key.as_ref(), deadline) {
+        if let Err(e) = time("append", || {
+            append(&mut client, rec, key.as_ref(), deadline)
+        }) {
             // Lockdown `all`: the daemon wrote the record as a deny.
             if let ClientError::Refused { code, message } = &e {
                 if code == ErrorCode::Lockdown.as_str() {
@@ -631,12 +652,14 @@ mod imp {
     /// call's key, bound on `client` while the worker runs (`key` is set to
     /// it; a payload that gives no key binds nothing). `cfg` was loaded from
     /// `config`. An MCP tool whose server `[guard.mcp]` does not list is
-    /// denied without a worker.
+    /// denied without a worker. `early`: the worker started before the
+    /// payload was read, which is sent the request, or killed when nothing
+    /// is to be judged; without one a worker is started here.
     fn judge_call(
         (cfg, config): (&SystemConfig, &Path),
         (agent, event): (&str, Option<&str>),
         ctx: &HookContext,
-        input: Result<String, String>,
+        (input, early): (Result<String, String>, Option<Result<Idle, std::io::Error>>),
         forced: Option<String>,
         client: &mut Client,
         (policy, key_project, key): (
@@ -656,7 +679,8 @@ mod imp {
         // environment's lookups failed) is judged `error_denied` with
         // policy `unavailable`, recorded like any other failure: never a
         // stderr-only block.
-        let (packs, unresolved) = match policy_for(cfg, start.as_deref()) {
+        let resolved = crate::hook_timing::time("policy", || policy_for(cfg, start.as_deref()));
+        let (packs, unresolved) = match resolved {
             Ok((packs, hash)) => {
                 *policy = Some(hash);
                 (packs, None)
@@ -690,8 +714,8 @@ mod imp {
             _ => None,
         };
         let (worker, unspawned) = match (&failed, &mcp_judged, input) {
-            (None, None, Ok(payload)) => (
-                Some(Worker::spawn(EvalRequest {
+            (None, None, Ok(payload)) => {
+                let req = EvalRequest {
                     payload,
                     // A settings change is judged without packs.
                     packs: if event.is_some() { Vec::new() } else { packs },
@@ -700,27 +724,48 @@ mod imp {
                     event: event.map(str::to_string),
                     ask: cfg.guard.ask.clone(),
                     agent: Some(agent.to_string()),
-                })),
-                None,
-            ),
-            (_, _, input) => (None, input.ok()),
+                };
+                let started = match early {
+                    Some(w) => w,
+                    None => crate::hook_timing::time("worker.start", Worker::start),
+                };
+                let sent = match started {
+                    Ok(w) => Ok(w.send(req)),
+                    Err(e) => Err((req.payload, e)),
+                };
+                (Some(sent), None)
+            }
+            (_, _, input) => {
+                // Nothing to judge: an early worker is killed and reaped.
+                drop(early);
+                (None, input.ok())
+            }
         };
 
-        // While the worker runs: the key, and its bind. A bind error leaves
-        // the call as it is; one that broke the connection is mended by the
-        // caller.
+        // While the worker runs: the record's masks are compiled on a thread
+        // (the record needs them once the worker answers; whoever comes
+        // first compiles them, the other waits), the key, and its bind. A
+        // bind error leaves the call as it is; one that broke the connection
+        // is mended by the caller.
+        let _ = std::thread::Builder::new()
+            .name("saiife-masks".into())
+            .spawn(|| crate::hook_timing::time("masks", || saiife_audit::mask::mask("")));
         let payload = match (&worker, &unspawned) {
             (Some(Ok(w)), _) => Some(w.payload.as_str()),
             (Some(Err((p, _))), _) => Some(p.as_str()),
             (None, p) => p.as_deref(),
         };
-        *key = payload.and_then(|p| hook_key_bounded(agent, p, PARSE_MAX_BYTES).ok());
-        bind(
-            client,
-            key.as_ref(),
-            ctx.tool.as_deref(),
-            Instant::now() + ACK_TIMEOUT,
-        );
+        *key = crate::hook_timing::time("key", || {
+            payload.and_then(|p| hook_key_bounded(agent, p, PARSE_MAX_BYTES).ok())
+        });
+        crate::hook_timing::time("bind", || {
+            bind(
+                client,
+                key.as_ref(),
+                ctx.tool.as_deref(),
+                Instant::now() + ACK_TIMEOUT,
+            )
+        });
 
         if let Some(reason) = failed {
             return Judged::error(String::new(), reason);
@@ -729,7 +774,7 @@ mod imp {
             return judged;
         }
         let (payload, answer) = match worker {
-            Some(Ok(w)) => w.finish(),
+            Some(Ok(w)) => crate::hook_timing::time("worker.wait", || w.finish()),
             Some(Err((payload, e))) => (payload, Err(format!("could not start: {e}"))),
             // A worker is spawned whenever nothing failed; deny regardless.
             None => (String::new(), Err("not started".into())),
@@ -840,7 +885,9 @@ mod imp {
     /// `load_system`, which must say `locked = true`. A config that fails Windows' DACL
     /// check is no policy: the call is denied, whoever wrote the file.
     fn load_locked(config: &Path) -> Result<SystemConfig, String> {
-        crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, config)?;
+        crate::hook_timing::time("config.trust", || {
+            crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, config)
+        })?;
         let loaded = load_system(config).map_err(|e| e.to_string())?;
         if !loaded.config.locked {
             return Err(format!("{}: locked is not true", config.display()));
@@ -882,8 +929,8 @@ mod imp {
                 Err(e) => ignored(&e.to_string()),
             }
         });
-        let catalog: Vec<PackInfo> = Catalog::builtin()
-            .headers()
+        let headers = crate::hook_timing::time("policy.catalog", || Catalog::builtin().headers());
+        let catalog: Vec<PackInfo> = headers
             .into_iter()
             .map(|(id, version, default_on)| PackInfo {
                 id,
@@ -997,8 +1044,20 @@ mod imp {
         applied_for(cfg, dir, &name).map_err(|e| format!("environment: {e}"))
     }
 
-    /// The worker child, running: the child itself is in [`WORKER`].
+    /// The worker child, started and not yet sent its request: it waits on
+    /// its stdin and has judged nothing. The child itself is in [`WORKER`].
+    /// Dropped unsent, it is killed and reaped.
+    struct Idle {
+        /// `None` once sent.
+        stdin: Option<ChildStdin>,
+        /// The reader thread's result: everything on the worker's stdout.
+        /// `None` once sent.
+        out: Option<mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    }
+
+    /// The worker child, sent its request: the child itself is in [`WORKER`].
     struct Worker {
+        /// When the request was handed to the writer thread.
         started: Instant,
         /// The payload, kept for the record if the worker fails.
         payload: String,
@@ -1013,20 +1072,15 @@ mod imp {
         /// `SAIIFE_EVAL_FAULT` test seam). An agent started with another
         /// `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `XDG_*` therefore
         /// cannot move the path rules; the worker derives the agent dirs
-        /// from that home. The request is written and the answer read on
-        /// threads, so neither a worker that never reads nor one that
-        /// never writes can outlast the deadline.
-        fn spawn(req: EvalRequest) -> Result<Worker, (String, std::io::Error)> {
-            let started = Instant::now();
-            let exe = match std::env::current_exe() {
-                Ok(e) => e,
-                Err(e) => return Err((req.payload, e)),
-            };
+        /// from that home. It is started before the payload is known
+        /// (creating a process is slow on Windows) and judges nothing until
+        /// [`Idle::send`]. The answer is read on a thread, so a worker that
+        /// never writes cannot outlast the deadline.
+        fn start() -> Result<Idle, std::io::Error> {
+            let exe = std::env::current_exe()?;
             let mut cmd = Command::new(exe);
             cmd.arg("__eval").env_clear();
-            if let Err(e) = worker_account(&mut cmd) {
-                return Err((req.payload, e));
-            }
+            crate::hook_timing::time("worker.env", || worker_account(&mut cmd))?;
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
@@ -1034,41 +1088,38 @@ mod imp {
             if let Some(f) = std::env::var_os("SAIIFE_EVAL_FAULT") {
                 cmd.env("SAIIFE_EVAL_FAULT", f);
             }
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => return Err((req.payload, e)),
-            };
+            // SAIIFE_HOOK_TIMING (debug builds only): the worker says what it
+            // took, on this process's stderr.
+            if crate::hook_timing::on() {
+                cmd.env(crate::hook_timing::VAR, "1")
+                    .env(
+                        crate::hook_timing::SPAWNED_VAR,
+                        crate::hook_timing::now_us().to_string(),
+                    )
+                    .stderr(Stdio::inherit());
+            }
+            let mut child = crate::hook_timing::time("worker.create", || cmd.spawn())?;
             // A worker that cannot be tied to this process is not run: it could outlive
             // the hook. Joined before it is sent the request, so it has judged nothing yet.
             #[cfg(windows)]
-            if let Err(e) = join_job(&child) {
+            if let Err(e) = crate::hook_timing::time("worker.job", || join_job(&child)) {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err((req.payload, e));
+                return Err(e);
             }
             let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err((req.payload, std::io::Error::other("no pipes")));
+                return Err(std::io::Error::other("no pipes"));
             };
             *worker_slot() = Some(child);
-            // The parent keeps a copy for the record; the request owns the
-            // one the writer thread sends.
-            let payload = req.payload.clone();
-            std::thread::spawn(move || {
-                let mut w = BufWriter::new(stdin);
-                // A worker that dies early closes the pipe: EPIPE, ignored.
-                let _ = serde_json::to_writer(&mut w, &req);
-                let _ = w.flush();
-            });
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(read_bounded(stdout));
             });
-            Ok(Worker {
-                started,
-                payload,
-                out: rx,
+            Ok(Idle {
+                stdin: Some(stdin),
+                out: Some(rx),
             })
         }
 
@@ -1082,7 +1133,7 @@ mod imp {
         }
 
         /// The answer, or why there is none, within `WORKER_TIMEOUT` of the
-        /// spawn. A worker still running then is killed.
+        /// request. A worker still running then is killed.
         fn finish(mut self) -> (String, Result<EvalAnswer, String>) {
             let deadline = self.started + WORKER_TIMEOUT;
             let r = self.answer(deadline);
@@ -1103,6 +1154,7 @@ mod imp {
                 }
             };
             // Stdout is closed; the exit follows at once.
+            let reaping = Instant::now();
             let status = loop {
                 let looked = match worker_slot().as_mut() {
                     Some(child) => child.try_wait(),
@@ -1115,6 +1167,7 @@ mod imp {
                     Err(e) => return Err(format!("wait: {e}")),
                 }
             };
+            crate::hook_timing::add("worker.reap", reaping.elapsed());
             if !status.success() {
                 return Err(status_text(status));
             }
@@ -1133,6 +1186,45 @@ mod imp {
         }
     }
 
+    impl Idle {
+        /// Hands `req` to a writer thread, so a worker that never reads cannot
+        /// outlast the deadline, which starts now.
+        fn send(mut self, req: EvalRequest) -> Worker {
+            // The parent keeps a copy for the record; the request owns the
+            // one the writer thread sends.
+            let payload = req.payload.clone();
+            if let Some(stdin) = self.stdin.take() {
+                std::thread::spawn(move || {
+                    let mut w = BufWriter::new(stdin);
+                    // A worker that dies early closes the pipe: EPIPE, ignored.
+                    let _ = serde_json::to_writer(&mut w, &req);
+                    let _ = w.flush();
+                });
+            }
+            // Always there: only `send` takes it, and it takes `self`. A lost
+            // one would read as "its output was lost": a deny.
+            let out = self.out.take().unwrap_or_else(|| mpsc::channel().1);
+            Worker {
+                started: Instant::now(),
+                payload,
+                out,
+            }
+        }
+    }
+
+    /// Unsent, the worker has judged nothing: it is killed and reaped.
+    impl Drop for Idle {
+        fn drop(&mut self) {
+            if self.out.is_some() {
+                let child = worker_slot().take();
+                if let Some(mut child) = child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+
     /// Everything on `r`, up to one byte past `MAX_EVAL_BYTES`. Closing
     /// the pipe then makes a worker that writes more fail with EPIPE.
     fn read_bounded(r: ChildStdout) -> std::io::Result<Vec<u8>> {
@@ -1142,7 +1234,7 @@ mod imp {
     }
 
     /// The worker's environment on Linux and macOS: only `HOME` and `USER` from the entry
-    /// of this process's real uid. See [`Worker::spawn`].
+    /// of this process's real uid. See [`Worker::start`].
     #[cfg(unix)]
     fn worker_account(cmd: &mut Command) -> std::io::Result<()> {
         let uid = rustix::process::getuid().as_raw();
@@ -1507,11 +1599,15 @@ mod imp {
         event: Option<&str>,
     ) -> Result<Client, String> {
         let deadline = Instant::now() + CONNECT_TIMEOUT;
-        let mut c = connect_locked(cfg, daemon_uid, deadline)?;
+        let mut c = crate::hook_timing::time("begin.connect", || {
+            connect_locked(cfg, daemon_uid, deadline)
+        })?;
         let mut args = Map::new();
         args.insert("agent".into(), agent.into());
         args.insert("event".into(), event.map_or(Value::Null, Value::from));
-        if let Err(e) = c.call(OP_HOOK_BEGIN, args, deadline) {
+        let begun =
+            crate::hook_timing::time("begin.call", || c.call(OP_HOOK_BEGIN, args, deadline));
+        if let Err(e) = begun {
             if c.is_poisoned() {
                 return Err(format!("cannot reach the audit daemon ({})", describe(&e)));
             }
@@ -1537,7 +1633,7 @@ mod imp {
                 .spawn_scoped(s, || connect_begun(cfg, daemon_uid, agent, event));
             match helper {
                 Ok(h) => {
-                    let input = read_stdin();
+                    let input = crate::hook_timing::time("stdin", read_stdin);
                     let begun = h.join().unwrap_or_else(|_| {
                         Err("cannot reach the audit daemon (saiife crashed)".into())
                     });
