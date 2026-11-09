@@ -19,7 +19,7 @@
 #     after whitespace, with `//` or `/*` are skipped;
 #   - crates/darwin/src/lib.rs drops its `unsafe_op_in_unsafe_fn` /
 #     `undocumented_unsafe_blocks` lints, its non-macOS forbid or its macOS
-#     deny, or crates/darwin/src has other than exactly two
+#     deny, or crates/darwin/src has other than exactly three
 #     `allow(unsafe_code)` sites;
 #   - crates/win drops its `unsafe_op_in_unsafe_fn` /
 #     `undocumented_unsafe_blocks` lints, its non-Windows forbid, its Windows
@@ -105,8 +105,8 @@ if [ -e "$d" ]; then
         || err "$d lacks #![cfg_attr(target_os = \"macos\", deny(unsafe_code))]"
     allows="$(grep -rhE --include='*.rs' 'allow\([^)]*unsafe_code' crates/darwin/src \
         | grep -cvE '^[[:space:]]*(//|/\*)' || true)"
-    if [ "$allows" != 2 ]; then
-        err "crates/darwin/src has $allows allow(unsafe_code) sites, want exactly 2"
+    if [ "$allows" != 3 ]; then
+        err "crates/darwin/src has $allows allow(unsafe_code) sites, want exactly 3 (plan 21: sysctl, its assume_init, sysctlbyname)"
     fi
 fi
 

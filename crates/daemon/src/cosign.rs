@@ -13,7 +13,7 @@
 //! No token: the answer only ever takes away. A browser request (it carries
 //! `Origin`), a wrong content type, a wrong path and a flood each get a
 //! refusal that blocks only that request (`onFailure: "block"`). Where the
-//! asker's uid is known (Linux), each uid has its own share of the
+//! asker's uid is known (Linux, macOS), each uid has its own share of the
 //! connection and in-flight caps, so one user's flood leaves room for
 //! another's calls; the global caps stay as the backstop.
 
@@ -508,9 +508,9 @@ fn is_json(h: &http::HeaderMap) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
 }
 
-/// Who asks: on Linux the uid of the client's socket, from `/proc/net`.
-/// Elsewhere a TCP peer is not identified (W13; no `/proc` on macOS), and
-/// every principal's verdict counts.
+/// Who asks: the uid of the client's socket, on Linux from `/proc/net`,
+/// on macOS from `net.inet.tcp.pcblist_n` (`asker_macos`). Elsewhere a
+/// TCP peer is not identified (W13), and every principal's verdict counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Asker {
     Known(Principal),
@@ -541,19 +541,76 @@ async fn asker(opts: Opts, local: Option<SocketAddr>, peer: SocketAddr) -> Asker
         let _ = local;
         return known(f(peer));
     }
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Asker::Unscoped;
     }
     let Some(local) = local else {
         return Asker::Unknown;
     };
     known(
-        tokio::task::spawn_blocking(move || crate::mcp_gateway::tcp_peer_socket(local, peer))
+        tokio::task::spawn_blocking(move || socket_uid(local, peer))
             .await
             .ok()
-            .flatten()
-            .map(|(uid, _)| uid),
+            .flatten(),
     )
+}
+
+/// The uid that owns the client end of a connection the co-signer
+/// accepted (`local` its own end, `peer` the client's).
+#[cfg(not(target_os = "macos"))]
+fn socket_uid(local: SocketAddr, peer: SocketAddr) -> Option<u32> {
+    crate::mcp_gateway::tcp_peer_socket(local, peer).map(|(uid, _)| uid)
+}
+
+#[cfg(target_os = "macos")]
+fn socket_uid(local: SocketAddr, peer: SocketAddr) -> Option<u32> {
+    asker_macos::socket_uid(local, peer)
+}
+
+/// Who asks, on macOS (plan 21, Task 5): the `so_uid` of the client's
+/// socket in `net.inet.tcp.pcblist_n`, a private kernel layout (D4) that
+/// `saiife_darwin` reads and parses strictly. A layout it does not know,
+/// a failed read, or no matching socket is no uid: the asker is
+/// `Asker::Unknown`, and the call is denied.
+#[cfg(target_os = "macos")]
+pub mod asker_macos {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The `status.cosign.asker` name of this source.
+    pub const SOURCE: &str = "pcblist";
+
+    /// One warning per daemon for a read or layout failure; every call
+    /// it hits is denied all the same.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn socket_uid(local: SocketAddr, peer: SocketAddr) -> Option<u32> {
+        match saiife_darwin::tcp_peer_uid_checked(local, peer) {
+            Ok(uid) => uid,
+            Err(e) => {
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "saiife: warning: the co-signer cannot tell who asks ({e}); Claude Code calls are blocked"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// [`SOURCE`] when a loopback connection of the daemon's own is found
+    /// in the pcb list with the daemon's own uid; `None` (the asker source
+    /// is broken, and every call is denied) otherwise. For
+    /// `status.cosign.asker`, checked once at startup. Blocking.
+    pub fn probe() -> Option<&'static str> {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let server = l.local_addr().ok()?;
+        let _client = std::net::TcpStream::connect(server).ok()?;
+        let (_conn, peer) = l.accept().ok()?;
+        let me = saiife_darwin::proc_info(std::process::id())?.uid;
+        let got = saiife_darwin::tcp_peer_uid_checked(server, peer).ok()??;
+        (got == me).then_some(SOURCE)
+    }
 }
 
 async fn handle(

@@ -38,6 +38,13 @@ jobs:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           LOCALAPPDATA: ${{ runner.temp }}/localappdata
+      # The co-signer's macOS asker reads XNU's private pcblist_n layout (plan 21, D4):
+      # its live test, on its own line, so a macOS that changes the layout is named here.
+      - name: pcblist_n layout (live)
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        run: cargo test -p saiife-darwin -- --exact macos::tests::own_connection_has_own_uid
+        env:
+          TMPDIR: ${{ runner.temp }}
       - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-macos-sign.sh

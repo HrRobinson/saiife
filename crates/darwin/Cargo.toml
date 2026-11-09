@@ -1,6 +1,6 @@
 [package]
 name = "saiife-darwin"
-description = "The one crate of saiife allowed unsafe: sysctl(KERN_PROC_PID) on macOS. Empty on other targets."
+description = "The one crate of saiife allowed unsafe: sysctl(KERN_PROC_PID) and sysctlbyname(net.inet.tcp.pcblist_n) on macOS. Only the safe pcblist_n parser on other targets."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -14,6 +14,6 @@ path = "src/lib.rs"
 libc = "0.2"
 
 # Not the workspace lints: this is the one crate allowed unsafe. Denied here
-# and allowed only on its two blocks (src/lib.rs); forbidden off macOS.
+# and allowed only on its three blocks (src/lib.rs); forbidden off macOS.
 [lints.rust]
 unsafe_code = "deny"

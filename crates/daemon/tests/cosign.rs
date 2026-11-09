@@ -346,9 +346,9 @@ async fn killed_hook_gets_deny_at_once() {
     assert_eq!(got[0].kind(), "hook");
     assert_eq!(got[0].decision, DecisionKind::ErrorDenied);
     assert_eq!(got[0].tool, "Bash");
-    // The asker's input and session only where it is identified (Linux).
-    assert_eq!(got[0].input, if LINUX { "ls" } else { "" });
-    assert_eq!(got[0].session.as_deref(), LINUX.then_some("c-1"));
+    // The asker's input and session only where it is identified (Linux, macOS).
+    assert_eq!(got[0].input, if IDENTIFIED { "ls" } else { "" });
+    assert_eq!(got[0].session.as_deref(), IDENTIFIED.then_some("c-1"));
     assert_eq!(got[0].extra["tool_use_id"], "toolu_4");
     assert_eq!(wait_records(&d.audit, "no_verdict", 1).await.len(), 1);
 }
@@ -361,10 +361,12 @@ async fn other_payload_does_not_match() {
     let a = post(d.addr.unwrap(), payload("toolu_5", "rm -rf /")).await;
     assert_deny(&a, CosignDeny::NoReport);
     let got = wait_records(&d.audit, "cosign_denied", 1).await;
-    assert_eq!(got[0].input, if LINUX { "rm -rf /" } else { "" });
+    assert_eq!(got[0].input, if IDENTIFIED { "rm -rf /" } else { "" });
 }
 
-const LINUX: bool = cfg!(target_os = "linux");
+/// The co-signer identifies a TCP asker by its uid here (`/proc/net` on
+/// Linux, `pcblist_n` on macOS).
+const IDENTIFIED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 #[tokio::test]
 async fn not_cosignable_without_tool_use_id() {

@@ -1,23 +1,37 @@
 //! The one crate of saiife allowed `unsafe` (plan 13, decision 1).
 //!
-//! It holds exactly one FFI call: `sysctl({CTL_KERN, KERN_PROC,
-//! KERN_PROC_PID, pid})` on macOS, read into a `struct kinfo_proc`. That is
-//! how the daemon learns a peer's parent, uid, name and start time without
-//! `/proc`. `scripts/check-unsafe.sh` fails CI when `unsafe` appears in any
-//! other crate.
+//! It holds two FFI calls, both on macOS:
+//! - `sysctl({CTL_KERN, KERN_PROC, KERN_PROC_PID, pid})`, read into a
+//!   `struct kinfo_proc`. That is how the daemon learns a peer's parent,
+//!   uid, name and start time without `/proc`.
+//! - `sysctlbyname("net.inet.tcp.pcblist_n")` (plan 21): the TCP pcb list,
+//!   from which the co-signer learns the uid that owns the client end of a
+//!   connection (`tcp_peer_uid`). The bytes are parsed by [`pcblist`], safe
+//!   code compiled on every target.
 //!
-//! On every other target the crate is empty and forbids `unsafe`. On macOS
-//! `unsafe_code` is denied too, and allowed only on the two blocks below.
+//! `scripts/check-unsafe.sh` fails CI when `unsafe` appears in any other
+//! crate.
+//!
+//! On every other target the crate holds only the parser and forbids
+//! `unsafe`. On macOS `unsafe_code` is denied too, and allowed only on the
+//! three blocks below.
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 #![cfg_attr(target_os = "macos", deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
+pub mod pcblist;
+
+pub use pcblist::{parse_pcblist_n, ParseError};
+
 #[cfg(target_os = "macos")]
-pub use macos::{proc_info, ProcInfo};
+pub use macos::{pcblist_n, proc_info, tcp_peer_uid, tcp_peer_uid_checked, ProcInfo};
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::ffi::CStr;
+    use std::io;
     use std::mem::{size_of, MaybeUninit};
+    use std::net::SocketAddr;
 
     /// One process as `sysctl(KERN_PROC_PID)` reports it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +65,7 @@ mod macos {
         // zero bytes is a valid `KinfoProc`.
         let mut kp = MaybeUninit::<KinfoProc>::zeroed();
         let mut len: libc::size_t = size_of::<KinfoProc>();
-        #[allow(unsafe_code)] // the one FFI call of saiife
+        #[allow(unsafe_code)] // FFI call 1 of 2
         // SAFETY: `mib` is a live array of 4 c_ints and the length passed is
         // its own. `kp` is a live, writable `KinfoProc` buffer and `len` holds
         // its exact size, so the kernel writes at most that many bytes into
@@ -76,6 +90,80 @@ mod macos {
         // the kernel overwrote it with a whole `kinfo_proc` (`len` checked).
         let kp = unsafe { kp.assume_init() };
         Some(from_kinfo(&kp))
+    }
+
+    /// The sysctl the co-signer reads (plan 21, Task 5; xnu
+    /// `bsd/netinet/tcp_subr.c`: `CTLTYPE_STRUCT | CTLFLAG_RD`, no caller
+    /// check, as `netstat` reads it unprivileged).
+    const PCBLIST_N: &CStr = c"net.inet.tcp.pcblist_n";
+    /// The largest list read: far above any real host's pcb count (under
+    /// 1 KiB per connection), and a bound on what one call allocates.
+    const PCBLIST_MAX: usize = 64 * 1024 * 1024;
+
+    /// The bytes of `net.inet.tcp.pcblist_n`. The size comes first; the
+    /// list is then read into a buffer 25% larger, and both steps are tried
+    /// again (twice) when the list grew past it (`ENOMEM`).
+    pub fn pcblist_n() -> io::Result<Vec<u8>> {
+        let mut last = io::Error::from_raw_os_error(libc::ENOMEM);
+        for _ in 0..3 {
+            let need = sysctl_read(PCBLIST_N, None)?;
+            let cap = need.saturating_add(need / 4).max(4096);
+            if cap > PCBLIST_MAX {
+                return Err(io::Error::other(format!(
+                    "pcblist_n wants {need} bytes, over the {PCBLIST_MAX} cap"
+                )));
+            }
+            let mut buf = vec![0u8; cap];
+            match sysctl_read(PCBLIST_N, Some(&mut buf)) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    return Ok(buf);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// `sysctlbyname(name)` into `buf`, or only its size with `None`.
+    /// Returns the byte count the kernel wrote (or wants).
+    fn sysctl_read(name: &CStr, buf: Option<&mut [u8]>) -> io::Result<usize> {
+        let (ptr, mut len) = match buf {
+            Some(b) => (b.as_mut_ptr().cast::<libc::c_void>(), b.len()),
+            None => (std::ptr::null_mut(), 0),
+        };
+        let cap = len;
+        #[allow(unsafe_code)] // FFI call 2 of 2
+        // SAFETY: `name` is a live NUL-terminated C string. `ptr` is either
+        // null (a size query, `len` 0) or the start of a live, writable
+        // byte buffer of exactly `len` bytes, which the kernel writes at
+        // most `len` bytes into, storing the count back into `len`. No new
+        // value is set (null pointer, length 0). No pointer outlives the
+        // call.
+        let rc =
+            unsafe { libc::sysctlbyname(name.as_ptr(), ptr, &mut len, std::ptr::null_mut(), 0) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !ptr.is_null() && len > cap {
+            return Err(io::Error::other("sysctl reports more than its buffer"));
+        }
+        Ok(len)
+    }
+
+    /// The uid that owns the client end of the TCP connection a server at
+    /// `local` accepted from `peer`: the socket whose local end is `peer`
+    /// and whose foreign end is `local`, by its `so_uid`. An unknown record
+    /// layout is an error (the caller denies), never a guess.
+    pub fn tcp_peer_uid_checked(local: SocketAddr, peer: SocketAddr) -> io::Result<Option<u32>> {
+        let buf = pcblist_n()?;
+        crate::parse_pcblist_n(&buf, local, peer).map_err(io::Error::other)
+    }
+
+    /// [`tcp_peer_uid_checked`], with every failure as `None`.
+    pub fn tcp_peer_uid(local: SocketAddr, peer: SocketAddr) -> Option<u32> {
+        tcp_peer_uid_checked(local, peer).ok().flatten()
     }
 
     fn from_kinfo(kp: &KinfoProc) -> ProcInfo {
@@ -261,6 +349,25 @@ mod macos {
                 std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&f).expect("stat probe"));
             let _ = std::fs::remove_file(&f);
             assert_eq!(me.uid, file_uid);
+        }
+
+        /// The live check of the private layout (plan 21, D4): a macOS that
+        /// changes it fails here, on the CI runner, rather than on a user's
+        /// call (which is then denied).
+        #[test]
+        fn own_connection_has_own_uid() {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+            let server = l.local_addr().expect("addr");
+            let c = std::net::TcpStream::connect(server).expect("connect");
+            let (_s, peer) = l.accept().expect("accept");
+            assert_eq!(peer, c.local_addr().expect("client addr"));
+            let me = proc_info(std::process::id()).expect("own pid").uid;
+            let got = tcp_peer_uid_checked(server, peer).expect("pcblist_n parses");
+            assert_eq!(got, Some(me));
+            assert_eq!(tcp_peer_uid(server, peer), Some(me));
+            // No socket has a foreign end at port 1.
+            let gone: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            assert_eq!(tcp_peer_uid_checked(gone, peer).expect("parses"), None);
         }
 
         #[test]
