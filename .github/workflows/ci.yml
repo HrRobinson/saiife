@@ -299,7 +299,7 @@ jobs:
       # Debug assertions on, like locked-macos; the static CRT and the load flag come from
       # .cargo/config.toml.
       - run: cargo build --locked --profile ci-locked --bin saiife
-      - name: install, ACLs, fail-closed, attacks, measurements, approvals, uninstall
+      - name: install, ACLs, fail-closed, attacks, measurements, co-signer, approvals, uninstall
         env:
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}\target\locked-windows-logs
         run: |
