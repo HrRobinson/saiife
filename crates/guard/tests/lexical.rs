@@ -9,9 +9,7 @@
 #[path = "support/corpus.rs"]
 mod corpus;
 
-#[cfg(unix)]
-use saiifeguard::canon::PathStyle;
-use saiifeguard::canon::{fs_calls_made, with_fs_view, FsView, PathVars};
+use saiifeguard::canon::{fs_calls_made, with_fs_view, FsView, PathStyle, PathVars};
 use saiifeguard::engine::Engine;
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::Dialects;
