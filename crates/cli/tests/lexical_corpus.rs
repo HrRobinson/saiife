@@ -16,6 +16,10 @@ use corpus::{claude_fixtures, configs, corpus_cases, judge_payload, rehome, Tree
 /// approved by the owner by name (ruling of 2026-11-09), as `(label suffix,
 /// why)`. The lexical view cannot tell a directory from a file, so a move or
 /// copy target is judged as both (`mv x ~/.aws/credentials` must stay denied).
+/// No glob is here: the host judges a glob's spelling before its matches, so a
+/// spelling a rule names (`cat .env.*`, which finds only `.env.example`) is
+/// denied by both views (`globs_are_judged_as_spelled_and_as_expanded` in
+/// `corpus_secrets.rs`; whole-branch review, F3).
 const KNOWN_STRICTER: &[(&str, &str)] = &[(
     ": cp review.md .claude",
     "a copy into the protected .claude folder, spelled bare, reads as a write onto .claude itself",

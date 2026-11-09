@@ -16,8 +16,10 @@
 //!   makes no file system call.
 //! - **Bounds.** At most `REJUDGE_POOL` workers in all, at most
 //!   `REJUDGE_PER_PRINCIPAL` requests of one principal judged at once, and at
-//!   most `REJUDGE_MAX_WAITING` requests waiting. A worker serves
-//!   `REJUDGE_MAX_USES` requests, then is replaced.
+//!   most `REJUDGE_MAX_WAITING` requests waiting. A request takes its
+//!   waiting place before any work is done for it, and gives it up at once
+//!   when its co-signed request is gone (`RejudgeRequest.cancel`). A worker
+//!   serves `REJUDGE_MAX_USES` requests, then is replaced.
 //! - **Failure.** A worker that crashes, hangs past the deadline or answers
 //!   badly is killed and reaped, its request is `Failed` (the co-signer
 //!   denies), and a new worker takes its place. Nothing a worker does reaches
@@ -32,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use saiife_daemon::hooks::Principal;
 use saiife_daemon::rejudge::{
-    Rejudge, RejudgeAnswer, RejudgeRequest, REJUDGE_MAX_USES, REJUDGE_MAX_WAITING,
+    Cancel, Rejudge, RejudgeAnswer, RejudgeRequest, REJUDGE_MAX_USES, REJUDGE_MAX_WAITING,
     REJUDGE_PER_PRINCIPAL, REJUDGE_POOL, REJUDGE_TIMEOUT,
 };
 use saiife_policy::SystemConfig;
@@ -405,6 +407,37 @@ struct State {
     waiting: usize,
 }
 
+/// How often a request waiting for a worker looks at its cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(20);
+
+/// Why a request whose co-signed request is gone gets no judgment.
+const GONE: &str = "the co-signed request is gone";
+
+/// A request's place among the waiting ([`State::waiting`]), given up on
+/// drop unless [`Pool::take`] gave it up.
+struct Place<'a> {
+    pool: &'a Pool,
+    held: bool,
+}
+
+impl Place<'_> {
+    fn leave(&mut self, st: &mut State) {
+        if self.held {
+            st.waiting = st.waiting.saturating_sub(1);
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            let mut st = self.pool.lock();
+            self.leave(&mut st);
+        }
+    }
+}
+
 /// The pool. Blocking: the daemon calls [`Rejudge::judge`] on
 /// `spawn_blocking`.
 pub struct Pool {
@@ -510,19 +543,40 @@ impl Pool {
         })
     }
 
-    /// Waits for a worker `who` may use, by `deadline`. `Ok(None)`: none is
-    /// idle, and one may be started.
-    fn take(&self, who: &Principal, deadline: Instant) -> Result<Option<Warm>, String> {
+    /// A place among the waiting, or `Err` when [`Limits::waiting`] are
+    /// waiting already. Taken before any work is done for a request.
+    fn enter(&self) -> Result<Place<'_>, String> {
         let mut st = self.lock();
         if st.waiting >= self.limits.waiting {
             return Err("too many calls are waiting to be judged".into());
         }
         st.waiting += 1;
+        Ok(Place {
+            pool: self,
+            held: true,
+        })
+    }
+
+    /// Waits in `place` for a worker `who` may use, by `deadline`, unless
+    /// `cancel` is set first. `Ok(None)`: none is idle, and one may be
+    /// started.
+    fn take(
+        &self,
+        mut place: Place<'_>,
+        who: &Principal,
+        deadline: Instant,
+        cancel: &Cancel,
+    ) -> Result<Option<Warm>, String> {
+        let mut st = self.lock();
         loop {
+            if cancel.is_cancelled() {
+                place.leave(&mut st);
+                return Err(GONE.into());
+            }
             let mine = st.busy.get(who).copied().unwrap_or(0);
             let free = !st.idle.is_empty() || st.live < self.limits.workers;
             if mine < self.limits.per_principal && free {
-                st.waiting -= 1;
+                place.leave(&mut st);
                 *st.busy.entry(who.clone()).or_insert(0) += 1;
                 return Ok(match st.idle.pop() {
                     Some(w) => Some(w),
@@ -534,12 +588,12 @@ impl Pool {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                st.waiting -= 1;
+                place.leave(&mut st);
                 return Err("no worker was free in time".into());
             }
             st = self
                 .freed
-                .wait_timeout(st, left)
+                .wait_timeout(st, left.min(CANCEL_POLL))
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
@@ -632,6 +686,14 @@ impl Rejudge for Pool {
 
     fn judge(&self, req: RejudgeRequest) -> RejudgeAnswer {
         let deadline = req.deadline.min(Instant::now() + self.limits.timeout);
+        if req.cancel.is_cancelled() {
+            return RejudgeAnswer::Failed(GONE.into());
+        }
+        // The waiting cap is checked before the request is built.
+        let place = match self.enter() {
+            Ok(p) => p,
+            Err(why) => return RejudgeAnswer::Failed(why),
+        };
         let eval = match self.prepare(&req) {
             Ok(eval) => eval,
             Err(answer) => return answer,
@@ -641,7 +703,7 @@ impl Rejudge for Pool {
         };
         drop(eval);
         let who = &req.principal;
-        let mut worker = match self.take(who, deadline) {
+        let mut worker = match self.take(place, who, deadline, &req.cancel) {
             Ok(Some(w)) => w,
             Ok(None) => match Warm::start(self.launch.as_ref()) {
                 Ok(w) => w,
@@ -653,6 +715,10 @@ impl Rejudge for Pool {
             },
             Err(why) => return RejudgeAnswer::Failed(why),
         };
+        if req.cancel.is_cancelled() {
+            self.give_back(who, Some(worker));
+            return RejudgeAnswer::Failed(GONE.into());
+        }
         match worker.ask(body, deadline) {
             Ok(answer) => {
                 self.give_back(who, Some(worker));
@@ -802,6 +868,7 @@ mod tests {
             principal: Principal::Uid(uid),
             groups: Vec::new(),
             deadline,
+            cancel: Cancel::new(),
         })
     }
 
@@ -937,6 +1004,7 @@ mod tests {
                 principal: Principal::Uid(4242),
                 groups: Vec::new(),
                 deadline: Instant::now() + Duration::from_secs(5),
+                cancel: Cancel::new(),
             })
             .unwrap();
         assert_eq!(req.view, View::Lexical);
@@ -1041,6 +1109,98 @@ mod tests {
         let second = ask_by(&pool, 4242, &payload, start + Duration::from_millis(300));
         assert!(matches!(second, RejudgeAnswer::Failed(ref w) if w.contains("in time")));
         assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(matches!(hung.join().unwrap(), RejudgeAnswer::Failed(_)));
+    }
+
+    /// Whole-branch review, F1: a full queue fails before any work is done
+    /// for the request (here a body that is not UTF-8 is never looked at).
+    #[test]
+    fn a_full_queue_fails_before_the_request_is_built() {
+        let s = Setup::new("");
+        let pool = s.pool(
+            &TestLaunch::new(vec![]),
+            Limits {
+                waiting: 0,
+                ..one()
+            },
+        );
+        let answer = pool.judge(RejudgeRequest {
+            payload: Bytes::from_static(b"\xff"),
+            principal: Principal::Uid(4242),
+            groups: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancel: Cancel::new(),
+        });
+        assert!(
+            matches!(answer, RejudgeAnswer::Failed(ref w) if w.contains("waiting")),
+            "{answer:?}"
+        );
+    }
+
+    /// A request whose co-signed request is gone takes no place and starts
+    /// nothing.
+    #[test]
+    fn a_cancelled_request_is_not_judged() {
+        let s = Setup::new("");
+        let launch = TestLaunch::new(vec![]);
+        let pool = s.pool(&launch, one());
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let answer = pool.judge(RejudgeRequest {
+            payload: Bytes::from(fixture("bash-allow.json")),
+            principal: Principal::Uid(4242),
+            groups: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancel,
+        });
+        assert_eq!(answer, RejudgeAnswer::Failed(GONE.into()));
+        assert_eq!(launch.launched(), 1);
+        assert_eq!(pool.lock().waiting, 0);
+        assert!(pool.lock().busy.is_empty());
+    }
+
+    /// A request waiting for a worker leaves as soon as its co-signed
+    /// request is gone, long before its deadline, and gives up its place.
+    #[test]
+    fn a_request_gone_while_waiting_leaves_at_once() {
+        let s = Setup::new("");
+        let launch = TestLaunch::new(vec![(0, "hang")]);
+        let pool = Arc::new(s.pool(&launch, one()));
+        let payload = fixture("bash-allow.json");
+        let hung = {
+            let (pool, payload) = (pool.clone(), payload.clone());
+            std::thread::spawn(move || {
+                ask_by(
+                    &pool,
+                    4242,
+                    &payload,
+                    Instant::now() + Duration::from_secs(2),
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let cancel = Cancel::new();
+        let waiter = {
+            let (pool, cancel) = (pool.clone(), cancel.clone());
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                let answer = pool.judge(RejudgeRequest {
+                    payload: Bytes::from(payload),
+                    principal: Principal::Uid(4343),
+                    groups: Vec::new(),
+                    deadline: start + Duration::from_secs(10),
+                    cancel,
+                });
+                (answer, start.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(pool.lock().waiting, 1);
+        cancel.cancel();
+        let (answer, took) = waiter.join().unwrap();
+        assert_eq!(answer, RejudgeAnswer::Failed(GONE.into()));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(pool.lock().waiting, 0);
         assert!(matches!(hung.join().unwrap(), RejudgeAnswer::Failed(_)));
     }
 

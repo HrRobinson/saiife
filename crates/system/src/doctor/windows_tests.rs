@@ -347,7 +347,7 @@ fn info_lines_say_what_the_brief_fixes() {
 /// co-signer whole, Claude Code is no preview, and the line names the other two.
 #[test]
 fn the_preview_limits_are_said_and_fail_nothing() {
-    let c = installed().doctor();
+    let c = as_alice(&installed());
     let c = get(&c, "locked.preview");
     assert_eq!(c.status, Status::Info);
     for word in [
@@ -397,9 +397,17 @@ fn cosign_without(field: &str) -> Map<String, serde_json::Value> {
     a
 }
 
+/// Doctor run by alice from her own plain shell, her `claude.exe` new enough: the one run
+/// that shows Claude Code's version.
+fn as_alice(e: &Env) -> Report {
+    claude_exe(e, Some(("2.1.300 (Claude Code)\n", 0)));
+    e.host.set(|s| s.euid = 1000);
+    e.doctor_as(Some(ALICE))
+}
+
 #[test]
 fn preview_absent_for_claude_only_when_cosign_is_whole() {
-    let r = with_agents(&[Agent::Claude], answer()).doctor();
+    let r = as_alice(&with_agents(&[Agent::Claude], answer()));
     let c = get(&r, "locked.preview");
     assert_eq!(c.status, Status::Pass, "{}", r.to_text());
     assert_eq!(
@@ -413,7 +421,7 @@ fn preview_absent_for_claude_only_when_cosign_is_whole() {
 #[test]
 fn preview_names_codex_and_gemini() {
     // Both, with Claude Code: they are named, Claude Code is not a preview.
-    let c = get(&installed().doctor(), "locked.preview").clone();
+    let c = get(&as_alice(&installed()), "locked.preview").clone();
     assert_eq!(c.status, Status::Info);
     assert!(
         c.detail.starts_with(
@@ -451,6 +459,69 @@ fn preview_names_codex_and_gemini() {
         "{}",
         c.detail
     );
+}
+
+/// Whole-branch review, F2: the co-signer can be whole while Claude Code never calls it.
+/// An HKLM policy that overrides or weakens the drop-in, a drop-in without the HTTP hook,
+/// or a Claude Code too old for it each keeps Claude Code a preview.
+#[test]
+fn preview_kept_when_claude_does_not_call_the_cosigner() {
+    let preview = |r: &Report| {
+        let c = get(r, "locked.preview").clone();
+        assert_eq!(c.status, Status::Info, "{}", r.to_text());
+        assert_eq!(c.detail, PREVIEW_LIMITS, "{}", r.to_text());
+    };
+    // The control: whole, and Pass.
+    let e = with_agents(&[Agent::Claude], answer());
+    assert_eq!(get(&as_alice(&e), "locked.preview").status, Status::Pass);
+    // HKLM overrides the drop-in, or merges one that drops the hooks.
+    for settings in [
+        r#"{"permissions":{"deny":[]}}"#,
+        r#"{"managedSourcesBehavior":"merge","disableAllHooks":true}"#,
+    ] {
+        let e = with_agents(&[Agent::Claude], answer());
+        hklm(&e, settings);
+        preview(&as_alice(&e));
+    }
+    // A drop-in without the co-signer's HTTP hook.
+    let e = with_agents(&[Agent::Claude], answer());
+    let old = saiife_agents::claude::managed_settings_for(true).replace(
+        "http://127.0.0.1:7433/v1/cosign/claude",
+        "http://127.0.0.1:7433/elsewhere",
+    );
+    fs::write(e.at(CLAUDE_SETTINGS), old).unwrap();
+    let r = as_alice(&e);
+    assert_eq!(get(&r, "agents.claude.policy").status, Status::Fail);
+    preview(&r);
+    // A Claude Code older than the minimum, or one whose version cannot be read.
+    for out in [("2.0.1\n", 0), ("2.1.300", 1)] {
+        let e = with_agents(&[Agent::Claude], answer());
+        claude_exe(&e, Some(out));
+        e.host.set(|s| s.euid = 1000);
+        preview(&e.doctor_as(Some(ALICE)));
+    }
+    // With Codex and Gemini CLI too, Claude Code is not said to be out of the preview.
+    let e = installed();
+    hklm(&e, r#"{"permissions":{"deny":[]}}"#);
+    preview(&as_alice(&e));
+}
+
+/// A version no check showed (an elevated doctor never runs the agent) is no pass: Info,
+/// with how to show it.
+#[test]
+fn preview_kept_until_the_claude_version_is_shown() {
+    let r = with_agents(&[Agent::Claude], answer()).doctor();
+    let c = get(&r, "locked.preview");
+    assert_eq!(c.status, Status::Info, "{}", r.to_text());
+    assert!(c.detail.starts_with(PREVIEW_LIMITS), "{}", c.detail);
+    assert!(c.detail.contains("--user"), "{}", c.detail);
+    // Run as alice, but no claude.exe found: still not shown.
+    let e = with_agents(&[Agent::Claude], answer());
+    e.user_in(ALICE, USER, &[]);
+    e.host.set(|s| s.euid = 1000);
+    let c = get(&e.doctor_as(Some(ALICE)), "locked.preview").clone();
+    assert_eq!(c.status, Status::Info);
+    assert!(c.detail.contains("--user"), "{}", c.detail);
 }
 
 /// The old text, and Info, when any part of the co-signer is not whole: Claude Code is

@@ -26,7 +26,7 @@
 
 use crate::hooks::{Bound, Principal, Waited};
 use crate::ops::{Ctx, VERSION};
-use crate::rejudge::{Rejudge, RejudgeAnswer, RejudgeRequest, REJUDGE_TIMEOUT};
+use crate::rejudge::{Cancel, Rejudge, RejudgeAnswer, RejudgeRequest, REJUDGE_TIMEOUT};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use http::{Method, Request, Response, StatusCode};
@@ -46,7 +46,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 mod win;
@@ -88,6 +88,15 @@ const MAX_FOLD_KEYS: usize = 256;
 /// The fold windows one pid asker (Windows) may hold. A pid is cheap to
 /// come by (another process), so past this its sessions fold together.
 const MAX_FOLD_KEYS_PER_PID: usize = 16;
+/// `rejudge_denied` records one principal writes per [`REJUDGE_RATE_WINDOW`], one per
+/// call. Past this the window's other calls fold into one record, written when the window
+/// ends, with `suppressed` (whole-branch review, F4): the audit volume's floor is then not
+/// the only limit on a flood of forged allows.
+pub const REJUDGE_RECORDS_PER_MINUTE: u32 = 60;
+/// The window of [`REJUDGE_RECORDS_PER_MINUTE`].
+pub const REJUDGE_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// The rate windows kept at once; ended ones that hold nothing go first.
+const MAX_RATE_WINDOWS: usize = 1024;
 /// Debug builds only: `SAIIFE_TEST_COSIGN_ADDR=<addr>` binds the co-signer
 /// there instead of [`saiife_system::layout::COSIGN_ADDR`], and `off` binds
 /// none. The test suite runs many system daemons at once; release builds
@@ -226,6 +235,7 @@ pub struct CosignState {
     /// `rejudge_denied` records since the start, and the `ts` of the last.
     pub rejudge_denied: (u64, Option<String>),
     fold: Folder,
+    rate: RejudgeRate,
 }
 
 impl std::fmt::Debug for CosignState {
@@ -350,6 +360,102 @@ impl Folder {
             key.pid = None;
         }
         key
+    }
+}
+
+/// One principal's `rejudge_denied` window ([`REJUDGE_RECORDS_PER_MINUTE`]).
+#[derive(Debug)]
+struct RateWindow {
+    /// Tells a window from the next one of the same principal.
+    id: u64,
+    start: Instant,
+    /// Records written in it, one per call.
+    written: u32,
+    /// Calls past the cap, and the record of the last of them: written once the
+    /// window ends, with `suppressed: held`.
+    held: u64,
+    last: Option<Record>,
+}
+
+/// What [`RejudgeRate::admit`] says of one `rejudge_denied` record.
+#[derive(Debug, Default)]
+struct RateOutcome {
+    /// Write this record now.
+    write: Option<Record>,
+    /// The fold record of the principal's last window, which ended: write it first.
+    flush: Option<Record>,
+    /// The first call held back in this window: write its fold record at this time
+    /// ([`RejudgeRate::take`] with this window id).
+    flush_at: Option<(u64, Instant)>,
+}
+
+/// The `rejudge_denied` windows, one per principal.
+#[derive(Debug, Default)]
+struct RejudgeRate {
+    windows: HashMap<Principal, RateWindow>,
+    next_id: u64,
+    /// Tests only: a shorter window than [`REJUDGE_RATE_WINDOW`].
+    window: Option<Duration>,
+}
+
+impl RejudgeRate {
+    fn window(&self) -> Duration {
+        self.window.unwrap_or(REJUDGE_RATE_WINDOW)
+    }
+
+    fn admit(&mut self, who: &Principal, now: Instant, r: Record) -> RateOutcome {
+        let window = self.window();
+        let ended = |w: &RateWindow| now.saturating_duration_since(w.start) >= window;
+        let mut out = RateOutcome::default();
+        match self.windows.get_mut(who) {
+            Some(w) if !ended(w) => {
+                if w.written < REJUDGE_RECORDS_PER_MINUTE {
+                    w.written += 1;
+                    out.write = Some(r);
+                } else {
+                    w.held += 1;
+                    w.last = Some(r);
+                    if w.held == 1 {
+                        out.flush_at = Some((w.id, w.start + window));
+                    }
+                }
+                return out;
+            }
+            Some(w) => out.flush = Self::folded(w),
+            None => {}
+        }
+        if self.windows.len() >= MAX_RATE_WINDOWS {
+            self.windows.retain(|_, w| !ended(w) || w.held > 0);
+        }
+        self.next_id += 1;
+        self.windows.insert(
+            who.clone(),
+            RateWindow {
+                id: self.next_id,
+                start: now,
+                written: 1,
+                held: 0,
+                last: None,
+            },
+        );
+        out.write = Some(r);
+        out
+    }
+
+    /// The fold record of window `id` of `who`, once: `None` when that window is gone or
+    /// its fold record was written already.
+    fn take(&mut self, who: &Principal, id: u64) -> Option<Record> {
+        self.windows
+            .get_mut(who)
+            .filter(|w| w.id == id)
+            .and_then(Self::folded)
+    }
+
+    fn folded(w: &mut RateWindow) -> Option<Record> {
+        let mut r = w.last.take()?;
+        r.extra.insert("suppressed".into(), w.held.into());
+        w.held = 0;
+        Some(r)
     }
 }
 
@@ -828,7 +934,7 @@ async fn handle(
     if who == Asker::Unknown {
         return denied(ctx, CosignDeny::NoReport, &who, None).await;
     }
-    let _asker_permit = match who.cap_key() {
+    let asker = match who.cap_key() {
         Some(k) => match lim
             .per_asker
             .take(k, Slot::Inflight, opts.max_inflight_per_uid)
@@ -838,14 +944,29 @@ async fn handle(
         },
         None => None,
     };
-    let Ok(_permit) = Arc::clone(&lim.inflight).try_acquire_owned() else {
+    let Ok(inflight) = Arc::clone(&lim.inflight).try_acquire_owned() else {
         return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n");
+    };
+    let held = Held {
+        _inflight: Some(inflight),
+        _asker: asker,
     };
     let body = match read_body(req, opts).await {
         Ok(b) => b,
         Err(why) => return denied(ctx, why, &who, None).await,
     };
-    judge_body(ctx, opts, arrival, body, &who).await
+    judge_body(ctx, opts, arrival, body, &who, held).await
+}
+
+/// A request's in-flight slots (global, and its asker's share). The
+/// request holds them; its re-judge, once started, holds them until the
+/// blocking work ends, even when the request is gone first. So the
+/// blocking work never exceeds the in-flight caps (whole-branch review,
+/// F1).
+#[derive(Default)]
+struct Held {
+    _inflight: Option<OwnedSemaphorePermit>,
+    _asker: Option<AskerSlot>,
 }
 
 /// What the co-signer keeps of a request body, parsed once: the call's
@@ -894,6 +1015,7 @@ async fn judge_body(
     arrival: Instant,
     body: Bytes,
     who: &Asker,
+    held: Held,
 ) -> Resp {
     let parsed = body.clone();
     let call = match tokio::task::spawn_blocking(move || parse(&parsed)).await {
@@ -901,14 +1023,15 @@ async fn judge_body(
         Ok(Err(why)) => return denied(ctx, why, who, None).await,
         Err(_) => return denied(ctx, CosignDeny::BadJson, who, None).await,
     };
-    judge(ctx, opts, arrival, &call, body, who).await
+    judge(ctx, opts, arrival, &call, body, who, held).await
 }
 
 /// The answer for `call` (whose body is `body`), asked by `who`. Both
 /// must agree (plan 21): the hook's recorded verdict, and the service's
-/// own judgment of `body`. Where the asker's principal is known (Linux,
-/// macOS) that judgment starts at once, beside the wait; elsewhere it
-/// starts once the wait names the binder.
+/// own judgment of `body`. On every system that judgment starts only once
+/// the hook's verdict is an allow, as the binder's principal: a call the
+/// hook denied, or that no hook reported, never takes a place in the
+/// re-judge pool (whole-branch review, F1).
 async fn judge(
     ctx: &Arc<Ctx>,
     opts: Opts,
@@ -916,6 +1039,7 @@ async fn judge(
     call: &Call,
     body: Bytes,
     who: &Asker,
+    held: Held,
 ) -> Resp {
     if !call.key.cosignable() {
         return denied(ctx, CosignDeny::NotCosignable, who, Some(call)).await;
@@ -927,27 +1051,23 @@ async fn judge(
         Asker::Unknown => return denied(ctx, CosignDeny::NoReport, who, Some(call)).await,
     };
     let until = arrival + opts.wait;
-    let early =
-        principal.map(|p| Rejudging::start(ctx, body.clone(), p.clone(), Vec::new(), until));
     let bound = match ctx.hooks.wait(&call.key, principal, asker_pid, until).await {
         Waited::Allow(b) => b,
-        // The guard record says why. A judgment still running is dropped.
+        // The guard record says why.
         Waited::Deny => return deny(CosignDeny::Denied),
         Waited::NoVerdict => return denied(ctx, CosignDeny::NoVerdict, who, Some(call)).await,
         Waited::Timeout | Waited::Foreign => {
             return denied(ctx, CosignDeny::NoReport, who, Some(call)).await
         }
     };
-    let rejudging = match early {
-        Some(r) => r,
-        None => Rejudging::start(
-            ctx,
-            body,
-            bound.principal.clone(),
-            bound.groups.clone(),
-            until,
-        ),
-    };
+    let rejudging = Rejudging::start(
+        ctx,
+        body,
+        bound.principal.clone(),
+        bound.groups.clone(),
+        until,
+        held,
+    );
     match rejudging.answer().await {
         RejudgeAnswer::Allow => no_opinion(),
         RejudgeAnswer::Deny { askable: true, .. } if granted(&bound, call) => no_opinion(),
@@ -1008,6 +1128,9 @@ enum Rejudging {
     Running {
         task: tokio::task::JoinHandle<RejudgeAnswer>,
         deadline: Instant,
+        /// Cancels the request when the judgment is dropped: answered,
+        /// timed out, or its HTTP request gone.
+        _cancel: CancelOnDrop,
     },
     /// No pool: nothing to run.
     Done(RejudgeAnswer),
@@ -1016,12 +1139,15 @@ enum Rejudging {
 impl Rejudging {
     /// Start judging `body` as `principal`; it must answer by `until` (the
     /// co-sign wait) and within [`REJUDGE_TIMEOUT`] from now.
+    /// The blocking work holds `held` (the request's in-flight slots) to
+    /// its end.
     fn start(
         ctx: &Ctx,
         body: Bytes,
         principal: Principal,
         groups: Vec<String>,
         until: Instant,
+        held: Held,
     ) -> Rejudging {
         let pool = ctx
             .cosign
@@ -1033,15 +1159,21 @@ impl Rejudging {
             return Rejudging::Done(RejudgeAnswer::Failed(NO_REJUDGE.into()));
         };
         let deadline = until.min(Instant::now() + REJUDGE_TIMEOUT);
+        let cancel = Cancel::new();
         let req = RejudgeRequest {
             payload: body,
             principal,
             groups,
             deadline: deadline.into_std(),
+            cancel: cancel.clone(),
         };
         Rejudging::Running {
-            task: tokio::task::spawn_blocking(move || pool.judge(req)),
+            task: tokio::task::spawn_blocking(move || {
+                let _held = held;
+                pool.judge(req)
+            }),
             deadline,
+            _cancel: CancelOnDrop(cancel),
         }
     }
 
@@ -1049,7 +1181,7 @@ impl Rejudging {
     async fn answer(self) -> RejudgeAnswer {
         match self {
             Rejudging::Done(a) => a,
-            Rejudging::Running { task, deadline } => {
+            Rejudging::Running { task, deadline, .. } => {
                 match tokio::time::timeout_at(deadline, task).await {
                     Ok(Ok(a)) => a,
                     Ok(Err(_)) => RejudgeAnswer::Failed("the re-judge panicked".into()),
@@ -1057,6 +1189,15 @@ impl Rejudging {
                 }
             }
         }
+    }
+}
+
+/// Sets its [`Cancel`] when dropped.
+struct CancelOnDrop(Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1100,9 +1241,12 @@ struct Disagreed<'a> {
 }
 
 /// The `rejudge_denied` record of a call the hook allowed and the
-/// service's own judgment denied: one per call, never folded (owner
-/// ruling 4), unless the audit volume is below its floor. It is counted
-/// in `status.hooks_rejudge_denied` either way.
+/// service's own judgment denied: one per call (owner ruling 4), unless the
+/// audit volume is below its floor, up to [`REJUDGE_RECORDS_PER_MINUTE`] per
+/// principal in a window. Past that the window's other calls fold into one
+/// record, the last of them with `suppressed` (how many it stands for, itself
+/// included), written when the window ends. Every call is counted in
+/// `status.hooks_rejudge_denied` either way.
 async fn rejudge_denied(ctx: &Arc<Ctx>, bound: &Bound, call: &Call, d: Disagreed<'_>) {
     let ts = crate::ops::now_ts();
     {
@@ -1164,6 +1308,38 @@ async fn rejudge_denied(ctx: &Arc<Ctx>, bound: &Bound, call: &Call, d: Disagreed
             .as_deref()
             .map(crate::hooks::recorded_id)),
     );
+    let who = bound.principal.clone();
+    let out = ctx
+        .cosign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .rate
+        .admit(&who, Instant::now(), r);
+    for r in out.flush.into_iter().chain(out.write) {
+        write_rejudge_denied(ctx, r).await;
+    }
+    if let Some((id, at)) = out.flush_at {
+        let ctx = Arc::clone(ctx);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(at).await;
+            let r = ctx
+                .cosign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .rate
+                .take(&who, id);
+            if let Some(r) = r {
+                let p = ctx.policy();
+                let free = crate::disk::free_mb(&ctx.audit_dir).unwrap_or(0);
+                if crate::disk::disk_gate(free, p.min_free_mb, false).is_ok() {
+                    write_rejudge_denied(&ctx, r).await;
+                }
+            }
+        });
+    }
+}
+
+async fn write_rejudge_denied(ctx: &Ctx, r: Record) {
     if let Err(e) = ctx.writer.append(r).await {
         eprintln!("saiife: warning: cannot write a rejudge_denied record: {e}");
     }
@@ -1592,7 +1768,15 @@ mod tests {
 
     #[cfg(unix)]
     async fn ask(ctx: &Arc<Ctx>, start: Instant, body: String, who: &Asker) -> Resp {
-        judge_body(ctx, Opts::default(), start, Bytes::from(body), who).await
+        judge_body(
+            ctx,
+            Opts::default(),
+            start,
+            Bytes::from(body),
+            who,
+            Held::default(),
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -1889,6 +2073,111 @@ mod tests {
         asked
     }
 
+    /// A Linux hook connection of `uid`: begins, binds `body`'s key and
+    /// records `decision`.
+    #[cfg(unix)]
+    fn uid_hook_says(ctx: &Ctx, conn: u64, uid: u32, body: &str, decision: DecisionKind) {
+        use crate::hooks::{ConnId, Verdict};
+        let peer = saiife_ipc::peer::PeerCred {
+            uid,
+            gid: uid,
+            pid: 7000 + conn as u32,
+            sid: None,
+            group_sids: Vec::new(),
+        };
+        let key = parse(body.as_bytes()).unwrap().key;
+        assert!(ctx
+            .hooks
+            .begin(ConnId(conn), &peer, "claude", Some("PreToolUse")));
+        assert!(ctx.hooks.bind(ConnId(conn), key.clone()));
+        ctx.hooks
+            .verdict(ConnId(conn), &Verdict::for_key(&key, decision));
+    }
+
+    /// Whole-branch review, F1: a loop of requests for a key the hook
+    /// denied starts no judgment, on every system, so it holds no place in
+    /// the re-judge pool: another user's allowed call still co-signs.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn denied_calls_start_no_rejudge() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        let asked = allow_all(&ctx);
+        let flood = Asker::Known(Principal::Uid(5000));
+        let denied = payload_in("flood", "Bash", "toolu_d", "rm -rf /");
+        uid_hook_says(&ctx, 1, 5000, &denied, DecisionKind::Deny);
+        for _ in 0..(2 * crate::rejudge::REJUDGE_MAX_WAITING) {
+            let r = ask(&ctx, Instant::now(), denied.clone(), &flood).await;
+            assert_eq!(body_of(r).await, deny_body(CosignDeny::Denied));
+        }
+        // No hook at all: no judgment either.
+        let r = ask(&ctx, Instant::now(), payload("toolu_none", "ls"), &flood).await;
+        assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
+        assert!(asked.lock().unwrap().is_empty(), "no judgment started");
+        let allowed = payload("toolu_ok", "ls");
+        uid_hook_says(&ctx, 2, 4242, &allowed, DecisionKind::Allow);
+        let r = ask(&ctx, Instant::now(), allowed, &ME).await;
+        assert_eq!(body_of(r).await, "");
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].principal, Principal::Uid(4242));
+    }
+
+    /// Whole-branch review, F1: when the HTTP request is gone, its judgment
+    /// is cancelled, and the blocking work holds the request's in-flight
+    /// slot until it ends, so no detached work exceeds the caps.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gone_request_cancels_its_rejudge_and_holds_its_slot() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let tx = Mutex::new(tx);
+        ctx.cosign.lock().unwrap().rejudge = Some(Arc::new(move |req: RejudgeRequest| {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while !req.cancel.is_cancelled() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = tx.lock().unwrap().send(req.cancel.is_cancelled());
+            // Still busy for a while after the cancel.
+            std::thread::sleep(Duration::from_millis(300));
+            RejudgeAnswer::Allow
+        }));
+        let body = payload("toolu_1", "ls");
+        uid_hook_says(&ctx, 1, 4242, &body, DecisionKind::Allow);
+        let slots = Arc::new(Semaphore::new(1));
+        let held = Held {
+            _inflight: Some(Arc::clone(&slots).try_acquire_owned().unwrap()),
+            _asker: None,
+        };
+        let task = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                judge_body(
+                    &ctx,
+                    Opts::default(),
+                    Instant::now(),
+                    Bytes::from(body),
+                    &ME,
+                    held,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        let saw = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap();
+        assert_eq!(saw, Ok(true), "the judgment saw the cancel");
+        assert_eq!(slots.available_permits(), 0, "held by the blocking work");
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        while slots.available_permits() == 0 && std::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(slots.available_permits(), 1, "given back when it ends");
+    }
+
     /// Windows: a forged allow under the asker is still judged, as the
     /// binder, and denied; its record names the binder's SID and pid.
     #[cfg(unix)]
@@ -1926,6 +2215,133 @@ mod tests {
         assert_eq!(got[0].uid, None);
         assert_eq!(got[0].extra["hook_pid"], 777);
         assert_eq!(got[0].pack.as_deref(), Some("core.secrets"));
+    }
+
+    /// The `rejudge_denied` records in the audit, waiting (on the real clock) for `n`.
+    #[cfg(unix)]
+    fn rejudge_records(dir: &std::path::Path, n: usize) -> Vec<Record> {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got: Vec<Record> = saiife_audit::store::read_all(&dir.join("audit"))
+                .records
+                .into_iter()
+                .filter(|r| r.extra.get("event").and_then(Value::as_str) == Some("rejudge_denied"))
+                .collect();
+            if got.len() >= n || std::time::Instant::now() > end {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Whole-branch review, F4: one `rejudge_denied` record per call, up to 60 per
+    /// principal a minute; the rest of that minute fold into one record with
+    /// `suppressed`, written when the minute ends. Another principal is not held back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejudge_denied_folds_past_the_rate() {
+        // The real clock: a paused one jumps to the fold timer while a record is written.
+        const WINDOW: Duration = Duration::from_secs(8);
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        ctx.cosign.lock().unwrap().rate.window = Some(WINDOW);
+        ctx.cosign.lock().unwrap().rejudge =
+            Some(Arc::new(|_: RejudgeRequest| RejudgeAnswer::Deny {
+                reason: "reads a secret".into(),
+                pack: Some("core.secrets".into()),
+                rule: Some("dotenv".into()),
+                input: "cat .env".into(),
+                askable: false,
+            }));
+        let flood = Asker::Known(Principal::Uid(5000));
+        let cap = REJUDGE_RECORDS_PER_MINUTE as usize;
+        let mut conn = 0;
+        let mut forged = |ctx: &Arc<Ctx>, uid: u32, n: usize| {
+            conn += 1;
+            let body = payload_in("s", "Bash", &format!("toolu_{uid}_{n}"), "cat .env");
+            uid_hook_says(ctx, conn, uid, &body, DecisionKind::Allow);
+            body
+        };
+        let start = Instant::now();
+        for n in 0..cap + 10 {
+            let body = forged(&ctx, 5000, n);
+            let r = ask(&ctx, Instant::now(), body, &flood).await;
+            assert_eq!(body_of(r).await, rejudged_body("reads a secret"));
+        }
+        // Another principal, in the same minute: its own record.
+        let body = forged(&ctx, 4242, 0);
+        ask(&ctx, Instant::now(), body, &ME).await;
+        assert!(start.elapsed() < WINDOW, "{:?}", start.elapsed());
+        let got = rejudge_records(t.path(), cap + 1);
+        assert_eq!(got.len(), cap + 1);
+        assert!(got.iter().all(|r| !r.extra.contains_key("suppressed")));
+        assert_eq!(got.iter().filter(|r| r.uid == Some(5000)).count(), cap);
+        assert_eq!(got[cap].uid, Some(4242));
+        // Every call is counted all the same.
+        assert_eq!(
+            ctx.cosign.lock().unwrap().rejudge_denied.0,
+            (cap + 11) as u64
+        );
+        // The minute ends: one record for the 10 held back, the last of them.
+        tokio::time::sleep_until(start + WINDOW + Duration::from_millis(200)).await;
+        let got = rejudge_records(t.path(), cap + 2);
+        assert_eq!(got.len(), cap + 2, "one fold record");
+        let fold = &got[cap + 1];
+        assert_eq!(fold.uid, Some(5000));
+        assert_eq!(fold.extra["suppressed"], 10);
+        assert_eq!(fold.extra["tool_use_id"], format!("toolu_5000_{}", cap + 9));
+        assert_eq!(fold.pack.as_deref(), Some("core.secrets"));
+        // A new minute: one record per call again.
+        let body = forged(&ctx, 5000, 1000);
+        ask(&ctx, Instant::now(), body, &flood).await;
+        let got = rejudge_records(t.path(), cap + 3);
+        assert_eq!(got.len(), cap + 3);
+        assert!(!got[cap + 2].extra.contains_key("suppressed"));
+    }
+
+    #[test]
+    fn rate_window_folds_once() {
+        let mut rate = RejudgeRate::default();
+        let who = Principal::Uid(7);
+        let rec = || {
+            Record::new(
+                NewRecord {
+                    agent: "claude",
+                    project: "",
+                    session: None,
+                    tool: "Bash",
+                    input: "x",
+                    decision: DecisionKind::Deny,
+                    pack: None,
+                    rule: None,
+                    reason: None,
+                    mode: "locked",
+                    policy: None,
+                    permission_mode: None,
+                },
+                VERSION,
+            )
+        };
+        let t0 = Instant::now();
+        for _ in 0..REJUDGE_RECORDS_PER_MINUTE {
+            let o = rate.admit(&who, t0, rec());
+            assert!(o.write.is_some() && o.flush.is_none() && o.flush_at.is_none());
+        }
+        let o = rate.admit(&who, t0, rec());
+        assert!(o.write.is_none());
+        let (id, at) = o.flush_at.unwrap();
+        assert_eq!(at, t0 + REJUDGE_RATE_WINDOW);
+        let o = rate.admit(&who, t0, rec());
+        assert!(
+            o.write.is_none() && o.flush_at.is_none(),
+            "one timer per window"
+        );
+        // A call after the window ends, before the timer: it writes the fold first.
+        let o = rate.admit(&who, at, rec());
+        assert_eq!(o.flush.unwrap().extra["suppressed"], 2);
+        assert!(o.write.is_some());
+        // The timer then finds nothing to write.
+        assert!(rate.take(&who, id).is_none());
     }
 
     /// Security review of task 4, finding 2: a pid asker (Windows) folds

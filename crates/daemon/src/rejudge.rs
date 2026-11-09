@@ -9,6 +9,8 @@
 //! environment the agent set) and the system policy's packs for that user's
 //! scope, without the project config (which only adds packs in locked mode).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use bytes::Bytes;
@@ -40,6 +42,29 @@ pub struct RejudgeRequest {
     pub groups: Vec<String>,
     /// No answer after this is `Failed`.
     pub deadline: Instant,
+    /// Set once the co-signed request that asked is gone (answered, timed
+    /// out, or its connection closed): the pool checks it before it builds
+    /// the worker's request and while it waits for a worker, so no judgment
+    /// is started or kept waiting for a request nobody reads.
+    pub cancel: Cancel,
+}
+
+/// A request's cancel flag ([`RejudgeRequest::cancel`]). Clones share it.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Cancel {
+        Cancel::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// The service's judgment.
@@ -85,7 +110,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     // One principal never holds every worker.
     const _: () = assert!(REJUDGE_PER_PRINCIPAL < REJUDGE_POOL);
@@ -109,11 +133,21 @@ mod tests {
             principal: p,
             groups: Vec::new(),
             deadline: Instant::now() + REJUDGE_TIMEOUT,
+            cancel: Cancel::new(),
         };
         assert_eq!(r.judge(req(Principal::Uid(1000))), RejudgeAnswer::Allow);
         assert!(matches!(
             r.judge(req(Principal::Uid(0))),
             RejudgeAnswer::Failed(_)
         ));
+    }
+
+    #[test]
+    fn cancel_is_shared_by_clones() {
+        let c = Cancel::new();
+        let d = c.clone();
+        assert!(!d.is_cancelled());
+        c.cancel();
+        assert!(d.is_cancelled());
     }
 }

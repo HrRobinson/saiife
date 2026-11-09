@@ -772,7 +772,7 @@ async fn forged_allow_of_a_denied_call_is_denied() {
     assert_eq!(r.extra["tool_use_id"], "toolu_01");
     assert_eq!(r.extra["hook_pid"], std::process::id());
     assert!(records(&d.audit, "cosign_denied").is_empty());
-    // One record per call, not folded.
+    // One record per call (up to 60 a minute per principal).
     let mut h = Client::hook(&d.sock, &body).await;
     h.verdict(DecisionKind::Allow, "rm -rf /").await;
     let a = post(d.addr.unwrap(), body.clone()).await;

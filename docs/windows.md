@@ -259,8 +259,12 @@ so neither a killed hook nor a forged allow lets a denied call run.
 - **When it leaves preview:** once the `locked-windows` CI job shows the forged allow
   and the hook kill denied on `windows-2022` and `windows-2025`. Until that run is
   green, treat Claude Code on Windows as a preview too. `doctor` passes
-  `locked.preview` for Claude Code only when `cosign.listen`, `cosign.rejudge` and
-  `cosign.asker` all pass.
+  `locked.preview` for Claude Code only when `cosign.listen`, `cosign.rejudge`,
+  `cosign.asker` and `agents.claude.policy` all pass (the drop-in carries the co-signer's
+  HTTP hook, and no HKLM policy overrides or weakens it), and Claude Code's version was
+  shown to be new enough. Only the agent user's own plain shell runs `claude.exe
+  --version` (`saiife doctor --user <name>`), so an elevated `doctor` keeps the preview
+  line and says how to show the version.
 - **Every agent:** the daemon notices a hook that ends without a verdict and writes a
   `hook` record with decision `no_verdict`. `doctor` warns (`hooks.no-verdict`). There is
   no automatic lockdown. For Codex and Gemini CLI that is all: the call still runs.
@@ -330,8 +334,9 @@ written. That is why the binary is not under `C:\Program Files`.
 - `saiife doctor`, from an elevated terminal, checks the service, the access lists, the
   binary (build, load flag, imports, signature), the managed files, Claude Code's
   `HKLM\SOFTWARE\Policies\ClaudeCode` key, UAC and the agent users. It prints
-  `locked.preview` as info when Codex or Gemini CLI is installed, or when one of
-  `cosign.listen`, `cosign.rejudge` and `cosign.asker` fails. Some Linux checks have no
+  `locked.preview` as info when Codex or Gemini CLI is installed, when one of
+  `cosign.listen`, `cosign.rejudge`, `cosign.asker` and `agents.claude.policy` fails, or
+  when no `agent-version` check showed Claude Code new enough. Some Linux checks have no
   Windows form yet, and `doctor` lists them.
 - `saiife system uninstall` removes the service and the managed files and keeps the
   audit and the config. `--purge` removes the rest, but keeps `C:\ProgramData\saiife` while

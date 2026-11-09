@@ -1364,7 +1364,12 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     `REJUDGE_TIMEOUT = 3 s` per request, always inside `COSIGN_WAIT` from
     arrival; `REJUDGE_PER_PRINCIPAL = 1` request of one principal judged at
     once, so one user never holds every worker; `REJUDGE_MAX_WAITING = 32`
-    requests waiting in all, and one more fails at once. A worker that
+    requests waiting in all, and one more fails at once, before its request
+    is built. A request whose co-signed HTTP request is gone (answered, timed
+    out, or its connection closed) is cancelled: the pool checks before it
+    builds the worker's request and while it waits for a worker, and gives
+    up its place at once. The blocking work holds the HTTP request's
+    in-flight slots until it ends, so it never exceeds the co-signer's caps. A worker that
     crashes, hangs or answers badly is killed and replaced, and its request
     fails. The daemon calls the pool on `spawn_blocking`.
   - **Decision.** `wait` gives `Allow` and the re-judge allows: empty `200`.
@@ -1372,9 +1377,10 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     Any other re-judge deny: `Rejudged` and a `rejudge_denied` record. The
     re-judge fails or passes its deadline: `RejudgeFailed` and a
     `rejudge_failed` record. `wait` gives anything else (`Deny`,
-    `NoVerdict`, `Timeout`, `Foreign`): plan 20's answer, and the re-judge
-    result is dropped. On Windows the re-judge starts once `wait` has named
-    the binder, because only then is the SID known.
+    `NoVerdict`, `Timeout`, `Foreign`): plan 20's answer, and no re-judge
+    is started. On every system the re-judge starts only once `wait` gives
+    `Allow`, as the binder's principal (on Windows only then is the SID
+    known), so a loop of calls the hook denied takes no place in the pool.
   - **No judge.** A system daemon without a pool denies every co-signed call
     with `RejudgeFailed`, and `status.cosign.rejudge.error` says why.
   - **Status.** `cosign.rejudge: {"workers": <n>, "error": <s|null>}`,
@@ -2372,11 +2378,16 @@ come from the same `status` call):
 - **`locked.preview` on Windows** names only the installed agents without a
   co-signer: "Windows locked mode is a preview for Codex and Gemini CLI: a
   process of the agent's user can end their hook with exit 0". With only
-  Claude Code installed and `cosign.listen`, `cosign.rejudge` and
-  `cosign.asker` all passing, it passes: "Windows locked mode for Claude Code:
-  each call is judged by the hook and by the service". If any of the three
-  fails, it stays info with the old text. Linux and macOS have no
-  `locked.preview`.
+  Claude Code installed and `cosign.listen`, `cosign.rejudge`,
+  `cosign.asker` and `agents.claude.policy` all passing, and an
+  `agent-version` check that showed Claude Code at least the minimum (none
+  failing), it passes: "Windows locked mode for Claude Code: each call is
+  judged by the hook and by the service". A whole co-signer that Claude Code
+  never calls (an HKLM override, a drop-in without the HTTP hook, an old
+  Claude Code) does not pass it. If any of these fails, it stays info with the
+  old text; when only the version was not checked (an elevated `doctor`
+  never runs the agent), the old text says to run `doctor --user <name>` as
+  that user. Linux and macOS have no `locked.preview`.
 
 `--json` gives machine-readable output, and the exit code is 0 (all pass),
 1 (a warning), or 2 (a failure). Fleet tools can run it on a schedule.
@@ -2820,7 +2831,14 @@ knowledge of the hook connections (§6.1.1). Two events:
   `suppressed: <n>`.
 
 **Note (plan 21): two more `hook` events**, from the co-signer's own judgment
-(§6.1.1). One record per call, not folded (owner ruling 2026-11-09).
+(§6.1.1). One record per call (owner ruling 2026-11-09), with one safety
+valve: past `REJUDGE_RECORDS_PER_MINUTE = 60` `rejudge_denied` records of
+one principal in a 60-second window (from that principal's first record),
+the window's other calls fold into one record, written when the window
+ends: the last of those calls, with `suppressed` = how many calls it stands
+for, itself included. So the audit volume's floor is not the only limit on
+a flood of forged allows. `status.hooks_rejudge_denied` still counts every
+call. `rejudge_failed` records fold like `cosign_denied` ones.
 
 - `event: "rejudge_denied"`, decision `deny`: the hook recorded an allow and
   the service's own judgment denied the call. `agent: "claude"`, the

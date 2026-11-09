@@ -70,17 +70,66 @@ fn preview_for(agents: &str, claude: &str) -> String {
 const CLAUDE_JUDGED: &str =
     "Windows locked mode for Claude Code: each call is judged by the hook and by the service";
 
+/// Said after [`PREVIEW_LIMITS`] when all that keeps Claude Code a preview is that no
+/// `agent-version` check showed its version.
+const CLAUDE_VERSION_UNCHECKED: &str = " Claude Code leaves the preview only once its \
+     version is shown to be new enough: run saiife doctor --user <name> as that user, from \
+     a plain shell";
+
+/// Whether Claude Code is shown to call the co-signer, which `locked.preview` needs before
+/// it says Claude Code is no preview (whole-branch review, F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CosignWhole {
+    /// `cosign.listen`, `cosign.rejudge`, `cosign.asker` and `agents.claude.policy` pass
+    /// (the drop-in carries the HTTP hook, and no HKLM policy overrides or weakens it),
+    /// and every `agent-version` check that ran passed, at least one of them.
+    Yes,
+    /// All of that but the version: no `agent-version` check ran (an elevated doctor,
+    /// or no agent user named), or none found Claude Code.
+    VersionUnchecked,
+    No,
+}
+
+/// [`CosignWhole`] from the checks it rests on. `versions` are the `agent-version`
+/// checks of this run.
+fn cosign_whole(cosign: &[Check], policy: Option<&Check>, versions: &[&Check]) -> CosignWhole {
+    let pass = |c: &Check| c.status == Status::Pass;
+    if !cosign.iter().all(pass) || !policy.is_some_and(pass) {
+        return CosignWhole::No;
+    }
+    if versions
+        .iter()
+        .any(|c| matches!(c.status, Status::Fail | Status::Warn))
+    {
+        return CosignWhole::No;
+    }
+    if versions.iter().any(|c| pass(c)) {
+        CosignWhole::Yes
+    } else {
+        CosignWhole::VersionUnchecked
+    }
+}
+
 /// `locked.preview` (plan 21 Task 6). Claude Code leaves the preview only when
-/// `cosign_whole`: `cosign.listen`, `cosign.rejudge` and `cosign.asker` all pass. Until
-/// then it is the plan 19b text, Info. Codex and Gemini CLI have no co-signer, so they
-/// stay preview, named when installed.
-fn locked_preview(installed: Option<&Installed>, cosign_whole: bool) -> Check {
+/// `cosign_whole` is [`CosignWhole::Yes`]. Until then it is the plan 19b text, Info. Codex
+/// and Gemini CLI have no co-signer, so they stay preview, named when installed.
+fn locked_preview(installed: Option<&Installed>, cosign_whole: CosignWhole) -> Check {
     const ID: &str = "locked.preview";
     const TITLE: &str = "Windows locked mode";
     let has = |name: &str| installed.is_some_and(|i| i.agents.iter().any(|a| a.agent == name));
     let claude = has("claude");
-    if claude && !cosign_whole {
-        return Check::new(ID, Status::Info, TITLE, PREVIEW_LIMITS);
+    match cosign_whole {
+        _ if !claude => {}
+        CosignWhole::Yes => {}
+        CosignWhole::No => return Check::new(ID, Status::Info, TITLE, PREVIEW_LIMITS),
+        CosignWhole::VersionUnchecked => {
+            return Check::new(
+                ID,
+                Status::Info,
+                TITLE,
+                format!("{PREVIEW_LIMITS}.{CLAUDE_VERSION_UNCHECKED}"),
+            )
+        }
     }
     let others: Vec<&str> = [("codex", "Codex"), ("gemini", "Gemini CLI")]
         .into_iter()
@@ -135,7 +184,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     }
     // `daemon.health`, the `cosign.*` checks and the `hooks.*` counts read one `status`
     // answer, and so does `locked.preview`: Claude Code leaves the preview only when its
-    // co-signer is whole.
+    // co-signer is whole, its machine policy carries it, and its version is new enough.
     let status: DaemonStatus = ctx
         .host
         .daemon_status(HEALTH_WAIT)
@@ -146,9 +195,19 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         cosign_rejudge(claude, &status),
         cosign_asker(claude, &status, Platform::Windows),
     ];
+    let policy = ctx
+        .installed
+        .as_ref()
+        .filter(|i| lists_claude(i))
+        .map(|_| claude_policy(ctx));
+    let user_checks = users(ctx);
+    let versions: Vec<&Check> = user_checks
+        .iter()
+        .filter(|c| c.id.ends_with(".agent-version"))
+        .collect();
     out.push(locked_preview(
         ctx.installed.as_ref(),
-        cosign.iter().all(|c| c.status == Status::Pass),
+        cosign_whole(&cosign, policy.as_ref(), &versions),
     ));
     if !ctx.as_root {
         out.push(Check::new(
@@ -180,10 +239,8 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
         }
         out.extend(i.agents.iter().map(|a| agent_label(ctx, &a.agent)));
-        if lists_claude(i) {
-            out.push(claude_policy(ctx));
-        }
     }
+    out.extend(policy);
     out.extend(allow_server_warnings(ctx));
     out.push(Check::new(
         "mcp.landlock",
@@ -227,7 +284,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         "audit forwarding",
         forwarding_detail(&ctx.config),
     ));
-    out.extend(users(ctx));
+    out.extend(user_checks);
     out.push(Check::new(
         "host.not-ported",
         Status::Info,
