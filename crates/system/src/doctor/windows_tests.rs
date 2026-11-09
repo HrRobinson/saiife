@@ -32,11 +32,18 @@ fn canned(stdout: &str, status: i32) -> crate::host::CmdOutput {
 
 fn answer() -> Map<String, serde_json::Value> {
     json!({"policy_ok": true, "chain": "ok", "head_seq": 7, "last_checkpoint_seq": 6,
-        "cosign": {"addr": "127.0.0.1:7433", "error": null},
-        "hooks_no_verdict": {"since_start": 0, "last_ts": null}})
+        "cosign": whole_cosign(),
+        "hooks_no_verdict": {"since_start": 0, "last_ts": null},
+        "hooks_rejudge_denied": {"since_start": 0, "last_ts": null}})
     .as_object()
     .unwrap()
     .clone()
+}
+
+/// A co-signer that listens, judges each call itself, and knows who asks (plan 21).
+fn whole_cosign() -> serde_json::Value {
+    json!({"addr": "127.0.0.1:7433", "error": null, "asker": "tcp_table",
+        "rejudge": {"workers": 2, "error": null}})
 }
 
 struct Env {
@@ -290,6 +297,10 @@ fn every_windows_check_id_is_there_and_no_unix_one() {
         "disk.encryption",
         "locked.preview",
         "forwarding",
+        "cosign.listen",
+        "cosign.rejudge",
+        "cosign.asker",
+        "hooks.rejudge-denied",
     ] {
         get(&r, id);
     }
@@ -332,11 +343,259 @@ fn info_lines_say_what_the_brief_fixes() {
     );
 }
 
-/// What the lock does not do must be said, in a line that fails nothing.
+/// What the lock does not do must be said, in a line that fails nothing. With the
+/// co-signer whole, Claude Code is no preview, and the line names the other two.
 #[test]
 fn the_preview_limits_are_said_and_fail_nothing() {
     let c = installed().doctor();
     let c = get(&c, "locked.preview");
+    assert_eq!(c.status, Status::Info);
+    for word in [
+        "a preview for Codex and Gemini CLI",
+        "exit 0",
+        "reads as allow",
+        "recorded, not prevented",
+        "unverified",
+        "Claude Code is not",
+        "judged by the hook and by the service",
+        "docs/windows.md#locked-mode",
+    ] {
+        assert!(c.detail.contains(word), "{word}: {}", c.detail);
+    }
+    // Only CI has run it, and it must not claim more.
+    assert!(!c.detail.contains("tested by hand"), "{}", c.detail);
+    assert!(!c.detail.contains("has not been tested"), "{}", c.detail);
+}
+
+/// A Windows install with only these agents, and this `status` answer.
+fn with_agents(agents: &[Agent], status: Map<String, serde_json::Value>) -> Env {
+    let e = stock_machine(PeFixture::default());
+    e.install(agents);
+    e.host.set(|s| {
+        s.daemon_status = Some(status);
+        s.authenticode = Some(0);
+    });
+    e.audit_key_as_the_daemon_left_it();
+    e
+}
+
+/// `answer()` with one field of `status.cosign` set to `v`.
+fn cosign_field(field: &str, v: serde_json::Value) -> Map<String, serde_json::Value> {
+    let mut c = whole_cosign();
+    c.as_object_mut().unwrap().insert(field.into(), v);
+    let mut a = answer();
+    a.insert("cosign".into(), c);
+    a
+}
+
+/// `answer()` with `status.cosign.<field>` absent (an older daemon).
+fn cosign_without(field: &str) -> Map<String, serde_json::Value> {
+    let mut c = whole_cosign();
+    c.as_object_mut().unwrap().remove(field);
+    let mut a = answer();
+    a.insert("cosign".into(), c);
+    a
+}
+
+#[test]
+fn preview_absent_for_claude_only_when_cosign_is_whole() {
+    let r = with_agents(&[Agent::Claude], answer()).doctor();
+    let c = get(&r, "locked.preview");
+    assert_eq!(c.status, Status::Pass, "{}", r.to_text());
+    assert_eq!(
+        c.detail,
+        "Windows locked mode for Claude Code: each call is judged by the hook and by the service"
+    );
+    assert!(!c.detail.contains("preview"), "{}", c.detail);
+    assert_eq!(failed(&r), Vec::<&str>::new(), "{}", r.to_text());
+}
+
+#[test]
+fn preview_names_codex_and_gemini() {
+    // Both, with Claude Code: they are named, Claude Code is not a preview.
+    let c = get(&installed().doctor(), "locked.preview").clone();
+    assert_eq!(c.status, Status::Info);
+    assert!(
+        c.detail.starts_with(
+            "Windows locked mode is a preview for Codex and Gemini CLI: a process of the \
+             agent's user can end their hook with exit 0"
+        ),
+        "{}",
+        c.detail
+    );
+    assert!(!c.detail.contains("TerminateProcess"), "{}", c.detail);
+    // Only the installed ones are named.
+    let c = get(
+        &with_agents(&[Agent::Codex], answer()).doctor(),
+        "locked.preview",
+    )
+    .clone();
+    assert_eq!(c.status, Status::Info);
+    assert!(
+        c.detail
+            .starts_with("Windows locked mode is a preview for Codex: "),
+        "{}",
+        c.detail
+    );
+    assert!(!c.detail.contains("Gemini"), "{}", c.detail);
+    // Without Claude Code, nothing is said of it.
+    assert!(!c.detail.contains("Claude Code"), "{}", c.detail);
+    let c = get(
+        &with_agents(&[Agent::Gemini], answer()).doctor(),
+        "locked.preview",
+    )
+    .clone();
+    assert!(
+        c.detail
+            .starts_with("Windows locked mode is a preview for Gemini CLI: "),
+        "{}",
+        c.detail
+    );
+}
+
+/// The old text, and Info, when any part of the co-signer is not whole: Claude Code is
+/// then a preview too.
+#[test]
+fn preview_kept_when_rejudge_fails() {
+    let broken = [
+        cosign_field(
+            "rejudge",
+            json!({"workers": 0, "error": "no re-judge pool"}),
+        ),
+        cosign_without("rejudge"),
+        cosign_field("asker", serde_json::Value::Null),
+        cosign_without("asker"),
+        cosign_field("addr", serde_json::Value::Null),
+    ];
+    for status in broken {
+        for agents in [&[Agent::Claude][..], &Agent::ALL[..]] {
+            let r = with_agents(agents, status.clone()).doctor();
+            let c = get(&r, "locked.preview");
+            assert_eq!(c.status, Status::Info, "{status:?}");
+            assert_eq!(c.detail, PREVIEW_LIMITS, "{status:?}");
+        }
+    }
+    // No answer at all: nothing says the co-signer is whole.
+    let e = with_agents(&[Agent::Claude], answer());
+    e.host.set(|s| s.daemon_status = None);
+    let c = get(&e.doctor(), "locked.preview").clone();
+    assert_eq!(
+        (c.status, c.detail.as_str()),
+        (Status::Info, PREVIEW_LIMITS)
+    );
+}
+
+#[test]
+fn rejudge_fail_check() {
+    let c = get(&installed().doctor(), "cosign.rejudge").clone();
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(
+        c.detail,
+        "the service judges each Claude Code call itself (2 workers)"
+    );
+    let down = cosign_field(
+        "rejudge",
+        json!({"workers": 0, "error": "the re-judge pool could not start"}),
+    );
+    let r = with_agents(&Agent::ALL, down).doctor();
+    let c = get(&r, "cosign.rejudge");
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(
+        c.detail,
+        "the service cannot judge Claude Code calls (the re-judge pool could not start), so \
+         every call is blocked"
+    );
+    let r = with_agents(&Agent::ALL, cosign_without("rejudge")).doctor();
+    let c = get(&r, "cosign.rejudge");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("an older daemon?"), "{}", c.detail);
+    // No worker right now and no error: a warning, never a pass.
+    let idle = cosign_field("rejudge", json!({"workers": 0, "error": null}));
+    let c = get(&with_agents(&Agent::ALL, idle).doctor(), "cosign.rejudge").clone();
+    assert_eq!(c.status, Status::Warn, "{c:?}");
+    // Without Claude Code there is nothing to judge.
+    let c = get(
+        &with_agents(&[Agent::Codex], cosign_without("rejudge")).doctor(),
+        "cosign.rejudge",
+    )
+    .clone();
+    assert_eq!(c.status, Status::Info);
+}
+
+#[test]
+fn asker_fail_check() {
+    let c = get(&installed().doctor(), "cosign.asker").clone();
+    assert_eq!(c.status, Status::Pass);
+    assert!(c.detail.contains("tcp_table"), "{}", c.detail);
+    let r = with_agents(&Agent::ALL, cosign_field("asker", serde_json::Value::Null)).doctor();
+    let c = get(&r, "cosign.asker");
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(
+        c.detail,
+        "the co-signer cannot tell who asks (GetExtendedTcpTable gave no owner pid for the \
+         service's own test connection), so every Claude Code call is blocked"
+    );
+    let r = with_agents(&Agent::ALL, cosign_without("asker")).doctor();
+    let c = get(&r, "cosign.asker");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("an older daemon?"), "{}", c.detail);
+    // Another system's source is no pass here.
+    let r = with_agents(&Agent::ALL, cosign_field("asker", json!("proc_net"))).doctor();
+    assert_eq!(get(&r, "cosign.asker").status, Status::Fail);
+    let c = get(
+        &with_agents(&[Agent::Gemini], cosign_without("asker")).doctor(),
+        "cosign.asker",
+    )
+    .clone();
+    assert_eq!(c.status, Status::Info);
+    // No answer: daemon.health fails, and these say they could not look.
+    let e = installed();
+    e.host.set(|s| s.daemon_status = None);
+    let r = e.doctor();
+    for id in ["cosign.asker", "cosign.rejudge", "hooks.rejudge-denied"] {
+        assert_eq!(get(&r, id).status, Status::Info, "{id}");
+    }
+}
+
+#[test]
+fn rejudge_denied_warns_with_count() {
+    let mut a = answer();
+    a.insert(
+        "hooks_rejudge_denied".into(),
+        json!({"since_start": 2, "last_ts": "2026-11-09T10:00:00Z"}),
+    );
+    let c = get(
+        &with_agents(&Agent::ALL, a).doctor(),
+        "hooks.rejudge-denied",
+    )
+    .clone();
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(
+        c.detail,
+        "2 call(s) the hook allowed were denied by the service's own judgment (last \
+         2026-11-09T10:00:00Z): a forged verdict, or a guard difference; see saiife audit \
+         --kind hook"
+    );
+    assert_eq!(
+        get(&installed().doctor(), "hooks.rejudge-denied").status,
+        Status::Pass
+    );
+    let mut old = answer();
+    old.remove("hooks_rejudge_denied");
+    let c = get(
+        &with_agents(&Agent::ALL, old).doctor(),
+        "hooks.rejudge-denied",
+    )
+    .clone();
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains("an older daemon?"), "{}", c.detail);
+}
+
+/// The plan 19b text, kept for when the co-signer is not whole.
+#[test]
+fn the_old_preview_limits_are_kept() {
+    let r = with_agents(&Agent::ALL, cosign_field("asker", serde_json::Value::Null)).doctor();
+    let c = get(&r, "locked.preview");
     assert_eq!(c.status, Status::Info);
     for word in [
         "preview",

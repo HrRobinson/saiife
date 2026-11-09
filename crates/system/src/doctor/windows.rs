@@ -10,10 +10,10 @@
 //! [`Host`]: crate::host::Host
 
 use super::common::{
-    agent_label, allow_server_warnings, claude_installed, cloud_sts, config_valid, cosign_listen,
-    entry_fingerprint, fmt_version, forwarding_detail, health_check, hooks_no_verdict,
-    install_record, mcp_restrictions, parse_agent_version, proxy_check, DaemonStatus, EnvLayer,
-    CLAUDE_MIN, NOT_INSTALLED,
+    agent_label, allow_server_warnings, claude_installed, cloud_sts, config_valid, cosign_asker,
+    cosign_listen, cosign_rejudge, entry_fingerprint, fmt_version, forwarding_detail, health_check,
+    hooks_no_verdict, hooks_rejudge_denied, install_record, mcp_restrictions, parse_agent_version,
+    proxy_check, DaemonStatus, EnvLayer, CLAUDE_MIN, NOT_INSTALLED,
 };
 use super::report::{Check, Status};
 use super::Ctx;
@@ -54,6 +54,59 @@ const PREVIEW_LIMITS: &str = "Windows locked mode is a preview: a process runnin
      and Gemini CLI on Windows are preview too, and every Windows lock label is unverified; \
      see docs/windows.md#locked-mode";
 
+/// `locked.preview` for an install whose agents have no co-signer (plan 21): their hook
+/// can still be ended with exit 0. `{agents}` names them; `{claude}` is empty, or says
+/// why Claude Code is no preview.
+fn preview_for(agents: &str, claude: &str) -> String {
+    format!(
+        "Windows locked mode is a preview for {agents}: a process of the agent's user can \
+         end their hook with exit 0, which the agent reads as allow (recorded, not \
+         prevented; measured in CI on Windows Server 2022 and 2025).{claude} Every Windows \
+         lock label is unverified; see docs/windows.md#locked-mode"
+    )
+}
+
+/// `locked.preview` with only Claude Code installed and its co-signer whole.
+const CLAUDE_JUDGED: &str =
+    "Windows locked mode for Claude Code: each call is judged by the hook and by the service";
+
+/// `locked.preview` (plan 21 Task 6). Claude Code leaves the preview only when
+/// `cosign_whole`: `cosign.listen`, `cosign.rejudge` and `cosign.asker` all pass. Until
+/// then it is the plan 19b text, Info. Codex and Gemini CLI have no co-signer, so they
+/// stay preview, named when installed.
+fn locked_preview(installed: Option<&Installed>, cosign_whole: bool) -> Check {
+    const ID: &str = "locked.preview";
+    const TITLE: &str = "Windows locked mode";
+    let has = |name: &str| installed.is_some_and(|i| i.agents.iter().any(|a| a.agent == name));
+    let claude = has("claude");
+    if claude && !cosign_whole {
+        return Check::new(ID, Status::Info, TITLE, PREVIEW_LIMITS);
+    }
+    let others: Vec<&str> = [("codex", "Codex"), ("gemini", "Gemini CLI")]
+        .into_iter()
+        .filter(|(name, _)| has(name))
+        .map(|(_, label)| label)
+        .collect();
+    match (claude, others.is_empty()) {
+        (true, true) => Check::new(ID, Status::Pass, TITLE, CLAUDE_JUDGED),
+        // No agent at all (or an unreadable record): nothing is shown to be whole.
+        (false, true) => Check::new(ID, Status::Info, TITLE, PREVIEW_LIMITS),
+        (_, false) => {
+            let note = if claude {
+                " Claude Code is not: each call is judged by the hook and by the service."
+            } else {
+                ""
+            };
+            Check::new(
+                ID,
+                Status::Info,
+                TITLE,
+                preview_for(&others.join(" and "), note),
+            )
+        }
+    }
+}
+
 /// The Linux checks with no Windows form in this version. Said, so that their absence does
 /// not read as "fine".
 const NOT_PORTED: &str = "not checked on Windows in this version: plaintext credentials, \
@@ -80,11 +133,22 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.push(record_when_unlocked(ctx));
         return out;
     }
-    out.push(Check::new(
-        "locked.preview",
-        Status::Info,
-        "Windows locked mode",
-        PREVIEW_LIMITS,
+    // `daemon.health`, the `cosign.*` checks and the `hooks.*` counts read one `status`
+    // answer, and so does `locked.preview`: Claude Code leaves the preview only when its
+    // co-signer is whole.
+    let status: DaemonStatus = ctx
+        .host
+        .daemon_status(HEALTH_WAIT)
+        .map_err(|e| e.to_string());
+    let claude = claude_installed(ctx);
+    let cosign = [
+        cosign_listen(claude, &status),
+        cosign_rejudge(claude, &status),
+        cosign_asker(claude, &status, Platform::Windows),
+    ];
+    out.push(locked_preview(
+        ctx.installed.as_ref(),
+        cosign.iter().all(|c| c.status == Status::Pass),
     ));
     if !ctx.as_root {
         out.push(Check::new(
@@ -107,14 +171,10 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.extend(files_package(ctx));
     out.push(keys(ctx));
     out.push(daemon_unit(ctx));
-    // `daemon.health`, `cosign.listen` and `hooks.no-verdict` read one `status` answer.
-    let status: DaemonStatus = ctx
-        .host
-        .daemon_status(HEALTH_WAIT)
-        .map_err(|e| e.to_string());
     out.push(health_check(status.clone()));
-    out.push(cosign_listen(claude_installed(ctx), &status));
+    out.extend(cosign);
     out.push(hooks_no_verdict(&status));
+    out.push(hooks_rejudge_denied(claude, &status));
     if let Some(i) = &ctx.installed {
         if i.agents.is_empty() {
             out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));

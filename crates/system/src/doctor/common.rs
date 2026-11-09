@@ -321,6 +321,156 @@ pub(super) fn cosign_listen(claude: bool, status: &DaemonStatus) -> Check {
     }
 }
 
+/// What the plan 21 co-signer checks say when Claude Code is not installed.
+const NO_CLAUDE: &str = "Claude Code is not installed: no co-signer needed";
+
+/// `cosign.rejudge` (plan 21): with Claude Code installed, the service judges each
+/// co-signed call itself (`status.cosign.rejudge`), or the co-signer denies every call.
+pub(super) fn cosign_rejudge(claude: bool, status: &DaemonStatus) -> Check {
+    const ID: &str = "cosign.rejudge";
+    const TITLE: &str = "the service's own judgment";
+    if !claude {
+        return Check::new(ID, Status::Info, TITLE, NO_CLAUDE);
+    }
+    let Ok(m) = status else {
+        return Check::new(ID, Status::Info, TITLE, NO_ANSWER);
+    };
+    let fail = |why: &str| {
+        Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            format!("the service cannot judge Claude Code calls ({why}), so every call is blocked"),
+        )
+    };
+    let Some(r) = m.get("cosign").and_then(|c| c.get("rejudge")) else {
+        return fail("the daemon does not report a re-judge pool: an older daemon?");
+    };
+    match r.get("error") {
+        Some(Value::Null) | None => {}
+        Some(Value::String(e)) if !e.is_empty() => return fail(e),
+        Some(_) => return fail("no error given"),
+    }
+    match r.get("workers").and_then(Value::as_u64) {
+        Some(0) => Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            "no re-judge worker is running right now: the service starts one for the next \
+             call, or denies it",
+        ),
+        Some(n) => Check::new(
+            ID,
+            Status::Pass,
+            TITLE,
+            format!(
+                "the service judges each Claude Code call itself ({n} worker{})",
+                if n == 1 { "" } else { "s" }
+            ),
+        ),
+        None => fail("the daemon does not say how many workers it runs"),
+    }
+}
+
+/// `cosign.asker` (plan 21): with Claude Code installed, the co-signer must find who sends
+/// each call from the TCP connection (`status.cosign.asker`), or it denies every call.
+/// Only this system's source passes: `proc_net` (Linux), `pcblist` (macOS), `tcp_table`
+/// (Windows).
+pub(super) fn cosign_asker(claude: bool, status: &DaemonStatus, platform: Platform) -> Check {
+    const ID: &str = "cosign.asker";
+    const TITLE: &str = "who asks the co-signer";
+    if !claude {
+        return Check::new(ID, Status::Info, TITLE, NO_CLAUDE);
+    }
+    let Ok(m) = status else {
+        return Check::new(ID, Status::Info, TITLE, NO_ANSWER);
+    };
+    let (want, reason) = match platform {
+        Platform::Linux => (
+            "proc_net",
+            "/proc/net/tcp gave no owner for the service's own test connection",
+        ),
+        Platform::Macos => (
+            "pcblist",
+            "net.inet.tcp.pcblist_n could not be read, or its layout is one this version \
+             does not know",
+        ),
+        Platform::Windows => (
+            "tcp_table",
+            "GetExtendedTcpTable gave no owner pid for the service's own test connection",
+        ),
+    };
+    let fail = |why: &str| {
+        Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            format!(
+                "the co-signer cannot tell who asks ({why}), so every Claude Code call is \
+                 blocked"
+            ),
+        )
+    };
+    let Some(c) = m.get("cosign") else {
+        return fail("the daemon does not report a co-signer: an older daemon?");
+    };
+    match c.get("asker") {
+        None => fail("the daemon does not report how it finds the asker: an older daemon?"),
+        Some(Value::String(s)) if s == want => Check::new(
+            ID,
+            Status::Pass,
+            TITLE,
+            format!("found from the TCP connection ({s})"),
+        ),
+        Some(Value::String(s)) => fail(&format!("it reports {s}, not {want}, on this system")),
+        Some(_) => fail(reason),
+    }
+}
+
+/// `hooks.rejudge-denied` (plan 21): calls the hook allowed and the service's own
+/// judgment denied, since the daemon started. Record only: a warning, never a failure.
+pub(super) fn hooks_rejudge_denied(claude: bool, status: &DaemonStatus) -> Check {
+    const ID: &str = "hooks.rejudge-denied";
+    const TITLE: &str = "calls the service's own judgment denied";
+    if !claude {
+        return Check::new(ID, Status::Info, TITLE, NO_CLAUDE);
+    }
+    let Ok(m) = status else {
+        return Check::new(ID, Status::Info, TITLE, NO_ANSWER);
+    };
+    let h = m.get("hooks_rejudge_denied");
+    let Some(n) = h.and_then(|h| h.get("since_start")).and_then(Value::as_u64) else {
+        return Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            "the daemon does not count calls its own judgment denied: an older daemon?",
+        );
+    };
+    if n == 0 {
+        return Check::new(
+            ID,
+            Status::Pass,
+            TITLE,
+            "no call the hook allowed was denied by the service's own judgment since the \
+             daemon started",
+        );
+    }
+    let last = h
+        .and_then(|h| h.get("last_ts"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Check::new(
+        ID,
+        Status::Warn,
+        TITLE,
+        format!(
+            "{n} call(s) the hook allowed were denied by the service's own judgment (last \
+             {last}): a forged verdict, or a guard difference; see saiife audit --kind hook"
+        ),
+    )
+}
+
 /// What `cosign.listen` and `hooks.no-verdict` say without a `status` answer:
 /// `daemon.health` fails then, so they do not fail again.
 const NO_ANSWER: &str = "not checked: the daemon did not answer (see daemon.health)";
