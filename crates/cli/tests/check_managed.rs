@@ -1569,6 +1569,33 @@ fn poisoned_client_rebinds_on_the_new_connection() {
     assert!(append.args["rec"].get("input_sha256").is_none());
 }
 
+/// A key the daemon's `hook.bind` would refuse (a session over 128 bytes,
+/// a tool call id over 256) is neither bound nor named in the append: the
+/// call is recorded as unbound, not as a hook without a verdict.
+#[test]
+fn key_over_the_daemon_limits_is_not_bound() {
+    for (session, id) in [
+        ("s".repeat(129), "toolu_1".to_string()),
+        ("s-m".into(), "t".repeat(257)),
+    ] {
+        let d = TestDaemon::prepare(&Opts::default());
+        let fake = FakeDaemon::start(&d, false);
+        let project = tempfile::tempdir().unwrap();
+        let mut v: Value = serde_json::from_str(&bash(project.path(), "ls")).unwrap();
+        v["session_id"] = session.into();
+        v["tool_use_id"] = id.into();
+        let (o, _, _sb) = managed(&d.config(), &v.to_string());
+        assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+        assert_eq!(
+            fake.ops(),
+            ops_of(&[(0, "hello"), (0, "hook.begin"), (0, "audit.append")])
+        );
+        let append = &fake.seen()[2].args;
+        assert!(append.get("tool_use_id").is_none(), "{append}");
+        assert!(append.get("input_sha256").is_none(), "{append}");
+    }
+}
+
 #[test]
 fn unparseable_payload_still_appends_error_denied_without_bind() {
     let d = TestDaemon::prepare(&Opts::default());

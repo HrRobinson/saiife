@@ -179,6 +179,9 @@ mod imp {
     /// The longest `tool_use_id` a record shows, in bytes (the daemon's
     /// `hook.bind` limit).
     const MAX_RECORDED_ID: usize = 256;
+    /// The longest session that `hook.bind` takes, in bytes (the daemon's
+    /// `sessions::MAX_SESSION_ID`).
+    const MAX_BIND_SESSION: usize = 128;
     /// The reason recorded when even the shrunk record does not fit.
     const TOO_LARGE: &str = "record too large";
     /// The fields `fit` may cut: everything the agent or the project
@@ -1518,12 +1521,13 @@ mod imp {
         Ok(c)
     }
 
-    /// `key`, if it can be bound: a key with a session or tool call id
-    /// over `MAX_FIELD_CHARS` is not sent (it could pass the frame limit
-    /// and cost the record), and the record does not name it either.
+    /// `key`, if the daemon's `hook.bind` takes it: a session over
+    /// `MAX_BIND_SESSION` bytes or a tool call id over `MAX_RECORDED_ID` is
+    /// not sent (the daemon would refuse the bind, and settle nothing with
+    /// the append's arguments), and the append does not name it either.
     fn bindable(key: Option<&HookKey>) -> Option<&HookKey> {
-        let fits = |s: &Option<String>| s.as_ref().is_none_or(|s| s.len() <= MAX_FIELD_CHARS);
-        key.filter(|k| fits(&k.session) && fits(&k.tool_use_id))
+        let fits = |s: &Option<String>, max: usize| s.as_ref().is_none_or(|s| s.len() <= max);
+        key.filter(|k| fits(&k.session, MAX_BIND_SESSION) && fits(&k.tool_use_id, MAX_RECORDED_ID))
     }
 
     /// `hook.bind` with `key`, if there is one ([`bindable`]), and `tool`
