@@ -45,6 +45,33 @@ pub const NO_VERDICT_REASON: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnId(pub u64);
 
+/// Why [`HookTable::bind_tool`] refused a bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindRefused {
+    /// The connection sent no `hook.begin`.
+    NotBegun,
+    /// The connection's hook already ended.
+    Ended,
+    /// The connection already bound another key (one key per connection).
+    OtherKey,
+    /// Another principal bound this key.
+    OtherPrincipal,
+}
+
+impl BindRefused {
+    /// The `hook.bind` error message.
+    pub fn message(self) -> &'static str {
+        match self {
+            BindRefused::NotBegun => "hook.bind needs hook.begin first on this connection",
+            BindRefused::Ended => "hook.bind: this connection's hook already ended",
+            BindRefused::OtherKey => {
+                "hook.bind: this connection already bound another key (one key per connection)"
+            }
+            BindRefused::OtherPrincipal => "hook.bind: the key is bound by another principal",
+        }
+    }
+}
+
 /// What [`HookTable::wait`] saw for a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waited {
@@ -458,11 +485,17 @@ impl HookTable {
     /// principal. The first bind of a connection on a key that already has
     /// an outcome clears it: the key waits for this connection's verdict.
     pub fn bind(&self, conn: ConnId, key: HookKey) -> bool {
-        self.bind_tool(conn, key, None)
+        self.bind_tool(conn, key, None).is_ok()
     }
 
-    /// [`HookTable::bind`], naming the tool for the record.
-    pub fn bind_tool(&self, conn: ConnId, key: HookKey, tool: Option<String>) -> bool {
+    /// [`HookTable::bind`], naming the tool for the record, and saying why
+    /// a refused bind was refused.
+    pub fn bind_tool(
+        &self,
+        conn: ConnId,
+        key: HookKey,
+        tool: Option<String>,
+    ) -> Result<(), BindRefused> {
         let mut st = self.inner.lock();
         let now = Instant::now();
         // Expired keys go first: an old slot of another principal must not
@@ -471,13 +504,15 @@ impl HookTable {
         let (principal, first) = match st.conns.get(&conn) {
             // One key per connection: a second key would let one
             // connection add slots and evict other users' keys.
-            Some(o) if !o.done && o.key.as_ref().is_none_or(|k| *k == key) => {
-                (o.principal.clone(), o.key.is_none())
+            Some(o) if o.done => return Err(BindRefused::Ended),
+            Some(o) if o.key.as_ref().is_some_and(|k| *k != key) => {
+                return Err(BindRefused::OtherKey)
             }
-            _ => return false,
+            Some(o) => (o.principal.clone(), o.key.is_none()),
+            None => return Err(BindRefused::NotBegun),
         };
         if st.keys.get(&key).is_some_and(|s| s.principal != principal) {
-            return false;
+            return Err(BindRefused::OtherPrincipal);
         }
         if let Some(o) = st.conns.get_mut(&conn) {
             o.key = Some(key.clone());
@@ -507,7 +542,7 @@ impl HookTable {
             self.inner.added.notify_waiters();
         }
         st.prune(now);
-        true
+        Ok(())
     }
 
     /// The verdict of `conn`, called once its `audit.append` is written.
@@ -707,7 +742,7 @@ mod tests {
     async fn end_without_verdict_writes_one_record() {
         let (t, seen) = table();
         t.begin(ConnId(1), &peer(), "claude", Some("PreToolUse"));
-        assert!(t.bind_tool(ConnId(1), key(1), Some("Bash".into())));
+        assert_eq!(t.bind_tool(ConnId(1), key(1), Some("Bash".into())), Ok(()));
         tokio::time::sleep(Duration::from_millis(250)).await;
         t.ended(ConnId(1));
         settle().await;

@@ -1270,8 +1270,8 @@ fn hook_bind(ctx: &Ctx, conn: &Conn, req: Request) -> Value {
         Ok(t) => t,
         Err(e) => return bad(&e),
     };
-    if !ctx.hooks.bind_tool(conn.id, key, tool) {
-        return bad("hook.bind needs hook.begin first on this connection");
+    if let Err(why) = ctx.hooks.bind_tool(conn.id, key, tool) {
+        return bad(why.message());
     }
     ok(req.id, Map::new())
 }

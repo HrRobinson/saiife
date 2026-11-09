@@ -367,6 +367,26 @@ async fn only_an_append_naming_the_key_settles_it() {
         .contains("\"tool_use_id\":\"toolu_4\""));
 }
 
+/// Each refused `hook.bind` says why: no `hook.begin` on the connection,
+/// or another key already bound on it.
+#[tokio::test]
+async fn a_refused_bind_says_why() {
+    let d = daemon();
+    let bind = |n| serde_json::to_value(key(n)).unwrap();
+    let mut c = Client::hello(&d.sock).await;
+    let a = c.call(OP_HOOK_BIND, bind(21)).await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert!(a.to_string().contains("needs hook.begin first"), "{a}");
+    c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
+    let a = c.call(OP_HOOK_BIND, bind(21)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = c.call(OP_HOOK_BIND, bind(22)).await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let msg = a.to_string();
+    assert!(msg.contains("already bound another key"), "{a}");
+    assert!(!msg.contains("hook.begin"), "{a}");
+}
+
 /// A connection binds one key: a second key is refused and adds no slot.
 /// A new connection that binds a key clears its old outcome.
 #[tokio::test]
@@ -381,6 +401,9 @@ async fn one_key_per_connection_and_a_rebind_clears_the_outcome() {
     assert_eq!(a["ok"], true, "{a}");
     let a = c.call(OP_HOOK_BIND, bind(12)).await;
     assert_eq!(a["error"], "bad_request", "{a}");
+    let msg = a.to_string();
+    assert!(msg.contains("already bound another key"), "{a}");
+    assert!(!msg.contains("hook.begin first"), "{a}");
     let a = c.call(OP_HOOK_BIND, bind(11)).await;
     assert_eq!(a["ok"], true, "the same key again: {a}");
     let a = c
