@@ -408,8 +408,9 @@ Windows follows the Linux design (§5.2) with the differences below.
 can end the hook with `TerminateProcess(hook, 0)`, which every agent reads as allow,
 and nothing is recorded. CI measured it on `windows-2022` and `windows-2025`. Since
 plan 21 the preview covers Codex and Gemini CLI only: for Claude Code the service
-judges each call itself (§6.1.1), so that it leaves preview once `locked-windows`
-shows the forged allow and the hook kill denied (§13). `doctor` prints
+judges each call itself (§6.1.1), and it is not a preview: `locked-windows`
+showed the forged allow and the hook kill denied on `windows-2022` and
+`windows-2025` (§13, CI run 42673682022). `doctor` prints
 `locked.preview` when Codex or Gemini CLI is installed, or when the co-signer is not
 whole (§6.16), and the docs say "preview for Codex and Gemini CLI" wherever they offer
 Windows locked mode. What changed from the design while it was built:
@@ -453,8 +454,8 @@ Windows locked mode. What changed from the design while it was built:
   the policy denies is denied and recorded (`rejudge_denied`, §8.5). The co-signer
   finds who asks through the TCP table and the process tree (§5.3a.2, W13). Windows
   locked mode stays a preview for Codex and Gemini CLI, which have no HTTP hook. For
-  Claude Code the preview ends when `phase_forge` (§13) is green on both
-  `locked-windows` cells.
+  Claude Code it is not a preview: `phase_forge` (§13) was green on both
+  `locked-windows` cells (CI run 42673682022).
 
 **Platform (W2).** Windows is a third value of `Platform`, with the name
 `windows`. Developer mode is v2.2 too, and needs no admin.
@@ -1462,7 +1463,10 @@ engine (TOML parse and regex compile) on every call. Two changes:
   load.
 
 The managed hook benches were report-only during plan 21 and gate CI again
-with budgets per OS that plan 21's CI run sets from its measurements (§13).
+with budgets per OS set from plan 21's CI measurements (§13): the managed
+bash call's p95 was 41.2 to 50.0 ms on Linux (`ubuntu-24.04`, budget 60 ms),
+under 40 ms on macOS (budget 40 ms), and 59.1 ms on `windows-2022` and
+59.6 ms on `windows-2025` (budget 130 ms; about 150 ms before plan 21).
 Exec form in the drop-in (option E, no Git Bash or PowerShell per Windows
 call) waits until the Claude Code version that added `args` is known.
 
@@ -2385,9 +2389,11 @@ come from the same `status` call):
   judged by the hook and by the service". A whole co-signer that Claude Code
   never calls (an HKLM override, a drop-in without the HTTP hook, an old
   Claude Code) does not pass it. If any of these fails, it stays info with the
-  old text; when only the version was not checked (an elevated `doctor`
-  never runs the agent), the old text says to run `doctor --user <name>` as
-  that user. Linux and macOS have no `locked.preview`.
+  old text; when only the version was not checked, the old text says to run
+  `doctor --user <name>` as that user. An elevated `doctor` therefore can
+  never drop "preview": it does not run `claude.exe`, so it cannot show the
+  version. The agent user runs `saiife doctor --user <name>` from its own
+  shell. Linux and macOS have no `locked.preview`.
 
 `--json` gives machine-readable output, and the exit code is 0 (all pass),
 1 (a warning), or 2 (a failure). Fleet tools can run it on a schedule.
@@ -2994,7 +3000,7 @@ is out of scope (§9.5).
 | A21 | Run its own code outside the hook (script, patched agent, nested agent with other settings) | **Not prevented in v2.** That code runs as the user with no keys, cannot touch saiife, and is not audited. v3. `doctor` warns when agent binaries are user-writable. A hook such code kills is recorded (`no_verdict`, plan 20). Such code can also swap a symlink, a junction or a folder's files, or edit its own project config, after any judgment; this is why the co-signer's lexical judgment (plan 21, §6.1.1) loses nothing by not seeing them. A verdict it forges for Claude Code is checked against the service's own judgment (A25). |
 | A22 | Send data it can read to any host | **Not prevented in v2.** v3 egress control. Egress recipe (proposed, §6.20) for dedicated accounts on Linux. |
 | A23 | Plant persistence that runs later outside a session (cron, user units, login items) | `core.lock` denies the common ways (proposed). A script can still do it: that code is as in A21. |
-| A25 | Forge the hook's verdict on Windows: end the hook with `TerminateProcess(hook, 0)`, or begin, bind and append an allow itself | A process of the agent's user can still end the hook with exit 0 (it has full access to its own processes), or begin, bind and append an allow itself, with no code injection, and then end the real hook. Code injected into the hook can do the same. **Claude Code (plans 20 and 21):** the service judges every call itself, on the input Claude Code sent, and the co-signer (§6.1.1) answers "no opinion" only when both the hook's recorded verdict and the service's own judgment allow. A killed hook recorded nothing, so the call is denied ("the saiife hook ended without a verdict"). A forged allow of a call the policy denies is denied ("the saiife service's own judgment denies this call"), with a `rejudge_denied` record and a `doctor` warning (`hooks.rejudge-denied`). `locked-windows` is to assert both on `windows-2022` and `windows-2025` with Claude Code's request simulated (`phase_forge`, §13); until it does, Claude Code on Windows stays a preview too. **Left:** a forged allow of a call the policy allows runs, as it would anyway (pinned by a test). What only the user's own file system view decides is the hook's alone: a junction, a symlink, a glob's matches, the project's extra packs (A18 note). Code of the user can change these after any judgment (A21). **Codex and Gemini CLI:** recorded only (`no_verdict`, `doctor` warns `hooks.no-verdict`), no automatic lockdown, and still a preview: they have no HTTP hook, so no co-signer. **Not prevented:** a squat of `127.0.0.1:7433` while the service restarts (the daemon binds with `SO_EXCLUSIVEADDRUSE`, a failed bind is recorded and fails `doctor`): a squatter answers an empty `200`, and a forged hook exit 0 then allows. It needs the service to crash first (A5). Accepted for dropping "preview" for Claude Code (owner ruling 2026-11-09). Before plan 20 the call ran and no record was written (measured on both runners: the audit's size did not change). On Linux the binary is `0711`, so the hook cannot be traced by its own user, and a kill cannot choose an exit code; on macOS the hardened runtime refuses `task_for_pid` and the binary stays `0755`. There a forged allow already gained nothing, so the re-judge is defence in depth. In CI a second account could end the hook too, but only because both test accounts were started with `CreateProcessWithLogonW` from one runner session and so carry its logon SID (`S-1-5-5-0-…`), which the hook's default DACL grants: a test artifact, not a cross-user hole. |
+| A25 | Forge the hook's verdict on Windows: end the hook with `TerminateProcess(hook, 0)`, or begin, bind and append an allow itself | A process of the agent's user can still end the hook with exit 0 (it has full access to its own processes), or begin, bind and append an allow itself, with no code injection, and then end the real hook. Code injected into the hook can do the same. **Claude Code (plans 20 and 21):** the service judges every call itself, on the input Claude Code sent, and the co-signer (§6.1.1) answers "no opinion" only when both the hook's recorded verdict and the service's own judgment allow. A killed hook recorded nothing, so the call is denied ("the saiife hook ended without a verdict"). A forged allow of a call the policy denies is denied ("the saiife service's own judgment denies this call"), with a `rejudge_denied` record and a `doctor` warning (`hooks.rejudge-denied`). `locked-windows` asserts both on `windows-2022` and `windows-2025` with Claude Code's request simulated (`phase_forge`, §13), and both were denied in CI run 42673682022, so Claude Code on Windows is not a preview. **Left:** a forged allow of a call the policy allows runs, as it would anyway (pinned by a test). What only the user's own file system view decides is the hook's alone: a junction, a symlink, a glob's matches, the project's extra packs (A18 note). Code of the user can change these after any judgment (A21). **Codex and Gemini CLI:** recorded only (`no_verdict`, `doctor` warns `hooks.no-verdict`), no automatic lockdown, and still a preview: they have no HTTP hook, so no co-signer. **Not prevented:** a squat of `127.0.0.1:7433` while the service restarts (the daemon binds with `SO_EXCLUSIVEADDRUSE`, a failed bind is recorded and fails `doctor`): a squatter answers an empty `200`, and a forged hook exit 0 then allows. It needs the service to crash first (A5). Accepted for dropping "preview" for Claude Code (owner ruling 2026-11-09). Before plan 20 the call ran and no record was written (measured on both runners: the audit's size did not change). On Linux the binary is `0711`, so the hook cannot be traced by its own user, and a kill cannot choose an exit code; on macOS the hardened runtime refuses `task_for_pid` and the binary stays `0755`. There a forged allow already gained nothing, so the re-judge is defence in depth. In CI a second account could end the hook too, but only because both test accounts were started with `CreateProcessWithLogonW` from one runner session and so carry its logon SID (`S-1-5-5-0-…`), which the hook's default DACL grants: a test artifact, not a cross-user hole. |
 
 ### 9.3 Fail-closed matrix
 
@@ -3054,7 +3060,8 @@ in the Developer column until v2.1 (macOS) or for good (Alpine,
 containers). Windows is in the Developer column until v2.2 (§5.3a); from v2.2 its
 locked columns are a preview for Codex and Gemini CLI, and hold against mistakes and
 helpful bypasses but not against A25 (§9.2). For Claude Code the service's own
-judgment holds against A25 too, once `phase_forge` (§13) is green on Windows. The Personal broker column describes the mode that ships after
+judgment holds against A25 too: `phase_forge` (§13) was green on `windows-2022`
+and `windows-2025` (CI run 42673682022), so Claude Code is not a preview there. The Personal broker column describes the mode that ships after
 v2.0 (decision 7). An agent labelled "not lockable" by the plan 7 gate
 (decision 9) falls back to the Developer column for the first two rows,
 even on a locked machine.
@@ -3264,14 +3271,25 @@ connection. Asserted steps (each fails the job):
    co-signer, and the co-sign latency for the allow fixture after the hook's
    exit (50 runs, p95 printed; report-only until the owner accepts a number,
    target ≤ 300 ms).
-6. `doctor --json`: `cosign.rejudge` = pass, `cosign.asker` = pass, and no
-   `locked.preview` info when only Claude Code is installed.
+6. `doctor --json`: elevated, `cosign.rejudge` = pass, `cosign.asker` =
+   pass, `hooks.rejudge-denied` = warn, and `locked.preview` stays info with
+   the hint to run `saiife doctor --user <name>` (an elevated `doctor` does
+   not run `claude.exe`, so it cannot drop "preview"). Then as the agent,
+   `doctor --user <name>` with a stand-in `claude.exe` in its profile (the
+   runner has no Claude Code): the `agent-version` check passes and
+   `locked.preview` names Codex and Gemini CLI only.
 
 `phase_forge` runs on both `locked-windows` cells, both `locked-linux` cells
-and `locked-macos`. Its green run on `windows-2022` and `windows-2025` is what
-drops "preview" for Claude Code (§5.3a). The managed hook benches gate again
-with budgets per OS set from plan 21's CI measurements; the macOS job also
-runs the live `pcblist_n` test (`own_connection_has_own_uid`).
+and `locked-macos`. Its green run on `windows-2022` and `windows-2025` (CI
+run 42673682022: the forged append and the kill denied on both) drops
+"preview" for Claude Code (§5.3a). In that run and the one before, a burst
+of 8 parallel honest calls from one user gave 8 "no opinion" answers on
+Linux, macOS and Windows. The managed hook benches gate again with budgets
+per OS set from plan 21's CI measurements: Linux 60 ms p95 (measured 41.2
+to 50.0 ms on `ubuntu-24.04`), macOS 40 ms (measured under 40 ms), Windows
+130 ms (measured 59.1 ms on `windows-2022` and 59.6 ms on `windows-2025`).
+The macOS job also runs the live `pcblist_n` test
+(`own_connection_has_own_uid`).
 
 The live lock check on Windows is `scripts/lock-check/windows-vm.ps1`, run by hand
 in a throwaway VM; it has not run yet, so every Windows lock label is `unverified`.
@@ -3361,8 +3379,11 @@ missing signature only warns. **v2.2** is done as a preview: locked mode meets p
 1, 4 and 7 on Windows Server 2022 and 2025 x64 in CI, with a second account for
 point 7. Point 2 waits for the Windows lock check, and point 3 is not met while A25
 stands. Plan 21 answers A25 for Claude Code (its co-signed calls are judged by the
-service too), once `phase_forge` is green on both `locked-windows` cells. For Codex
-and Gemini CLI A25 stands.
+service too): `phase_forge` was green on both `locked-windows` cells (CI run
+42673682022, the forged append and the kill denied), so for Claude Code v2.2 is
+no longer a preview. The managed hook p95 measured 59.1 ms (`windows-2022`) and
+59.6 ms (`windows-2025`) against a 130 ms budget. For Codex and Gemini CLI A25
+stands, and they stay a preview.
 
 ## 15. Delivery plans
 
@@ -3399,7 +3420,7 @@ costs about the same, so the total stays close to the first draft.
 | 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible). Built (plan 18): Linux packages, Ansible, Intune Linux; `.pkg`, Jamf and Intune macOS after plan 13 | 1 |
 | 19a/19b | Windows developer mode, then locked mode (§5.3a) | v2.2 | 19a: the PowerShell and cmd guard readers, Windows paths, signed zips and `install.ps1`, the `saiife-win` crate, a `windows-latest` test cell. 19b: the `saiifed` service, named-pipe IPC, SDDL ACLs, same-user approval off (a second account approves), MSI, Intune and GPO recipes, a `locked-windows` CI job. Built (plan 19b): all of it, shipped as a **preview** (A25, §9.2); the `locked-windows` (Server 2022 and 2025) and `package-windows` jobs; the Windows lock-check harness, not run yet. Next: plan 20 | 4 |
 | 20 | A killed or crashed hook never counts as an allow | v2.2 | The Claude Code co-signer HTTP hook on `127.0.0.1:7433` (§6.1.1, §8.3); hello-first hooks and the `hook` record with decision `no_verdict` for every agent (§8.5), record only; the Linux binary at `0711` (§5.2); `doctor` checks `cosign.listen` and `hooks.no-verdict`; CI phases in `locked-linux`, `locked-macos` and `locked-windows` (§13). Codex and Gemini CLI get detection only. Windows locked mode stays a preview: code injected into the hook is not prevented (A25). Next: the service judges each co-signed input itself | — |
-| 21 | The service judges each co-signed call itself | v2.2 | The co-signer allows only when the hook's verdict and the service's own lexical judgment agree, on Linux, macOS and Windows (§6.1.1): `FsView::Lexical` in the guard, a warm `__eval --serve` pool as the service account, the `rejudge_denied` and `rejudge_failed` records (§8.5). Who asks: `/proc/net/tcp` (Linux), `pcblist_n` (macOS), the TCP table plus the process tree at depth 3 (Windows, §5.3a.2). Claude Code's managed hook judges in-process, and the built-in packs are prebuilt (§6.1.2). `doctor` checks `cosign.rejudge`, `cosign.asker` and `hooks.rejudge-denied`, and `locked.preview` names Codex and Gemini CLI only (§6.16). `phase_forge` in the `locked-*` jobs (§13). Windows locked mode leaves preview for Claude Code once `phase_forge` is green on Windows; Codex and Gemini CLI stay preview. Not closed: the restart-window port squat (A25) | — |
+| 21 | The service judges each co-signed call itself | v2.2 | The co-signer allows only when the hook's verdict and the service's own lexical judgment agree, on Linux, macOS and Windows (§6.1.1): `FsView::Lexical` in the guard, a warm `__eval --serve` pool as the service account, the `rejudge_denied` and `rejudge_failed` records (§8.5). Who asks: `/proc/net/tcp` (Linux), `pcblist_n` (macOS), the TCP table plus the process tree at depth 3 (Windows, §5.3a.2). Claude Code's managed hook judges in-process, and the built-in packs are prebuilt (§6.1.2). `doctor` checks `cosign.rejudge`, `cosign.asker` and `hooks.rejudge-denied`, and `locked.preview` names Codex and Gemini CLI only (§6.16). `phase_forge` in the `locked-*` jobs (§13). Windows locked mode is not a preview for Claude Code (`phase_forge` green on `windows-2022` and `windows-2025`, CI run 42673682022); Codex and Gemini CLI stay preview. Not closed: the restart-window port squat (A25) | — |
 
 **Full v2 series (plans 7–18): about 20.5 weeks of evenings.** Plans 14–18
 can be reordered by customer demand. Plan 13 comes first after v2.0 because

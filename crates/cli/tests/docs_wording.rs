@@ -212,6 +212,7 @@ fn windows_preview_names_codex_and_gemini_only() {
     }
     let bare = "windows locked mode is a preview";
     for rel in [
+        "README.md",
         "docs/windows.md",
         "docs/threats.md",
         "docs/install.md",
@@ -231,6 +232,23 @@ fn windows_preview_names_codex_and_gemini_only() {
                 &s[i..(i + 80).min(s.len())]
             );
         }
+        // CI run 42673682022 showed the forged allow and the kill denied on
+        // windows-2022 and windows-2025: no page waits on that run any more.
+        for stale in [
+            "leaves preview once",
+            "until that run is green",
+            "is to assert",
+            "preview too",
+        ] {
+            assert!(!s.contains(stale), "{rel} still says \"{stale}\"");
+        }
+    }
+    let readme = flat(&page_text("README.md"));
+    for stale in ["locked mode (preview)", "as a preview, windows"] {
+        assert!(
+            !readme.contains(stale),
+            "README.md calls Windows locked mode a preview with no qualifier: {stale}"
+        );
     }
     assert!(
         flat(&page_text("CHANGELOG.md")).contains(ONLY),

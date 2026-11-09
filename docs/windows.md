@@ -4,8 +4,8 @@
 GitHub's `windows-latest`, `windows-2022` and `windows-2025`. They are Windows Server,
 x64, with an administrator and UAC off. Nothing here has run on a person's Windows 11
 machine or on ARM64. **Windows locked mode is a preview for Codex and Gemini CLI.**
-For Claude Code the service judges each call itself; see [Locked mode](#locked-mode)
-for why, and for the CI run that decides it.
+For Claude Code it is not a preview: the service judges each call itself, and CI
+showed a forged allow and a hook kill denied; see [Locked mode](#locked-mode).
 
 Supported: Windows 11 23H2 (build 22631) or later and Windows Server 2022 (build
 20348) or later, on x64 and ARM64. Windows 10 is not supported.
@@ -106,9 +106,9 @@ What happens when the guard cannot judge something:
   allows too. A forged allow of a call the policy denies is denied, and the daemon
   writes a `hook` record with `event: "rejudge_denied"`. This is the same class as
   running its own code outside the hook ([threats](threats.md), A21 and A25).
-  Claude Code leaves preview only once `locked-windows` shows the forged allow and the
-  hook kill denied on `windows-2022` and `windows-2025`. Until that run is green,
-  treat Claude Code on Windows as a preview too.
+  The `locked-windows` CI job showed the forged allow and the hook kill denied on
+  `windows-2022` and `windows-2025` (run 42673682022), so Claude Code on Windows is
+  not a preview.
 - **What the service's judgment does not see.** The service reads no file of the
   agent's user. It judges paths as written: it does not follow a symlink or a
   junction, does not expand a glob against the disk, and does not read the project's
@@ -206,7 +206,7 @@ What happens when the guard cannot judge something:
 
 ## Speed
 
-The hook is slower on Windows than on Linux and macOS, whose budget stays 50 ms p95.
+The developer hook is slower on Windows than on Linux and macOS.
 On the GitHub `windows-latest` runner, starting any process costs 20.3 ms (median),
 `saiife --version` 26.9 ms, and the hook 84.7 ms (median) and 90.4 ms (p95). With no
 code change, runner noise has since moved that p95 from 83-87 ms to 102-114 ms. So the
@@ -225,7 +225,12 @@ Plan 21 makes the managed hook faster, on every OS:
   they load.
 
 The managed hook benches were report-only while this was built. They gate CI again,
-with budgets per OS that plan 21's CI run sets from its own measurements.
+with budgets per OS set from plan 21's CI runs. The managed bash call measured a
+p95 of 59.1 ms on `windows-2022` and 59.6 ms on `windows-2025` (about 150 ms before
+plan 21), against a 130 ms budget. Linux measured 41.2 to 50.0 ms p95 on
+`ubuntu-24.04`, with a 60 ms budget; macOS measured under 40 ms and keeps its 40 ms
+budget. A burst of 8 parallel honest calls from one user gave 8 "no opinion"
+answers on all three OSes.
 
 ## Locked mode
 
@@ -256,15 +261,16 @@ so neither a killed hook nor a forged allow lets a denied call run.
   allow, then end the real hook. For a call the policy denies, that forgery now gets a
   deny and a `rejudge_denied` record. What this judgment cannot see, and why that is
   accepted, is in [Limits](#limits).
-- **When it leaves preview:** once the `locked-windows` CI job shows the forged allow
-  and the hook kill denied on `windows-2022` and `windows-2025`. Until that run is
-  green, treat Claude Code on Windows as a preview too. `doctor` passes
+- **Not a preview for Claude Code:** the `locked-windows` CI job showed the forged
+  allow and the hook kill denied on `windows-2022` and `windows-2025` (run
+  42673682022). `doctor` passes
   `locked.preview` for Claude Code only when `cosign.listen`, `cosign.rejudge`,
   `cosign.asker` and `agents.claude.policy` all pass (the drop-in carries the co-signer's
   HTTP hook, and no HKLM policy overrides or weakens it), and Claude Code's version was
-  shown to be new enough. Only the agent user's own plain shell runs `claude.exe
-  --version` (`saiife doctor --user <name>`), so an elevated `doctor` keeps the preview
-  line and says how to show the version.
+  shown to be new enough. An elevated `doctor` cannot drop the preview line: it does
+  not run `claude.exe`, so it cannot show the version. The agent user runs
+  `saiife doctor --user <name>` from its own plain shell, which runs `claude.exe
+  --version`.
 - **Every agent:** the daemon notices a hook that ends without a verdict and writes a
   `hook` record with decision `no_verdict`. `doctor` warns (`hooks.no-verdict`). There is
   no automatic lockdown. For Codex and Gemini CLI that is all: the call still runs.
@@ -336,7 +342,9 @@ written. That is why the binary is not under `C:\Program Files`.
   `HKLM\SOFTWARE\Policies\ClaudeCode` key, UAC and the agent users. It prints
   `locked.preview` as info when Codex or Gemini CLI is installed, when one of
   `cosign.listen`, `cosign.rejudge`, `cosign.asker` and `agents.claude.policy` fails, or
-  when no `agent-version` check showed Claude Code new enough. Some Linux checks have no
+  when no `agent-version` check showed Claude Code new enough. The elevated `doctor`
+  does not run `claude.exe`, so it cannot show that; the agent user runs
+  `saiife doctor --user <name>`. Some Linux checks have no
   Windows form yet, and `doctor` lists them.
 - `saiife system uninstall` removes the service and the managed files and keeps the
   audit and the config. `--purge` removes the rest, but keeps `C:\ProgramData\saiife` while

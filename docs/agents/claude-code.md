@@ -107,8 +107,9 @@ Lock label on Linux: **lockable** (checked live with Claude Code 2.1.308 on
 `crates/agents/tests/fixtures/lock-check/claude.tsv`).
 
 Lock label on Windows: **unverified**. Windows locked mode is a preview for Codex and
-Gemini CLI; for Claude Code it leaves preview once CI shows a forged hook verdict
-denied ([Windows](../windows.md#locked-mode)). saiife installs the managed hook in
+Gemini CLI; for Claude Code it is not a preview: CI showed a forged hook verdict
+and a hook kill denied on `windows-2022` and `windows-2025`
+([Windows](../windows.md#locked-mode)). saiife installs the managed hook in
 `C:\Program Files\ClaudeCode\managed-settings.d\` (`50-saiife.json` and
 `60-saiife-mcp.json`), with the command
 `C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent claude`.
@@ -119,9 +120,11 @@ The lock check has not run in a Windows VM yet; the results will go to
 co-signer denies a call whose hook was ended with `TerminateProcess(hook, 0)`.
 A process of your user can also forge the hook's allow, or inject code into
 the hook. The service's own judgment of each call (below) denies such a
-forged allow when the policy denies the call. `locked-windows` in CI is to
-show both attacks denied; until it has, treat Claude Code on Windows as a
-preview too.
+forged allow when the policy denies the call. `locked-windows` in CI showed
+both attacks denied on `windows-2022` and `windows-2025` (run 42673682022).
+To drop the `locked.preview` line, the agent user runs
+`saiife doctor --user <name>`: an elevated `doctor` does not run
+`claude.exe`, so it cannot show Claude Code's version.
 
 Lock label on macOS: **unverified**. saiife installs the same managed hook
 in `/Library/Application Support/ClaudeCode/managed-settings.d/`

@@ -477,7 +477,8 @@ and `daemon.log`, and deletes the accounts with `dscl`.
 **Windows locked mode is a preview for Codex and Gemini CLI** (v2.2, Windows 11 23H2+
 and Server 2022+). A process running as the agent's own user can end a hook with exit
 0, which the agent reads as allow. For Claude Code the service judges each call itself,
-so that does not let a denied call run; it leaves preview once CI shows it. The
+so that does not let a denied call run, and it is not a preview: CI showed a forged
+allow and a hook kill denied on `windows-2022` and `windows-2025`. The
 details, the paths and the limits are in [Windows: locked mode](windows.md#locked-mode).
 
 From an elevated terminal (Run as administrator):

@@ -662,17 +662,24 @@ fn rejudge_denied_warns_with_count() {
     assert!(c.detail.contains("an older daemon?"), "{}", c.detail);
 }
 
-/// The plan 19b text, kept for when the co-signer is not whole.
+/// The plan 19b text, kept for when the co-signer is not whole. Since plan 20 a killed
+/// hook is recorded (`no_verdict`), so the text no longer says nothing is.
 #[test]
 fn the_old_preview_limits_are_kept() {
     let r = with_agents(&Agent::ALL, cosign_field("asker", serde_json::Value::Null)).doctor();
     let c = get(&r, "locked.preview");
     assert_eq!(c.status, Status::Info);
+    assert!(
+        c.detail.starts_with("Windows locked mode is a preview:"),
+        "{}",
+        c.detail
+    );
     for word in [
         "preview",
         "TerminateProcess(hook, 0)",
         "reads as allow",
-        "nothing is recorded",
+        "no_verdict",
+        "recorded, not prevented",
         "measured in CI",
         "unverified",
         "Codex",
@@ -681,6 +688,7 @@ fn the_old_preview_limits_are_kept() {
     ] {
         assert!(c.detail.contains(word), "{word}: {}", c.detail);
     }
+    assert!(!c.detail.contains("nothing is recorded"), "{}", c.detail);
     // Only CI has run it, and it must not claim more.
     assert!(!c.detail.contains("tested by hand"), "{}", c.detail);
     assert!(!c.detail.contains("has not been tested"), "{}", c.detail);

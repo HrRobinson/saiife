@@ -644,7 +644,8 @@ run `saiife system uninstall --purge` first, then remove the package.
   `[ProgramFiles64Folder]saiife\saiife.exe`, so a folder chosen on the command line cannot
   make them run another binary.
 - **Preview.** Windows locked mode is a preview for Codex and Gemini CLI. For Claude
-  Code it leaves preview once CI shows a forged hook verdict denied. See
+  Code it is not a preview: CI showed a forged hook verdict and a hook kill denied on
+  `windows-2022` and `windows-2025`. See
   [Windows](windows.md). Every lock label there is unverified until it has been tried
   on real machines. Same-user approval is off, by the owner's
   ruling, so approvals come from a second account in a separate session. Set approvers in

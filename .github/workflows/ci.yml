@@ -246,13 +246,18 @@ jobs:
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
         run: bash scripts/locked-linux/run.sh "$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife"
       # The managed hook's p95 (plan 20 adds the hook.begin round trip to it),
-      # with macOS's budget. It times the ci-locked build above (only a build
+      # It times the ci-locked build above (only a build
       # with debug assertions lets a daemon serve a hook of its own user),
       # starts its own daemon in a scratch dir, fails unless every call
       # allows, and prints the median and p95 per payload and each step's median.
-      # Gating again since plan 21 (owner ruling 6): 40 ms p95 on Linux.
+      # Gating again since plan 21 (owner ruling 6), with a budget set from
+      # measurements ("real budgets from measurements"): plan 21's CI runs on
+      # ubuntu-24.04 measured the managed bash p95 at 41.2 to 50.0 ms (45.1 ms
+      # on run 42673682022), so Linux gets 60 ms p95. macOS measured under
+      # 40 ms and keeps 40; Windows measured 59.1 (2022) and 59.6 ms (2025)
+      # against its 130 ms budget.
       - name: managed hook bench (Linux, p95 budget)
-        run: SAIIFE_BENCH_BIN="$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife" BENCH_MAX_P95_MS=40 bash scripts/bench-check.sh --managed 50
+        run: SAIIFE_BENCH_BIN="$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife" BENCH_MAX_P95_MS=60 bash scripts/bench-check.sh --managed 50
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
