@@ -266,8 +266,15 @@ Check ((Service-Status) -eq 'Running') "the service runs after the upgrade ($(Se
 $pid2 = Service-Pid
 Check (($null -ne $pid1) -and ($null -ne $pid2) -and ($pid1 -ne $pid2)) "the service restarted ($pid1 -> $pid2)"
 # Service Control Manager event 7036 says "... entered the running state" once per start.
-$starts = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = $since } -ErrorAction SilentlyContinue |
-    Where-Object { $_.Message -match 'saiife' -and $_.Message -match 'running' })
+# The event can reach the System log after the service already runs, so poll for up to 30 s.
+$starts = @()
+$deadline = (Get-Date).AddSeconds(30)
+while ($true) {
+  $starts = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = $since } -ErrorAction SilentlyContinue |
+      Where-Object { $_.Message -match 'saiife' -and $_.Message -match 'running' })
+  if ($starts.Count -ge 1 -or (Get-Date) -ge $deadline) { break }
+  Start-Sleep -Seconds 2
+}
 Check ($starts.Count -eq 1) "the service started once during the upgrade (saw $($starts.Count))"
 foreach ($f in $managed) {
   if ($before.ContainsKey($f)) {

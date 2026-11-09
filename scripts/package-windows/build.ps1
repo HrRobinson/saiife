@@ -48,6 +48,41 @@ function Run([string]$what, [scriptblock]$cmd) {
   if ($LASTEXITCODE -ne 0) { Fail "$what failed with exit code $LASTEXITCODE" }
 }
 
+# Network fetches get 5 tries, 5, 10, 20 and 30 s apart, so a short outage (a 504 from
+# GitHub or NuGet) does not fail the build. Checks on what was fetched stay with the caller.
+function Retry-Wait([int]$try) { [int][Math]::Min(30, 5 * [Math]::Pow(2, $try - 1)) }
+
+function Run-Retry([string]$what, [scriptblock]$cmd) {
+  $tries = 5
+  for ($i = 1; $i -le $tries; $i++) {
+    & $cmd
+    if ($LASTEXITCODE -eq 0) { return }
+    if ($i -lt $tries) {
+      $wait = Retry-Wait $i
+      Write-Output "${what} failed with exit code $LASTEXITCODE (try $i of $tries); retrying in $wait s"
+      Start-Sleep -Seconds $wait
+    }
+  }
+  Fail "$what failed with exit code $LASTEXITCODE after $tries tries"
+}
+
+function Get-Download([string]$uri, [string]$outFile) {
+  $tries = 5
+  for ($i = 1; $i -le $tries; $i++) {
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $outFile
+      return
+    } catch {
+      $why = $_.Exception.Message
+      Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+      if ($i -eq $tries) { Fail "download of $uri failed after $tries tries: $why" }
+      $wait = Retry-Wait $i
+      Write-Output "download of $uri failed (try $i of $tries): $why; retrying in $wait s"
+      Start-Sleep -Seconds $wait
+    }
+  }
+}
+
 function Build-Msi {
   if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.+-]+)?$') {
     Fail "version '$Version' is not major.minor.patch"
@@ -74,12 +109,12 @@ function Build-Msi {
   }
   if ($have -ne $wixVersion) {
     if ($have -ne '') { Run 'dotnet tool uninstall wix' { dotnet tool uninstall --global wix } }
-    Run 'dotnet tool install wix' { dotnet tool install --global wix --version $wixVersion }
+    Run-Retry 'dotnet tool install wix' { dotnet tool install --global wix --version $wixVersion }
   }
   # The Util extension supplies WixQuietExec, which puts the actions' output in msi.log.
   $exts = & wix extension list --global
   if (-not ($exts | Select-String -SimpleMatch "WixToolset.Util.wixext $wixVersion")) {
-    Run 'wix extension add' { wix extension add --global "WixToolset.Util.wixext/$wixVersion" }
+    Run-Retry 'wix extension add' { wix extension add --global "WixToolset.Util.wixext/$wixVersion" }
   }
 
   $stage = Join-Path ([IO.Path]::GetTempPath()) ("p19b-t13-stage-" + [Guid]::NewGuid().ToString('N'))
@@ -116,11 +151,25 @@ function Build-Intunewin {
   New-Item -ItemType Directory -Path $work | Out-Null
   try {
     $tool = Join-Path $work 'IntuneWinAppUtil.exe'
-    Invoke-WebRequest -UseBasicParsing -Uri $pin['url'] -OutFile $tool
+    # SAIIFE_DOWNLOAD_CACHE (CI): a folder actions/cache keeps. A copy there is used in
+    # place of the download and gets the same SHA-256 check; a checked download goes there.
+    $cacheDir = [string]$env:SAIIFE_DOWNLOAD_CACHE
+    $cached = ''
+    if ($cacheDir -ne '') { $cached = Join-Path $cacheDir "IntuneWinAppUtil-$($pin['sha256']).exe" }
+    if (($cached -ne '') -and (Test-Path -LiteralPath $cached -PathType Leaf)) {
+      Write-Output "IntuneWinAppUtil.exe from the cache: $cached"
+      Copy-Item -LiteralPath $cached -Destination $tool
+    } else {
+      Get-Download $pin['url'] $tool
+    }
     $got = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($got -ne $pin['sha256']) {
       Remove-Item -LiteralPath $tool -Force
       Fail "IntuneWinAppUtil.exe has SHA-256 $got, want $($pin['sha256'])"
+    }
+    if (($cached -ne '') -and -not (Test-Path -LiteralPath $cached -PathType Leaf)) {
+      New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+      Copy-Item -LiteralPath $tool -Destination $cached
     }
     # The tool packs a whole folder: give it one holding the MSI alone.
     $src = Join-Path $work 'src'
