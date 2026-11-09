@@ -148,31 +148,21 @@ checks run a stub, not the saiife daemon, so nothing listens on
 `127.0.0.1:7433`. The HTTP hook then fails, and Claude Code blocks every tool
 call, so the control row cannot pass and the Claude results mean nothing.
 
-The harness does not start a co-signer yet. Until it does, a run for Claude
-Code needs a stand-in co-signer on `127.0.0.1:7433`, inside the container or
-VM, for the whole run. It must answer every `POST /v1/cosign/claude` with
-`200` and an empty body. An empty `200` is "no opinion" to Claude Code, so
-the stub's verdict decides each row, as before plan 20. This stand-in has
-not been run yet. A sketch with Python's standard library:
-
-```python
-import http.server
-
-class Cosign(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-http.server.HTTPServer(("127.0.0.1", 7433), Cosign).serve_forever()
-```
+So the Claude Code table starts a stand-in co-signer,
+`scripts/lock-check/cosign-stub.js` (Node, which every run already needs),
+on `127.0.0.1:7433` before its first check and stops it after its last, in
+the container and in both VMs. It answers every `POST /v1/cosign/claude`
+with `200` and an empty body. An empty `200` is "no opinion" to Claude Code,
+so the stub's verdict decides each row, as before plan 20. Each request is a
+line in `cosign.log` in the run dir. The stand-in stops by itself when the
+harness removes its run file or dies; the harness never signals it. If the
+port is taken (saiife installed, or another program), the Claude run stops
+before its first check and says so. The offline tests start it on a free
+port, never on 7433. It has not been run against a real Claude Code yet.
 
 With the stand-in, the Claude rows test the command hook only. They say
 nothing about the real co-signer: CI's `locked-*` jobs test that against the
-real daemon. Do not leave the stand-in running on a machine where saiife is
-installed: it would take the daemon's port and answer for it. Codex and
-Gemini CLI have no co-signer and need nothing.
+real daemon. Codex and Gemini CLI have no co-signer and need nothing.
 
 ## Knobs (`LOCKCHECK_*`)
 

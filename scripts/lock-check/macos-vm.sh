@@ -212,6 +212,7 @@ run_agent() {
   hand_results
   # shellcheck disable=SC2329 # invoked by the EXIT trap below
   agent_cleanup() {
+    lc_cosign_stop || true
     lc_restore_snapshot || true
     rm -rf "$LC_HOME/alt" "$LC_SNAPSHOT"
     hand_results

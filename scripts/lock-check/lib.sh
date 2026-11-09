@@ -589,6 +589,69 @@ lc_managed_file() {
   printf '%s\n' "$dst"
 }
 
+# --- stand-in co-signer (plan 20) ---------------------------------------------
+# The Claude Code fixture has an HTTP hook to 127.0.0.1:7433 with
+# onFailure "block". With nothing listening there, every Claude call is
+# blocked, so checks-claude.sh starts cosign-stub.js (an empty 200 for every
+# POST /v1/cosign/claude) for the whole table: lc_cosign_start first,
+# lc_cosign_stop last, and the runners' cleanup calls lc_cosign_stop too.
+# The stub stops when $LC_RUN/cosign.run is gone or the harness has died;
+# nothing ever signals it. Port: LOCKCHECK_COSIGN_PORT, else 7433 in the
+# container and the VMs, and 0 (any free port) offline, so an offline test
+# never takes 7433. LC_COSIGN_ADDR is 127.0.0.1:<port> once it listens.
+if [[ -n "${LOCKCHECK_COSIGN_PORT:-}" ]]; then
+  LC_COSIGN_PORT="$LOCKCHECK_COSIGN_PORT"
+elif [[ -n "$LC_ROOT" && -z "$LC_WIN_XCHG" ]]; then
+  LC_COSIGN_PORT=0
+else
+  LC_COSIGN_PORT=7433
+fi
+LC_COSIGN_PID=""
+LC_COSIGN_ADDR=""
+
+lc_cosign_start() {
+  local node run waited=0
+  if [[ -n "$LC_COSIGN_PID" ]]; then
+    return 0
+  fi
+  if ! node="$(PATH="$PATH:$LC_AGENT_PATH" command -v node)"; then
+    echo "lib.sh: node not found; the stand-in co-signer needs it" >&2
+    return 1
+  fi
+  mkdir -p "$LC_RUN"
+  rm -f "$LC_RUN/cosign.ready" "$LC_RUN/cosign.failed" "$LC_RUN/cosign.log"
+  : >"$LC_RUN/cosign.run"
+  run="$LC_RUN"
+  if [[ "$LC_PLATFORM" == windows ]] && command -v cygpath >/dev/null 2>&1; then
+    run="$(cygpath -m "$LC_RUN")"
+  fi
+  "$node" "$LC_SRC/cosign-stub.js" "$run" "$LC_COSIGN_PORT" </dev/null >>"$LC_LOG" 2>&1 &
+  LC_COSIGN_PID=$!
+  while [[ ! -s "$LC_RUN/cosign.ready" ]]; do
+    if [[ -e "$LC_RUN/cosign.failed" ]] || ((waited >= 100)); then
+      echo "lib.sh: the stand-in co-signer did not start on 127.0.0.1:$LC_COSIGN_PORT:" \
+        "$(cat "$LC_RUN/cosign.failed" 2>/dev/null || echo 'no answer in 20 s')" \
+        "(is saiife installed here, or another program on that port?)" >&2
+      lc_cosign_stop
+      return 1
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  LC_COSIGN_ADDR="127.0.0.1:$(tr -d '\r\n' <"$LC_RUN/cosign.ready")"
+  echo "[lockcheck] stand-in co-signer on $LC_COSIGN_ADDR (empty 200 for every co-sign request)"
+}
+
+lc_cosign_stop() {
+  if [[ -z "$LC_COSIGN_PID" ]]; then
+    return 0
+  fi
+  rm -f "$LC_RUN/cosign.run"
+  wait "$LC_COSIGN_PID" 2>/dev/null || true
+  LC_COSIGN_PID=""
+  LC_COSIGN_ADDR=""
+}
+
 # Offline only: a bin dir with links to the basic host tools in
 # LC_HOSTBIN_TOOLS, so an offline agent run can never find a real agent CLI.
 lc_hostbin() {

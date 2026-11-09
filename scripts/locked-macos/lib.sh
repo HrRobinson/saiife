@@ -640,6 +640,174 @@ phase_hooks() {
     audit_verify
 }
 
+# ------------------------------------------------- co-signer (plan 20)
+# Mirrors scripts/locked-linux/lib.sh, without the other-uid case: on macOS
+# the co-signer cannot tell which uid asks (no /proc), so it takes any
+# principal's verdict (a known limit, docs/threats.md A25).
+
+COSIGN_URL=http://127.0.0.1:7433/v1/cosign/claude
+# Set by `cosign_result`.
+CO_CODE=""
+CO_BODY=""
+CO_TIME=""
+
+# The co-signer's deny body for a reason, byte for byte (Global Constraints).
+cosign_deny_body() {
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"saiife: BLOCKED (fail closed): %s"}}' "$1"
+}
+
+# `cosign_post <payload file> <tag> [curl args...]`: POST the payload to the
+# co-signer as the agent user. The body, then a line "<status> <seconds>",
+# go to $WORK/cosign-<tag>.out; read them with `cosign_result <tag>`. Never
+# fails: run it in the background too.
+cosign_post() {
+    local file="$1" tag="$2"
+    shift 2
+    as_user "$AGENT_USER" "$AGENT_HOME" /usr/bin/curl -sS --noproxy '*' --max-time 15 -o - \
+        -w '\n%{http_code} %{time_total}' -H 'Content-Type: application/json' "$@" \
+        --data-binary @- "$COSIGN_URL" <"$file" >"$WORK/cosign-$tag.out" 2>"$WORK/cosign-$tag.err" || true
+}
+
+# Sets CO_CODE, CO_BODY and CO_TIME from $WORK/cosign-<tag>.out.
+cosign_result() {
+    local out
+    out="$(cat "$WORK/cosign-$1.out")"
+    CO_BODY="${out%$'\n'*}"
+    [[ "$out" == *$'\n'* ]] || CO_BODY=""
+    out="${out##*$'\n'}"
+    CO_CODE="${out%% *}"
+    CO_TIME="${out#* }"
+}
+
+# `expect_cosign <tag> <status> <body> <what> [max seconds] [min seconds]`
+expect_cosign() {
+    local tag="$1" status="$2" body="$3" what="$4" max="${5:-}" min="${6:-}"
+    cosign_result "$tag"
+    [[ "$CO_CODE" == "$status" ]] ||
+        fail "$what: co-sign status $CO_CODE, want $status; body: $CO_BODY; curl: $(cat "$WORK/cosign-$tag.err")"
+    [[ "$CO_BODY" == "$body" ]] || fail "$what: co-sign body '$CO_BODY', want '$body'"
+    if [[ -n "$max" ]] && ! awk -v t="$CO_TIME" -v m="$max" 'BEGIN { exit !(t < m) }'; then
+        fail "$what: answered in ${CO_TIME}s, want under ${max}s"
+    fi
+    if [[ -n "$min" ]] && ! awk -v t="$CO_TIME" -v m="$min" 'BEGIN { exit !(t >= m) }'; then
+        fail "$what: answered in ${CO_TIME}s, want at least ${min}s"
+    fi
+    ok "$what: $CO_CODE ${CO_BODY:-(empty)} in ${CO_TIME}s"
+}
+
+# `cosign_payload <fixture> <case>`: the fixture with a tool_use_id no other
+# case uses (a verdict stays on its key for 60 s).
+cosign_payload() {
+    payload "$1" ".tool_use_id = \"toolu_p20_$2_$$_$SECONDS\""
+}
+
+# The newest `hook` record with this event and tool_use_id ("" if none).
+hook_record() {
+    records | jq -c --arg e "$1" --arg id "$2" \
+        'select(.kind == "hook" and .event == $e and .tool_use_id == $id)' | tail -n 1
+}
+
+hook_record_exists() {
+    [[ -n "$(hook_record "$1" "$2")" ]]
+}
+
+cosign_denied_count() {
+    records | jq -c 'select(.kind == "hook" and .event == "cosign_denied")' | wc -l | tr -d ' '
+}
+
+# The pid the hook in $WORK/kill.err printed first ("" until then).
+kill_hook_pid() {
+    sed -n '1s/^pid=\([0-9][0-9]*\)$/\1/p' "$WORK/kill.err" 2>/dev/null
+}
+
+phase_cosign() {
+    phase "3b. the Claude Code co-signer on 127.0.0.1:7433 (plan 20)"
+    local allow deny p id rec before hook_job post_job pid code=0 status
+    allow="$(cosign_payload claude/bash-allow.json allow)"
+    deny="$(cosign_payload claude/bash-deny.json deny)"
+
+    # An honest allow: the hook and the co-sign request at the same time.
+    cosign_post "$allow" allow &
+    post_job=$!
+    expect_hook 0 "" "co-signed allow: the hook" claude "$allow"
+    wait "$post_job"
+    expect_cosign allow 200 "" "co-signed allow: no opinion"
+
+    # A deny: the deny body, and no co-sign record (the guard record says why).
+    before="$(cosign_denied_count)"
+    cosign_post "$deny" deny &
+    post_job=$!
+    expect_hook 2 "BLOCKED by" "co-signed deny: the hook" claude "$deny"
+    wait "$post_job"
+    expect_cosign deny 200 "$(cosign_deny_body "saiife denied this call")" "co-signed deny"
+    [[ "$(cosign_denied_count)" == "$before" ]] || fail "a co-signed deny wrote a cosign_denied record"
+
+    # The kill: the hook is bound and waits for its hanging worker; the
+    # co-sign request comes; the agent's user SIGKILLs the hook. CI only, on
+    # the hook this phase started.
+    p="$(cosign_payload claude/bash-allow.json kill)"
+    id="$(jq -r .tool_use_id "$p")"
+    : >"$WORK/kill.err"
+    # shellcheck disable=SC2016
+    as_user "$AGENT_USER" "$AGENT_HOME" /usr/bin/env SAIIFE_EVAL_FAULT=hang \
+        /bin/sh -c 'echo "pid=$$" >&2; exec "$0" check --managed --hook-exit --agent claude' "$OPT_BIN" \
+        <"$p" >"$WORK/kill.out" 2>"$WORK/kill.err" &
+    hook_job=$!
+    # A fast poll: the hook gives up on its worker 3 s after it starts.
+    for _ in $(seq 1 100); do
+        [[ -n "$(kill_hook_pid)" ]] && break
+        sleep 0.05
+    done
+    pid="$(kill_hook_pid)"
+    [[ -n "$pid" ]] || fail "the hook printed no pid in 5 s: $(cat "$WORK/kill.err")"
+    # Bound by now (it binds as soon as the worker is spawned); the worker
+    # hangs for 10 s and the hook gives up on it at 3 s.
+    sleep 0.3
+    cosign_post "$p" kill &
+    post_job=$!
+    sleep 0.5
+    as_user "$AGENT_USER" "$AGENT_HOME" /bin/kill -KILL "$pid" ||
+        fail "kill -KILL $pid as $AGENT_USER failed (the hook ended early?): $(cat "$WORK/kill.err")"
+    wait "$hook_job" || code=$?
+    if ((code <= 128)) || grep -q 'saiife:' "$WORK/kill.err"; then
+        fail "the hook was not killed before its verdict (exit $code): $(cat "$WORK/kill.err")"
+    fi
+    ok "the hook (pid $pid) was killed by $AGENT_USER (exit $code)"
+    wait "$post_job"
+    expect_cosign kill 200 "$(cosign_deny_body "the saiife hook ended without a verdict")" \
+        "co-sign of the killed hook's call" 7
+    wait_until 10 "the no_verdict record of $id" hook_record_exists no_verdict "$id"
+    rec="$(hook_record no_verdict "$id")"
+    jq -e --arg u "$AGENT_USER" '.decision == "no_verdict" and .bound == true and .agent == "claude" and .user == $u' \
+        <<<"$rec" >/dev/null || fail "the no_verdict record is not bound, claude, $AGENT_USER: $rec"
+    ok "no_verdict record: $rec"
+    rec="$(hook_record cosign_denied "$id")"
+    jq -e '.decision == "error_denied" and .reason == "the saiife hook ended without a verdict"' \
+        <<<"$rec" >/dev/null || fail "no cosign_denied record for $id: $rec"
+    ok "cosign_denied record: $rec"
+
+    # No hook at all: the co-signer waits its 8 s cap, then denies.
+    p="$(cosign_payload claude/bash-allow.json nohook)"
+    cosign_post "$p" nohook
+    expect_cosign nohook 200 "$(cosign_deny_body "no saiife hook reported a verdict for this call")" \
+        "co-sign with no hook at all" 11 7
+
+    # A browser's request (a local web page) carries Origin.
+    cosign_post "$allow" origin -H 'Origin: http://example.com'
+    cosign_result origin
+    [[ "$CO_CODE" == 403 ]] || fail "co-sign with an Origin header: $CO_CODE, want 403: $CO_BODY"
+    ok "co-sign with an Origin header: 403"
+
+    as_root "$OPT_BIN" doctor --json >"$WORK/doctor-cosign.json" 2>"$WORK/doctor-cosign.err" || true
+    for p in hooks.no-verdict:warn cosign.listen:pass; do
+        status="$(jq -r --arg id "${p%%:*}" '.checks[] | select(.id == $id) | .status' "$WORK/doctor-cosign.json")"
+        [[ "$status" == "${p#*:}" ]] ||
+            fail "doctor ${p%%:*}: ${status:-missing}, want ${p#*:}: $(jq -c --arg id "${p%%:*}" '.checks[] | select(.id == $id)' "$WORK/doctor-cosign.json")"
+        ok "doctor ${p%%:*}: $status"
+    done
+    audit_verify
+}
+
 # `bootstrap_once`: load the job again (launchd may still be tearing the
 # old one down for a moment).
 bootstrap_once() {

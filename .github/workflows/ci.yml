@@ -217,7 +217,9 @@ jobs:
       # SAIIFE_EVAL_FAULT test seam exists only there. run.sh installs it
       # with --allow-test-build (spec §9.2 A4: never in production).
       - run: cargo build --locked --profile ci-locked --target x86_64-unknown-linux-musl --bin saiife
-      - name: install, fail-closed matrix, uninstall (sudo inside, this job only)
+      # Plan 20 phases need python3 (ptrace-probe.py) and curl (the co-signer):
+      # both are on the ubuntu runner images.
+      - name: install, 0711 and ptrace, co-signer, fail-closed matrix, uninstall (sudo inside, this job only)
         env:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
@@ -258,7 +260,7 @@ jobs:
       # hook. run.sh installs it with --allow-test-build (never production).
       - name: sign ad hoc with the hardened runtime
         run: codesign --force --options runtime --sign - target/ci-locked/saiife
-      - name: install, fail-closed matrix, attacks, uninstall (sudo inside, this job only)
+      - name: install, co-signer, fail-closed matrix, attacks, uninstall (sudo inside, this job only)
         env:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-macos-logs
