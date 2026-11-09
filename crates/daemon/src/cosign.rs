@@ -175,7 +175,8 @@ pub struct CosignState {
     /// Why the bind fails (the latest try), until a retry binds it.
     pub error: Option<String>,
     /// How the asker is found, when that worked at the start on a
-    /// connection to itself: `"proc_net"` (Linux), `"tcp_table"` (Windows).
+    /// connection to itself: `"proc_net"` (Linux), `"pcblist"` (macOS),
+    /// `"tcp_table"` (Windows).
     /// `None`: not checked yet, or it failed (every call is denied).
     pub asker: Option<&'static str>,
     fold: Folder,
@@ -617,20 +618,6 @@ pub mod asker_macos {
             }
         }
     }
-
-    /// [`SOURCE`] when a loopback connection of the daemon's own is found
-    /// in the pcb list with the daemon's own uid; `None` (the asker source
-    /// is broken, and every call is denied) otherwise. For
-    /// `status.cosign.asker`, checked once at startup. Blocking.
-    pub fn probe() -> Option<&'static str> {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-        let server = l.local_addr().ok()?;
-        let _client = std::net::TcpStream::connect(server).ok()?;
-        let (_conn, peer) = l.accept().ok()?;
-        let me = saiife_darwin::proc_info(std::process::id())?.uid;
-        let got = saiife_darwin::tcp_peer_uid_checked(server, peer).ok()??;
-        (got == me).then_some(SOURCE)
-    }
 }
 
 /// How this system finds the asker, when that works on a connection the
@@ -647,6 +634,23 @@ fn asker_source() -> Option<&'static str> {
         })
         .then_some("proc_net");
     }
+    if cfg!(target_os = "macos") {
+        return macos_source();
+    }
+    None
+}
+
+/// macOS: [`asker_macos::SOURCE`] when the pcb list shows the daemon's own
+/// uid on a connection to itself.
+#[cfg(target_os = "macos")]
+fn macos_source() -> Option<&'static str> {
+    let me = saiife_darwin::proc_info(std::process::id())?.uid;
+    self_connection(|local, peer| asker_macos::socket_uid(local, peer) == Some(me))
+        .then_some(asker_macos::SOURCE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_source() -> Option<&'static str> {
     None
 }
 
@@ -1404,6 +1408,12 @@ mod tests {
     #[test]
     fn asker_source_on_linux_is_proc_net() {
         assert_eq!(asker_source(), Some("proc_net"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn asker_source_on_macos_is_pcblist() {
+        assert_eq!(asker_source(), Some(asker_macos::SOURCE));
     }
 
     #[cfg(windows)]
