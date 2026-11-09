@@ -9,12 +9,21 @@
 # config (locked = true, socket and audit dirs in the scratch dir, the
 # current user as the daemon user), starts `saiife daemon --system` in the
 # background and prints the median and p95 of N `saiife check --managed`
-# calls per payload (worker process + daemon ack).
+# calls per payload (worker process + daemon ack). The daemon and the hook run
+# as one user here, which a locked daemon refuses unless a debug-build seam
+# lets it (SAIIFE_TEST_OWN_UID_PEERS): --managed therefore builds and times
+# the ci-locked build (debug assertions on, opt-level 1; the release build is
+# faster), and its daemon binds no co-signer. Every timed call must allow
+# (exit 0), or the script fails: a hook that is refused exits in 2 ms and
+# would pass any budget. Then 10 more calls run with SAIIFE_HOOK_TIMING=1, and
+# the median of each of the hook's steps is printed (`timing <step>: ...`).
 #
 # With BENCH_MAX_P95_MS=<ms> it exits 1 when a payload's p95 is above that
 # budget (the macOS CI test job uses 40 for --managed; the windows-latest test
 # job uses 130 for the developer hook, which allows for slow runners; the planned
-# speed-up should tighten it).
+# speed-up should tighten it). With BENCH_REPORT_ONLY=1 a p95 over budget prints
+# "over budget (report-only)" and exits 0; a call that does not allow still fails.
+# The managed benches use it until plan 21 sets real budgets.
 #
 # On Windows (or with BENCH_SPLIT=1 anywhere) the same N calls of cheaper things
 # come first, so a number over budget can be read: a program of Git Bash's own, the
@@ -25,7 +34,7 @@
 # builds can be compared with the same script. SAIIFE_BENCH_TMP=<dir> is where
 # the scratch dir goes (default: next to the repo, then the system's).
 #
-# Usage: [BENCH_MAX_P95_MS=<ms>] scripts/bench-check.sh [--managed] [N]   (default N = 50)
+# Usage: [BENCH_MAX_P95_MS=<ms>] [BENCH_REPORT_ONLY=1] scripts/bench-check.sh [--managed] [N]   (default N = 50)
 set -euo pipefail
 
 managed=0
@@ -64,6 +73,9 @@ fi
 
 if [[ -n "${SAIIFE_BENCH_BIN:-}" ]]; then
   bin="$SAIIFE_BENCH_BIN"
+elif [[ "$managed" == 1 ]]; then
+  cargo build --profile ci-locked --quiet --manifest-path "$repo/Cargo.toml" -p saiife
+  bin="${CARGO_TARGET_DIR:-$repo/target}/ci-locked/saiife$exe"
 else
   cargo build --release --quiet --manifest-path "$repo/Cargo.toml" -p saiife
   bin="${CARGO_TARGET_DIR:-$repo/target}/release/saiife$exe"
@@ -123,14 +135,21 @@ pwsh_payload="$(payload PowerShell '{"command":"git status; Get-ChildItem -Recur
 # "median <m> ms, p95 <p> ms" of N timed calls: payload $1 on stdin to the
 # command in the remaining arguments (EPOCHREALTIME is in microseconds once
 # the decimal point is dropped; needs bash 5).
+# With CHECK_EXIT=1 every call must exit 0 (the payloads are allows), or this
+# fails with the call's stderr.
 stats_ms() {
-  local p="$1" i t0 t1
+  local p="$1" i t0 t1 rc
   shift
   local -a times=()
   for ((i = 0; i < N; i++)); do
+    rc=0
     t0=${EPOCHREALTIME/[.,]/}
-    "$@" <<<"$p" >/dev/null
+    "$@" <<<"$p" >/dev/null 2>"$tmp/call.stderr" || rc=$?
     t1=${EPOCHREALTIME/[.,]/}
+    if [[ "${CHECK_EXIT:-0}" == 1 && "$rc" != 0 ]]; then
+      echo "call $((i + 1)) of $N exited $rc, want 0 (allow): $(cat "$tmp/call.stderr")" >&2
+      return 1
+    fi
     times+=($((t1 - t0)))
   done
   printf '%s\n' "${times[@]}" | sort -n | awk -v n="$N" '
@@ -163,7 +182,7 @@ report() {
       read) p="$read_payload" ;;
       *) p="$pwsh_payload" ;;
     esac
-    line="$(stats_ms "$p" "$@")"
+    line="$(stats_ms "$p" "$@")" || exit 1
     echo "$prefix$kind: $line/call"
     if over_budget "$line"; then
       echo "$prefix$kind: p95 is above the budget of $max_p95 ms" >&2
@@ -172,6 +191,10 @@ report() {
   done
   if [[ -n "$max_p95" ]]; then
     if [[ "$over" == 1 ]]; then
+      if [[ "${BENCH_REPORT_ONLY:-0}" == 1 ]]; then
+        echo "over budget (report-only)"
+        return 0
+      fi
       exit 1
     fi
     echo "p95 within the budget of $max_p95 ms"
@@ -212,7 +235,10 @@ socket_dir = "$tmp/run"
 [audit]
 dir = "$tmp/daemon-audit"
 EOF
-saiife daemon --system --config "$tmp/etc/config.toml" --state-dir "$tmp/state" \
+# One user for daemon and hook (the seams are debug-build only), and no
+# co-signer on the fixed 127.0.0.1:7433: the call is timed, not co-signed.
+SAIIFE_TEST_OWN_UID_PEERS=allow SAIIFE_TEST_COSIGN_ADDR=off \
+  saiife daemon --system --config "$tmp/etc/config.toml" --state-dir "$tmp/state" \
   2>"$tmp/daemon.stderr" </dev/null &
 daemon_pid=$!
 for ((i = 0; i < 250; i++)); do
@@ -229,4 +255,28 @@ if [[ ! -S "$tmp/run/saiife.sock" ]]; then
 fi
 
 cd "$tmp/project"
-report "managed " saiife check --managed --system-config "$tmp/etc/config.toml" --agent claude
+managed_hook=(saiife check --managed --system-config "$tmp/etc/config.toml" --agent claude)
+
+# Where the time goes: 10 untimed calls with the step trace, and each step's
+# median. Steps on the hook's helper thread and in its worker overlap the main
+# thread's; `total` is the hook's own, without its process start and exit.
+for ((i = 0; i < 10; i++)); do
+  rc=0
+  SAIIFE_HOOK_TIMING=1 "${managed_hook[@]}" <<<"$bash_payload" >/dev/null 2>>"$tmp/timing.stderr" || rc=$?
+  if [[ "$rc" != 0 ]]; then
+    echo "a traced call exited $rc, want 0 (allow): $(cat "$tmp/timing.stderr")" >&2
+    exit 1
+  fi
+done
+awk '$1 == "saiife-timing" { n[$2]++; v[$2, n[$2]] = $3; if (!($2 in seen)) { seen[$2] = 1; order[++k] = $2 } }
+  END {
+    for (j = 1; j <= k; j++) {
+      s = order[j]; c = n[s]
+      for (a = 1; a <= c; a++) x[a] = v[s, a]
+      for (a = 2; a <= c; a++) { t = x[a]; b = a - 1; while (b > 0 && x[b] > t) { x[b + 1] = x[b]; b-- } x[b + 1] = t }
+      m = (c % 2) ? x[(c + 1) / 2] : (x[c / 2] + x[c / 2 + 1]) / 2
+      printf "timing %s: median %.2f ms over %d calls\n", s, m, c
+    }
+  }' "$tmp/timing.stderr"
+
+CHECK_EXIT=1 report "managed " "${managed_hook[@]}"

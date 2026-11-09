@@ -81,6 +81,18 @@ pub const OP_MCP_LIST: &str = "mcp.list";
 /// masked `CallToolResult`), `{pending}`, or an error with code `denied`
 /// (`rule`), `limited` (`limit`) or `upstream_failed` (`reason`).
 pub const OP_MCP_CALL: &str = "mcp.call";
+/// The managed hook, first thing on its connection, before it reads its
+/// input (plan 20): `{agent, event}` -> `{}`. The daemon then follows the
+/// connection; one that ends without an `audit.append` is recorded as a
+/// hook without a verdict.
+pub const OP_HOOK_BEGIN: &str = "hook.begin";
+/// The managed hook, once it has read its input: the fields of
+/// [`crate::hookkey::HookKey`] (`agent`, `session`, `tool_use_id`,
+/// `input_sha256`) and an optional `tool` -> `{}`. Names the call the
+/// connection's verdict is for. The verdict, `audit.append`, names the
+/// same call with its own optional `tool_use_id` and `input_sha256`
+/// arguments beside `rec`; the daemon never writes those two.
+pub const OP_HOOK_BIND: &str = "hook.bind";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with

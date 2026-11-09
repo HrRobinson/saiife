@@ -10,6 +10,9 @@
 # check then tries one way to switch the managed hook off or make it fail,
 # and asks `claude -p` to touch a marker: `blocked` means the stub saiife
 # denied the call and the witness saw it, `ran` means the bypass worked.
+# The fixture's second PreToolUse hook (plan 20) posts to a co-signer on
+# 127.0.0.1:7433; agent_checks runs lib.sh's stand-in there for the whole
+# table (an empty 200, "no opinion"), so the rows test the command hook only.
 #
 # What it touches (container paths; under $LC_ROOT in the offline tests;
 # in the macOS VM the managed dir is /Library/Application Support/ClaudeCode/
@@ -228,6 +231,9 @@ claude_probe_onfailure() {
 # --- checks ------------------------------------------------------------------
 
 agent_checks() {
+  # The fixture's co-signer HTTP hook needs an answer (lib.sh, "stand-in
+  # co-signer"); without one every call is blocked and no row means anything.
+  lc_cosign_start
   lc_check claude.control control ran allow -
   lc_check claude.managed.fires gate fired allow -
   lc_check claude.deny gate blocked deny -
@@ -256,4 +262,5 @@ agent_checks() {
   lc_check claude.mcp.command design ran allow claude_setup_mcp_command
   lc_check claude.mcp.command-other design unavailable allow claude_setup_mcp_command_other claude.mcp.control
   claude_probe_onfailure
+  lc_cosign_stop
 }

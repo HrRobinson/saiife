@@ -671,6 +671,117 @@ test_mcp_marker_server() {
   assert_eq "$(find "$dir/markers" -mindepth 1 -printf '%f\n')" 0123456789ab "markers"
 }
 
+# --- stand-in co-signer (lib.sh lc_cosign_*, cosign-stub.js) --------------------
+
+have_cosign_tools() {
+  command -v node >/dev/null 2>&1 && command -v curl >/dev/null 2>&1
+}
+
+# `cosign_req <addr> <curl args...>`: "<status> <body bytes>" of one request.
+cosign_req() {
+  local addr="$1"
+  shift
+  curl -sS --noproxy '*' --max-time 5 -o "$SCRATCH/cosign.body" -w '%{http_code}' \
+    "$@" "http://$addr/v1/cosign/claude" || true
+  printf ' %s\n' "$(wc -c <"$SCRATCH/cosign.body" | tr -d ' ')"
+}
+
+# True while something accepts connections on <addr>.
+cosign_listening() {
+  curl -sS --noproxy '*' --max-time 2 -o /dev/null "http://$1/" 2>/dev/null
+}
+
+# The port offline (any free one), with the knob, and in a Windows run.
+test_cosign_port_defaults() {
+  new_root
+  assert_eq "$LC_COSIGN_PORT" 0 "offline port"
+  LOCKCHECK_COSIGN_PORT=7999 new_root
+  assert_eq "$LC_COSIGN_PORT" 7999 "LOCKCHECK_COSIGN_PORT"
+  local x
+  x="$(mktemp -d "$SCRATCH/xchg.XXXXXX")"
+  LOCKCHECK_PLATFORM=windows LC_WIN_XCHG="$x" new_root
+  assert_eq "$LC_COSIGN_PORT" 7433 "Windows run port"
+}
+
+# Start: an empty 200 for every co-sign POST, 404 otherwise, one log line per
+# request. Stop: the run file goes, the stub exits by itself, the port closes.
+test_cosign_stub_answers_and_stops() {
+  if ! have_cosign_tools; then
+    echo "skip: node or curl not installed"
+    return 0
+  fi
+  new_root
+  LC_LOG="$LC_ROOT/lc.log"
+  lc_cosign_start
+  [[ "$LC_COSIGN_ADDR" =~ ^127\.0\.0\.1:[0-9]+$ ]] || fail "addr: $LC_COSIGN_ADDR"
+  [[ "$LC_COSIGN_ADDR" != 127.0.0.1:7433 && "$LC_COSIGN_ADDR" != 127.0.0.1:0 ]] ||
+    fail "offline stub on $LC_COSIGN_ADDR"
+  local addr="$LC_COSIGN_ADDR" pid="$LC_COSIGN_PID"
+  assert_eq "$(cosign_req "$addr" -H 'Content-Type: application/json' \
+    --data-binary @"$REPO/crates/cli/tests/fixtures/claude/bash-allow.json")" "200 0" "co-sign POST"
+  assert_eq "$(cosign_req "$addr")" "404 0" "GET"
+  assert_eq "$(curl -sS --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' \
+    -d x "http://$addr/other")" 404 "POST elsewhere"
+  assert_eq "$(cat "$LC_RUN/cosign.log")" "POST /v1/cosign/claude 200
+GET /v1/cosign/claude 404
+POST /other 404" "log"
+  lc_cosign_start
+  assert_eq "$LC_COSIGN_PID" "$pid" "a second start reuses the running stub"
+  lc_cosign_stop
+  assert_eq "$LC_COSIGN_PID$LC_COSIGN_ADDR" "" "state after stop"
+  [[ ! -e "$LC_RUN/cosign.run" ]] || fail "run file kept"
+  if cosign_listening "$addr"; then
+    fail "still listening on $addr after stop"
+  fi
+  lc_cosign_stop
+}
+
+# A taken port: start fails with the reason, and leaves nothing running.
+test_cosign_stub_port_taken() {
+  if ! have_cosign_tools; then
+    echo "skip: node or curl not installed"
+    return 0
+  fi
+  new_root
+  LC_LOG="$LC_ROOT/lc.log"
+  lc_cosign_start
+  local addr="$LC_COSIGN_ADDR" err rc=0
+  # A second harness state (dynamic scope), on the first stub's port.
+  start_on() {
+    local LC_RUN="$LC_ROOT/run2" LC_COSIGN_PID="" LC_COSIGN_ADDR="" LC_COSIGN_PORT="$1"
+    lc_cosign_start
+  }
+  start_on "${addr##*:}" >/dev/null 2>"$LC_ROOT/start.err" || rc=$?
+  err="$(cat "$LC_ROOT/start.err")"
+  assert_eq "$rc" 1 "start on a taken port"
+  [[ "$err" == *"did not start on $addr"*"EADDRINUSE"* ]] || fail "message: $err"
+  [[ ! -e "$LC_ROOT/run2/cosign.run" ]] || fail "run file of the failed start kept"
+  assert_eq "$(cosign_req "$addr" -H 'Content-Type: application/json' -d '{}')" "200 0" \
+    "the first stub still answers"
+  lc_cosign_stop
+}
+
+# The harness dies without lc_cosign_stop: the stub notices and exits.
+test_cosign_stub_exits_with_the_harness() {
+  if ! have_cosign_tools; then
+    echo "skip: node or curl not installed"
+    return 0
+  fi
+  new_root
+  local addr i
+  LC_ROOT="$LC_ROOT" bash -c 'set -euo pipefail; source "$1/lib.sh"; LC_LOG="$LC_ROOT/lc.log"
+    lc_cosign_start >/dev/null; printf "%s\n" "$LC_COSIGN_ADDR" >"$LC_ROOT/addr"' lc "$HERE"
+  addr="$(cat "$LC_ROOT/addr")"
+  [[ -e "$LC_RUN/cosign.run" ]] || fail "the run file should outlive the harness here"
+  for i in $(seq 1 25); do
+    if ! cosign_listening "$addr"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  fail "the stub on $addr outlived its harness by 5 s"
+}
+
 # --- Codex checks (checks-codex.sh) -------------------------------------------
 
 CODEX_IDS="codex.control codex.managed.path-probe codex.managed.fires codex.deny
@@ -1251,8 +1362,14 @@ test_claude_checks_static() {
     fi
     return 0
   }
+  # The stand-in co-signer brackets the table (test_cosign_* run the real one).
+  lc_cosign_start() { printf 'cosign-start\n' >>"$rec"; }
+  lc_cosign_stop() { printf 'cosign-stop\n' >>"$rec"; }
   lc_snapshot
   agent_checks
+  assert_eq "$(head -n1 "$rec")" cosign-start "the co-signer starts before the first check"
+  assert_eq "$(tail -n1 "$rec")" cosign-stop "the co-signer stops after the last check"
+  sed -i '/^cosign-st/d' "$rec"
 
   # Ids, in the order of the plan's table.
   assert_eq "$(cut -f1 "$rec" | paste -sd' ' -)" "claude.control claude.managed.fires \

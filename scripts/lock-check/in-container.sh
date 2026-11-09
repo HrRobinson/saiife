@@ -131,6 +131,7 @@ hand_results() {
 hand_results
 
 cleanup() {
+  lc_cosign_stop || true
   lc_restore_snapshot || true
   rm -rf "$LC_HOME/alt" "$LC_SNAPSHOT"
   hand_results

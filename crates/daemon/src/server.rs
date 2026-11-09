@@ -1,10 +1,12 @@
 //! One task per connection on the control socket (spec §6.3, §8.7).
 
+use crate::hooks::{ConnId, HookTable};
 use crate::ops::{self, Ctx, Notice};
 use saiife_ipc::frame::{body_len, decode, encode_max, FrameError, MAX_ANSWER_FRAME};
 use saiife_ipc::msg::{err, ErrorCode, Request, OP_HELLO, PROTO};
 use saiife_ipc::peer::PeerCred;
 use serde_json::{Map, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -22,6 +24,21 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a refused connection gets to take its `busy` answer.
 const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// The next connection's [`ConnId`].
+pub fn next_conn_id() -> ConnId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    ConnId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Tells the hook table that a connection ended, however it ends.
+struct EndsHook<'a>(&'a HookTable, ConnId);
+
+impl Drop for EndsHook<'_> {
+    fn drop(&mut self) {
+        self.0.ended(self.1);
+    }
+}
 
 enum ReadError {
     /// A malformed frame: answer `bad_frame` and close.
@@ -133,10 +150,16 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, peer: PeerCred,
         peer.clone(),
         crate::reauth::start_time_of(ctx.proc.as_ref(), peer.pid),
     );
+    let _ends = EndsHook(&ctx.hooks, conn.id);
     let mut greeted = false;
     loop {
         let next = if greeted {
-            read_frame(&mut s).await
+            // A hook connection the hook table closes (its overrun) ends here.
+            tokio::select! {
+                biased;
+                _ = conn.close.notified() => return,
+                f = read_frame(&mut s) => f,
+            }
         } else {
             // No idle timeout between frames, but the hello must come in time.
             tokio::time::timeout_at(accepted + HELLO_DEADLINE, read_frame(&mut s))
@@ -272,6 +295,55 @@ mod tests {
         let (mut ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, me.wrapping_add(1));
         Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
         assert!(hello_answer_bytes(ctx).await.len() > 4);
+    }
+
+    /// A hook connection with no verdict by `HOOK_OVERRUN` is closed by the
+    /// daemon and recorded; a CLI connection idles on.
+    #[tokio::test(start_paused = true)]
+    async fn overrun_is_closed_and_recorded() {
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, me);
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let (mut cli, cli_theirs) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(theirs, Arc::clone(&ctx)));
+        let cli_task = tokio::spawn(connection(cli_theirs, Arc::clone(&ctx)));
+        let start = tokio::time::Instant::now();
+        for (n, op) in [(1, json!({"op": OP_HELLO, "proto": PROTO}))]
+            .into_iter()
+            .chain([(
+                2,
+                json!({"op": saiife_ipc::msg::OP_HOOK_BEGIN, "agent": "claude"}),
+            )])
+        {
+            let mut m = op;
+            m["id"] = n.into();
+            ours.write_all(&encode_max(&m, MAX_ANSWER_FRAME).unwrap())
+                .await
+                .unwrap();
+        }
+        let hello = json!({"id": 1, "op": OP_HELLO, "proto": PROTO});
+        cli.write_all(&encode_max(&hello, MAX_ANSWER_FRAME).unwrap())
+            .await
+            .unwrap();
+        // Both answers: the begin is in.
+        let mut answers = vec![0u8; 4 + 61 + 4 + 18];
+        ours.read_exact(&mut answers).await.unwrap();
+        assert!(answers.ends_with(br#"{"id":2,"ok":true}"#), "{answers:?}");
+        // The paused clock may run ahead while the socket is idle, so the
+        // overrun's exact time is the hook table's test; here: closed, and
+        // recorded, no earlier than the overrun.
+        // Then EOF from the daemon's side.
+        let mut got = Vec::new();
+        let read = timeout(Duration::from_secs(60), ours.read_to_end(&mut got)).await;
+        assert!(read.is_ok(), "the hook connection was not closed");
+        assert!(got.is_empty(), "{got:?}");
+        assert!(start.elapsed() >= crate::hooks::HOOK_OVERRUN);
+        let _ = task.await;
+        assert_eq!(ctx.hooks.no_verdict_count().0, 1);
+        // The CLI connection is still open.
+        assert!(!cli_task.is_finished());
+        cli_task.abort();
     }
 
     fn windows_peer(uid: u32, sid: &str) -> PeerCred {

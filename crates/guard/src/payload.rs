@@ -166,6 +166,10 @@ struct Envelope {
     #[serde(default, rename = "sessionId", deserialize_with = "lenient_string")]
     session_id_camel: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
+    tool_use_id: Option<String>,
+    #[serde(default, rename = "toolUseId", deserialize_with = "lenient_string")]
+    tool_use_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
     cwd: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
     permission_mode: Option<String>,
@@ -344,7 +348,25 @@ pub fn classify_for(
     agent: Option<&str>,
     windows_host: bool,
 ) -> Result<ToolCall, PayloadError> {
-    let env = envelope(input, max_bytes)?;
+    classify_envelope(envelope(input, max_bytes)?, agent, windows_host)
+}
+
+/// [`classify_for`] of a payload already parsed (the daemon's co-signer
+/// parses its body once).
+pub fn classify_value(
+    v: &serde_json::Value,
+    agent: Option<&str>,
+    windows_host: bool,
+) -> Result<ToolCall, PayloadError> {
+    let env = Envelope::deserialize(v).map_err(|e| PayloadError::Json(e.to_string()))?;
+    classify_envelope(env, agent, windows_host)
+}
+
+fn classify_envelope(
+    env: Envelope,
+    agent: Option<&str>,
+    windows_host: bool,
+) -> Result<ToolCall, PayloadError> {
     let dialects = dialects_for(agent, env.tool(), windows_host);
     let shell = |command| ToolCall::Shell { command, dialects };
     let Some(tool) = env.tool() else {
@@ -462,6 +484,8 @@ fn patch_paths(patch: &str) -> Vec<String> {
 pub struct HookContext {
     pub tool: Option<String>,
     pub session: Option<String>,
+    /// The agent's id for this one tool call (Claude Code's `tool_use_id`).
+    pub tool_use_id: Option<String>,
     pub cwd: Option<String>,
     /// The agent's permission mode (`default`, `plan`, ...), when it sends one.
     pub permission_mode: Option<String>,
@@ -488,6 +512,7 @@ pub fn context_from_hook_json_bounded(input: &str, max_bytes: usize) -> HookCont
     HookContext {
         tool: field(&env.tool_name, &env.tool_name_camel),
         session: field(&env.session_id, &env.session_id_camel),
+        tool_use_id: field(&env.tool_use_id, &env.tool_use_id_camel),
         cwd: env.cwd.clone().filter(|c| !c.is_empty()),
         permission_mode: env.permission_mode.clone().filter(|c| !c.is_empty()),
     }
@@ -717,6 +742,26 @@ pub(crate) fn fish_input(args: &[String]) -> FishInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_value_matches_classify_for() {
+        for p in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls -la"}}"#,
+            r#"{"tool_name":"Write","tool_input":{"file_path":"/p/a","content":"x"}}"#,
+            r#"{"tool_name":"Grep","cwd":"/p","tool_input":{"pattern":"x"}}"#,
+            r#"{"tool_name":"Write","tool_input":"nope"}"#,
+            r#"{"tool_name":"Task","tool_input":{"prompt":"x"}}"#,
+            r#"{"command":"rm -rf /tmp/x"}"#,
+            r#"{"tool_name":7,"tool_input":{"command":"ls"}}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(p).unwrap();
+            for win in [false, true] {
+                let a = classify_for(p, MAX_PAYLOAD_BYTES, Some("claude"), win);
+                let b = classify_value(&v, Some("claude"), win);
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "{p}");
+            }
+        }
+    }
 
     #[test]
     fn extracts_claude_pretooluse_bash_command() {
@@ -1386,6 +1431,24 @@ mod tests {
         assert_eq!(ctx.tool.as_deref(), Some("Bash"));
         assert_eq!(ctx.session.as_deref(), Some("abc"));
         assert_eq!(ctx.cwd.as_deref(), Some("/home/u/app"));
+    }
+
+    #[test]
+    fn context_reads_tool_use_id() {
+        let json = include_str!("../../cli/tests/fixtures/claude/bash-allow.json");
+        assert_eq!(
+            context_from_hook_json(json).tool_use_id.as_deref(),
+            Some("toolu_02")
+        );
+        let ctx = context_from_hook_json(r#"{"toolUseId":"t-9"}"#);
+        assert_eq!(ctx.tool_use_id.as_deref(), Some("t-9"));
+        // As `session`: the snake-case field wins when present, even empty.
+        let ctx = context_from_hook_json(r#"{"tool_use_id":"","toolUseId":"t-9"}"#);
+        assert_eq!(ctx.tool_use_id, None);
+        assert_eq!(
+            context_from_hook_json(r#"{"tool_use_id":7}"#).tool_use_id,
+            None
+        );
     }
 
     #[test]

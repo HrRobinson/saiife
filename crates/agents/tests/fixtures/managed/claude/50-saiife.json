@@ -4,6 +4,9 @@
       { "matcher": "*",
         "hooks": [ { "type": "command",
                      "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" },
+                   { "type": "http",
+                     "url": "http://127.0.0.1:7433/v1/cosign/claude",
                      "timeout": 10, "onFailure": "block" } ] }
     ],
     "ConfigChange": [
@@ -12,5 +15,6 @@
                      "timeout": 10, "onFailure": "block" } ] }
     ]
   },
+  "allowedHttpHookUrls": ["http://127.0.0.1:7433/*"],
   "disableAllHooks": false
 }

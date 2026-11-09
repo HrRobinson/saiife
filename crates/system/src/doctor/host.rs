@@ -4,7 +4,7 @@
 //! model login and leftover project hooks; once per host, `hidepid`.
 //! Read-only. Agent binaries never run as root.
 
-use super::common::fmt_version;
+use super::common::{claude_installed, fmt_version, proxy_check, EnvLayer};
 pub use super::common::{parse_agent_version, CLAUDE_MIN};
 use super::report::{Check, Status};
 use super::secrets::{self, read_at, read_under};
@@ -254,6 +254,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             }));
         }
         out.push(model_login(u, id("model-login")));
+        if claude_installed(ctx) {
+            out.push(proxy(ctx, u, id("proxy")));
+        }
         if mac(ctx) {
             out.push(Check::new(
                 id("egress"),
@@ -683,6 +686,27 @@ fn is_local_url(url: &str) -> bool {
         host.to_ascii_lowercase().as_str(),
         "localhost" | "127.0.0.1" | "::1"
     )
+}
+
+/// The proxy Claude Code would use for the co-sign request: the caller's environment on
+/// a self-check (as root it is root's, not the agent user's), then the `env` of the
+/// user's `~/.claude/settings.json`, which overwrites it.
+fn proxy(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
+    let mut layers = Vec::new();
+    if !ctx.as_root {
+        layers.push(EnvLayer::from_lookup("the environment".into(), |k| {
+            ctx.host.env_var(k)
+        }));
+    }
+    if !u.home.as_os_str().is_empty() {
+        if let Some(b) = read_under(&u.home, ".claude/settings.json") {
+            layers.push(EnvLayer::from_settings(
+                "~/.claude/settings.json".into(),
+                &b,
+            ));
+        }
+    }
+    proxy_check(id, &layers)
 }
 
 /// Decision 5: the model login is information, never a failure.

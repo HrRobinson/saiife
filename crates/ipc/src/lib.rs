@@ -4,5 +4,6 @@
 
 pub mod client;
 pub mod frame;
+pub mod hookkey;
 pub mod msg;
 pub mod peer;

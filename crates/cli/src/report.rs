@@ -299,6 +299,7 @@ fn decision_label(d: DecisionKind) -> &'static str {
         DecisionKind::Approved => "Approved",
         DecisionKind::Rejected => "Rejected",
         DecisionKind::Expired => "Expired",
+        DecisionKind::NoVerdict => "No verdict (hook ended)",
         DecisionKind::Unknown => "Other",
     }
 }

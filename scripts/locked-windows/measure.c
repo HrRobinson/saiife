@@ -2,8 +2,9 @@
  * The measurements of scripts/locked-windows (phase_measurements). CI only. Native, so
  * that a remapped C: cannot break the prober's own lazy loading, as it would in pwsh.
  *
- * These are not tests of a promise. lib.ps1 records what happens and asserts nothing
- * about the result; the owner reads them to decide how Windows locked mode is described.
+ * These are not tests of a promise, apart from the two co-signer modes at the end.
+ * lib.ps1 records what happens and asserts nothing about the result; the owner reads
+ * them to decide how Windows locked mode is described.
  * Each runs as the non-admin account `agent` on the throwaway runner, and touches only
  * the session of that account and files on the runner. Global\ device names are not tried.
  *
@@ -24,17 +25,36 @@
  *       PROCESS_TERMINATE) and TerminateProcess on someone else's pid. A logon SID the
  *       killer shares with the hook would explain a cross-user kill.
  *
+ * The co-signer steps of lib.ps1 (phase_cosign, plan 20) assert on these two:
+ *
+ *   measure spawn-fed-hold <hook> <agent> <payload file> <pid file> <wait seconds>
+ *       Starts the hook with the payload file on its stdin and closes stdin, writes the
+ *       hook's pid and a newline to <pid file>, then waits up to <wait> s for the hook to
+ *       end and prints child_exit (259 is still running) as spawn-hold does. The hook
+ *       inherits this process's environment, so SAIIFE_EVAL_FAULT reaches its worker.
+ *   measure terminate-bound <pid file> <exit code> <max seconds>
+ *       Waits for <pid file>, then for the hook's guard worker (a saiife.exe whose parent
+ *       is that pid): the hook spawns it and then binds its key with the daemon. After
+ *       BIND_SETTLE_MS, TerminateProcess(hook, <exit code>). Prints worker_seen_ms and
+ *       kill_at_filetime (UTC, 100 ns since 1601), or why it did not kill.
+ *
  * Output: key=value lines.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 #pragma comment(lib, "advapi32.lib")
+
+/* From the worker's start to the kill: long enough for the hook's hook.bind round trip,
+ * well inside the hook's 3 s worker deadline. */
+#define BIND_SETTLE_MS 300
 
 static void say_err(const char *key) {
     printf("%s_error=%lu\n", key, GetLastError());
@@ -324,6 +344,176 @@ static int terminate(DWORD pid, UINT exit_code) {
     return 0;
 }
 
+/* Starts the hook with the payload in `payload_path` on stdin, then closes stdin. */
+static int spawn_fed_hold(const wchar_t *hook, const wchar_t *agent, const wchar_t *payload_path,
+                          const wchar_t *pid_file, int wait) {
+    static char payload[65536];
+    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
+    HANDLE in_read, in_write, f;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[2048];
+    DWORD len = 0, wrote = 0, code = 0;
+    char text[32];
+    int n;
+
+    f = CreateFileW(payload_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        say_err("payload_file");
+        return 3;
+    }
+    if (!ReadFile(f, payload, (DWORD)sizeof payload, &len, NULL)) {
+        say_err("payload_read");
+        CloseHandle(f);
+        return 3;
+    }
+    CloseHandle(f);
+    if (len == 0 || len == (DWORD)sizeof payload) {
+        printf("payload_error=size %lu\n", len);
+        fflush(stdout);
+        return 3;
+    }
+    if (!CreatePipe(&in_read, &in_write, &sa, 0)) {
+        say_err("pipe");
+        return 3;
+    }
+    SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0);
+    ZeroMemory(&si, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = in_read;
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    swprintf(cmd, 2048, L"\"%ls\" check --managed --hook-exit --agent %ls", hook, agent);
+    if (!CreateProcessW(hook, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        say_err("hook_create");
+        return 3;
+    }
+    CloseHandle(in_read);
+    /* After the start: a payload larger than the pipe's buffer waits for the hook to read. */
+    if (!WriteFile(in_write, payload, len, &wrote, NULL) || wrote != len) {
+        say_err("payload_write");
+    }
+    CloseHandle(in_write);
+    printf("payload_bytes=%lu\n", wrote);
+    printf("hook_pid=%lu\n", pi.dwProcessId);
+    fflush(stdout);
+    /* The newline ends the pid: terminate-bound reads the file only once it has one. */
+    f = CreateFileW(pid_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        say_err("pid_file");
+        return 3;
+    }
+    n = sprintf(text, "%lu\n", pi.dwProcessId);
+    WriteFile(f, text, (DWORD)n, &wrote, NULL);
+    CloseHandle(f);
+    WaitForSingleObject(pi.hProcess, (DWORD)wait * 1000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    printf("child_exit=%lu\n", code);
+    fflush(stdout);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 0;
+}
+
+/* The pid in `pid_file`, once it holds digits and a newline; 0 until then. */
+static DWORD read_pid_file(const wchar_t *pid_file) {
+    char buf[32];
+    DWORD got = 0;
+    HANDLE f = CreateFileW(pid_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    if (!ReadFile(f, buf, (DWORD)sizeof buf - 1, &got, NULL)) {
+        got = 0;
+    }
+    CloseHandle(f);
+    buf[got] = '\0';
+    if (strchr(buf, '\n') == NULL) {
+        return 0;
+    }
+    return (DWORD)strtoul(buf, NULL, 10);
+}
+
+/* Whether a saiife.exe whose parent is `parent` runs: the hook's guard worker. */
+static int has_worker(DWORD parent) {
+    PROCESSENTRY32W pe;
+    int found = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if (snap == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    pe.dwSize = sizeof pe;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ParentProcessID == parent && _wcsicmp(pe.szExeFile, L"saiife.exe") == 0) {
+                found = 1;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+static int terminate_bound(const wchar_t *pid_file, UINT exit_code, int max_seconds) {
+    ULONGLONG start = GetTickCount64();
+    ULONGLONG deadline = start + (ULONGLONG)max_seconds * 1000;
+    ULARGE_INTEGER at;
+    FILETIME ft;
+    DWORD pid = 0;
+    HANDLE p;
+
+    while ((pid = read_pid_file(pid_file)) == 0) {
+        if (GetTickCount64() > deadline) {
+            printf("pid_file_error=timeout\n");
+            fflush(stdout);
+            return 0;
+        }
+        Sleep(10);
+    }
+    printf("target_pid=%lu\n", pid);
+    p = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (p == NULL) {
+        say_err("open_process");
+        return 0;
+    }
+    for (;;) {
+        if (WaitForSingleObject(p, 0) == WAIT_OBJECT_0) {
+            printf("target_exited_first=1\n");
+            fflush(stdout);
+            CloseHandle(p);
+            return 0;
+        }
+        if (has_worker(pid)) {
+            break;
+        }
+        if (GetTickCount64() > deadline) {
+            printf("worker_seen=timeout\n");
+            fflush(stdout);
+            CloseHandle(p);
+            return 0;
+        }
+        Sleep(5);
+    }
+    printf("worker_seen_ms=%llu\n", GetTickCount64() - start);
+    Sleep(BIND_SETTLE_MS);
+    if (TerminateProcess(p, exit_code)) {
+        GetSystemTimeAsFileTime(&ft);
+        at.LowPart = ft.dwLowDateTime;
+        at.HighPart = ft.dwHighDateTime;
+        printf("terminate=succeeded\n");
+        printf("kill_at_filetime=%llu\n", at.QuadPart);
+    } else {
+        say_err("terminate");
+    }
+    fflush(stdout);
+    CloseHandle(p);
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
     if (argc == 6 && wcscmp(argv[1], L"dosdevice") == 0) {
         return dosdevice(argv[2], argv[3], argv[4], _wtoi(argv[5]));
@@ -336,6 +526,12 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (argc == 5 && wcscmp(argv[1], L"spawn-kill") == 0) {
         return spawn_kill(argv[2], argv[3], (UINT)_wtoi(argv[4]));
+    }
+    if (argc == 7 && wcscmp(argv[1], L"spawn-fed-hold") == 0) {
+        return spawn_fed_hold(argv[2], argv[3], argv[4], argv[5], _wtoi(argv[6]));
+    }
+    if (argc == 5 && wcscmp(argv[1], L"terminate-bound") == 0) {
+        return terminate_bound(argv[2], (UINT)_wtoi(argv[3]), _wtoi(argv[4]));
     }
     if (argc == 4 && wcscmp(argv[1], L"terminate") == 0) {
         return terminate((DWORD)_wtoi(argv[2]), (UINT)_wtoi(argv[3]));
