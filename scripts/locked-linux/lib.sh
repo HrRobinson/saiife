@@ -345,9 +345,10 @@ phase_hooks() {
     phase "3. managed hooks as $AGENT_USER"
     # Each payload is made first: a failing `payload` inside an argument
     # list would not stop the job (set -e ignores it there).
-    local allow deny codex_deny gemini_deny mcp write
+    local allow deny codex_allow codex_deny gemini_deny mcp write
     allow="$(payload claude/bash-allow.json)"
     deny="$(payload claude/bash-deny.json)"
+    codex_allow="$(payload codex/bash-allow.json)"
     codex_deny="$(payload codex/bash-deny.json)"
     gemini_deny="$(payload gemini/shell-deny.json)"
     mcp="$(payload codex/mcp-tool.json)"
@@ -363,9 +364,12 @@ phase_hooks() {
     expect_hook 2 "BLOCKED by guard.mcp" "codex MCP tool of an unlisted server" codex "$mcp"
     expect_hook 2 "BLOCKED by core.lock" "claude Write to /etc/saiife/x" claude "$write"
     as_root test ! -e /etc/saiife/x || fail "/etc/saiife/x exists"
-    expect_hook 2 "" "guard worker SIGSEGV" claude "$allow" SAIIFE_EVAL_FAULT=segv
+    # Codex keeps the worker: its crash is the hook's error_denied. Claude
+    # Code judges in the hook since plan 21; its crash is phase_cosign's.
+    expect_hook 2 "signal 11" "codex guard worker SIGSEGV" codex "$codex_allow" SAIIFE_EVAL_FAULT=segv
+    expect_last_guard codex error_denied
+    expect_hook 2 "" "claude judgment hang in the hook" claude "$allow" SAIIFE_EVAL_FAULT=hang
     expect_last_guard claude error_denied
-    expect_hook 2 "" "guard worker hang" claude "$allow" SAIIFE_EVAL_FAULT=hang
     audit_verify
 }
 
@@ -572,6 +576,32 @@ phase_cosign() {
     jq -e '.decision == "error_denied" and .reason == "the saiife hook ended without a verdict"' \
         <<<"$rec" >/dev/null || fail "no cosign_denied record for $id: $rec"
     ok "cosign_denied record: $rec"
+
+    # A crash in the hook (plan 21): Claude Code calls are judged in the
+    # hook, not in a worker, so a SIGSEGV there kills the bound hook with no
+    # verdict. Claude Code's onFailure "block" blocks the call; the co-signer
+    # denies it, and the daemon records no_verdict.
+    as_root cat /etc/claude-code/managed-settings.d/50-saiife.json |
+        jq -e '[.hooks.PreToolUse[].hooks[] | select(.type == "command") | .onFailure] | length > 0 and all(. == "block")' \
+            >/dev/null || fail "the managed Claude Code hook is not onFailure \"block\""
+    ok "the managed Claude Code hook is onFailure \"block\""
+    p="$(cosign_payload claude/bash-allow.json segv)"
+    id="$(jq -r .tool_use_id "$p")"
+    cosign_post "$p" segv "" &
+    post_job=$!
+    hook claude "$p" SAIIFE_EVAL_FAULT=segv
+    if ((HOOK_CODE <= 128)) || [[ "$HOOK_ERR" == *saiife:* ]]; then
+        fail "claude judgment SIGSEGV: the hook was not killed (exit $HOOK_CODE): $HOOK_ERR"
+    fi
+    ok "claude judgment SIGSEGV: the hook died by signal $((HOOK_CODE - 128))"
+    wait "$post_job"
+    expect_cosign segv 200 "$(cosign_deny_body "the saiife hook ended without a verdict")" \
+        "co-sign of the crashed hook's call" 7
+    wait_until 10 "the no_verdict record of $id" hook_record_exists no_verdict "$id"
+    rec="$(hook_record no_verdict "$id")"
+    jq -e --arg u "$AGENT_USER" '.decision == "no_verdict" and .bound == true and .agent == "claude" and .user == $u' \
+        <<<"$rec" >/dev/null || fail "the crashed hook's no_verdict record is not bound, claude, $AGENT_USER: $rec"
+    ok "no_verdict record of the crashed hook: $rec"
 
     # No hook at all: the co-signer waits its 8 s cap, then denies.
     p="$(cosign_payload claude/bash-allow.json nohook)"

@@ -892,22 +892,26 @@ mod imp {
         (payload, answer)
     }
 
-    /// Test seam, debug builds only: `SAIIFE_EVAL_FAULT=hang|panic|abort` makes the
-    /// judgment in this process hang, panic, or abort the hook. The worker's other
-    /// faults are its own and are ignored here.
+    /// Test seam, debug builds only: `SAIIFE_EVAL_FAULT=hang|panic|abort|segv`
+    /// makes the judgment in this process hang, panic, or kill the hook by
+    /// SIGABRT or (Unix) SIGSEGV. The worker's other faults are its own and are
+    /// ignored here.
     #[cfg(debug_assertions)]
     fn judge_here_fault() {
-        match eval::fault().as_str() {
+        let fault = eval::fault();
+        // No core dump for the owner's crash reporter (as the worker's seam).
+        #[cfg(target_os = "linux")]
+        if matches!(fault.as_str(), "abort" | "segv") {
+            let _ = rustix::process::set_dumpable_behavior(
+                rustix::process::DumpableBehavior::NotDumpable,
+            );
+        }
+        match fault.as_str() {
             "hang" => std::thread::sleep(Duration::from_secs(10)),
             "panic" => panic!("SAIIFE_EVAL_FAULT=panic"),
-            "abort" => {
-                // No core dump for the owner's crash reporter (as the worker's seam).
-                #[cfg(target_os = "linux")]
-                let _ = rustix::process::set_dumpable_behavior(
-                    rustix::process::DumpableBehavior::NotDumpable,
-                );
-                std::process::abort()
-            }
+            "abort" => std::process::abort(),
+            #[cfg(unix)]
+            "segv" => eval::segv(),
             _ => {}
         }
     }

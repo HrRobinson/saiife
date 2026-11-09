@@ -630,16 +630,27 @@ fn claude_in_process_panic_denies() {
 /// `onFailure: "block"` blocks the call, and its co-signer denies it.
 #[test]
 fn claude_in_process_crash_is_no_verdict() {
+    in_process_crash("abort");
+}
+
+/// The same for a SIGSEGV in the hook's own judgment: the locked-linux and
+/// locked-macos jobs send `SAIIFE_EVAL_FAULT=segv` to a Claude Code hook,
+/// which has judged in-process since plan 21 (no worker there to crash).
+#[test]
+fn claude_in_process_segv_is_no_verdict() {
+    use std::os::unix::process::ExitStatusExt;
+    let o = in_process_crash("segv");
+    assert_eq!(o.status.signal(), Some(11), "SIGSEGV: {o:?}");
+}
+
+/// The hook of a Claude Code call with its judgment crashed by `fault`:
+/// killed by a signal, a bound `no_verdict` record, and no guard record.
+fn in_process_crash(fault: &str) -> Output {
     let d = TestDaemon::start(Opts::default());
     let home = common::FixtureHome::new();
     let payload = home.real(&fixture("claude/bash-allow.json"));
-    let (o, _, _sb) = managed_with(
-        &d.config(),
-        &payload,
-        &[("SAIIFE_EVAL_FAULT", "abort")],
-        &[],
-    );
-    assert_eq!(o.status.code(), None, "killed by a signal: {o:?}");
+    let (o, _, _sb) = managed_with(&d.config(), &payload, &[("SAIIFE_EVAL_FAULT", fault)], &[]);
+    assert_eq!(o.status.code(), None, "{fault}: killed by a signal: {o:?}");
     let until = Instant::now() + Duration::from_secs(15);
     let r = loop {
         if let Some(r) = d.of_kind("hook").pop() {
@@ -658,6 +669,7 @@ fn claude_in_process_crash_is_no_verdict() {
     assert_eq!(r["tool"], "Bash", "{r}");
     assert_eq!(r["tool_use_id"], "toolu_02", "{r}");
     assert!(guard_records(&d).is_empty());
+    o
 }
 
 #[test]

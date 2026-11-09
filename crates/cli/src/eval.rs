@@ -1066,19 +1066,7 @@ fn fault_seam() {
     match fault.as_str() {
         "abort" => std::process::abort(),
         #[cfg(unix)]
-        "segv" => {
-            // std's SIGSEGV handler (stack-overflow detection) takes the
-            // first signal, finds no guard-page hit and restores the
-            // default action; the second one kills the process.
-            for _ in 0..2 {
-                let _ = rustix::process::kill_process(
-                    rustix::process::getpid(),
-                    rustix::process::Signal::SEGV,
-                );
-            }
-            // Never judge after the seam fired.
-            std::process::abort();
-        }
+        "segv" => segv(),
         "hang" => std::thread::sleep(Duration::from_secs(10)),
         "overflow" => {
             overflow(1);
@@ -1093,6 +1081,26 @@ fn fault_seam() {
         }
         _ => {}
     }
+}
+
+/// Test seam, debug builds only: this process dies of SIGSEGV (the
+/// worker's seam, and the hook's own judgment of a Claude Code call).
+/// The caller makes the process not dumpable first on Linux.
+#[cfg(all(debug_assertions, unix))]
+pub fn segv() -> ! {
+    // std's SIGSEGV handler (stack-overflow detection) takes the
+    // first signal, finds no guard-page hit and restores the
+    // default action; the next one kills the process. The signal goes
+    // to the process, so in a process with other threads (the hook) it
+    // may land after kill returns: two sent back to back can merge into
+    // one. Each gets time to arrive before the next is sent.
+    for _ in 0..20 {
+        let _ =
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::SEGV);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Never judge after the seam fired.
+    std::process::abort();
 }
 
 #[cfg(debug_assertions)]
