@@ -271,11 +271,37 @@ struct Etc {
     dir: tempfile::TempDir,
 }
 
+/// The runner's SID, which `SAIIFE_TEST_TRUST_SID` makes one of the trusted writers.
+#[cfg(windows)]
+fn me() -> String {
+    saiife_win::ffi::token::current().unwrap().sid
+}
+
 impl Etc {
+    /// On Windows `etc` holds a protected DACL (the runner and SYSTEM) from its first
+    /// moment, as `windows_locked`'s tree does: what it would inherit from the runner's
+    /// temp folder differs between runner machines, and may let Authenticated Users
+    /// delete, which rightly makes the files below it not ours.
     fn new() -> Etc {
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        {
+            let me = me();
+            saiife_win::ffi::acl::create_dir_with_sddl(
+                &dir.path().join("etc"),
+                &format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)"),
+            )
+            .unwrap();
+        }
         std::fs::create_dir_all(dir.path().join("etc/saiife")).unwrap();
         Etc { dir }
+    }
+    /// The debug-build seams that let the system-file check believe this tree: the walk
+    /// stops at the temp dir, and on Windows the runner counts as an admin.
+    fn trust(&self, cmd: &mut Command) {
+        cmd.env("SAIIFE_TEST_TRUST_BELOW", self.dir.path());
+        #[cfg(windows)]
+        cmd.env("SAIIFE_TEST_TRUST_SID", me());
     }
     fn config(&self) -> std::path::PathBuf {
         self.dir.path().join("etc/saiife/config.toml")
@@ -331,8 +357,8 @@ fn dev_check(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, audit);
     cmd.args(["check", "--agent", agent, "--system-config"])
-        .arg(etc.config())
-        .env("SAIIFE_TEST_TRUST_BELOW", etc.dir.path());
+        .arg(etc.config());
+    etc.trust(&mut cmd);
     if hook_exit {
         cmd.arg("--hook-exit");
     }
@@ -521,6 +547,7 @@ fn developer_bad_args_fail_closed_when_opted_in() {
     let audit = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, audit.path());
+    etc.trust(&mut cmd);
     let o = cmd
         .args([
             "check",
@@ -531,7 +558,6 @@ fn developer_bad_args_fail_closed_when_opted_in() {
             "--system-config",
         ])
         .arg(etc.config())
-        .env("SAIIFE_TEST_TRUST_BELOW", etc.dir.path())
         .stdin(Stdio::null())
         .output()
         .unwrap();

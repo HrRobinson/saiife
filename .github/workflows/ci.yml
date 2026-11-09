@@ -224,6 +224,11 @@ jobs:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
         run: bash scripts/locked-linux/run.sh "$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife"
+      # The managed hook's p95 (plan 20 adds the hook.begin round trip to it),
+      # with macOS's budget. It builds the release binary and starts its own
+      # daemon in a scratch dir; it prints the median and p95 per payload.
+      - name: managed hook bench (Linux, p95 budget)
+        run: BENCH_MAX_P95_MS=40 bash scripts/bench-check.sh --managed 50
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

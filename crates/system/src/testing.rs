@@ -47,10 +47,13 @@ fn file(path: &Path, bytes: &[u8], mode: u32) {
 }
 
 /// The config a fake install writes: the socket and audit dirs under
-/// `root`, so nothing points at the real `/run` or `/var`.
+/// `root`, so nothing points at the real `/run` or `/var`. The daemon user
+/// is the layout's, written out: the default follows the build host
+/// (`_saiife` on macOS), and the Linux tree's passwd has `saiife`.
 pub fn fake_config(layout: &Layout) -> String {
     format!(
-        "version = 2\nlocked = true\n\n[daemon]\nsocket_dir = {:?}\n\n[audit]\ndir = {:?}\n",
+        "version = 2\nlocked = true\n\n[daemon]\nuser = {:?}\nsocket_dir = {:?}\n\n[audit]\ndir = {:?}\n",
+        layout.daemon_user(),
         layout.at(RUN_DIR).display().to_string(),
         layout.at(AUDIT_DIR).display().to_string(),
     )

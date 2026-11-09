@@ -469,13 +469,23 @@ cosign_listen_passes() {
     [[ "$(jq -r '.checks[] | select(.id == "cosign.listen") | .status' "$WORK/doctor-listen.json")" == pass ]]
 }
 
+# `cosign_bind_failed` records in the whole chain.
+cosign_bind_failed_count() {
+    records | jq -c 'select(.kind == "daemon" and .event == "cosign_bind_failed")' | wc -l
+}
+
 # `cosign_recheck <when>`: after a restart the co-signer listens again (it
 # binds over the last daemon's TIME_WAIT, and retries a failed bind), and
-# co-signs an honest allow.
+# co-signs an honest allow. Every co-signed call leaves the daemon's end in
+# TIME_WAIT on the port (it closes first), so each restart here binds over
+# it: SO_REUSEADDR must let the first try bind, with no retry needed.
 cosign_recheck() {
-    local when="$1" p post_job
+    local when="$1" p post_job n
     wait_until 60 "doctor cosign.listen to pass $when" cosign_listen_passes
     ok "doctor cosign.listen: pass $when"
+    n="$(cosign_bind_failed_count)"
+    [[ "$n" -eq 0 ]] || fail "$n cosign_bind_failed record(s): a restart did not bind the co-signer at once"
+    ok "no cosign_bind_failed record: every restart bound the co-signer at once"
     p="$(cosign_payload claude/bash-allow.json recheck)"
     cosign_post "$p" recheck "" &
     post_job=$!
