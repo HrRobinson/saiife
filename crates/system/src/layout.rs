@@ -167,6 +167,20 @@ impl Platform {
     }
 }
 
+/// The mode of the installed binary ([`BINARY`], root-owned).
+///
+/// - Linux `0711`: an exec needs only execute permission, and the kernel
+///   makes a process whose binary it cannot read not dumpable, so `ptrace`,
+///   `/proc/<pid>/mem` and `process_vm_writev` refuse a hook to its own user.
+/// - macOS `0755`: the hardened runtime already refuses `task_for_pid`.
+/// - Windows: not used (the file's DACL is set instead).
+pub fn binary_mode(platform: Platform) -> u32 {
+    match platform {
+        Platform::Linux => 0o711,
+        Platform::Macos | Platform::Windows => 0o755,
+    }
+}
+
 /// The macOS path (spec §5.3) for a Linux path constant, when it differs.
 /// Every other constant is the same on both platforms.
 pub fn macos_path(linux: &str) -> Option<&'static str> {
