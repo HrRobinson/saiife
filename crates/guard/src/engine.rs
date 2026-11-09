@@ -38,7 +38,7 @@ use crate::normalize::{build_argv, windows_program_names};
 use crate::operands::{operands, Operand, Source};
 use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
-use crate::payload::{inline_payload, watch_payload, Dialects};
+use crate::payload::{fish_input, inline_payload, watch_payload, Dialects};
 use crate::prefilter::Prefilter;
 use crate::pwsh;
 use crate::subst::{command_position_substitution_kind, may_expand_to_nothing};
@@ -920,6 +920,9 @@ impl Engine {
         if let Some(d) = self.cd_phase(&view, state, cx) {
             return Some(d);
         }
+        if let Some(d) = self.fish_phase(&view, cx, state, found) {
+            return Some(d);
+        }
         if let Some(d) = self.inline_payload_phase(&view, cx, state, found) {
             return Some(d);
         }
@@ -1535,6 +1538,56 @@ impl Engine {
             None,
         );
         found.nested(nested)
+    }
+
+    /// fish, which the guard has no reader for: a command line (`-c`,
+    /// `-C`), a script operand or a here-document it is given to run is not
+    /// fully judged. A command line is still read as POSIX, so one that
+    /// reads as a destructive line is denied. Plain `fish` is an interactive
+    /// shell, as plain `bash` is. What a pipe, a here-string or a redirect
+    /// feeds it is the lexer's (`lexer::hidden`).
+    fn fish_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        if view.argv.first().map(String::as_str) != Some("fish") {
+            return None;
+        }
+        let args: Vec<String> = wintable::without_redirects(&view.resolved)
+            .iter()
+            .skip(1)
+            .map(|w| w.text.clone())
+            .collect();
+        let input = fish_input(&args);
+        if input.about {
+            return None;
+        }
+        let heredoc = view.seg.iter().any(|w| {
+            let op = w.text.trim_start_matches(|c: char| c.is_ascii_digit());
+            let fd = &w.text[..w.text.len() - op.len()];
+            w.redirect && matches!(fd, "" | "0") && matches!(op, "<<" | "<<-")
+        });
+        if !input.lines.is_empty() || input.script.is_some() || heredoc {
+            found.unjudged(UNREAD_SCRIPT);
+        }
+        for line in &input.lines {
+            let nested = self.recurse_in(
+                Dialect::Posix,
+                line,
+                cx,
+                state,
+                false,
+                "inline command",
+                None,
+            );
+            if let Some(d) = found.nested(nested) {
+                return Some(d);
+            }
+        }
+        None
     }
 
     /// The directories to judge `ops` in: all of them. `None` when the last
