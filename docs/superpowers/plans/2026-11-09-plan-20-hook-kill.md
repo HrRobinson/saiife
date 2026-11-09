@@ -416,3 +416,10 @@ Nothing here runs on Claude's machine.
   4. **Allow-list (F6):** add `"allowedHttpHookUrls": ["https://example.com/*"]` to `~/.claude/settings.json` of the agent user, restart Claude, and ask for `ls`. The call must still go through the co-signer: the managed list merges in.
   5. **The kill (Windows):** as the agent user, run a script that waits for a `saiife.exe check` process and ends it with exit 0 (the `measure terminate` probe from the CI build), then ask Claude for a command the guard allows. Expect the call to be blocked with `saiife: BLOCKED (fail closed): the saiife hook ended without a verdict`, and `saiife doctor` to warn `hooks.no-verdict`.
   6. **Port squat (D6, Windows):** with the service running, try binding `127.0.0.1:7433` as the agent user. It must fail.
+
+## Owner rulings (2026-11-09)
+1. Port: fixed 7433, not configurable.
+2. NO_PROXY: docs only. The managed settings don't set it; doctor warns when a proxy is set and 127.0.0.1 is not in NO_PROXY.
+3. Windows locked mode stays preview until a later plan has the service re-judge each input (closes D4). Claude Code's lock label may be raised once Task 9's CI run passes.
+4. macOS keeps 0755 and relies on the hardened runtime.
+5. Coordinator defaults, owner may overrule: ConfigChange has no co-signer; the cross-user kill is re-run with a real interactive logon later; one co-signer deny record per reason per 10 s.
