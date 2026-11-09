@@ -4,9 +4,14 @@
 //!
 //! It never answers `allow` (decision D3). For a call the command hook has
 //! recorded as allowed (same session, tool call id and input hash, and the
-//! same principal) it answers `200` with an empty body: no opinion, so the
-//! command hook's verdict and Claude Code's own prompts stand. Anything else
-//! is `200` with a `permissionDecision: "deny"` body. Claude Code runs the
+//! same principal) **and** that the service's own judgment of the body
+//! allows too (plan 21: [`crate::rejudge`], lexical, as the binding hook's
+//! principal), it answers `200` with an empty body: no opinion, so the
+//! command hook's verdict and Claude Code's own prompts stand. A service
+//! deny of only `[guard] ask` rules passes when the binding connection used
+//! up a grant for exactly the body's command. Anything else is `200` with a
+//! `permissionDecision: "deny"` body: a service deny is one `rejudge_denied`
+//! record per call, a failed or late judgment a `rejudge_failed` one. Claude Code runs the
 //! two hooks in parallel, so the co-signer waits for the verdict, at most
 //! [`COSIGN_WAIT`] from the request's arrival.
 //!
@@ -19,8 +24,9 @@
 //! `cosign_denied` records fold per pid and carry `asker_pid`. The global
 //! caps stay as the backstop.
 
-use crate::hooks::{Principal, Waited};
+use crate::hooks::{Bound, Principal, Waited};
 use crate::ops::{Ctx, VERSION};
+use crate::rejudge::{Rejudge, RejudgeAnswer, RejudgeRequest, REJUDGE_TIMEOUT};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use http::{Method, Request, Response, StatusCode};
@@ -71,6 +77,8 @@ pub const MAX_RECORDED_SESSION: usize = crate::sessions::MAX_SESSION_ID;
 /// The longest tool name a `cosign_denied` record keeps, in bytes
 /// (`hook.bind`'s own limit).
 pub const MAX_RECORDED_TOOL: usize = 64;
+/// The longest re-judge error a `rejudge_failed` record keeps, in bytes.
+const MAX_RECORDED_ERROR: usize = 256;
 /// At most one `cosign_denied` record per reason, asker and session this
 /// often; the next one carries `suppressed`.
 pub const FOLD_EVERY: Duration = Duration::from_secs(10);
@@ -152,6 +160,11 @@ pub enum CosignDeny {
     NotCosignable,
     TooLarge,
     BadJson,
+    /// The service's own judgment of the call denies it (plan 21).
+    Rejudged,
+    /// The service could not judge the call: no pool, a worker that failed
+    /// or timed out, or a full pool.
+    RejudgeFailed,
 }
 
 impl CosignDeny {
@@ -163,20 +176,38 @@ impl CosignDeny {
             CosignDeny::NotCosignable => "the call has no session or tool use id",
             CosignDeny::TooLarge => "the payload is too large",
             CosignDeny::BadJson => "the payload is not JSON",
+            CosignDeny::Rejudged => "the saiife service's own judgment denies this call",
+            CosignDeny::RejudgeFailed => "the saiife service could not judge this call",
         }
     }
 }
 
+/// The longest guard reason a [`CosignDeny::Rejudged`] answer carries, in
+/// characters.
+pub const MAX_REJUDGED_REASON: usize = 200;
+
 /// The deny body, byte for byte as the spec fixes it.
 pub fn deny_body(why: CosignDeny) -> String {
+    deny_body_text(why.text())
+}
+
+/// The [`CosignDeny::Rejudged`] body: its text, then the guard's `reason`
+/// cut to [`MAX_REJUDGED_REASON`] characters.
+pub fn rejudged_body(reason: &str) -> String {
+    let reason: String = reason.chars().take(MAX_REJUDGED_REASON).collect();
+    deny_body_text(&format!("{}: {reason}", CosignDeny::Rejudged.text()))
+}
+
+fn deny_body_text(text: &str) -> String {
+    // A JSON string: a guard reason may hold quotes or backslashes.
+    let text = Value::String(format!("saiife: BLOCKED (fail closed): {text}")).to_string();
     format!(
-        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"saiife: BLOCKED (fail closed): {}\"}}}}",
-        why.text()
+        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":{text}}}}}"
     )
 }
 
 /// The co-signer's place in `status`, and its record folding.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct CosignState {
     /// The address bound; `None` before the start, in personal mode, or
     /// while the bind fails.
@@ -188,12 +219,53 @@ pub struct CosignState {
     /// `"tcp_table"` (Windows).
     /// `None`: not checked yet, or it failed (every call is denied).
     pub asker: Option<&'static str>,
+    /// The service's own judgment of each call (plan 21), set by the
+    /// system daemon's start. `None`: every co-signed call is denied
+    /// ([`CosignDeny::RejudgeFailed`]).
+    pub rejudge: Option<Arc<dyn Rejudge>>,
+    /// `rejudge_denied` records since the start, and the `ts` of the last.
+    pub rejudge_denied: (u64, Option<String>),
     fold: Folder,
 }
 
+impl std::fmt::Debug for CosignState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CosignState")
+            .field("addr", &self.addr)
+            .field("error", &self.error)
+            .field("asker", &self.asker)
+            .field("rejudge", &self.rejudge.as_ref().map(|r| r.workers()))
+            .field("rejudge_denied", &self.rejudge_denied)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `status.cosign.rejudge.error` when the daemon has no re-judge pool.
+pub const NO_REJUDGE: &str = "the re-judge pool did not start";
+
 impl CosignState {
     pub fn status(&self) -> serde_json::Value {
-        json!({"addr": self.addr.map(|a| a.to_string()), "error": self.error, "asker": self.asker})
+        json!({
+            "addr": self.addr.map(|a| a.to_string()),
+            "error": self.error,
+            "asker": self.asker,
+            "rejudge": self.rejudge_status(),
+        })
+    }
+
+    /// `status.cosign.rejudge`: `{"workers": n, "state": "ready" |
+    /// "unavailable", "error": null | why}`.
+    pub fn rejudge_status(&self) -> serde_json::Value {
+        match &self.rejudge {
+            Some(r) => json!({"workers": r.workers(), "state": "ready", "error": null}),
+            None => json!({"workers": 0, "state": "unavailable", "error": NO_REJUDGE}),
+        }
+    }
+
+    /// `status.hooks_rejudge_denied`.
+    pub fn rejudge_denied_status(&self) -> serde_json::Value {
+        let (n, last) = &self.rejudge_denied;
+        json!({"since_start": n, "last_ts": last})
     }
 }
 
@@ -548,7 +620,11 @@ fn no_opinion() -> Resp {
 }
 
 fn deny(why: CosignDeny) -> Resp {
-    let mut r = Response::new(Full::new(Bytes::from(deny_body(why))));
+    deny_with(deny_body(why))
+}
+
+fn deny_with(body: String) -> Resp {
+    let mut r = Response::new(Full::new(Bytes::from(body)));
     r.headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     r.headers_mut()
@@ -779,6 +855,9 @@ struct Call {
     key: HookKey,
     tool: Option<String>,
     input: String,
+    /// A shell call's command, as the hook hashes it for a grant
+    /// (`raw_sha256`).
+    command: Option<String>,
 }
 
 /// The one parse of a body.
@@ -790,12 +869,17 @@ fn parse(body: &[u8]) -> Result<Call, CosignDeny> {
         .find_map(|f| v.get(f).and_then(Value::as_str))
         .filter(|t| !t.is_empty())
         .map(str::to_string);
-    let input = match classify_value(&v, Some("claude"), cfg!(windows)) {
-        Ok(ToolCall::Shell { command, .. }) => command,
-        Ok(ToolCall::File { paths, .. }) => paths.join(" "),
-        Ok(ToolCall::Other { .. }) | Err(_) => String::new(),
+    let (input, command) = match classify_value(&v, Some("claude"), cfg!(windows)) {
+        Ok(ToolCall::Shell { command, .. }) => (command.clone(), Some(command)),
+        Ok(ToolCall::File { paths, .. }) => (paths.join(" "), None),
+        Ok(ToolCall::Other { .. }) | Err(_) => (String::new(), None),
     };
-    Ok(Call { key, tool, input })
+    Ok(Call {
+        key,
+        tool,
+        input,
+        command,
+    })
 }
 
 /// The answer for a request body that arrived at `arrival`. The body is
@@ -808,16 +892,28 @@ async fn judge_body(
     body: Bytes,
     who: &Asker,
 ) -> Resp {
-    let call = match tokio::task::spawn_blocking(move || parse(&body)).await {
+    let parsed = body.clone();
+    let call = match tokio::task::spawn_blocking(move || parse(&parsed)).await {
         Ok(Ok(c)) => c,
         Ok(Err(why)) => return denied(ctx, why, who, None).await,
         Err(_) => return denied(ctx, CosignDeny::BadJson, who, None).await,
     };
-    judge(ctx, opts, arrival, &call, who).await
+    judge(ctx, opts, arrival, &call, body, who).await
 }
 
-/// The answer for `call`, asked by `who`.
-async fn judge(ctx: &Arc<Ctx>, opts: Opts, arrival: Instant, call: &Call, who: &Asker) -> Resp {
+/// The answer for `call` (whose body is `body`), asked by `who`. Both
+/// must agree (plan 21): the hook's recorded verdict, and the service's
+/// own judgment of `body`. Where the asker's principal is known (Linux,
+/// macOS) that judgment starts at once, beside the wait; elsewhere it
+/// starts once the wait names the binder.
+async fn judge(
+    ctx: &Arc<Ctx>,
+    opts: Opts,
+    arrival: Instant,
+    call: &Call,
+    body: Bytes,
+    who: &Asker,
+) -> Resp {
     if !call.key.cosignable() {
         return denied(ctx, CosignDeny::NotCosignable, who, Some(call)).await;
     }
@@ -827,17 +923,119 @@ async fn judge(ctx: &Arc<Ctx>, opts: Opts, arrival: Instant, call: &Call, who: &
         Asker::Unscoped => (None, None),
         Asker::Unknown => return denied(ctx, CosignDeny::NoReport, who, Some(call)).await,
     };
-    match ctx
-        .hooks
-        .wait(&call.key, principal, asker_pid, arrival + opts.wait)
-        .await
-    {
-        Waited::Allow => no_opinion(),
-        // The guard record says why.
-        Waited::Deny => deny(CosignDeny::Denied),
-        Waited::NoVerdict => denied(ctx, CosignDeny::NoVerdict, who, Some(call)).await,
+    let until = arrival + opts.wait;
+    let early =
+        principal.map(|p| Rejudging::start(ctx, body.clone(), p.clone(), Vec::new(), until));
+    let bound = match ctx.hooks.wait(&call.key, principal, asker_pid, until).await {
+        Waited::Allow(b) => b,
+        // The guard record says why. A judgment still running is dropped.
+        Waited::Deny => return deny(CosignDeny::Denied),
+        Waited::NoVerdict => return denied(ctx, CosignDeny::NoVerdict, who, Some(call)).await,
         Waited::Timeout | Waited::Foreign => {
-            denied(ctx, CosignDeny::NoReport, who, Some(call)).await
+            return denied(ctx, CosignDeny::NoReport, who, Some(call)).await
+        }
+    };
+    let rejudging = match early {
+        Some(r) => r,
+        None => Rejudging::start(
+            ctx,
+            body,
+            bound.principal.clone(),
+            bound.groups.clone(),
+            until,
+        ),
+    };
+    match rejudging.answer().await {
+        RejudgeAnswer::Allow => no_opinion(),
+        RejudgeAnswer::Deny { askable: true, .. } if granted(&bound, call) => no_opinion(),
+        RejudgeAnswer::Deny {
+            reason,
+            pack,
+            rule,
+            input,
+            ..
+        } => {
+            let d = Disagreed {
+                reason: &reason,
+                pack: pack.as_deref(),
+                rule: rule.as_deref(),
+                input: &input,
+            };
+            rejudge_denied(ctx, &bound, call, d).await;
+            deny_with(rejudged_body(&reason))
+        }
+        RejudgeAnswer::Failed(e) => {
+            record_as(ctx, CosignDeny::RejudgeFailed, who, Some(call), Some(&e)).await;
+            deny(CosignDeny::RejudgeFailed)
+        }
+    }
+}
+
+/// Whether the binding connection used up a grant for exactly this call's
+/// command (`grant.consume`'s `raw_sha256`): only that lets an `ask` deny
+/// of the service pass.
+fn granted(bound: &Bound, call: &Call) -> bool {
+    use sha2::{Digest, Sha256};
+    let (Some(grant), Some(command)) = (&bound.grant_sha256, &call.command) else {
+        return false;
+    };
+    let mine = crate::grants::hex(&Sha256::digest(command.as_bytes()).into());
+    grant.eq_ignore_ascii_case(&mine)
+}
+
+/// The service's own judgment of one call, on a blocking thread.
+enum Rejudging {
+    Running {
+        task: tokio::task::JoinHandle<RejudgeAnswer>,
+        deadline: Instant,
+    },
+    /// No pool: nothing to run.
+    Done(RejudgeAnswer),
+}
+
+impl Rejudging {
+    /// Start judging `body` as `principal`; it must answer by `until` (the
+    /// co-sign wait) and within [`REJUDGE_TIMEOUT`] from now.
+    fn start(
+        ctx: &Ctx,
+        body: Bytes,
+        principal: Principal,
+        groups: Vec<String>,
+        until: Instant,
+    ) -> Rejudging {
+        let pool = ctx
+            .cosign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rejudge
+            .clone();
+        let Some(pool) = pool else {
+            return Rejudging::Done(RejudgeAnswer::Failed(NO_REJUDGE.into()));
+        };
+        let deadline = until.min(Instant::now() + REJUDGE_TIMEOUT);
+        let req = RejudgeRequest {
+            payload: body,
+            principal,
+            groups,
+            deadline: deadline.into_std(),
+        };
+        Rejudging::Running {
+            task: tokio::task::spawn_blocking(move || pool.judge(req)),
+            deadline,
+        }
+    }
+
+    /// The answer, or `Failed` past the deadline or on a panic.
+    async fn answer(self) -> RejudgeAnswer {
+        match self {
+            Rejudging::Done(a) => a,
+            Rejudging::Running { task, deadline } => {
+                match tokio::time::timeout_at(deadline, task).await {
+                    Ok(Ok(a)) => a,
+                    Ok(Err(_)) => RejudgeAnswer::Failed("the re-judge panicked".into()),
+                    Err(_) => RejudgeAnswer::Failed("the re-judge timed out".into()),
+                }
+            }
         }
     }
 }
@@ -873,6 +1071,84 @@ async fn denied(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call
     deny(why)
 }
 
+/// What the service's own judgment said of a call the hook allowed.
+struct Disagreed<'a> {
+    reason: &'a str,
+    pack: Option<&'a str>,
+    rule: Option<&'a str>,
+    input: &'a str,
+}
+
+/// The `rejudge_denied` record of a call the hook allowed and the
+/// service's own judgment denied: one per call, never folded (owner
+/// ruling 4), unless the audit volume is below its floor. It is counted
+/// in `status.hooks_rejudge_denied` either way.
+async fn rejudge_denied(ctx: &Arc<Ctx>, bound: &Bound, call: &Call, d: Disagreed<'_>) {
+    let ts = crate::ops::now_ts();
+    {
+        let mut st = ctx.cosign.lock().unwrap_or_else(|p| p.into_inner());
+        st.rejudge_denied.0 += 1;
+        st.rejudge_denied.1 = Some(ts.clone());
+    }
+    let p = ctx.policy();
+    let free = crate::disk::free_mb(&ctx.audit_dir).unwrap_or(0);
+    if crate::disk::disk_gate(free, p.min_free_mb, false).is_err() {
+        return;
+    }
+    let session = call
+        .key
+        .session
+        .as_deref()
+        .map(|s| capped(s, MAX_RECORDED_SESSION));
+    let tool = call
+        .tool
+        .as_deref()
+        .map(|t| capped(t, MAX_RECORDED_TOOL))
+        .unwrap_or_default();
+    let input = if d.input.is_empty() {
+        call.input.as_str()
+    } else {
+        d.input
+    };
+    let mut r = Record::new(
+        NewRecord {
+            agent: "claude",
+            project: "",
+            session: session.as_deref(),
+            tool: &tool,
+            input,
+            decision: DecisionKind::Deny,
+            pack: d.pack,
+            rule: d.rule,
+            reason: Some(d.reason),
+            mode: ctx.mode.as_str(),
+            policy: p.hash.as_deref(),
+            permission_mode: None,
+        },
+        VERSION,
+    );
+    r.ts = ts;
+    r.kind = Some("hook".into());
+    match &bound.principal {
+        Principal::Uid(u) => r.uid = Some(*u),
+        Principal::Sid(s) => r.sid = Some(s.clone()),
+    }
+    let x = &mut r.extra;
+    x.insert("event".into(), "rejudge_denied".into());
+    x.insert("hook_pid".into(), bound.pid.into());
+    x.insert(
+        "tool_use_id".into(),
+        json!(call
+            .key
+            .tool_use_id
+            .as_deref()
+            .map(crate::hooks::recorded_id)),
+    );
+    if let Err(e) = ctx.writer.append(r).await {
+        eprintln!("saiife: warning: cannot write a rejudge_denied record: {e}");
+    }
+}
+
 /// `s` masked and cut to at most `max` bytes on a character boundary.
 fn capped(s: &str, max: usize) -> String {
     saiife_audit::mask::mask_cut(s, max)
@@ -884,6 +1160,18 @@ fn capped(s: &str, max: usize) -> String {
 /// they are kept only when the asker is identified, and every string is
 /// capped as `hook.bind` caps it.
 async fn record(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call>) {
+    record_as(ctx, why, who, call, None).await
+}
+
+/// [`record`], and for [`CosignDeny::RejudgeFailed`] a `rejudge_failed`
+/// record (folded the same way) whose `error` says what failed.
+async fn record_as(
+    ctx: &Arc<Ctx>,
+    why: CosignDeny,
+    who: &Asker,
+    call: Option<&Call>,
+    error: Option<&str>,
+) {
     let session = call
         .and_then(|c| c.key.session.as_deref())
         .map(|s| capped(s, MAX_RECORDED_SESSION));
@@ -934,7 +1222,14 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call
     );
     r.kind = Some("hook".into());
     let x = &mut r.extra;
-    x.insert("event".into(), "cosign_denied".into());
+    let event = match why {
+        CosignDeny::RejudgeFailed => "rejudge_failed",
+        _ => "cosign_denied",
+    };
+    x.insert("event".into(), event.into());
+    if let Some(e) = error {
+        x.insert("error".into(), capped(e, MAX_RECORDED_ERROR).into());
+    }
     // The call by its id only: no hash of the input (see `hooks::Verdict`).
     x.insert(
         "tool_use_id".into(),
@@ -950,7 +1245,7 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call
         x.insert("suppressed".into(), suppressed.into());
     }
     if let Err(e) = ctx.writer.append(r).await {
-        eprintln!("saiife: warning: cannot write a cosign_denied record: {e}");
+        eprintln!("saiife: warning: cannot write a {event} record: {e}");
     }
 }
 
@@ -971,11 +1266,34 @@ mod tests {
             CosignDeny::NotCosignable,
             CosignDeny::TooLarge,
             CosignDeny::BadJson,
+            CosignDeny::Rejudged,
+            CosignDeny::RejudgeFailed,
         ] {
             let v: serde_json::Value = serde_json::from_str(&deny_body(d)).unwrap();
             assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
             assert!(!d.text().contains('"') && !d.text().contains('\\'));
         }
+        assert_eq!(
+            deny_body(CosignDeny::RejudgeFailed),
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"saiife: BLOCKED (fail closed): the saiife service could not judge this call"}}"#
+        );
+    }
+
+    /// The guard's reason, escaped and cut to 200 characters.
+    #[test]
+    fn rejudged_body_carries_the_reason() {
+        let b = rejudged_body(r#"a "quoted" \ reason"#);
+        assert_eq!(
+            b,
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"saiife: BLOCKED (fail closed): the saiife service's own judgment denies this call: a \"quoted\" \\ reason"}}"#
+        );
+        let long = "é".repeat(300);
+        let v: Value = serde_json::from_str(&rejudged_body(&long)).unwrap();
+        let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(why.ends_with(&"é".repeat(MAX_REJUDGED_REASON)));
+        assert!(!why.ends_with(&"é".repeat(MAX_REJUDGED_REASON + 1)));
     }
 
     #[test]
@@ -1414,6 +1732,11 @@ mod tests {
         assert_eq!(wait_records(t.path(), 5).len(), 5);
     }
 
+    #[cfg(unix)]
+    const BINDER_SID: &str = "S-1-5-21-1-2-3-1001";
+    #[cfg(unix)]
+    const BINDER_GROUP: &str = "S-1-5-32-545";
+
     /// A hook connection of `pid`, as a Windows pipe client: begins, binds
     /// `body`'s key and records `decision`.
     #[cfg(unix)]
@@ -1423,8 +1746,8 @@ mod tests {
             uid: 4242,
             gid: 4242,
             pid,
-            sid: Some("S-1-5-21-1-2-3-1001".into()),
-            group_sids: Vec::new(),
+            sid: Some(BINDER_SID.into()),
+            group_sids: vec![BINDER_GROUP.into()],
         };
         let key = parse(body.as_bytes()).unwrap().key;
         assert!(ctx
@@ -1495,6 +1818,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
         ctx.hooks.set_tree(fake_tree());
+        let asked = allow_all(&ctx);
         let allowed = payload("toolu_1", "ls");
         hook_says(&ctx, 1, 777, &allowed, DecisionKind::Allow);
         // Claude Code, 2 steps up; its parent, 3 steps up (the depth cap).
@@ -1523,6 +1847,65 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         hook_says(&ctx, 3, 777, &later, DecisionKind::Allow);
         assert_eq!(w.await.unwrap(), "");
+        // A pid asker is judged once the wait names the binder, as the
+        // binder's SID and groups; the hook's deny needs no judgment.
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 3);
+        for req in asked.iter() {
+            assert_eq!(req.principal, Principal::Sid(BINDER_SID.into()));
+            assert_eq!(req.groups, [BINDER_GROUP]);
+        }
+    }
+
+    /// A re-judge that allows every call, keeping what it was asked.
+    #[cfg(unix)]
+    fn allow_all(ctx: &Ctx) -> Arc<Mutex<Vec<RejudgeRequest>>> {
+        let asked: Arc<Mutex<Vec<RejudgeRequest>>> = Arc::default();
+        let a = Arc::clone(&asked);
+        ctx.cosign.lock().unwrap().rejudge = Some(Arc::new(move |req: RejudgeRequest| {
+            a.lock().unwrap().push(req);
+            RejudgeAnswer::Allow
+        }));
+        asked
+    }
+
+    /// Windows: a forged allow under the asker is still judged, as the
+    /// binder, and denied; its record names the binder's SID and pid.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn pid_asker_forged_allow_is_rejudged_as_the_binder() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        ctx.hooks.set_tree(fake_tree());
+        ctx.cosign.lock().unwrap().rejudge =
+            Some(Arc::new(|_: RejudgeRequest| RejudgeAnswer::Deny {
+                reason: "reads a secret".into(),
+                pack: Some("core.secrets".into()),
+                rule: Some("ssh-key".into()),
+                input: "type secrets.env".into(),
+                askable: false,
+            }));
+        let body = payload("toolu_1", "type secrets.env");
+        hook_says(&ctx, 1, 777, &body, DecisionKind::Allow);
+        let r = ask(&ctx, Instant::now(), body, &Asker::Process(100)).await;
+        assert_eq!(body_of(r).await, rejudged_body("reads a secret"));
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            let got: Vec<Record> = saiife_audit::store::read_all(&t.path().join("audit"))
+                .records
+                .into_iter()
+                .filter(|r| r.extra.get("event").and_then(Value::as_str) == Some("rejudge_denied"))
+                .collect();
+            if !got.is_empty() || std::time::Instant::now() > end {
+                break got;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].sid.as_deref(), Some(BINDER_SID));
+        assert_eq!(got[0].uid, None);
+        assert_eq!(got[0].extra["hook_pid"], 777);
+        assert_eq!(got[0].pack.as_deref(), Some("core.secrets"));
     }
 
     /// Security review of task 4, finding 2: a pid asker (Windows) folds

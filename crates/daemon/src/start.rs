@@ -747,8 +747,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         directory,
         credentials_dir,
         mode: daemon_mode,
-        // The co-signer takes it once it re-judges (plan 21, Task 3).
-        rejudge: _rejudge,
+        rejudge,
         #[cfg(windows)]
         test_pipe,
     } = opts;
@@ -1076,6 +1075,11 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
+    // The service's own judgment of each co-signed call (plan 21), for the
+    // system daemon only: the personal broker has no co-signer.
+    if ctx.mode == Mode::Locked {
+        ctx.cosign.lock().unwrap_or_else(|p| p.into_inner()).rejudge = rejudge;
+    }
 
     // The forwarding workers start in `serve`, after the start records.
     {

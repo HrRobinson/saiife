@@ -332,8 +332,18 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_APPROVAL_SHOW => show(ctx, &conn.peer, req).await,
         OP_APPROVAL_DECIDE => decide(ctx, conn, req).await,
         OP_GRANT_CONSUME => {
+            let raw_sha256 = req
+                .args
+                .get("raw_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let (v, granted) = grant_consume(ctx, &conn.peer, req).await;
             conn.steps().granted = granted;
+            // The co-signer lets the service's `ask` deny pass only for the
+            // command this connection's grant was for (plan 21).
+            if let (Some(_), Some(sha)) = (granted, raw_sha256) {
+                ctx.hooks.granted(conn.id, &sha);
+            }
             v
         }
         OP_APPROVAL_CREATE => {
