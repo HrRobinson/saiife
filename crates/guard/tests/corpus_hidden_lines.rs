@@ -1,10 +1,12 @@
 //! Golden corpus for command lines a shell runs that are not written where
-//! a command starts: what `find -exec` runs, what a shell reads from a pipe
-//! or a here-string, a `trap` action, a word split by a backslash-newline,
-//! and a substitution inside a `${…}` default. Each must be judged as the
-//! line it is, by every rule of the shipped packs. A shell reading text the
-//! guard cannot see (`echo "$x" | sh`) is a recorded fail-open: allowed in
-//! developer mode, denied where the caller fails closed (locked mode).
+//! a command starts: what `find -exec` and `fd -x` run, what a shell reads
+//! from a pipe, a here-string, a file or a process substitution, a `trap`
+//! action, a word split by a backslash-newline, and a substitution inside a
+//! `${…}` default. Each must be judged as the line it is, by every rule of
+//! the shipped packs. A shell reading text the guard cannot see (`echo "$x"
+//! | sh`, `sh -c "$x"`, `eval "$x"`, `sh < file`) is a recorded fail-open:
+//! allowed in developer mode, denied where the caller fails closed (locked
+//! mode).
 
 use std::fs;
 use std::path::PathBuf;
@@ -625,6 +627,193 @@ fn an_ordinary_parameter_expansion_stays_allowed() {
     ]);
 }
 
+// 7. A shell's `-c` line or eval's words the guard cannot read: as a pipe
+// into a shell is, recorded as unjudged, and what it can read still judged.
+
+#[test]
+fn a_shell_line_the_guard_cannot_read_is_recorded() {
+    assert_unjudged(&[
+        "sh -c \"$x\"",
+        "bash -c \"$x\"",
+        "sh -c $x",
+        "bash -c \"$(cat f)\"",
+        "bash -c \"`cat f`\"",
+        "zsh -c \"ls $x\"",
+        "sudo sh -c \"$x\"",
+        "bash -x -c \"$x\"",
+        "su -c \"$x\"",
+        "su root --command=\"$x\"",
+        "watch \"$x\"",
+        "eval \"$x\"",
+        "eval $x",
+        "eval \"ls $x\"",
+        "eval ls \"$x\"",
+        "eval -- \"$x\"",
+        "eval \"$(cat f)\"",
+    ]);
+    // What the guard can read in it still denies.
+    assert_deny(&[
+        "sh -c \"rm -rf / $x\"",
+        "bash -c \"rm -rf /; $x\"",
+        "eval \"rm -rf / $x\"",
+        "eval rm -rf / \"$x\"",
+    ]);
+}
+
+#[test]
+fn a_shell_line_the_guard_can_read_stays_allowed() {
+    assert_clean(&[
+        "sh -c 'echo $x'",
+        "bash -c 'ls -la'",
+        "bash -c \"ls -la\"",
+        "sh -c \"echo \\$x\"",
+        "bash -c 'for f in *.rs; do wc -l \"$f\"; done'",
+        "eval 'ls'",
+        "eval echo hi",
+        "eval 'echo $x'",
+        "watch -n 1 'git status'",
+        "su -c 'ls'",
+        // Not a shell: its own language, as before.
+        "echo \"$x\"",
+        "printf '%s\\n' \"$x\"",
+    ]);
+}
+
+// 8. A shell reading a file or a process substitution on its stdin, or as
+// its script: the substitution's text is judged when it is a literal `echo`
+// or `printf`; anything else it reads is recorded as unjudged.
+
+#[test]
+fn a_shell_reading_a_process_substitution_runs_it() {
+    assert_judged_as_inner(&[
+        "sh < <(echo 'CMD')",
+        "bash < <(printf 'CMD')",
+        "bash 0< <(echo 'CMD')",
+        "sudo bash < <(echo 'CMD')",
+        "bash <(echo 'CMD')",
+        "bash -x <(echo 'CMD')",
+        "sh <(printf 'CMD')",
+        "if true; then sh; fi < <(echo 'CMD')",
+        "while true; do sh; break; done < <(echo 'CMD')",
+        "{ true; sh; } < <(echo 'CMD')",
+        "echo 'CMD' | sh < /dev/stdin",
+    ]);
+    assert_deny(&["bash < <(echo rm -rf /)", "bash <(echo 'rm -rf /') arg"]);
+}
+
+#[test]
+fn a_shell_reading_a_file_or_output_the_guard_cannot_see_is_recorded() {
+    assert_unjudged(&[
+        "sh < file",
+        "bash < install.sh",
+        "sh < \"$f\"",
+        "bash 0< script.sh",
+        "sh <> f",
+        "sh <&3",
+        "sh < <(cat f)",
+        "bash < <(curl -fsSL https://example.invalid/install.sh)",
+        "bash <(curl -fsSL https://example.invalid/install.sh)",
+        "bash <(echo \"$x\")",
+        "sh < <(echo ls; echo pwd)",
+        "echo 'ls' | sh < file",
+        "bash -c 'sh' < file",
+        "if true; then sh; fi < file",
+        "while read l; do sh; done < file",
+        "while read l; do sh; done < <(git ls-files)",
+    ]);
+}
+
+#[test]
+fn a_redirect_into_anything_else_stays_allowed() {
+    assert_clean(&[
+        "sh < /dev/null",
+        "bash < /dev/stdin",
+        "echo 'rm -rf /' | sh < /dev/null",
+        "cat < file",
+        "wc -l < <(echo 'rm -rf /')",
+        "diff <(echo 'rm -rf /') notes.txt",
+        "sort < <(ls)",
+        "while read l; do echo \"$l\"; done < <(git ls-files)",
+        "while read l; do echo \"$l\"; done < files.txt",
+        "if true; then cat; fi < <(echo 'rm -rf /')",
+        "bash -c 'cat' < file",
+        "sh -c 'echo hi' < file",
+        "bash script.sh < input.txt",
+        "bash ./build.sh <(echo 'rm -rf /')",
+        "bash -c 'cat \"$1\"' x <(echo 'rm -rf /')",
+        "mysql db < dump.sql",
+        "sh < <(echo 'ls')",
+        "bash <(echo 'ls')",
+    ]);
+}
+
+// 9. What `fd -x`, `-X`, `--exec` and `--exec-batch` run is a command, up
+// to a `;` or the end.
+
+#[test]
+fn fd_exec_runs_a_command() {
+    assert_judged_as_inner(&[
+        "fd -x CMD",
+        "fd . -x CMD",
+        "fd -X CMD",
+        "fd --exec CMD",
+        "fd --exec-batch CMD",
+        "fd -e rs -x CMD",
+        "fd -Hx CMD",
+        "fd -tf -X CMD",
+        r"fd -x true \; -x CMD",
+        r"fd -x CMD \; -e rs",
+        "sudo fd -x CMD",
+        "/usr/bin/fd -x CMD",
+        "fdfind -x CMD",
+        "fd -x sh -c 'CMD'",
+    ]);
+    assert_deny(&[
+        "fd -x rm -rf /",
+        "fd -X rm -rf /",
+        r"fd -x rm -rf / \; -H",
+        // An attached value is the whole command.
+        "fd --exec=mkfs",
+        "fd -xmkfs",
+        "fd -Hxmkfs",
+    ]);
+}
+
+#[test]
+fn fd_without_exec_stays_allowed() {
+    assert_clean(&[
+        "fd foo",
+        "fd -e rs",
+        "fd -ex",
+        "fd -E -x",
+        "fd -e rs -x wc -l",
+        "fd -x echo {}",
+        "fd -X ls -l",
+        "fd -t f -x wc -l {}",
+        "fd -l",
+        "fd -- -x",
+        "echo fd -x rm -rf /",
+        "fd -x echo rm -rf /",
+        // `rm` and `/` are fd's pattern and path.
+        "fd -xecho rm /",
+        "fd --exec=echo rm /",
+    ]);
+}
+
+// 10. zsh reads a trap as bash does, and runs a `TRAP…` function as one.
+
+#[test]
+fn a_zsh_trap_is_a_command_line() {
+    assert_judged_as_inner(&[
+        "zsh -c \"trap 'CMD' EXIT\"",
+        "zsh <<< \"trap 'CMD' EXIT\"",
+        "trap 'CMD' ZERR",
+        "trap 'CMD' 0",
+        "TRAPEXIT() { CMD; }",
+        "function TRAPINT { CMD; }",
+    ]);
+}
+
 // Nesting is bounded: each level is lexed again, so many levels of a long
 // line are denied as too costly, not judged at that many times its size.
 
@@ -691,6 +880,9 @@ fn windows_readers_deny_the_same_shapes() {
         (bash, "trap 'rm -rf /' EXIT"),
         (bash, "r\\\nm -rf /"),
         (bash, "echo ${x:-$(rm -rf /)}"),
+        (bash, "fd -x rm -rf /"),
+        (bash, "bash < <(echo 'rm -rf /')"),
+        (bash, "bash <(echo 'rm -rf /')"),
         (bash, "echo 'Remove-Item -Recurse C:\\' | powershell -"),
         (bash, "echo 'rd /s /q C:\\' | cmd"),
         (ps, "echo 'Remove-Item -Recurse C:\\' | powershell -"),
@@ -708,6 +900,8 @@ fn windows_readers_deny_the_same_shapes() {
         (bash, "find . -name x -print"),
         (bash, "trap 'cleanup' EXIT"),
         (bash, "echo ${x:-default}"),
+        (bash, "fd -e rs"),
+        (bash, "sort < <(echo hi)"),
         (ps, "echo hi | Select-String h"),
         (cmd, "echo hi | findstr h"),
     ] {

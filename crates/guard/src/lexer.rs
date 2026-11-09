@@ -193,7 +193,7 @@ fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>
 }
 
 mod hidden;
-pub(crate) use hidden::{fed_script_in, fed_script_may_be_stdin, PathKind};
+pub(crate) use hidden::{fed_script_in, fed_script_may_be_stdin, readable, PathKind};
 pub use hidden::{HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT};
 
 /// Shell keywords that only ever *introduce* a real command inside a
@@ -290,6 +290,9 @@ pub enum Operator {
     Amp,
     Newline,
     LParen,
+    /// The `<(` of a process substitution: what its command prints is read
+    /// from a file of that name.
+    ProcIn,
     RParen,
     LBrace,
     RBrace,
@@ -777,7 +780,11 @@ impl Lexer<'_, '_> {
             self.flush_word();
             self.chars.next();
             self.parens += 1;
-            self.toks.push(LexTok::Operator(Operator::LParen));
+            self.toks.push(LexTok::Operator(if c == '<' {
+                Operator::ProcIn
+            } else {
+                Operator::LParen
+            }));
         } else {
             // A word of bare digits right before the operator is its
             // descriptor (`2>f`); anything else ends the word (`x>f`).

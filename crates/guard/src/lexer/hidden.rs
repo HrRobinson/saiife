@@ -1,14 +1,18 @@
 //! Command lines a segment runs that are not where a command starts: what
-//! `find -exec` runs, what a shell reads from a pipe or a here-string, and a
-//! `trap` action. Each becomes segments of its own, after the segment that
-//! runs it, so every rule judges it, as the body of `bash <<EOF` already is.
-//! A pipe feeds every command of a group it feeds (`| { true; sh; }`), the
-//! commands of a `-c` line (`| bash -c 'sh'`) and what find runs; a shell
-//! reads it as its script with no command, with `-s`, or given a path to
-//! its stdin (`bash /dev/stdin`).
-//! Text a shell runs that the guard cannot read (`echo "$x" | sh`, `curl … |
-//! sh`) is noted (`UNREAD_SCRIPT`): a recorded fail-open, which a caller that
-//! fails closed denies. Literal text is still judged.
+//! `find -exec` and `fd -x` run, what a shell reads from a pipe, a
+//! here-string, a file or a process substitution (`sh < <(…)`,
+//! `bash <(…)`), and a `trap` action. Each becomes segments of its own,
+//! after the segment that runs it, so every rule judges it, as the body of
+//! `bash <<EOF` already is. A pipe feeds every command of a group it feeds
+//! (`| { true; sh; }`), the commands of a `-c` line (`| bash -c 'sh'`) and
+//! what find and fd run; a shell reads it as its script with no command,
+//! with `-s`, or given a path to its stdin (`bash /dev/stdin`). A
+//! redirection of a segment's stdin replaces the pipe, and one of a block's
+//! (`done < f`) feeds every command of it.
+//! Text a shell runs that the guard cannot read (`echo "$x" | sh`,
+//! `curl … | sh`, `sh < file`, `bash <(curl …)`) is noted (`UNREAD_SCRIPT`):
+//! a recorded fail-open, which a caller that fails closed denies. Literal
+//! text is still judged.
 //!
 //! The gates are a pass over each segment's words, with no allocation; the
 //! rest runs only for a segment that has one of these shapes.
@@ -61,8 +65,29 @@ enum Source {
     Segment(usize),
     /// A here-string's text, and whether the guard can read it.
     Text(String, bool),
-    /// Something else writes it: a group, a compound command, a pipeline.
+    /// Something else writes it: a group, a compound command, a pipeline,
+    /// a file.
     Unknown,
+}
+
+/// What reads a process substitution's output (`<(…)`), waiting for its
+/// `)`: what the substitution prints is known only then.
+enum ProcReader {
+    /// A shell, on its stdin (`sh < <(…)`) or as its script (`bash <(…)`):
+    /// the segment, finished at the `)` with the output as its stdin.
+    Shell(Segment),
+    /// A compound command or a group, on its stdin (`done < <(…)`): its
+    /// closing segment's index, and where its line's segments start.
+    Block { first: usize, at: usize },
+}
+
+/// A process substitution being read, until its `)`.
+struct Proc {
+    reader: ProcReader,
+    /// The parentheses open around it.
+    level: usize,
+    /// Nothing but one simple command in it so far.
+    simple: bool,
 }
 
 /// What opened a frame: a group or a compound command a pipe or a
@@ -211,6 +236,10 @@ impl Out {
         // The unquoted openers and closers of blocks seen so far, wherever
         // they stand: a frame closes only if they balance since it opened.
         let mut seen = (0usize, 0usize);
+        // Process substitutions being read, innermost last, and the
+        // parentheses open, theirs counted.
+        let mut procs: Vec<Proc> = Vec::new();
+        let mut parens = 0usize;
         for tok in toks {
             match tok {
                 LexTok::Word(w) => {
@@ -259,18 +288,64 @@ impl Out {
                         || current.first().is_some_and(|w| {
                             !w.quoted && matches!(w.text.as_str(), "fi" | "done" | "esac")
                         });
-                    let source = ended.then(|| {
-                        let seg = std::mem::take(&mut current);
-                        // `fi <<< 'x'`, `} <<< 'x'`: the compound command
-                        // before reads the here-string.
-                        let at = self.finish(seg, fed.take(), ctx, depth, false);
-                        if closes {
-                            self.compound_here_string(first, at, ctx, depth);
+                    // Any operator but its own `)` makes a process
+                    // substitution more than one simple command.
+                    if let Some(p) = procs.last_mut() {
+                        p.simple &= op == Operator::RParen && parens == p.level + 1;
+                    }
+                    // A shell that reads the process substitution this
+                    // opens is finished at its `)`, reading what it prints.
+                    let shell_reads =
+                        op == Operator::ProcIn && ended && !closes && reads_proc(&current);
+                    let source = if shell_reads {
+                        procs.push(Proc {
+                            reader: ProcReader::Shell(std::mem::take(&mut current)),
+                            level: parens,
+                            simple: true,
+                        });
+                        fed = None;
+                        None
+                    } else {
+                        ended.then(|| {
+                            let seg = std::mem::take(&mut current);
+                            // `fi <<< 'x'`, `} < f`: the compound command
+                            // before reads it.
+                            let at = self.finish(seg, fed.take(), ctx, depth, false);
+                            if closes {
+                                self.compound_stdin(first, at, ctx, depth);
+                            }
+                            at
+                        })
+                    };
+                    // `done < <(…)`: the block before reads it.
+                    if let (Operator::ProcIn, true, Some(at)) = (op, closes, source) {
+                        if self.segments[at]
+                            .last()
+                            .is_some_and(redirects_stdin_from_file)
+                        {
+                            procs.push(Proc {
+                                reader: ProcReader::Block { first, at },
+                                level: parens,
+                                simple: true,
+                            });
                         }
-                        at
-                    });
+                    }
                     match op {
-                        Operator::LParen | Operator::LBrace => {
+                        Operator::LParen | Operator::ProcIn => parens += 1,
+                        Operator::RParen => {
+                            parens = parens.saturating_sub(1);
+                            if let Some(p) = procs.pop_if(|p| p.level == parens) {
+                                let src = match source {
+                                    Some(at) if p.simple => Source::Segment(at),
+                                    _ => Source::Unknown,
+                                };
+                                self.read_proc(p.reader, src, ctx, depth);
+                            }
+                        }
+                        _ => {}
+                    }
+                    match op {
+                        Operator::LParen | Operator::LBrace | Operator::ProcIn => {
                             seen.0 += 1;
                             let feeds = pipe
                                 .take()
@@ -278,10 +353,10 @@ impl Out {
                                 .or_else(|| groups.last().map(|g| g.source.clone()));
                             if let Some(source) = feeds {
                                 groups.push(Group {
-                                    open: if op == Operator::LParen {
-                                        Opener::Paren
-                                    } else {
+                                    open: if op == Operator::LBrace {
                                         Opener::Brace
+                                    } else {
+                                        Opener::Paren
                                     },
                                     source,
                                     start: self.segments.len(),
@@ -316,8 +391,13 @@ impl Out {
                 });
             let at = self.finish(current, fed, ctx, depth, false);
             if closes {
-                self.compound_here_string(first, at, ctx, depth);
+                self.compound_stdin(first, at, ctx, depth);
             }
+        }
+        // A process substitution that never closed: what it prints is not
+        // known.
+        while let Some(p) = procs.pop() {
+            self.read_proc(p.reader, Source::Unknown, ctx, depth);
         }
         // A frame that never closed (an unbalanced block, or one a closer
         // could not end because its openers and closers did not balance):
@@ -335,37 +415,61 @@ impl Out {
     }
 
     /// The segment at `at` ends a compound command or a group (`fi`, `done`,
-    /// `esac`, after `)` or `}`) and may hold a here-string, which every
-    /// command of it reads. When a shell that reads stdin is among the
-    /// segments of this line since `first`, the here-string is judged as its
-    /// script (an over-approximation: the block's own start is not tracked
-    /// outside a pipe).
-    fn compound_here_string(&mut self, first: usize, at: usize, ctx: &mut Ctx, depth: usize) {
-        let Some(i) = self.segments[at]
+    /// `esac`, after `)` or `}`) and may redirect its stdin, which every
+    /// command of it reads: a here-string, or a file. When a shell that
+    /// reads stdin is among the segments of this line since `first`, the
+    /// here-string is judged as its script, and a file is not read (an
+    /// over-approximation: the block's own start is not tracked outside a
+    /// pipe).
+    fn compound_stdin(&mut self, first: usize, at: usize, ctx: &mut Ctx, depth: usize) {
+        let seg = &self.segments[at];
+        let Some(i) = seg
             .iter()
-            .position(|w| w.redirect && w.text.ends_with("<<<"))
+            .rposition(|w| w.redirect && stdin_op(&w.text).is_some())
         else {
             return;
         };
-        let Some((text, readable)) = self.segments[at]
-            .get(i + 1)
-            .map(|w| (w.text.clone(), readable(w)))
-        else {
-            return;
-        };
+        if let Some(src) = redirected(seg, i, None) {
+            self.block_reads(first, at, src, ctx, depth);
+        }
+    }
+
+    /// The block whose closing segment is at `at` reads `src` on its stdin:
+    /// judged as a script when a shell that reads stdin is among the
+    /// segments since `first`.
+    fn block_reads(&mut self, first: usize, at: usize, src: Source, ctx: &mut Ctx, depth: usize) {
         if !spend(ctx, at - first.min(at)) {
             return;
         }
-        if !self.segments[first.min(at)..at]
+        if self.segments[first.min(at)..at]
             .iter()
             .any(|s| stdin_reader(s).is_some())
         {
-            return;
+            self.read_script(&src, ctx, depth);
         }
-        if !readable {
-            ctx.note(UNREAD_SCRIPT);
+    }
+
+    /// What `src` writes, run by a shell as its script.
+    fn read_script(&mut self, src: &Source, ctx: &mut Ctx, depth: usize) {
+        match self.text_of(src) {
+            Some((text, readable)) => {
+                if !readable {
+                    ctx.note(UNREAD_SCRIPT);
+                }
+                self.splice(&text, ctx, depth, None);
+            }
+            None => ctx.note(UNREAD_SCRIPT),
         }
-        self.splice(&text, ctx, depth, None);
+    }
+
+    /// A process substitution's `)`: `reader` reads `src`, what it prints.
+    fn read_proc(&mut self, reader: ProcReader, src: Source, ctx: &mut Ctx, depth: usize) {
+        match reader {
+            ProcReader::Shell(seg) => {
+                self.finish(seg, Some(src), ctx, depth, false);
+            }
+            ProcReader::Block { first, at } => self.block_reads(first, at, src, ctx, depth),
+        }
     }
 
     /// Add `seg`, and after it the command lines it runs. `fed`: what it
@@ -382,19 +486,21 @@ impl Out {
         let seg = strip_leading_keywords(seg);
         let at = self.segments.len();
         // The gates: one pass over the words.
-        let mut here = None;
+        let mut stdin = None;
         let mut exec = false;
+        let mut fd_exec = false;
         let mut trap = false;
         for (i, w) in seg.iter().enumerate() {
-            if w.redirect && w.text.ends_with("<<<") && here.is_none() {
-                here = Some(i + 1);
+            if w.redirect && stdin_op(&w.text).is_some() {
+                stdin = Some(i);
             }
             exec |= is_exec(w);
+            fd_exec |= is_fd_exec(w);
             trap |= w.text == "trap";
         }
-        // Its stdin: the here-string, else what fed it.
-        let source = match here.and_then(|i| seg.get(i)) {
-            Some(w) => Some(Source::Text(w.text.clone(), readable(w))),
+        // Its stdin: its last redirection of it, else what fed it.
+        let source = match stdin {
+            Some(i) => redirected(&seg, i, fed),
             None => fed,
         };
         let reader = if source.is_some() {
@@ -402,11 +508,14 @@ impl Out {
         } else {
             None
         };
-        let slices = if exec {
+        let mut slices = if exec {
             find_slices(&seg, in_find)
         } else {
             Vec::new()
         };
+        if fd_exec {
+            slices.extend(fd_slices(&seg));
+        }
         let action = if trap { trap_action(&seg) } else { None };
         let mut seg = seg;
         if let (Some(Reader::Relative(path)), Some(src), Some(first)) =
@@ -421,15 +530,7 @@ impl Out {
         }
         self.segments.push(seg);
         match (reader, &source) {
-            (Some(Reader::Script), Some(src)) => match self.text_of(src) {
-                Some((text, readable)) => {
-                    if !readable {
-                        ctx.note(UNREAD_SCRIPT);
-                    }
-                    self.splice(&text, ctx, depth, None);
-                }
-                None => ctx.note(UNREAD_SCRIPT),
-            },
+            (Some(Reader::Script), Some(src)) => self.read_script(src, ctx, depth),
             (Some(Reader::Inline(line, readable)), Some(_)) => {
                 if !readable {
                     ctx.note(UNREAD_SCRIPT);
@@ -439,7 +540,7 @@ impl Out {
             (Some(Reader::Unread), Some(_)) => ctx.note(UNREAD_SCRIPT),
             _ => {}
         }
-        // What find runs reads find's stdin.
+        // What find and fd run read their stdin.
         for slice in slices {
             if depth + 1 >= MAX_FRAME_DEPTH {
                 ctx.note(TOO_DEEP);
@@ -518,13 +619,146 @@ fn spend(ctx: &mut Ctx, bytes: usize) -> bool {
 
 /// Text the guard can read as it is: no substitution and no `$` a shell
 /// expands.
-fn readable(w: &Word) -> bool {
+pub(crate) fn readable(w: &Word) -> bool {
     !w.has_substitution && (!w.text.contains('$') || w.literal_dollars)
 }
 
 /// `find`'s actions that run a command.
 fn is_exec(w: &Word) -> bool {
     matches!(w.text.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
+}
+
+/// The operator of a redirection of stdin (no descriptor, or `0`): `<`,
+/// `<>`, `<&` or `<<<`.
+fn stdin_op(text: &str) -> Option<&str> {
+    let op = text.trim_start_matches(|c: char| c.is_ascii_digit());
+    let fd = &text[..text.len() - op.len()];
+    (fd.is_empty() || fd == "0")
+        .then_some(op)
+        .filter(|op| matches!(*op, "<" | "<>" | "<&" | "<<<"))
+}
+
+/// A `<` or `<>` of stdin from a file.
+fn redirects_stdin_from_file(w: &Word) -> bool {
+    w.redirect && matches!(stdin_op(&w.text), Some("<" | "<>"))
+}
+
+/// The stdin that `seg[i]`, a redirection of it, gives: a here-string's
+/// text; what fed the segment (`< /dev/stdin`, `<&0`, or a `<` whose target
+/// is a process substitution, which the caller passes as `fed`); nothing (a
+/// plain device, `<&-`); or a file the guard does not read.
+fn redirected(seg: &[Word], i: usize, fed: Option<Source>) -> Option<Source> {
+    let op = stdin_op(&seg[i].text)?;
+    let Some(target) = seg.get(i + 1) else {
+        return fed;
+    };
+    let plain = readable(target) && !target.glob;
+    match op {
+        "<<<" => Some(Source::Text(target.text.clone(), readable(target))),
+        "<&" if plain && target.text == "0" => fed,
+        "<&" if plain && target.text == "-" => None,
+        "<&" => Some(Source::Unknown),
+        // A file named `-` is no stdin here.
+        _ if plain && target.text != "-" => match stdin_path(&target.text) {
+            PathKind::Stdin => fed,
+            PathKind::Other if plain_device(&target.text) => None,
+            _ => Some(Source::Unknown),
+        },
+        _ => Some(Source::Unknown),
+    }
+}
+
+/// `path` is a device under `/dev/` that is no stdin (`PLAIN_DEVICES`).
+fn plain_device(path: &str) -> bool {
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    path.starts_with('/') && matches!(parts.as_slice(), ["dev", d] if PLAIN_DEVICES.contains(d))
+}
+
+/// `seg`, a POSIX shell, reads the process substitution that follows it:
+/// on its stdin (`sh <`), or as its script (`bash -x <(…)`). A `-c` line or
+/// a script it already has takes it as an argument.
+fn reads_proc(seg: &[Word]) -> bool {
+    match seg.last() {
+        Some(w) if redirects_stdin_from_file(w) => stdin_reader(seg).is_some(),
+        Some(w) if w.redirect => false,
+        _ => matches!(stdin_reader(seg), Some(Reader::Script)),
+    }
+}
+
+/// A word that may start what `fd` runs: `--exec`, `--exec-batch`, or a
+/// short-option cluster with `x` or `X`.
+fn is_fd_exec(w: &Word) -> bool {
+    let t = w.text.as_str();
+    t.starts_with("--exec")
+        || (t.starts_with('-') && !t.starts_with("--") && t.contains(['x', 'X']))
+}
+
+/// fd's short options that take a value: in a cluster, the rest is it.
+const FD_VALUE_SHORTS: &str = "dEtesocjC";
+
+/// The commands `fd -x`, `-X`, `--exec` and `--exec-batch` run, as fd 10
+/// reads them: every word after one up to a `;` (or the end) is the command,
+/// and fd's own options may follow the `;`. `-xCMD` and `--exec=CMD` run
+/// CMD alone. In a short-option cluster, an option that takes a value takes
+/// the rest (`-ex` is `-e x`). After `--` no option follows. A value of an
+/// option that looks like `-x` is taken as one: fail closed.
+fn fd_slices(seg: &[Word]) -> Vec<Segment> {
+    let Some((name, args)) = effective_command(seg).split_first() else {
+        return Vec::new();
+    };
+    let base = base_name(&name.text);
+    if !(base.eq_ignore_ascii_case("fd") || base.eq_ignore_ascii_case("fdfind")) {
+        return Vec::new();
+    }
+    let with_text = |w: &Word, text: &str| Word {
+        text: text.to_string(),
+        ..w.clone()
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        let t = w.text.as_str();
+        if t == "--" {
+            break;
+        }
+        // When `w` starts a command: the value attached to it, if any.
+        let start: Option<&str> = if t == "--exec" || t == "--exec-batch" {
+            Some("")
+        } else if let Some(v) = t
+            .strip_prefix("--exec=")
+            .or_else(|| t.strip_prefix("--exec-batch="))
+        {
+            Some(v)
+        } else if t.starts_with('-') && !t.starts_with("--") {
+            t.char_indices()
+                .skip(1)
+                .take_while(|(_, c)| !FD_VALUE_SHORTS.contains(*c))
+                .find(|(_, c)| matches!(c, 'x' | 'X'))
+                .map(|(k, _)| &t[k + 1..])
+        } else {
+            None
+        };
+        match start {
+            None => {}
+            // An attached value is the whole command, as clap reads it: the
+            // words after it are fd's (`fd -xtouch ran` searches for `ran`).
+            Some(v) if !v.is_empty() => out.push(vec![with_text(w, v)]),
+            Some(_) => {
+                let stop = (i..args.len())
+                    .find(|&j| args[j].text == ";")
+                    .unwrap_or(args.len());
+                if i < stop {
+                    out.push(args[i..stop].to_vec());
+                }
+                i = stop + 1;
+            }
+        }
+    }
+    out
 }
 
 /// A program's name without its directory and a `.exe`.

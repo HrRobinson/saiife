@@ -247,14 +247,9 @@ fn encoded_command_judged_inside() {
 #[test]
 fn bad_encoded_command_is_unresolved() {
     let e = engine();
-    // Not the brief's `eval "$x"`: POSIX reads `$x` as text, so that one is a
-    // silent `NoMatch`, which a bad `-enc` must never be (W5).
-    assert_eq!(
-        e.evaluate(r#"eval "$x""#),
-        Decision::Allow {
-            trace: AllowTrace::NoMatch
-        }
-    );
+    // A bad `-enc` must never be a silent `NoMatch` (W5). POSIX `eval "$x"`
+    // is recorded as unjudged too, as text a shell reads from a pipe is.
+    assert!(is_unjudged(&e.evaluate(r#"eval "$x""#)));
     let want = e.evaluate(r#"eval "$(x)""#);
     assert!(is_unjudged(&want), "{want:?}");
     for cmd in ["pwsh -e !!notbase64", "powershell -enc ???"] {
