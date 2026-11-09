@@ -374,3 +374,4 @@ Nothing here runs on Claude's machine.
 3. Windows hook speed: option B, judge in the hook process for Claude Code only (a crash gets a co-signer deny). Then option E (hook in exec form, no shell) once the Claude Code version that supports `args` is confirmed. The 130 ms budget stays.
 4. One `rejudge_denied` record per call, not folded.
 5. Coordinator default, owner may overrule: Windows process-tree depth 3 (1 with exec form).
+6. Owner ruling 2026-11-09, after plan 20 CI: the managed hook costs about 90 ms p95 on Linux CI and 104-139 ms on Windows. Building the engine (TOML parse plus regex compile) is 62-66 ms per call, and that predates plan 20. Plan 21's speed task adds option C, prebuilt packs with stored compiled patterns (for example regex-automata serialized DFAs, or another load-once format), alongside option B. It then sets real budgets for Linux, macOS and Windows from measurements and makes the managed benches gating again.
