@@ -322,7 +322,9 @@ pub struct Ctx {
     pub config_path: PathBuf,
     pub catalog: Vec<PackInfo>,
     pub started: Instant,
-    pub policy: Mutex<PolicyState>,
+    /// Shared with the hook table's record sink, which checks the disk
+    /// floor against it.
+    pub policy: Arc<Mutex<PolicyState>>,
     /// Agent process -> session, for attributing connector requests.
     pub sessions: Sessions,
     pub proc: Box<dyn Proc + Send + Sync>,
@@ -386,8 +388,12 @@ pub struct Ctx {
     pub hooks: Arc<crate::hooks::HookTable>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
-    notices: Mutex<HashMap<(u32, Notice), Instant>>,
+    notices: Notices,
 }
+
+/// When each (uid, kind) notice was last written; shared with the hook
+/// table's record sink.
+type Notices = Arc<Mutex<HashMap<(u32, Notice), Instant>>>;
 
 pub struct CtxInit {
     pub writer: WriterHandle,
@@ -542,23 +548,98 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// A `daemon` record of this daemon's own identity, as [`Ctx::record`]
+/// makes it.
+fn daemon_record(
+    policy: &Mutex<PolicyState>,
+    mode: Mode,
+    own: (u32, Option<&str>, &str),
+    kind: &str,
+    input: &str,
+) -> Record {
+    let hash = lock(policy).hash.clone();
+    let mut r = Record::new(
+        NewRecord {
+            agent: "",
+            project: "",
+            session: None,
+            tool: kind,
+            input,
+            decision: DecisionKind::Allow,
+            pack: None,
+            rule: None,
+            reason: None,
+            mode: mode.as_str(),
+            policy: hash.as_deref(),
+            permission_mode: None,
+        },
+        VERSION,
+    );
+    r.kind = Some(kind.to_string());
+    r.uid = Some(own.0);
+    r.sid = own.1.map(str::to_string);
+    r.user = Some(own.2.to_string());
+    r
+}
+
 /// Where the hook table's hooks without a verdict go: a `hook` record,
 /// written off the caller, with the peer's name looked up as
 /// [`Ctx::peer_name`] does (uncached: these are rare).
-fn no_verdict_sink(i: &CtxInit) -> crate::hooks::Sink {
+///
+/// The record is the peer's, so it passes the disk floor as an
+/// `audit.append` of that peer would: below `[audit] min_free_mb` only the
+/// table's in-memory count keeps it, and a `low_disk` notice (once a
+/// minute per uid) says so.
+fn no_verdict_sink(
+    i: &CtxInit,
+    policy: &Arc<Mutex<PolicyState>>,
+    notices: &Notices,
+) -> crate::hooks::Sink {
     let writer = i.writer.clone();
     let directory = Arc::clone(&i.directory);
-    let mode = i.mode.as_str();
-    let (own_uid, own_user) = (i.own_uid, i.own_user.clone());
+    let mode = i.mode;
+    let (own_uid, own_sid, own_user) = (i.own_uid, i.own_sid.clone(), i.own_user.clone());
+    let audit_dir = i.audit_dir.clone();
+    let (policy, notices) = (Arc::clone(policy), Arc::clone(notices));
     Box::new(move |nv: crate::hooks::NoVerdict| {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             eprintln!("saiifed: warning: cannot record a hook without a verdict: no runtime");
             return;
         };
-        let (writer, directory, own_user) =
-            (writer.clone(), Arc::clone(&directory), own_user.clone());
+        let (writer, directory, own_user, own_sid) = (
+            writer.clone(),
+            Arc::clone(&directory),
+            own_user.clone(),
+            own_sid.clone(),
+        );
+        let (audit_dir, policy, notices) =
+            (audit_dir.clone(), Arc::clone(&policy), Arc::clone(&notices));
         rt.spawn(async move {
             let peer = nv.peer.clone();
+            let min_free = lock(&policy).min_free_mb;
+            let is_own = same_principal(peer.uid, peer.sid.as_deref(), own_uid, own_sid.as_deref());
+            // Fail closed: an unknown free space counts as too little.
+            let free = disk::free_mb(&audit_dir).unwrap_or(0);
+            if disk::disk_gate(free, min_free, is_own).is_err() {
+                if notice_due(
+                    &mut lock(&notices),
+                    peer.uid,
+                    Notice::LowDisk,
+                    Instant::now(),
+                ) {
+                    let n = Notice::LowDisk;
+                    let own = (own_uid, own_sid.as_deref(), own_user.as_str());
+                    let mut r = daemon_record(&policy, mode, own, "daemon", n.event());
+                    r.extra.insert("event".into(), n.event().into());
+                    r.reason = Some(n.reason(peer.uid));
+                    r.sid = peer.sid.clone();
+                    if let Err(e) = writer.append(r).await {
+                        eprintln!("saiifed: warning: cannot write low_disk record: {e}");
+                    }
+                }
+                return;
+            }
+            let mode = mode.as_str();
             let user = match peer.sid {
                 None if !cfg!(windows) && peer.uid == own_uid => Some(own_user),
                 None => tokio::task::spawn_blocking(move || directory.name_of(peer.uid))
@@ -581,7 +662,11 @@ fn no_verdict_sink(i: &CtxInit) -> crate::hooks::Sink {
 impl Ctx {
     pub fn new(i: CtxInit) -> Ctx {
         let tool_caller: Arc<dyn crate::mcp_gateway::ToolCaller> = i.mcp.clone();
-        let hooks = Arc::new(crate::hooks::HookTable::new(no_verdict_sink(&i)));
+        let policy = Arc::new(Mutex::new(i.policy.clone()));
+        let notices: Notices = Arc::default();
+        let hooks = Arc::new(crate::hooks::HookTable::new(no_verdict_sink(
+            &i, &policy, &notices,
+        )));
         Ctx {
             writer: i.writer,
             writer_cfg: i.writer_cfg,
@@ -598,7 +683,7 @@ impl Ctx {
             config_path: i.config_path,
             catalog: i.catalog,
             started: Instant::now(),
-            policy: Mutex::new(i.policy),
+            policy,
             sessions: Sessions::new(),
             proc: i.proc,
             vault: crate::vault::Shared::new(i.vault),
@@ -627,7 +712,7 @@ impl Ctx {
             hooks,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
-            notices: Mutex::new(HashMap::new()),
+            notices,
         }
     }
 
@@ -661,29 +746,12 @@ impl Ctx {
     /// A record the daemon writes about itself: `tool` = kind, `input` =
     /// a short summary, its own uid and user, the current policy hash.
     pub fn record(&self, kind: &str, input: &str) -> Record {
-        let hash = self.policy().hash;
-        let mut r = Record::new(
-            NewRecord {
-                agent: "",
-                project: "",
-                session: None,
-                tool: kind,
-                input,
-                decision: DecisionKind::Allow,
-                pack: None,
-                rule: None,
-                reason: None,
-                mode: self.mode.as_str(),
-                policy: hash.as_deref(),
-                permission_mode: None,
-            },
-            VERSION,
+        let own = (
+            self.own_uid,
+            self.own_sid.as_deref(),
+            self.own_user.as_str(),
         );
-        r.kind = Some(kind.to_string());
-        r.uid = Some(self.own_uid);
-        r.sid = self.own_sid.clone();
-        r.user = Some(self.own_user.clone());
-        r
+        daemon_record(&self.policy, self.mode, own, kind, input)
     }
 
     /// An `approval` record of `action` for request `r` (§6.10.1): the
@@ -1329,11 +1397,11 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if rec.decision == DecisionKind::ErrorDenied {
         ctx.note_error_denied(peer.uid);
     }
-    let decision = rec.decision;
+    let verdict = crate::hooks::Verdict::of_record(&rec);
     let written = ctx.writer.append(rec).await;
     // The verdict of a hook connection, once its record is written.
     if written.is_ok() {
-        ctx.hooks.verdict(conn.id, decision);
+        ctx.hooks.verdict(conn.id, &verdict);
     }
     match written {
         Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),

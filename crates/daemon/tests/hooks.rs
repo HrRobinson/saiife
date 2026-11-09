@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use saiife_audit::{ChainWriter, DecisionKind, NewRecord, Record, WriterOptions};
-use saiife_daemon::hooks::{Waited, NO_VERDICT_REASON, RECONNECT_GRACE};
+use saiife_daemon::hooks::{Principal, Waited, NO_VERDICT_REASON, RECONNECT_GRACE};
 use saiife_daemon::ops::{Ctx, CtxInit};
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_ipc::frame::{encode_max, MAX_ANSWER_FRAME};
@@ -36,6 +36,12 @@ struct Daemon {
 /// A locked daemon context on a socket in a tempdir, serving every
 /// connection as `start.rs` does.
 fn daemon() -> Daemon {
+    daemon_as(None)
+}
+
+/// [`daemon`], with the daemon's own uid set to `own_uid` (the peers here
+/// are then not the daemon itself).
+fn daemon_as(own_uid: Option<u32>) -> Daemon {
     let tmp = scratch();
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
@@ -58,10 +64,12 @@ fn daemon() -> Daemon {
     let (handle, _join) = writer::spawn(cw, cfg, None).unwrap();
     let dirs: Arc<dyn Directory + Send + Sync> =
         Arc::new(saiife_policy::FixedDirectory::from_text("", ""));
+    let base = CtxInit::minimal(handle, cfg, dirs, &state);
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
         own_user: "saiife".into(),
-        ..CtxInit::minimal(handle, cfg, dirs, &state)
+        own_uid: own_uid.unwrap_or(base.own_uid),
+        ..base
     }));
     let sock = tmp.path().join("s.sock");
     let listener = UnixListener::bind(&sock).unwrap();
@@ -108,6 +116,11 @@ impl Client {
         self.s.read_exact(&mut body).await.unwrap();
         serde_json::from_slice(&body).unwrap()
     }
+}
+
+/// This test process's principal, which every hook connection here has.
+fn me() -> Principal {
+    Principal::Uid(rustix::process::getuid().as_raw())
 }
 
 fn key(n: u32) -> HookKey {
@@ -209,7 +222,10 @@ async fn bound_hook_that_drops_is_recorded_after_the_grace() {
     drop(c);
     let start = tokio::time::Instant::now();
     let until = start + RECONNECT_GRACE + Duration::from_secs(2);
-    assert_eq!(d.ctx.hooks.wait(&key(1), until).await, Waited::NoVerdict);
+    assert_eq!(
+        d.ctx.hooks.wait(&key(1), Some(&me()), until).await,
+        Waited::NoVerdict
+    );
     assert!(start.elapsed() >= RECONNECT_GRACE - Duration::from_millis(100));
     let got = wait_hook_records(&d.audit, 1, Duration::from_secs(5)).await;
     assert_eq!(got.len(), 1, "{got:?}");
@@ -238,7 +254,10 @@ async fn a_verdict_writes_no_hook_record() {
     assert_eq!(a["ok"], true, "{a}");
     drop(c);
     let until = tokio::time::Instant::now() + Duration::from_secs(1);
-    assert_eq!(d.ctx.hooks.wait(&key(2), until).await, Waited::Allow);
+    assert_eq!(
+        d.ctx.hooks.wait(&key(2), Some(&me()), until).await,
+        Waited::Allow
+    );
     // A denied call on another connection settles its key as a deny.
     let mut c = Client::hello(&d.sock).await;
     c.call(OP_HOOK_BEGIN, json!({"agent": "claude"})).await;
@@ -250,7 +269,10 @@ async fn a_verdict_writes_no_hook_record() {
     )
     .await;
     drop(c);
-    assert_eq!(d.ctx.hooks.wait(&key(3), until).await, Waited::Deny);
+    assert_eq!(
+        d.ctx.hooks.wait(&key(3), Some(&me()), until).await,
+        Waited::Deny
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(hook_records(&d.audit).is_empty());
     assert_eq!(d.ctx.hooks.no_verdict_count().0, 0);
@@ -286,4 +308,37 @@ async fn cli_connections_are_not_tracked_and_ops_are_checked() {
     drop(c);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(hook_records(&d.audit).is_empty());
+}
+
+#[tokio::test]
+async fn below_the_disk_floor_no_verdict_is_counted_not_written() {
+    // The daemon's own records pass the floor; a hook's peer is never it.
+    let d = daemon_as(Some(rustix::process::getuid().as_raw().wrapping_add(1)));
+    d.ctx.policy.lock().unwrap().min_free_mb = u64::MAX;
+    let mut c = Client::hello(&d.sock).await;
+    c.call(OP_HOOK_BEGIN, json!({"agent": "codex"})).await;
+    drop(c);
+    let mut c = Client::hello(&d.sock).await;
+    c.call(OP_HOOK_BEGIN, json!({"agent": "codex"})).await;
+    drop(c);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while d.ctx.hooks.no_verdict_count().0 < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(d.ctx.hooks.no_verdict_count().0, 2);
+    let low = |a: &Path| {
+        saiife_audit::store::read_all(a)
+            .records
+            .into_iter()
+            .filter(|r| r.extra.get("event").and_then(Value::as_str) == Some("low_disk"))
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while low(&d.audit) < 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(hook_records(&d.audit).is_empty());
+    // One notice a minute per uid, however many hooks.
+    assert_eq!(low(&d.audit), 1);
 }
