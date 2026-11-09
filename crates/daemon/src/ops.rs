@@ -13,9 +13,9 @@ use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
     OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_CLOUD_LEASE, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_MCP_CALL,
-    OP_MCP_LIST, OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
-    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_AUDIT_ROTATE_KEY, OP_CLOUD_LEASE, OP_GRANT_CONSUME, OP_HELLO, OP_HOOK_BEGIN, OP_HOOK_BIND,
+    OP_LOCKDOWN_SET, OP_MCP_CALL, OP_MCP_LIST, OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD,
+    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::Mode as PolicyMode;
@@ -382,6 +382,8 @@ pub struct Ctx {
     /// before it is read (no client runs as the daemon user; gateway
     /// children do). Set by the daemon's start; off in test contexts.
     pub refuse_own_uid_peers: bool,
+    /// The managed hooks' connections and verdicts (plan 20).
+    pub hooks: Arc<crate::hooks::HookTable>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -540,9 +542,46 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Where the hook table's hooks without a verdict go: a `hook` record,
+/// written off the caller, with the peer's name looked up as
+/// [`Ctx::peer_name`] does (uncached: these are rare).
+fn no_verdict_sink(i: &CtxInit) -> crate::hooks::Sink {
+    let writer = i.writer.clone();
+    let directory = Arc::clone(&i.directory);
+    let mode = i.mode.as_str();
+    let (own_uid, own_user) = (i.own_uid, i.own_user.clone());
+    Box::new(move |nv: crate::hooks::NoVerdict| {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            eprintln!("saiifed: warning: cannot record a hook without a verdict: no runtime");
+            return;
+        };
+        let (writer, directory, own_user) =
+            (writer.clone(), Arc::clone(&directory), own_user.clone());
+        rt.spawn(async move {
+            let peer = nv.peer.clone();
+            let user = match peer.sid {
+                None if !cfg!(windows) && peer.uid == own_uid => Some(own_user),
+                None => tokio::task::spawn_blocking(move || directory.name_of(peer.uid))
+                    .await
+                    .ok()
+                    .flatten(),
+                Some(sid) => tokio::task::spawn_blocking(move || directory.name_of_sid(&sid))
+                    .await
+                    .ok()
+                    .flatten(),
+            };
+            let rec = crate::hooks::no_verdict_record(&nv, mode, user, VERSION);
+            if let Err(e) = writer.append(rec).await {
+                eprintln!("saiifed: warning: cannot write a hook no_verdict record: {e}");
+            }
+        });
+    })
+}
+
 impl Ctx {
     pub fn new(i: CtxInit) -> Ctx {
         let tool_caller: Arc<dyn crate::mcp_gateway::ToolCaller> = i.mcp.clone();
+        let hooks = Arc::new(crate::hooks::HookTable::new(no_verdict_sink(&i)));
         Ctx {
             writer: i.writer,
             writer_cfg: i.writer_cfg,
@@ -585,6 +624,7 @@ impl Ctx {
             mcp: i.mcp,
             tool_caller,
             refuse_own_uid_peers: i.refuse_own_uid_peers,
+            hooks,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -1014,6 +1054,10 @@ pub struct Conn {
     pub start_time: Option<u64>,
     /// What this connection's hook steps answered, for `audit.append`.
     pub steps: Arc<Mutex<HookSteps>>,
+    /// This connection in the hook table.
+    pub id: crate::hooks::ConnId,
+    /// Fired when the hook table closes this connection (a hook overrun).
+    pub close: Arc<tokio::sync::Notify>,
 }
 
 impl Conn {
@@ -1022,6 +1066,8 @@ impl Conn {
             peer,
             start_time,
             steps: Arc::default(),
+            id: crate::server::next_conn_id(),
+            close: Arc::default(),
         }
     }
 }
@@ -1058,6 +1104,8 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello_in(req.id, ctx.mode.as_str()),
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
+        OP_HOOK_BEGIN => hook_begin(ctx, conn, req),
+        OP_HOOK_BIND => hook_bind(ctx, conn, req),
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
         saiife_ipc::msg::OP_AUDIT_QUERY => crate::audit_query::handle(ctx, peer, req).await,
@@ -1077,6 +1125,83 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             &format!("unknown op {other:?}"),
         ),
     }
+}
+
+/// The longest `agent`, `event` or `tool` that `hook.begin` and `hook.bind`
+/// take.
+const MAX_HOOK_NAME: usize = 64;
+/// The longest `tool_use_id` that `hook.bind` takes.
+const MAX_TOOL_USE_ID: usize = 256;
+
+/// A string argument of at most `max` bytes: `Ok(None)` when absent or
+/// null, `Err` when it is something else or longer.
+fn short_str(args: &Map<String, Value>, name: &str, max: usize) -> Result<Option<String>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.len() <= max => Ok(Some(s.clone())),
+        Some(_) => Err(format!("{name} must be a string of at most {max} bytes")),
+    }
+}
+
+/// `hook.begin {agent, event}` (plan 20): the hook table follows this
+/// connection from here.
+fn hook_begin(ctx: &Ctx, conn: &Conn, req: Request) -> Value {
+    let bad = |m: &str| err(req.id, ErrorCode::BadRequest, m);
+    let agent = match short_str(&req.args, "agent", MAX_HOOK_NAME) {
+        Ok(Some(a)) if !a.is_empty() => a,
+        Ok(_) => return bad("hook.begin needs an agent"),
+        Err(e) => return bad(&e),
+    };
+    let event = match short_str(&req.args, "event", MAX_HOOK_NAME) {
+        Ok(e) => e,
+        Err(e) => return bad(&e),
+    };
+    let close = Some(Arc::clone(&conn.close));
+    if !ctx
+        .hooks
+        .begin_closing(conn.id, &conn.peer, &agent, event.as_deref(), close)
+    {
+        return bad("hook.begin was already sent on this connection");
+    }
+    ok(req.id, Map::new())
+}
+
+/// `hook.bind` with the fields of a `HookKey` (and an optional `tool`):
+/// names the call this connection's verdict is for.
+fn hook_bind(ctx: &Ctx, conn: &Conn, req: Request) -> Value {
+    let bad = |m: &str| err(req.id, ErrorCode::BadRequest, m);
+    let key = match serde_json::from_value::<saiife_ipc::hookkey::HookKey>(Value::Object(
+        req.args.clone(),
+    )) {
+        Ok(k) => k,
+        Err(e) => return bad(&format!("hook.bind: {e}")),
+    };
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if key.agent.is_empty() || key.agent.len() > MAX_HOOK_NAME {
+        return bad("hook.bind needs an agent of at most 64 bytes");
+    }
+    if key
+        .session
+        .as_ref()
+        .is_some_and(|s| s.len() > crate::sessions::MAX_SESSION_ID)
+        || key
+            .tool_use_id
+            .as_ref()
+            .is_some_and(|s| s.len() > MAX_TOOL_USE_ID)
+    {
+        return bad("hook.bind: session or tool_use_id is too long");
+    }
+    if !hex(&key.input_sha256) {
+        return bad("hook.bind: input_sha256 must be 64 lowercase hex digits");
+    }
+    let tool = match short_str(&req.args, "tool", MAX_HOOK_NAME) {
+        Ok(t) => t,
+        Err(e) => return bad(&e),
+    };
+    if !ctx.hooks.bind_tool(conn.id, key, tool) {
+        return bad("hook.bind needs hook.begin first on this connection");
+    }
+    ok(req.id, Map::new())
 }
 
 /// A client-supplied session id over the cap is not remembered (the
@@ -1204,7 +1329,13 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if rec.decision == DecisionKind::ErrorDenied {
         ctx.note_error_denied(peer.uid);
     }
-    match ctx.writer.append(rec).await {
+    let decision = rec.decision;
+    let written = ctx.writer.append(rec).await;
+    // The verdict of a hook connection, once its record is written.
+    if written.is_ok() {
+        ctx.hooks.verdict(conn.id, decision);
+    }
+    match written {
         Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),
         Ok(seq) => {
             if let Some(sid) = session {
@@ -1254,6 +1385,12 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     );
     // The MCP gateway's servers: `[{name, state, tools, since, last_error}]`.
     m.insert("mcp".into(), ctx.mcp.status());
+    // Hooks that ended without a verdict since start (plan 20).
+    let (n, last) = ctx.hooks.no_verdict_count();
+    m.insert(
+        "hooks_no_verdict".into(),
+        json!({"since_start": n, "last_ts": last}),
+    );
     ok(id, m)
 }
 

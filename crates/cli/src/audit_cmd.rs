@@ -395,6 +395,7 @@ pub fn render_table(records: &[&Record]) -> String {
             DecisionKind::Approved => "approved",
             DecisionKind::Rejected => "rejected",
             DecisionKind::Expired => "expired",
+            DecisionKind::NoVerdict => "NO VERDICT",
             DecisionKind::Unknown => "OTHER",
         };
         let time = sanitize(r.ts.get(..19).unwrap_or(&r.ts)).replace('T', " ");

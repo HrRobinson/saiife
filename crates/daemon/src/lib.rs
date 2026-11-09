@@ -20,6 +20,7 @@ pub mod forwarder;
 pub mod fsx;
 pub mod gateway;
 pub mod grants;
+pub mod hooks;
 pub mod import_backup;
 pub mod limits;
 pub mod lockdown;
