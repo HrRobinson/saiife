@@ -414,7 +414,30 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
     ),
     ("echo 'touch ran' | { echo }; sh; }", true),
     ("echo 'touch ran' | { echo 'if'; sh; }", true),
+    // A shell reading a process substitution, on its stdin or as its script.
+    ("sh < <(echo 'touch ran')", true),
+    ("bash < <(printf 'touch ran')", true),
+    ("bash 0< <(echo 'touch ran')", true),
+    ("bash <(echo 'touch ran')", true),
+    ("bash -x <(echo 'touch ran') 2>/dev/null", true),
+    ("if true; then sh; fi < <(echo 'touch ran')", true),
+    ("while true; do sh; break; done < <(echo 'touch ran')", true),
+    ("{ true; sh; } < <(echo 'touch ran')", true),
+    ("echo 'touch ran' | sh < /dev/stdin", true),
+    ("bash < <(echo touch ran)", true),
     // These do not.
+    ("cat < <(echo 'touch ran')", false),
+    ("sh < <(echo 'echo touch ran')", false),
+    ("echo 'touch ran' | sh < /dev/null", false),
+    ("bash -c 'cat' < <(echo 'touch ran')", false),
+    ("if true; then cat; fi < <(echo 'touch ran')", false),
+    ("diff <(echo 'touch ran') /dev/null", false),
+    ("bash -c 'cat \"$1\"' x <(echo 'touch ran')", false),
+    (
+        "while read l; do echo \"$l\"; done < <(echo 'touch ran')",
+        false,
+    ),
+    ("while read l; do sh; done < <(echo 'touch ran')", false),
     ("echo 'touch ran' | { time -p cat; }", false),
     (
         "printf 'touch ran' | while read l; do if [ -n \"$l\" ]; then echo \"$l\"; fi; done",
@@ -454,7 +477,7 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
 
 /// A trap for a signal that never comes: its action does not run here, but
 /// it could. A shell in a group after a command that may read the pipe
-/// first (`cat`): what is left for it is not known. A block whose openers and
+/// first (`cat`, a loop's `read`): what is left for it is not known. A block whose openers and
 /// closers do not balance (an argument `if` or `done`): the pipe is taken to
 /// feed the rest of the line. Denied, on the safe side.
 const HIDDEN_LINE_OVER_DENIES: &[&str] = &[
@@ -462,6 +485,7 @@ const HIDDEN_LINE_OVER_DENIES: &[&str] = &[
     "echo 'touch ran' | (cat >/dev/null; sh)",
     "echo 'touch ran' | if true; then echo if; fi; sh",
     "echo 'touch ran' | while true; do echo done; break; done; sh",
+    "while read l; do sh; done < <(echo 'touch ran')",
 ];
 
 #[test]
@@ -497,6 +521,70 @@ fn hidden_lines_match_bash() {
                     "{shell} ({version}): ran={ran} (listed {runs}) denied={denied}\n  case: {case:?}"
                 ));
             }
+        }
+    }
+    assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
+}
+
+/// What `fd -x`, `-X`, `--exec` and `--exec-batch` run, against fd itself,
+/// run by bash in a temp dir that holds one file, `a`, made with `: >`. Each
+/// `touch ran` there gets `a` as an argument too. Skipped where fd or bash is
+/// not installed.
+const FD_CASES: &[(&str, bool)] = &[
+    (": > a; fd -x touch ran", true),
+    (": > a; fd a -X touch ran", true),
+    (": > a; fd --exec touch ran", true),
+    (": > a; fd --exec-batch touch ran", true),
+    (": > a; fd -Hx touch ran", true),
+    (": > a; fd -tf -x touch ran", true),
+    // An attached value is the whole command: `touch ran` here is fd's.
+    (": > a; fd -xecho touch ran", false),
+    (": > a; fd --exec=echo touch ran", false),
+    (r": > a; fd -x true \; -x touch ran", true),
+    (r": > a; fd -x touch ran \; -H", true),
+    (": > a; fd -x echo touch ran", false),
+    (": > a; fd -- -x touch ran", false),
+    (": > a; fd -E -x a", false),
+];
+
+#[test]
+fn fd_exec_matches_fd() {
+    let e = engine();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let Some(shell) = candidate_shells()
+        .into_iter()
+        .find(|s| version_line(s).contains("bash"))
+    else {
+        println!("no bash found; skipped");
+        return;
+    };
+    let fd = Command::new(&shell)
+        .arg("-c")
+        .arg("command -v fd")
+        .env("HOME", home.path())
+        .output();
+    if !fd.is_ok_and(|o| o.status.success()) {
+        println!("no fd found; skipped");
+        return;
+    }
+    let mut failures = Vec::new();
+    for (case, runs) in FD_CASES {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        Command::new(&shell)
+            .arg("-c")
+            .arg(case)
+            .current_dir(tmp.path())
+            .env("HOME", home.path())
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .output()
+            .expect("bash runs");
+        let ran = tmp.path().join("ran").exists();
+        let denied = matches!(e.evaluate(case), Decision::Deny { .. });
+        if ran != *runs || ran != denied {
+            failures.push(format!(
+                "ran={ran} (listed {runs}) denied={denied}\n  case: {case:?}"
+            ));
         }
     }
     assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));

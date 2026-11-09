@@ -30,7 +30,7 @@ use crate::canon::{
 use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
 use crate::lexer::{
-    fed_script_in, fed_script_may_be_stdin, find_all_substitution_kinds, literal_word,
+    fed_script_in, fed_script_may_be_stdin, find_all_substitution_kinds, literal_word, readable,
     split_segments_noted, split_substitution_noted, FedScript, PathKind, Word,
     BRACES_PAST_LINE_LIMIT, HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT,
 };
@@ -1372,8 +1372,8 @@ impl Engine {
     }
 
     /// `eval ARGS` runs its joined arguments as a command line in this
-    /// shell. What a substitution inside it expands to cannot be judged:
-    /// recorded, not silent.
+    /// shell. What a substitution or a variable inside it expands to cannot
+    /// be judged: recorded, not silent, as a pipe into a shell is.
     fn eval_phase(
         &self,
         view: &SegmentView,
@@ -1387,6 +1387,8 @@ impl Engine {
         let effective = &view.resolved;
         if effective.iter().any(|w| w.has_substitution) {
             found.unjudged(UNRESOLVED_REASON);
+        } else if effective.iter().skip(1).any(|w| !readable(w)) {
+            found.unjudged(UNREAD_SCRIPT);
         }
         // `eval -- ARGS`: the `--` ends eval's (empty) options.
         let args = match effective.get(1) {
@@ -1519,6 +1521,9 @@ impl Engine {
             }
         }
         let inner = inline_payload(&view.argv).or_else(|| watch_payload(&view.argv))?;
+        if shell_payload_unread(view) {
+            found.unjudged(UNREAD_SCRIPT);
+        }
         // The program is a POSIX shell, whichever shell started it.
         let nested = self.recurse_in(
             Dialect::Posix,
@@ -2916,6 +2921,37 @@ fn changes_environment(argv: &[String], effective: &[Word], literal_path: bool) 
             .any(|w| !w.text.starts_with('-') && protected(&w.text)),
         _ => false,
     }
+}
+
+/// The line a POSIX shell's `-c`, su's command or what `watch` runs is a word
+/// the guard cannot read (`sh -c "$x"`, `su -c "$(cat f)"`): as text a shell
+/// reads from a pipe is (`echo "$x" | sh`), the line is not fully judged.
+/// What the guard can read in it is still judged.
+fn shell_payload_unread(view: &SegmentView) -> bool {
+    let words = &view.resolved;
+    let Some(prog) = view.argv.first().map(String::as_str) else {
+        return false;
+    };
+    if !matches!(
+        prog,
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "su" | "watch"
+    ) {
+        return false;
+    }
+    // Where the words and argv do not line up, any word may be the line.
+    if prog == "watch" || words.len() != view.argv.len() {
+        return words.iter().skip(1).any(|w| !readable(w));
+    }
+    let mut texts: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+    texts[0] = prog.to_string();
+    let Some(line) = inline_payload(&texts) else {
+        return false;
+    };
+    // su's `--command=LINE` holds it.
+    let attached = format!("={line}");
+    words[1..]
+        .iter()
+        .any(|w| (w.text == line || w.text.ends_with(&attached)) && !readable(w))
 }
 
 /// The whole segment's matching line for `whole_segment` rules: like
