@@ -322,6 +322,8 @@ mod win_tests {
             pid,
             ppid,
             exe: exe.to_string(),
+            created: None,
+            session: None,
         }
     }
 

@@ -205,12 +205,13 @@ pub type Sink = Box<dyn Fn(NoVerdict) + Send + Sync>;
 /// (Windows: `saiife_win::ffi::proc::snapshot`). Tests give a fake one.
 pub type Tree = Arc<dyn Fn() -> std::io::Result<Vec<ProcEntry>> + Send + Sync>;
 
-/// The process table of this system: a Toolhelp snapshot on Windows. No
+/// The process table of this system: a Toolhelp snapshot on Windows, with the
+/// creation times and sessions the service may read. No
 /// other system ties a co-sign request to a process, so there it is an
 /// error, and a wait that needs it sees [`Waited::Foreign`].
 #[cfg(windows)]
 fn system_tree() -> Tree {
-    Arc::new(saiife_win::ffi::proc::snapshot)
+    Arc::new(saiife_win::ffi::proc::snapshot_timed)
 }
 
 #[cfg(not(windows))]

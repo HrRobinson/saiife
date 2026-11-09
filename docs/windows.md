@@ -100,6 +100,14 @@ What happens when the guard cannot judge something:
   stops that, not even the co-signer (see [Locked mode](#locked-mode)). This is the same class as running its
   own code outside the hook ([threats](threats.md), A21 and A25). Locked mode stays a
   preview until a later plan has the service judge each input itself.
+- **Who asks.** The co-signer ties a co-sign request to the hook that bound the call
+  through the process tree: the hook must run under the process that owns the request's
+  socket, at most 3 parent steps down. Where the service can read them, it also rejects
+  a parent created after its child (a reused pid) and an asker in another session than
+  the hook. The tie is not a boundary against code of the agent's own user: that code
+  can start a process with Claude Code as its parent (Windows lets a user re-parent a
+  new process under its own processes) and bind the call from there. Against that code
+  the barrier is the service's own judgment of each call, not the tie.
 - **The co-signer port.** The co-signer listens on `127.0.0.1:7433`, a fixed port. If
   another program holds it, Claude Code blocks every call and `doctor` fails
   `cosign.listen`. The service binds it so that no other program can share it, but

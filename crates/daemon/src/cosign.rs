@@ -1315,6 +1315,8 @@ mod tests {
             pid,
             ppid,
             exe: format!("p{pid}.exe"),
+            created: None,
+            session: None,
         };
         let t = vec![
             e(10, 4),

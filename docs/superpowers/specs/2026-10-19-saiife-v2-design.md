@@ -959,7 +959,7 @@ updating this list and this section.
 | SIDs, accounts, local groups (`account.rs`) | `ConvertSidToStringSidW`, `ConvertStringSidToSidW`, `LookupAccountNameW`, `LookupAccountSidW`, `NetUserGetLocalGroups`, `NetLocalGroupGetMembers`, `NetApiBufferFree` |
 | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
 | Pipes (`pipe.rs`) | `ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
-| Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
+| Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`; plan 21: `OpenProcess` (`PROCESS_QUERY_LIMITED_INFORMATION`), `GetProcessTimes`, `ProcessIdToSessionId`: the creation time and session of a process where the service may read them, so the co-signer's process-tree tie rejects a reused parent pid and another session |
 | Signature check (`trust.rs`) | `WinVerifyTrust` |
 | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
@@ -967,7 +967,7 @@ updating this list and this section.
 | Sockets (`net.rs`, plans 20 and 21) | `setsockopt` (`SO_EXCLUSIVEADDRUSE`): the Claude Code co-signer's listener takes `127.0.0.1:7433` for itself before it binds; `GetExtendedTcpTable` (`AF_INET`, `TCP_TABLE_OWNER_PID_CONNECTIONS`, no privilege): the pid that owns a co-sign client's socket, which must be an ancestor of the hook that bound the call |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 43 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 42 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
+That is 46 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 45 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 

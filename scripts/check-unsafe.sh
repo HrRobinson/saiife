@@ -29,8 +29,9 @@
 #     compiles `ffi`, so the compiler lint alone would catch those only on Windows.
 #
 # Which Windows calls crates/win/src/ffi/ may make is a list, not a grep: spec
-# §5.3a "The complete list of FFI calls" (W1), 43 functions and one macro since
-# plan 21 added `GetExtendedTcpTable`. A new call updates that list, plan 19a's
+# §5.3a "The complete list of FFI calls" (W1), 46 functions and one macro since
+# plan 21 added `GetExtendedTcpTable`, `OpenProcess`, `GetProcessTimes` and
+# `ProcessIdToSessionId`. A new call updates that list, plan 19a's
 # and plan 19b's copies, and the count here.
 #
 # Known limit: `unsafe` that a dependency's macro expands into our code is
