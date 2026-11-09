@@ -367,3 +367,10 @@ Nothing here runs on Claude's machine.
   3. Check the process tree: Claude Code, then `bash.exe` (or `powershell.exe`), then `saiife.exe`. Confirm that the depth is ≤ 3 (D2, question 4).
   4. Read Claude Code's `CHANGELOG.md` for the release that added `args` (F5). Then try the exec-form drop-in (option E) by hand, and time a dozen calls against shell form.
 - [ ] **On a Mac with a real install:** `saiife doctor` shows `cosign.asker` pass (`pcblist`).
+
+## Owner rulings (2026-11-09)
+1. Re-judge on all three OSes: one code path, tested on Linux.
+2. The port squat during a service restart is accepted and documented in A25. Doctor flags a failed bind.
+3. Windows hook speed: option B, judge in the hook process for Claude Code only (a crash gets a co-signer deny). Then option E (hook in exec form, no shell) once the Claude Code version that supports `args` is confirmed. The 130 ms budget stays.
+4. One `rejudge_denied` record per call, not folded.
+5. Coordinator default, owner may overrule: Windows process-tree depth 3 (1 with exec form).
