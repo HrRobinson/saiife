@@ -6,6 +6,8 @@ runs them, and keeps an audit log that a non-developer can read.
 
 Status: pre-release.
 
+v2 adds locked mode on Linux and macOS, and Windows as a preview.
+
 ## Install
 
 ```sh

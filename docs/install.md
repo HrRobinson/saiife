@@ -23,7 +23,7 @@ saiife --version
 Set `SAIIFE_VERSION` to install a specific release:
 
 ```sh
-curl -fsSL https://github.com/HrRobinson/saiife/releases/latest/download/install.sh | SAIIFE_VERSION=0.1.0 sh
+curl -fsSL https://github.com/HrRobinson/saiife/releases/latest/download/install.sh | SAIIFE_VERSION=0.2.0 sh
 ```
 
 To use another folder, set `SAIIFE_INSTALL_DIR`.
@@ -54,9 +54,9 @@ If you do not want to pipe a script into your shell:
 4. Extract it and copy the binary to a folder on your `PATH`:
 
    ```sh
-   tar xzf saiife-0.1.0-x86_64-unknown-linux-musl.tar.gz
+   tar xzf saiife-0.2.0-x86_64-unknown-linux-musl.tar.gz
    mkdir -p ~/.local/bin
-   cp saiife-0.1.0-x86_64-unknown-linux-musl/saiife ~/.local/bin/
+   cp saiife-0.2.0-x86_64-unknown-linux-musl/saiife ~/.local/bin/
    ```
 
 ## Supported platforms
