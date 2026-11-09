@@ -397,7 +397,7 @@ jobs:
           sum="$(sed -n 's/^sha256_linux_x86_64=//p' packaging/linux/nfpm.version)"
           [ -n "$v" ] && [ -n "$sum" ]
           tgz="$RUNNER_TEMP/nfpm.tar.gz"
-          curl -fsSL -o "$tgz" "https://github.com/goreleaser/nfpm/releases/download/v${v}/nfpm_${v}_Linux_x86_64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$tgz" "https://github.com/goreleaser/nfpm/releases/download/v${v}/nfpm_${v}_Linux_x86_64.tar.gz"
           echo "$sum  $tgz" | sha256sum -c -
           mkdir "$RUNNER_TEMP/nfpm-bin"
           tar -xzf "$tgz" -C "$RUNNER_TEMP/nfpm-bin" nfpm
@@ -488,7 +488,7 @@ jobs:
           set -euo pipefail
           work="$(mktemp -d)"
           asset=saiife-0.1.0-x86_64-unknown-linux-musl
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$work/$asset.tar.gz" \
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$work/$asset.tar.gz" \
             "https://github.com/HrRobinson/saiife/releases/download/v0.1.0/$asset.tar.gz"
           echo "3f5b0d344794d880f87a62c4c30d96166d885046d688e7d09e9312b09a6e1e93  $work/$asset.tar.gz" | sha256sum -c -
           tar -xzf "$work/$asset.tar.gz" -C "$work" --strip-components=1 "$asset/saiife"
