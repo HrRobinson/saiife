@@ -630,6 +630,9 @@ pub mod asker_macos {
         let me = saiife_darwin::proc_info(std::process::id())?.uid;
         let got = saiife_darwin::tcp_peer_uid_checked(server, peer).ok()??;
         (got == me).then_some(SOURCE)
+    }
+}
+
 /// How this system finds the asker, when that works on a connection the
 /// daemon makes to itself; `None` when it does not (or there is none here).
 fn asker_source() -> Option<&'static str> {
