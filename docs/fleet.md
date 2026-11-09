@@ -643,9 +643,10 @@ run `saiife system uninstall --purge` first, then remove the package.
   property you can set: the install and uninstall actions run as SYSTEM and start
   `[ProgramFiles64Folder]saiife\saiife.exe`, so a folder chosen on the command line cannot
   make them run another binary.
-- **Preview.** Windows locked mode is a preview. See [Windows](windows.md). Every lock
-  label there is unverified until it has been tried on real machines. The Codex and
-  Gemini CLI hooks are preview on Windows too. Same-user approval is off, by the owner's
+- **Preview.** Windows locked mode is a preview for Codex and Gemini CLI. For Claude
+  Code it leaves preview once CI shows a forged hook verdict denied. See
+  [Windows](windows.md). Every lock label there is unverified until it has been tried
+  on real machines. Same-user approval is off, by the owner's
   ruling, so approvals come from a second account in a separate session. Set approvers in
   the fleet `config.toml`.
 - **Rollback.** A failed install, upgrade or removal is rolled back, with what

@@ -137,7 +137,8 @@ Lock label: **unverified**, on Linux, macOS and Windows. The
 account yet, so we do not know whether Codex can be locked. The managed
 file is `/etc/codex/requirements.toml` on Linux and macOS (on macOS `/etc` is
 `/private/etc`), and `C:\ProgramData\OpenAI\Codex\requirements.toml` on Windows, where
-locked mode is a preview ([Windows](../windows.md#locked-mode)). The macOS and Windows
+locked mode is a preview for Codex, as it has no co-signer
+([Windows](../windows.md#locked-mode)). The macOS and Windows
 results will go to `crates/agents/tests/fixtures/lock-check/macos/codex.tsv` and
 `…/windows/codex.tsv`. Until it has, treat Codex as running in the Developer
 setup even on a locked machine, and do not rely on the lock for it
@@ -151,6 +152,7 @@ Fail-closed matrix (Codex column, from the design; unverified live):
 | guard engine crash | blocked (a worker isolates it; the parent denies) |
 | `check` parent killed or crashes | **runs**; recorded |
 | `check` ended with exit 0 by a process of the agent's user (Windows) | **runs**; recorded |
+| a forged allow by a process of the agent's user | **runs**; recorded |
 | hook timeout (10 s) | **runs** |
 | daemon down or not answering in 2 s | blocked |
 | binary missing | **runs** |

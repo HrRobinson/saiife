@@ -106,8 +106,9 @@ Lock label on Linux: **lockable** (checked live with Claude Code 2.1.308 on
 2026-10-22, see [lock-check](../lock-check.md); results in
 `crates/agents/tests/fixtures/lock-check/claude.tsv`).
 
-Lock label on Windows: **unverified**, and Windows locked mode is a preview
-([Windows](../windows.md#locked-mode)). saiife installs the managed hook in
+Lock label on Windows: **unverified**. Windows locked mode is a preview for Codex and
+Gemini CLI; for Claude Code it leaves preview once CI shows a forged hook verdict
+denied ([Windows](../windows.md#locked-mode)). saiife installs the managed hook in
 `C:\Program Files\ClaudeCode\managed-settings.d\` (`50-saiife.json` and
 `60-saiife-mcp.json`), with the command
 `C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent claude`.
@@ -116,8 +117,11 @@ unless it says `"managedSourcesBehavior": "merge"`; install and `doctor` fail th
 The lock check has not run in a Windows VM yet; the results will go to
 `crates/agents/tests/fixtures/lock-check/windows/claude.tsv`. On Windows the
 co-signer denies a call whose hook was ended with `TerminateProcess(hook, 0)`.
-It does not stop code injected into the hook, which is why Windows locked
-mode is still a preview.
+A process of your user can also forge the hook's allow, or inject code into
+the hook. The service's own judgment of each call (below) denies such a
+forged allow when the policy denies the call. `locked-windows` in CI is to
+show both attacks denied; until it has, treat Claude Code on Windows as a
+preview too.
 
 Lock label on macOS: **unverified**. saiife installs the same managed hook
 in `/Library/Application Support/ClaudeCode/managed-settings.d/`
@@ -145,6 +149,23 @@ On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d
   So a hook that is killed, or that exits 0 without recording a verdict, is a
   deny. The drop-in also lists `http://127.0.0.1:7433/*` in
   `allowedHttpHookUrls`, so your own list cannot skip the co-signer.
+- The service judges each call itself too (plan 21, on Linux, macOS and
+  Windows). It uses the input Claude Code sent and the system policy of the
+  user who asks, and answers "no opinion" only when the hook recorded an
+  allow and its own judgment allows. So a verdict forged by another process
+  of your user cannot allow a call the policy denies. Such a call gets a
+  `hook` record with `event: "rejudge_denied"`, and `doctor` warns
+  (`hooks.rejudge-denied`).
+- The service reads none of your files. It judges paths as written: it does
+  not follow symlinks or junctions, expand globs, or read the project's
+  `.saiife/config.toml`. The hook still checks those. One call is stricter
+  in the service than in the hook: `cp review.md .claude` is denied, because
+  the service cannot tell that `.claude` is a folder and judges the copy as a
+  write onto it.
+- If the service cannot judge a call (its workers are down, or one crashed
+  or timed out), the call is blocked, and `doctor` fails `cosign.rejudge`
+  when the service has no judge at all. If it cannot tell who asks, every
+  call is blocked, and `doctor` fails `cosign.asker`.
 - A single tool call whose input is over 16 MiB is blocked in locked mode
   (the co-signer's body cap).
 - If nothing listens on `127.0.0.1:7433`, every call is blocked and `doctor`
@@ -206,13 +227,15 @@ On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d
 | Failure | Result |
 |---|---|
 | saiife reports an error (exit 2 and a reason) | blocked |
-| guard engine crash | blocked (a worker isolates it; the parent denies) |
+| guard engine crash | blocked (judged inside the hook: a crash ends it, `onFailure` blocks, and the co-signer denies) |
 | `check` parent killed or crashes | blocked (`onFailure`) |
 | hook timeout (10 s) | blocked |
 | daemon down or not answering in 2 s | blocked (saiife denies) |
 | binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway |
 | `check` ended with exit 0 by a process of the agent's user (Windows) | blocked (co-signer) |
+| a forged allow by a process of the agent's user | blocked (the service's own judgment) |
 | co-signer not listening on `127.0.0.1:7433` | blocked (`onFailure`) |
+| the service cannot judge the call | blocked (co-signer) |
 
 saiife answers well inside the timeout (an internal deadline of 3 s). The
 full matrix for all three agents is in [threats](../threats.md#fail-closed-matrix).

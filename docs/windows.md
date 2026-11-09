@@ -3,8 +3,9 @@
 **What has run, and where.** saiife on Windows has run only on throwaway CI runners:
 GitHub's `windows-latest`, `windows-2022` and `windows-2025`. They are Windows Server,
 x64, with an administrator and UAC off. Nothing here has run on a person's Windows 11
-machine or on ARM64. **Windows locked mode is a preview**: see
-[Locked mode](#locked-mode) for why.
+machine or on ARM64. **Windows locked mode is a preview for Codex and Gemini CLI.**
+For Claude Code the service judges each call itself; see [Locked mode](#locked-mode)
+for why, and for the CI run that decides it.
 
 Supported: Windows 11 23H2 (build 22631) or later and Windows Server 2022 (build
 20348) or later, on x64 and ARM64. Windows 10 is not supported.
@@ -90,16 +91,31 @@ What happens when the guard cannot judge something:
 
 ### In locked mode
 
-- **Windows locked mode is a preview.** A process of the agent's own user has full
-  access to the hook. It can end it with `TerminateProcess(hook, 0)`. For Claude Code
-  the co-signer then denies the call. For Codex and Gemini CLI the call runs, and the
-  daemon writes a `no_verdict` record. It can also forge the hook's allow, with no code
-  injection: any process of the agent's user can open the pipe, send `hook.begin`, bind
-  the call's key and append an allow, then end the real hook. The co-signer sees a
-  recorded allow and accepts it. Code injected into the hook can do the same. Nothing
-  stops that, not even the co-signer (see [Locked mode](#locked-mode)). This is the same class as running its
-  own code outside the hook ([threats](threats.md), A21 and A25). Locked mode stays a
-  preview until a later plan has the service judge each input itself.
+- **Windows locked mode is a preview for Codex and Gemini CLI.** A process of the
+  agent's own user has full access to the hook. It can end it with
+  `TerminateProcess(hook, 0)`, and the agent reads exit 0 as allow. For Codex and
+  Gemini CLI the call then runs, and the daemon writes a `no_verdict` record: recorded,
+  not prevented; measured in CI on Windows Server 2022 and 2025. They have no
+  co-signer.
+- **Claude Code: the service's own judgment.** A process of the agent's user can also
+  forge the hook's allow, with no code injection: it can open the pipe, send
+  `hook.begin`, bind the call's key and append an allow, then end the real hook. Code
+  injected into the hook can do the same. The co-signer does not trust that allow
+  alone. The service judges the call itself, on the input Claude Code sent, and
+  answers "no opinion" only when the hook recorded an allow and its own judgment
+  allows too. A forged allow of a call the policy denies is denied, and the daemon
+  writes a `hook` record with `event: "rejudge_denied"`. This is the same class as
+  running its own code outside the hook ([threats](threats.md), A21 and A25).
+  Claude Code leaves preview only once `locked-windows` shows the forged allow and the
+  hook kill denied on `windows-2022` and `windows-2025`. Until that run is green,
+  treat Claude Code on Windows as a preview too.
+- **What the service's judgment does not see.** The service reads no file of the
+  agent's user. It judges paths as written: it does not follow a symlink or a
+  junction, does not expand a glob against the disk, and does not read the project's
+  `.saiife/config.toml`, so a project's extra packs count in the hook only. The hook
+  still checks all of these and denies on its own. A forged hook verdict skips them.
+  This is accepted: code of the agent's user can change a symlink, a junction, a
+  folder's files or its own project config after any judgment anyway.
 - **Who asks.** The co-signer ties a co-sign request to the hook that bound the call
   through the process tree: the hook must run under the process that owns the request's
   socket, at most 3 parent steps down. Where the service can read them, it also rejects
@@ -107,14 +123,20 @@ What happens when the guard cannot judge something:
   the hook. The tie is not a boundary against code of the agent's own user: that code
   can start a process with Claude Code as its parent (Windows lets a user re-parent a
   new process under its own processes) and bind the call from there. Against that code
-  the barrier is the service's own judgment of each call, not the tie.
+  the barrier is the service's own judgment of each call, not the tie. The service
+  judges as the user of the hook connection that bound the call, with that user's
+  profile paths.
 - **The co-signer port.** The co-signer listens on `127.0.0.1:7433`, a fixed port. If
   another program holds it, Claude Code blocks every call and `doctor` fails
   `cosign.listen`. The service binds it so that no other program can share it, but
   while the service restarts (one second) a process of the agent's user could take it.
+  That process could then answer "no opinion", and a forged hook allow would let the
+  call run. The owner accepts this: it needs the service to crash or restart first,
+  and the agent's user cannot stop it.
 - **Codex and Gemini CLI.** Their fail-open gaps (the
   [fail-closed matrix](threats.md#fail-closed-matrix)) apply on Windows too, and their
-  Windows hook shells come from their docs, not a run. Their Windows hooks are preview.
+  Windows hook shells come from their docs, not a run. Their Windows hooks stay a
+  preview: neither has an HTTP hook, so neither has a co-signer.
 - **Lock labels.** Every Windows lock label is `unverified` until
   `scripts/lock-check/windows-vm.ps1` has run in a VM ([lock checks](lock-check.md#windows-in-a-throwaway-vm)).
   Until then each agent falls back to the Developer column for the hook rows.
@@ -188,37 +210,60 @@ The hook is slower on Windows than on Linux and macOS, whose budget stays 50 ms 
 On the GitHub `windows-latest` runner, starting any process costs 20.3 ms (median),
 `saiife --version` 26.9 ms, and the hook 84.7 ms (median) and 90.4 ms (p95). With no
 code change, runner noise has since moved that p95 from 83-87 ms to 102-114 ms. So the
-owner set the Windows CI budget to 130 ms p95, which allows for slow runners. The
-planned speed-up should tighten it; no figure is promised.
+owner set the Windows CI budget to 130 ms p95, which allows for slow runners.
+
+Plan 21 makes the managed hook faster, on every OS:
+
+- **Claude Code's calls are judged inside the hook**, with no worker process. A crash
+  then ends the hook, which `onFailure: "block"` turns into a block. The co-signer
+  denies too, and the daemon records `no_verdict`. Codex and Gemini CLI keep the
+  worker, because for them a crashed hook can let the call run.
+- **The built-in packs are prebuilt.** They are Rust data in the binary, so no hook
+  parses their TOML, and each rule's regex is compiled only when a command first
+  reaches it. Building the guard engine went from 30-54 ms to under 1.3 ms (measured
+  with the `ci-locked` build). Packs from `policy.d` are still read and compiled when
+  they load.
+
+The managed hook benches were report-only while this was built. They gate CI again,
+with budgets per OS that plan 21's CI run sets from its own measurements.
 
 ## Locked mode
 
 Locked mode on Windows is plan 19b (v2.2). The design is in the v2 spec, section
 5.3a.
 
-**Windows locked mode is a preview.** A process that runs as the agent's own user can
-end the hook with `TerminateProcess(hook, 0)`. The agent reads exit 0 as allow. Before
-plan 20 the call the hook was judging then ran, and nothing was recorded: on
-`windows-2022` and `windows-2025` the audit had the same size before and after. The
-agent's user may do this because Windows gives a user full access to its own processes.
-On Linux and macOS a kill cannot choose the exit code, so a killed hook does not read as
-allow there. Use Windows locked mode against mistakes and helpful bypasses. Do not rely
-on it against an agent that writes and runs its own code to get past the hook.
+**Windows locked mode is a preview for Codex and Gemini CLI.** A process that runs as
+the agent's own user can end the hook with `TerminateProcess(hook, 0)`. The agent reads
+exit 0 as allow. Before plan 20 the call the hook was judging then ran, and nothing was
+recorded: on `windows-2022` and `windows-2025` the audit had the same size before and
+after. The agent's user may do this because Windows gives a user full access to its own
+processes. On Linux and macOS a kill cannot choose the exit code, so a killed hook does
+not read as allow there. For Codex and Gemini CLI, use Windows locked mode against
+mistakes and helpful bypasses. Do not rely on it against an agent that writes and runs
+its own code to get past the hook.
 
-Plan 20 narrows this, and does not close it:
+**Claude Code** (plans 20 and 21) has a second managed hook, an HTTP hook to the
+service's co-signer on `127.0.0.1:7433`, and the service judges each of its calls
+itself. A call runs only when the hook and the service's own judgment both allow it,
+so neither a killed hook nor a forged allow lets a denied call run.
 
-- **Claude Code** has a second managed hook, an HTTP hook to the daemon's co-signer on
-  `127.0.0.1:7433`. The co-signer denies the call unless the command hook recorded an
-  allow for it. A killed hook records nothing, so the call is denied.
+- **The co-signer** denies the call unless the command hook recorded an allow for it. A
+  killed hook records nothing, so the call is denied.
+- **The service's own judgment** (plan 21): the co-signer also judges the input Claude
+  Code sent, with the system policy of the user who asks, and answers "no opinion"
+  only when both allow. A forged allow needs no code injection: any process of the
+  agent's user can open the pipe, send `hook.begin`, bind the call's key and append an
+  allow, then end the real hook. For a call the policy denies, that forgery now gets a
+  deny and a `rejudge_denied` record. What this judgment cannot see, and why that is
+  accepted, is in [Limits](#limits).
+- **When it leaves preview:** once the `locked-windows` CI job shows the forged allow
+  and the hook kill denied on `windows-2022` and `windows-2025`. Until that run is
+  green, treat Claude Code on Windows as a preview too. `doctor` passes
+  `locked.preview` for Claude Code only when `cosign.listen`, `cosign.rejudge` and
+  `cosign.asker` all pass.
 - **Every agent:** the daemon notices a hook that ends without a verdict and writes a
   `hook` record with decision `no_verdict`. `doctor` warns (`hooks.no-verdict`). There is
   no automatic lockdown. For Codex and Gemini CLI that is all: the call still runs.
-- **Not prevented:** a forged allow. It needs no code injection: any process of the
-  agent's user can open the pipe, send `hook.begin`, bind the call's key and append an
-  allow, then end the real hook. Code injected into the hook (the agent's user may write
-  to the hook's memory) can do the same. Either way the co-signer sees a recorded allow
-  and accepts it. Windows locked mode stays a preview until the service
-  judges each co-signed input itself.
 
 ### Install
 
@@ -285,8 +330,9 @@ written. That is why the binary is not under `C:\Program Files`.
 - `saiife doctor`, from an elevated terminal, checks the service, the access lists, the
   binary (build, load flag, imports, signature), the managed files, Claude Code's
   `HKLM\SOFTWARE\Policies\ClaudeCode` key, UAC and the agent users. It prints
-  `locked.preview` on every locked run. Some Linux checks have no Windows form yet, and
-  `doctor` lists them.
+  `locked.preview` as info when Codex or Gemini CLI is installed, or when one of
+  `cosign.listen`, `cosign.rejudge` and `cosign.asker` fails. Some Linux checks have no
+  Windows form yet, and `doctor` lists them.
 - `saiife system uninstall` removes the service and the managed files and keeps the
   audit and the config. `--purge` removes the rest, but keeps `C:\ProgramData\saiife` while
   a managed file still names the binary, so that no user can put a file there that a

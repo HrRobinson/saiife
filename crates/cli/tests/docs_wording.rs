@@ -189,37 +189,86 @@ fn windows_page_has_the_locked_mode_facts() {
 
 /// Owner ruling 2026-11-06: Windows locked mode ships as preview, because a
 /// process of the agent's own user can end the hook with exit 0, which the
-/// agent reads as allow. Each page that sells locked mode says so.
+/// agent reads as allow. Plan 21: the service judges each Claude Code call
+/// itself, so the preview names Codex and Gemini CLI only. Each docs page that
+/// offers Windows locked mode says so, and none calls it a preview bare.
 #[test]
-fn windows_locked_mode_is_documented_as_preview() {
+fn windows_preview_names_codex_and_gemini_only() {
+    const ONLY: &str = "preview for codex and gemini cli";
     let t = page_text("docs/windows.md");
     for h in ["## Locked mode", "## Limits"] {
         let s = flat(section(&t, h));
         assert!(
-            s.contains("preview"),
-            "docs/windows.md {h} must say locked mode is preview"
+            s.contains(ONLY),
+            "docs/windows.md {h} must say locked mode is a {ONLY}"
         );
     }
     let locked = flat(section(&t, "## Locked mode"));
-    for want in ["terminateprocess", "exit 0", "allow"] {
+    for want in ["terminateprocess", "exit 0", "allow", "own judgment"] {
         assert!(
             locked.contains(want),
             "docs/windows.md#locked-mode must name the reason ({want})"
         );
     }
-    for rel in ["README.md", "CHANGELOG.md", "docs/threats.md"] {
+    let bare = "windows locked mode is a preview";
+    for rel in [
+        "docs/windows.md",
+        "docs/threats.md",
+        "docs/install.md",
+        "docs/fleet.md",
+        "docs/approvals.md",
+        "docs/agents/claude-code.md",
+    ] {
         let s = flat(&page_text(rel));
         assert!(
-            s.contains("windows locked mode is a preview"),
-            "{rel} must say Windows locked mode is a preview"
+            s.contains(ONLY),
+            "{rel} must say Windows locked mode is a {ONLY}"
         );
+        for (i, _) in s.match_indices(bare) {
+            assert!(
+                s[i + bare.len()..].starts_with(&ONLY["preview".len()..]),
+                "{rel} calls Windows locked mode a preview bare: {}",
+                &s[i..(i + 80).min(s.len())]
+            );
+        }
     }
+    assert!(
+        flat(&page_text("CHANGELOG.md")).contains(ONLY),
+        "CHANGELOG.md must say Windows locked mode is a {ONLY}"
+    );
     let threats = page_text("docs/threats.md");
     assert!(threats.contains("A25"), "docs/threats.md has the A25 row");
     assert!(
         flat(&threats).contains("terminateprocess(hook, 0)"),
         "the A25 row names the forged exit"
     );
+}
+
+/// Plan 21: the A25 row names the service's own judgment and its record, the
+/// restart-window squat, and what only the user's file system view decides.
+#[test]
+fn threats_a25_names_the_service_judgment() {
+    let t = page_text("docs/threats.md");
+    let row = t
+        .lines()
+        .find(|l| l.starts_with("| A25 |"))
+        .expect("docs/threats.md has the A25 row");
+    let s = flat(row);
+    for want in [
+        "own judgment",
+        "rejudge_denied",
+        "127.0.0.1:7433",
+        "symlink",
+        "junction",
+        "glob",
+        "project",
+        "codex and gemini cli",
+    ] {
+        assert!(
+            s.contains(want),
+            "the A25 row of docs/threats.md lacks {want:?}"
+        );
+    }
 }
 
 /// The limits the owner confirmed for the docs (progress note, 2026-11-06).
@@ -535,12 +584,7 @@ fn install_page_has_the_no_proxy_note() {
 fn windows_limits_keep_preview_and_name_the_cosigner() {
     let t = page_text("docs/windows.md");
     let limits = flat(section(&t, "## Limits"));
-    for want in [
-        "preview",
-        "co-signer",
-        "no_verdict",
-        "with no code injection",
-    ] {
+    for want in ["preview", "co-signer", "no_verdict", "own judgment"] {
         assert!(
             limits.contains(want),
             "docs/windows.md#limits lacks {want:?}"
