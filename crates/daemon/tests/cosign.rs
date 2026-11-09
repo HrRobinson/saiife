@@ -821,24 +821,61 @@ async fn forged_allow_of_an_allowed_call_is_allowed() {
     assert!(records(&d.audit, "cosign_denied").is_empty());
 }
 
-/// A hook connection that uses up a grant for `granted` and records the
+/// What a grant was given for: its agent, tool, project root and command.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    agent: &'a str,
+    tool: &'a str,
+    project: &'a str,
+    command: &'a str,
+}
+
+/// The scope every approved call below is co-signed in: Claude Code's
+/// `Bash` in `/p`.
+const SCOPE: Scope = Scope {
+    agent: "claude",
+    tool: "Bash",
+    project: "/p",
+    command: "rm -rf /",
+};
+
+/// A Bash call of `command` run in `cwd`.
+fn payload_in(tool_use_id: &str, command: &str, cwd: &str) -> String {
+    let mut v: Value = serde_json::from_str(&payload(tool_use_id, command)).unwrap();
+    v["cwd"] = cwd.into();
+    v.to_string()
+}
+
+/// A hook connection that uses up a grant for `scope` (the record the hook
+/// sends with `grant.consume` names it, as the hook would) and records the
 /// call as `approved`.
-async fn approved_hook(d: &Daemon, body: &str, granted: &str, approval: u64) -> Client {
+async fn approved_hook(d: &Daemon, body: &str, scope: Scope<'_>, approval: u64) -> Client {
     let mut h = Client::hook(&d.sock, body).await;
-    let sha = sha256_hex(granted);
+    let sha = sha256_hex(scope.command);
     let raw: [u8; 32] = saiife_daemon::grants::unhex(&sha).unwrap();
-    let key = saiife_daemon::grants::grant_key(my_uid(), "claude", "/p", "Bash", granted, &raw);
+    let key = saiife_daemon::grants::grant_key(
+        my_uid(),
+        scope.agent,
+        scope.project,
+        scope.tool,
+        scope.command,
+        &raw,
+    );
     let far = std::time::SystemTime::now() + Duration::from_secs(3600);
     d.ctx.grants.insert(key, approval, far).unwrap();
+    let mut asked = guard_rec(DecisionKind::Ask, scope.command);
+    asked["agent"] = scope.agent.into();
+    asked["tool"] = scope.tool.into();
+    asked["project"] = scope.project.into();
     let a = h
         .call(
             saiife_ipc::msg::OP_GRANT_CONSUME,
-            json!({"rec": guard_rec(DecisionKind::Ask, granted), "raw_sha256": sha, "project": "/p"}),
+            json!({"rec": asked, "raw_sha256": sha, "project": scope.project}),
         )
         .await;
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(a["granted"], true, "{a}");
-    let mut rec = guard_rec(DecisionKind::Approved, granted);
+    let mut rec = guard_rec(DecisionKind::Approved, scope.command);
     rec["approval"] = approval.into();
     let a = h.call(OP_AUDIT_APPEND, json!({"rec": rec})).await;
     assert_eq!(a["ok"], true, "{a}");
@@ -849,29 +886,76 @@ async fn approved_hook(d: &Daemon, body: &str, granted: &str, approval: u64) -> 
 async fn approved_call_passes_only_with_its_grant() {
     let (rj, _) = fake(rule_deny(true));
     let d = daemon_with(Some(Opts::default()), Some(rj)).await;
-    // A grant for this very command: allowed.
-    let body = payload("toolu_g1", "rm -rf /");
-    let _h1 = approved_hook(&d, &body, "rm -rf /", 1).await;
-    assert_no_opinion(&post(d.addr.unwrap(), body).await);
+    let rejudged = cosign::rejudged_body(RULE_DENY_REASON);
+    // A grant for this very call: allowed, at the root and below it.
+    for (n, cwd) in [(1, "/p"), (2, "/p/sub")] {
+        let body = payload_in(&format!("toolu_g{n}"), "rm -rf /", cwd);
+        let _h = approved_hook(&d, &body, SCOPE, n).await;
+        assert_no_opinion(&post(d.addr.unwrap(), body).await);
+    }
     // A grant for another command: the service's deny stands.
-    let body = payload("toolu_g2", "rm -rf /");
-    let _h2 = approved_hook(&d, &body, "rm -rf /tmp/x", 2).await;
-    let a = post(d.addr.unwrap(), body).await;
-    assert_eq!(a.body, cosign::rejudged_body(RULE_DENY_REASON));
+    let body = payload_in("toolu_g3", "rm -rf /", "/p");
+    let other = Scope {
+        command: "rm -rf /tmp/x",
+        ..SCOPE
+    };
+    let _h = approved_hook(&d, &body, other, 3).await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
     // No grant at all.
-    let body = payload("toolu_g3", "rm -rf /");
+    let body = payload_in("toolu_g4", "rm -rf /", "/p");
     let mut h = Client::hook(&d.sock, &body).await;
     h.verdict(DecisionKind::Allow, "rm -rf /").await;
-    let a = post(d.addr.unwrap(), body).await;
-    assert_eq!(a.body, cosign::rejudged_body(RULE_DENY_REASON));
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
     assert_eq!(wait_records(&d.audit, "rejudge_denied", 2).await.len(), 2);
     // A grant does not lift a deny that is not only `ask` rules'.
     let (rj, _) = fake(rule_deny(false));
     d.ctx.cosign.lock().unwrap().rejudge = Some(rj);
-    let body = payload("toolu_g4", "rm -rf /");
-    let _h4 = approved_hook(&d, &body, "rm -rf /", 4).await;
-    let a = post(d.addr.unwrap(), body).await;
-    assert_eq!(a.body, cosign::rejudged_body(RULE_DENY_REASON));
+    let body = payload_in("toolu_g5", "rm -rf /", "/p");
+    let _h = approved_hook(&d, &body, SCOPE, 5).await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
+}
+
+/// A grant is for one agent, tool and project: the same command in
+/// another scope does not pass on it.
+#[tokio::test]
+async fn a_grant_passes_only_in_its_own_scope() {
+    let (rj, _) = fake(rule_deny(true));
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let rejudged = cosign::rejudged_body(RULE_DENY_REASON);
+    let tool = Scope {
+        tool: "PowerShell",
+        ..SCOPE
+    };
+    let agent = Scope {
+        agent: "codex",
+        ..SCOPE
+    };
+    let project = Scope {
+        project: "/q",
+        ..SCOPE
+    };
+    let cases = [
+        (1, tool, "/p"),
+        (2, agent, "/p"),
+        (3, project, "/p"),
+        // The grant's project, but the call runs outside it.
+        (4, SCOPE, "/elsewhere"),
+        (5, SCOPE, "/pq"),
+    ];
+    for (n, scope, cwd) in cases {
+        let body = payload_in(&format!("toolu_s{n}"), "rm -rf /", cwd);
+        let _h = approved_hook(&d, &body, scope, n).await;
+        let a = post(d.addr.unwrap(), body).await;
+        assert_eq!(a.body, rejudged, "case {n}");
+    }
+    // A body with no cwd names no project.
+    let body = payload("toolu_s6", "rm -rf /");
+    let _h = approved_hook(&d, &body, SCOPE, 6).await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
+    // The matching scope still passes.
+    let body = payload_in("toolu_s7", "rm -rf /", "/p");
+    let _h = approved_hook(&d, &body, SCOPE, 7).await;
+    assert_no_opinion(&post(d.addr.unwrap(), body).await);
 }
 
 #[tokio::test]

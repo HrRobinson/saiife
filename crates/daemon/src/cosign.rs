@@ -858,6 +858,8 @@ struct Call {
     /// A shell call's command, as the hook hashes it for a grant
     /// (`raw_sha256`).
     command: Option<String>,
+    /// Claude Code's `cwd`: a grant's project root must hold it.
+    cwd: Option<String>,
 }
 
 /// The one parse of a body.
@@ -879,6 +881,7 @@ fn parse(body: &[u8]) -> Result<Call, CosignDeny> {
         tool,
         input,
         command,
+        cwd: v.get("cwd").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -971,16 +974,33 @@ async fn judge(
     }
 }
 
-/// Whether the binding connection used up a grant for exactly this call's
-/// command (`grant.consume`'s `raw_sha256`): only that lets an `ask` deny
-/// of the service pass.
+/// Whether the binding connection used up a grant for exactly this call:
+/// only that lets an `ask` deny of the service pass. The grant key is
+/// computed again from the co-signed body's own fields, as `grant.consume`
+/// computes it (`grants::grant_key`: the binder's principal, the agent, the
+/// grant's project root, the body's tool, and its command and the
+/// command's SHA-256), and must be the key used up. The body's `cwd` must
+/// be that project root or lie below it.
 fn granted(bound: &Bound, call: &Call) -> bool {
     use sha2::{Digest, Sha256};
-    let (Some(grant), Some(command)) = (&bound.grant_sha256, &call.command) else {
+    let (Some(grant), Some(command), Some(tool), Some(cwd)) =
+        (&bound.grant, &call.command, &call.tool, &call.cwd)
+    else {
         return false;
     };
-    let mine = crate::grants::hex(&Sha256::digest(command.as_bytes()).into());
-    grant.eq_ignore_ascii_case(&mine)
+    if !crate::approval_ops::within_project(cwd, &grant.project) {
+        return false;
+    }
+    let raw: [u8; 32] = Sha256::digest(command.as_bytes()).into();
+    let key = match &bound.principal {
+        Principal::Uid(uid) => {
+            crate::grants::grant_key(*uid, "claude", &grant.project, tool, command, &raw)
+        }
+        Principal::Sid(sid) => {
+            crate::grants::grant_key_for_sid(sid, "claude", &grant.project, tool, command, &raw)
+        }
+    };
+    crate::grants::hex(&key).eq_ignore_ascii_case(&grant.key)
 }
 
 /// The service's own judgment of one call, on a blocking thread.

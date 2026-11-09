@@ -103,9 +103,19 @@ pub struct Bound {
     pub pid: u32,
     /// Windows: that connection's token groups. Empty elsewhere.
     pub groups: Vec<String>,
-    /// The `raw_sha256` (lowercase hex) of the grant that connection used
-    /// up (`grant.consume`), if it used one.
-    pub grant_sha256: Option<String>,
+    /// The grant that connection used up (`grant.consume`), if it used one.
+    pub grant: Option<UsedGrant>,
+}
+
+/// A grant a hook connection used up: its key, which holds the principal,
+/// agent, project root, tool, input and the command's SHA-256
+/// (`grants::grant_key`), and that project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsedGrant {
+    /// The grant key, lowercase hex.
+    pub key: String,
+    /// The canonical project root the key holds.
+    pub project: String,
 }
 
 /// [`Waited`] without the binder: what a key's slot keeps, and what the
@@ -325,8 +335,8 @@ struct Open {
     began: Instant,
     key: Option<HookKey>,
     tool: Option<String>,
-    /// The `raw_sha256` of the grant this connection used up.
-    grant: Option<String>,
+    /// The grant this connection used up.
+    grant: Option<UsedGrant>,
     /// A verdict came, or the overrun already ended it.
     done: bool,
     /// Fired at the overrun: the connection's server closes it.
@@ -349,8 +359,8 @@ struct Slot {
     /// That connection's token groups (Windows), for the service's own
     /// judgment.
     groups: Vec<String>,
-    /// The `raw_sha256` of the grant that connection used up.
-    grant: Option<String>,
+    /// The grant that connection used up.
+    grant: Option<UsedGrant>,
     outcome: Option<Outcome>,
     /// Verdicts given on this key, so a grace period sees a later one.
     verdicts: u64,
@@ -366,7 +376,7 @@ impl Slot {
                 principal: self.principal.clone(),
                 pid: self.pid,
                 groups: self.groups.clone(),
-                grant_sha256: self.grant.clone(),
+                grant: self.grant.clone(),
             }),
             Some(Outcome::Deny) => Waited::Deny,
             Some(Outcome::NoVerdict) => Waited::NoVerdict,
@@ -714,13 +724,12 @@ impl HookTable {
         }
     }
 
-    /// `conn` used up a grant for the command whose SHA-256 is `raw_sha256`
-    /// (`grant.consume`). It is kept for the connection's key while that
-    /// connection is the key's binder, so the co-signer lets the service's
-    /// `ask` deny pass for exactly that command (plan 21).
-    pub fn granted(&self, conn: ConnId, raw_sha256: &str) {
+    /// `conn` used up `grant` (`grant.consume`). It is kept for the
+    /// connection's key while that connection is the key's binder, so the
+    /// co-signer lets the service's `ask` deny pass for exactly the call
+    /// the grant was for (plan 21).
+    pub fn granted(&self, conn: ConnId, grant: UsedGrant) {
         let mut st = self.inner.lock();
-        let grant = raw_sha256.to_ascii_lowercase();
         let Some(o) = st.conns.get_mut(&conn) else {
             return;
         };
