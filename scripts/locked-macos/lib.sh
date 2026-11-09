@@ -715,6 +715,27 @@ cosign_denied_count() {
     records | jq -c 'select(.kind == "hook" and .event == "cosign_denied")' | wc -l | tr -d ' '
 }
 
+# doctor's cosign.listen passes.
+cosign_listen_passes() {
+    as_root "$OPT_BIN" doctor --json >"$WORK/doctor-listen.json" 2>"$WORK/doctor-listen.err" || true
+    [[ "$(jq -r '.checks[] | select(.id == "cosign.listen") | .status' "$WORK/doctor-listen.json")" == pass ]]
+}
+
+# `cosign_recheck <when>`: after a restart the co-signer listens again (it
+# binds over the last daemon's TIME_WAIT, and retries a failed bind), and
+# co-signs an honest allow.
+cosign_recheck() {
+    local when="$1" p post_job
+    wait_until 60 "doctor cosign.listen to pass $when" cosign_listen_passes
+    ok "doctor cosign.listen: pass $when"
+    p="$(cosign_payload claude/bash-allow.json recheck)"
+    cosign_post "$p" recheck &
+    post_job=$!
+    expect_hook 0 "" "co-signed allow $when: the hook" claude "$p"
+    wait "$post_job"
+    expect_cosign recheck 200 "" "co-signed allow $when: no opinion"
+}
+
 # The pid the hook in $WORK/kill.err printed first ("" until then).
 kill_hook_pid() {
     sed -n '1s/^pid=\([0-9][0-9]*\)$/\1/p' "$WORK/kill.err" 2>/dev/null
@@ -848,6 +869,7 @@ phase_fail_closed() {
     local allow
     allow="$(payload claude/bash-allow.json)"
     expect_hook 0 "" "allow after the restart" claude "$allow"
+    cosign_recheck "after the restart"
 
     # The disk floor, through a reload (SIGHUP via launchctl kill).
     set_config 's/^min_free_mb = 512$/min_free_mb = 99999999/'

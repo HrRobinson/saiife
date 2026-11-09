@@ -348,7 +348,25 @@ pub fn classify_for(
     agent: Option<&str>,
     windows_host: bool,
 ) -> Result<ToolCall, PayloadError> {
-    let env = envelope(input, max_bytes)?;
+    classify_envelope(envelope(input, max_bytes)?, agent, windows_host)
+}
+
+/// [`classify_for`] of a payload already parsed (the daemon's co-signer
+/// parses its body once).
+pub fn classify_value(
+    v: &serde_json::Value,
+    agent: Option<&str>,
+    windows_host: bool,
+) -> Result<ToolCall, PayloadError> {
+    let env = Envelope::deserialize(v).map_err(|e| PayloadError::Json(e.to_string()))?;
+    classify_envelope(env, agent, windows_host)
+}
+
+fn classify_envelope(
+    env: Envelope,
+    agent: Option<&str>,
+    windows_host: bool,
+) -> Result<ToolCall, PayloadError> {
     let dialects = dialects_for(agent, env.tool(), windows_host);
     let shell = |command| ToolCall::Shell { command, dialects };
     let Some(tool) = env.tool() else {
@@ -661,6 +679,26 @@ pub fn watch_payload(argv: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_value_matches_classify_for() {
+        for p in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls -la"}}"#,
+            r#"{"tool_name":"Write","tool_input":{"file_path":"/p/a","content":"x"}}"#,
+            r#"{"tool_name":"Grep","cwd":"/p","tool_input":{"pattern":"x"}}"#,
+            r#"{"tool_name":"Write","tool_input":"nope"}"#,
+            r#"{"tool_name":"Task","tool_input":{"prompt":"x"}}"#,
+            r#"{"command":"rm -rf /tmp/x"}"#,
+            r#"{"tool_name":7,"tool_input":{"command":"ls"}}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(p).unwrap();
+            for win in [false, true] {
+                let a = classify_for(p, MAX_PAYLOAD_BYTES, Some("claude"), win);
+                let b = classify_value(&v, Some("claude"), win);
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "{p}");
+            }
+        }
+    }
 
     #[test]
     fn extracts_claude_pretooluse_bash_command() {

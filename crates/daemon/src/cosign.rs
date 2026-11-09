@@ -12,7 +12,10 @@
 //!
 //! No token: the answer only ever takes away. A browser request (it carries
 //! `Origin`), a wrong content type, a wrong path and a flood each get a
-//! refusal that blocks only that request (`onFailure: "block"`).
+//! refusal that blocks only that request (`onFailure: "block"`). Where the
+//! asker's uid is known (Linux), each uid has its own share of the
+//! connection and in-flight caps, so one user's flood leaves room for
+//! another's calls; the global caps stay as the backstop.
 
 use crate::hooks::{Principal, Waited};
 use crate::ops::{Ctx, VERSION};
@@ -25,16 +28,16 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use saiife_audit::{DecisionKind, NewRecord, Record};
-use saiife_ipc::hookkey::{hook_key_bounded, HookKey, KeyError, HOOK_KEY_MAX_BYTES};
-use saiifeguard::payload::{classify_for, context_from_hook_json_bounded, ToolCall};
-use serde_json::json;
+use saiife_ipc::hookkey::{hook_key_value, HookKey};
+use saiifeguard::payload::{classify_value, ToolCall};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
@@ -43,13 +46,29 @@ pub const COSIGN_PATH: &str = "/v1/cosign/claude";
 /// How long a request waits for the command hook's verdict, from its
 /// arrival. Under the drop-in's `"timeout": 10`.
 pub const COSIGN_WAIT: Duration = Duration::from_secs(8);
+/// The body cap. Claude Code's payloads are far smaller (the largest
+/// recorded fixture, an `Edit`, is 325 bytes); a larger body is denied.
+pub const MAX_BODY: usize = 1024 * 1024;
 /// Requests in flight; one more is answered `503`.
 pub const MAX_INFLIGHT: usize = 16;
+/// Requests in flight from one uid, where the uid is known.
+pub const MAX_INFLIGHT_PER_UID: usize = 8;
 /// Open connections; one more is closed at once.
 pub const MAX_CONNS: usize = 64;
-/// At most one `cosign_denied` record per [`CosignDeny`] value this often;
-/// the next one carries `suppressed`.
+/// Open connections from one uid, where the uid is known.
+pub const MAX_CONNS_PER_UID: usize = 32;
+/// The longest session id a `cosign_denied` record keeps, in bytes
+/// (`hook.bind`'s own limit).
+pub const MAX_RECORDED_SESSION: usize = crate::sessions::MAX_SESSION_ID;
+/// The longest tool name a `cosign_denied` record keeps, in bytes
+/// (`hook.bind`'s own limit).
+pub const MAX_RECORDED_TOOL: usize = 64;
+/// At most one `cosign_denied` record per reason, asker and session this
+/// often; the next one carries `suppressed`.
 pub const FOLD_EVERY: Duration = Duration::from_secs(10);
+/// The fold windows kept at once. When they are all live, a new session
+/// folds with the others of its reason and asker.
+const MAX_FOLD_KEYS: usize = 256;
 /// Debug builds only: `SAIIFE_TEST_COSIGN_ADDR=<addr>` binds the co-signer
 /// there instead of [`saiife_system::layout::COSIGN_ADDR`], and `off` binds
 /// none. The test suite runs many system daemons at once; release builds
@@ -59,26 +78,54 @@ pub const ADDR_SEAM: &str = "SAIIFE_TEST_COSIGN_ADDR";
 /// The co-signer's timeouts and caps; the tests shorten them.
 #[derive(Debug, Clone, Copy)]
 pub struct Opts {
-    /// The body cap (`PARSE_MAX_BYTES`, 64 MiB).
+    /// The body cap ([`MAX_BODY`]).
     pub max_body: usize,
     pub wait: Duration,
     pub max_inflight: usize,
+    pub max_inflight_per_uid: usize,
+    pub max_conns: usize,
+    pub max_conns_per_uid: usize,
     pub header_read_timeout: Duration,
     pub body_read_timeout: Duration,
     /// A whole connection, write included: a client that does not read its
     /// answer cannot keep its slot.
     pub conn_limit: Duration,
+    /// Tests only: the uid of a client by its address, in place of
+    /// `/proc/net/tcp` (`None` is a client that cannot be identified).
+    #[doc(hidden)]
+    pub peer_uid: Option<fn(SocketAddr) -> Option<u32>>,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
         Opts {
-            max_body: HOOK_KEY_MAX_BYTES,
+            max_body: MAX_BODY,
             wait: COSIGN_WAIT,
             max_inflight: MAX_INFLIGHT,
+            max_inflight_per_uid: MAX_INFLIGHT_PER_UID,
+            max_conns: MAX_CONNS,
+            max_conns_per_uid: MAX_CONNS_PER_UID,
             header_read_timeout: Duration::from_secs(5),
             body_read_timeout: Duration::from_secs(10),
             conn_limit: Duration::from_secs(30),
+            peer_uid: None,
+        }
+    }
+}
+
+/// How a failed bind is tried again: after `first`, then twice as long
+/// each time, up to `max`, for the daemon's whole life.
+#[derive(Debug, Clone, Copy)]
+pub struct Retry {
+    pub first: Duration,
+    pub max: Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Retry {
+        Retry {
+            first: Duration::from_millis(250),
+            max: Duration::from_secs(5),
         }
     }
 }
@@ -119,9 +166,9 @@ pub fn deny_body(why: CosignDeny) -> String {
 #[derive(Debug, Default)]
 pub struct CosignState {
     /// The address bound; `None` before the start, in personal mode, or
-    /// after a failed bind.
+    /// while the bind fails.
     pub addr: Option<SocketAddr>,
-    /// Why the bind failed.
+    /// Why the bind fails (the latest try), until a retry binds it.
     pub error: Option<String>,
     fold: Folder,
 }
@@ -132,19 +179,46 @@ impl CosignState {
     }
 }
 
-/// One `cosign_denied` record per [`CosignDeny`] per [`FOLD_EVERY`].
+/// What one fold window is for: a reason, who asked, and the call's
+/// session when the payload names one. So a flood of decoys folds only
+/// with itself, never over another asker's or another session's record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FoldKey {
+    why: CosignDeny,
+    principal: Option<Principal>,
+    session: Option<String>,
+}
+
+/// One `cosign_denied` record per [`FoldKey`] per [`FOLD_EVERY`], with at
+/// most [`MAX_FOLD_KEYS`] windows.
 #[derive(Debug, Default)]
 struct Folder {
-    /// The start of the current window, and the records held back in it.
-    windows: HashMap<CosignDeny, (Instant, u64)>,
+    /// The start of each window, and the records held back in it.
+    windows: HashMap<FoldKey, (Instant, u64)>,
 }
 
 impl Folder {
-    /// `Some(suppressed)` when a record for `why` is written now, with the
+    /// `Some(suppressed)` when a record for `key` is written now, with the
     /// count held back in the window before; `None` when it is held back.
-    fn admit(&mut self, why: CosignDeny, now: Instant) -> Option<u64> {
-        match self.windows.get_mut(&why) {
-            Some((start, held)) if now.saturating_duration_since(*start) < FOLD_EVERY => {
+    fn admit(&mut self, key: FoldKey, now: Instant) -> Option<u64> {
+        let live = |start: &Instant| now.saturating_duration_since(*start) < FOLD_EVERY;
+        let key = if self.windows.contains_key(&key) || self.windows.len() < MAX_FOLD_KEYS {
+            key
+        } else {
+            // Ended windows go (with any count they held back); if every
+            // window is live, the session folds with its reason and asker.
+            self.windows.retain(|_, (start, _)| live(start));
+            if self.windows.len() < MAX_FOLD_KEYS {
+                key
+            } else {
+                FoldKey {
+                    session: None,
+                    ..key
+                }
+            }
+        };
+        match self.windows.get_mut(&key) {
+            Some((start, held)) if live(start) => {
                 *held += 1;
                 None
             }
@@ -155,7 +229,7 @@ impl Folder {
                 Some(n)
             }
             None => {
-                self.windows.insert(why, (now, 0));
+                self.windows.insert(key, (now, 0));
                 Some(0)
             }
         }
@@ -180,9 +254,13 @@ pub fn target(system: bool, test_pipe: bool) -> Option<SocketAddr> {
     saiife_system::layout::COSIGN_ADDR.parse().ok()
 }
 
-/// A listener on `addr` that is ours alone: `SO_REUSEADDR` off, and on
-/// Windows `SO_EXCLUSIVEADDRUSE`, so no other process can bind the same
-/// address beside it (D6). For a fixed port the bound address is checked.
+/// A listener on `addr` that is ours alone (D6). On Linux and macOS
+/// `SO_REUSEADDR` is on: it lets the daemon bind again over the last
+/// daemon's connections in `TIME_WAIT` after a restart, and it does not let
+/// a second socket listen on the same address there. On Windows, where it
+/// would, `SO_EXCLUSIVEADDRUSE` is on and `SO_REUSEADDR` off (a bind over
+/// `TIME_WAIT` fails there; [`start_cosign`] retries it). For a fixed port
+/// the bound address is checked.
 pub fn bind_cosign(addr: SocketAddr) -> io::Result<TcpListener> {
     let sock = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
@@ -192,8 +270,10 @@ pub fn bind_cosign(addr: SocketAddr) -> io::Result<TcpListener> {
     {
         use std::os::windows::io::AsRawSocket;
         saiife_win::ffi::net::exclusive_addr_use(sock.as_raw_socket())?;
+        sock.set_reuseaddr(false)?;
     }
-    sock.set_reuseaddr(false)?;
+    #[cfg(not(windows))]
+    sock.set_reuseaddr(true)?;
     sock.bind(addr)?;
     let l = sock.listen(64)?;
     let bound = l.local_addr()?;
@@ -205,40 +285,69 @@ pub fn bind_cosign(addr: SocketAddr) -> io::Result<TcpListener> {
     Ok(l)
 }
 
-/// Bind `addr` and serve the co-signer on it. A failure does not stop the
-/// daemon: it is a `daemon` record with `event: "cosign_bind_failed"`, a
-/// log line, and `status.cosign.error`. Claude Code then blocks every call
-/// (`onFailure: "block"`) until a restart binds it.
-pub async fn start_cosign(ctx: &Arc<Ctx>, addr: SocketAddr) -> Option<tokio::task::JoinHandle<()>> {
-    match bind_cosign(addr) {
+/// [`start_cosign_with`] with the default caps and retry.
+pub async fn start_cosign(ctx: &Arc<Ctx>, addr: SocketAddr) -> tokio::task::JoinHandle<()> {
+    start_cosign_with(ctx, addr, Opts::default(), Retry::default()).await
+}
+
+/// Bind `addr` and serve the co-signer on it, in the returned task. A
+/// failed bind does not stop the daemon: it is one `daemon` record with
+/// `event: "cosign_bind_failed"`, a log line, and `status.cosign.error`
+/// for as long as it lasts; the task tries the bind again per `retry` for
+/// the daemon's whole life. Claude Code blocks every call
+/// (`onFailure: "block"`) until a try binds it.
+pub async fn start_cosign_with(
+    ctx: &Arc<Ctx>,
+    addr: SocketAddr,
+    opts: Opts,
+    retry: Retry,
+) -> tokio::task::JoinHandle<()> {
+    let e = match bind_cosign(addr) {
         Ok(l) => {
-            let bound = l.local_addr().ok();
-            {
-                let mut st = ctx.cosign.lock().unwrap_or_else(|p| p.into_inner());
-                st.addr = bound;
-                st.error = None;
-            }
-            Some(tokio::spawn(serve_cosign(l, Arc::clone(ctx))))
+            set_bound(ctx, &l);
+            return tokio::spawn(serve_cosign_with(l, Arc::clone(ctx), opts));
         }
-        Err(e) => {
-            let reason = e.to_string();
-            eprintln!(
-                "saiife: warning: co-signer {addr} is not available: {reason}; Claude Code calls are blocked until it is"
-            );
-            {
-                let mut st = ctx.cosign.lock().unwrap_or_else(|p| p.into_inner());
-                st.addr = None;
-                st.error = Some(reason.clone());
-            }
-            let mut r = ctx.event("cosign_bind_failed");
-            r.reason = Some(reason);
-            r.extra.insert("addr".into(), addr.to_string().into());
-            if let Err(e) = ctx.writer.append(r).await {
-                eprintln!("saiife: warning: cannot write the cosign_bind_failed record: {e}");
-            }
-            None
-        }
+        Err(e) => e,
+    };
+    let reason = e.to_string();
+    eprintln!(
+        "saiife: warning: co-signer {addr} is not available: {reason}; Claude Code calls are blocked until it is (trying again)"
+    );
+    set_error(ctx, reason.clone());
+    let mut r = ctx.event("cosign_bind_failed");
+    r.reason = Some(reason);
+    r.extra.insert("addr".into(), addr.to_string().into());
+    if let Err(e) = ctx.writer.append(r).await {
+        eprintln!("saiife: warning: cannot write the cosign_bind_failed record: {e}");
     }
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        let mut pause = retry.first;
+        loop {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(retry.max);
+            match bind_cosign(addr) {
+                Ok(l) => {
+                    set_bound(&ctx, &l);
+                    eprintln!("saiife: co-signer {addr} is listening now");
+                    return serve_cosign_with(l, ctx, opts).await;
+                }
+                Err(e) => set_error(&ctx, e.to_string()),
+            }
+        }
+    })
+}
+
+fn set_bound(ctx: &Ctx, l: &TcpListener) {
+    let mut st = ctx.cosign.lock().unwrap_or_else(|p| p.into_inner());
+    st.addr = l.local_addr().ok();
+    st.error = None;
+}
+
+fn set_error(ctx: &Ctx, reason: String) {
+    let mut st = ctx.cosign.lock().unwrap_or_else(|p| p.into_inner());
+    st.addr = None;
+    st.error = Some(reason);
 }
 
 /// Serve `listener` until the task is dropped.
@@ -246,10 +355,20 @@ pub async fn serve_cosign(listener: TcpListener, ctx: Arc<Ctx>) {
     serve_cosign_with(listener, ctx, Opts::default()).await
 }
 
+/// The caps shared by the connections of one listener.
+#[derive(Clone)]
+struct Limits {
+    inflight: Arc<Semaphore>,
+    per_uid: Arc<PerUid>,
+}
+
 /// [`serve_cosign`] with `opts`.
 pub async fn serve_cosign_with(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
-    let inflight = Arc::new(Semaphore::new(opts.max_inflight));
-    let conns = Arc::new(Semaphore::new(MAX_CONNS));
+    let lim = Limits {
+        inflight: Arc::new(Semaphore::new(opts.max_inflight)),
+        per_uid: Arc::default(),
+    };
+    let conns = Arc::new(Semaphore::new(opts.max_conns));
     loop {
         match listener.accept().await {
             Ok((s, peer)) => {
@@ -260,30 +379,91 @@ pub async fn serve_cosign_with(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts)
                 let Ok(slot) = Arc::clone(&conns).try_acquire_owned() else {
                     continue;
                 };
-                let local = s.local_addr().ok();
-                let (ctx, inflight) = (Arc::clone(&ctx), Arc::clone(&inflight));
+                let (ctx, lim) = (Arc::clone(&ctx), lim.clone());
                 tokio::spawn(async move {
                     let _slot = slot;
-                    let svc = service_fn(move |req| {
-                        let (ctx, inflight) = (Arc::clone(&ctx), Arc::clone(&inflight));
-                        async move {
-                            Ok::<_, Infallible>(
-                                handle(&ctx, &inflight, opts, req, local, peer).await,
-                            )
-                        }
-                    });
-                    let conn = http1::Builder::new()
-                        .timer(TokioTimer::new())
-                        .keep_alive(false)
-                        .max_buf_size(64 * 1024)
-                        .header_read_timeout(opts.header_read_timeout)
-                        .serve_connection(TokioIo::new(s), svc);
-                    let _ = tokio::time::timeout(opts.conn_limit, conn).await;
+                    let _ =
+                        tokio::time::timeout(opts.conn_limit, connection(s, peer, ctx, lim, opts))
+                            .await;
                 });
             }
             Err(e) => {
                 eprintln!("saiife: warning: co-signer accept failed: {e}");
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// One connection: who asks (before any of the body is read), that
+/// asker's connection slot, then the one request.
+async fn connection(s: TcpStream, peer: SocketAddr, ctx: Arc<Ctx>, lim: Limits, opts: Opts) {
+    let who = asker(opts, s.local_addr().ok(), peer).await;
+    let _uid_slot = match who.uid() {
+        Some(uid) => match lim.per_uid.take(uid, Slot::Conn, opts.max_conns_per_uid) {
+            Some(g) => Some(g),
+            None => return,
+        },
+        None => None,
+    };
+    let svc = service_fn(move |req| {
+        let (ctx, lim, who) = (Arc::clone(&ctx), lim.clone(), who.clone());
+        async move { Ok::<_, Infallible>(handle(&ctx, &lim, opts, req, who).await) }
+    });
+    let _ = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .keep_alive(false)
+        .max_buf_size(64 * 1024)
+        .header_read_timeout(opts.header_read_timeout)
+        .serve_connection(TokioIo::new(s), svc)
+        .await;
+}
+
+/// The connections and requests in flight per uid.
+#[derive(Debug, Default)]
+struct PerUid {
+    counts: Mutex<HashMap<u32, [usize; 2]>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    Conn = 0,
+    Inflight = 1,
+}
+
+/// A held [`PerUid`] slot, given back on drop.
+struct UidSlot {
+    table: Arc<PerUid>,
+    uid: u32,
+    slot: Slot,
+}
+
+impl PerUid {
+    fn take(self: &Arc<Self>, uid: u32, slot: Slot, max: usize) -> Option<UidSlot> {
+        let mut m = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let c = m.entry(uid).or_default();
+        if c[slot as usize] >= max {
+            if *c == [0, 0] {
+                m.remove(&uid);
+            }
+            return None;
+        }
+        c[slot as usize] += 1;
+        Some(UidSlot {
+            table: Arc::clone(self),
+            uid,
+            slot,
+        })
+    }
+}
+
+impl Drop for UidSlot {
+    fn drop(&mut self) {
+        let mut m = self.table.counts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = m.get_mut(&self.uid) {
+            c[self.slot as usize] = c[self.slot as usize].saturating_sub(1);
+            if *c == [0, 0] {
+                m.remove(&self.uid);
             }
         }
     }
@@ -329,6 +509,7 @@ fn is_json(h: &http::HeaderMap) -> bool {
 /// Who asks: on Linux the uid of the client's socket, from `/proc/net`.
 /// Elsewhere a TCP peer is not identified (W13; no `/proc` on macOS), and
 /// every principal's verdict counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Asker {
     Known(Principal),
     Unscoped,
@@ -336,28 +517,49 @@ enum Asker {
     Unknown,
 }
 
-async fn asker(local: Option<SocketAddr>, peer: SocketAddr) -> Asker {
+impl Asker {
+    fn uid(&self) -> Option<u32> {
+        match self {
+            Asker::Known(Principal::Uid(u)) => Some(*u),
+            _ => None,
+        }
+    }
+
+    fn principal(&self) -> Option<&Principal> {
+        match self {
+            Asker::Known(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+async fn asker(opts: Opts, local: Option<SocketAddr>, peer: SocketAddr) -> Asker {
+    let known = |uid: Option<u32>| uid.map_or(Asker::Unknown, |u| Asker::Known(Principal::Uid(u)));
+    if let Some(f) = opts.peer_uid {
+        let _ = local;
+        return known(f(peer));
+    }
     if !cfg!(target_os = "linux") {
-        let _ = (local, peer);
         return Asker::Unscoped;
     }
     let Some(local) = local else {
         return Asker::Unknown;
     };
-    tokio::task::spawn_blocking(move || crate::mcp_gateway::tcp_peer_socket(local, peer))
-        .await
-        .ok()
-        .flatten()
-        .map_or(Asker::Unknown, |(uid, _)| Asker::Known(Principal::Uid(uid)))
+    known(
+        tokio::task::spawn_blocking(move || crate::mcp_gateway::tcp_peer_socket(local, peer))
+            .await
+            .ok()
+            .flatten()
+            .map(|(uid, _)| uid),
+    )
 }
 
 async fn handle(
     ctx: &Arc<Ctx>,
-    inflight: &Arc<Semaphore>,
+    lim: &Limits,
     opts: Opts,
     req: Request<Incoming>,
-    local: Option<SocketAddr>,
-    peer: SocketAddr,
+    who: Asker,
 ) -> Resp {
     let arrival = Instant::now();
     if req.method() != Method::POST || req.uri().path() != COSIGN_PATH {
@@ -373,52 +575,95 @@ async fn handle(
             "the body must be application/json\n",
         );
     }
-    let Ok(_permit) = Arc::clone(inflight).try_acquire_owned() else {
+    // No verdict can be this asker's: denied before the body is read.
+    if who == Asker::Unknown {
+        return denied(ctx, CosignDeny::NoReport, &who, None).await;
+    }
+    let _uid_permit = match who.uid() {
+        Some(uid) => match lim
+            .per_uid
+            .take(uid, Slot::Inflight, opts.max_inflight_per_uid)
+        {
+            Some(g) => Some(g),
+            None => return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n"),
+        },
+        None => None,
+    };
+    let Ok(_permit) = Arc::clone(&lim.inflight).try_acquire_owned() else {
         return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n");
     };
     let body = match read_body(req, opts).await {
         Ok(b) => b,
-        Err(why) => return denied(ctx, why, None, None).await,
+        Err(why) => return denied(ctx, why, &who, None).await,
     };
-    judge(ctx, opts, arrival, &body, || asker(local, peer)).await
+    judge_body(ctx, opts, arrival, body, &who).await
 }
 
-/// The answer for a request body that arrived at `arrival`; `who` finds
-/// the asking principal, once the body names a call.
-async fn judge<F, Fut>(ctx: &Arc<Ctx>, opts: Opts, arrival: Instant, body: &[u8], who: F) -> Resp
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Asker>,
-{
-    let Ok(text) = std::str::from_utf8(body) else {
-        return denied(ctx, CosignDeny::BadJson, None, None).await;
+/// What the co-signer keeps of a request body, parsed once: the call's
+/// key, its tool, and its input as the guard would show it.
+#[derive(Debug)]
+struct Call {
+    key: HookKey,
+    tool: Option<String>,
+    input: String,
+}
+
+/// The one parse of a body.
+fn parse(body: &[u8]) -> Result<Call, CosignDeny> {
+    let v: Value = serde_json::from_slice(body).map_err(|_| CosignDeny::BadJson)?;
+    let key = hook_key_value("claude", &v).map_err(|_| CosignDeny::BadJson)?;
+    let tool = ["tool_name", "toolName"]
+        .into_iter()
+        .find_map(|f| v.get(f).and_then(Value::as_str))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let input = match classify_value(&v, Some("claude"), cfg!(windows)) {
+        Ok(ToolCall::Shell { command, .. }) => command,
+        Ok(ToolCall::File { paths, .. }) => paths.join(" "),
+        Ok(ToolCall::Other { .. }) | Err(_) => String::new(),
     };
-    let key = match hook_key_bounded("claude", text, opts.max_body) {
-        Ok(k) => k,
-        Err(KeyError::TooLarge) => return denied(ctx, CosignDeny::TooLarge, None, None).await,
-        Err(KeyError::Json(_)) => return denied(ctx, CosignDeny::BadJson, None, None).await,
+    Ok(Call { key, tool, input })
+}
+
+/// The answer for a request body that arrived at `arrival`. The body is
+/// parsed on a blocking thread, never on a runtime worker; the request's
+/// in-flight slot bounds how many parses run at once.
+async fn judge_body(
+    ctx: &Arc<Ctx>,
+    opts: Opts,
+    arrival: Instant,
+    body: Bytes,
+    who: &Asker,
+) -> Resp {
+    let call = match tokio::task::spawn_blocking(move || parse(&body)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(why)) => return denied(ctx, why, who, None).await,
+        Err(_) => return denied(ctx, CosignDeny::BadJson, who, None).await,
     };
-    if !key.cosignable() {
-        return denied(ctx, CosignDeny::NotCosignable, Some(&key), Some(text)).await;
+    judge(ctx, opts, arrival, &call, who).await
+}
+
+/// The answer for `call`, asked by `who`.
+async fn judge(ctx: &Arc<Ctx>, opts: Opts, arrival: Instant, call: &Call, who: &Asker) -> Resp {
+    if !call.key.cosignable() {
+        return denied(ctx, CosignDeny::NotCosignable, who, Some(call)).await;
     }
-    let principal = match who().await {
+    let principal = match who {
         Asker::Known(p) => Some(p),
         Asker::Unscoped => None,
-        Asker::Unknown => {
-            return denied(ctx, CosignDeny::NoReport, Some(&key), Some(text)).await;
-        }
+        Asker::Unknown => return denied(ctx, CosignDeny::NoReport, who, Some(call)).await,
     };
     match ctx
         .hooks
-        .wait(&key, principal.as_ref(), arrival + opts.wait)
+        .wait(&call.key, principal, arrival + opts.wait)
         .await
     {
         Waited::Allow => no_opinion(),
         // The guard record says why.
         Waited::Deny => deny(CosignDeny::Denied),
-        Waited::NoVerdict => denied(ctx, CosignDeny::NoVerdict, Some(&key), Some(text)).await,
+        Waited::NoVerdict => denied(ctx, CosignDeny::NoVerdict, who, Some(call)).await,
         Waited::Timeout | Waited::Foreign => {
-            denied(ctx, CosignDeny::NoReport, Some(&key), Some(text)).await
+            denied(ctx, CosignDeny::NoReport, who, Some(call)).await
         }
     }
 }
@@ -449,33 +694,33 @@ async fn read_body(req: Request<Incoming>, opts: Opts) -> Result<Bytes, CosignDe
 }
 
 /// The deny answer for `why`, with its `cosign_denied` record (folded).
-async fn denied(
-    ctx: &Arc<Ctx>,
-    why: CosignDeny,
-    key: Option<&HookKey>,
-    payload: Option<&str>,
-) -> Resp {
-    record(ctx, why, key, payload).await;
+async fn denied(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call>) -> Resp {
+    record(ctx, why, who, call).await;
     deny(why)
 }
 
-/// What the guard would show as the call's input: the command, or the
-/// paths of a file tool.
-fn shown_input(payload: &str) -> String {
-    match classify_for(payload, HOOK_KEY_MAX_BYTES, Some("claude"), cfg!(windows)) {
-        Ok(ToolCall::Shell { command, .. }) => command,
-        Ok(ToolCall::File { paths, .. }) => paths.join(" "),
-        Ok(ToolCall::Other { .. }) | Err(_) => String::new(),
-    }
+/// `s` masked and cut to at most `max` bytes on a character boundary.
+fn capped(s: &str, max: usize) -> String {
+    saiife_audit::mask::mask_cut(s, max)
 }
 
 /// The `cosign_denied` record of a deny, unless [`FOLD_EVERY`] holds it
 /// back, or the audit volume is below its floor (a TCP peer is never the
-/// daemon itself).
-async fn record(ctx: &Arc<Ctx>, why: CosignDeny, key: Option<&HookKey>, payload: Option<&str>) {
+/// daemon itself). The session and the input are the asker's own words:
+/// they are kept only when the asker is identified, and every string is
+/// capped as `hook.bind` caps it.
+async fn record(ctx: &Arc<Ctx>, why: CosignDeny, who: &Asker, call: Option<&Call>) {
+    let session = call
+        .and_then(|c| c.key.session.as_deref())
+        .map(|s| capped(s, MAX_RECORDED_SESSION));
+    let fold = FoldKey {
+        why,
+        principal: who.principal().cloned(),
+        session: session.clone(),
+    };
     let suppressed = {
         let mut st = ctx.cosign.lock().unwrap_or_else(|p| p.into_inner());
-        match st.fold.admit(why, Instant::now()) {
+        match st.fold.admit(fold, Instant::now()) {
             Some(n) => n,
             None => return,
         }
@@ -485,17 +730,23 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, key: Option<&HookKey>, payload:
     if crate::disk::disk_gate(free, p.min_free_mb, false).is_err() {
         return;
     }
-    let hc = payload
-        .map(|t| context_from_hook_json_bounded(t, HOOK_KEY_MAX_BYTES))
+    let identified = matches!(who, Asker::Known(_));
+    let session = session.filter(|_| identified);
+    let input = call
+        .filter(|_| identified)
+        .map(|c| c.input.as_str())
+        .unwrap_or("");
+    let tool = call
+        .and_then(|c| c.tool.as_deref())
+        .map(|t| capped(t, MAX_RECORDED_TOOL))
         .unwrap_or_default();
-    let input = payload.map(shown_input).unwrap_or_default();
     let mut r = Record::new(
         NewRecord {
             agent: "claude",
             project: "",
-            session: key.and_then(|k| k.session.as_deref()),
-            tool: hc.tool.as_deref().unwrap_or(""),
-            input: &input,
+            session: session.as_deref(),
+            tool: &tool,
+            input,
             decision: DecisionKind::ErrorDenied,
             pack: None,
             rule: None,
@@ -512,8 +763,8 @@ async fn record(ctx: &Arc<Ctx>, why: CosignDeny, key: Option<&HookKey>, payload:
     // The call by its id only: no hash of the input (see `hooks::Verdict`).
     x.insert(
         "tool_use_id".into(),
-        json!(key
-            .and_then(|k| k.tool_use_id.as_deref())
+        json!(call
+            .and_then(|c| c.key.tool_use_id.as_deref())
             .map(crate::hooks::recorded_id)),
     );
     if suppressed > 0 {
@@ -552,9 +803,30 @@ mod tests {
     fn fixed_values() {
         assert_eq!(COSIGN_WAIT, Duration::from_secs(8));
         assert_eq!(MAX_INFLIGHT, 16);
-        assert_eq!(Opts::default().max_body, 64 * 1024 * 1024);
+        assert_eq!(MAX_INFLIGHT_PER_UID, 8);
+        assert_eq!(MAX_CONNS_PER_UID, 32);
+        assert_eq!(Opts::default().max_body, 1024 * 1024);
+        assert_eq!(MAX_RECORDED_SESSION, 128);
+        assert_eq!(MAX_RECORDED_TOOL, 64);
         assert_eq!(COSIGN_PATH, "/v1/cosign/claude");
         assert_eq!(saiife_system::layout::COSIGN_ADDR, "127.0.0.1:7433");
+    }
+
+    /// Every recorded Claude Code payload is far under the body cap.
+    #[test]
+    fn claude_fixtures_are_far_under_the_cap() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cli/tests/fixtures/claude");
+        let mut largest = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let len = e.unwrap().metadata().unwrap().len();
+            largest = largest.max(len);
+        }
+        assert!(largest > 0);
+        assert!(
+            largest * 1000 < MAX_BODY as u64,
+            "largest fixture {largest} bytes"
+        );
     }
 
     #[test]
@@ -577,32 +849,125 @@ mod tests {
         assert_eq!(target(false, true), None);
     }
 
+    fn fk(why: CosignDeny, uid: Option<u32>, session: Option<&str>) -> FoldKey {
+        FoldKey {
+            why,
+            principal: uid.map(Principal::Uid),
+            session: session.map(str::to_string),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn folding_one_record_per_reason_per_window() {
+    async fn folding_one_record_per_key_per_window() {
         let mut f = Folder::default();
         let t0 = Instant::now();
-        assert_eq!(f.admit(CosignDeny::NoReport, t0), Some(0));
+        let k = fk(CosignDeny::NoReport, Some(1000), Some("c-1"));
+        assert_eq!(f.admit(k.clone(), t0), Some(0));
         for i in 1..20 {
             let at = t0 + Duration::from_millis(i * 400);
-            assert_eq!(f.admit(CosignDeny::NoReport, at), None);
+            assert_eq!(f.admit(k.clone(), at), None);
         }
-        // Another reason has its own window.
-        assert_eq!(f.admit(CosignDeny::BadJson, t0), Some(0));
+        // Another reason, another session, another asker: each its own window.
         assert_eq!(
-            f.admit(CosignDeny::NoReport, t0 + FOLD_EVERY),
+            f.admit(fk(CosignDeny::BadJson, Some(1000), Some("c-1")), t0),
+            Some(0)
+        );
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, Some(1000), Some("c-2")), t0),
+            Some(0)
+        );
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, Some(1001), Some("c-1")), t0),
+            Some(0)
+        );
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, None, Some("c-1")), t0),
+            Some(0)
+        );
+        assert_eq!(
+            f.admit(k.clone(), t0 + FOLD_EVERY),
             Some(19),
             "the next one carries the count"
         );
-        assert_eq!(f.admit(CosignDeny::NoReport, t0 + FOLD_EVERY * 3), Some(0));
+        assert_eq!(f.admit(k, t0 + FOLD_EVERY * 3), Some(0));
     }
 
-    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn fold_windows_are_bounded() {
+        let mut f = Folder::default();
+        let t0 = Instant::now();
+        for n in 0..MAX_FOLD_KEYS {
+            let s = format!("s-{n}");
+            assert_eq!(
+                f.admit(fk(CosignDeny::NoReport, Some(1), Some(&s)), t0),
+                Some(0)
+            );
+        }
+        // All live: new sessions fold with their reason and asker.
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, Some(1), Some("new-1")), t0),
+            Some(0)
+        );
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, Some(1), Some("new-2")), t0),
+            None
+        );
+        // Another asker still has a window of its own.
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, Some(2), Some("new-1")), t0),
+            Some(0)
+        );
+        assert!(f.windows.len() <= MAX_FOLD_KEYS + 2);
+        // Once the windows end, they make room again.
+        let later = t0 + FOLD_EVERY;
+        assert_eq!(
+            f.admit(fk(CosignDeny::NoReport, Some(1), Some("new-3")), later),
+            Some(0)
+        );
+        assert!(f.windows.len() <= 2, "{}", f.windows.len());
+    }
+
+    #[test]
+    fn per_uid_slots_are_given_back() {
+        let t = Arc::new(PerUid::default());
+        let a: Vec<_> = (0..3)
+            .map(|_| t.take(1, Slot::Inflight, 3).unwrap())
+            .collect();
+        assert!(t.take(1, Slot::Inflight, 3).is_none());
+        assert!(t.take(2, Slot::Inflight, 3).is_some(), "another uid");
+        let c = t.take(1, Slot::Conn, 3).unwrap();
+        drop(a);
+        assert!(t.take(1, Slot::Inflight, 3).is_some());
+        drop(c);
+        assert!(t.counts.lock().unwrap().is_empty());
+        assert!(t.take(9, Slot::Conn, 0).is_none());
+        assert!(t.counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_once_keeps_key_tool_and_input() {
+        let c = parse(payload("toolu_1", "ls -la").as_bytes()).unwrap();
+        assert_eq!(
+            c.key,
+            saiife_ipc::hookkey::hook_key("claude", &payload("toolu_1", "ls -la")).unwrap()
+        );
+        assert_eq!(c.tool.as_deref(), Some("Bash"));
+        assert_eq!(c.input, "ls -la");
+        assert_eq!(parse(b"{not json").unwrap_err(), CosignDeny::BadJson);
+        assert_eq!(parse(b"[1]").unwrap_err(), CosignDeny::BadJson);
+        assert_eq!(parse(b"\xff").unwrap_err(), CosignDeny::BadJson);
+    }
+
     fn payload(tool_use_id: &str, command: &str) -> String {
+        payload_in("c-1", "Bash", tool_use_id, command)
+    }
+
+    fn payload_in(session: &str, tool: &str, tool_use_id: &str, command: &str) -> String {
         json!({
-            "session_id": "c-1",
+            "session_id": session,
             "tool_use_id": tool_use_id,
             "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
+            "tool_name": tool,
             "tool_input": {"command": command},
         })
         .to_string()
@@ -637,16 +1002,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const ME: Asker = Asker::Known(Principal::Uid(4242));
+
+    #[cfg(unix)]
+    async fn ask(ctx: &Arc<Ctx>, start: Instant, body: String, who: &Asker) -> Resp {
+        judge_body(ctx, Opts::default(), start, Bytes::from(body), who).await
+    }
+
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn no_hook_at_all_denies_at_the_cap() {
         let t = tempfile::tempdir().unwrap();
         let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
         let start = Instant::now();
-        let body = payload("toolu_1", "ls -la");
-        let r = judge(&ctx, Opts::default(), start, body.as_bytes(), || async {
-            Asker::Unscoped
-        })
-        .await;
+        let r = ask(&ctx, start, payload("toolu_1", "ls -la"), &ME).await;
         assert_eq!(start.elapsed(), COSIGN_WAIT);
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
@@ -669,6 +1038,63 @@ mod tests {
         assert!(!rec.extra.contains_key("suppressed"));
     }
 
+    /// An asker that is not identified (macOS, Windows) has its session
+    /// and input left out of the record.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn unidentified_asker_records_no_session_or_input() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        let r = ask(
+            &ctx,
+            Instant::now(),
+            payload("toolu_1", "ls -la"),
+            &Asker::Unscoped,
+        )
+        .await;
+        assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
+        let r = ask(
+            &ctx,
+            Instant::now(),
+            // Another session: not folded with the first.
+            payload_in("c-2", "Bash", "toolu_2", "ls"),
+            &Asker::Unknown,
+        )
+        .await;
+        assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
+        let got = wait_records(t.path(), 2);
+        assert_eq!(got.len(), 2);
+        for rec in &got {
+            assert_eq!(rec.session, None, "{rec:?}");
+            assert_eq!(rec.input, "", "{rec:?}");
+            assert_eq!(rec.tool, "Bash");
+        }
+        assert_eq!(got[0].extra["tool_use_id"], "toolu_1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn recorded_session_and_tool_are_capped() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        let session = "s".repeat(300);
+        let tool = format!("{}é", "t".repeat(63));
+        let r = ask(
+            &ctx,
+            Instant::now(),
+            payload_in(&session, &tool, "toolu_1", "ls"),
+            &ME,
+        )
+        .await;
+        assert_eq!(body_of(r).await, deny_body(CosignDeny::NoReport));
+        let got = wait_records(t.path(), 1);
+        assert_eq!(
+            got[0].session.as_deref(),
+            Some(&session[..MAX_RECORDED_SESSION])
+        );
+        assert_eq!(got[0].tool, "t".repeat(63), "cut on a character boundary");
+    }
+
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn cosign_denied_records_are_folded() {
@@ -679,10 +1105,12 @@ mod tests {
         for n in 0..20 {
             let ctx = Arc::clone(&ctx);
             set.spawn(async move {
-                let b = payload(&format!("toolu_{n}"), "ls");
-                let r = judge(&ctx, Opts::default(), start, b.as_bytes(), || async {
-                    Asker::Unscoped
-                })
+                let r = ask(
+                    &ctx,
+                    start,
+                    payload(&format!("toolu_{n}"), "ls"),
+                    &Asker::Unscoped,
+                )
                 .await;
                 body_of(r).await
             });
@@ -693,18 +1121,49 @@ mod tests {
         assert_eq!(start.elapsed(), COSIGN_WAIT, "all at once");
         assert_eq!(wait_records(t.path(), 1).len(), 1);
         tokio::time::sleep(FOLD_EVERY).await;
-        let late = payload("toolu_late", "ls");
-        judge(
+        ask(
             &ctx,
-            Opts::default(),
             Instant::now(),
-            late.as_bytes(),
-            || async { Asker::Unscoped },
+            payload("toolu_late", "ls"),
+            &Asker::Unscoped,
         )
         .await;
         let got = wait_records(t.path(), 2);
         assert_eq!(got.len(), 2);
         assert_eq!(got[1].extra["suppressed"], 19);
+    }
+
+    /// A flood of decoys does not hide another session's or another
+    /// asker's record in the same window.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_decoy_does_not_hide_another_call() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
+        let decoy = Asker::Known(Principal::Uid(5000));
+        let start = Instant::now();
+        for n in 0..5 {
+            let p = payload_in("decoy", "Bash", &format!("toolu_d{n}"), "ls");
+            ask(&ctx, start, p, &decoy).await;
+        }
+        assert_eq!(wait_records(t.path(), 1).len(), 1);
+        // The real call: same reason, the victim's own session and uid.
+        let real = payload_in("victim", "Bash", "toolu_real", "rm -rf /");
+        ask(&ctx, Instant::now(), real, &ME).await;
+        // The same session from the decoy's uid does not fold with it either.
+        let same = payload_in("victim", "Bash", "toolu_same", "ls");
+        ask(&ctx, Instant::now(), same, &decoy).await;
+        let got = wait_records(t.path(), 3);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[1].extra["tool_use_id"], "toolu_real");
+        assert_eq!(got[1].input, "rm -rf /");
+        assert_eq!(got[2].extra["tool_use_id"], "toolu_same");
+        // On macOS and Windows (no asker), the session alone parts them.
+        let a = payload_in("u-1", "Bash", "toolu_u1", "ls");
+        let b = payload_in("u-2", "Bash", "toolu_u2", "ls");
+        ask(&ctx, Instant::now(), a, &Asker::Unscoped).await;
+        ask(&ctx, Instant::now(), b, &Asker::Unscoped).await;
+        assert_eq!(wait_records(t.path(), 5).len(), 5);
     }
 
     #[cfg(windows)]

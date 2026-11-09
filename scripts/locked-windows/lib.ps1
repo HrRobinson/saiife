@@ -1049,6 +1049,7 @@ function phase_fail_closed {
   Wait-Until 30 'the start record after Stop-Process' { @(Get-StartRecords).Count -gt $before -and (Test-DaemonReady) }
   Assert-LastStart $false 'after Stop-Process and the restart'
   Assert-Hook 0 '' 'allow after the restart' claude (Get-Payload 'claude\bash-allow.json')
+  Assert-CosignAfterRestart 'after the restart'
 }
 
 function attack_files {
@@ -1685,6 +1686,22 @@ function cosign_doctor {
   if ($cl -ne 'pass') { $problems.Add("cosign.listen is $cl, want pass") }
   if ($problems.Count) { Fail ($problems -join '; ') }
   Ok 'doctor: hooks.no-verdict warns, cosign.listen passes'
+}
+
+# After a restart: the co-signer binds again (SO_EXCLUSIVEADDRUSE refuses a bind over the last
+# daemon's TIME_WAIT, so the daemon retries it), and co-signs an honest allow.
+function Assert-CosignAfterRestart([string]$When) {
+  Wait-Until 300 "doctor cosign.listen to pass $When" { (Get-CheckStatus (Get-DoctorSummary $null $Script:Hook) 'cosign.listen') -eq 'pass' }
+  Ok "doctor cosign.listen: pass $When"
+  $allow = Get-CosignPayload 'claude\bash-allow.json' (New-ToolUseId)
+  $job = Start-Cosign $allow
+  Invoke-Hook -AgentKind claude -Payload $allow
+  $hookCode = $Script:HookCode
+  $hookErr = $Script:HookErr
+  $a = Receive-Cosign $job
+  if ($hookCode -ne 0) { Fail "${When}: the allow fixture's hook exited $hookCode, want 0: $hookErr" }
+  if ($a.Status -ne 200 -or $a.Body -ne '') { Fail "${When}: co-sign answer $(Format-Cosign $a), want 200 with an empty body; daemon.log: $(Get-DaemonLogTail)" }
+  Ok "${When}: hook exit 0, co-signer 200 with an empty body in $($a.Ms) ms"
 }
 
 # The managed hook's budget on Windows: p95 of 50 allow calls as the agent within 130 ms

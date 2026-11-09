@@ -1837,10 +1837,10 @@ async fn serve(
         None => None,
     };
     // The co-signer, once the control endpoint is open (its answers wait
-    // on the hooks' verdicts there). A bind failure is a record; the
-    // daemon runs on for the other agents.
+    // on the hooks' verdicts there). A bind failure is a record, and the
+    // task tries the bind again; the daemon runs on for the other agents.
     let cosign_task = match cosign {
-        Some(addr) => crate::cosign::start_cosign(&ctx, addr).await,
+        Some(addr) => Some(crate::cosign::start_cosign(&ctx, addr).await),
         None => None,
     };
 

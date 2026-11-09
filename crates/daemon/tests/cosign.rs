@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use saiife_audit::{ChainWriter, DecisionKind, NewRecord, Record, WriterOptions};
-use saiife_daemon::cosign::{self, deny_body, CosignDeny, Opts};
+use saiife_daemon::cosign::{self, deny_body, CosignDeny, Opts, Retry};
 use saiife_daemon::hooks::RECONNECT_GRACE;
 use saiife_daemon::ops::{Ctx, CtxInit};
 use saiife_daemon::writer::{self, WriterConfig};
@@ -346,7 +346,9 @@ async fn killed_hook_gets_deny_at_once() {
     assert_eq!(got[0].kind(), "hook");
     assert_eq!(got[0].decision, DecisionKind::ErrorDenied);
     assert_eq!(got[0].tool, "Bash");
-    assert_eq!(got[0].input, "ls");
+    // The asker's input and session only where it is identified (Linux).
+    assert_eq!(got[0].input, if LINUX { "ls" } else { "" });
+    assert_eq!(got[0].session.as_deref(), LINUX.then_some("c-1"));
     assert_eq!(got[0].extra["tool_use_id"], "toolu_4");
     assert_eq!(wait_records(&d.audit, "no_verdict", 1).await.len(), 1);
 }
@@ -359,8 +361,10 @@ async fn other_payload_does_not_match() {
     let a = post(d.addr.unwrap(), payload("toolu_5", "rm -rf /")).await;
     assert_deny(&a, CosignDeny::NoReport);
     let got = wait_records(&d.audit, "cosign_denied", 1).await;
-    assert_eq!(got[0].input, "rm -rf /");
+    assert_eq!(got[0].input, if LINUX { "rm -rf /" } else { "" });
 }
+
+const LINUX: bool = cfg!(target_os = "linux");
 
 #[tokio::test]
 async fn not_cosignable_without_tool_use_id() {
@@ -442,7 +446,13 @@ async fn get_404() {
 
 #[tokio::test]
 async fn inflight_cap_answers_503() {
-    let d = daemon(short(Duration::from_secs(3))).await;
+    // The global cap, with one uid's share as large as it.
+    let d = daemon(Some(Opts {
+        wait: Duration::from_secs(3),
+        max_inflight_per_uid: cosign::MAX_INFLIGHT,
+        ..Opts::default()
+    }))
+    .await;
     let addr = d.addr.unwrap();
     let held: Vec<_> = (0..16)
         .map(|n| tokio::spawn(post(addr, payload(&format!("toolu_h{n}"), "ls"))))
@@ -474,20 +484,24 @@ async fn oversize_body_denied() {
     assert_eq!(got[0].reason.as_deref(), Some(CosignDeny::TooLarge.text()));
 }
 
+/// A port held by another socket: one record, status shows the error for
+/// as long as it lasts, and once the port is free the co-signer binds it
+/// with no restart.
 #[tokio::test]
-async fn port_in_use_is_recorded_and_the_daemon_runs() {
+async fn port_in_use_is_retried_until_it_binds() {
     let d = daemon(None).await;
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = taken.local_addr().unwrap();
-    assert!(cosign::start_cosign(&d.ctx, addr).await.is_none());
+    let retry = Retry {
+        first: Duration::from_millis(20),
+        max: Duration::from_millis(80),
+    };
+    let _task = cosign::start_cosign_with(&d.ctx, addr, Opts::default(), retry).await;
     let got = wait_records(&d.audit, "cosign_bind_failed", 1).await;
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].kind(), "daemon");
     assert!(got[0].reason.as_deref().is_some_and(|r| !r.is_empty()));
     let mut c = Client::hello(&d.sock).await;
-    let s = c.call(OP_STATUS, json!({})).await;
-    assert_eq!(s["cosign"]["addr"], Value::Null, "{s}");
-    assert!(s["cosign"]["error"].is_string(), "{s}");
     let a = c
         .call(
             OP_AUDIT_APPEND,
@@ -495,13 +509,146 @@ async fn port_in_use_is_recorded_and_the_daemon_runs() {
         )
         .await;
     assert_eq!(a["ok"], true, "{a}");
-    // A free address binds, and status names it.
-    drop(taken);
-    let t = cosign::start_cosign(&d.ctx, addr).await;
-    assert!(t.is_some());
+    // Several tries fail meanwhile; doctor still sees the error.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let s = c.call(OP_STATUS, json!({})).await;
+    assert_eq!(s["cosign"]["addr"], Value::Null, "{s}");
+    assert!(s["cosign"]["error"].is_string(), "{s}");
+    assert_eq!(
+        records(&d.audit, "cosign_bind_failed").len(),
+        1,
+        "once, not per try"
+    );
+    // The port comes free: a retry binds it, and status names it.
+    drop(taken);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let s = loop {
+        let s = c.call(OP_STATUS, json!({})).await;
+        if s["cosign"]["addr"] == addr.to_string() || Instant::now() > deadline {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(s["cosign"]["addr"], addr.to_string(), "{s}");
     assert_eq!(s["cosign"]["error"], Value::Null, "{s}");
+    // And it answers: an honest allow is co-signed.
+    let p = payload("toolu_rebind", "ls");
+    let mut h = Client::hook(&d.sock, &p).await;
+    h.verdict(DecisionKind::Allow, "ls").await;
+    assert_no_opinion(&post(addr, p).await);
+    assert_eq!(records(&d.audit, "cosign_bind_failed").len(), 1);
+}
+
+/// After a restart the last daemon's connections sit in `TIME_WAIT` on
+/// the port (the co-signer closes first); the bind gets past them.
+#[tokio::test]
+async fn bind_gets_past_time_wait() {
+    let l = cosign::bind_cosign("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = l.local_addr().unwrap();
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, _) = l.accept().await.unwrap();
+    // The server end closes first, so it is the one in TIME_WAIT.
+    drop(server);
+    let mut client = client;
+    let mut buf = [0u8; 1];
+    assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+    drop(client);
+    drop(l);
+    let again = cosign::bind_cosign(addr).expect("binds over TIME_WAIT");
+    assert_eq!(again.local_addr().unwrap(), addr);
+}
+
+#[tokio::test]
+async fn default_body_cap_is_one_mib() {
+    let d = daemon(Some(Opts::default())).await;
+    let pad = 1024 * 1024 - payload("toolu_cap", "").len() + 1;
+    let a = post(d.addr.unwrap(), payload("toolu_cap", &"a".repeat(pad))).await;
+    assert_deny(&a, CosignDeny::TooLarge);
+}
+
+/// An asker whose socket is not found is denied before its body is read.
+#[tokio::test]
+async fn unidentified_peer_is_denied_without_its_body() {
+    let d = daemon(Some(Opts {
+        peer_uid: Some(|_| None),
+        ..Opts::default()
+    }))
+    .await;
+    let addr = d.addr.unwrap();
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let head = "POST /v1/cosign/claude HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n";
+    s.write_all(head.as_bytes()).await.unwrap();
+    let start = Instant::now();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.ends_with(&deny_body(CosignDeny::NoReport)), "{text}");
+    let got = wait_records(&d.audit, "cosign_denied", 1).await;
+    assert_eq!(got[0].session, None);
+    assert_eq!(got[0].input, "");
+}
+
+/// Linux: one uid's flood of slow bodies takes only its own share of the
+/// in-flight cap; another uid's request is answered at once. The uid is
+/// the last byte of the client's loopback address here (`peer_uid`), as
+/// `/proc/net/tcp` would give it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn slow_body_flood_from_one_uid_does_not_block_another() {
+    async fn from(src: [u8; 4], addr: SocketAddr) -> TcpStream {
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.bind(SocketAddr::from((src, 0))).unwrap();
+        s.connect(addr).await.unwrap()
+    }
+    let d = daemon(Some(Opts {
+        peer_uid: Some(|peer| match peer.ip() {
+            std::net::IpAddr::V4(ip) => Some(10_000 + u32::from(ip.octets()[3])),
+            std::net::IpAddr::V6(_) => None,
+        }),
+        ..Opts::default()
+    }))
+    .await;
+    let addr = d.addr.unwrap();
+    let head = "POST /v1/cosign/claude HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"a\":";
+    // uid 10002: as many slow bodies as the global in-flight cap.
+    let mut flood = Vec::new();
+    for _ in 0..cosign::MAX_INFLIGHT {
+        let mut s = from([127, 0, 0, 2], addr).await;
+        s.write_all(head.as_bytes()).await.unwrap();
+        flood.push(s);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Those over its own share were answered 503 already.
+    let mut busy = 0;
+    for s in &mut flood {
+        let mut out = Vec::new();
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(50), s.read_to_end(&mut out)).await
+        {
+            if String::from_utf8_lossy(&out).starts_with("HTTP/1.1 503") {
+                busy += 1;
+            }
+        }
+    }
+    // uid 10003, while the flood holds its slots: answered at once.
+    let start = Instant::now();
+    let mut s = from([127, 0, 0, 3], addr).await;
+    let body = b"{not json";
+    let req = format!(
+        "POST /v1/cosign/claude HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.ends_with(&deny_body(CosignDeny::BadJson)), "{text}");
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(busy, cosign::MAX_INFLIGHT - cosign::MAX_INFLIGHT_PER_UID);
+    drop(flood);
 }
 
 #[tokio::test]

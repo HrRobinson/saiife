@@ -54,6 +54,12 @@ pub fn hook_key_bounded(agent: &str, payload: &str, max_bytes: usize) -> Result<
         return Err(KeyError::TooLarge);
     }
     let v: Value = serde_json::from_str(payload).map_err(|e| KeyError::Json(e.to_string()))?;
+    hook_key_value(agent, &v)
+}
+
+/// [`hook_key_bounded`] of a payload already parsed (the co-signer parses
+/// its body once).
+pub fn hook_key_value(agent: &str, v: &Value) -> Result<HookKey, KeyError> {
     let Value::Object(map) = v else {
         return Err(KeyError::Json("not an object".into()));
     };
