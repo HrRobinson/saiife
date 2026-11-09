@@ -151,11 +151,25 @@ function Build-Intunewin {
   New-Item -ItemType Directory -Path $work | Out-Null
   try {
     $tool = Join-Path $work 'IntuneWinAppUtil.exe'
-    Get-Download $pin['url'] $tool
+    # SAIIFE_DOWNLOAD_CACHE (CI): a folder actions/cache keeps. A copy there is used in
+    # place of the download and gets the same SHA-256 check; a checked download goes there.
+    $cacheDir = [string]$env:SAIIFE_DOWNLOAD_CACHE
+    $cached = ''
+    if ($cacheDir -ne '') { $cached = Join-Path $cacheDir "IntuneWinAppUtil-$($pin['sha256']).exe" }
+    if (($cached -ne '') -and (Test-Path -LiteralPath $cached -PathType Leaf)) {
+      Write-Output "IntuneWinAppUtil.exe from the cache: $cached"
+      Copy-Item -LiteralPath $cached -Destination $tool
+    } else {
+      Get-Download $pin['url'] $tool
+    }
     $got = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($got -ne $pin['sha256']) {
       Remove-Item -LiteralPath $tool -Force
       Fail "IntuneWinAppUtil.exe has SHA-256 $got, want $($pin['sha256'])"
+    }
+    if (($cached -ne '') -and -not (Test-Path -LiteralPath $cached -PathType Leaf)) {
+      New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+      Copy-Item -LiteralPath $tool -Destination $cached
     }
     # The tool packs a whole folder: give it one holding the MSI alone.
     $src = Join-Path $work 'src'

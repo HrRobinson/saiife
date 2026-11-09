@@ -390,18 +390,47 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools jq
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p saiife
+      # Pinned downloads are cached, keyed on the pinned SHA-256, because GitHub release
+      # downloads can fail for hours. The SHA-256 check runs on a cache hit too, so a bad
+      # entry fails the job; a miss downloads with retries. Saved only after the check.
+      - name: read the nfpm pin
+        id: nfpm-pin
+        run: |
+          set -euo pipefail
+          sum="$(sed -n 's/^sha256_linux_x86_64=//p' packaging/linux/nfpm.version)"
+          [[ "$sum" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+      - name: restore the nfpm tarball
+        id: nfpm-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nfpm-cache
+          key: nfpm-${{ steps.nfpm-pin.outputs.sha256 }}
       - name: install nfpm (pinned, sha256 checked)
+        env:
+          CACHE_HIT: ${{ steps.nfpm-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           v="$(sed -n 's/^version=//p' packaging/linux/nfpm.version)"
           sum="$(sed -n 's/^sha256_linux_x86_64=//p' packaging/linux/nfpm.version)"
           [ -n "$v" ] && [ -n "$sum" ]
-          tgz="$RUNNER_TEMP/nfpm.tar.gz"
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$tgz" "https://github.com/goreleaser/nfpm/releases/download/v${v}/nfpm_${v}_Linux_x86_64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/nfpm-cache"
+          tgz="$RUNNER_TEMP/nfpm-cache/nfpm.tar.gz"
+          if [ "$CACHE_HIT" = true ]; then
+            echo "nfpm tarball from the cache"
+          else
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$tgz" "https://github.com/goreleaser/nfpm/releases/download/v${v}/nfpm_${v}_Linux_x86_64.tar.gz"
+          fi
           echo "$sum  $tgz" | sha256sum -c -
           mkdir "$RUNNER_TEMP/nfpm-bin"
           tar -xzf "$tgz" -C "$RUNNER_TEMP/nfpm-bin" nfpm
           echo "$RUNNER_TEMP/nfpm-bin" >> "$GITHUB_PATH"
+      - name: save the nfpm tarball
+        if: steps.nfpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nfpm-cache
+          key: nfpm-${{ steps.nfpm-pin.outputs.sha256 }}
       # old = the cargo version; new = the same build with an extra ELF
       # section, so its bytes differ and it stays static (upgrade phase).
       - name: build the old and the new package
@@ -456,13 +485,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --release --locked --bin saiife
+      # The Content Prep Tool, cached as the nfpm tarball is (see package-linux). build.ps1
+      # takes a copy from SAIIFE_DOWNLOAD_CACHE, checks its SHA-256 either way, and puts a
+      # checked download there.
+      - name: read the Content Prep Tool pin
+        id: intunewin-pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          sum="$(sed -n 's/^sha256=//p' scripts/package-windows/intunewin.version | tr -d '\r')"
+          [[ "$sum" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+      - name: restore the Content Prep Tool
+        id: intunewin-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/intunewin-cache
+          key: intunewin-${{ steps.intunewin-pin.outputs.sha256 }}
       - name: build, install, upgrade and remove the MSI
         shell: pwsh
+        env:
+          SAIIFE_DOWNLOAD_CACHE: ${{ runner.temp }}/intunewin-cache
         run: |
           $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object { $_.name -eq 'saiife' } | Select-Object -ExpandProperty version
           ./scripts/package-windows/test.ps1 -Exe target/release/saiife.exe -Version $ver `
             -LogDir "$env:GITHUB_WORKSPACE/target/package-windows-logs" -OutDir "$env:GITHUB_WORKSPACE/target/package-windows-dist"
+      - name: save the Content Prep Tool
+        if: steps.intunewin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/intunewin-cache
+          key: intunewin-${{ steps.intunewin-pin.outputs.sha256 }}
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -479,19 +533,36 @@ jobs:
   # so the path is absolute.
   compat-v010:
     runs-on: ubuntu-latest
+    env:
+      V010_SHA256: 3f5b0d344794d880f87a62c4c30d96166d885046d688e7d09e9312b09a6e1e93
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Cached as the nfpm tarball is (see package-linux).
+      - name: restore the 0.1.0 tarball
+        id: v010-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/v010-cache
+          key: saiife-v010-${{ env.V010_SHA256 }}
       - name: 0.1.0 reads a v2 log
+        env:
+          CACHE_HIT: ${{ steps.v010-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
           asset=saiife-0.1.0-x86_64-unknown-linux-musl
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$work/$asset.tar.gz" \
-            "https://github.com/HrRobinson/saiife/releases/download/v0.1.0/$asset.tar.gz"
-          echo "3f5b0d344794d880f87a62c4c30d96166d885046d688e7d09e9312b09a6e1e93  $work/$asset.tar.gz" | sha256sum -c -
-          tar -xzf "$work/$asset.tar.gz" -C "$work" --strip-components=1 "$asset/saiife"
+          tgz="$RUNNER_TEMP/v010-cache/$asset.tar.gz"
+          mkdir -p "$RUNNER_TEMP/v010-cache"
+          if [ "$CACHE_HIT" = true ]; then
+            echo "0.1.0 tarball from the cache"
+          else
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$tgz" \
+              "https://github.com/HrRobinson/saiife/releases/download/v0.1.0/$asset.tar.gz"
+          fi
+          echo "$V010_SHA256  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$work" --strip-components=1 "$asset/saiife"
           for fixture in v2 v2-locked; do
             dir="$PWD/crates/audit/tests/fixtures/$fixture"
             echo "== $fixture"
@@ -511,6 +582,12 @@ jobs:
             lines="$(cat "$dir"/*.jsonl | wc -l)"
             test "$rows" -eq "$lines"
           done
+      - name: save the 0.1.0 tarball
+        if: steps.v010-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/v010-cache
+          key: saiife-v010-${{ env.V010_SHA256 }}
 
   # Fuzzing: 60 s per target on every push; the long run is
   # fuzz-nightly.yml. libFuzzer needs a nightly toolchain, pinned by date.
