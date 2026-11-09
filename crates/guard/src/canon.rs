@@ -317,9 +317,11 @@ fn resolve(abs: &Path) -> Option<PathBuf> {
 ///   directories are listed. What the hook does.
 /// - `Lexical`: no file system call at all. Every path reads as missing, so a
 ///   path is judged as spelled (made absolute, `..` removed lexically), a glob
-///   matches nothing and is judged as spelled, and a copy target is a
-///   directory when its name has no extension (`fs_is_dir`). Each answer is
-///   picked so that the view is never stricter than the host's. What the
+///   matches nothing and is judged as spelled, and a move or copy target is
+///   judged both as itself and as `target/<name>` (`fs_is_dir` cannot tell).
+///   Each answer is picked so that the view is never stricter than the
+///   host's, but for a copy into a protected directory spelled bare
+///   (`cp x .claude`), which reads as a write to it. What the
 ///   saiife service does when it re-judges a co-signed call: it must not read
 ///   the agent user's files (plan 21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -525,33 +527,21 @@ pub(crate) fn fs_next_entry() -> bool {
     true
 }
 
-/// `Path::is_dir`, paid for. Under `FsView::Lexical` there is no call, and the
-/// answer comes from the spelling (`looks_like_a_dir`). A copy into `.claude`
-/// lands as `.claude/<name>`, as it does when the host finds a directory:
-/// always `false` would judge `cp x .claude` as a write to `.claude` itself, a
-/// deny the host never gives (`lexical_never_stricter_on_the_corpora`). A
-/// copy onto `.claude/settings.json` is a write to that file: always `true`
-/// would judge it as `.claude/settings.json/<name>` and allow it. `descend`
-/// asks `lexical` first, so `**` still expands to nothing.
-pub(crate) fn fs_is_dir(path: &Path) -> bool {
+/// `Path::is_dir`, paid for. `None` under `FsView::Lexical`, which makes no
+/// call and cannot tell: a move or copy target is then judged both as a
+/// file and as a directory. A guess from the spelling is wrong both ways: a
+/// directory guess judges `mv x ~/.aws/credentials` as
+/// `~/.aws/credentials/x` and allows it, a file guess judges `cp x .claude`
+/// as a write to `.claude` itself.
+pub(crate) fn fs_is_dir(path: &Path) -> Option<bool> {
     if lexical() {
-        return looks_like_a_dir(path);
+        return None;
     }
     if !fs_call() {
-        return false;
+        return Some(false);
     }
     made_fs_call();
-    path.is_dir()
-}
-
-/// The lexical guess at a directory: a last name with no extension (no `.`
-/// after its first character: `src`, `.claude`, `.ssh`). `settings.json`,
-/// `id_rsa.pub` and `.env.local` read as files.
-fn looks_like_a_dir(path: &Path) -> bool {
-    match path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => !name.chars().skip(1).any(|c| c == '.'),
-        None => true,
-    }
+    Some(path.is_dir())
 }
 
 /// `os(path)` of a Windows host's path resolution, paid for and asked once.
@@ -1189,7 +1179,7 @@ fn descend(
     limit: usize,
     out: &mut Vec<PathBuf>,
 ) -> Option<()> {
-    if lexical() || !fs_is_dir(base) {
+    if fs_is_dir(base) != Some(true) {
         return Some(());
     }
     out.push(base.to_path_buf());

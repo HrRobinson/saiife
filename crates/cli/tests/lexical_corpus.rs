@@ -13,8 +13,13 @@ use saiifeguard::pathrule::Access;
 use corpus::{claude_fixtures, configs, corpus_cases, judge_payload, rehome, Tree};
 
 /// Cases the lexical view may deny although the host allows them, each
-/// approved by the owner by name. Starts empty.
-const KNOWN_STRICTER: &[&str] = &[];
+/// approved by the owner by name (ruling of 2026-11-09), as `(label suffix,
+/// why)`. The lexical view cannot tell a directory from a file, so a move or
+/// copy target is judged as both (`mv x ~/.aws/credentials` must stay denied).
+const KNOWN_STRICTER: &[(&str, &str)] = &[(
+    ": cp review.md .claude",
+    "a copy into the protected .claude folder, spelled bare, reads as a write onto .claude itself",
+)];
 
 /// What is judged, as `(case label, denied)`, in a fixed order.
 fn verdicts(view: FsView, tree: &Tree, cases: &[String]) -> Vec<(String, bool)> {
@@ -55,12 +60,22 @@ fn lexical_never_stricter_on_the_corpora() {
     let host = verdicts(FsView::Host, &tree, &cases);
     let lexical = verdicts(FsView::Lexical, &tree, &cases);
     assert_eq!(host.len(), lexical.len());
-    let stricter: Vec<&str> = host
+    let all_stricter: Vec<&str> = host
         .iter()
         .zip(&lexical)
         .filter(|((_, h), (_, l))| !*h && *l)
         .map(|((label, _), _)| label.as_str())
-        .filter(|label| !KNOWN_STRICTER.iter().any(|k| label.ends_with(k)))
+        .collect();
+    // Every accepted entry is still needed.
+    for (k, why) in KNOWN_STRICTER {
+        assert!(
+            all_stricter.iter().any(|label| label.ends_with(k)),
+            "KNOWN_STRICTER{k:?} ({why}) no longer applies"
+        );
+    }
+    let stricter: Vec<&str> = all_stricter
+        .into_iter()
+        .filter(|label| !KNOWN_STRICTER.iter().any(|(k, _)| label.ends_with(k)))
         .collect();
     assert!(
         stricter.is_empty(),

@@ -191,8 +191,6 @@ fn a_copy_target_is_judged_both_ways_with_no_budget() {
         "cp /tmp/empty.json ~/.claude/settings.json",
         "cp /tmp/x .saiife/config.toml",
         "cp review.md .claude",
-        "cp -t .claude review.md",
-        "mv -t .claude x",
         "ln -s /tmp/u ~/.config/systemd",
         "mv /tmp/s ~/.config/systemd",
     ] {
@@ -205,14 +203,16 @@ fn a_copy_target_is_judged_both_ways_with_no_budget() {
         let line = padded("$(true) ", 8 * KB, cmd);
         assert!(cheap.evaluate(&line).is_deny(), "padded {cmd}");
     }
-    // A copy to nowhere special stays what it was, and a trailing slash says
-    // the target is a directory, so only what lands in it is judged.
+    // A copy to nowhere special stays what it was, and a trailing slash or a
+    // `-t` says the target is a directory, so only what lands in it is judged.
     for cmd in [
         "cp a b",
         "mv a b/",
         "cp review.md .claude/",
         "mv notes.md .claude/",
         "cp -r docs .claude/",
+        "cp -t .claude review.md",
+        "mv -t .claude x",
     ] {
         assert!(!full.evaluate(cmd).is_deny(), "{cmd}");
         assert_eq!(cheap.evaluate(cmd), timeout(), "{cmd}");

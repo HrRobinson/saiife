@@ -30,6 +30,9 @@ pub struct Operand {
     /// `path/<base name>` for each source, not the directory itself; a
     /// `contents` source puts each of its entries in `path`.
     pub into: Vec<Source>,
+    /// Named by `-t DIR`/`--target-directory[=]DIR`: a directory, whatever
+    /// is on disk (the copy fails if it is not one).
+    pub target_dir: bool,
 }
 
 /// A copy/move source, as written.
@@ -197,12 +200,17 @@ struct Out(Vec<Operand>);
 
 impl Out {
     fn push(&mut self, t: Tok, access: Access, into: Vec<Source>) {
+        self.push_target(t, access, into, false);
+    }
+    /// A copy/move target; `dir`: named by `-t`, so a directory.
+    fn push_target(&mut self, t: Tok, access: Access, into: Vec<Source>, dir: bool) {
         if !t.s.is_empty() {
             self.0.push(Operand {
                 path: t.s.to_string(),
                 access,
                 glob: t.glob,
                 dots: t.dots,
+                target_dir: dir && !into.is_empty(),
                 into,
             });
         }
@@ -349,6 +357,7 @@ fn rm_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
             glob,
             dots: t.dots,
             into: Vec::new(),
+            target_dir: false,
         });
     }
 }
@@ -358,7 +367,7 @@ fn rm_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
 fn mv_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
     let args = parse(words, &TARGET_SPEC);
     let ops = operands_of(&args);
-    let (target, sources) = split_target(&args, &ops);
+    let (target, sources, target_dir) = split_target(&args, &ops);
     let contents = no_target_directory(&args);
     let mut push = |t: Tok, access, into: Vec<Source>| {
         let (path, glob) = under(dir, t);
@@ -367,6 +376,7 @@ fn mv_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
             access,
             glob,
             dots: t.dots,
+            target_dir: target_dir && !into.is_empty(),
             into,
         });
     };
@@ -394,16 +404,20 @@ const TARGET_SPEC: Spec = Spec {
     long: &["target-directory", "suffix"],
 };
 
-/// The `-t DIR` target or else the last operand, and the sources.
-fn split_target<'a, 'b>(args: &[Arg<'a>], ops: &'b [Tok<'a>]) -> (Option<Tok<'a>>, &'b [Tok<'a>]) {
+/// The `-t DIR` target or else the last operand, the sources, and whether
+/// the target was named by `-t` (so is a directory).
+fn split_target<'a, 'b>(
+    args: &[Arg<'a>],
+    ops: &'b [Tok<'a>],
+) -> (Option<Tok<'a>>, &'b [Tok<'a>], bool) {
     let t = args.iter().find_map(|a| match a {
         Arg::Opt(Name::Short('t') | Name::Long("target-directory"), v) => *v,
         _ => None,
     });
     match t {
-        Some(t) => (Some(t), ops),
-        None if ops.len() >= 2 => (ops.last().copied(), &ops[..ops.len() - 1]),
-        None => (None, ops),
+        Some(t) => (Some(t), ops, true),
+        None if ops.len() >= 2 => (ops.last().copied(), &ops[..ops.len() - 1], false),
+        None => (None, ops, false),
     }
 }
 
@@ -503,10 +517,10 @@ fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
         }
     }
     let ops = operands_of(&args);
-    let (target, sources) = if cmd == "rsync" || cmd == "scp" {
+    let (target, sources, target_dir) = if cmd == "rsync" || cmd == "scp" {
         match ops.len() {
-            0 | 1 => (None, &ops[..]),
-            n => (ops.last().copied(), &ops[..n - 1]),
+            0 | 1 => (None, &ops[..], false),
+            n => (ops.last().copied(), &ops[..n - 1], false),
         }
     } else {
         split_target(&args, &ops)
@@ -518,7 +532,7 @@ fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
         None,
     );
     match target {
-        Some(t) => out.push(t, Access::Write, into),
+        Some(t) => out.push_target(t, Access::Write, into, target_dir),
         None => {
             if let Some(only) = ops.first() {
                 out.write(*only);
@@ -787,6 +801,7 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
             glob,
             dots: false,
             into: Vec::new(),
+            target_dir: false,
         });
     }
 }

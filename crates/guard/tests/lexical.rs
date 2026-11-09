@@ -166,26 +166,111 @@ fn lexical_globs_are_judged_as_spelled() {
     });
 }
 
-/// A copy target the view cannot see lands as `target/<name>`, as in a
-/// directory: never stricter than the host, and the landing is still judged.
+/// A move or copy target the view cannot see may be a file or a directory,
+/// so it is judged as both: `mv evil ~/.aws/credentials` reads and replaces
+/// the credentials when they are a file, as the host sees they are.
 #[test]
-fn lexical_copy_lands_inside_the_target() {
+fn lexical_target_is_judged_as_the_file_and_the_directory() {
     let tree = Tree::new();
+    // A protected name with no extension that is a file here: `**/.codex`
+    // may not be written, `.codex/<name>` may.
+    std::fs::write(tree.home().join(".codex"), "x").unwrap();
     let host = default_engine(tree.vars());
+    let cmds = [
+        "mv evil ~/.aws/credentials",
+        "mv -f evil ~/.aws/credentials",
+        "mv evil/ ~/.aws/credentials",
+        "mv a b ~/.aws/credentials",
+        "mv evil $HOME/.aws/credentials",
+        "mv evil ~/.ssh/id_rsa",
+        "mv -T evil ~/.aws/credentials",
+        "cp evil ~/.codex",
+        "cp -r evil/ ~/.codex",
+        "cp -T evil ~/.codex",
+        "install evil ~/.codex",
+        "ln -sf evil ~/.codex",
+        "mv evil ~/.codex",
+        "cp evil.json .claude/settings.json",
+        "cp settings.json .claude",
+    ];
+    for cmd in cmds {
+        assert!(host.evaluate(cmd).is_deny(), "host: {cmd}");
+    }
     with_fs_view(FsView::Lexical, || {
         let e = default_engine(tree.vars());
         let before = fs_calls_made();
+        for cmd in cmds {
+            let d = e.evaluate(cmd);
+            assert!(d.is_deny(), "lexical: {cmd}: {d:?}");
+        }
+        assert_eq!(fs_calls_made(), before);
+    });
+}
+
+/// `-t DIR` and `--target-directory[=]DIR` always name a directory, in both
+/// views: what lands is `DIR/<name>`, never `DIR` itself.
+#[test]
+fn target_directory_is_a_directory_in_both_views() {
+    let tree = Tree::new();
+    std::fs::write(tree.home().join(".codex"), "x").unwrap();
+    let allowed = [
+        "cp -t .claude review.md",
+        "cp --target-directory=.claude review.md",
+        "cp --target-directory .claude review.md",
+        "mv -t .claude x",
+        "mv --target-directory=.claude x",
+        "install -t .claude x",
+        "ln -s -t .claude x",
+        // Not `.codex` itself: `cp` refuses a `-t` file.
+        "cp -t ~/.codex x",
+        "mv -t ~/.aws x",
+    ];
+    let denied = [
+        "cp -t .claude settings.json",
+        "mv --target-directory=.claude settings.json",
+        "install -t ~/.ssh/x .codex",
+        "mv -t ~/.aws x/credentials",
+        "ln -t ~/proj/.claude settings.local.json",
+        "cp -t ~/.newdir .codex",
+    ];
+    for view in [FsView::Host, FsView::Lexical] {
+        with_fs_view(view, || {
+            let e = default_engine(tree.vars());
+            for cmd in allowed {
+                let d = e.evaluate(cmd);
+                assert!(!d.is_deny(), "{view:?}: {cmd}: {d:?}");
+            }
+            for cmd in denied {
+                assert!(e.evaluate(cmd).is_deny(), "{view:?}: {cmd}");
+            }
+        });
+    }
+}
+
+/// What the lexical view may deny that the host allows: a copy into a
+/// protected directory spelled with no trailing `/` and no `-t`, which the
+/// view cannot tell from a copy onto that name (`KNOWN_STRICTER`).
+#[test]
+fn lexical_copy_into_a_bare_protected_directory_is_stricter() {
+    let tree = Tree::new();
+    let host = default_engine(tree.vars());
+    let stricter = ["cp review.md .claude", "mv x .claude"];
+    for cmd in stricter {
+        assert!(!host.evaluate(cmd).is_deny(), "host: {cmd}");
+    }
+    with_fs_view(FsView::Lexical, || {
+        let e = default_engine(tree.vars());
+        for cmd in stricter {
+            assert!(e.evaluate(cmd).is_deny(), "lexical: {cmd}");
+        }
         for cmd in [
-            "cp review.md .claude",
+            "cp review.md .claude/",
             "cp -t .claude review.md",
-            "mv -t .claude x",
+            "cp review.md src",
+            "mv x build",
         ] {
-            assert!(!host.evaluate(cmd).is_deny(), "host: {cmd}");
             assert!(!e.evaluate(cmd).is_deny(), "lexical: {cmd}");
         }
-        assert!(e.evaluate("cp evil.json .claude/settings.json").is_deny());
-        assert!(e.evaluate("cp settings.json .claude").is_deny());
-        assert_eq!(fs_calls_made(), before);
     });
 }
 
