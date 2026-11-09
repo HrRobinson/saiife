@@ -425,8 +425,20 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
     ("{ true; sh; } < <(echo 'touch ran')", true),
     ("echo 'touch ran' | sh < /dev/stdin", true),
     ("bash < <(echo touch ran)", true),
+    // `source` and `.` reading one as their script.
+    ("source <(echo 'touch ran')", true),
+    (". <(echo 'touch ran')", true),
+    ("source <(printf 'touch ran')", true),
+    ("source -- <(echo 'touch ran')", true),
+    ("source <(echo 'touch ran') x", true),
+    ("true && . <(echo 'touch ran')", true),
     // These do not.
     ("cat < <(echo 'touch ran')", false),
+    ("source <(echo 'echo touch ran')", false),
+    ("source /dev/null <(echo 'touch ran')", false),
+    (". /dev/null <(echo 'touch ran')", false),
+    // bash does not run it: an array element. zsh runs it at exit.
+    ("functions[TRAPEXIT]='touch ran'", false),
     ("sh < <(echo 'echo touch ran')", false),
     ("echo 'touch ran' | sh < /dev/null", false),
     ("bash -c 'cat' < <(echo 'touch ran')", false),
@@ -479,13 +491,15 @@ const HIDDEN_LINE_CASES: &[(&str, bool)] = &[
 /// it could. A shell in a group after a command that may read the pipe
 /// first (`cat`, a loop's `read`): what is left for it is not known. A block whose openers and
 /// closers do not balance (an argument `if` or `done`): the pipe is taken to
-/// feed the rest of the line. Denied, on the safe side.
+/// feed the rest of the line. A zsh trap function set by assignment: bash
+/// keeps it as an array element. Denied, on the safe side.
 const HIDDEN_LINE_OVER_DENIES: &[&str] = &[
     "trap 'touch ran' INT",
     "echo 'touch ran' | (cat >/dev/null; sh)",
     "echo 'touch ran' | if true; then echo if; fi; sh",
     "echo 'touch ran' | while true; do echo done; break; done; sh",
     "while read l; do sh; done < <(echo 'touch ran')",
+    "functions[TRAPEXIT]='touch ran'",
 ];
 
 #[test]

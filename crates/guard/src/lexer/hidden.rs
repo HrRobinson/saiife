@@ -1,7 +1,8 @@
 //! Command lines a segment runs that are not where a command starts: what
 //! `find -exec` and `fd -x` run, what a shell reads from a pipe, a
 //! here-string, a file or a process substitution (`sh < <(…)`,
-//! `bash <(…)`), and a `trap` action. Each becomes segments of its own,
+//! `bash <(…)`, `source <(…)`), a `trap` action and a zsh trap function
+//! set by assignment (`functions[TRAPEXIT]=…`). Each becomes segments of its own,
 //! after the segment that runs it, so every rule judges it, as the body of
 //! `bash <<EOF` already is. A pipe feeds every command of a group it feeds
 //! (`| { true; sh; }`), the commands of a `-c` line (`| bash -c 'sh'`) and
@@ -12,7 +13,8 @@
 //! Text a shell runs that the guard cannot read (`echo "$x" | sh`,
 //! `curl … | sh`, `sh < file`, `bash <(curl …)`) is noted (`UNREAD_SCRIPT`):
 //! a recorded fail-open, which a caller that fails closed denies. Literal
-//! text is still judged.
+//! text is still judged. fish has no reader here: what it reads is noted
+//! too, and its literal text read as POSIX.
 //!
 //! The gates are a pass over each segment's words, with no allocation; the
 //! rest runs only for a segment that has one of these shapes.
@@ -22,7 +24,7 @@ use super::{
     lex_in, printed, strip_leading_keywords, Chars, Ctx, LexTok, Operator, Segment, Word,
     MAX_FRAME_DEPTH, TOO_DEEP,
 };
-use crate::payload::inline_payload;
+use crate::payload::{fish_input, inline_payload};
 use crate::wintable::{unread_shell, without_redirects};
 use crate::wrappers::{effective_command, peeled_wrappers};
 
@@ -76,6 +78,9 @@ enum ProcReader {
     /// A shell, on its stdin (`sh < <(…)`) or as its script (`bash <(…)`):
     /// the segment, finished at the `)` with the output as its stdin.
     Shell(Segment),
+    /// `source` or `.`, as its script (`source <(…)`): the segment, run by
+    /// this shell, which then runs the output.
+    Source(Segment),
     /// A compound command or a group, on its stdin (`done < <(…)`): its
     /// closing segment's index, and where its line's segments start.
     Block { first: usize, at: usize },
@@ -206,6 +211,9 @@ enum Reader {
     /// A relative script path: whether it is the shell's stdin depends on
     /// the directory, which the engine resolves (`FedScript`).
     Relative(String),
+    /// fish, as its script: the guard has no fish reader, so it is not
+    /// fully judged; its text is still read as POSIX.
+    Fish,
 }
 
 struct Out {
@@ -293,13 +301,20 @@ impl Out {
                     if let Some(p) = procs.last_mut() {
                         p.simple &= op == Operator::RParen && parens == p.level + 1;
                     }
-                    // A shell that reads the process substitution this
-                    // opens is finished at its `)`, reading what it prints.
-                    let shell_reads =
-                        op == Operator::ProcIn && ended && !closes && reads_proc(&current);
-                    let source = if shell_reads {
+                    // A shell, `source` or `.` that reads the process
+                    // substitution this opens is finished at its `)`,
+                    // reading what it prints.
+                    let opens_proc = op == Operator::ProcIn && ended && !closes;
+                    let proc_reader = if opens_proc && reads_proc(&current) {
+                        Some(ProcReader::Shell(std::mem::take(&mut current)))
+                    } else if opens_proc && sources_proc(&current) {
+                        Some(ProcReader::Source(std::mem::take(&mut current)))
+                    } else {
+                        None
+                    };
+                    let source = if let Some(reader) = proc_reader {
                         procs.push(Proc {
-                            reader: ProcReader::Shell(std::mem::take(&mut current)),
+                            reader,
                             level: parens,
                             simple: true,
                         });
@@ -441,10 +456,18 @@ impl Out {
         if !spend(ctx, at - first.min(at)) {
             return;
         }
-        if self.segments[first.min(at)..at]
+        // fish among them: the guard has no fish reader.
+        let mut reads = false;
+        for reader in self.segments[first.min(at)..at]
             .iter()
-            .any(|s| stdin_reader(s).is_some())
+            .filter_map(|s| stdin_reader(s))
         {
+            reads = true;
+            if matches!(reader, Reader::Fish) {
+                ctx.note(UNREAD_SCRIPT);
+            }
+        }
+        if reads {
             self.read_script(&src, ctx, depth);
         }
     }
@@ -468,6 +491,10 @@ impl Out {
             ProcReader::Shell(seg) => {
                 self.finish(seg, Some(src), ctx, depth, false);
             }
+            ProcReader::Source(seg) => {
+                self.finish(seg, None, ctx, depth, false);
+                self.read_script(&src, ctx, depth);
+            }
             ProcReader::Block { first, at } => self.block_reads(first, at, src, ctx, depth),
         }
     }
@@ -490,6 +517,7 @@ impl Out {
         let mut exec = false;
         let mut fd_exec = false;
         let mut trap = false;
+        let mut trap_fns = false;
         for (i, w) in seg.iter().enumerate() {
             if w.redirect && stdin_op(&w.text).is_some() {
                 stdin = Some(i);
@@ -497,6 +525,7 @@ impl Out {
             exec |= is_exec(w);
             fd_exec |= is_fd_exec(w);
             trap |= w.text == "trap";
+            trap_fns |= w.assignment && w.text.starts_with("functions[");
         }
         // Its stdin: its last redirection of it, else what fed it.
         let source = match stdin {
@@ -517,6 +546,13 @@ impl Out {
             slices.extend(fd_slices(&seg));
         }
         let action = if trap { trap_action(&seg) } else { None };
+        let trap_bodies: Vec<String> = if trap_fns {
+            leading_assignments(&seg)
+                .filter_map(trap_function_body)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut seg = seg;
         if let (Some(Reader::Relative(path)), Some(src), Some(first)) =
             (&reader, &source, seg.first_mut())
@@ -531,6 +567,10 @@ impl Out {
         self.segments.push(seg);
         match (reader, &source) {
             (Some(Reader::Script), Some(src)) => self.read_script(src, ctx, depth),
+            (Some(Reader::Fish), Some(src)) => {
+                ctx.note(UNREAD_SCRIPT);
+                self.read_script(src, ctx, depth);
+            }
             (Some(Reader::Inline(line, readable)), Some(_)) => {
                 if !readable {
                     ctx.note(UNREAD_SCRIPT);
@@ -556,6 +596,13 @@ impl Out {
                 ctx.note(UNREAD_SCRIPT);
             }
             self.traps.push((text, depth));
+        }
+        // zsh runs a trap function set by assignment as a trap: recorded,
+        // as the guard does not read zsh's special parameters, and its text
+        // judged as a trap action.
+        for body in trap_bodies {
+            ctx.note(UNREAD_SCRIPT);
+            self.traps.push((body, depth));
         }
         at
     }
@@ -684,8 +731,20 @@ fn reads_proc(seg: &[Word]) -> bool {
     match seg.last() {
         Some(w) if redirects_stdin_from_file(w) => stdin_reader(seg).is_some(),
         Some(w) if w.redirect => false,
-        _ => matches!(stdin_reader(seg), Some(Reader::Script)),
+        _ => matches!(stdin_reader(seg), Some(Reader::Script | Reader::Fish)),
     }
+}
+
+/// `seg` is `source` or `.` with no operand yet: the process substitution
+/// that follows is its script (`source <(…)`).
+fn sources_proc(seg: &[Word]) -> bool {
+    let argv = without_redirects(effective_command(seg));
+    let [cmd, rest @ ..] = argv.as_slice() else {
+        return false;
+    };
+    matches!(cmd.text.as_str(), "source" | ".")
+        && rest.len() <= 1
+        && rest.iter().all(|w| w.text == "--")
 }
 
 /// A word that may start what `fd` runs: `--exec`, `--exec-batch`, or a
@@ -802,6 +861,20 @@ fn stdin_reader(seg: &[Word]) -> Option<Reader> {
     let name = base_name(&first.text).to_ascii_lowercase();
     if !POSIX_SHELLS.contains(&name.as_str()) {
         return None;
+    }
+    if name == "fish" {
+        let args: Vec<String> = argv[1..].iter().map(|w| w.text.clone()).collect();
+        let input = fish_input(&args);
+        let stdin = input
+            .script
+            .is_none_or(|i| readable(&argv[i + 1]) && stdin_path(&args[i]) == PathKind::Stdin);
+        return if input.about {
+            None
+        } else if input.lines.is_empty() && stdin {
+            Some(Reader::Fish)
+        } else {
+            Some(Reader::Unread)
+        };
     }
     if unread_shell(&argv).is_some() {
         return Some(Reader::Script);
@@ -952,6 +1025,32 @@ fn find_slices(seg: &[Word], in_find: bool) -> Vec<Segment> {
         i = stop + 1;
     }
     out
+}
+
+/// The assignments in front of `seg`'s command (redirections between them
+/// skipped): an assignment-shaped argument (`echo a=b`) is none.
+fn leading_assignments(seg: &[Word]) -> impl Iterator<Item = &Word> {
+    let mut target = false;
+    seg.iter()
+        .filter(move |w| {
+            let skip = w.redirect || target;
+            target = w.redirect;
+            !skip
+        })
+        .take_while(|w| w.assignment)
+}
+
+/// The body of a zsh trap function set by assignment, `functions[NAME]=BODY`
+/// or `+=`, where NAME is `TRAP` and a signal name (`TRAPEXIT`, `TRAPZERR`,
+/// `TRAPINT`), or a key the guard cannot read (`functions[$n]`). Any other
+/// key is an ordinary function.
+fn trap_function_body(w: &Word) -> Option<String> {
+    let (key, rest) = w.text.strip_prefix("functions[")?.split_once(']')?;
+    let body = rest.strip_prefix('=').or_else(|| rest.strip_prefix("+="))?;
+    let trap = key
+        .strip_prefix("TRAP")
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric()));
+    (trap || key.contains(['$', '`'])).then(|| body.to_string())
 }
 
 /// The action of `trap [--] ACTION SIGNAL…`, and whether it is readable.

@@ -651,6 +651,69 @@ pub fn watch_payload(argv: &[String]) -> Option<String> {
     Some(rest.join(" "))
 }
 
+/// fish 4 (`fish --help`; optstring `+hPilNnvc:C:p:d:o:f:D:`): options stop
+/// at the first operand, the script. `-c` and `-C` (`--init-command`) take
+/// a command line.
+const FISH: Spec<'static> = Spec::new(
+    "+hPilNnvc:C:p:d:o:f:D:",
+    &[
+        req("command", 'c'),
+        req("init-command", 'C'),
+        req("features", 'f'),
+        req("debug", 'd'),
+        req("debug-output", 'o'),
+        req("debug-stack-frames", 'D'),
+        flag("interactive", 'i'),
+        flag("login", 'l'),
+        flag("no-execute", 'n'),
+        flag("print-rusage-self", '\0'),
+        flag("print-debug-categories", '\0'),
+        req("profile", 'p'),
+        req("profile-startup", '\0'),
+        flag("private", 'P'),
+        flag("help", 'h'),
+        flag("version", 'v'),
+        flag("no-config", 'N'),
+    ],
+);
+
+/// What `fish ARGS` is given to run. The guard has no fish reader: what it
+/// runs is not fully judged.
+pub(crate) struct FishInput {
+    /// The lines of its `-c` and `-C` options, in order.
+    pub lines: Vec<String>,
+    /// The index in ARGS of its script operand.
+    pub script: Option<usize>,
+    /// Only `--help`, `--version` or `--print-debug-categories`: it runs
+    /// nothing.
+    pub about: bool,
+}
+
+/// What `fish ARGS` runs: its command lines, its script operand, and
+/// whether it only reports on itself.
+pub(crate) fn fish_input(args: &[String]) -> FishInput {
+    let mut lines = Vec::new();
+    let mut about = false;
+    let first = FISH.leading(args, &mut |o| {
+        if let Opt::Known {
+            short, long, value, ..
+        } = o
+        {
+            match (short, value) {
+                ('c' | 'C', Some(v)) => lines.push(v.to_string()),
+                ('h' | 'v', _) => about = true,
+                _ => about |= long == Some("print-debug-categories"),
+            }
+        }
+    });
+    let script = (first < args.len()).then_some(first);
+    FishInput {
+        about: about && lines.is_empty() && script.is_none(),
+        lines,
+        script,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,5 +1405,30 @@ mod tests {
         assert_eq!(ctx.permission_mode.as_deref(), Some("default"));
         let none = context_from_hook_json(r#"{"tool_name":"Bash"}"#);
         assert_eq!(none.permission_mode, None);
+    }
+
+    #[test]
+    fn fish_options_follow_its_getopt() {
+        let run = |line: &str| {
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            let input = fish_input(&args);
+            (input.lines, input.script, input.about)
+        };
+        let none: (Vec<String>, _, _) = (vec![], None, false);
+        assert_eq!(run(""), none);
+        assert_eq!(run("-l -i --private"), none);
+        assert_eq!(run("-c ls"), (vec!["ls".into()], None, false));
+        assert_eq!(run("-lcls"), (vec!["ls".into()], None, false));
+        assert_eq!(run("--comm=ls x"), (vec!["ls".into()], Some(1), false));
+        assert_eq!(
+            run("-C a --command b"),
+            (vec!["a".into(), "b".into()], None, false)
+        );
+        // `-d` takes a value; options stop at the script.
+        assert_eq!(run("-d all f.fish -c x"), (vec![], Some(2), false));
+        assert_eq!(run("-- -c"), (vec![], Some(1), false));
+        assert_eq!(run("-"), (vec![], Some(0), false));
+        assert_eq!(run("--version"), (vec![], None, true));
+        assert_eq!(run("-v -c ls"), (vec!["ls".into()], None, false));
     }
 }
