@@ -99,7 +99,8 @@ pub(crate) fn valid_project(name: &str) -> bool {
     saiife_dev::project::check_name(name).is_ok()
 }
 
-const NEED_YES: &str = "deleting volumes needs a yes. Run it in a terminal, or add --yes.";
+pub(crate) const NEED_YES: &str =
+    "deleting volumes needs a yes. Run it in a terminal, or add --yes.";
 
 /// Asks `question` on stderr and reads the answer from `input`. `yes` skips
 /// the question; with no terminal there is no one to ask, so it is an error.

@@ -90,8 +90,6 @@ pub(crate) struct Row {
     pub last_up: Option<String>,
     pub running: usize,
     pub total: usize,
-    // Read by `gc` (plan 24 Task 5).
-    #[allow(dead_code)]
     pub containers: Vec<Container>,
 }
 
