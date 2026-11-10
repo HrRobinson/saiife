@@ -9,8 +9,9 @@
 use crate::paths::DevPaths;
 use crate::DevError;
 use rcgen::{
-    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree,
-    IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    NameConstraints, SanType,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -287,8 +288,6 @@ fn load_ca(dir: &Path, now: OffsetDateTime) -> Result<Ca, DevError> {
 
 /// The issuer of `ca`, rebuilt from `ca.json` and the stored key, and the CA's
 /// raw public key (recorded in each leaf's `meta.json`).
-// Plan 23 Task 2 (`ensure_project_cert`) is the first caller outside the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ca_issuer(ca: &Ca) -> Result<(Issuer<'static, KeyPair>, Vec<u8>), DevError> {
     let dir = ca.cert_path.parent().unwrap_or(Path::new("."));
     let meta_path = dir.join(CA_META);
@@ -298,6 +297,124 @@ pub(crate) fn ca_issuer(ca: &Ca) -> Result<(Issuer<'static, KeyPair>, Vec<u8>), 
     let key = read_key(&ca.key_path)?;
     let raw = key.public_key_raw().to_vec();
     Ok((Issuer::new(ca_params(created, created), key), raw))
+}
+
+/// `<state>/tls`: the only certificate directory the proxy mounts (D9).
+pub fn tls_dir(paths: &DevPaths) -> PathBuf {
+    paths.state.join("tls")
+}
+
+/// The names a project's leaf covers; routes use the same rule for hosts.
+pub fn project_sans(project: &str) -> Vec<String> {
+    vec![
+        format!("*.{project}.localhost"),
+        format!("{project}.localhost"),
+    ]
+}
+
+/// Ensures `<state>/tls/<project>/` holds a current leaf signed by `ca`.
+pub fn ensure_project_cert(
+    paths: &DevPaths,
+    ca: &Ca,
+    project: &str,
+) -> Result<CertPaths, DevError> {
+    ensure_project_cert_at(paths, ca, project, OffsetDateTime::now_utc())
+}
+
+const LEAF_CERT: &str = "cert.pem";
+const LEAF_KEY: &str = "key.pem";
+const LEAF_META: &str = "meta.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LeafMeta {
+    sans: Vec<String>,
+    ca_key: String,
+    not_after: i64,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A leaf is reissued (with a new key every time, F14) when a file is missing,
+/// `meta.json` does not match, or fewer than `RENEW_BEFORE_DAYS` remain.
+pub(crate) fn ensure_project_cert_at(
+    paths: &DevPaths,
+    ca: &Ca,
+    project: &str,
+    now: OffsetDateTime,
+) -> Result<CertPaths, DevError> {
+    crate::project::check_name(project)?;
+    let dir = tls_dir(paths).join(project);
+    let out = CertPaths {
+        cert: dir.join(LEAF_CERT),
+        key: dir.join(LEAF_KEY),
+    };
+    let (issuer, ca_key) = ca_issuer(ca)?;
+    let ca_key = hex(&ca_key);
+    let sans = project_sans(project);
+    let meta_path = dir.join(LEAF_META);
+    let current = fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<LeafMeta>(&t).ok())
+        .is_some_and(|m| {
+            m.sans == sans
+                && m.ca_key == ca_key
+                && m.not_after - now.unix_timestamp() >= RENEW_BEFORE_DAYS * 86_400
+        });
+    if current && out.cert.is_file() && out.key.is_file() {
+        return Ok(out);
+    }
+
+    create_private_dir(&dir, true).or_else(|e| {
+        if dir.is_dir() {
+            Ok(())
+        } else {
+            Err(io_err(&dir)(e))
+        }
+    })?;
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, format!("{project}.localhost"));
+    params.distinguished_name = dn;
+    params.subject_alt_names = sans
+        .iter()
+        .map(|s| {
+            s.as_str()
+                .try_into()
+                .map(SanType::DnsName)
+                .map_err(cert_err)
+        })
+        .collect::<Result<_, _>>()?;
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.use_authority_key_identifier_extension = true;
+    params.not_before = now - Duration::hours(1);
+    params.not_after = now + Duration::days(LEAF_DAYS);
+    let key = KeyPair::generate().map_err(cert_err)?;
+    let cert = params.signed_by(&key, &issuer).map_err(cert_err)?;
+    let meta = LeafMeta {
+        sans,
+        ca_key,
+        not_after: params.not_after.unix_timestamp(),
+    };
+    let meta = serde_json::to_vec(&meta).map_err(|e| DevError::Cert(e.to_string()))?;
+    write_atomic(&out.key, key.serialize_pem().as_bytes(), true)?;
+    write_atomic(&out.cert, cert.pem().as_bytes(), false)?;
+    write_atomic(&meta_path, &meta, false)?;
+    Ok(out)
+}
+
+/// Removes a project's certificate directory. Idempotent.
+pub fn remove_project_cert(paths: &DevPaths, project: &str) -> Result<(), DevError> {
+    crate::project::check_name(project)?;
+    let dir = tls_dir(paths).join(project);
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(&dir)(e)),
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +670,165 @@ mod tests {
             .filter(|n| n.starts_with(".ca.tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    fn verify_at(
+        ca_pem: &str,
+        leaf_pem: &str,
+        name: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), rustls::Error> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca_pem.as_bytes()).unwrap())
+            .unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let leaf = CertificateDer::from_pem_slice(leaf_pem.as_bytes()).unwrap();
+        verifier
+            .verify_server_cert(
+                &leaf,
+                &[],
+                &ServerName::try_from(name.to_string()).unwrap(),
+                &[],
+                UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+                    at.unix_timestamp() as u64
+                )),
+            )
+            .map(|_| ())
+    }
+
+    fn setup() -> (tempfile::TempDir, DevPaths, Ca) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = dev_paths(tmp.path());
+        let ca = ensure_ca(&paths).unwrap();
+        (tmp, paths, ca)
+    }
+
+    #[test]
+    fn leaf_verifies_for_project_hosts() {
+        let (_t, paths, ca) = setup();
+        let now = OffsetDateTime::now_utc();
+        let c = ensure_project_cert_at(&paths, &ca, "shop", now).unwrap();
+        assert_eq!(c.cert, tls_dir(&paths).join("shop").join("cert.pem"));
+        assert_eq!(c.key, tls_dir(&paths).join("shop").join("key.pem"));
+        let pem = fs::read_to_string(&c.cert).unwrap();
+        verify_at(&ca.cert_pem, &pem, "web.shop.localhost", now).unwrap();
+        verify_at(&ca.cert_pem, &pem, "shop.localhost", now).unwrap();
+    }
+
+    #[test]
+    fn leaf_rejects_other_hosts() {
+        let (_t, paths, ca) = setup();
+        let now = OffsetDateTime::now_utc();
+        let c = ensure_project_cert_at(&paths, &ca, "shop", now).unwrap();
+        let pem = fs::read_to_string(&c.cert).unwrap();
+        assert!(verify_at(&ca.cert_pem, &pem, "a.web.shop.localhost", now).is_err());
+        assert!(verify_at(&ca.cert_pem, &pem, "web.other.localhost", now).is_err());
+    }
+
+    #[test]
+    fn leaf_lifetime_is_365_days() {
+        let (_t, paths, ca) = setup();
+        let now = OffsetDateTime::now_utc();
+        let c = ensure_project_cert_at(&paths, &ca, "shop", now).unwrap();
+        let pem = fs::read_to_string(&c.cert).unwrap();
+        let at = |d| now + Duration::days(d);
+        verify_at(&ca.cert_pem, &pem, "shop.localhost", at(364)).unwrap();
+        assert!(verify_at(&ca.cert_pem, &pem, "shop.localhost", at(366)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaf_key_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, paths, ca) = setup();
+        let c = ensure_project_cert(&paths, &ca, "shop").unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&c.key), 0o600);
+        assert_eq!(mode(&tls_dir(&paths)), 0o700);
+        assert_eq!(mode(&tls_dir(&paths).join("shop")), 0o700);
+    }
+
+    #[test]
+    fn unchanged_leaf_is_reused() {
+        let (_t, paths, ca) = setup();
+        let a = ensure_project_cert(&paths, &ca, "shop").unwrap();
+        let first = fs::read(&a.cert).unwrap();
+        let b = ensure_project_cert(&paths, &ca, "shop").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(first, fs::read(&b.cert).unwrap());
+    }
+
+    #[test]
+    fn leaf_is_reissued() {
+        let now = OffsetDateTime::now_utc();
+        type Mutate = Box<dyn Fn(&DevPaths, &Ca) -> OffsetDateTime>;
+        let cases: [(&str, Mutate); 3] = [
+            (
+                "near expiry",
+                Box::new(move |_, _| now + Duration::days(336)),
+            ),
+            (
+                "other ca_key",
+                Box::new(move |paths, _| {
+                    let p = tls_dir(paths).join("shop").join("meta.json");
+                    let mut m: serde_json::Value =
+                        serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+                    m["ca_key"] = "00".into();
+                    fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+                    now
+                }),
+            ),
+            (
+                "key deleted",
+                Box::new(move |paths, _| {
+                    fs::remove_file(tls_dir(paths).join("shop").join("key.pem")).unwrap();
+                    now
+                }),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let (_t, paths, ca) = setup();
+            let a = ensure_project_cert_at(&paths, &ca, "shop", now).unwrap();
+            let cert1 = fs::read(&a.cert).unwrap();
+            let key1 = fs::read(&a.key).ok();
+            let at = mutate(&paths, &ca);
+            let b = ensure_project_cert_at(&paths, &ca, "shop", at).unwrap();
+            assert_ne!(cert1, fs::read(&b.cert).unwrap(), "{name}: cert");
+            assert_ne!(key1, fs::read(&b.key).ok(), "{name}: key");
+        }
+    }
+
+    #[test]
+    fn bad_project_name_is_refused() {
+        let (_t, paths, ca) = setup();
+        for bad in ["Shop", "a/b", ""] {
+            assert!(
+                matches!(
+                    ensure_project_cert(&paths, &ca, bad),
+                    Err(DevError::BadProjectName(_))
+                ),
+                "{bad:?}"
+            );
+            assert!(remove_project_cert(&paths, bad).is_err());
+        }
+        assert!(!tls_dir(&paths).exists());
+    }
+
+    #[test]
+    fn remove_project_cert_is_idempotent() {
+        let (_t, paths, ca) = setup();
+        let c = ensure_project_cert(&paths, &ca, "shop").unwrap();
+        ensure_project_cert(&paths, &ca, "other").unwrap();
+        remove_project_cert(&paths, "shop").unwrap();
+        remove_project_cert(&paths, "shop").unwrap();
+        assert!(!c.cert.exists());
+        assert!(tls_dir(&paths).join("other").join("cert.pem").exists());
     }
 
     #[test]
