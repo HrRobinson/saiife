@@ -49,6 +49,14 @@ pub enum DevError {
         host: String,
         reason: &'static str,
     },
+    PortBusy {
+        port: u16,
+        holder: Option<String>,
+    },
+    NotOurs {
+        kind: &'static str,
+        name: String,
+    },
     // plan 24
 }
 
@@ -116,6 +124,19 @@ impl fmt::Display for DevError {
             DevError::RouteHost { host, reason } => {
                 write!(f, "cannot route {host:?}: {reason}")
             }
+            DevError::PortBusy { port, holder } => {
+                write!(f, "port {port} on 127.0.0.1 is in use by ")?;
+                match holder {
+                    Some(name) => write!(f, "container {name}")?,
+                    None => f.write_str("another program")?,
+                }
+                f.write_str("; stop it, then run saiife dev up again")
+            }
+            DevError::NotOurs { kind, name } => write!(
+                f,
+                "the docker {kind} {name} exists but saiife did not create it; \
+                 remove or rename it, then run saiife dev up again"
+            ),
         }
     }
 }

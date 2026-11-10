@@ -4,6 +4,8 @@
 //! from strings. Traefik parses every file as a Go template and fails the whole
 //! directory on one bad file, so everything is validated before anything is written.
 use crate::certs::{write_atomic, CertPaths};
+use crate::docker::{run_ok, Docker};
+use crate::labels::{MANAGED, NETWORK, PROXY_CONTAINER};
 use crate::paths::DevPaths;
 use crate::project::check_name;
 use crate::rewrite::Route;
@@ -13,6 +15,149 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+
+/// Label naming a resource's role (`proxy` or `network`). Role-labelled
+/// resources carry no project label.
+pub const ROLE: &str = "saiife.dev.role";
+/// Reserved for shared TLS options; saiife never writes it, and route
+/// handling ignores it. A leading `_` is never a valid project name.
+pub const TLS_FILE: &str = "_tls.toml";
+
+/// What binding a loopback port said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    Free,
+    InUse,
+    Unknown,
+}
+
+/// Binds `127.0.0.1:<port>` and drops the listener at once.
+/// In debug builds `SAIIFE_DEV_SKIP_PORT_BIND=1` answers `Unknown` unbound.
+pub(crate) fn probe_bind(port: u16) -> Probe {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SAIIFE_DEV_SKIP_PORT_BIND").is_some_and(|v| v == "1") {
+        return Probe::Unknown;
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => Probe::Free,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Probe::InUse,
+        Err(_) => Probe::Unknown,
+    }
+}
+
+fn first_name(out: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Checks that 127.0.0.1:80 and :443 are free, or already held by our proxy.
+pub fn preflight_ports(d: &dyn Docker) -> Result<(), DevError> {
+    preflight_ports_with(d, &probe_bind)
+}
+
+pub fn preflight_ports_with(d: &dyn Docker, probe: &dyn Fn(u16) -> Probe) -> Result<(), DevError> {
+    let managed = format!("label={MANAGED}=true");
+    let role = format!("label={ROLE}=proxy");
+    let up = run_ok(
+        d,
+        &[
+            "ps",
+            "--filter",
+            &managed,
+            "--filter",
+            &role,
+            "--format",
+            "{{.Names}}",
+        ],
+    )?;
+    // Compare names exactly: docker's name filter is a substring match.
+    if String::from_utf8_lossy(&up)
+        .lines()
+        .any(|l| l.trim() == PROXY_CONTAINER)
+    {
+        return Ok(());
+    }
+    for port in [80u16, 443] {
+        let state = probe(port);
+        if state == Probe::Free {
+            continue;
+        }
+        let publish = format!("publish={port}");
+        let holder = d
+            .run(
+                &["ps", "--filter", &publish, "--format", "{{.Names}}"],
+                None,
+            )
+            .ok()
+            .filter(|o| o.status == 0)
+            .and_then(|o| first_name(&o.stdout));
+        if state == Probe::InUse || holder.is_some() {
+            return Err(DevError::PortBusy { port, holder });
+        }
+    }
+    Ok(())
+}
+
+/// `None` when the network is missing, else whether saiife created it.
+fn network_is_ours(d: &dyn Docker) -> Result<Option<bool>, DevError> {
+    let args = [
+        "network",
+        "inspect",
+        NETWORK,
+        "--format",
+        "{{json .Labels}}",
+    ];
+    let out = d.run(&args, None)?;
+    if out.status != 0 {
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        if err.contains("not found") || err.contains("no such network") {
+            return Ok(None);
+        }
+        return run_ok(d, &args).map(|_| None);
+    }
+    let labels: Option<BTreeMap<String, String>> =
+        serde_json::from_slice(&out.stdout).unwrap_or(None);
+    let labels = labels.unwrap_or_default();
+    Ok(Some(
+        labels.get(MANAGED).map(String::as_str) == Some("true")
+            && labels.get(ROLE).map(String::as_str) == Some("network"),
+    ))
+}
+
+/// Creates the shared `saiife-dev` network if it is missing; refuses one
+/// saiife did not create.
+pub fn ensure_network(d: &dyn Docker) -> Result<(), DevError> {
+    let not_ours = || DevError::NotOurs {
+        kind: "network",
+        name: NETWORK.into(),
+    };
+    match network_is_ours(d)? {
+        Some(true) => return Ok(()),
+        Some(false) => return Err(not_ours()),
+        None => {}
+    }
+    let managed = format!("{MANAGED}=true");
+    let role = format!("{ROLE}=network");
+    let created = run_ok(
+        d,
+        &[
+            "network", "create", "--driver", "bridge", "--label", &managed, "--label", &role,
+            NETWORK,
+        ],
+    );
+    match created {
+        Ok(_) => Ok(()),
+        // Another `up` may have created it first.
+        Err(e) => match network_is_ours(d) {
+            Ok(Some(true)) => Ok(()),
+            Ok(Some(false)) => Err(not_ours()),
+            _ => Err(e),
+        },
+    }
+}
 
 pub(crate) fn dynamic_dir(paths: &DevPaths) -> PathBuf {
     paths.proxy_dir().join("dynamic")
@@ -237,7 +382,212 @@ pub fn remove_routes(paths: &DevPaths, project: &str) -> Result<(), DevError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::docker::{FakeDocker, Output};
     use std::fs;
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    // plan 23 task 4
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn probe_sees_a_held_port() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        assert_eq!(probe_bind(l.local_addr().unwrap().port()), Probe::InUse);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn skip_env_makes_probe_unknown() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        std::env::set_var("SAIIFE_DEV_SKIP_PORT_BIND", "1");
+        let got = probe_bind(l.local_addr().unwrap().port());
+        std::env::remove_var("SAIIFE_DEV_SKIP_PORT_BIND");
+        assert_eq!(got, Probe::Unknown);
+    }
+
+    const PS_PROXY: &[&str] = &[
+        "ps",
+        "--filter",
+        "label=saiife.managed=true",
+        "--filter",
+        "label=saiife.dev.role=proxy",
+        "--format",
+        "{{.Names}}",
+    ];
+
+    #[test]
+    fn running_proxy_passes() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok("saiife-dev-proxy\n"));
+        preflight_ports_with(&d, &|_| panic!("probe must not run")).unwrap();
+    }
+
+    #[test]
+    fn similar_name_is_not_the_proxy() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok("saiife-dev-proxy-old\n"));
+        let called = std::cell::Cell::new(false);
+        preflight_ports_with(&d, &|_| {
+            called.set(true);
+            Probe::Free
+        })
+        .unwrap();
+        assert!(called.get());
+    }
+
+    #[test]
+    fn free_ports_pass() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok(""));
+        preflight_ports_with(&d, &|_| Probe::Free).unwrap();
+    }
+
+    #[test]
+    fn busy_port_names_the_container() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok(""));
+        d.on(&["ps", "--filter", "publish=443"], Output::ok("web-1\n"));
+        let e = preflight_ports_with(&d, &|p| {
+            if p == 443 {
+                Probe::InUse
+            } else {
+                Probe::Free
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            &e,
+            DevError::PortBusy { port: 443, holder: Some(h) } if h == "web-1"
+        ));
+        assert_eq!(
+            e.to_string(),
+            "port 443 on 127.0.0.1 is in use by container web-1; stop it, then run saiife dev up again"
+        );
+    }
+
+    #[test]
+    fn in_use_with_no_container_says_another_program() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok(""));
+        d.on(&["ps", "--filter", "publish="], Output::ok(""));
+        let e = preflight_ports_with(&d, &|_| Probe::InUse).unwrap_err();
+        assert!(matches!(
+            e,
+            DevError::PortBusy {
+                port: 80,
+                holder: None
+            }
+        ));
+        assert!(e.to_string().contains("in use by another program; stop it"));
+    }
+
+    #[test]
+    fn unknown_port_with_no_container_passes() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok(""));
+        d.on(&["ps", "--filter", "publish="], Output::ok(""));
+        preflight_ports_with(&d, &|_| Probe::Unknown).unwrap();
+    }
+
+    #[test]
+    fn unknown_port_with_container_is_busy() {
+        let d = FakeDocker::new();
+        d.on(PS_PROXY, Output::ok(""));
+        d.on(&["ps", "--filter", "publish=80"], Output::ok("nginx\n"));
+        let e = preflight_ports_with(&d, &|_| Probe::Unknown).unwrap_err();
+        assert!(matches!(
+            &e,
+            DevError::PortBusy { port: 80, holder: Some(h) } if h == "nginx"
+        ));
+    }
+
+    const INSPECT: &[&str] = &[
+        "network",
+        "inspect",
+        "saiife-dev",
+        "--format",
+        "{{json .Labels}}",
+    ];
+    const CREATE: &[&str] = &[
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--label",
+        "saiife.managed=true",
+        "--label",
+        "saiife.dev.role=network",
+        "saiife-dev",
+    ];
+    const OURS: &str = r#"{"saiife.managed":"true","saiife.dev.role":"network"}"#;
+
+    fn created(d: &FakeDocker) -> usize {
+        d.calls()
+            .iter()
+            .filter(|c| c.args.iter().map(String::as_str).eq(CREATE.iter().copied()))
+            .count()
+    }
+
+    #[test]
+    fn network_is_created_when_missing() {
+        let d = FakeDocker::new();
+        d.on(
+            INSPECT,
+            Output::fail(1, "Error: network saiife-dev not found"),
+        );
+        d.on(CREATE, Output::ok("abc\n"));
+        ensure_network(&d).unwrap();
+        assert_eq!(created(&d), 1);
+    }
+
+    #[test]
+    fn existing_network_is_kept() {
+        let d = FakeDocker::new();
+        d.on(INSPECT, Output::ok(OURS));
+        ensure_network(&d).unwrap();
+        assert_eq!(created(&d), 0);
+    }
+
+    #[test]
+    fn foreign_network_is_refused() {
+        let d = FakeDocker::new();
+        d.on(INSPECT, Output::ok("{}"));
+        let e = ensure_network(&d).unwrap_err();
+        assert!(matches!(
+            &e,
+            DevError::NotOurs { kind: "network", name } if name == "saiife-dev"
+        ));
+        assert_eq!(created(&d), 0);
+    }
+
+    #[test]
+    fn create_race_is_tolerated() {
+        let d = FakeDocker::new();
+        d.once(INSPECT, Output::fail(1, "network saiife-dev not found"));
+        d.on(INSPECT, Output::ok(OURS));
+        d.on(
+            CREATE,
+            Output::fail(1, "network with name saiife-dev already exists"),
+        );
+        ensure_network(&d).unwrap();
+    }
+
+    #[test]
+    fn docker_down_is_an_error() {
+        let d = FakeDocker::new();
+        d.on(
+            INSPECT,
+            Output::fail(1, "Cannot connect to the Docker daemon"),
+        );
+        assert!(matches!(
+            ensure_network(&d).unwrap_err(),
+            DevError::Docker { .. }
+        ));
+        assert_eq!(created(&d), 0);
+    }
 
     fn setup() -> (tempfile::TempDir, DevPaths) {
         let d = tempfile::tempdir().unwrap();
