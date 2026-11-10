@@ -160,16 +160,18 @@ pub fn write_routes(
 ) -> Result<(), DevError> {
     check_name(project)?;
     check_cert(paths, project, cert)?;
-    let transport = format!("{project}-insecure");
+    let transport = format!("{project}__insecure");
     let mut http = Http::default();
     for r in routes {
         check_host(&r.host, project)?;
-        if !is_label(&r.service) {
-            return Err(bad(&r.host, "service name is not a plain lowercase label"));
-        }
-        let n = format!("{project}-{}", r.service);
+        let label = r.host.split('.').next().unwrap_or_default();
+        let n = if r.host == format!("{project}.localhost") {
+            format!("{project}__apex")
+        } else {
+            format!("{project}_{label}")
+        };
         if http.routers.contains_key(&n) {
-            return Err(bad(&r.host, "two routes use the same service name"));
+            return Err(bad(&r.host, "two routes use the same host"));
         }
         let (url, https) = server_url(r)?;
         http.routers.insert(
@@ -290,26 +292,26 @@ mod tests {
         let (_d, paths) = setup();
         two(&paths).unwrap();
         let v = read(&paths, "shop");
-        let r = &v["http"]["routers"]["shop-web"];
+        let r = &v["http"]["routers"]["shop_web"];
         assert_eq!(r["rule"].as_str(), Some("Host(`web.shop.localhost`)"));
         assert_eq!(r["entryPoints"].as_array().unwrap().len(), 1);
         assert_eq!(r["entryPoints"][0].as_str(), Some("websecure"));
         assert!(r["tls"].is_table());
-        assert_eq!(r["service"].as_str(), Some("shop-web"));
-        let web = &v["http"]["services"]["shop-web"]["loadBalancer"];
+        assert_eq!(r["service"].as_str(), Some("shop_web"));
+        let web = &v["http"]["services"]["shop_web"]["loadBalancer"];
         assert_eq!(
             web["servers"][0]["url"].as_str(),
             Some("http://web.shop:3000")
         );
         assert!(web.get("serversTransport").is_none());
-        let api = &v["http"]["services"]["shop-api"]["loadBalancer"];
+        let api = &v["http"]["services"]["shop_api"]["loadBalancer"];
         assert_eq!(
             api["servers"][0]["url"].as_str(),
             Some("https://api.shop:8443")
         );
-        assert_eq!(api["serversTransport"].as_str(), Some("shop-insecure"));
+        assert_eq!(api["serversTransport"].as_str(), Some("shop__insecure"));
         assert_eq!(
-            v["http"]["serversTransports"]["shop-insecure"]["insecureSkipVerify"].as_bool(),
+            v["http"]["serversTransports"]["shop__insecure"]["insecureSkipVerify"].as_bool(),
             Some(true)
         );
         let c = &v["tls"]["certificates"][0];
@@ -333,7 +335,7 @@ mod tests {
         write_routes(&paths, "shop", &routes, &certs(&paths, "shop")).unwrap();
         let v = read(&paths, "shop");
         assert_eq!(
-            v["http"]["services"]["shop-web"]["loadBalancer"]["servers"][0]["url"].as_str(),
+            v["http"]["services"]["shop_web"]["loadBalancer"]["servers"][0]["url"].as_str(),
             Some("http://web.shop:3000")
         );
     }
@@ -372,7 +374,7 @@ mod tests {
         write_routes(&paths, "shop", &[r], &certs(&paths, "shop")).unwrap();
         let v = read(&paths, "shop");
         assert_eq!(
-            v["http"]["routers"]["shop-web"]["rule"].as_str(),
+            v["http"]["routers"]["shop__apex"]["rule"].as_str(),
             Some("Host(`shop.localhost`)")
         );
     }
@@ -446,5 +448,35 @@ mod tests {
         two(&paths).unwrap();
         let s = fs::read_to_string(dynamic_dir(&paths).join("shop.toml")).unwrap();
         assert!(!s.contains("{{"));
+    }
+
+    #[test]
+    fn compose_service_names_are_accepted() {
+        let (_d, paths) = setup();
+        let mut r = route("my_db", "shop", "my-db.shop:5432", "http");
+        r.host = "my-db.shop.localhost".into();
+        write_routes(&paths, "shop", &[r], &certs(&paths, "shop")).unwrap();
+        let v = read(&paths, "shop");
+        assert!(v["http"]["routers"].get("shop_my-db").is_some());
+    }
+
+    #[test]
+    fn names_do_not_collide_across_projects() {
+        let (_d, paths) = setup();
+        let mut a = route("x", "a", "x.a:1", "http");
+        a.host = "b-c.a.localhost".into();
+        let mut b = route("x", "a-b", "x.a-b:1", "http");
+        b.host = "c.a-b.localhost".into();
+        write_routes(&paths, "a", &[a], &certs(&paths, "a")).unwrap();
+        write_routes(&paths, "a-b", &[b], &certs(&paths, "a-b")).unwrap();
+        let ra = read(&paths, "a")["http"]["routers"]
+            .as_table()
+            .unwrap()
+            .clone();
+        let rb = read(&paths, "a-b")["http"]["routers"]
+            .as_table()
+            .unwrap()
+            .clone();
+        assert!(ra.keys().all(|k| !rb.contains_key(k)));
     }
 }
