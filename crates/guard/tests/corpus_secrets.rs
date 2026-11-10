@@ -1146,3 +1146,277 @@ fn keychain_dump_gaps_round_one() {
         ],
     );
 }
+
+/// Writing onto a credential file is a takeover: `cp evil ~/.aws/credentials`
+/// swaps in the attacker's account, `>> ~/.ssh/authorized_keys` lets the
+/// attacker log in. Every shell writer, redirect and file tool denies it, as
+/// a read of the same file does. `.env` files stay writable.
+#[test]
+fn writes_onto_secret_files_deny() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "cp evil ~/.aws/credentials",
+        "cp -f evil ~/.aws/credentials",
+        "cp evil $HOME/.aws/credentials",
+        "cp -t ~/.aws evil credentials",
+        "mv x ~/.aws/credentials",
+        "tee ~/.aws/credentials < x",
+        "tee -a ~/.aws/credentials < x",
+        "echo k > ~/.aws/credentials",
+        "printf k >| ~/.aws/credentials",
+        "dd if=evil of=~/.aws/credentials",
+        "install -m 600 evil ~/.aws/credentials",
+        "rsync evil ~/.aws/credentials",
+        "ln -sf /tmp/evil ~/.aws/credentials",
+        "sudo tee /root/.aws/credentials < x",
+        "bash -c 'cat evil > ~/.aws/credentials'",
+        "cp evil ~/.ssh/id_ed25519",
+        "cp id_rsa ~/.ssh/",
+        "echo key > ~/.ssh/id_rsa",
+        "echo 'ssh-ed25519 AAAA x' >> ~/.ssh/authorized_keys",
+        "cat evil.pub >> ~/.ssh/authorized_keys",
+        "cp evil.pub ~/.ssh/authorized_keys",
+        "mv evil.pub ~/.ssh/authorized_keys",
+        "tee -a ~/.ssh/authorized_keys < evil.pub",
+        "tee -a ~/.ssh/authorized_keys2 < evil.pub",
+        "cp authorized_keys ~/.ssh/",
+        "sudo tee -a /root/.ssh/authorized_keys < evil.pub",
+        "echo k >> /home/other/.ssh/authorized_keys",
+        "cp evil ~/.kube/config",
+        "cp evil ~/.docker/config.json",
+        "echo machine x > ~/.netrc",
+        "echo x > ~/.git-credentials",
+        "cp evil ~/.config/gh/hosts.yml",
+        "printf x > ~/.vault-token",
+        "cp evil ~/.pypirc",
+        "echo //registry/:_authToken=x > ~/.npmrc",
+        "cp evil ~/.config/gcloud/credentials.db",
+        "cp evil ~/.azure/msal_token_cache.json",
+        "cp evil ~/.aws/sso/cache/abc.json",
+        "cp evil ~/.claude/.credentials.json",
+        "cp evil ~/.codex/auth.json",
+        "cp evil ~/.gemini/oauth_creds.json",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+    let home = f.home();
+    for path in [
+        "~/.aws/credentials".to_string(),
+        "~/.ssh/id_ed25519".to_string(),
+        "~/.ssh/authorized_keys".to_string(),
+        home.join(".ssh/authorized_keys").display().to_string(),
+        home.join(".kube/config").display().to_string(),
+        "~/.npmrc".to_string(),
+        "~/.claude/.credentials.json".to_string(),
+    ] {
+        match e.evaluate_path(Access::Write, &path) {
+            Decision::Deny { pack, reason, .. } => {
+                assert_eq!(pack, "core.secrets", "{path}");
+                assert!(reason.contains("(write: "), "{reason}");
+            }
+            d => panic!("expected DENY for write of {path:?}, got {d:?}"),
+        }
+    }
+}
+
+/// The file tools, as the hook sees them: Write, Edit and MultiEdit onto a
+/// credential file deny.
+#[test]
+fn file_tools_writing_secret_files_deny() {
+    use saiifeguard::payload::{classify, ToolCall};
+    let f = Fixture::new();
+    let e = f.engine();
+    let home = f.home().display().to_string();
+    for (tool, file) in [
+        ("Write", format!("{home}/.aws/credentials")),
+        ("Edit", format!("{home}/.aws/credentials")),
+        ("MultiEdit", format!("{home}/.ssh/authorized_keys")),
+        ("Write", format!("{home}/.ssh/authorized_keys")),
+        ("Write", format!("{home}/.ssh/id_ed25519")),
+        ("Edit", format!("{home}/.kube/config")),
+    ] {
+        let payload = format!(
+            r#"{{"cwd":"{home}/app","hook_event_name":"PreToolUse","tool_name":"{tool}","tool_input":{{"file_path":"{file}","content":"x","old_string":"a","new_string":"b"}}}}"#
+        );
+        let Ok(ToolCall::File { paths, write, .. }) = classify(&payload, 1 << 20) else {
+            panic!("not a file call: {payload}");
+        };
+        assert!(write, "{tool}");
+        let denied = paths
+            .iter()
+            .any(|p| e.evaluate_path(Access::Write, p).is_deny());
+        assert!(denied, "expected DENY for {tool} of {file}");
+    }
+}
+
+/// What stays allowed next to the write rules.
+#[test]
+fn writes_next_to_secret_files_stay_allowed() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_allows(
+        &e,
+        &[
+            "cp .env.example .env",
+            "echo 'DEBUG=1' >> .env",
+            "echo 'registry=https://r.example' > .npmrc",
+            "cp ~/.ssh/id_rsa.pub ~/backup.pub",
+            "cp key.pub ~/.ssh/id_rsa.pub",
+            "echo 'Host x' >> ~/.ssh/config",
+            "cat ~/.ssh/authorized_keys",
+            "cp ~/.ssh/authorized_keys ~/ak.bak",
+            "cp evil ~/.aws/config",
+            "chmod 600 ~/.ssh/id_rsa",
+            "chmod 600 ~/.aws/credentials",
+            "chmod 600 ~/.ssh/authorized_keys",
+        ],
+    );
+}
+
+/// Replacing a folder that holds credential files replaces them: removing,
+/// moving, linking or copying over `~/.ssh`, `~/.aws` … denies, and so does
+/// extracting a whole archive into one. Listing them, a `chmod 700` and a
+/// write of another file in them stay allowed. Every case here has the same
+/// verdict when the folder exists and when it does not (`lexical_corpus`).
+#[test]
+fn replacing_a_folder_of_secret_files_denies() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "rm -rf ~/.ssh",
+        "rm -rf ~/.aws",
+        "rm -rf ~/.aws && cp -r evil ~/.aws",
+        "mv ~/.ssh ~/.ssh.bak",
+        "mv ~/.ssh ~/.ssh.bak && mkdir ~/.ssh && cp evil ~/.ssh/authorized_keys",
+        "mv ~/.aws /tmp/old",
+        "mv evil_dir ~/.kube",
+        "cp -r evil ~/.docker",
+        "ln -s /tmp/evil ~/.kube",
+        "ln -sfn /tmp/evil ~/.config/gh",
+        "rm -rf ~/.config/gh",
+        "rm -rf ~/.aws/sso",
+        "cp -r evil/. ~/.ssh/",
+        "tar -xf evil.tar -C ~/.ssh",
+        "tar -xzf evil.tgz --directory=~/.aws",
+        "tar -xf evil.tar -C ~/",
+        "rsync -a evil/ ~/.ssh/",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+    // `~/.azure` and `~/.config/gcloud` are secret themselves (`**/.azure/**`).
+    for path in [
+        "~/.ssh",
+        "~/.aws",
+        "~/.kube",
+        "~/.config/gh",
+        "~/.azure",
+        "~",
+    ] {
+        match e.evaluate_path(Access::Write, path) {
+            Decision::Deny { .. } => {}
+            d => panic!("expected DENY for write of {path:?}, got {d:?}"),
+        }
+    }
+    for path in ["~/.ssh", "~/.aws", "~/.kube", "~/.config/gh"] {
+        assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
+        assert!(!e.evaluate_path(Access::Attr, path).is_deny(), "{path}");
+    }
+    assert_allows(
+        &e,
+        &[
+            "ls -la ~/.ssh",
+            "ls ~/.aws",
+            "chmod 700 ~/.ssh",
+            "echo 'host ssh-ed25519 AAAA' >> ~/.ssh/known_hosts",
+            "tar -tf evil.tar -C ~/.ssh",
+            "tar -xf build.tar -C dist",
+            "rm -rf ~/.cache/pip",
+        ],
+    );
+}
+
+/// The Windows shells (cmd, PowerShell, Git Bash) on a Windows-style engine:
+/// copies, moves, redirects and `Set-Content`-like writes onto a credential
+/// file deny. Any host runs these.
+#[test]
+fn windows_writes_onto_secret_files_deny() {
+    use saiifeguard::builtins::Catalog;
+    use saiifeguard::canon::PathStyle;
+    use saiifeguard::payload::Dialects;
+    use saiifeguard::wintable::Dialect;
+    let vars = PathVars::new()
+        .with_style(PathStyle::Windows)
+        .with_var("USERPROFILE", r"C:\Users\a")
+        .with_var("LOCALAPPDATA", r"C:\Users\a\AppData\Local")
+        .with_var("APPDATA", r"C:\Users\a\AppData\Roaming")
+        .with_cwd(r"D:\work\app");
+    let (packs, warnings) = Catalog::builtin_for(PathStyle::Windows).load_active(&[]);
+    assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+    let e = Engine::new(packs).with_paths(vars).with_budget(TEST_BUDGET);
+    let cmd = Dialects::One(Dialect::Cmd);
+    let ps = Dialects::One(Dialect::PowerShell);
+    let bash = Dialects::One(Dialect::Posix);
+    let deny = [
+        (cmd, r"copy /y evil %USERPROFILE%\.aws\credentials"),
+        (cmd, r"move evil %USERPROFILE%\.aws\credentials"),
+        (cmd, r"echo x> %USERPROFILE%\.aws\credentials"),
+        (cmd, r"type evil.pub >> %USERPROFILE%\.ssh\authorized_keys"),
+        (cmd, r"copy evil C:\Users\a\.ssh\id_ed25519"),
+        (cmd, r"copy evil %APPDATA%\Microsoft\Credentials\ABC"),
+        (ps, r"Copy-Item evil $env:USERPROFILE\.aws\credentials"),
+        (
+            ps,
+            r"Move-Item evil $env:USERPROFILE\.aws\credentials -Force",
+        ),
+        (ps, r"Set-Content $env:USERPROFILE\.aws\credentials x"),
+        (
+            ps,
+            r"Add-Content $env:USERPROFILE\.ssh\authorized_keys 'ssh-ed25519 AAAA x'",
+        ),
+        (
+            ps,
+            r"'ssh-ed25519 AAAA x' | Out-File -Append $env:USERPROFILE\.ssh\authorized_keys",
+        ),
+        (ps, r"echo x > $env:USERPROFILE\.kube\config"),
+        (ps, r"Copy-Item evil $env:APPDATA\gcloud\credentials.db"),
+        (ps, r#"Copy-Item evil "$env:APPDATA\GitHub CLI\hosts.yml""#),
+        (ps, r"Remove-Item -Recurse -Force $env:USERPROFILE\.ssh"),
+        (ps, r"Move-Item $env:USERPROFILE\.aws C:\tmp\old"),
+        (ps, r"Remove-Item -Recurse $env:APPDATA\Microsoft"),
+        (cmd, r"rmdir /s /q %USERPROFILE%\.kube"),
+        (bash, "cp evil /c/Users/a/.aws/credentials"),
+        (bash, "rm -rf /c/Users/a/.ssh"),
+        (bash, "cat evil.pub >> /c/Users/a/.ssh/authorized_keys"),
+    ];
+    let wrong: Vec<String> = deny
+        .iter()
+        .filter_map(|(d, c)| {
+            let got = e.evaluate_in(c, *d);
+            (!got.is_deny()).then(|| format!("{c:?}: {got:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "expected DENY: {wrong:#?}");
+    for path in [
+        r"C:\Users\a\.aws\credentials",
+        r"C:\Users\a\.ssh\authorized_keys",
+        r"C:\Users\a\AppData\Roaming\Microsoft\Protect\S-1\key",
+    ] {
+        assert!(e.evaluate_path(Access::Write, path).is_deny(), "{path}");
+    }
+    let allow = [
+        (cmd, r"copy .env.example .env"),
+        (cmd, r"type %USERPROFILE%\.ssh\authorized_keys"),
+        (ps, r"Get-Content $env:USERPROFILE\.ssh\authorized_keys"),
+        (ps, r"Copy-Item evil $env:USERPROFILE\.aws\config"),
+        (ps, r"Set-Content .env 'DEBUG=1'"),
+    ];
+    let wrong: Vec<String> = allow
+        .iter()
+        .filter_map(|(d, c)| {
+            let got = e.evaluate_in(c, *d);
+            got.is_deny().then(|| format!("{c:?}: {got:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "expected ALLOW: {wrong:#?}");
+}

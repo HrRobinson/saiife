@@ -436,7 +436,7 @@ impl Engine {
         if self.vars.style() != PathStyle::Windows || !self.has_path_rules {
             return None;
         }
-        match winpath::provider_access(raw, access == Access::Write) {
+        match winpath::provider_access(raw, access != Access::Read) {
             Some(Ok(())) => None,
             Some(Err(why)) => Some(Self::unreadable_deny(raw, why)),
             None => self.unreadable(raw, cwd),

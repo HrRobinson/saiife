@@ -205,7 +205,9 @@ fn reading_the_setup_and_everyday_work_are_allowed() {
         "echo x > src/main.rs",
         "sed -i s/a/b/ src/main.rs",
         "ls /",
-        "tar -C ~ -xf x.tar",
+        // `tar -C ~ -xf x.tar` (the whole archive into the home) denies since
+        // `core.secrets` 6: it can replace `~/.ssh/authorized_keys`.
+        "tar -C ~ -xf x.tar app/src",
         "tar -C ~ -czf backup.tgz app/src",
         "git checkout main",
         "git checkout -b feature",

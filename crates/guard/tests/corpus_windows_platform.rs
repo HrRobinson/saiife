@@ -48,6 +48,13 @@ const MARKED: &[(&str, &[&str])] = &[
             "?:/windows/system32/config/system",
             "windows-credential-dump",
             "windows-hive-save",
+            "~/AppData/Local/Microsoft/Credentials",
+            "~/AppData/Local/Microsoft/Vault",
+            "~/AppData/Roaming/GitHub CLI/hosts.yml",
+            "~/AppData/Roaming/Microsoft/Credentials",
+            "~/AppData/Roaming/Microsoft/Protect",
+            "~/AppData/Roaming/Microsoft/Vault",
+            "~/AppData/Roaming/gcloud",
         ],
     ),
     (
@@ -129,7 +136,11 @@ fn only_on_windows(pack: &str) -> Vec<String> {
     let mut out: Vec<String> = out
         .into_iter()
         .map(|n| match n.rsplit_once('/') {
-            Some((glob, access)) if ["read", "write", "any"].contains(&access) => glob.to_string(),
+            Some((glob, access))
+                if ["read", "write", "any", "replace", "content"].contains(&access) =>
+            {
+                glob.to_string()
+            }
             _ => n,
         })
         .collect();

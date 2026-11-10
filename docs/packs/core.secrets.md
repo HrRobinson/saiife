@@ -31,6 +31,28 @@ own file tools and through shell commands that read them (`cat`, `grep`,
   or `$CODEX_HOME`) and Gemini CLI's `~/.gemini/oauth_creds.json`. With these
   an agent could act as you elsewhere.
 
+**Writing credential files.** Overwriting a login file swaps in someone
+else's account, and a key added to `authorized_keys` can log in as you. So
+writing these is blocked too, through the file tools (Write, Edit) and
+through shell commands that write them (`cp`, `mv`, `tee`, `dd`, `ln`,
+`install`, `rsync`, `rm`, `>`/`>>` redirects, and in cmd and PowerShell
+`copy`, `move`, `Copy-Item`, `Set-Content`, `Add-Content`, `Out-File`):
+
+- Every file above except the `.env` files and `/proc/<pid>/environ`.
+- `~/.ssh/authorized_keys` and `authorized_keys2`, in any home. Reading
+  them stays allowed.
+- `~/.npmrc` (a project's own `.npmrc` stays writable).
+- On Windows, the stored credentials, the vaults and the DPAPI keys under
+  `AppData`, and the GitHub CLI and Google Cloud login files there.
+- The folders that hold them in your own home, and every folder above:
+  removing, moving or replacing `~/.ssh`, `~/.aws`, `~/.kube`, `~/.docker`,
+  `~/.config/gh` (and so on) is blocked, for example `rm -rf ~/.aws`,
+  `mv ~/.ssh ~/.ssh.bak`, `ln -s /tmp/x ~/.kube` or `cp -r x/. ~/.ssh/`.
+  Extracting a whole archive into one of them or into your home
+  (`tar -xf x.tar -C ~`) is blocked too: what it holds is not known. Listing
+  them (`ls ~/.ssh`), `chmod 700 ~/.ssh` and writing other files in them
+  (`~/.ssh/known_hosts`, `~/.ssh/config`, `~/.aws/config`) stay allowed.
+
 **Printing every environment variable.** A bare `env`, `printenv` without a
 name, a bare `set`, `export -p`, `declare -x`/`declare -p` (and `typeset`),
 and `ps e`. They print tokens and keys along with everything else.
@@ -64,6 +86,10 @@ and `ps e`. They print tokens and keys along with everything else.
 - Example env files: `.env.example`, `.env.sample`, `.env.dist`,
   `.env.defaults`, `.env.template`. They hold no secrets.
 - SSH public keys (`~/.ssh/id_*.pub`) and `~/.ssh/config`.
+- Writing `.env` files (`cp .env.example .env`, `echo 'DEBUG=1' >> .env`)
+  and a project's `.npmrc`.
+- Changing the mode or owner of a credential file (`chmod 600 ~/.ssh/id_rsa`,
+  `chown`, `chgrp`, `chattr`).
 - Printing one named variable (`printenv HOME`) and running a command with
   extra variables (`env FOO=1 npm test`).
 - `kubectl describe secret` (Kubernetes hides the values) and
@@ -81,6 +107,9 @@ seen:
 - A recursive read of a folder that holds a secret, for example
   `grep -r KEY .` or `cp -r ~/.ssh x`.
 - A secret read from git history: `git show HEAD:.env`.
+- Writes onto another user's credential folders (`/root/.ssh` as a whole)
+  and an archive extracted into the folder you are in (`cd ~ && tar -xf x`):
+  the folder rules name your own home and `tar -C` only.
 - Reads through `find ... -exec cat {} +` and through `xargs`.
 - Gemini CLI's `read_many_files` with a broad pattern (`**/*`). This relies on
   Gemini's own handling of git-ignored files.
@@ -133,6 +162,10 @@ allow kubectl describe secret db
 allow kubectl get secrets
 allow aws configure get region
 allow aws secretsmanager list-secrets
+deny cp /tmp/evil /home/me/.aws/credentials
+deny tee -a /home/me/.ssh/authorized_keys < /tmp/key.pub
+allow cat /home/me/.ssh/authorized_keys
+allow chmod 600 /home/me/.ssh/id_rsa
 ```
 - A home directory that is unknown or not an absolute path. saiife takes it
   from `HOME`, or from the user database when `HOME` is unset or empty; if the

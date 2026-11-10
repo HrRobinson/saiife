@@ -74,6 +74,10 @@ const WRITERS: &[&str] = &[
     "chattr", "sponge",
 ];
 
+/// The `WRITERS` that change only a mode, owner or attributes: their
+/// operands are `Access::Attr` (`chmod 600 ~/.ssh/id_rsa` keeps the key).
+const ATTR_CHANGERS: &[&str] = &["chmod", "chown", "chgrp", "chattr"];
+
 /// The paths `segment` touches, with how. `effective` is the segment with
 /// wrapper commands (`sudo`, `env`, …) peeled off and `argv` its matching
 /// argv (argv[0] case-folded and directory-stripped); both are empty for a
@@ -153,7 +157,13 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
     } else if cmd == "mv" {
         mv_like(rest, &mut out, None);
     } else if WRITERS.contains(&cmd) {
+        let from = out.0.len();
         rm_like(rest, &mut out, None);
+        if ATTR_CHANGERS.contains(&cmd) {
+            for o in &mut out.0[from..] {
+                o.access = Access::Attr;
+            }
+        }
     } else if cmd == "git" {
         git(rest, &mut out);
     } else if cmd == "dd" {
@@ -786,7 +796,15 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
             _ => {}
         }
     }
-    for t in operands_of(&args) {
+    let members = operands_of(&args);
+    // An extract of the whole archive into `-C DIR` may replace anything
+    // below DIR, DIR itself included (`tar -xf evil.tar -C ~/.ssh`).
+    if extracts && members.is_empty() {
+        if let Some(d) = dir {
+            out.write(d);
+        }
+    }
+    for t in members {
         let (path, glob) = under(dir.map(|d| d.s), t);
         let access = if extracts {
             Access::Write
@@ -1240,6 +1258,27 @@ mod tests {
     }
 
     #[test]
+    fn mode_and_owner_changes_are_attribute_writes() {
+        for cmd in ["chmod 600 f", "chown me f", "chgrp g f", "chattr +i f"] {
+            let o = full(cmd);
+            let f: Vec<_> = o.iter().filter(|x| x.path == "f").collect();
+            assert_eq!(f.len(), 1, "{cmd}");
+            assert_eq!(f[0].access, Access::Attr, "{cmd}");
+        }
+        // A redirect on the same line still writes what the file holds.
+        let o = full("chmod 600 f > g");
+        assert!(o.iter().any(|x| x.path == "g" && x.access == Access::Write));
+        for cmd in ["rm f", "touch f", "truncate -s 0 f", "tee f"] {
+            assert!(
+                full(cmd)
+                    .iter()
+                    .any(|x| x.path == "f" && x.access == Access::Write),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn copy_and_move_targets_name_their_sources() {
         let o = full("cp a/review.md notes/ .claude/");
         assert_eq!(o[0].path, ".claude/");
@@ -1321,8 +1360,12 @@ mod tests {
         assert!(o.contains(&r("snap")) && o.contains(&w("snap")), "{o:?}");
         let o = ops("tar --listed-incremental=snap -cf o src");
         assert!(o.contains(&r("snap")) && o.contains(&w("snap")), "{o:?}");
-        // `-C DIR` is where tar works, not a write of DIR.
-        assert_eq!(ops("tar -C ~ -xf x.tar"), vec![r("x.tar")]);
+        // `-C DIR` is where tar works, not a write of DIR, unless the whole
+        // archive (no member named) is extracted there: it may replace
+        // anything below DIR.
+        assert_eq!(ops("tar -C ~ -xf x.tar a"), vec![r("x.tar"), w("~/a")]);
+        assert_eq!(ops("tar -C ~ -xf x.tar"), vec![r("x.tar"), w("~")]);
+        assert_eq!(ops("tar -C ~ -tf x.tar"), vec![r("x.tar")]);
         assert_eq!(
             ops("tar -C /srv -czf x.tgz app"),
             vec![w("x.tgz"), r("/srv/app")]
