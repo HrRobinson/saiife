@@ -721,9 +721,10 @@ fn an_oversize_write_is_still_judged() {
 }
 
 /// Past the parse cap nothing is parsed, but the first `tool_name` still says it is
-/// a shell line. A file tool past it stays what it was.
+/// a shell line. A file tool past it is denied too, in developer mode (owner's
+/// ruling, 2026-11-10).
 #[test]
-fn a_shell_line_past_the_parse_cap_is_denied_and_a_write_stays_open() {
+fn a_shell_line_and_a_write_past_the_parse_cap_are_denied() {
     let big = "a".repeat(65 * 1024 * 1024);
     let shell =
         format!(r#"{{"tool_name":"Bash","cwd":"/home/u/app","tool_input":{{"command":"{big}"}}}}"#);
@@ -735,8 +736,15 @@ fn a_shell_line_past_the_parse_cap_is_denied_and_a_write_stays_open() {
         r#"{{"tool_name":"Write","cwd":"/home/u/app","tool_input":{{"file_path":"/home/u/app/x","content":"{big}"}}}}"#
     );
     let (out, rec) = run_bytes("claude", write.as_bytes());
-    assert_eq!(out.code, 0);
-    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorDenied);
+    let reason = rec.reason.as_deref().unwrap_or("");
+    for said in [reason, out.stderr.as_str()] {
+        assert!(
+            said.contains("hook payload larger than 67108864 bytes; not judged"),
+            "{said}"
+        );
+    }
 }
 
 /// The parse cap (`PARSE_MAX_BYTES`).
@@ -791,15 +799,16 @@ fn past_the_parse_cap_an_unparsed_tool_fails_closed() {
             }
         }
     }
-    // A file tool named before the cap stays what it was, however it is spelled.
+    // A file tool named before the cap is denied too, however it is spelled
+    // (owner's ruling, 2026-11-10).
     let camel_write = past_the_cap(
         r#"{"toolName":"Write","toolInput":{"file_path":"/x","content":""#,
         "aaaaaaaa",
         r#""}}"#,
     );
     let (out, rec) = run_bytes("claude", &camel_write);
-    assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorDenied);
 }
 
 /// A short command in a payload over the shell limit is denied, but not told it is

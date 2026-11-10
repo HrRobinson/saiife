@@ -241,25 +241,17 @@ fn read_capped(r: &mut impl Read, cap: usize) -> Stdin {
     String::from_utf8(bytes).map_or(Stdin::Unreadable, Stdin::Whole)
 }
 
-/// A payload over `PARSE_MAX_BYTES`, of which `head` is the start: must it
-/// fail closed whatever the config says, and why. Only a tool named in
-/// `head` that is not a shell tool follows `Fail`; a shell tool, or a tool
-/// not named there, is denied: what is not parsed is not allowed.
-pub fn over_the_cap(head: &str) -> (bool, String) {
+/// Why a payload over `PARSE_MAX_BYTES`, of which `head` is the start, is
+/// denied. It is denied in every mode, whatever tool it names: what is not
+/// parsed is not allowed (owner's ruling, 2026-11-10). A shell tool named in
+/// `head` is told to split the line.
+pub fn over_the_cap(head: &str) -> String {
     match first_tool_name(head) {
-        Some(t) if saiifeguard::payload::is_shell_tool(t) => {
-            (true, too_large_reason(PARSE_MAX_BYTES))
-        }
-        Some(_) => (
-            false,
-            format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged"),
-        ),
-        None => (
-            true,
-            format!(
-                "hook payload larger than {PARSE_MAX_BYTES} bytes, with no tool name \
-                 in its first {PARSE_MAX_BYTES} bytes; not judged"
-            ),
+        Some(t) if saiifeguard::payload::is_shell_tool(t) => too_large_reason(PARSE_MAX_BYTES),
+        Some(_) => format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged"),
+        None => format!(
+            "hook payload larger than {PARSE_MAX_BYTES} bytes, with no tool name \
+             in its first {PARSE_MAX_BYTES} bytes; not judged"
         ),
     }
 }
@@ -1378,29 +1370,29 @@ mod tests {
         assert_eq!(read_capped(&mut r, 3), Stdin::Unreadable);
     }
 
-    /// Past the parse cap only a tool named in what was read, and not a shell
-    /// tool, follows `Fail`.
+    /// Past the parse cap every payload is denied, whatever tool it names
+    /// (owner's ruling, 2026-11-10).
     #[test]
-    fn over_the_cap_denies_what_it_cannot_name() {
-        for (head, closed) in [
-            (r#"{"tool_name":"Bash","tool_input":{"command":"ls"#, true),
-            (r#"{"toolName":"run_shell_command","toolInput":{"#, true),
-            (r#"{"tool_name":"PowerShell""#, true),
-            (
-                r#"{"tool_input":{"command":"ls; \"tool_name\":\"Write\""#,
-                true,
-            ),
-            (r#"{"tool_name":"Bash","tool_input":{"#, true),
-            (r#"{"tool_name":"","toolName":"Bash""#, true),
-            (r#"{"tool_name":"Wri"#, true),
-            (r#"{"tool_name":"Write","tool_input":{"content":"#, false),
-            (r#"{"toolName":"Write","toolInput":{"content":"#, false),
+    fn over_the_cap_denies_every_tool() {
+        for head in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"#,
+            r#"{"toolName":"run_shell_command","toolInput":{"#,
+            r#"{"tool_name":"PowerShell""#,
+            r#"{"tool_input":{"command":"ls; \"tool_name\":\"Write\""#,
+            r#"{"tool_name":"Bash","tool_input":{"#,
+            r#"{"tool_name":"","toolName":"Bash""#,
+            r#"{"tool_name":"Wri"#,
+            r#"{"tool_name":"Write","tool_input":{"content":"#,
+            r#"{"toolName":"Edit","toolInput":{"content":"#,
         ] {
-            let (c, reason) = over_the_cap(head);
-            assert_eq!(c, closed, "{head}");
+            let reason = over_the_cap(head);
             assert!(reason.contains("not judged"), "{reason}");
             assert!(reason.contains("67108864"), "{reason}");
         }
+        assert_eq!(
+            over_the_cap(r#"{"tool_name":"Write","tool_input":{"content":"#),
+            "hook payload larger than 67108864 bytes; not judged"
+        );
     }
 
     /// The reason for a shell call over the shell limit says which part is large.

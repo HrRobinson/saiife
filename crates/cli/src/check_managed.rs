@@ -988,7 +988,7 @@ mod imp {
         // so the agent gets no EPIPE, and the call is denied.
         match eval::read_payload(&mut std::io::stdin().lock()) {
             eval::Stdin::Whole(buf) => Ok(buf),
-            eval::Stdin::TooLarge(head) => Err(eval::over_the_cap(&head).1),
+            eval::Stdin::TooLarge(head) => Err(eval::over_the_cap(&head)),
             eval::Stdin::Unreadable => Err("could not read hook payload".to_string()),
         }
     }

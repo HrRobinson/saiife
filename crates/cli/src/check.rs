@@ -105,19 +105,13 @@ pub fn run(
     let buf = match eval::read_payload(&mut std::io::stdin().lock()) {
         eval::Stdin::Whole(buf) => buf,
         eval::Stdin::TooLarge(head) => {
-            // Not parsed: denied unless its start names a tool that is not
-            // a shell tool.
+            // Not parsed: denied in every mode, whatever tool it names.
             let audit = Audit::new(agent, HookContext::default(), cli_packs);
-            let (closed, reason) = eval::over_the_cap(&head);
-            if closed {
-                let fail = Fail {
-                    closed: true,
-                    ..fail
-                };
-                return fail.unjudged(&audit, "", &reason, None);
-            }
-            let warning = format!("{reason}; failing open (allow)");
-            return fail.unjudged(&audit, "", &reason, Some(&warning));
+            let fail = Fail {
+                closed: true,
+                ..fail
+            };
+            return fail.unjudged(&audit, "", &eval::over_the_cap(&head), None);
         }
         eval::Stdin::Unreadable => {
             let audit = Audit::new(agent, HookContext::default(), cli_packs);

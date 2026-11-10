@@ -844,6 +844,10 @@ applies and the engine is unchanged.
   ruling), `error_denied`, with a message telling the agent to split it, on any
   OS. Padding must not be a way past the guard. File tools are not affected, and
   a broken or unreadable stdin stays as it is.
+- **A hook payload over the parse cap (64 MiB) is denied in every mode**
+  (owner's ruling, 2026-11-10), `error_denied`, whatever tool it names: a huge
+  `Write` or `Edit` too, with "hook payload larger than 67108864 bytes; not
+  judged". Nothing past the cap is parsed, and what is not parsed is not allowed.
 - **Limits, written down** (as `cd` tracking is for POSIX in §10):
   aliases and functions defined in the same command (`Set-Alias`,
   `function f {…}`), `.ps1` script contents, .NET calls
