@@ -4,7 +4,7 @@
 //! from strings. Traefik parses every file as a Go template and fails the whole
 //! directory on one bad file, so everything is validated before anything is written.
 use crate::certs::{tls_dir, write_atomic, CertPaths};
-use crate::docker::{run_ok, Docker};
+use crate::docker::{run_ok, Docker, Output};
 use crate::labels::{MANAGED, NETWORK, PROXY_CONTAINER};
 use crate::paths::DevPaths;
 use crate::project::check_name;
@@ -101,6 +101,31 @@ pub fn preflight_ports_with(d: &dyn Docker, probe: &dyn Fn(u16) -> Probe) -> Res
     Ok(())
 }
 
+/// Replays one recorded `Output`, so a failed call becomes `run_ok`'s
+/// `DevError::Docker` (trimmed, capped stderr) without running docker again.
+struct Replay(std::sync::Mutex<Option<Output>>);
+
+impl Docker for Replay {
+    fn run(&self, _args: &[&str], _stdin: Option<&[u8]>) -> Result<Output, DevError> {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(slot.take().unwrap_or_else(|| Output::fail(-1, "")))
+    }
+}
+
+/// The `DevError::Docker` for a failed `out` of `docker <args>`.
+fn docker_error(args: &[&str], out: Output) -> DevError {
+    let status = out.status;
+    let replay = Replay(std::sync::Mutex::new(Some(out)));
+    match run_ok(&replay, args) {
+        Err(e) => e,
+        Ok(_) => DevError::Docker {
+            args: args.iter().map(|a| a.to_string()).collect(),
+            status,
+            stderr: String::new(),
+        },
+    }
+}
+
 /// `None` when the network is missing, else whether saiife created it.
 fn network_is_ours(d: &dyn Docker) -> Result<Option<bool>, DevError> {
     let args = [
@@ -116,7 +141,7 @@ fn network_is_ours(d: &dyn Docker) -> Result<Option<bool>, DevError> {
         if err.contains("not found") || err.contains("no such network") {
             return Ok(None);
         }
-        return run_ok(d, &args).map(|_| None);
+        return Err(docker_error(&args, out));
     }
     let labels: Option<BTreeMap<String, String>> =
         serde_json::from_slice(&out.stdout).unwrap_or(None);
@@ -587,6 +612,8 @@ mod tests {
             DevError::Docker { .. }
         ));
         assert_eq!(created(&d), 0);
+        // The error comes from the first inspect; it is not run again.
+        assert_eq!(d.calls().len(), 1);
     }
 
     fn setup() -> (tempfile::TempDir, DevPaths) {
@@ -947,7 +974,7 @@ fn inspect_proxy(d: &dyn Docker) -> Result<Option<Inspected>, DevError> {
         if err.contains("no such container") || err.contains("no such object") {
             return Ok(None);
         }
-        return run_ok(d, &args).map(|_| None);
+        return Err(docker_error(&args, out));
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     let first = &v[0];
@@ -971,13 +998,27 @@ fn remove_proxy(d: &dyn Docker) -> Result<(), DevError> {
 
 /// Runs `run` or `start`; on failure removes the container and maps an
 /// address-in-use error to `PortBusy`.
+///
+/// After a failed `run` the container is removed only when a fresh inspect
+/// shows it is ours, and never on a name conflict: that container belongs to a
+/// concurrent `up` (or to someone else). A failed `start` is of a container
+/// already inspected as ours.
 fn run_or_clean(d: &dyn Docker, args: &[&str]) -> Result<(), DevError> {
     let e = match run_ok(d, args) {
         Ok(_) => return Ok(()),
         Err(e) => e,
     };
-    // Best effort: the next `up` must start clean; the run error is the one to report.
-    let _ = remove_proxy(d);
+    let conflict = matches!(&e, DevError::Docker { stderr, .. }
+        if stderr.contains("is already in use by container"));
+    let clean = if args.first() == Some(&"run") {
+        !conflict && matches!(inspect_proxy(d), Ok(Some(c)) if c.ours())
+    } else {
+        true
+    };
+    if clean {
+        // Best effort: the next `up` must start clean; the run error is the one to report.
+        let _ = remove_proxy(d);
+    }
     match e {
         DevError::Docker { ref stderr, .. }
             if stderr.contains("address already in use")
@@ -1253,7 +1294,9 @@ mod container_tests {
     fn failed_run_removes_the_container() {
         let (_t, paths) = setup();
         let d = FakeDocker::new();
-        d.on(INSPECT, Output::fail(1, MISSING));
+        d.once(INSPECT, Output::fail(1, MISSING));
+        // The half-made container `run` left behind carries our labels.
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), false));
         d.on(
             &["run"],
             Output::fail(
@@ -1309,7 +1352,65 @@ mod container_tests {
         d.on(RM, Output::ok(""));
         let e = ensure_proxy(&d, &paths).unwrap_err();
         assert!(matches!(e, DevError::Docker { status: 125, .. }), "{e:?}");
-        assert_eq!(d.calls().last().unwrap().args, RM);
+        // Nothing was created, so the re-inspect finds nothing to remove.
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn run_conflict_removes_nothing() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.once(INSPECT, Output::fail(1, MISSING));
+        // A concurrent `up` won the race; its proxy is ours but not this run's.
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), true));
+        d.on(
+            &["run"],
+            Output::fail(
+                125,
+                "docker: Error response from daemon: Conflict. The container name \
+                 \"/saiife-dev-proxy\" is already in use by container \"abc\".",
+            ),
+        );
+        d.on(RM, Output::ok(""));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(e, DevError::Docker { status: 125, .. }), "{e:?}");
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn failed_run_keeps_a_foreign_container() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.once(INSPECT, Output::fail(1, MISSING));
+        d.on(INSPECT, inspect_reply(r#"{"maintainer":"someone"}"#, true));
+        d.on(
+            &["run"],
+            Output::fail(
+                125,
+                "Bind for 127.0.0.1:443 failed: port is already allocated",
+            ),
+        );
+        d.on(RM, Output::ok(""));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(e, DevError::PortBusy { port: 443, .. }), "{e:?}");
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn failed_inspect_is_not_rerun() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(
+            INSPECT,
+            Output::fail(1, "  Cannot connect to the Docker daemon\n"),
+        );
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(
+            matches!(&e, DevError::Docker { status: 1, stderr, args }
+                if stderr == "Cannot connect to the Docker daemon" && args[1] == "inspect"),
+            "{e:?}"
+        );
+        assert_eq!(d.calls().len(), 1);
     }
 
     #[test]
