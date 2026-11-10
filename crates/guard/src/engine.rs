@@ -607,6 +607,7 @@ impl Engine {
             env_changed: false,
             ifs_named: false,
             null_redirect_discards: undecided && !names_null(raw_cmd),
+            saiife_vars: SaiifeVars::default(),
         };
         let clock = Clock {
             start,
@@ -816,6 +817,11 @@ impl Engine {
         // the engine reasons about the *effective* command, not the
         // wrapper, so packs never need to know these wrappers exist.
         let effective = unwrap_transparent_prefix(seg);
+        // Noted before the phases below, which may end this segment early: a
+        // bare `x=$(which saiife)` is one.
+        if cx.dialect == Dialect::Posix {
+            state.saiife_vars.note(seg);
+        }
         // Both phases read a word's text as POSIX. The readers already made
         // segments of what a `$(…)` holds, and noted what they could not read.
         if cx.dialect == Dialect::Posix {
@@ -886,6 +892,23 @@ impl Engine {
             );
             if let Some(d) = found.nested(nested) {
                 return Some(d);
+            }
+        }
+        // `$(which saiife) init --off`, `"$SAIIFE_BIN" init --off`,
+        // `x=$(which saiife); $x init --off`: the command word may expand to
+        // saiife, so it is judged as `saiife` as well. Only a deny (or the
+        // budget running out) comes of it; the segment is judged as written below.
+        if let Some(alt) =
+            saiife_named_command(seg, cx.dialect == Dialect::Posix, &state.saiife_vars)
+        {
+            let effective = unwrap_transparent_prefix(&alt);
+            let mut alt_state = state.clone();
+            let mut alt_found = Findings::default();
+            if let Some(d) = self.judge_command(&alt, effective, cx, &mut alt_state, &mut alt_found)
+            {
+                if d.is_deny() || is_timed_out(&d) {
+                    return Some(d);
+                }
             }
         }
         if let Some(without) = &without {
@@ -2923,6 +2946,67 @@ fn without_leading_empty_expansions(seg: &[Word]) -> Option<Vec<Word>> {
     removed.then_some(kept)
 }
 
+/// `seg` with its command word read as `saiife`, if that word may expand to
+/// saiife (`saiife_named_word`). Wrappers and assignments in front are
+/// peeled as `effective_command` does; under POSIX, words in front that may
+/// expand to nothing are dropped and the next one is tried
+/// (`$(true) env $(which saiife) init --off`). Bounded: each step consumes a
+/// word.
+fn saiife_named_command(seg: &[Word], posix: bool, vars: &SaiifeVars) -> Option<Vec<Word>> {
+    let mut kept: Vec<Word> = Vec::new();
+    let mut cursor = seg;
+    loop {
+        #[cfg(test)]
+        crate::work::add(1);
+        let rest = effective_command(cursor);
+        kept.extend_from_slice(&cursor[..cursor.len() - rest.len()]);
+        let (first, after) = rest.split_first()?;
+        if saiife_named_word(first, vars) {
+            kept.push(Word {
+                text: "saiife".to_string(),
+                behind_reserved: first.behind_reserved,
+                ..Word::default()
+            });
+            kept.extend_from_slice(after);
+            return Some(kept);
+        }
+        if !posix || !may_expand_to_nothing(first) {
+            return None;
+        }
+        cursor = after;
+    }
+}
+
+/// A word the shell expands (a substitution, or a `$` not in single quotes)
+/// whose text names saiife (`$(which saiife)`, `$SAIIFE_BIN`), or that
+/// expands a variable set to such a value. Its value may be saiife's path.
+fn saiife_named_word(w: &Word, vars: &SaiifeVars) -> bool {
+    if w.redirect || w.assignment {
+        return false;
+    }
+    let expands = w.has_substitution || (w.text.contains('$') && !w.literal_dollars);
+    expands && (names_saiife(&w.text) || vars.expanded_in(&w.text))
+}
+
+fn names_saiife(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("saiife")
+}
+
+/// The names of the `$NAME` and `${NAME…}` parameters in `text` (`${!NAME}`
+/// gives `NAME` as well).
+fn parameter_names(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices('$').filter_map(move |(at, _)| {
+        let rest = &text[at + 1..];
+        let rest = rest
+            .strip_prefix('{')
+            .map_or(rest, |r| r.strip_prefix('!').unwrap_or(r));
+        let len = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        (len > 0).then(|| &rest[..len])
+    })
+}
+
 /// The last of `words` that is more than an assignment, a redirection with
 /// its target, or a word that may expand to nothing.
 fn last_command_word(words: &[Word]) -> Option<usize> {
@@ -3076,6 +3160,58 @@ struct ShellState {
     ifs_named: bool,
     /// `> $null` discards under a POSIX reading (`null_device_words`).
     null_redirect_discards: bool,
+    /// The variables an earlier segment set to a value that may name saiife
+    /// (`x=$(which saiife)`): `$x` as the command may run it.
+    saiife_vars: SaiifeVars,
+}
+
+/// The names in `ShellState::saiife_vars`, up to `MAX_SAIIFE_VARS`. Past
+/// that, every expansion in command position counts as naming saiife.
+#[derive(Clone, Default)]
+struct SaiifeVars {
+    names: Vec<String>,
+    overflow: bool,
+}
+
+const MAX_SAIIFE_VARS: usize = 32;
+
+impl SaiifeVars {
+    /// Does `text` (an assignment's value or a command word) expand a
+    /// variable held here?
+    fn expanded_in(&self, text: &str) -> bool {
+        if self.names.is_empty() && !self.overflow {
+            return false;
+        }
+        parameter_names(text).any(|n| self.overflow || self.names.iter().any(|v| v == n))
+    }
+
+    /// Note each `NAME=value` word of `seg` (in front of a command, or an
+    /// argument of `export`, `local`, …) whose value may name saiife.
+    fn note(&mut self, seg: &[Word]) {
+        for w in seg {
+            let Some((name, value)) = w.text.split_once('=') else {
+                continue;
+            };
+            let name = name.strip_suffix('+').unwrap_or(name);
+            let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid || !names_saiife(value) && !self.expanded_in(value) {
+                continue;
+            }
+            if self.names.iter().any(|v| v == name) {
+                continue;
+            }
+            if self.names.len() >= MAX_SAIIFE_VARS {
+                self.overflow = true;
+            } else {
+                self.names.push(name.to_string());
+            }
+        }
+    }
+
+    fn weight(&self) -> usize {
+        self.names.iter().map(String::len).sum()
+    }
 }
 
 impl ShellState {
@@ -3083,7 +3219,7 @@ impl ShellState {
     /// words themselves, in bytes.
     fn weight(&self) -> usize {
         let dirs: usize = self.cwds.iter().map(|c| c.as_os_str().len()).sum();
-        dirs + self.rule_cwd.weight()
+        dirs + self.rule_cwd.weight() + self.saiife_vars.weight()
     }
 }
 

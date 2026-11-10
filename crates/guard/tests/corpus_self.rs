@@ -1071,3 +1071,66 @@ fn broker_glob_units_exit_targets_and_drop_ins() {
     assert!(e.evaluate_path(Access::Write, p).is_deny());
     assert!(!e.evaluate_path(Access::Read, p).is_deny());
 }
+
+/// `$(which saiife) init --off`: a command word whose expansion may name
+/// saiife (a substitution or a parameter whose text names it, or a variable
+/// an earlier segment set to such a value) is judged as `saiife` too. Under
+/// both file system views, since none of this reads the disk.
+#[test]
+fn a_command_word_that_may_expand_to_saiife_is_judged_as_saiife() {
+    use saiifeguard::canon::{with_fs_view, FsView};
+    let f = Fixture::new();
+    for view in [FsView::Host, FsView::Lexical] {
+        with_fs_view(view, || {
+            let e = f.engine();
+            for cmd in [
+                "$(which saiife) init --off",
+                "`which saiife` init --off",
+                "$(command -v saiife) init --off",
+                "\"$(type -P saiife)\" init --off",
+                "$(type -p saiife) init --agent claude --off",
+                "x=$(which saiife); $x init --off",
+                "x=saiife; \"${x}\" init --off",
+                "export S=$(which saiife) && \"$S\" init --off",
+                "y=$(which saiife); x=$y; $x init --off",
+                "x=; x+=saiife; $x init --off",
+                "env $(which saiife) init --off",
+                "sudo $(which saiife) init --off",
+                "command $(which saiife) init --off",
+                "exec $(which saiife) init --off",
+                "nohup $(command -v saiife) init --off",
+                "$(true) $(which saiife) init --off",
+                "$(true) env $(which saiife) init --off",
+                "$SAIIFE_BIN init --off",
+                "\"$SAIIFE_BIN\" init --off",
+                "${SAIIFE_BIN} init --off",
+                "$(dirname $(which saiife))/saiife init --off",
+                "bash -c '$(which saiife) init --off'",
+                "eval $(which saiife) init --off",
+                "echo hi; $(which saiife) init --off",
+            ] {
+                assert_eq!(deny_pack(&e, cmd), "core.self", "{view:?}: {cmd}");
+            }
+            for cmd in [
+                "$(which cargo) build",
+                "$(which cargo) init --off",
+                "$(git rev-parse --show-toplevel)/x.sh",
+                "\"$(git rev-parse --show-toplevel)/scripts/test.sh\" --all",
+                "$(which saiife) status",
+                "$(which saiife) init",
+                "$SAIIFE_BIN audit",
+                "x=$(which saiife); $x status",
+                "x=$(which saiife); $y init --off",
+                "'$saiife' init --off",
+                "echo $(which saiife) init --off",
+                "ls $(which saiife)",
+            ] {
+                let d = e.evaluate(cmd);
+                assert!(
+                    !d.is_deny(),
+                    "{view:?}: expected ALLOW for {cmd:?}, got {d:?}"
+                );
+            }
+        });
+    }
+}
