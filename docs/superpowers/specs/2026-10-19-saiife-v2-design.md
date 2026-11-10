@@ -427,7 +427,9 @@ Windows locked mode. What changed from the design while it was built:
   as an admin owner.
 - **Peers (W11, W12).** A pipe peer is an admin, uid 0, only at High integrity or above
   with no restricted SIDs; the same holds for a lowered SYSTEM token. The pipe has at
-  most 254 instances. Approver names and `[[scope]] users` match by SID;
+  most 254 instances, and one uid holds at most 64 of them (the control socket's
+  per-uid connection cap, `MAX_CONNS_PER_UID`), so three uids at the cap still
+  leave instances free. Approver names and `[[scope]] users` match by SID;
   `group:` approvers count by the token's groups only.
 - **Service (W10).** The restart action repeats for every failure past the third, so
   the restarts never run out.
@@ -1323,8 +1325,10 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
   Windows, and 16 in all) waits for a slot, its asker's share first, before
   its body is read, and gets `503` only when none is free within
   `COSIGN_WAIT` from its arrival (since the re-judge concurrency review,
-  2026-11-10: ten or more parallel sessions of one user burst past 8). Each of these
-  blocks only the request it answers, through `onFailure`. Every deny except
+  2026-11-10: ten or more parallel sessions of one user burst past 8). Open
+  connections are capped at 64 per uid (or per pid on Windows) and 128 in all
+  (owner's ruling, 2026-11-10; they were 32 and 64); one more is closed at once.
+  Each of these blocks only the request it answers, through `onFailure`. Every deny except
   `saiife denied this call` writes a `hook` record with `event:
   "cosign_denied"`, at most one per reason per 10 s, the next one carrying
   `suppressed: <n>`. The co-signer has no token: its answer can only take

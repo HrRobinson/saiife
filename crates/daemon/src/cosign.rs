@@ -70,10 +70,14 @@ pub const MAX_INFLIGHT: usize = 16;
 /// from one pid ([`Asker::Process`]).
 pub const MAX_INFLIGHT_PER_UID: usize = 8;
 /// Open connections; one more is closed at once.
-pub const MAX_CONNS: usize = 64;
+pub const MAX_CONNS: usize = 128;
 /// Open connections from one uid, where the uid is known; on Windows, from
-/// one pid.
-pub const MAX_CONNS_PER_UID: usize = 32;
+/// one pid (owner's ruling, 2026-11-10: 48 parallel sessions of one user
+/// passed 32).
+pub const MAX_CONNS_PER_UID: usize = 64;
+// One asker's share leaves room for others, and holds its requests in flight.
+const _: () = assert!(MAX_CONNS_PER_UID < MAX_CONNS);
+const _: () = assert!(MAX_INFLIGHT_PER_UID <= MAX_CONNS_PER_UID);
 /// The longest session id a `cosign_denied` record keeps, in bytes
 /// (`hook.bind`'s own limit).
 pub const MAX_RECORDED_SESSION: usize = crate::sessions::MAX_SESSION_ID;
@@ -1540,7 +1544,8 @@ mod tests {
         assert_eq!(COSIGN_WAIT, Duration::from_secs(8));
         assert_eq!(MAX_INFLIGHT, 16);
         assert_eq!(MAX_INFLIGHT_PER_UID, 8);
-        assert_eq!(MAX_CONNS_PER_UID, 32);
+        assert_eq!(MAX_CONNS, 128);
+        assert_eq!(MAX_CONNS_PER_UID, 64);
         assert_eq!(Opts::default().max_body, 16 * 1024 * 1024);
         assert_eq!(MAX_RECORDED_SESSION, 128);
         assert_eq!(MAX_RECORDED_TOOL, 64);

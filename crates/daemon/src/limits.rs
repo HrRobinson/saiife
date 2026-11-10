@@ -67,8 +67,11 @@ impl Limits {
     }
 }
 
-/// Open connections per uid.
-pub const MAX_CONNS_PER_UID: u32 = 32;
+/// Open connections per uid (owner's ruling, 2026-11-10: was 32).
+pub const MAX_CONNS_PER_UID: u32 = 64;
+// On Windows a uid's connections are pipe instances: three uids at the cap
+// still leave instances free (spec §5.3a).
+const _: () = assert!(MAX_CONNS_PER_UID as usize * 3 < saiife_win::pipe::MAX_INSTANCES);
 /// File descriptors kept free of connections for logs, keys and the like.
 const FD_RESERVE: u64 = 64;
 
@@ -204,12 +207,13 @@ mod tests {
     }
 
     #[test]
-    fn connection_cap_is_32_per_uid_and_global() {
-        let l = ConnLimits::new(40);
-        let mut a: Vec<ConnSlot> = (0..32).map(|_| l.try_open(1).unwrap()).collect();
+    fn connection_cap_is_64_per_uid_and_global() {
+        assert_eq!(MAX_CONNS_PER_UID, 64);
+        let l = ConnLimits::new(72);
+        let mut a: Vec<ConnSlot> = (0..64).map(|_| l.try_open(1).unwrap()).collect();
         assert_eq!(l.try_open(1).unwrap_err(), ErrorCode::Busy);
         let b: Vec<ConnSlot> = (0..8).map(|_| l.try_open(2).unwrap()).collect();
-        // Global cap of 40 reached.
+        // Global cap of 72 reached.
         assert_eq!(l.try_open(3).unwrap_err(), ErrorCode::Busy);
         a.pop();
         assert!(l.try_open(3).is_ok());
