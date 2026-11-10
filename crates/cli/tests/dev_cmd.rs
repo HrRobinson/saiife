@@ -655,7 +655,7 @@ fn down_runs_compose_down_and_removes_routes() {
 #[cfg(unix)]
 #[test]
 fn down_rejects_a_bad_name() {
-    for bad in ["../../etc", "Shop", "", "a/b"] {
+    for bad in ["../../etc", "Shop", "", "a/b", "tls/../x"] {
         let d = Dev::with(vec![]);
         let o = d.saiife(&["dev", "down", bad], d.root.path());
         assert_eq!(code(&o), 1, "{bad:?}");
@@ -1050,6 +1050,7 @@ fn no_port_anywhere_says_how_to_add_one() {
     );
     assert!(out.contains(&want), "{out}");
     assert!(!out.contains("https://"), "{out}");
+    assert!(!out.contains("Not routed"), "{out}");
     assert_eq!(
         read_json(&project_state_dir(&d, "shop").join("urls.json")),
         serde_json::json!([])
@@ -1398,6 +1399,10 @@ fn gc_a_bad_state_file_is_one_clear_line() {
     let err = stderr(&o);
     assert_eq!(err.lines().count(), 1, "{err}");
     assert!(err.starts_with("saiife dev: "), "{err}");
+    assert!(
+        err.trim_end().ends_with(". Fix or delete that file."),
+        "{err}"
+    );
     assert!(d.calls().is_empty(), "{:?}", d.calls());
     assert!(d.state.join("saiife/dev/projects/c").is_dir());
 }
@@ -1423,4 +1428,88 @@ fn gc_one_failing_project_does_not_stop_the_others() {
     assert_eq!(stdout(&o).lines().last(), Some(IMAGE_LINE));
     assert!(d.calls().iter().any(|c| c.contains("network prune")));
     assert!(d.state.join("saiife/dev/proxy/dynamic/b.toml").is_file());
+}
+
+// ---- plan 24 fix wave: one `up`, `down` or `gc` at a time ----
+
+const WAITING: &str = "saiife dev: another saiife dev command is running; waiting.";
+
+/// A `down` started while another command holds the lock waits for it, and
+/// says so once; it runs when the lock is released.
+#[cfg(unix)]
+#[test]
+fn down_waits_for_the_dev_lock() {
+    use std::time::{Duration, Instant};
+    let d = Dev::with(vec![]);
+    seed_up(&d, "shop");
+    let lock_path = d.state.join("saiife/dev/dev.lock");
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    held.lock().unwrap();
+    let mut child = d
+        .command(&["dev", "down", "shop"], d.root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        assert!(child.try_wait().unwrap().is_none(), "down did not wait");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(d.calls().is_empty(), "{:?}", d.calls());
+    assert!(d.state.join("saiife/dev/proxy/dynamic/shop.toml").is_file());
+    drop(held);
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stderr(&o).matches(WAITING).count(), 1, "{}", stderr(&o));
+    assert!(stdout(&o).contains("saiife dev: shop is down."));
+    assert!(!d.state.join("saiife/dev/proxy/dynamic/shop.toml").exists());
+}
+
+/// With no other command running, nothing is said about the lock.
+#[cfg(unix)]
+#[test]
+fn an_unheld_lock_says_nothing() {
+    let d = Dev::with(vec![]);
+    seed_up(&d, "shop");
+    let o = d.saiife(&["dev", "down", "shop"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stderr(&o).contains("waiting"), "{}", stderr(&o));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(d.state.join("saiife/dev/dev.lock"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+/// `up` checks the proxy again after it writes the routes: a `down` or `gc`
+/// that ran meanwhile may have stopped it.
+#[cfg(unix)]
+#[test]
+fn up_ensures_the_proxy_after_writing_routes() {
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let calls = d.calls();
+    let up_at = calls
+        .iter()
+        .position(|c| c.starts_with("compose ") && c.ends_with(" up -d"))
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    assert!(
+        calls[up_at + 1..]
+            .iter()
+            .any(|c| c == "container inspect saiife-dev-proxy"),
+        "{calls:?}"
+    );
 }

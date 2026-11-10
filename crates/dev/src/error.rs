@@ -101,9 +101,10 @@ impl fmt::Display for DevError {
                 f,
                 "not a valid saiife dev project name: {name:?} (lowercase letters, digits and -, at most 40)"
             ),
-            DevError::State { path, msg } | DevError::Quirks { path, msg } => {
-                write!(f, "{}: {msg}", path.display())
+            DevError::State { path, msg } => {
+                write!(f, "{}: {msg}. Fix or delete that file.", path.display())
             }
+            DevError::Quirks { path, msg } => write!(f, "{}: {msg}", path.display()),
             DevError::Rewrite(msg) => write!(f, "cannot prepare the compose model: {msg}"),
             // plan 23
             DevError::Cert(msg) => write!(f, "certificate error: {msg}"),
@@ -162,5 +163,17 @@ mod tests {
             stderr: "boom".into(),
         };
         assert_eq!(e.to_string(), "docker compose up failed (exit 1): boom");
+    }
+
+    #[test]
+    fn state_error_says_what_to_do() {
+        let e = DevError::State {
+            path: PathBuf::from("p/project.json"),
+            msg: "expected value at line 1 column 1".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "p/project.json: expected value at line 1 column 1. Fix or delete that file."
+        );
     }
 }

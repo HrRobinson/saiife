@@ -103,6 +103,9 @@ pub(crate) fn up(d: &dyn Docker, paths: &DevPaths, dir: Option<&Path>) -> Res {
 
     // Plan 23 D2: on every `up`, so Traefik rereads a reissued certificate.
     proxy::write_routes(paths, &p.name, &rewritten.routes, &cert).map_err(msg)?;
+    // Again: a `down` or `gc` that ran before this `up` took the lock may
+    // have stopped the proxy, since it decides from route files.
+    proxy::ensure_proxy(d, paths).map_err(msg)?;
 
     let urls: Vec<String> = rewritten
         .routes
@@ -133,7 +136,8 @@ pub(crate) fn up(d: &dyn Docker, paths: &DevPaths, dir: Option<&Path>) -> Res {
         .filter(|n| !q.services.get(*n).is_some_and(|s| s.skip))
         .map(sanitize)
         .collect();
-    if !unrouted.is_empty() {
+    // With no URL at all, the line above already says what to do.
+    if !urls.is_empty() && !unrouted.is_empty() {
         outln!(
             "Not routed (no port): {}. Set a port in {quirks_file}.",
             unrouted.join(", ")

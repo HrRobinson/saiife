@@ -35,7 +35,7 @@ sha2 = "0.10"
 # The developer hook reads /etc/saiife/config.toml as a raw table.
 toml = "0.8"
 toml_edit = "0.22.27"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 saiife-win = { path = "../win" }
 # `saiife api` sends and reads bodies as base64 (the version saiife-broker uses).
 base64 = "=0.23.1"

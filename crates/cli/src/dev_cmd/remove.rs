@@ -56,11 +56,19 @@ pub(crate) fn labelled_volumes(
     run_strings(d, &args).map(|s| words(&s))
 }
 
-/// Shows `names` and asks. No names is `Ok`; a no is an error.
-// Used by `gc` too (plan 24 Task 5).
-pub(crate) fn confirm_volumes(names: &[String], yes: bool, what: &str) -> Res {
+/// Asks a yes-or-no question: [`super::confirm`] on the terminal.
+pub(crate) type Ask<'a> = &'a dyn Fn(&str, bool) -> Result<bool, String>;
+
+/// Shows `names` and asks. No names is `Ok(true)`; a no is `Ok(false)`,
+/// and the caller says what it kept.
+pub(crate) fn confirm_volumes(
+    names: &[String],
+    yes: bool,
+    what: &str,
+    ask: Ask,
+) -> Result<bool, String> {
     if names.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     for n in names {
         outln!("  volume {}", sanitize(n));
@@ -69,12 +77,7 @@ pub(crate) fn confirm_volumes(names: &[String], yes: bool, what: &str) -> Res {
         "Delete {} volumes of {what}? Their data is gone for good.",
         names.len()
     );
-    if confirm(&q, yes)? {
-        Ok(())
-    } else {
-        outln!("Nothing deleted.");
-        Err("volumes kept: the answer was not yes.".into())
-    }
+    ask(&q, yes)
 }
 
 /// `docker volume rm <names>`; nothing for none.
@@ -165,7 +168,10 @@ pub(crate) fn down(
     }
     let doomed = if volumes {
         let names = labelled_volumes(d, Some(project), false)?;
-        confirm_volumes(&names, yes, project)?;
+        if !confirm_volumes(&names, yes, project, &confirm)? {
+            outln!("Nothing deleted.");
+            return Err("volumes kept: the answer was not yes.".into());
+        }
         names
     } else {
         Vec::new()
@@ -221,6 +227,12 @@ const IMAGE_LINE: &str = "Dangling images are not touched: saiife removes only w
 /// An unreadable `project.json` stops `gc` before any docker call: with one
 /// project unknown, its labelled things could not be told apart.
 pub(crate) fn gc(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool) -> Res {
+    let tty = std::io::stdin().is_terminal();
+    gc_with(d, paths, volumes, yes, tty, &confirm)
+}
+
+/// [`gc`] with the terminal check and the question passed in.
+fn gc_with(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool, tty: bool, ask: Ask) -> Res {
     let inv = inventory(d, paths)?;
     if let Some(e) = &inv.docker_error {
         return Err(format!(
@@ -229,7 +241,7 @@ pub(crate) fn gc(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool) -> 
         ));
     }
     // Ask nothing halfway: with no one to say yes, nothing at all is removed.
-    if volumes && !yes && !std::io::stdin().is_terminal() {
+    if volumes && !yes && !tty {
         return Err(NEED_YES.into());
     }
     let mut failed = 0usize;
@@ -256,7 +268,7 @@ pub(crate) fn gc(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool) -> 
             },
         }
     }
-    let rest = gc_shared(d, paths, &kept, volumes, yes);
+    let rest = gc_shared(d, paths, &kept, volumes, yes, ask);
     outln!("{IMAGE_LINE}");
     rest?;
     if failed > 0 {
@@ -288,7 +300,14 @@ fn gc_project(d: &dyn Docker, paths: &DevPaths, row: &Row) -> Res {
 }
 
 /// Steps 4 to 6: stale route files, the proxy, networks, volumes.
-fn gc_shared(d: &dyn Docker, paths: &DevPaths, kept: &[&str], volumes: bool, yes: bool) -> Res {
+fn gc_shared(
+    d: &dyn Docker,
+    paths: &DevPaths,
+    kept: &[&str],
+    volumes: bool,
+    yes: bool,
+    ask: Ask,
+) -> Res {
     let mut stale = Vec::new();
     if let Ok(entries) = std::fs::read_dir(paths.proxy_dir().join("dynamic")) {
         for entry in entries.flatten() {
@@ -329,7 +348,12 @@ fn gc_shared(d: &dyn Docker, paths: &DevPaths, kept: &[&str], volumes: bool, yes
     }
     let unused = labelled_volumes(d, None, true)?;
     if volumes {
-        confirm_volumes(&unused, yes, "saiife dev")?;
+        // Containers, routes and networks are already gone: a no keeps only
+        // the volumes, and is not an error.
+        if !confirm_volumes(&unused, yes, "saiife dev", ask)? {
+            outln!("Volumes kept.");
+            return Ok(());
+        }
         rm_volumes(d, &unused)?;
         if !unused.is_empty() {
             let shown: Vec<String> = unused.iter().map(|n| sanitize(n)).collect();
@@ -342,4 +366,55 @@ fn gc_shared(d: &dyn Docker, paths: &DevPaths, kept: &[&str], volumes: bool, yes
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+
+    use saiife_dev::docker::Output;
+    use saiife_dev::DevError;
+
+    /// Answers `volume ls` with one volume and every other call with nothing.
+    #[derive(Default)]
+    struct OneVolume {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Docker for OneVolume {
+        fn run(&self, args: &[&str], _stdin: Option<&[u8]>) -> Result<Output, DevError> {
+            let line = args.join(" ");
+            let stdout = if line.starts_with("volume ls") {
+                b"saiife-shop_db\n".to_vec()
+            } else {
+                Vec::new()
+            };
+            self.calls.lock().unwrap().push(line);
+            Ok(Output {
+                status: 0,
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn gc_volumes_answered_no_keeps_them_and_succeeds() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = DevPaths {
+            state: base.path().join("state"),
+            config: base.path().join("config"),
+        };
+        let d = OneVolume::default();
+        let no = |_: &str, _: bool| Ok(false);
+        assert_eq!(gc_with(&d, &paths, true, false, true, &no), Ok(()));
+        let calls = d.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("volume ls")),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("volume rm")), "{calls:?}");
+    }
 }

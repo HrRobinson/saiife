@@ -161,13 +161,23 @@ no project, and unused saiife networks.
   and URLs stay the same. A project whose folder is gone loses its state too.
 - Running and partial projects are kept and named.
 - `--volumes`: also delete saiife's unused (dangling) labelled volumes, after a
-  yes. Without it, `gc` says how many volumes it kept.
+  yes. That includes the volumes of stopped projects whose saved state `gc`
+  keeps: their containers are gone, so no container uses them. Answering no
+  keeps the volumes and is not an error. Without `--volumes`, `gc` says how
+  many volumes it kept.
 - `--yes`: answer yes. Without a terminal, `--volumes` with no `--yes` is an
   error and nothing is removed.
 
 `gc` always ends with this line: "Dangling images are not touched: saiife
 removes only what it labelled saiife.managed=true. docker image prune removes
 them."
+
+### One command at a time
+
+`up`, `down` and `gc` take a lock (`dev.lock` in saiife's dev state folder), so
+only one of them runs at a time; a second one waits, and says once: "saiife
+dev: another saiife dev command is running; waiting." `ls` and `ca` take no
+lock.
 
 ### `saiife dev ca`
 

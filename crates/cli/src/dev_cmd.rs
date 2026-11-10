@@ -79,6 +79,15 @@ fn dispatch(action: DevAction) -> Result<ExitCode, String> {
         return ca(&paths).map(|()| ExitCode::SUCCESS);
     }
     let docker = DockerCli::from_env().map_err(|e| e.to_string())?;
+    // `up`, `down` and `gc` change containers, routes and the proxy: one at a
+    // time, so a `down` never stops the proxy an `up` in flight needs. `ls`
+    // only reads. The lock is released when `_lock` drops, at return.
+    let _lock = match action {
+        DevAction::Up { .. } | DevAction::Down { .. } | DevAction::Gc { .. } => {
+            Some(dev_lock(&paths)?)
+        }
+        DevAction::Ls { .. } | DevAction::Ca => None,
+    };
     let done = |r: Res| r.map(|()| ExitCode::SUCCESS);
     match action {
         DevAction::Up { dir } => done(up::up(&docker, &paths, dir.as_deref())),
@@ -91,6 +100,45 @@ fn dispatch(action: DevAction) -> Result<ExitCode, String> {
         DevAction::Gc { volumes, yes } => done(remove::gc(&docker, &paths, volumes, yes)),
         DevAction::Ca => unreachable!("handled above"),
     }
+}
+
+/// Printed once, after `saiife dev: `, when another command holds the lock.
+pub(crate) const WAITING: &str = "another saiife dev command is running; waiting.";
+
+/// Takes an exclusive lock on `<state>/dev.lock`, waiting for it if another
+/// `saiife dev` command holds it. The state dir is `0700` and the file `0600`,
+/// as for [`write_private`]; the file is never removed, only locked. The OS
+/// drops the lock when the returned file closes, also on a crash.
+fn dev_lock(paths: &DevPaths) -> Result<fs::File, String> {
+    let path = paths.state.join("dev.lock");
+    let err =
+        |e: std::io::Error| format!("cannot lock {}: {e}", sanitize(&path.display().to_string()));
+    fs::create_dir_all(&paths.state).map_err(err)?;
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(&paths.state, fs::Permissions::from_mode(0o700)).map_err(err)?;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&path).map_err(err)?;
+    #[cfg(unix)]
+    {
+        // A file left by an older run keeps its mode on open: set it again.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(err)?;
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            eprintln!("saiife dev: {WAITING}");
+            file.lock().map_err(err)?;
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(err(e)),
+    }
+    Ok(file)
 }
 
 /// A project name as plan 22 makes them (one rule: `project::check_name`).
