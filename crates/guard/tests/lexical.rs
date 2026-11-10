@@ -199,6 +199,8 @@ fn lexical_globs_that_may_match_a_secret_deny() {
         "cat src/../.e*",
         "cp ~/.ssh/id_* /tmp/",
         "cat .{e,x}*",
+        // `**` read as `*` (bash without globstar) still reaches the file.
+        "cat ~/.aws/**",
     ];
     let host = default_engine(tree.vars());
     for cmd in gap {
@@ -212,10 +214,14 @@ fn lexical_globs_that_may_match_a_secret_deny() {
             assert!(d.is_deny(), "lexical: {cmd}: {d:?}");
         }
         // Not on disk, so only the lexical view denies these.
+        // A first witness in a carve-out (`.env.example`, `id_rsa.pub`) is not
+        // the end: other matches (`.env.example#`, `id_rsa.pux`) are denied.
         for cmd in [
             "cat src/**/.env*",
             "cat ~/.n*rc",
             "cat ~/.config/gcl*/x.json",
+            "cat .e?v.example*",
+            "cat ~/.ssh/id_rsa.pu[bx]",
         ] {
             let d = e.evaluate(cmd);
             assert!(d.is_deny(), "lexical: {cmd}: {d:?}");
@@ -251,6 +257,8 @@ fn lexical_globs_that_cannot_match_a_secret_allow() {
         "wc -l src/**/*.rs",
         "cat ~/.ssh/id_*.pub",
         "cat ~/.ssh/*.pub",
+        "cat .e?v.exampl[e]",
+        "cat ~/**/credentials",
         "cat ~/*.txt",
         "head ./*.pem",
         "cat [.]env",
@@ -308,9 +316,10 @@ reason = "keys"
 }
 
 /// The Windows engine, on every host: names compare case-folded, and
-/// PowerShell's and cmd's `?` and `[…]` match a leading `.`. Their `*` does
-/// too, but here it does not stand for one, or every `*.md` could be a
-/// `.env.md`: `Get-Content *env` stays the hook's to deny (`globlap`).
+/// PowerShell's and cmd's wildcards match a leading `.`: `?` and `[…]` here
+/// too, and `*` for a name a rule spells out (`.env`, `.aws`), not for one it
+/// leaves open (`.env.*`, `.ssh/id_*`), or every `*.md` could be a
+/// `.env.md`. `Get-Content *.local` stays the hook's to deny (`globlap`).
 #[test]
 fn lexical_windows_globs_that_may_match_a_secret_deny() {
     with_fs_view(FsView::Lexical, || {
@@ -324,15 +333,25 @@ fn lexical_windows_globs_that_may_match_a_secret_deny() {
                 Dialect::PowerShell,
             ),
             (r"Get-Content ?env", Dialect::PowerShell),
+            (r"Get-Content *env", Dialect::PowerShell),
+            (r"type %USERPROFILE%\*\credentials", Dialect::Cmd),
+            (r"Get-Content $env:USERPROFILE\.aws\**", Dialect::PowerShell),
         ] {
             let d = e.evaluate_in(cmd, Dialects::One(dialect));
             assert!(d.is_deny(), "{cmd}: {d:?}");
         }
+        // A bare `*` at the end ("everything here") stands for no dotfile.
         for (cmd, dialect) in [
+            (r"type *", Dialect::Cmd),
+            (r"cd build && rm -rf *", Dialect::PowerShell),
             (r"type src\*.md", Dialect::Cmd),
             (r"Get-Content *.rs", Dialect::PowerShell),
-            (r"Get-Content *", Dialect::PowerShell),
-            (r"Get-Content *env", Dialect::PowerShell),
+            (r"Get-Content src\**\*.ts", Dialect::PowerShell),
+            (r"Get-Content *.local", Dialect::PowerShell),
+            (
+                r"Get-Content $env:USERPROFILE\*\id_rsa",
+                Dialect::PowerShell,
+            ),
         ] {
             let d = e.evaluate_in(cmd, Dialects::One(dialect));
             assert!(!d.is_deny(), "{cmd}: {d:?}");

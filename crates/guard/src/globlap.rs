@@ -15,19 +15,32 @@
 //! rule glob has `*`, `?` and `**` (`pathrule`); its other characters are
 //! literal.
 //!
-//! One reading is less strict than the expansion, on purpose: PowerShell's
-//! and cmd's wildcards match a leading `.` (`dots`), but here a `*` or `**`
-//! never stands for it; `?` and `[…]` still do. Otherwise every `*.md` there
-//! could be a `.env.md` (`**/.env.*`), and every such honest call would be
-//! denied in locked mode. So `Get-Content *env` is the hook's to deny (as a
-//! symlink is, A21), while `.e*`, `?env` and `[.]env` are denied here.
+//! Two readings are less strict than the expansion, on purpose, so honest
+//! calls stay allowed (a lexical deny blocks the call in locked mode):
 //!
-//! The other: a glob's `**` never stands for a folder a rule names
-//! literally. Otherwise every `src/**/*.rs` could be
-//! `src/AppData/x/Microsoft/Credentials/a.rs` (`**/AppData/*/Microsoft/
-//! Credentials/**`). Bash without `globstar`, PowerShell and cmd read `**` as
-//! `*` anyway. A named folder the glob spells, or a `*` in its place, still
-//! meets the rule (`%APPDATA%\Microsoft\*\x`).
+//! - PowerShell's and cmd's wildcards match a leading `.` (`dots`). `?` and
+//!   `[…]` do here too, and a `*` does where the rule spells out the rest of
+//!   the path (`*env` may be `.env`, `*\credentials` may be
+//!   `.aws\credentials`), but not where the rule leaves it open (`.env.*`,
+//!   `.ssh/id_*`), or every `*.md` there could be a `.env.md` and every
+//!   `src\**\*.ts` a `src\.ssh\id_x.ts`. So `Get-Content *.local` (which may
+//!   be `.env.local`) and `Get-Content $HOME\*\id_rsa` are the hook's to
+//!   deny, as a symlink is (A21). Nor does a bare `*` or `**` that ends the
+//!   glob ("everything here"): `rm -rf *` in a build folder is not denied as
+//!   a possible write onto a `.claude` there, and `type *` is not a possible
+//!   `.env` read. Bash's `dotglob` is not modelled by the
+//!   host's expansion either, so there the two views agree.
+//! - A glob's `**` stands for one folder a rule names (as `*` does: bash
+//!   without `globstar`, PowerShell and cmd read it so), or for any number of
+//!   folders the rule leaves open, but not for several named ones. Otherwise
+//!   every `src/**/*.rs` could be `src/AppData/x/Microsoft/Credentials/a.rs`
+//!   (`**/AppData/*/Microsoft/Credentials/**`). `~/.aws/**` still meets
+//!   `**/.aws/credentials`.
+//!
+//! One witness can fall into an `allow_path` carve-out while other matches of
+//! the glob would not (`.e?v.example*` is `.env.example` with its star empty):
+//! the engine then tries more (`filled`, and other characters by `rot`), and
+//! passes a rule only when every one is carved out.
 
 /// One element of a component pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,11 +187,39 @@ pub(crate) fn rule_pattern(full: &str, fold: bool) -> Pattern {
         .collect()
 }
 
+/// `p` with a fill character in front of each `*` of a name: a second
+/// witness, whose stars take a character, for when the first one (every star
+/// empty) fell into an `allow_path` carve-out (`.e?v.example*` is
+/// `.env.example` with its star empty, `.env.example#` without).
+pub(crate) fn filled(p: &[Seg]) -> Pattern {
+    p.iter()
+        .map(|s| match s {
+            Seg::Deep => Seg::Deep,
+            Seg::Name(els) => Seg::Name(
+                els.iter()
+                    .flat_map(|e| match e {
+                        El::Star => vec![El::Lit(FILL), El::Star],
+                        e => vec![e.clone()],
+                    })
+                    .collect(),
+            ),
+        })
+        .collect()
+}
+
 /// One path `glob` (a shell glob) and `rule` (a rule glob) both match, as its
 /// components, if there is one. `dots`: the glob's wildcards match a leading
 /// `.`. `nocase`: characters compare case-insensitively (the rule regexes
-/// are; a folded Windows path is already lower case).
-pub(crate) fn witness(glob: &[Seg], rule: &[Seg], dots: bool, nocase: bool) -> Option<Vec<String>> {
+/// are; a folded Windows path is already lower case). `rot` picks another
+/// character where several would do (a class's other members), for a further
+/// witness when one fell into a carve-out.
+pub(crate) fn witness(
+    glob: &[Seg],
+    rule: &[Seg],
+    dots: bool,
+    nocase: bool,
+    rot: usize,
+) -> Option<Vec<String>> {
     // Breadth first over (glob component, rule component), remembering how
     // each state was reached and what component that step produced.
     let (gl, rl) = (glob.len(), rule.len());
@@ -208,17 +249,29 @@ pub(crate) fn witness(glob: &[Seg], rule: &[Seg], dots: bool, nocase: bool) -> O
             next.push((g, r + 1, None));
         }
         if let (Some(gs), Some(rs)) = (glob.get(g), rule.get(r)) {
+            // With `dots`, a `*` stands for a leading `.` only where the rule
+            // spells out the rest of the path (`.env`, `.aws/credentials`).
+            // And a bare `*` or `**` that ends the glob ("everything here")
+            // stands for none: `rm -rf *` in a build folder is no write onto
+            // a `.claude` there.
+            let bare_end = g + 1 == gl && bare(gs);
+            let star_dot = dots
+                && !bare_end
+                && rule[r..]
+                    .iter()
+                    .all(|s| matches!(s, Seg::Name(n) if literal(n)));
             let comp = match (gs, rs) {
                 (Seg::Deep, Seg::Deep) => None,
-                // The glob's `**` skips hidden directories, as `*` does, and
-                // never stands for a folder the rule names (module header).
-                (Seg::Deep, Seg::Name(n)) if n.iter().all(|e| matches!(e, El::Lit(_))) => None,
-                (Seg::Deep, Seg::Name(n)) => component(&star, n, dots, nocase),
-                (Seg::Name(n), Seg::Deep) => component(n, &star, dots, nocase),
-                (Seg::Name(a), Seg::Name(b)) => component(a, b, dots, nocase),
+                // The glob's `**` reads as `*` here: it skips hidden names
+                // (unless `dots`), and stands for one folder a rule names at
+                // most, or any number the rule leaves open (module header).
+                (Seg::Deep, Seg::Name(n)) => component(&star, n, dots, star_dot, nocase, rot),
+                (Seg::Name(n), Seg::Deep) => component(n, &star, dots, star_dot, nocase, rot),
+                (Seg::Name(a), Seg::Name(b)) => component(a, b, dots, star_dot, nocase, rot),
             };
             if let Some(c) = comp {
-                let g2 = if *gs == Seg::Deep { g } else { g + 1 };
+                let named = matches!(rs, Seg::Name(n) if literal(n));
+                let g2 = if *gs == Seg::Deep && !named { g } else { g + 1 };
                 let r2 = if *rs == Seg::Deep { r } else { r + 1 };
                 next.push((g2, r2, Some(c)));
             }
@@ -234,13 +287,35 @@ pub(crate) fn witness(glob: &[Seg], rule: &[Seg], dots: bool, nocase: bool) -> O
     None
 }
 
+/// `**`, or a name that is one `*` (or cmd's `*.*`, "every file").
+fn bare(s: &Seg) -> bool {
+    match s {
+        Seg::Deep => true,
+        Seg::Name(els) => {
+            els.as_slice() == [El::Star] || els.as_slice() == [El::Star, El::Lit('.'), El::Star]
+        }
+    }
+}
+
+fn literal(els: &[El]) -> bool {
+    els.iter().all(|e| matches!(e, El::Lit(_)))
+}
+
 /// A non-empty name both component patterns match, if any. `glob` is the
 /// shell's side: a leading `.` must be its literal first element, or with
-/// `dots` any first element but a `*` (see the module header).
-fn component(glob: &[El], rule: &[El], dots: bool, nocase: bool) -> Option<String> {
+/// `dots` any first element, a `*` only with `star_dot` (see the module
+/// header).
+fn component(
+    glob: &[El],
+    rule: &[El],
+    dots: bool,
+    star_dot: bool,
+    nocase: bool,
+    rot: usize,
+) -> Option<String> {
     let dot_ok = match glob.first() {
         Some(El::Lit('.')) => true,
-        Some(El::Star) | None => false,
+        Some(El::Star) | None => star_dot,
         Some(_) => dots,
     };
     let (gl, rl) = (glob.len(), rule.len());
@@ -271,7 +346,7 @@ fn component(glob: &[El], rule: &[El], dots: bool, nocase: bool) -> Option<Strin
             next.push((g, r + 1, s, None));
         }
         if let (Some(a), Some(b)) = (glob.get(g), rule.get(r)) {
-            if let Some(c) = common(a, b, !s && !dot_ok, nocase) {
+            if let Some(c) = common(a, b, !s && !dot_ok, nocase, rot) {
                 let g2 = if *a == El::Star { g } else { g + 1 };
                 let r2 = if *b == El::Star { r } else { r + 1 };
                 next.push((g2, r2, true, Some(c)));
@@ -289,7 +364,7 @@ fn component(glob: &[El], rule: &[El], dots: bool, nocase: bool) -> Option<Strin
 }
 
 /// A character both elements take (never `/`; never `.` with `no_dot`).
-fn common(a: &El, b: &El, no_dot: bool, nocase: bool) -> Option<char> {
+fn common(a: &El, b: &El, no_dot: bool, nocase: bool, rot: usize) -> Option<char> {
     let ok =
         |c: char| c != '/' && !(no_dot && c == '.') && takes(a, c, nocase) && takes(b, c, nocase);
     // A literal on either side is the only candidate; else the first
@@ -305,7 +380,13 @@ fn common(a: &El, b: &El, no_dot: bool, nocase: bool) -> Option<char> {
         }
     }
     candidates.extend([FILL, 'z', '0', '_', '~']);
-    candidates.into_iter().find(|c| ok(*c))
+    let mut fit: Vec<char> = Vec::new();
+    for c in candidates {
+        if ok(c) && !fit.contains(&c) {
+            fit.push(c);
+        }
+    }
+    (!fit.is_empty()).then(|| fit[rot % fit.len()])
 }
 
 /// Whether `e` takes the single character `c`.
@@ -334,7 +415,8 @@ mod tests {
 
     fn w(glob: &str, rule: &str) -> Option<String> {
         let g = shell_pattern(glob, false).expect("a glob");
-        witness(&g, &rule_pattern(rule, false), false, false).map(|c| format!("/{}", c.join("/")))
+        witness(&g, &rule_pattern(rule, false), false, false, 0)
+            .map(|c| format!("/{}", c.join("/")))
     }
 
     #[test]
@@ -375,17 +457,59 @@ mod tests {
             assert_eq!(w(g, "**/.env"), None, "{g}");
         }
         assert_eq!(w("/h/**/x", "**/.ssh/x"), None);
-        // PowerShell and cmd: `?` and `[…]` match a leading `.`, `*` does not
-        // here (the module header says why).
-        let env = rule_pattern("**/.env", false);
-        for g in ["/h/app/?env", "/h/app/[.]env", "/h/app/[!x]env"] {
+        // PowerShell and cmd: `?` and `[…]` match a leading `.`, and so does
+        // `*` for a name the rule spells out (`.env`, `.aws`), not for one it
+        // leaves open (`.env.*`; the module header says why).
+        let dots = |g: &str, r: &str| {
             let g = shell_pattern(g, false).unwrap();
-            assert!(witness(&g, &env, true, false).is_some());
+            witness(&g, &rule_pattern(r, false), true, false, 0).is_some()
+        };
+        for g in [
+            "/h/app/?env",
+            "/h/app/[.]env",
+            "/h/app/[!x]env",
+            "/h/app/*env",
+            "/h/app/*v",
+        ] {
+            assert!(dots(g, "**/.env"), "{g}");
         }
-        for g in ["/h/app/*", "/h/app/*env", "/h/**/x"] {
-            let g = shell_pattern(g, false).unwrap();
-            assert!(witness(&g, &env, true, false).is_none(), "{g:?}");
-        }
+        // A bare `*` or `**` at the end means "everything here".
+        assert!(!dots("/h/app/*", "**/.env"));
+        assert!(!dots("/h/app/**", "**/.env"));
+        assert!(!dots("/h/app/*.*", "**/.claude"));
+        assert!(dots("/h/*/credentials", "**/.aws/credentials"));
+        assert!(dots("/h/**/credentials", "**/.aws/credentials"));
+        assert!(!dots("/h/app/*.md", "**/.env.*"));
+        assert!(!dots("/h/app/src/**/*.ts", "**/.ssh/id_*"));
+        assert!(!dots("/h/*/id_rsa", "**/.ssh/id_*"));
+        assert!(dots("/h/.ssh/*", "**/.ssh/id_*"));
+        assert!(!dots("/h/app/*", "**/.env.*"));
+        assert!(dots("/h/app/?env.local", "**/.env.*"));
+    }
+
+    #[test]
+    fn a_double_star_is_at_least_a_star() {
+        // Bash without `globstar`, PowerShell and cmd read `**` as `*`.
+        assert!(w("/h/.aws/**", "**/.aws/credentials").is_some());
+        assert!(w("/h/.aws/**/credentials", "**/.aws/credentials").is_some());
+        assert!(w("/proc/**/environ", "/proc/*/environ").is_some());
+        assert!(w("/h/.ssh/**", "**/.ssh/id_*").is_some());
+        assert_eq!(w("/h/**/credentials", "**/.aws/credentials"), None);
+    }
+
+    #[test]
+    fn filled_stars_take_a_character() {
+        let g = shell_pattern("/h/app/.e?v.example*", false).unwrap();
+        let r = rule_pattern("**/.env.*", false);
+        let first = witness(&g, &r, false, false, 0).unwrap();
+        assert_eq!(first.last().unwrap(), ".env.example");
+        let second = witness(&filled(&g), &r, false, false, 0).unwrap();
+        assert_eq!(second.last().unwrap(), ".env.example#");
+        // Another member of a class.
+        let g = shell_pattern("/h/.ssh/id_rsa.pu[bx]", false).unwrap();
+        let r = rule_pattern("**/.ssh/id_*", false);
+        assert_eq!(witness(&g, &r, false, false, 0).unwrap()[2], "id_rsa.pub");
+        assert_eq!(witness(&g, &r, false, false, 1).unwrap()[2], "id_rsa.pux");
     }
 
     #[test]
@@ -418,10 +542,10 @@ mod tests {
     fn case_folds_when_asked() {
         let g = shell_pattern("/h/app/.E*", false).unwrap();
         let r = rule_pattern("**/.env", false);
-        assert!(witness(&g, &r, false, false).is_none());
-        assert!(witness(&g, &r, false, true).is_some());
+        assert!(witness(&g, &r, false, false, 0).is_none());
+        assert!(witness(&g, &r, false, true, 0).is_some());
         let g = shell_pattern("c:/Users/a/.SSH/id_*", true).unwrap();
-        assert!(witness(&g, &rule_pattern("**/.ssh/id_*", true), true, false).is_some());
+        assert!(witness(&g, &rule_pattern("**/.ssh/id_*", true), true, false, 0).is_some());
     }
 
     #[test]

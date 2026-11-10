@@ -1355,9 +1355,13 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     guard compares it with each `deny_path` pattern (`globlap`) and denies
     when one path both match is denied, carve-outs applied, so `cat .e*` and
     `cat ~/.ssh/id_*` are denied with no file on disk. A PowerShell or cmd
-    `*` is not read as a leading dot there (`Get-Content *env` is the hook's
-    to deny), or every `*.md` could be a `.env.md`, and a glob's `**` never
-    stands for a folder a rule names. A move or copy target is judged both
+    `*` is read as a leading dot only where the rule spells out the rest of
+    the path (`*env`, `*\credentials`), and never as a bare `*` that ends the
+    glob (`type *`), or every `*.md` could be a `.env.md` and every `rm -rf *`
+    a write onto a `.claude`. A glob's `**` stands for one folder a rule
+    names at most (bash without `globstar` reads it as `*`). When a witness
+    path falls into a carve-out, more are tried (stars filled, other class
+    members). A move or copy target is judged both
     as itself and as `target/name`, because the lexical view cannot tell a
     folder from a file, and `-t`/`--target-directory` names a folder. The
     corpus cases stricter than the hook are accepted by name

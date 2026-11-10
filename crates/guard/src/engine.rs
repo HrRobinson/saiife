@@ -523,48 +523,66 @@ impl Engine {
             return JudgeOutcome::Clean;
         };
         let nocase = PATHS_CASE_INSENSITIVE || windows;
+        // A witness that falls into a carve-out proves nothing about the
+        // glob's other matches: then the next is tried, with each star taking
+        // a character and other choices of character (`globlap::filled`,
+        // `rot`). A rule passes only when every witness is carved out.
+        let full = globlap::filled(&glob);
+        let variants = [
+            (&glob, 0),
+            (&full, 0),
+            (&glob, 1),
+            (&full, 1),
+            (&glob, 2),
+            (&full, 2),
+        ];
         for (rule_access, rule) in self.deny_globs() {
             if !rule_access.covers(access) {
                 continue;
             }
-            if self.over_budget(start) {
-                return JudgeOutcome::TimedOut;
-            }
-            let Some(comps) = globlap::witness(&glob, rule, dots, nocase) else {
-                continue;
-            };
-            let path = if windows {
-                let p = comps.join("/");
-                if comps.len() == 1 {
-                    format!("{p}/")
-                } else {
-                    p
+            for (g, rot) in variants {
+                if self.over_budget(start) {
+                    return JudgeOutcome::TimedOut;
                 }
-            } else {
-                format!("/{}", comps.join("/"))
-            };
-            match self.judge_path(access, Path::new(&path), start) {
-                JudgeOutcome::Decided(Decision::Deny {
-                    pack,
-                    pattern,
-                    reason,
-                    via_inline,
-                }) => {
-                    let suffix = format!(" ({}: {path})", access.label());
-                    let base = reason.strip_suffix(&suffix).unwrap_or(&reason);
-                    return JudgeOutcome::Decided(Decision::Deny {
+                let Some(comps) = globlap::witness(g, rule, dots, nocase, rot) else {
+                    continue;
+                };
+                let path = if windows {
+                    let p = comps.join("/");
+                    if comps.len() == 1 {
+                        format!("{p}/")
+                    } else {
+                        p
+                    }
+                } else {
+                    format!("/{}", comps.join("/"))
+                };
+                match self.judge_path(access, Path::new(&path), start) {
+                    JudgeOutcome::Decided(Decision::Deny {
                         pack,
                         pattern,
-                        reason: format!(
-                            "{base} ({}: the glob {raw} may match such a path, and the saiife \
-                             service judges without listing files)",
-                            access.label()
-                        ),
+                        reason,
                         via_inline,
-                    });
+                    }) => {
+                        let suffix = format!(" ({}: {path})", access.label());
+                        let base = reason.strip_suffix(&suffix).unwrap_or(&reason);
+                        return JudgeOutcome::Decided(Decision::Deny {
+                            pack,
+                            pattern,
+                            reason: format!(
+                                "{base} ({}: the glob {raw} may match such a path, and the \
+                                 saiife service judges without listing files)",
+                                access.label()
+                            ),
+                            via_inline,
+                        });
+                    }
+                    JudgeOutcome::TimedOut => return JudgeOutcome::TimedOut,
+                    // Carved out: try the next witness.
+                    JudgeOutcome::Decided(_) => {}
+                    // No rule matches it (it matches `rule`, so not expected).
+                    JudgeOutcome::Clean => break,
                 }
-                JudgeOutcome::TimedOut => return JudgeOutcome::TimedOut,
-                _ => {}
             }
         }
         JudgeOutcome::Clean
