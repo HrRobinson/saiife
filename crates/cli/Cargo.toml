@@ -23,6 +23,8 @@ saiife-broker = { path = "../broker" }
 saiife-mcp = { path = "../mcp" }
 # `saiife daemon --user` opens the keychain that holds the vault key.
 saiife-keychain = { path = "../keychain" }
+# `saiife dev`: compose stacks behind one local HTTPS proxy (plans 22 to 24).
+saiife-dev = { path = "../dev" }
 # `saiife mcp`: the JSON-RPC/MCP codec and types (tokio-free).
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
