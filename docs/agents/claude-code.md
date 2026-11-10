@@ -161,10 +161,12 @@ On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d
   (`hooks.rejudge-denied`).
 - The service reads none of your files. It judges paths as written: it does
   not follow symlinks or junctions, expand globs, or read the project's
-  `.saiife/config.toml`. The hook still checks those. One call is stricter
-  in the service than in the hook: `cp review.md .claude` is denied, because
-  the service cannot tell that `.claude` is a folder and judges the copy as a
-  write onto it.
+  `.saiife/config.toml`. The hook still checks those. Two kinds of call are
+  stricter in the service than in the hook. `cp review.md .claude` is denied,
+  because the service cannot tell that `.claude` is a folder and judges the
+  copy as a write onto it. And a glob that may match a protected file is
+  denied even where none exists (`cat .e*` with no `.env` in the folder),
+  because the service compares the glob with the rules instead of listing.
 - If the service cannot judge a call (its workers are down, or one crashed
   or timed out), the call is blocked, and `doctor` fails `cosign.rejudge`
   when the service has no judge at all. If it cannot tell who asks, every

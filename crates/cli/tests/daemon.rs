@@ -677,9 +677,9 @@ fn silent_client_is_closed_after_hello_deadline() {
 }
 
 #[test]
-fn connection_cap_per_uid_is_32() {
+fn connection_cap_per_uid_is_64() {
     let d = TestDaemon::start(Opts::default());
-    let mut held: Vec<_> = (0..32).map(|_| d.client()).collect();
+    let mut held: Vec<_> = (0..64).map(|_| d.client()).collect();
     let mut s = raw(&d);
     let a = read_frame(&mut s).expect("a busy answer");
     assert_eq!(a["error"], json!("busy"));

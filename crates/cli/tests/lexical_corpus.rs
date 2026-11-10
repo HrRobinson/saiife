@@ -16,14 +16,31 @@ use corpus::{configs, corpus_cases, fixtures_in, judge_payload, Tree};
 /// approved by the owner by name (ruling of 2026-11-09), as `(label suffix,
 /// why)`. The lexical view cannot tell a directory from a file, so a move or
 /// copy target is judged as both (`mv x ~/.aws/credentials` must stay denied).
-/// No glob is here: the host judges a glob's spelling before its matches, so a
-/// spelling a rule names (`cat .env.*`, which finds only `.env.example`) is
-/// denied by both views (`globs_are_judged_as_spelled_and_as_expanded` in
-/// `corpus_secrets.rs`; whole-branch review, F3).
-const KNOWN_STRICTER: &[(&str, &str)] = &[(
-    ": cp review.md .claude",
-    "a copy into the protected .claude folder, spelled bare, reads as a write onto .claude itself",
-)];
+/// The host judges a glob's spelling before its matches, so a spelling a rule
+/// names (`cat .env.*`, which finds only `.env.example`) is denied by both
+/// views (`globs_are_judged_as_spelled_and_as_expanded` in
+/// `corpus_secrets.rs`; whole-branch review, F3). A glob that may match a
+/// protected path is denied by the lexical view with no file on disk (the
+/// lexical gap, closed by owner ruling 2026-11-09). The globs below are those
+/// cases: the Windows engine here has no files, so its host view finds no
+/// `.env` (a Windows host with one denies them too), and the POSIX tree has a
+/// `.env`, so both views deny them there.
+const KNOWN_STRICTER: &[(&str, &str)] = &[
+    (
+        ": cp review.md .claude",
+        "a copy into the protected .claude folder, spelled bare, reads as a write onto .claude itself",
+    ),
+    (": cat .e*", "may match .env"),
+    (": cat .en*", "may match .env"),
+    (": cat .en?", "may match .env"),
+    (": cat .e[n]v", "may match .env"),
+    (": cat .env*", "may match .env"),
+    (": Get-Content .en*", "may match .env"),
+    (
+        ": cd /tmp && chmod -R 777 *",
+        "read by cmd, a match of `*` may be a parent of ~/Library/LaunchAgents, which chmod -R replaces the mode of",
+    ),
+];
 
 /// What is judged, as `(case label, denied)`, in a fixed order.
 fn verdicts(view: FsView, tree: &Tree, cases: &[String]) -> Vec<(String, bool)> {

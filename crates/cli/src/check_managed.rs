@@ -984,20 +984,13 @@ mod imp {
 
     /// Stdin with the `PARSE_MAX_BYTES` cap. `Err` is the reason to deny.
     fn read_stdin() -> Result<String, String> {
-        let mut buf = String::new();
-        let mut stdin = std::io::stdin().lock();
-        let read = (&mut stdin)
-            .take(PARSE_MAX_BYTES as u64 + 1)
-            .read_to_string(&mut buf);
-        if read.is_ok() && buf.len() > PARSE_MAX_BYTES {
-            // Drain the rest so the agent gets no EPIPE.
-            let _ = std::io::copy(&mut stdin, &mut std::io::sink());
-            return Err(format!(
-                "hook payload larger than {PARSE_MAX_BYTES} bytes; not judged"
-            ));
+        // Past the cap (the cut inside a character too) the rest is drained,
+        // so the agent gets no EPIPE, and the call is denied.
+        match eval::read_payload(&mut std::io::stdin().lock()) {
+            eval::Stdin::Whole(buf) => Ok(buf),
+            eval::Stdin::TooLarge(head) => Err(eval::over_the_cap(&head)),
+            eval::Stdin::Unreadable => Err("could not read hook payload".to_string()),
         }
-        read.map(|_| buf)
-            .map_err(|_| "could not read hook payload".to_string())
     }
 
     /// The paths `core.lock` guards beyond the §5.2 defaults: the system

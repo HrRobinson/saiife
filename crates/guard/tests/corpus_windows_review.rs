@@ -429,3 +429,30 @@ fn the_differential_floors_are_close_to_what_ci_compared() {
     let bench = std::fs::read_to_string(root.join("scripts/bench-check.sh")).unwrap();
     assert!(bench.contains("job uses 130 for the developer hook"));
 }
+
+/// A program word whose value may be saiife's path is judged as `saiife`:
+/// PowerShell's `env $(which saiife) init --off` runs Git's `env.exe` on it.
+#[test]
+fn a_substituted_saiife_cannot_turn_saiife_off() {
+    use saiifeguard::canon::{with_fs_view, FsView};
+    for view in [FsView::Host, FsView::Lexical] {
+        with_fs_view(view, || {
+            let e = engine();
+            for how in [PS, STRICTEST] {
+                denied(
+                    &e,
+                    how,
+                    &[
+                        "env $(which saiife) init --off",
+                        "& (Get-Command saiife) init --off",
+                        "& (gcm saiife).Source init --off",
+                        "& $env:SAIIFE_BIN init --off",
+                        "command $(Get-Command saiife) init --off",
+                    ],
+                );
+            }
+            denied(&e, BASH, &["env $(which saiife) init --off"]);
+            not_denied(&e, PS, &["env $(where.exe git) status", "git status"]);
+        });
+    }
+}

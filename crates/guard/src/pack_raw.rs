@@ -39,8 +39,15 @@ pub enum OperandSyntax {
 #[serde(rename_all = "lowercase")]
 pub enum RuleAccess {
     Read,
+    /// Every write, a mode, owner or attribute change (`chmod`) included.
     Write,
     Any,
+    /// A write that changes what the file holds (`cp x f`, `> f`, `rm f`),
+    /// not a mode, owner or attribute change (`chmod 600 f`).
+    Replace,
+    /// `read` and `replace`: a credential file, which may be neither read
+    /// nor overwritten, but may be `chmod`ed.
+    Content,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

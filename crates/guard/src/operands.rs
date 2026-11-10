@@ -74,6 +74,13 @@ const WRITERS: &[&str] = &[
     "chattr", "sponge",
 ];
 
+/// Extractors besides `tar`: `bsdtar`, `unzip`, `cpio` and 7-Zip's names.
+const ARCHIVERS: &[&str] = &["bsdtar", "unzip", "cpio", "7z", "7za", "7zz", "7zr"];
+
+/// The `WRITERS` that change only a mode, owner or attributes: their
+/// operands are `Access::Attr` (`chmod 600 ~/.ssh/id_rsa` keeps the key).
+const ATTR_CHANGERS: &[&str] = &["chmod", "chown", "chgrp", "chattr"];
+
 /// The paths `segment` touches, with how. `effective` is the segment with
 /// wrapper commands (`sudo`, `env`, …) peeled off and `argv` its matching
 /// argv (argv[0] case-folded and directory-stripped); both are empty for a
@@ -100,13 +107,26 @@ pub(crate) fn understood(cmd: &str) -> bool {
             cmd,
             "mv" | "git" | "dd" | "curl" | "wget" | "tar" | "perl" | "find"
         )
+        || ARCHIVERS.contains(&cmd)
 }
 
 /// Like `path_operands`, with whether each operand is a glob and, for a
 /// copy/move target, the names that land in it.
 pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Operand> {
+    operands_in(segment, effective, argv, false)
+}
+
+/// `operands` in a Windows dialect (`windows`: a drive or a backslash root
+/// starts a path from the root) or a POSIX one.
+pub fn operands_in(
+    segment: &[Word],
+    effective: &[Word],
+    argv: &[String],
+    windows: bool,
+) -> Vec<Operand> {
     let mut out = Out(Vec::new());
     redirections(segment, &mut out);
+    archiver_options_from_env(segment, &mut out);
     let Some(cmd) = argv.first() else {
         return out.0;
     };
@@ -153,7 +173,13 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
     } else if cmd == "mv" {
         mv_like(rest, &mut out, None);
     } else if WRITERS.contains(&cmd) {
+        let from = out.0.len();
         rm_like(rest, &mut out, None);
+        if ATTR_CHANGERS.contains(&cmd) {
+            for o in &mut out.0[from..] {
+                o.access = Access::Attr;
+            }
+        }
     } else if cmd == "git" {
         git(rest, &mut out);
     } else if cmd == "dd" {
@@ -168,8 +194,14 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
         curl(rest, &mut out);
     } else if cmd == "wget" {
         wget(rest, &mut out);
-    } else if cmd == "tar" {
-        tar(rest, &mut out);
+    } else if cmd == "tar" || cmd == "bsdtar" {
+        tar(rest, &mut out, windows);
+    } else if cmd == "unzip" {
+        unzip(rest, &mut out);
+    } else if cmd == "cpio" {
+        cpio(rest, &mut out);
+    } else if ARCHIVERS.contains(&cmd) {
+        seven_zip(rest, &mut out);
     } else if cmd == "perl" {
         perl(rest, &mut out);
     } else if cmd == "find" {
@@ -730,7 +762,7 @@ fn git(words: &[Option<Tok>], out: &mut Out) {
 /// not written); creating reads the operands, extracting writes them;
 /// `-g F` (`--listed-incremental`) is a snapshot file read and rewritten.
 /// The first word may be a dashless cluster (`tar czf out.tgz`).
-fn tar(words: &[Option<Tok>], out: &mut Out) {
+fn tar(words: &[Option<Tok>], out: &mut Out, windows: bool) {
     // Ignored values: `-b BLOCKS`, `-H FORMAT`, `-K MEMBER` (a name in the
     // archive), `-L LENGTH`, `-N DATE`, `-V LABEL` name no path.
     let spec = Spec {
@@ -764,7 +796,9 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
         Name::Long("update"),
     ]);
     let extracts = any(&[Name::Short('x'), Name::Long("extract"), Name::Long("get")]);
-    let mut dir: Option<Tok> = None;
+    let mut dirs: Vec<Tok> = Vec::new();
+    // A `-C` whose value the line does not show (`-C "$(pwd)"`).
+    let mut unseen_dir = false;
     for a in &args {
         match a {
             Arg::Opt(Name::Short('f') | Name::Long("file"), Some(v)) => {
@@ -774,7 +808,8 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
                     out.read(*v);
                 }
             }
-            Arg::Opt(Name::Short('C') | Name::Long("directory"), Some(v)) => dir = Some(*v),
+            Arg::Opt(Name::Short('C') | Name::Long("directory"), Some(v)) => dirs.push(*v),
+            Arg::Opt(Name::Short('C') | Name::Long("directory"), None) => unseen_dir = true,
             Arg::Opt(
                 Name::Short('T' | 'X') | Name::Long("files-from" | "exclude-from"),
                 Some(v),
@@ -786,7 +821,31 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
             _ => {}
         }
     }
-    for t in operands_of(&args) {
+    let dir = dirs.last().copied();
+    let members = operands_of(&args);
+    if extracts
+        && !any(&[
+            Name::Short('O'),
+            Name::Long("to-stdout"),
+            Name::Long("to-command"),
+        ])
+    {
+        // What lands is not known from the line: a member named may be
+        // renamed (`--transform`, `--strip-components`) or misread (a value
+        // of an option not listed above), so every folder is written. An
+        // option not known here may change where (an abbreviation of
+        // `--absolute-names`), so it counts as `-P`.
+        // `-C a -C b` is `a/b`: a relative `-C` after the first joins the one
+        // before, so where it lands is not one of the folders named. One with
+        // `..` or a value not known is not known either.
+        let relative_again = dirs.iter().skip(1).any(|d| !rooted_dir(d.s, windows));
+        let absolute = any(&[Name::Short('P'), Name::Long("absolute-names")])
+            || !all_known(&args, TAR_SHORT, TAR_LONG)
+            || relative_again
+            || unseen_dir;
+        extract_into(out, &dirs, absolute);
+    }
+    for t in members {
         let (path, glob) = under(dir.map(|d| d.s), t);
         let access = if extracts {
             Access::Write
@@ -803,6 +862,323 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
             into: Vec::new(),
             target_dir: false,
         });
+    }
+}
+
+/// Does the folder `d` (a `tar -C` value) start from the root, so a `-C`
+/// before it does not move it, and name one known place? By the dialect's
+/// rules: on POSIX `/` or a `~` the shell resolves (`~`, `~/…`), plus
+/// `$HOME`; in a Windows dialect also a drive with its root (`C:/`, `C:\`)
+/// or a root (`\…`). Never with a `..` part or a `$` with no known value.
+fn rooted_dir(d: &str, windows: bool) -> bool {
+    let seps: &[char] = if windows { &['/', '\\'] } else { &['/'] };
+    let (home, rest) = match d.strip_prefix('~') {
+        Some(r) => (true, r),
+        None => match d
+            .strip_prefix("$HOME")
+            .or_else(|| d.strip_prefix("${HOME}"))
+        {
+            Some(r) => (true, r),
+            None => (false, d),
+        },
+    };
+    let rooted = if home {
+        rest.is_empty() || rest.starts_with(seps)
+    } else {
+        let b = d.as_bytes();
+        d.starts_with(seps)
+            || (windows
+                && b.len() > 2
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && matches!(b[2], b'/' | b'\\'))
+    };
+    rooted && !rest.contains('$') && !rest.split(seps).any(|part| part == "..")
+}
+
+/// The `tar` options an extract may carry without changing where its members
+/// land beyond its folders (GNU and bsdtar). Any other option, an abbreviated
+/// long option included, makes the extract write anywhere (fail closed).
+const TAR_SHORT: &str = "xtcruAfCTXgbHKLNVzjJZavkmopOsSUWhiIwBGMl";
+const TAR_LONG: &[&str] = &[
+    "extract",
+    "get",
+    "list",
+    "create",
+    "append",
+    "update",
+    "file",
+    "directory",
+    "files-from",
+    "exclude-from",
+    "listed-incremental",
+    "gzip",
+    "gunzip",
+    "ungzip",
+    "bzip2",
+    "xz",
+    "lzma",
+    "lzip",
+    "lzop",
+    "zstd",
+    "compress",
+    "uncompress",
+    "auto-compress",
+    "use-compress-program",
+    "verbose",
+    "keep-old-files",
+    "skip-old-files",
+    "keep-newer-files",
+    "overwrite",
+    "overwrite-dir",
+    "no-overwrite-dir",
+    "unlink-first",
+    "recursive-unlink",
+    "same-owner",
+    "no-same-owner",
+    "same-permissions",
+    "preserve-permissions",
+    "no-same-permissions",
+    "touch",
+    "to-stdout",
+    "to-command",
+    "strip-components",
+    "transform",
+    "xform",
+    "exclude",
+    "wildcards",
+    "no-wildcards",
+    "anchored",
+    "no-anchored",
+    "ignore-zeros",
+    "warning",
+    "one-top-level",
+    "totals",
+    "absolute-names",
+];
+
+/// Are all options in `args` named exactly in `short`/`long`?
+fn all_known(args: &[Arg], short: &str, long: &[&str]) -> bool {
+    args.iter().all(|a| match a {
+        Arg::Opt(Name::Short(c), _) => short.contains(*c),
+        Arg::Opt(Name::Long(l), _) => long.contains(l),
+        Arg::Operand(_) => true,
+    })
+}
+
+/// Variables an extractor reads its options from (GNU tar, Info-ZIP unzip).
+const ARCHIVER_OPTION_VARS: &[&str] = &["TAR_OPTIONS", "UNZIP", "UNZIPOPT", "UNZIP_OPTS"];
+
+/// Setting one of `ARCHIVER_OPTION_VARS` (`TAR_OPTIONS=-P tar -xf x`,
+/// `export UNZIP=-:`, `env TAR_OPTIONS=… tar`) hands every later extract
+/// options this module does not see, so it may write anywhere: `/`. Any word
+/// of the segment counts; a later line cannot be followed back to it.
+fn archiver_options_from_env(segment: &[Word], out: &mut Out) {
+    // Any word naming one (`export TAR_OPTIONS`, `read UNZIP`, `printf -v
+    // TAR_OPTIONS`, attached `-vTAR_OPTIONS`), with a value or not.
+    let sets = segment.iter().any(|w| {
+        let name = w.text.split_once('=').map_or(w.text.as_str(), |(n, _)| n);
+        let name = name.strip_suffix('+').unwrap_or(name);
+        let name = name.strip_prefix("-v").unwrap_or(name);
+        ARCHIVER_OPTION_VARS.contains(&name)
+    });
+    if sets {
+        out.write(Tok {
+            s: "/",
+            glob: false,
+            dots: false,
+        });
+    }
+}
+
+/// An archive extracted into `dirs` (`.` when none is named; every `-C`
+/// counts): it may replace anything below a folder and the folder itself
+/// (`tar -xf evil.tar -C ~/.ssh`, `cd ~ && unzip evil.zip`). With absolute
+/// or `../` member names allowed (`tar -P`, `unzip -:`, `7z -spf`), or an
+/// option not known, it may write anywhere, so `/`.
+fn extract_into<'a>(out: &mut Out, dirs: &[Tok<'a>], absolute: bool) {
+    let here = Tok {
+        s: ".",
+        glob: false,
+        dots: false,
+    };
+    if dirs.is_empty() {
+        out.write(here);
+    }
+    for d in dirs {
+        out.write(*d);
+    }
+    if absolute {
+        out.write(Tok { s: "/", ..here });
+    }
+}
+
+/// `unzip ARCHIVE [MEMBERS] [-d DIR]`: every operand is read. It lists,
+/// tests or prints only when one of `-l -t -z -p -c -v -Z` comes before the
+/// archive and every option is known; otherwise DIR (or `.`) is written, and
+/// with `-:` (`../` names) or an unknown option, `/`.
+fn unzip(words: &[Option<Tok>], out: &mut Out) {
+    let spec = Spec {
+        short: "dP",
+        optional: "",
+        long: &[],
+    };
+    let args = parse(words, &spec);
+    let mut dirs = Vec::new();
+    let mut looks = false;
+    let mut seen_operand = false;
+    for a in &args {
+        match a {
+            Arg::Opt(Name::Short('d'), Some(v)) => dirs.push(*v),
+            Arg::Opt(Name::Short(c), _) if !seen_operand && "ltzpcvZ".contains(*c) => looks = true,
+            Arg::Operand(t) => {
+                seen_operand = true;
+                out.read(*t);
+            }
+            _ => {}
+        }
+    }
+    let known = all_known(&args, "dPxoqnjufaCLXKbBMDTVWltzpcvZ", &[]);
+    if !(looks && known) {
+        let absolute = !known || has_opt(&args, &[Name::Short(':')]);
+        extract_into(out, &dirs, absolute);
+    }
+}
+
+/// `cpio`: `-i`/`--extract` (the archive on stdin) writes `-D DIR` or `.`,
+/// and `/` unless `--no-absolute-filenames` is given (GNU cpio keeps absolute
+/// names by default) or with an unknown option; `-p DIR` (pass-through)
+/// writes DIR; `-o` with `-F`/`-O FILE` writes FILE. Other operands are read.
+fn cpio(words: &[Option<Tok>], out: &mut Out) {
+    let spec = Spec {
+        short: "DFEHIMOR",
+        optional: "",
+        long: &[
+            "directory",
+            "file",
+            "pattern-file",
+            "format",
+            "message",
+            "owner",
+            "rsh-command",
+            "block-size",
+        ],
+    };
+    let args = parse(words, &spec);
+    let extract = has_opt(&args, &[Name::Short('i'), Name::Long("extract")]);
+    let create = has_opt(&args, &[Name::Short('o'), Name::Long("create")]);
+    let pass = has_opt(&args, &[Name::Short('p'), Name::Long("pass-through")]);
+    let mut dirs = Vec::new();
+    for a in &args {
+        match a {
+            Arg::Opt(Name::Short('D') | Name::Long("directory"), Some(v)) => dirs.push(*v),
+            Arg::Opt(Name::Short('F' | 'O') | Name::Long("file"), Some(v)) if create => {
+                out.write(*v)
+            }
+            Arg::Opt(
+                Name::Short('F' | 'I' | 'E') | Name::Long("file" | "pattern-file"),
+                Some(v),
+            ) => out.read(*v),
+            _ => {}
+        }
+    }
+    let ops = operands_of(&args);
+    if pass {
+        // `cpio -p DIR`: the files named on stdin land below DIR.
+        for t in &ops {
+            out.write(*t);
+        }
+    } else {
+        for t in &ops {
+            out.read(*t);
+        }
+    }
+    if extract {
+        let known = all_known(
+            &args,
+            "iDFEHIMRdmuvtfnrsSbBcV",
+            &[
+                "extract",
+                "directory",
+                "file",
+                "pattern-file",
+                "format",
+                "make-directories",
+                "preserve-modification-time",
+                "unconditional",
+                "verbose",
+                "no-absolute-filenames",
+                "quiet",
+                "nonmatching",
+                "numeric-uid-gid",
+                "no-preserve-owner",
+                "only-verify-crc",
+                "sparse",
+                "to-stdout",
+            ],
+        );
+        if !has_opt(&args, &[Name::Long("to-stdout")]) {
+            let absolute = !known || !has_opt(&args, &[Name::Long("no-absolute-filenames")]);
+            extract_into(out, &dirs, absolute);
+        }
+    }
+}
+
+/// 7-Zip (`7z`, `7za`, `7zz`, `7zr`), verbs and switches in any case:
+/// `x`/`e ARCHIVE` writes `-oDIR` or `.`, and `/` with `-spf`/`-spf2`
+/// (absolute paths), `-snl` (links) or a switch not known; `a`/`u`/`d`/`rn`
+/// write the archive; `l`/`t`/`h`/`i`/`b` read. A verb not known may be an
+/// extract, so it writes `/`. Every other operand is read, as for a command
+/// the guard does not know.
+fn seven_zip(words: &[Option<Tok>], out: &mut Out) {
+    let ops = plain_operands(words);
+    let Some(verb) = ops.first() else { return };
+    let rest = &ops[1..];
+    let verb = verb.s.to_ascii_lowercase();
+    let read_rest = |out: &mut Out| {
+        for t in rest {
+            out.read(*t);
+        }
+    };
+    match verb.as_str() {
+        "x" | "e" => {
+            read_rest(out);
+            let switches: Vec<String> = words
+                .iter()
+                .flatten()
+                .filter(|t| t.s.starts_with('-'))
+                .map(|t| t.s.to_ascii_lowercase())
+                .collect();
+            let dirs: Vec<Tok> = words
+                .iter()
+                .flatten()
+                .filter(|t| t.s.len() > 2 && (t.s.starts_with("-o") || t.s.starts_with("-O")))
+                .map(|t| t.sub(&t.s[2..]))
+                .collect();
+            const KNOWN: &[&str] = &[
+                "-o", "-y", "-p", "-ao", "-t", "-r", "-bb", "-bs", "-bd", "-x", "-i", "-mmt",
+                "-scc",
+            ];
+            let absolute = switches.iter().any(|s| {
+                s.starts_with("-spf")
+                    || s.starts_with("-snl")
+                    || !KNOWN.iter().any(|k| s.starts_with(k))
+            });
+            extract_into(out, &dirs, absolute);
+        }
+        "a" | "u" | "d" | "rn" => {
+            if let Some((archive, files)) = rest.split_first() {
+                out.write(*archive);
+                for t in files {
+                    out.read(*t);
+                }
+            }
+        }
+        "l" | "t" | "h" | "i" | "b" => read_rest(out),
+        _ => {
+            read_rest(out);
+            extract_into(out, &[], true);
+        }
     }
 }
 
@@ -970,6 +1346,58 @@ mod tests {
             .into_iter()
             .map(|(p, a)| (p, a.label()))
             .collect()
+    }
+
+    /// Like `ops`, in a Windows dialect when `windows`.
+    fn ops_in(cmd: &str, windows: bool) -> Vec<(String, &'static str)> {
+        let seg = split_segments(cmd).remove(0);
+        let eff = unwrap_transparent_prefix(&seg);
+        let argv = build_argv(eff);
+        operands_in(&seg, eff, &argv, windows)
+            .into_iter()
+            .map(|o| (o.path, o.access.label()))
+            .collect()
+    }
+
+    #[test]
+    fn tar_directories_are_absolute_by_the_dialects_rules() {
+        let lands = |cmd: &str, windows: bool| ops_in(cmd, windows).contains(&w("/"));
+        // On POSIX only `/` and a `~` the shell resolves start from the root:
+        // `C:/b`, `\b`, `~bob/b` and `~+` join the `-C` before.
+        for later in ["C:/b", r"'C:\b'", r"'\b'", "~bob/b", "~+/b"] {
+            let cmd = format!("tar -xf x.tar -C a -C {later}");
+            assert!(lands(&cmd, false), "{cmd}");
+        }
+        // In a Windows dialect a drive or a root is absolute too; a drive with
+        // no root (`C:b`) is relative to that drive's folder, which `-C` moved.
+        for later in ["C:/b", r"'C:\b'", r"'\b'", "/b", "~/b", r"'~\b'"] {
+            let cmd = format!("tar -xf x.tar -C a -C {later}");
+            assert!(!lands(&cmd, true), "{cmd}");
+        }
+        for later in ["C:b", "1:/b", "~+/b", "b"] {
+            let cmd = format!("tar -xf x.tar -C a -C {later}");
+            assert!(lands(&cmd, true), "{cmd}");
+        }
+        // `..` or a `$` with no known value: where it lands is not known.
+        for windows in [false, true] {
+            for later in [
+                "/srv/../b",
+                "/srv/..",
+                "~/..",
+                "$X/b",
+                "/srv/$X",
+                "$HOMEX",
+                "\"$(pwd)\"",
+                "`pwd`",
+            ] {
+                let cmd = format!("tar -xf x.tar -C a -C {later}");
+                assert!(lands(&cmd, windows), "{cmd} windows={windows}");
+            }
+            assert!(!lands("tar -xf x.tar -C a -C /srv/..b", windows));
+            assert!(!lands("tar -xf x.tar -C a -C ${HOME}/b", windows));
+            // Only an extract writes.
+            assert!(!lands("tar -tf x.tar -C a -C C:b", windows));
+        }
     }
 
     fn r(p: &str) -> (String, &'static str) {
@@ -1143,15 +1571,15 @@ mod tests {
             vec![w("out.tgz"), r("src"), r(".env")]
         );
         assert_eq!(ops("tar czf out.tgz .env"), vec![w("out.tgz"), r(".env")]);
-        assert_eq!(ops("tar -xfa.tar"), vec![r("a.tar")]);
+        assert_eq!(ops("tar -xfa.tar"), vec![r("a.tar"), w(".")]);
         assert_eq!(ops("tar -tf a.tar"), vec![r("a.tar")]);
         assert_eq!(
             ops("tar -xf a.tar -C .claude settings.json"),
-            vec![r("a.tar"), w(".claude/settings.json")]
+            vec![r("a.tar"), w(".claude"), w(".claude/settings.json")]
         );
         assert_eq!(
             ops("tar --file=a.tar --extract x"),
-            vec![r("a.tar"), w("x")]
+            vec![r("a.tar"), w("."), w("x")]
         );
     }
 
@@ -1240,6 +1668,27 @@ mod tests {
     }
 
     #[test]
+    fn mode_and_owner_changes_are_attribute_writes() {
+        for cmd in ["chmod 600 f", "chown me f", "chgrp g f", "chattr +i f"] {
+            let o = full(cmd);
+            let f: Vec<_> = o.iter().filter(|x| x.path == "f").collect();
+            assert_eq!(f.len(), 1, "{cmd}");
+            assert_eq!(f[0].access, Access::Attr, "{cmd}");
+        }
+        // A redirect on the same line still writes what the file holds.
+        let o = full("chmod 600 f > g");
+        assert!(o.iter().any(|x| x.path == "g" && x.access == Access::Write));
+        for cmd in ["rm f", "touch f", "truncate -s 0 f", "tee f"] {
+            assert!(
+                full(cmd)
+                    .iter()
+                    .any(|x| x.path == "f" && x.access == Access::Write),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn copy_and_move_targets_name_their_sources() {
         let o = full("cp a/review.md notes/ .claude/");
         assert_eq!(o[0].path, ".claude/");
@@ -1321,8 +1770,128 @@ mod tests {
         assert!(o.contains(&r("snap")) && o.contains(&w("snap")), "{o:?}");
         let o = ops("tar --listed-incremental=snap -cf o src");
         assert!(o.contains(&r("snap")) && o.contains(&w("snap")), "{o:?}");
-        // `-C DIR` is where tar works, not a write of DIR.
-        assert_eq!(ops("tar -C ~ -xf x.tar"), vec![r("x.tar")]);
+        // `-C DIR` is where tar works, not a write of DIR, unless it
+        // extracts there: what lands is not known from the line (members
+        // may be renamed), so DIR (or `.`) is written; with `-P` anything.
+        assert_eq!(
+            ops("tar -C ~ -xf x.tar a"),
+            vec![r("x.tar"), w("~"), w("~/a")]
+        );
+        assert_eq!(ops("tar -C ~ -xf x.tar"), vec![r("x.tar"), w("~")]);
+        assert_eq!(ops("tar xzf x.tgz"), vec![r("x.tgz"), w(".")]);
+        assert_eq!(ops("tar -xPf x.tar"), vec![r("x.tar"), w("."), w("/")]);
+        assert_eq!(
+            ops("tar --absolute-names -x -f x.tar -C d"),
+            vec![r("x.tar"), w("d"), w("/")]
+        );
+        assert_eq!(ops("bsdtar -xf x.tar"), vec![r("x.tar"), w(".")]);
+        assert_eq!(ops("tar -C ~ -tf x.tar"), vec![r("x.tar")]);
+        assert_eq!(ops("tar -xOf x.tar a"), vec![r("x.tar"), w("a")]);
+    }
+
+    #[test]
+    fn other_extractors_write_their_folder() {
+        let none = Vec::<(String, &str)>::new();
+        // tar: every `-C`; an option not known (an abbreviation) is `-P`.
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C /b"),
+            vec![r("x.tar"), w("a"), w("/b")]
+        );
+        assert_eq!(ops("tar -xf x.tar --abs"), vec![r("x.tar"), w("."), w("/")]);
+        assert_eq!(
+            ops("tar -xf x.tar --absolute-n"),
+            vec![r("x.tar"), w("."), w("/")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar --dir ~/.ssh"),
+            vec![r("x.tar"), w("."), w("/"), w("~/.ssh")]
+        );
+        assert_eq!(
+            ops("tar -xzf x.tgz --strip-components=1 --no-same-owner -C d"),
+            vec![r("x.tgz"), w("d")]
+        );
+        assert_eq!(ops("tar -tf x.tar --abs"), vec![r("x.tar")]);
+        // unzip: list-only only before the archive and with known options.
+        assert_eq!(ops("unzip x.zip"), vec![r("x.zip"), w(".")]);
+        assert_eq!(ops("unzip -o x.zip -d out"), vec![r("x.zip"), w("out")]);
+        assert_eq!(ops("unzip -l x.zip"), vec![r("x.zip")]);
+        assert_eq!(ops("unzip -p x.zip a"), vec![r("x.zip"), r("a")]);
+        assert_eq!(ops("unzip x.zip -l"), vec![r("x.zip"), w(".")]);
+        assert_eq!(ops("unzip -:o x.zip"), vec![r("x.zip"), w("."), w("/")]);
+        assert_eq!(ops("unzip -l^ x.zip"), vec![r("x.zip"), w("."), w("/")]);
+        assert_eq!(ops("unzip -lo x.zip"), vec![r("x.zip")]);
+        // cpio: absolute names unless told not to.
+        assert_eq!(ops("cpio -idm"), vec![w("."), w("/")]);
+        assert_eq!(
+            ops("cpio -i -D out --no-absolute-filenames"),
+            vec![w("out")]
+        );
+        assert_eq!(ops("cpio -i --absolute-filenames"), vec![w("."), w("/")]);
+        assert_eq!(ops("cpio -i --no-absolute-filenames"), vec![w(".")]);
+        assert_eq!(
+            ops("cpio -i --no-absolute-filenames --zz"),
+            vec![w("."), w("/")]
+        );
+        assert_eq!(ops("cpio -o"), none);
+        assert_eq!(ops("cpio -o -F out.cpio"), vec![w("out.cpio")]);
+        assert_eq!(ops("cpio -pdm dest"), vec![w("dest")]);
+        // 7-Zip.
+        assert_eq!(ops("7z x x.7z -oout"), vec![r("x.7z"), w("out")]);
+        assert_eq!(ops("7za e x.7z"), vec![r("x.7z"), w(".")]);
+        assert_eq!(ops("7z x x.7z -spf"), vec![r("x.7z"), w("."), w("/")]);
+        assert_eq!(
+            ops("7z x x.7z -spf2 -oout"),
+            vec![r("x.7z"), w("out"), w("/")]
+        );
+        assert_eq!(ops("7z x x.7z -snl"), vec![r("x.7z"), w("."), w("/")]);
+        assert_eq!(ops("7z x x.7z -zz"), vec![r("x.7z"), w("."), w("/")]);
+        assert_eq!(ops("7z x -y -aoa x.7z"), vec![r("x.7z"), w(".")]);
+        assert_eq!(ops("7z l x.7z"), vec![r("x.7z")]);
+        assert_eq!(ops("7z a out.7z .env"), vec![w("out.7z"), r(".env")]);
+        assert_eq!(ops("7z rn a.7z x y"), vec![w("a.7z"), r("x"), r("y")]);
+        // Any case; a verb not known may extract.
+        assert_eq!(ops("7z X x.7z -Oout"), vec![r("x.7z"), w("out")]);
+        assert_eq!(ops("7z E x.7z -SPF"), vec![r("x.7z"), w("."), w("/")]);
+        assert_eq!(ops("7z L x.7z"), vec![r("x.7z")]);
+        assert_eq!(ops("7z zz x.7z"), vec![r("x.7z"), w("."), w("/")]);
+        // tar `-C` is cumulative: a relative one after the first joins it.
+        assert_eq!(
+            ops("tar -xf x.tar -C ~ -C .ssh"),
+            vec![r("x.tar"), w("~"), w(".ssh"), w("/")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C /srv"),
+            vec![r("x.tar"), w("a"), w("/srv")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C ~/srv"),
+            vec![r("x.tar"), w("a"), w("~/srv")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C $HOME/srv"),
+            vec![r("x.tar"), w("a"), w("$HOME/srv")]
+        );
+        // Options from the environment.
+        // (This helper does not peel a leading assignment; the engine does,
+        // see `corpus_secrets`.)
+        assert!(ops("TAR_OPTIONS=-P tar -xf x.tar -C d").contains(&w("/")));
+        assert_eq!(ops("export UNZIP=-:"), vec![w("/")]);
+        assert!(ops("env UNZIPOPT=-: unzip x.zip").contains(&w("/")));
+        assert_eq!(ops("export TAR_OPTIONS+=-P"), vec![w("/")]);
+        for set in [
+            "export TAR_OPTIONS",
+            "declare -x UNZIP",
+            "typeset UNZIPOPT=-:",
+            "readonly TAR_OPTIONS",
+            "local UNZIP_OPTS",
+            "printf -v TAR_OPTIONS %s -P",
+            "printf -vTAR_OPTIONS %s -P",
+            "read TAR_OPTIONS",
+            "mapfile UNZIP",
+        ] {
+            assert_eq!(ops(set), vec![w("/")], "{set}");
+        }
+        assert_eq!(ops("export FOO=1"), none);
         assert_eq!(
             ops("tar -C /srv -czf x.tgz app"),
             vec![w("x.tgz"), r("/srv/app")]

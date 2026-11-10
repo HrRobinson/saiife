@@ -1971,7 +1971,11 @@ fn cosign_post(addr: &str, payload: &str) -> (String, String) {
     )
     .unwrap();
     let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
+    // A connection the co-signer closes unanswered (over its caps) may
+    // reset: no status line.
+    if let Err(e) = s.read_to_string(&mut out) {
+        return (format!("closed unanswered ({})", e.kind()), String::new());
+    }
     let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
     (
         head.lines().next().unwrap_or("").to_string(),
@@ -2003,6 +2007,118 @@ fn an_allowed_call_is_not_denied_by_the_cosigner() {
     let (status, body) = cosign_post(&addr, &payload);
     assert!(status.contains(" 200 "), "{status}");
     assert!(!body.contains("deny"), "{body}");
+}
+
+/// One co-signed call of a burst: the co-signer's status line, its body,
+/// and the time to its answer from the start of the call.
+struct CosignOutcome {
+    status: String,
+    body: String,
+    took: Duration,
+    /// The hook's own refusal of the call, if it refused it.
+    hook: Option<String>,
+}
+
+/// `n` Claude Code calls of this user at once, as parallel sessions make
+/// them: each call's managed hook and its co-sign request start together
+/// (Claude Code runs matching hooks in parallel), every call with a tool
+/// use id of its own.
+fn cosign_burst(
+    d: &TestDaemon,
+    addr: &str,
+    home: &common::FixtureHome,
+    tag: &str,
+    n: usize,
+) -> Vec<CosignOutcome> {
+    let base: Value = serde_json::from_str(&home.real(&fixture("claude/bash-allow.json"))).unwrap();
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2 * n));
+    let config = d.config();
+    let mut hooks = Vec::new();
+    let mut posts = Vec::new();
+    for i in 0..n {
+        let mut v = base.clone();
+        v["session_id"] = json!(format!("s-{tag}-{}", i % 12));
+        v["tool_use_id"] = json!(format!("toolu_{tag}_{i}"));
+        let payload = v.to_string();
+        let (g, cfg, p) = (gate.clone(), config.clone(), payload.clone());
+        hooks.push(std::thread::spawn(move || {
+            g.wait();
+            let o = managed(&cfg, &p).0;
+            (code(&o), stderr(&o))
+        }));
+        let (g, a) = (gate.clone(), addr.to_string());
+        posts.push(std::thread::spawn(move || {
+            g.wait();
+            let t = Instant::now();
+            let (status, body) = cosign_post(&a, &payload);
+            CosignOutcome {
+                status,
+                body,
+                took: t.elapsed(),
+                hook: None,
+            }
+        }));
+    }
+    let hooks: Vec<_> = hooks.into_iter().map(|h| h.join().unwrap()).collect();
+    posts
+        .into_iter()
+        .zip(hooks)
+        .map(|(p, (code, err))| CosignOutcome {
+            hook: (code != 0).then(|| {
+                let first = err.lines().next().unwrap_or("").chars().take(160);
+                format!("hook exit {code}: {}", first.collect::<String>())
+            }),
+            ..p.join().unwrap()
+        })
+        .collect()
+}
+
+/// The co-signer under one user's parallel sessions: bursts of `n` calls,
+/// end to end (hook process, daemon, co-signer, re-judge pool). Prints the
+/// co-sign answer times and every call it did not let through; asserts
+/// nothing on the clock. Run with `cargo test -p saiife --test
+/// check_managed measure_cosign_bursts -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: prints the numbers, asserts nothing"]
+fn measure_cosign_bursts() {
+    let d = TestDaemon::start(Opts::default());
+    let addr = d.status()["cosign"]["addr"]
+        .as_str()
+        .expect("cosign addr")
+        .to_string();
+    let home = common::FixtureHome::new();
+    cosign_burst(&d, &addr, &home, "warm", 2);
+    println!("| N | calls | p50 answer | p95 answer | max answer | not let through |");
+    println!("|---|---|---|---|---|---|");
+    for n in [1, 4, 8, 12, 16, 24, 32, 48] {
+        let mut took = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for round in 0..5 {
+            for o in cosign_burst(&d, &addr, &home, &format!("{n}x{round}"), n) {
+                took.push(o.took);
+                if let Some(h) = o.hook {
+                    refused.push(h);
+                } else if !o.status.contains(" 200 ") {
+                    refused.push(o.status);
+                } else if o.body.contains("deny") {
+                    refused.push(o.body);
+                }
+            }
+        }
+        took.sort();
+        let at = |p: usize| took[(took.len() * p / 100).min(took.len() - 1)];
+        let mut why = refused.clone();
+        why.sort();
+        why.dedup();
+        println!(
+            "| {n} | {} | {:.1?} | {:.1?} | {:.1?} | {} {why:?} |",
+            took.len(),
+            at(50),
+            at(95),
+            took[took.len() - 1],
+            refused.len()
+        );
+    }
 }
 
 /// The real daemon, whether it takes the hook ops or refuses them (one

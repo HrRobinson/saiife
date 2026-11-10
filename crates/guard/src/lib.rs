@@ -20,6 +20,7 @@ pub mod cmdexe;
 pub mod debug_read;
 pub mod engine;
 pub mod getopt;
+mod globlap;
 pub mod lexer;
 pub mod normalize;
 pub mod operands;
