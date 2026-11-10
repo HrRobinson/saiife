@@ -95,7 +95,6 @@ fn dispatch(action: DevAction) -> Result<ExitCode, String> {
 
 /// A project name as plan 22 makes them (one rule: `project::check_name`).
 // Used by `down` and `gc` (plan 24 Tasks 4 and 5).
-#[allow(dead_code)]
 pub(crate) fn valid_project(name: &str) -> bool {
     saiife_dev::project::check_name(name).is_ok()
 }
@@ -105,7 +104,6 @@ const NEED_YES: &str = "deleting volumes needs a yes. Run it in a terminal, or a
 /// Asks `question` on stderr and reads the answer from `input`. `yes` skips
 /// the question; with no terminal there is no one to ask, so it is an error.
 /// Only `y` or `yes` (any case) is a yes; anything else, or EOF, is a no.
-#[allow(dead_code)]
 pub(crate) fn confirm_with(
     question: &str,
     yes: bool,
@@ -130,7 +128,6 @@ pub(crate) fn confirm_with(
 
 /// [`confirm_with`] on the terminal.
 // Used by `down` and `gc` (plan 24 Tasks 4 and 5).
-#[allow(dead_code)]
 pub(crate) fn confirm(question: &str, yes: bool) -> Result<bool, String> {
     let stdin = std::io::stdin();
     let tty = stdin.is_terminal();
