@@ -22,16 +22,15 @@ warning. When you are done, `saiife dev down shop`.
 
 ## Names
 
-- A service is reachable at `<service>.<project>.localhost`. The apex
-  `<project>.localhost` is routed too, for the project's first routed service.
+- Every routed service gets `https://<service>.<project>.localhost`. The bare
+  `<project>.localhost` is not routed (a later quirk may add it).
 - The project name is the folder name, lowercased, with anything that is not a
   letter, digit or `-` turned into `-`, and cut to 40 characters.
 - A second folder with the same name becomes `shop-2`, then `shop-3`. A folder
   keeps its name between runs.
 - A service with no port has no URL. `up` lists it as "Not routed". Set a port
   for it in the [quirks file](#quirks).
-- Traefik route names are `<project>_<label>`, and `<project>__apex` for the
-  apex host.
+- Traefik route names are `<project>_<label>`.
 
 ## HTTPS and the local CA
 
