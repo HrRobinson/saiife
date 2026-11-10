@@ -344,3 +344,224 @@ fn the_fake_answers_by_rule_and_logs_each_call() {
     assert_ne!(a, b);
     assert!(a.join("compose.yaml").is_file());
 }
+
+// ---- plan 24 Task 3: `saiife dev ls` ----
+
+/// Seeds a project's state as `up` leaves it: `project.json`, and
+/// `urls.json` when `urls` is not empty.
+#[cfg(unix)]
+fn seed_project(d: &Dev, name: &str, dir: &Path, last_up: Option<&str>, urls: &[&str]) {
+    let pdir = d
+        .state
+        .join("saiife")
+        .join("dev")
+        .join("projects")
+        .join(name);
+    fs::create_dir_all(&pdir).unwrap();
+    let state = serde_json::json!({
+        "name": name,
+        "dir": dir,
+        "created": "2026-11-01T00:00:00Z",
+        "last_up": last_up,
+    });
+    fs::write(pdir.join("project.json"), state.to_string()).unwrap();
+    if !urls.is_empty() {
+        fs::write(pdir.join("urls.json"), serde_json::json!(urls).to_string()).unwrap();
+    }
+}
+
+/// The `ps -a` rule: one tab line per `(id, name, project, state)`.
+#[cfg(unix)]
+fn ps_rule(rows: &[(&str, &str, &str, &str)]) -> Rule {
+    let body: String = rows
+        .iter()
+        .map(|(i, n, p, s)| format!("{i}\t{n}\t{p}\t{s}\n"))
+        .collect();
+    Rule::ok("ps -a --filter label=saiife.managed=true*", body)
+}
+
+#[cfg(unix)]
+fn ls_json(d: &Dev) -> serde_json::Value {
+    let o = d.saiife(&["dev", "ls", "--json"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    serde_json::from_str(&stdout(&o)).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_shows_running_partial_and_stopped() {
+    let d = Dev::with(vec![ps_rule(&[
+        ("a1", "saiife-shop-web-1", "shop", "running"),
+        ("a2", "saiife-shop-db-1", "shop", "running"),
+        ("b1", "saiife-blog-web-1", "blog", "running"),
+        ("b2", "saiife-blog-db-1", "blog", "exited"),
+        ("c1", "saiife-docs-web-1", "docs", "exited"),
+    ])]);
+    let shop = d.repo("shop", &[]);
+    let blog = d.repo("blog", &[]);
+    let docs = d.repo("docs", &[]);
+    seed_project(
+        &d,
+        "shop",
+        &shop,
+        Some("2026-11-10T09:12:00Z"),
+        &["https://web.shop.localhost"],
+    );
+    seed_project(&d, "blog", &blog, None, &["https://web.blog.localhost"]);
+    seed_project(&d, "docs", &docs, None, &["https://web.docs.localhost"]);
+    let v = ls_json(&d);
+    let rows = v["projects"].as_array().unwrap();
+    let names: Vec<_> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["blog", "docs", "shop"]);
+    assert_eq!(rows[0]["state"], "partial");
+    assert_eq!(rows[0]["containers"]["running"], 1);
+    assert_eq!(rows[0]["containers"]["total"], 2);
+    assert_eq!(rows[1]["state"], "stopped");
+    assert_eq!(rows[1]["containers"]["running"], 0);
+    assert_eq!(rows[1]["containers"]["total"], 1);
+    assert_eq!(rows[2]["state"], "running");
+    assert_eq!(rows[2]["containers"]["total"], 2);
+    assert_eq!(rows[2]["last_up"], "2026-11-10T09:12:00Z");
+    assert!(rows[0]["last_up"].is_null());
+    assert_eq!(rows[2]["urls"][0], "https://web.shop.localhost");
+    assert_eq!(rows[2]["dir"], shop.to_str().unwrap());
+    assert_eq!(v["proxy"], "absent");
+    // The text form: URL lines for running and partial rows only.
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.starts_with("PROJECT"), "{out}");
+    assert!(out.contains("https://web.shop.localhost"), "{out}");
+    assert!(out.contains("https://web.blog.localhost"), "{out}");
+    assert!(!out.contains("web.docs.localhost"), "{out}");
+    assert!(out.contains("2026-11-10T09:12:00Z"), "{out}");
+    assert!(out.ends_with("proxy: absent\n"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_shows_missing_when_the_folder_is_gone() {
+    let d = Dev::with(vec![]);
+    let gone = d.repo_parent.join("nowhere").join("old");
+    seed_project(&d, "old", &gone, None, &["https://web.old.localhost"]);
+    let v = ls_json(&d);
+    assert_eq!(v["projects"][0]["state"], "missing");
+    assert_eq!(v["projects"][0]["dir"], gone.to_str().unwrap());
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    let out = stdout(&o);
+    let line = out.lines().find(|l| l.starts_with("old")).unwrap();
+    assert!(line.contains("missing"), "{out}");
+    assert!(line.contains(" -  "), "{out}");
+    assert!(!out.contains("web.old.localhost"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_shows_an_orphan_from_labels() {
+    let d = Dev::with(vec![ps_rule(&[(
+        "g1",
+        "saiife-ghost-web-1",
+        "ghost",
+        "exited",
+    )])]);
+    let v = ls_json(&d);
+    let rows = v["projects"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{v}");
+    assert_eq!(rows[0]["name"], "ghost");
+    assert!(rows[0]["dir"].is_null());
+    // No folder and nothing running: the P3 table says missing.
+    assert_eq!(rows[0]["state"], "missing");
+    assert_eq!(rows[0]["containers"]["total"], 1);
+    assert_eq!(rows[0]["urls"].as_array().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_proxy_line() {
+    let d = Dev::with(vec![ps_rule(&[("p1", "saiife-dev-proxy", "", "running")])]);
+    let v = ls_json(&d);
+    assert_eq!(v["proxy"], "running");
+    assert_eq!(v["projects"].as_array().unwrap().len(), 0, "{v}");
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert!(stdout(&o).ends_with("proxy: running\n"), "{}", stdout(&o));
+    let d = Dev::with(vec![ps_rule(&[("p1", "saiife-dev-proxy", "", "exited")])]);
+    assert_eq!(ls_json(&d)["proxy"], "stopped");
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_docker_down_is_unknown_and_exit_1() {
+    let d = Dev::with(vec![Rule::fail(
+        "ps -a *",
+        1,
+        "Cannot connect to the Docker daemon",
+    )]);
+    let shop = d.repo("shop", &[]);
+    seed_project(&d, "shop", &shop, None, &[]);
+    let o = d.saiife(&["dev", "ls", "--json"], d.root.path());
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(
+        err.starts_with("saiife dev: docker did not answer, so states are unknown: "),
+        "{err}"
+    );
+    assert!(err.contains("Cannot connect to the Docker daemon"), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["projects"][0]["name"], "shop");
+    assert_eq!(v["projects"][0]["state"], "unknown");
+    assert_eq!(v["proxy"], "unknown");
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert_eq!(code(&o), 1);
+    assert!(stdout(&o).contains("unknown"), "{}", stdout(&o));
+    assert!(stdout(&o).ends_with("proxy: unknown\n"), "{}", stdout(&o));
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_empty_says_how_to_start() {
+    let d = Dev::with(vec![]);
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).starts_with(
+            "No saiife dev projects yet. Run saiife dev up in a folder with a compose file.\n"
+        ),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(ls_json(&d)["projects"].as_array().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_a_mismatched_state_name_is_one_clear_line() {
+    let d = Dev::with(vec![]);
+    let shop = d.repo("shop", &[]);
+    seed_project(&d, "shop", &shop, None, &[]);
+    let pdir = d.state.join("saiife/dev/projects/other");
+    fs::create_dir_all(&pdir).unwrap();
+    fs::copy(
+        d.state.join("saiife/dev/projects/shop/project.json"),
+        pdir.join("project.json"),
+    )
+    .unwrap();
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.starts_with("saiife dev: "), "{err}");
+    assert!(stdout(&o).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_text_has_no_escape_from_a_folder_name() {
+    let d = Dev::with(vec![]);
+    let dir = d.repo("a\u{1b}[31mb", &[]);
+    seed_project(&d, "shop", &dir, None, &[]);
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+    assert!(out.contains("shop"), "{out}");
+}
