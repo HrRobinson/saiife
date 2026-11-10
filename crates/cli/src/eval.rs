@@ -315,6 +315,15 @@ pub fn plan(buf: &str, agent: Option<&str>) -> Plan {
 /// Judge every file `call` reads or writes. A glob too large to expand
 /// fails open as unjudgeable unless a path is denied or ran out of budget.
 pub fn judge_files(engine: &Engine, vars: &PathVars, call: &FileCall) -> Decision {
+    // The service's lexical view expands no pattern, so one that may match a
+    // protected path is denied as such (`Engine::lexical_glob_deny`).
+    if fs_view() == FsView::Lexical {
+        for word in pattern_words(&call.paths, &call.filters, call.expand_paths) {
+            if let Some(d) = engine.lexical_glob_deny(call.access, &word) {
+                return d;
+            }
+        }
+    }
     let (targets, overflow) = expand_targets(vars, &call.paths, &call.filters, call.expand_paths);
     let d = judge_paths(engine, call.access, &targets);
     // A deny stays; so does a latency fail-open (it ranks above).
@@ -354,25 +363,34 @@ pub fn expand_targets(
         }
         out.extend(found.iter().map(|p| p.display().to_string()));
     };
-    for p in paths {
-        if expand_paths {
-            add(p, &mut out);
-        } else {
-            out.push(p.clone());
-        }
+    if !expand_paths {
+        out.extend(paths.iter().cloned());
     }
+    for word in pattern_words(paths, filters, expand_paths) {
+        add(&word, &mut out);
+    }
+    (out, overflow)
+}
+
+/// The patterns `expand_targets` expands: the paths of `read_many_files`
+/// (`expand_paths`), then each search filter under each path.
+fn pattern_words(paths: &[String], filters: &[String], expand_paths: bool) -> Vec<String> {
+    let mut out = if expand_paths {
+        paths.to_vec()
+    } else {
+        Vec::new()
+    };
     for p in paths {
         for f in filters {
             let root = p.trim_end_matches('/');
-            let word = if f.contains('/') {
+            out.push(if f.contains('/') {
                 format!("{root}/{f}")
             } else {
                 format!("{root}/**/{f}")
-            };
-            add(&word, &mut out);
+            });
         }
     }
-    (out, overflow)
+    out
 }
 
 /// How much a file-call result matters when several paths are judged:
@@ -1225,6 +1243,36 @@ mod tests {
             } => (Some(pack.clone()), Some(pattern.clone())),
             Decision::Allow { .. } => (None, None),
         }
+    }
+
+    /// The service's lexical view expands no search filter: one that may
+    /// select a secret is denied, as the hook denies it where one exists.
+    #[test]
+    fn lexical_search_filters_that_may_select_a_secret_deny() {
+        let p = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(p.path()).unwrap();
+        let call = |filter: &str| FileCall {
+            paths: vec![root.display().to_string()],
+            access: Access::Read,
+            filters: vec![filter.to_string()],
+            expand_paths: false,
+        };
+        with_fs_view(FsView::Lexical, || {
+            let engine = dev_engine(&root);
+            let vars = path_vars(Some(&root), None);
+            for f in [".env*", ".e?v", "**/.ssh/id_*"] {
+                let d = judge_files(&engine, &vars, &call(f));
+                assert!(d.is_deny(), "{f}: {d:?}");
+            }
+            for f in ["*.rs", "src/**/*.md", "*.env.example"] {
+                let d = judge_files(&engine, &vars, &call(f));
+                assert!(!d.is_deny(), "{f}: {d:?}");
+            }
+        });
+        // The host lists: nothing there, nothing denied.
+        let engine = dev_engine(&root);
+        let vars = path_vars(Some(&root), None);
+        assert!(!judge_files(&engine, &vars, &call(".env*")).is_deny());
     }
 
     #[test]

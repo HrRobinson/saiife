@@ -111,8 +111,11 @@ What happens when the guard cannot judge something:
   not a preview.
 - **What the service's judgment does not see.** The service reads no file of the
   agent's user. It judges paths as written: it does not follow a symlink or a
-  junction, does not expand a glob against the disk, and does not read the project's
-  `.saiife/config.toml`, so a project's extra packs count in the hook only. The hook
+  junction, does not expand a glob against the disk (a glob that may match a
+  protected path, such as `type .e*`, is denied without listing, but a `*`
+  standing for a leading dot, as in `Get-Content *env`, is the hook's to
+  deny), and does not read the project's `.saiife/config.toml`, so a
+  project's extra packs count in the hook only. The hook
   still checks all of these and denies on its own. A forged hook verdict skips them.
   This is accepted: code of the agent's user can change a symlink, a junction, a
   folder's files or its own project config after any judgment anyway.

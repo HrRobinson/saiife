@@ -181,8 +181,8 @@ fn secret_files_through_shell_readers() {
 /// denies is denied even when the fixture holds only allowed matches (`.env.*` finds
 /// `.env.example` alone here), so the hook and the service's lexical view agree on these
 /// (`crates/cli/tests/lexical_corpus.rs`). The other way, a spelling no rule names that
-/// expands to a secret (`.e*` finds `.env`), only the host's expansion denies: the
-/// lexical view misses it, like a symlink (docs/threats.md, A21).
+/// expands to a secret (`.e*` finds `.env`), the host's expansion denies, and the
+/// lexical view denies it because it may match one (`globlap`; `tests/lexical.rs`).
 #[test]
 fn globs_are_judged_as_spelled_and_as_expanded() {
     let f = Fixture::new();

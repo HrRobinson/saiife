@@ -233,6 +233,46 @@ pub fn ancestors_source(
     Ok(Some(format!("{flags}^(?:{})$", alts.join("|"))))
 }
 
+/// The globs `glob` stands for here, as text: its variable replaced by each
+/// of its values, as `glob_source` binds them (`ancestors_source`'s
+/// ancestors for an `ancestors` rule, `/` included). Empty when the variable
+/// has no value. For `globlap`, which compares them with a shell glob.
+pub(crate) fn bound_texts(glob: &str, vars: &PathVars, ancestors: bool) -> Vec<String> {
+    let Ok((var, rest)) = split_var(glob) else {
+        return Vec::new();
+    };
+    let windows = vars.style() == PathStyle::Windows;
+    let fulls: Vec<String> = match var {
+        None => vec![rest.to_string()],
+        Some(name) => vars
+            .values(name)
+            .into_iter()
+            .filter_map(|v| v.to_str())
+            .map(|v| {
+                let v = if windows {
+                    v.replace('\\', "/")
+                } else {
+                    v.to_string()
+                };
+                format!("{}{rest}", v.trim_end_matches('/'))
+            })
+            .collect(),
+    };
+    if !ancestors {
+        return fulls;
+    }
+    let mut out = Vec::new();
+    for full in fulls {
+        out.push("/".to_string());
+        for (i, c) in full.char_indices() {
+            if c == '/' && i > 0 {
+                out.push(full[..i].to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Translate a glob into an anchored regex over canonical paths, with its
 /// variable replaced by the values in `vars` (an alternation if several).
 /// `Ok(None)`: the variable has no value here, so the rule cannot apply.

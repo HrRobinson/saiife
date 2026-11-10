@@ -29,6 +29,7 @@ use crate::canon::{
 };
 use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
+use crate::globlap;
 use crate::lexer::{
     fed_script_in, fed_script_may_be_stdin, find_all_substitution_kinds, literal_word, readable,
     split_segments_noted, split_substitution_noted, FedScript, PathKind, Word,
@@ -146,6 +147,9 @@ pub struct Engine {
     path_rules: OnceLock<Vec<PackPaths>>,
     /// Some active pack has `deny_path` rules: `path_rules` is not empty.
     has_path_rules: bool,
+    /// Each `deny_path` rule's glob, bound to `vars`, as a pattern a shell
+    /// glob is compared with (`FsView::Lexical` only, built on first use).
+    deny_globs: OnceLock<Vec<(RuleAccess, globlap::Pattern)>>,
 }
 
 /// One pack's path rules with their globs compiled for this machine.
@@ -280,6 +284,7 @@ impl Engine {
             guarded_commands,
             vars: PathVars::default(),
             path_rules: OnceLock::new(),
+            deny_globs: OnceLock::new(),
         }
     }
 
@@ -299,6 +304,7 @@ impl Engine {
         );
         self.vars = vars;
         self.path_rules = OnceLock::new();
+        self.deny_globs = OnceLock::new();
         self
     }
 
@@ -481,6 +487,114 @@ impl Engine {
             Some(d) => JudgeOutcome::Decided(d),
             None => JudgeOutcome::Clean,
         }
+    }
+
+    /// `FsView::Lexical` only, which cannot list what the glob `raw` expands
+    /// to: a deny when some path it may expand to is denied (`globlap`). One
+    /// path both the glob and a `deny_path` rule match is built and judged
+    /// with every rule, so an `allow_path` carve-out still applies: `cat
+    /// ~/.ssh/id_*.pub` matches only public keys. Under `Host` the glob is
+    /// expanded and its matches judged instead, so this is `Clean` there.
+    fn lexical_glob(
+        &self,
+        access: Access,
+        raw: &str,
+        cwd: Option<&Path>,
+        dots: bool,
+        start: Instant,
+    ) -> JudgeOutcome {
+        if crate::canon::fs_view() != crate::canon::FsView::Lexical || !self.has_path_rules {
+            return JudgeOutcome::Clean;
+        }
+        let windows = self.vars.style() == PathStyle::Windows;
+        let abs = if windows {
+            // The host lists no share either (`canon::expand_alternatives`).
+            match winpath::canonical(raw, cwd, &self.vars) {
+                Some(c) if !c.starts_with("//") => c,
+                _ => return JudgeOutcome::Clean,
+            }
+        } else {
+            match lexical_form(raw, cwd, &self.vars) {
+                Some(p) => p.to_string_lossy().into_owned(),
+                None => return JudgeOutcome::Clean,
+            }
+        };
+        let Some(glob) = globlap::shell_pattern(&abs, windows) else {
+            return JudgeOutcome::Clean;
+        };
+        let nocase = PATHS_CASE_INSENSITIVE || windows;
+        for (rule_access, rule) in self.deny_globs() {
+            if !rule_access.covers(access) {
+                continue;
+            }
+            if self.over_budget(start) {
+                return JudgeOutcome::TimedOut;
+            }
+            let Some(comps) = globlap::witness(&glob, rule, dots, nocase) else {
+                continue;
+            };
+            let path = if windows {
+                let p = comps.join("/");
+                if comps.len() == 1 {
+                    format!("{p}/")
+                } else {
+                    p
+                }
+            } else {
+                format!("/{}", comps.join("/"))
+            };
+            match self.judge_path(access, Path::new(&path), start) {
+                JudgeOutcome::Decided(Decision::Deny {
+                    pack,
+                    pattern,
+                    reason,
+                    via_inline,
+                }) => {
+                    let suffix = format!(" ({}: {path})", access.label());
+                    let base = reason.strip_suffix(&suffix).unwrap_or(&reason);
+                    return JudgeOutcome::Decided(Decision::Deny {
+                        pack,
+                        pattern,
+                        reason: format!(
+                            "{base} ({}: the glob {raw} may match such a path, and the saiife \
+                             service judges without listing files)",
+                            access.label()
+                        ),
+                        via_inline,
+                    });
+                }
+                JudgeOutcome::TimedOut => return JudgeOutcome::TimedOut,
+                _ => {}
+            }
+        }
+        JudgeOutcome::Clean
+    }
+
+    /// `lexical_glob` for a file tool's path pattern (a search tool's
+    /// filter, `read_many_files`): a deny under `FsView::Lexical` when a
+    /// path `pattern` may match is denied; `None` otherwise (out of budget
+    /// included), and always under `Host`, which expands the pattern instead.
+    pub fn lexical_glob_deny(&self, access: Access, pattern: &str) -> Option<Decision> {
+        self.path_rules();
+        match self.lexical_glob(access, pattern, None, false, Instant::now()) {
+            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn deny_globs(&self) -> &[(RuleAccess, globlap::Pattern)] {
+        self.deny_globs.get_or_init(|| {
+            let fold = self.vars.style() == PathStyle::Windows;
+            self.packs
+                .iter()
+                .flat_map(|p| &p.deny_path)
+                .flat_map(|r| {
+                    crate::pathrule::bound_texts(&r.glob, &self.vars, r.ancestors)
+                        .into_iter()
+                        .map(|t| (r.access, globlap::rule_pattern(&t, fold)))
+                })
+                .collect()
+        })
     }
 
     /// Override the latency budget (mainly for tests).
@@ -1813,6 +1927,11 @@ impl Engine {
                     return timed_out();
                 }
                 let words = if op.glob {
+                    match self.lexical_glob(op.access, &op.path, *cwd, op.dots, start) {
+                        JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                        JudgeOutcome::TimedOut => return timed_out(),
+                        _ => {}
+                    }
                     match expand_operand_glob_dots(&op.path, *cwd, &self.vars, op.dots) {
                         GlobExpansion::Matches(m) if !m.is_empty() => m
                             .into_iter()

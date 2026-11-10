@@ -1351,11 +1351,18 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     contents, and the project config's extra packs (A18 note). That is
     accepted: code of that user can change each of them after any judgment
     (A21), so they were never a boundary against it. The hook still judges
-    them and denies on its own. A move or copy target is judged both as
-    itself and as `target/name`, because the lexical view cannot tell a
-    folder from a file, and `-t`/`--target-directory` names a folder. One
-    corpus case is stricter than the hook, by owner ruling (`KNOWN_STRICTER`):
-    `cp review.md .claude`.
+    them and denies on its own. A glob is judged by what it may match: the
+    guard compares it with each `deny_path` pattern (`globlap`) and denies
+    when one path both match is denied, carve-outs applied, so `cat .e*` and
+    `cat ~/.ssh/id_*` are denied with no file on disk. A PowerShell or cmd
+    `*` is not read as a leading dot there (`Get-Content *env` is the hook's
+    to deny), or every `*.md` could be a `.env.md`, and a glob's `**` never
+    stands for a folder a rule names. A move or copy target is judged both
+    as itself and as `target/name`, because the lexical view cannot tell a
+    folder from a file, and `-t`/`--target-directory` names a folder. The
+    corpus cases stricter than the hook are accepted by name
+    (`KNOWN_STRICTER`): `cp review.md .claude`, and globs that may match a
+    protected path where the test's Windows engine has no file to find.
   - **As whom.** The principal is the asker (Linux, macOS: the socket's uid)
     or, on Windows, the SID and groups of the hook connection that bound the
     key, tied to the asker (§5.3a.2, W13). The path variables (`HOME`,
