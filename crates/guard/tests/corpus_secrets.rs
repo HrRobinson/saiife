@@ -1363,6 +1363,19 @@ fn archive_extracts_into_a_secret_folder_deny() {
         "cpio -i -D ~/.aws < evil.cpio",
         "cpio -i --absolute-filenames < evil.cpio",
         "cd ~/.ssh && 7z x evil.7z",
+        // Fail closed: `../` or absolute names, unknown or abbreviated
+        // options, every `-C`.
+        "unzip -: evil.zip -d out",
+        "unzip evil.zip -l -d ~/.ssh",
+        "7z x evil.7z -spf -oout",
+        "7z x evil.7z -snl -oout",
+        "tar -xf evil.tar --abs -C out",
+        "tar -xf evil.tar -C out -C ~/.ssh",
+        "cpio -idm < evil.cpio",
+        // Not extracts, still judged: the archive written, the files read.
+        "7z a out.7z .env",
+        "cpio -o -F ~/.aws/credentials < list",
+        "cpio -pdm ~/.ssh < list",
     ] {
         let d = e.evaluate(cmd);
         assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
@@ -1381,6 +1394,10 @@ fn archive_extracts_into_a_secret_folder_deny() {
             "7z l evil.7z",
             "7z x dist.7z -oout",
             "cpio -o < list > out.cpio",
+            "cpio -idm --no-absolute-filenames < dist.cpio",
+            "tar -xzf node.tgz --strip-components=1 -C vendor",
+            "7z x -y dist.7z -oout",
+            "7z l dist.7z",
         ],
     );
 }
@@ -1436,6 +1453,10 @@ fn windows_writes_onto_secret_files_deny() {
         (cmd, r"rmdir /s /q %USERPROFILE%\.kube"),
         (bash, "cp evil /c/Users/a/.aws/credentials"),
         (bash, "rm -rf /c/Users/a/.ssh"),
+        // An archiver's other verbs still read what they are given.
+        (ps, r"7z a out.7z .env"),
+        (cmd, r"7z a out.7z .env"),
+        (ps, r"unzip -l .env"),
         (bash, "cat evil.pub >> /c/Users/a/.ssh/authorized_keys"),
     ];
     let wrong: Vec<String> = deny

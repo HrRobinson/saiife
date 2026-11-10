@@ -51,8 +51,10 @@ through shell commands that write them (`cp`, `mv`, `tee`, `dd`, `ln`,
   Extracting an archive into one of them or into your home is blocked too,
   with `tar`, `bsdtar`, `unzip`, `cpio -i` or `7z x` (`tar -xf x.tar -C ~`,
   `cd ~ && unzip x.zip`): what it holds is not known. So is an extract that
-  allows absolute names (`tar -P`, `cpio --absolute-filenames`), wherever it
-  runs. Listing
+  may write anywhere, wherever it runs: absolute or `../` names
+  (`tar -P`, `unzip -:`, `7z x -spf`, `-snl`), `cpio -i` without
+  `--no-absolute-filenames`, and an extract with an option saiife does not
+  know (an abbreviated long option included). Listing
   them (`ls ~/.ssh`), `chmod 700 ~/.ssh` and writing other files in them
   (`~/.ssh/known_hosts`, `~/.ssh/config`, `~/.aws/config`) stay allowed.
 
