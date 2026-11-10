@@ -188,24 +188,99 @@ pub fn too_large_reason(limit: usize) -> String {
     format!("shell command over {limit} bytes, not judged: split it into smaller commands")
 }
 
-/// The payload's first `tool_name`, read off the text because it may not parse.
-/// Inside a command's string the key's quotes are escaped, so a command cannot
-/// spell it.
+/// The answer for a shell call over `MAX_PAYLOAD_BYTES`: [`too_large_reason`]
+/// when its `command` is the long part, else that the other fields are.
+pub fn shell_too_large_reason(command: &str) -> String {
+    if command.len() > MAX_PAYLOAD_BYTES {
+        return too_large_reason(MAX_PAYLOAD_BYTES);
+    }
+    format!(
+        "hook payload over {MAX_PAYLOAD_BYTES} bytes for a shell call, not judged: \
+         the command is short, the call's other fields are what is large"
+    )
+}
+
+/// A hook payload read with the `PARSE_MAX_BYTES` cap.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stdin {
+    /// The whole payload.
+    Whole(String),
+    /// More than the cap; the rest was drained. Its first `PARSE_MAX_BYTES`
+    /// bytes, cut back to the last whole character, for [`over_the_cap`].
+    TooLarge(String),
+    /// A read error, or a payload within the cap that is not UTF-8.
+    Unreadable,
+}
+
+/// Read a hook payload from `r` with the `PARSE_MAX_BYTES` cap. Past the cap
+/// the rest is drained (so the agent gets no EPIPE), and a cut that falls
+/// inside a character is still `TooLarge`, never `Unreadable`.
+pub fn read_payload(r: &mut impl Read) -> Stdin {
+    read_capped(r, PARSE_MAX_BYTES)
+}
+
+fn read_capped(r: &mut impl Read, cap: usize) -> Stdin {
+    let mut bytes = Vec::new();
+    if r.take(cap as u64 + 1).read_to_end(&mut bytes).is_err() {
+        return Stdin::Unreadable;
+    }
+    if bytes.len() > cap {
+        let _ = std::io::copy(r, &mut std::io::sink());
+        bytes.truncate(cap);
+        let text = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let whole = e.utf8_error().valid_up_to();
+                let mut b = e.into_bytes();
+                b.truncate(whole);
+                String::from_utf8(b).unwrap_or_default()
+            }
+        };
+        return Stdin::TooLarge(text);
+    }
+    String::from_utf8(bytes).map_or(Stdin::Unreadable, Stdin::Whole)
+}
+
+/// A payload over `PARSE_MAX_BYTES`, of which `head` is the start: must it
+/// fail closed whatever the config says, and why. Only a tool named in
+/// `head` that is not a shell tool follows `Fail`; a shell tool, or a tool
+/// not named there, is denied: what is not parsed is not allowed.
+pub fn over_the_cap(head: &str) -> (bool, String) {
+    match first_tool_name(head) {
+        Some(t) if saiifeguard::payload::is_shell_tool(t) => {
+            (true, too_large_reason(PARSE_MAX_BYTES))
+        }
+        Some(_) => (
+            false,
+            format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged"),
+        ),
+        None => (
+            true,
+            format!(
+                "hook payload larger than {PARSE_MAX_BYTES} bytes, with no tool name \
+                 in its first {PARSE_MAX_BYTES} bytes; not judged"
+            ),
+        ),
+    }
+}
+
+/// The payload's first `tool_name` (or, without one, `toolName`), read off
+/// the text because it may not parse. Inside a command's string the key's
+/// quotes are escaped, so a command cannot spell it. A name that is empty,
+/// not closed in `buf`, or has an escape in it, is none.
 fn first_tool_name(buf: &str) -> Option<&str> {
-    const KEY: &str = "\"tool_name\"";
-    let at = buf.find(KEY)?;
-    let rest = buf[at + KEY.len()..].trim_start();
-    let name = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
-    name.split('"').next()
+    let named = |key: &str| {
+        let at = buf.find(key)?;
+        let rest = buf[at + key.len()..].trim_start();
+        let name = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+        let (name, _) = name.split_once('"')?;
+        (!name.is_empty() && !name.contains('\\')).then_some(name)
+    };
+    named("\"tool_name\"").or_else(|| named("\"toolName\""))
 }
 
 fn names_powershell(buf: &str) -> bool {
     first_tool_name(buf).is_some_and(|t| t.eq_ignore_ascii_case("powershell"))
-}
-
-/// Past `PARSE_MAX_BYTES` nothing is parsed, but the text still says a shell tool.
-pub fn names_shell_tool(buf: &str) -> bool {
-    first_tool_name(buf).is_some_and(saiifeguard::payload::is_shell_tool)
 }
 
 /// Classify `buf` (a payload of at most `PARSE_MAX_BYTES`) into what the
@@ -435,11 +510,10 @@ fn judge_in(
         })
     };
     match plan(payload, agent) {
-        Plan::TooLarge { command, .. } => answer(
-            Verdict::Unjudged,
-            command,
-            &too_large_reason(MAX_PAYLOAD_BYTES),
-        ),
+        Plan::TooLarge { command, .. } => {
+            let reason = shell_too_large_reason(&command);
+            answer(Verdict::Unjudged, command, &reason)
+        }
         Plan::Unusable(e) => answer(
             Verdict::Unjudged,
             String::new(),
@@ -1285,6 +1359,59 @@ mod tests {
         let too_large = Plan::Unusable(saiifeguard::payload::PayloadError::TooLarge { limit: 1 });
         let text = r#"{"tool_name":"PowerShell""#;
         assert!(!must_fail_closed(&too_large, text));
+        // `toolName` is read too.
+        let camel = r#"{"toolName":"PowerShell","toolInput":"#;
+        let p = plan(camel, None);
+        assert!(must_fail_closed(&p, camel), "{camel}");
+    }
+
+    /// The cap read: a cut inside a character is still over the cap, and the
+    /// rest is drained; within the cap, text that is not UTF-8 is unreadable.
+    #[test]
+    fn a_capped_read_cut_inside_a_character_is_too_large() {
+        let mut r = std::io::Cursor::new("aé…".as_bytes().to_vec());
+        assert_eq!(read_capped(&mut r, 2), Stdin::TooLarge("a".into()));
+        assert_eq!(r.position(), "aé…".len() as u64, "drained");
+        let mut r = std::io::Cursor::new("aé".as_bytes().to_vec());
+        assert_eq!(read_capped(&mut r, 3), Stdin::Whole("aé".into()));
+        let mut r = std::io::Cursor::new(vec![b'a', 0xC3]);
+        assert_eq!(read_capped(&mut r, 3), Stdin::Unreadable);
+    }
+
+    /// Past the parse cap only a tool named in what was read, and not a shell
+    /// tool, follows `Fail`.
+    #[test]
+    fn over_the_cap_denies_what_it_cannot_name() {
+        for (head, closed) in [
+            (r#"{"tool_name":"Bash","tool_input":{"command":"ls"#, true),
+            (r#"{"toolName":"run_shell_command","toolInput":{"#, true),
+            (r#"{"tool_name":"PowerShell""#, true),
+            (
+                r#"{"tool_input":{"command":"ls; \"tool_name\":\"Write\""#,
+                true,
+            ),
+            (r#"{"tool_name":"Bash","tool_input":{"#, true),
+            (r#"{"tool_name":"","toolName":"Bash""#, true),
+            (r#"{"tool_name":"Wri"#, true),
+            (r#"{"tool_name":"Write","tool_input":{"content":"#, false),
+            (r#"{"toolName":"Write","toolInput":{"content":"#, false),
+        ] {
+            let (c, reason) = over_the_cap(head);
+            assert_eq!(c, closed, "{head}");
+            assert!(reason.contains("not judged"), "{reason}");
+            assert!(reason.contains("67108864"), "{reason}");
+        }
+    }
+
+    /// The reason for a shell call over the shell limit says which part is large.
+    #[test]
+    fn a_shell_call_over_the_limit_is_told_what_is_large() {
+        assert!(shell_too_large_reason("ls").contains("other fields"));
+        let long = "x".repeat(MAX_PAYLOAD_BYTES + 1);
+        assert_eq!(
+            shell_too_large_reason(&long),
+            too_large_reason(MAX_PAYLOAD_BYTES)
+        );
     }
 
     /// Fail policy in the worker, which is what a locked hook asks: what cannot

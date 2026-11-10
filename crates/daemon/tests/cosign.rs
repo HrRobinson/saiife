@@ -498,6 +498,34 @@ async fn oversize_body_denied() {
     assert_eq!(got[0].reason.as_deref(), Some(CosignDeny::TooLarge.text()));
 }
 
+/// Follow-up of PR #29: over the cap, a cut inside a multibyte character and a
+/// tool name past the cap (either spelling) are denied as too large too: the
+/// co-signer never parses a body it did not read whole.
+#[tokio::test]
+async fn oversize_body_denied_wherever_its_tool_is() {
+    let d = daemon(Some(Opts {
+        max_body: 1024,
+        ..Opts::default()
+    }))
+    .await;
+    let head = r#"{"session_id":"c-1","tool_use_id":"toolu_10","tool_input":{"command":""#;
+    let cut = format!(
+        "{head}{}{}\"}},\"tool_name\":\"Bash\"}}",
+        "a".repeat(1024 - head.len()),
+        "é".repeat(64)
+    );
+    assert_eq!(cut.as_bytes()[1024], 0xC3, "the cut is inside a character");
+    let camel = format!(r#"{head}{}"}},"toolName":"Bash"}}"#, "a".repeat(2048));
+    for body in [cut, camel] {
+        let a = post(d.addr.unwrap(), body.clone()).await;
+        assert_deny(&a, CosignDeny::TooLarge);
+        let chunked = "POST /v1/cosign/claude HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n";
+        let framed = format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+        let a = raw(d.addr.unwrap(), chunked, framed.as_bytes()).await;
+        assert_deny(&a, CosignDeny::TooLarge);
+    }
+}
+
 /// A port held by another socket: one record, status shows the error for
 /// as long as it lasts, and once the port is free the co-signer binds it
 /// with no restart.

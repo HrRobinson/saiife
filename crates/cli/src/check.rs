@@ -16,9 +16,7 @@ use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::builtins::Catalog;
 use saiifeguard::canon::PathVars;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
-use saiifeguard::payload::{
-    context_from_hook_json_bounded, HookContext, PayloadError, MAX_PAYLOAD_BYTES,
-};
+use saiifeguard::payload::{context_from_hook_json_bounded, HookContext, PayloadError};
 
 use crate::check_managed::SYSTEM_CONFIG;
 use crate::eval::{self, Plan, PARSE_MAX_BYTES};
@@ -104,37 +102,33 @@ pub fn run(
         closed: view.fail_closed,
         hook_exit,
     };
-    let mut buf = String::new();
-    let mut stdin = std::io::stdin().lock();
-    let read = (&mut stdin)
-        .take(PARSE_MAX_BYTES as u64 + 1)
-        .read_to_string(&mut buf);
-    if read.is_ok() && buf.len() > PARSE_MAX_BYTES {
-        // Drain the rest so the agent gets no EPIPE.
-        let _ = std::io::copy(&mut stdin, &mut std::io::sink());
-        let audit = Audit::new(agent, HookContext::default(), cli_packs);
-        if eval::names_shell_tool(&buf) {
-            let fail = Fail {
-                closed: true,
-                ..fail
-            };
-            let reason = eval::too_large_reason(PARSE_MAX_BYTES);
-            return fail.unjudged(&audit, "", &reason, None);
+    let buf = match eval::read_payload(&mut std::io::stdin().lock()) {
+        eval::Stdin::Whole(buf) => buf,
+        eval::Stdin::TooLarge(head) => {
+            // Not parsed: denied unless its start names a tool that is not
+            // a shell tool.
+            let audit = Audit::new(agent, HookContext::default(), cli_packs);
+            let (closed, reason) = eval::over_the_cap(&head);
+            if closed {
+                let fail = Fail {
+                    closed: true,
+                    ..fail
+                };
+                return fail.unjudged(&audit, "", &reason, None);
+            }
+            let warning = format!("{reason}; failing open (allow)");
+            return fail.unjudged(&audit, "", &reason, Some(&warning));
         }
-        let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
-        let warning = format!("{reason}; failing open (allow)");
-        return fail.unjudged(&audit, "", &reason, Some(&warning));
-    }
-    drop(stdin);
-    if read.is_err() {
-        let audit = Audit::new(agent, HookContext::default(), cli_packs);
-        return fail.unjudged(
-            &audit,
-            "",
-            "could not read hook payload",
-            Some("could not read hook payload; failing open (allow)"),
-        );
-    }
+        eval::Stdin::Unreadable => {
+            let audit = Audit::new(agent, HookContext::default(), cli_packs);
+            return fail.unjudged(
+                &audit,
+                "",
+                "could not read hook payload",
+                Some("could not read hook payload; failing open (allow)"),
+            );
+        }
+    };
     let audit = Audit::new(
         agent,
         context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
@@ -149,7 +143,7 @@ pub fn run(
         Plan::TooLarge { command, .. } => fail.unjudged(
             &audit,
             &command,
-            &eval::too_large_reason(MAX_PAYLOAD_BYTES),
+            &eval::shell_too_large_reason(&command),
             None,
         ),
         Plan::Shell { command, dialects } => {
