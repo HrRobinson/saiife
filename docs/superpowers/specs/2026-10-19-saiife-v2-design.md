@@ -1315,7 +1315,11 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     not tell who sent this call` (`AskerUnknown`).
   Only `POST /v1/cosign/claude` is served (else `404`). A request with an
   `Origin` header gets `403`, a `Content-Type` other than `application/json`
-  gets `415`, and more than 16 requests in flight get `503`. Each of these
+  gets `415`. A request over the in-flight caps (8 per uid, or per pid on
+  Windows, and 16 in all) waits for a slot, its asker's share first, before
+  its body is read, and gets `503` only when none is free within
+  `COSIGN_WAIT` from its arrival (since the re-judge concurrency review,
+  2026-11-10: ten or more parallel sessions of one user burst past 8). Each of these
   blocks only the request it answers, through `onFailure`. Every deny except
   `saiife denied this call` writes a `hook` record with `event:
   "cosign_denied"`, at most one per reason per 10 s, the next one carrying
@@ -1360,13 +1364,16 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     running as the service account (never root, never the agent user), with
     a cleared environment; on Windows in a kill-on-close job. They read
     length-prefixed `EvalRequest` frames (u32 big-endian, at most
-    `MAX_EVAL_BYTES`). Fixed values: `REJUDGE_POOL = 2` warm workers;
+    `MAX_EVAL_BYTES`). Fixed values: `REJUDGE_POOL = 4` warm workers;
     `REJUDGE_MAX_USES = 500` requests each, then replaced;
     `REJUDGE_TIMEOUT = 3 s` per request, always inside `COSIGN_WAIT` from
-    arrival; `REJUDGE_PER_PRINCIPAL = 1` request of one principal judged at
-    once, so one user never holds every worker; `REJUDGE_MAX_WAITING = 32`
-    requests waiting in all, and one more fails at once, before its request
-    is built. A request whose co-signed HTTP request is gone (answered, timed
+    arrival; `REJUDGE_PER_PRINCIPAL = 3` requests of one principal judged at
+    once, so one user never holds every worker and parallel sessions of one
+    user are not judged one at a time (2 and 1 before 2026-11-10: a burst of
+    8 calls waited 32 ms at p95, 10 ms with 4 and 3); `REJUDGE_MAX_WAITING = 32`
+    requests waiting in all (at least the co-signer's 16 in flight, so it
+    never refuses a request the co-signer let in), and one more fails at
+    once, before its request is built. A request whose co-signed HTTP request is gone (answered, timed
     out, or its connection closed) is cancelled: the pool checks before it
     builds the worker's request and while it waits for a worker, and gives
     up its place at once. The blocking work holds the HTTP request's

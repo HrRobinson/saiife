@@ -56,7 +56,8 @@ server and gateway, the personal broker and fleet packages.
 - The service judges with the system policy of the user who asks, as that user's account record gives the paths. It reads none of that user's files: it does not follow symlinks or junctions, expand globs, or read the project's config. Those stay the hook's checks.
 - One case is stricter than the hook: `cp review.md .claude` is denied.
 - A call that only `[guard] ask` rules deny passes when the same hook connection used an approval for that command.
-- If the service cannot judge, the call is denied (`rejudge_failed`). It keeps 2 warm judge workers (`REJUDGE_POOL`), runs at most 1 call per user at once (`REJUDGE_PER_PRINCIPAL`), and lets at most 32 wait (`REJUDGE_MAX_WAITING`).
+- If the service cannot judge, the call is denied (`rejudge_failed`). It keeps 4 warm judge workers (`REJUDGE_POOL`), runs at most 3 calls per user at once (`REJUDGE_PER_PRINCIPAL`), and lets at most 32 wait (`REJUDGE_MAX_WAITING`).
+- A burst of co-signed calls over the co-signer's caps (8 in flight per user, 16 in all) waits for a slot within the co-sign wait instead of getting `503`, which Claude Code blocked. Ten or more parallel sessions of one user no longer have calls blocked by the caps.
 - The co-signer now finds who asks on every OS. On Linux it reads the socket's uid from `/proc/net/tcp`, and on macOS from `net.inet.tcp.pcblist_n`. Windows is below. When it cannot tell who asks, it denies.
 - `doctor` gains `cosign.rejudge`, `cosign.asker` and `hooks.rejudge-denied`.
 - The managed hook benches gate CI again, with budgets per OS taken from plan 21's CI runs. The managed bash p95 measured 41.2 to 50.0 ms on Linux (budget 60 ms) and under 40 ms on macOS (budget 40 ms).
