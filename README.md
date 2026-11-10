@@ -141,6 +141,7 @@ model.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
   and [collections](docs/collections.md).
+- [Dev environments](docs/dev.md): saiife dev, compose stacks behind one HTTPS proxy (preview).
 - [MCP](docs/mcp.md): `saiife mcp` (connectors as MCP tools) and the MCP
   gateway for third-party servers.
 - [Packs](docs/packs/README.md): the rule sets, what each blocks and allows.
