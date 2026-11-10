@@ -45,6 +45,10 @@ pub enum DevError {
         path: PathBuf,
         reason: String,
     },
+    RouteHost {
+        host: String,
+        reason: &'static str,
+    },
     // plan 24
 }
 
@@ -108,6 +112,9 @@ impl fmt::Display for DevError {
                     path.display(),
                     dir.display()
                 )
+            }
+            DevError::RouteHost { host, reason } => {
+                write!(f, "cannot route {host:?}: {reason}")
             }
         }
     }

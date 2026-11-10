@@ -7,6 +7,7 @@ pub mod docker;
 pub mod labels;
 pub mod paths;
 pub mod project;
+pub mod proxy;
 pub mod quirks;
 pub mod rewrite;
 
