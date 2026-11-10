@@ -565,3 +565,202 @@ fn ls_text_has_no_escape_from_a_folder_name() {
     assert!(!out.contains('\u{1b}'), "{out:?}");
     assert!(out.contains("shop"), "{out}");
 }
+
+// ---- plan 24 Task 4: `saiife dev down` ----
+
+/// A seeded project with a `compose.json`, as `up` leaves it. Returns the repo.
+#[cfg(unix)]
+fn seed_up(d: &Dev, name: &str) -> PathBuf {
+    let repo = d.repo(name, &[]);
+    seed_project(
+        d,
+        name,
+        &repo,
+        None,
+        &[&format!("https://web.{name}.localhost")],
+    );
+    let pdir = d.state.join("saiife/dev/projects").join(name);
+    fs::write(pdir.join("compose.json"), "{}").unwrap();
+    let dynamic = d.state.join("saiife/dev/proxy/dynamic");
+    fs::create_dir_all(&dynamic).unwrap();
+    fs::write(dynamic.join(format!("{name}.toml")), "").unwrap();
+    repo
+}
+
+#[cfg(unix)]
+#[test]
+fn down_runs_compose_down_and_removes_routes() {
+    let d = Dev::with(vec![]);
+    let repo = seed_up(&d, "shop");
+    let o = d.saiife(&["dev", "down", "shop"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("saiife dev: shop is down."),
+        "{}",
+        stdout(&o)
+    );
+    let compose = d.state.join("saiife/dev/projects/shop/compose.json");
+    let want = format!(
+        "compose -p saiife-shop --project-directory {} -f {} down",
+        repo.display(),
+        compose.display()
+    );
+    let calls = d.calls();
+    assert!(calls.contains(&want), "{want}\n{calls:?}");
+    assert!(!calls.iter().any(|c| c.contains("--volumes")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.contains("volume rm")), "{calls:?}");
+    assert!(!d.state.join("saiife/dev/proxy/dynamic/shop.toml").exists());
+    assert!(d
+        .state
+        .join("saiife/dev/projects/shop/project.json")
+        .is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn down_rejects_a_bad_name() {
+    for bad in ["../../etc", "Shop", "", "a/b"] {
+        let d = Dev::with(vec![]);
+        let o = d.saiife(&["dev", "down", bad], d.root.path());
+        assert_eq!(code(&o), 1, "{bad:?}");
+        assert!(
+            stderr(&o).contains("is not a saiife dev project name"),
+            "{bad:?}: {}",
+            stderr(&o)
+        );
+        assert!(d.calls().is_empty(), "{bad:?}: {:?}", d.calls());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn down_unknown_project() {
+    let d = Dev::with(vec![]);
+    let o = d.saiife(&["dev", "down", "nope"], d.root.path());
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains("no project named nope"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn down_refuses_foreign_containers() {
+    let d = Dev::with(vec![Rule::ok(
+        "ps -a --filter label=com.docker.compose.project=saiife-shop*",
+        "saiife-shop-web-1\ttrue\nmine\t\n",
+    )]);
+    seed_up(&d, "shop");
+    let o = d.saiife(
+        &["dev", "down", "shop", "--volumes", "--yes"],
+        d.root.path(),
+    );
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(
+        err.contains("containers saiife did not create (mine)"),
+        "{err}"
+    );
+    assert!(err.contains("nothing was touched"), "{err}");
+    let calls = d.calls();
+    assert!(!calls.iter().any(|c| c.contains("down")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.starts_with("rm ")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.contains("volume rm")), "{calls:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn down_volumes_without_yes_deletes_nothing() {
+    let d = Dev::with(vec![Rule::ok("volume ls*", "saiife-shop_db\n")]);
+    seed_up(&d, "shop");
+    let o = d.saiife(&["dev", "down", "shop", "--volumes"], d.root.path());
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains(
+            "saiife dev: deleting volumes needs a yes. Run it in a terminal, or add --yes."
+        ),
+        "{}",
+        stderr(&o)
+    );
+    let calls = d.calls();
+    assert!(!calls.iter().any(|c| c.contains(" down")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.contains("volume rm")), "{calls:?}");
+    assert!(d.state.join("saiife/dev/proxy/dynamic/shop.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn down_volumes_with_yes_removes_only_listed() {
+    let d = Dev::with(vec![Rule::ok("volume ls*", "saiife-shop_db\n")]);
+    seed_up(&d, "shop");
+    let o = d.saiife(
+        &["dev", "down", "shop", "--volumes", "--yes"],
+        d.root.path(),
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("Volumes deleted: saiife-shop_db."),
+        "{}",
+        stdout(&o)
+    );
+    let calls = d.calls();
+    let ls = calls
+        .iter()
+        .position(|c| c.starts_with("volume ls"))
+        .unwrap();
+    let rm = calls
+        .iter()
+        .position(|c| c.starts_with("volume rm"))
+        .unwrap();
+    assert!(ls < rm, "{calls:?}");
+    assert!(calls[ls].contains("--filter label=saiife.managed=true"));
+    assert!(calls[ls].contains("--filter label=saiife.dev.project=shop"));
+    assert_eq!(calls[rm], "volume rm saiife-shop_db");
+    assert_eq!(calls.iter().filter(|c| c.contains("volume rm")).count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn down_volumes_piped_answer_is_not_a_yes() {
+    let d = Dev::with(vec![Rule::ok("volume ls*", "saiife-shop_db\n")]);
+    seed_up(&d, "shop");
+    let o = d.saiife_with_stdin(&["dev", "down", "shop", "--volumes"], d.root.path(), "y\n");
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains("deleting volumes needs a yes"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        !d.calls().iter().any(|c| c.contains("volume rm")),
+        "{:?}",
+        d.calls()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn down_without_compose_json_removes_by_label() {
+    let d = Dev::with(vec![
+        Rule::ok("ps -aq*", "c1\nc2\n"),
+        Rule::ok("network ls -q*", "n1\n"),
+    ]);
+    seed_up(&d, "shop");
+    fs::remove_file(d.state.join("saiife/dev/projects/shop/compose.json")).unwrap();
+    let o = d.saiife(&["dev", "down", "shop"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let calls = d.calls();
+    let both = "--filter label=saiife.managed=true --filter label=saiife.dev.project=shop";
+    let pos = |want: String| calls.iter().position(|c| *c == want).unwrap();
+    let ps = pos(format!("ps -aq {both}"));
+    let rm = pos("rm -f c1 c2".to_string());
+    let nl = pos(format!("network ls -q {both}"));
+    let nr = pos("network rm n1".to_string());
+    assert!(ps < rm && rm < nl && nl < nr, "{calls:?}");
+    assert!(
+        !calls.iter().any(|c| c.starts_with("compose ")),
+        "{calls:?}"
+    );
+}
