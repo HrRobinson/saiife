@@ -3,8 +3,8 @@
 //! Output is built from `serde` structs held in `BTreeMap`s (fixed order), never
 //! from strings. Traefik parses every file as a Go template and fails the whole
 //! directory on one bad file, so everything is validated before anything is written.
-use crate::certs::{write_atomic, CertPaths};
-use crate::docker::{run_ok, Docker};
+use crate::certs::{tls_dir, write_atomic, CertPaths};
+use crate::docker::{run_ok, Docker, Output};
 use crate::labels::{MANAGED, NETWORK, PROXY_CONTAINER};
 use crate::paths::DevPaths;
 use crate::project::check_name;
@@ -101,6 +101,31 @@ pub fn preflight_ports_with(d: &dyn Docker, probe: &dyn Fn(u16) -> Probe) -> Res
     Ok(())
 }
 
+/// Replays one recorded `Output`, so a failed call becomes `run_ok`'s
+/// `DevError::Docker` (trimmed, capped stderr) without running docker again.
+struct Replay(std::sync::Mutex<Option<Output>>);
+
+impl Docker for Replay {
+    fn run(&self, _args: &[&str], _stdin: Option<&[u8]>) -> Result<Output, DevError> {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(slot.take().unwrap_or_else(|| Output::fail(-1, "")))
+    }
+}
+
+/// The `DevError::Docker` for a failed `out` of `docker <args>`.
+fn docker_error(args: &[&str], out: Output) -> DevError {
+    let status = out.status;
+    let replay = Replay(std::sync::Mutex::new(Some(out)));
+    match run_ok(&replay, args) {
+        Err(e) => e,
+        Ok(_) => DevError::Docker {
+            args: args.iter().map(|a| a.to_string()).collect(),
+            status,
+            stderr: String::new(),
+        },
+    }
+}
+
 /// `None` when the network is missing, else whether saiife created it.
 fn network_is_ours(d: &dyn Docker) -> Result<Option<bool>, DevError> {
     let args = [
@@ -116,7 +141,7 @@ fn network_is_ours(d: &dyn Docker) -> Result<Option<bool>, DevError> {
         if err.contains("not found") || err.contains("no such network") {
             return Ok(None);
         }
-        return run_ok(d, &args).map(|_| None);
+        return Err(docker_error(&args, out));
     }
     let labels: Option<BTreeMap<String, String>> =
         serde_json::from_slice(&out.stdout).unwrap_or(None);
@@ -587,6 +612,8 @@ mod tests {
             DevError::Docker { .. }
         ));
         assert_eq!(created(&d), 0);
+        // The error comes from the first inspect; it is not run again.
+        assert_eq!(d.calls().len(), 1);
     }
 
     fn setup() -> (tempfile::TempDir, DevPaths) {
@@ -828,5 +855,648 @@ mod tests {
             .unwrap()
             .clone();
         assert!(ra.keys().all(|k| !rb.contains_key(k)));
+    }
+}
+
+// plan 23 task 5: the proxy container.
+
+/// The Traefik image. The owner appends `@sha256:<digest>`.
+pub const PROXY_IMAGE: &str = "traefik:v3.7.16";
+
+/// Label carrying `spec_hash(run_args)`; a different value means recreate.
+const SPEC: &str = "saiife.dev.proxy-spec";
+
+/// `--user <uid>:<gid>` of the owner of `paths.state` (or of its nearest
+/// existing ancestor, before the first `up` creates it), so the proxy can read
+/// the user's 0600 leaf keys.
+#[cfg(unix)]
+fn user_arg(paths: &DevPaths) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = paths.state.ancestors().find_map(|p| fs::metadata(p).ok())?;
+    Some(format!("{}:{}", meta.uid(), meta.gid()))
+}
+
+/// The full `docker run` argument list for the proxy, without the spec label.
+pub(crate) fn run_args(paths: &DevPaths) -> Vec<String> {
+    let dynamic = format!("{}:/saiife/dynamic:ro", dynamic_dir(paths).display());
+    let tls = format!("{}:/saiife/tls:ro", tls_dir(paths).display());
+    let managed = format!("{MANAGED}=true");
+    let role = format!("{ROLE}=proxy");
+    let mut a: Vec<String> = [
+        "run",
+        "-d",
+        "--name",
+        PROXY_CONTAINER,
+        "--network",
+        NETWORK,
+        "--restart",
+        "unless-stopped",
+        "--label",
+        &managed,
+        "--label",
+        &role,
+        "-p",
+        "127.0.0.1:80:8080",
+        "-p",
+        "127.0.0.1:443:8443",
+        "-v",
+        &dynamic,
+        "-v",
+        &tls,
+        "--read-only",
+        "--tmpfs",
+        "/tmp",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    #[cfg(unix)]
+    if let Some(user) = user_arg(paths) {
+        a.push("--user".into());
+        a.push(user);
+    }
+    a.push(PROXY_IMAGE.into());
+    a.extend(
+        [
+            "--providers.file.directory=/saiife/dynamic",
+            "--providers.file.watch=true",
+            "--entryPoints.web.address=:8080",
+            "--entryPoints.web.http.redirections.entryPoint.to=:443",
+            "--entryPoints.web.http.redirections.entryPoint.scheme=https",
+            "--entryPoints.web.http.redirections.entryPoint.permanent=true",
+            "--entryPoints.websecure.address=:8443",
+            "--global.checkNewVersion=false",
+            "--global.sendAnonymousUsage=false",
+            "--log.level=INFO",
+        ]
+        .map(String::from),
+    );
+    a
+}
+
+/// FNV-1a 64-bit over the arguments joined with `\0`, as 16 lowercase hex
+/// digits. Drift detection only; not security-relevant.
+pub(crate) fn spec_hash(args: &[String]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (i, a) in args.iter().enumerate() {
+        let sep: &[u8] = if i == 0 { b"" } else { b"\0" };
+        for &b in sep.iter().chain(a.as_bytes()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// What `container inspect saiife-dev-proxy` said.
+struct Inspected {
+    labels: BTreeMap<String, String>,
+    running: bool,
+}
+
+impl Inspected {
+    fn ours(&self) -> bool {
+        self.labels.get(MANAGED).map(String::as_str) == Some("true")
+            && self.labels.get(ROLE).map(String::as_str) == Some("proxy")
+    }
+}
+
+/// `None` when no container has the proxy's name.
+fn inspect_proxy(d: &dyn Docker) -> Result<Option<Inspected>, DevError> {
+    let args = ["container", "inspect", PROXY_CONTAINER];
+    let out = d.run(&args, None)?;
+    if out.status != 0 {
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        if err.contains("no such container") || err.contains("no such object") {
+            return Ok(None);
+        }
+        return Err(docker_error(&args, out));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let first = &v[0];
+    let labels = first["Config"]["Labels"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(Inspected {
+        labels,
+        running: first["State"]["Running"].as_bool().unwrap_or(false),
+    }))
+}
+
+fn remove_proxy(d: &dyn Docker) -> Result<(), DevError> {
+    run_ok(d, &["rm", "-f", PROXY_CONTAINER]).map(|_| ())
+}
+
+/// Runs `run` or `start`; on failure removes the container and maps an
+/// address-in-use error to `PortBusy`.
+///
+/// After a failed `run` the container is removed only when a fresh inspect
+/// shows it is ours, and never on a name conflict: that container belongs to a
+/// concurrent `up` (or to someone else). A failed `start` is of a container
+/// already inspected as ours.
+fn run_or_clean(d: &dyn Docker, args: &[&str]) -> Result<(), DevError> {
+    let e = match run_ok(d, args) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    let conflict = matches!(&e, DevError::Docker { stderr, .. }
+        if stderr.contains("is already in use by container"));
+    let clean = if args.first() == Some(&"run") {
+        !conflict && matches!(inspect_proxy(d), Ok(Some(c)) if c.ours())
+    } else {
+        true
+    };
+    if clean {
+        // Best effort: the next `up` must start clean; the run error is the one to report.
+        let _ = remove_proxy(d);
+    }
+    match e {
+        DevError::Docker { ref stderr, .. }
+            if stderr.contains("address already in use")
+                || stderr.contains("port is already allocated") =>
+        {
+            Err(DevError::PortBusy {
+                port: if stderr.contains(":443") { 443 } else { 80 },
+                holder: None,
+            })
+        }
+        e => Err(e),
+    }
+}
+
+fn mkdir(dir: PathBuf) -> Result<(), DevError> {
+    fs::create_dir_all(&dir).map_err(|source| DevError::Io { path: dir, source })
+}
+
+/// Makes sure the one `saiife-dev-proxy` container runs with today's spec.
+/// Refuses a container of that name that saiife did not create.
+pub fn ensure_proxy(d: &dyn Docker, paths: &DevPaths) -> Result<(), DevError> {
+    // D1: if these were missing, Docker would create them owned by root.
+    mkdir(dynamic_dir(paths))?;
+    mkdir(tls_dir(paths))?;
+    let mut args = run_args(paths);
+    let spec = spec_hash(&args);
+    let at = args
+        .iter()
+        .position(|a| *a == format!("{ROLE}=proxy"))
+        .map_or(args.len(), |i| i + 1);
+    args.splice(at..at, ["--label".into(), format!("{SPEC}={spec}")]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match inspect_proxy(d)? {
+        None => run_or_clean(d, &args),
+        Some(c) if !c.ours() => Err(DevError::NotOurs {
+            kind: "container",
+            name: PROXY_CONTAINER.into(),
+        }),
+        Some(c) if c.labels.get(SPEC) != Some(&spec) => {
+            remove_proxy(d)?;
+            run_or_clean(d, &args)
+        }
+        Some(c) if !c.running => run_or_clean(d, &["start", PROXY_CONTAINER]),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Whether any project route file is left in the dynamic directory.
+fn routes_left(paths: &DevPaths) -> Result<bool, DevError> {
+    let dir = dynamic_dir(paths);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(DevError::Io { path: dir, source }),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| DevError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".toml") && name != TLS_FILE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Removes the proxy once no project has routes left. Returns `true` when it
+/// removed the proxy. A missing or foreign container is left alone.
+pub fn stop_proxy_if_unused(d: &dyn Docker, paths: &DevPaths) -> Result<bool, DevError> {
+    if routes_left(paths)? {
+        return Ok(false);
+    }
+    match inspect_proxy(d)? {
+        Some(c) if c.ours() => remove_proxy(d).map(|()| true),
+        _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+
+    use crate::docker::{FakeDocker, Output};
+
+    const INSPECT: &[&str] = &["container", "inspect", "saiife-dev-proxy"];
+    const RM: &[&str] = &["rm", "-f", "saiife-dev-proxy"];
+    const START: &[&str] = &["start", "saiife-dev-proxy"];
+    const MISSING: &str = "Error: No such container: saiife-dev-proxy";
+
+    fn setup() -> (tempfile::TempDir, DevPaths) {
+        let d = tempfile::tempdir().unwrap();
+        let paths = DevPaths {
+            state: d.path().join("state"),
+            config: d.path().join("config"),
+        };
+        (d, paths)
+    }
+
+    fn full_args(paths: &DevPaths) -> Vec<String> {
+        let mut a = run_args(paths);
+        let h = spec_hash(&a);
+        let at = a.iter().position(|x| x == "saiife.dev.role=proxy").unwrap() + 1;
+        a.insert(at, "--label".into());
+        a.insert(at + 1, format!("saiife.dev.proxy-spec={h}"));
+        a
+    }
+
+    fn inspect_reply(labels: &str, running: bool) -> Output {
+        Output::ok(format!(
+            r#"[{{"Config":{{"Labels":{labels}}},"State":{{"Running":{running}}}}}]"#
+        ))
+    }
+
+    fn ours(paths: &DevPaths, spec: Option<&str>) -> String {
+        let spec = spec.map_or_else(|| spec_hash(&run_args(paths)), str::to_string);
+        format!(
+            r#"{{"saiife.managed":"true","saiife.dev.role":"proxy","saiife.dev.proxy-spec":"{spec}"}}"#
+        )
+    }
+
+    fn count(d: &FakeDocker, prefix: &[&str]) -> usize {
+        d.calls()
+            .iter()
+            .filter(|c| {
+                c.args.len() >= prefix.len() && c.args.iter().zip(prefix).all(|(a, p)| a == p)
+            })
+            .count()
+    }
+
+    fn has_pair(a: &[String], x: &str, y: &str) -> bool {
+        a.windows(2).any(|w| w[0] == x && w[1] == y)
+    }
+
+    #[test]
+    fn run_args_are_locked_down() {
+        // A state path outside any `/projects` directory, so the check below
+        // sees only what saiife itself adds.
+        let paths = DevPaths {
+            state: PathBuf::from("/nonexistent-p23/state"),
+            config: PathBuf::from("/nonexistent-p23/config"),
+        };
+        let a = run_args(&paths);
+        assert_eq!(&a[..2], &["run", "-d"]);
+        assert!(a.iter().any(|x| x == "--read-only"));
+        assert!(has_pair(&a, "--cap-drop", "ALL"));
+        assert!(has_pair(&a, "-p", "127.0.0.1:80:8080"));
+        assert!(has_pair(&a, "-p", "127.0.0.1:443:8443"));
+        let dynamic = format!("{}:/saiife/dynamic:ro", dynamic_dir(&paths).display());
+        let tls = format!("{}:/saiife/tls:ro", tls_dir(&paths).display());
+        assert!(has_pair(&a, "-v", &dynamic), "{a:?}");
+        assert!(has_pair(&a, "-v", &tls), "{a:?}");
+        assert_eq!(a.iter().filter(|x| *x == "-v").count(), 2);
+        assert!(a
+            .iter()
+            .any(|x| x == "--providers.file.directory=/saiife/dynamic"));
+        assert!(a
+            .iter()
+            .any(|x| x == "--entryPoints.web.http.redirections.entryPoint.to=:443"));
+        let ca = paths.ca_dir().display().to_string();
+        for x in &a {
+            assert!(!x.contains("docker.sock"), "{x}");
+            assert!(!x.contains("providers.docker"), "{x}");
+            assert!(!x.contains("/projects"), "{x}");
+            assert!(!x.contains(&ca), "{x}");
+        }
+        let img = a.iter().position(|x| x == PROXY_IMAGE).unwrap();
+        assert_eq!(
+            &a[img + 1..],
+            &[
+                "--providers.file.directory=/saiife/dynamic",
+                "--providers.file.watch=true",
+                "--entryPoints.web.address=:8080",
+                "--entryPoints.web.http.redirections.entryPoint.to=:443",
+                "--entryPoints.web.http.redirections.entryPoint.scheme=https",
+                "--entryPoints.web.http.redirections.entryPoint.permanent=true",
+                "--entryPoints.websecure.address=:8443",
+                "--global.checkNewVersion=false",
+                "--global.sendAnonymousUsage=false",
+                "--log.level=INFO",
+            ]
+        );
+        assert_eq!(a.iter().any(|x| x == "--user"), cfg!(unix));
+    }
+
+    #[test]
+    fn image_is_pinned() {
+        let rest = PROXY_IMAGE.strip_prefix("traefik:v3.7.16").unwrap();
+        if !rest.is_empty() {
+            let hex = rest.strip_prefix("@sha256:").unwrap();
+            assert_eq!(hex.len(), 64);
+            assert!(hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        }
+    }
+
+    #[test]
+    fn missing_proxy_is_run() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, Output::fail(1, MISSING));
+        d.on(&["run"], Output::ok("id\n"));
+        ensure_proxy(&d, &paths).unwrap();
+        assert!(dynamic_dir(&paths).is_dir());
+        assert!(tls_dir(&paths).is_dir());
+        let runs: Vec<_> = d
+            .calls()
+            .into_iter()
+            .filter(|c| c.args[0] == "run")
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].args, full_args(&paths));
+        assert_eq!(count(&d, RM), 0);
+    }
+
+    #[test]
+    fn running_proxy_with_same_spec_is_left_alone() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), true));
+        ensure_proxy(&d, &paths).unwrap();
+        assert_eq!(
+            count(&d, &["run"]) + count(&d, &["start"]) + count(&d, &["rm"]),
+            0
+        );
+    }
+
+    #[test]
+    fn stopped_proxy_is_started() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), false));
+        d.on(START, Output::ok("saiife-dev-proxy\n"));
+        ensure_proxy(&d, &paths).unwrap();
+        assert_eq!(count(&d, START), 1);
+        assert_eq!(count(&d, &["run"]) + count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn changed_spec_is_recreated() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(
+            INSPECT,
+            inspect_reply(&ours(&paths, Some("0000000000000000")), true),
+        );
+        d.on(RM, Output::ok("saiife-dev-proxy\n"));
+        d.on(&["run"], Output::ok("id\n"));
+        ensure_proxy(&d, &paths).unwrap();
+        let tail: Vec<_> = d.calls().into_iter().skip(1).map(|c| c.args).collect();
+        assert_eq!(tail.len(), 2, "{tail:?}");
+        assert_eq!(tail[0], RM);
+        assert_eq!(tail[1], full_args(&paths));
+    }
+
+    #[test]
+    fn foreign_container_is_refused() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply("null", true));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(
+            &e,
+            DevError::NotOurs { kind: "container", name } if name == "saiife-dev-proxy"
+        ));
+        assert_eq!(count(&d, &["rm"]) + count(&d, &["run"]), 0);
+    }
+
+    #[test]
+    fn failed_run_removes_the_container() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.once(INSPECT, Output::fail(1, MISSING));
+        // The half-made container `run` left behind carries our labels.
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), false));
+        d.on(
+            &["run"],
+            Output::fail(
+                125,
+                "Bind for 127.0.0.1:443 failed: port is already allocated",
+            ),
+        );
+        d.on(RM, Output::ok("saiife-dev-proxy\n"));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                DevError::PortBusy {
+                    port: 443,
+                    holder: None
+                }
+            ),
+            "{e:?}"
+        );
+        assert_eq!(d.calls().last().unwrap().args, RM);
+    }
+
+    #[test]
+    fn failed_start_on_80_is_port_busy() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), false));
+        d.on(
+            START,
+            Output::fail(1, "listen tcp4 127.0.0.1:80: bind: address already in use"),
+        );
+        d.on(RM, Output::ok(""));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                DevError::PortBusy {
+                    port: 80,
+                    holder: None
+                }
+            ),
+            "{e:?}"
+        );
+        assert_eq!(d.calls().last().unwrap().args, RM);
+    }
+
+    #[test]
+    fn other_run_failure_is_a_docker_error() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, Output::fail(1, MISSING));
+        d.on(&["run"], Output::fail(125, "Unable to find image"));
+        d.on(RM, Output::ok(""));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(e, DevError::Docker { status: 125, .. }), "{e:?}");
+        // Nothing was created, so the re-inspect finds nothing to remove.
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn run_conflict_removes_nothing() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.once(INSPECT, Output::fail(1, MISSING));
+        // A concurrent `up` won the race; its proxy is ours but not this run's.
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), true));
+        d.on(
+            &["run"],
+            Output::fail(
+                125,
+                "docker: Error response from daemon: Conflict. The container name \
+                 \"/saiife-dev-proxy\" is already in use by container \"abc\".",
+            ),
+        );
+        d.on(RM, Output::ok(""));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(e, DevError::Docker { status: 125, .. }), "{e:?}");
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn failed_run_keeps_a_foreign_container() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.once(INSPECT, Output::fail(1, MISSING));
+        d.on(INSPECT, inspect_reply(r#"{"maintainer":"someone"}"#, true));
+        d.on(
+            &["run"],
+            Output::fail(
+                125,
+                "Bind for 127.0.0.1:443 failed: port is already allocated",
+            ),
+        );
+        d.on(RM, Output::ok(""));
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(e, DevError::PortBusy { port: 443, .. }), "{e:?}");
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn failed_inspect_is_not_rerun() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(
+            INSPECT,
+            Output::fail(1, "  Cannot connect to the Docker daemon\n"),
+        );
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(
+            matches!(&e, DevError::Docker { status: 1, stderr, args }
+                if stderr == "Cannot connect to the Docker daemon" && args[1] == "inspect"),
+            "{e:?}"
+        );
+        assert_eq!(d.calls().len(), 1);
+    }
+
+    #[test]
+    fn docker_down_is_an_error() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(
+            INSPECT,
+            Output::fail(1, "Cannot connect to the Docker daemon"),
+        );
+        let e = ensure_proxy(&d, &paths).unwrap_err();
+        assert!(matches!(e, DevError::Docker { .. }), "{e:?}");
+        assert_eq!(count(&d, &["run"]) + count(&d, &["rm"]), 0);
+    }
+
+    fn touch(paths: &DevPaths, name: &str) {
+        let dir = dynamic_dir(paths);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), "").unwrap();
+    }
+
+    #[test]
+    fn proxy_kept_while_routes_exist() {
+        let (_t, paths) = setup();
+        touch(&paths, "shop.toml");
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), true));
+        assert!(!stop_proxy_if_unused(&d, &paths).unwrap());
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn tls_file_alone_does_not_keep_the_proxy() {
+        let (_t, paths) = setup();
+        touch(&paths, TLS_FILE);
+        touch(&paths, ".shop.toml.tmp");
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), true));
+        d.on(RM, Output::ok(""));
+        assert!(stop_proxy_if_unused(&d, &paths).unwrap());
+        assert_eq!(d.calls().last().unwrap().args, RM);
+    }
+
+    #[test]
+    fn unused_proxy_is_removed() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(&ours(&paths, None), false));
+        d.on(RM, Output::ok(""));
+        assert!(stop_proxy_if_unused(&d, &paths).unwrap());
+        assert_eq!(count(&d, RM), 1);
+    }
+
+    #[test]
+    fn missing_proxy_is_not_removed() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, Output::fail(1, MISSING));
+        assert!(!stop_proxy_if_unused(&d, &paths).unwrap());
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn foreign_proxy_is_not_removed() {
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, inspect_reply(r#"{"maintainer":"someone"}"#, true));
+        assert!(!stop_proxy_if_unused(&d, &paths).unwrap());
+        assert_eq!(count(&d, &["rm"]), 0);
+    }
+
+    #[test]
+    fn spec_hash_is_stable() {
+        // Published FNV-1a 64 vectors.
+        assert_eq!(spec_hash(&[]), "cbf29ce484222325");
+        assert_eq!(spec_hash(&["a".into()]), "af63dc4c8601ec8c");
+        assert_eq!(spec_hash(&["foobar".into()]), "85944171f73967e8");
+        let a: Vec<String> = ["run", "-d", "x"].map(String::from).to_vec();
+        let mut b = a.clone();
+        b[2] = "y".into();
+        assert_eq!(spec_hash(&a).len(), 16);
+        assert_ne!(spec_hash(&a), spec_hash(&b));
+        // The separator counts: ["ab"] is not ["a", "b"].
+        assert_ne!(
+            spec_hash(&["ab".into()]),
+            spec_hash(&["a".into(), "b".into()])
+        );
     }
 }
