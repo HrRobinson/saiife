@@ -4,12 +4,16 @@
 //! The proxy goes only through `proxy::stop_proxy_if_unused`; the shared network
 //! is never removed (its labels carry no project, so the project filter misses it).
 
+use std::io::IsTerminal;
+
+use saiife_dev::certs::remove_project_cert;
 use saiife_dev::docker::{run_ok, Docker};
 use saiife_dev::labels::{compose_project, MANAGED, PROJECT};
 use saiife_dev::paths::DevPaths;
 use saiife_dev::{project, proxy};
 
-use super::{confirm, valid_project, Res};
+use super::inventory::{inventory, Row, State};
+use super::{confirm, valid_project, Res, NEED_YES};
 use crate::text::sanitize;
 
 /// `--filter` pairs: labelled by saiife, and for one project when given.
@@ -207,8 +211,135 @@ pub(crate) fn down(
     Ok(())
 }
 
+/// The last line of every `gc` that got past its checks.
+const IMAGE_LINE: &str = "Dangling images are not touched: saiife removes only what it labelled saiife.managed=true. docker image prune removes them.";
+
 /// Removes what saiife labelled for stopped and missing projects.
+///
+/// A stopped project keeps its state dir while its folder exists, so its name
+/// and URLs stay stable (P4); a missing one loses its state and leaf cert.
+/// An unreadable `project.json` stops `gc` before any docker call: with one
+/// project unknown, its labelled things could not be told apart.
 pub(crate) fn gc(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool) -> Res {
-    let _ = (d, paths, volumes, yes);
-    Err("not built yet".into())
+    let inv = inventory(d, paths)?;
+    if let Some(e) = &inv.docker_error {
+        return Err(format!(
+            "docker did not answer, so nothing was removed: {}",
+            e.trim_end()
+        ));
+    }
+    // Ask nothing halfway: with no one to say yes, nothing at all is removed.
+    if volumes && !yes && !std::io::stdin().is_terminal() {
+        return Err(NEED_YES.into());
+    }
+    let mut failed = 0usize;
+    // Projects whose route files step 4 leaves alone: kept, or half removed.
+    let mut kept: Vec<&str> = Vec::new();
+    for row in &inv.rows {
+        let name = sanitize(&row.name);
+        match row.state {
+            // `Unknown` only comes with `docker_error`, handled above.
+            State::Running | State::Partial | State::Unknown => {
+                kept.push(&row.name);
+                outln!("kept {name}: still running");
+            }
+            State::Stopped | State::Missing => match gc_project(d, paths, row) {
+                Ok(()) => outln!("removed {name} ({})", row.state.as_str()),
+                Err(e) => {
+                    failed += 1;
+                    kept.push(&row.name);
+                    eprintln!(
+                        "saiife dev: could not remove {name}: {}",
+                        sanitize(e.trim_end())
+                    );
+                }
+            },
+        }
+    }
+    let rest = gc_shared(d, paths, &kept, volumes, yes);
+    outln!("{IMAGE_LINE}");
+    rest?;
+    if failed > 0 {
+        return Err(format!(
+            "{failed} of the projects above could not be removed; the lines above say why."
+        ));
+    }
+    Ok(())
+}
+
+/// Step 3 for one stopped or missing project.
+fn gc_project(d: &dyn Docker, paths: &DevPaths, row: &Row) -> Res {
+    let ids: Vec<String> = row.containers.iter().map(|c| c.id.clone()).collect();
+    remove_containers(d, &ids, false)?;
+    // A name from `docker ps` that is not a project name never reaches a path.
+    if !valid_project(&row.name) {
+        return Ok(());
+    }
+    proxy::remove_routes(paths, &row.name).map_err(|e| e.to_string())?;
+    if row.state == State::Missing {
+        match std::fs::remove_dir_all(paths.project_dir(&row.name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        remove_project_cert(paths, &row.name).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Steps 4 to 6: stale route files, the proxy, networks, volumes.
+fn gc_shared(d: &dyn Docker, paths: &DevPaths, kept: &[&str], volumes: bool, yes: bool) -> Res {
+    let mut stale = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(paths.proxy_dir().join("dynamic")) {
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            let Some(stem) = file.to_str().and_then(|f| f.strip_suffix(".toml")) else {
+                continue;
+            };
+            if valid_project(stem) && !kept.contains(&stem) {
+                stale.push(stem.to_string());
+            }
+        }
+    }
+    stale.sort();
+    for stem in &stale {
+        proxy::remove_routes(paths, stem).map_err(|e| e.to_string())?;
+    }
+    if !stale.is_empty() {
+        outln!("removed stale routes: {}", stale.join(", "));
+    }
+    if proxy::stop_proxy_if_unused(d, paths).map_err(|e| e.to_string())? {
+        outln!("Proxy stopped: no project is running.");
+    }
+    let mut prune: Vec<String> = vec!["network".into(), "prune".into(), "-f".into()];
+    prune.extend(label_filters(None));
+    prune.push("--filter".into());
+    prune.push(format!("label={PROJECT}"));
+    let out = run_strings(d, &prune)?;
+    let nets: Vec<String> = out
+        .lines()
+        .skip_while(|l| l.trim() != "Deleted Networks:")
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(sanitize)
+        .collect();
+    if !nets.is_empty() {
+        outln!("removed unused saiife networks: {}", nets.join(", "));
+    }
+    let unused = labelled_volumes(d, None, true)?;
+    if volumes {
+        confirm_volumes(&unused, yes, "saiife dev")?;
+        rm_volumes(d, &unused)?;
+        if !unused.is_empty() {
+            let shown: Vec<String> = unused.iter().map(|n| sanitize(n)).collect();
+            outln!("Volumes deleted: {}.", shown.join(", "));
+        }
+    } else if !unused.is_empty() {
+        outln!(
+            "{} saiife volumes kept; saiife dev gc --volumes deletes them.",
+            unused.len()
+        );
+    }
+    Ok(())
 }

@@ -1098,3 +1098,329 @@ fn up_then_ls_shows_it_running_with_its_url() {
         stdout(&o)
     );
 }
+
+// ---- plan 24 Task 5: saiife dev gc ----
+
+#[cfg(unix)]
+const IMAGE_LINE: &str = "Dangling images are not touched: saiife removes only what it labelled saiife.managed=true. docker image prune removes them.";
+
+/// `a` running, `b` stopped, `c` missing (its folder deleted), each with a
+/// route file; `c` also has a leaf cert dir.
+#[cfg(unix)]
+fn seed_three(d: &Dev) {
+    seed_up(d, "a");
+    seed_up(d, "b");
+    let c = seed_up(d, "c");
+    fs::remove_dir_all(&c).unwrap();
+    let tls = d.state.join("saiife/dev/tls/c");
+    fs::create_dir_all(&tls).unwrap();
+    fs::write(tls.join("cert.pem"), "x").unwrap();
+}
+
+#[cfg(unix)]
+fn three_ps() -> Rule {
+    ps_rule(&[
+        ("a1", "saiife-a-web-1", "a", "running"),
+        ("b1", "saiife-b-web-1", "b", "exited"),
+        ("b2", "saiife-b-db-1", "b", "exited"),
+        ("c1", "saiife-c-web-1", "c", "exited"),
+        ("p1", "saiife-dev-proxy", "", "running"),
+    ])
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_removes_stopped_and_missing_keeps_running() {
+    let d = Dev::with(vec![three_ps()]);
+    seed_three(&d);
+    let projects = d.state.join("saiife/dev/projects");
+    let b_before = fs::read(projects.join("b/project.json")).unwrap();
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    for want in [
+        "removed b (stopped)",
+        "removed c (missing)",
+        "kept a: still running",
+    ] {
+        assert!(out.lines().any(|l| l == want), "{want}\n{out}");
+    }
+    assert!(!projects.join("c").exists());
+    assert!(!d.state.join("saiife/dev/tls/c").exists());
+    assert!(projects.join("a/project.json").is_file());
+    assert_eq!(fs::read(projects.join("b/project.json")).unwrap(), b_before);
+    let dynamic = d.state.join("saiife/dev/proxy/dynamic");
+    assert!(dynamic.join("a.toml").is_file());
+    assert!(!dynamic.join("b.toml").exists());
+    assert!(!dynamic.join("c.toml").exists());
+    let calls = d.calls();
+    assert!(calls.contains(&"rm b1 b2".to_string()), "{calls:?}");
+    assert!(calls.contains(&"rm c1".to_string()), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("rm ") && c.split(' ').any(|w| w == "a1" || w == "p1")),
+        "{calls:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_removes_only_labelled() {
+    let d = Dev::with(vec![
+        three_ps(),
+        Rule::ok(
+            "network prune*",
+            "Deleted Networks:\nsaiife-b_default\nsaiife-c_default\n",
+        ),
+        Rule::ok("volume ls*", "saiife-b_db\n"),
+    ]);
+    seed_three(&d);
+    let o = d.saiife(&["dev", "gc", "--volumes", "--yes"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o)
+            .lines()
+            .any(|l| l == "removed unused saiife networks: saiife-b_default, saiife-c_default"),
+        "{}",
+        stdout(&o)
+    );
+    let calls = d.calls();
+    // What the labelled listings returned.
+    let listed = ["a1", "b1", "b2", "c1", "p1", "saiife-b_db"];
+    let mut seen_listing = false;
+    for c in &calls {
+        if c.starts_with("ps -a --filter label=saiife.managed=true")
+            || c.starts_with("volume ls -q --filter label=saiife.managed=true")
+        {
+            seen_listing = true;
+        }
+        if c == "rm -f saiife-dev-proxy" {
+            continue;
+        }
+        let names: Option<&str> = c
+            .strip_prefix("rm ")
+            .or_else(|| c.strip_prefix("network rm "))
+            .or_else(|| c.strip_prefix("volume rm "));
+        if let Some(names) = names {
+            assert!(seen_listing, "{c} before any labelled listing: {calls:?}");
+            for n in names.split(' ') {
+                assert!(listed.contains(&n), "{n} was never listed: {calls:?}");
+            }
+        }
+        if c.contains("prune") {
+            assert!(
+                c.contains("--filter label=saiife.managed=true")
+                    && c.contains("--filter label=saiife.dev.project"),
+                "{c}"
+            );
+        }
+        assert!(
+            !(c.starts_with("network rm") && c.split(' ').any(|w| w == "saiife-dev")),
+            "{c}"
+        );
+        assert!(!c.contains("image"), "{c}");
+    }
+    assert!(
+        calls.iter().any(|c| c.contains("network prune")),
+        "{calls:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_says_images_are_not_touched() {
+    let d = Dev::with(vec![]);
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o).lines().last(),
+        Some(IMAGE_LINE),
+        "{}",
+        stdout(&o)
+    );
+
+    let d = Dev::with(vec![three_ps()]);
+    seed_three(&d);
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o).lines().last(),
+        Some(IMAGE_LINE),
+        "{}",
+        stdout(&o)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_volumes_without_yes_deletes_nothing() {
+    let d = Dev::with(vec![three_ps(), Rule::ok("volume ls*", "saiife-b_db\n")]);
+    seed_three(&d);
+    let o = d.saiife(&["dev", "gc", "--volumes"], d.root.path());
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains(
+            "saiife dev: deleting volumes needs a yes. Run it in a terminal, or add --yes."
+        ),
+        "{}",
+        stderr(&o)
+    );
+    let calls = d.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("rm") || c.contains(" rm") || c.contains("prune")),
+        "{calls:?}"
+    );
+    assert!(d.state.join("saiife/dev/projects/c").is_dir());
+    assert!(d.state.join("saiife/dev/proxy/dynamic/b.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_volumes_with_yes() {
+    let d = Dev::with(vec![Rule::ok("volume ls*", "v1\nv2\n")]);
+    let o = d.saiife(&["dev", "gc", "--volumes", "--yes"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let calls = d.calls();
+    let ls = calls
+        .iter()
+        .position(|c| c == "volume ls -q --filter label=saiife.managed=true --filter dangling=true")
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    let rms: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.starts_with("volume rm"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(rms.len(), 1, "{calls:?}");
+    assert!(ls < rms[0], "{calls:?}");
+    assert_eq!(calls[rms[0]], "volume rm v1 v2");
+    // The removals of steps 3 to 5 come before the listing.
+    let prune = calls
+        .iter()
+        .position(|c| c.contains("network prune"))
+        .unwrap();
+    assert!(prune < ls, "{calls:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_removes_stale_route_files_only() {
+    let d = Dev::with(vec![ps_rule(&[("a1", "saiife-a-web-1", "a", "running")])]);
+    seed_up(&d, "a");
+    let dynamic = d.state.join("saiife/dev/proxy/dynamic");
+    fs::write(dynamic.join("ghost.toml"), "").unwrap();
+    fs::write(dynamic.join("_tls.toml"), "").unwrap();
+    fs::write(dynamic.join("Bad.toml"), "").unwrap();
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o)
+            .lines()
+            .any(|l| l == "removed stale routes: ghost"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(!dynamic.join("ghost.toml").exists());
+    assert!(dynamic.join("a.toml").is_file());
+    assert!(dynamic.join("_tls.toml").is_file());
+    assert!(dynamic.join("Bad.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_docker_down_removes_nothing() {
+    let d = Dev::with(vec![Rule::fail(
+        "ps -a *",
+        1,
+        "Cannot connect to the Docker daemon",
+    )]);
+    seed_three(&d);
+    let projects = d.state.join("saiife/dev/projects");
+    let read_all = || -> Vec<Vec<u8>> {
+        ["a", "b", "c"]
+            .iter()
+            .map(|p| fs::read(projects.join(p).join("project.json")).unwrap())
+            .collect()
+    };
+    let before = read_all();
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains("docker did not answer, so nothing was removed"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(read_all(), before);
+    assert_eq!(d.calls().len(), 1, "{:?}", d.calls());
+    assert!(d.state.join("saiife/dev/proxy/dynamic/b.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_counts_kept_volumes() {
+    let d = Dev::with(vec![Rule::ok("volume ls*", "v1\nv2\nv3\n")]);
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o)
+            .lines()
+            .any(|l| l == "3 saiife volumes kept; saiife dev gc --volumes deletes them."),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        !d.calls().iter().any(|c| c.starts_with("volume rm")),
+        "{:?}",
+        d.calls()
+    );
+
+    let d = Dev::with(vec![]);
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("volumes kept"), "{}", stdout(&o));
+}
+
+/// A corrupt `project.json` stops `gc` before any docker call: with one
+/// project unreadable, gc cannot tell which labelled things are its.
+#[cfg(unix)]
+#[test]
+fn gc_a_bad_state_file_is_one_clear_line() {
+    let d = Dev::with(vec![three_ps()]);
+    seed_three(&d);
+    let pdir = d.state.join("saiife/dev/projects/other");
+    fs::create_dir_all(&pdir).unwrap();
+    fs::write(pdir.join("project.json"), "{not json").unwrap();
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.starts_with("saiife dev: "), "{err}");
+    assert!(d.calls().is_empty(), "{:?}", d.calls());
+    assert!(d.state.join("saiife/dev/projects/c").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_one_failing_project_does_not_stop_the_others() {
+    let d = Dev::with(vec![three_ps(), Rule::fail("rm b1 b2", 1, "conflict")]);
+    seed_three(&d);
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(
+        err.lines()
+            .any(|l| l.starts_with("saiife dev: could not remove b: ")),
+        "{err}"
+    );
+    assert!(
+        stdout(&o).lines().any(|l| l == "removed c (missing)"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(stdout(&o).lines().last(), Some(IMAGE_LINE));
+    assert!(d.calls().iter().any(|c| c.contains("network prune")));
+    assert!(d.state.join("saiife/dev/proxy/dynamic/b.toml").is_file());
+}
