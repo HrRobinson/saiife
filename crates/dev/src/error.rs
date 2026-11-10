@@ -40,6 +40,11 @@ pub enum DevError {
     },
     Rewrite(String),
     // plan 23
+    Cert(String),
+    CaInvalid {
+        path: PathBuf,
+        reason: String,
+    },
     // plan 24
 }
 
@@ -88,6 +93,22 @@ impl fmt::Display for DevError {
                 write!(f, "{}: {msg}", path.display())
             }
             DevError::Rewrite(msg) => write!(f, "cannot prepare the compose model: {msg}"),
+            // plan 23
+            DevError::Cert(msg) => write!(f, "certificate error: {msg}"),
+            DevError::CaInvalid { path, reason } => {
+                // `path` is the CA directory itself or one of its files.
+                let dir = match path.extension() {
+                    Some(_) => path.parent().unwrap_or(path),
+                    None => path.as_path(),
+                };
+                write!(
+                    f,
+                    "the saiife dev CA is unusable: {}: {reason}; saiife never replaces it on its own. \
+                     To start over, delete {} and run again, then trust the new CA",
+                    path.display(),
+                    dir.display()
+                )
+            }
         }
     }
 }

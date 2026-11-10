@@ -1564,6 +1564,8 @@ dependencies = [
 name = "saiife-dev"
 version = "0.2.0"
 dependencies = [
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
