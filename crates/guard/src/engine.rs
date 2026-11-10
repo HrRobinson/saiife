@@ -36,7 +36,7 @@ use crate::lexer::{
     BRACES_PAST_LINE_LIMIT, HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT,
 };
 use crate::normalize::{build_argv, windows_program_names};
-use crate::operands::{operands, Operand, Source};
+use crate::operands::{operands, operands_in, Operand, Source};
 use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{fish_input, inline_payload, watch_payload, Dialects};
@@ -2046,7 +2046,8 @@ impl Engine {
         }
         let seg = winpath::path_words(seg, &self.vars);
         let effective = winpath::path_words(effective, &self.vars);
-        let mut ops = operands(&seg, &effective, &self.path_argv(argv, &effective));
+        let windows = self.vars.style() == PathStyle::Windows;
+        let mut ops = operands_in(&seg, &effective, &self.path_argv(argv, &effective), windows);
         ops.extend(extra);
         ops
     }
@@ -2395,7 +2396,8 @@ impl Engine {
         self.path_rules();
         let argv = crate::normalize::build_argv(seg);
         let seg = winpath::path_words(seg, &self.vars);
-        let ops = operands(&seg, &seg, &self.path_argv(&argv, &seg));
+        let windows = self.vars.style() == PathStyle::Windows;
+        let ops = operands_in(&seg, &seg, &self.path_argv(&argv, &seg), windows);
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
         self.judge_operands(ops, &cwds, false, Instant::now(), false)
     }

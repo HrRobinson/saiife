@@ -113,6 +113,17 @@ pub(crate) fn understood(cmd: &str) -> bool {
 /// Like `path_operands`, with whether each operand is a glob and, for a
 /// copy/move target, the names that land in it.
 pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Operand> {
+    operands_in(segment, effective, argv, false)
+}
+
+/// `operands` in a Windows dialect (`windows`: a drive or a backslash root
+/// starts a path from the root) or a POSIX one.
+pub fn operands_in(
+    segment: &[Word],
+    effective: &[Word],
+    argv: &[String],
+    windows: bool,
+) -> Vec<Operand> {
     let mut out = Out(Vec::new());
     redirections(segment, &mut out);
     archiver_options_from_env(segment, &mut out);
@@ -184,7 +195,7 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
     } else if cmd == "wget" {
         wget(rest, &mut out);
     } else if cmd == "tar" || cmd == "bsdtar" {
-        tar(rest, &mut out);
+        tar(rest, &mut out, windows);
     } else if cmd == "unzip" {
         unzip(rest, &mut out);
     } else if cmd == "cpio" {
@@ -751,7 +762,7 @@ fn git(words: &[Option<Tok>], out: &mut Out) {
 /// not written); creating reads the operands, extracting writes them;
 /// `-g F` (`--listed-incremental`) is a snapshot file read and rewritten.
 /// The first word may be a dashless cluster (`tar czf out.tgz`).
-fn tar(words: &[Option<Tok>], out: &mut Out) {
+fn tar(words: &[Option<Tok>], out: &mut Out, windows: bool) {
     // Ignored values: `-b BLOCKS`, `-H FORMAT`, `-K MEMBER` (a name in the
     // archive), `-L LENGTH`, `-N DATE`, `-V LABEL` name no path.
     let spec = Spec {
@@ -786,6 +797,8 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
     ]);
     let extracts = any(&[Name::Short('x'), Name::Long("extract"), Name::Long("get")]);
     let mut dirs: Vec<Tok> = Vec::new();
+    // A `-C` whose value the line does not show (`-C "$(pwd)"`).
+    let mut unseen_dir = false;
     for a in &args {
         match a {
             Arg::Opt(Name::Short('f') | Name::Long("file"), Some(v)) => {
@@ -796,6 +809,7 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
                 }
             }
             Arg::Opt(Name::Short('C') | Name::Long("directory"), Some(v)) => dirs.push(*v),
+            Arg::Opt(Name::Short('C') | Name::Long("directory"), None) => unseen_dir = true,
             Arg::Opt(
                 Name::Short('T' | 'X') | Name::Long("files-from" | "exclude-from"),
                 Some(v),
@@ -822,13 +836,13 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
         // option not known here may change where (an abbreviation of
         // `--absolute-names`), so it counts as `-P`.
         // `-C a -C b` is `a/b`: a relative `-C` after the first joins the one
-        // before, so where it lands is not one of the folders named.
-        let relative_again = dirs.iter().skip(1).any(|d| {
-            !d.s.starts_with(['/', '\\', '~', '$']) && d.s.as_bytes().get(1) != Some(&b':')
-        });
+        // before, so where it lands is not one of the folders named. One with
+        // `..` or a value not known is not known either.
+        let relative_again = dirs.iter().skip(1).any(|d| !rooted_dir(d.s, windows));
         let absolute = any(&[Name::Short('P'), Name::Long("absolute-names")])
             || !all_known(&args, TAR_SHORT, TAR_LONG)
-            || relative_again;
+            || relative_again
+            || unseen_dir;
         extract_into(out, &dirs, absolute);
     }
     for t in members {
@@ -849,6 +863,37 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
             target_dir: false,
         });
     }
+}
+
+/// Does the folder `d` (a `tar -C` value) start from the root, so a `-C`
+/// before it does not move it, and name one known place? By the dialect's
+/// rules: on POSIX `/` or a `~` the shell resolves (`~`, `~/…`), plus
+/// `$HOME`; in a Windows dialect also a drive with its root (`C:/`, `C:\`)
+/// or a root (`\…`). Never with a `..` part or a `$` with no known value.
+fn rooted_dir(d: &str, windows: bool) -> bool {
+    let seps: &[char] = if windows { &['/', '\\'] } else { &['/'] };
+    let (home, rest) = match d.strip_prefix('~') {
+        Some(r) => (true, r),
+        None => match d
+            .strip_prefix("$HOME")
+            .or_else(|| d.strip_prefix("${HOME}"))
+        {
+            Some(r) => (true, r),
+            None => (false, d),
+        },
+    };
+    let rooted = if home {
+        rest.is_empty() || rest.starts_with(seps)
+    } else {
+        let b = d.as_bytes();
+        d.starts_with(seps)
+            || (windows
+                && b.len() > 2
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && matches!(b[2], b'/' | b'\\'))
+    };
+    rooted && !rest.contains('$') && !rest.split(seps).any(|part| part == "..")
 }
 
 /// The `tar` options an extract may carry without changing where its members
@@ -1301,6 +1346,58 @@ mod tests {
             .into_iter()
             .map(|(p, a)| (p, a.label()))
             .collect()
+    }
+
+    /// Like `ops`, in a Windows dialect when `windows`.
+    fn ops_in(cmd: &str, windows: bool) -> Vec<(String, &'static str)> {
+        let seg = split_segments(cmd).remove(0);
+        let eff = unwrap_transparent_prefix(&seg);
+        let argv = build_argv(eff);
+        operands_in(&seg, eff, &argv, windows)
+            .into_iter()
+            .map(|o| (o.path, o.access.label()))
+            .collect()
+    }
+
+    #[test]
+    fn tar_directories_are_absolute_by_the_dialects_rules() {
+        let lands = |cmd: &str, windows: bool| ops_in(cmd, windows).contains(&w("/"));
+        // On POSIX only `/` and a `~` the shell resolves start from the root:
+        // `C:/b`, `\b`, `~bob/b` and `~+` join the `-C` before.
+        for later in ["C:/b", r"'C:\b'", r"'\b'", "~bob/b", "~+/b"] {
+            let cmd = format!("tar -xf x.tar -C a -C {later}");
+            assert!(lands(&cmd, false), "{cmd}");
+        }
+        // In a Windows dialect a drive or a root is absolute too; a drive with
+        // no root (`C:b`) is relative to that drive's folder, which `-C` moved.
+        for later in ["C:/b", r"'C:\b'", r"'\b'", "/b", "~/b", r"'~\b'"] {
+            let cmd = format!("tar -xf x.tar -C a -C {later}");
+            assert!(!lands(&cmd, true), "{cmd}");
+        }
+        for later in ["C:b", "1:/b", "~+/b", "b"] {
+            let cmd = format!("tar -xf x.tar -C a -C {later}");
+            assert!(lands(&cmd, true), "{cmd}");
+        }
+        // `..` or a `$` with no known value: where it lands is not known.
+        for windows in [false, true] {
+            for later in [
+                "/srv/../b",
+                "/srv/..",
+                "~/..",
+                "$X/b",
+                "/srv/$X",
+                "$HOMEX",
+                "\"$(pwd)\"",
+                "`pwd`",
+            ] {
+                let cmd = format!("tar -xf x.tar -C a -C {later}");
+                assert!(lands(&cmd, windows), "{cmd} windows={windows}");
+            }
+            assert!(!lands("tar -xf x.tar -C a -C /srv/..b", windows));
+            assert!(!lands("tar -xf x.tar -C a -C ${HOME}/b", windows));
+            // Only an extract writes.
+            assert!(!lands("tar -tf x.tar -C a -C C:b", windows));
+        }
     }
 
     fn r(p: &str) -> (String, &'static str) {
@@ -1765,6 +1862,14 @@ mod tests {
         assert_eq!(
             ops("tar -xf x.tar -C a -C /srv"),
             vec![r("x.tar"), w("a"), w("/srv")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C ~/srv"),
+            vec![r("x.tar"), w("a"), w("~/srv")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C $HOME/srv"),
+            vec![r("x.tar"), w("a"), w("$HOME/srv")]
         );
         // Options from the environment.
         // (This helper does not peel a leading assignment; the engine does,
