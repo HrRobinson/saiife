@@ -48,8 +48,11 @@ through shell commands that write them (`cp`, `mv`, `tee`, `dd`, `ln`,
   removing, moving or replacing `~/.ssh`, `~/.aws`, `~/.kube`, `~/.docker`,
   `~/.config/gh` (and so on) is blocked, for example `rm -rf ~/.aws`,
   `mv ~/.ssh ~/.ssh.bak`, `ln -s /tmp/x ~/.kube` or `cp -r x/. ~/.ssh/`.
-  Extracting a whole archive into one of them or into your home
-  (`tar -xf x.tar -C ~`) is blocked too: what it holds is not known. Listing
+  Extracting an archive into one of them or into your home is blocked too,
+  with `tar`, `bsdtar`, `unzip`, `cpio -i` or `7z x` (`tar -xf x.tar -C ~`,
+  `cd ~ && unzip x.zip`): what it holds is not known. So is an extract that
+  allows absolute names (`tar -P`, `cpio --absolute-filenames`), wherever it
+  runs. Listing
   them (`ls ~/.ssh`), `chmod 700 ~/.ssh` and writing other files in them
   (`~/.ssh/known_hosts`, `~/.ssh/config`, `~/.aws/config`) stay allowed.
 
@@ -107,9 +110,10 @@ seen:
 - A recursive read of a folder that holds a secret, for example
   `grep -r KEY .` or `cp -r ~/.ssh x`.
 - A secret read from git history: `git show HEAD:.env`.
-- Writes onto another user's credential folders (`/root/.ssh` as a whole)
-  and an archive extracted into the folder you are in (`cd ~ && tar -xf x`):
-  the folder rules name your own home and `tar -C` only.
+- Replacing another user's credential folders as a whole (`rm -rf
+  /root/.ssh`): the folder rules name your own home. Their files are covered.
+- Other extractors and installers (`git clone` into a folder, `pip`, a
+  script) that may write a credential folder.
 - Reads through `find ... -exec cat {} +` and through `xargs`.
 - Gemini CLI's `read_many_files` with a broad pattern (`**/*`). This relies on
   Gemini's own handling of git-ignored files.

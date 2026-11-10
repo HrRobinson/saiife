@@ -1336,6 +1336,55 @@ fn replacing_a_folder_of_secret_files_denies() {
     );
 }
 
+/// An archive extracted into the home or a credential folder may hold
+/// `.ssh/authorized_keys` or `.aws/credentials`: what lands is not known from
+/// the line, so the folder (or `.`, as `cd` left it) is written, and with
+/// absolute member names allowed, `/`. Listing, printing and extracting in
+/// the project stay allowed.
+#[test]
+fn archive_extracts_into_a_secret_folder_deny() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "cd ~ && tar -xf evil.tar",
+        "cd ~/.ssh && tar -xf evil.tar",
+        "cd ~ && tar xzf evil.tgz",
+        "cd ~ && tar -xf evil.tar app/notes",
+        "cd ~ && tar -xf evil.tar --transform s,^,.ssh/, app",
+        "cd ~ && tar -xf evil.tar --strip-components 1 x/y",
+        "tar -xPf evil.tar",
+        "tar -xf evil.tar --absolute-names",
+        "tar -xf evil.tar -P -C /tmp",
+        "cd ~ && bsdtar -xf evil.tar",
+        "cd ~ && unzip evil.zip",
+        "unzip -o evil.zip -d ~/.ssh",
+        "unzip evil.zip -d ~",
+        "cd ~ && cpio -idm < evil.cpio",
+        "cpio -i -D ~/.aws < evil.cpio",
+        "cpio -i --absolute-filenames < evil.cpio",
+        "cd ~/.ssh && 7z x evil.7z",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
+    }
+    assert_allows(
+        &e,
+        &[
+            "tar -xf build.tar",
+            "tar -xzf node.tgz -C vendor",
+            "cd ~ && tar -tf evil.tar",
+            "cd ~ && tar -xOf evil.tar a.txt",
+            "tar -czf backup.tgz src",
+            "unzip -l evil.zip",
+            "unzip dist.zip -d out",
+            "cd ~ && unzip -p evil.zip a.txt",
+            "7z l evil.7z",
+            "7z x dist.7z -oout",
+            "cpio -o < list > out.cpio",
+        ],
+    );
+}
+
 /// The Windows shells (cmd, PowerShell, Git Bash) on a Windows-style engine:
 /// copies, moves, redirects and `Set-Content`-like writes onto a credential
 /// file deny. Any host runs these.
