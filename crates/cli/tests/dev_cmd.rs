@@ -800,3 +800,301 @@ fn down_without_compose_json_removes_by_label() {
         "{calls:?}"
     );
 }
+
+// ---- plan 24 Task 2: `saiife dev up` ----
+
+/// `<state>/saiife/dev/projects/<p>`.
+#[cfg(unix)]
+fn project_state_dir(d: &Dev, p: &str) -> PathBuf {
+    d.state.join("saiife/dev/projects").join(p)
+}
+
+#[cfg(unix)]
+fn shop_repo(d: &Dev) -> PathBuf {
+    d.repo("shop", &[("compose.yaml", "services: {}\n")])
+}
+
+/// Every logged call ending `up -d`.
+#[cfg(unix)]
+fn up_calls(d: &Dev) -> Vec<String> {
+    d.calls()
+        .into_iter()
+        .filter(|c| c.ends_with(" up -d"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn has_key(v: &serde_json::Value, key: &str) -> bool {
+    match v {
+        serde_json::Value::Object(m) => m.iter().any(|(k, v)| k == key || has_key(v, key)),
+        serde_json::Value::Array(a) => a.iter().any(|v| has_key(v, key)),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn read_json(p: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn up_routes_and_prints_urls() {
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.starts_with("saiife dev: shop is up (compose project saiife-shop).\n"),
+        "{out}"
+    );
+    assert!(out.contains("\n  https://web.shop.localhost\n"), "{out}");
+    let quirks = d.config.join("saiife/dev/shop.toml");
+    let not_routed = format!(
+        "Not routed (no port): worker. Set a port in {}.\n",
+        quirks.display()
+    );
+    assert!(out.contains(&not_routed), "{out}");
+    let pdir = project_state_dir(&d, "shop");
+    let compose = pdir.join("compose.json");
+    let want = format!(
+        "compose -p saiife-shop --project-directory {} -f {} up -d",
+        repo.display(),
+        compose.display()
+    );
+    assert_eq!(up_calls(&d), [want]);
+    let model = read_json(&compose);
+    assert!(!has_key(&model, "ports"), "{model}");
+    assert_eq!(model["name"], "saiife-shop");
+    let state = read_json(&pdir.join("project.json"));
+    let last_up = state["last_up"].as_str().unwrap();
+    time::OffsetDateTime::parse(last_up, &time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|e| panic!("{last_up}: {e}"));
+    assert_eq!(
+        read_json(&pdir.join("urls.json")),
+        serde_json::json!(["https://web.shop.localhost"])
+    );
+    assert!(d.state.join("saiife/dev/proxy/dynamic/shop.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn up_defaults_to_the_cwd() {
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up"], &repo);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("https://web.shop.localhost"),
+        "{}",
+        stdout(&o)
+    );
+    let calls = up_calls(&d);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let dir_arg = format!("--project-directory {} ", repo.display());
+    assert!(calls[0].starts_with("compose -p saiife-shop "), "{calls:?}");
+    assert!(calls[0].contains(&dir_arg), "{calls:?}");
+    let state = read_json(&project_state_dir(&d, "shop").join("project.json"));
+    assert_eq!(state["dir"], repo.to_str().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn same_folder_name_gets_dash_two() {
+    let d = Dev::with(vec![]);
+    let a = shop_repo(&d);
+    let b = shop_repo(&d);
+    let up = |dir: &Path| {
+        let o = d.saiife(&["dev", "up", dir.to_str().unwrap()], d.root.path());
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        stdout(&o)
+    };
+    assert!(up(&a).contains("https://web.shop.localhost\n"));
+    let second = up(&b);
+    assert!(
+        second.contains("https://web.shop-2.localhost\n"),
+        "{second}"
+    );
+    assert!(
+        second.starts_with("saiife dev: shop-2 is up (compose project saiife-shop-2).\n"),
+        "{second}"
+    );
+    let third = up(&a);
+    assert!(third.contains("https://web.shop.localhost\n"), "{third}");
+    assert!(!third.contains("shop-2"), "{third}");
+}
+
+#[cfg(unix)]
+#[test]
+fn compose_json_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let pdir = project_state_dir(&d, "shop");
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&pdir.join("compose.json")), 0o600);
+    assert_eq!(mode(&pdir.join("urls.json")), 0o600);
+    assert_eq!(mode(&pdir), 0o700);
+}
+
+/// Every entry under `dir`, sorted: (path, len, mtime).
+#[cfg(unix)]
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        let meta = fs::symlink_metadata(&p).unwrap();
+        out.push((p.clone(), meta.len(), meta.modified().unwrap()));
+        if meta.is_dir() {
+            for e in fs::read_dir(&p).unwrap() {
+                todo.push(e.unwrap().path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn up_never_writes_the_repo() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = Dev::with(vec![]);
+    let repo = d.repo(
+        "shop",
+        &[
+            ("compose.yaml", "services: {}\n"),
+            (".env", "SECRET=not-a-real-one\n"),
+        ],
+    );
+    let before = snapshot(&repo);
+    fs::set_permissions(&repo, fs::Permissions::from_mode(0o555)).unwrap();
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    let o2 = d.saiife(&["dev", "up"], &repo);
+    fs::set_permissions(&repo, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&o2), 0, "{}", stderr(&o2));
+    assert_eq!(snapshot(&repo), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_compose_up_writes_no_routes() {
+    let d = Dev::with(vec![Rule::fail(
+        "compose * up -d",
+        1,
+        "port is already allocated",
+    )]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(err.starts_with("saiife dev: "), "{err}");
+    assert!(err.contains("port is already allocated"), "{err}");
+    assert!(!d.state.join("saiife/dev/proxy/dynamic/shop.toml").exists());
+    assert!(!project_state_dir(&d, "shop").join("urls.json").exists());
+    let state = read_json(&project_state_dir(&d, "shop").join("project.json"));
+    assert!(state["last_up"].is_null(), "{state}");
+    // The proxy is looked at again after the failure (best effort cleanup).
+    let calls = d.calls();
+    let at = calls.iter().position(|c| c.ends_with(" up -d")).unwrap();
+    assert!(
+        calls[at + 1..]
+            .iter()
+            .any(|c| c == "container inspect saiife-dev-proxy"),
+        "{calls:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn not_a_folder_is_a_plain_error() {
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let nope = repo.join("nope");
+    let o = d.saiife(&["dev", "up", nope.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.starts_with("saiife dev: "), "{err}");
+    assert!(err.contains("is not a folder"), "{err}");
+    assert!(d.calls().is_empty(), "{:?}", d.calls());
+    // A file is not a folder either.
+    let file = repo.join("compose.yaml");
+    let o = d.saiife(&["dev", "up", file.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("is not a folder"), "{}", stderr(&o));
+    assert!(d.calls().is_empty(), "{:?}", d.calls());
+}
+
+#[cfg(unix)]
+#[test]
+fn no_port_anywhere_says_how_to_add_one() {
+    let worker_only = r#"{
+  "name": "shop",
+  "services": { "worker": { "image": "busybox:1", "networks": { "default": null } } },
+  "networks": { "default": { "name": "shop_default" } }
+}"#;
+    let d = Dev::with(vec![Rule::ok("*config --format json*", worker_only)]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    let quirks = d.config.join("saiife/dev/shop.toml");
+    let want = format!(
+        "No service has a port, so there is no URL. Set one in {}.\n",
+        quirks.display()
+    );
+    assert!(out.contains(&want), "{out}");
+    assert!(!out.contains("https://"), "{out}");
+    assert_eq!(
+        read_json(&project_state_dir(&d, "shop").join("urls.json")),
+        serde_json::json!([])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn first_up_says_trust_the_ca_once() {
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let line = "New local CA: run saiife dev ca to trust it.\n";
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).ends_with(line), "{}", stdout(&o));
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("New local CA"), "{}", stdout(&o));
+}
+
+#[cfg(unix)]
+#[test]
+fn up_then_ls_shows_it_running_with_its_url() {
+    let d = Dev::with(vec![ps_rule(&[
+        ("a1", "saiife-shop-web-1", "shop", "running"),
+        ("a2", "saiife-shop-worker-1", "shop", "running"),
+    ])]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = ls_json(&d);
+    let row = &v["projects"][0];
+    assert_eq!(row["name"], "shop", "{v}");
+    assert_eq!(row["state"], "running", "{v}");
+    assert_eq!(
+        row["urls"],
+        serde_json::json!(["https://web.shop.localhost"])
+    );
+    assert_eq!(row["dir"], repo.to_str().unwrap());
+    assert!(row["last_up"].is_string(), "{v}");
+    let o = d.saiife(&["dev", "ls"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("https://web.shop.localhost"),
+        "{}",
+        stdout(&o)
+    );
+}

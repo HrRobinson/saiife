@@ -137,8 +137,6 @@ pub(crate) fn confirm(question: &str, yes: bool) -> Result<bool, String> {
 /// Writes `bytes` to `path` so only the user can read it: the parent dir is
 /// `0700` (set even when it exists) and the file `0600` from its creation.
 /// The write goes to `<path>.tmp`, then is renamed over `path`.
-// Used by `up` (plan 24 Task 2: compose.json, urls.json).
-#[allow(dead_code)]
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
