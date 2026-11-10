@@ -20,6 +20,8 @@ P=smokeapp
 CA=$XDG_STATE_HOME/saiife/dev/ca/ca.pem
 FAILS=0
 
+# Called by the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() {
   "$SAIIFE" dev down "$P" --volumes --yes >/dev/null 2>&1 || true
   docker rm -f smoke-canary >/dev/null 2>&1 || true
