@@ -565,3 +565,39 @@ fn ls_text_has_no_escape_from_a_folder_name() {
     assert!(!out.contains('\u{1b}'), "{out:?}");
     assert!(out.contains("shop"), "{out}");
 }
+
+#[test]
+fn dev_page_states_its_facts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let page = fs::read_to_string(root.join("docs/dev.md")).unwrap();
+    let heads = [
+        "## Quick start",
+        "## Names",
+        "## HTTPS and the local CA",
+        "## Quirks",
+        "## Commands",
+        "## Cleanup and labels",
+        "## Limits",
+    ];
+    for want in heads.into_iter().chain([
+        "saiife.managed=true",
+        "saiife.dev.project",
+        "update-ca-certificates",
+        "trust anchor --store",
+        "add-trusted-cert -d -r trustRoot",
+        "certutil -user -addstore Root",
+        "Dangling images are not touched",
+        "--yes",
+        "COMPOSE_FILE",
+        "not a security boundary",
+    ]) {
+        assert!(page.contains(want), "docs/dev.md lacks {want:?}");
+    }
+    let at = |h: &str| page.find(h).unwrap();
+    assert!(
+        heads.windows(2).all(|w| at(w[0]) < at(w[1])),
+        "heading order"
+    );
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(readme.contains("docs/dev.md"), "README lacks docs/dev.md");
+}
