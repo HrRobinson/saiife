@@ -109,9 +109,11 @@ impl Drop for ConnSlot {
 }
 
 /// The global cap for a soft `RLIMIT_NOFILE` of `nofile`: that minus a
-/// reserve of 64, and at least 64.
+/// reserve of 64, and at least room for two users at the per-uid cap.
 pub fn total_cap(nofile: u64) -> u64 {
-    nofile.saturating_sub(FD_RESERVE).max(64)
+    nofile
+        .saturating_sub(FD_RESERVE)
+        .max(2 * MAX_CONNS_PER_UID as u64)
 }
 
 impl ConnLimits {
@@ -225,8 +227,8 @@ mod tests {
     #[test]
     fn total_cap_keeps_a_reserve_and_a_floor() {
         assert_eq!(total_cap(1024), 960);
-        assert_eq!(total_cap(100), 64);
-        assert_eq!(total_cap(0), 64);
+        assert_eq!(total_cap(100), 128);
+        assert_eq!(total_cap(0), 128);
         assert_eq!(total_cap(u64::MAX), u64::MAX - 64);
     }
 }

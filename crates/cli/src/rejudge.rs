@@ -1450,9 +1450,9 @@ mod tests {
             ("saiife init --off", Verdict::Deny),
             ("/opt/saiife/bin/saiife init --off", Verdict::Deny),
             ("/usr/bin/saiife init --off", Verdict::Deny),
-            // Not caught by either: the substitution is not run, so its
-            // command is unknown (the same text, the same answer).
-            ("$(which saiife) init --off", Verdict::Allow),
+            // A command word that may expand to saiife is judged as saiife
+            // by both (the same text, the same answer).
+            ("$(which saiife) init --off", Verdict::Deny),
             ("PATH=/home/other/bin saiife status", Verdict::Deny),
             ("PATH=$PATH claude", Verdict::Deny),
             (&format!("rm {exe}"), Verdict::Deny),
