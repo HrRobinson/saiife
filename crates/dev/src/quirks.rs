@@ -1,5 +1,6 @@
 //! Per-project quirks from the config dir.
 use crate::paths::DevPaths;
+use crate::project::{check_name, dns_label};
 use crate::DevError;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -21,15 +22,6 @@ pub struct ServiceQuirk {
 pub struct Quirks {
     #[serde(default)]
     pub services: BTreeMap<String, ServiceQuirk>,
-}
-
-// TODO(p22-t6): call project::check_name and project::dns_label instead of this local copy.
-fn is_label(s: &str) -> bool {
-    (1..=40).contains(&s.len())
-        && !s.starts_with('-')
-        && !s.ends_with('-')
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Parse and check a quirks file. Errors name the service.
@@ -58,7 +50,7 @@ pub fn parse(text: &str) -> Result<Quirks, String> {
             }
         }
         if let Some(h) = &s.host {
-            if !is_label(h) {
+            if dns_label(h).as_deref() != Some(h.as_str()) {
                 return Err(format!(
                     "services.{name}: host {h:?} must be a DNS label (lowercase letters, digits, -)"
                 ));
@@ -70,10 +62,7 @@ pub fn parse(text: &str) -> Result<Quirks, String> {
 
 /// Load `<config>/<project>.toml`. A missing file means no quirks.
 pub fn load(paths: &DevPaths, project: &str) -> Result<Quirks, DevError> {
-    // TODO(p22-t6): call project::check_name
-    if !is_label(project) {
-        return Err(DevError::BadProjectName(project.to_string()));
-    }
+    check_name(project)?;
     let path = paths.quirks_file(project);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
