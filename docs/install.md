@@ -210,7 +210,9 @@ For Claude Code, the managed drop-in has two `PreToolUse` hooks: the command
 hook, and an HTTP hook that posts each call to the daemon's co-signer at
 `http://127.0.0.1:7433/v1/cosign/claude`. The co-signer answers deny unless
 the command hook recorded an allow for the same call, so a killed hook does
-not count as an allow. The port is fixed. `doctor` fails `cosign.listen` when
+not count as an allow. It also judges the call itself, and denies what its
+own judgment denies, so a forged allow does not count either
+([threats](threats.md#fail-closed-matrix)). The port is fixed. `doctor` fails `cosign.listen` when
 the daemon could not bind it, and Claude Code then blocks every call.
 
 Claude Code follows the usual proxy variables. If `HTTPS_PROXY` or
@@ -472,10 +474,12 @@ and `daemon.log`, and deletes the accounts with `dscl`.
 
 ## Locked mode (Windows)
 
-**Windows locked mode is a preview** (v2.2, Windows 11 23H2+ and Server 2022+). A
-process running as the agent's own user can end a hook with exit 0, which the agent
-reads as allow. The details, the paths and the limits are in
-[Windows: locked mode](windows.md#locked-mode).
+**Windows locked mode is a preview for Codex and Gemini CLI** (v2.2, Windows 11 23H2+
+and Server 2022+). A process running as the agent's own user can end a hook with exit
+0, which the agent reads as allow. For Claude Code the service judges each call itself,
+so that does not let a denied call run, and it is not a preview: CI showed a forged
+allow and a hook kill denied on `windows-2022` and `windows-2025`. The
+details, the paths and the limits are in [Windows: locked mode](windows.md#locked-mode).
 
 From an elevated terminal (Run as administrator):
 

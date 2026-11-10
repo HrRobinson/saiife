@@ -181,7 +181,8 @@ password. So on Windows:
   counts by the groups in the caller's token only. A
   restricted or low-integrity token still holds the user's other groups, so it still
   matches a `group:` approver.
-- Windows locked mode is a preview: see [Windows](windows.md#locked-mode).
+- Windows locked mode is a preview for Codex and Gemini CLI: see
+  [Windows](windows.md#locked-mode).
 - Only an elevated admin, SYSTEM and `[admin]` users can lift or narrow `saiife lockdown`.
 
 ## Command grants

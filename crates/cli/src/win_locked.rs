@@ -202,16 +202,25 @@ pub(crate) fn own_account_name() -> Option<String> {
 /// The environment for the worker, or why there can be none.
 #[cfg(windows)]
 pub(crate) fn worker_environment() -> Result<Vec<(&'static str, String)>, String> {
-    use saiife_system::host::{Host, RealHost, REG_NT_CURRENT_VERSION};
     let token = saiife_win::ffi::token::current().map_err(|e| format!("no token: {e}"))?;
-    let host = RealHost;
+    environment_of(&saiife_system::host::RealHost, &token.sid)
+}
+
+/// [`worker_environment`] for `sid`, from `host`'s registry: the machine's record of
+/// that profile, whoever asks (the service's re-judgment, plan 21).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn environment_of(
+    host: &dyn saiife_system::host::Host,
+    sid: &str,
+) -> Result<Vec<(&'static str, String)>, String> {
+    use saiife_system::host::REG_NT_CURRENT_VERSION;
     let system_root = host
         .reg_string(REG_NT_CURRENT_VERSION, "SystemRoot")
         .ok_or("the machine's SystemRoot cannot be read")?;
     let home = host
-        .reg_string(&profile_key(&token.sid), "ProfileImagePath")
+        .reg_string(&profile_key(sid), "ProfileImagePath")
         .and_then(|raw| profile_home(&raw, &system_root))
-        .ok_or_else(|| format!("no profile on record for {}", token.sid))?;
+        .ok_or_else(|| format!("no profile on record for {sid}"))?;
     Ok(worker_env(&home, &system_root))
 }
 
@@ -329,6 +338,30 @@ mod tests {
         ] {
             assert!(!env.iter().any(|(n, _)| *n == gone), "{gone}");
         }
+    }
+
+    /// The service's re-judgment reads the asker's profile, never its own
+    /// (`vars_come_from_the_principal_record`, Windows twin).
+    #[test]
+    fn environment_of_reads_that_sids_profile() {
+        use saiife_system::host::{FakeHost, RegValue, REG_NT_CURRENT_VERSION};
+        const OTHER: &str = "S-1-5-21-1-2-3-1002";
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeHost::open(dir.path()).unwrap();
+        host.set(|s| {
+            s.registry.insert(
+                (REG_NT_CURRENT_VERSION.into(), "SystemRoot".into()),
+                RegValue::Str(r"C:\Windows".into()),
+            );
+            s.registry.insert(
+                (profile_key(OTHER), "ProfileImagePath".into()),
+                RegValue::Str(r"C:\Users\other".into()),
+            );
+        });
+        let env = environment_of(&host, OTHER).unwrap();
+        assert_eq!(env, worker_env(r"C:\Users\other", r"C:\Windows"));
+        let e = environment_of(&host, "S-1-5-21-1-2-3-1003").unwrap_err();
+        assert!(e.contains("S-1-5-21-1-2-3-1003"), "{e}");
     }
 
     #[test]

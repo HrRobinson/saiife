@@ -6,7 +6,9 @@
 # (A4), `doctor`, approvals from a second account, lockdown, reinstall,
 # uninstall and purge, and (plan 20) the Claude Code co-signer on
 # 127.0.0.1:7433 with a hook killed by its own user (`no_verdict`). The
-# phases mirror scripts/locked-linux/lib.sh.
+# phases mirror scripts/locked-linux/lib.sh. Plan 21: a forged allow over
+# the control socket (scripts/locked-linux/forge-allow.py), which the
+# co-signer's own judgment denies (phase_forge).
 #
 # CI ONLY. This creates local accounts with dscl, writes /etc, /opt,
 # /Library and /var, registers an authorization right, and loads, kills
@@ -57,6 +59,7 @@ phase_install
 phase_modes
 phase_hooks
 phase_cosign
+phase_forge
 phase_fail_closed
 phase_attacks
 phase_doctor

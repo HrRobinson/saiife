@@ -24,6 +24,7 @@ pub mod lexer;
 pub mod normalize;
 pub mod operands;
 pub mod pack;
+mod pack_raw;
 pub mod pathrule;
 pub mod payload;
 pub mod prefilter;
@@ -34,6 +35,7 @@ pub mod winpath;
 pub mod wintable;
 pub mod wrappers;
 
+pub use canon::{with_fs_view, FsView};
 pub use engine::{AllowTrace, Decision, Engine};
 pub use pack::{Pack, PackWarning};
 

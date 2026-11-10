@@ -5,9 +5,9 @@
 //! [`super::windows`] instead, where `Layout::at` has no run dir, unit or credstore.
 
 use super::common::{
-    agent_label, allow_server_warnings, claude_installed, cloud_sts, config_valid, cosign_listen,
-    entry_fingerprint, health_check, hooks_no_verdict, install_record, mcp_restrictions,
-    DaemonStatus, NOT_INSTALLED,
+    agent_label, allow_server_warnings, claude_installed, cloud_sts, config_valid, cosign_asker,
+    cosign_listen, cosign_rejudge, entry_fingerprint, health_check, hooks_no_verdict,
+    hooks_rejudge_denied, install_record, mcp_restrictions, DaemonStatus, NOT_INSTALLED,
 };
 pub use super::common::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use super::report::{Check, Status};
@@ -1186,7 +1186,7 @@ fn launchd_unit(ctx: &Ctx) -> Check {
     }
 }
 
-/// `daemon.health`, `cosign.listen` and `hooks.no-verdict`, from one `status` call.
+/// `daemon.health`, the `cosign.*` checks and the `hooks.*` counts, from one `status` call.
 fn daemon_health(ctx: &Ctx) -> Vec<Check> {
     use std::time::Duration;
     let user = match &ctx.config {
@@ -1205,7 +1205,10 @@ fn daemon_health(ctx: &Ctx) -> Vec<Check> {
     vec![
         health_check(status.clone()),
         cosign_listen(claude_installed(ctx), &status),
+        cosign_rejudge(claude_installed(ctx), &status),
+        cosign_asker(claude_installed(ctx), &status, ctx.layout.platform()),
         hooks_no_verdict(&status),
+        hooks_rejudge_denied(claude_installed(ctx), &status),
     ]
 }
 
@@ -2173,6 +2176,143 @@ mod tests {
         t.host
             .set(|s| s.daemon_status = Some(answer(listening(), 100_000)));
         assert_status(&t.doctor(), "hooks.no-verdict", Status::Warn);
+    }
+
+    // ------------------------------------------------------------ plan 21
+
+    /// A whole co-signer on Linux: it listens, judges each call itself, and reads the
+    /// asker from /proc/net/tcp.
+    fn whole() -> serde_json::Value {
+        serde_json::json!({"addr": "127.0.0.1:7433", "error": null, "asker": "proc_net",
+            "rejudge": {"workers": 2, "error": null}})
+    }
+
+    /// `whole()` with `field` set to `v`, or removed when `v` is `None`.
+    fn whole_with(field: &str, v: Option<serde_json::Value>) -> serde_json::Value {
+        let mut c = whole();
+        let m = c.as_object_mut().unwrap();
+        match v {
+            Some(v) => m.insert(field.into(), v),
+            None => m.remove(field),
+        };
+        c
+    }
+
+    fn with_denied(
+        cosign: serde_json::Value,
+        denied: Option<u64>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut a = answer(cosign, 0);
+        if let Some(n) = denied {
+            let last = (n > 0).then_some("2026-11-09T10:00:00Z");
+            a.insert(
+                "hooks_rejudge_denied".into(),
+                serde_json::json!({"since_start": n, "last_ts": last}),
+            );
+        }
+        a
+    }
+
+    #[test]
+    fn rejudge_fail_check() {
+        let t = T::installed();
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole(), Some(0))));
+        let r = t.doctor();
+        assert_status(&r, "cosign.rejudge", Status::Pass);
+        assert_eq!(
+            get(&r, "cosign.rejudge").detail,
+            "the service judges each Claude Code call itself (2 workers)"
+        );
+        let one = whole_with(
+            "rejudge",
+            Some(serde_json::json!({"workers": 1, "error": null})),
+        );
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(one, Some(0))));
+        assert_eq!(
+            get(&t.doctor(), "cosign.rejudge").detail,
+            "the service judges each Claude Code call itself (1 worker)"
+        );
+        let down = whole_with(
+            "rejudge",
+            Some(serde_json::json!({"workers": 0, "error": "re-judge workers never run as root"})),
+        );
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(down, Some(0))));
+        let r = t.doctor();
+        assert_status(&r, "cosign.rejudge", Status::Fail);
+        assert_eq!(
+            get(&r, "cosign.rejudge").detail,
+            "the service cannot judge Claude Code calls (re-judge workers never run as root), \
+             so every call is blocked"
+        );
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole_with("rejudge", None), Some(0))));
+        assert_status(&t.doctor(), "cosign.rejudge", Status::Fail);
+        // Without Claude Code there is nothing to judge.
+        t.edit_installed(|i| i.agents.retain(|a| a.agent != "claude"));
+        assert_status(&t.doctor(), "cosign.rejudge", Status::Info);
+    }
+
+    #[test]
+    fn asker_fail_check() {
+        let t = T::installed();
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole(), Some(0))));
+        let r = t.doctor();
+        assert_status(&r, "cosign.asker", Status::Pass);
+        assert!(get(&r, "cosign.asker").detail.contains("proc_net"));
+        let none = whole_with("asker", Some(serde_json::Value::Null));
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(none, Some(0))));
+        let r = t.doctor();
+        assert_status(&r, "cosign.asker", Status::Fail);
+        assert_eq!(
+            get(&r, "cosign.asker").detail,
+            "the co-signer cannot tell who asks (/proc/net/tcp gave no owner for the \
+             service's own test connection), so every Claude Code call is blocked"
+        );
+        let mac = whole_with("asker", Some(serde_json::json!("pcblist")));
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(mac, Some(0))));
+        assert_status(&t.doctor(), "cosign.asker", Status::Fail);
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole_with("asker", None), Some(0))));
+        assert_status(&t.doctor(), "cosign.asker", Status::Fail);
+        t.edit_installed(|i| i.agents.retain(|a| a.agent != "claude"));
+        assert_status(&t.doctor(), "cosign.asker", Status::Info);
+    }
+
+    #[test]
+    fn rejudge_denied_warns_with_count() {
+        let t = T::installed();
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole(), Some(3))));
+        let r = t.doctor();
+        assert_status(&r, "hooks.rejudge-denied", Status::Warn);
+        assert_eq!(
+            get(&r, "hooks.rejudge-denied").detail,
+            "3 call(s) the hook allowed were denied by the service's own judgment (last \
+             2026-11-09T10:00:00Z): a forged verdict, or a guard difference; see saiife audit \
+             --kind hook"
+        );
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole(), Some(0))));
+        assert_status(&t.doctor(), "hooks.rejudge-denied", Status::Pass);
+        t.host
+            .set(|s| s.daemon_status = Some(with_denied(whole(), None)));
+        assert_status(&t.doctor(), "hooks.rejudge-denied", Status::Warn);
+    }
+
+    /// No answer: the plan 21 checks say they could not look; and Unix has no preview line.
+    #[test]
+    fn plan21_checks_without_an_answer_are_info_and_no_preview() {
+        let r = T::installed().doctor();
+        for id in ["cosign.rejudge", "cosign.asker", "hooks.rejudge-denied"] {
+            assert_status(&r, id, Status::Info);
+        }
+        assert!(!r.checks.iter().any(|c| c.id == "locked.preview"));
     }
 
     #[test]
@@ -3473,5 +3613,44 @@ mod macos_tests {
         assert_eq!(r.exit_code(), 0, "{}", r.to_text());
         assert_eq!(r.to_json()["exit"], 0);
         assert_status(&r, "install.record", Status::Info);
+    }
+
+    /// macOS reads the asker from `net.inet.tcp.pcblist_n` (plan 21 Task 5); a layout it
+    /// does not know leaves `status.cosign.asker` null, and every call is denied.
+    #[test]
+    fn asker_on_macos_is_pcblist() {
+        let e = installed();
+        let status = |asker: serde_json::Value| {
+            serde_json::json!({
+                "policy_ok": true, "chain": "c", "head_seq": 1, "last_checkpoint_seq": null,
+                "cosign": {"addr": "127.0.0.1:7433", "error": null, "asker": asker,
+                    "rejudge": {"workers": 2, "error": null}},
+                "hooks_no_verdict": {"since_start": 0, "last_ts": null},
+                "hooks_rejudge_denied": {"since_start": 0, "last_ts": null},
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        };
+        e.host
+            .set(|s| s.daemon_status = Some(status(serde_json::json!("pcblist"))));
+        let r = doctor(&e);
+        assert_status(&r, "cosign.asker", Status::Pass);
+        assert_status(&r, "cosign.rejudge", Status::Pass);
+        assert_status(&r, "hooks.rejudge-denied", Status::Pass);
+        assert!(!r.checks.iter().any(|c| c.id == "locked.preview"));
+        e.host
+            .set(|s| s.daemon_status = Some(status(serde_json::Value::Null)));
+        let r = doctor(&e);
+        assert_status(&r, "cosign.asker", Status::Fail);
+        assert_eq!(
+            get(&r, "cosign.asker").detail,
+            "the co-signer cannot tell who asks (net.inet.tcp.pcblist_n could not be read, \
+             or its layout is one this version does not know), so every Claude Code call is \
+             blocked"
+        );
+        e.host
+            .set(|s| s.daemon_status = Some(status(serde_json::json!("proc_net"))));
+        assert_status(&doctor(&e), "cosign.asker", Status::Fail);
     }
 }

@@ -1,8 +1,9 @@
 //! The Windows pieces of saiife (plan 19a, decision W1).
 //!
 //! The pure parts run on every OS, so Linux tests cover them: service SIDs,
-//! the uid mapping and token facts in [`sid`], SDDL text in [`sddl`], and the
-//! one home and data-dir lookup in [`profile`].
+//! the uid mapping and token facts in [`sid`], SDDL text in [`sddl`], the
+//! one home and data-dir lookup in [`profile`], the process tree in [`proc`], and
+//! the TCP table in [`tcp`].
 //!
 //! `ffi` is the one place in saiife, besides `saiife-darwin`, allowed `unsafe`.
 //! It exists on Windows only. Off Windows the crate forbids `unsafe`; on Windows
@@ -20,6 +21,7 @@ pub mod proc;
 pub mod profile;
 pub mod sddl;
 pub mod sid;
+pub mod tcp;
 
 #[cfg(windows)]
 pub mod ffi;

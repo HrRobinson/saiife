@@ -6,7 +6,8 @@ runs them, and keeps an audit log that a non-developer can read.
 
 Status: pre-release.
 
-v2 adds locked mode on Linux and macOS, and Windows as a preview.
+v2 adds locked mode on Linux, macOS and Windows. Windows locked mode is a preview
+for Codex and Gemini CLI, and not for Claude Code.
 
 ## Install
 
@@ -54,7 +55,7 @@ and it does not notice that the newest records were removed (see
 
 ## Brokered services
 
-In locked mode (Linux, macOS and, as a preview, Windows), saiife can make API calls for the agent. You store a
+In locked mode (Linux, macOS and Windows, where locked mode is a preview for Codex and Gemini CLI), saiife can make API calls for the agent. You store a
 credential in saiife's vault (`saiife secret add`, or `saiife secret import`
 to move plaintext credentials out of the home), connect a service with
 `saiife connect shopify|hubspot|github|aws-s3|...`, and the agent calls it through
@@ -89,11 +90,14 @@ On macOS every agent is still unverified (the macOS lock check has not been
 recorded), same-user approval is off (approvals need a second account), and
 the MCP gateway and the egress recipe are Linux only.
 
-Windows locked mode is a preview (v2.2): `saiife system install` from an elevated
-terminal, or the MSI ([Windows](docs/windows.md#locked-mode)). A process running as the
-agent's own user can end a hook with exit 0, which the agent reads as allow, so it does
-not hold against an agent that runs its own code to get past the hook. Every Windows
-lock label is unverified, and approvals need a second account.
+Windows locked mode (v2.2) is a preview for Codex and Gemini CLI: `saiife system
+install` from an elevated terminal, or the MSI
+([Windows](docs/windows.md#locked-mode)). A process running as the agent's own user can
+end a hook with exit 0, which the agent reads as allow, so for Codex and Gemini CLI it
+does not hold against an agent that runs its own code to get past the hook. For Claude
+Code it is not a preview: the service judges each call itself, and CI showed a forged
+allow and a hook kill denied on `windows-2022` and `windows-2025`. Every Windows lock
+label is unverified, and approvals need a second account.
 
 The agent never holds a credential for a brokered
 service; it holds its own model-provider login unless you run a local
@@ -130,8 +134,8 @@ model.
   protects and what it does not.
 - [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
   the [egress recipe](docs/egress.md).
-- [Windows](docs/windows.md): developer mode, locked mode (preview), how each shell
-  is read, and the limits.
+- [Windows](docs/windows.md): developer mode, locked mode (a preview for Codex and
+  Gemini CLI, not for Claude Code), how each shell is read, and the limits.
 - [Fleet install](docs/fleet.md): `.deb`, `.rpm`, macOS `.pkg` and Windows `.msi`
   packages, with Ansible, Jamf, Intune and GPO recipes.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).

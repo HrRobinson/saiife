@@ -7,6 +7,7 @@ use saiife_audit::{ChainWriter, DecisionKind, NewRecord, Record, WriterOptions};
 use saiife_daemon::cosign::{self, deny_body, CosignDeny, Opts, Retry};
 use saiife_daemon::hooks::RECONNECT_GRACE;
 use saiife_daemon::ops::{Ctx, CtxInit};
+use saiife_daemon::rejudge::{Rejudge, RejudgeAnswer, RejudgeRequest};
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_ipc::frame::{encode_max, MAX_ANSWER_FRAME};
 use saiife_ipc::hookkey::hook_key;
@@ -39,8 +40,18 @@ struct Daemon {
 }
 
 /// A locked daemon context: control socket in a tempdir, and the co-signer
-/// on a free loopback port with `opts`.
+/// on a free loopback port with `opts`. The service's own judgment allows
+/// every call.
 async fn daemon(opts: Option<Opts>) -> Daemon {
+    daemon_with(
+        opts,
+        Some(Arc::new(|_: RejudgeRequest| RejudgeAnswer::Allow)),
+    )
+    .await
+}
+
+/// [`daemon`] with `rejudge` as the service's own judgment.
+async fn daemon_with(opts: Option<Opts>, rejudge: Option<Arc<dyn Rejudge>>) -> Daemon {
     let tmp = scratch();
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
@@ -68,6 +79,7 @@ async fn daemon(opts: Option<Opts>) -> Daemon {
         own_user: "saiife".into(),
         ..CtxInit::minimal(handle, cfg, dirs, &state)
     }));
+    ctx.cosign.lock().unwrap().rejudge = rejudge;
     let sock = tmp.path().join("s.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let c = Arc::clone(&ctx);
@@ -346,9 +358,9 @@ async fn killed_hook_gets_deny_at_once() {
     assert_eq!(got[0].kind(), "hook");
     assert_eq!(got[0].decision, DecisionKind::ErrorDenied);
     assert_eq!(got[0].tool, "Bash");
-    // The asker's input and session only where it is identified (Linux).
-    assert_eq!(got[0].input, if LINUX { "ls" } else { "" });
-    assert_eq!(got[0].session.as_deref(), LINUX.then_some("c-1"));
+    // The asker's input and session only where it is identified (Linux, macOS).
+    assert_eq!(got[0].input, if IDENTIFIED { "ls" } else { "" });
+    assert_eq!(got[0].session.as_deref(), IDENTIFIED.then_some("c-1"));
     assert_eq!(got[0].extra["tool_use_id"], "toolu_4");
     assert_eq!(wait_records(&d.audit, "no_verdict", 1).await.len(), 1);
 }
@@ -361,10 +373,12 @@ async fn other_payload_does_not_match() {
     let a = post(d.addr.unwrap(), payload("toolu_5", "rm -rf /")).await;
     assert_deny(&a, CosignDeny::NoReport);
     let got = wait_records(&d.audit, "cosign_denied", 1).await;
-    assert_eq!(got[0].input, if LINUX { "rm -rf /" } else { "" });
+    assert_eq!(got[0].input, if IDENTIFIED { "rm -rf /" } else { "" });
 }
 
-const LINUX: bool = cfg!(target_os = "linux");
+/// The co-signer identifies a TCP asker by its uid here (`/proc/net` on
+/// Linux, `pcblist_n` on macOS).
+const IDENTIFIED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 #[tokio::test]
 async fn not_cosignable_without_tool_use_id() {
@@ -679,4 +693,402 @@ async fn a_second_bind_beside_the_cosigner_fails() {
 fn personal_mode_does_not_bind() {
     assert_eq!(cosign::target(false, false), None);
     assert_eq!(cosign::target(false, true), None);
+}
+
+// ------------------------------------------------ plan 21: both must agree
+
+/// A Claude Code fixture body, byte for byte.
+fn fixture(name: &str) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../cli/tests/fixtures/claude")
+        .join(name);
+    std::fs::read_to_string(p).unwrap()
+}
+
+/// What a fake re-judge was asked.
+type Asked = Arc<std::sync::Mutex<Vec<RejudgeRequest>>>;
+
+/// A re-judge that answers `answer` and keeps every request.
+fn fake(answer: RejudgeAnswer) -> (Arc<dyn Rejudge>, Asked) {
+    let asked: Asked = Arc::default();
+    let a = Arc::clone(&asked);
+    let r: Arc<dyn Rejudge> = Arc::new(move |req: RejudgeRequest| {
+        a.lock().unwrap().push(req);
+        answer.clone()
+    });
+    (r, asked)
+}
+
+fn rule_deny(askable: bool) -> RejudgeAnswer {
+    RejudgeAnswer::Deny {
+        reason: "rm -rf / removes \"everything\"".into(),
+        pack: Some("core.filesystem".into()),
+        rule: Some("rm-root".into()),
+        input: "rm -rf /".into(),
+        askable,
+    }
+}
+
+const RULE_DENY_REASON: &str = "rm -rf / removes \"everything\"";
+
+fn my_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    saiife_daemon::grants::hex(&Sha256::digest(s.as_bytes()).into())
+}
+
+#[tokio::test]
+async fn forged_allow_of_a_denied_call_is_denied() {
+    let (rj, asked) = fake(rule_deny(false));
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let body = fixture("bash-deny.json");
+    // A forger: begin, bind the key of the denied call, append an allow.
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "rm -rf /").await;
+    let a = post(d.addr.unwrap(), body.clone()).await;
+    assert_eq!(
+        a.body,
+        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"saiife: BLOCKED (fail closed): the saiife service's own judgment denies this call: rm -rf / removes \"everything\""}}"#
+    );
+    assert_eq!(a.body, cosign::rejudged_body(RULE_DENY_REASON));
+    assert_eq!(a.header("content-type"), Some("application/json"));
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    let got = wait_records(&d.audit, "rejudge_denied", 1).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    let r = &got[0];
+    assert_eq!(r.kind(), "hook");
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.agent, "claude");
+    assert_eq!(r.tool, "Bash");
+    assert_eq!(r.input, "rm -rf /");
+    assert_eq!(r.session.as_deref(), Some("c-1"));
+    assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
+    assert_eq!(r.rule.as_deref(), Some("rm-root"));
+    assert_eq!(r.reason.as_deref(), Some(RULE_DENY_REASON));
+    assert_eq!(r.uid, Some(my_uid()));
+    assert_eq!(r.extra["tool_use_id"], "toolu_01");
+    assert_eq!(r.extra["hook_pid"], std::process::id());
+    assert!(records(&d.audit, "cosign_denied").is_empty());
+    // One record per call (up to 60 a minute per principal).
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "rm -rf /").await;
+    let a = post(d.addr.unwrap(), body.clone()).await;
+    assert_eq!(a.body, cosign::rejudged_body(RULE_DENY_REASON));
+    assert_eq!(wait_records(&d.audit, "rejudge_denied", 2).await.len(), 2);
+    let mut c = Client::hello(&d.sock).await;
+    let st = c.call(OP_STATUS, json!({})).await;
+    assert_eq!(st["hooks_rejudge_denied"]["since_start"], 2, "{st}");
+    assert!(st["hooks_rejudge_denied"]["last_ts"].is_string(), "{st}");
+}
+
+#[tokio::test]
+async fn honest_allow_still_gets_empty_200() {
+    let (rj, asked) = fake(RejudgeAnswer::Allow);
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let body = fixture("bash-allow.json");
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "ls -la").await;
+    let a = post(d.addr.unwrap(), body.clone()).await;
+    assert_no_opinion(&a);
+    {
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            asked[0].principal,
+            saiife_daemon::hooks::Principal::Uid(my_uid())
+        );
+        assert!(asked[0].groups.is_empty());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(records(&d.audit, "rejudge_denied").is_empty());
+    assert!(records(&d.audit, "rejudge_failed").is_empty());
+}
+
+/// The residual, pinned: a forged allow of a call the policy allows anyway
+/// is allowed, with no record.
+#[tokio::test]
+async fn forged_allow_of_an_allowed_call_is_allowed() {
+    let d = daemon(Some(Opts::default())).await;
+    let body = fixture("bash-allow.json");
+    let mut forger = Client::hook(&d.sock, &body).await;
+    forger.verdict(DecisionKind::Allow, "anything at all").await;
+    assert_no_opinion(&post(d.addr.unwrap(), body).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(records(&d.audit, "rejudge_denied").is_empty());
+    assert!(records(&d.audit, "cosign_denied").is_empty());
+}
+
+/// What a grant was given for: its agent, tool, project root and command.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    agent: &'a str,
+    tool: &'a str,
+    project: &'a str,
+    command: &'a str,
+}
+
+/// The scope every approved call below is co-signed in: Claude Code's
+/// `Bash` in `/p`.
+const SCOPE: Scope = Scope {
+    agent: "claude",
+    tool: "Bash",
+    project: "/p",
+    command: "rm -rf /",
+};
+
+/// A Bash call of `command` run in `cwd`.
+fn payload_in(tool_use_id: &str, command: &str, cwd: &str) -> String {
+    let mut v: Value = serde_json::from_str(&payload(tool_use_id, command)).unwrap();
+    v["cwd"] = cwd.into();
+    v.to_string()
+}
+
+/// A hook connection that uses up a grant for `scope` (the record the hook
+/// sends with `grant.consume` names it, as the hook would) and records the
+/// call as `approved`.
+async fn approved_hook(d: &Daemon, body: &str, scope: Scope<'_>, approval: u64) -> Client {
+    let mut h = Client::hook(&d.sock, body).await;
+    let sha = sha256_hex(scope.command);
+    let raw: [u8; 32] = saiife_daemon::grants::unhex(&sha).unwrap();
+    let key = saiife_daemon::grants::grant_key(
+        my_uid(),
+        scope.agent,
+        scope.project,
+        scope.tool,
+        scope.command,
+        &raw,
+    );
+    let far = std::time::SystemTime::now() + Duration::from_secs(3600);
+    d.ctx.grants.insert(key, approval, far).unwrap();
+    let mut asked = guard_rec(DecisionKind::Ask, scope.command);
+    asked["agent"] = scope.agent.into();
+    asked["tool"] = scope.tool.into();
+    asked["project"] = scope.project.into();
+    let a = h
+        .call(
+            saiife_ipc::msg::OP_GRANT_CONSUME,
+            json!({"rec": asked, "raw_sha256": sha, "project": scope.project}),
+        )
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["granted"], true, "{a}");
+    let mut rec = guard_rec(DecisionKind::Approved, scope.command);
+    rec["approval"] = approval.into();
+    let a = h.call(OP_AUDIT_APPEND, json!({"rec": rec})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    h
+}
+
+#[tokio::test]
+async fn approved_call_passes_only_with_its_grant() {
+    let (rj, _) = fake(rule_deny(true));
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let rejudged = cosign::rejudged_body(RULE_DENY_REASON);
+    // A grant for this very call: allowed, at the root and below it.
+    for (n, cwd) in [(1, "/p"), (2, "/p/sub")] {
+        let body = payload_in(&format!("toolu_g{n}"), "rm -rf /", cwd);
+        let _h = approved_hook(&d, &body, SCOPE, n).await;
+        assert_no_opinion(&post(d.addr.unwrap(), body).await);
+    }
+    // A grant for another command: the service's deny stands.
+    let body = payload_in("toolu_g3", "rm -rf /", "/p");
+    let other = Scope {
+        command: "rm -rf /tmp/x",
+        ..SCOPE
+    };
+    let _h = approved_hook(&d, &body, other, 3).await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
+    // No grant at all.
+    let body = payload_in("toolu_g4", "rm -rf /", "/p");
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "rm -rf /").await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
+    assert_eq!(wait_records(&d.audit, "rejudge_denied", 2).await.len(), 2);
+    // A grant does not lift a deny that is not only `ask` rules'.
+    let (rj, _) = fake(rule_deny(false));
+    d.ctx.cosign.lock().unwrap().rejudge = Some(rj);
+    let body = payload_in("toolu_g5", "rm -rf /", "/p");
+    let _h = approved_hook(&d, &body, SCOPE, 5).await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
+}
+
+/// A grant is for one agent, tool and project: the same command in
+/// another scope does not pass on it.
+#[tokio::test]
+async fn a_grant_passes_only_in_its_own_scope() {
+    let (rj, _) = fake(rule_deny(true));
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let rejudged = cosign::rejudged_body(RULE_DENY_REASON);
+    let tool = Scope {
+        tool: "PowerShell",
+        ..SCOPE
+    };
+    let agent = Scope {
+        agent: "codex",
+        ..SCOPE
+    };
+    let project = Scope {
+        project: "/q",
+        ..SCOPE
+    };
+    let cases = [
+        (1, tool, "/p"),
+        (2, agent, "/p"),
+        (3, project, "/p"),
+        // The grant's project, but the call runs outside it.
+        (4, SCOPE, "/elsewhere"),
+        (5, SCOPE, "/pq"),
+    ];
+    for (n, scope, cwd) in cases {
+        let body = payload_in(&format!("toolu_s{n}"), "rm -rf /", cwd);
+        let _h = approved_hook(&d, &body, scope, n).await;
+        let a = post(d.addr.unwrap(), body).await;
+        assert_eq!(a.body, rejudged, "case {n}");
+    }
+    // A body with no cwd names no project.
+    let body = payload("toolu_s6", "rm -rf /");
+    let _h = approved_hook(&d, &body, SCOPE, 6).await;
+    assert_eq!(post(d.addr.unwrap(), body).await.body, rejudged);
+    // The matching scope still passes.
+    let body = payload_in("toolu_s7", "rm -rf /", "/p");
+    let _h = approved_hook(&d, &body, SCOPE, 7).await;
+    assert_no_opinion(&post(d.addr.unwrap(), body).await);
+}
+
+#[tokio::test]
+async fn rejudge_failure_denies_and_records() {
+    let (rj, _) = fake(RejudgeAnswer::Failed("the worker crashed".into()));
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let body = fixture("bash-allow.json");
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "ls -la").await;
+    assert_deny(
+        &post(d.addr.unwrap(), body).await,
+        CosignDeny::RejudgeFailed,
+    );
+    let got = wait_records(&d.audit, "rejudge_failed", 1).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].kind(), "hook");
+    assert_eq!(got[0].decision, DecisionKind::ErrorDenied);
+    assert_eq!(
+        got[0].reason.as_deref(),
+        Some(CosignDeny::RejudgeFailed.text())
+    );
+    assert_eq!(got[0].extra["error"], "the worker crashed");
+    assert_eq!(got[0].extra["tool_use_id"], "toolu_02");
+    assert!(records(&d.audit, "rejudge_denied").is_empty());
+    assert!(records(&d.audit, "cosign_denied").is_empty());
+}
+
+/// A re-judge that does not answer by its deadline is a deny, at the
+/// deadline (here the co-sign wait, shorter than `REJUDGE_TIMEOUT`).
+#[tokio::test]
+async fn rejudge_timeout_denies() {
+    let rj: Arc<dyn Rejudge> = Arc::new(|_: RejudgeRequest| {
+        std::thread::sleep(Duration::from_secs(3));
+        RejudgeAnswer::Allow
+    });
+    let d = daemon_with(short(Duration::from_secs(1)), Some(rj)).await;
+    let body = fixture("bash-allow.json");
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "ls -la").await;
+    let start = Instant::now();
+    assert_deny(
+        &post(d.addr.unwrap(), body).await,
+        CosignDeny::RejudgeFailed,
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(wait_records(&d.audit, "rejudge_failed", 1).await.len(), 1);
+}
+
+#[tokio::test]
+async fn no_verdict_wins_over_a_running_rejudge() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let rx = std::sync::Mutex::new(rx);
+    let rj: Arc<dyn Rejudge> = Arc::new(move |_: RejudgeRequest| {
+        // Runs until the test has its answer.
+        let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+        RejudgeAnswer::Deny {
+            reason: "x".into(),
+            pack: None,
+            rule: None,
+            input: "ls".into(),
+            askable: false,
+        }
+    });
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let body = payload("toolu_nv", "ls");
+    let h = Client::hook(&d.sock, &body).await;
+    let start = Instant::now();
+    drop(h);
+    assert_deny(&post(d.addr.unwrap(), body).await, CosignDeny::NoVerdict);
+    assert!(start.elapsed() < RECONNECT_GRACE + Duration::from_secs(1));
+    tx.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(records(&d.audit, "rejudge_denied").is_empty());
+    assert!(records(&d.audit, "rejudge_failed").is_empty());
+}
+
+#[tokio::test]
+async fn no_rejudge_configured_denies_everything() {
+    let d = daemon_with(Some(Opts::default()), None).await;
+    let body = fixture("bash-allow.json");
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "ls -la").await;
+    assert_deny(
+        &post(d.addr.unwrap(), body).await,
+        CosignDeny::RejudgeFailed,
+    );
+    let mut c = Client::hello(&d.sock).await;
+    let st = c.call(OP_STATUS, json!({})).await;
+    let rj = &st["cosign"]["rejudge"];
+    assert_eq!(rj["workers"], 0, "{st}");
+    assert_eq!(rj["state"], "unavailable", "{st}");
+    assert_eq!(rj["error"], cosign::NO_REJUDGE, "{st}");
+    assert_eq!(st["hooks_rejudge_denied"]["since_start"], 0, "{st}");
+}
+
+#[tokio::test]
+async fn status_shows_the_rejudge_workers() {
+    struct Two;
+    impl Rejudge for Two {
+        fn judge(&self, _: RejudgeRequest) -> RejudgeAnswer {
+            RejudgeAnswer::Allow
+        }
+        fn workers(&self) -> usize {
+            2
+        }
+    }
+    let d = daemon_with(None, Some(Arc::new(Two))).await;
+    let mut c = Client::hello(&d.sock).await;
+    let st = c.call(OP_STATUS, json!({})).await;
+    let rj = &st["cosign"]["rejudge"];
+    assert_eq!(rj["workers"], 2, "{st}");
+    assert_eq!(rj["state"], "ready", "{st}");
+    assert_eq!(rj["error"], Value::Null, "{st}");
+}
+
+/// The forged append's record says `ls`; the body says something else:
+/// the service judges the body, exactly as it arrived.
+#[tokio::test]
+async fn rejudge_sees_the_body_not_the_record() {
+    let (rj, asked) = fake(RejudgeAnswer::Allow);
+    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let body = serde_json::to_string_pretty(
+        &serde_json::from_str::<Value>(&payload("toolu_b", "type secrets.env")).unwrap(),
+    )
+    .unwrap();
+    let mut h = Client::hook(&d.sock, &body).await;
+    h.verdict(DecisionKind::Allow, "ls").await;
+    assert_no_opinion(&post(d.addr.unwrap(), body.clone()).await);
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(&asked[0].payload[..], body.as_bytes());
 }

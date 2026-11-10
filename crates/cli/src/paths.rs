@@ -5,11 +5,12 @@
 //! and locked mode's system paths `$SAIIFE_ETC`, `$SAIIFE_STATE`,
 //! `$SAIIFE_LOG`, `$SAIIFE_RUN`, `$SAIIFE_OPT`, `$SAIIFE_UNIT`).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use saiife_agents::detect::{agent_paths, which};
+use saiife_agents::detect::{agent_paths, find_in_path, find_in_path_ext, which};
 use saiife_agents::integrity;
 use saiife_agents::Agent;
 use saiife_audit::store;
@@ -152,40 +153,121 @@ pub fn path_vars_locked(
     project: Option<&Path>,
     locked: Option<&LockedPaths>,
 ) -> PathVars {
+    let found = Found {
+        home: saiife_win::profile::home_dir(),
+        data_dir: integrity::data_dir(),
+        audit_dir: store::default_dir(),
+        saiife: which("saiife"),
+    };
+    bind_vars(
+        (cwd, project, locked),
+        &|name| std::env::var_os(name),
+        found,
+    )
+}
+
+/// An environment as a list, as a worker child is started with it.
+pub type EnvList = [(OsString, OsString)];
+
+/// `path_vars_locked` as a process started with exactly `env` binds it, read from `env`
+/// alone and never from this process's environment: the locked hook judges Claude Code's
+/// calls in its own process (plan 21), and its environment is the agent's. A home or data
+/// dir that `env` lacks is left out: no fallback reads this process's environment.
+pub fn path_vars_locked_env(
+    cwd: Option<&Path>,
+    project: Option<&Path>,
+    locked: Option<&LockedPaths>,
+    env: &EnvList,
+) -> PathVars {
+    let get = |name: &str| {
+        env.iter()
+            .rev()
+            .find(|(k, _)| match cfg!(windows) {
+                true => k.eq_ignore_ascii_case(name),
+                false => k == name,
+            })
+            .map(|(_, v)| v.clone())
+    };
+    let absolute = |name: &str| {
+        get(name)
+            .filter(|d| Path::new(d).is_absolute())
+            .map(PathBuf::from)
+    };
+    // As `saiife_win::profile::{home_dir, data_base_dir}`, and `dirs` on Unix.
+    #[cfg(windows)]
+    let (home, base) = (absolute("USERPROFILE"), absolute("LOCALAPPDATA"));
+    #[cfg(not(windows))]
+    let home = get("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = home.as_ref().map(|h| h.join("Library/Application Support"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = absolute("XDG_DATA_HOME").or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+    // As `integrity::data_dir`, `store::default_dir` and `detect::which`.
+    let data = base.map(|b| b.join("saiife"));
+    let found = Found {
+        data_dir: absolute(integrity::DATA_DIR_ENV).or_else(|| data.clone()),
+        audit_dir: absolute(store::DIR_ENV).or_else(|| data.map(|d| d.join("audit"))),
+        saiife: get("PATH").and_then(|path| match cfg!(windows) {
+            true => {
+                let exts = get("PATHEXT").and_then(|e| e.into_string().ok());
+                let exts = exts.unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+                find_in_path_ext("saiife", &path, &exts)
+            }
+            false => find_in_path("saiife", &path),
+        }),
+        home,
+    };
+    bind_vars((cwd, project, locked), &get, found)
+}
+
+/// What [`bind_vars`] takes from the profile and the file system rather than from one
+/// variable: the home, saiife's data and audit dirs, and the `saiife` on `PATH`.
+struct Found {
+    home: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    audit_dir: Option<PathBuf>,
+    saiife: Option<PathBuf>,
+}
+
+/// The rule variables, with the agents' variables read through `env`.
+fn bind_vars(
+    (cwd, project, locked): (Option<&Path>, Option<&Path>, Option<&LockedPaths>),
+    env: &dyn Fn(&str) -> Option<OsString>,
+    found: Found,
+) -> PathVars {
     let mut v = PathVars::new().with_style(PathStyle::host());
     if v.style() == PathStyle::Windows {
-        v = bind_windows_vars(v, |name| std::env::var_os(name));
+        v = bind_windows_vars(v, env);
     }
     if let Some(c) = cwd {
         v = v.with_cwd(c);
     }
-    if let Some(h) = saiife_win::profile::home_dir() {
+    if let Some(h) = &found.home {
         v = v.with_var("HOME", h);
     }
     // The agents' config dirs: the variable when set (and absolute), else
     // the default under HOME, so the rules naming them are always active.
     // `XDG_CONFIG_HOME` the same way (`~/.config`); in locked mode the
     // worker's environment is cleared, so it is always the default there.
-    let home = saiife_win::profile::home_dir();
+    let home = found.home;
     for (name, agent) in [
         ("CLAUDE_CONFIG_DIR", Agent::Claude),
         ("CODEX_HOME", Agent::Codex),
     ] {
-        let value = std::env::var_os(name);
-        if let Some(d) = agent_config_dir(value, home.as_deref(), agent, cfg!(windows)) {
+        if let Some(d) = agent_config_dir(env(name), home.as_deref(), agent, cfg!(windows)) {
             v = v.with_var(name, d);
         }
     }
-    if let Some(d) = config_dir(std::env::var_os("XDG_CONFIG_HOME"), home, ".config") {
+    if let Some(d) = config_dir(env("XDG_CONFIG_HOME"), home, ".config") {
         v = v.with_var("XDG_CONFIG_HOME", d);
     }
     if let Some(p) = project.or(cwd) {
         v = v.with_var("PROJECT", p);
     }
-    if let Some(d) = integrity::data_dir() {
+    if let Some(d) = found.data_dir {
         v = v.with_var("SAIIFE_DATA_DIR", d);
     }
-    if let Some(d) = store::default_dir() {
+    if let Some(d) = found.audit_dir {
         v = v.with_var("SAIIFE_AUDIT_DIR", d);
     }
     // The binary answering this hook and the `saiife` on PATH (usually
@@ -193,7 +275,7 @@ pub fn path_vars_locked(
     if let Ok(exe) = std::env::current_exe() {
         v = v.with_var("SAIIFE_BIN", exe);
     }
-    if let Some(p) = which("saiife") {
+    if let Some(p) = found.saiife {
         v = v.with_var("SAIIFE_BIN", p);
     }
     for (name, default) in SYSTEM_PATHS {
@@ -430,5 +512,86 @@ mod tests {
         if saiife_win::profile::home_dir().is_some() {
             assert!(!v.values("XDG_CONFIG_HOME").is_empty());
         }
+    }
+
+    /// This process's environment as a list binds what `path_vars_locked` binds.
+    #[test]
+    #[cfg(unix)]
+    fn env_list_of_this_process_binds_the_same() {
+        let env: Vec<_> = std::env::vars_os().collect();
+        let cwd = Path::new("/srv/p");
+        let locked = LockedPaths {
+            etc: "/x/etc".into(),
+            audit_dir: "/x/audit".into(),
+            socket_dir: "/x/run".into(),
+        };
+        assert_eq!(
+            format!("{:?}", path_vars_locked(Some(cwd), None, Some(&locked))),
+            format!(
+                "{:?}",
+                path_vars_locked_env(Some(cwd), None, Some(&locked), &env)
+            )
+        );
+    }
+
+    /// A worker's environment (the account's home, nothing else) binds the account's
+    /// dirs, whatever this process's environment says.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn env_list_is_the_only_source() {
+        let env: Vec<(OsString, OsString)> = [
+            ("HOME", "/home/other"),
+            ("USER", "other"),
+            ("PATH", "/nonexistent-bin"),
+            ("LANG", "C"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let v = path_vars_locked_env(None, None, None, &env);
+        let one = |name: &str| v.values(name).first().map(|p| p.to_path_buf());
+        let at = |p: &str| Some(PathBuf::from(p));
+        assert_eq!(one("HOME"), at("/home/other"));
+        assert_eq!(one("CLAUDE_CONFIG_DIR"), at("/home/other/.claude"));
+        assert_eq!(one("CODEX_HOME"), at("/home/other/.codex"));
+        assert_eq!(one("XDG_CONFIG_HOME"), at("/home/other/.config"));
+        assert_eq!(
+            one("SAIIFE_DATA_DIR"),
+            at("/home/other/.local/share/saiife")
+        );
+        assert_eq!(
+            one("SAIIFE_AUDIT_DIR"),
+            at("/home/other/.local/share/saiife/audit")
+        );
+        // No `saiife` on that PATH: only this binary.
+        assert_eq!(
+            v.values("SAIIFE_BIN"),
+            vec![std::env::current_exe().unwrap().as_path()]
+        );
+        // Set or not, the variables an agent could move are taken from the list.
+        let moved: Vec<(OsString, OsString)> = env
+            .iter()
+            .cloned()
+            .chain(
+                [
+                    ("CLAUDE_CONFIG_DIR", "/elsewhere/c"),
+                    ("XDG_DATA_HOME", "/elsewhere/d"),
+                ]
+                .map(|(k, v)| (k.into(), v.into())),
+            )
+            .collect();
+        let v = path_vars_locked_env(None, None, None, &moved);
+        assert_eq!(
+            v.values("CLAUDE_CONFIG_DIR"),
+            vec![Path::new("/elsewhere/c")]
+        );
+        assert_eq!(
+            v.values("SAIIFE_DATA_DIR"),
+            vec![Path::new("/elsewhere/d/saiife")]
+        );
+        // An empty list binds no home at all.
+        let v = path_vars_locked_env(None, None, None, &[]);
+        assert!(v.values("HOME").is_empty());
+        assert!(v.values("CLAUDE_CONFIG_DIR").is_empty());
     }
 }

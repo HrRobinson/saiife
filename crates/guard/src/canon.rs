@@ -15,6 +15,10 @@
 //! spelled (made absolute, `..` removed lexically), so a symlink is judged
 //! by what it points to AND by its own name: `notes.txt -> .env` reads a
 //! secret, and so does `.env -> vars/dev`.
+//!
+//! Under `FsView::Lexical` (`with_fs_view`) nothing is resolved or listed:
+//! the file system primitives answer with no system call, so every path is
+//! judged as spelled.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -293,12 +297,80 @@ fn strip_var<'a>(raw: &'a str, prefixes: &[&str]) -> Option<&'a str> {
 /// is normalized lexically. A second pass resolves what the first one made
 /// reachable (`missing/../link`). `None`: unresolvable (symlink loop).
 fn resolve(abs: &Path) -> Option<PathBuf> {
+    if lexical() {
+        return Some(push_lexical(
+            PathBuf::from("/"),
+            &abs.components().collect::<Vec<_>>(),
+        ));
+    }
     let once = resolve_once(abs)?;
     if once == abs {
         Some(once)
     } else {
         resolve_once(&once)
     }
+}
+
+/// How the guard sees the file system on this thread.
+///
+/// - `Host` (the default): paths are resolved by the OS, globs are expanded,
+///   directories are listed. What the hook does.
+/// - `Lexical`: no file system call at all. Every path reads as missing, so a
+///   path is judged as spelled (made absolute, `..` removed lexically), a glob
+///   matches nothing and is judged as spelled, and a move or copy target is
+///   judged both as itself and as `target/<name>` (`fs_is_dir` cannot tell).
+///   Each answer is picked so that the view is never stricter than the
+///   host's, but for a copy into a protected directory spelled bare
+///   (`cp x .claude`), which reads as a write to it. What the
+///   saiife service does when it re-judges a co-signed call: it must not read
+///   the agent user's files (plan 21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsView {
+    #[default]
+    Host,
+    Lexical,
+}
+
+thread_local! {
+    /// This thread's view; `with_fs_view` sets it for one scope.
+    static FS_VIEW: Cell<FsView> = const { Cell::new(FsView::Host) };
+    /// Real file system calls made on this thread (`fs_calls_made`).
+    static FS_CALLS_MADE: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Run `f` with this thread's file system view set to `view`, then restore
+/// the view it had (also when `f` panics). Scopes nest. Other threads keep
+/// their own view: a guard run spread over threads sets it in each.
+pub fn with_fs_view<R>(view: FsView, f: impl FnOnce() -> R) -> R {
+    struct Restore(FsView);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FS_VIEW.set(self.0);
+        }
+    }
+    let _restore = Restore(FS_VIEW.replace(view));
+    f()
+}
+
+/// This thread's file system view.
+pub fn fs_view() -> FsView {
+    FS_VIEW.get()
+}
+
+fn lexical() -> bool {
+    FS_VIEW.get() == FsView::Lexical
+}
+
+/// Real file system calls this thread has made through the guard's
+/// primitives, ever: a test reads it before and after a judgment.
+#[doc(hidden)]
+pub fn fs_calls_made() -> u64 {
+    FS_CALLS_MADE.get()
+}
+
+/// Count one real file system call.
+fn made_fs_call() {
+    FS_CALLS_MADE.set(FS_CALLS_MADE.get().wrapping_add(1));
 }
 
 /// What one system call, or one directory entry read, costs the last look
@@ -404,6 +476,9 @@ fn fs_call() -> bool {
 
 /// What is at `path`, without following a last symlink.
 fn fs_entry(path: &Path) -> FsEntry {
+    if lexical() {
+        return FsEntry::Missing;
+    }
     let looked_up = FS_METER.with_borrow(|m| m.as_ref().map(|m| m.entries.get(path).cloned()));
     if looked_up.is_some() && !fs_pay(FS_LOOKUP_COST + path.as_os_str().len()) {
         return FsEntry::Missing;
@@ -414,11 +489,13 @@ fn fs_entry(path: &Path) -> FsEntry {
     if !fs_call() {
         return FsEntry::Missing;
     }
+    made_fs_call();
     let entry = match std::fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_symlink() => {
             if !fs_call() {
                 return FsEntry::Missing;
             }
+            made_fs_call();
             FsEntry::Link(std::fs::read_link(path).ok())
         }
         Ok(_) => FsEntry::Plain,
@@ -434,24 +511,44 @@ fn fs_entry(path: &Path) -> FsEntry {
 
 /// `read_dir`, paid for.
 pub(crate) fn fs_read_dir(path: &Path) -> Option<std::fs::ReadDir> {
-    if !fs_call() {
+    if lexical() || !fs_call() {
         return None;
     }
+    made_fs_call();
     std::fs::read_dir(path).ok()
 }
 
 /// One directory entry read, paid for: false when the listing must stop.
 pub(crate) fn fs_next_entry() -> bool {
-    fs_call()
+    if lexical() || !fs_call() {
+        return false;
+    }
+    made_fs_call();
+    true
 }
 
-/// `Path::is_dir`, paid for.
-pub(crate) fn fs_is_dir(path: &Path) -> bool {
-    fs_call() && path.is_dir()
+/// `Path::is_dir`, paid for. `None` under `FsView::Lexical`, which makes no
+/// call and cannot tell: a move or copy target is then judged both as a
+/// file and as a directory. A guess from the spelling is wrong both ways: a
+/// directory guess judges `mv x ~/.aws/credentials` as
+/// `~/.aws/credentials/x` and allows it, a file guess judges `cp x .claude`
+/// as a write to `.claude` itself.
+pub(crate) fn fs_is_dir(path: &Path) -> Option<bool> {
+    if lexical() {
+        return None;
+    }
+    if !fs_call() {
+        return Some(false);
+    }
+    made_fs_call();
+    Some(path.is_dir())
 }
 
 /// `os(path)` of a Windows host's path resolution, paid for and asked once.
 pub(crate) fn fs_os_name(path: &str, os: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if lexical() {
+        return None;
+    }
     let known = FS_METER.with_borrow(|m| m.as_ref().map(|m| m.os_names.get(path).cloned()));
     if known.is_some() && !fs_pay(FS_LOOKUP_COST + path.len()) {
         return None;
@@ -462,6 +559,7 @@ pub(crate) fn fs_os_name(path: &str, os: impl Fn(&str) -> Option<String>) -> Opt
     if !fs_call() {
         return None;
     }
+    made_fs_call();
     let name = os(path);
     FS_METER.with_borrow_mut(|m| {
         if let Some(m) = m {
@@ -1081,7 +1179,7 @@ fn descend(
     limit: usize,
     out: &mut Vec<PathBuf>,
 ) -> Option<()> {
-    if !fs_is_dir(base) {
+    if fs_is_dir(base) != Some(true) {
         return Some(());
     }
     out.push(base.to_path_buf());

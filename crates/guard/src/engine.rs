@@ -444,7 +444,7 @@ impl Engine {
         let text = real.to_string_lossy();
         let mut carved: Option<Decision> = None;
         for pp in self.path_rules() {
-            if start.elapsed() > self.budget {
+            if self.over_budget(start) {
                 return JudgeOutcome::TimedOut;
             }
             let hit = |rules: &[BoundPathRule], set: &Option<RegexSet>| match set {
@@ -487,6 +487,12 @@ impl Engine {
     pub fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
         self
+    }
+
+    /// Has an evaluation that began at `start` spent its budget? Compiling a
+    /// rule regex on first use is not counted (`pack::budget_elapsed`).
+    fn over_budget(&self, start: Instant) -> bool {
+        crate::pack::budget_elapsed(start) > self.budget
     }
 
     /// Number of loaded packs.
@@ -696,7 +702,7 @@ impl Engine {
         };
 
         for (at, seg) in segments.iter().enumerate() {
-            if start.elapsed() > self.budget {
+            if self.over_budget(start) {
                 let rest = &segments[at..];
                 return self.out_of_budget(rest, &cx, &mut state, &mut found, profile_moved);
             }
@@ -988,7 +994,7 @@ impl Engine {
         if depth >= MAX_INLINE_DEPTH {
             return Nested::Unjudged(format!("{what} nested too deeply to judge"));
         }
-        if start.elapsed() > self.budget {
+        if self.over_budget(start) {
             return Nested::TimedOut;
         }
         if !cx.clock.afford_line(inner.len() + state.weight()) {
@@ -1737,9 +1743,10 @@ impl Engine {
             // look, which may not get there, it is judged as a directory and as
             // the file here too.
             let plain = op.into.iter().all(|s| !s.glob && !s.contents);
+            let known_dir = op.target_dir || op.path.ends_with('/');
             let mut landing = if op.into.is_empty() {
                 vec![op.path.clone()]
-            } else if (last_look || op.path.ends_with('/')) && plain {
+            } else if (last_look || known_dir) && plain {
                 let names: Vec<String> = op
                     .into
                     .iter()
@@ -1751,7 +1758,7 @@ impl Engine {
             } else {
                 continue;
             };
-            if last_look && !op.into.is_empty() && !op.path.ends_with('/') {
+            if last_look && !op.into.is_empty() && !known_dir {
                 landing.push(op.path.clone());
             }
             for raw in &landing {
@@ -1779,7 +1786,7 @@ impl Engine {
         let mut unjudged = None;
         for op in &ops {
             for cwd in anchors(&op.path) {
-                if start.elapsed() > self.budget {
+                if self.over_budget(start) {
                     return timed_out();
                 }
                 let words = if op.glob {
@@ -1801,7 +1808,8 @@ impl Engine {
                     let landing = if op.into.is_empty() {
                         vec![word]
                     } else {
-                        let (landing, forms, err) = self.landing(&word, &op.into, *cwd);
+                        let (landing, forms, err) =
+                            self.landing(&word, &op.into, op.target_dir, *cwd);
                         if let Some(reason) = err {
                             unjudged.get_or_insert(reason);
                         }
@@ -1886,7 +1894,8 @@ impl Engine {
     /// What a copy/move into `target` writes. Paths to judge in full:
     /// `target/<name>` for each source when `target` is a directory (glob
     /// sources expanded first), `target` itself otherwise or when a source
-    /// is a `contents` copy. Forms to judge as they are: for a `contents`
+    /// is a `contents` copy; both when the view cannot tell (`fs_is_dir`).
+    /// `target_dir`: named by `-t`, a directory whatever is on disk. Forms to judge as they are: for a `contents`
     /// source (`cp -T dir t`, `rsync dir/ t`, globs expanded first), each
     /// top-level entry under each form of `target` (one resolution of
     /// `target`, none per entry). A reason when a glob or a source directory
@@ -1895,6 +1904,7 @@ impl Engine {
         &self,
         target: &str,
         sources: &[Source],
+        target_dir: bool,
         cwd: Option<&Path>,
     ) -> (Vec<String>, Vec<PathBuf>, Option<String>) {
         let mut names = Vec::new();
@@ -1943,15 +1953,20 @@ impl Engine {
                 }
             }
         }
-        let is_dir = target.ends_with('/')
-            || canonicalize(target, cwd, &self.vars)
-                .is_some_and(|p| !self.is_remote(&p) && fs_is_dir(&p));
+        let is_dir = if target_dir || target.ends_with('/') {
+            Some(true)
+        } else {
+            match canonicalize(target, cwd, &self.vars) {
+                Some(p) if !self.is_remote(&p) => fs_is_dir(&p),
+                _ => Some(false),
+            }
+        };
         let mut full = Vec::new();
-        if is_dir {
+        if is_dir != Some(false) {
             full.extend(into_dir(target, &names));
         }
         let contents = sources.iter().any(|s| s.contents);
-        if !is_dir || contents {
+        if is_dir != Some(true) || contents {
             full.push(target.to_string());
         }
         let mut forms = Vec::new();
@@ -2106,12 +2121,12 @@ impl Engine {
         // rule asks for (and has no operand, when the rule asks for that),
         // and an operand names a target when the rule asks
         // for one.
-        let over_budget = || start.elapsed() > self.budget;
+        let over_budget = || self.over_budget(start);
         let matches = |rule: &crate::pack::Rule| -> Hit {
             if !line(rule).is_some_and(|l| {
                 #[cfg(test)]
                 crate::work::add(1 + l.len());
-                rule.regex.is_match(l)
+                rule.is_match(l)
             }) {
                 return Hit::No;
             }
@@ -2139,7 +2154,7 @@ impl Engine {
         };
         let mut allowed: Option<AllowTrace> = None;
         for pack in &self.packs {
-            if start.elapsed() > self.budget {
+            if self.over_budget(start) {
                 return JudgeOutcome::TimedOut;
             }
             if only.is_some_and(|id| id != pack.id) {
@@ -3388,6 +3403,7 @@ impl<'a> SegmentView<'a> {
                 glob,
                 dots: false,
                 into: Vec::new(),
+                target_dir: false,
             })
             .collect();
         // Assignments in front of this segment's own command

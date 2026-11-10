@@ -19,6 +19,11 @@
  *       A stand-in for saiife.exe that says it ran and exits 0. The DefineDosDevice
  *       measurement puts it where a remapped C: would find the hook.
  *
+ *   cl /DFAKE_CLAUDE plant.c
+ *       A stand-in for Claude Code's claude.exe that prints a version and exits 0. The
+ *       runner has no Claude Code; doctor's agent-version check, run as the agent, reads
+ *       this one from the agent's %USERPROFILE%\.local\bin (phase_forge, forge_doctor).
+ *
  * A real import of saiife.exe, planted, has none of the exports saiife.exe wants. The
  * loader would then fail the process (STATUS_ENTRYPOINT_NOT_FOUND) with no DllMain run,
  * so lib.ps1 checks the hook's exit code as well as the marker.
@@ -42,6 +47,15 @@ int main(void) {
 
 int main(void) {
     static const char line[] = "fake-hook ran\r\n";
+    DWORD n = 0;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, sizeof line - 1, &n, NULL);
+    return 0;
+}
+
+#elif defined(FAKE_CLAUDE)
+
+int main(void) {
+    static const char line[] = "9.9.9 (Claude Code)\r\n";
     DWORD n = 0;
     WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, sizeof line - 1, &n, NULL);
     return 0;

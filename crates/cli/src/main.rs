@@ -57,6 +57,7 @@ mod policy_cmd;
 mod project;
 #[cfg(debug_assertions)]
 mod read_segments_cmd;
+mod rejudge;
 mod report;
 mod report_html;
 mod run_cmd;
@@ -235,9 +236,13 @@ enum Cmd {
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<std::path::PathBuf>,
     },
-    /// The locked-mode guard worker (`check --managed` spawns it).
+    /// The locked-mode guard worker (`check --managed` spawns it). With
+    /// `--serve`, the service's warm re-judge worker (plan 21).
     #[command(name = "__eval", hide = true)]
-    Eval,
+    Eval {
+        #[arg(long)]
+        serve: bool,
+    },
     /// The MCP gateway's spawn helper (the daemon runs it): reads a spawn
     /// spec on stdin, confines itself, execs the server.
     #[command(name = "__mcp-spawn", hide = true)]
@@ -419,7 +424,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Check { .. }
-        | Cmd::Eval
+        | Cmd::Eval { .. }
         | Cmd::Secret { .. }
         | Cmd::Connect(..)
         | Cmd::Run { .. }
@@ -485,8 +490,11 @@ fn main() -> ExitCode {
         }
         return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
     }
-    if let Cmd::Eval = cli.command {
-        return eval::worker_main();
+    if let Cmd::Eval { serve } = cli.command {
+        return match serve {
+            true => eval::serve_main(),
+            false => eval::worker_main(),
+        };
     }
     if let Cmd::McpSpawn = cli.command {
         #[cfg(target_os = "linux")]
@@ -694,7 +702,7 @@ fn main() -> ExitCode {
         #[cfg(debug_assertions)]
         Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => unreachable!("handled above"),
         Cmd::Check { .. }
-        | Cmd::Eval
+        | Cmd::Eval { .. }
         | Cmd::McpSpawn
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
@@ -786,8 +794,10 @@ mod win_daemon {
         let test_pipe = std::env::var("SAIIFE_TEST_PIPE").ok();
         #[cfg(not(debug_assertions))]
         let test_pipe = None;
+        let config = paths.config.unwrap_or_else(|| layout.at(CONFIG));
         saiife_daemon::DaemonOptions {
-            config: paths.config.unwrap_or_else(|| layout.at(CONFIG)),
+            rejudge: crate::rejudge::for_system_daemon(&config),
+            config,
             state_dir: paths.state_dir.unwrap_or_else(|| layout.at(STATE_DIR)),
             credentials_dir: Some(paths.credentials_dir.unwrap_or_else(|| layout.at(KEYS_DIR))),
             catalog: super::daemon_catalog(),
@@ -897,6 +907,7 @@ fn cmd_daemon_user(a: UserArgs) -> ExitCode {
         credentials_dir: None,
         catalog: daemon_catalog(),
         directory: Box::new(saiife_policy::WinDirectory::system()),
+        rejudge: None,
         mode: saiife_daemon::DaemonMode::Personal {
             socket_dir: paths.socket_dir,
             audit_dir: paths.audit_dir,
@@ -976,8 +987,10 @@ fn cmd_daemon(a: DaemonArgs) -> ExitCode {
                 .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
         })
         .unwrap_or_else(|| daemon_default_dirs(platform).0.into());
+    let config = config.unwrap_or_else(|| daemon_default_config(platform).into());
     saiife_daemon::run(saiife_daemon::DaemonOptions {
-        config: config.unwrap_or_else(|| daemon_default_config(platform).into()),
+        rejudge: rejudge::for_system_daemon(&config),
+        config,
         state_dir,
         credentials_dir: credentials_dir
             .or_else(|| std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into))
@@ -1063,6 +1076,7 @@ fn cmd_daemon_user(a: DaemonArgs) -> ExitCode {
         credentials_dir: None,
         catalog: daemon_catalog(),
         directory: Box::new(saiife_policy::Getent),
+        rejudge: None,
         mode: saiife_daemon::DaemonMode::Personal {
             socket_dir: paths.socket_dir,
             audit_dir: paths.audit_dir,

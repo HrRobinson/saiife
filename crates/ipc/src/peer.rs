@@ -16,7 +16,10 @@ pub struct PeerCred {
     /// one: never decide access on it there.
     pub uid: u32,
     pub gid: u32,
-    /// For attribution only on Windows.
+    /// On Windows, from `GetNamedPipeClientProcessId` (the kernel gives it). It
+    /// never grants access on its own. Since plan 21 it ties a hook's `hook.bind`
+    /// to the Claude Code process that sent the co-sign request (that process
+    /// must be the hook's ancestor); elsewhere it is for attribution.
     pub pid: u32,
     /// Windows: the token's user, which is the identity. `None` on unix.
     pub sid: Option<String>,

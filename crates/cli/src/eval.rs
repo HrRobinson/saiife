@@ -5,6 +5,7 @@
 //! or a stack overflow in the engine becomes a clean `error_denied` in the
 //! parent instead of a dead hook (spec §6.1.2).
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use saiifeguard::builtins::Catalog;
-use saiifeguard::canon::{expand_glob_partial, PathVars};
+use saiifeguard::canon::{expand_glob_partial, fs_view, with_fs_view, FsView, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
@@ -21,7 +22,7 @@ use saiifeguard::payload::{
     MAX_PAYLOAD_BYTES,
 };
 
-use crate::paths::{path_vars_locked, LockedPaths};
+use crate::paths::{path_vars_locked, path_vars_locked_env, EnvList, LockedPaths};
 
 /// Memory-safety cap on what is read from stdin. Parsing skips the content
 /// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
@@ -76,6 +77,24 @@ pub struct EvalRequest {
     /// dialect of a shell command (`payload::dialects_for`).
     #[serde(default)]
     pub agent: Option<String>,
+    /// How the guard sees the file system: `host` (the hook's) or `lexical`
+    /// (the service's re-judgment, plan 21: no file system call at all).
+    #[serde(default)]
+    pub view: View,
+    /// The whole environment the path rules read, in place of this process's
+    /// (the service builds it from the asking user's account record). `None`:
+    /// this process's own.
+    #[serde(default)]
+    pub vars: Option<Vec<(String, String)>>,
+}
+
+/// [`EvalRequest::view`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum View {
+    #[default]
+    Host,
+    Lexical,
 }
 
 /// What the worker answers on stdout.
@@ -343,6 +362,59 @@ pub fn judge_with(
     ask: &[String],
     agent: Option<&str>,
 ) -> EvalAnswer {
+    judge_in(payload, packs, budget, (locked, None), ask, agent)
+}
+
+/// What the worker answers `req`. `env`: the environment a worker would be started
+/// with, which the path rules then read instead of this process's (the locked hook's
+/// in-process judgment, plan 21).
+/// The request's own `vars`, when it has them, win over `env`.
+pub fn answer(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
+    let vars: Option<Vec<(OsString, OsString)>> = req
+        .vars
+        .as_ref()
+        .map(|v| v.iter().map(|(k, v)| (k.into(), v.into())).collect());
+    let env = vars.as_deref().or(env);
+    match req.view {
+        View::Lexical => with_fs_view(FsView::Lexical, || judged(req, env)),
+        View::Host => judged(req, env),
+    }
+}
+
+/// [`answer`] in the view already set on this thread.
+fn judged(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
+    match req.event.as_deref() {
+        None => judge_in(
+            &req.payload,
+            &req.packs,
+            Duration::from_millis(req.budget_ms),
+            (req.locked.as_ref(), env),
+            &req.ask,
+            req.agent.as_deref(),
+        ),
+        Some("config-change") => judge_config_change(&req.payload),
+        Some(other) => EvalAnswer {
+            verdict: Verdict::Unjudged,
+            input: String::new(),
+            tool: None,
+            pack: None,
+            rule: None,
+            reason: Some(format!("unknown hook event {other:?}")),
+            rule_id: None,
+            askable: false,
+        },
+    }
+}
+
+/// [`judge_with`], with the path rules read from `env` when it is given.
+fn judge_in(
+    payload: &str,
+    packs: &[String],
+    budget: Duration,
+    (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
+    ask: &[String],
+    agent: Option<&str>,
+) -> EvalAnswer {
     let ctx = context_from_hook_json_bounded(payload, PARSE_MAX_BYTES);
     let answer = |verdict, input: String, reason: &str| EvalAnswer {
         verdict,
@@ -359,7 +431,7 @@ pub fn judge_with(
     }
     let engine = || {
         crate::hook_timing::time("worker.engine", || {
-            engine_for(packs, ctx.cwd.as_deref(), budget, locked)
+            engine_for(packs, ctx.cwd.as_deref(), budget, (locked, env))
         })
     };
     match plan(payload, agent) {
@@ -431,21 +503,34 @@ fn askable(
 
 /// The engine with exactly `packs` compiled (every default-on pack is
 /// compiled as well), path rules bound to `cwd` (else this process's
-/// directory), its project and the locked host's system paths.
+/// directory), its project and the locked host's system paths. The rule
+/// variables come from `env` when it is given, else from this process.
 fn engine_for(
     packs: &[String],
     cwd: Option<&str>,
     budget: Duration,
-    locked: Option<&LockedPaths>,
+    (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
 ) -> (Engine, PathVars) {
+    // Lexical (the service): nothing is looked up, neither this process's
+    // directory nor a project root above the payload's cwd.
+    let lexical = fs_view() == FsView::Lexical;
     let start = match cwd {
-        Some(c) => PathBuf::from(c),
-        None => std::env::current_dir().unwrap_or_default(),
+        Some(c) => Some(PathBuf::from(c)),
+        None if lexical => None,
+        None => Some(std::env::current_dir().unwrap_or_default()),
     };
-    let project = saiife_agents::config::find_project_root(&start);
+    let project = match lexical {
+        true => None,
+        false => start
+            .as_deref()
+            .and_then(saiife_agents::config::find_project_root),
+    };
     // Broken built-ins are skipped; their rules are not in force.
     let (packs, _warnings) = Catalog::builtin().load_active(packs);
-    let vars = path_vars_locked(Some(&start), project.as_deref(), locked);
+    let vars = match env {
+        Some(env) => path_vars_locked_env(start.as_deref(), project.as_deref(), locked, env),
+        None => path_vars_locked(start.as_deref(), project.as_deref(), locked),
+    };
     let engine = Engine::new(packs)
         .with_paths(vars.clone())
         .with_budget(budget);
@@ -866,27 +951,7 @@ fn worker_run() -> ExitCode {
     #[cfg(debug_assertions)]
     fault_seam();
     let judging = std::time::Instant::now();
-    let answer = match req.event.as_deref() {
-        None => judge_with(
-            &req.payload,
-            &req.packs,
-            Duration::from_millis(req.budget_ms),
-            req.locked.as_ref(),
-            &req.ask,
-            req.agent.as_deref(),
-        ),
-        Some("config-change") => judge_config_change(&req.payload),
-        Some(other) => EvalAnswer {
-            verdict: Verdict::Unjudged,
-            input: String::new(),
-            tool: None,
-            pack: None,
-            rule: None,
-            reason: Some(format!("unknown hook event {other:?}")),
-            rule_id: None,
-            askable: false,
-        },
-    };
+    let answer = answer(&req, None);
     crate::hook_timing::add("worker.judge", judging.elapsed());
     let mut out = std::io::stdout().lock();
     if serde_json::to_writer(&mut out, &answer)
@@ -897,6 +962,84 @@ fn worker_run() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// `saiife __eval --serve`: the service's warm worker (plan 21). It reads
+/// length-prefixed `EvalRequest` frames from stdin (a u32 big-endian length,
+/// at most `MAX_EVAL_BYTES`, then the JSON) and writes one `EvalAnswer` frame
+/// to stdout for each, until EOF (exit 0). A frame it cannot read or parse
+/// ends it with exit 1. Every request is judged lexically, whatever it asks:
+/// the service never reads the agent user's files.
+pub fn serve_main() -> ExitCode {
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    serve(&mut input, &mut output)
+}
+
+/// [`serve_main`] on any pair of streams.
+pub fn serve(input: &mut impl Read, output: &mut impl Write) -> ExitCode {
+    loop {
+        let mut req = match read_frame(input) {
+            Ok(Some(buf)) => match serde_json::from_slice::<EvalRequest>(&buf) {
+                Ok(req) => req,
+                Err(_) => return ExitCode::from(1),
+            },
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(_) => return ExitCode::from(1),
+        };
+        #[cfg(debug_assertions)]
+        fault_seam();
+        req.view = View::Lexical;
+        let answer = answer(&req, None);
+        drop(req);
+        let Ok(body) = serde_json::to_vec(&answer) else {
+            return ExitCode::from(1);
+        };
+        if write_frame(output, &body).is_err() {
+            return ExitCode::from(1);
+        }
+    }
+}
+
+/// One frame of `__eval --serve`: `None` at EOF before its first byte. A
+/// length over `MAX_EVAL_BYTES`, or a stream that ends inside the frame, is an
+/// error.
+pub fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    let mut got = 0;
+    while got < len.len() {
+        match r.read(&mut len[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_EVAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// Writes `body` as one frame and flushes.
+pub fn write_frame(w: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
+    if body.len() > MAX_EVAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
+    }
+    let len = u32::try_from(body.len()).map_err(std::io::Error::other)?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(body)?;
+    w.flush()
 }
 
 /// The `SAIIFE_EVAL_FAULT` test seam's value (debug builds only).
@@ -923,19 +1066,7 @@ fn fault_seam() {
     match fault.as_str() {
         "abort" => std::process::abort(),
         #[cfg(unix)]
-        "segv" => {
-            // std's SIGSEGV handler (stack-overflow detection) takes the
-            // first signal, finds no guard-page hit and restores the
-            // default action; the second one kills the process.
-            for _ in 0..2 {
-                let _ = rustix::process::kill_process(
-                    rustix::process::getpid(),
-                    rustix::process::Signal::SEGV,
-                );
-            }
-            // Never judge after the seam fired.
-            std::process::abort();
-        }
+        "segv" => segv(),
         "hang" => std::thread::sleep(Duration::from_secs(10)),
         "overflow" => {
             overflow(1);
@@ -950,6 +1081,26 @@ fn fault_seam() {
         }
         _ => {}
     }
+}
+
+/// Test seam, debug builds only: this process dies of SIGSEGV (the
+/// worker's seam, and the hook's own judgment of a Claude Code call).
+/// The caller makes the process not dumpable first on Linux.
+#[cfg(all(debug_assertions, unix))]
+pub fn segv() -> ! {
+    // std's SIGSEGV handler (stack-overflow detection) takes the
+    // first signal, finds no guard-page hit and restores the
+    // default action; the next one kills the process. The signal goes
+    // to the process, so in a process with other threads (the hook) it
+    // may land after kill returns: two sent back to back can merge into
+    // one. Each gets time to arrive before the next is sent.
+    for _ in 0..20 {
+        let _ =
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::SEGV);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Never judge after the seam fired.
+    std::process::abort();
 }
 
 #[cfg(debug_assertions)]

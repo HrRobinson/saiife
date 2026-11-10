@@ -1483,9 +1483,14 @@ fn status(ctx: &Ctx, id: u64) -> Value {
         "hooks_no_verdict".into(),
         json!({"since_start": n, "last_ts": last}),
     );
-    // The co-signer: `{"addr": "127.0.0.1:7433", "error": null}`, or the
-    // bind error with `addr: null`.
-    m.insert("cosign".into(), lock(&ctx.cosign).status());
+    // The co-signer: `{"addr": "127.0.0.1:7433", "error": null, "asker",
+    // "rejudge"}`, or the bind error with `addr: null`; and the calls the
+    // hook allowed that its own judgment denied (plan 21).
+    {
+        let c = lock(&ctx.cosign);
+        m.insert("cosign".into(), c.status());
+        m.insert("hooks_rejudge_denied".into(), c.rejudge_denied_status());
+    }
     ok(id, m)
 }
 

@@ -3,8 +3,9 @@
 ## 0.2.0 — YYYY-MM-DD (unreleased: waiting for the red-team suite)
 
 0.2.0 adds locked mode on Linux (v2.0) and macOS (v2.1), and Windows (v2.2):
-developer mode, and locked mode as a preview. It also adds the connector broker,
-the MCP server and gateway, the personal broker and fleet packages.
+developer mode, and locked mode. Windows locked mode is a preview for Codex and
+Gemini CLI, and not for Claude Code. It also adds the connector broker, the MCP
+server and gateway, the personal broker and fleet packages.
 
 ### Developer mode and the guard
 
@@ -28,6 +29,8 @@ the MCP server and gateway, the personal broker and fleet packages.
 - New `saiife audit verify` checks the chain (exit 0 intact, 1 broken, 2 unreadable), and the checkpoint and key-rotation signatures.
 - `saiife audit --report` gains sections: Audit chain, Policy in force, Mode per host, connectors, approvals, `error_denied`, daemon restarts and forwarding outages. `error_denied` now counts as blocked in `saiife audit`, `--blocked` and the report.
 - `scripts/bench-check.sh` prints the p95 of the developer hook too, and `BENCH_MAX_P95_MS` now applies to it.
+- The built-in packs are prebuilt into the binary, and each rule's regex is compiled on first use. Building the guard engine went from 30-54 ms to under 1.3 ms (plan 21).
+- The guard can judge a call lexically, for the service's own judgment (plan 21). It then does not follow symlinks or junctions, expand globs, or read the project's config. Those stay the hook's checks.
 
 ### Locked mode on Linux
 
@@ -37,6 +40,7 @@ the MCP server and gateway, the personal broker and fleet packages.
 - Uninstall removes exactly what install listed. `--purge` also removes the state, the audit and the users.
 - New `saiife daemon --system`: the locked-mode daemon. It is the single writer of the audit log, stamps every record's time and identity, and signs checkpoints with an Ed25519 key.
 - New `saiife check --managed`: the locked-mode hook. The guard runs in a separate worker process, and the call is allowed only after the daemon has recorded it. Every error blocks the call (it fails closed): a worker crash or hang, a daemon that is down, slow or refuses, or a policy that cannot be loaded.
+- Claude Code's managed hook judges in its own process, without a worker (plan 21). A crash is still blocked by `onFailure` and the co-signer.
 - New `saiife check --managed --event config-change`: Claude Code's ConfigChange hook. A change to user, project or local settings that sets a locked key is denied.
 - Under a managed hook, the project hook of that agent goes quiet: no double judging, no second record. In locked mode `saiife init` writes no project hook for an agent with a managed hook, and `saiife init --off` keeps the project config.
 - A killed or crashed hook never counts as an allow without a trace (plan 20).
@@ -46,6 +50,16 @@ the MCP server and gateway, the personal broker and fleet packages.
 - With `HTTPS_PROXY` or `HTTP_PROXY` set for Claude Code, add `127.0.0.1` to `NO_PROXY`. saiife does not set it, and `doctor` warns.
 - Exit watch, for every agent: the hook registers with the daemon (`hook.begin`) before it reads its input, and names the call (`hook.bind`) once it has. A hook that ends without a verdict becomes a `hook` record with decision `no_verdict`, and `doctor` warns (`hooks.no-verdict`). This is a record only; there is no automatic lockdown.
 - Codex and Gemini CLI get this detection and no co-signer, so their calls still run.
+- The service judges each Claude Code call itself (plan 21), on Linux, macOS and Windows.
+- The co-signer answers "no opinion" only when the hook recorded an allow and the service's own judgment of the input Claude Code sent allows too. Otherwise it denies with `the saiife service's own judgment denies this call` and writes a `hook` record with `event: "rejudge_denied"`, one per call.
+- So a process of the agent's user that forges the hook's allow (begin, bind, append an allow, then end the hook) cannot let a call the policy denies run.
+- The service judges with the system policy of the user who asks, as that user's account record gives the paths. It reads none of that user's files: it does not follow symlinks or junctions, expand globs, or read the project's config. Those stay the hook's checks.
+- One case is stricter than the hook: `cp review.md .claude` is denied.
+- A call that only `[guard] ask` rules deny passes when the same hook connection used an approval for that command.
+- If the service cannot judge, the call is denied (`rejudge_failed`). It keeps 2 warm judge workers (`REJUDGE_POOL`), runs at most 1 call per user at once (`REJUDGE_PER_PRINCIPAL`), and lets at most 32 wait (`REJUDGE_MAX_WAITING`).
+- The co-signer now finds who asks on every OS. On Linux it reads the socket's uid from `/proc/net/tcp`, and on macOS from `net.inet.tcp.pcblist_n`. Windows is below. When it cannot tell who asks, it denies.
+- `doctor` gains `cosign.rejudge`, `cosign.asker` and `hooks.rejudge-denied`.
+- The managed hook benches gate CI again, with budgets per OS taken from plan 21's CI runs. The managed bash p95 measured 41.2 to 50.0 ms on Linux (budget 60 ms) and under 40 ms on macOS (budget 40 ms).
 - New `core.lock` pack, on in locked mode. It protects saiife's own install: `/etc/saiife`, `/opt/saiife`, the state, audit and socket dirs, the unit and the managed agent settings.
 - New `saiife doctor [--user <name>] [--json]` checks what locked mode relies on: files, owners and modes, keys, the daemon, agent users, sudo and root-equivalent groups, and plaintext credentials. Exit 0 all pass, 1 a warning, 2 a failure. It also warns when re-authentication is unavailable.
 - `saiife status` shows a Locked mode block: mode, daemon health and chain head, policy hash, each managed agent's lock label and the MCP warnings.
@@ -81,7 +95,7 @@ the MCP server and gateway, the personal broker and fleet packages.
 - `core.lock` denies `security authorizationdb` writes, and `dscl`/`dseditgroup` on `_saiife*`.
 - Lock labels are per platform. See `docs/install.md`.
 
-### Windows (developer mode, and locked mode as a preview)
+### Windows (developer mode and locked mode)
 
 - Developer mode on Windows (v2.2): Windows 11 23H2 or later and Server 2022 or later, x64 and ARM64, no administrator rights. `install.ps1` installs `saiife.exe` from a zip checked against `SHA256SUMS`. The audit is in `%LOCALAPPDATA%\saiife\audit`. See `docs/windows.md`.
 - The guard has PowerShell and cmd readers. Claude Code's `PowerShell` tool is read as PowerShell on every OS, and its project matcher now includes it: run `saiife init` once, and `saiife status` warns until you do.
@@ -91,13 +105,17 @@ the MCP server and gateway, the personal broker and fleet packages.
 - From Git Bash, a nested PowerShell or cmd line the reader cannot read is denied, `wsl` is judged inside, and a shell reading its stdin is denied.
 - The reserved-word and vanishing-word rules hold for Windows program names too. `! rm.exe -rf /c/Windows`, `if cat.exe .env; then x; fi`, `! powershell -c "gc .env"` and `$v rm.exe -rf /c/Windows` are denied.
 - `while`, `until`, `for x do`, `select x do` and `function` still count as running text out of order when a profile variable moves on the line (`while cat ~/y; do HOME=/x; done`).
-- Locked mode on Windows (v2.2, plan 19b). Windows locked mode is a preview; see Known limits.
+- Locked mode on Windows (v2.2, plan 19b). Windows locked mode is a preview for Codex and Gemini CLI. Since plan 21 it is not a preview for Claude Code; see Known limits.
 - `saiife system install`, from an elevated terminal, copies the binary to `C:\ProgramData\saiife\bin\saiife.exe`. It creates the service `saiifed` as the virtual account `NT SERVICE\saiifed`. The service restarts after 1 s, without end, and only SYSTEM and Administrators can stop or change it.
 - It writes the managed hooks for Claude Code (`C:\Program Files\ClaudeCode\managed-settings.d\`), Codex (`C:\ProgramData\OpenAI\Codex\requirements.toml`) and Gemini CLI (`C:\ProgramData\gemini-cli\settings.json`). The hook command is `C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent <a>`.
 - Every path it makes has a protected access list, which `doctor` reads back.
 - The daemon listens on the named pipe `\\.\pipe\saiife` and refuses to start when the name is taken. It reads each caller's SID and groups from its token; records carry `sid`.
 - Release builds load DLLs only from System32. `doctor` checks the build, its imports and its signature. It also fails when Claude Code's `HKLM\SOFTWARE\Policies\ClaudeCode` would replace the managed files, and when an agent user can become an admin.
-- With the co-signer (plan 20), a hook ended with `TerminateProcess(hook, 0)` is a deny for Claude Code. Windows locked mode is still a preview. A forged allow needs no code injection: any process of the agent's user can open the service's pipe, send `hook.begin`, bind the call's key, append an allow, and then end the real hook. The co-signer sees a recorded allow and accepts it. Code injected into the hook can do the same. Plan 21 closes this; see Known limits.
+- With the co-signer (plan 20), a hook ended with `TerminateProcess(hook, 0)` is a deny for Claude Code. After plan 20 a forged allow still got through, with no code injection: any process of the agent's user could open the service's pipe, send `hook.begin`, bind the call's key, append an allow, and then end the real hook. The co-signer saw a recorded allow and accepted it. Code injected into the hook could do the same.
+- Plan 21 closes this for Claude Code: the service judges each call itself, so a forged allow cannot let a call the policy denies run. `locked-windows` showed the forged allow and the hook kill denied on `windows-2022` and `windows-2025` (CI run 42673682022).
+- On Windows the co-signer finds who asks by the pid that owns the socket in the TCP table. That pid must be at most 3 parent steps above the hook that bound the call. Code of the agent's user can re-parent a process under Claude Code, so there the service's own judgment, not the tie, is the barrier.
+- An elevated `doctor` keeps the `locked.preview` line, because it does not run `claude.exe`. The agent user runs `saiife doctor --user <name>`.
+- The managed bash p95 on Windows measured 59.1 ms (`windows-2022`) and 59.6 ms (`windows-2025`), with a budget of 130 ms. It was about 150 ms before plan 21.
 - CI's new `locked-windows` and `package-windows` jobs run it on throwaway runners. `windows-latest` checks the readers against real PowerShell and cmd.
 
 ### Connectors, MCP and the personal broker
@@ -148,13 +166,15 @@ the MCP server and gateway, the personal broker and fleet packages.
 
 ### Known limits
 
-- Windows locked mode is a preview. A process running as the agent's own user can end a hook with `TerminateProcess(hook, 0)`. Before plan 20 the agent read that exit 0 as allow, and nothing was recorded (measured on `windows-2022` and `windows-2025`). `doctor` says so on every locked run (`locked.preview`).
-- It stays a preview after plan 20. The co-signer blocks a forged exit 0 for Claude Code, but not a forged allow. That needs no code injection: any process of the agent's user can open the service's pipe, send `hook.begin`, bind the call's key, append an allow, and then end the real hook with `TerminateProcess`. The co-signer sees a recorded allow and accepts it. Code injected into the hook can do the same, as Windows gives a user full access to its own processes. A program that takes `127.0.0.1:7433` while the service restarts is not prevented either. Plan 21 is what closes this.
-- On macOS and Windows the co-signer cannot identify the TCP peer.
+- Windows locked mode is a preview for Codex and Gemini CLI. A process running as the agent's own user can end a hook with `TerminateProcess(hook, 0)`. Before plan 20 the agent read that exit 0 as allow, and nothing was recorded (measured on `windows-2022` and `windows-2025`). `doctor` says so on every locked run (`locked.preview`). An elevated `doctor` says so for Claude Code too, as it does not run `claude.exe`.
+- For Claude Code it is not a preview since plan 21. After plan 20 the co-signer blocked a forged exit 0, but not a forged allow, which needs no code injection. Code injected into the hook could do the same, as Windows gives a user full access to its own processes. Plan 21's own judgment by the service closes both: a forged allow cannot let a call the policy denies run (CI run 42673682022).
+- Not closed: a program that takes `127.0.0.1:7433` while the service restarts. This is accepted.
+- The service's judgment reads none of the asking user's files. Symlinks, junctions, globs and the project's config stay the hook's checks, and code of the agent's user can change them after any judgment anyway.
+- On Windows the co-signer ties the asker to the hook only by parent steps, and code of the agent's user can re-parent a process under Claude Code. The service's own judgment is the barrier there.
 - Codex and Gemini CLI get detection only: a hook that ends without a verdict is recorded, but the call still runs.
 - In locked mode, a Claude Code tool call whose input is over 16 MiB is blocked (the co-signer's body cap).
 - Behind a proxy, add `127.0.0.1` to `NO_PROXY` for Claude Code, or the co-signer blocks every call.
-- The managed hook costs about 90 ms on Linux, and 104 to 139 ms on Windows. Plan 21 targets that.
+- Before plan 21 the managed hook cost about 90 ms on Linux, and 104 to 139 ms on Windows. Plan 21 brought the managed bash p95 to 41.2 to 50.0 ms on Linux and about 59 ms on Windows.
 - Nothing has run on real Windows outside CI.
 - Every macOS lock label is `unverified` until the new `scripts/lock-check/macos-vm.sh` has run in a macOS VM. Every Windows lock label is `unverified` until the new `scripts/lock-check/windows-vm.ps1` has run in a VM.
 - Same-user approval is off on macOS and Windows; approvals need a second account. On macOS the prompt cannot show what is approved, so `same_user = "reauth"` acts as `"deny"`. On Windows the approver needs a separate session, and saiife never handles a Windows password.

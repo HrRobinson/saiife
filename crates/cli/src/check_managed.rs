@@ -1,8 +1,13 @@
 //! `saiife check --managed`: the locked-mode hook (spec §6.1.2). FAIL
 //! CLOSED on every error.
 //!
-//! The guard runs in a worker child (`saiife __eval`), so an abort, a
-//! signal or a stack overflow in the engine becomes a clean deny. The
+//! For Codex and Gemini CLI the guard runs in a worker child (`saiife
+//! __eval`), so an abort, a signal or a stack overflow in the engine becomes
+//! a clean deny: a dead hook would let their call run. Claude Code's calls
+//! are judged in this process, on a thread, with the worker's environment
+//! (plan 21): a hang or a panic there is a clean deny, and a crash kills the
+//! hook, which Claude Code's `onFailure: "block"` blocks and the daemon
+//! records as `no_verdict`. That saves starting a process per call. The
 //! masked record goes to the daemon (`audit.append`); the call is allowed
 //! only once the daemon has acknowledged it. Every error ends in exit 2, a
 //! reason on stderr and, when the daemon can be reached, an `error_denied`
@@ -123,10 +128,17 @@ mod imp {
     }
 }
 
+#[cfg(unix)]
+pub(crate) use imp::{hook_env, uid_env};
+/// What the service's re-judge pool shares with the hook (plan 21).
+#[cfg(any(unix, windows))]
+pub(crate) use imp::{load_locked, locked_paths, policy_with, Applied, ScopeEnv};
+
 #[cfg(any(unix, windows))]
 mod imp {
     use super::*;
 
+    use std::ffi::OsString;
     use std::io::{BufWriter, Read, Write};
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
@@ -418,10 +430,11 @@ mod imp {
         // The worker process starts now, so that its start (a large part of
         // the call on Windows) overlaps the steps below. It judges nothing
         // until it is sent the request, after the begin. A call denied before
-        // it is judged (bad arguments) starts none.
+        // it is judged (bad arguments) starts none, and neither does one
+        // judged in this process (Claude Code).
         let early = match forced {
-            None => Some(time("worker.start", Worker::start)),
-            Some(_) => None,
+            None if !in_process(agent) => Some(time("worker.start", Worker::start)),
+            _ => None,
         };
 
         // 2. Register with the daemon (plan 20) while 3. the payload is read,
@@ -654,7 +667,9 @@ mod imp {
     /// `config`. An MCP tool whose server `[guard.mcp]` does not list is
     /// denied without a worker. `early`: the worker started before the
     /// payload was read, which is sent the request, or killed when nothing
-    /// is to be judged; without one a worker is started here.
+    /// is to be judged; without one a worker is started here. Claude Code's
+    /// call is judged in this process instead, after its key is bound, so a
+    /// crash there leaves the bound `no_verdict` record.
     fn judge_call(
         (cfg, config): (&SystemConfig, &Path),
         (agent, event): (&str, Option<&str>),
@@ -713,7 +728,9 @@ mod imp {
             (None, Ok(payload), None) => mcp_judgement(agent, ctx, payload, cfg),
             _ => None,
         };
-        let (worker, unspawned) = match (&failed, &mcp_judged, input) {
+        // A worker judges the call, or (Claude Code) this process does, once
+        // the key is bound.
+        let (worker, here, unspawned) = match (&failed, &mcp_judged, input) {
             (None, None, Ok(payload)) => {
                 let req = EvalRequest {
                     payload,
@@ -724,21 +741,28 @@ mod imp {
                     event: event.map(str::to_string),
                     ask: cfg.guard.ask.clone(),
                     agent: Some(agent.to_string()),
+                    view: eval::View::Host,
+                    vars: None,
                 };
-                let started = match early {
-                    Some(w) => w,
-                    None => crate::hook_timing::time("worker.start", Worker::start),
-                };
-                let sent = match started {
-                    Ok(w) => Ok(w.send(req)),
-                    Err(e) => Err((req.payload, e)),
-                };
-                (Some(sent), None)
+                if in_process(agent) {
+                    drop(early);
+                    (None, Some(req), None)
+                } else {
+                    let started = match early {
+                        Some(w) => w,
+                        None => crate::hook_timing::time("worker.start", Worker::start),
+                    };
+                    let sent = match started {
+                        Ok(w) => Ok(w.send(req)),
+                        Err(e) => Err((req.payload, e)),
+                    };
+                    (Some(sent), None, None)
+                }
             }
             (_, _, input) => {
                 // Nothing to judge: an early worker is killed and reaped.
                 drop(early);
-                (None, input.ok())
+                (None, None, input.ok())
             }
         };
 
@@ -750,10 +774,11 @@ mod imp {
         let _ = std::thread::Builder::new()
             .name("saiife-masks".into())
             .spawn(|| crate::hook_timing::time("masks", || saiife_audit::mask::mask("")));
-        let payload = match (&worker, &unspawned) {
-            (Some(Ok(w)), _) => Some(w.payload.as_str()),
-            (Some(Err((p, _))), _) => Some(p.as_str()),
-            (None, p) => p.as_deref(),
+        let payload = match (&worker, &here, &unspawned) {
+            (Some(Ok(w)), _, _) => Some(w.payload.as_str()),
+            (Some(Err((p, _))), _, _) => Some(p.as_str()),
+            (None, Some(req), _) => Some(req.payload.as_str()),
+            (None, None, p) => p.as_deref(),
         };
         *key = crate::hook_timing::time("key", || {
             payload.and_then(|p| hook_key_bounded(agent, p, PARSE_MAX_BYTES).ok())
@@ -773,11 +798,21 @@ mod imp {
         if let Some(judged) = mcp_judged {
             return judged;
         }
-        let (payload, answer) = match worker {
-            Some(Ok(w)) => crate::hook_timing::time("worker.wait", || w.finish()),
-            Some(Err((payload, e))) => (payload, Err(format!("could not start: {e}"))),
+        let (payload, answer) = match (worker, here) {
+            (Some(Ok(w)), _) => crate::hook_timing::time("worker.wait", || w.finish()),
+            (Some(Err((payload, e))), _) => (payload, Err(format!("could not start: {e}"))),
+            (None, Some(req)) => {
+                let (payload, answer) = judge_here(req);
+                return match answer {
+                    Ok(a) => Judged::from_answer(a),
+                    Err(why) => Judged::error(
+                        recorded_input(&payload),
+                        format!("{JUDGE_HERE_FAILED} ({why})"),
+                    ),
+                };
+            }
             // A worker is spawned whenever nothing failed; deny regardless.
-            None => (String::new(), Err("not started".into())),
+            (None, None) => (String::new(), Err("not started".into())),
         };
         match answer {
             Ok(a) => Judged::from_answer(a),
@@ -785,6 +820,99 @@ mod imp {
                 recorded_input(&payload),
                 format!("guard worker failed ({why})"),
             ),
+        }
+    }
+
+    /// Whether `agent`'s calls are judged in this process, not in a worker (plan 21,
+    /// option B): Claude Code's only. A crash here kills the hook, which Claude Code's
+    /// `onFailure: "block"` turns into a block and the daemon records as `no_verdict`.
+    /// Codex and Gemini CLI keep the worker: for them a dead hook lets the call run
+    /// (§9.3).
+    fn in_process(agent: &str) -> bool {
+        agent == "claude"
+    }
+
+    /// The reason's start when the judgment in this process gave no answer.
+    const JUDGE_HERE_FAILED: &str = "the guard failed in the hook";
+
+    /// The stack of the thread that judges in this process: the engine's recursion
+    /// gets at least what it has on a worker's main thread.
+    const JUDGE_STACK: usize = 8 << 20;
+
+    /// The name of the thread that judges in this process.
+    const JUDGE_THREAD: &str = "saiife-judge";
+
+    /// `req` judged in this process, on its own thread, with the environment a worker
+    /// would get (never the agent's): the answer, or why there is none, within
+    /// `WORKER_TIMEOUT` of the start. A panic there is caught; a judgment still running
+    /// then is left behind, and ends with the process.
+    fn judge_here(req: EvalRequest) -> (String, Result<EvalAnswer, String>) {
+        use crate::hook_timing::time;
+        let payload = req.payload.clone();
+        let env = match time("judge.env", account_env) {
+            Ok(env) => env,
+            Err(e) => return (payload, Err(format!("could not start: {e}"))),
+        };
+        // A panic of the judgment is told by the deny alone: its report would
+        // stand before the deny on stderr, which Claude Code shows. Others
+        // keep the default report.
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().name() != Some(JUDGE_THREAD) {
+                report(info);
+            }
+        }));
+        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        let spawned = time("judge.start", || {
+            std::thread::Builder::new()
+                .name(JUDGE_THREAD.into())
+                .stack_size(JUDGE_STACK)
+                .spawn(move || {
+                    let judged = std::panic::catch_unwind(|| {
+                        time("judge.run", || {
+                            #[cfg(debug_assertions)]
+                            judge_here_fault();
+                            eval::answer(&req, Some(&env))
+                        })
+                    });
+                    let _ = tx.send(judged.map_err(|_| ()));
+                })
+        });
+        if let Err(e) = spawned {
+            return (payload, Err(format!("could not start: {e}")));
+        }
+        let left = (started + WORKER_TIMEOUT).saturating_duration_since(Instant::now());
+        let answer = match time("judge.wait", || rx.recv_timeout(left)) {
+            Ok(Ok(a)) => Ok(a),
+            Ok(Err(())) => Err("it panicked".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("no answer within 3 s".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("it is gone".into()),
+        };
+        (payload, answer)
+    }
+
+    /// Test seam, debug builds only: `SAIIFE_EVAL_FAULT=hang|panic|abort|segv`
+    /// makes the judgment in this process hang, panic, or kill the hook by
+    /// SIGABRT or (Unix) SIGSEGV. The worker's other faults are its own and are
+    /// ignored here.
+    #[cfg(debug_assertions)]
+    fn judge_here_fault() {
+        let fault = eval::fault();
+        // No core dump for the owner's crash reporter (as the worker's seam).
+        #[cfg(target_os = "linux")]
+        if matches!(fault.as_str(), "abort" | "segv") {
+            let _ = rustix::process::set_dumpable_behavior(
+                rustix::process::DumpableBehavior::NotDumpable,
+            );
+        }
+        match fault.as_str() {
+            "hang" => std::thread::sleep(Duration::from_secs(10)),
+            "panic" => panic!("SAIIFE_EVAL_FAULT=panic"),
+            "abort" => std::process::abort(),
+            #[cfg(unix)]
+            "segv" => eval::segv(),
+            _ => {}
         }
     }
 
@@ -874,7 +1002,7 @@ mod imp {
 
     /// The paths `core.lock` guards beyond the §5.2 defaults: the system
     /// config's own dir, the audit dir and the socket dir it names.
-    fn locked_paths(cfg: &SystemConfig, config: &Path) -> LockedPaths {
+    pub(crate) fn locked_paths(cfg: &SystemConfig, config: &Path) -> LockedPaths {
         LockedPaths {
             etc: config.parent().unwrap_or(Path::new("/")).to_path_buf(),
             audit_dir: cfg.audit.dir.clone(),
@@ -884,7 +1012,7 @@ mod imp {
 
     /// `load_system`, which must say `locked = true`. A config that fails Windows' DACL
     /// check is no policy: the call is denied, whoever wrote the file.
-    fn load_locked(config: &Path) -> Result<SystemConfig, String> {
+    pub(crate) fn load_locked(config: &Path) -> Result<SystemConfig, String> {
         crate::hook_timing::time("config.trust", || {
             crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, config)
         })?;
@@ -903,11 +1031,39 @@ mod imp {
         cfg: &SystemConfig,
         start: Option<&Path>,
     ) -> Result<(Vec<String>, String), String> {
+        policy_with(cfg, start, &OwnEnv)
+    }
+
+    /// A config with the scope environment of some user applied, and its name.
+    pub(crate) type Applied<'a> = (std::borrow::Cow<'a, SystemConfig>, Option<String>);
+
+    /// Whose scope environment a policy is resolved for: this process's user
+    /// (the hook), or the asking user (the service's re-judgment, plan 21).
+    pub(crate) trait ScopeEnv {
+        fn applied<'a>(&self, cfg: &'a SystemConfig) -> Result<Applied<'a>, String>;
+    }
+
+    /// This process's user.
+    struct OwnEnv;
+
+    impl ScopeEnv for OwnEnv {
+        fn applied<'a>(&self, cfg: &'a SystemConfig) -> Result<Applied<'a>, String> {
+            own_env(cfg)
+        }
+    }
+
+    /// [`policy_for`] with the scope environment of `who`. `start: None` reads
+    /// no project config.
+    pub(crate) fn policy_with(
+        cfg: &SystemConfig,
+        start: Option<&Path>,
+        who: &dyn ScopeEnv,
+    ) -> Result<(Vec<String>, String), String> {
         // The caller's scope environment adds its packs and is part of the
         // hash. Nothing is read or spawned unless some scope binds one; an
         // environment that cannot be resolved denies the call.
         let (cfg_env, env) = if cfg.scope.iter().any(|s| s.env.is_some()) {
-            own_env(cfg)?
+            who.applied(cfg)?
         } else {
             (std::borrow::Cow::Borrowed(cfg), None)
         };
@@ -958,6 +1114,13 @@ mod imp {
     fn own_env(
         cfg: &SystemConfig,
     ) -> Result<(std::borrow::Cow<'_, SystemConfig>, Option<String>), String> {
+        uid_env(cfg, rustix::process::getuid().as_raw())
+    }
+
+    /// The scope environment of `uid`, from this host's account files (and
+    /// `nss` where they are not the whole answer), as the daemon finds it.
+    #[cfg(unix)]
+    pub(crate) fn uid_env(cfg: &SystemConfig, uid: u32) -> Result<Applied<'_>, String> {
         let linux = cfg!(target_os = "linux");
         let read = |p: &str| {
             linux
@@ -969,7 +1132,7 @@ mod imp {
         let nsswitch = (!nsswitch.is_empty()).then_some(nsswitch);
         hook_env(
             cfg,
-            rustix::process::getuid().as_raw(),
+            uid,
             (&read("/etc/passwd"), &read("/etc/group")),
             nsswitch.as_deref(),
             &saiife_policy::Getent,
@@ -1027,7 +1190,7 @@ mod imp {
     /// `nsswitch.conf` has no other group source; otherwise `nss` answers,
     /// and a failed lookup denies.
     #[cfg(unix)]
-    fn hook_env<'a>(
+    pub(crate) fn hook_env<'a>(
         cfg: &'a SystemConfig,
         uid: u32,
         (passwd, group): (&str, &str),
@@ -1077,6 +1240,11 @@ mod imp {
         /// [`Idle::send`]. The answer is read on a thread, so a worker that
         /// never writes cannot outlast the deadline.
         fn start() -> Result<Idle, std::io::Error> {
+            // Test seam: no worker can be started (so a call judged without one shows).
+            #[cfg(debug_assertions)]
+            if eval::fault() == "worker_spawn" {
+                return Err(std::io::Error::other("SAIIFE_EVAL_FAULT=worker_spawn"));
+            }
             let exe = std::env::current_exe()?;
             let mut cmd = Command::new(exe);
             cmd.arg("__eval").env_clear();
@@ -1235,28 +1403,36 @@ mod imp {
 
     /// The worker's environment on Linux and macOS: only `HOME` and `USER` from the entry
     /// of this process's real uid. See [`Worker::start`].
-    #[cfg(unix)]
     fn worker_account(cmd: &mut Command) -> std::io::Result<()> {
+        cmd.envs(account_env()?);
+        Ok(())
+    }
+
+    /// The whole environment of a worker, and of a judgment in this process. On Linux
+    /// and macOS: only `HOME` and `USER` from the entry of this process's real uid,
+    /// `PATH=/usr/bin:/bin` and `LANG=C`.
+    #[cfg(unix)]
+    fn account_env() -> std::io::Result<Vec<(OsString, OsString)>> {
         let uid = rustix::process::getuid().as_raw();
         let Some(account) = system_entry(uid) else {
             return Err(std::io::Error::other(format!(
                 "no /etc/passwd entry for uid {uid}"
             )));
         };
-        cmd.env("HOME", &account.home)
-            .env("USER", &account.name)
-            .env("PATH", "/usr/bin:/bin")
-            .env("LANG", "C");
-        Ok(())
+        Ok(vec![
+            ("HOME".into(), account.home.into_os_string()),
+            ("USER".into(), account.name.into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("LANG".into(), "C".into()),
+        ])
     }
 
-    /// The worker's environment on Windows: the machine's record of this SID, as
-    /// `/etc/passwd` is on Linux, never `USERPROFILE`.
+    /// On Windows: the machine's record of this SID, as `/etc/passwd` is on Linux,
+    /// never `USERPROFILE`.
     #[cfg(windows)]
-    fn worker_account(cmd: &mut Command) -> std::io::Result<()> {
+    fn account_env() -> std::io::Result<Vec<(OsString, OsString)>> {
         let env = crate::win_locked::worker_environment().map_err(std::io::Error::other)?;
-        cmd.envs(env);
-        Ok(())
+        Ok(env.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
     }
 
     #[cfg(windows)]

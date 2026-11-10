@@ -19,7 +19,7 @@
 #     after whitespace, with `//` or `/*` are skipped;
 #   - crates/darwin/src/lib.rs drops its `unsafe_op_in_unsafe_fn` /
 #     `undocumented_unsafe_blocks` lints, its non-macOS forbid or its macOS
-#     deny, or crates/darwin/src has other than exactly two
+#     deny, or crates/darwin/src has other than exactly three
 #     `allow(unsafe_code)` sites;
 #   - crates/win drops its `unsafe_op_in_unsafe_fn` /
 #     `undocumented_unsafe_blocks` lints, its non-Windows forbid, its Windows
@@ -27,6 +27,12 @@
 #     Windows; or has any `allow(unsafe_code)` but the one at the top of
 #     crates/win/src/ffi/mod.rs, which covers ffi and nothing else. Linux never
 #     compiles `ffi`, so the compiler lint alone would catch those only on Windows.
+#
+# Which Windows calls crates/win/src/ffi/ may make is a list, not a grep: spec
+# §5.3a "The complete list of FFI calls" (W1), 46 functions and one macro since
+# plan 21 added `GetExtendedTcpTable`, `OpenProcess`, `GetProcessTimes` and
+# `ProcessIdToSessionId`. A new call updates that list, plan 19a's
+# and plan 19b's copies, and the count here.
 #
 # Known limit: `unsafe` that a dependency's macro expands into our code is
 # invisible to the grep. The compiler lint still catches it, unless the macro
@@ -105,8 +111,8 @@ if [ -e "$d" ]; then
         || err "$d lacks #![cfg_attr(target_os = \"macos\", deny(unsafe_code))]"
     allows="$(grep -rhE --include='*.rs' 'allow\([^)]*unsafe_code' crates/darwin/src \
         | grep -cvE '^[[:space:]]*(//|/\*)' || true)"
-    if [ "$allows" != 2 ]; then
-        err "crates/darwin/src has $allows allow(unsafe_code) sites, want exactly 2"
+    if [ "$allows" != 3 ]; then
+        err "crates/darwin/src has $allows allow(unsafe_code) sites, want exactly 3 (plan 21: sysctl, its assume_init, sysctlbyname)"
     fi
 fi
 

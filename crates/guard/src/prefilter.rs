@@ -21,9 +21,11 @@ const NOCASE: &str = "(?i)";
 #[derive(Debug, Clone, Default)]
 pub struct Prefilter {
     triggers: Vec<String>,
-    /// All triggers as one regex; `None` if empty (or, never in practice,
+    /// All triggers as one regex, compiled on the first `might_match` (a
+    /// pack's own pre-filter is asked only once the engine's combined one
+    /// matched); clones share it. `None` if empty (or, never in practice,
     /// too large to compile — then each trigger is searched on its own).
-    set: Option<Regex>,
+    set: std::sync::Arc<std::sync::OnceLock<Option<Regex>>>,
 }
 
 impl Prefilter {
@@ -35,19 +37,34 @@ impl Prefilter {
         S: Into<String>,
     {
         let triggers: Vec<String> = triggers.into_iter().map(Into::into).collect();
-        let set = if triggers.is_empty() {
-            None
-        } else {
-            let alts: Vec<String> = triggers
-                .iter()
-                .map(|t| match t.strip_prefix(NOCASE) {
-                    Some(rest) => format!("(?i:{})", regex::escape(rest)),
-                    None => regex::escape(t),
-                })
-                .collect();
-            Regex::new(&alts.join("|")).ok()
-        };
-        Self { triggers, set }
+        Self {
+            triggers,
+            set: Default::default(),
+        }
+    }
+
+    /// The triggers as one regex. Its compile time is not the engine's
+    /// (`pack::budget_elapsed`).
+    fn set(&self) -> Option<&Regex> {
+        self.set
+            .get_or_init(|| {
+                if self.triggers.is_empty() {
+                    return None;
+                }
+                let began = std::time::Instant::now();
+                let alts: Vec<String> = self
+                    .triggers
+                    .iter()
+                    .map(|t| match t.strip_prefix(NOCASE) {
+                        Some(rest) => format!("(?i:{})", regex::escape(rest)),
+                        None => regex::escape(t),
+                    })
+                    .collect();
+                let set = Regex::new(&alts.join("|")).ok();
+                crate::pack::note_compile(began, began.elapsed());
+                set
+            })
+            .as_ref()
     }
 
     /// True if `normalized` might match — i.e. it contains at least one trigger,
@@ -56,7 +73,7 @@ impl Prefilter {
         if self.triggers.is_empty() {
             return true;
         }
-        match &self.set {
+        match self.set() {
             Some(set) => set.is_match(normalized),
             None => self.triggers.iter().any(|t| match t.strip_prefix(NOCASE) {
                 Some(rest) => normalized

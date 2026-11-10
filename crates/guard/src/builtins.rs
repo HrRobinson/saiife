@@ -7,70 +7,62 @@
 //! `cloud.gcloud`, `cloud.aws`, `cloud.azure`, `iac.terraform`, `db.postgres`,
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
+//!
+//! The packs are written as `packs/*.toml` and shipped as Rust data that
+//! `build.rs` makes from them, so no hook parses TOML for them;
+//! `builtin_data_is_the_toml` keeps the two the same.
 
 use crate::canon::PathStyle;
-use crate::pack::{lazy_pack, load_shipped, peek_header, LazyMeta, Pack, PackWarning};
+use crate::pack::{
+    data_header, lazy_pack, load_shipped, peek_header, Compile, LazyMeta, Pack, PackWarning,
+    Shipped,
+};
+use crate::pack_raw::RawPackFile;
 
-/// `(source_label, toml)` for every embedded pack.
-const BUILTIN_SOURCES: &[(&str, &str)] = &[
-    (
-        "<builtin>core.filesystem",
-        include_str!("../packs/core.filesystem.toml"),
-    ),
-    ("<builtin>core.git", include_str!("../packs/core.git.toml")),
-    (
-        "<builtin>core.secrets",
-        include_str!("../packs/core.secrets.toml"),
-    ),
+/// `(source_label, file)` for every built-in pack, in load order: the first
+/// deny wins, so the order is part of every verdict. `file` names its
+/// `packs/*.toml`, which `build.rs` turned into [`data::BUILTIN_DATA`].
+const BUILTIN_ORDER: &[(&str, &str)] = &[
+    ("<builtin>core.filesystem", "core.filesystem.toml"),
+    ("<builtin>core.git", "core.git.toml"),
+    ("<builtin>core.secrets", "core.secrets.toml"),
     // Before core.self (the first deny wins): in locked mode a write to the
     // system audit dir, bound to `$SAIIFE_AUDIT_DIR` for both packs, is
     // named core.lock. After the other core packs, so their verdicts on
     // `sudo rm -rf /` and the like stay theirs.
-    (
-        "<builtin>core.lock",
-        include_str!("../packs/core.lock.toml"),
-    ),
-    (
-        "<builtin>core.self",
-        include_str!("../packs/core.self.toml"),
-    ),
+    ("<builtin>core.lock", "core.lock.toml"),
+    ("<builtin>core.self", "core.self.toml"),
     // After core.lock, so a locked-mode kill that names saiifed stays
     // core.lock's verdict.
-    (
-        "<builtin>core.process",
-        include_str!("../packs/core.process.toml"),
-    ),
-    (
-        "<builtin>cloud.gcloud",
-        include_str!("../packs/cloud.gcloud.toml"),
-    ),
-    (
-        "<builtin>cloud.aws",
-        include_str!("../packs/cloud.aws.toml"),
-    ),
-    (
-        "<builtin>iac.terraform",
-        include_str!("../packs/iac.terraform.toml"),
-    ),
-    (
-        "<builtin>db.postgres",
-        include_str!("../packs/db.postgres.toml"),
-    ),
-    (
-        "<builtin>cloud.azure",
-        include_str!("../packs/cloud.azure.toml"),
-    ),
-    ("<builtin>db.mysql", include_str!("../packs/db.mysql.toml")),
-    ("<builtin>db.mongo", include_str!("../packs/db.mongo.toml")),
-    (
-        "<builtin>container.docker",
-        include_str!("../packs/container.docker.toml"),
-    ),
-    (
-        "<builtin>container.k8s",
-        include_str!("../packs/container.k8s.toml"),
-    ),
+    ("<builtin>core.process", "core.process.toml"),
+    ("<builtin>cloud.gcloud", "cloud.gcloud.toml"),
+    ("<builtin>cloud.aws", "cloud.aws.toml"),
+    ("<builtin>iac.terraform", "iac.terraform.toml"),
+    ("<builtin>db.postgres", "db.postgres.toml"),
+    ("<builtin>cloud.azure", "cloud.azure.toml"),
+    ("<builtin>db.mysql", "db.mysql.toml"),
+    ("<builtin>db.mongo", "db.mongo.toml"),
+    ("<builtin>container.docker", "container.docker.toml"),
+    ("<builtin>container.k8s", "container.k8s.toml"),
 ];
+
+/// The built-in packs as Rust data (`build.rs`, from `packs/*.toml`).
+mod data {
+    use crate::pack_raw::{
+        OperandSyntax, RawMeta, RawPackFile, RawPathRule, RawRule, RuleAccess, RulePlatform,
+    };
+    use std::borrow::Cow;
+
+    include!(concat!(env!("OUT_DIR"), "/builtin_packs.rs"));
+}
+
+/// The data of the built-in pack in `file`.
+fn builtin_data(file: &str) -> Option<&'static RawPackFile> {
+    data::BUILTIN_DATA
+        .iter()
+        .find(|(f, _)| *f == file)
+        .map(|(_, raw)| raw)
+}
 
 /// Load and compile the embedded built-in packs for this host (fail-open: a bad
 /// built-in is skipped with a warning, never fatal — though built-ins are
@@ -123,7 +115,7 @@ pub struct Catalog {
 
 struct Entry {
     source: &'static str,
-    toml: &'static str,
+    src: Shipped,
     /// `(id, default_on, version)`; `None` if the header cannot be read.
     /// Such an entry is always loaded (and fails), so its failure is still
     /// reported.
@@ -141,8 +133,34 @@ impl Catalog {
 
     /// The embedded built-in packs, for a host of `style`: `platform` rules for
     /// another style are not compiled. See `pack`'s module docs.
+    /// No TOML is parsed: the packs are Rust data (`build.rs`).
     pub fn builtin_for(style: PathStyle) -> Self {
-        Self::from_sources_for(BUILTIN_SOURCES, style)
+        let entries = BUILTIN_ORDER
+            .iter()
+            .map(|&(source, file)| match builtin_data(file) {
+                Some(raw) => {
+                    let (header, lazy) = match data_header(raw, style) {
+                        Some((h, l)) => (Some(h), l),
+                        None => (None, None),
+                    };
+                    Entry {
+                        source,
+                        src: Shipped::Data(raw),
+                        header,
+                        lazy,
+                    }
+                }
+                // Never (a test pins the list to the data): an entry whose
+                // load fails, so a warning names it.
+                None => Entry {
+                    source,
+                    src: Shipped::Toml(""),
+                    header: None,
+                    lazy: None,
+                },
+            })
+            .collect();
+        Self { entries, style }
     }
 
     /// `(source_label, toml)` pairs, in load order, for this host.
@@ -160,7 +178,7 @@ impl Catalog {
                 };
                 Entry {
                     source,
-                    toml,
+                    src: Shipped::Toml(toml),
                     header,
                     lazy,
                 }
@@ -195,7 +213,8 @@ impl Catalog {
     /// plus those whose id is in `enabled`. The others are never compiled.
     /// A pack that says `lazy = true` is compiled only when the engine
     /// first sees one of its triggers (`core.process`: most hook calls
-    /// never name `kill`).
+    /// never name `kill`). A built-in pack's rule regexes are compiled
+    /// when a command first reaches the rule (`Compile::OnFirstUse`).
     pub fn load_active(&self, enabled: &[String]) -> (Vec<Pack>, Vec<PackWarning>) {
         self.load(
             |(id, default_on, _)| *default_on || enabled.iter().any(|e| e == id),
@@ -210,15 +229,22 @@ impl Catalog {
     ) -> (Vec<Pack>, Vec<PackWarning>) {
         let mut packs = Vec::new();
         let mut warnings = Vec::new();
+        // Only `load_active` (a hook) defers the regexes; `load_all` compiles
+        // them all and reports any that does not compile.
+        let compile = if allow_lazy {
+            Compile::OnFirstUse
+        } else {
+            Compile::Now
+        };
         for e in &self.entries {
             if e.header.as_ref().is_some_and(|h| !wanted(h)) {
                 continue;
             }
             if let (true, Some(h), Some(meta)) = (allow_lazy, &e.header, &e.lazy) {
-                packs.push(lazy_pack(e.source, e.toml, h, meta, self.style));
+                packs.push(lazy_pack(e.source, e.src, h, meta, self.style, compile));
                 continue;
             }
-            match load_shipped(e.source, e.toml, self.style, &mut warnings) {
+            match load_shipped(e.source, e.src, self.style, compile, &mut warnings) {
                 Ok(p) => packs.push(p),
                 Err(err) => {
                     let what = if err.is_broken_rule() {
@@ -240,6 +266,169 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packs_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packs")
+    }
+
+    /// `packs/*.toml` as they are on disk now, by file name, sorted.
+    fn toml_on_disk() -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = std::fs::read_dir(packs_dir())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&p).unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The catalog of the TOML on disk, as `BUILTIN_ORDER` lists it: what
+    /// the built-in packs were before they were Rust data.
+    fn toml_catalog(style: PathStyle) -> Catalog {
+        let disk = toml_on_disk();
+        let sources: Vec<(&'static str, &'static str)> = BUILTIN_ORDER
+            .iter()
+            .map(|&(label, file)| {
+                let text = &disk.iter().find(|(f, _)| f == file).unwrap().1;
+                (label, &*Box::leak(text.clone().into_boxed_str()))
+            })
+            .collect();
+        Catalog::from_sources_for(&sources, style)
+    }
+
+    /// The built-in data is the TOML: each file parses to exactly its data,
+    /// and the files, the data and the load order name the same packs. A
+    /// TOML edited without a rebuild (or an emitter in `build.rs` that
+    /// mixes up two fields) fails here.
+    #[test]
+    fn builtin_data_is_the_toml() {
+        let disk = toml_on_disk();
+        let files: Vec<&str> = disk.iter().map(|(f, _)| f.as_str()).collect();
+        let data: Vec<&str> = data::BUILTIN_DATA.iter().map(|(f, _)| *f).collect();
+        assert_eq!(files, data, "packs/ and the built-in data differ: rebuild");
+        for ((file, text), (_, raw)) in disk.iter().zip(data::BUILTIN_DATA) {
+            let parsed: RawPackFile = toml::from_str(text).unwrap();
+            assert_eq!(&parsed, raw, "{file}");
+        }
+        let mut order: Vec<&str> = BUILTIN_ORDER.iter().map(|(_, f)| *f).collect();
+        order.sort();
+        assert_eq!(order, data, "each pack is in BUILTIN_ORDER once");
+        for (label, file) in BUILTIN_ORDER {
+            let id = &builtin_data(file).unwrap().pack.id;
+            assert_eq!(*label, format!("<builtin>{id}"), "{file}");
+        }
+    }
+
+    /// Loaded from the data, every pack is what it was loaded from the TOML:
+    /// the same headers (so the same pack list and policy hash), and every
+    /// rule, path rule and trigger the same, for both host styles.
+    #[test]
+    fn data_packs_load_as_the_toml_did() {
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            let (data, toml) = (Catalog::builtin_for(style), toml_catalog(style));
+            assert_eq!(data.headers(), toml.headers(), "{style:?}");
+            let (a, wa) = data.load_all();
+            let (b, wb) = toml.load_all();
+            assert!(wa.is_empty() && wb.is_empty(), "{wa:?} {wb:?}");
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "{style:?}");
+            for enabled in [vec![], vec!["core.lock".to_string()]] {
+                let ids = |c: &Catalog| {
+                    let (p, w) = c.load_active(&enabled);
+                    assert!(w.is_empty(), "{w:?}");
+                    p.iter()
+                        .map(|p| (p.id.clone(), p.version, p.triggers.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(ids(&data), ids(&toml), "{style:?} {enabled:?}");
+            }
+        }
+    }
+
+    /// A hook's load compiles no rule regex; a command compiles only the
+    /// rules it reaches, once per engine, and judges as an eager load does.
+    #[test]
+    fn hook_load_compiles_rules_on_first_use() {
+        let enabled = ["core.lock".to_string()];
+        let (packs, w) = Catalog::builtin().load_active(&enabled);
+        assert!(w.is_empty(), "{w:?}");
+        let compiled = |packs: &[Pack], id: &str| {
+            let p = packs.iter().find(|p| p.id == id).unwrap();
+            p.allow_rules()
+                .iter()
+                .chain(p.deny_rules())
+                .filter(|r| r.is_compiled())
+                .count()
+        };
+        // Clones share the regexes: `packs` sees what the engine compiles.
+        let engine = crate::engine::Engine::new(packs.clone());
+        for p in &packs {
+            assert_eq!(compiled(&packs, &p.id), 0, "{}", p.id);
+        }
+        assert!(!engine.evaluate("ls -la").is_deny());
+        for p in &packs {
+            assert_eq!(compiled(&packs, &p.id), 0, "ls compiles nothing: {}", p.id);
+        }
+        let d = engine.evaluate("git push --force origin main");
+        assert!(matches!(&d, crate::Decision::Deny { pack, .. } if pack == "core.git"));
+        assert!(compiled(&packs, "core.git") > 0);
+        assert_eq!(compiled(&packs, "core.secrets"), 0);
+        assert_eq!(compiled(&packs, "core.filesystem"), 0);
+        // The eager load has every regex compiled, and judges the same.
+        let (eager, _) = builtin_packs();
+        let eager = crate::profile::select_active(eager, &enabled);
+        for p in &eager {
+            assert_eq!(
+                compiled(&eager, &p.id),
+                p.rule_count() - p.allow_path.len() - p.deny_path.len()
+            );
+        }
+        let eager = crate::engine::Engine::new(eager);
+        for cmd in [
+            "git push --force origin main",
+            "git push --force-with-lease",
+            "ls -la",
+        ] {
+            assert_eq!(
+                format!("{:?}", engine.evaluate(cmd)),
+                format!("{:?}", eager.evaluate(cmd)),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// The built-in packs judge alike whether their regexes were compiled at
+    /// load or on first use, nested lines and lazy packs included (the
+    /// corpora pin this at scale: `tests/prebuilt_packs.rs`).
+    #[test]
+    fn first_use_compiles_judge_as_compiled_ones() {
+        let (lazy, _) = Catalog::builtin().load_active(&[]);
+        let (eager, _) = builtin_packs();
+        let eager = crate::profile::select_active(eager, &[]);
+        let budget = std::time::Duration::from_secs(30);
+        let lazy = crate::engine::Engine::new(lazy).with_budget(budget);
+        let eager = crate::engine::Engine::new(eager).with_budget(budget);
+        for cmd in [
+            "rm -rf /",
+            "cat ~/.ssh/id_rsa",
+            "env",
+            "pkill -n",
+            "kill -9 -1",
+            "git reset --hard",
+            "sudo rm -rf --no-preserve-root /",
+            "echo $(rm -rf /)",
+            "bash -c 'git clean -fdx'",
+        ] {
+            assert_eq!(
+                format!("{:?}", lazy.evaluate(cmd)),
+                format!("{:?}", eager.evaluate(cmd)),
+                "{cmd}"
+            );
+        }
+    }
 
     #[test]
     fn builtin_rule_denies_only_with_that_rule() {

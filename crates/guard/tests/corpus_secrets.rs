@@ -177,6 +177,29 @@ fn secret_files_through_shell_readers() {
     }
 }
 
+/// A glob is judged as it is spelled, and then as what it expands to. A spelling a rule
+/// denies is denied even when the fixture holds only allowed matches (`.env.*` finds
+/// `.env.example` alone here), so the hook and the service's lexical view agree on these
+/// (`crates/cli/tests/lexical_corpus.rs`). The other way, a spelling no rule names that
+/// expands to a secret (`.e*` finds `.env`), only the host's expansion denies: the
+/// lexical view misses it, like a symlink (docs/threats.md, A21).
+#[test]
+fn globs_are_judged_as_spelled_and_as_expanded() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "cat .env.*",
+        "cat .env.e*",
+        "head -n 5 .env.?xample",
+        "cat .env.[e]xample",
+        "cat ~/.ssh/id_rsa.p*",
+        "cat .e*",
+        "cat .env*",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_symlink_to_a_secret_is_the_secret() {

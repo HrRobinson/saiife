@@ -19,7 +19,6 @@
 //! a rule whose variable has no value on this machine is skipped.
 
 use regex::Regex;
-use serde::Deserialize;
 
 use crate::canon::{PathStyle, PathVars};
 use crate::winpath;
@@ -40,14 +39,7 @@ impl Access {
     }
 }
 
-/// Which accesses a path rule applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RuleAccess {
-    Read,
-    Write,
-    Any,
-}
+pub use crate::pack_raw::RuleAccess;
 
 impl RuleAccess {
     pub fn covers(self, a: Access) -> bool {

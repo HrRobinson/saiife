@@ -153,7 +153,7 @@ logged-in account yet, so we do not know whether Gemini CLI can be locked.
 The managed file is `/etc/gemini-cli/settings.json` on Linux,
 `/Library/Application Support/GeminiCli/settings.json` on macOS and
 `C:\ProgramData\gemini-cli\settings.json` on Windows, where locked mode is a preview
-([Windows](../windows.md#locked-mode)). The macOS and Windows results will go to
+for Gemini CLI, as it has no co-signer ([Windows](../windows.md#locked-mode)). The macOS and Windows results will go to
 `crates/agents/tests/fixtures/lock-check/macos/gemini.tsv` and `…/windows/gemini.tsv`.
 On macOS and Windows the daemon matches sessions by process name only, so a Gemini CLI
 running as `node` gets no session: its requests share the per-uid limits
@@ -169,6 +169,7 @@ Fail-closed matrix (Gemini CLI column, from the design; unverified live):
 | guard engine crash | blocked (a worker isolates it; the parent denies) |
 | `check` parent killed or crashes | blocked if the exit code is not 0 or 1 (unverified for signals); recorded |
 | `check` ended with exit 0 by a process of the agent's user (Windows) | **runs**; recorded |
+| a forged allow by a process of the agent's user | **runs**; recorded |
 | hook timeout (10 s) | **runs** |
 | daemon down or not answering in 2 s | blocked |
 | binary missing | possibly blocked (exit 127, unverified) |

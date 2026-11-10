@@ -332,8 +332,18 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_APPROVAL_SHOW => show(ctx, &conn.peer, req).await,
         OP_APPROVAL_DECIDE => decide(ctx, conn, req).await,
         OP_GRANT_CONSUME => {
+            // The grant's key and scope, as `grant_consume` computes them.
+            let used = call_fields(&req).ok().map(|f| crate::hooks::UsedGrant {
+                key: crate::grants::hex(&f.key(&conn.peer)),
+                project: f.key_project,
+            });
             let (v, granted) = grant_consume(ctx, &conn.peer, req).await;
             conn.steps().granted = granted;
+            // The co-signer lets the service's `ask` deny pass only for the
+            // call this connection's grant was for (plan 21).
+            if let (Some(_), Some(used)) = (granted, used) {
+                ctx.hooks.granted(conn.id, used);
+            }
             v
         }
         OP_APPROVAL_CREATE => {
@@ -859,12 +869,19 @@ fn normal_absolute(p: &str) -> bool {
 /// canonicalizes both, and the daemon (another uid, `ProtectHome=`) does no
 /// filesystem access here.
 fn project_ok(f: &CallFields) -> bool {
+    within_project(&f.project, &f.key_project)
+}
+
+/// Whether `project` (a cwd) is the project root `root` or below it, by
+/// the rules of [`project_ok`]. The co-signer checks a co-signed body's
+/// `cwd` against the root of the grant its hook used (plan 21).
+pub(crate) fn within_project(project: &str, root: &str) -> bool {
     if cfg!(windows) {
-        return windows_within(&f.project, &f.key_project);
+        return windows_within(project, root);
     }
-    normal_absolute(&f.project)
-        && normal_absolute(&f.key_project)
-        && std::path::Path::new(&f.project).starts_with(&f.key_project)
+    normal_absolute(project)
+        && normal_absolute(root)
+        && std::path::Path::new(project).starts_with(root)
 }
 
 /// No `.` or `..` component in `p`, past a device prefix (`\\?\`, `\\.\`, `\??\`).

@@ -19,11 +19,12 @@
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::hookkey::HookKey;
 use saiife_ipc::peer::PeerCred;
+use saiife_win::proc::{is_descendant, ProcEntry};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -37,6 +38,20 @@ pub const HOOK_OVERRUN: Duration = Duration::from_secs(10);
 pub const VERDICT_TTL: Duration = Duration::from_secs(60);
 /// The most keys kept; the oldest is dropped first.
 pub const MAX_KEYS: usize = 4096;
+/// Windows (plan 21, D2): the hook that bound a call is at most this many
+/// parent steps under the process that sent the co-sign request (Claude Code,
+/// then Git Bash or PowerShell, then `saiife.exe`; 1 in exec form).
+///
+/// The hook's chain (its own entry and those of up to this many ancestors) is
+/// read once, at its bind, while its connection is open and so the hook is
+/// alive: a fast hook has often bound, given its verdict and exited by the
+/// time the co-sign request is waited on (CI-2). The co-sign request is then
+/// checked against that stored chain. Residual: an ancestor that exits within
+/// [`VERDICT_TTL`] of the bind can have its pid reused, and a request from
+/// the new owner of that pid ties, as a later table read would also have
+/// let it. The service cannot read the creation times that would tell them
+/// apart; the re-judge still stands behind the tie.
+pub const ASKER_MAX_DEPTH: usize = 3;
 /// The `reason` of a `no_verdict` record.
 pub const NO_VERDICT_REASON: &str =
     "the hook ended without a verdict (killed, crashed or timed out)";
@@ -73,19 +88,67 @@ impl BindRefused {
 }
 
 /// What [`HookTable::wait`] saw for a key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waited {
-    /// The hook recorded an `allow` (or an `approved`).
-    Allow,
+    /// The hook recorded an `allow` (or an `approved`), and who bound it.
+    Allow(Bound),
     /// The hook recorded any other decision.
     Deny,
     /// The hook ended without a verdict, and no other connection gave one.
     NoVerdict,
     /// Nothing by the deadline.
     Timeout,
-    /// The key was bound by another principal than the one waiting: no
-    /// allow for the waiter.
+    /// The key was bound by another principal than the one waiting, or
+    /// (Windows) by a process that is not under the asker: no allow for the
+    /// waiter.
     Foreign,
+}
+
+/// The hook connection whose `allow` settled a key (plan 21): who the
+/// co-signer's own judgment judges the call as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bound {
+    pub principal: Principal,
+    /// The binding connection's pid (`PeerCred.pid`).
+    pub pid: u32,
+    /// Windows: that connection's token groups. Empty elsewhere.
+    pub groups: Vec<String>,
+    /// The grant that connection used up (`grant.consume`), if it used one.
+    pub grant: Option<UsedGrant>,
+}
+
+/// A grant a hook connection used up: its key, which holds the principal,
+/// agent, project root, tool, input and the command's SHA-256
+/// (`grants::grant_key`), and that project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsedGrant {
+    /// The grant key, lowercase hex.
+    pub key: String,
+    /// The canonical project root the key holds.
+    pub project: String,
+}
+
+/// [`Waited`] without the binder: what a key's slot keeps, and what the
+/// tests compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Allow,
+    Deny,
+    NoVerdict,
+    Timeout,
+    Foreign,
+}
+
+impl Waited {
+    pub fn outcome(&self) -> Outcome {
+        match self {
+            Waited::Allow(_) => Outcome::Allow,
+            Waited::Deny => Outcome::Deny,
+            Waited::NoVerdict => Outcome::NoVerdict,
+            Waited::Timeout => Outcome::Timeout,
+            Waited::Foreign => Outcome::Foreign,
+        }
+    }
 }
 
 /// Who a hook connection runs as: the SID on Windows, the uid elsewhere
@@ -195,6 +258,79 @@ pub struct NoVerdict {
 /// table's lock held, from a tokio task or a connection's end.
 pub type Sink = Box<dyn Fn(NoVerdict) + Send + Sync>;
 
+/// The process table read at each hook's bind to tie it to its asker later
+/// (Windows: `saiife_win::ffi::proc::snapshot`). Tests give a fake one.
+pub type Tree = Arc<dyn Fn() -> std::io::Result<Vec<ProcEntry>> + Send + Sync>;
+
+/// The process table of this system: a Toolhelp snapshot on Windows, with the
+/// creation times and sessions the service may read. No other system ties a
+/// co-sign request to a process, so there is none (no read at a bind), and a
+/// wait that needs one sees [`Waited::Foreign`].
+#[cfg(windows)]
+fn system_tree() -> Option<Tree> {
+    Some(Arc::new(saiife_win::ffi::proc::snapshot_timed))
+}
+
+#[cfg(not(windows))]
+fn system_tree() -> Option<Tree> {
+    None
+}
+
+/// A binder's chain, read at its bind ([`ASKER_MAX_DEPTH`]).
+#[derive(Debug, Clone)]
+enum Chain {
+    /// The read runs on a blocking thread.
+    Reading,
+    /// The binder's entry and those of its ancestors, as the table had them.
+    Read(Arc<[ProcEntry]>),
+    /// No table, or it could not be read: ties nothing.
+    Failed,
+}
+
+/// `pid`'s entry, then its parent's, up to `depth` parent steps: every entry
+/// [`is_descendant`]`(snap, _, pid, depth)` looks at, so the walk over these
+/// alone gives the same answer for any ancestor as over all of `snap`.
+fn chain_of(snap: &[ProcEntry], pid: u32, depth: usize) -> Vec<ProcEntry> {
+    let mut out: Vec<ProcEntry> = Vec::new();
+    let mut at = pid;
+    for _ in 0..=depth {
+        if out.iter().any(|e| e.pid == at) {
+            break;
+        }
+        let Some(e) = snap.iter().find(|e| e.pid == at) else {
+            break;
+        };
+        out.push(e.clone());
+        at = e.ppid;
+    }
+    out
+}
+
+/// A chain read, started by calling it (outside the table's lock).
+type ChainJob = Box<dyn FnOnce()>;
+
+/// Start reading `pid`'s chain: [`Chain::Failed`] at once without a table.
+/// The read itself runs when the returned job is called: on a blocking
+/// thread when there is a runtime, else in place.
+fn chain_read(tree: Option<Tree>, pid: u32) -> (watch::Receiver<Chain>, Option<ChainJob>) {
+    let Some(tree) = tree else {
+        return (watch::channel(Chain::Failed).1, None);
+    };
+    let (tx, rx) = watch::channel(Chain::Reading);
+    let job = move || {
+        let chain = match tree() {
+            Ok(snap) => Chain::Read(chain_of(&snap, pid, ASKER_MAX_DEPTH).into()),
+            Err(_) => Chain::Failed,
+        };
+        tx.send_replace(chain);
+    };
+    let run = move || match tokio::runtime::Handle::try_current() {
+        Ok(h) => drop(h.spawn_blocking(job)),
+        Err(_) => job(),
+    };
+    (rx, Some(Box::new(run)))
+}
+
 /// The longest `tool_use_id` kept in a record, in bytes (`hook.bind`'s own
 /// limit).
 pub const MAX_RECORDED_ID: usize = 256;
@@ -259,6 +395,10 @@ struct Open {
     began: Instant,
     key: Option<HookKey>,
     tool: Option<String>,
+    /// The grant this connection used up.
+    grant: Option<UsedGrant>,
+    /// Its chain, read at its first bind.
+    chain: Option<watch::Receiver<Chain>>,
     /// A verdict came, or the overrun already ended it.
     done: bool,
     /// Fired at the overrun: the connection's server closes it.
@@ -271,11 +411,43 @@ struct Slot {
     /// Who bound it first; only connections of this principal may bind
     /// it again or settle it, and only its waiters may see its outcome.
     principal: Principal,
-    outcome: Option<Waited>,
+    /// The connection that bound it last (each connection's first bind
+    /// sets it, and clears the outcome): the hook whose verdict counts. A
+    /// connection it superseded settles nothing, neither by a verdict nor
+    /// by ending without one.
+    conn: ConnId,
+    /// That connection's pid. Windows ties it to the asker's process tree.
+    pid: u32,
+    /// That connection's chain, read at its bind: what the tie checks.
+    chain: watch::Receiver<Chain>,
+    /// That connection's token groups (Windows), for the service's own
+    /// judgment.
+    groups: Vec<String>,
+    /// The grant that connection used up.
+    grant: Option<UsedGrant>,
+    outcome: Option<Outcome>,
     /// Verdicts given on this key, so a grace period sees a later one.
     verdicts: u64,
     at: Instant,
     notify: Arc<Notify>,
+}
+
+impl Slot {
+    /// The outcome as a waiter sees it (an allow names its binder).
+    fn waited(&self) -> Waited {
+        match self.outcome {
+            Some(Outcome::Allow) => Waited::Allow(Bound {
+                principal: self.principal.clone(),
+                pid: self.pid,
+                groups: self.groups.clone(),
+                grant: self.grant.clone(),
+            }),
+            Some(Outcome::Deny) => Waited::Deny,
+            Some(Outcome::NoVerdict) => Waited::NoVerdict,
+            Some(Outcome::Foreign) => Waited::Foreign,
+            Some(Outcome::Timeout) | None => Waited::Timeout,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -314,6 +486,7 @@ struct Inner {
     sink: Sink,
     /// Fired whenever a key is added, for waiters on a key not seen yet.
     added: Arc<Notify>,
+    tree: Mutex<Option<Tree>>,
 }
 
 impl Inner {
@@ -322,8 +495,9 @@ impl Inner {
     }
 
     /// Count a hook without a verdict and send it to the sink; settles the
-    /// key's waiters on `NoVerdict` unless a verdict came after `seen`.
-    fn record(&self, mut nv: NoVerdict, seen: Option<u64>) {
+    /// key's waiters on `NoVerdict` unless a verdict came after `seen`, and
+    /// only while `conn` is still the key's binder.
+    fn record(&self, mut nv: NoVerdict, seen: Option<u64>, conn: ConnId) {
         {
             let mut st = self.lock();
             let principal = Principal::of(&nv.peer);
@@ -342,9 +516,9 @@ impl Inner {
                 .key
                 .as_ref()
                 .and_then(|k| st.keys.get_mut(k))
-                .filter(|s| s.principal == principal)
+                .filter(|s| s.principal == principal && s.conn == conn)
             {
-                slot.outcome = Some(Waited::NoVerdict);
+                slot.outcome = Some(Outcome::NoVerdict);
                 slot.notify.notify_waiters();
             }
             nv.ts = crate::ops::now_ts();
@@ -356,7 +530,13 @@ impl Inner {
 
     /// A connection that ended (or overran) without a verdict: recorded at
     /// once when unbound, after [`RECONNECT_GRACE`] when bound.
-    fn ended_without_verdict(self: &Arc<Self>, st: MutexGuard<'_, State>, o: Open, overrun: bool) {
+    fn ended_without_verdict(
+        self: &Arc<Self>,
+        st: MutexGuard<'_, State>,
+        conn: ConnId,
+        o: Open,
+        overrun: bool,
+    ) {
         let seen = o
             .key
             .as_ref()
@@ -373,18 +553,18 @@ impl Inner {
             ts: String::new(),
         };
         if nv.key.is_none() {
-            return self.record(nv, None);
+            return self.record(nv, None, conn);
         }
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 let inner = Arc::clone(self);
                 h.spawn(async move {
                     tokio::time::sleep(RECONNECT_GRACE).await;
-                    inner.record(nv, seen);
+                    inner.record(nv, seen, conn);
                 });
             }
             // No runtime (a shutdown): record without the grace.
-            Err(_) => self.record(nv, seen),
+            Err(_) => self.record(nv, seen, conn),
         }
     }
 
@@ -410,11 +590,33 @@ impl Inner {
             began: o.began,
             key: o.key.clone(),
             tool: o.tool.clone(),
+            grant: o.grant.clone(),
+            chain: o.chain.clone(),
             done: true,
             close: None,
             overrun: None,
         };
-        self.ended_without_verdict(st, copy, true);
+        self.ended_without_verdict(st, conn, copy, true);
+    }
+}
+
+/// Whether `binder` ran under `asker` ([`ASKER_MAX_DEPTH`]) in its `chain`
+/// read at its bind, once that read is done; `None` past `until`. A read
+/// that failed or never finished ties nothing.
+async fn tie(
+    asker: u32,
+    binder: u32,
+    mut chain: watch::Receiver<Chain>,
+    until: Instant,
+) -> Option<bool> {
+    let read = chain.wait_for(|c| !matches!(c, Chain::Reading));
+    match tokio::time::timeout_at(until, read).await {
+        Err(_) => None,
+        Ok(Err(_)) => Some(false),
+        Ok(Ok(c)) => Some(match &*c {
+            Chain::Read(entries) => is_descendant(entries, asker, binder, ASKER_MAX_DEPTH),
+            Chain::Reading | Chain::Failed => false,
+        }),
     }
 }
 
@@ -430,8 +632,15 @@ impl HookTable {
                 state: Mutex::default(),
                 sink,
                 added: Arc::new(Notify::new()),
+                tree: Mutex::new(system_tree()),
             }),
         }
+    }
+
+    /// Tests only: walk `tree` in place of the system's process table.
+    #[doc(hidden)]
+    pub fn set_tree(&self, tree: Tree) {
+        *self.inner.tree.lock().unwrap_or_else(|p| p.into_inner()) = Some(tree);
     }
 
     /// `hook.begin` on `conn`; `false` when the connection already sent it.
@@ -472,6 +681,8 @@ impl HookTable {
                 began,
                 key: None,
                 tool: None,
+                grant: None,
+                chain: None,
                 done: false,
                 close,
                 overrun,
@@ -490,6 +701,11 @@ impl HookTable {
 
     /// [`HookTable::bind`], naming the tool for the record, and saying why
     /// a refused bind was refused.
+    ///
+    /// A connection's first bind reads the process table once, for the
+    /// hook's chain ([`ASKER_MAX_DEPTH`]): on a blocking thread, so the bind
+    /// answers at once, while the connection is open. A wait that ties waits
+    /// for that read before it takes any outcome of this binder.
     pub fn bind_tool(
         &self,
         conn: ConnId,
@@ -501,30 +717,50 @@ impl HookTable {
         // Expired keys go first: an old slot of another principal must not
         // refuse a fresh bind.
         st.prune(now);
-        let (principal, first) = match st.conns.get(&conn) {
+        let (principal, pid, groups, grant, first) = match st.conns.get(&conn) {
             // One key per connection: a second key would let one
             // connection add slots and evict other users' keys.
             Some(o) if o.done => return Err(BindRefused::Ended),
             Some(o) if o.key.as_ref().is_some_and(|k| *k != key) => {
                 return Err(BindRefused::OtherKey)
             }
-            Some(o) => (o.principal.clone(), o.key.is_none()),
+            Some(o) => (
+                o.principal.clone(),
+                o.peer.pid,
+                o.peer.group_sids.clone(),
+                o.grant.clone(),
+                o.key.is_none(),
+            ),
             None => return Err(BindRefused::NotBegun),
         };
         if st.keys.get(&key).is_some_and(|s| s.principal != principal) {
             return Err(BindRefused::OtherPrincipal);
         }
+        let mut read = None;
+        let mut chain = watch::channel(Chain::Failed).1;
         if let Some(o) = st.conns.get_mut(&conn) {
             o.key = Some(key.clone());
             if tool.is_some() {
                 o.tool = tool;
             }
+            let rx = o.chain.get_or_insert_with(|| {
+                let tree = self.inner.tree.lock().unwrap_or_else(|p| p.into_inner());
+                let (rx, job) = chain_read(tree.clone(), pid);
+                read = job;
+                rx
+            });
+            chain = rx.clone();
         }
         // A new connection on a known key asks again: the old outcome no
         // longer answers it, and waiters wait for this connection's verdict.
         if first {
             if let Some(s) = st.keys.get_mut(&key) {
                 s.outcome = None;
+                s.conn = conn;
+                s.pid = pid;
+                s.chain = chain.clone();
+                s.groups = groups.clone();
+                s.grant = grant.clone();
             }
         }
         if !st.keys.contains_key(&key) {
@@ -532,6 +768,11 @@ impl HookTable {
                 key.clone(),
                 Slot {
                     principal,
+                    conn,
+                    pid,
+                    chain,
+                    groups,
+                    grant,
                     outcome: None,
                     verdicts: 0,
                     at: now,
@@ -542,6 +783,10 @@ impl HookTable {
             self.inner.added.notify_waiters();
         }
         st.prune(now);
+        drop(st);
+        if let Some(read) = read {
+            read();
+        }
         Ok(())
     }
 
@@ -549,7 +794,8 @@ impl HookTable {
     /// `allow` and `approved` settle its key as [`Waited::Allow`]; every
     /// other decision as [`Waited::Deny`]. A record that does not name the
     /// bound key ([`Verdict::names`]) settles nothing, and the connection
-    /// stays without a verdict.
+    /// stays without a verdict. A connection whose key a later connection
+    /// bound has its verdict, but settles nothing: only the binder's counts.
     pub fn verdict(&self, conn: ConnId, v: &Verdict) {
         let mut st = self.inner.lock();
         let Some(o) = st.conns.get_mut(&conn) else {
@@ -570,13 +816,36 @@ impl HookTable {
         };
         let principal = o.principal.clone();
         let outcome = match v.decision {
-            DecisionKind::Allow | DecisionKind::Approved => Waited::Allow,
-            _ => Waited::Deny,
+            DecisionKind::Allow | DecisionKind::Approved => Outcome::Allow,
+            _ => Outcome::Deny,
         };
-        if let Some(slot) = st.keys.get_mut(&key).filter(|s| s.principal == principal) {
+        if let Some(slot) = st
+            .keys
+            .get_mut(&key)
+            .filter(|s| s.principal == principal && s.conn == conn)
+        {
             slot.outcome = Some(outcome);
             slot.verdicts += 1;
             slot.notify.notify_waiters();
+        }
+    }
+
+    /// `conn` used up `grant` (`grant.consume`). It is kept for the
+    /// connection's key while that connection is the key's binder, so the
+    /// co-signer lets the service's `ask` deny pass for exactly the call
+    /// the grant was for (plan 21).
+    pub fn granted(&self, conn: ConnId, grant: UsedGrant) {
+        let mut st = self.inner.lock();
+        let Some(o) = st.conns.get_mut(&conn) else {
+            return;
+        };
+        o.grant = Some(grant.clone());
+        let (key, principal) = (o.key.clone(), o.principal.clone());
+        if let Some(s) = key
+            .and_then(|k| st.keys.get_mut(&k))
+            .filter(|s| s.principal == principal && s.conn == conn)
+        {
+            s.grant = Some(grant);
         }
     }
 
@@ -593,30 +862,56 @@ impl HookTable {
         if o.done {
             return;
         }
-        self.inner.ended_without_verdict(st, o, false);
+        self.inner.ended_without_verdict(st, conn, o, false);
     }
 
     /// The verdict on `key` for `principal`, waiting for it until `until`
     /// (tokio's clock). A key bound by another principal is
     /// [`Waited::Foreign`] at once. `None` takes any principal's verdict:
     /// for a caller that cannot tell who asks.
+    ///
+    /// `asker_pid` (Windows, plan 21 D2): the pid that owns the co-sign
+    /// request's socket. The key's binder must then be a descendant of it,
+    /// at most [`ASKER_MAX_DEPTH`] parent steps down, or the wait is
+    /// [`Waited::Foreign`]. The tie checks the binder's chain read at its
+    /// bind ([`HookTable::bind_tool`]), never a later table: the hook may
+    /// have exited by now. It waits for that read (until `until`) before it
+    /// takes any outcome of the binder. A table that could not be read ties
+    /// nothing.
     pub async fn wait(
         &self,
         key: &HookKey,
         principal: Option<&Principal>,
+        asker_pid: Option<u32>,
         until: Instant,
     ) -> Waited {
         let foreign = |s: &Slot| principal.is_some_and(|p| s.principal != *p);
+        // The binder (connection) this wait has tied to the asker.
+        let mut tied: Option<ConnId> = None;
         loop {
+            let untied = |s: &Slot| asker_pid.is_some() && tied != Some(s.conn);
             let notify = {
                 let st = self.inner.lock();
                 match st.keys.get(key) {
                     Some(s) if foreign(s) => return Waited::Foreign,
-                    Some(Slot {
-                        outcome: Some(o), ..
-                    }) => return *o,
-                    Some(s) => Arc::clone(&s.notify),
-                    None => Arc::clone(&self.inner.added),
+                    Some(s) if untied(s) => Err((s.conn, s.pid, s.chain.clone())),
+                    Some(s) if s.outcome.is_some() => return s.waited(),
+                    Some(s) => Ok(Arc::clone(&s.notify)),
+                    None => Ok(Arc::clone(&self.inner.added)),
+                }
+            };
+            let notify = match notify {
+                Ok(n) => n,
+                // Only a wait with an asker pid ties (pid 0 is no one's).
+                Err((conn, binder, chain)) => {
+                    match tie(asker_pid.unwrap_or(0), binder, chain, until).await {
+                        Some(true) => {
+                            tied = Some(conn);
+                            continue;
+                        }
+                        Some(false) => return Waited::Foreign,
+                        None => return Waited::Timeout,
+                    }
                 }
             };
             let woken = notify.notified();
@@ -627,10 +922,8 @@ impl HookTable {
                 let st = self.inner.lock();
                 woken.as_mut().enable();
                 match st.keys.get(key) {
-                    Some(s) if foreign(s) => return Waited::Foreign,
-                    Some(Slot {
-                        outcome: Some(o), ..
-                    }) => return *o,
+                    Some(s) if foreign(s) || untied(s) => continue,
+                    Some(s) if s.outcome.is_some() => return s.waited(),
                     Some(s) if Arc::ptr_eq(&s.notify, &notify) => {}
                     None if Arc::ptr_eq(&self.inner.added, &notify) => {}
                     _ => continue,
@@ -639,8 +932,9 @@ impl HookTable {
             if tokio::time::timeout_at(until, woken).await.is_err() {
                 let st = self.inner.lock();
                 return match st.keys.get(key) {
-                    Some(s) if foreign(s) => Waited::Foreign,
-                    s => s.and_then(|s| s.outcome).unwrap_or(Waited::Timeout),
+                    Some(s) if foreign(s) || untied(s) => Waited::Foreign,
+                    Some(s) if s.outcome.is_some() => s.waited(),
+                    _ => Waited::Timeout,
                 };
             }
         }
@@ -708,8 +1002,10 @@ mod tests {
 
     impl HookTable {
         /// [`HookTable::wait`] as the principal of [`peer`].
-        async fn wait_me(&self, key: &HookKey, until: Instant) -> Waited {
-            self.wait(key, Some(&Principal::of(&peer())), until).await
+        async fn wait_me(&self, key: &HookKey, until: Instant) -> Outcome {
+            self.wait(key, Some(&Principal::of(&peer())), None, until)
+                .await
+                .outcome()
         }
     }
 
@@ -735,7 +1031,7 @@ mod tests {
         assert!(got(&seen).is_empty());
         assert_eq!(t.no_verdict_count(), (0, None));
         let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Allow);
     }
 
     #[tokio::test(start_paused = true)]
@@ -777,7 +1073,7 @@ mod tests {
         assert!(!r.extra.contains_key("overrun"));
         assert_eq!(t.no_verdict_count(), (1, Some(nv.ts.clone())));
         let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::NoVerdict);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::NoVerdict);
     }
 
     #[tokio::test(start_paused = true)]
@@ -814,7 +1110,7 @@ mod tests {
             t.ended(ConnId(2));
         };
         let (w, ()) = tokio::join!(waiter, reconnect);
-        assert_eq!(w, Waited::Allow);
+        assert_eq!(w, Outcome::Allow);
         assert_eq!(start.elapsed(), Duration::from_secs(2), "woken at once");
         tokio::time::sleep(RECONNECT_GRACE * 2).await;
         settle().await;
@@ -823,7 +1119,7 @@ mod tests {
         assert_eq!(
             t.wait_me(&key(1), Instant::now() + Duration::from_secs(1))
                 .await,
-            Waited::Allow
+            Outcome::Allow
         );
     }
 
@@ -835,7 +1131,7 @@ mod tests {
         t.ended(ConnId(1));
         let start = Instant::now();
         let w = t.wait_me(&key(1), start + Duration::from_secs(8)).await;
-        assert_eq!(w, Waited::NoVerdict);
+        assert_eq!(w, Outcome::NoVerdict);
         assert_eq!(start.elapsed(), RECONNECT_GRACE);
         assert_eq!(got(&seen).len(), 1);
     }
@@ -853,7 +1149,7 @@ mod tests {
         t.verdict(ConnId(1), &any(DecisionKind::Allow));
         t.ended(ConnId(1));
         let w = t.wait_me(&key(1), start + Duration::from_secs(60)).await;
-        assert_eq!(w, Waited::NoVerdict);
+        assert_eq!(w, Outcome::NoVerdict);
         assert_eq!(start.elapsed(), HOOK_OVERRUN + RECONNECT_GRACE);
         let all = got(&seen);
         assert_eq!(all.len(), 1);
@@ -874,7 +1170,7 @@ mod tests {
         assert!(got(&seen).is_empty());
         let start = Instant::now();
         let w = t.wait_me(&key(1), start + Duration::from_secs(1)).await;
-        assert_eq!(w, Waited::Timeout);
+        assert_eq!(w, Outcome::Timeout);
     }
 
     #[tokio::test(start_paused = true)]
@@ -894,10 +1190,10 @@ mod tests {
     async fn deny_and_other_decisions_settle_deny() {
         let (t, _seen) = table();
         for (n, d, w) in [
-            (1, DecisionKind::Deny, Waited::Deny),
-            (2, DecisionKind::ErrorDenied, Waited::Deny),
-            (3, DecisionKind::Ask, Waited::Deny),
-            (4, DecisionKind::Approved, Waited::Allow),
+            (1, DecisionKind::Deny, Outcome::Deny),
+            (2, DecisionKind::ErrorDenied, Outcome::Deny),
+            (3, DecisionKind::Ask, Outcome::Deny),
+            (4, DecisionKind::Approved, Outcome::Allow),
         ] {
             t.begin(ConnId(n as u64), &peer(), "claude", None);
             t.bind(ConnId(n as u64), key(n));
@@ -920,9 +1216,9 @@ mod tests {
         assert_eq!(t.inner.lock().keys.len(), MAX_KEYS);
         let start = Instant::now();
         let until = start + Duration::from_secs(3);
-        assert_eq!(t.wait_me(&key(0), until).await, Waited::Timeout);
+        assert_eq!(t.wait_me(&key(0), until).await, Outcome::Timeout);
         assert_eq!(start.elapsed(), Duration::from_secs(3));
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Allow);
     }
 
     #[tokio::test(start_paused = true)]
@@ -936,7 +1232,7 @@ mod tests {
         t.begin(ConnId(2), &peer(), "claude", None);
         t.bind(ConnId(2), key(2));
         let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Timeout);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout);
     }
 
     #[tokio::test(start_paused = true)]
@@ -952,7 +1248,7 @@ mod tests {
             t.verdict(ConnId(1), &any(DecisionKind::Allow));
         };
         let (w, ()) = tokio::join!(waiter, hook);
-        assert_eq!(w, Waited::Allow);
+        assert_eq!(w, Outcome::Allow);
         assert_eq!(start.elapsed(), Duration::from_millis(400));
     }
 
@@ -966,7 +1262,7 @@ mod tests {
         // Its verdict settles nothing.
         t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Allow));
         let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Timeout);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout);
         // The same uid on another SID is another principal too.
         let sid = PeerCred {
             sid: Some("S-1-5-21-1-2-3-1001".into()),
@@ -976,7 +1272,7 @@ mod tests {
         assert!(!t.bind(ConnId(3), key(1)));
         // The binder's own verdict settles it.
         t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Allow);
     }
 
     #[tokio::test(start_paused = true)]
@@ -992,7 +1288,7 @@ mod tests {
         t.ended(ConnId(2));
         let start = Instant::now();
         let w = t.wait_me(&key(1), start + Duration::from_secs(8)).await;
-        assert_eq!(w, Waited::NoVerdict);
+        assert_eq!(w, Outcome::NoVerdict);
         settle().await;
         // Conn 1's no_verdict, and conn 2 (unbound, its verdict taken
         // without a key) adds none.
@@ -1008,14 +1304,16 @@ mod tests {
         let start = Instant::now();
         let them = Principal::of(&other());
         let w = t
-            .wait(&key(1), Some(&them), start + Duration::from_secs(8))
-            .await;
-        assert_eq!(w, Waited::Foreign);
+            .wait(&key(1), Some(&them), None, start + Duration::from_secs(8))
+            .await
+            .outcome();
+        assert_eq!(w, Outcome::Foreign);
         assert_eq!(start.elapsed(), Duration::ZERO, "at once");
         // A waiter on a key not bound yet sees foreign once it is bound.
         let waiter = async {
-            t.wait(&key(2), Some(&them), start + Duration::from_secs(8))
+            t.wait(&key(2), Some(&them), None, start + Duration::from_secs(8))
                 .await
+                .outcome()
         };
         let hook = async {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1023,10 +1321,13 @@ mod tests {
             t.bind(ConnId(2), key(2));
         };
         let (w, ()) = tokio::join!(waiter, hook);
-        assert_eq!(w, Waited::Foreign);
+        assert_eq!(w, Outcome::Foreign);
         // `None` takes any principal's verdict.
-        let w = t.wait(&key(1), None, start + Duration::from_secs(8)).await;
-        assert_eq!(w, Waited::Allow);
+        let w = t
+            .wait(&key(1), None, None, start + Duration::from_secs(8))
+            .await
+            .outcome();
+        assert_eq!(w, Outcome::Allow);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1057,7 +1358,7 @@ mod tests {
             assert!(t.bind(c, key(1)));
             t.verdict(c, v);
             let until = Instant::now() + Duration::from_secs(1);
-            assert_eq!(t.wait_me(&key(1), until).await, Waited::Timeout, "{v:?}");
+            assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout, "{v:?}");
             // Still without a verdict: its end is recorded.
             t.ended(c);
         }
@@ -1091,10 +1392,13 @@ mod tests {
         assert!(t.bind(ConnId(1), key(1)));
         t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
         let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Allow);
         let them = Principal::of(&other());
         t.verdict(ConnId(2), &Verdict::for_key(&key(0), DecisionKind::Deny));
-        assert_eq!(t.wait(&key(0), Some(&them), until).await, Waited::Deny);
+        assert_eq!(
+            t.wait(&key(0), Some(&them), None, until).await.outcome(),
+            Outcome::Deny
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1105,13 +1409,13 @@ mod tests {
         t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
         t.ended(ConnId(1));
         let until = Instant::now() + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Allow);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Allow);
         // A new connection binds the key: the old allow is gone.
         t.begin(ConnId(2), &peer(), "claude", None);
         assert!(t.bind(ConnId(2), key(1)));
         let start = Instant::now();
         let until = start + Duration::from_secs(1);
-        assert_eq!(t.wait_me(&key(1), until).await, Waited::Timeout);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout);
         // The waiter gets the new verdict when it comes, not before.
         let waiter = async { t.wait_me(&key(1), start + Duration::from_secs(8)).await };
         let hook = async {
@@ -1119,8 +1423,279 @@ mod tests {
             t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Deny));
         };
         let (w, ()) = tokio::join!(waiter, hook);
-        assert_eq!(w, Waited::Deny);
+        assert_eq!(w, Outcome::Deny);
         assert_eq!(start.elapsed(), Duration::from_millis(1500));
+    }
+
+    /// A connection superseded by a later bind of its key (security review
+    /// of T4, finding 1): its verdict no longer settles the key, so a
+    /// forger that bound first cannot allow the real hook's call.
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_connection_cannot_settle_the_key() {
+        let (t, _seen) = table();
+        t.set_tree(Arc::new(|| {
+            let e = |pid, ppid| ProcEntry {
+                pid,
+                ppid,
+                exe: String::new(),
+                created: None,
+                session: None,
+            };
+            Ok(vec![e(100, 50), e(777, 100), e(900, 100)])
+        }));
+        let forger = PeerCred { pid: 900, ..peer() };
+        t.begin(ConnId(1), &forger, "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        // The real hook binds the same key after it.
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Timeout);
+        // Nor does the forger tied to an asker: the binder is the hook (777).
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Timeout
+        );
+        // The binder's own verdict settles it.
+        t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Deny));
+        assert_eq!(t.wait_me(&key(1), until).await, Outcome::Deny);
+    }
+
+    /// A superseded connection that ends without a verdict is recorded, but
+    /// does not settle the binder's key as `NoVerdict`.
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_end_does_not_settle_no_verdict() {
+        let (t, seen) = table();
+        t.begin(ConnId(1), &peer(), "claude", None);
+        t.bind(ConnId(1), key(1));
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.ended(ConnId(1));
+        let start = Instant::now();
+        let waiter = async { t.wait_me(&key(1), start + Duration::from_secs(8)).await };
+        let hook = async {
+            tokio::time::sleep(RECONNECT_GRACE + Duration::from_secs(1)).await;
+            t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        };
+        let (w, ()) = tokio::join!(waiter, hook);
+        assert_eq!(w, Outcome::Allow);
+        settle().await;
+        assert_eq!(got(&seen).len(), 1, "conn 1 is still recorded");
+        assert_eq!(t.no_verdict_count().0, 1);
+        // The binder's own end without a verdict does settle it.
+        t.begin(ConnId(3), &peer(), "claude", None);
+        t.bind(ConnId(3), key(2));
+        t.ended(ConnId(3));
+        let until = Instant::now() + Duration::from_secs(8);
+        assert_eq!(t.wait_me(&key(2), until).await, Outcome::NoVerdict);
+    }
+
+    /// Until the chain read at the bind of `k`'s binder is done.
+    async fn read_done(t: &HookTable, k: &HookKey) {
+        let mut chain = t.inner.lock().keys[k].chain.clone();
+        let _ = chain.wait_for(|c| !matches!(c, Chain::Reading)).await;
+    }
+
+    fn pe(pid: u32, ppid: u32) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            exe: format!("p{pid}.exe"),
+            created: None,
+            session: None,
+        }
+    }
+
+    /// A process table the test changes as processes come and go: Claude
+    /// Code (100) under 50 under 10, its shell (200), the hook (777);
+    /// another branch (900).
+    fn live_tree(t: &HookTable) -> Arc<Mutex<Option<Vec<ProcEntry>>>> {
+        let table = Arc::new(Mutex::new(Some(vec![
+            pe(10, 4),
+            pe(50, 10),
+            pe(100, 50),
+            pe(200, 100),
+            pe(777, 200),
+            pe(900, 50),
+        ])));
+        let read = Arc::clone(&table);
+        t.set_tree(Arc::new(move || {
+            read.lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| std::io::Error::other("no table"))
+        }));
+        table
+    }
+
+    /// CI-2 race: a fast hook binds, appends its allow and exits before the
+    /// co-sign request reaches `wait`. Its chain was read at the bind, so
+    /// the call still ties to its live asker.
+    #[tokio::test(start_paused = true)]
+    async fn a_hook_gone_before_the_request_still_ties() {
+        let (t, _seen) = table();
+        let procs = live_tree(&t);
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        t.ended(ConnId(1));
+        read_done(&t, &key(1)).await;
+        // The hook and its shell exit; Claude Code still runs.
+        procs
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .retain(|e| e.pid != 777 && e.pid != 200);
+        for asker in [100, 50] {
+            let until = Instant::now() + Duration::from_secs(1);
+            assert_eq!(
+                t.wait(&key(1), None, Some(asker), until).await.outcome(),
+                Outcome::Allow,
+                "{asker}"
+            );
+        }
+    }
+
+    /// The asker is checked against the chain read at the bind: a process
+    /// outside it is foreign, even when a later table says otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn an_asker_outside_the_stored_chain_is_foreign() {
+        let (t, _seen) = table();
+        let procs = live_tree(&t);
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        read_done(&t, &key(1)).await;
+        // Another branch, 4 steps up, the hook itself, System.
+        for asker in [900, 10, 777, 4] {
+            let until = Instant::now() + Duration::from_secs(1);
+            assert_eq!(
+                t.wait(&key(1), None, Some(asker), until).await.outcome(),
+                Outcome::Foreign,
+                "{asker}"
+            );
+        }
+        // The hook's pid now names a process under 900: not read again.
+        procs.lock().unwrap().as_mut().unwrap().push(pe(777, 900));
+        procs
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .retain(|e| !(e.pid == 777 && e.ppid == 200));
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            t.wait(&key(1), None, Some(900), until).await.outcome(),
+            Outcome::Foreign
+        );
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Allow
+        );
+    }
+
+    /// A chain that could not be read at the bind ties nothing, even when
+    /// the table can be read by the time of the request.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_chain_read_is_foreign() {
+        let (t, _seen) = table();
+        let procs = live_tree(&t);
+        let full = procs.lock().unwrap().take();
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)));
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        read_done(&t, &key(1)).await;
+        *procs.lock().unwrap() = full;
+        let until = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Foreign
+        );
+        // A new binder of the key is read afresh, at its bind.
+        t.begin(ConnId(2), &peer(), "claude", None);
+        assert!(t.bind(ConnId(2), key(1)));
+        t.verdict(ConnId(2), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        assert_eq!(
+            t.wait(&key(1), None, Some(100), until).await.outcome(),
+            Outcome::Allow
+        );
+    }
+
+    /// The relation over the stored chain is the relation over the whole
+    /// table: only the time of the read changed.
+    #[test]
+    fn the_chain_ties_as_the_whole_table() {
+        let et = |pid, ppid, created, session| ProcEntry {
+            created: Some(created),
+            session: Some(session),
+            ..pe(pid, ppid)
+        };
+        let tables = [
+            vec![
+                pe(4, 0),
+                pe(10, 4),
+                pe(50, 10),
+                pe(100, 50),
+                pe(200, 100),
+                pe(777, 200),
+                pe(800, 777),
+                pe(900, 50),
+            ],
+            // A loop, and a process that is its own parent.
+            vec![pe(10, 20), pe(20, 30), pe(30, 10), pe(40, 40)],
+            // A reused parent pid, another session, a parent not listed.
+            vec![
+                et(100, 50, 10, 1),
+                et(200, 100, 40, 1),
+                et(300, 200, 30, 1),
+                et(400, 300, 50, 2),
+                et(500, 999, 60, 1),
+            ],
+        ];
+        for snap in &tables {
+            let mut pids: Vec<u32> = snap.iter().flat_map(|e| [e.pid, e.ppid]).collect();
+            pids.extend([0, 4, 999, 12345]);
+            for &binder in &pids {
+                let chain = chain_of(snap, binder, ASKER_MAX_DEPTH);
+                assert!(chain.len() <= ASKER_MAX_DEPTH + 1);
+                for &asker in &pids {
+                    assert_eq!(
+                        is_descendant(&chain, asker, binder, ASKER_MAX_DEPTH),
+                        is_descendant(snap, asker, binder, ASKER_MAX_DEPTH),
+                        "{asker} {binder} {snap:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bind answers before the read is done, and an allow is not taken
+    /// until it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allow_waits_for_the_chain_read() {
+        let (t, _seen) = table();
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        t.set_tree(Arc::new(move || {
+            gate.lock().unwrap().recv().ok();
+            Ok(vec![pe(100, 50), pe(200, 100), pe(777, 200)])
+        }));
+        let t = Arc::new(t);
+        t.begin(ConnId(1), &peer(), "claude", None);
+        assert!(t.bind(ConnId(1), key(1)), "not held by the read");
+        t.verdict(ConnId(1), &Verdict::for_key(&key(1), DecisionKind::Allow));
+        let t2 = Arc::clone(&t);
+        let w = tokio::spawn(async move {
+            let until = Instant::now() + Duration::from_secs(30);
+            t2.wait(&key(1), None, Some(100), until).await.outcome()
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!w.is_finished(), "the allow waits for the read");
+        go.send(()).unwrap();
+        assert_eq!(w.await.unwrap(), Outcome::Allow);
     }
 
     #[test]
