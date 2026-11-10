@@ -114,18 +114,18 @@ Scope as in the vision §5, unchanged:
 - one proxy owns 80/443;
 - `<service>.<project>.localhost` names instead of ports;
 - zero-edit use on any compose repo (an override written outside the repo);
-- per-project mkcert certificates;
+- per-project certificates from a local saiife CA (rcgen; trusting it is a one-time user step);
 - `saiife dev up | ls | down | gc`;
 - an ownership label `saiife.managed` on everything it creates, and volumes deleted only after confirmation;
 - per-project quirks in `~/.config/saiife/dev/<project>.toml`.
 
-**Why first [call]:** boxes need it. App links from a box (`https://app.box1.localhost`) go through this proxy. It is also useful alone, and it builds the label, cleanup and Docker-API code (`bollard`) the box manager reuses.
+**Why first [call]:** boxes need it. App links from a box (`https://app.box1.localhost`) go through this proxy. It is also useful alone, and it builds the label and cleanup code the box manager reuses. saiife drives the `docker` CLI as a subprocess (no Docker API crate), and the proxy (Traefik) uses only its file provider, never the Docker socket.
 
 **v3 addition:** the proxy gets a second kind of backend, "a port inside box N". The daemon opens a vsock connection into the guest on demand. No host port is ever bound for a box.
 
 **Release [call]:** ship as `saiife dev` in a 0.3.x release before boxes, labelled preview.
 
-**Builder note:** host Docker is off-limits to build agents. Unit and integration tests use a loopback mock of the Docker Engine API. Owner smoke: `scripts/dev-smoke.sh`.
+**Builder note:** host Docker is off-limits to build agents. Unit and integration tests use a fake `docker` executable (`SAIIFE_DOCKER`). Owner smoke: `scripts/dev-smoke.sh`.
 
 ## 7. Part B: boxes
 
@@ -394,7 +394,7 @@ The touch and never-rules steps can run in parallel with late box plans; they do
 
 ## 12. Testing
 
-- Unit and integration tests use mocks: a Docker Engine API mock, a Cloud Hypervisor REST mock, a fake vsock (Unix socket pair), FIDO2 and WebAuthn test vectors, and loopback rcgen TLS for `saiife-link`.
+- Unit and integration tests use mocks: a fake `docker` executable, a Cloud Hypervisor REST mock, a fake vsock (Unix socket pair), FIDO2 and WebAuthn test vectors, and loopback rcgen TLS for `saiife-link`.
 - The diff importer gets an adversarial test suite: path traversal, symlinks, `.git` writes, huge files.
 - Real VM, real Docker and real hardware key are **owner-run smoke scripts** (`scripts/box-smoke.sh`, `scripts/dev-smoke.sh`, `scripts/touch-smoke.sh`). Build agents never run them (hard rules).
 - Red-team scenarios for v3 (box tries to reach the host, forge a diff, exhaust disk, fake terminal UI) are added to the parked 9c suite.
