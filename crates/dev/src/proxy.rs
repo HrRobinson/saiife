@@ -894,8 +894,9 @@ mod tests {
 
 // plan 23 task 5: the proxy container.
 
-/// The Traefik image. The owner appends `@sha256:<digest>`.
-pub const PROXY_IMAGE: &str = "traefik:v3.7.16";
+/// The Traefik image, pinned by digest (owner, 2026-11-10).
+pub const PROXY_IMAGE: &str =
+    "traefik:v3.7.16@sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65";
 
 /// Label carrying `spec_hash(run_args)`; a different value means recreate.
 const SPEC: &str = "saiife.dev.proxy-spec";
