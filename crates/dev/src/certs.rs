@@ -9,8 +9,8 @@
 use crate::paths::DevPaths;
 use crate::DevError;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, GeneralSubtree, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, NameConstraints,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree,
+    IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -150,14 +150,23 @@ fn ca_params(created: OffsetDateTime, now: OffsetDateTime) -> CertificateParams 
     );
     params.distinguished_name = dn;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    // DNS names only under `localhost`. A permitted DNS subtree leaves the other
+    // name forms open (RFC 5280 4.2.1.10), so:
+    // - every IPv4 and IPv6 address is excluded (/0);
+    // - mail names are permitted only under the reserved `.invalid` (RFC 6761),
+    //   because RFC 5280 has no "every mailbox" form for an exclusion. webpki
+    //   refuses any mail SAN once a mail constraint exists.
+    // rcgen 0.14.10 cannot encode a URI subtree, so URI names stay unconstrained.
     params.name_constraints = Some(NameConstraints {
-        permitted_subtrees: vec![GeneralSubtree::DnsName("localhost".to_string())],
-        excluded_subtrees: vec![],
+        permitted_subtrees: vec![
+            GeneralSubtree::DnsName("localhost".to_string()),
+            GeneralSubtree::Rfc822Name(".invalid".to_string()),
+        ],
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])),
+            GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])),
+        ],
     });
     params.not_before = now - Duration::hours(1);
     params.not_after = now + Duration::days(CA_DAYS);
@@ -218,9 +227,9 @@ fn read_key(path: &Path) -> Result<KeyPair, DevError> {
 }
 
 fn load_ca(dir: &Path, now: OffsetDateTime) -> Result<Ca, DevError> {
-    let meta = fs::metadata(dir).map_err(io_err(dir))?;
+    let meta = fs::symlink_metadata(dir).map_err(io_err(dir))?;
     if !meta.is_dir() {
-        return Err(invalid(dir, "not a directory"));
+        return Err(invalid(dir, "not a directory (a symlink is refused too)"));
     }
     let cert_path = dir.join(CA_CERT);
     let key_path = dir.join(CA_KEY);
@@ -294,7 +303,7 @@ pub(crate) fn ca_issuer(ca: &Ca) -> Result<(Issuer<'static, KeyPair>, Vec<u8>), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, KeyPair};
+    use rcgen::{CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, KeyPair, SanType};
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -391,6 +400,86 @@ mod tests {
             format!("{err:?}").contains("NameConstraintViolation"),
             "{err:?}"
         );
+    }
+
+    /// A leaf with exactly `sans`, signed through `ca_issuer`.
+    fn leaf_with(ca: &Ca, sans: Vec<SanType>) -> CertificateDer<'static> {
+        let (issuer, _) = ca_issuer(ca).unwrap();
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = sans;
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::hours(1);
+        params.not_after = now + Duration::days(1);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        params.signed_by(&key, &issuer).unwrap().der().clone()
+    }
+
+    fn dns(s: &str) -> SanType {
+        SanType::DnsName(s.try_into().unwrap())
+    }
+
+    fn ip(s: &str) -> SanType {
+        SanType::IpAddress(s.parse().unwrap())
+    }
+
+    fn assert_constraint_violation(r: Result<(), rustls::Error>) {
+        let err = r.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("NameConstraintViolation"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn ip_sans_are_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = ensure_ca(&dev_paths(tmp.path())).unwrap();
+
+        let v4 = leaf_with(&ca, vec![ip("10.0.0.1"), ip("::1")]);
+        assert_constraint_violation(verify(&ca.cert_pem, &v4, "10.0.0.1"));
+
+        let v6 = leaf_with(&ca, vec![ip("::1")]);
+        assert_constraint_violation(verify(&ca.cert_pem, &v6, "::1"));
+
+        // An IP next to a good DNS name still taints the whole leaf.
+        let mixed = leaf_with(&ca, vec![dns("web.shop.localhost"), ip("127.0.0.1")]);
+        assert_constraint_violation(verify(&ca.cert_pem, &mixed, "web.shop.localhost"));
+
+        let good = leaf_with(&ca, vec![dns("web.shop.localhost"), dns("shop.localhost")]);
+        verify(&ca.cert_pem, &good, "web.shop.localhost").unwrap();
+        verify(&ca.cert_pem, &good, "shop.localhost").unwrap();
+    }
+
+    #[test]
+    fn email_sans_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = ensure_ca(&dev_paths(tmp.path())).unwrap();
+        for mail in ["a@evil.example", "a@shop.localhost"] {
+            let leaf = leaf_with(
+                &ca,
+                vec![
+                    dns("web.shop.localhost"),
+                    SanType::Rfc822Name(mail.try_into().unwrap()),
+                ],
+            );
+            assert_constraint_violation(verify(&ca.cert_pem, &leaf, "web.shop.localhost"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ca_dir_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = dev_paths(&tmp.path().join("other"));
+        ensure_ca(&elsewhere).unwrap();
+        let paths = dev_paths(tmp.path());
+        fs::create_dir_all(&paths.state).unwrap();
+        std::os::unix::fs::symlink(elsewhere.ca_dir(), paths.ca_dir()).unwrap();
+        match ensure_ca(&paths) {
+            Err(DevError::CaInvalid { path, .. }) => assert_eq!(path, paths.ca_dir()),
+            other => panic!("expected CaInvalid, got {other:?}"),
+        }
     }
 
     #[test]
