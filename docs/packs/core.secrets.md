@@ -54,7 +54,10 @@ through shell commands that write them (`cp`, `mv`, `tee`, `dd`, `ln`,
   may write anywhere, wherever it runs: absolute or `../` names
   (`tar -P`, `unzip -:`, `7z x -spf`, `-snl`), `cpio -i` without
   `--no-absolute-filenames`, and an extract with an option saiife does not
-  know (an abbreviated long option included). Listing
+  know (an abbreviated long option included), a 7-Zip verb it does not
+  know, or a second relative `tar -C`. Setting `TAR_OPTIONS`, `UNZIP`,
+  `UNZIPOPT` or `UNZIP_OPTS` is blocked: those give every later extract
+  options the line does not show. Listing
   them (`ls ~/.ssh`), `chmod 700 ~/.ssh` and writing other files in them
   (`~/.ssh/known_hosts`, `~/.ssh/config`, `~/.aws/config`) stay allowed.
 

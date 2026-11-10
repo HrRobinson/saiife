@@ -115,6 +115,7 @@ pub(crate) fn understood(cmd: &str) -> bool {
 pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Operand> {
     let mut out = Out(Vec::new());
     redirections(segment, &mut out);
+    archiver_options_from_env(segment, &mut out);
     let Some(cmd) = argv.first() else {
         return out.0;
     };
@@ -820,8 +821,14 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
         // of an option not listed above), so every folder is written. An
         // option not known here may change where (an abbreviation of
         // `--absolute-names`), so it counts as `-P`.
+        // `-C a -C b` is `a/b`: a relative `-C` after the first joins the one
+        // before, so where it lands is not one of the folders named.
+        let relative_again = dirs.iter().skip(1).any(|d| {
+            !d.s.starts_with(['/', '\\', '~', '$']) && d.s.as_bytes().get(1) != Some(&b':')
+        });
         let absolute = any(&[Name::Short('P'), Name::Long("absolute-names")])
-            || !all_known(&args, TAR_SHORT, TAR_LONG);
+            || !all_known(&args, TAR_SHORT, TAR_LONG)
+            || relative_again;
         extract_into(out, &dirs, absolute);
     }
     for t in members {
@@ -912,6 +919,31 @@ fn all_known(args: &[Arg], short: &str, long: &[&str]) -> bool {
         Arg::Opt(Name::Long(l), _) => long.contains(l),
         Arg::Operand(_) => true,
     })
+}
+
+/// Variables an extractor reads its options from (GNU tar, Info-ZIP unzip).
+const ARCHIVER_OPTION_VARS: &[&str] = &["TAR_OPTIONS", "UNZIP", "UNZIPOPT", "UNZIP_OPTS"];
+
+/// Setting one of `ARCHIVER_OPTION_VARS` (`TAR_OPTIONS=-P tar -xf x`,
+/// `export UNZIP=-:`, `env TAR_OPTIONS=… tar`) hands every later extract
+/// options this module does not see, so it may write anywhere: `/`. Any word
+/// of the segment counts; a later line cannot be followed back to it.
+fn archiver_options_from_env(segment: &[Word], out: &mut Out) {
+    // Any word naming one (`export TAR_OPTIONS`, `read UNZIP`, `printf -v
+    // TAR_OPTIONS`, attached `-vTAR_OPTIONS`), with a value or not.
+    let sets = segment.iter().any(|w| {
+        let name = w.text.split_once('=').map_or(w.text.as_str(), |(n, _)| n);
+        let name = name.strip_suffix('+').unwrap_or(name);
+        let name = name.strip_prefix("-v").unwrap_or(name);
+        ARCHIVER_OPTION_VARS.contains(&name)
+    });
+    if sets {
+        out.write(Tok {
+            s: "/",
+            glob: false,
+            dots: false,
+        });
+    }
 }
 
 /// An archive extracted into `dirs` (`.` when none is named; every `-C`
@@ -1047,47 +1079,40 @@ fn cpio(words: &[Option<Tok>], out: &mut Out) {
     }
 }
 
-/// 7-Zip (`7z`, `7za`, `7zz`, `7zr`): `x`/`e ARCHIVE` writes `-oDIR` or `.`,
-/// and `/` with `-spf`/`-spf2` (absolute paths), `-snl` (links) or a switch
-/// not known; `a`/`u`/`d`/`rn` write the archive; every other operand is
-/// read, as for a command the guard does not know.
+/// 7-Zip (`7z`, `7za`, `7zz`, `7zr`), verbs and switches in any case:
+/// `x`/`e ARCHIVE` writes `-oDIR` or `.`, and `/` with `-spf`/`-spf2`
+/// (absolute paths), `-snl` (links) or a switch not known; `a`/`u`/`d`/`rn`
+/// write the archive; `l`/`t`/`h`/`i`/`b` read. A verb not known may be an
+/// extract, so it writes `/`. Every other operand is read, as for a command
+/// the guard does not know.
 fn seven_zip(words: &[Option<Tok>], out: &mut Out) {
     let ops = plain_operands(words);
     let Some(verb) = ops.first() else { return };
     let rest = &ops[1..];
-    match verb.s {
+    let verb = verb.s.to_ascii_lowercase();
+    let read_rest = |out: &mut Out| {
+        for t in rest {
+            out.read(*t);
+        }
+    };
+    match verb.as_str() {
         "x" | "e" => {
-            for t in rest {
-                out.read(*t);
-            }
-            let switches: Vec<&str> = words
+            read_rest(out);
+            let switches: Vec<String> = words
                 .iter()
                 .flatten()
-                .map(|t| t.s)
-                .filter(|s| s.starts_with('-'))
+                .filter(|t| t.s.starts_with('-'))
+                .map(|t| t.s.to_ascii_lowercase())
                 .collect();
             let dirs: Vec<Tok> = words
                 .iter()
                 .flatten()
-                .filter_map(|t| t.strip_prefix("-o").filter(|d| !d.s.is_empty()))
+                .filter(|t| t.s.len() > 2 && (t.s.starts_with("-o") || t.s.starts_with("-O")))
+                .map(|t| t.sub(&t.s[2..]))
                 .collect();
             const KNOWN: &[&str] = &[
-                "-o",
-                "-y",
-                "-p",
-                "-ao",
-                "-t",
-                "-r",
-                "-bb",
-                "-bs",
-                "-bd",
-                "-x",
-                "-i",
-                "-mmt",
-                "-sccUTF-8",
-                "-bso",
-                "-bse",
-                "-bsp",
+                "-o", "-y", "-p", "-ao", "-t", "-r", "-bb", "-bs", "-bd", "-x", "-i", "-mmt",
+                "-scc",
             ];
             let absolute = switches.iter().any(|s| {
                 s.starts_with("-spf")
@@ -1104,10 +1129,10 @@ fn seven_zip(words: &[Option<Tok>], out: &mut Out) {
                 }
             }
         }
+        "l" | "t" | "h" | "i" | "b" => read_rest(out),
         _ => {
-            for t in rest {
-                out.read(*t);
-            }
+            read_rest(out);
+            extract_into(out, &[], true);
         }
     }
 }
@@ -1672,8 +1697,8 @@ mod tests {
         let none = Vec::<(String, &str)>::new();
         // tar: every `-C`; an option not known (an abbreviation) is `-P`.
         assert_eq!(
-            ops("tar -xf x.tar -C a -C b"),
-            vec![r("x.tar"), w("a"), w("b")]
+            ops("tar -xf x.tar -C a -C /b"),
+            vec![r("x.tar"), w("a"), w("/b")]
         );
         assert_eq!(ops("tar -xf x.tar --abs"), vec![r("x.tar"), w("."), w("/")]);
         assert_eq!(
@@ -1727,6 +1752,41 @@ mod tests {
         assert_eq!(ops("7z l x.7z"), vec![r("x.7z")]);
         assert_eq!(ops("7z a out.7z .env"), vec![w("out.7z"), r(".env")]);
         assert_eq!(ops("7z rn a.7z x y"), vec![w("a.7z"), r("x"), r("y")]);
+        // Any case; a verb not known may extract.
+        assert_eq!(ops("7z X x.7z -Oout"), vec![r("x.7z"), w("out")]);
+        assert_eq!(ops("7z E x.7z -SPF"), vec![r("x.7z"), w("."), w("/")]);
+        assert_eq!(ops("7z L x.7z"), vec![r("x.7z")]);
+        assert_eq!(ops("7z zz x.7z"), vec![r("x.7z"), w("."), w("/")]);
+        // tar `-C` is cumulative: a relative one after the first joins it.
+        assert_eq!(
+            ops("tar -xf x.tar -C ~ -C .ssh"),
+            vec![r("x.tar"), w("~"), w(".ssh"), w("/")]
+        );
+        assert_eq!(
+            ops("tar -xf x.tar -C a -C /srv"),
+            vec![r("x.tar"), w("a"), w("/srv")]
+        );
+        // Options from the environment.
+        // (This helper does not peel a leading assignment; the engine does,
+        // see `corpus_secrets`.)
+        assert!(ops("TAR_OPTIONS=-P tar -xf x.tar -C d").contains(&w("/")));
+        assert_eq!(ops("export UNZIP=-:"), vec![w("/")]);
+        assert!(ops("env UNZIPOPT=-: unzip x.zip").contains(&w("/")));
+        assert_eq!(ops("export TAR_OPTIONS+=-P"), vec![w("/")]);
+        for set in [
+            "export TAR_OPTIONS",
+            "declare -x UNZIP",
+            "typeset UNZIPOPT=-:",
+            "readonly TAR_OPTIONS",
+            "local UNZIP_OPTS",
+            "printf -v TAR_OPTIONS %s -P",
+            "printf -vTAR_OPTIONS %s -P",
+            "read TAR_OPTIONS",
+            "mapfile UNZIP",
+        ] {
+            assert_eq!(ops(set), vec![w("/")], "{set}");
+        }
+        assert_eq!(ops("export FOO=1"), none);
         assert_eq!(
             ops("tar -C /srv -czf x.tgz app"),
             vec![w("x.tgz"), r("/srv/app")]
