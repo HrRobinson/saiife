@@ -1234,4 +1234,114 @@ mod tests {
             .collect();
         assert!(set.is_empty(), "{set:?}");
     }
+
+    /// The hook judges with `PATH=/usr/bin:/bin` (`check_managed::account_env`), the
+    /// re-judgment with no `PATH` at all. The only thing read from `PATH` is the
+    /// `saiife` on it, an extra `$SAIIFE_BIN` value (`paths::path_vars_locked_env`): the
+    /// guard expands no `$PATH` in a command and looks no command name up, so
+    /// `command -v`, `which` and `$PATH` judge the same, and a write to the binary
+    /// both judges run is denied by both. The hook can only deny more (a `saiife`
+    /// on its `PATH` that is another file), never allow more, so the co-signer
+    /// never denies an honest call the hook allowed.
+    #[test]
+    fn path_does_not_split_the_hook_and_the_rejudgment() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Setup::new("");
+        let pool = s.pool(&TestLaunch::new(vec![]), one());
+        // Another `saiife` the hook's `PATH` could find first.
+        let bin = s.dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let other = bin.join("saiife");
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let other = other.display().to_string();
+        // Both judges run in one binary, as the hook and the service do in
+        // locked mode (`/opt/saiife/bin/saiife`).
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let prepare = |command: &str| {
+            pool.prepare(&RejudgeRequest {
+                payload: Bytes::from(bash("/home/other/app", command)),
+                principal: Principal::Uid(4242),
+                groups: Vec::new(),
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancel: Cancel::new(),
+            })
+            .unwrap()
+        };
+        let verdict = |req: &EvalRequest| eval::answer(req, None).verdict;
+        // The hook's request: the re-judgment's, with `PATH` added.
+        let with_path = |command: &str, path: &str, view: View| {
+            let mut req = prepare(command);
+            let vars = req.vars.as_mut().unwrap();
+            assert!(vars.iter().all(|(k, _)| k != "PATH"), "{vars:?}");
+            vars.push(("PATH".into(), path.into()));
+            req.view = view;
+            req
+        };
+        let system = "/usr/bin:/bin".to_string();
+        let shadowed = format!("{}:/usr/bin:/bin", bin.display());
+        // (command, the verdict both judges give)
+        let same: Vec<(String, Verdict)> = [
+            ("saiife status", Verdict::Allow),
+            ("saiife audit verify", Verdict::Allow),
+            (&format!("{exe} status"), Verdict::Allow),
+            ("/opt/saiife/bin/saiife status", Verdict::Allow),
+            ("command -v saiife", Verdict::Allow),
+            ("which saiife", Verdict::Allow),
+            ("type -p saiife", Verdict::Allow),
+            ("echo $PATH", Verdict::Allow),
+            ("printenv PATH", Verdict::Allow),
+            ("ls $(dirname $(command -v saiife))", Verdict::Allow),
+            ("export PATH=$PATH:/home/other/.local/bin", Verdict::Allow),
+            ("PATH=$PATH:/home/other/bin cargo build", Verdict::Allow),
+            ("$(command -v saiife) status", Verdict::Allow),
+            ("saiife init --off", Verdict::Deny),
+            ("/opt/saiife/bin/saiife init --off", Verdict::Deny),
+            ("/usr/bin/saiife init --off", Verdict::Deny),
+            // Not caught by either: the substitution is not run, so its
+            // command is unknown (the same text, the same answer).
+            ("$(which saiife) init --off", Verdict::Allow),
+            ("PATH=/home/other/bin saiife status", Verdict::Deny),
+            ("PATH=$PATH claude", Verdict::Deny),
+            (&format!("rm {exe}"), Verdict::Deny),
+            (&format!("cp /home/other/x {exe}"), Verdict::Deny),
+        ]
+        .into_iter()
+        .map(|(c, v)| (c.to_string(), v))
+        .collect();
+        for (command, want) in &same {
+            let req = prepare(command);
+            assert_eq!(verdict(&req), *want, "re-judge: {command}");
+            for path in [&system, &shadowed] {
+                for view in [View::Lexical, View::Host] {
+                    let hook = with_path(command, path, view);
+                    assert_eq!(verdict(&hook), *want, "hook ({path}, {view:?}): {command}");
+                }
+            }
+        }
+        // The worker answers as judged here.
+        for (command, want) in same.iter().filter(|(c, _)| !c.contains(&exe)) {
+            let got = ask(&pool, 4242, &bash("/home/other/app", command));
+            let allowed = got == RejudgeAnswer::Allow;
+            assert_eq!(
+                allowed,
+                *want == Verdict::Allow,
+                "worker: {command}: {got:?}"
+            );
+        }
+        // Where `PATH` finds another `saiife`, only the hook guards it: the
+        // co-signed call is denied, the hook's own answer.
+        for command in [format!("rm {other}"), format!("cp /home/other/x {other}")] {
+            let req = prepare(&command);
+            assert_eq!(verdict(&req), Verdict::Allow, "re-judge: {command}");
+            let hook = with_path(&command, &shadowed, View::Lexical);
+            assert_eq!(verdict(&hook), Verdict::Deny, "hook: {command}");
+            let hook = with_path(&command, &system, View::Lexical);
+            assert_eq!(
+                verdict(&hook),
+                Verdict::Allow,
+                "hook, system PATH: {command}"
+            );
+        }
+    }
 }
