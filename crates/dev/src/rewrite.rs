@@ -186,7 +186,10 @@ pub fn rewrite(m: &ComposeModel, project: &str, q: &Quirks) -> Result<Rewritten,
             let Some(e) = entry.as_object_mut() else {
                 continue;
             };
-            if e.get("external").and_then(Value::as_bool) == Some(true) {
+            if matches!(
+                e.get("external"),
+                Some(Value::Bool(true) | Value::Object(_))
+            ) {
                 continue;
             }
             if e.get("name").and_then(Value::as_str) != Some(&format!("{orig}_{key}")) {
@@ -394,6 +397,17 @@ mod tests {
         assert_eq!(r.model["volumes"]["pg"], input["volumes"]["pg"]);
         assert_eq!(r.model["networks"]["edge"], input["networks"]["edge"]);
         assert_eq!(r.model["networks"]["ext2"], input["networks"]["ext2"]);
+    }
+
+    #[test]
+    fn deprecated_external_object_is_not_labelled() {
+        let input = json!({
+            "name": "myrepo",
+            "services": {"web": web_on(3000)},
+            "networks": {"old": {"name": "myrepo_old", "external": {"name": "myrepo_old"}}}
+        });
+        let r = rw(input.clone());
+        assert_eq!(r.model["networks"]["old"], input["networks"]["old"]);
     }
 
     #[test]

@@ -114,7 +114,7 @@ pub fn save(paths: &DevPaths, s: &ProjectState) -> Result<(), DevError> {
     let dir = paths.project_dir(&s.name);
     std::fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
     let file = paths.project_file(&s.name);
-    let tmp = dir.join("project.json.tmp");
+    let tmp = dir.join(format!("project.json.tmp.{}", std::process::id()));
     let text = serde_json::to_string_pretty(s).map_err(|e| DevError::State {
         path: file.clone(),
         msg: e.to_string(),
@@ -123,14 +123,19 @@ pub fn save(paths: &DevPaths, s: &ProjectState) -> Result<(), DevError> {
     std::fs::rename(&tmp, &file).map_err(|e| io_err(&file, e))
 }
 
-fn read_state(file: &Path) -> Result<Option<ProjectState>, DevError> {
+fn read_state(file: &Path, expected: &str) -> Result<Option<ProjectState>, DevError> {
     match std::fs::read_to_string(file) {
-        Ok(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| DevError::State {
+        Ok(text) => {
+            let bad = |msg: String| DevError::State {
                 path: file.to_path_buf(),
-                msg: e.to_string(),
-            }),
+                msg,
+            };
+            let s: ProjectState = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
+            if s.name != expected || check_name(&s.name).is_err() {
+                return Err(bad("name does not match its folder".into()));
+            }
+            Ok(Some(s))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_err(file, e)),
     }
@@ -138,7 +143,7 @@ fn read_state(file: &Path) -> Result<Option<ProjectState>, DevError> {
 
 pub fn load(paths: &DevPaths, name: &str) -> Result<Option<ProjectState>, DevError> {
     check_name(name)?;
-    read_state(&paths.project_file(name))
+    read_state(&paths.project_file(name), name)
 }
 
 /// Every project with a `project.json`, sorted by name. Other files are ignored.
@@ -156,7 +161,8 @@ pub fn list(paths: &DevPaths) -> Result<Vec<ProjectState>, DevError> {
         if !path.is_dir() {
             continue;
         }
-        if let Some(s) = read_state(&path.join("project.json"))? {
+        let folder = entry.file_name().to_string_lossy().into_owned();
+        if let Some(s) = read_state(&path.join("project.json"), &folder)? {
             out.push(s);
         }
     }
@@ -286,7 +292,7 @@ mod tests {
         let pd = paths.project_dir("shop");
         fs::write(pd.join("compose.json"), "{").unwrap();
         fs::write(pd.join("urls.json"), "[").unwrap();
-        fs::write(pd.join("project.json.tmp"), "x").unwrap();
+        fs::write(pd.join("project.json.tmp.123"), "x").unwrap();
         fs::write(pd.parent().unwrap().join("README"), "hi").unwrap();
         assert_eq!(list(&paths).unwrap().len(), 1);
     }
@@ -300,10 +306,36 @@ mod tests {
         save(&paths, &s).unwrap();
         s.last_up = None;
         save(&paths, &s).unwrap();
-        assert!(!paths.project_dir("shop").join("project.json.tmp").exists());
+        let leftovers = fs::read_dir(paths.project_dir("shop"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("project.json.tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
         let text = fs::read_to_string(paths.project_file("shop")).unwrap();
         let back: ProjectState = serde_json::from_str(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn mismatched_or_unsafe_name_in_state_is_refused() {
+        let (t, paths) = setup();
+        let d = mk(&t, "shop");
+        assign(&paths, &d).unwrap();
+        let file = paths.project_file("shop");
+        for bad in ["other", "../x"] {
+            let text = fs::read_to_string(&file).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["name"] = bad.into();
+            fs::write(&file, v.to_string()).unwrap();
+            assert!(matches!(load(&paths, "shop"), Err(DevError::State { .. })));
+            assert!(matches!(list(&paths), Err(DevError::State { .. })));
+        }
     }
 
     #[test]

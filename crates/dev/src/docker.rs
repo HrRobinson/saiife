@@ -44,7 +44,7 @@ impl Output {
 
 /// Runs `docker` with arguments. `Err` only when the process cannot run at
 /// all; a non-zero exit is an `Ok` with that status.
-pub trait Docker {
+pub trait Docker: Send + Sync {
     fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Output, DevError>;
 }
 
@@ -186,6 +186,24 @@ mod tests {
         p
     }
 
+    /// Run a just-written script, retrying while another thread's fork holds
+    /// the write fd open (ETXTBSY).
+    #[cfg(unix)]
+    fn run_retry(cli: &DockerCli, args: &[&str], stdin: Option<&[u8]>) -> Result<Output, DevError> {
+        let mut tries = 0;
+        loop {
+            match cli.run(args, stdin) {
+                Err(DevError::Spawn { source, .. })
+                    if source.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 =>
+                {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
     fn touch(p: &Path) {
         std::fs::write(p, "").unwrap();
     }
@@ -292,7 +310,7 @@ mod tests {
     fn cli_runs_a_script() {
         let t = tempfile::tempdir().unwrap();
         let s = script(t.path(), "d", "printf '%s\\n' \"$@\"; cat >&2; exit 3");
-        let out = DockerCli::new(s).run(&["a b", "c"], Some(b"in")).unwrap();
+        let out = run_retry(&DockerCli::new(s), &["a b", "c"], Some(b"in")).unwrap();
         assert_eq!(out.status, 3);
         assert_eq!(out.stdout, b"a b\nc\n");
         assert_eq!(out.stderr, b"in");
@@ -304,7 +322,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let s = script(t.path(), "d", "cat; cat /dev/null >&2");
         let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        let out = DockerCli::new(s).run(&["x"], Some(&data)).unwrap();
+        let out = run_retry(&DockerCli::new(s), &["x"], Some(&data)).unwrap();
         assert_eq!(out.status, 0);
         assert_eq!(out.stdout, data);
     }

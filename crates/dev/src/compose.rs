@@ -174,7 +174,8 @@ pub fn read_config(d: &dyn Docker, dir: &Path) -> Result<ComposeModel, DevError>
     match run_ok(d, &args) {
         Ok(stdout) => parse_model(&stdout),
         Err(DevError::Docker { stderr, .. })
-            if stderr.contains("is not a docker command") || stderr.contains("unknown command") =>
+            if stderr.contains("'compose' is not a docker command")
+                || stderr.contains("unknown command: docker compose") =>
         {
             Err(DevError::ComposeMissing)
         }
