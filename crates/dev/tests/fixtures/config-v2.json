@@ -1,0 +1,36 @@
+{
+  "x-saiife-fixture": "hand-written from plan 22 facts F3 to F8 (current docker compose config --format json shape); not captured from a real Compose",
+  "name": "shop",
+  "services": {
+    "web": {
+      "image": "node:20",
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "host_ip": "127.0.0.1", "target": 3000, "published": "8080", "protocol": "tcp" },
+        { "mode": "ingress", "target": 4000, "published": "8000-8005", "protocol": "tcp" },
+        { "mode": "ingress", "target": 5000, "protocol": "tcp" }
+      ],
+      "expose": ["9000/tcp", "9001-9003", "53/udp"],
+      "volumes": [
+        { "type": "volume", "source": "data", "target": "/data", "volume": {} }
+      ]
+    },
+    "db": {
+      "image": "postgres:16",
+      "networks": { "default": null, "backend": { "aliases": ["database"] } },
+      "expose": ["5432"]
+    },
+    "agent": {
+      "image": "agent:1",
+      "network_mode": "host"
+    }
+  },
+  "networks": {
+    "default": { "name": "shop_default" },
+    "backend": { "name": "shop_backend" },
+    "edge": { "name": "edge", "external": true }
+  },
+  "volumes": {
+    "data": { "name": "shop_data" }
+  }
+}
