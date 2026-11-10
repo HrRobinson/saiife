@@ -294,11 +294,12 @@ fn server_url(r: &Route) -> Result<(String, bool), DevError> {
     if !plain {
         return Err(bad(&r.host, "upstream is not a plain URL"));
     }
-    if r.upstream.starts_with("http://") {
-        return Ok((r.upstream.clone(), false));
-    }
-    if r.upstream.starts_with("https://") {
-        return Ok((r.upstream.clone(), true));
+    if let Some((scheme, rest)) = r.upstream.split_once("://") {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "http" => Ok((format!("http://{rest}"), false)),
+            "https" => Ok((format!("https://{rest}"), true)),
+            _ => Err(bad(&r.host, "upstream scheme is not http or https")),
+        };
     }
     match r.upstream_scheme.as_str() {
         s @ ("http" | "https") => Ok((format!("{s}://{}", r.upstream), s == "https")),
@@ -697,6 +698,39 @@ mod tests {
     }
 
     #[test]
+    fn scheme_prefix_is_case_insensitive() {
+        let (_d, paths) = setup();
+        for up in ["HTTP://web.shop:3000", "Https://web.shop:3000"] {
+            let r = [route("web", "shop", up, "http")];
+            let e = write_routes(&paths, "shop", &r, &certs(&paths, "shop"));
+            if up.starts_with("HTTP") {
+                e.unwrap();
+                let v = read(&paths, "shop");
+                let url = v["http"]["services"]["shop_web"]["loadBalancer"]["servers"][0]["url"]
+                    .as_str()
+                    .unwrap();
+                assert_eq!(url, "http://web.shop:3000");
+            } else {
+                e.unwrap();
+                assert!(read(&paths, "shop")["http"]["serversTransports"].is_table());
+            }
+        }
+        let r = [route("web", "shop", "ftp://web.shop:3000", "http")];
+        assert!(write_routes(&paths, "shop", &r, &certs(&paths, "shop")).is_err());
+    }
+
+    #[test]
+    fn same_host_twice_is_refused() {
+        let (_d, paths) = setup();
+        let r = [
+            route("web", "shop", "web.shop:3000", "http"),
+            route("web", "shop", "web.shop:3001", "http"),
+        ];
+        let e = write_routes(&paths, "shop", &r, &certs(&paths, "shop")).unwrap_err();
+        assert!(e.to_string().contains("same host"), "{e}");
+    }
+
+    #[test]
     fn no_transport_when_all_http() {
         let (_d, paths) = setup();
         let routes = [route("web", "shop", "web.shop:3000", "http")];
@@ -1042,7 +1076,18 @@ fn mkdir(dir: PathBuf) -> Result<(), DevError> {
 pub fn ensure_proxy(d: &dyn Docker, paths: &DevPaths) -> Result<(), DevError> {
     // D1: if these were missing, Docker would create them owned by root.
     mkdir(dynamic_dir(paths))?;
-    mkdir(tls_dir(paths))?;
+    crate::certs::create_private_dir(&tls_dir(paths), true)
+        .or_else(|e| {
+            if tls_dir(paths).is_dir() {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|source| DevError::Io {
+            path: tls_dir(paths),
+            source,
+        })?;
     let mut args = run_args(paths);
     let spec = spec_hash(&args);
     let at = args
@@ -1216,6 +1261,21 @@ mod container_tests {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_dir_is_private_after_ensure_proxy() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, paths) = setup();
+        let d = FakeDocker::new();
+        d.on(INSPECT, Output::fail(1, MISSING));
+        d.on(&["run"], Output::ok("id\n"));
+        ensure_proxy(&d, &paths).unwrap();
+        let ca = crate::certs::ensure_ca(&paths).unwrap();
+        crate::certs::ensure_project_cert(&paths, &ca, "shop").unwrap();
+        let mode = fs::metadata(tls_dir(&paths)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

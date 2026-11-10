@@ -129,7 +129,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<()
     })
 }
 
-fn create_private_dir(dir: &Path, recursive: bool) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path, recursive: bool) -> io::Result<()> {
     let mut b = fs::DirBuilder::new();
     b.recursive(recursive);
     #[cfg(unix)]
@@ -400,6 +400,12 @@ pub(crate) fn ensure_project_cert_at(
         not_after: params.not_after.unix_timestamp(),
     };
     let meta = serde_json::to_vec(&meta).map_err(|e| DevError::Cert(e.to_string()))?;
+    // meta.json is written last: it is the commit marker the fast path trusts.
+    match fs::remove_file(&meta_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(&meta_path)(e)),
+    }
     write_atomic(&out.key, key.serialize_pem().as_bytes(), true)?;
     write_atomic(&out.cert, cert.pem().as_bytes(), false)?;
     write_atomic(&meta_path, &meta, false)?;
@@ -752,6 +758,24 @@ mod tests {
         assert_eq!(mode(&c.key), 0o600);
         assert_eq!(mode(&tls_dir(&paths)), 0o700);
         assert_eq!(mode(&tls_dir(&paths).join("shop")), 0o700);
+    }
+
+    #[test]
+    fn crash_mid_reissue_is_repaired() {
+        let (_t, paths, ca) = setup();
+        let c = ensure_project_cert(&paths, &ca, "shop").unwrap();
+        let dir = tls_dir(&paths).join("shop");
+        fs::remove_file(&c.key).unwrap();
+        fs::remove_file(&c.cert).unwrap();
+        fs::create_dir(&c.cert).unwrap();
+        assert!(ensure_project_cert(&paths, &ca, "shop").is_err());
+        assert!(!dir.join("meta.json").exists());
+        fs::remove_dir(&c.cert).unwrap();
+        ensure_project_cert(&paths, &ca, "shop").unwrap();
+        let key = KeyPair::from_pem(&fs::read_to_string(&c.key).unwrap()).unwrap();
+        let cert = CertificateDer::from_pem_slice(fs::read(&c.cert).unwrap().as_slice()).unwrap();
+        let spki = rcgen::PublicKeyData::subject_public_key_info(&key);
+        assert!(cert.windows(spki.len()).any(|w| w == spki.as_slice()));
     }
 
     #[test]
