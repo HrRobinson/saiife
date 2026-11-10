@@ -1561,6 +1561,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-dev"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "toml",
+]
+
+[[package]]
 name = "saiife-guard"
 version = "0.2.0"
 dependencies = [
