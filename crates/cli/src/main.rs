@@ -36,6 +36,7 @@ mod check;
 mod check_managed;
 mod collection;
 mod connect_cmd;
+mod dev_cmd;
 #[cfg(any(unix, windows))]
 mod doctor_cmd;
 #[cfg(any(unix, windows))]
@@ -380,6 +381,11 @@ enum Cmd {
         #[command(subcommand)]
         action: env_cmd::EnvAction,
     },
+    /// Local dev environments: compose stacks behind one HTTPS proxy (preview).
+    Dev {
+        #[command(subcommand)]
+        action: dev_cmd::DevAction,
+    },
     /// Locked mode: install or uninstall the system setup (root, or an elevated
     /// administrator on Windows).
     #[cfg(any(unix, windows))]
@@ -432,6 +438,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
         | Cmd::Env { .. }
+        | Cmd::Dev { .. }
         | Cmd::Policy { .. }
         | Cmd::Test { .. }
         | Cmd::Explain { .. }
@@ -656,6 +663,9 @@ fn main() -> ExitCode {
     {
         return env_cmd::run(system_config, action);
     }
+    if let Cmd::Dev { action } = cli.command {
+        return dev_cmd::run(action);
+    }
     #[cfg(any(unix, windows))]
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
@@ -715,6 +725,7 @@ fn main() -> ExitCode {
         | Cmd::Approvals { .. }
         | Cmd::Policy { .. }
         | Cmd::Env { .. }
+        | Cmd::Dev { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {
