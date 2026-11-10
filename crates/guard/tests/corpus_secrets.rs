@@ -1224,7 +1224,6 @@ fn writes_onto_secret_files_deny() {
 /// credential file deny.
 #[test]
 fn file_tools_writing_secret_files_deny() {
-    use saiifeguard::payload::{classify, ToolCall};
     let f = Fixture::new();
     let e = f.engine();
     let home = f.home().display().to_string();
@@ -1236,17 +1235,80 @@ fn file_tools_writing_secret_files_deny() {
         ("Write", format!("{home}/.ssh/id_ed25519")),
         ("Edit", format!("{home}/.kube/config")),
     ] {
-        let payload = format!(
-            r#"{{"cwd":"{home}/app","hook_event_name":"PreToolUse","tool_name":"{tool}","tool_input":{{"file_path":"{file}","content":"x","old_string":"a","new_string":"b"}}}}"#
+        assert!(
+            file_tool_denies(&e, &format!("{home}/app"), tool, &file),
+            "expected DENY for {tool} of {file}"
         );
-        let Ok(ToolCall::File { paths, write, .. }) = classify(&payload, 1 << 20) else {
-            panic!("not a file call: {payload}");
-        };
-        assert!(write, "{tool}");
-        let denied = paths
-            .iter()
-            .any(|p| e.evaluate_path(Access::Write, p).is_deny());
-        assert!(denied, "expected DENY for {tool} of {file}");
+    }
+}
+
+/// Whether the hook's `tool` call onto `file` (from `cwd`) denies. The payload
+/// is built by serde_json: a Windows path's backslashes must be escaped.
+fn file_tool_denies(e: &Engine, cwd: &str, tool: &str, file: &str) -> bool {
+    use saiifeguard::payload::{classify, ToolCall};
+    let payload = serde_json::json!({
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": {
+            "file_path": file,
+            "content": "x",
+            "old_string": "a",
+            "new_string": "b",
+        },
+    })
+    .to_string();
+    let Ok(ToolCall::File { paths, write, .. }) = classify(&payload, 1 << 20) else {
+        panic!("not a file call: {payload}");
+    };
+    assert!(write, "{tool}");
+    paths
+        .iter()
+        .any(|p| e.evaluate_path(Access::Write, p).is_deny())
+}
+
+/// The Windows half of `file_tools_writing_secret_files_deny`, on every host:
+/// a Windows-style engine and the paths a Windows agent hands the file tools
+/// (backslashes, `/` mixed in, the `\\?\` prefix, another user's profile).
+#[test]
+fn windows_file_tools_writing_secret_files_deny() {
+    use saiifeguard::builtins::Catalog;
+    use saiifeguard::canon::PathStyle;
+    let (packs, warnings) = Catalog::builtin_for(PathStyle::Windows).load_active(&[]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let e = Engine::new(packs).with_budget(TEST_BUDGET).with_paths(
+        PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("USERPROFILE", r"C:\Users\a")
+            .with_var("LOCALAPPDATA", r"C:\Users\a\AppData\Local")
+            .with_var("APPDATA", r"C:\Users\a\AppData\Roaming")
+            .with_cwd(r"D:\work\app"),
+    );
+    for (tool, file) in [
+        ("Write", r"C:\Users\a\.aws\credentials"),
+        ("Edit", r"C:\Users\a\.aws\credentials"),
+        ("MultiEdit", r"C:\Users\a\.ssh\authorized_keys"),
+        ("Write", r"\\?\C:\Users\a\.ssh\authorized_keys"),
+        ("Write", r"\\?\D:\a\_temp\.tmp1\home/.aws/credentials"),
+        ("Write", r"c:/users/a/.ssh/id_ed25519"),
+        ("Edit", r"C:\Users\me\.kube\config"),
+        ("Write", r"C:\Users\a\.npmrc"),
+        ("Write", r"C:\Users\a\.claude\.credentials.json"),
+    ] {
+        assert!(
+            file_tool_denies(&e, r"D:\work\app", tool, file),
+            "expected DENY for {tool} of {file}"
+        );
+    }
+    for (tool, file) in [
+        ("Write", r"D:\work\app\.env"),
+        ("Write", r"D:\work\app\.npmrc"),
+        ("Edit", r"C:\Users\a\.ssh\config"),
+    ] {
+        assert!(
+            !file_tool_denies(&e, r"D:\work\app", tool, file),
+            "expected ALLOW for {tool} of {file}"
+        );
     }
 }
 
@@ -1468,6 +1530,21 @@ fn windows_writes_onto_secret_files_deny() {
         (cmd, r"7z a out.7z .env"),
         (ps, r"unzip -l .env"),
         (bash, "cat evil.pub >> /c/Users/a/.ssh/authorized_keys"),
+        // The rules are `**/` globs, not home-rooted: another user's profile,
+        // `$HOME`, `tee` and a rooted path with no drive deny as well.
+        (ps, r"cp evil C:\Users\me\.aws\credentials"),
+        (cmd, r"copy evil C:\Users\me\.ssh\authorized_keys"),
+        (ps, r"Copy-Item evil $HOME\.aws\credentials"),
+        (
+            ps,
+            r"'k' | Tee-Object -Append -FilePath $HOME\.ssh\authorized_keys",
+        ),
+        (ps, r"'k' | tee $HOME\.ssh\authorized_keys"),
+        (ps, "cp /tmp/evil /home/me/.aws/credentials"),
+        (cmd, r"copy evil \Users\me\.aws\credentials"),
+        (bash, "cp evil C:/Users/a/.ssh/authorized_keys"),
+        (bash, "tee -a ~/.ssh/authorized_keys < k.pub"),
+        (bash, "tee -a /home/me/.ssh/authorized_keys < /tmp/key.pub"),
     ];
     let wrong: Vec<String> = deny
         .iter()

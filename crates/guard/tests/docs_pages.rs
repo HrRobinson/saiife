@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use saiifeguard::builtins::builtin_packs;
+use saiifeguard::builtins::{builtin_packs, builtin_packs_for};
 use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::Engine;
 use saiifeguard::pack::Pack;
@@ -30,13 +30,18 @@ const POSIX_LOCK_EXAMPLES: [&str; 3] = [
     "echo '{}' > /etc/claude-code/managed-settings.json",
 ];
 
-/// No paths bound on Linux and macOS. Under Windows style an unbound `~` is a
-/// path nothing can read, which denies (W5): those hosts get a profile.
-fn host_paths() -> PathVars {
-    if PathStyle::host() == PathStyle::Windows {
-        PathVars::new().with_var("USERPROFILE", r"C:\Users\a")
-    } else {
-        PathVars::new()
+/// No paths bound under POSIX style. Under Windows style an unbound `~` is a
+/// path nothing can read, which denies (W5), so it gets a profile; and a
+/// working directory, as the hook's payload gives one: without it a rooted
+/// path with no drive (`/home/me/.aws/credentials`) names no file, so no
+/// path rule can match it.
+fn style_paths(style: PathStyle) -> PathVars {
+    match style {
+        PathStyle::Windows => PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("USERPROFILE", r"C:\Users\a")
+            .with_cwd(r"C:\Users\a\p"),
+        PathStyle::Posix => PathVars::new().with_style(PathStyle::Posix),
     }
 }
 
@@ -101,13 +106,27 @@ fn every_builtin_pack_has_a_page() {
 
 #[test]
 fn examples_match_the_engine() {
+    examples_match_the_engine_in(PathStyle::host());
+}
+
+/// The same examples on a Windows-style engine, on every host: what the
+/// windows-latest job judges, readable on Linux.
+#[test]
+fn examples_match_a_windows_style_engine() {
+    examples_match_the_engine_in(PathStyle::Windows);
+}
+
+fn examples_match_the_engine_in(style: PathStyle) {
+    let (all, warnings) = builtin_packs_for(style);
+    assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+    assert_eq!(all.len(), packs().len());
     let mut wrong = Vec::new();
-    for pack in packs() {
+    for pack in all {
         let id = pack.id.clone();
         let lines = example_lines(&page(&id));
         let engine = Engine::new(vec![pack])
             .with_budget(TEST_BUDGET)
-            .with_paths(host_paths());
+            .with_paths(style_paths(style));
         let (mut denies, mut allows) = (0, 0);
         for line in lines {
             let (want_deny, cmd) = if let Some(cmd) = line.strip_prefix("deny ") {
@@ -119,7 +138,7 @@ fn examples_match_the_engine() {
             } else {
                 panic!("{id}: example line must start with `deny ` or `allow `: {line:?}");
             };
-            if PathStyle::host() == PathStyle::Windows && POSIX_LOCK_EXAMPLES.contains(&cmd) {
+            if style == PathStyle::Windows && POSIX_LOCK_EXAMPLES.contains(&cmd) {
                 continue;
             }
             let got = engine.evaluate(cmd);
