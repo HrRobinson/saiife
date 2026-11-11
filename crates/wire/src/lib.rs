@@ -17,4 +17,5 @@ pub mod verify;
 
 mod error;
 pub use error::WireError;
+pub use level::{level_for, Level};
 pub use source::BoxSource;
