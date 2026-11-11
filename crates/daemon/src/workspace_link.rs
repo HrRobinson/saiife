@@ -383,6 +383,7 @@ async fn frame(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
     };
     // The daemon answers a device's frames to its owner's processes only.
+    // `check` has burned the nonce already: a frame refused below is spent.
     let owner_uid = uid_of(ctx, &v.owner_user).await;
     let refused = if owner_uid != Some(conn.peer.uid) {
         Some(Refused::new(

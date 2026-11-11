@@ -17,6 +17,19 @@ pub const HANDSHAKE_DOMAIN: &[u8] = b"saiife-seal-v1 hello\n";
 /// another.
 pub const MACHINE_HELLO_DOMAIN: &[u8] = b"saiife-seal-v1 machine\n";
 
+/// Domain of the machine key's signature in the hub hello (plan 29), over
+/// [`hub_hello_msg`]: the hub's challenge nonce ‖ the machine id.
+pub const HUB_HELLO_DOMAIN: &[u8] = b"saiife-hub-hello-v1\n";
+
+/// What the machine key signs for the hub (domain [`HUB_HELLO_DOMAIN`]):
+/// nonce ‖ machine_id (ASCII).
+pub fn hub_hello_msg(nonce: &[u8], machine_id: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(nonce.len() + machine_id.len());
+    v.extend_from_slice(nonce);
+    v.extend_from_slice(machine_id.as_bytes());
+    v
+}
+
 /// What a sealed session is for: a paired device (its id), or a pairing
 /// offer (its pair_id) for a pairing-only session.
 #[derive(Debug, Clone, PartialEq, Eq)]

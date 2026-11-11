@@ -117,6 +117,7 @@ const IPC_OPS: &[&str] = &[
     "secret.remove",
     "secret.rotate",
     "status",
+    // Workspace (plan 29): sorted in with the rest.
     "workspace.devices",
     "workspace.frame",
     "workspace.hello",

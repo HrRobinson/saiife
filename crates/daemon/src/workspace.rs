@@ -28,8 +28,6 @@ pub const KEY_FILE: &str = "machine.p256";
 pub const DEVICES_FILE: &str = "devices.json";
 /// Far more than a person's devices; a larger file is not ours.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-/// Domain of the signature a machine gives a hub on connect.
-pub const HUB_HELLO_DOMAIN: &[u8] = b"saiife-hub-hello-v1\n";
 
 /// `<state_dir>/state/workspace`.
 pub fn dir_in(state_dir: &Path) -> PathBuf {
@@ -50,7 +48,8 @@ pub enum SignPurpose {
     /// The machine's seal handshake (`saiife_wire::seal::MACHINE_HELLO_DOMAIN`,
     /// over `saiife_wire::seal::machine_hello_msg`).
     Seal,
-    /// The hub hello (`b"saiife-hub-hello-v1\n"`).
+    /// The hub hello (`saiife_wire::seal::HUB_HELLO_DOMAIN`, over
+    /// `saiife_wire::seal::hub_hello_msg`).
     HubHello,
 }
 
@@ -58,7 +57,7 @@ impl SignPurpose {
     fn domain(self) -> &'static [u8] {
         match self {
             SignPurpose::Seal => saiife_wire::seal::MACHINE_HELLO_DOMAIN,
-            SignPurpose::HubHello => HUB_HELLO_DOMAIN,
+            SignPurpose::HubHello => saiife_wire::seal::HUB_HELLO_DOMAIN,
         }
     }
 }
@@ -360,6 +359,9 @@ impl Workspace {
     }
 
     /// The gate every frame passes (`saiife_wire::verify::Verifier::check`).
+    /// A frame that passes has its nonce burned here, before the caller's
+    /// `wrong_owner` / `wrong_device` checks: a frame refused by those is
+    /// spent and cannot be replayed (intended).
     pub fn check(&self, sf: &SignedFrame, now: u64) -> Result<Verified, WireError> {
         let mut g = self.inner();
         let Inner {
@@ -698,7 +700,7 @@ mod tests {
         let sig = ws.sign(SignPurpose::HubHello, b"x").unwrap();
         assert!(saiife_wire::sig::verify_p256_domain(
             &pubkey,
-            HUB_HELLO_DOMAIN,
+            saiife_wire::seal::HUB_HELLO_DOMAIN,
             b"x",
             &sig
         ));
@@ -711,7 +713,7 @@ mod tests {
         ));
         assert!(!saiife_wire::sig::verify_p256_domain(
             &pubkey,
-            HUB_HELLO_DOMAIN,
+            saiife_wire::seal::HUB_HELLO_DOMAIN,
             b"x",
             &sig
         ));

@@ -922,7 +922,7 @@ fn hub_hello_verifies(w: &World, hh: &[u8], a: &Value) -> bool {
     let sig = b64::dec_n::<64>(a["sig"].as_str().unwrap()).unwrap();
     saiife_wire::sig::verify_p256_domain(
         &machine_pub(w),
-        saiife_daemon::workspace::HUB_HELLO_DOMAIN,
+        saiife_wire::seal::HUB_HELLO_DOMAIN,
         hh,
         &sig,
     )

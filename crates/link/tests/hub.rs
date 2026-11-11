@@ -368,7 +368,7 @@ async fn hello_is_signed_by_the_machine_key() {
     msg.extend_from_slice(mid.as_bytes());
     assert!(verify_p256_domain(
         &mpub,
-        saiife_daemon::workspace::HUB_HELLO_DOMAIN,
+        saiife_wire::seal::HUB_HELLO_DOMAIN,
         &msg,
         &sig
     ));
@@ -377,7 +377,7 @@ async fn hello_is_signed_by_the_machine_key() {
     other.extend_from_slice(mid.as_bytes());
     assert!(!verify_p256_domain(
         &mpub,
-        saiife_daemon::workspace::HUB_HELLO_DOMAIN,
+        saiife_wire::seal::HUB_HELLO_DOMAIN,
         &other,
         &sig
     ));

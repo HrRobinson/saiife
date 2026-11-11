@@ -157,10 +157,11 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(
     // A gateway MCP child (decision 12), or in locked mode any process of
     // the daemon's own uid: closed before a byte is read or answered.
     if crate::mcp_gateway::unix_peer_refused(&ctx, &peer) {
-        ctx.notice(
-            peer.uid,
-            Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Control),
-        );
+        let on = match listener {
+            Listener::Control => crate::mcp_gateway::PeerSocket::Control,
+            Listener::Link => crate::mcp_gateway::PeerSocket::Link,
+        };
+        ctx.notice(peer.uid, Notice::McpChildPeer(on));
         return;
     }
     // The personal broker talks to its own uid only (decision 3): any
@@ -324,6 +325,27 @@ mod tests {
             ctx.mcp.add_test_pid(std::process::id());
             assert!(hello_answer_bytes(ctx).await.is_empty(), "{mode:?}");
         }
+    }
+
+    /// The same refusal on `link.sock` is recorded as the link socket's
+    /// (plan 29), not the control socket's.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mcp_child_peer_on_link_sock_is_labelled_link() {
+        let me = rustix::process::getuid().as_raw();
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        ctx.mcp.add_test_pid(std::process::id());
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(link_connection(theirs, ctx));
+        let _ = ours.shutdown().await;
+        let mut got = Vec::new();
+        let read = timeout(Duration::from_secs(5), ours.read_to_end(&mut got)).await;
+        assert!(read.is_ok(), "the connection was not closed");
+        assert!(got.is_empty(), "{got:?}");
+        let _ = task.await;
+        let why = Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Link).reason(me);
+        assert!(why.starts_with("the link socket closed"), "{why}");
     }
 
     /// Locked mode, refusing its own uid (as the daemon's start sets it):
