@@ -1,0 +1,34 @@
+{
+  "browser_eph": "BB8wWLWQzIJxeXwCEF0pLO8bmhWR0kieniWwxsjgsmve2jS6BU1SN8blcbeUnxu5JTEwmVrq2b6h3dGmIhTa51A",
+  "comment": "generated ephemeral data; HKDF-SHA256(salt 'saiife-seal-v1', ikm shared, info 'saiife-seal-v1 keys'||machine_eph||browser_eph||session_id) -> 64 bytes, [0..32] browser->machine, [32..64] machine->browser; AES-256-GCM, nonce 4 zero bytes||u64 BE counter, AAD 'saiife-seal-v1 '||dir byte; sealed = counter(8 BE)||ct||tag",
+  "keys_hex": "46f225dcd6dcc294e8b0d152f2a7fbfac62ad4ce57263681a89354439ec1d3abe821c7211605956c8c1b3d4a2e6266ad698083fd2241301b0e5515ea5faa9ebe",
+  "machine_eph": "BOj7auZXTzY5wq4hYJZ41mM0lA91i_xvgj5TJatKhxw57dOIt-mJiV2W1LVoO_0LQgNjnEcnwOaZ15oobLdefcM",
+  "messages": [
+    {
+      "counter": 0,
+      "dir": "b",
+      "plaintext": "{\"hello\":\"machine\"}",
+      "sealed_b64u": "AAAAAAAAAAAaCIlSKRE-b3h7VUZPHl574O-Qt6CjE48puPw43qlVA9Yicg"
+    },
+    {
+      "counter": 0,
+      "dir": "m",
+      "plaintext": "{\"hello\":\"browser\"}",
+      "sealed_b64u": "AAAAAAAAAABDhbMy5slsBmVm7E1QFQMIEYd7xwQJuCsC6_c2khPqjkaWsA"
+    },
+    {
+      "counter": 1,
+      "dir": "b",
+      "plaintext": "second from the browser",
+      "sealed_b64u": "AAAAAAAAAAEX1CKZbRzAlcmROSnKc2j5DuoVtZUBfEr0JJpfMHInj1ZfCvT2dE8"
+    },
+    {
+      "counter": 1,
+      "dir": "m",
+      "plaintext": "",
+      "sealed_b64u": "AAAAAAAAAAEgHuAwICP7W2KurDQnQpl5"
+    }
+  ],
+  "session_id": "WgtMY-wJWJTgL00l3UVBXA",
+  "shared_secret_hex": "072a27721f065fbf4ac075e1ed0a7a15ccc7d91b1cb73e99c6e9dfd0f4182b6c"
+}

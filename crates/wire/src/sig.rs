@@ -114,6 +114,11 @@ impl TestDevice {
         b64::enc(&self.key.sign(SIG_DOMAIN, body.as_bytes(), &self.rng))
     }
 
+    /// Signs `domain || msg` with the device key.
+    pub fn sign_domain(&self, domain: &[u8], msg: &[u8]) -> [u8; 64] {
+        self.key.sign(domain, msg, &self.rng)
+    }
+
     /// body = `serde_json::to_string(f)`.
     pub fn frame(&self, f: &crate::frame::Frame) -> crate::frame::SignedFrame {
         let body = serde_json::to_string(f).expect("frame serializes");
