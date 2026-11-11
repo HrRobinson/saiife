@@ -6,9 +6,19 @@
 //! the trait contracts bound to about a second. Time comes from the injected
 //! [`Clock`]; the manager never reads the system clock.
 //!
-//! Each state change is saved before the method returns. When a save fails
-//! the in-memory record still follows what the VMM did, and the method
-//! returns the save error as `Unavailable`.
+//! Each state change is saved before the method returns. Two saves come
+//! before any VMM work and are strict: spawn's first save (on failure the
+//! claimed dir is removed, nothing stays in memory and the error is
+//! returned) and admission's save of the Starting record (on failure the box
+//! stays Queued, no VM is created and the pass stops). Every later save
+//! follows a VMM call that already happened, so the in-memory record keeps
+//! following the VMM even when the save fails: the caller-facing methods
+//! return that error as `Unavailable`, while the tick and the admission pass
+//! (which return only changes) are best effort and retry on the next save.
+//!
+//! A Discarded record whose `vm` is still `Some` means the VMM resource may
+//! still exist (its destroy failed); gc retries the destroy before removing
+//! the record.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -99,6 +109,13 @@ impl Inner {
         let saved = self.store.save(&r);
         self.records.insert(r.id.clone(), r);
         saved.map_err(BoxError::from)
+    }
+
+    /// Save `r`, and keep it in memory only when the save worked.
+    fn save_new(&mut self, r: BoxRecord) -> Result<(), BoxError> {
+        self.store.save(&r)?;
+        self.records.insert(r.id.clone(), r);
+        Ok(())
     }
 
     fn committed(&self) -> Committed {
@@ -332,7 +349,10 @@ impl Manager {
             error: None,
             image: None,
         };
-        g.put(r)?;
+        if let Err(e) = g.save_new(r) {
+            let _ = g.store.remove(&id);
+            return Err(e);
+        }
         self.admission(&mut g, &host, now);
         g.get(&id).cloned()
     }
@@ -357,10 +377,13 @@ impl Manager {
             r.turn_finished_at = None;
             r.error = None;
             r.updated_at = now;
-            out.push(change(&r, from, "admitted"));
             // Saved before the VM exists: a crash now leaves a Starting box
-            // that the boot timeout cleans up.
-            let _ = g.put(r.clone());
+            // that the boot timeout cleans up. A failed save leaves the box
+            // Queued and stops the pass, so no VM exists without a record.
+            if g.save_new(r.clone()).is_err() {
+                break;
+            }
+            out.push(change(&r, from, "admitted"));
             let spec = VmSpec {
                 id: r.id.clone(),
                 size: r.size,
@@ -376,13 +399,9 @@ impl Manager {
             match booted {
                 Ok(()) => r.vm_on = true,
                 Err(e) => {
-                    if let Some(h) = &r.vm {
-                        let _ = self.vmm.destroy(h);
-                    }
                     let from = r.state;
-                    r.state = transition(from, Event::BootFailed).unwrap_or(BoxState::Discarded);
-                    r.vm_on = false;
-                    r.error = Some(format!("boot failed: {}", vmm_msg(e)));
+                    let msg = format!("boot failed: {}", vmm_msg(e));
+                    self.boot_failed(&mut r, msg, false);
                     out.push(change(&r, from, "boot failed"));
                 }
             }
@@ -390,6 +409,41 @@ impl Manager {
             let _ = g.put(r);
         }
         out
+    }
+
+    /// Starting → Discarded with `error = why`: the VM is (stopped and)
+    /// destroyed; a failed teardown is appended to the error and keeps `vm`
+    /// set for gc to retry.
+    fn boot_failed(&self, r: &mut BoxRecord, why: String, stop_first: bool) {
+        let mut why = why;
+        if let Some(h) = r.vm.clone() {
+            if stop_first {
+                if let Err(e) = self.vmm.stop(&h) {
+                    why.push_str(&format!("; stop failed: {}", vmm_msg(e)));
+                }
+            }
+            match self.vmm.destroy(&h) {
+                Ok(()) => r.vm = None,
+                Err(e) => why.push_str(&format!("; destroy failed: {}", vmm_msg(e))),
+            }
+        }
+        r.state = transition(r.state, Event::BootFailed).unwrap_or(BoxState::Discarded);
+        r.vm_on = false;
+        r.error = Some(why);
+    }
+
+    /// Stop (when on) and destroy a box's VM; `vm` becomes `None` on success.
+    fn teardown(&self, r: &mut BoxRecord) -> Result<(), String> {
+        let Some(h) = r.vm.clone() else {
+            return Ok(());
+        };
+        if r.vm_on {
+            self.vmm.stop(&h).map_err(vmm_msg)?;
+            r.vm_on = false;
+        }
+        self.vmm.destroy(&h).map_err(vmm_msg)?;
+        r.vm = None;
+        Ok(())
     }
 
     pub fn pause(&self, id: &BoxId) -> Result<Change, BoxError> {
@@ -483,26 +537,25 @@ impl Manager {
     }
 
     /// Valid from Queued, Done, Landed and Discarded (R2). The VM is stopped
-    /// and destroyed (errors are not fatal), the dir removed and the record
-    /// dropped.
+    /// and destroyed, the dir removed and the record dropped. When the VMM
+    /// fails, the box is still Discarded (Ok) but the record and dir stay,
+    /// with the error, for gc to retry the destroy.
     pub fn discard(&self, id: &BoxId) -> Result<Change, BoxError> {
         let now = self.now();
         let mut g = self.lock();
         let mut r = g.get(id)?.clone();
         let from = r.state;
         let to = transition(from, Event::Discard)?;
-        if let Some(h) = &r.vm {
-            if r.vm_on {
-                let _ = self.vmm.stop(h);
-            }
-            if from != BoxState::Discarded {
-                let _ = self.vmm.destroy(h);
-            }
-        }
+        let torn = self.teardown(&mut r);
         r.state = to;
         r.vm_on = false;
         r.queue_seq = None;
         r.updated_at = now;
+        if let Err(msg) = torn {
+            r.error = Some(format!("discard: the VM could not be destroyed: {msg}"));
+            g.put(r.clone())?;
+            return Ok(change(&r, from, "discard"));
+        }
         if let Err(e) = g.store.remove(id) {
             // Keep it as a Discarded record so gc retries.
             let _ = g.put(r);
@@ -650,14 +703,8 @@ impl Manager {
             let mut changed = false;
             let started = r.started_at.unwrap_or(r.updated_at);
             if r.state == BoxState::Starting && now.saturating_sub(started) >= BOOT_TIMEOUT_SECS {
-                if let Some(h) = &r.vm {
-                    let _ = self.vmm.stop(h);
-                    let _ = self.vmm.destroy(h);
-                }
                 let from = r.state;
-                r.state = transition(from, Event::BootFailed).unwrap_or(BoxState::Discarded);
-                r.vm_on = false;
-                r.error = Some("boot timed out".into());
+                self.boot_failed(&mut r, "boot timed out".into(), true);
                 r.updated_at = now;
                 out.push(change(&r, from, "boot timed out"));
                 let _ = g.put(r);
@@ -703,8 +750,11 @@ impl Manager {
         out
     }
 
-    /// Remove every Discarded record's dir and every orphan dir.
+    /// Remove every Discarded record's dir and every orphan dir. A Discarded
+    /// record that still holds a VM handle has its destroy retried first; if
+    /// that fails again the record stays, with the error updated.
     pub fn gc(&self) -> Result<GcReport, BoxesError> {
+        let now = self.now();
         let mut g = self.lock();
         let mut removed = Vec::new();
         let gone: Vec<BoxId> = g
@@ -714,6 +764,16 @@ impl Manager {
             .map(|r| r.id.clone())
             .collect();
         for id in gone {
+            let mut r = g.records[&id].clone();
+            if let Some(h) = r.vm.clone() {
+                if let Err(e) = self.vmm.destroy(&h) {
+                    r.error = Some(format!("gc: the VM could not be destroyed: {}", vmm_msg(e)));
+                    r.updated_at = now;
+                    g.store.save(&r)?;
+                    g.records.insert(id, r);
+                    continue;
+                }
+            }
             g.store.remove(&id)?;
             g.records.remove(&id);
             removed.push(id);

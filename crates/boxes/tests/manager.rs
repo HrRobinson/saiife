@@ -900,3 +900,117 @@ fn gc_removes_discarded_and_orphans() {
     // Ids are never reused.
     assert_eq!(w.spawn("c").id, id("b4"));
 }
+
+#[test]
+fn discard_destroy_failure_keeps_record_for_gc() {
+    let w = world(1);
+    let a = running(&w, "a");
+    w.mgr.done(&a).unwrap();
+    w.vmm.fail_next(VmOp::Destroy, "busy");
+    assert_eq!(
+        w.mgr.discard(&a).unwrap(),
+        change(&a, BoxState::Done, BoxState::Discarded, "discard")
+    );
+    let g = w.mgr.get(&a).unwrap();
+    assert_eq!(g.state, BoxState::Discarded);
+    assert!(!g.vm_on);
+    assert!(g.vm.is_some());
+    assert_eq!(
+        g.error.as_deref(),
+        Some("discard: the VM could not be destroyed: busy")
+    );
+    assert!(w.root.join(a.as_str()).join("box.json").exists());
+    w.assert_saved(&a);
+    assert_eq!(w.mgr.capacity().1, Committed::default());
+    // gc retries the destroy; a second failure keeps the record.
+    w.vmm.fail_next(VmOp::Destroy, "still busy");
+    assert_eq!(w.mgr.gc().unwrap(), GcReport::default());
+    assert_eq!(
+        w.mgr.get(&a).unwrap().error.as_deref(),
+        Some("gc: the VM could not be destroyed: still busy")
+    );
+    w.assert_saved(&a);
+    assert_eq!(
+        w.mgr.gc().unwrap(),
+        GcReport {
+            removed: vec![a.clone()]
+        }
+    );
+    assert_eq!(count(&w, &a, VmOp::Destroy), 3);
+    assert!(!w.root.join(a.as_str()).exists());
+    assert_eq!(w.mgr.get(&a), Err(BoxError::NotFound));
+}
+
+#[test]
+fn discard_clears_the_vm_handle_on_success() {
+    let w = world(1);
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let r = w.spawn("a");
+    // The boot failure destroyed the VM, so its handle is gone and a later
+    // discard makes no VMM call.
+    assert_eq!(r.vm, None);
+    let before = w.vmm.calls().len();
+    w.mgr.discard(&r.id).unwrap();
+    assert_eq!(w.vmm.calls().len(), before);
+}
+
+#[test]
+fn boot_timeout_destroy_failure_is_recorded() {
+    let w = world(1);
+    let r = w.spawn("a");
+    w.vmm.fail_next(VmOp::Destroy, "stuck");
+    w.advance(BOOT_TIMEOUT_SECS);
+    assert_eq!(
+        w.mgr.tick(),
+        vec![change(
+            &r.id,
+            BoxState::Starting,
+            BoxState::Discarded,
+            "boot timed out"
+        )]
+    );
+    let g = w.mgr.get(&r.id).unwrap();
+    assert_eq!(
+        g.error.as_deref(),
+        Some("boot timed out; destroy failed: stuck")
+    );
+    assert!(g.vm.is_some());
+    w.assert_saved(&r.id);
+    assert_eq!(
+        w.mgr.gc().unwrap(),
+        GcReport {
+            removed: vec![r.id.clone()]
+        }
+    );
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
+}
+
+#[test]
+fn boot_failure_destroy_failure_keeps_vm() {
+    let w = world(1);
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    w.vmm.fail_next(VmOp::Destroy, "stuck");
+    let r = w.spawn("a");
+    assert_eq!(r.state, BoxState::Discarded);
+    assert_eq!(
+        r.error.as_deref(),
+        Some("boot failed: no kvm; destroy failed: stuck")
+    );
+    assert!(r.vm.is_some());
+    w.assert_saved(&r.id);
+}
+
+#[test]
+fn admission_save_failure_leaves_box_queued() {
+    let w = world(1);
+    let a = running(&w, "a");
+    let b = w.spawn("b");
+    // Without its marker the store refuses to save the box.
+    std::fs::remove_file(w.root.join(b.id.as_str()).join(".saiife-box")).unwrap();
+    w.mgr.stop(&a, false).unwrap();
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(state(&w, &b.id), BoxState::Queued);
+    assert_eq!(w.mgr.queue(), vec![b.id.clone()]);
+    assert!(ops(&w, &b.id).is_empty());
+    assert_eq!(w.mgr.capacity().1, Committed::default());
+}
