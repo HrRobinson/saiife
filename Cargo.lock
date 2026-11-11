@@ -1630,6 +1630,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "ring",
  "rustix",
  "rustls",
  "rustls-native-certs",

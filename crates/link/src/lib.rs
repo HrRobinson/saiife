@@ -2,12 +2,12 @@
 //! phone and saiifed's `link.sock`. The daemon decides; this relays.
 #![forbid(unsafe_code)]
 
-mod assets;
+pub mod assets;
 pub mod daemon;
 #[cfg(unix)]
 mod hub;
 #[cfg(unix)]
-mod local;
+pub mod local;
 mod ws;
 
 pub use daemon::{Daemon, LinkError};
@@ -41,13 +41,14 @@ pub async fn run(cfg: LinkConfig) -> Result<(), String> {
         url,
         roots: cfg.hub_roots,
     });
+    // `local::serve` never returns; only the hub client can end the pair.
     let local = local::serve(listener, daemon.clone(), cfg.port);
     match hub {
-        Some(h) => {
-            let (a, b) = tokio::join!(local, hub::run(h, daemon));
-            a.and(b)
+        Some(h) => tokio::join!(local, hub::run(h, daemon)).1,
+        None => {
+            local.await;
+            Ok(())
         }
-        None => local.await,
     }
 }
 
