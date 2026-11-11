@@ -5,12 +5,14 @@
 
 mod common;
 
-use common::http::{frame_for, json_of, Server};
+use common::http::{frame_for, frame_with, json_of, Server};
 use common::{control, me, world, World};
 use http::StatusCode;
 use saiife_ipc::msg::{OP_WORKSPACE_PAIR_BEGIN, OP_WORKSPACE_PAIR_CONFIRM};
 use saiife_link::Daemon;
+use saiife_wire::fake::FakeCall;
 use saiife_wire::sig::TestDevice;
+use saiife_wire::source::{BoxId, BoxSource, SpawnReq, Start};
 use saiife_wire::{b64, pair};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -238,4 +240,207 @@ async fn node_pairs_with_the_real_link() {
         .device(v["deviceId"].as_str().unwrap())
         .unwrap();
     assert_eq!(dev.label, LABEL);
+}
+
+/// A paired, confirmed device (the pair view's steps, then the owner's).
+async fn paired(w: &World, s: &Server) -> TestDevice {
+    let o = begin(w).await;
+    let d = TestDevice::generate();
+    assert_eq!(post_pair(s, &o, &d).await["ok"], true);
+    confirm(w, &o, true).await;
+    d
+}
+
+/// `POST /api/frame` with the args a view builds from `ACTIONS`.
+async fn act(w: &World, s: &Server, d: &TestDevice, action: &str, args: Value) -> Value {
+    let sf = frame_with(w, d, action, common::args(args));
+    let (st, _, body) = s
+        .post("/api/frame", &json!({"body": sf.body, "sig": sf.sig}))
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    json_of(&body)
+}
+
+fn bid(s: &str) -> BoxId {
+    BoxId::parse(s).unwrap()
+}
+
+/// The `workspace` audit records so far, oldest first.
+fn records(w: &World) -> Vec<Value> {
+    fn walk(p: &Path, out: &mut Vec<Value>) {
+        let mut entries: Vec<_> = std::fs::read_dir(p).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.path());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if let Ok(t) = std::fs::read_to_string(&p) {
+                for line in t.lines() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        if v["kind"] == "workspace" {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&w._tmp.path().join("audit"), &mut out);
+    out
+}
+
+/// The record's extra fields may sit at the top level or under `extra`.
+fn field<'a>(r: &'a Value, k: &str) -> &'a Value {
+    match &r[k] {
+        Value::Null => &r["extra"][k],
+        v => v,
+    }
+}
+
+#[tokio::test]
+async fn overview_lists_demo_boxes() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let a = act(&w, &s, &d, "box.overview", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let r = &a["result"];
+    let states: Vec<_> = r["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["id"].as_str().unwrap(), b["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            ("b-run", "running"),
+            ("b-done", "done"),
+            ("b-q1", "queued"),
+            ("b-q2", "queued")
+        ],
+        "{a}"
+    );
+    // The fields the cards and the header line read.
+    assert_eq!(r["load"]["cpu_pct"], 37, "{a}");
+    assert!(r["slots_free"].is_u64() && r["slots_total"].is_u64(), "{a}");
+    let b = &r["boxes"][0];
+    for k in ["template", "repo", "task", "started_at", "queue_pos"] {
+        assert!(b.get(k).is_some(), "{k} in {b}");
+    }
+}
+
+#[tokio::test]
+async fn overview_with_200_boxes() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    for n in 0..196 {
+        w.boxes
+            .spawn(&SpawnReq {
+                template: "claude".into(),
+                repo: "erp".into(),
+                task: format!("task number {n}"),
+                start: Start::Queue,
+            })
+            .unwrap();
+    }
+    let sf = frame_with(&w, &d, "box.overview", common::args(json!({})));
+    let t = std::time::Instant::now();
+    let (st, _, body) = s
+        .post("/api/frame", &json!({"body": sf.body, "sig": sf.sig}))
+        .await;
+    let took = t.elapsed();
+    assert_eq!(st, StatusCode::OK);
+    let a = json_of(&body);
+    assert_eq!(
+        a["result"]["boxes"].as_array().unwrap().len(),
+        200,
+        "{took:?}"
+    );
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    assert!(body.len() < 1_000_000, "{} bytes", body.len());
+}
+
+#[tokio::test]
+async fn stop_and_pause_run() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let before = records(&w).len();
+    let a = act(&w, &s, &d, "box.pause", json!({"id": "b-run"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = act(&w, &s, &d, "box.stop", json!({"id": "b-run"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(
+        w.boxes.calls(),
+        vec![FakeCall::Pause(bid("b-run")), FakeCall::Stop(bid("b-run"))]
+    );
+    let r = records(&w);
+    assert_eq!(r.len(), before + 2, "{r:?}");
+    for (rec, action) in r[before..].iter().zip(["box.pause", "box.stop"]) {
+        assert_eq!(field(rec, "action"), action, "{rec}");
+        assert_eq!(field(rec, "device"), d.device_id().as_str(), "{rec}");
+        assert_eq!(field(rec, "box"), "b-run", "{rec}");
+    }
+}
+
+#[tokio::test]
+async fn reorder_sends_full_order() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    // The "↑" on b-q2 sends the whole queue with b-q2 first.
+    let a = act(&w, &s, &d, "box.reorder", json!({"ids": ["b-q2", "b-q1"]})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(
+        w.boxes.calls(),
+        vec![FakeCall::Reorder(vec![bid("b-q2"), bid("b-q1")])]
+    );
+    let a = act(&w, &s, &d, "box.overview", json!({})).await;
+    let ids: Vec<_> = a["result"]["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["state"] == "queued")
+        .map(|b| b["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b-q2", "b-q1"], "{a}");
+    // A partial order is refused by the daemon, not guessed at.
+    let a = act(&w, &s, &d, "box.reorder", json!({"ids": ["b-q1"]})).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(a["message"].is_string(), "{a}");
+}
+
+#[tokio::test]
+async fn steer_is_refused_touch_required() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    for (action, args) in [
+        (
+            "box.steer",
+            json!({"id": "b-run", "msg": "use the new API"}),
+        ),
+        ("box.resume", json!({"id": "b-run"})),
+    ] {
+        let a = act(&w, &s, &d, action, args).await;
+        assert_eq!(a["ok"], false, "{a}");
+        assert_eq!(a["rule"], "touch_required", "{a}");
+        assert!(a["message"].as_str().is_some_and(|m| !m.is_empty()), "{a}");
+    }
+    // Nothing reached the box.
+    assert_eq!(w.boxes.calls(), vec![]);
+}
+
+#[tokio::test]
+async fn lockdown_on_from_ui() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    assert!(w.ctx.lockdown.get().is_none());
+    let a = act(&w, &s, &d, "lockdown.on", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(w.ctx.lockdown.get().is_some(), "{a}");
+    let rec = records(&w)
+        .into_iter()
+        .rev()
+        .find(|r| field(r, "action") == "lockdown.on")
+        .expect("lockdown.on recorded");
+    assert_eq!(field(&rec, "device"), d.device_id().as_str(), "{rec}");
 }

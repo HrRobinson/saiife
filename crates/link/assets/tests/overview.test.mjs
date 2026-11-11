@@ -1,0 +1,70 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { headerLine, preview, hrefFor, reorderIds, counter, machineCommand, MAX_STEER_BYTES } from "../js/overviewlogic.js";
+
+const b = (id, state) => ({ id, state });
+const ov = {
+  boxes: [b("r", "running"), b("d", "done"), b("q1", "queued"), b("q2", "queued")],
+  load: { cpu_pct: 37, mem_used_mb: 6144, mem_total_mb: 16384 },
+  slots_total: 4,
+  slots_free: 3,
+};
+
+test("header line, with and without load", () => {
+  assert.equal(headerLine(ov), "1 running · 2 queued · 3 free slots · CPU 37% · RAM 6.0/16.0 GB");
+  assert.equal(headerLine({ ...ov, load: null }), "1 running · 2 queued · 3 free slots");
+});
+
+test("task preview cuts at 140 characters", () => {
+  assert.deepEqual(preview("abc"), { text: "abc", cut: false });
+  const p = preview("x".repeat(141));
+  assert.equal(p.text.length, 140);
+  assert.equal(p.cut, true);
+});
+
+test("cards link by state", () => {
+  assert.equal(hrefFor(b("d", "done")), "#/box/d");
+  assert.equal(hrefFor(b("r", "running")), "#/box/r/steer");
+  assert.equal(hrefFor(b("p", "paused")), "#/box/p/steer");
+  assert.equal(hrefFor(b("q", "queued")), null);
+  assert.equal(hrefFor(b("l", "landed")), null);
+});
+
+test("reorder sends the full new order of queued boxes", () => {
+  assert.deepEqual(reorderIds(ov.boxes, "q2", -1), ["q2", "q1"]);
+  assert.deepEqual(reorderIds(ov.boxes, "q1", 1), ["q2", "q1"]);
+  assert.equal(reorderIds(ov.boxes, "q1", -1), null);
+  assert.equal(reorderIds(ov.boxes, "q2", 1), null);
+  assert.equal(reorderIds(ov.boxes, "r", 1), null);
+});
+
+test("steer counter counts bytes", () => {
+  assert.deepEqual(counter("é"), { text: `2 / ${MAX_STEER_BYTES} bytes`, over: false });
+  assert.equal(counter("a".repeat(4097)).over, true);
+  assert.equal(counter("a".repeat(4096)).over, false);
+});
+
+test("machine commands", () => {
+  assert.equal(machineCommand("box.land", "b-1"), "saiife box land b-1");
+  assert.equal(machineCommand("box.steer", "b-1"), 'saiife box say b-1 "…"');
+});
+
+class Node_ {
+  constructor(tag) { this.tag = tag; this.children = []; this.attrs = {}; }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  addEventListener() {}
+  append(...k) { this.children.push(...k); }
+}
+globalThis.document = { createElement: (t) => new Node_(t), createTextNode: (s) => ({ text: s }) };
+const texts = (n) => (n.text !== undefined ? [n.text] : n.children.flatMap(texts));
+
+test("touch prompt shows the ask, the box, the code and the command, never success", async () => {
+  const { show } = await import("../js/touchprompt.js");
+  const all = texts(show({ short_code: "ABC123", message: "needs a touch" }, { action: "box.land", id: "b-1", summary: "Land b-1" })).join("|");
+  for (const s of ["Land b-1", "b-1", "ABC123", "Needs a touch on a paired passkey", "saiife box land b-1"]) {
+    assert.ok(all.includes(s), s);
+  }
+  assert.ok(!/sent|paused|stopped|done\b/i.test(all.replace("Not done yet", "")));
+  const none = texts(show({}, { action: "box.steer", id: "b-2" })).join("|");
+  assert.ok(!none.includes("Code:"));
+});
