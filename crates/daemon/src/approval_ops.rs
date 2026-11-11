@@ -157,17 +157,20 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
     );
     let faithful = display_is_faithful(p);
-    // The environment-applied config the call was asked under: the gateway's
-    // snapshot for the call's env (policy `class_for` reads marks from it).
-    let touch_class = ctx.policy().gateway.as_deref().and_then(|g| {
-        let cap = saiife_policy::Capability::parse(p.capability.as_deref()?).ok()?;
-        saiife_policy::touch::class_for(
-            &g.snapshot_for(p.stored.env.as_deref()).config,
-            &p.stored.service,
-            &cap,
-        )
-        .map(str::to_string)
-    });
+    // Fail closed: the class comes from the environment-applied snapshot of
+    // the call's env. Without a snapshot, or for a service it does not know,
+    // the request cannot be classified, so nothing is stored.
+    let touch_class = {
+        const UNCLASSIFIED: &str = "touch_policy_unavailable";
+        let policy = ctx.policy();
+        let g = policy.gateway.as_deref().ok_or(UNCLASSIFIED)?;
+        let cfg = &g.snapshot_for(p.stored.env.as_deref()).config;
+        if !cfg.services.contains_key(&p.stored.service) {
+            return Err(UNCLASSIFIED.into());
+        }
+        saiife_policy::touch::class_for_call(cfg, &p.stored.service, p.capability.as_deref())
+            .map(str::to_string)
+    };
     let new = NewRequest {
         uid: p.stored.uid,
         sid: p.stored.sid.clone(),
@@ -2033,6 +2036,55 @@ mod tests {
         let id = create(&ctx, &plain, "claude").await.unwrap();
         let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
         assert_eq!(r.touch_class, None);
+
+        // An unparsable or missing capability on a deploy-marked service is
+        // the strictest class, never none.
+        for cap in [Some("not a capability"), None] {
+            let mut bad = pending(Some("third"), None);
+            bad.capability = cap.map(str::to_string);
+            let id = create(&ctx, &bad, "claude").await.unwrap();
+            let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+            assert_eq!(r.touch_class.as_deref(), Some("deploy"), "{cap:?}");
+        }
+
+        // A service the snapshot does not know cannot be classified.
+        let before = ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .list(crate::approvals::Filter::default())
+            .len();
+        let mut unknown = pending(Some("fourth"), None);
+        unknown.stored.service = "nope".into();
+        let e = create(&ctx, &unknown, "claude").await.unwrap_err();
+        assert_eq!(e, "touch_policy_unavailable");
+        assert_eq!(
+            ctx.approvals
+                .as_ref()
+                .unwrap()
+                .list(crate::approvals::Filter::default())
+                .len(),
+            before
+        );
+    }
+
+    /// No gateway snapshot: the request is refused and nothing is stored.
+    #[tokio::test]
+    async fn connector_create_without_a_gateway_refuses() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().approvals = Ok(store);
+        let e = create(&ctx, &pending(None, None), "claude")
+            .await
+            .unwrap_err();
+        assert_eq!(e, "touch_policy_unavailable");
+        assert!(ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .list(crate::approvals::Filter::default())
+            .is_empty());
     }
 
     #[test]
