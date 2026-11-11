@@ -52,6 +52,10 @@ pub mod tokens;
 pub mod touch;
 pub mod touch_ops;
 pub mod vault;
+pub mod workspace;
+// Workspace (plan 29): link.sock and frame execution.
+pub mod workspace_link;
+pub mod workspace_ops;
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};

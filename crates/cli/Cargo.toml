@@ -39,6 +39,10 @@ time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 saiife-win = { path = "../win" }
 # `saiife api` sends and reads bodies as base64 (the version saiife-broker uses).
 base64 = "=0.23.1"
+# `saiife workspace serve` runs the Workspace link (plan 29).
+saiife-link = { path = "../link" }
+# 0.14.1 is from 2024-07-05; no default features: no image crate.
+qrcode = { version = "=0.14.1", default-features = false }
 # Secret values `saiife secret` reads are wiped when dropped.
 zeroize = "=1.9.1"
 # `saiife touch` and touch approvals: the soft key is compiled in; only debug
@@ -55,6 +59,9 @@ fido-hid = ["dep:ctap-hid-fido2"]
 # Signals for the worker fault seam (debug builds); no unsafe calls.
 rustix = { version = "1", features = ["process", "termios", "fs"] }
 base64 = "=0.23.1"
+# A runtime for `saiife workspace serve`, and the SIGINT wait of `workspace pair`
+# (the version saiife-link uses).
+tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "signal"] }
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 
@@ -76,6 +83,8 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 # The approvals tests serve an in-process daemon context to the CLI (an
 # approver with a second uid at the ops level); the version saiife-daemon uses.
 tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+# The workspace tests pair a `TestDevice` through link.sock.
+saiife-wire = { path = "../wire", features = ["fake"] }
 
 [target.'cfg(windows)'.dependencies]
 # A console prompt without echo, for `secret add` and `connect` (never for approvals: W16).

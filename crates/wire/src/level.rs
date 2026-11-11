@@ -117,6 +117,16 @@ const IPC_OPS: &[&str] = &[
     "secret.remove",
     "secret.rotate",
     "status",
+    // Workspace (plan 29): sorted in with the rest.
+    "workspace.devices",
+    "workspace.frame",
+    "workspace.hello",
+    "workspace.pair.begin",
+    "workspace.pair.confirm",
+    "workspace.pair.finish",
+    "workspace.pair.status",
+    "workspace.revoke",
+    "workspace.sign",
 ];
 
 /// Exact string match only: no prefixes, wildcards or case folding. `None` means deny.

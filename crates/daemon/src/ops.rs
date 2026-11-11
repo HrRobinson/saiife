@@ -394,6 +394,11 @@ pub struct Ctx {
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
+    // Workspace (plan 29)
+    /// The machine key, paired devices, pairing offers and frame verifier.
+    pub workspace: Arc<crate::workspace::Workspace>,
+    /// What Workspace frames act on (no boxes unless a build wires some).
+    pub boxes: Arc<dyn saiife_wire::BoxSource>,
 }
 
 /// When each (uid, kind) notice was last written; shared with the hook
@@ -435,6 +440,9 @@ pub struct CtxInit {
     pub mcp: Arc<crate::mcp_gateway::Gateway>,
     /// See [`Ctx::refuse_own_uid_peers`]. `minimal` leaves it off.
     pub refuse_own_uid_peers: bool,
+    // Workspace (plan 29)
+    pub workspace: Arc<crate::workspace::Workspace>,
+    pub boxes: Arc<dyn saiife_wire::BoxSource>,
 }
 
 impl CtxInit {
@@ -488,6 +496,9 @@ impl CtxInit {
                 crate::mcp_gateway::GatewaySetup::in_state(state_dir),
             )),
             refuse_own_uid_peers: false,
+            // Workspace (plan 29)
+            workspace: Arc::new(crate::workspace::Workspace::memory()),
+            boxes: Arc::new(saiife_wire::source::NoBoxes),
         }
     }
 }
@@ -723,6 +734,9 @@ impl Ctx {
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
+            // Workspace (plan 29)
+            workspace: i.workspace,
+            boxes: i.boxes,
         }
     }
 
@@ -1206,6 +1220,14 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_MCP_LIST | OP_MCP_CALL => crate::mcp_ops::handle(ctx, peer, req).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
+        // Workspace (plan 29): machine side, control socket only.
+        saiife_ipc::msg::OP_WORKSPACE_PAIR_BEGIN
+        | saiife_ipc::msg::OP_WORKSPACE_PAIR_STATUS
+        | saiife_ipc::msg::OP_WORKSPACE_PAIR_CONFIRM
+        | saiife_ipc::msg::OP_WORKSPACE_DEVICES
+        | saiife_ipc::msg::OP_WORKSPACE_REVOKE => {
+            crate::workspace_ops::handle(ctx, conn, req).await
+        }
         other => err(
             req.id,
             ErrorCode::UnknownOp,
@@ -1506,6 +1528,12 @@ fn status(ctx: &Ctx, id: u64) -> Value {
         m.insert("cosign".into(), c.status());
         m.insert("hooks_rejudge_denied".into(), c.rejudge_denied_status());
     }
+    // Workspace (plan 29): frames refused before their signature verified
+    // (never recorded).
+    m.insert(
+        "workspace".into(),
+        json!({"refused_unsigned": ctx.workspace.refused_unsigned()}),
+    );
     ok(id, m)
 }
 

@@ -404,7 +404,20 @@ impl Client {
         daemon_uid: u32,
         deadline: Instant,
     ) -> Result<Client, ClientError> {
-        let sock = socket_dir.join(SOCKET_NAME);
+        Client::connect_named(socket_dir, SOCKET_NAME, daemon_uid, deadline)
+    }
+
+    /// As [`Client::connect`] for another socket of the daemon in `socket_dir`
+    /// (`name` is a file name such as [`crate::msg::LINK_SOCKET_NAME`]), with
+    /// the same owner and peer checks.
+    #[cfg(unix)]
+    pub fn connect_named(
+        socket_dir: &Path,
+        name: &str,
+        daemon_uid: u32,
+        deadline: Instant,
+    ) -> Result<Client, ClientError> {
+        let sock = socket_dir.join(name);
         check_owner(socket_dir, &sock, daemon_uid)?;
         let stream = connect_by(&sock, deadline)?;
         // Closes the check-then-connect race: whoever answers must be the daemon.
@@ -1175,6 +1188,16 @@ mod tests {
         l.set_nonblocking(true).unwrap();
         let r = Client::connect(d.path(), me() + 1, dl(500));
         assert!(matches!(r, Err(ClientError::Owner { .. })));
+        assert!(l.accept().is_err(), "listener must never be connected to");
+    }
+
+    #[test]
+    fn connect_named_checks_the_owner() {
+        let d = dir_0755();
+        let l = UnixListener::bind(d.path().join(crate::msg::LINK_SOCKET_NAME)).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let r = Client::connect_named(d.path(), crate::msg::LINK_SOCKET_NAME, me() + 1, dl(500));
+        assert!(matches!(r, Err(ClientError::Owner { .. })), "{r:?}");
         assert!(l.accept().is_err(), "listener must never be connected to");
     }
 

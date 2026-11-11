@@ -8,8 +8,54 @@ use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, E
 use ring::hkdf::{KeyType, Salt, HKDF_SHA256};
 use ring::rand::SecureRandom;
 
-/// Domain of the handshake signatures (machine key and device key).
+/// Domain of the device key's handshake signature (session_id ‖
+/// machine_eph ‖ browser_eph).
 pub const HANDSHAKE_DOMAIN: &[u8] = b"saiife-seal-v1 hello\n";
+/// Domain of the machine key's handshake signature, over
+/// [`machine_hello_msg`]: it binds the session to one device or one
+/// pairing offer, so a signature made for one cannot open a session as
+/// another.
+pub const MACHINE_HELLO_DOMAIN: &[u8] = b"saiife-seal-v1 machine\n";
+
+/// Domain of the machine key's signature in the hub hello (plan 29), over
+/// [`hub_hello_msg`]: the hub's challenge nonce ‖ the machine id.
+pub const HUB_HELLO_DOMAIN: &[u8] = b"saiife-hub-hello-v1\n";
+
+/// What the machine key signs for the hub (domain [`HUB_HELLO_DOMAIN`]):
+/// nonce ‖ machine_id (ASCII).
+pub fn hub_hello_msg(nonce: &[u8], machine_id: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(nonce.len() + machine_id.len());
+    v.extend_from_slice(nonce);
+    v.extend_from_slice(machine_id.as_bytes());
+    v
+}
+
+/// What a sealed session is for: a paired device (its id), or a pairing
+/// offer (its pair_id) for a pairing-only session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealBinding {
+    Device(String),
+    Pair(String),
+}
+
+/// What the machine key signs (domain [`MACHINE_HELLO_DOMAIN`]):
+/// session_id ‖ machine_eph ‖ (`d:` device_id | `p:` pair_id), ASCII.
+pub fn machine_hello_msg(
+    session_id: &[u8; 16],
+    machine_eph: &[u8; 65],
+    b: &SealBinding,
+) -> Vec<u8> {
+    let (tag, id) = match b {
+        SealBinding::Device(d) => (b"d:", d),
+        SealBinding::Pair(p) => (b"p:", p),
+    };
+    let mut v = Vec::with_capacity(16 + 65 + 2 + id.len());
+    v.extend_from_slice(session_id);
+    v.extend_from_slice(machine_eph);
+    v.extend_from_slice(tag);
+    v.extend_from_slice(id.as_bytes());
+    v
+}
 /// HKDF salt.
 pub const SEAL_SALT: &[u8] = b"saiife-seal-v1";
 const KEYS_INFO: &[u8] = b"saiife-seal-v1 keys";
@@ -168,8 +214,9 @@ impl Core {
 }
 
 /// Machine side of one hub session. Link holds it (plan 29); the daemon
-/// signs `to_sign()` with the machine key so the browser, which knows
-/// `machine_pub` from the QR code, can check it.
+/// signs `to_sign(binding)` with the machine key (domain
+/// [`MACHINE_HELLO_DOMAIN`]) so the browser, which knows `machine_pub` from
+/// the QR code, can check it and that it is for its own device or offer.
 pub struct MachineHandshake {
     private: EphemeralPrivateKey,
     eph_pub: [u8; 65],
@@ -205,13 +252,10 @@ impl MachineHandshake {
         self.session_id
     }
 
-    /// The bytes the machine key signs (domain `HANDSHAKE_DOMAIN`):
-    /// session_id ‖ eph_pub.
-    pub fn to_sign(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(81);
-        v.extend_from_slice(&self.session_id);
-        v.extend_from_slice(&self.eph_pub);
-        v
+    /// The bytes the machine key signs (domain [`MACHINE_HELLO_DOMAIN`]):
+    /// [`machine_hello_msg`] of this session for `b`.
+    pub fn to_sign(&self, b: &SealBinding) -> Vec<u8> {
+        machine_hello_msg(&self.session_id, &self.eph_pub, b)
     }
 
     /// `browser_sig` is the device key's signature (`HANDSHAKE_DOMAIN`) over
@@ -224,15 +268,15 @@ impl MachineHandshake {
         browser_sig: Option<&[u8; 64]>,
         device_pub: Option<&[u8; 65]>,
     ) -> Result<Channel, WireError> {
-        let pairing_only = match (browser_sig, device_pub) {
+        let device_id = match (browser_sig, device_pub) {
             (Some(sig), Some(pk)) => {
                 let msg = handshake_msg(&self.session_id, &self.eph_pub, browser_eph);
                 if !verify_p256_domain(pk, HANDSHAKE_DOMAIN, &msg, sig) {
                     return Err(WireError::Seal("bad handshake signature".into()));
                 }
-                false
+                Some(crate::sig::device_id_of(pk))
             }
-            (None, None) => true,
+            (None, None) => None,
             _ => {
                 return Err(WireError::Seal(
                     "signature and device key go together".into(),
@@ -246,7 +290,7 @@ impl MachineHandshake {
         )
         .map_err(|_| WireError::Seal("bad browser key".into()))?;
         let keys = keys_from_shared(&shared, &self.eph_pub, browser_eph, &self.session_id)?;
-        Channel::from_keys(&keys, pairing_only)
+        Channel::from_keys(&keys, device_id)
     }
 }
 
@@ -261,14 +305,16 @@ fn handshake_msg(session_id: &[u8; 16], machine_eph: &[u8; 65], browser_eph: &[u
 /// The machine end of a sealed session.
 pub struct Channel {
     core: Core,
-    pairing_only: bool,
+    /// The device whose key signed the handshake; `None` for a pairing
+    /// session.
+    device_id: Option<String>,
 }
 
 impl Channel {
-    fn from_keys(keys: &[u8; 64], pairing_only: bool) -> Result<Channel, WireError> {
+    fn from_keys(keys: &[u8; 64], device_id: Option<String>) -> Result<Channel, WireError> {
         Ok(Channel {
             core: Core::new(keys, true)?,
-            pairing_only,
+            device_id,
         })
     }
 
@@ -284,7 +330,14 @@ impl Channel {
     }
 
     pub fn pairing_only(&self) -> bool {
-        self.pairing_only
+        self.device_id.is_none()
+    }
+
+    /// The id of the device whose key signed the handshake
+    /// (`device_id_of(device_pub)`); `None` for a pairing session. Link
+    /// passes it as `channel_device` with every hub frame.
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 }
 
@@ -328,18 +381,19 @@ impl<'a> TestBrowserEnd<'a> {
         })
     }
 
-    /// Checks the machine's handshake signature and derives the channel.
+    /// Checks the machine's handshake signature, made for `expect` (this
+    /// browser's device, or the offer it pairs with), and derives the
+    /// channel.
     pub fn finish(
         self,
         machine_eph: &[u8; 65],
         session_id: &[u8; 16],
         machine_sig: &[u8; 64],
         machine_pub: &[u8; 65],
+        expect: &SealBinding,
     ) -> Result<BrowserChannel, WireError> {
-        let mut msg = Vec::with_capacity(81);
-        msg.extend_from_slice(session_id);
-        msg.extend_from_slice(machine_eph);
-        if !verify_p256_domain(machine_pub, HANDSHAKE_DOMAIN, &msg, machine_sig) {
+        let msg = machine_hello_msg(session_id, machine_eph, expect);
+        if !verify_p256_domain(machine_pub, MACHINE_HELLO_DOMAIN, &msg, machine_sig) {
             return Err(WireError::Seal("bad handshake signature".into()));
         }
         let shared = agree_ephemeral(
@@ -382,7 +436,11 @@ mod tests {
         let r = rng();
         let (mk, _) = MachineKey::generate(&r).unwrap();
         let mh = MachineHandshake::new(&r).unwrap();
-        let machine_sig = mk.sign(HANDSHAKE_DOMAIN, &mh.to_sign(), &r);
+        let binding = match device {
+            Some(d) => SealBinding::Device(d.device_id()),
+            None => SealBinding::Pair("p-1".into()),
+        };
+        let machine_sig = mk.sign(MACHINE_HELLO_DOMAIN, &mh.to_sign(&binding), &r);
         let be = TestBrowserEnd::new(device);
         let bsig = be.sign_handshake(&mh.session_id(), &mh.eph_pub());
         let beph = be.eph_pub();
@@ -390,7 +448,7 @@ mod tests {
         let pk = device.map(|d| d.public_raw());
         let ch = mh.finish(&beph, bsig.as_ref(), pk.as_ref()).unwrap();
         let bc = be
-            .finish(&meph, &sid, &machine_sig, &mk.public_raw())
+            .finish(&meph, &sid, &machine_sig, &mk.public_raw(), &binding)
             .unwrap();
         (ch, bc)
     }
@@ -465,13 +523,88 @@ mod tests {
         let (mk, _) = MachineKey::generate(&r).unwrap();
         let (other, _) = MachineKey::generate(&r).unwrap();
         let mh = MachineHandshake::new(&r).unwrap();
-        let sig = mk.sign(HANDSHAKE_DOMAIN, &mh.to_sign(), &r);
+        let b = SealBinding::Pair("p-1".into());
+        let sig = mk.sign(MACHINE_HELLO_DOMAIN, &mh.to_sign(&b), &r);
         let be = TestBrowserEnd::new(None);
         let e = be
-            .finish(&mh.eph_pub(), &mh.session_id(), &sig, &other.public_raw())
+            .finish(
+                &mh.eph_pub(),
+                &mh.session_id(),
+                &sig,
+                &other.public_raw(),
+                &b,
+            )
             .err()
             .unwrap();
         assert_eq!(e, WireError::Seal("bad handshake signature".into()));
+    }
+
+    #[test]
+    fn machine_signature_is_bound_to_its_device_or_offer() {
+        let r = rng();
+        let (mk, _) = MachineKey::generate(&r).unwrap();
+        let (a, b) = (TestDevice::generate(), TestDevice::generate());
+        let for_a = SealBinding::Device(a.device_id());
+        let try_as = [
+            SealBinding::Device(b.device_id()),
+            SealBinding::Pair(a.device_id()),
+            SealBinding::Pair("p-1".into()),
+        ];
+        for other in &try_as {
+            let mh = MachineHandshake::new(&r).unwrap();
+            let sig = mk.sign(MACHINE_HELLO_DOMAIN, &mh.to_sign(&for_a), &r);
+            let be = TestBrowserEnd::new(Some(&b));
+            let e = be
+                .finish(
+                    &mh.eph_pub(),
+                    &mh.session_id(),
+                    &sig,
+                    &mk.public_raw(),
+                    other,
+                )
+                .err()
+                .unwrap();
+            assert_eq!(
+                e,
+                WireError::Seal("bad handshake signature".into()),
+                "{other:?}"
+            );
+        }
+        // The same signature under the device domain does not verify either.
+        let mh = MachineHandshake::new(&r).unwrap();
+        let sig = mk.sign(HANDSHAKE_DOMAIN, &mh.to_sign(&for_a), &r);
+        let be = TestBrowserEnd::new(Some(&a));
+        assert!(be
+            .finish(
+                &mh.eph_pub(),
+                &mh.session_id(),
+                &sig,
+                &mk.public_raw(),
+                &for_a
+            )
+            .is_err());
+        // And for A it does.
+        let mh = MachineHandshake::new(&r).unwrap();
+        let sig = mk.sign(MACHINE_HELLO_DOMAIN, &mh.to_sign(&for_a), &r);
+        let be = TestBrowserEnd::new(Some(&a));
+        assert!(be
+            .finish(
+                &mh.eph_pub(),
+                &mh.session_id(),
+                &sig,
+                &mk.public_raw(),
+                &for_a
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn machine_hello_msg_shape() {
+        let m = machine_hello_msg(&[1; 16], &[4; 65], &SealBinding::Device("d-ab".into()));
+        assert_eq!(m.len(), 16 + 65 + 6);
+        assert!(m.ends_with(b"d:d-ab"));
+        let p = machine_hello_msg(&[1; 16], &[4; 65], &SealBinding::Pair("x".into()));
+        assert!(p.ends_with(b"p:x"));
     }
 
     #[test]
@@ -543,6 +676,15 @@ mod tests {
     }
 
     #[test]
+    fn channel_names_its_device() {
+        let d = TestDevice::generate();
+        let (m, _) = session(Some(&d));
+        assert_eq!(m.device_id(), Some(d.device_id().as_str()));
+        let (m, _) = session(None);
+        assert_eq!(m.device_id(), None);
+    }
+
+    #[test]
     fn pairing_session_is_flagged() {
         let (mut m, mut b) = session(None);
         assert!(m.pairing_only());
@@ -561,7 +703,7 @@ mod tests {
         let sid = crate::b64::dec_n::<16>(&s("session_id")).unwrap();
         let keys = keys_from_shared(&shared, &meph, &beph, &sid).unwrap();
         assert_eq!(crate::b64::hex(&keys), s("keys_hex"));
-        let mut m = Channel::from_keys(&keys, false).unwrap();
+        let mut m = Channel::from_keys(&keys, Some("d-vector".into())).unwrap();
         let mut b = BrowserChannel(Core::new(&keys, false).unwrap());
         for msg in v["messages"].as_array().unwrap() {
             let plain = msg["plaintext"].as_str().unwrap().as_bytes();

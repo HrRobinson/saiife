@@ -26,6 +26,20 @@ pub fn verify_p256_domain(
         .is_ok()
 }
 
+/// Whether `p` is an uncompressed P-256 point (0x04 prefix) that ring
+/// accepts: an ECDH with a throwaway key over it succeeds.
+pub fn is_p256_point(p: &[u8; 65]) -> bool {
+    use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
+    if p[0] != 0x04 {
+        return false;
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let Ok(eph) = EphemeralPrivateKey::generate(&ECDH_P256, &rng) else {
+        return false;
+    };
+    agree_ephemeral(eph, &UnparsedPublicKey::new(&ECDH_P256, p), |_| ()).is_ok()
+}
+
 /// Verifies a frame body signature (domain `SIG_DOMAIN`).
 pub fn verify_p256(public_raw: &[u8; 65], body: &[u8], sig_raw: &[u8; 64]) -> bool {
     verify_p256_domain(public_raw, SIG_DOMAIN, body, sig_raw)
@@ -134,6 +148,21 @@ impl TestDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p256_points() {
+        let d = TestDevice::generate();
+        assert!(is_p256_point(&d.public_raw()));
+        let mut junk = [5u8; 65];
+        junk[0] = 0x04;
+        assert!(!is_p256_point(&junk));
+        let mut off = d.public_raw();
+        off[0] = 0x02;
+        assert!(!is_p256_point(&off));
+        off = d.public_raw();
+        off[64] ^= 1;
+        assert!(!is_p256_point(&off));
+    }
     use crate::frame::Frame;
 
     fn frame() -> Frame {

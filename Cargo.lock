@@ -1381,6 +1381,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,6 +1613,7 @@ dependencies = [
  "ctap-hid-fido2",
  "libc",
  "predicates",
+ "qrcode",
  "rcgen",
  "rpassword",
  "rustix",
@@ -1619,11 +1626,13 @@ dependencies = [
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",
+ "saiife-link",
  "saiife-mcp",
  "saiife-policy",
  "saiife-system",
  "saiife-touch",
  "saiife-win",
+ "saiife-wire",
  "security-framework",
  "serde",
  "serde_json",
@@ -1733,6 +1742,7 @@ dependencies = [
  "saiife-system",
  "saiife-touch",
  "saiife-win",
+ "saiife-wire",
  "serde",
  "serde_json",
  "sha2",
@@ -1805,6 +1815,34 @@ dependencies = [
  "tokio",
  "zbus",
  "zeroize",
+]
+
+[[package]]
+name = "saiife-link"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "getrandom 0.3.4",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "saiife-audit",
+ "saiife-daemon",
+ "saiife-ipc",
+ "saiife-policy",
+ "saiife-wire",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1889,6 +1927,7 @@ version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "ring",
+ "saiife-ipc",
  "saiife-touch",
  "serde",
  "serde_json",

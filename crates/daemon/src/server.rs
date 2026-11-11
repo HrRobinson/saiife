@@ -1,4 +1,5 @@
-//! One task per connection on the control socket (spec §6.3, §8.7).
+//! One task per connection on the control socket (spec §6.3, §8.7), and on
+//! the Workspace link's `link.sock` (plan 29), which answers other ops.
 
 use crate::hooks::{ConnId, HookTable};
 use crate::ops::{self, Ctx, Notice};
@@ -24,6 +25,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a refused connection gets to take its `busy` answer.
 const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Which socket a connection came in on: each answers its own ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listener {
+    /// `saiife.sock`: [`ops::dispatch_conn`].
+    Control,
+    /// `link.sock`: [`crate::workspace_ops::dispatch_link`] only.
+    Link,
+}
 
 /// The next connection's [`ConnId`].
 pub fn next_conn_id() -> ConnId {
@@ -89,7 +99,34 @@ pub async fn connection(s: UnixStream, ctx: Arc<Ctx>) {
     let Ok(peer) = saiife_ipc::peer::peer_cred(&s) else {
         return;
     };
-    serve_peer(s, peer, ctx).await
+    serve_peer(s, peer, ctx, Listener::Control).await
+}
+
+/// One connection on `link.sock` (plan 29).
+#[cfg(unix)]
+pub async fn link_connection(s: UnixStream, ctx: Arc<Ctx>) {
+    let Ok(peer) = saiife_ipc::peer::peer_cred(&s) else {
+        return;
+    };
+    serve_peer(s, peer, ctx, Listener::Link).await
+}
+
+/// Accepts on `link.sock` until the task is aborted, one task per
+/// connection.
+#[cfg(unix)]
+pub async fn serve_link(listener: tokio::net::UnixListener, ctx: Arc<Ctx>) {
+    loop {
+        match listener.accept().await {
+            Ok((s, _)) => {
+                tokio::spawn(link_connection(s, Arc::clone(&ctx)));
+            }
+            Err(e) => {
+                // EMFILE and friends: back off instead of spinning.
+                eprintln!("saiifed: warning: link.sock accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
 /// A connected instance of the control pipe. Its identity is read first, with nothing read
@@ -105,20 +142,26 @@ pub async fn connection(s: NamedPipeServer, ctx: Arc<Ctx>) {
     let Ok(peer) = saiife_ipc::peer::pipe_peer(&s) else {
         return;
     };
-    serve_peer(s, peer, ctx).await
+    serve_peer(s, peer, ctx, Listener::Control).await
 }
 
 /// Serves one identified peer. The caps are taken before any frame is read: a connection
 /// over its uid's cap is closed at once, so it cannot hold a pipe instance or a descriptor.
-async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, peer: PeerCred, ctx: Arc<Ctx>) {
+async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    mut s: S,
+    peer: PeerCred,
+    ctx: Arc<Ctx>,
+    listener: Listener,
+) {
     let accepted = tokio::time::Instant::now();
     // A gateway MCP child (decision 12), or in locked mode any process of
     // the daemon's own uid: closed before a byte is read or answered.
     if crate::mcp_gateway::unix_peer_refused(&ctx, &peer) {
-        ctx.notice(
-            peer.uid,
-            Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Control),
-        );
+        let on = match listener {
+            Listener::Control => crate::mcp_gateway::PeerSocket::Control,
+            Listener::Link => crate::mcp_gateway::PeerSocket::Link,
+        };
+        ctx.notice(peer.uid, Notice::McpChildPeer(on));
         return;
     }
     // The personal broker talks to its own uid only (decision 3): any
@@ -203,7 +246,10 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, peer: PeerCred,
             continue;
         }
         let answer = match ctx.limits.try_begin(peer.uid, Instant::now()) {
-            Ok(_in_flight) => ops::dispatch_conn(&ctx, &conn, req).await,
+            Ok(_in_flight) => match listener {
+                Listener::Control => ops::dispatch_conn(&ctx, &conn, req).await,
+                Listener::Link => crate::workspace_ops::dispatch_link(&ctx, &conn, req).await,
+            },
             Err(code) => {
                 ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Requests);
                 err(req.id, code, "too many requests from this uid")
@@ -279,6 +325,27 @@ mod tests {
             ctx.mcp.add_test_pid(std::process::id());
             assert!(hello_answer_bytes(ctx).await.is_empty(), "{mode:?}");
         }
+    }
+
+    /// The same refusal on `link.sock` is recorded as the link socket's
+    /// (plan 29), not the control socket's.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mcp_child_peer_on_link_sock_is_labelled_link() {
+        let me = rustix::process::getuid().as_raw();
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        ctx.mcp.add_test_pid(std::process::id());
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(link_connection(theirs, ctx));
+        let _ = ours.shutdown().await;
+        let mut got = Vec::new();
+        let read = timeout(Duration::from_secs(5), ours.read_to_end(&mut got)).await;
+        assert!(read.is_ok(), "the connection was not closed");
+        assert!(got.is_empty(), "{got:?}");
+        let _ = task.await;
+        let why = Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Link).reason(me);
+        assert!(why.starts_with("the link socket closed"), "{why}");
     }
 
     /// Locked mode, refusing its own uid (as the daemon's start sets it):
@@ -359,7 +426,7 @@ mod tests {
     /// `serve_peer` over a socket pair, as a Windows pipe peer: what came back.
     async fn peer_answer(ctx: Arc<Ctx>, peer: PeerCred) -> Vec<u8> {
         let (mut ours, theirs) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(serve_peer(theirs, peer, ctx));
+        let task = tokio::spawn(serve_peer(theirs, peer, ctx, Listener::Control));
         let hello = json!({"id": 1, "op": OP_HELLO, "proto": PROTO});
         let _ = ours
             .write_all(&encode_max(&hello, MAX_ANSWER_FRAME).unwrap())

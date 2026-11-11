@@ -12,10 +12,15 @@ use crate::{b64, WireError};
 /// Live nonces kept; when full, new frames are refused, never evicted early.
 pub const REPLAY_CAP: usize = 8192;
 
+/// Live nonces one device may hold: a single (even valid) device cannot fill
+/// the cache and starve the others. Refused with `Busy`.
+pub const REPLAY_PER_DEVICE: usize = 1024;
+
 /// Burned `(device_id, nonce)` pairs with the frame's `expires_at`.
 pub struct ReplayCache {
     seen: BTreeMap<(String, String), u64>,
     cap: usize,
+    per_device: usize,
 }
 
 impl ReplayCache {
@@ -23,7 +28,16 @@ impl ReplayCache {
         ReplayCache {
             seen: BTreeMap::new(),
             cap,
+            per_device: REPLAY_PER_DEVICE,
         }
+    }
+
+    /// Live entries of one device.
+    fn held_by(&self, device_id: &str) -> usize {
+        self.seen
+            .range((device_id.to_string(), String::new())..)
+            .take_while(|((d, _), _)| d == device_id)
+            .count()
     }
 
     pub fn len(&self) -> usize {
@@ -117,6 +131,9 @@ impl Verifier {
         if self.replay.seen.contains_key(&k) {
             return Err(WireError::Replayed);
         }
+        if self.replay.held_by(&frame.device_id) >= self.replay.per_device {
+            return Err(WireError::Busy);
+        }
         if self.replay.seen.len() >= self.replay.cap {
             return Err(WireError::Busy);
         }
@@ -184,6 +201,44 @@ mod tests {
 
     fn v() -> Verifier {
         Verifier::new(M.into(), E.into())
+    }
+
+    #[test]
+    fn one_device_cannot_fill_the_cache() {
+        let a = TestDevice::generate();
+        let b = TestDevice::generate();
+        let list = vec![
+            dev_for(&a, DeviceState::Active),
+            dev_for(&b, DeviceState::Active),
+        ];
+        let mut vf = v();
+        vf.replay.per_device = 3;
+        for n in 0..3 {
+            let sf = a.frame(&ok_frame(&a, n));
+            run(&mut vf, &sf, list.clone(), NOW).unwrap();
+        }
+        let sf = a.frame(&ok_frame(&a, 9));
+        assert!(matches!(
+            run(&mut vf, &sf, list.clone(), NOW),
+            Err(WireError::Busy)
+        ));
+        // Another device still passes, and a replay is still a replay.
+        let sf = b.frame(&ok_frame(&b, 1));
+        run(&mut vf, &sf, list.clone(), NOW).unwrap();
+        let sf = a.frame(&ok_frame(&a, 0));
+        assert!(matches!(
+            run(&mut vf, &sf, list.clone(), NOW),
+            Err(WireError::Replayed)
+        ));
+        // Expired entries free the quota.
+        let sf = a.frame(&frame(&a, "box.list", 10, NOW + 200, NOW + 300));
+        run(&mut vf, &sf, list, NOW + 200).unwrap();
+    }
+
+    #[test]
+    fn production_quota_is_1024() {
+        assert_eq!(REPLAY_PER_DEVICE, 1024);
+        assert_eq!(v().replay.per_device, 1024);
     }
 
     fn run(
