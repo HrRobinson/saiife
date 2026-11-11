@@ -97,3 +97,49 @@ fn nothing_is_reported_inactive_when_everything_is_bound() {
     let text = stdout(&env.saiife(&["explain", "--write", ".claude/settings.json"]));
     assert!(!text.contains("inactive here"), "{text}");
 }
+
+fn put_pack(env: &Env, text: &str) {
+    let dir = env.home.path().join(".config/saiife/broker/policy.d/packs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("user.t.toml"), text).unwrap();
+}
+
+fn user_pack_env(extra: &str) -> Env {
+    let env = Env::new(&[]);
+    put_pack(
+        &env,
+        &format!(
+            "[pack]\nid = \"user.t\"\ntriggers = [\"deploy-prod\"]\n[[deny]]\nid = \"no-prod\"\npattern = '^deploy-prod\\b'\nreason = \"never deploy prod\"\n{extra}"
+        ),
+    );
+    env
+}
+
+/// `saiife <args>` with the personal config dir under the test HOME.
+fn user_run(env: &Env, args: &[&str]) -> std::process::Output {
+    env.command_in(env.root(), args)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn explain_box_profile_skips_host_rules() {
+    let env = user_pack_env("where = \"host\"\n");
+    let out = user_run(&env, &["explain", "deploy-prod --now"]);
+    let text = stdout(&out);
+    assert!(text.contains("decision: DENY\n"), "{text}");
+    assert!(text.contains("pack:     user.t\n"), "{text}");
+    let out = user_run(&env, &["explain", "--profile", "box", "deploy-prod --now"]);
+    let text = stdout(&out);
+    assert!(text.contains("decision: ALLOW\n"), "{text}");
+    assert!(!text.contains("user.t"), "{text}");
+    // An `everywhere` rule stays in the box.
+    let env = user_pack_env("");
+    let out = user_run(&env, &["explain", "--profile", "box", "deploy-prod --now"]);
+    assert!(
+        stdout(&out).contains("pack:     user.t\n"),
+        "{}",
+        stdout(&out)
+    );
+}

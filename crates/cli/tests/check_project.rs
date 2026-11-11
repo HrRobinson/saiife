@@ -628,3 +628,125 @@ fn invalid_system_config_fails_open_with_warning() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].decision, DecisionKind::ErrorAllowed);
 }
+
+// ---- user packs in the developer hook (plan 32) ----
+
+const USER_PACK: &str = r#"[pack]
+id = "user.t"
+triggers = ["deploy-prod"]
+[[deny]]
+id = "no-prod"
+pattern = '^deploy-prod\b'
+reason = "never deploy prod from here"
+"#;
+
+fn put_user_pack(env: &common::Env, text: &str) {
+    let dir = env.home.path().join(".config/saiife/broker/policy.d/packs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("user.t.toml"), text).unwrap();
+}
+
+/// A developer-mode `saiife check` for a Claude Bash call, with the personal
+/// config dir under the test HOME (`/etc/saiife` is never read).
+fn personal_check(env: &common::Env, cmd: &str) -> (i32, String) {
+    personal_tool(env, "Bash", serde_json::json!({ "command": cmd }))
+}
+
+fn personal_tool(env: &common::Env, tool: &str, input: serde_json::Value) -> (i32, String) {
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": env.root(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": input
+    })
+    .to_string();
+    let absent = common::absent_system_config(env.home.path());
+    let mut child = env
+        .command_in(
+            env.root(),
+            &[
+                "check",
+                "--hook-exit",
+                "--agent",
+                "claude",
+                "--system-config",
+            ],
+        )
+        .arg(absent)
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn dev_hook_enforces_personal_user_pack() {
+    let env = common::Env::new(&["claude"]);
+    put_user_pack(&env, USER_PACK);
+    let (code, err) = personal_check(&env, "deploy-prod --now");
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("BLOCKED by user.t: never deploy prod from here"),
+        "{err}"
+    );
+    let recs = read_all(env.audit.path()).records;
+    let last = recs.last().unwrap();
+    assert_eq!(last.decision, DecisionKind::Deny);
+    assert_eq!(last.pack.as_deref(), Some("user.t"));
+    assert_eq!(personal_check(&env, "ls").0, 0);
+}
+
+#[test]
+fn dev_broken_user_pack_fails_open_with_warning() {
+    let env = common::Env::new(&["claude"]);
+    put_user_pack(&env, &USER_PACK.replace(r"'^deploy-prod\b'", "'('"));
+    let (code, err) = personal_check(&env, "deploy-prod --now");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("user pack"), "{err}");
+    assert!(err.contains("failing open"), "{err}");
+    let recs = read_all(env.audit.path()).records;
+    assert_eq!(recs.last().unwrap().decision, DecisionKind::ErrorAllowed);
+}
+
+#[test]
+fn dev_ask_rule_denies_with_note() {
+    let env = common::Env::new(&["claude"]);
+    put_user_pack(&env, &format!("{USER_PACK}ask = true\n"));
+    let (code, err) = personal_check(&env, "deploy-prod --now");
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.trim_end()
+            .ends_with("(needs approval; approvals need locked mode)"),
+        "{err}"
+    );
+}
+
+/// A broken user pack is reported for a tool the guard does not judge too:
+/// the same warning and an `error_allowed` record, whatever tool came first.
+#[test]
+fn dev_broken_user_pack_is_reported_for_unjudged_tools_too() {
+    let env = common::Env::new(&["claude"]);
+    put_user_pack(&env, &USER_PACK.replace(r"'^deploy-prod\b'", "'('"));
+    let (code, err) = personal_tool(&env, "WebSearch", serde_json::json!({ "query": "x" }));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("user pack") && err.contains("failing open"),
+        "{err}"
+    );
+    let recs = read_all(env.audit.path()).records;
+    assert_eq!(recs.last().unwrap().decision, DecisionKind::ErrorAllowed);
+}

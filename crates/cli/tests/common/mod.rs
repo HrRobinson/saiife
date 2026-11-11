@@ -145,7 +145,7 @@ impl Env {
         PathBuf::from(env!("CARGO_BIN_EXE_saiife"))
     }
 
-    fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
+    pub fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(self.exe());
         cmd.args(args)
             .current_dir(dir)

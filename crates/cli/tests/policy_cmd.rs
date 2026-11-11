@@ -320,3 +320,50 @@ expect = "{expect}"
     assert_eq!(code(&run("check")), 0);
     assert_eq!(code(&run("test")), 1);
 }
+
+/// A user pack that does not compile is an error of `policy check`, for either
+/// profile; a good one is counted on the `ok:` line.
+#[test]
+fn policy_check_reports_a_broken_user_pack() {
+    let tmp = common::tmp::short_tempdir();
+    let p = tmp.path();
+    fs::write(p.join("passwd"), "agent-shop:x:4001:4001::/h:/bin/sh\n").unwrap();
+    fs::write(p.join("group"), "").unwrap();
+    let cfg = p.join("config.toml");
+    fs::write(&cfg, format!("version = 2\n{}", no_daemon(p))).unwrap();
+    let packs = p.join("policy.d/packs");
+    fs::create_dir_all(&packs).unwrap();
+    let pack = |pattern: &str| {
+        format!(
+            "[pack]\nid = \"user.t\"\ntriggers = [\"zz\"]\n[[deny]]\nid = \"d\"\npattern = {pattern}\nreason = \"r\"\n"
+        )
+    };
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_saiife"))
+            .args(["policy", "check"])
+            .arg(&cfg)
+            .arg("--passwd")
+            .arg(p.join("passwd"))
+            .arg("--group")
+            .arg(p.join("group"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    fs::write(packs.join("user.t.toml"), pack("'('")).unwrap();
+    let o = run();
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("saiife: error: user pack ") && stderr(&o).contains("uncompilable"),
+        "{}",
+        stderr(&o)
+    );
+    fs::write(packs.join("user.t.toml"), pack("'^zz$'")).unwrap();
+    let o = run();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).trim_end().ends_with(", 1 user packs)"),
+        "{}",
+        stdout(&o)
+    );
+}

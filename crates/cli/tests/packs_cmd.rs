@@ -71,3 +71,33 @@ fn explain_prints_inactive_note() {
         "{text}"
     );
 }
+
+#[test]
+fn packs_lists_user_packs() {
+    let env = Env::new(&[]);
+    let dir = env.home.path().join(".config/saiife/broker/policy.d/packs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("user.t.toml"),
+        "[pack]\nid = \"user.t\"\nname = \"Mine\"\ntriggers = [\"deploy-prod\"]\n[[deny]]\nid = \"no-prod\"\npattern = '^deploy-prod\\b'\nreason = \"never deploy prod\"\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        env.command_in(env.root(), args)
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["packs"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    let row = text.lines().find(|l| l.starts_with("user.t ")).unwrap();
+    assert!(row.contains(" user ") && row.contains("    1"), "{row}");
+    let out = run(&["packs", "user.t"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("user.t — Mine\n"), "{text}");
+    assert!(text.contains("user pack: always on"), "{text}");
+    assert!(text.contains("  deny   ^deploy-prod"), "{text}");
+    assert!(text.contains("never deploy prod"), "{text}");
+}
