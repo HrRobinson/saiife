@@ -8,7 +8,7 @@ pub mod daemon;
 mod hub;
 #[cfg(unix)]
 pub mod local;
-mod ws;
+pub mod ws;
 
 pub use daemon::{Daemon, LinkError};
 
