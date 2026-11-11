@@ -340,6 +340,7 @@ fn validate_services(
             .iter()
             .chain(&svc.ask)
             .chain(&svc.deny)
+            .chain(&svc.deploy)
             .chain(svc.rule.iter().map(|r| &r.capability));
         for pat in patterns {
             if let Err(why) = validate_pattern(pat) {

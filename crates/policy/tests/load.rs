@@ -582,6 +582,34 @@ fn patterns_are_validated_at_load() {
     ));
 }
 
+/// Final review Important 1: a `deploy` mark is a touch mark, so a pattern
+/// that can never match (`run` is no verb) must not load and quietly turn
+/// the mark off.
+#[test]
+fn deploy_patterns_are_validated_at_load() {
+    for pat in ["deploy:run", "deploy", "Deploy:*"] {
+        let (_d, cfg) = etc(
+            "version = 2\n",
+            &[(
+                "10-s.toml",
+                &format!("[services.s]\nconnector = \"c\"\ndeploy = [\"{pat}\"]\n"),
+            )],
+        );
+        let e = load_system(&cfg).unwrap_err();
+        let msg = e.to_string();
+        assert!(matches!(e, PolicyError::Invalid { .. }), "{pat}: {msg}");
+        assert!(msg.contains("10-s.toml") && msg.contains(pat), "{msg}");
+    }
+    for pat in ["deploy:*", "deploy:write", "objects:write"] {
+        let (_d, cfg) = etc(
+            &format!("version = 2\n[services.s]\nconnector = \"c\"\ndeploy = [\"{pat}\"]\n"),
+            &[],
+        );
+        let c = load_system(&cfg).unwrap().config;
+        assert_eq!(c.services["s"].deploy, vec![pat.to_string()], "{pat}");
+    }
+}
+
 #[test]
 fn profile_as_param_name_is_fine() {
     let (_d, cfg) = etc(
