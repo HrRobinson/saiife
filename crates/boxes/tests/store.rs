@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::path::Path;
 
 use saiife_boxes::store::{BoxRecord, Store, VmHandle};

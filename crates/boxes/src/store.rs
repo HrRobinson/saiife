@@ -146,12 +146,15 @@ impl Store {
             let id =
                 BoxId::parse(&format!("b{n}")).map_err(|e| state_err(&counter, e.to_string()))?;
             let dir = self.box_dir(&id);
-            let mut b = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let b = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut b = fs::DirBuilder::new();
                 b.mode(0o700);
-            }
+                b
+            };
+            #[cfg(not(unix))]
+            let b = fs::DirBuilder::new();
             match b.create(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
