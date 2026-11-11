@@ -1,0 +1,8 @@
+{
+  "bad_sig_b64u": "QYuAXwTCgB5StSPms0ugATr110L03EIefKoTlxwkhdhieqidPvPRPjm6LGsQHL62Q9xRR8cM0FWxJ7tbWPieww",
+  "body": "{\"v\":1,\"machine_id\":\"0123456789abcdef0123456789abcdef\",\"epoch\":\"AwMDAwMDAwMDAwMDAwMDAw\",\"device_id\":\"d-2b7a6867b8754f7f\",\"action\":\"box.list\",\"args\":{},\"nonce\":\"BAQEBAQEBAQEBAQEBAQEBA\",\"issued_at\":1700000000,\"expires_at\":1700000060}",
+  "device_id": "d-2b7a6867b8754f7f",
+  "machine_id": "2b7a6867b8754f7f054f5248ab338209",
+  "public_raw_b64u": "BHYKjuUEIsDcSwEs8iMFwcLvcUR3T91BN_2sj3WPOIoNY5gfCgL4dLbEtm7Zpi4I1sel39qMm-yBG1LqaosGdis",
+  "sig_b64u": "QYuAXwTCgB5StSLms0ugATr110L03EIefKoTlxwkhdhieqidPvPRPjm6LGsQHL62Q9xRR8cM0FWxJ7tbWPieww"
+}
