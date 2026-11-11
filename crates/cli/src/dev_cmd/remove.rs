@@ -256,7 +256,9 @@ fn gc_with(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool, tty: bool
                 outln!("kept {name}: still running");
             }
             State::Stopped | State::Missing => match gc_project(d, paths, row) {
-                Ok(()) => outln!("removed {name} ({})", row.state.as_str()),
+                Ok(true) => outln!("removed {name} ({})", row.state.as_str()),
+                // Nothing left to remove (a `down` already did it): say nothing.
+                Ok(false) => {}
                 Err(e) => {
                     failed += 1;
                     kept.push(&row.name);
@@ -279,14 +281,21 @@ fn gc_with(d: &dyn Docker, paths: &DevPaths, volumes: bool, yes: bool, tty: bool
     Ok(())
 }
 
-/// Step 3 for one stopped or missing project.
-fn gc_project(d: &dyn Docker, paths: &DevPaths, row: &Row) -> Res {
+/// Step 3 for one stopped or missing project. `Ok(true)` when it removed
+/// something (containers, a route file, or a missing project's state);
+/// a stopped project that a `down` already cleaned gives `Ok(false)`.
+fn gc_project(d: &dyn Docker, paths: &DevPaths, row: &Row) -> Result<bool, String> {
     let ids: Vec<String> = row.containers.iter().map(|c| c.id.clone()).collect();
     remove_containers(d, &ids, false)?;
     // A name from `docker ps` that is not a project name never reaches a path.
     if !valid_project(&row.name) {
-        return Ok(());
+        return Ok(!ids.is_empty());
     }
+    let route = paths
+        .proxy_dir()
+        .join("dynamic")
+        .join(format!("{}.toml", row.name));
+    let removed = !ids.is_empty() || route.is_file();
     proxy::remove_routes(paths, &row.name).map_err(|e| e.to_string())?;
     if row.state == State::Missing {
         match std::fs::remove_dir_all(paths.project_dir(&row.name)) {
@@ -295,8 +304,9 @@ fn gc_project(d: &dyn Docker, paths: &DevPaths, row: &Row) -> Res {
             Err(e) => return Err(e.to_string()),
         }
         remove_project_cert(paths, &row.name).map_err(|e| e.to_string())?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// Steps 4 to 6: stale route files, the proxy, networks, volumes.

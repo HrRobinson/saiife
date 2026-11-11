@@ -58,7 +58,7 @@ fn now() -> String {
 
 /// Starts the compose stack in `dir` (default: the current folder) behind the
 /// proxy. Every file it writes is under `paths.state`; the repo is only read.
-pub(crate) fn up(d: &dyn Docker, paths: &DevPaths, dir: Option<&Path>) -> Res {
+pub(crate) fn up(d: &dyn Docker, paths: &DevPaths, dir: Option<&Path>, build: bool) -> Res {
     let dir = repo_dir(dir)?;
     // P1: read compose before assigning, so a folder with no compose file
     // leaves no project state behind.
@@ -83,7 +83,7 @@ pub(crate) fn up(d: &dyn Docker, paths: &DevPaths, dir: Option<&Path>) -> Res {
     write_private(&compose, &body).map_err(|e| format!("cannot write {}: {e}", shown(&compose)))?;
 
     let cp = compose_project(&p.name);
-    let args = [
+    let mut args = vec![
         "compose",
         "-p",
         &cp,
@@ -94,6 +94,9 @@ pub(crate) fn up(d: &dyn Docker, paths: &DevPaths, dir: Option<&Path>) -> Res {
         "up",
         "-d",
     ];
+    if build {
+        args.push("--build");
+    }
     if let Err(e) = run_ok(d, &args) {
         // Best effort: a first `up` that failed should not leave the proxy
         // holding 80 and 443. The compose error is the one to report.

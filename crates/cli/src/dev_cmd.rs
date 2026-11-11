@@ -28,6 +28,9 @@ pub enum DevAction {
     Up {
         /// The repo folder that holds the compose file (default: the current one).
         dir: Option<PathBuf>,
+        /// Rebuild images first (docker compose up -d --build).
+        #[arg(long)]
+        build: bool,
     },
     /// List every saiife dev environment, with its state and URLs.
     Ls {
@@ -90,7 +93,7 @@ fn dispatch(action: DevAction) -> Result<ExitCode, String> {
     };
     let done = |r: Res| r.map(|()| ExitCode::SUCCESS);
     match action {
-        DevAction::Up { dir } => done(up::up(&docker, &paths, dir.as_deref())),
+        DevAction::Up { dir, build } => done(up::up(&docker, &paths, dir.as_deref(), build)),
         DevAction::Ls { json } => Ok(inventory::ls(&docker, &paths, json)),
         DevAction::Down {
             project,

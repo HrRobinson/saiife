@@ -114,14 +114,15 @@ An unknown key, a bad port or a bad scheme is an error that names the service.
 
 ## Commands
 
-### `saiife dev up [DIR]`
+### `saiife dev up [DIR] [--build]`
 
 Starts the compose project in `DIR` (default: the current folder) behind the
 proxy, and prints the URLs. It starts the shared proxy and network if they are
 not running, issues the CA and project certificate if needed, strips every
 host port from the compose model (so a stack cannot collide with another one),
 and brings the stack up. The first run also prints a line about trusting the
-CA.
+CA. `--build` passes through to `docker compose up -d --build`, so images are
+rebuilt first; without it `up` builds only what is missing.
 
 ### `saiife dev ls [--json]`
 
@@ -155,7 +156,10 @@ that saiife did not create.
 ### `saiife dev gc [--volumes] [--yes]`
 
 Cleans up what is left over: containers of stopped projects, route files with
-no project, and unused saiife networks.
+no project, and unused saiife networks. It prints `removed NAME (stopped)` only
+when it removed something for that project. A stopped project that `down` has
+already cleaned (no containers, no route file) is not mentioned; its saved
+state stays, as `down` leaves it.
 
 - A stopped project keeps its saved state while its folder exists, so its name
   and URLs stay the same. A project whose folder is gone loses its state too.

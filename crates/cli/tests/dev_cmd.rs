@@ -880,6 +880,31 @@ fn up_routes_and_prints_urls() {
 
 #[cfg(unix)]
 #[test]
+fn up_build_reaches_compose_and_is_absent_by_default() {
+    let d = Dev::with(vec![]);
+    let repo = shop_repo(&d);
+    let o = d.saiife(&["dev", "up", repo.to_str().unwrap()], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        !d.calls().iter().any(|c| c.contains("--build")),
+        "{:?}",
+        d.calls()
+    );
+    let o = d.saiife(
+        &["dev", "up", "--build", repo.to_str().unwrap()],
+        d.root.path(),
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let built: Vec<String> = d
+        .calls()
+        .into_iter()
+        .filter(|c| c.ends_with(" up -d --build"))
+        .collect();
+    assert_eq!(built.len(), 1, "{:?}", d.calls());
+}
+
+#[cfg(unix)]
+#[test]
 fn up_defaults_to_the_cwd() {
     let d = Dev::with(vec![]);
     let repo = shop_repo(&d);
@@ -1163,6 +1188,28 @@ fn gc_removes_stopped_and_missing_keeps_running() {
             .any(|c| c.starts_with("rm ") && c.split(' ').any(|w| w == "a1" || w == "p1")),
         "{calls:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_after_down_reports_nothing_it_did_not_remove() {
+    // `down` leaves the state dir, no containers and no route file: gc has
+    // nothing to remove for it and must not say it did.
+    let d = Dev::with(vec![ps_rule(&[])]);
+    seed_up(&d, "spilprisen");
+    let o = d.saiife(
+        &["dev", "down", "spilprisen", "--volumes", "--yes"],
+        d.root.path(),
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.saiife(&["dev", "gc"], d.root.path());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(!out.contains("removed spilprisen"), "{out}");
+    assert!(d
+        .state
+        .join("saiife/dev/projects/spilprisen/project.json")
+        .is_file());
 }
 
 #[cfg(unix)]
