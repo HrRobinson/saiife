@@ -570,6 +570,104 @@ mod tests {
         .unwrap();
     }
 
+    /// The rendered pack of one line, enforced or skipped, with the
+    /// built-in packs before it, as the hook judges.
+    fn engine_for(line: &str, w: &str, choice: Choice) -> saiifeguard::engine::Engine {
+        let l = src(1, line);
+        let pack = NewPack {
+            id: "user.t".into(),
+            file: FILE.into(),
+            file_sha256: "00".repeat(32),
+            decided: vec![decided(&l, cmd(&[w]), choice, RuleWhere::Everywhere)],
+            unverified: vec![],
+            judgement: vec![],
+        };
+        let text = render(&pack);
+        let (mut packs, _) = saiifeguard::builtins::builtin_packs();
+        if choice != Choice::Skip {
+            packs.extend(
+                load_user_packs(
+                    &[UserSrc {
+                        source: "new",
+                        text: &text,
+                    }],
+                    PathStyle::host(),
+                    Profile::Host,
+                )
+                .unwrap(),
+            );
+        } else {
+            assert!(!text.contains("[[allow]]"), "{text}");
+        }
+        saiifeguard::engine::Engine::new(packs).with_paths(vars())
+    }
+
+    fn denied_by(e: &saiifeguard::engine::Engine, c: &str) -> Option<String> {
+        match e.evaluate(c) {
+            saiifeguard::Decision::Deny { pack, .. } => Some(pack),
+            saiifeguard::Decision::Allow { .. } => None,
+        }
+    }
+
+    #[test]
+    fn carve_out_never_lifts_another_packs_deny() {
+        // `mkfs` is denied by core.filesystem whatever follows: the import's
+        // `mkfs --help` carve-out lifts only its own pack's deny.
+        let e = engine_for("Never run `mkfs`.", "mkfs", Choice::Enforce);
+        assert_eq!(
+            denied_by(&e, "mkfs --help").as_deref(),
+            Some("core.filesystem")
+        );
+        assert_eq!(
+            denied_by(&e, "mkfs.ext4 /dev/sda").as_deref(),
+            Some("core.filesystem")
+        );
+    }
+
+    #[test]
+    fn shutdown_dash_h_is_never_carved_out() {
+        let e = engine_for("Never run `shutdown`.", "shutdown", Choice::Enforce);
+        assert_eq!(denied_by(&e, "shutdown -h now").as_deref(), Some("user.t"));
+        assert_eq!(denied_by(&e, "shutdown -h").as_deref(), Some("user.t"));
+        assert_eq!(denied_by(&e, "shutdown now").as_deref(), Some("user.t"));
+        // The confirmed rule's shown carve-out lets help through ...
+        assert_eq!(denied_by(&e, "shutdown --help"), None);
+        assert_eq!(denied_by(&e, "shutdown --version"), None);
+        // ... and only it: the same deny without its [[allow]] blocks help.
+        let l = src(1, "Never run `shutdown`.");
+        let text = render(&NewPack {
+            id: "user.t".into(),
+            file: FILE.into(),
+            file_sha256: "00".repeat(32),
+            decided: vec![decided(
+                &l,
+                cmd(&["shutdown"]),
+                Choice::Enforce,
+                RuleWhere::Everywhere,
+            )],
+            unverified: vec![],
+            judgement: vec![],
+        });
+        let cut = text.split("[[allow]]").next().unwrap().to_string();
+        let packs = load_user_packs(
+            &[UserSrc {
+                source: "cut",
+                text: &cut,
+            }],
+            PathStyle::host(),
+            Profile::Host,
+        )
+        .unwrap();
+        let bare = saiifeguard::engine::Engine::new(packs).with_paths(vars());
+        assert_eq!(
+            denied_by(&bare, "shutdown --help").as_deref(),
+            Some("user.t")
+        );
+        // A skipped rule writes no carve-out (and no deny).
+        let skipped = engine_for("Never run `shutdown`.", "shutdown", Choice::Skip);
+        assert_eq!(denied_by(&skipped, "shutdown -h now"), None);
+    }
+
     #[test]
     fn pack_id_shape() {
         let a = pack_id(Path::new("/p/CLAUDE.md"), None).unwrap();

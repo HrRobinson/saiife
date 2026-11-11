@@ -84,7 +84,7 @@ fn command_proposal(
         .collect::<Vec<_>>()
         .join(r"\s+");
     let wrapper = is_transparent(first);
-    let (rules, carve, block, mut allow) = if wrapper && words.len() == 1 {
+    let (rules, carve, mut block, mut allow) = if wrapper && words.len() == 1 {
         let rules = vec![
             CmdRule {
                 pattern: format!(r"(?:^|\s){body}(?:\s|$)"),
@@ -114,7 +114,10 @@ fn command_proposal(
         )
     };
     if carve {
+        // `-h` is an action for some programs (`shutdown -h`): never carved out.
         allow.push(format!("{first} --help"));
+        allow.push(format!("{first} --version"));
+        block.push(format!("{first} -h"));
     }
     Some(Proposal {
         src: c.src.clone(),
@@ -235,7 +238,9 @@ pub(crate) fn rule_id(line: u32, k: usize) -> String {
 pub(crate) enum PackRule<'a> {
     /// A `[[deny]]`; it takes the next `l<line>-<k>` id.
     Deny(&'a CmdRule),
-    /// The `--help` carve-out `[[allow]]` (`whole_segment = true`, no id).
+    /// The `--help` carve-out `[[allow]]` (`whole_segment = true`, no id):
+    /// only `--help` and `--version`, never `-h`. The engine lets an allow
+    /// lift only its own pack's denies, never a built-in's or another pack's.
     HelpAllow { pattern: String, reason: String },
     /// A `[[deny_path]]` (no id).
     DenyPath { glob: &'a str, access: RuleAccess },
@@ -261,7 +266,7 @@ pub(crate) fn pack_rules(p: &Proposal) -> Vec<PackRule<'_>> {
             let mut out: Vec<PackRule> = rules.iter().map(PackRule::Deny).collect();
             if *help_carve_out {
                 out.push(PackRule::HelpAllow {
-                    pattern: format!(r"^{}\s+(?:--help|-h|--version)$", escape(first)),
+                    pattern: format!(r"^{}\s+(?:--help|--version)$", escape(first)),
                     reason: format!("{first} --help changes nothing"),
                 });
             }
@@ -511,8 +516,15 @@ mod tests {
             panic!()
         };
         assert!(help_carve_out);
-        assert_eq!(p.block, strs(&["pkill"]));
-        assert_eq!(p.allow, strs(&["echo pkill", "pkill --help"]));
+        assert_eq!(p.block, strs(&["pkill", "pkill -h"]));
+        assert_eq!(
+            p.allow,
+            strs(&["echo pkill", "pkill --help", "pkill --version"])
+        );
+        let PackRule::HelpAllow { pattern, .. } = pack_rules(&p).pop().unwrap() else {
+            panic!("no carve-out")
+        };
+        assert_eq!(pattern, r"^pkill\s+(?:--help|--version)$");
         assert_eq!(verify(&mut p, &vars()), Ok(()));
         assert!(p.broad.is_none());
     }

@@ -10,6 +10,7 @@ use saiifeguard::pack::RuleWhere;
 use saiifeguard::pathrule::RuleAccess;
 
 use super::extract::{clean, span_target};
+use super::propose::{pack_rules, PackRule};
 use super::{Choice, Decided, Proposal, ProposalKind, SourceLine, Target, Unverified};
 
 /// Input ended (or failed) before the last answer.
@@ -40,6 +41,15 @@ fn rule_text(p: &Proposal) -> String {
     }
 }
 
+/// The exact `[[allow]]` pattern a proposal writes (its `--help` carve-out),
+/// shown so the human confirms it too.
+fn carve_out(p: &Proposal) -> Option<String> {
+    pack_rules(p).into_iter().find_map(|r| match r {
+        PackRule::HelpAllow { pattern, .. } => Some(format!("(allow {})", clean(&pattern))),
+        _ => None,
+    })
+}
+
 /// `file:line` of a proposal, from the start of its reason.
 fn location(p: &Proposal) -> String {
     match p.reason.split(' ').next() {
@@ -64,13 +74,15 @@ pub fn table(props: &[Proposal], unverified: &[Unverified], judgement: &[SourceL
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let carve = carve_out(p).map(|c| format!(" {c}")).unwrap_or_default();
         out.push_str(&format!(
-            "{:>3}  {}  {}  blocks {}  allows {}{}\n",
+            "{:>3}  {}  {}  blocks {}  allows {}{}{}\n",
             i + 1,
             location(p),
             rule_text(p),
             list(&p.block),
             list(&p.allow),
+            carve,
             flags
         ));
     }
@@ -149,6 +161,9 @@ pub fn confirm(
                 clean(p.src.text.trim())
             );
             let _ = writeln!(out, "      {}", rule_text(&p));
+            if let Some(c) = carve_out(&p) {
+                let _ = writeln!(out, "      and {c}");
+            }
             let _ = write!(
                 out,
                 "enforce, {}skip, edit? [e/{}s/x] (s): ",
@@ -375,6 +390,21 @@ mod tests {
         assert!(t.contains("unverified: the rule does not block"), "{t}");
         assert!(t.contains("judgement"), "{t}");
         assert!(t.contains("2 proposed, 1 unverified, 1 judgement"), "{t}");
+        // The carve-out is shown as the exact pattern written.
+        assert!(
+            t.contains(
+                r"allows `echo pkill`, `pkill --help`, `pkill --version` (allow ^pkill\s+(?:--help|--version)$)"
+            ),
+            "{t}"
+        );
+        assert!(!t.contains("-h|"), "{t}");
+        let (_, out) = run(vec![prop(1, cmd(&["pkill"]))], false, "s\n");
+        assert!(
+            out.contains(r"and (allow ^pkill\s+(?:--help|--version)$)"),
+            "{out}"
+        );
+        let (_, out) = run(vec![prop(1, cmd(&["git", "push"]))], false, "s\n");
+        assert!(!out.contains("(allow "), "{out}");
     }
 
     #[test]
@@ -392,7 +422,7 @@ mod tests {
         p.kind = ProposalKind::Command {
             words: vec!["sh\u{1b}[1mred".into(), "\u{2066}x".into()],
             rules: vec![],
-            help_carve_out: false,
+            help_carve_out: true,
         };
         let bad = vec![Unverified {
             src: p.src.clone(),

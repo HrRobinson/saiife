@@ -154,6 +154,36 @@ fn import_writes_a_pack_the_hook_enforces() {
     }
 }
 
+/// The `--help` carve-out never covers `-h` (`shutdown -h now` halts),
+/// and lifts only the import's own deny: a built-in deny stays.
+#[cfg(unix)]
+#[test]
+fn carve_out_is_help_only_and_own_pack_only() {
+    let env = Env::new(&["claude"]);
+    env.write("CLAUDE.md", "Never run `shutdown`.\nNever run `mkfs`.\n");
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ne\n\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains(r"(allow ^shutdown\s+(?:--help|--version)$)"),
+        "{out}"
+    );
+    assert!(
+        stderr(&o).contains("and (allow ^shutdown"),
+        "{}",
+        stderr(&o)
+    );
+    let (c, err) = hook(&env, "shutdown -h now");
+    assert_eq!(c, 2, "{err}");
+    assert!(err.contains("user.claude-md-"), "{err}");
+    assert_eq!(hook(&env, "shutdown --help").0, 0);
+    // core.filesystem denies `mkfs` whatever follows: the import's own
+    // `mkfs --help` carve-out does not lift it.
+    let (c, err) = hook(&env, "mkfs --help");
+    assert_eq!(c, 2, "{err}");
+    assert!(err.contains("core.filesystem"), "{err}");
+}
+
 #[test]
 fn import_eof_writes_nothing() {
     let env = Env::new(&[]);
