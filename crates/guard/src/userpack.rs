@@ -9,12 +9,12 @@ use sha2::{Digest, Sha256};
 
 use crate::canon::{PathStyle, PathVars};
 use crate::engine::Engine;
-use crate::pack::{load_raw, parse_pack, Compile, Pack, PackWarning};
+use crate::pack::{load_raw, parse_pack, valid_rule_id, Compile, Pack, PackWarning};
 use crate::pack_raw::{RawPathRule, RawRule, RawSource, RawUnenforced};
 pub use crate::pack_raw::{RuleAccess, RuleWhere, UnenforcedWhy};
 use crate::pathrule::Access;
 use crate::profile::Profile;
-use crate::Decision;
+use crate::{AllowTrace, Decision};
 
 pub const USER_PREFIX: &str = "user.";
 pub const MAX_USER_RULES: usize = 128;
@@ -69,6 +69,8 @@ pub fn load_user_packs(
     let mut total = 0usize;
     for s in srcs {
         let raw = parse_pack(s.text).map_err(|e| err(s.source, e.to_string()))?;
+        check_keys(s.text).map_err(|m| err(s.source, m))?;
+        check_rule_ids(&raw).map_err(|m| err(s.source, m))?;
         #[cfg(test)]
         crate::pack::note_compiled();
         let mut warnings: Vec<PackWarning> = Vec::new();
@@ -108,6 +110,19 @@ pub fn load_user_packs(
         if raw.deny.iter().any(|r| r.id.is_none()) {
             return Err(err(s.source, "every [[deny]] in a user pack needs an id"));
         }
+        // The engine reads a command only when it holds one of a pack's
+        // triggers: command rules without any would almost never fire.
+        let commands = raw
+            .allow
+            .iter()
+            .chain(raw.deny.iter())
+            .any(|r| r.platform.is_none_or(|p| p.applies_on(style)));
+        if commands && pack.triggers.is_empty() {
+            return Err(err(
+                s.source,
+                "a user pack with [[deny]] or [[allow]] rules needs triggers in [pack] (the commands it is about)",
+            ));
+        }
         total += pack.rule_count();
         if total > MAX_USER_RULES {
             return Err(err(
@@ -118,6 +133,70 @@ pub fn load_user_packs(
         out.push(pack);
     }
     Ok(out)
+}
+
+/// The top-level keys a user pack may have.
+const TOP_KEYS: &[&str] = &[
+    "pack",
+    "allow",
+    "deny",
+    "allow_path",
+    "deny_path",
+    "import",
+    "unenforced",
+];
+
+/// The keys of a user pack's `[pack]` table.
+const PACK_KEYS: &[&str] = &[
+    "id",
+    "name",
+    "description",
+    "default_on",
+    "version",
+    "triggers",
+    "windows_triggers",
+    "substitution_failsafe",
+    "lazy",
+];
+
+/// An unknown key is an error in a user pack (a typo such as `[[deny_paths]]`
+/// would drop its rules). The rule tables already refuse unknown keys.
+fn check_keys(text: &str) -> Result<(), String> {
+    let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    if let Some(k) = table.keys().find(|k| !TOP_KEYS.contains(&k.as_str())) {
+        return Err(format!(
+            "unknown key {k:?}; a user pack has only {}",
+            TOP_KEYS.join(", ")
+        ));
+    }
+    if let Some(meta) = table.get("pack").and_then(toml::Value::as_table) {
+        if let Some(k) = meta.keys().find(|k| !PACK_KEYS.contains(&k.as_str())) {
+            return Err(format!(
+                "unknown key {k:?} in [pack]; it has only {}",
+                PACK_KEYS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A bad or repeated rule id is an error in a user pack (a built-in pack
+/// keeps the rule and drops the id: D2 needs every user deny named).
+fn check_rule_ids(raw: &crate::pack_raw::RawPackFile) -> Result<(), String> {
+    for (kind, rules) in [("[[allow]]", &raw.allow), ("[[deny]]", &raw.deny)] {
+        let mut seen = std::collections::HashSet::new();
+        for id in rules.iter().filter_map(|r| r.id.as_deref()) {
+            if !valid_rule_id(id) {
+                return Err(format!(
+                    "{kind} rule id {id:?}: use 1 to 64 of a-z, 0-9 or `-` (not first)"
+                ));
+            }
+            if !seen.insert(id) {
+                return Err(format!("{kind} rule id {id:?} is used twice"));
+            }
+        }
+    }
+    Ok(())
 }
 
 type Cached = Option<([u8; 32], Result<Vec<Pack>, UserPackError>)>;
@@ -351,17 +430,30 @@ pub fn diff_hits(
             continue;
         }
         let full = repo_root.join(p);
-        if let Decision::Deny { pack, reason, .. } =
-            engine.evaluate_path(Access::Write, &full.to_string_lossy())
-        {
-            out.push(DiffHit {
-                path: (*rel).to_string(),
-                pack,
-                reason,
-            });
-        }
+        out.extend(diff_hit(
+            rel,
+            engine.evaluate_path(Access::Write, &full.to_string_lossy()),
+        ));
     }
     out
+}
+
+/// The hit, if any, that `d` (the verdict on writing `rel`) makes. A path
+/// the guard did not judge (out of time, or unresolvable) is a hit: the diff
+/// is never passed unchecked.
+fn diff_hit(rel: &str, d: Decision) -> Option<DiffHit> {
+    let (pack, reason) = match d {
+        Decision::Deny { pack, reason, .. } => (pack, reason),
+        Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout | AllowTrace::Unjudgeable { .. },
+        } => ("saiife".to_string(), "not judged".to_string()),
+        Decision::Allow { .. } => return None,
+    };
+    Some(DiffHit {
+        path: rel.to_string(),
+        pack,
+        reason,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -636,7 +728,7 @@ line_sha256 = "cd"
     #[test]
     fn broad_findings_flag_the_hostile() {
         let broad = one(
-            "[pack]\nid = \"user.b\"\n[[deny]]\nid = \"d\"\npattern = '^\\S+'\nreason = \"r\"\n",
+            "[pack]\nid = \"user.b\"\ntriggers = [\"ls\"]\n[[deny]]\nid = \"d\"\npattern = '^\\S+'\nreason = \"r\"\n",
             Profile::Host,
         );
         let f = broad_findings(&broad[0]);
@@ -657,5 +749,103 @@ line_sha256 = "cd"
             Profile::Host,
         );
         assert!(broad_findings(&ok[0]).is_empty());
+    }
+
+    fn load_err(text: &str) -> String {
+        load_user_packs(
+            &[UserSrc {
+                source: "t.toml",
+                text,
+            }],
+            PathStyle::Posix,
+            Profile::Host,
+        )
+        .map(|p| format!("loaded {} packs", p.len()))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "loaded".to_string())
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_an_error() {
+        for table in ["[[deny_paths]]", "[[Deny]]"] {
+            let text = format!("{A}{table}\nglob = \"$PROJECT/x\"\nreason = \"r\"\n");
+            let e = load_err(&text);
+            let key = table.trim_matches(|c| c == '[' || c == ']');
+            assert!(
+                e.contains("t.toml") && e.contains(&format!("unknown key {key:?}")),
+                "{table}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_pack_key_is_an_error() {
+        let text = A.replace(
+            "triggers = [\"zz\"]",
+            "triggers = [\"zz\"]\ntrigger = [\"zz\"]",
+        );
+        let e = load_err(&text);
+        assert!(e.contains("unknown key \"trigger\" in [pack]"), "{e}");
+    }
+
+    #[test]
+    fn command_rules_need_triggers() {
+        let deny = A.replace("triggers = [\"zz\"]\n", "");
+        let e = load_err(&deny);
+        assert!(e.contains("needs triggers"), "{e}");
+        let allow = "[pack]\nid = \"user.a\"\n[[allow]]\npattern = '^zz$'\nreason = \"r\"\n";
+        assert!(load_err(allow).contains("needs triggers"));
+        // Windows triggers do not count on a POSIX host ...
+        let win = A.replace("triggers = ", "windows_triggers = ");
+        assert!(load_err(&win).contains("needs triggers"));
+        // ... but a rule for Windows only needs none there.
+        let win_rule = win.replace("[[deny]]\n", "[[deny]]\nplatform = \"windows\"\n");
+        assert_eq!(load_err(&win_rule), "loaded");
+        // A pack of path rules only needs none.
+        assert_eq!(load_err(PATHS), "loaded");
+    }
+
+    #[test]
+    fn invalid_rule_id_is_an_error() {
+        let e = load_err(&A.replace("id = \"d\"", "id = \"L3_1\""));
+        assert!(e.contains("\"L3_1\"") && e.contains("rule id"), "{e}");
+    }
+
+    #[test]
+    fn duplicate_rule_id_is_an_error() {
+        let text = format!("{A}[[deny]]\nid = \"d\"\npattern = '^zz2$'\nreason = \"r\"\n");
+        let e = load_err(&text);
+        assert!(e.contains("\"d\"") && e.contains("used twice"), "{e}");
+        let allow = format!(
+            "{A}[[allow]]\nid = \"a\"\npattern = '^zz1$'\n[[allow]]\nid = \"a\"\npattern = '^zz2$'\n"
+        );
+        assert!(load_err(&allow).contains("used twice"));
+    }
+
+    #[test]
+    fn lazy_is_an_error() {
+        let e = load_err(&A.replace("triggers = ", "lazy = true\ntriggers = "));
+        assert!(e.contains("cannot be lazy"), "{e}");
+    }
+
+    #[test]
+    fn unjudged_path_is_a_diff_hit() {
+        for trace in [
+            AllowTrace::FailedOpenTimeout,
+            AllowTrace::Unjudgeable { reason: "x".into() },
+        ] {
+            let h = diff_hit("a", Decision::Allow { trace }).unwrap();
+            assert_eq!(h.path, "a");
+            assert_eq!(h.pack, "saiife");
+            assert_eq!(h.reason, "not judged");
+        }
+        assert!(diff_hit(
+            "a",
+            Decision::Allow {
+                trace: AllowTrace::NoMatch
+            }
+        )
+        .is_none());
     }
 }

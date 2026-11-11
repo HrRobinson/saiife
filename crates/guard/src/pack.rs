@@ -101,7 +101,7 @@ pub use crate::pack_raw::{OperandSyntax, RawSource, RulePlatform, RuleWhere, Une
 use crate::pack_raw::{RawPackFile, RawPathRule, RawRule, Str};
 
 impl RulePlatform {
-    fn applies_on(self, style: PathStyle) -> bool {
+    pub(crate) fn applies_on(self, style: PathStyle) -> bool {
         match self {
             RulePlatform::Windows => style == PathStyle::Windows,
         }
