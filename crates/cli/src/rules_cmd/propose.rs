@@ -214,7 +214,7 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-fn access_word(a: RuleAccess) -> &'static str {
+pub(crate) fn access_word(a: RuleAccess) -> &'static str {
     match a {
         RuleAccess::Read => "read",
         RuleAccess::Write => "write",
@@ -224,10 +224,33 @@ fn access_word(a: RuleAccess) -> &'static str {
     }
 }
 
-/// The proposal alone as a user pack. It is used only to verify; `store`
-/// renders the real pack.
-pub fn one_rule_pack(p: &Proposal, id_line: u32) -> String {
-    let mut out = String::from("[pack]\nid = \"user.proposal\"\nname = \"proposal\"\n");
+/// The id of the `k`th rule (from 1) of source line `line` (D2).
+pub(crate) fn rule_id(line: u32, k: usize) -> String {
+    format!("l{line}-{k}")
+}
+
+/// One rule table a proposal becomes in a pack. The one-rule pack that
+/// verifies a proposal and the pack `store` writes both come from this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PackRule<'a> {
+    /// A `[[deny]]`; it takes the next `l<line>-<k>` id.
+    Deny(&'a CmdRule),
+    /// The `--help` carve-out `[[allow]]` (`whole_segment = true`, no id).
+    HelpAllow { pattern: String, reason: String },
+    /// A `[[deny_path]]` (no id).
+    DenyPath { glob: &'a str, access: RuleAccess },
+}
+
+/// The trigger word of a command proposal.
+pub(crate) fn trigger(p: &Proposal) -> Option<&str> {
+    match &p.kind {
+        ProposalKind::Command { words, .. } => words.first().map(String::as_str),
+        ProposalKind::Path { .. } => None,
+    }
+}
+
+/// The rule tables of `p`, in pack order.
+pub(crate) fn pack_rules(p: &Proposal) -> Vec<PackRule<'_>> {
     match &p.kind {
         ProposalKind::Command {
             words,
@@ -235,11 +258,40 @@ pub fn one_rule_pack(p: &Proposal, id_line: u32) -> String {
             help_carve_out,
         } => {
             let first = words.first().map(String::as_str).unwrap_or("");
-            out.push_str(&format!("triggers = [{}]\n", toml_str(first)));
-            for (k, r) in rules.iter().enumerate() {
+            let mut out: Vec<PackRule> = rules.iter().map(PackRule::Deny).collect();
+            if *help_carve_out {
+                out.push(PackRule::HelpAllow {
+                    pattern: format!(r"^{}\s+(?:--help|-h|--version)$", escape(first)),
+                    reason: format!("{first} --help changes nothing"),
+                });
+            }
+            out
+        }
+        ProposalKind::Path { globs, access } => globs
+            .iter()
+            .map(|g| PackRule::DenyPath {
+                glob: g,
+                access: *access,
+            })
+            .collect(),
+    }
+}
+
+/// The proposal alone as a user pack. It is used only to verify; `store`
+/// renders the real pack from the same [`pack_rules`].
+pub fn one_rule_pack(p: &Proposal, id_line: u32) -> String {
+    let mut out = String::from("[pack]\nid = \"user.proposal\"\nname = \"proposal\"\n");
+    if let Some(first) = trigger(p) {
+        out.push_str(&format!("triggers = [{}]\n", toml_str(first)));
+    }
+    let mut k = 0;
+    for r in pack_rules(p) {
+        match r {
+            PackRule::Deny(r) => {
+                k += 1;
                 out.push_str(&format!(
-                    "\n[[deny]]\nid = \"l{id_line}-{}\"\npattern = {}\nreason = {}\n",
-                    k + 1,
+                    "\n[[deny]]\nid = \"{}\"\npattern = {}\nreason = {}\n",
+                    rule_id(id_line, k),
                     toml_str(&r.pattern),
                     toml_str(&p.reason)
                 ));
@@ -250,19 +302,18 @@ pub fn one_rule_pack(p: &Proposal, id_line: u32) -> String {
                     out.push_str("peeled_wrappers = true\n");
                 }
             }
-            if *help_carve_out {
+            PackRule::HelpAllow { pattern, reason } => {
                 out.push_str(&format!(
-                    "\n[[allow]]\npattern = {}\nreason = \"reading help changes nothing\"\nwhole_segment = true\n",
-                    toml_str(&format!(r"^{}\s+(?:--help|-h|--version)$", escape(first)))
+                    "\n[[allow]]\npattern = {}\nreason = {}\nwhole_segment = true\n",
+                    toml_str(&pattern),
+                    toml_str(&reason)
                 ));
             }
-        }
-        ProposalKind::Path { globs, access } => {
-            for g in globs {
+            PackRule::DenyPath { glob, access } => {
                 out.push_str(&format!(
                     "\n[[deny_path]]\nglob = {}\naccess = \"{}\"\nreason = {}\n",
-                    toml_str(g),
-                    access_word(*access),
+                    toml_str(glob),
+                    access_word(access),
                     toml_str(&p.reason)
                 ));
             }
