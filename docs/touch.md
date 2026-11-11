@@ -43,9 +43,11 @@ saiife never falls back to a password. Two cases differ:
    saiife touch enrol --label desk-key
    ```
 
-   The first device needs host access. Each later device needs a touch from one
-   already enrolled: the CLI asks you to touch the new key twice, then to unplug
-   it, plug in an enrolled one and press Enter, and touch that one.
+   The first device needs host access. Each touch asks for the key's PIN
+   first: the first device takes its PIN and a touch, twice. Each later device
+   needs a touch from one already enrolled: after the new key's PIN and touch,
+   twice, the CLI asks you to unplug it, plug in an enrolled one and press
+   Enter, then to type that key's PIN and touch it once.
 3. Enrol a second device the same way (`saiife touch enrol --label spare-key`).
    Two devices are recommended: with one, losing it leaves you at the recovery
    path below.
@@ -74,7 +76,8 @@ saiife never installs it.
 
 `saiife doctor` reports the state in its `touch-key` check: Info when no FIDO
 key is plugged in, Pass when the node is usable by you, and Warn when it is
-plugged in but you cannot use it. It only tests access and never opens the
+plugged in but you cannot use it, or when more than one is plugged in. On a
+build without key support ([Builds](#7-builds)) a plugged-in key is Info. It only tests access and never opens the
 node. It is never a failure.
 
 ## 3. Approving with a touch
@@ -101,7 +104,10 @@ saiife: touch your key now
   `deploy` and `secret:sensitive`). It is typed without echo. It is not logged,
   not sent to the daemon and not kept.
 - Each prompt waits 120 seconds. After that the CLI prints `no touch within
-  120 s` and exits 5, and the request stays pending.
+  120 s` and exits 5, and the request stays pending. A key may stop waiting
+  sooner on its own (often after about 30 seconds); then the CLI says "the
+  touch was cancelled or not given" and exits 2, and the request stays pending
+  too.
 - The challenge the daemon issued lives 5 minutes.
 - One key at a time: with none plugged in the CLI says so, and with more than
   one it asks you to leave only the one to use.
@@ -161,17 +167,24 @@ mode is a workflow aid, not a security boundary
 
 ## 7. Builds
 
-Key support is a build feature. A build without it refuses with:
+Key support is a build feature. A build without it refuses with (on Linux):
 
 ```
 this saiife build has no FIDO2 key support (a static Linux build); see docs/touch.md
 ```
 
+The part in brackets names the build: `(a Windows build)` on Windows, and
+`(built without fido-hid)` on other systems.
+
 `saiife touch enrol`, `saiife touch test`, `saiife touch rm` (without
 `--host`) and an `approve` that needs a touch then exit 5. `saiife touch ls`
 still lists the devices and prints the line as a note.
 
-- The macOS and Windows release builds carry key support.
+- The macOS release builds carry key support.
+- The Windows release builds do not, and refuse with `(a Windows build)` in
+  the line above. Key support there is planned: raw HID access to a FIDO key
+  needs an elevated shell on Windows, and an elevated shell maps to the shared
+  admin uid 0, so every elevated admin would share the device.
 - The Linux release packages are static, and the main `saiife` binary stays
   static. Key support for them is planned through a small dynamically linked
   helper binary shipped in the Linux packages. It is not built yet.

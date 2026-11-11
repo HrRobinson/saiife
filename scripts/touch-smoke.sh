@@ -44,7 +44,8 @@
 set -euo pipefail
 
 SAIIFE=${SAIIFE:-target/debug/saiife}
-case $SAIIFE in /*) ;; *) SAIIFE=$PWD/$SAIIFE ;; esac
+# A relative path is made absolute; a bare name (saiife, on PATH) is kept.
+case $SAIIFE in /*) ;; */*) SAIIFE=$PWD/$SAIIFE ;; esac
 SERVICE=${SAIIFE_SMOKE_SERVICE:-smoke}
 OP=${SAIIFE_SMOKE_OP:-send}
 read -r -a CALL_ARGS <<<"${SAIIFE_SMOKE_ARGS:-}"
@@ -75,9 +76,9 @@ bad() {
 }
 
 # The ids of the enrolled devices whose label starts with smoke-.
+SMOKE_IDS='.[] | select(.label | startswith("smoke-")) | .id'
 smoke_ids() {
-  "$SAIIFE" touch ls --json 2>/dev/null |
-    jq -r '.[] | select(.label | startswith("smoke-")) | .id' || true
+  "$SAIIFE" touch ls --json 2>/dev/null | jq -r "$SMOKE_IDS" || true
 }
 
 # Called by the EXIT trap below. Removes what the script enrolled (a touch may be
@@ -104,7 +105,7 @@ trap cleanup EXIT
 # prints "pending approval #<id>". Prints the id; returns 1 if it did not go pending.
 new_pending() {
   local rc=0 out
-  out=$("$SAIIFE" api "$SERVICE" "$OP" "${CALL_ARGS[@]}" 2>&1) || rc=$?
+  out=$("$SAIIFE" api "$SERVICE" "$OP" "${CALL_ARGS[@]+"${CALL_ARGS[@]}"}" 2>&1) || rc=$?
   [ "$rc" = 3 ] || return 1
   grep -oE '#[0-9]+' <<<"$out" | head -n 1 | tr -d '#'
 }
@@ -124,7 +125,7 @@ else
 fi
 
 # 2. enrol the first key.
-echo "step 2: touch the key twice and type its PIN"
+echo "step 2: type the key's PIN and touch it, twice"
 # Set first: cleanup looks for smoke-* devices even if enrol fails half way.
 ENROLLED=1
 if "$SAIIFE" touch enrol --label smoke-1; then
@@ -217,7 +218,8 @@ if [ -z "$rid" ]; then
   bad "touch rm: smoke-1 is not enrolled"
 else
   echo "step 8: PIN, then touch, to remove smoke-1"
-  if "$SAIIFE" touch rm "$rid" && left=$(smoke_ids) && [ -z "$left" ]; then
+  # Not smoke_ids: a failed `touch ls` must not read as "none left".
+  if "$SAIIFE" touch rm "$rid" && left=$("$SAIIFE" touch ls --json | jq -r "$SMOKE_IDS") && [ -z "$left" ]; then
     ok "touch rm removed smoke-1"
     ENROLLED=0
   else

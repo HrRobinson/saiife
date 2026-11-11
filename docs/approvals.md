@@ -330,10 +330,10 @@ bound to that one request on this machine and is single use. Other approvers'
 devices do not count. Setting up a key, and what a touch proves, is in
 [Touch approvals](touch.md).
 
-- **User verification (UV).** `deploy` and `secret:sensitive` need the device
-  to verify its user (a PIN or a fingerprint), not just a touch. Every WebAuthn
-  (browser) assertion needs UV, whatever the class. Enrolling a device needs UV
-  too, so a key without a PIN cannot be enrolled.
+- **User verification (UV).** `land`, `deploy` and `secret:sensitive` need
+  the device to verify its user (a PIN or a fingerprint), not just a touch.
+  Every WebAuthn (browser) assertion needs UV, whatever the class. Enrolling a
+  device needs UV too, so a key without a PIN cannot be enrolled.
 - **No password fallback.** With no device enrolled, or no touch sent, the
   approval is refused with `touch_unavailable`, and the request stays pending.
   A password or polkit prompt never stands in for the touch. In locked mode a
