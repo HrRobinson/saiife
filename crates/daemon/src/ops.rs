@@ -368,6 +368,8 @@ pub struct Ctx {
     pub reauth_cooldowns: Mutex<crate::reauth::Cooldowns>,
     /// One-use command grants (`[guard] ask`, spec §6.10.4).
     pub grants: crate::grants::Grants,
+    /// The touch devices, the instance id and the live touch challenges.
+    pub touch: Arc<crate::touch::TouchState>,
     /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
     pub signals: crate::signals::Signals,
     /// Held for the whole of a policy reload (SIGHUP and `policy.reload`),
@@ -426,6 +428,8 @@ pub struct CtxInit {
     pub lockdown: crate::lockdown::Store,
     /// One-use command grants (`<state>/state/grants.json`).
     pub grants: crate::grants::Grants,
+    /// The touch state (`<state>/state/touch`).
+    pub touch: Arc<crate::touch::TouchState>,
     /// The MCP gateway (plan 17, Task 6); attached to the context by
     /// [`Ctx::new`]'s caller once the context is shared.
     pub mcp: Arc<crate::mcp_gateway::Gateway>,
@@ -479,6 +483,7 @@ impl CtxInit {
                 std::time::SystemTime::now(),
             )
             .0,
+            touch: Arc::new(crate::touch::TouchState::open(state_dir).0),
             mcp: Arc::new(crate::mcp_gateway::Gateway::new(
                 crate::mcp_gateway::GatewaySetup::in_state(state_dir),
             )),
@@ -707,6 +712,7 @@ impl Ctx {
             reauth: crate::reauth::host_reauth(),
             reauth_cooldowns: Mutex::default(),
             grants: i.grants,
+            touch: i.touch,
             signals: Default::default(),
             reloads: tokio::sync::Mutex::new(()),
             mcp: i.mcp,
@@ -1174,6 +1180,11 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     match req.op.as_str() {
         OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
+        saiife_ipc::msg::OP_TOUCH_BEGIN
+        | saiife_ipc::msg::OP_TOUCH_ENROL
+        | saiife_ipc::msg::OP_TOUCH_REMOVE
+        | saiife_ipc::msg::OP_TOUCH_LIST
+        | saiife_ipc::msg::OP_TOUCH_CHECK => crate::touch_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello_in(req.id, ctx.mode.as_str()),
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_HOOK_BEGIN => hook_begin(ctx, conn, req),

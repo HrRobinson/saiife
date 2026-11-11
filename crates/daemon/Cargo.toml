@@ -16,6 +16,8 @@ saiife-ipc = { path = "../ipc" }
 saiife-policy = { path = "../policy" }
 # Touch classes, action records and refusals (plan 26, Task 6).
 saiife-touch = { path = "../touch" }
+# The touch instance id and challenge nonces (plan 26, Task 7); as in saiife-touch.
+ring = "=0.17.14"
 # `approval.create` checks that the claimed `[guard] ask` rule denies the
 # command (plan 11, Task 4).
 saiife-guard = { path = "../guard" }

@@ -54,7 +54,26 @@ pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// approval is refused (`reauth_unavailable`); bad hex is `bad_request`.
 /// In this version the macOS daemon refuses every same-user approval
 /// (`reauth_unavailable`): its prompt cannot show which request it is.
+/// `touch` (an `Assertion` JSON, the signed answer of `touch.begin`) is
+/// optional: a request whose touch class needs one is refused without it
+/// (`touch_unavailable` / `touch_failed` / `touch_mismatch`), and the
+/// request stays pending.
 pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
+/// Starts a touch (plan 26). `{purpose: "approve", request} |
+/// {purpose: "enrol", label} | {purpose: "remove", credential} |
+/// {purpose: "test"}` -> a `TouchRequest` plus `{expires_at, class}`; for
+/// `enrol`, an `EnrolRequest` plus `{touch?: TouchRequest}` (the touch of an
+/// existing device, when the user has one). The challenge lives 300 s and is
+/// single use.
+pub const OP_TOUCH_BEGIN: &str = "touch.begin";
+/// Finishes an enrolment (args and answer: plan 26, Task 9).
+pub const OP_TOUCH_ENROL: &str = "touch.enrol";
+/// Removes an enrolled device (plan 26, Task 9).
+pub const OP_TOUCH_REMOVE: &str = "touch.remove";
+/// Lists the caller's enrolled devices (plan 26, Task 9).
+pub const OP_TOUCH_LIST: &str = "touch.list";
+/// Checks a test touch (plan 26, Task 9).
+pub const OP_TOUCH_CHECK: &str = "touch.check";
 /// The managed hook, for a call a `[guard] ask` rule denied: use up the
 /// caller's grant for it. `{rec}` (the guard record it will send; the
 /// daemon computes the key from the peer uid and `agent`, `project`,
@@ -238,6 +257,15 @@ pub fn err_with(id: u64, code: ErrorCode, message: &str, extra: Map<String, Valu
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ops_constants_documented() {
+        assert_eq!(OP_TOUCH_BEGIN, "touch.begin");
+        assert_eq!(OP_TOUCH_ENROL, "touch.enrol");
+        assert_eq!(OP_TOUCH_REMOVE, "touch.remove");
+        assert_eq!(OP_TOUCH_LIST, "touch.list");
+        assert_eq!(OP_TOUCH_CHECK, "touch.check");
+    }
 
     #[test]
     fn err_with_adds_fields_but_keeps_the_shape() {

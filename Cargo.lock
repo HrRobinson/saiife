@@ -1531,6 +1531,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "rcgen",
+ "ring",
  "rustix",
  "rustls",
  "saiife-audit",
