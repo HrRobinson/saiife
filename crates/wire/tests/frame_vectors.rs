@@ -22,3 +22,16 @@ fn frozen_vector_verifies() {
     assert_eq!(device_id_of(&pk), s(&v, "device_id"));
     assert_eq!(machine_id_of(&pk), s(&v, "machine_id"));
 }
+
+#[test]
+fn frozen_pair_vector() {
+    use saiife_wire::pair::{proof, short_code};
+    let v: serde_json::Value = serde_json::from_str(include_str!("vectors/pair-v1.json")).unwrap();
+    let secret = b64::dec_n::<32>(&s(&v, "secret_b64u")).unwrap();
+    assert_eq!(secret, std::array::from_fn::<u8, 32, _>(|i| i as u8));
+    let m = b64::dec_n::<65>(&s(&v, "machine_pub_b64u")).unwrap();
+    let d = b64::dec_n::<65>(&s(&v, "device_pub_b64u")).unwrap();
+    let id = s(&v, "pair_id");
+    assert_eq!(b64::enc(&proof(&secret, &id, &d)), s(&v, "proof_b64u"));
+    assert_eq!(short_code(&m, &d, &secret), s(&v, "short_code"));
+}
