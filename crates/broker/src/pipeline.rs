@@ -919,7 +919,12 @@ async fn steps(
     let ask = match verdict {
         Verdict::Deny { rule } => return changed(&rule),
         Verdict::Ask => stage == Stage::New,
-        Verdict::Allow => false,
+        // An allowed call that carries a touch mark asks all the same
+        // (spec §8.2). An approved one (`Stage::Approved`) is sent.
+        Verdict::Allow => {
+            stage == Stage::New
+                && saiife_policy::touch::class_for(cfg, &call.service, &cap).is_some()
+        }
     };
 
     // 7. Limits. An operation that moves money must carry its amount.

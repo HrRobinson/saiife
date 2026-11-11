@@ -282,3 +282,40 @@ If the limit is reached by then, the request ends as `send_failed` with that
 `limit`, and the result says so. A policy that now says `deny` ends a request as
 `send_failed` with rule `policy_changed`. While lockdown is on, nothing is sent
 and nothing new can be asked.
+
+## Touch marks
+
+Three keys mark a call as one that always asks, even when `allow` would let it
+through. An approved request is sent; only a new call asks. Marks live in the
+system config; an environment cannot set or remove one (its keys are closed,
+so `real_system = false` there is a load error).
+
+- `deploy`, on a service: capability patterns, matched like `ask`. A call that
+  matches one has the class `deploy`.
+
+  ```toml
+  [services.erp]
+  connector = "erp"
+  allow = ["deploy:*"]
+  deploy = ["deploy:*"]
+  ```
+
+- `real_system`, on a service: every call to it has the class
+  `egress:external`.
+
+  ```toml
+  [services.erp]
+  connector = "erp"
+  real_system = true
+  ```
+
+- `sensitive`, on a secret: every call to a service that uses this secret
+  (after the environment is applied) has the class `secret:sensitive`.
+
+  ```toml
+  [secrets.erp-prod]
+  sensitive = true
+  ```
+
+When several apply, `deploy` wins, then `secret:sensitive`, then
+`egress:external`. A config without marks has the same policy hash as before.

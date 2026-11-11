@@ -567,6 +567,46 @@ async fn ask_creates_pending_no_upstream_call() {
 }
 
 #[tokio::test]
+async fn allowed_marked_call_asks() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    // Allowed AND marked as a deploy: it asks all the same (spec 8.2).
+    let snap = snapshot("deploy = [\"orders:read\"]");
+    let c = call("orders.list", &[]);
+    let (o, _) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(env.approvals.lock().unwrap().len(), 1);
+    // The same call with no mark is sent.
+    let (o, _) = run(
+        &c,
+        &snapshot(""),
+        &catalog(),
+        &Limiter::new(),
+        &env,
+        Some(&up),
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn approved_marked_call_sends() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let snap = snapshot("deploy = [\"orders:read\"]");
+    let c = call("orders.list", &[]);
+    let lim = Limiter::new();
+    let (o, _) = run(&c, &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let stored = env.approvals.lock().unwrap().pop().unwrap().stored;
+    let (_, o, _) = send_approved(&stored, &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn pending_display_shows_what_will_be_sent_masked() {
     let (m, up) = mock().await;
     let env = FakeEnv::ok();
