@@ -163,6 +163,7 @@ mod linux {
     use crate::broker::{self, Target};
     use crate::text::sanitize;
     use saiife_ipc::client::{Client, ClientError};
+    use saiife_touch::{TouchClass, TouchError, TouchRequest};
     use serde_json::{json, Map, Value};
     use std::path::PathBuf;
     use std::process::ExitCode;
@@ -182,10 +183,12 @@ mod linux {
     /// The command / operation column, in characters.
     const WHAT_CHARS: usize = 60;
 
-    /// Exit 2 (`Refused`) or 5 (`Unavailable`).
+    /// Exit 2 (`Refused`) or 5 (`Unavailable`); a touch error as
+    /// [`crate::touch_cmd::exit_for`] says (D5).
     pub(crate) enum Stop {
         Refused(Vec<String>),
         Unavailable(String),
+        Touch(TouchError),
     }
 
     fn unavailable(m: impl Into<String>) -> Stop {
@@ -204,6 +207,10 @@ mod linux {
             Err(Stop::Unavailable(m)) => {
                 eprintln!("saiife: {m}");
                 ExitCode::from(5)
+            }
+            Err(Stop::Touch(e)) => {
+                eprintln!("saiife: touch: {e}");
+                ExitCode::from(crate::touch_cmd::exit_for(e))
             }
         }
     }
@@ -396,6 +403,15 @@ mod linux {
             outln!("  scope      {}", s("scope"));
         }
         outln!("  type       {}", s("type"));
+        if let Some(class) = item["touch_class"].as_str() {
+            // A class this version cannot read is the strictest (plan 26).
+            let pin = TouchClass::from_name(class).is_none_or(TouchClass::needs_uv);
+            outln!(
+                "  touch:     {} (your enrolled key{})",
+                sanitize(class),
+                if pin { ", and its PIN" } else { "" }
+            );
+        }
         let mcp = item["type"] == "mcp";
         if item["type"] == "command" {
             outln!("  command    {}", s("input"));
@@ -518,6 +534,13 @@ mod linux {
         let _held = if action == "approve" {
             let shown = call(&mut c, "approval.show", args([("request", json!(id))]))?;
             eprintln!("saiife: approving {}", request_summary(id, &shown["item"]));
+            if shown["item"]["touch_class"].is_string() {
+                let asr = touch_for(&mut c, id)?;
+                a.insert("touch".into(), asr);
+                // D6: a touch may take 120 s; the decision goes over a
+                // new connection, never one left idle that long.
+                c = connect(config)?;
+            }
             let uid = shown["item"]["uid"].as_u64();
             // The personal broker needs no re-authentication for the
             // user's own requests (spec 6.10.2): no prompt agent.
@@ -533,6 +556,33 @@ mod linux {
         let state = ans.get("state").and_then(Value::as_str).unwrap_or(action);
         outln!("request #{id} {state}");
         Ok(())
+    }
+
+    /// The touch an approval of request `id` needs (D6): the key's
+    /// assertion over the challenge of `touch.begin {purpose: "approve"}`,
+    /// as the `touch` argument of `approval.decide`. The key is picked
+    /// first, so no challenge is issued (and no code shown) for a build or
+    /// seam with no key. A touch error stops here: nothing is decided and
+    /// the request stays pending.
+    fn touch_for(c: &mut Client, id: u64) -> Result<Value, Stop> {
+        let key = crate::touch_cmd::pick().map_err(Stop::Unavailable)?;
+        let b = call(
+            c,
+            "touch.begin",
+            args([("purpose", json!("approve")), ("request", json!(id))]),
+        )?;
+        let class = sanitize(b.get("class").and_then(Value::as_str).unwrap_or_default());
+        let r: TouchRequest = serde_json::from_value(Value::Object(b)).map_err(|e| {
+            unavailable(format!(
+                "the saiife daemon sent a touch answer this saiife cannot read: {e}"
+            ))
+        })?;
+        eprintln!(
+            "saiife: touch needed ({class}); code {}; check that the same code shows wherever you started this",
+            sanitize(&r.short_code)
+        );
+        let asr = key.request(&r).map_err(Stop::Touch)?;
+        serde_json::to_value(asr).map_err(|e| unavailable(format!("cannot encode the touch: {e}")))
     }
 
     /// Whether a re-authentication could be asked for this request's uid.

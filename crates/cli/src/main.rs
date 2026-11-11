@@ -340,6 +340,7 @@ enum Cmd {
     },
     /// Locked mode (Linux, macOS, approver): approve request <id>. For your own
     /// request (`same_user = "reauth"`) you are asked to authenticate.
+    /// A touch-class request asks you to touch your enrolled key (saiife touch).
     Approve {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]

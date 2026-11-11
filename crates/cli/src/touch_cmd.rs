@@ -60,11 +60,11 @@ mod cmd {
     use std::path::PathBuf;
     use std::process::ExitCode;
 
-    use saiife_touch::{Assertion, EnrolRequest, Touch, TouchError, TouchRequest};
+    use saiife_touch::{Assertion, EnrolRequest, Touch, TouchRequest};
     use serde::de::DeserializeOwned;
     use serde_json::{json, Map, Value};
 
-    use super::{exit_for, pick, TouchAction, NO_DAEMON_SUPPORT};
+    use super::{pick, TouchAction, NO_DAEMON_SUPPORT};
     use crate::approvals_cmd::client::{answer, call_raw, connect, finish, target, Stop};
     use crate::broker::Target;
     use crate::text::sanitize;
@@ -96,15 +96,6 @@ mod cmd {
             return Err(Stop::Unavailable(NO_DAEMON_SUPPORT.into()));
         }
         answer(ans)
-    }
-
-    /// A touch error: `saiife: touch: <error>`, exit 2 or 5 (D5).
-    fn touch_stop(e: TouchError) -> Stop {
-        let m = format!("touch: {e}");
-        match exit_for(e) {
-            5 => Stop::Unavailable(m),
-            _ => Stop::Refused(vec![m]),
-        }
     }
 
     /// The source of touches; none is exit 5 with its message (D1).
@@ -155,8 +146,8 @@ mod cmd {
         } else {
             eprintln!("saiife: enrolling \"{shown}\": touch the new key twice");
         }
-        let auth_data = k.enrol(&er).map_err(touch_stop)?;
-        let proof = k.request(&proof_req).map_err(touch_stop)?;
+        let auth_data = k.enrol(&er).map_err(Stop::Touch)?;
+        let proof = k.request(&proof_req).map_err(Stop::Touch)?;
         let mut args = json!({
             "label": label,
             "auth_data": base64_url(&auth_data),
@@ -167,7 +158,7 @@ mod cmd {
             eprintln!("saiife: unplug the new key and plug in an enrolled one, then press Enter");
             let mut line = String::new();
             let _ = std::io::stdin().read_line(&mut line);
-            let approval = k.request(&r).map_err(touch_stop)?;
+            let approval = k.request(&r).map_err(Stop::Touch)?;
             args["approval"] = json_of(&approval);
         }
         let done = op(t, "touch.enrol", args)?;
@@ -304,7 +295,7 @@ mod cmd {
                 "saiife: removing \"{}\": touch one of your enrolled keys",
                 sanitize(dev["label"].as_str().unwrap_or_default())
             );
-            let asr = k.request(&r).map_err(touch_stop)?;
+            let asr = k.request(&r).map_err(Stop::Touch)?;
             op(
                 t,
                 "touch.remove",
@@ -320,7 +311,7 @@ mod cmd {
         let b = op(t, "touch.begin", json!({"purpose": "test"}))?;
         let r: TouchRequest = field(&b, "")?;
         eprintln!("saiife: touch one of your enrolled keys");
-        let asr = k.request(&r).map_err(touch_stop)?;
+        let asr = k.request(&r).map_err(Stop::Touch)?;
         let done = op(t, "touch.check", json!({"assertion": json_of(&asr)}))?;
         let uv = if done.get("uv") == Some(&Value::Bool(true)) {
             "yes"

@@ -1,5 +1,6 @@
 //! A FIDO2 key over USB HID (feature `fido-hid`), driven by ctap-hid-fido2.
-//! Never run in tests: only `classify` and `one_of` are tested.
+//! Never run in tests: only `classify`, `one_of` and `credential_of` are
+//! tested.
 
 use ctap_hid_fido2::fidokey::{
     CredentialSupportedKeyType, GetAssertionArgsBuilder, MakeCredentialArgsBuilder,
@@ -103,6 +104,16 @@ fn open() -> Result<FidoKeyHid, TouchError> {
     FidoKeyHidFactory::create(&cfg).map_err(fail)
 }
 
+/// The credential an assertion is from: the id the key gave, or, when it
+/// gave none, the one entry of a single-entry allow list (CTAP 2.1
+/// §6.2.2 lets a key omit the id then).
+pub(crate) fn credential_of(given: Vec<u8>, allow: &[Vec<u8>]) -> Vec<u8> {
+    match allow {
+        [only] if given.is_empty() => only.clone(),
+        _ => given,
+    }
+}
+
 fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
@@ -144,7 +155,7 @@ impl Touch for HidAuthenticator {
                     TouchError::Unavailable
                 })?;
                 Ok(Assertion::Ctap2 {
-                    credential_id: a.credential_id,
+                    credential_id: credential_of(a.credential_id, &r.allow),
                     auth_data: a.auth_data,
                     signature: a.signature,
                     client_data_hash: sha256(&r.challenge),
@@ -253,6 +264,21 @@ mod tests {
         assert_eq!(CANCELLED, "the touch was cancelled or not given");
         assert_eq!(DID_NOT_ANSWER, "the key did not answer");
         assert_eq!(first_line("a\nb"), "a");
+    }
+
+    /// R-F: a key may omit the credential id for a single-entry allow list.
+    #[test]
+    fn omitted_id_is_the_one_allowed() {
+        let (a, b) = (vec![1u8, 2, 3], vec![4u8, 5]);
+        assert_eq!(credential_of(vec![], std::slice::from_ref(&a)), a);
+        assert_eq!(credential_of(b.clone(), std::slice::from_ref(&a)), b);
+        // Two allowed, or none: the key's own answer, even when empty.
+        assert_eq!(
+            credential_of(vec![], &[a.clone(), b.clone()]),
+            Vec::<u8>::new()
+        );
+        assert_eq!(credential_of(vec![], &[]), Vec::<u8>::new());
+        assert_eq!(credential_of(b.clone(), &[a, b.clone()]), b);
     }
 
     #[test]

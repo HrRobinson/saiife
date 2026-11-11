@@ -16,6 +16,7 @@ use approvals_world::*;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use common::daemon::{own_group, own_user};
+use saiife_daemon::approvals::State;
 use saiife_daemon::ops::{dispatch_conn, hello_in, Conn};
 use saiife_ipc::frame::{read_frame, write_frame};
 use saiife_ipc::msg::{err, ErrorCode, Request, OP_HELLO};
@@ -315,4 +316,200 @@ fn audit_has_the_enrol_record() {
     let _sb = common::hermetic_audit(&mut c, &w.path().join("audit"), ["verify"]);
     let o = c.output().unwrap();
     assert_eq!(code(&o), Some(0), "{}", text(&o));
+}
+
+// ------------------------------------------------- approve with a touch
+
+/// The erp `invoices:write` capability (what `World::ask` asks for) is a
+/// deploy: a touch with its PIN (plan 26 D4).
+const DEPLOY: &str = "deploy = [\"invoices:write\"]";
+
+/// A world whose `invoices.create` needs a touch, the own user an approver
+/// who re-authenticates for its own requests (the fake says yes), with the
+/// soft key `soft.json` enrolled. The key file and its credential id.
+fn marked_world() -> (World, PathBuf, String) {
+    let w = world_with(DEPLOY);
+    w.serial
+        .get_or_init(|| REAUTH_SERIAL.lock().unwrap_or_else(|p| p.into_inner()));
+    w.reauth
+        .allow
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let text = config_text(w.path(), w.m.port, DEPLOY).replace(
+        "approvers = [\"boss\"]",
+        &format!(
+            "approvers = [\"boss\", {:?}]\nsame_user = \"reauth\"",
+            own_user()
+        ),
+    );
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &text);
+    let key = soft_key(&w.path().join("soft.json"), true);
+    ok(&enrol(&w, &key, "key1"));
+    let id = listed(&w, &key)[0]["id"].as_str().unwrap().to_string();
+    (w, key, id)
+}
+
+/// `saiife approve <id>` with the soft key seam set to `key`.
+fn approve(w: &World, key: &Path, id: u64) -> Output {
+    let mut c = w.cli_cmd("approve", &[&id.to_string()]);
+    c.env("SAIIFE_TEST_TOUCH_SOFT", key);
+    c.output().unwrap()
+}
+
+/// No `approval`/`refused` record for `id`: nothing was decided.
+fn no_refusal(w: &World, id: u64) {
+    let refused: Vec<Value> = w
+        .approval_records(id)
+        .into_iter()
+        .filter(|r| r["action"] == "refused")
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+#[test]
+fn approve_with_touch_round_trip() {
+    let (w, key, cred) = marked_world();
+    let id = w.ask(BODY_A);
+    let o = approve(&w, &key, id);
+    ok(&o);
+    let e = stderr(&o);
+    let approving = format!("saiife: approving request #{id}: connector erp invoices.create");
+    let at = e.find(&approving).unwrap_or_else(|| panic!("{e}"));
+    let lead = "saiife: touch needed (deploy); code ";
+    let t = e.find(lead).unwrap_or_else(|| panic!("{e}"));
+    assert!(at < t, "the request is shown before the touch: {e}");
+    let rest = &e[t + lead.len()..];
+    let code: String = rest.chars().take(6).collect();
+    assert!(code.chars().all(|c| c.is_ascii_digit()), "{e}");
+    assert!(
+        rest[6..].starts_with("; check that the same code shows wherever you started this\n"),
+        "{e}"
+    );
+    assert!(
+        stdout(&o).contains(&format!("request #{id} approved")),
+        "{}",
+        text(&o)
+    );
+    let rec = w.wait_record(id, "approved");
+    assert_eq!(rec["touch"]["cred_id"], cred.as_str(), "{rec}");
+    assert_eq!(rec["touch"]["uv"], true, "{rec}");
+    w.wait_state(id, State::Sent);
+    assert_eq!(w.m.hits().len(), 1);
+}
+
+#[test]
+fn show_prints_the_touch_line() {
+    let (w, _key, _) = marked_world();
+    let id = w.ask(BODY_A);
+    let o = w.cli("approvals", &["show", &id.to_string()]);
+    ok(&o);
+    let out = stdout(&o);
+    assert!(
+        out.lines()
+            .any(|l| l == "  touch:     deploy (your enrolled key, and its PIN)"),
+        "{out}"
+    );
+    // An unmarked request has no touch line.
+    let w = world();
+    let id = w.ask(BODY_A);
+    let o = w.cli("approvals", &["show", &id.to_string()]);
+    ok(&o);
+    assert!(!stdout(&o).contains("touch:"), "{}", stdout(&o));
+}
+
+/// Review Focus 2. The request allows only the approver's own devices, so
+/// a key that is not enrolled refuses it itself (as a real key does: no
+/// credential): exit 2, nothing sent to `approval.decide`.
+#[test]
+fn unenrolled_key_is_refused_before_decide() {
+    let (w, _key, _) = marked_world();
+    let other = soft_key(&w.path().join("other.json"), true);
+    let id = w.ask(BODY_A);
+    let o = approve(&w, &other, id);
+    assert_eq!(code(&o), Some(2), "{}", text(&o));
+    assert!(
+        stderr(&o).contains("saiife: touch: this device is not enrolled for you"),
+        "{}",
+        text(&o)
+    );
+    assert_eq!(w.state(id), Some(State::Pending));
+    no_refusal(&w, id);
+    assert!(w.reauth.details.lock().unwrap().is_empty());
+    assert!(w.m.hits().is_empty());
+}
+
+/// Review Focus 1: no key, exit 5; nothing decided and no password prompt
+/// offered instead.
+#[test]
+fn unavailable_key_leaves_the_request_pending() {
+    let (w, _key, _) = marked_world();
+    let id = w.ask(BODY_A);
+    let o = approve(&w, &w.path().join("missing.json"), id);
+    assert_eq!(code(&o), Some(5), "{}", text(&o));
+    assert!(
+        stderr(&o).contains("cannot read the soft key"),
+        "{}",
+        text(&o)
+    );
+    assert_eq!(w.state(id), Some(State::Pending));
+    no_refusal(&w, id);
+    assert!(w.reauth.details.lock().unwrap().is_empty());
+    assert!(w.m.hits().is_empty());
+}
+
+#[test]
+fn slow_soft_key_times_out() {
+    let (w, key, _) = marked_world();
+    let mut f: Value = serde_json::from_slice(&fs::read(&key).unwrap()).unwrap();
+    f["delay_ms"] = 3000.into();
+    fs::write(&key, f.to_string()).unwrap();
+    let id = w.ask(BODY_A);
+    let mut c = w.cli_cmd("approve", &[&id.to_string()]);
+    c.env("SAIIFE_TEST_TOUCH_SOFT", &key)
+        .env("SAIIFE_TEST_TOUCH_TIMEOUT_MS", "200");
+    let t = std::time::Instant::now();
+    let o = c.output().unwrap();
+    assert_eq!(code(&o), Some(5), "{}", text(&o));
+    assert!(stderr(&o).contains("no touch within"), "{}", text(&o));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(w.state(id), Some(State::Pending));
+    no_refusal(&w, id);
+    assert!(w.reauth.details.lock().unwrap().is_empty());
+}
+
+#[test]
+fn reject_needs_no_touch() {
+    let (w, _key, _) = marked_world();
+    let id = w.ask(BODY_A);
+    let o = w.cli("reject", &[&id.to_string()]);
+    ok(&o);
+    assert!(
+        stdout(&o).contains(&format!("request #{id} rejected")),
+        "{}",
+        text(&o)
+    );
+    assert!(!stderr(&o).contains("touch"), "{}", text(&o));
+    assert_eq!(w.state(id), Some(State::Rejected));
+}
+
+/// A regression guard: an unmarked request never enters the touch path
+/// (the seam names a missing key, which would exit 5).
+#[test]
+fn unmarked_approve_unchanged() {
+    let w = world();
+    w.own_reauth(true);
+    let id = w.ask(BODY_A);
+    let o = approve(&w, &w.path().join("missing.json"), id);
+    ok(&o);
+    assert!(
+        stdout(&o).contains(&format!("request #{id} approved")),
+        "{}",
+        text(&o)
+    );
+    assert!(!stderr(&o).contains("touch"), "{}", text(&o));
+    w.wait_state(id, State::Sent);
+    assert!(w.wait_record(id, "approved").get("touch").is_none());
 }
