@@ -91,6 +91,9 @@ jobs:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.check-version.outputs.version }}
       EXE: ${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+      # FIDO2 key support (plan 27, D1): on for macOS and Windows, off for the static musl Linux builds.
+      # Written as !linux && flag || '': an '' in the middle of a && / || chain is falsy and would fall through to the flag.
+      FEATURES: ${{ !contains(matrix.target, 'linux') && '--features fido-hid' || '' }}
       LLVM_VERSION: 23.1.2
       LLVM_SHA256: 8fb91cdc44fcbbdcf6b3ffd0a1f9859abd14a3c3aae4423c2b6d4a4f90bf0095
     steps:
@@ -163,7 +166,8 @@ jobs:
           "$RUNNER_TEMP/p19a-llvm/bin/clang" --version
       - name: cargo build
         shell: bash
-        run: cargo build --release --locked --target "$TARGET" -p saiife
+        # $FEATURES is unquoted on purpose: empty, or two words.
+        run: cargo build --release --locked --target "$TARGET" -p saiife $FEATURES
       - name: verify architecture (Linux)
         if: runner.os == 'Linux'
         shell: bash

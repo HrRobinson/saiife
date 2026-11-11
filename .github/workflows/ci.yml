@@ -22,6 +22,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The FIDO2 key transport (plan 27) is a feature; hidapi needs libudev on Linux.
+      - name: install libudev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - run: cargo clippy -p saiife --features fido-hid --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       # A short temp base keeps unix socket paths under 108 bytes.
       # TMPDIR too: tempfile::tempdir() (and anything else using the
