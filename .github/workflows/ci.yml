@@ -47,6 +47,17 @@ jobs:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           LOCALAPPDATA: ${{ runner.temp }}/localappdata
+      # The box manager behind its fake VM (plan 34): nothing in the workspace
+      # turns on saiife-boxes/fake or saiife-daemon/fake-vmm, so the step above
+      # never builds these tests. Test builds only; release never sets them.
+      - name: box manager and box.* ops (fake VM)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          cargo test -p saiife-boxes --features fake --no-fail-fast
+          cargo test -p saiife-daemon --features fake-vmm --test boxes
+        env:
+          SAIIFE_TEST_TMP: ${{ runner.temp }}/s
+          TMPDIR: ${{ runner.temp }}
       # The co-signer's macOS asker reads XNU's private pcblist_n layout (plan 21, D4):
       # its live test, on its own line, so a macOS that changes the layout is named here.
       - name: pcblist_n layout (live)
