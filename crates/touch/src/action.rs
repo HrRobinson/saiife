@@ -152,7 +152,6 @@ pub(crate) fn sha256(b: &[u8]) -> [u8; 32] {
     out
 }
 
-#[allow(dead_code)] // used by the verifier and store (later tasks)
 pub(crate) fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {

@@ -7,6 +7,7 @@ pub mod action;
 pub mod authdata;
 pub(crate) mod cbor;
 pub mod client;
+pub(crate) mod codec;
 pub mod cose;
 pub mod error;
 #[cfg(any(test, feature = "soft"))]
@@ -15,9 +16,11 @@ pub mod store;
 pub mod verify;
 
 pub use action::{challenge, short_code, ActionRecord, TouchClass};
+pub use client::{EnrolRequest, Touch, TouchRequest};
 pub use cose::CoseKey;
 pub use error::TouchError;
-pub use store::CoseAlg;
+pub use store::{CoseAlg, Credential};
+pub use verify::{verify, verify_parts, Assertion, TouchEvidence};
 
 /// The relying party id of local (CTAP2) touches.
 pub const LOCAL_RP_ID: &str = "saiife.local";
