@@ -50,11 +50,21 @@ pub struct Credential {
 const MAX_PER_UID: usize = 16;
 
 /// The enrolled credentials of every user, as one JSON file (`v` is 1).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialFile {
     pub v: u32,
     pub credentials: Vec<Credential>,
+}
+
+impl Default for CredentialFile {
+    /// An empty file at version 1, which `save` and `load` agree on.
+    fn default() -> Self {
+        CredentialFile {
+            v: 1,
+            credentials: Vec::new(),
+        }
+    }
 }
 
 fn invalid(path: &Path, why: impl std::fmt::Display) -> io::Error {
@@ -270,10 +280,7 @@ mod tests {
     fn file_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("touch.json");
-        let mut f = CredentialFile {
-            v: 1,
-            ..Default::default()
-        };
+        let mut f = CredentialFile::default();
         f.add(with_id(1, 1000)).unwrap();
         f.add(with_id(2, 1001)).unwrap();
         f.save(&path).unwrap();
@@ -290,6 +297,17 @@ mod tests {
         assert!(!f.set_count(&[7; 16], 9));
         assert_eq!(f.of_uid(1000)[0].sign_count, 9);
         assert!(f.remove(&[1; 16]).is_some() && f.remove(&[1; 16]).is_none());
+    }
+
+    #[test]
+    fn default_file_saves_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("touch.json");
+        let mut f = CredentialFile::default();
+        assert_eq!(f.v, 1);
+        f.add(with_id(3, 1000)).unwrap();
+        f.save(&path).unwrap();
+        assert_eq!(CredentialFile::load(&path).unwrap(), f);
     }
 
     #[test]

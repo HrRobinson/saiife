@@ -539,6 +539,35 @@ fn verify_parts_kind_mismatch() {
     assert_eq!(verify_parts(&web_cred, &asr, RP, &c, false), Ok((0x05, 2)));
 }
 
+/// The audit `touch` object for an assertion made outside `verify`.
+fn audit_of(a: &ActionRecord, asr: &Assertion) -> serde_json::Value {
+    let ad = crate::authdata::parse(asr.auth_data()).unwrap();
+    let (client_data, chash) = match asr {
+        Assertion::Ctap2 {
+            client_data_hash, ..
+        } => (None, *client_data_hash),
+        Assertion::WebAuthn {
+            client_data_json, ..
+        } => (Some(client_data_json.clone()), sha256(client_data_json)),
+    };
+    let mut v = serde_json::json!({
+        "via": "x", "kind": asr.kind(), "cred_id": crate::codec::b64(asr.credential_id()),
+        "label": "key", "flags": ad.flags, "uv": ad.flags & crate::authdata::UV != 0,
+        "sign_count": ad.sign_count, "auth_data": crate::codec::b64(asr.auth_data()),
+        "client_data_hash": hex(&chash), "signature": crate::codec::b64(asr.signature()),
+        "challenge": hex(&challenge(a)), "preimage": hex(&a.preimage()),
+        "action": a.canonical_action(),
+    });
+    if let Some(cd) = client_data {
+        v["client_data"] = crate::codec::b64(&cd).into();
+    }
+    v
+}
+
+fn origins() -> Vec<String> {
+    vec![ORIGIN.to_string()]
+}
+
 #[test]
 fn reverify_from_audit() {
     let a = fixture();
@@ -549,36 +578,128 @@ fn reverify_from_audit() {
     ] {
         let ev = if web_kind { web(&s, &a) } else { ctap(&s, &a) }.unwrap();
         let audit = ev.to_audit();
-        assert_eq!(reverify(&audit, &s.public_key()), Ok(()));
-        let flip = |k: &str| {
+        let k = s.public_key();
+        let o = if web_kind { origins() } else { vec![] };
+        assert_eq!(reverify(&audit, &k, RP, &o), Ok(()));
+        let flip = |key: &str| {
             let mut v = audit.clone();
-            let t = v[k].as_str().unwrap().to_string();
-            let mut b = t.into_bytes();
+            let mut b = v[key].as_str().unwrap().to_string().into_bytes();
             let i = b.len() / 2;
             b[i] = if b[i] == b'A' { b'B' } else { b'A' };
-            v[k] = String::from_utf8(b).unwrap().into();
+            v[key] = String::from_utf8(b).unwrap().into();
             v
         };
-        for k in ["action", "preimage", "signature", "auth_data"] {
-            assert!(reverify(&flip(k), &s.public_key()).is_err(), "{k}");
+        for (key, want) in [
+            ("action", TouchError::Mismatch),
+            ("preimage", TouchError::Mismatch),
+            ("signature", TouchError::BadSignature),
+            ("auth_data", TouchError::Mismatch),
+        ] {
+            assert_eq!(reverify(&flip(key), &k, RP, &o), Err(want), "{key}");
         }
+        for (key, val) in [
+            ("flags", serde_json::json!(0x41)),
+            ("uv", serde_json::json!(false)),
+            ("sign_count", serde_json::json!(99)),
+        ] {
+            let mut v = audit.clone();
+            v[key] = val;
+            assert_eq!(reverify(&v, &k, RP, &o), Err(TouchError::Mismatch), "{key}");
+        }
+        assert_eq!(
+            reverify(&audit, &k, "other.example", &o),
+            Err(TouchError::Mismatch)
+        );
         let other = SoftAuthenticator::new_es256().public_key();
-        assert_eq!(reverify(&audit, &other), Err(TouchError::BadSignature));
+        assert_eq!(
+            reverify(&audit, &other, RP, &o),
+            Err(TouchError::BadSignature)
+        );
         let mut missing = audit.clone();
         missing.as_object_mut().unwrap().remove("challenge");
-        assert_eq!(
-            reverify(&missing, &s.public_key()),
-            Err(TouchError::Malformed)
-        );
+        assert_eq!(reverify(&missing, &k, RP, &o), Err(TouchError::Malformed));
         let mut wrong = audit.clone();
         wrong["kind"] = "nope".into();
+        assert_eq!(reverify(&wrong, &k, RP, &o), Err(TouchError::Malformed));
+        let mut swapped = audit.clone();
+        swapped["kind"] = if web_kind { "fido2" } else { "webauthn" }.into();
+        let want = if web_kind {
+            TouchError::Mismatch
+        } else {
+            TouchError::Malformed
+        };
+        assert_eq!(reverify(&swapped, &k, RP, &o), Err(want));
         assert_eq!(
-            reverify(&wrong, &s.public_key()),
-            Err(TouchError::Malformed)
-        );
-        assert_eq!(
-            reverify(&serde_json::json!([]), &s.public_key()),
+            reverify(&serde_json::json!([]), &k, RP, &o),
             Err(TouchError::Malformed)
         );
     }
+}
+
+#[test]
+fn reverify_checks_rp_origin_type_and_presence() {
+    let a = fixture();
+    let c = challenge(&a);
+    let mut s = SoftAuthenticator::new_es256();
+    let k = s.public_key();
+    // authData from another rp id.
+    s.rp_override = Some("evil.example".into());
+    let v = audit_of(&a, &s.assert_ctap(RP, &c));
+    assert_eq!(reverify(&v, &k, RP, &[]), Err(TouchError::Mismatch));
+    s.rp_override = None;
+    // The webauthn type.
+    s.type_override = Some("webauthn.create".into());
+    let v = audit_of(&a, &s.assert_webauthn(RP, ORIGIN, &c));
+    assert_eq!(reverify(&v, &k, RP, &origins()), Err(TouchError::Malformed));
+    s.type_override = None;
+    // An origin that is not enrolled.
+    let v = audit_of(&a, &s.assert_webauthn(RP, ORIGIN, &c));
+    assert_eq!(reverify(&v, &k, RP, &origins()), Ok(()));
+    assert_eq!(
+        reverify(&v, &k, RP, &["https://other.example".to_string()]),
+        Err(TouchError::Mismatch)
+    );
+    assert_eq!(reverify(&v, &k, RP, &[]), Err(TouchError::Mismatch));
+    // UP cleared and re-signed.
+    s.up = false;
+    let v = audit_of(&a, &s.assert_ctap(RP, &c));
+    assert_eq!(reverify(&v, &k, RP, &[]), Err(TouchError::NotPresent));
+    s.up = true;
+    // crossOrigin: true, signed by hand with the soft key.
+    let (_, pkcs8, _, _) = s.parts();
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &pkcs8,
+        &ring::rand::SystemRandom::new(),
+    )
+    .unwrap();
+    let Assertion::WebAuthn {
+        credential_id,
+        auth_data,
+        ..
+    } = s.assert_webauthn(RP, ORIGIN, &c)
+    else {
+        unreachable!()
+    };
+    let cdj = format!(
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":true}}",
+        crate::codec::b64(&c)
+    )
+    .into_bytes();
+    let mut msg = auth_data.clone();
+    msg.extend(sha256(&cdj));
+    let signature = pair
+        .sign(&ring::rand::SystemRandom::new(), &msg)
+        .unwrap()
+        .as_ref()
+        .to_vec();
+    let asr = Assertion::WebAuthn {
+        credential_id,
+        auth_data,
+        signature,
+        client_data_json: cdj,
+        origin: ORIGIN.into(),
+    };
+    let v = audit_of(&a, &asr);
+    assert_eq!(reverify(&v, &k, RP, &origins()), Err(TouchError::Mismatch));
 }

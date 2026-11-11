@@ -18,18 +18,21 @@ pub(crate) fn unb64(s: &str) -> Option<Vec<u8>> {
     URL_SAFE_NO_PAD.decode(s).ok()
 }
 
-/// Decodes lowercase (or uppercase) hex of exactly `N` bytes.
-pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+/// Decodes lowercase (or uppercase) hex of any even length.
+pub(crate) fn unhex_vec(s: &str) -> Option<Vec<u8>> {
     let s = s.as_bytes();
-    if s.len() != 2 * N {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let nib = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
-    let mut out = [0u8; N];
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = nib(s[2 * i])? << 4 | nib(s[2 * i + 1])?;
-    }
-    Some(out)
+    s.chunks(2)
+        .map(|p| Some(nib(p[0])? << 4 | nib(p[1])?))
+        .collect()
+}
+
+/// Decodes hex of exactly `N` bytes.
+pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    unhex_vec(s)?.try_into().ok()
 }
 
 /// `Vec<u8>` as base64url.
