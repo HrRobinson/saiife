@@ -6,7 +6,6 @@ use super::{verify_parts, Assertion};
 use crate::action::{sha256, TouchClass};
 use crate::authdata::UV;
 use crate::codec::{unb64, unhex, unhex_vec};
-use crate::cose::CoseKey;
 use crate::store::Credential;
 use crate::TouchError;
 
@@ -30,39 +29,39 @@ fn number(v: &Value, k: &str) -> Result<u64, TouchError> {
         .ok_or(TouchError::Malformed)
 }
 
-/// Re-checks the `touch` object of an audit record, with no state: what an
-/// auditor runs. `key`, `rp_id` and `origins` come from the credential's
-/// `touch_enrolled` record (for a `fido2` credential `origins` may be empty).
-/// The encodings are those of `TouchEvidence::to_audit` (bytes base64url,
-/// hashes hex, `action` the canonical JSON).
+/// Re-checks the `touch` object of an audit record against `enrolled`, with
+/// no state: what an auditor runs.
 ///
-/// A missing key, a wrong type, a bad encoding, an unknown `kind` or a
-/// WebAuthn record without a usable `client_data` is `Malformed`. Then:
+/// `enrolled` is the trust anchor and must come from a trusted source (the
+/// `touch_enrolled` record, or the credential store). It alone supplies the
+/// credential id, kind, public key, rp id and origins. From the record only
+/// the assertion bytes (`auth_data`, `signature`, `client_data` or
+/// `client_data_hash`), `challenge`, `preimage` and `action` are read as
+/// data; `cred_id`, `kind`, `flags`, `uv` and `sign_count` are claims that
+/// are compared, never used as inputs. The encodings are those of
+/// `TouchEvidence::to_audit` (bytes base64url, hashes hex).
+///
+/// A missing key, a wrong type or a bad encoding is `Malformed`. Then:
+/// - a `cred_id` other than `enrolled.id` is `UnknownCredential`, and a
+///   `kind` other than `enrolled.kind` is `Mismatch` (both before any
+///   signature work);
 /// - `challenge != sha256(preimage)`, or a preimage whose last 32 bytes are
 ///   not `sha256(action)`, is `Mismatch`;
-/// - the rest is the verifier's own core ([`verify_parts`]) on a transient
-///   credential, so both paths share every check: caps, authData parse, the
-///   kind binding, rp id hash, UP, UV (needed for the action's class, for
-///   webauthn, or when the record says `uv`), the clientDataJSON type,
-///   origin (in `origins`) and `crossOrigin`, the client data hash rules and
-///   the signature (`BadSignature`). The sign counter is not compared with
-///   an earlier one (no history);
+/// - the rest is [`verify_parts`] on a copy of `enrolled` with the counter at
+///   0, so both paths share every check (caps, authData parse, kind binding,
+///   rp id hash, UP, UV, clientDataJSON type, origin in `enrolled.origins`,
+///   `crossOrigin`, client data hash rules, `BadSignature`). The assertion
+///   variant follows `enrolled.kind`. UV is needed as in `verify`: for the
+///   action's class (missing or unknown means yes), for WebAuthn, or for a
+///   `webauthn` credential;
 /// - for webauthn, a recorded `client_data_hash != sha256(client_data)` is
 ///   `Mismatch`;
-/// - finally the recorded `flags`, `uv` and `sign_count` must equal what the
-///   signed authData says, else `Mismatch`.
-pub fn reverify(
-    touch: &Value,
-    key: &CoseKey,
-    rp_id: &str,
-    origins: &[String],
-) -> Result<(), TouchError> {
+/// - the recorded `flags`, `uv` and `sign_count` must equal the signed
+///   authData's, else `Mismatch`.
+///
+/// This checks one record, not counter progression across records.
+pub fn reverify(touch: &Value, enrolled: &Credential) -> Result<(), TouchError> {
     let kind = text(touch, "kind")?;
-    let web = match kind {
-        "fido2" => false,
-        "webauthn" => true,
-        _ => return Err(TouchError::Malformed),
-    };
     let auth_data = bytes(touch, "auth_data")?;
     let signature = bytes(touch, "signature")?;
     let cred_id = bytes(touch, "cred_id")?;
@@ -79,6 +78,12 @@ pub fn reverify(
         number(touch, "sign_count")?,
     );
 
+    if cred_id != enrolled.id {
+        return Err(TouchError::UnknownCredential);
+    }
+    if kind != enrolled.kind {
+        return Err(TouchError::Mismatch);
+    }
     if sha256(&preimage) != challenge {
         return Err(TouchError::Mismatch);
     }
@@ -90,44 +95,37 @@ pub fn reverify(
         return Err(TouchError::Mismatch);
     }
 
-    let asr = if web {
-        let client_data_json = bytes(touch, "client_data")?;
-        let cd: Value =
-            serde_json::from_slice(&client_data_json).map_err(|_| TouchError::Malformed)?;
-        let origin = text(&cd, "origin")?.to_string();
-        if chash != sha256(&client_data_json) {
-            return Err(TouchError::Mismatch);
+    let asr = match enrolled.kind.as_str() {
+        "webauthn" => {
+            let client_data_json = bytes(touch, "client_data")?;
+            let cd: Value =
+                serde_json::from_slice(&client_data_json).map_err(|_| TouchError::Malformed)?;
+            let origin = text(&cd, "origin")?.to_string();
+            if chash != sha256(&client_data_json) {
+                return Err(TouchError::Mismatch);
+            }
+            Assertion::WebAuthn {
+                credential_id: cred_id,
+                auth_data,
+                signature,
+                client_data_json,
+                origin,
+            }
         }
-        Assertion::WebAuthn {
-            credential_id: cred_id.clone(),
-            auth_data,
-            signature,
-            client_data_json,
-            origin,
-        }
-    } else {
-        Assertion::Ctap2 {
-            credential_id: cred_id.clone(),
+        "fido2" => Assertion::Ctap2 {
+            credential_id: cred_id,
             auth_data,
             signature,
             client_data_hash: chash,
-        }
+        },
+        _ => return Err(TouchError::Mismatch),
     };
 
     let cred = Credential {
-        id: cred_id,
-        public_key: key.clone(),
-        kind: kind.to_string(),
-        rp_id: rp_id.to_string(),
-        origins: origins.to_vec(),
-        label: String::new(),
-        owner_uid: 0,
-        owner_sid: None,
         sign_count: 0,
-        created: String::new(),
-        aaguid: String::new(),
+        ..enrolled.clone()
     };
-    // A missing or unknown class needs UV, as does webauthn or a recorded uv.
+    // As in `verify`: a missing or unknown class needs UV, as does WebAuthn.
     let class_uv = serde_json::from_str::<Value>(action)
         .ok()
         .and_then(|a| {
@@ -136,8 +134,8 @@ pub fn reverify(
                 .and_then(TouchClass::from_name)
         })
         .is_none_or(|c| c.needs_uv());
-    let need_uv = class_uv || web || uv;
-    let (real_flags, real_count) = verify_parts(&cred, &asr, rp_id, &challenge, need_uv)?;
+    let need_uv = class_uv || matches!(asr, Assertion::WebAuthn { .. }) || cred.kind == "webauthn";
+    let (real_flags, real_count) = verify_parts(&cred, &asr, &cred.rp_id, &challenge, need_uv)?;
     if flags != u64::from(real_flags)
         || uv != (real_flags & UV != 0)
         || count != u64::from(real_count)

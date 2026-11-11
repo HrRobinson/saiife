@@ -564,8 +564,22 @@ fn audit_of(a: &ActionRecord, asr: &Assertion) -> serde_json::Value {
     v
 }
 
-fn origins() -> Vec<String> {
-    vec![ORIGIN.to_string()]
+fn enrolled(s: &SoftAuthenticator, web: bool) -> Credential {
+    if web {
+        s.web_credential(RP, ORIGIN, 1000)
+    } else {
+        s.credential(RP, 1000, "key")
+    }
+}
+
+/// Flips the middle character of a string field of `v` to a different one.
+fn flip(v: &serde_json::Value, key: &str, a: u8, b: u8) -> serde_json::Value {
+    let mut v = v.clone();
+    let mut s = v[key].as_str().unwrap().to_string().into_bytes();
+    let i = s.len() / 2;
+    s[i] = if s[i] == a { b } else { a };
+    v[key] = String::from_utf8(s).unwrap().into();
+    v
 }
 
 #[test]
@@ -578,24 +592,37 @@ fn reverify_from_audit() {
     ] {
         let ev = if web_kind { web(&s, &a) } else { ctap(&s, &a) }.unwrap();
         let audit = ev.to_audit();
-        let k = s.public_key();
-        let o = if web_kind { origins() } else { vec![] };
-        assert_eq!(reverify(&audit, &k, RP, &o), Ok(()));
-        let flip = |key: &str| {
-            let mut v = audit.clone();
-            let mut b = v[key].as_str().unwrap().to_string().into_bytes();
-            let i = b.len() / 2;
-            b[i] = if b[i] == b'A' { b'B' } else { b'A' };
-            v[key] = String::from_utf8(b).unwrap().into();
-            v
+        let en = enrolled(&s, web_kind);
+        assert_eq!(reverify(&audit, &en), Ok(()));
+        // An old record still verifies against a credential whose counter moved on.
+        let moved = Credential {
+            sign_count: 50,
+            ..en.clone()
         };
-        for (key, want) in [
-            ("action", TouchError::Mismatch),
-            ("preimage", TouchError::Mismatch),
-            ("signature", TouchError::BadSignature),
-            ("auth_data", TouchError::Mismatch),
+        assert_eq!(reverify(&audit, &moved), Ok(()));
+        for (key, bad, want) in [
+            (
+                "action",
+                flip(&audit, "action", b'A', b'B'),
+                TouchError::Mismatch,
+            ),
+            (
+                "preimage",
+                flip(&audit, "preimage", b'0', b'1'),
+                TouchError::Mismatch,
+            ),
+            (
+                "signature",
+                flip(&audit, "signature", b'A', b'B'),
+                TouchError::BadSignature,
+            ),
+            (
+                "auth_data",
+                flip(&audit, "auth_data", b'A', b'B'),
+                TouchError::Mismatch,
+            ),
         ] {
-            assert_eq!(reverify(&flip(key), &k, RP, &o), Err(want), "{key}");
+            assert_eq!(reverify(&bad, &en), Err(want), "{key}");
         }
         for (key, val) in [
             ("flags", serde_json::json!(0x41)),
@@ -604,36 +631,88 @@ fn reverify_from_audit() {
         ] {
             let mut v = audit.clone();
             v[key] = val;
-            assert_eq!(reverify(&v, &k, RP, &o), Err(TouchError::Mismatch), "{key}");
+            assert_eq!(reverify(&v, &en), Err(TouchError::Mismatch), "{key}");
         }
-        assert_eq!(
-            reverify(&audit, &k, "other.example", &o),
-            Err(TouchError::Mismatch)
-        );
-        let other = SoftAuthenticator::new_es256().public_key();
-        assert_eq!(
-            reverify(&audit, &other, RP, &o),
-            Err(TouchError::BadSignature)
-        );
+        let other_rp = Credential {
+            rp_id: "other.example".into(),
+            ..en.clone()
+        };
+        assert_eq!(reverify(&audit, &other_rp), Err(TouchError::Mismatch));
+        // Another key's credential with this record's id faked in.
+        let imposter = Credential {
+            id: s.credential_id(),
+            ..enrolled(&SoftAuthenticator::new_es256(), web_kind)
+        };
+        assert_eq!(reverify(&audit, &imposter), Err(TouchError::BadSignature));
+        // A different credential id.
+        let other = enrolled(&SoftAuthenticator::new_es256(), web_kind);
+        assert_eq!(reverify(&audit, &other), Err(TouchError::UnknownCredential));
         let mut missing = audit.clone();
         missing.as_object_mut().unwrap().remove("challenge");
-        assert_eq!(reverify(&missing, &k, RP, &o), Err(TouchError::Malformed));
-        let mut wrong = audit.clone();
-        wrong["kind"] = "nope".into();
-        assert_eq!(reverify(&wrong, &k, RP, &o), Err(TouchError::Malformed));
-        let mut swapped = audit.clone();
-        swapped["kind"] = if web_kind { "fido2" } else { "webauthn" }.into();
-        let want = if web_kind {
-            TouchError::Mismatch
-        } else {
-            TouchError::Malformed
-        };
-        assert_eq!(reverify(&swapped, &k, RP, &o), Err(want));
+        assert_eq!(reverify(&missing, &en), Err(TouchError::Malformed));
+        // The record's kind is a claim: any other value than the enrolled kind is Mismatch.
+        for k in ["nope", "fido2", "webauthn"] {
+            let mut v = audit.clone();
+            v["kind"] = k.into();
+            let want = if k == en.kind {
+                Ok(())
+            } else {
+                Err(TouchError::Mismatch)
+            };
+            assert_eq!(reverify(&v, &en), want, "{k}");
+        }
         assert_eq!(
-            reverify(&serde_json::json!([]), &k, RP, &o),
+            reverify(&serde_json::json!([]), &en),
             Err(TouchError::Malformed)
         );
     }
+}
+
+#[test]
+fn reverify_needs_uv_from_the_enrolled_credential() {
+    let a = fixture();
+    let c = challenge(&a);
+    let mut s = SoftAuthenticator::new_es256();
+    s.uv = false;
+    // A webauthn credential: UV is forced even with consistent flags and uv.
+    let v = audit_of(&a, &s.assert_webauthn(RP, ORIGIN, &c));
+    assert_eq!(v["uv"], false);
+    assert_eq!(
+        reverify(&v, &enrolled(&s, true)),
+        Err(TouchError::NotVerified)
+    );
+    // A Deploy-class fido2 record without UV.
+    let v = audit_of(&a, &s.assert_ctap(RP, &c));
+    assert_eq!(
+        reverify(&v, &enrolled(&s, false)),
+        Err(TouchError::NotVerified)
+    );
+    // An unknown class and no UV.
+    let action = r#"{"class":"bogus","fields":{},"summary":"x"}"#;
+    let mut pre = vec![7u8; 79];
+    pre.extend(sha256(action.as_bytes()));
+    let c2 = sha256(&pre);
+    let mut v = audit_of(&a, &s.assert_ctap(RP, &c2));
+    v["action"] = action.into();
+    v["preimage"] = hex(&pre).into();
+    v["challenge"] = hex(&c2).into();
+    assert_eq!(
+        reverify(&v, &enrolled(&s, false)),
+        Err(TouchError::NotVerified)
+    );
+    // A low class without UV is fine for a fido2 credential.
+    let low = ActionRecord {
+        class: TouchClass::EgressExternal,
+        ..a.clone()
+    };
+    let mut ok = audit_of(&low, &s.assert_ctap(RP, &challenge(&low)));
+    assert_eq!(reverify(&ok, &enrolled(&s, false)), Ok(()));
+    // But the record's own uv claim is not an input: a false one is a Mismatch.
+    ok["uv"] = true.into();
+    assert_eq!(
+        reverify(&ok, &enrolled(&s, false)),
+        Err(TouchError::Mismatch)
+    );
 }
 
 #[test]
@@ -641,29 +720,39 @@ fn reverify_checks_rp_origin_type_and_presence() {
     let a = fixture();
     let c = challenge(&a);
     let mut s = SoftAuthenticator::new_es256();
-    let k = s.public_key();
     // authData from another rp id.
     s.rp_override = Some("evil.example".into());
     let v = audit_of(&a, &s.assert_ctap(RP, &c));
-    assert_eq!(reverify(&v, &k, RP, &[]), Err(TouchError::Mismatch));
+    assert_eq!(
+        reverify(&v, &enrolled(&s, false)),
+        Err(TouchError::Mismatch)
+    );
     s.rp_override = None;
     // The webauthn type.
     s.type_override = Some("webauthn.create".into());
     let v = audit_of(&a, &s.assert_webauthn(RP, ORIGIN, &c));
-    assert_eq!(reverify(&v, &k, RP, &origins()), Err(TouchError::Malformed));
+    assert_eq!(
+        reverify(&v, &enrolled(&s, true)),
+        Err(TouchError::Malformed)
+    );
     s.type_override = None;
     // An origin that is not enrolled.
     let v = audit_of(&a, &s.assert_webauthn(RP, ORIGIN, &c));
-    assert_eq!(reverify(&v, &k, RP, &origins()), Ok(()));
-    assert_eq!(
-        reverify(&v, &k, RP, &["https://other.example".to_string()]),
-        Err(TouchError::Mismatch)
-    );
-    assert_eq!(reverify(&v, &k, RP, &[]), Err(TouchError::Mismatch));
+    assert_eq!(reverify(&v, &enrolled(&s, true)), Ok(()));
+    for origins in [vec!["https://other.example".to_string()], vec![]] {
+        let en = Credential {
+            origins,
+            ..enrolled(&s, true)
+        };
+        assert_eq!(reverify(&v, &en), Err(TouchError::Mismatch));
+    }
     // UP cleared and re-signed.
     s.up = false;
     let v = audit_of(&a, &s.assert_ctap(RP, &c));
-    assert_eq!(reverify(&v, &k, RP, &[]), Err(TouchError::NotPresent));
+    assert_eq!(
+        reverify(&v, &enrolled(&s, false)),
+        Err(TouchError::NotPresent)
+    );
     s.up = true;
     // crossOrigin: true, signed by hand with the soft key.
     let (_, pkcs8, _, _) = s.parts();
@@ -701,5 +790,5 @@ fn reverify_checks_rp_origin_type_and_presence() {
         origin: ORIGIN.into(),
     };
     let v = audit_of(&a, &asr);
-    assert_eq!(reverify(&v, &k, RP, &origins()), Err(TouchError::Mismatch));
+    assert_eq!(reverify(&v, &enrolled(&s, true)), Err(TouchError::Mismatch));
 }
