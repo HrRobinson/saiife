@@ -37,6 +37,9 @@ pub struct DoctorOptions {
     /// The caller's home (`$HOME`) for a self-check. Ignored as root, where
     /// every home comes from `/etc/passwd`.
     pub home: Option<std::path::PathBuf>,
+    /// This CLI build can use a FIDO2 key (`cfg!(feature = "fido-hid")` in
+    /// the CLI). Read by the `touch-key` check only.
+    pub touch_supported: bool,
 }
 
 /// What every check reads.

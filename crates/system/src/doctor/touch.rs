@@ -3,7 +3,8 @@
 //! hidraw node whose report descriptor starts with the FIDO usage page item
 //! (`06 D0 F1`) is a FIDO key. This is an access test only: the node is never
 //! opened. It is Info or Pass, and a Warn at worst: touch is optional until a
-//! policy marks something.
+//! policy marks something. A CLI build without key support
+//! (`DoctorOptions::touch_supported`) gives Info for a plugged-in key.
 
 use super::report::{Check, Status};
 use super::Ctx;
@@ -27,6 +28,23 @@ pub(super) fn checks(ctx: &Ctx) -> Vec<Check> {
             Status::Info,
             TITLE,
             "no FIDO key plugged in",
+        )];
+    }
+    if !ctx.opts.touch_supported {
+        return vec![Check::new(
+            ID,
+            Status::Info,
+            TITLE,
+            "a FIDO key is plugged in; this build has no FIDO2 key support (docs/touch.md)",
+        )];
+    }
+    // D2: the CLI refuses with more than one plugged in.
+    if nodes.len() > 1 {
+        return vec![Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            "more than one FIDO key is plugged in; leave only the one to use",
         )];
     }
     let dev = ctx.layout.at(DEV);
@@ -81,11 +99,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    /// The check in a build with key support.
     fn run(root: &std::path::Path) -> Check {
+        run_with(root, true)
+    }
+
+    fn run_with(root: &std::path::Path, touch_supported: bool) -> Check {
         let layout = Layout::under(root);
         let host = FakeHost::open(root).unwrap();
         let dir = FixedDirectory::from_text("", "");
-        let opts = DoctorOptions::default();
+        let opts = DoctorOptions {
+            touch_supported,
+            ..Default::default()
+        };
         let ctx = Ctx {
             layout: &layout,
             host: &host,
@@ -144,6 +170,37 @@ mod tests {
             .detail
             .starts_with("hidraw3 is plugged in but not usable by you"));
         assert!(c.detail.contains("log in at the machine"));
+    }
+
+    /// M2: a build without key support cannot use a plugged-in key.
+    #[test]
+    fn key_without_build_support_is_info() {
+        let t = TempDir::new().unwrap();
+        node(t.path(), "hidraw3", &[0x06, 0xD0, 0xF1, 0x09, 0x01], 0o600);
+        let c = run_with(t.path(), false);
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(
+            c.detail,
+            "a FIDO key is plugged in; this build has no FIDO2 key support (docs/touch.md)"
+        );
+        // No key: the same line as in a build with support.
+        let t = TempDir::new().unwrap();
+        fs::create_dir_all(t.path().join("sys/class/hidraw")).unwrap();
+        assert_eq!(run_with(t.path(), false).detail, "no FIDO key plugged in");
+    }
+
+    /// M2 and D2: one key at a time.
+    #[test]
+    fn two_keys_warn() {
+        let t = TempDir::new().unwrap();
+        node(t.path(), "hidraw3", &[0x06, 0xD0, 0xF1, 0x09, 0x01], 0o600);
+        node(t.path(), "hidraw5", &[0x06, 0xD0, 0xF1, 0x09, 0x01], 0o600);
+        let c = run(t.path());
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.detail,
+            "more than one FIDO key is plugged in; leave only the one to use"
+        );
     }
 
     #[test]

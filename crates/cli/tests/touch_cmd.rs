@@ -389,6 +389,8 @@ fn approve_with_touch_round_trip() {
         "{}",
         text(&o)
     );
+    // D6: the same-user re-authentication ran too, after the touch.
+    assert!(!w.reauth.details.lock().unwrap().is_empty(), "{}", text(&o));
     let rec = w.wait_record(id, "approved");
     assert_eq!(rec["touch"]["cred_id"], cred.as_str(), "{rec}");
     assert_eq!(rec["touch"]["uv"], true, "{rec}");

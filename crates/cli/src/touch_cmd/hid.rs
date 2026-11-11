@@ -27,22 +27,23 @@ const SET_PIN: &str = "set a PIN on the key first (for a YubiKey: ykman fido acc
 const CANCELLED: &str = "the touch was cancelled or not given";
 /// The catch-all hint; the error's first line is printed after it.
 const DID_NOT_ANSWER: &str = "the key did not answer";
+/// D2's two texts.
+const PLUG_IN: &str = "plug in your key";
+const ONLY_ONE: &str = "more than one FIDO key is plugged in; leave only the one to use";
 
 /// D2: exactly one FIDO key may be plugged in.
 pub(crate) fn one_of(n: usize) -> Result<(), (TouchError, &'static str)> {
     match n {
         1 => Ok(()),
-        0 => Err((TouchError::Unavailable, "plug in your key")),
-        _ => Err((
-            TouchError::Unavailable,
-            "more than one FIDO key is plugged in; leave only the one to use",
-        )),
+        0 => Err((TouchError::Unavailable, PLUG_IN)),
+        _ => Err((TouchError::Unavailable, ONLY_ONE)),
     }
 }
 
 /// The error and hint for an error text of ctap-hid-fido2 (`format!("{e:#}")`).
 /// The substrings are the status names 3.6.0 renders in
-/// `ctapdef::get_ctap_status_message` (`0x31 CTAP2_ERR_PIN_INVALID   PIN Invalid.`).
+/// `ctapdef::get_ctap_status_message` (`0x31 CTAP2_ERR_PIN_INVALID   PIN Invalid.`),
+/// and the device texts of `FidoKeyHidFactory::create` (lib.rs:99, :102).
 pub(crate) fn classify(msg: &str) -> (TouchError, &'static str) {
     use TouchError::*;
     let has = |names: &[&str]| names.iter().any(|n| msg.contains(n));
@@ -59,6 +60,10 @@ pub(crate) fn classify(msg: &str) -> (TouchError, &'static str) {
         )
     } else if has(&["CTAP2_ERR_CREDENTIAL_EXCLUDED"]) {
         (Mismatch, "this key is already enrolled")
+    } else if has(&["FIDO device not found"]) {
+        (Unavailable, PLUG_IN)
+    } else if has(&["Multiple FIDO devices found"]) {
+        (Unavailable, ONLY_ONE)
     } else if has(&[
         "CTAP2_ERR_OPERATION_DENIED",
         "CTAP2_ERR_USER_ACTION_TIMEOUT",
@@ -241,7 +246,15 @@ mod tests {
                 NotPresent,
                 CANCELLED,
             ),
-            ("FIDO device not found.", Unavailable, DID_NOT_ANSWER),
+            // `FidoKeyHidFactory::create` (lib.rs:99, :102): the key was
+            // pulled, or another plugged in, after `one_device`.
+            ("FIDO device not found.", Unavailable, "plug in your key"),
+            (
+                "Multiple FIDO devices found.",
+                Unavailable,
+                "more than one FIDO key is plugged in; leave only the one to use",
+            ),
+            ("unexpected HID read error", Unavailable, DID_NOT_ANSWER),
             (
                 "0x33 CTAP2_ERR_PIN_AUTH_INVALID PIN authentication, pinAuth, verification failed.",
                 Unavailable,

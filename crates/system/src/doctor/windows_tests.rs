@@ -126,6 +126,7 @@ impl Env {
             &DoctorOptions {
                 user: user.map(str::to_string),
                 home: None,
+                ..Default::default()
             },
         )
     }

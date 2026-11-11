@@ -133,7 +133,7 @@ mod cmd {
             json!({"purpose": "enrol", "label": label}),
         )?;
         let er: EnrolRequest = field(&b, "")?;
-        let proof_req: TouchRequest = field(&b, "touch")?;
+        let mut proof_req: TouchRequest = field(&b, "touch")?;
         let approve_with: Option<TouchRequest> = match b.get("approve_with") {
             None | Some(Value::Null) => None,
             Some(_) => Some(field(&b, "approve_with")?),
@@ -147,6 +147,15 @@ mod cmd {
             eprintln!("saiife: enrolling \"{shown}\": touch the new key twice");
         }
         let auth_data = k.enrol(&er).map_err(Stop::Touch)?;
+        // C1: the new credential is not discoverable, so the proof must
+        // name it. This routes the request; the daemon still judges all of it.
+        let new_id =
+            saiife_touch::credential_from_attestation(&auth_data, &er.rp_id, label, 0, None, "")
+                .map_err(Stop::Touch)?
+                .id;
+        if proof_req.allow.is_empty() {
+            proof_req.allow = vec![new_id.clone()];
+        }
         let proof = k.request(&proof_req).map_err(Stop::Touch)?;
         let mut args = json!({
             "label": label,
@@ -162,9 +171,9 @@ mod cmd {
             args["approval"] = json_of(&approval);
         }
         let done = op(t, "touch.enrol", args)?;
-        // The new id is the proof's: the answer's `id` is the frame's own
-        // (`ok` keeps the frame id), so it never names the credential.
-        let id = base64_url(proof.credential_id());
+        // The new id is the attestation's: the answer's `id` is the frame's
+        // own (`ok` keeps the frame id), so it never names the credential.
+        let id = base64_url(&new_id);
         outln!(
             "enrolled \"{}\" ({})",
             sanitize(s(&done, "label")),
@@ -332,10 +341,16 @@ mod cmd {
 #[cfg(feature = "fido-hid")]
 mod hid;
 
-/// D1: a build without `fido-hid`.
-#[cfg(not(feature = "fido-hid"))]
+/// D1: a build without `fido-hid`, named by its target (R-O).
+#[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
 pub(crate) const NO_KEY_SUPPORT: &str =
     "this saiife build has no FIDO2 key support (a static Linux build); see docs/touch.md";
+#[cfg(all(not(feature = "fido-hid"), windows))]
+pub(crate) const NO_KEY_SUPPORT: &str =
+    "this saiife build has no FIDO2 key support (a Windows build); see docs/touch.md";
+#[cfg(all(not(feature = "fido-hid"), not(target_os = "linux"), not(windows)))]
+pub(crate) const NO_KEY_SUPPORT: &str =
+    "this saiife build has no FIDO2 key support (built without fido-hid); see docs/touch.md";
 
 /// The source of touches, in order: the soft key seam (debug builds only),
 /// the plugged-in FIDO2 key (`fido-hid`), or `Err` (D1). A seam file that is
@@ -593,7 +608,12 @@ mod soft_file {
     }
 
     impl Touch for SoftFile {
+        /// As a real key's non-discoverable credential: with no allow list
+        /// it is not found (C1), where the bare soft key would answer.
         fn request(&self, r: &TouchRequest) -> Result<Assertion, TouchError> {
+            if r.allow.is_empty() {
+                return Err(TouchError::UnknownCredential);
+            }
             let r = r.clone();
             self.touch(move |k| k.request(&r))
         }
@@ -696,6 +716,17 @@ mod tests {
         let e = pick().err().expect("no key source in this build");
         assert!(e.contains("no FIDO2 key support"), "{e}");
         assert_eq!(e, NO_KEY_SUPPORT);
+        let build = if cfg!(target_os = "linux") {
+            "a static Linux build"
+        } else if cfg!(windows) {
+            "a Windows build"
+        } else {
+            "built without fido-hid"
+        };
+        assert_eq!(
+            e,
+            format!("this saiife build has no FIDO2 key support ({build}); see docs/touch.md")
+        );
     }
 
     /// Review Focus 5: a release build ignores the soft key seam.
@@ -750,11 +781,11 @@ mod tests {
             }
         }
 
-        fn request(a: &ActionRecord) -> TouchRequest {
+        fn request(a: &ActionRecord, allow: &[Vec<u8>]) -> TouchRequest {
             TouchRequest {
                 rp_id: LOCAL_RP_ID.into(),
                 challenge: challenge(a),
-                allow: vec![],
+                allow: allow.to_vec(),
                 uv: true,
                 summary: a.summary.clone(),
                 short_code: "000000".into(),
@@ -768,7 +799,11 @@ mod tests {
             let made = SoftFile::create(&p, CoseAlg::Es256).unwrap();
             assert_eq!(made.key.parts().3, 0);
             let a = action(1);
-            let asr = SoftFile::open(&p).unwrap().request(&request(&a)).unwrap();
+            let id = made.key.credential_id();
+            let asr = SoftFile::open(&p)
+                .unwrap()
+                .request(&request(&a, std::slice::from_ref(&id)))
+                .unwrap();
             let again = SoftFile::load(&p).unwrap();
             assert_eq!(again.key.parts().3, 1);
             let cred = again.key.credential(LOCAL_RP_ID, 0, "k");
@@ -787,9 +822,10 @@ mod tests {
             let list = serde_json::json!({ "chain": [pa, pb] });
             std::fs::write(&chain, list.to_string()).unwrap();
             let touch = SoftFile::open(&chain).unwrap();
+            let both = [ka.credential_id(), kb.credential_id()];
             let ids: Vec<Vec<u8>> = (0..3)
                 .map(|i| {
-                    let asr = touch.request(&request(&action(i))).unwrap();
+                    let asr = touch.request(&request(&action(i), &both)).unwrap();
                     asr.credential_id().to_vec()
                 })
                 .collect();
@@ -805,7 +841,10 @@ mod tests {
             v["up"] = false.into();
             std::fs::write(&pa, v.to_string()).unwrap();
             let a = action(9);
-            let asr = SoftFile::open(&pa).unwrap().request(&request(&a)).unwrap();
+            let asr = SoftFile::open(&pa)
+                .unwrap()
+                .request(&request(&a, &both))
+                .unwrap();
             let k = SoftFile::load(&pa).unwrap().key;
             assert!(!k.up);
             assert_eq!(
@@ -819,6 +858,20 @@ mod tests {
                 .unwrap_err(),
                 TouchError::NotPresent
             );
+        }
+
+        /// C1: as a non-discoverable key, no allow list finds nothing.
+        #[test]
+        fn soft_file_needs_an_allow_list() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("key.json");
+            SoftFile::create(&p, CoseAlg::Es256).unwrap();
+            let r = SoftFile::open(&p)
+                .unwrap()
+                .request(&request(&action(1), &[]));
+            assert_eq!(r.err(), Some(TouchError::UnknownCredential));
+            // Nothing was signed: the counter is unchanged.
+            assert_eq!(SoftFile::load(&p).unwrap().key.parts().3, 0);
         }
 
         #[test]

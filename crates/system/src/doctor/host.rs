@@ -1435,6 +1435,7 @@ mod tests {
         let r = t.doctor_opts(DoctorOptions {
             user: Some("bot".into()),
             home: None,
+            ..Default::default()
         });
         let x = r.checks.iter().find(|c| c.id == "user.bot.egress");
         assert!(x.is_none_or(|c| c.detail.contains("run as root")));

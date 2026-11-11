@@ -2368,6 +2368,7 @@ mod tests {
             &DoctorOptions {
                 user: None,
                 home: Some(home.to_path_buf()),
+                ..Default::default()
             },
         )
     }
@@ -3315,6 +3316,7 @@ mod macos_tests {
             DoctorOptions {
                 user: Some("agent".into()),
                 home: None,
+                ..Default::default()
             },
         )
     }
