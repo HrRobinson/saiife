@@ -117,6 +117,11 @@ const IPC_OPS: &[&str] = &[
     "secret.remove",
     "secret.rotate",
     "status",
+    "touch.begin",
+    "touch.check",
+    "touch.enrol",
+    "touch.list",
+    "touch.remove",
 ];
 
 /// Exact string match only: no prefixes, wildcards or case folding. `None` means deny.
