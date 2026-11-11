@@ -726,6 +726,7 @@ fn unknown_guard_ask_rule_is_config_error() {
         version: 1,
         default_on,
         rules: rules.iter().map(|r| r.to_string()).collect(),
+        sha256: None,
     };
     let catalog = [
         pack("core.git", true, &["force-push", "reset-hard"]),
@@ -993,4 +994,145 @@ fn load_system_with_uses_the_given_dropin_dir() {
         Err(PolicyError::Parse { path, .. }) => assert!(path.ends_with("60-bad.toml"), "{path:?}"),
         other => panic!("{other:?}"),
     }
+}
+
+// ---- user packs (plan 32, task 4) ----
+
+const USER_A: &str = "[pack]\nid = \"user.a\"\nversion = 2\n\n\
+    [[deny]]\nid = \"l1-1\"\nask = true\nmatch = \"x\"\nreason = \"r\"\n\n\
+    [[deny]]\nid = \"l1-2\"\nmatch = \"y\"\nreason = \"r\"\n";
+
+/// A temp /etc/saiife with `policy.d/packs/<name>` for each pack.
+fn etc_packs(packs: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let (dir, cfg) = etc("version = 2\n", &[]);
+    let packs_dir = dir.path().join("policy.d/packs");
+    fs::create_dir_all(&packs_dir).unwrap();
+    for (name, text) in packs {
+        fs::write(packs_dir.join(name), text).unwrap();
+    }
+    (dir, cfg)
+}
+
+fn invalid_text(r: Result<saiife_policy::LoadedPolicy, PolicyError>) -> String {
+    match r {
+        Err(PolicyError::Invalid { path, detail }) => format!("{} {detail}", path.display()),
+        Err(other) => panic!("expected Invalid, got {other:?}"),
+        Ok(_) => panic!("expected Invalid, got Ok"),
+    }
+}
+
+#[test]
+fn reads_user_packs_below_policy_d() {
+    let (d, cfg) = etc_packs(&[("user.a.toml", USER_A)]);
+    let p = load_system(&cfg).unwrap();
+    assert_eq!(p.config.user_packs.len(), 1);
+    let u = &p.config.user_packs[0];
+    assert_eq!(u.id, "user.a");
+    assert_eq!(u.version, 2);
+    assert_eq!(u.rules, vec!["l1-1", "l1-2"]);
+    assert_eq!(u.ask, vec!["l1-1"]);
+    assert_eq!(u.text, USER_A);
+    let path = d.path().join("policy.d/packs/user.a.toml");
+    assert_eq!(u.path, path.display().to_string());
+    assert!(p.files.contains(&(u.path.clone(), u.sha256.clone())));
+    assert_eq!(u.sha256.len(), 64);
+    assert!(p.config.guard.ask.contains(&"user.a/l1-1".to_string()));
+    assert!(!p.config.guard.ask.contains(&"user.a/l1-2".to_string()));
+}
+
+#[test]
+fn a_pack_in_policy_d_itself_is_still_a_drop_in_error() {
+    let (_d, cfg) = etc("version = 2\n", &[("user.a.toml", USER_A)]);
+    assert!(matches!(load_system(&cfg), Err(PolicyError::Parse { .. })));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_pack_file_is_refused() {
+    let (d, cfg) = etc_packs(&[]);
+    let target = d.path().join("real.toml");
+    fs::write(&target, USER_A).unwrap();
+    std::os::unix::fs::symlink(&target, d.path().join("policy.d/packs/user.a.toml")).unwrap();
+    let t = invalid_text(load_system(&cfg));
+    assert!(t.contains("user.a.toml"), "{t}");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_packs_dir_is_refused() {
+    let (d, cfg) = etc("version = 2\n", &[]);
+    fs::create_dir(d.path().join("policy.d")).unwrap();
+    let real = d.path().join("real-packs");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, d.path().join("policy.d/packs")).unwrap();
+    let t = invalid_text(load_system(&cfg));
+    assert!(t.contains("packs"), "{t}");
+}
+
+#[test]
+fn pack_text_cap() {
+    let many: Vec<(String, String)> = (0..33)
+        .map(|i| {
+            (
+                format!("user.p{i:02}.toml"),
+                format!("[pack]\nid = \"user.p{i:02}\"\n"),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_d, cfg) = etc_packs(&refs);
+    assert!(invalid_text(load_system(&cfg)).contains("packs"));
+
+    // 257 KiB in total, in files each below the 1 MiB file cap.
+    let pad = format!("# {}\n", "x".repeat(130 * 1024));
+    let a = format!("[pack]\nid = \"user.a\"\n{pad}");
+    let b = format!("[pack]\nid = \"user.b\"\n{pad}");
+    let (_d, cfg) = etc_packs(&[("user.a.toml", &a), ("user.b.toml", &b)]);
+    assert!(invalid_text(load_system(&cfg)).contains("packs"));
+}
+
+#[test]
+fn user_pack_header_rules() {
+    let head = |id: &str| format!("[pack]\nid = \"{id}\"\n");
+    for bad in [
+        "core.git", "user.", "user.-x", "user.A", "user.a_b", "user.a.b",
+    ] {
+        let (_d, cfg) = etc_packs(&[("a.toml", &head(bad))]);
+        let t = invalid_text(load_system(&cfg));
+        assert!(t.contains("a.toml"), "{bad}: {t}");
+    }
+    let long = format!("user.{}", "a".repeat(49));
+    let (_d, cfg) = etc_packs(&[("a.toml", &head(&long))]);
+    invalid_text(load_system(&cfg));
+    let ok = format!("user.{}", "a".repeat(48));
+    let (_d, cfg) = etc_packs(&[("a.toml", &head(&ok))]);
+    load_system(&cfg).unwrap();
+    let (_d, cfg) = etc_packs(&[("a.toml", &head("user.-"))]);
+    invalid_text(load_system(&cfg));
+    // No [pack] id, or not a string.
+    let (_d, cfg) = etc_packs(&[("a.toml", "[pack]\nid = 3\n")]);
+    invalid_text(load_system(&cfg));
+    let (_d, cfg) = etc_packs(&[("a.toml", "version = 1\n")]);
+    invalid_text(load_system(&cfg));
+    // Duplicate id.
+    let (_d, cfg) = etc_packs(&[("a.toml", &head("user.x")), ("b.toml", &head("user.x"))]);
+    let t = invalid_text(load_system(&cfg));
+    assert!(t.contains("b.toml") && t.contains("user.x"), "{t}");
+    // ask without an id.
+    let ask_no_id =
+        "[pack]\nid = \"user.x\"\n[[deny]]\nask = true\nmatch = \"x\"\nreason = \"r\"\n";
+    let (_d, cfg) = etc_packs(&[("a.toml", ask_no_id)]);
+    invalid_text(load_system(&cfg));
+    // version must be an integer >= 1.
+    for v in ["0", "\"2\"", "-1"] {
+        let t = format!("[pack]\nid = \"user.x\"\nversion = {v}\n");
+        let (_d, cfg) = etc_packs(&[("a.toml", &t)]);
+        invalid_text(load_system(&cfg));
+    }
+}
+
+#[test]
+fn user_packs_key_in_config_is_unknown() {
+    let (_d, cfg) = etc("version = 2\nuser_packs = []\n", &[]);
+    assert!(matches!(load_system(&cfg), Err(PolicyError::Parse { .. })));
 }

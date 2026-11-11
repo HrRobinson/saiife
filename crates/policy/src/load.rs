@@ -216,6 +216,21 @@ pub fn load_system_with(
         cfg.example.extend(d.example);
     }
 
+    // User packs (plan 32): read below policy.d/packs, their `ask` rules
+    // merged into `[guard] ask` before the shape check and the warning.
+    cfg.user_packs = crate::userpacks::read_user_packs(
+        &dropin_dir.join(crate::userpacks::USER_PACKS_DIR),
+        &mut files,
+    )?;
+    for u in &cfg.user_packs {
+        for r in &u.ask {
+            let entry = format!("{}/{r}", u.id);
+            if !cfg.guard.ask.contains(&entry) {
+                cfg.guard.ask.push(entry);
+            }
+        }
+    }
+
     validate_services(config_file, &cfg, &service_origin)?;
     validate_environments(config_file, &cfg, &service_origin)?;
     validate_mcp(config_file, &cfg, &mcp_origin)?;
@@ -635,7 +650,7 @@ fn validate_environments(
     Ok(())
 }
 
-fn invalid(path: &Path, detail: impl Into<String>) -> PolicyError {
+pub(crate) fn invalid(path: &Path, detail: impl Into<String>) -> PolicyError {
     PolicyError::Invalid {
         path: path.to_path_buf(),
         detail: detail.into(),
@@ -746,7 +761,7 @@ fn check_dropin_keys(path: &Path, table: &toml::Table) -> Result<(), PolicyError
 /// no drop-ins; a symlinked one is refused, as a symlinked drop-in is.
 /// Dot-files (editor lock links such as emacs `.#a.toml`, hidden backups)
 /// are skipped.
-fn dropin_paths(dropin_dir: &Path) -> Result<Vec<PathBuf>, PolicyError> {
+pub(crate) fn dropin_paths(dropin_dir: &Path) -> Result<Vec<PathBuf>, PolicyError> {
     let dir = dropin_dir.to_path_buf();
     match std::fs::symlink_metadata(&dir) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -780,7 +795,10 @@ fn dropin_paths(dropin_dir: &Path) -> Result<Vec<PathBuf>, PolicyError> {
 
 /// Reads one policy file (regular file, no symlink, at most 1 MiB, UTF-8)
 /// and records its name and SHA-256 in `files`.
-fn read_policy_file(path: &Path, files: &mut Vec<(String, String)>) -> Result<String, PolicyError> {
+pub(crate) fn read_policy_file(
+    path: &Path,
+    files: &mut Vec<(String, String)>,
+) -> Result<String, PolicyError> {
     let bytes = read_regular(path)?;
     let digest = Sha256::digest(&bytes);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -794,7 +812,7 @@ fn read_policy_file(path: &Path, files: &mut Vec<(String, String)>) -> Result<St
 /// Opens `path` without following a symlink and without blocking (a FIFO
 /// cannot hang the load); anything the handle does not show as a regular
 /// file of at most 1 MiB is refused before it is read.
-fn read_regular(path: &Path) -> Result<Vec<u8>, PolicyError> {
+pub(crate) fn read_regular(path: &Path) -> Result<Vec<u8>, PolicyError> {
     let io = |source| PolicyError::Io {
         path: path.to_path_buf(),
         source,

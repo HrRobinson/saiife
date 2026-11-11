@@ -1086,6 +1086,7 @@ mod imp {
                 version,
                 default_on,
                 rules: Vec::new(),
+                sha256: None,
             })
             .collect();
         let (packs, warnings) = active_packs(cfg, &catalog, merged.as_ref());

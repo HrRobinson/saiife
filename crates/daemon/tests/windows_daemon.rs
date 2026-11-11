@@ -566,6 +566,7 @@ fn builtin_catalog() -> Vec<saiife_policy::PackInfo> {
             version: p.version,
             default_on: p.default_on,
             rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+            sha256: None,
         })
         .collect()
 }

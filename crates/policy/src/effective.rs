@@ -14,6 +14,8 @@ pub struct PackInfo {
     /// The ids of its `[[deny]]` rules that have one (for `[guard] ask`);
     /// empty where nobody checks them (the hook).
     pub rules: Vec<String>,
+    /// The SHA-256 of a user pack's file; part of the hash. `None` for built-ins.
+    pub sha256: Option<String>,
 }
 
 /// The pack locked mode always turns on.
@@ -52,10 +54,15 @@ pub fn active_packs(
             }
         }
     }
-    let packs = ids
+    let mut packs: Vec<PackInfo> = ids
         .into_iter()
         .filter_map(|id| catalog.iter().find(|p| p.id == id).cloned())
         .collect();
+    // User packs are always active, after the built-ins, in id order (their
+    // `user.` prefix keeps them out of the catalog).
+    let mut user = crate::userpacks::pack_infos(cfg);
+    user.sort_by(|a, b| a.id.cmp(&b.id));
+    packs.extend(user);
     (packs, warnings)
 }
 
@@ -77,7 +84,10 @@ pub fn effective_policy(
         .unwrap_or(Value::Null);
     let packs: Vec<Value> = packs
         .iter()
-        .map(|p| json!({"id": p.id, "version": p.version}))
+        .map(|p| match &p.sha256 {
+            Some(sha) => json!({"id": p.id, "version": p.version, "sha256": sha}),
+            None => json!({"id": p.id, "version": p.version}),
+        })
         .collect();
     json!({
         "saiife_policy": 1,
@@ -154,6 +164,7 @@ mod tests {
             version,
             default_on,
             rules: Vec::new(),
+            sha256: None,
         };
         vec![
             p("core.git", 1, true),
@@ -363,6 +374,7 @@ mod tests {
             version: 1,
             default_on: false,
             rules: Vec::new(),
+            sha256: None,
         });
         let ids = |text: &str, cat: &[PackInfo]| -> Vec<String> {
             let (packs, w) = active_packs(&cfg(text), cat, None);
@@ -374,5 +386,70 @@ mod tests {
         assert!(!ids("version = 2\n", &cat).contains(&"core.lock".to_string()));
         // A catalog without it: nothing is added, and no warning.
         assert!(!ids("version = 2\nlocked = true\n", &catalog()).contains(&"core.lock".to_string()));
+    }
+
+    /// Taken from the pre-change code (HEAD 321a784, before user packs
+    /// existed): a host with no user packs hashes byte-identically.
+    #[test]
+    fn hash_unchanged_without_user_packs() {
+        assert_eq!(
+            hash_of(&cfg(CFG_A), &catalog(), None),
+            "sha256:d99cd4f512bde96e024c8aa1b3692fcbcd6bd0215cabf6481e823f2a3e070631"
+        );
+        assert_eq!(
+            hash_of(&cfg("version = 2\n"), &catalog(), None),
+            "sha256:d66a7aa520da98b434365e024fe87635ee9dd59f791cf19b629da2b08dc22371"
+        );
+    }
+
+    fn user_pack(id: &str, text: &str, ask: &[&str]) -> crate::userpacks::UserPackFile {
+        use sha2::{Digest, Sha256};
+        crate::userpacks::UserPackFile {
+            path: format!("/etc/saiife/policy.d/packs/{id}.toml"),
+            sha256: Sha256::digest(text.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            text: text.into(),
+            id: id.into(),
+            version: 1,
+            rules: vec!["r1".into()],
+            ask: ask.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn hash_changes_with_user_pack_bytes() {
+        let base = cfg(CFG_A);
+        let mut one = base.clone();
+        one.user_packs = vec![user_pack("user.a", "[pack]\nid = \"user.a\"\n", &[])];
+        let mut two = base.clone();
+        two.user_packs = vec![user_pack("user.a", "[pack]\nid = \"user.a\"\n#", &[])];
+        let (h0, h1, h2) = (
+            hash_of(&base, &catalog(), None),
+            hash_of(&one, &catalog(), None),
+            hash_of(&two, &catalog(), None),
+        );
+        assert_ne!(h0, h1);
+        assert_ne!(h1, h2);
+        assert_ne!(h0, h2);
+        let (packs, _) = active_packs(&one, &catalog(), None);
+        let v = effective_policy(&one, &packs, None, None);
+        let last = v["packs"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["id"], "user.a");
+        assert_eq!(last["sha256"], one.user_packs[0].sha256.as_str());
+    }
+
+    #[test]
+    fn user_packs_are_active_and_askable() {
+        let mut c = cfg("version = 2\n");
+        c.user_packs = vec![user_pack("user.a", "[pack]\nid = \"user.a\"\n", &["r1"])];
+        c.guard.ask.push("user.a/r1".into());
+        assert_eq!(crate::load::check_guard_ask(&c, &catalog()), Ok(()));
+        let (packs, w) = active_packs(&c, &catalog(), None);
+        assert!(w.is_empty());
+        assert!(packs.iter().any(|p| p.id == "user.a" && p.default_on));
+        c.guard.ask.push("user.a/nope".into());
+        assert!(crate::load::check_guard_ask(&c, &catalog()).is_err());
     }
 }
