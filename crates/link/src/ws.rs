@@ -4,11 +4,10 @@
 //!
 //! Keepalive (driven by the caller, normally in a `select!` with `recv`):
 //! call [`WsClient::ping`] every [`PING_INTERVAL`] (25 s) and close the
-//! connection when [`WsClient::pong_overdue`] is true (no pong, or other
-//! proof of life from a pong, for [`PONG_TIMEOUT`] = 60 s). `recv` answers
-//! the server's pings itself and records pongs. `recv` is cancel-safe up to
-//! the point where it replies to a ping or close; drop the client after any
-//! error.
+//! connection when [`WsClient::pong_overdue`] is true (no pong for
+//! [`PONG_TIMEOUT`] = 60 s). `recv` answers the server's pings itself and
+//! records pongs. `recv`, `send` and `ping` are cancel-safe (see
+//! [`WsClient`]); drop the client after any error.
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sha1::{Digest, Sha1};
@@ -246,7 +245,16 @@ fn parse_close(payload: &[u8]) -> Result<Option<u16>, WsError> {
     match payload.len() {
         0 => Ok(None),
         1 => proto("close frame with a one-byte payload"),
-        _ => Ok(Some(u16::from_be_bytes([payload[0], payload[1]]))),
+        _ => {
+            let code = u16::from_be_bytes([payload[0], payload[1]]);
+            if matches!(code, 0..=999 | 1004 | 1005 | 1006 | 1015 | 1016..=2999 | 5000..) {
+                return proto("close code not valid on the wire");
+            }
+            if std::str::from_utf8(&payload[2..]).is_err() {
+                return proto("invalid utf-8 in the close reason");
+            }
+            Ok(Some(code))
+        }
     }
 }
 
@@ -312,6 +320,15 @@ fn no_crlf(s: &str) -> Result<(), WsError> {
 }
 
 /// A client-side WebSocket connection.
+///
+/// Cancel safety: `recv`, `send` and `ping` may be dropped at any await
+/// point (e.g. losing a `select!`) without corrupting the stream. Reads
+/// append to a persistent buffer and parse from it; everything that is
+/// written goes through one outgoing frame buffer with a write cursor, and
+/// the next call of `send`, `ping` or `recv` first resumes a partial write.
+/// Control replies (pong, Close echo) are queued, a newer pending pong
+/// replaces an older one (RFC 6455 section 5.5.3). A cancelled `send` or
+/// `ping` may still be delivered later, so do not blindly retry it.
 pub struct WsClient<S> {
     stream: S,
     buf: Vec<u8>,
@@ -319,6 +336,12 @@ pub struct WsClient<S> {
     last_pong: Instant,
     /// `(is_text, bytes so far)` of an open fragmented message.
     frag: Option<(bool, Vec<u8>)>,
+    /// The frame being written and how much of it is out.
+    out: Vec<u8>,
+    out_pos: usize,
+    /// Queued control replies, written (pong first) once `out` is empty.
+    pending_pong: Option<Vec<u8>>,
+    pending_close: Option<Vec<u8>>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
@@ -373,18 +396,74 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
             closed: false,
             last_pong: Instant::now(),
             frag: None,
+            out: Vec::new(),
+            out_pos: 0,
+            pending_pong: None,
+            pending_close: None,
         })
     }
 
-    async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WsError> {
-        let f = encode_frame(true, opcode, payload, Some(random::<4>()?));
-        self.stream.write_all(&f).await?;
+    /// Write out everything queued, resuming a partial write. An I/O error
+    /// closes the connection.
+    async fn flush_out(&mut self) -> Result<(), WsError> {
+        let r = self.flush_inner().await;
+        if matches!(r, Err(WsError::Io(_))) {
+            // The pipe is dead: drop what was queued so later calls say Closed.
+            self.closed = true;
+            self.out.clear();
+            self.out_pos = 0;
+            self.pending_pong = None;
+            self.pending_close = None;
+        }
+        r
+    }
+
+    async fn flush_inner(&mut self) -> Result<(), WsError> {
+        loop {
+            while self.out_pos < self.out.len() {
+                // `write` either writes (and we advance) or is Pending
+                // having written nothing, so dropping it here is safe.
+                let n = self.stream.write(&self.out[self.out_pos..]).await?;
+                if n == 0 {
+                    return Err(WsError::Io(std::io::ErrorKind::WriteZero.into()));
+                }
+                self.out_pos += n;
+            }
+            self.out.clear();
+            self.out_pos = 0;
+            if let Some(p) = self.pending_pong.take() {
+                self.out = p;
+            } else if let Some(c) = self.pending_close.take() {
+                self.out = c;
+            } else {
+                break;
+            }
+        }
         self.stream.flush().await?;
         Ok(())
     }
 
-    /// Client frames are always masked with a fresh random key.
+    /// `flush_out` bounded to one second (close echoes, failure closes).
+    async fn flush_bounded(&mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.flush_out()).await;
+    }
+
+    /// Queue one masked frame (a fresh random key) and write it.
+    async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WsError> {
+        self.flush_out().await?;
+        if self.closed {
+            return Err(WsError::Closed);
+        }
+        self.out = encode_frame(true, opcode, payload, Some(random::<4>()?));
+        self.out_pos = 0;
+        self.flush_out().await
+    }
+
+    /// Client frames are always masked with a fresh random key. Cancel-safe
+    /// (see the type docs). After a client-initiated `Close`, `recv` returns
+    /// `Closed` without waiting for the server's Close.
     pub async fn send(&mut self, m: Message) -> Result<(), WsError> {
+        self.flush_out().await?;
         if self.closed {
             return Err(WsError::Closed);
         }
@@ -402,17 +481,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
                 self.write_frame(OP_BIN, &b).await
             }
             Message::Close(c) => {
+                self.out = encode_frame(true, OP_CLOSE, &close_payload(c), Some(random::<4>()?));
+                self.out_pos = 0;
                 self.closed = true;
-                self.write_frame(OP_CLOSE, &close_payload(c)).await
+                self.flush_out().await
             }
         }
     }
 
-    /// Send a ping (call every [`PING_INTERVAL`]).
+    /// Send a ping (call every [`PING_INTERVAL`]). Cancel-safe.
     pub async fn ping(&mut self) -> Result<(), WsError> {
-        if self.closed {
-            return Err(WsError::Closed);
-        }
         self.write_frame(OP_PING, b"").await
     }
 
@@ -434,20 +512,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
     async fn fail(&mut self, code: u16, e: WsError) -> WsError {
         if !self.closed {
             self.closed = true;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(1),
-                self.write_frame(OP_CLOSE, &code.to_be_bytes()),
-            )
-            .await;
+            if let Ok(k) = random::<4>() {
+                self.pending_close =
+                    Some(encode_frame(true, OP_CLOSE, &code.to_be_bytes(), Some(k)));
+                self.flush_bounded().await;
+            }
         }
         e
     }
 
     /// The next data message. Reassembles fragments, answers pings, notes
     /// pongs, answers a Close with a Close and returns `Message::Close`;
-    /// afterwards every call is `Closed`.
+    /// afterwards every call is `Closed`. Cancel-safe (see the type docs):
+    /// a ping read before cancellation is answered by the next call.
     pub async fn recv(&mut self) -> Result<Message, WsError> {
         loop {
+            self.flush_out().await?;
             if self.closed {
                 return Err(WsError::Closed);
             }
@@ -460,8 +540,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
                     return Err(e);
                 }
             };
-            match self.step(f).await {
-                Ok(Some(m)) => return Ok(m),
+            match self.step(f) {
+                Ok(Some(m)) => {
+                    if matches!(m, Message::Close(_)) {
+                        self.flush_bounded().await; // the echo
+                    }
+                    return Ok(m);
+                }
                 Ok(None) => {}
                 Err(e @ WsError::TooLarge) => return Err(self.fail(1009, e).await),
                 Err(e @ WsError::Protocol(_)) => return Err(self.fail(1002, e).await),
@@ -470,10 +555,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
         }
     }
 
-    async fn step(&mut self, f: RawFrame) -> Result<Option<Message>, WsError> {
+    /// Handle one frame; replies are only queued, never written here.
+    fn step(&mut self, f: RawFrame) -> Result<Option<Message>, WsError> {
         match f.opcode {
             OP_PING => {
-                self.write_frame(OP_PONG, &f.payload).await?;
+                self.pending_pong = Some(encode_frame(
+                    true,
+                    OP_PONG,
+                    &f.payload,
+                    Some(random::<4>()?),
+                ));
                 Ok(None)
             }
             OP_PONG => {
@@ -483,8 +574,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
             OP_CLOSE => {
                 let code = parse_close(&f.payload)?;
                 self.closed = true;
-                // Echo the code; failure to deliver the echo is not an error.
-                let _ = self.write_frame(OP_CLOSE, &close_payload(code)).await;
+                self.pending_close = Some(encode_frame(
+                    true,
+                    OP_CLOSE,
+                    &close_payload(code),
+                    Some(random::<4>()?),
+                ));
                 Ok(Some(Message::Close(code)))
             }
             OP_TEXT | OP_BIN => {
@@ -658,6 +753,7 @@ pub mod server_side {
 mod tests {
     use super::server_side::{accept, AcceptOpts, ServerWs};
     use super::*;
+    use std::time::Duration;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     async fn pair_with(
@@ -680,6 +776,17 @@ mod tests {
         (c.unwrap(), s.unwrap())
     }
 
+    /// Like `pair` with a tiny duplex buffer, so writes can fill up.
+    async fn small_pair(size: usize) -> (WsClient<DuplexStream>, ServerWs<DuplexStream>) {
+        let (c, s) = duplex(size);
+        let hdrs: [(&str, String); 0] = [];
+        let (cl, sv) = tokio::join!(
+            WsClient::handshake(c, "h", "/", &hdrs),
+            accept(s, AcceptOpts::default())
+        );
+        (cl.unwrap(), sv.unwrap().0)
+    }
+
     #[test]
     fn accept_key_rfc_example() {
         assert_eq!(
@@ -700,6 +807,7 @@ mod tests {
         let mut b = [0u8; 1024];
         while !got.windows(4).any(|w| w == b"\r\n\r\n") {
             let n = s.read(&mut b).await.unwrap();
+            assert!(n > 0, "peer closed before the head was complete");
             got.extend_from_slice(&b[..n]);
         }
         let t = String::from_utf8(got).unwrap();
@@ -859,7 +967,8 @@ mod tests {
         s.send_raw(&h).await.unwrap();
         assert!(matches!(c.recv().await, Err(WsError::TooLarge)));
         assert!(matches!(c.recv().await, Err(WsError::Closed)));
-        assert_eq!(s.recv_frame().await.unwrap().opcode, 0x8);
+        let f = s.recv_frame().await.unwrap();
+        assert_eq!((f.opcode, f.payload), (0x8, 1009u16.to_be_bytes().to_vec()));
     }
 
     #[tokio::test]
@@ -885,7 +994,12 @@ mod tests {
     async fn refused(raw: &[u8]) -> WsError {
         let (mut c, mut s) = pair().await;
         s.send_raw(raw).await.unwrap();
-        c.recv().await.unwrap_err()
+        let e = c.recv().await.unwrap_err();
+        if matches!(e, WsError::Protocol(_)) {
+            let f = s.recv_frame().await.unwrap();
+            assert_eq!((f.opcode, f.payload), (0x8, 1002u16.to_be_bytes().to_vec()));
+        }
+        e
     }
 
     #[tokio::test]
@@ -920,6 +1034,16 @@ mod tests {
         // a new data frame while a fragmented message is open
         assert!(matches!(
             refused(&[0x01, 0x01, b'a', 0x81, 0x01, b'b']).await,
+            WsError::Protocol(_)
+        ));
+        // close codes never valid on the wire, and a bad close reason
+        for code in [999u16, 1004, 1005, 1006, 1015, 1016, 2999, 5000] {
+            let mut f = vec![0x88, 0x02];
+            f.extend_from_slice(&code.to_be_bytes());
+            assert!(matches!(refused(&f).await, WsError::Protocol(_)), "{code}");
+        }
+        assert!(matches!(
+            refused(&[0x88, 0x04, 0x03, 0xE8, 0xC3, 0x28]).await,
             WsError::Protocol(_)
         ));
         // one-byte close payload
@@ -983,6 +1107,7 @@ mod tests {
         let mut b = [0u8; 1024];
         while !got.windows(4).any(|w| w == b"\r\n\r\n") {
             let n = s.read(&mut b).await.unwrap();
+            assert!(n > 0, "peer closed before the head was complete");
             got.extend_from_slice(&b[..n]);
         }
         let t = String::from_utf8(got).unwrap();
@@ -995,5 +1120,62 @@ mod tests {
         s.write_all(&resp).await.unwrap();
         let mut ws = h.await.unwrap().unwrap();
         assert!(matches!(ws.recv().await.unwrap(), Message::Text(t) if t == "ok"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recv_with_full_write_side_loses_nothing() {
+        let (mut c, mut s) = small_pair(256).await;
+        // Five whole 50-byte frames leave 6 bytes of the 256-byte pipe free.
+        for i in 0..5u8 {
+            c.send(Message::Binary(vec![i; 44])).await.unwrap();
+        }
+        // The pong (7 bytes) cannot fit: recv reads the ping, queues the pong,
+        // writes 6 of its 7 bytes, stalls, and is dropped by the timeout.
+        s.send_frame(true, 0x9, b"a").await.unwrap();
+        let r = tokio::time::timeout(Duration::from_millis(50), c.recv()).await;
+        assert!(r.is_err(), "recv should stall on the full pipe");
+        // The next ping resumes the half-written pong first; the server drains.
+        let (r, frames) = tokio::join!(c.ping(), async {
+            let mut v = Vec::new();
+            for _ in 0..7 {
+                v.push(s.recv_frame().await.unwrap());
+            }
+            v
+        });
+        r.unwrap();
+        for (i, f) in frames[..5].iter().enumerate() {
+            assert_eq!((f.opcode, &f.payload), (0x2, &vec![i as u8; 44]));
+        }
+        assert_eq!(
+            (frames[5].opcode, frames[5].payload.as_slice()),
+            (0xA, &b"a"[..])
+        );
+        assert_eq!(frames[6].opcode, 0x9);
+    }
+
+    #[tokio::test]
+    async fn newer_ping_replaces_pending_pong() {
+        let (mut c, mut s) = pair().await;
+        s.send_frame(true, 0x9, b"1").await.unwrap();
+        s.send_frame(true, 0x9, b"2").await.unwrap();
+        s.send(Message::Text("x".into())).await.unwrap();
+        // recv flushes before each read, so both pongs are written; the
+        // replacement rule only applies while one is still queued.
+        assert!(matches!(c.recv().await.unwrap(), Message::Text(_)));
+        let a = s.recv_frame().await.unwrap();
+        let b = s.recv_frame().await.unwrap();
+        assert_eq!((a.payload, b.payload), (b"1".to_vec(), b"2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn io_error_on_control_reply_closes() {
+        let (mut c, mut s) = pair().await;
+        s.send_frame(true, 0x9, b"a").await.unwrap();
+        s.send(Message::Text("x".into())).await.unwrap();
+        drop(s);
+        // The pong write may fail or not depending on the half-closed pipe;
+        // either way the client ends up Closed, never panicking or hanging.
+        let _ = c.recv().await;
+        assert!(matches!(c.recv().await, Err(WsError::Closed)));
     }
 }
