@@ -255,15 +255,15 @@ impl MachineHandshake {
         browser_sig: Option<&[u8; 64]>,
         device_pub: Option<&[u8; 65]>,
     ) -> Result<Channel, WireError> {
-        let pairing_only = match (browser_sig, device_pub) {
+        let device_id = match (browser_sig, device_pub) {
             (Some(sig), Some(pk)) => {
                 let msg = handshake_msg(&self.session_id, &self.eph_pub, browser_eph);
                 if !verify_p256_domain(pk, HANDSHAKE_DOMAIN, &msg, sig) {
                     return Err(WireError::Seal("bad handshake signature".into()));
                 }
-                false
+                Some(crate::sig::device_id_of(pk))
             }
-            (None, None) => true,
+            (None, None) => None,
             _ => {
                 return Err(WireError::Seal(
                     "signature and device key go together".into(),
@@ -277,7 +277,7 @@ impl MachineHandshake {
         )
         .map_err(|_| WireError::Seal("bad browser key".into()))?;
         let keys = keys_from_shared(&shared, &self.eph_pub, browser_eph, &self.session_id)?;
-        Channel::from_keys(&keys, pairing_only)
+        Channel::from_keys(&keys, device_id)
     }
 }
 
@@ -292,14 +292,16 @@ fn handshake_msg(session_id: &[u8; 16], machine_eph: &[u8; 65], browser_eph: &[u
 /// The machine end of a sealed session.
 pub struct Channel {
     core: Core,
-    pairing_only: bool,
+    /// The device whose key signed the handshake; `None` for a pairing
+    /// session.
+    device_id: Option<String>,
 }
 
 impl Channel {
-    fn from_keys(keys: &[u8; 64], pairing_only: bool) -> Result<Channel, WireError> {
+    fn from_keys(keys: &[u8; 64], device_id: Option<String>) -> Result<Channel, WireError> {
         Ok(Channel {
             core: Core::new(keys, true)?,
-            pairing_only,
+            device_id,
         })
     }
 
@@ -315,7 +317,14 @@ impl Channel {
     }
 
     pub fn pairing_only(&self) -> bool {
-        self.pairing_only
+        self.device_id.is_none()
+    }
+
+    /// The id of the device whose key signed the handshake
+    /// (`device_id_of(device_pub)`); `None` for a pairing session. Link
+    /// passes it as `channel_device` with every hub frame.
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 }
 
@@ -654,6 +663,15 @@ mod tests {
     }
 
     #[test]
+    fn channel_names_its_device() {
+        let d = TestDevice::generate();
+        let (m, _) = session(Some(&d));
+        assert_eq!(m.device_id(), Some(d.device_id().as_str()));
+        let (m, _) = session(None);
+        assert_eq!(m.device_id(), None);
+    }
+
+    #[test]
     fn pairing_session_is_flagged() {
         let (mut m, mut b) = session(None);
         assert!(m.pairing_only());
@@ -672,7 +690,7 @@ mod tests {
         let sid = crate::b64::dec_n::<16>(&s("session_id")).unwrap();
         let keys = keys_from_shared(&shared, &meph, &beph, &sid).unwrap();
         assert_eq!(crate::b64::hex(&keys), s("keys_hex"));
-        let mut m = Channel::from_keys(&keys, false).unwrap();
+        let mut m = Channel::from_keys(&keys, Some("d-vector".into())).unwrap();
         let mut b = BrowserChannel(Core::new(&keys, false).unwrap());
         for msg in v["messages"].as_array().unwrap() {
             let plain = msg["plaintext"].as_str().unwrap().as_bytes();
