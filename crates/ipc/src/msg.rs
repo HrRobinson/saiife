@@ -231,7 +231,8 @@ pub const OP_BOX_PR: &str = "box.pr";
 pub const OP_BOX_SPAWN: &str = "box.spawn";
 pub const OP_BOX_TEMPLATES: &str = "box.templates";
 pub const OP_BOX_INBOX: &str = "box.inbox";
-/// `saiife box done` (control socket, machine local): `{id}` -> `BoxInfo`.
+/// `saiife box done` (control socket, machine local): `{box}` -> `{box: BoxInfo}`.
+/// (A per-box op names its box `box`: the frame's own `id` is the request's.)
 /// A Running box becomes Done.
 pub const OP_BOX_DONE: &str = "box.done";
 /// Removes discarded boxes and orphan box dirs (control socket, machine

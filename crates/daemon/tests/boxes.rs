@@ -256,17 +256,17 @@ const EVERY_OP: [(&str, &str); 14] = [
     ),
     ("box.list", "{}"),
     ("box.templates", "{}"),
-    ("box.pause", r#"{"id":"b1"}"#),
-    ("box.stop", r#"{"id":"b1"}"#),
-    ("box.discard", r#"{"id":"b1"}"#),
-    ("box.done", r#"{"id":"b1"}"#),
-    ("box.resume", r#"{"id":"b1"}"#),
-    ("box.revise", r#"{"id":"b1","comment":"c"}"#),
-    ("box.steer", r#"{"id":"b1","msg":"m"}"#),
+    ("box.pause", r#"{"box":"b1"}"#),
+    ("box.stop", r#"{"box":"b1"}"#),
+    ("box.discard", r#"{"box":"b1"}"#),
+    ("box.done", r#"{"box":"b1"}"#),
+    ("box.resume", r#"{"box":"b1"}"#),
+    ("box.revise", r#"{"box":"b1","comment":"c"}"#),
+    ("box.steer", r#"{"box":"b1","msg":"m"}"#),
     ("box.reorder", r#"{"ids":[]}"#),
     ("box.gc", "{}"),
-    ("box.diff", r#"{"id":"b1"}"#),
-    ("box.term.read", r#"{"id":"b1"}"#),
+    ("box.diff", r#"{"box":"b1"}"#),
+    ("box.term.read", r#"{"box":"b1"}"#),
 ];
 
 #[tokio::test]
@@ -304,7 +304,7 @@ async fn spawn_list_stop_roundtrip() {
         (l["slots_total"].as_u64(), l["slots_free"].as_u64()),
         (Some(2), Some(1))
     );
-    let s = w.ok(ALICE, "box.stop", json!({"id": "b1"})).await;
+    let s = w.ok(ALICE, "box.stop", json!({"box": "b1"})).await;
     assert_eq!(
         (s["box"]["id"].as_str(), s["box"]["state"].as_str()),
         (Some("b1"), Some("done")),
@@ -313,7 +313,7 @@ async fn spawn_list_stop_roundtrip() {
     let l = w.ok(ALICE, "box.list", json!({})).await;
     assert_eq!(l["boxes"][0]["state"], "done");
     assert_eq!(l["slots_free"], 2);
-    let d = w.ok(ALICE, "box.discard", json!({"id": "b1"})).await;
+    let d = w.ok(ALICE, "box.discard", json!({"box": "b1"})).await;
     assert_eq!(d["box"]["id"], "b1", "{d}");
     let l = w.ok(ALICE, "box.list", json!({})).await;
     assert!(l["boxes"].as_array().unwrap().is_empty(), "{l}");
@@ -343,14 +343,14 @@ async fn spawn_is_recorded_with_session() {
 async fn other_user_gets_not_found() {
     let w = world();
     let b = w.running(ALICE, "add a cart").await;
-    let missing = w.call(BOB, "box.stop", json!({"id": "b9"})).await;
+    let missing = w.call(BOB, "box.stop", json!({"box": "b9"})).await;
     assert_refused(&missing, "bad_request", "not_found");
     for (op, args) in [
-        ("box.stop", json!({"id": b})),
-        ("box.steer", json!({"id": b, "msg": "hi"})),
-        ("box.diff", json!({"id": b})),
-        ("box.pause", json!({"id": b})),
-        ("box.term.read", json!({"id": b})),
+        ("box.stop", json!({"box": b})),
+        ("box.steer", json!({"box": b, "msg": "hi"})),
+        ("box.diff", json!({"box": b})),
+        ("box.pause", json!({"box": b})),
+        ("box.term.read", json!({"box": b})),
     ] {
         let a = w.call(BOB, op, args).await;
         assert_refused(&a, "bad_request", "not_found");
@@ -390,7 +390,7 @@ async fn admin_sees_all() {
     let l = w.ok(ALICE, "box.list", json!({"all": true})).await;
     assert_eq!(l["boxes"].as_array().unwrap().len(), 1, "{l}");
     // An admin may act on another user's box.
-    let s = w.ok(CAROL, "box.stop", json!({"id": "b2"})).await;
+    let s = w.ok(CAROL, "box.stop", json!({"box": "b2"})).await;
     assert_eq!(s["box"]["state"], "done", "{s}");
 }
 
@@ -410,9 +410,9 @@ async fn lockdown_refuses_power_ops_only() {
         .unwrap();
     let before = w.records().len();
     // Allowed: they only take power away.
-    let p = w.ok(ALICE, "box.pause", json!({"id": b1})).await;
+    let p = w.ok(ALICE, "box.pause", json!({"box": b1})).await;
     assert_eq!(p["box"]["state"], "paused");
-    let s = w.ok(ALICE, "box.stop", json!({"id": b2})).await;
+    let s = w.ok(ALICE, "box.stop", json!({"box": b2})).await;
     assert_eq!(s["box"]["state"], "done");
     w.ok(ALICE, "box.list", json!({})).await;
     w.ok(ALICE, "box.templates", json!({})).await;
@@ -422,14 +422,14 @@ async fn lockdown_refuses_power_ops_only() {
             "box.spawn",
             json!({"template": "claude-code", "repo": "shop", "task": "x", "start": "queue"}),
         ),
-        ("box.resume", json!({"id": b1})),
-        ("box.revise", json!({"id": b2, "comment": "more"})),
-        ("box.steer", json!({"id": b1, "msg": "go"})),
+        ("box.resume", json!({"box": b1})),
+        ("box.revise", json!({"box": b2, "comment": "more"})),
+        ("box.steer", json!({"box": b1, "msg": "go"})),
     ] {
         let a = w.call(ALICE, op, args).await;
         assert_refused(&a, "lockdown", "lockdown");
     }
-    let d = w.ok(ALICE, "box.discard", json!({"id": b2})).await;
+    let d = w.ok(ALICE, "box.discard", json!({"box": b2})).await;
     assert_eq!(d["box"]["id"], b2.as_str());
     // Nothing moved behind the refusals.
     assert_eq!(
@@ -461,7 +461,7 @@ async fn lockdown_refuses_power_ops_only() {
 async fn bad_id_is_bad_request() {
     let w = world();
     w.spawn(ALICE, "one").await;
-    for args in [json!({"id": "../b1"}), json!({"id": 1}), json!({})] {
+    for args in [json!({"box": "../b1"}), json!({"box": 1}), json!({})] {
         let a = w.call(ALICE, "box.stop", args).await;
         assert_refused(&a, "bad_request", "invalid");
     }
@@ -501,7 +501,7 @@ async fn escape_in_task_is_bad_request() {
     // A steer with a control character never reaches the manager.
     w.mgr().guest_event(&id("b1"), GuestEvent::Ready).unwrap();
     let a = w
-        .call(ALICE, "box.steer", json!({"id": "b1", "msg": "x\u{7}"}))
+        .call(ALICE, "box.steer", json!({"box": "b1", "msg": "x\u{7}"}))
         .await;
     assert_refused(&a, "bad_request", "invalid");
 }
@@ -527,9 +527,9 @@ async fn spawn_now_is_strict() {
         (Some("b3"), Some("queued"))
     );
     assert_eq!(q["box"]["queue_pos"], 1);
-    let a = w.call(ALICE, "box.stop", json!({"id": "b3"})).await;
+    let a = w.call(ALICE, "box.stop", json!({"box": "b3"})).await;
     assert_refused(&a, "bad_request", "wrong_state");
-    w.ok(ALICE, "box.discard", json!({"id": "b3"})).await;
+    w.ok(ALICE, "box.discard", json!({"box": "b3"})).await;
 }
 
 #[tokio::test]
@@ -565,7 +565,7 @@ async fn spawn_records_the_heads_it_admits() {
     w.running(ALICE, "two").await;
     let q = w.spawn(BOB, "three").await;
     assert_eq!(q["box"]["state"], "queued");
-    w.ok(ALICE, "box.stop", json!({"id": b1})).await;
+    w.ok(ALICE, "box.stop", json!({"box": b1})).await;
     let before = w.records().len();
     let a = w.spawn(ALICE, "four").await;
     assert_eq!(a["box"]["id"], "b4");

@@ -55,6 +55,7 @@ jobs:
         run: |
           cargo test -p saiife-boxes --features fake --no-fail-fast
           cargo test -p saiife-daemon --features fake-vmm --test boxes
+          cargo test -p saiife --features fake-vmm --test box_cmd
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}

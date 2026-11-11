@@ -258,7 +258,7 @@ fn build_fake(
         guest: Arc::new(FakeGuest::new()),
         templates,
         host: Arc::new(move || match &pinned {
-            Some(h) => h.clone(),
+            Some(h) => *h,
             None => host_facts(&root, &prev),
         }),
         clock: Arc::new(unix_now),
@@ -315,8 +315,38 @@ pub fn start_tick(ctx: Arc<Ctx>) {
             tick.tick().await;
             let Some(ctx) = weak.upgrade() else { break };
             tick_once(&ctx).await;
+            #[cfg(feature = "fake-vmm")]
+            fake_ready(&ctx).await;
         }
     });
+}
+
+/// The fake VM "boots" at once: its guest says `Ready` for every box that
+/// is Starting, at the next tick (there is no guest process to say it). Test
+/// builds only; the CLI tests need a Running box. Recorded like any tick
+/// change.
+#[cfg(feature = "fake-vmm")]
+async fn fake_ready(ctx: &Ctx) {
+    let Some(mgr) = ctx.box_manager.clone() else {
+        return;
+    };
+    let done = tokio::task::spawn_blocking(move || {
+        mgr.list()
+            .into_iter()
+            .filter(|r| r.state == BoxState::Starting)
+            .filter_map(|r| {
+                let c = mgr
+                    .guest_event(&r.id, saiife_boxes::guest::GuestEvent::Ready)
+                    .ok()
+                    .flatten()?;
+                Some((c, Some(r.template)))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    if let Ok(changes) = done {
+        write_tick_records(ctx, changes).await;
+    }
 }
 
 /// One tick: the manager's tick off the runtime thread, then one `box`
@@ -422,9 +452,9 @@ fn invalid(why: &str) -> BoxError {
 }
 
 fn arg_id(args: &Map<String, Value>) -> Result<BoxId, BoxError> {
-    match args.get("id") {
+    match args.get("box") {
         Some(Value::String(s)) => BoxId::parse(s),
-        _ => Err(invalid("id must be a box id")),
+        _ => Err(invalid("box must be a box id")),
     }
 }
 
