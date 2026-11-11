@@ -2,6 +2,8 @@
 //! pattern of crates/daemon/tests/workspace_link.rs).
 #![allow(dead_code)]
 
+pub mod http;
+
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::ops::{self, Ctx, CtxInit, Mode as DaemonMode};
 use saiife_daemon::workspace::{dir_in, now_secs, Workspace};

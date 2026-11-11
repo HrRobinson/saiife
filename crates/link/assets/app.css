@@ -37,3 +37,4 @@ label{display:block;margin:12px 0 4px;color:var(--muted)}
 #toast{position:fixed;left:16px;right:16px;bottom:16px;max-width:688px;margin:0 auto;pointer-events:none}
 #toast:empty{display:none}
 #toast>*{background:var(--fg);color:var(--bg);padding:8px 12px;border-radius:6px}
+.code{font:700 2.4rem/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.08em;margin:16px 0}

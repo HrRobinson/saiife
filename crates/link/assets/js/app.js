@@ -6,7 +6,7 @@ import { render as review } from "./views/placeholder.js";
 import { render as steer } from "./views/placeholder.js";
 import { render as inbox } from "./views/placeholder.js";
 import { render as spawn } from "./views/placeholder.js";
-import { render as pair } from "./views/placeholder.js";
+import { render as pair } from "./views/pair.js";
 
 const BOX_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
@@ -32,8 +32,23 @@ export function parse(hash) {
 
 let latest = 0;
 
+// A pairing link "#pair=<offer>": the secret leaves the address bar and
+// this history entry at once (replaceState fires no hashchange), before any
+// await; the pair view gets it in memory.
+function takeFragment() {
+  const hash = String(location.hash || "");
+  if (!hash.startsWith("#pair=")) return null;
+  history.replaceState(null, "", location.pathname);
+  return hash;
+}
+
 async function route() {
   const mine = ++latest;
+  const fragment = takeFragment();
+  if (fragment !== null) {
+    mount(pair({ name: "pair", fragment }));
+    return;
+  }
   let r = parse(location.hash);
   if (r.name !== "pair" && !(await paired())) {
     // The hashchange this triggers renders the pair screen.
