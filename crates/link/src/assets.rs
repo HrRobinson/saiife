@@ -53,6 +53,9 @@ pub static ASSETS: &[Asset] = &[
     asset!("js/dom.js"),
     asset!("js/format.js"),
     asset!("js/views/placeholder.js"),
+    asset!("js/actions.js"),
+    asset!("js/keystore.js"),
+    asset!("js/wire.js"),
 ];
 
 /// The strong ETag: `"` + the first 16 hex digits of SHA-256(bytes) + `"`.

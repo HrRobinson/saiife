@@ -1,5 +1,6 @@
 // Hash router. An unpaired browser always lands on #/pair.
 import { mount, h } from "./dom.js";
+import { loadDevice } from "./keystore.js";
 import { render as overview } from "./views/placeholder.js";
 import { render as review } from "./views/placeholder.js";
 import { render as steer } from "./views/placeholder.js";
@@ -9,48 +10,9 @@ import { render as pair } from "./views/placeholder.js";
 
 const BOX_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
-// Reads the device record from IndexedDB; any error or absence means unpaired.
-// The probe has no side effect: if the database does not exist yet, the open
-// would create an empty one and block the keystore's own upgrade, so the
-// upgrade handler aborts the transaction (nothing is created) and says false.
-export function paired() {
-  return new Promise((resolve) => {
-    try {
-      const open = indexedDB.open("saiife-workspace");
-      open.onerror = () => resolve(false);
-      open.onblocked = () => resolve(false);
-      open.onupgradeneeded = () => {
-        try {
-          open.transaction.abort();
-        } catch {
-          // already gone
-        }
-        resolve(false);
-      };
-      open.onsuccess = () => {
-        try {
-          const db = open.result;
-          if (!db.objectStoreNames.contains("keys")) {
-            db.close();
-            return resolve(false);
-          }
-          const get = db.transaction("keys", "readonly").objectStore("keys").get("device");
-          get.onsuccess = () => {
-            db.close();
-            resolve(get.result !== undefined && get.result !== null);
-          };
-          get.onerror = () => {
-            db.close();
-            resolve(false);
-          };
-        } catch {
-          resolve(false);
-        }
-      };
-    } catch {
-      resolve(false);
-    }
-  });
+// Unpaired unless the keystore holds a device record (loadDevice never throws).
+export async function paired() {
+  return (await loadDevice()) !== null;
 }
 
 // Maps a hash to a route; unknown hashes and bad box ids become the overview.
