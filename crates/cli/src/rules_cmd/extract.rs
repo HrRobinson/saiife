@@ -193,7 +193,7 @@ fn is_path_like(s: &str) -> bool {
     }
 }
 
-fn span_target(span: &str, access: RuleAccess) -> Option<Target> {
+pub(crate) fn span_target(span: &str, access: RuleAccess) -> Option<Target> {
     let span = span.trim();
     if is_path_like(span) {
         return Some(Target::Path {
