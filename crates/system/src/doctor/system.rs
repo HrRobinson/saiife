@@ -378,29 +378,35 @@ fn paths_owner(ctx: &Ctx) -> Check {
         .map(|p| fixed(&p.display().to_string()))
         .collect();
     paths.extend([ETC_DIR, CONFIG, POLICY_D].map(fixed));
-    let policy_d = ctx.layout.at(POLICY_D);
-    match fs::read_dir(&policy_d) {
-        Ok(rd) => {
-            let mut names = Vec::new();
-            for e in rd {
-                match e {
-                    Ok(e) => names.push(e.file_name()),
-                    Err(e) => t.bad(format!("{POLICY_D}: cannot list: {e}")),
+    // The drop-ins, then the user packs below them (plan 32).
+    for dir_const in [POLICY_D, POLICY_PACKS_D] {
+        let policy_d = ctx.layout.at(dir_const);
+        if dir_const == POLICY_PACKS_D {
+            paths.push(fixed(POLICY_PACKS_D));
+        }
+        match fs::read_dir(&policy_d) {
+            Ok(rd) => {
+                let mut names = Vec::new();
+                for e in rd {
+                    match e {
+                        Ok(e) => names.push(e.file_name()),
+                        Err(e) => t.bad(format!("{dir_const}: cannot list: {e}")),
+                    }
                 }
+                // Every drop-in the loader reads, whatever its name's encoding.
+                names.retain(|n| Path::new(n).extension().is_some_and(|x| x == "toml"));
+                names.sort();
+                paths.extend(names.into_iter().map(|n| {
+                    let shown = format!("{dir_const}/{}", n.to_string_lossy());
+                    (shown, policy_d.join(n))
+                }));
             }
-            // Every drop-in the loader reads, whatever its name's encoding.
-            names.retain(|n| Path::new(n).extension().is_some_and(|x| x == "toml"));
-            names.sort();
-            paths.extend(names.into_iter().map(|n| {
-                let shown = format!("{POLICY_D}/{}", n.to_string_lossy());
-                (shown, policy_d.join(n))
-            }));
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
+                t.unchecked.push(format!("{dir_const}/*.toml"))
+            }
+            Err(e) => t.bad(format!("{dir_const}: cannot list: {e}")),
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
-            t.unchecked.push(format!("{POLICY_D}/*.toml"))
-        }
-        Err(e) => t.bad(format!("{POLICY_D}: cannot list: {e}")),
     }
     paths.push(fixed(INSTALLED));
     paths.push(fixed(CREDSTORE));
@@ -1808,6 +1814,22 @@ mod tests {
         assert!(get(&r, "paths.owner")
             .detail
             .contains("/etc/saiife/policy.d/10-team.toml"));
+    }
+
+    #[test]
+    fn group_writable_user_pack_fails() {
+        let t = T::installed();
+        let dir = t.at(POLICY_PACKS_D);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let p = dir.join("user.a.toml");
+        fs::write(&p, "").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o666)).unwrap();
+        let r = t.doctor();
+        assert_status(&r, "paths.owner", Status::Fail);
+        assert!(get(&r, "paths.owner")
+            .detail
+            .contains("/etc/saiife/policy.d/packs/user.a.toml"));
     }
 
     #[test]

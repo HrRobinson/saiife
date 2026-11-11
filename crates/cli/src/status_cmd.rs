@@ -921,6 +921,7 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
                     version: p.version,
                     default_on: p.default_on,
                     rules: Vec::new(),
+                    sha256: None,
                 })
                 .collect();
             for (env, hash) in saiife_policy::env_hashes(&l.config, &catalog) {

@@ -20,6 +20,7 @@ pub mod scope;
 pub mod service;
 pub mod system;
 pub mod touch;
+pub mod userpacks;
 pub mod users;
 pub mod view;
 
@@ -47,6 +48,7 @@ pub use system::{
     McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SyslogFormat, SystemConfig, TargetCfg, WebhookCfg,
     RESERVED_SERVICES,
 };
+pub use userpacks::{UserPackFile, USER_PACKS_DIR};
 #[cfg(windows)]
 pub use users::FfiAccounts;
 pub use users::{

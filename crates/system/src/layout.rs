@@ -17,6 +17,8 @@ pub const BINARY: &str = "/opt/saiife/bin/saiife";
 pub const ETC_DIR: &str = "/etc/saiife";
 pub const CONFIG: &str = "/etc/saiife/config.toml";
 pub const POLICY_D: &str = "/etc/saiife/policy.d";
+/// User packs (plan 32): checked like the drop-ins above them.
+pub const POLICY_PACKS_D: &str = "/etc/saiife/policy.d/packs";
 pub const CREDSTORE: &str = "/etc/saiife/credstore";
 pub const VAULT_KEY: &str = "/etc/saiife/credstore/vault-key";
 pub const INSTALLED: &str = "/etc/saiife/installed.toml";
@@ -222,6 +224,7 @@ pub fn windows_path(linux: &str) -> Option<&'static str> {
         ETC_DIR => r"C:\ProgramData\saiife\etc",
         CONFIG => r"C:\ProgramData\saiife\etc\config.toml",
         POLICY_D => r"C:\ProgramData\saiife\etc\policy.d",
+        POLICY_PACKS_D => r"C:\ProgramData\saiife\etc\policy.d\packs",
         INSTALLED => r"C:\ProgramData\saiife\etc\installed.toml",
         CA_DIR => r"C:\ProgramData\saiife\etc\ca",
         FLEET_DIR => r"C:\ProgramData\saiife\etc\fleet",
@@ -575,13 +578,14 @@ mod windows_tests {
     use saiife_agents::Agent;
 
     /// Every Linux constant with a Windows path, with its §5.3a value.
-    const WINDOWS_TABLE: [(&str, &str); 26] = [
+    const WINDOWS_TABLE: [(&str, &str); 27] = [
         (OPT_DIR, r"C:\ProgramData\saiife"),
         (BIN_DIR, r"C:\ProgramData\saiife\bin"),
         (BINARY, r"C:\ProgramData\saiife\bin\saiife.exe"),
         (ETC_DIR, r"C:\ProgramData\saiife\etc"),
         (CONFIG, r"C:\ProgramData\saiife\etc\config.toml"),
         (POLICY_D, r"C:\ProgramData\saiife\etc\policy.d"),
+        (POLICY_PACKS_D, r"C:\ProgramData\saiife\etc\policy.d\packs"),
         (INSTALLED, r"C:\ProgramData\saiife\etc\installed.toml"),
         (CA_DIR, r"C:\ProgramData\saiife\etc\ca"),
         (FLEET_DIR, r"C:\ProgramData\saiife\etc\fleet"),
@@ -957,6 +961,7 @@ mod tests {
         assert_eq!(ETC_DIR, "/etc/saiife");
         assert_eq!(CONFIG, "/etc/saiife/config.toml");
         assert_eq!(POLICY_D, "/etc/saiife/policy.d");
+        assert_eq!(POLICY_PACKS_D, "/etc/saiife/policy.d/packs");
         assert_eq!(CREDSTORE, "/etc/saiife/credstore");
         assert_eq!(VAULT_KEY, "/etc/saiife/credstore/vault-key");
         assert_eq!(INSTALLED, "/etc/saiife/installed.toml");
@@ -1017,13 +1022,14 @@ mod tests {
     ];
 
     /// Every path constant of this module.
-    const ALL_PATHS: [&str; 27] = [
+    const ALL_PATHS: [&str; 28] = [
         OPT_DIR,
         BIN_DIR,
         BINARY,
         ETC_DIR,
         CONFIG,
         POLICY_D,
+        POLICY_PACKS_D,
         CREDSTORE,
         VAULT_KEY,
         INSTALLED,

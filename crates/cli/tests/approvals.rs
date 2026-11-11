@@ -295,6 +295,17 @@ fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
 
 /// [`world_full`] for a daemon of `mode`.
 fn world_full_in(erp_extra: &str, result_cap: Option<usize>, tail: &str, mode: Mode) -> World {
+    world_packed(erp_extra, result_cap, tail, mode, None)
+}
+
+/// [`world_full_in`] with a user pack at `etc/policy.d/packs/user.t.toml`.
+fn world_packed(
+    erp_extra: &str,
+    result_cap: Option<usize>,
+    tail: &str,
+    mode: Mode,
+    user_pack: Option<&str>,
+) -> World {
     let m = mock();
     let tmp = common::tmp::short_tempdir();
     let t = tmp.path();
@@ -304,6 +315,10 @@ fn world_full_in(erp_extra: &str, result_cap: Option<usize>, tail: &str, mode: M
         fs::create_dir_all(t.join(d)).unwrap();
     }
     fs::write(t.join("etc/ca/test-ca.pem"), &m.ca_pem).unwrap();
+    if let Some(pack) = user_pack {
+        fs::create_dir_all(t.join("etc/policy.d/packs")).unwrap();
+        fs::write(t.join("etc/policy.d/packs/user.t.toml"), pack).unwrap();
+    }
     let text = format!("{}{tail}", config_text(t, m.port, erp_extra));
     let policy = policy_in(t, m.port, &text, mode);
 
@@ -2354,4 +2369,28 @@ fn lockdown_notifies() {
     let evs = w.events(Lockdown);
     assert_eq!(evs.len(), 2, "{evs:?}");
     assert!(evs[1].summary.contains("off"));
+}
+
+/// A user-pack rule with `ask = true` on a locked host with approvers (plan
+/// 32): the hook makes a pending request the daemon accepts, not a plain deny.
+#[test]
+fn managed_user_ask_rule_creates_a_request() {
+    let pack = "[pack]\nid = \"user.t\"\ntriggers = [\"deploy-prod\"]\n[[deny]]\nid = \"l3-1\"\npattern = '^deploy-prod\\b'\n\
+                reason = \"Never run deploy-prod\"\nask = true\n";
+    let turn = HOOK_TURNS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut w = world_packed("", None, &ask_tail(""), Mode::Locked, Some(pack));
+    w._hook_turn = Some(turn);
+    let o = w.hook("deploy-prod --now");
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let id = needs_approval_id(&o);
+    let r = w.ctx.approvals.as_ref().unwrap().get(id).unwrap();
+    assert_eq!(r.state, State::Pending);
+    assert_eq!(r.input.as_deref(), Some("deploy-prod --now"));
+    let list = w.op(BOSS, "approval.list", json!({}));
+    let text = list.to_string();
+    assert!(text.contains("user.t"), "{text}");
+    let last = w.guard_records().pop().unwrap();
+    assert_eq!(last["decision"], "ask", "{last}");
+    assert_eq!(last["pack"], "user.t");
+    assert_eq!(last["rule_id"], "l3-1");
 }

@@ -14,9 +14,13 @@ use std::process::ExitCode;
 use saiife_audit::chain::{append_chained, sha256_hex, written_unchained};
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::builtins::Catalog;
+use saiifeguard::canon::PathStyle;
 use saiifeguard::canon::PathVars;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::{context_from_hook_json_bounded, HookContext, PayloadError};
+use saiifeguard::profile::Profile;
+use saiifeguard::userpack::{load_user_packs, UserSrc};
+use saiifeguard::Pack;
 
 use crate::check_managed::SYSTEM_CONFIG;
 use crate::eval::{self, Plan, PARSE_MAX_BYTES};
@@ -89,6 +93,7 @@ pub fn run(
     hook_exit: bool,
     agent: &str,
     system_config: Option<&Path>,
+    profile: Profile,
 ) -> ExitCode {
     let view = system_view(system_config);
     if view.is_managed(agent) {
@@ -123,7 +128,7 @@ pub fn run(
             );
         }
     };
-    let audit = Audit::new(
+    let mut audit = Audit::new(
         agent,
         context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
         cli_packs,
@@ -141,23 +146,40 @@ pub fn run(
             None,
         ),
         Plan::Shell { command, dialects } => {
+            let user = match user_or_absent(fail, &mut audit, profile, &command) {
+                Ok(u) => u,
+                Err(code) => return code,
+            };
+            let audit = audit;
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config, building the engine or hashing the policy
             // fails open too.
             decide(&audit, &command, fail, |c| {
-                active_engine(&audit, cli_packs)
-                    .0
-                    .evaluate_call(c, dialects)
+                let (engine, _) = active_engine(&audit, cli_packs, &user, profile);
+                user.note_ask(&engine, engine.evaluate_call(c, dialects))
             })
         }
-        Plan::Files(call) => decide(&audit, &call.input(), fail, |_| {
-            let (engine, vars) = active_engine(&audit, cli_packs);
-            eval::judge_files(&engine, &vars, &call)
-        }),
+        Plan::Files(call) => {
+            let user = match user_or_absent(fail, &mut audit, profile, &call.input()) {
+                Ok(u) => u,
+                Err(code) => return code,
+            };
+            let audit = audit;
+            decide(&audit, &call.input(), fail, |_| {
+                let (engine, vars) = active_engine(&audit, cli_packs, &user, profile);
+                user.note_ask(&engine, eval::judge_files(&engine, &vars, &call))
+            })
+        }
         // A write (an apply_patch without file headers, an Edit without a
         // path): never recorded as a judged allow.
         Plan::NoPath => fail.unjudged(&audit, "", "no path to judge", None),
         Plan::Other => {
+            // A broken user pack is reported for a tool the guard does not
+            // judge too, so the warning and the record do not depend on
+            // which tool happened to be called first.
+            if let Err(code) = user_or_absent(fail, &mut audit, profile, "") {
+                return code;
+            }
             audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
             allow()
         }
@@ -225,10 +247,142 @@ pub(crate) fn agent_from_args(args: &[String]) -> Option<&str> {
     })
 }
 
+/// Appended to the reason of a deny by an `ask = true` user rule: the
+/// developer hook has no approvals, so it can only deny and say why.
+const ASK_NOTE: &str = " (needs approval; approvals need locked mode)";
+
+/// The developer's own user packs (`<broker config dir>/policy.d/packs`),
+/// compiled for one profile.
+#[derive(Default)]
+struct DevUser {
+    packs: Vec<Pack>,
+    /// `(pack id, SHA-256 of its file)`, for the policy hash.
+    files: Vec<(String, String)>,
+    /// `pack/rule_id` of every kept `ask = true` deny.
+    ask: Vec<String>,
+}
+
+impl DevUser {
+    /// Read and compile the personal user packs for `profile`. `Err` is the
+    /// reason (`user pack …`) of the first one that does not load: the caller
+    /// fails open with it (D3), it never denies for this alone.
+    fn load(profile: Profile) -> Result<Self, String> {
+        let files = dev_user_packs()?;
+        if files.is_empty() {
+            return Ok(Self::default());
+        }
+        let packs = compile_user_packs(&files, profile).map_err(|e| e.to_string())?;
+        let ask = packs
+            .iter()
+            .flat_map(|p| p.ask_ids.iter().map(move |r| format!("{}/{r}", p.id)))
+            .collect();
+        Ok(Self {
+            packs,
+            files: files.into_iter().map(|f| (f.id, f.sha256)).collect(),
+            ask,
+        })
+    }
+
+    /// `d` with the approval note on its reason when an `ask` rule denied.
+    fn note_ask(&self, engine: &Engine, d: Decision) -> Decision {
+        match d {
+            Decision::Deny {
+                pack,
+                pattern,
+                reason,
+                via_inline,
+            } if engine
+                .rule_id(&pack, &pattern)
+                .is_some_and(|id| self.ask.contains(&format!("{pack}/{id}"))) =>
+            {
+                Decision::Deny {
+                    reason: format!("{reason}{ASK_NOTE}"),
+                    pack,
+                    pattern,
+                    via_inline,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// `files` compiled strictly for `profile`: the one place a user pack file
+/// becomes a [`Pack`] outside the managed worker.
+pub(crate) fn compile_user_packs(
+    files: &[saiife_policy::userpacks::UserPackFile],
+    profile: Profile,
+) -> Result<Vec<Pack>, saiifeguard::userpack::UserPackError> {
+    let srcs: Vec<UserSrc> = files
+        .iter()
+        .map(|f| UserSrc {
+            source: &f.path,
+            text: &f.text,
+        })
+        .collect();
+    load_user_packs(&srcs, PathStyle::host(), profile)
+}
+
+/// The user pack files of this developer: `policy.d/packs` beside the
+/// personal broker config. No home directory means no packs.
+pub(crate) fn dev_user_packs() -> Result<Vec<saiife_policy::userpacks::UserPackFile>, String> {
+    let home = saiife_win::profile::home_dir();
+    // The runtime dir is not needed to find a config dir: any absolute value
+    // satisfies `personal_paths`, as `audit --broker` does.
+    let env = |k: &str| match k {
+        "XDG_RUNTIME_DIR" => Some(std::ffi::OsString::from("/")),
+        _ => std::env::var_os(k),
+    };
+    let paths = match saiife_system::personal::personal_paths(&env, home.as_deref()) {
+        Ok(p) => p,
+        Err(_) if home.is_none() => return Ok(Vec::new()),
+        Err(e) => return Err(format!("user pack directory: {e}")),
+    };
+    let dir = saiife_system::personal::user_packs_dir(&paths);
+    saiife_policy::userpacks::read_user_packs(&dir, &mut Vec::new())
+        .map_err(|e| format!("user pack {e}"))
+}
+
+/// The user packs for this call. When they do not load, the built-in and
+/// project packs still judge the call (D3's fail-open covers the user-pack
+/// layer only): the user packs count as absent, stderr warns, and `audit`
+/// remembers the error so an allowed call is recorded as `error_allowed`
+/// naming it. A deny stays a normal deny. When `/etc/saiife` asks for fail
+/// closed, the call is denied instead (`Err`).
+fn user_or_absent(
+    fail: Fail,
+    audit: &mut Audit,
+    profile: Profile,
+    input: &str,
+) -> Result<DevUser, ExitCode> {
+    match DevUser::load(profile) {
+        Ok(u) => Ok(u),
+        Err(why) if fail.closed => Err(fail.unjudged(audit, input, &why, None)),
+        Err(why) => {
+            warn(&format!(
+                "{why} (not loaded); the user packs are off, the built-in packs still apply; failing open (allow)"
+            ));
+            audit.pack_error = Some(why);
+            Ok(DevUser::default())
+        }
+    }
+}
+
 /// `engine_for` the built-in packs and the payload's `cwd`: its warnings
 /// printed, its policy hash handed to `audit` for the records of this call.
-fn active_engine(audit: &Audit, cli_packs: &[String]) -> (Engine, PathVars) {
-    let active = engine_for(&Catalog::builtin(), cli_packs, audit.ctx.cwd.as_deref());
+fn active_engine(
+    audit: &Audit,
+    cli_packs: &[String],
+    user: &DevUser,
+    profile: Profile,
+) -> (Engine, PathVars) {
+    let active = engine_for(
+        &Catalog::builtin(),
+        cli_packs,
+        audit.ctx.cwd.as_deref(),
+        user,
+        profile,
+    );
     for w in &active.warnings {
         warn(w);
     }
@@ -255,7 +409,13 @@ struct Active {
 /// Only these packs of `catalog` are compiled. The project root is looked
 /// up once and its config read once (bounded), for the packs and the
 /// policy hash alike.
-fn engine_for(catalog: &Catalog, cli_packs: &[String], cwd: Option<&str>) -> Active {
+fn engine_for(
+    catalog: &Catalog,
+    cli_packs: &[String],
+    cwd: Option<&str>,
+    user: &DevUser,
+    profile: Profile,
+) -> Active {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir().unwrap_or_default(),
@@ -263,7 +423,7 @@ fn engine_for(catalog: &Catalog, cli_packs: &[String], cwd: Option<&str>) -> Act
     let project = project_packs_known(&start, |id| catalog.knows(id));
     let mut enabled = cli_packs.to_vec();
     enabled.extend(project.enabled);
-    let (packs, pack_warnings) = catalog.load_active(&enabled);
+    let (mut packs, pack_warnings) = catalog.load_active(&enabled);
     let mut warnings: Vec<String> = pack_warnings
         .iter()
         .map(|w| format!("pack warning ({}): {}", w.source, w.message))
@@ -275,7 +435,15 @@ fn engine_for(catalog: &Catalog, cli_packs: &[String], cwd: Option<&str>) -> Act
         (Some(_), None) => CONFIG_UNAVAILABLE,
     };
     let ids: Vec<&str> = packs.iter().map(|p| p.id.as_str()).collect();
-    let policy = policy_hash(env!("CARGO_PKG_VERSION"), &ids, config);
+    let hashes: Vec<(&str, &str)> = user
+        .files
+        .iter()
+        .map(|(id, sha)| (id.as_str(), sha.as_str()))
+        .collect();
+    let policy = policy_hash(env!("CARGO_PKG_VERSION"), &ids, config, &hashes, profile);
+    // The user packs follow the built-ins (their ids are `user.`-prefixed, so
+    // they never replace one), compiled strictly for `profile`.
+    packs.extend(user.packs.iter().cloned());
     let vars = path_vars(Some(&start), project.root.as_deref());
     let engine = Engine::new(packs).with_paths(vars.clone());
     Active {
@@ -395,6 +563,8 @@ struct Audit {
     /// Set by `active_engine` from the engine it built; a call that built
     /// none gets the `--pack` ids with the config `unavailable` marker.
     policy: OnceCell<String>,
+    /// Why the user packs are off for this call (they did not load).
+    pack_error: Option<String>,
 }
 
 impl Audit {
@@ -415,6 +585,7 @@ impl Audit {
             project,
             cli_packs: cli_packs.to_vec(),
             policy: OnceCell::new(),
+            pack_error: None,
         }
     }
 
@@ -423,7 +594,13 @@ impl Audit {
     fn policy(&self) -> &str {
         self.policy.get_or_init(|| {
             let ids: Vec<&str> = self.cli_packs.iter().map(String::as_str).collect();
-            policy_hash(env!("CARGO_PKG_VERSION"), &ids, CONFIG_UNAVAILABLE)
+            policy_hash(
+                env!("CARGO_PKG_VERSION"),
+                &ids,
+                CONFIG_UNAVAILABLE,
+                &[],
+                Profile::Host,
+            )
         })
     }
 
@@ -437,6 +614,11 @@ impl Audit {
     ) {
         let Some(dir) = &self.dir else {
             return;
+        };
+        // The built-ins judged an allowed call without the user packs: say so.
+        let (decision, reason) = match (&self.pack_error, decision) {
+            (Some(e), DecisionKind::Allow) => (DecisionKind::ErrorAllowed, Some(e.as_str())),
+            _ => (decision, reason),
         };
         let rec = Record::new(
             NewRecord {
@@ -472,15 +654,31 @@ const CONFIG_UNAVAILABLE: &str = "unavailable";
 
 /// `sha256:<hex>` over the saiife version, the sorted unique active pack ids
 /// and `config`: the hex SHA-256 of the project config's bytes, or
-/// `CONFIG_NONE` / `CONFIG_UNAVAILABLE`.
-fn policy_hash(version: &str, active_pack_ids: &[&str], config: &str) -> String {
+/// `CONFIG_NONE` / `CONFIG_UNAVAILABLE`. `user` is `(id, sha256)` of each user
+/// pack, one line each sorted by id; `profile box` follows when the box
+/// profile is used. With neither, the text is what it was before user packs.
+fn policy_hash(
+    version: &str,
+    active_pack_ids: &[&str],
+    config: &str,
+    user: &[(&str, &str)],
+    profile: Profile,
+) -> String {
     let mut ids: Vec<&str> = active_pack_ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
-    let text = format!(
+    let mut text = format!(
         "saiife-policy-v1\nsaiife {version}\npacks {}\nconfig {config}\n",
         ids.join(",")
     );
+    let mut user: Vec<&(&str, &str)> = user.iter().collect();
+    user.sort_unstable();
+    for (id, sha) in user {
+        text.push_str(&format!("user {id} {sha}\n"));
+    }
+    if profile == Profile::Box {
+        text.push_str("profile box\n");
+    }
     format!("sha256:{}", sha256_hex(text.as_bytes()))
 }
 
@@ -636,6 +834,7 @@ mod tests {
             project: "/p".into(),
             cli_packs: Vec::new(),
             policy: OnceCell::new(),
+            pack_error: None,
         }
     }
 
@@ -671,7 +870,7 @@ reason = "drops the thing"
         let cwd = p.path().to_str().unwrap();
         let Active {
             engine, warnings, ..
-        } = engine_for(&cat, &[], Some(cwd));
+        } = engine_for(&cat, &[], Some(cwd), &DevUser::default(), Profile::Host);
         assert!(
             warnings.iter().any(
                 |w| w.starts_with("pack warning (<t>core.broken): skipping uncompilable regex")
@@ -689,11 +888,18 @@ reason = "drops the thing"
         .unwrap();
         let Active {
             engine, warnings, ..
-        } = engine_for(&cat, &[], Some(cwd));
+        } = engine_for(&cat, &[], Some(cwd), &DevUser::default(), Profile::Host);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(engine.evaluate("thing wipe").is_deny());
         assert!(engine.evaluate("thing drop").is_deny());
-        let engine = engine_for(&cat, &["opt.thing".into()], None).engine;
+        let engine = engine_for(
+            &cat,
+            &["opt.thing".into()],
+            None,
+            &DevUser::default(),
+            Profile::Host,
+        )
+        .engine;
         assert!(engine.evaluate("thing drop").is_deny());
     }
 
@@ -737,25 +943,33 @@ reason = "drops the thing"
         let cwd = p.path().to_str().unwrap();
         let v = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            engine_for(&cat, &[], Some(cwd)).policy,
-            policy_hash(v, &["core.broken"], CONFIG_NONE)
+            engine_for(&cat, &[], Some(cwd), &DevUser::default(), Profile::Host).policy,
+            policy_hash(v, &["core.broken"], CONFIG_NONE, &[], Profile::Host)
         );
         std::fs::create_dir(p.path().join(".saiife")).unwrap();
         let cfg = "packs = [\"opt.thing\"]\n";
         std::fs::write(p.path().join(".saiife/config.toml"), cfg).unwrap();
         assert_eq!(
-            engine_for(&cat, &[], Some(cwd)).policy,
+            engine_for(&cat, &[], Some(cwd), &DevUser::default(), Profile::Host).policy,
             policy_hash(
                 v,
                 &["core.broken", "opt.thing"],
-                &sha256_hex(cfg.as_bytes())
+                &sha256_hex(cfg.as_bytes()),
+                &[],
+                Profile::Host
             )
         );
         // Unparseable bytes are still the config in force: hashed as read.
         std::fs::write(p.path().join(".saiife/config.toml"), "packs = [\n").unwrap();
         assert_eq!(
-            engine_for(&cat, &[], Some(cwd)).policy,
-            policy_hash(v, &["core.broken"], &sha256_hex(b"packs = [\n"))
+            engine_for(&cat, &[], Some(cwd), &DevUser::default(), Profile::Host).policy,
+            policy_hash(
+                v,
+                &["core.broken"],
+                &sha256_hex(b"packs = [\n"),
+                &[],
+                Profile::Host
+            )
         );
     }
 
@@ -771,7 +985,9 @@ reason = "drops the thing"
             policy_hash(
                 env!("CARGO_PKG_VERSION"),
                 &["db.postgres"],
-                CONFIG_UNAVAILABLE
+                CONFIG_UNAVAILABLE,
+                &[],
+                Profile::Host
             )
         );
     }
@@ -783,6 +999,8 @@ reason = "drops the thing"
                 v,
                 ids,
                 &cfg.map_or_else(|| CONFIG_NONE.to_string(), sha256_hex),
+                &[],
+                Profile::Host,
             )
         };
         let base = h("0.1.0", &["a", "b"], Some(b"x"));
@@ -792,7 +1010,10 @@ reason = "drops the thing"
         assert_ne!(base, h("0.1.0", &["a", "b"], None));
         assert_ne!(base, h("0.1.0", &["a", "b", "c"], Some(b"x")));
         assert_ne!(base, h("0.2.0", &["a", "b"], Some(b"x")));
-        assert_ne!(base, policy_hash("0.1.0", &["a", "b"], CONFIG_UNAVAILABLE));
+        assert_ne!(
+            base,
+            policy_hash("0.1.0", &["a", "b"], CONFIG_UNAVAILABLE, &[], Profile::Host)
+        );
         assert_eq!(base, h("0.1.0", &["b", "a", "a"], Some(b"x")));
     }
 
@@ -802,11 +1023,108 @@ reason = "drops the thing"
             "sha256:{}",
             sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a,b\nconfig none\n")
         );
-        assert_eq!(policy_hash("1", &["b", "a"], CONFIG_NONE), want);
+        assert_eq!(
+            policy_hash("1", &["b", "a"], CONFIG_NONE, &[], Profile::Host),
+            want
+        );
         let want = format!(
             "sha256:{}",
             sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a\nconfig unavailable\n")
         );
-        assert_eq!(policy_hash("1", &["a"], CONFIG_UNAVAILABLE), want);
+        assert_eq!(
+            policy_hash("1", &["a"], CONFIG_UNAVAILABLE, &[], Profile::Host),
+            want
+        );
+    }
+
+    #[test]
+    fn dev_hash_unchanged_without_user_packs() {
+        let want = format!(
+            "sha256:{}",
+            sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a,b\nconfig none\n")
+        );
+        assert_eq!(
+            policy_hash("1", &["b", "a"], CONFIG_NONE, &[], Profile::Host),
+            want
+        );
+    }
+
+    #[test]
+    fn dev_hash_names_the_box_profile() {
+        let want = format!(
+            "sha256:{}",
+            sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a,b\nconfig none\nprofile box\n")
+        );
+        let boxed = policy_hash("1", &["b", "a"], CONFIG_NONE, &[], Profile::Box);
+        assert_eq!(boxed, want);
+        assert_ne!(
+            boxed,
+            policy_hash("1", &["b", "a"], CONFIG_NONE, &[], Profile::Host)
+        );
+    }
+
+    #[test]
+    fn dev_hash_lists_user_packs() {
+        let want = format!(
+            "sha256:{}",
+            sha256_hex(
+                b"saiife-policy-v1\nsaiife 1\npacks a\nconfig none\nuser user.a aa\nuser user.b bb\n"
+            )
+        );
+        // Sorted by id, whatever the order given.
+        assert_eq!(
+            policy_hash(
+                "1",
+                &["a"],
+                CONFIG_NONE,
+                &[("user.b", "bb"), ("user.a", "aa")],
+                Profile::Host
+            ),
+            want
+        );
+        assert_ne!(
+            want,
+            policy_hash(
+                "1",
+                &["a"],
+                CONFIG_NONE,
+                &[("user.a", "ab"), ("user.b", "bb")],
+                Profile::Host
+            )
+        );
+    }
+
+    /// A user pack is judged after the built-ins, and an `ask` rule's deny
+    /// carries the approval note.
+    #[test]
+    fn user_pack_denies_and_ask_rule_is_noted() {
+        let text = "[pack]\nid = \"user.t\"\ntriggers = [\"zz\"]\n[[deny]]\nid = \"plain\"\npattern = '^zz plain'\nreason = \"r1\"\n[[deny]]\nid = \"asked\"\npattern = '^zz asked'\nreason = \"r2\"\nask = true\n";
+        let packs = load_user_packs(
+            &[UserSrc {
+                source: "<t>",
+                text,
+            }],
+            PathStyle::host(),
+            Profile::Host,
+        )
+        .unwrap();
+        let user = DevUser {
+            ask: vec!["user.t/asked".into()],
+            files: vec![("user.t".into(), "ab".into())],
+            packs,
+        };
+        let p = tempfile::tempdir().unwrap();
+        let cwd = p.path().to_str().unwrap();
+        let cat = Catalog::from_sources(&[]);
+        let a = engine_for(&cat, &[], Some(cwd), &user, Profile::Host);
+        let reason = |cmd: &str| match user.note_ask(&a.engine, a.engine.evaluate(cmd)) {
+            Decision::Deny { reason, .. } => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reason("zz plain"), "r1");
+        assert_eq!(
+            reason("zz asked"),
+            "r2 (needs approval; approvals need locked mode)"
+        );
     }
 }

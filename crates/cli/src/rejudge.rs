@@ -368,31 +368,54 @@ fn read_frames(stdout: ChildStdout, answers: &mpsc::Sender<io::Result<Vec<u8>>>)
     }
 }
 
-/// When the system config and its drop-ins were last seen as they are.
-type Stamp = Vec<(PathBuf, Option<(SystemTime, u64)>)>;
+/// What a stat of one path saw: its mtime (with nanoseconds), size and inode
+/// (0 where there is none). `None`: nothing there.
+type Seen = Option<(SystemTime, u64, u64)>;
 
-fn stamp(config: &Path) -> Stamp {
-    let seen = |p: &Path| {
-        std::fs::symlink_metadata(p)
-            .ok()
-            .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
-    };
-    let dropins = config
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("policy.d");
-    let mut out = vec![
-        (config.to_path_buf(), seen(config)),
-        (dropins.clone(), seen(&dropins)),
-    ];
-    if let Ok(dir) = std::fs::read_dir(&dropins) {
-        let mut entries: Vec<PathBuf> = dir.flatten().map(|e| e.path()).collect();
+/// When the system config, its drop-ins and its user packs were last seen as
+/// they are.
+type Stamp = Vec<(PathBuf, Seen)>;
+
+/// Most entries of one directory a stamp looks at (the loader refuses more
+/// than 32 packs, so a larger directory is a failed load, never cached).
+const STAMP_ENTRIES: usize = 1024;
+
+fn seen(p: &Path) -> Seen {
+    let m = std::fs::symlink_metadata(p).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len(), ino))
+}
+
+/// `dir` and every entry in it, sorted by path.
+fn stamp_dir(dir: &Path, out: &mut Stamp) {
+    out.push((dir.to_path_buf(), seen(dir)));
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut entries: Vec<PathBuf> =
+            rd.flatten().take(STAMP_ENTRIES).map(|e| e.path()).collect();
         entries.sort();
         out.extend(entries.into_iter().map(|p| {
             let s = seen(&p);
             (p, s)
         }));
     }
+}
+
+/// The one stamp that keys every cache of the loaded system config: the
+/// config file, `policy.d` and its entries, and `policy.d/packs` and its
+/// entries (an edit in place changes a file's mtime, size or inode; an add
+/// or remove changes the directory's mtime and the entry list). One stat per
+/// file, no hashing.
+fn stamp(config: &Path) -> Stamp {
+    let dropins = config
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("policy.d");
+    let mut out = vec![(config.to_path_buf(), seen(config))];
+    stamp_dir(&dropins, &mut out);
+    stamp_dir(&dropins.join("packs"), &mut out);
     out
 }
 
@@ -540,6 +563,7 @@ impl Pool {
             agent: Some(AGENT.to_string()),
             view: View::Lexical,
             vars: Some(vars),
+            user_packs: crate::eval::user_pack_srcs(&cfg),
         })
     }
 
@@ -1261,6 +1285,68 @@ mod tests {
             ask(&pool, 4242, &payload),
             RejudgeAnswer::Deny { .. }
         ));
+    }
+
+    /// A pool-level check of the stamp: the pack in `policy.d/packs` is read
+    /// again when it is edited in place (same size, later mtime), added or
+    /// removed, and not read again when nothing changed.
+    fn set_mtime(p: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    const PACK_A: &str = "[pack]\nid = \"user.t\"\ntriggers = [\"deploy-prod\"]\n[[deny]]\nid = \"a\"\npattern = '^deploy-prod\\b'\nreason = \"no\"\n";
+
+    #[test]
+    fn the_stamp_covers_policy_d_packs() {
+        let s = Setup::new("");
+        let config = s.config();
+        let packs = s.dir.path().join("etc/policy.d/packs");
+        let none = stamp(&config);
+        assert_eq!(stamp(&config), none, "nothing changed: the same stamp");
+        std::fs::create_dir_all(&packs).unwrap();
+        let file = packs.join("user.t.toml");
+        std::fs::write(&file, PACK_A).unwrap();
+        set_mtime(&file, 1_000_000);
+        let added = stamp(&config);
+        assert_ne!(added, none, "an added file changes the stamp");
+        assert_eq!(stamp(&config), added);
+        // In place: same size, later mtime.
+        std::fs::write(&file, PACK_A.replace("no", "ok")).unwrap();
+        set_mtime(&file, 1_000_001);
+        let edited = stamp(&config);
+        assert_ne!(edited, added, "an edit in place changes the stamp");
+        std::fs::remove_file(&file).unwrap();
+        assert_ne!(stamp(&config), edited, "a removed file changes the stamp");
+    }
+
+    #[test]
+    fn the_pool_reads_a_user_pack_again_when_it_changes() {
+        let s = Setup::new("");
+        let pool = s.pool(&TestLaunch::new(vec![]), one());
+        let payload = bash("/tmp", "deploy-prod --now");
+        assert_eq!(ask(&pool, 4242, &payload), RejudgeAnswer::Allow);
+        let packs = s.dir.path().join("etc/policy.d/packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        let file = packs.join("user.t.toml");
+        std::fs::write(&file, PACK_A).unwrap();
+        assert!(matches!(
+            ask(&pool, 4242, &payload),
+            RejudgeAnswer::Deny { .. }
+        ));
+        // Tightened in place, same size: a different command is now denied.
+        let other = bash("/tmp", "deploy-stg --now");
+        assert_eq!(ask(&pool, 4242, &other), RejudgeAnswer::Allow);
+        let tight = PACK_A.replace("deploy-prod", "deploy-stg");
+        std::fs::write(&file, tight).unwrap();
+        set_mtime(&file, 2_000_000);
+        assert!(matches!(
+            ask(&pool, 4242, &other),
+            RejudgeAnswer::Deny { .. }
+        ));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(ask(&pool, 4242, &other), RejudgeAnswer::Allow);
     }
 
     /// What one burst of `n` calls of one principal got: each allowed

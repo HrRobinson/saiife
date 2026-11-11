@@ -29,7 +29,7 @@ use saiife_policy::{
 use serde_json::Value;
 
 use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
-use crate::eval::{judge_with, Verdict as GuardVerdict};
+use crate::eval::{judge_with_user, user_pack_srcs, Verdict as GuardVerdict};
 use crate::paths::LockedPaths;
 
 /// Where `check` and `test` find users.
@@ -200,6 +200,7 @@ fn pack_catalog() -> Vec<PackInfo> {
             version: p.version,
             default_on: p.default_on,
             rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+            sha256: None,
         })
         .collect()
 }
@@ -290,6 +291,22 @@ fn unreadable(e: &PolicyError) -> bool {
     matches!(e, PolicyError::Io { .. })
 }
 
+/// Every user pack that does not compile, as the hook would meet it: for the
+/// host profile and for the box profile (one message when both say the same).
+fn user_pack_errors(packs: &[saiife_policy::UserPackFile]) -> Vec<String> {
+    use saiifeguard::profile::Profile;
+    let mut errors: Vec<String> = Vec::new();
+    for profile in [Profile::Host, Profile::Box] {
+        if let Err(e) = crate::check::compile_user_packs(packs, profile) {
+            let e = e.to_string();
+            if !errors.contains(&e) {
+                errors.push(e);
+            }
+        }
+    }
+    errors
+}
+
 /// `saiife policy check <file>`.
 pub fn check(file: &Path, dir: &dyn Directory) -> Outcome {
     let loaded = match load_system(file) {
@@ -308,6 +325,8 @@ pub fn check(file: &Path, dir: &dyn Directory) -> Outcome {
             c.errors.push(format!("example {}: {why}", i + 1));
         }
     }
+    c.errors
+        .extend(user_pack_errors(&c.loaded.config.user_packs));
     let mut o = Outcome::default();
     for w in &c.warnings {
         o.err.push_str(&format!("saiife: warning: {w}\n"));
@@ -317,8 +336,12 @@ pub fn check(file: &Path, dir: &dyn Directory) -> Outcome {
     }
     if c.errors.is_empty() {
         let cfg = &c.loaded.config;
+        let packs = match cfg.user_packs.len() {
+            0 => String::new(),
+            n => format!(", {n} user packs"),
+        };
         o.out = format!(
-            "ok: {} ({} services, {} scopes, {} examples)\n",
+            "ok: {} ({} services, {} scopes, {} examples{packs})\n",
             file.display(),
             cfg.services.len(),
             cfg.scope.len(),
@@ -494,9 +517,11 @@ fn run_case(
             });
             // Long enough that a slow runner never fails open.
             let budget = Duration::from_millis(cfg.guard.budget_ms.max(10_000));
-            let a = judge_with(
+            // The policy's user packs too: `ids` names them.
+            let a = judge_with_user(
                 &payload,
                 &ids,
+                &user_pack_srcs(cfg),
                 budget,
                 locked.as_ref(),
                 &cfg.guard.ask,

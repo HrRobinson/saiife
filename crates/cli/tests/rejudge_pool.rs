@@ -177,3 +177,37 @@ fn serve_is_lexical_whatever_it_is_asked() {
     let host: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(host["verdict"], "deny", "{host}");
 }
+
+/// A user pack in a request (plan 32): the worker enforces it, and a second
+/// frame with the same pack judges the same way (the compile cache is pinned
+/// by the guard's `cache_hits_on_same_input`).
+#[test]
+fn serve_judges_user_packs() {
+    let pack = "[pack]\nid = \"user.t\"\ntriggers = [\"deploy-prod\"]\n[[deny]]\nid = \"l3-1\"\npattern = '^deploy-prod\\b'\n\
+                reason = \"no deploys\"\n";
+    let cwd = format!("{HOME}{}app", std::path::MAIN_SEPARATOR);
+    let one = |command: &str| {
+        let req = json!({
+            "payload": bash(&cwd, command),
+            "packs": ["core.filesystem"],
+            "budget_ms": 1000,
+            "agent": "claude",
+            "vars": vars(),
+            "user_packs": [{"source": "/etc/saiife/policy.d/packs/user.t.toml", "text": pack}],
+        });
+        frame(&serde_json::to_vec(&req).unwrap())
+    };
+    let mut input = one("deploy-prod --now");
+    input.extend(one("deploy-prod --now"));
+    input.extend(one("ls"));
+    let out = serve(&input);
+    assert!(out.status.success(), "{out:?}");
+    let got = answers(&out.stdout);
+    assert_eq!(got.len(), 3);
+    for a in &got[..2] {
+        assert_eq!(a["verdict"], "deny", "{a}");
+        assert_eq!(a["pack"], "user.t", "{a}");
+        assert_eq!(a["rule_id"], "l3-1", "{a}");
+    }
+    assert_eq!(got[2]["verdict"], "allow", "{}", got[2]);
+}

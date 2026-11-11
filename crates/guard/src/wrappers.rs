@@ -311,6 +311,11 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
     rest
 }
 
+/// Whether `name` (case-folded) is a wrapper the guard sees through.
+pub fn is_transparent(name: &str) -> bool {
+    TRANSPARENT_PREFIXES.contains(&name.to_ascii_lowercase().as_str())
+}
+
 /// Peel one transparent wrapper off the front of `rest`: its (lowered,
 /// directory-stripped) name and the words after it and its options.
 fn unwrap_one(rest: &[Word]) -> Option<(String, &[Word])> {
@@ -672,6 +677,16 @@ fn is_duration_shape(tok: &str) -> bool {
 mod tests {
     use super::*;
     use crate::getopt::req;
+
+    #[test]
+    fn is_transparent_names_the_wrappers() {
+        for n in ["sudo", "ENV", "timeout"] {
+            assert!(is_transparent(n), "{n}");
+        }
+        for n in ["pkill", "git"] {
+            assert!(!is_transparent(n), "{n}");
+        }
+    }
 
     const NONE: Spec<'static> = Spec::new("", &[]);
     const W: Spec<'static> = Spec::new("w:", &[]);

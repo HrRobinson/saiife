@@ -45,6 +45,10 @@ pub struct SystemConfig {
     pub secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     pub scope: Vec<Scope>,
+    /// `policy.d/packs/*.toml`, filled by the loader (never a config key; the
+    /// hash covers them through [`crate::PackInfo::sha256`]).
+    #[serde(skip)]
+    pub user_packs: Vec<crate::userpacks::UserPackFile>,
     #[serde(default)]
     pub example: Vec<Example>,
     /// `[environments.<name>]` (spec §6.11): overlays bound to a scope by

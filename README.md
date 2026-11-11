@@ -146,6 +146,7 @@ model.
 - [MCP](docs/mcp.md): `saiife mcp` (connectors as MCP tools) and the MCP
   gateway for third-party servers.
 - [Packs](docs/packs/README.md): the rule sets, what each blocks and allows.
+- [Never-rules](docs/never-rules.md): your own packs (`policy.d/packs`), `ask` rules and how they work in boxes.
 - Agents: [Claude Code](docs/agents/claude-code.md),
   [Codex](docs/agents/codex.md), [Gemini CLI](docs/agents/gemini.md).
 - Recipe: [Codex with a local Ollama model](docs/recipes/codex-ollama.md).

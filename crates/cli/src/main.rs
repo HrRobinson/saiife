@@ -76,7 +76,7 @@ mod win_locked;
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
-use saiifeguard::profile::select_active;
+use saiifeguard::profile::{select_active, Profile};
 
 #[derive(Parser)]
 #[command(
@@ -109,6 +109,10 @@ enum Cmd {
         /// Explain a write tool (Write, Edit, apply_patch, …) changing this path.
         #[arg(long, value_name = "PATH")]
         write: Option<String>,
+        /// Judge as the host (default) or as inside a box: the box profile
+        /// leaves out user rules marked `where = "host"`.
+        #[arg(long, value_parser = ["host", "box"], default_value = "host")]
+        profile: String,
     },
     /// Hook mode: read a pre-tool JSON payload on stdin, decide, audit, respond.
     Check {
@@ -132,6 +136,10 @@ enum Cmd {
         /// ConfigChange hook: `config-change`). Locked mode only.
         #[arg(long, value_parser = ["config-change"], requires = "managed")]
         event: Option<String>,
+        /// Judge as the host (default) or as inside a box: the box profile
+        /// leaves out user rules marked `where = "host"`.
+        #[arg(long, hide = true, value_parser = ["host", "box"], default_value = "host")]
+        profile: String,
     },
     /// Turn saiife on for this project: write the guard hook into each
     /// agent's project config and create .saiife/config.toml.
@@ -496,6 +504,7 @@ fn main() -> ExitCode {
         managed,
         system_config,
         event,
+        profile,
     } = &cli.command
     {
         if *managed {
@@ -508,7 +517,13 @@ fn main() -> ExitCode {
             }
             return check_managed::run(agent, config, event.as_deref());
         }
-        return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
+        return check::run(
+            &cli.packs,
+            *hook_exit,
+            agent,
+            system_config.as_deref(),
+            Profile::from_name(profile).unwrap_or_default(),
+        );
     }
     if let Cmd::Eval { serve } = cli.command {
         return match serve {
@@ -708,9 +723,23 @@ fn main() -> ExitCode {
         .as_deref()
         .and_then(saiife_agents::config::find_project_root);
     let vars = || paths::path_vars(cwd.as_deref(), project.as_deref());
-    let engine = || Engine::new(select_active(packs.clone(), &cli.packs)).with_paths(vars());
-
-    let active = || select_active(packs.clone(), &cli.packs);
+    // The developer's own user packs follow the built-ins in `test`,
+    // `explain` and `packs`. One that does not load is reported and left
+    // out, as the developer hook does.
+    let profile = match &cli.command {
+        Cmd::Explain { profile, .. } => Profile::from_name(profile).unwrap_or_default(),
+        _ => Profile::Host,
+    };
+    let user = match &cli.command {
+        Cmd::Test { .. } | Cmd::Explain { .. } | Cmd::Packs { .. } => dev_user_pack_list(profile),
+        _ => Vec::new(),
+    };
+    let active = || {
+        let mut a = select_active(packs.clone(), &cli.packs);
+        a.extend(user.iter().cloned());
+        a
+    };
+    let engine = || Engine::new(active()).with_paths(vars());
 
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine(), &command),
@@ -718,6 +747,7 @@ fn main() -> ExitCode {
             command,
             read,
             write,
+            ..
         } => match (command, read, write) {
             (_, Some(path), _) => {
                 cmd_explain_path(&engine(), &active(), &vars(), Access::Read, &path)
@@ -761,7 +791,7 @@ fn main() -> ExitCode {
             root,
         } => init_cmd::run(&packs, &agents, &cli.packs, root),
         Cmd::Status { root } => status_cmd::run(&packs, root),
-        Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
+        Cmd::Packs { id } => packs_cmd::run(&packs, &user, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
             action:
                 Some(AuditAction::Verify {
@@ -1159,6 +1189,7 @@ fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
             version: p.version,
             default_on: p.default_on,
             rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+            sha256: None,
         })
         .collect()
 }
@@ -1196,6 +1227,25 @@ fn arg_error(e: clap::Error) -> ExitCode {
         return check::arg_error(&args, first);
     }
     e.exit()
+}
+
+/// The personal user packs compiled for `profile`. A failure is a warning:
+/// the packs are left out.
+fn dev_user_pack_list(profile: Profile) -> Vec<saiifeguard::Pack> {
+    let files = match check::dev_user_packs() {
+        Ok(f) => f,
+        Err(e) => {
+            warn(&format!("{e} (not loaded)"));
+            return Vec::new();
+        }
+    };
+    match check::compile_user_packs(&files, profile) {
+        Ok(p) => p,
+        Err(e) => {
+            warn(&format!("{e} (not loaded)"));
+            Vec::new()
+        }
+    }
 }
 
 fn cmd_test(engine: &Engine, command: &str) -> ExitCode {

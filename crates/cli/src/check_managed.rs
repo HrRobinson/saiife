@@ -743,6 +743,12 @@ mod imp {
                     agent: Some(agent.to_string()),
                     view: eval::View::Host,
                     vars: None,
+                    // A settings change is judged without user packs too.
+                    user_packs: if event.is_some() {
+                        Vec::new()
+                    } else {
+                        eval::user_pack_srcs(cfg)
+                    },
                 };
                 if in_process(agent) {
                     drop(early);
@@ -1086,6 +1092,7 @@ mod imp {
                 version,
                 default_on,
                 rules: Vec::new(),
+                sha256: None,
             })
             .collect();
         let (packs, warnings) = active_packs(cfg, &catalog, merged.as_ref());
