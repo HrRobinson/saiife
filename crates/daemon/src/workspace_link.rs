@@ -719,7 +719,11 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
 ///   machine_eph, binding)` (domain `MACHINE_HELLO_DOMAIN`), so the
 ///   signature opens a session for that device or offer only.
 /// - `{purpose: "hub_hello", data}`: a 16..=64 byte nonce ‖ this machine's
-///   id, for a peer that owns an Active device.
+///   id, for a peer that owns an Active device or may pair on this machine
+///   (root, `[admin] groups`, an `[approval] approvers` member: the people
+///   `workspace.pair.begin` serves, without re-authentication; the hub
+///   hello grants nothing, and the first phone pairs over the hub). Anyone
+///   else: `forbidden`, rule `no_active_device`.
 async fn sign(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
     match sign_inner(ctx, conn, &req.args).await {
@@ -748,6 +752,12 @@ async fn owns_active_device(ctx: &Arc<Ctx>, peer_uid: u32) -> bool {
         }
     }
     false
+}
+
+/// Whether the peer may pair devices on this machine (an admin or an
+/// approver, as `workspace_ops` decides for `workspace.pair.begin`).
+async fn may_pair(ctx: &Arc<Ctx>, peer: &saiife_ipc::peer::PeerCred) -> bool {
+    ctx.peer_is_admin(peer).await || crate::approval_ops::is_approver(ctx, peer).await
 }
 
 async fn sign_inner(
@@ -798,8 +808,12 @@ async fn sign_inner(
             if !shape_ok {
                 return Err(bad("data is not a hub hello for this machine"));
             }
-            if !owns_active_device(ctx, peer_uid).await {
-                return Err(no_device());
+            if !owns_active_device(ctx, peer_uid).await && !may_pair(ctx, &conn.peer).await {
+                return Err(forbidden(
+                    "no_active_device",
+                    "the machine key signs a hub hello only for a user with a paired device \
+                     or one who may pair on this machine",
+                ));
             }
             data
         }

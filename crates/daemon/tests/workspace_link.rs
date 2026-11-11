@@ -104,6 +104,17 @@ async fn world_in(state: Option<PathBuf>) -> World {
 }
 
 async fn build(tmp: tempfile::TempDir, state: PathBuf, ws: Workspace) -> World {
+    build_as(tmp, state, ws, DaemonMode::Personal, me()).await
+}
+
+/// [`build`] with the daemon's mode and own uid.
+async fn build_as(
+    tmp: tempfile::TempDir,
+    state: PathBuf,
+    ws: Workspace,
+    mode: DaemonMode,
+    own: u32,
+) -> World {
     let audit = tmp.path().join("audit");
     let run = tmp.path().join("run");
     std::fs::create_dir_all(&audit).unwrap();
@@ -127,8 +138,8 @@ async fn build(tmp: tempfile::TempDir, state: PathBuf, ws: Workspace) -> World {
     users.set(ME, me());
     let boxes = Arc::new(FakeBoxSource::demo(now_secs()));
     let ctx = Arc::new(Ctx::new(CtxInit {
-        mode: DaemonMode::Personal,
-        own_uid: me(),
+        mode,
+        own_uid: own,
         own_user: ME.into(),
         audit_dir: audit.clone(),
         socket_dir: run.clone(),
@@ -901,33 +912,51 @@ async fn sign(link: &mut Link, args: Value) -> Value {
     link.call(OP_WORKSPACE_SIGN, args).await
 }
 
-#[tokio::test]
-async fn sign_needs_an_active_device() {
-    let w = world().await;
-    let mut link = Link::open(&w).await;
+fn hub_hello_data(w: &World) -> Vec<u8> {
     let mut hh = vec![1u8; 32];
     hh.extend_from_slice(w.ctx.workspace.machine_id().as_bytes());
-    let a = sign(
-        &mut link,
-        json!({"purpose": "hub_hello", "data": b64::enc(&hh)}),
+    hh
+}
+
+fn hub_hello_verifies(w: &World, hh: &[u8], a: &Value) -> bool {
+    let sig = b64::dec_n::<64>(a["sig"].as_str().unwrap()).unwrap();
+    saiife_wire::sig::verify_p256_domain(
+        &machine_pub(w),
+        saiife_daemon::workspace::HUB_HELLO_DOMAIN,
+        hh,
+        &sig,
     )
-    .await;
-    assert_eq!(a["error"], "forbidden", "{a}");
-    assert_eq!(a["rule"], "no_active_device", "{a}");
-    let d = pair_device(&w, &mut link).await;
+}
+
+/// An admin (the personal broker's own user) gets a hub hello with no
+/// device yet: the first phone pairs over the hub. A seal for a device
+/// still needs that device.
+#[tokio::test]
+async fn admin_without_a_device_gets_a_hub_hello() {
+    let w = world().await;
+    let mut link = Link::open(&w).await;
+    let hh = hub_hello_data(&w);
     let a = sign(
         &mut link,
         json!({"purpose": "hub_hello", "data": b64::enc(&hh)}),
     )
     .await;
     assert_eq!(a["ok"], true, "{a}");
-    let sig = b64::dec_n::<64>(a["sig"].as_str().unwrap()).unwrap();
-    assert!(saiife_wire::sig::verify_p256_domain(
-        &machine_pub(&w),
-        saiife_daemon::workspace::HUB_HELLO_DOMAIN,
-        &hh,
-        &sig
-    ));
+    assert!(hub_hello_verifies(&w, &hh, &a));
+    let (_, data) = handshake();
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&data), "device_id": "d-none"}),
+    )
+    .await;
+    assert_eq!(a["rule"], "no_active_device", "{a}");
+}
+
+#[tokio::test]
+async fn sign_needs_an_active_device() {
+    let w = world().await;
+    let mut link = Link::open(&w).await;
+    let d = pair_device(&w, &mut link).await;
     let (mh, data) = handshake();
     let a = sign(
         &mut link,
@@ -941,13 +970,59 @@ async fn sign_needs_an_active_device() {
         &a,
         &SealBinding::Device(d.device_id())
     ));
-    // Revoked: no Active device left.
+    // Revoked: no Active device left for a device seal.
     control(&w, OP_WORKSPACE_REVOKE, json!({"device_id": d.device_id()})).await;
+    let (_, data) = handshake();
     let a = sign(
         &mut link,
-        json!({"purpose": "hub_hello", "data": b64::enc(&hh)}),
+        json!({"purpose": "seal", "data": b64::enc(&data), "device_id": d.device_id()}),
     )
     .await;
+    assert_eq!(a["rule"], "no_active_device", "{a}");
+}
+
+/// A locked daemon of another uid with no `[admin] groups` and no
+/// approvers: this process is neither admin nor approver. It gets a hub
+/// hello only while it owns an Active device.
+#[tokio::test]
+async fn non_approver_needs_a_device_for_a_hub_hello() {
+    if me() == 0 {
+        return; // root is always an admin
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let (ws, _) = Workspace::open(dir_in(&state));
+    let w = build_as(tmp, state, ws, DaemonMode::Locked, me().wrapping_add(1)).await;
+    let mut link = Link::open(&w).await;
+    let hh = hub_hello_data(&w);
+    let hello = json!({"purpose": "hub_hello", "data": b64::enc(&hh)});
+    let a = sign(&mut link, hello.clone()).await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "no_active_device", "{a}");
+
+    // A device of this process's user (paired on the Workspace itself: the
+    // control ops would refuse a non-approver).
+    let ws = &w.ctx.workspace;
+    let now = ws.now();
+    let offer = ws.begin_pair(ME, None, now).unwrap();
+    let d = TestDevice::generate();
+    let pubkey = d.public_raw();
+    let req = pair::PairRequest {
+        pair_id: offer.pair_id.clone(),
+        device_pub: b64::enc(&pubkey),
+        label: "phone".into(),
+        proof: b64::enc(&pair::proof(&offer.secret, &offer.pair_id, &pubkey)),
+    };
+    ws.finish_pair(&req, now).unwrap();
+    assert!(ws
+        .confirm_pair(&offer.pair_id, true, now)
+        .unwrap()
+        .is_some());
+    let a = sign(&mut link, hello.clone()).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(hub_hello_verifies(&w, &hh, &a));
+    ws.revoke(&d.device_id()).unwrap();
+    let a = sign(&mut link, hello).await;
     assert_eq!(a["rule"], "no_active_device", "{a}");
 }
 
