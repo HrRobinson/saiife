@@ -2890,7 +2890,7 @@ mod tests {
         let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["system.supported", "install.record"],
+            ["system.supported", "install.record", "touch-key"],
             "{}",
             r.to_text()
         );

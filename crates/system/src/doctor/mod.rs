@@ -15,6 +15,8 @@ pub mod report;
 pub mod secrets;
 #[cfg(unix)]
 pub mod system;
+#[cfg(target_os = "linux")]
+mod touch;
 pub mod windows;
 
 pub use report::{Check, Report, Status};
@@ -120,6 +122,8 @@ fn unix_config(
 fn unix_checks(ctx: &Ctx) -> Vec<Check> {
     let mut checks = system::checks(ctx);
     checks.extend(host::checks(ctx));
+    #[cfg(target_os = "linux")]
+    checks.extend(touch::checks(ctx));
     checks
 }
 
