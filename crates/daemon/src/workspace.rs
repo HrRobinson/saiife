@@ -65,6 +65,10 @@ struct Inner {
     devices: DeviceList,
     offers: Offers,
     verifier: Verifier,
+    /// A revocation is in effect in memory but `devices.json` does not have
+    /// it yet; the next successful save (any write, or a retried revoke)
+    /// clears it.
+    dirty: bool,
 }
 
 pub struct Workspace {
@@ -130,6 +134,7 @@ impl Workspace {
                 devices,
                 offers: Offers::new(),
                 verifier,
+                dirty: false,
             }),
             dir,
             locked,
@@ -194,6 +199,18 @@ impl Workspace {
         let Inner {
             devices, offers, ..
         } = &mut *g;
+        // A revoked key never comes back (the tombstone must stay): the
+        // browser makes a new key. `Offers::request` only knows Active and
+        // Pending.
+        let key = b64::dec_n::<65>(&req.device_pub)?;
+        if devices
+            .get(&saiife_wire::sig::device_id_of(&key))
+            .is_some_and(|d| d.state == DeviceState::Revoked)
+        {
+            return Err(WireError::Malformed(
+                "this device key was revoked; make a new key".into(),
+            ));
+        }
         let device = offers.request(req, devices, now)?;
         match offers.status(&req.pair_id, now) {
             PairStatus::Requested { short_code, .. } => Ok((device, short_code)),
@@ -232,23 +249,49 @@ impl Workspace {
         next.upsert(device.clone());
         // A failed save leaves the list as it was; the offer is spent, so
         // the device pairs again.
+        // `next` carries any unsaved revocation too, so this save persists it.
         self.save(&next)?;
         g.devices = next;
+        g.dirty = false;
         Ok(Some(device))
     }
 
-    /// Marks a device Revoked (the tombstone stays) and saves. False when it
-    /// is unknown or already revoked.
+    /// Marks a device Revoked (the tombstone stays), in memory first and
+    /// unconditionally (frames from it are refused at once, even when the
+    /// Workspace is locked or the save fails), then saves the whole list.
+    ///
+    /// Returns `Ok(true)` when it revoked the device or saved a revocation
+    /// that an earlier call could not write (a retry), `Ok(false)` when the
+    /// device is unknown or already revoked and saved. If the save fails the
+    /// error says the revocation is in effect now but not saved, and the
+    /// next successful write (or a retry) persists it.
     pub fn revoke(&self, id: &str) -> io::Result<bool> {
         let mut g = self.inner();
-        let mut next = g.devices.clone();
-        if !next.revoke(id) {
+        let changed = g.devices.revoke(id);
+        let retry = !changed
+            && g.dirty
+            && g.devices
+                .get(id)
+                .is_some_and(|d| d.state == DeviceState::Revoked);
+        if !changed && !retry {
             return Ok(false);
         }
-        self.unlocked().map_err(io::Error::other)?;
-        self.save(&next)?;
-        g.devices = next;
-        Ok(true)
+        g.dirty = true;
+        let saved = self
+            .unlocked()
+            .map_err(|e| io::Error::other(e.to_string()))
+            .and_then(|()| self.save(&g.devices));
+        match saved {
+            Ok(()) => {
+                g.dirty = false;
+                Ok(true)
+            }
+            Err(e) => Err(io::Error::other(format!(
+                "device {id} is revoked now, but the revocation is NOT saved and will \
+                 come back after a daemon restart; run `saiife workspace revoke {id}` \
+                 again once the problem is fixed ({e})"
+            ))),
+        }
     }
 
     /// The gate every frame passes (`saiife_wire::verify::Verifier::check`).
@@ -260,10 +303,19 @@ impl Workspace {
         verifier.check(sf, &|id| devices.get(id).cloned(), now)
     }
 
+    /// Whether a bad file keeps this Workspace from trusting anything. A
+    /// locked Workspace has only a throwaway key: it refuses to sign.
+    pub fn locked(&self) -> bool {
+        self.locked.is_some()
+    }
+
     /// The raw signing primitive: `domain(purpose) || data` signed with the
-    /// machine key. What may be signed is the caller's rule.
-    pub fn sign(&self, purpose: SignPurpose, data: &[u8]) -> [u8; 64] {
-        self.machine.sign(purpose.domain(), data, &self.rng)
+    /// machine key. What may be signed is the caller's rule. Refused with
+    /// `WireError::Store` ("the Workspace is locked") while [`locked`]
+    /// (`Workspace::locked`).
+    pub fn sign(&self, purpose: SignPurpose, data: &[u8]) -> Result<[u8; 64], WireError> {
+        self.unlocked()?;
+        Ok(self.machine.sign(purpose.domain(), data, &self.rng))
     }
 
     fn save(&self, list: &DeviceList) -> io::Result<()> {
@@ -277,6 +329,7 @@ impl Workspace {
 fn load_or_create_key(dir: &Path, rng: &SystemRandom) -> Result<MachineKey, String> {
     let path = dir.join(KEY_FILE);
     for _ in 0..2 {
+        key_file_ok(&path)?;
         match read_capped(&path) {
             Ok(bytes) => {
                 return MachineKey::from_pkcs8(&bytes, rng).map_err(|_| {
@@ -300,6 +353,33 @@ fn load_or_create_key(dir: &Path, rng: &SystemRandom) -> Result<MachineKey, Stri
         }
     }
     Err(format!("cannot settle on a key in {}", path.display()))
+}
+
+/// An existing key file must be a regular file (not a link) and, on Unix,
+/// no broader than 0600. A missing file is fine (it is created).
+fn key_file_ok(path: &Path) -> Result<(), String> {
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    if !md.file_type().is_file() {
+        return Err(format!(
+            "{} is not a regular file (kept as it is)",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if md.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{} is readable by others, its mode is broader than 0600 (kept as it is)",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -400,10 +480,33 @@ mod tests {
         let dir = dir_in(t.path());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(KEY_FILE), b"not a key").unwrap();
+        std::fs::set_permissions(dir.join(KEY_FILE), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        // A valid device list next to the bad key: still trusted by nobody.
+        let d = TestDevice::generate();
+        let list = DeviceList {
+            v: 1,
+            devices: vec![Device {
+                id: d.device_id(),
+                label: "phone".into(),
+                owner_user: "alice".into(),
+                public_key: b64::enc(&d.public_raw()),
+                state: DeviceState::Active,
+                added_at: 1,
+                touch_credentials: vec![],
+            }],
+        };
+        std::fs::write(dir.join(DEVICES_FILE), list.to_bytes()).unwrap();
         let (ws, warning) = Workspace::open(dir.clone());
         assert!(warning.unwrap().contains("PKCS#8"));
         assert_eq!(std::fs::read(dir.join(KEY_FILE)).unwrap(), b"not a key");
         assert!(ws.devices().is_empty());
+        assert!(ws.device(&d.device_id()).is_none());
+        assert!(ws.locked());
+        assert!(matches!(
+            ws.sign(SignPurpose::HubHello, b"x"),
+            Err(WireError::Store(_))
+        ));
         let e = ws.begin_pair("alice", None, NOW).unwrap_err();
         assert!(matches!(e, WireError::Store(_)));
     }
@@ -527,14 +630,14 @@ mod tests {
         let ws = Workspace::memory();
         let h = ws.hello();
         let pubkey = b64::dec_n::<65>(h["machine_pub"].as_str().unwrap()).unwrap();
-        let sig = ws.sign(SignPurpose::HubHello, b"x");
+        let sig = ws.sign(SignPurpose::HubHello, b"x").unwrap();
         assert!(saiife_wire::sig::verify_p256_domain(
             &pubkey,
             HUB_HELLO_DOMAIN,
             b"x",
             &sig
         ));
-        let sig = ws.sign(SignPurpose::Seal, b"x");
+        let sig = ws.sign(SignPurpose::Seal, b"x").unwrap();
         assert!(saiife_wire::sig::verify_p256_domain(
             &pubkey,
             saiife_wire::seal::HANDSHAKE_DOMAIN,
@@ -547,5 +650,142 @@ mod tests {
             b"x",
             &sig
         ));
+    }
+
+    fn active(ws: &Workspace, d: &TestDevice) {
+        let (o, _) = pair(ws, d);
+        ws.confirm_pair(&o.pair_id, true, NOW).unwrap();
+    }
+
+    fn frame_of(ws: &Workspace, d: &TestDevice, nonce: u8) -> SignedFrame {
+        let h = ws.hello();
+        d.frame(&saiife_wire::frame::Frame {
+            v: 1,
+            machine_id: h["machine_id"].as_str().unwrap().into(),
+            epoch: h["epoch"].as_str().unwrap().into(),
+            device_id: d.device_id(),
+            action: "box.list".into(),
+            args: Default::default(),
+            nonce: b64::enc(&[nonce; 16]),
+            issued_at: NOW,
+            expires_at: NOW + 100,
+        })
+    }
+
+    #[test]
+    fn a_failed_save_still_revokes() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = dir_in(t.path());
+        let (ws, _) = Workspace::open(dir.clone());
+        let d = TestDevice::generate();
+        active(&ws, &d);
+        ws.check(&frame_of(&ws, &d, 1), NOW).unwrap();
+        // A directory where the temp file goes: the save cannot be staged.
+        let blocker = dir.join(format!(".{DEVICES_FILE}.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+        let e = ws.revoke(&d.device_id()).unwrap_err().to_string();
+        assert!(e.contains("revoked now") && e.contains("NOT saved"), "{e}");
+        assert!(
+            e.contains("restart") && e.contains("saiife workspace revoke"),
+            "{e}"
+        );
+        // In effect at once.
+        assert!(matches!(
+            ws.check(&frame_of(&ws, &d, 2), NOW),
+            Err(WireError::UnknownDevice)
+        ));
+        assert_eq!(
+            ws.device(&d.device_id()).unwrap().state,
+            DeviceState::Revoked
+        );
+        // The file still has the old state; a retry persists it.
+        let (old, _) = Workspace::open(dir.clone());
+        assert_eq!(
+            old.device(&d.device_id()).unwrap().state,
+            DeviceState::Active
+        );
+        assert!(ws.revoke(&d.device_id()).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert!(ws.revoke(&d.device_id()).unwrap(), "the retry saved it");
+        assert!(
+            !ws.revoke(&d.device_id()).unwrap(),
+            "now nothing is pending"
+        );
+        let (again, _) = Workspace::open(dir);
+        assert_eq!(
+            again.device(&d.device_id()).unwrap().state,
+            DeviceState::Revoked
+        );
+    }
+
+    #[test]
+    fn a_later_write_persists_an_unsaved_revocation() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = dir_in(t.path());
+        let (ws, _) = Workspace::open(dir.clone());
+        let (a, b) = (TestDevice::generate(), TestDevice::generate());
+        active(&ws, &a);
+        let blocker = dir.join(format!(".{DEVICES_FILE}.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(ws.revoke(&a.device_id()).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        active(&ws, &b);
+        let (again, _) = Workspace::open(dir);
+        assert_eq!(
+            again.device(&a.device_id()).unwrap().state,
+            DeviceState::Revoked
+        );
+        assert_eq!(
+            again.device(&b.device_id()).unwrap().state,
+            DeviceState::Active
+        );
+    }
+
+    #[test]
+    fn revoked_key_cannot_pair_again() {
+        let t = tempfile::tempdir().unwrap();
+        let (ws, _) = Workspace::open(dir_in(t.path()));
+        let d = TestDevice::generate();
+        active(&ws, &d);
+        ws.revoke(&d.device_id()).unwrap();
+        let o = ws.begin_pair("alice", None, NOW).unwrap();
+        let e = ws.finish_pair(&request(&o, &d, "phone"), NOW).unwrap_err();
+        assert!(matches!(e, WireError::Malformed(_)), "{e:?}");
+        assert_eq!(
+            ws.device(&d.device_id()).unwrap().state,
+            DeviceState::Revoked
+        );
+        // The offer was not burned; a new key can use it.
+        let n = TestDevice::generate();
+        ws.finish_pair(&request(&o, &n, "new"), NOW).unwrap();
+    }
+
+    #[test]
+    fn a_key_file_open_to_others_locks() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = dir_in(t.path());
+        let (a, _) = Workspace::open(dir.clone());
+        drop(a);
+        let p = dir.join(KEY_FILE);
+        let before = std::fs::read(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (ws, warning) = Workspace::open(dir.clone());
+        assert!(warning.unwrap().contains("0600"));
+        assert!(ws.locked());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn a_key_symlink_locks() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = dir_in(t.path());
+        let (a, _) = Workspace::open(dir.clone());
+        drop(a);
+        let real = dir.join("real.p256");
+        std::fs::rename(dir.join(KEY_FILE), &real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join(KEY_FILE)).unwrap();
+        let (ws, warning) = Workspace::open(dir);
+        assert!(warning.unwrap().contains("regular file"));
+        assert!(ws.locked());
     }
 }
