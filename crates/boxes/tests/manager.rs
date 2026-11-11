@@ -306,6 +306,60 @@ fn guest_event_for_unknown_box_is_not_found() {
 }
 
 #[test]
+fn spawn_changes_reports_every_admission() {
+    let w = world(1);
+    // Own admission only.
+    let (a, ch) = w
+        .mgr
+        .spawn_changes(&w.args("claude-code", "a", Start::Queue))
+        .unwrap();
+    assert_eq!(a.state, BoxState::Starting);
+    assert_eq!(
+        ch,
+        vec![change(
+            &a.id,
+            BoxState::Queued,
+            BoxState::Starting,
+            "admitted"
+        )]
+    );
+    // Queued: no change at all.
+    let (b, ch) = w
+        .mgr
+        .spawn_changes(&w.args("claude-code", "b", Start::Queue))
+        .unwrap();
+    assert_eq!(b.state, BoxState::Queued);
+    assert!(ch.is_empty());
+    // A slot frees; the next spawn's pass admits the earlier head, whose
+    // boot fails, then the one after it; the new box waits.
+    let (c, _) = w
+        .mgr
+        .spawn_changes(&w.args("claude-code", "c", Start::Queue))
+        .unwrap();
+    w.mgr.stop(&a.id, false).unwrap();
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let (d, ch) = w
+        .mgr
+        .spawn_changes(&w.args("claude-code", "d", Start::Queue))
+        .unwrap();
+    assert_eq!(d.state, BoxState::Queued);
+    assert_eq!(
+        ch,
+        vec![
+            change(&b.id, BoxState::Queued, BoxState::Starting, "admitted"),
+            change(
+                &b.id,
+                BoxState::Starting,
+                BoxState::Discarded,
+                "boot failed"
+            ),
+            change(&c.id, BoxState::Queued, BoxState::Starting, "admitted"),
+        ]
+    );
+    assert_eq!(w.mgr.queue(), vec![d.id.clone()]);
+}
+
+#[test]
 fn boot_failure_discards_and_keeps_dir() {
     let w = world(1);
     w.vmm.fail_next(VmOp::Boot, "no kvm");

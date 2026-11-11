@@ -319,6 +319,13 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
         }
     };
     let n = changes.len();
+    write_tick_records(ctx, changes).await;
+    n
+}
+
+/// The daemon's own `box` records (`action`/`via` "tick", `reason` = why),
+/// one per change, each with the box's template when it is still known.
+async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
     for (c, template) in changes {
         let mut rec = box_rec(
             ctx,
@@ -334,7 +341,6 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
             eprintln!("saiifed: warning: cannot write a box tick record: {e}");
         }
     }
-    n
 }
 
 fn state_value(s: BoxState) -> Value {
@@ -734,13 +740,26 @@ async fn run(
     };
     match op {
         Op::Spawn(args) => {
-            let (r, answer) = blocking(move || {
-                let r = m.spawn(&args)?;
+            let (r, answer, others) = blocking(move || {
+                let (r, changes) = m.spawn_changes(&args)?;
                 let answer = info_of(&m, &r, Some(r.owner_uid));
-                Ok((r, answer))
+                // Earlier queue heads this spawn's admission pass moved
+                // (possibly other owners' boxes): the tick never sees them.
+                // The new box's own admission is covered by the spawn
+                // record's `to`.
+                let others = changes
+                    .into_iter()
+                    .filter(|c| c.id != r.id)
+                    .map(|c| {
+                        let template = m.get(&c.id).ok().map(|b| b.template);
+                        (c, template)
+                    })
+                    .collect::<Vec<_>>();
+                Ok((r, answer, others))
             })
             .await?;
-            let rec = box_rec(
+            write_tick_records(ctx, others).await;
+            let mut rec = box_rec(
                 ctx,
                 "spawn",
                 Some(&r.id),
@@ -749,6 +768,9 @@ async fn run(
                 Some(r.state),
                 "cli",
             );
+            if r.state == BoxState::Discarded {
+                rec.reason = r.error.clone();
+            }
             Ok((answer, Some(rec)))
         }
         Op::List { all } => {

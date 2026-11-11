@@ -308,6 +308,14 @@ impl Manager {
     }
 
     pub fn spawn(&self, a: &SpawnArgs) -> Result<BoxRecord, BoxError> {
+        self.spawn_changes(a).map(|(r, _)| r)
+    }
+
+    /// `spawn`, plus every change the admission pass made: the new box's own
+    /// admission and any earlier queue heads it admitted (or discarded on a
+    /// boot failure), which may belong to other owners. The audit log needs
+    /// those, since the tick never sees them.
+    pub fn spawn_changes(&self, a: &SpawnArgs) -> Result<(BoxRecord, Vec<Change>), BoxError> {
         if a.repo_image.is_some() || a.base_manifest.is_some() {
             return Err(BoxError::Invalid("repo disks are not supported yet".into()));
         }
@@ -359,8 +367,8 @@ impl Manager {
             let _ = g.store.remove(&id);
             return Err(e);
         }
-        self.admission(&mut g, &host, now);
-        g.get(&id).cloned()
+        let changes = self.admission(&mut g, &host, now);
+        Ok((g.get(&id)?.clone(), changes))
     }
 
     /// Admit queue heads while they fit (strict FIFO: a head that does not

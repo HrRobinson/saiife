@@ -559,6 +559,58 @@ async fn tick_records_changes() {
 }
 
 #[tokio::test]
+async fn spawn_records_the_heads_it_admits() {
+    let w = world();
+    let b1 = w.running(ALICE, "one").await;
+    w.running(ALICE, "two").await;
+    let q = w.spawn(BOB, "three").await;
+    assert_eq!(q["box"]["state"], "queued");
+    w.ok(ALICE, "box.stop", json!({"id": b1})).await;
+    let before = w.records().len();
+    let a = w.spawn(ALICE, "four").await;
+    assert_eq!(a["box"]["id"], "b4");
+    assert_eq!(a["box"]["state"], "queued");
+    assert_eq!(
+        w.mgr().get(&id("b3")).unwrap().state.to_string_lossy(),
+        "starting"
+    );
+    let recs = w.records();
+    let new = &recs[before..];
+    let b3: Vec<_> = new.iter().filter(|r| r["box"] == "b3").collect();
+    assert_eq!(b3.len(), 1, "{new:?}");
+    let r = b3[0];
+    assert_eq!(r["action"], "tick");
+    assert_eq!(r["via"], "tick");
+    assert_eq!(r["from"], "queued");
+    assert_eq!(r["to"], "starting");
+    assert_eq!(r["reason"], "admitted");
+    assert_eq!(r["session"], "box-b3");
+    assert_eq!(r["uid"], 999, "the daemon's own record");
+    let b4: Vec<_> = new.iter().filter(|r| r["box"] == "b4").collect();
+    assert_eq!(b4.len(), 1, "{new:?}");
+    assert_eq!(b4[0]["action"], "spawn");
+    assert_eq!(b4[0]["to"], "queued");
+    assert_eq!(new.len(), 2, "{new:?}");
+    // The tick has nothing left to record about b3.
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
+}
+
+#[tokio::test]
+async fn spawn_boot_failure_is_one_record_with_the_reason() {
+    let w = world();
+    let before = w.records().len();
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let a = w.spawn(ALICE, "one").await;
+    assert_eq!(a["box"]["state"], "discarded");
+    let recs = w.records();
+    let new = &recs[before..];
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["action"], "spawn");
+    assert_eq!(new[0]["to"], "discarded");
+    assert_eq!(new[0]["reason"], "boot failed: no kvm");
+}
+
+#[tokio::test]
 async fn templates_lists_warnings() {
     let tmp = scratch();
     let xdg = tmp.path().join("xdg");
