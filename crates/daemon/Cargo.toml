@@ -28,7 +28,7 @@ saiife-keychain = { path = "../keychain" }
 zeroize = { version = "=1.9.1", features = ["serde"] }
 
 # 1.53.3 and later are younger than 14 days (2026-10-22).
-tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros", "process"] }
+tokio = { version = "=1.53.3", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros", "process"] }
 saiife-system = { path = "../system" }
 # Pure rules on every OS, for the tests; the Windows calls below.
 saiife-win = { path = "../win" }
@@ -51,7 +51,7 @@ percent-encoding = "2"
 # Gateway bearer tokens are stored as SHA-256 (Task 11); as in saiife-audit.
 sha2 = "0.10"
 # The SMTP client's TLS (plan 11, Task 6); versions as in saiife-broker.
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -71,10 +71,10 @@ tempfile = "3"
 # The gateway tests: a hyper client over the socket and a loopback TLS
 # upstream; versions as in saiife-broker.
 # test-util: the hook table's tests run on a paused clock (plan 20).
-tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "macros", "test-util"] }
+tokio = { version = "=1.53.3", features = ["rt", "net", "io-util", "sync", "time", "macros", "test-util"] }
 hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 [lints]

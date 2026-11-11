@@ -260,6 +260,12 @@ impl ExitWatch {
     #[cfg(target_os = "linux")]
     fn new(pid: u32) -> ExitWatch {
         use rustix::process::{pidfd_open, Pid, PidfdFlags};
+        // tokio 1.53.3 deprecates the safe constructors (RUSTSEC-2026-0386: any
+        // AsRawFd could be closed under the AsyncFd). The replacement is unsafe and
+        // this workspace forbids unsafe code. The unsoundness does not apply here:
+        // the AsyncFd takes sole ownership of a fresh OwnedFd, so nothing else can
+        // close or replace the descriptor.
+        #[allow(deprecated)]
         let fd = Pid::from_raw(pid as i32)
             .and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok())
             .and_then(|fd| {
