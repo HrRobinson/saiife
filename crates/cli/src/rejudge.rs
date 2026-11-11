@@ -540,6 +540,7 @@ impl Pool {
             agent: Some(AGENT.to_string()),
             view: View::Lexical,
             vars: Some(vars),
+            user_packs: crate::eval::user_pack_srcs(&cfg),
         })
     }
 

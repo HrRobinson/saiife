@@ -743,6 +743,12 @@ mod imp {
                     agent: Some(agent.to_string()),
                     view: eval::View::Host,
                     vars: None,
+                    // A settings change is judged without user packs too.
+                    user_packs: if event.is_some() {
+                        Vec::new()
+                    } else {
+                        eval::user_pack_srcs(cfg)
+                    },
                 };
                 if in_process(agent) {
                     drop(early);

@@ -14,13 +14,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use saiifeguard::builtins::Catalog;
-use saiifeguard::canon::{expand_glob_partial, fs_view, with_fs_view, FsView, PathVars};
+use saiifeguard::canon::{expand_glob_partial, fs_view, with_fs_view, FsView, PathStyle, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
     classify_for, context_from_hook_json_bounded, search_globs, Dialects, PayloadError, ToolCall,
     MAX_PAYLOAD_BYTES,
 };
+use saiifeguard::profile::Profile;
+use saiifeguard::userpack::{load_user_packs_cached, UserSrc};
 
 use crate::paths::{path_vars_locked, path_vars_locked_env, EnvList, LockedPaths};
 
@@ -33,8 +35,11 @@ pub const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Largest `EvalRequest` the worker reads, and largest `EvalAnswer` the
 /// parent reads: a payload at `PARSE_MAX_BYTES`, JSON-escaped (at most
-/// twice its size for a payload that is itself JSON), plus the envelope.
-pub const MAX_EVAL_BYTES: usize = 2 * PARSE_MAX_BYTES + 64 * 1024;
+/// twice its size for a payload that is itself JSON), plus the envelope and
+/// the user packs (each file at most `MAX_USER_PACK_BYTES`, sent twice over
+/// as a margin for JSON escaping).
+pub const MAX_EVAL_BYTES: usize =
+    2 * PARSE_MAX_BYTES + 2 * saiife_policy::userpacks::MAX_USER_PACK_BYTES + 64 * 1024;
 
 /// Longest payload `cwd` that is used (Linux `PATH_MAX`). A longer one, or
 /// one with a NUL, is never looked up: walking it can take longer than the
@@ -52,6 +57,25 @@ pub fn check_cwd(cwd: Option<&str>) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// One user pack file as the worker is sent it (plan 32): where it was read
+/// from, and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserPackSrc {
+    pub source: String,
+    pub text: String,
+}
+
+/// The system config's user packs, as a request carries them.
+pub fn user_pack_srcs(cfg: &saiife_policy::SystemConfig) -> Vec<UserPackSrc> {
+    cfg.user_packs
+        .iter()
+        .map(|u| UserPackSrc {
+            source: u.path.clone(),
+            text: u.text.clone(),
+        })
+        .collect()
 }
 
 /// What the parent sends the worker on stdin.
@@ -86,6 +110,10 @@ pub struct EvalRequest {
     /// this process's own.
     #[serde(default)]
     pub vars: Option<Vec<(String, String)>>,
+    /// The user packs (`policy.d/packs/*.toml`), compiled strictly on top of
+    /// `packs`: one that does not load leaves the call `unjudged`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_packs: Vec<UserPackSrc>,
 }
 
 /// [`EvalRequest::view`].
@@ -447,7 +475,7 @@ pub fn judge_with(
     ask: &[String],
     agent: Option<&str>,
 ) -> EvalAnswer {
-    judge_in(payload, packs, budget, (locked, None), ask, agent)
+    judge_in(payload, packs, &[], budget, (locked, None), ask, agent)
 }
 
 /// What the worker answers `req`. `env`: the environment a worker would be started
@@ -472,6 +500,7 @@ fn judged(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
         None => judge_in(
             &req.payload,
             &req.packs,
+            &req.user_packs,
             Duration::from_millis(req.budget_ms),
             (req.locked.as_ref(), env),
             &req.ask,
@@ -495,6 +524,7 @@ fn judged(req: &EvalRequest, env: Option<&EnvList>) -> EvalAnswer {
 fn judge_in(
     payload: &str,
     packs: &[String],
+    user: &[UserPackSrc],
     budget: Duration,
     (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
     ask: &[String],
@@ -516,7 +546,12 @@ fn judge_in(
     }
     let engine = || {
         crate::hook_timing::time("worker.engine", || {
-            engine_for(packs, ctx.cwd.as_deref(), budget, (locked, env))
+            engine_for(
+                (packs, user, Profile::Host),
+                ctx.cwd.as_deref(),
+                budget,
+                (locked, env),
+            )
         })
     };
     match plan(payload, agent) {
@@ -532,7 +567,10 @@ fn judge_in(
         Plan::NoPath => answer(Verdict::Unjudged, String::new(), "no path to judge"),
         Plan::Other => answer(Verdict::Allow, String::new(), "tool not judged"),
         Plan::Shell { command, dialects } => {
-            let (engine, _) = engine();
+            let (engine, _) = match engine() {
+                Ok(e) => e,
+                Err(reason) => return answer(Verdict::Unjudged, command, &reason),
+            };
             let d = engine.evaluate_call(&command, dialects);
             let rule_id = match &d {
                 Decision::Deny { pack, pattern, .. } => {
@@ -553,7 +591,10 @@ fn judge_in(
             }
         }
         Plan::Files(call) => {
-            let (engine, vars) = engine();
+            let (engine, vars) = match engine() {
+                Ok(e) => e,
+                Err(reason) => return answer(Verdict::Unjudged, call.input(), &reason),
+            };
             let d = judge_files(&engine, &vars, &call);
             from_decision(call.input(), ctx.tool.clone(), d)
         }
@@ -589,12 +630,14 @@ fn askable(
 /// compiled as well), path rules bound to `cwd` (else this process's
 /// directory), its project and the locked host's system paths. The rule
 /// variables come from `env` when it is given, else from this process.
+/// The user packs (compiled for `profile`) follow the built-ins; any one that
+/// does not load is an `Err` with the reason (the call is then `unjudged`).
 fn engine_for(
-    packs: &[String],
+    (packs, user, profile): (&[String], &[UserPackSrc], Profile),
     cwd: Option<&str>,
     budget: Duration,
     (locked, env): (Option<&LockedPaths>, Option<&EnvList>),
-) -> (Engine, PathVars) {
+) -> Result<(Engine, PathVars), String> {
     // Lexical (the service): nothing is looked up, neither this process's
     // directory nor a project root above the payload's cwd.
     let lexical = fs_view() == FsView::Lexical;
@@ -610,7 +653,19 @@ fn engine_for(
             .and_then(saiife_agents::config::find_project_root),
     };
     // Broken built-ins are skipped; their rules are not in force.
-    let (packs, _warnings) = Catalog::builtin().load_active(packs);
+    let (mut packs, _warnings) = Catalog::builtin().load_active(packs);
+    if !user.is_empty() {
+        let srcs: Vec<UserSrc> = user
+            .iter()
+            .map(|u| UserSrc {
+                source: &u.source,
+                text: &u.text,
+            })
+            .collect();
+        packs.extend(
+            load_user_packs_cached(&srcs, PathStyle::host(), profile).map_err(|e| e.to_string())?,
+        );
+    }
     let vars = match env {
         Some(env) => path_vars_locked_env(start.as_deref(), project.as_deref(), locked, env),
         None => path_vars_locked(start.as_deref(), project.as_deref(), locked),
@@ -618,7 +673,7 @@ fn engine_for(
     let engine = Engine::new(packs)
         .with_paths(vars.clone())
         .with_budget(budget);
-    (engine, vars)
+    Ok((engine, vars))
 }
 
 fn from_decision(input: String, tool: Option<String>, d: Decision) -> EvalAnswer {
@@ -2219,5 +2274,43 @@ mod tests {
         assert_eq!(v["verdict"], "unjudged");
         let back: EvalAnswer = serde_json::from_value(v).unwrap();
         assert_eq!(back, a);
+    }
+    fn request_with(user_packs: Vec<UserPackSrc>) -> EvalRequest {
+        EvalRequest {
+            payload: payload("/tmp", "Bash", serde_json::json!({"command": "ls"})),
+            packs: defaults(),
+            budget_ms: 1000,
+            locked: None,
+            event: None,
+            ask: Vec::new(),
+            agent: Some("claude".into()),
+            view: View::Host,
+            vars: None,
+            user_packs,
+        }
+    }
+
+    #[test]
+    fn request_without_user_packs_serializes_as_before() {
+        let s = serde_json::to_string(&request_with(Vec::new())).unwrap();
+        assert!(!s.contains("user_packs"), "{s}");
+        let back: EvalRequest = serde_json::from_str(&s).unwrap();
+        assert!(back.user_packs.is_empty());
+    }
+
+    #[test]
+    fn a_broken_user_pack_leaves_the_call_unjudged_naming_the_file() {
+        let bad = UserPackSrc {
+            source: "/etc/saiife/policy.d/packs/user.t.toml".into(),
+            text: "[pack]\nid = \"user.t\"\n[[deny]]\nid = \"a\"\npattern = '('\nreason = \"r\"\n"
+                .into(),
+        };
+        let a = answer(&request_with(vec![bad]), None);
+        assert_eq!(a.verdict, Verdict::Unjudged, "{a:?}");
+        let r = a.reason.unwrap();
+        assert!(
+            r.starts_with("user pack /etc/saiife/policy.d/packs/user.t.toml: "),
+            "{r}"
+        );
     }
 }

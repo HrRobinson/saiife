@@ -1120,8 +1120,24 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         f.rule_id.clone().unwrap_or_default(),
         f.input.clone(),
     );
-    let matches = tokio::task::spawn_blocking(move || {
-        saiifeguard::builtins::builtin_rule_denies(&pack, &rule_id, &input)
+    // A user pack's rule is checked against the pack file the daemon holds.
+    let user = sys.user_packs.iter().find(|u| u.id == pack).cloned();
+    let matches = tokio::task::spawn_blocking(move || match user {
+        Some(u) => {
+            let src = [saiifeguard::userpack::UserSrc {
+                source: &u.path,
+                text: &u.text,
+            }];
+            saiifeguard::userpack::load_user_packs_cached(
+                &src,
+                saiifeguard::canon::PathStyle::host(),
+                saiifeguard::profile::Profile::Host,
+            )
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .is_some_and(|p| saiifeguard::builtins::pack_rule_denies(&p, &rule_id, &input))
+        }
+        None => saiifeguard::builtins::builtin_rule_denies(&pack, &rule_id, &input),
     })
     .await
     .unwrap_or(false);
