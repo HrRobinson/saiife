@@ -216,13 +216,25 @@ impl TouchState {
         Ok(it)
     }
 
+    /// Spends the challenge of `key`: the entry is removed whatever the
+    /// outcome. None is `Expired`; one issued to another uid is `Mismatch`.
+    /// The expiry is the caller's to check (`consume` does, and `verify`
+    /// does against the record built from the entry).
+    pub fn take(&self, key: &IssueKey, uid: u32) -> Result<Issued, TouchError> {
+        let entry = lock(&self.issued).remove(key).ok_or(TouchError::Expired)?;
+        if entry.uid != uid {
+            return Err(TouchError::Mismatch);
+        }
+        Ok(entry)
+    }
+
     /// Spends the challenge of `key` and verifies `asr` against it and the
     /// credentials of `uid`. The entry is burned whatever the outcome. In
-    /// order: no live entry or one past its expiry is `Expired`, another
-    /// uid's is `Mismatch`, unwritable touch files are `Unavailable` (the
-    /// counter could not be saved), then the verify. On success the new
-    /// counter is saved before returning; a save failure refuses (fail
-    /// closed).
+    /// order: no live entry is `Expired`, another uid's is `Mismatch`, one
+    /// past its expiry is `Expired`, unwritable touch files are
+    /// `Unavailable` (the counter could not be saved), then the verify. On
+    /// success the new counter is saved before returning; a save failure
+    /// refuses (fail closed).
     ///
     /// Blocks (the credentials lock is held across the fsync): call it from
     /// `spawn_blocking`.
@@ -235,22 +247,35 @@ impl TouchState {
         rp_id: &str,
         now: u64,
     ) -> Result<(TouchEvidence, ActionRecord), TouchError> {
-        let entry = lock(&self.issued).remove(key).ok_or(TouchError::Expired)?;
+        let entry = self.take(key, uid)?;
         if entry.expires_at < now {
             return Err(TouchError::Expired);
         }
-        if entry.uid != uid {
-            return Err(TouchError::Mismatch);
-        }
-        self.writable().map_err(|_| TouchError::Unavailable)?;
         let record = build(&entry);
+        let ev = self.verify_counted(uid, &record, asr, rp_id, now)?;
+        Ok((ev, record))
+    }
+
+    /// Verifies `asr` as a touch for `record` against the credentials of
+    /// `uid` and saves the new counter (a save failure refuses). Unwritable
+    /// touch files are `Unavailable` before any verify. The caller has
+    /// spent the challenge. Blocks as [`TouchState::consume`] does.
+    pub fn verify_counted(
+        &self,
+        uid: u32,
+        record: &ActionRecord,
+        asr: &Assertion,
+        rp_id: &str,
+        now: u64,
+    ) -> Result<TouchEvidence, TouchError> {
+        self.writable().map_err(|_| TouchError::Unavailable)?;
         // Held across the verify and the save: no lost counter update.
         let mut f = lock(&self.creds);
-        let ev = verify(&f.of_uid(uid), &record, asr, rp_id, now)?;
+        let ev = verify(&f.of_uid(uid), record, asr, rp_id, now)?;
         f.set_count(asr.credential_id(), ev.sign_count);
         f.save(&self.creds_path())
             .map_err(|_| TouchError::Unavailable)?;
-        Ok((ev, record))
+        Ok(ev)
     }
 
     pub fn add(&self, c: Credential) -> Result<(), String> {
@@ -495,6 +520,23 @@ mod tests {
             }
         }
         issue(&t, IssueKey::Approve(0), 0, NOW).unwrap();
+    }
+
+    /// `take` spends the entry whatever the outcome: missing is
+    /// `Expired`, another uid's is `Mismatch`.
+    #[test]
+    fn take_spends_the_entry() {
+        let d = dir();
+        let (t, _) = TouchState::open(d.path());
+        let k = IssueKey::Enrol(1000);
+        issue(&t, k.clone(), 1000, NOW).unwrap();
+        assert_eq!(t.take(&k, 1001).unwrap_err(), TouchError::Mismatch);
+        assert_eq!(t.take(&k, 1000).unwrap_err(), TouchError::Expired);
+        let it = issue(&t, k.clone(), 1000, NOW).unwrap();
+        let got = t.take(&k, 1000).unwrap();
+        assert_eq!(got.nonce, it.nonce);
+        assert_eq!(got.summary, it.summary);
+        assert_eq!(t.take(&k, 1000).unwrap_err(), TouchError::Expired);
     }
 
     #[test]

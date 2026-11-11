@@ -2551,7 +2551,7 @@ mod tests {
 /// "approve"}` and the touch `approval.decide` needs, through
 /// `dispatch_conn` as a client sends them.
 #[cfg(all(test, unix))]
-mod touch_tests {
+pub(crate) mod touch_tests {
     use super::*;
     use crate::touch::TouchState;
     use saiife_broker::mask::Masker;
@@ -2559,11 +2559,11 @@ mod touch_tests {
     use saiife_touch::{reverify, Assertion, Touch as _, TouchRequest, LOCAL_RP_ID};
     use std::path::Path;
 
-    const OWN: u32 = 1000;
-    const MARKED: &str = "version = 2\n[services.s3_ask]\nconnector = \"s3\"\n\
+    pub(crate) const OWN: u32 = 1000;
+    pub(crate) const MARKED: &str = "version = 2\n[services.s3_ask]\nconnector = \"s3\"\n\
                           deploy = [\"objects:write\"]\n";
-    const PLAIN: &str = "version = 2\n[services.s3_ask]\nconnector = \"s3\"\n";
-    const LOCKED: &str = "version = 2\nlocked = true\n[approval]\n\
+    pub(crate) const PLAIN: &str = "version = 2\n[services.s3_ask]\nconnector = \"s3\"\n";
+    pub(crate) const LOCKED: &str = "version = 2\nlocked = true\n[approval]\n\
                           approvers = [\"ann\", \"bob\"]\nsame_user = \"deny\"\n\
                           [services.s3_ask]\nconnector = \"s3\"\ndeploy = [\"objects:write\"]\n";
     const PASSWD: &str = "agent:x:1000:1000::/home/agent:/bin/sh\n\
@@ -2573,7 +2573,7 @@ mod touch_tests {
 
     /// A connector call of `OWN` to `s3_ask` with capability `cap`; `key`
     /// tells requests apart.
-    fn call(key: &str, cap: &str) -> PendingCall {
+    pub(crate) fn call(key: &str, cap: &str) -> PendingCall {
         let stored: StoredCall = serde_json::from_value(json!({
             "uid": OWN, "user": "agent", "session": null, "project": "/p",
             "service": "s3_ask", "operation": "s3.put_object",
@@ -2614,16 +2614,16 @@ mod touch_tests {
         };
     }
 
-    struct World {
-        d: tempfile::TempDir,
-        ctx: Arc<Ctx>,
+    pub(crate) struct World {
+        pub(crate) d: tempfile::TempDir,
+        pub(crate) ctx: Arc<Ctx>,
         _join: std::thread::JoinHandle<()>,
-        soft: SoftAuthenticator,
+        pub(crate) soft: SoftAuthenticator,
     }
 
     /// A context with a store, a vault and `policy`; `soft` is enrolled
     /// for `OWN` unless `enrol` is false.
-    fn world_in(mode: crate::ops::Mode, own: u32, policy: &str, enrol: bool) -> World {
+    pub(crate) fn world_in(mode: crate::ops::Mode, own: u32, policy: &str, enrol: bool) -> World {
         let d = tempfile::tempdir().unwrap();
         let (mut ctx, join) = crate::ops::test_ctx(d.path(), mode, own);
         let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
@@ -2655,7 +2655,7 @@ mod touch_tests {
         }
     }
 
-    fn personal(policy: &str) -> World {
+    pub(crate) fn personal(policy: &str) -> World {
         world_in(crate::ops::Mode::Personal, OWN, policy, true)
     }
 
@@ -2672,7 +2672,7 @@ mod touch_tests {
         )
     }
 
-    async fn op(ctx: &Arc<Ctx>, uid: u32, op: &str, args: Value) -> Value {
+    pub(crate) async fn op(ctx: &Arc<Ctx>, uid: u32, op: &str, args: Value) -> Value {
         let req = Request {
             id: 7,
             op: op.into(),
@@ -2681,11 +2681,11 @@ mod touch_tests {
         crate::ops::dispatch_conn(ctx, &conn(uid), req).await
     }
 
-    async fn ask(w: &World, key: &str, cap: &str) -> u64 {
+    pub(crate) async fn ask(w: &World, key: &str, cap: &str) -> u64 {
         create(&w.ctx, &call(key, cap), "claude").await.unwrap()
     }
 
-    async fn begin(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Value {
+    pub(crate) async fn begin(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Value {
         op(
             ctx,
             uid,
@@ -2696,12 +2696,12 @@ mod touch_tests {
     }
 
     /// `touch.begin`'s answer as the client reads it.
-    fn treq(v: &Value) -> TouchRequest {
+    pub(crate) fn treq(v: &Value) -> TouchRequest {
         assert_eq!(v["ok"], true, "{v}");
         serde_json::from_value(v.clone()).unwrap()
     }
 
-    async fn decide_with(
+    pub(crate) async fn decide_with(
         ctx: &Arc<Ctx>,
         uid: u32,
         rid: u64,
@@ -2719,7 +2719,7 @@ mod touch_tests {
         w.ctx.approvals.as_ref().unwrap().get(rid).unwrap().state
     }
 
-    fn records(d: &Path) -> Vec<Value> {
+    pub(crate) fn records(d: &Path) -> Vec<Value> {
         let mut files: Vec<_> = std::fs::read_dir(d.join("audit"))
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -2739,14 +2739,14 @@ mod touch_tests {
     }
 
     /// The `approval` records of request `rid` with `action`.
-    fn approval_records(w: &World, rid: u64, action: &str) -> Vec<Value> {
+    pub(crate) fn approval_records(w: &World, rid: u64, action: &str) -> Vec<Value> {
         records(w.d.path())
             .into_iter()
             .filter(|r| r["kind"] == "approval" && r["id"] == rid && r["action"] == action)
             .collect()
     }
 
-    fn refused_rule(v: &Value) -> &str {
+    pub(crate) fn refused_rule(v: &Value) -> &str {
         assert_eq!(v["ok"], false, "{v}");
         assert_eq!(v["error"], "forbidden", "{v}");
         v["rule"].as_str().unwrap()
