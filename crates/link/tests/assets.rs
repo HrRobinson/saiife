@@ -106,7 +106,8 @@ fn dynamic_import_with_non_literal(line: &str) -> bool {
 fn has_event_attribute(line: &str) -> bool {
     let b = line.as_bytes();
     for i in 0..b.len().saturating_sub(2) {
-        let boundary = i == 0 || b[i - 1].is_ascii_whitespace() || b[i - 1] == b'"';
+        let prev = if i == 0 { b' ' } else { b[i - 1] };
+        let boundary = !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-');
         if boundary && b[i] == b'o' && b[i + 1] == b'n' {
             let mut j = i + 2;
             while j < b.len() && b[j].is_ascii_lowercase() {
@@ -123,8 +124,8 @@ fn has_event_attribute(line: &str) -> bool {
 /// Every forbidden thing found in one file, as "name:line: what".
 fn violations(url: &str, src: &str) -> Vec<String> {
     let mut v = Vec::new();
-    let is_html = ext(url) == "html";
     let is_svg = ext(url) == "svg";
+    let markup = ext(url) == "html" || is_svg;
     for (n, line) in src.lines().enumerate() {
         let at = n + 1;
         let mut hit = |what: &str| v.push(format!("{url}:{at}: {what}"));
@@ -158,7 +159,7 @@ fn violations(url: &str, src: &str) -> Vec<String> {
         if dynamic_import_with_non_literal(line) {
             hit("import( with a non-literal");
         }
-        if is_html {
+        if markup {
             if line.contains("<script") && !line.contains("src=") {
                 hit("<script without src");
             }
@@ -186,7 +187,17 @@ fn assets_never_use_html_sinks() {
 fn scan_names_file_and_line() {
     let v = violations("/js/x.js", "ok\nel.innerHTML = x;\n");
     assert_eq!(v, vec!["/js/x.js:2: innerHTML".to_string()]);
-    assert!(!violations("/a.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"/>").len() > 0);
+    assert!(violations("/a.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"/>").is_empty());
+    assert!(!violations(
+        "/a.svg",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"http://x/a\"/>"
+    )
+    .is_empty());
+    assert!(!violations("/a.svg", "<svg onload=\"x\"/>").is_empty());
+    assert!(!violations("/a.html", "<a/onclick=\"x\">").is_empty());
+    assert!(!violations("/a.html", "<a href='x'onclick='y'>").is_empty());
+    assert!(!violations("/a.html", "<a data-x='1' onclick=y>").is_empty());
+    assert!(violations("/a.html", "<a data-onclick=\"y\">").is_empty());
     assert!(!violations("/a.html", "<a onclick=\"x\">").is_empty());
     assert!(!violations("/a.html", "<script>x</script>").is_empty());
     assert!(!violations("/a.js", "import(name)").is_empty());
