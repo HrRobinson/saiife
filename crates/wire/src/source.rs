@@ -196,15 +196,17 @@ impl PendingAction {
     /// (plan 26 D9; §8.3).
     pub fn view(&self) -> PendingView {
         let ch = saiife_touch::challenge(&self.record);
+        // request_id, class, expires_at and summary come from the record: the
+        // touch challenge binds the record, so the UI must show the same.
         PendingView {
-            request_id: self.request_id.to_string(),
+            request_id: self.record.request_id.to_string(),
             class: self.record.class.name().to_string(),
             box_id: self.box_id.clone(),
-            summary: self.summary.clone(),
+            summary: self.record.summary.clone(),
             challenge_hex: crate::b64::hex(&ch),
             short_code: saiife_touch::short_code(&ch),
             created_at: self.created_at,
-            expires_at: self.expires_at,
+            expires_at: self.record.expires_at,
         }
     }
 }
@@ -292,9 +294,12 @@ impl std::error::Error for BoxError {}
 /// - `stop`: Starting/Running/Paused -> Done; Done/Landed/Discarded -> `Ok(())`
 ///   (idempotent no-op); Queued -> `WrongState`.
 /// - `pause` is Running -> Paused, `resume` Paused -> Running, `discard`
-///   Queued|Done -> Discarded; anything else is `WrongState`.
-/// - `revise` is only valid in `Done` (`WrongState` otherwise); it moves the
-///   box to Running with the comment as the next prompt.
+///   Queued|Done|Landed -> Discarded; anything else is `WrongState`.
+/// - `revise` is valid in `Done` or `Landed` (`WrongState` otherwise); it moves
+///   the box to Running with the comment as the next prompt, and `lands` is
+///   kept: a box can land several times (§7.7).
+/// - A pending `land` binds the box's current diff; when the box leaves Done
+///   the pending land is dropped.
 /// - `complete(Approve)` takes `Some(evidence)`, `complete(Reject)` takes
 ///   `None`; any other combination is `Invalid`. Approving `land` adds one
 ///   commit per §7.7 and never writes a user's repo (§5.1: the CLI does).
@@ -312,7 +317,7 @@ pub trait BoxSource: Send + Sync {
     /// The full new order of the queued boxes.
     fn reorder(&self, queue: &[BoxId]) -> Result<(), BoxError>;
     fn steer(&self, id: &BoxId, msg: &str) -> Result<(), BoxError>;
-    /// Done -> Running, with the comment as the next prompt.
+    /// Done or Landed -> Running, with the comment as the next prompt.
     fn revise(&self, id: &BoxId, comment: &str) -> Result<(), BoxError>;
     fn pending_actions(&self) -> Vec<PendingAction>;
     /// Evidence is `Some` for Approve, `None` for Reject.

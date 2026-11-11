@@ -10,6 +10,7 @@
 
 use crate::source::*;
 use saiife_touch::{TouchClass, TouchEvidence};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 /// What `check` needs: a source in a known state. The source must be
@@ -140,6 +141,12 @@ pub fn check(fx: &Fixture) -> Result<(), String> {
     let mut seen = HashSet::new();
     for p in src.pending_actions() {
         if p.record.class == TouchClass::Land {
+            if p.box_id.is_none() {
+                return fail(
+                    "land binding",
+                    format!("pending land {} names no box", p.request_id),
+                );
+            }
             if let Some(bid) = &p.box_id {
                 let d = match src.diff(bid) {
                     Ok(d) => d,
@@ -165,6 +172,7 @@ pub fn check(fx: &Fixture) -> Result<(), String> {
         if p.request_id != p.record.request_id
             || p.class != p.record.class
             || p.expires_at != p.record.expires_at
+            || p.summary != p.record.summary
         {
             return fail(
                 "pending mirrors record",
@@ -209,6 +217,14 @@ pub fn check(fx: &Fixture) -> Result<(), String> {
                     .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) => {}
         Ok(_) => return fail("diff is capped and hashed", fx.done.as_str()),
         Err(e) => return fail("diff of done box", e),
+    }
+    if let Ok(d) = src.diff(&fx.done) {
+        if !d.truncated && d.diff_sha256 != crate::b64::hex(&Sha256::digest(d.unified.as_bytes())) {
+            return fail(
+                "diff is capped and hashed",
+                "diff_sha256 is not sha256(unified)",
+            );
+        }
     }
     match src.terminal(&fx.done, None) {
         Ok(t) if t.ended => {}
@@ -324,6 +340,19 @@ pub fn check(fx: &Fixture) -> Result<(), String> {
                 format!("after stop call {n} the box is {st:?}, not Done"),
             );
         }
+    }
+    if let Err(e) = src.revise(&fx.done, "rework") {
+        return fail("revise of a done box", e);
+    }
+    if src
+        .pending_actions()
+        .iter()
+        .any(|p| p.record.class == TouchClass::Land && p.box_id.as_ref() == Some(&fx.done))
+    {
+        return fail(
+            "revise drops the pending land",
+            "a pending land still names the revised box",
+        );
     }
     Ok(())
 }

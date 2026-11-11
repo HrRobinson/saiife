@@ -41,6 +41,15 @@ pub struct Verifier {
     pub replay: ReplayCache,
 }
 
+/// The outcome of [`Verifier::check`]: the frame is authentic, fresh and the
+/// device may use its action's level. The caller still has duties `check`
+/// cannot do for it:
+/// - `Level::Touch` means the caller must verify `SignedFrame.touch` with
+///   `saiife_touch` (against the pending action it created) before acting.
+/// - `box.spawn`'s level here is only the base level; the caller must raise
+///   it with `level::spawn_level(template)` once the template is known.
+/// - A `pairing_only` seal channel may carry only pair messages; the caller
+///   must refuse every other action on it.
 #[derive(Debug, Clone)]
 pub struct Verified {
     pub frame: Frame,

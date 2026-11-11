@@ -60,6 +60,11 @@ impl DeviceList {
                 list.v
             )));
         }
+        let mut ids: Vec<&str> = list.devices.iter().map(|d| d.id.as_str()).collect();
+        ids.sort_unstable();
+        if let Some(w) = ids.windows(2).find(|w| w[0] == w[1]) {
+            return Err(WireError::Store(format!("duplicate device id {}", w[0])));
+        }
         Ok(list)
     }
 
@@ -152,6 +157,18 @@ mod tests {
     fn device_list_refuses_duplicate_keys() {
         let dup = br#"{"v":1,"v":1,"devices":[]}"#;
         assert!(matches!(DeviceList::parse(dup), Err(WireError::Store(_))));
+    }
+
+    #[test]
+    fn device_list_refuses_duplicate_ids() {
+        let mut l = DeviceList::default();
+        l.devices.push(dev("d-a", DeviceState::Active));
+        l.devices.push(dev("d-a", DeviceState::Revoked));
+        let bytes = serde_json::to_vec(&l).unwrap();
+        assert!(matches!(
+            DeviceList::parse(&bytes),
+            Err(WireError::Store(m)) if m.contains("duplicate device id d-a")
+        ));
     }
 
     #[test]

@@ -327,3 +327,60 @@ fn bad_fixture_is_named() {
     fx.queued.pop();
     assert!(check(&fx).unwrap_err().starts_with("fixture"));
 }
+
+#[test]
+fn land_twice() {
+    let src = FakeBoxSource::demo(NOW);
+    let b = id("b-done");
+    let p1 = src.pending_actions()[0].clone();
+    src.complete(p1.request_id, Decision::Approve, Some(evidence()))
+        .unwrap();
+    assert_eq!(info(&src, "b-done").state, BoxState::Landed);
+    assert_eq!(info(&src, "b-done").lands, 1);
+    src.revise(&b, "one more change").unwrap();
+    assert_eq!(info(&src, "b-done").state, BoxState::Running);
+    assert_eq!(info(&src, "b-done").lands, 1);
+    assert!(src.pending_actions().is_empty());
+    src.finish("b-done").unwrap();
+    assert_eq!(info(&src, "b-done").state, BoxState::Done);
+    let p2 = src.pending_actions();
+    assert_eq!(p2.len(), 1);
+    assert_ne!(p2[0].request_id, p1.request_id);
+    assert_ne!(
+        p2[0].record.fields["diff_sha256"],
+        p1.record.fields["diff_sha256"]
+    );
+    assert_eq!(
+        p2[0].record.fields["diff_sha256"],
+        src.diff(&b).unwrap().diff_sha256
+    );
+    src.complete(p2[0].request_id, Decision::Approve, Some(evidence()))
+        .unwrap();
+    assert_eq!(info(&src, "b-done").state, BoxState::Landed);
+    assert_eq!(info(&src, "b-done").lands, 2);
+}
+
+#[test]
+fn landed_box_can_be_discarded_and_stopped() {
+    let src = FakeBoxSource::demo(NOW);
+    let b = id("b-done");
+    let rid = src.pending_actions()[0].request_id;
+    src.complete(rid, Decision::Approve, Some(evidence()))
+        .unwrap();
+    assert_eq!(src.stop(&b), Ok(()));
+    assert_eq!(info(&src, "b-done").state, BoxState::Landed);
+    src.discard(&b).unwrap();
+    assert_eq!(info(&src, "b-done").state, BoxState::Discarded);
+    assert_eq!(info(&src, "b-done").lands, 1);
+}
+
+#[test]
+fn pending_view_uses_the_record() {
+    let src = FakeBoxSource::demo(NOW);
+    let mut p = src.pending_actions()[0].clone();
+    p.summary = "something else".into();
+    p.expires_at += 5;
+    let v = p.view();
+    assert_eq!(v.summary, p.record.summary);
+    assert_eq!(v.expires_at, p.record.expires_at);
+}

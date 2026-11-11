@@ -179,6 +179,34 @@ impl FakeState {
         n
     }
 
+    /// A fresh pending `land` for `bid`, binding `diff`.
+    fn push_land(&mut self, bid: BoxId, repo: &str, diff: &DiffSummary) {
+        let now = self.now;
+        let mut fields = BTreeMap::new();
+        fields.insert("repo".to_string(), repo.to_string());
+        fields.insert("base_commit".to_string(), diff.base_commit.clone());
+        fields.insert("diff_sha256".to_string(), diff.diff_sha256.clone());
+        let request_id = self.next_counter();
+        let record = ActionRecord {
+            instance_id: INSTANCE_ID,
+            request_id,
+            class: TouchClass::Land,
+            summary: format!("land {}", bid.as_str()),
+            fields,
+            nonce: self.nonce(),
+            expires_at: now + 300,
+        };
+        self.pending.push(PendingAction {
+            request_id,
+            class: TouchClass::Land,
+            box_id: Some(bid),
+            summary: record.summary.clone(),
+            expires_at: record.expires_at,
+            record,
+            created_at: now,
+        });
+    }
+
     fn find(&mut self, i: &BoxId) -> Result<&mut BoxInfo, BoxError> {
         self.boxes
             .iter_mut()
@@ -316,25 +344,7 @@ impl FakeBoxSource {
             fields.insert("repo".to_string(), "erp".to_string());
             fields.insert("base_commit".to_string(), base.to_string());
             fields.insert("diff_sha256".to_string(), diff.diff_sha256.clone());
-            let request_id = s.next_counter();
-            let record = ActionRecord {
-                instance_id: INSTANCE_ID,
-                request_id,
-                class: TouchClass::Land,
-                summary: "land b-done".into(),
-                fields,
-                nonce: s.nonce(),
-                expires_at: now + 300,
-            };
-            s.pending.push(PendingAction {
-                request_id,
-                class: TouchClass::Land,
-                box_id: Some(id("b-done")),
-                summary: record.summary.clone(),
-                expires_at: record.expires_at,
-                record,
-                created_at: now,
-            });
+            s.push_land(id("b-done"), "erp", &diff);
             s.diffs.insert(id("b-done"), diff);
             let snap = TermFrame::Snapshot {
                 seq: 1,
@@ -371,6 +381,44 @@ impl FakeBoxSource {
     /// Every mutating call so far, in order (failed calls are recorded too).
     pub fn calls(&self) -> Vec<FakeCall> {
         self.lock().calls.clone()
+    }
+
+    /// Fake-only: the box finishes its work. Running -> Done, with a new small
+    /// diff and a fresh pending `land` binding it (so a revised box can land
+    /// again). Any other state is `WrongState`.
+    pub fn finish(&self, id: &str) -> Result<(), BoxError> {
+        let bid = BoxId::parse(id).map_err(|_| BoxError::NotFound)?;
+        let mut s = self.lock();
+        let (state, repo, lands) = {
+            let b = s.find(&bid)?;
+            (b.state, b.repo.clone(), b.lands)
+        };
+        if state != BoxState::Running {
+            return Err(BoxError::WrongState { state });
+        }
+        s.set_state(&bid, BoxState::Done)?;
+        let unified = format!(
+            "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+revision {}\n",
+            lands + 1
+        );
+        let diff = DiffSummary {
+            id: bid.clone(),
+            base_commit: format!("{:040x}", lands + 1),
+            diff_sha256: hex(&Sha256::digest(unified.as_bytes())),
+            files: vec![FileChange {
+                path: "notes.txt".into(),
+                status: FileStatus::Modified,
+                added: 1,
+                removed: 0,
+                binary: false,
+            }],
+            unified,
+            truncated: false,
+            tests: None,
+        };
+        s.push_land(bid.clone(), &repo, &diff);
+        s.diffs.insert(bid, diff);
+        Ok(())
     }
 
     /// Time used for `updated_at` and new boxes from now on.
@@ -498,7 +546,7 @@ impl BoxSource for FakeBoxSource {
         let mut s = self.lock();
         s.calls.push(FakeCall::Discard(i.clone()));
         match s.find(i)?.state {
-            BoxState::Queued | BoxState::Done => {
+            BoxState::Queued | BoxState::Done | BoxState::Landed => {
                 s.set_state(i, BoxState::Discarded)?;
                 s.renumber();
                 Ok(())
@@ -545,7 +593,7 @@ impl BoxSource for FakeBoxSource {
         s.calls
             .push(FakeCall::Revise(i.clone(), comment.to_string()));
         let state = s.find(i)?.state;
-        if state != BoxState::Done {
+        if !matches!(state, BoxState::Done | BoxState::Landed) {
             return Err(BoxError::WrongState { state });
         }
         check_text(comment, MAX_STEER_BYTES)?;

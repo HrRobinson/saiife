@@ -150,7 +150,15 @@ mod tests {
             assert!(w[0].0 < w[1].0, "{} !< {}", w[0].0, w[1].0);
         }
         assert!(MACHINE_ONLY.windows(2).all(|w| w[0] < w[1]));
-        assert!(IPC_OPS.windows(2).all(|w| w[0] != w[1]));
+        let mut ops: Vec<&str> = IPC_OPS.to_vec();
+        ops.sort_unstable();
+        assert!(ops.windows(2).all(|w| w[0] != w[1]), "duplicate in IPC_OPS");
+        for (n, _) in REMOTE {
+            assert!(
+                !MACHINE_ONLY.contains(n),
+                "{n} is in REMOTE and MACHINE_ONLY"
+            );
+        }
     }
 
     #[test]
