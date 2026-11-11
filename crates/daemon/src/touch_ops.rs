@@ -120,20 +120,20 @@ async fn begin_approve(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let c = Arc::clone(ctx);
     let issued = tokio::task::spawn_blocking(move || {
         let t = &c.touch;
-        // The summary and fields do not depend on the nonce or expiry.
-        let shape = action_record(&r, class, t.instance_id(), [0; 32], 0);
+        // The summary and fields do not depend on the nonce or expiry: built
+        // once, then given the issued ones.
+        let mut rec = action_record(&r, class, t.instance_id(), [0; 32], 0);
         let i = t.issue(
             IssueKey::Approve(rid),
             uid,
             class,
-            shape.summary,
-            shape.fields,
+            rec.summary.clone(),
+            rec.fields.clone(),
             unix_now(),
         )?;
-        Ok::<_, String>((
-            action_record(&r, class, t.instance_id(), i.nonce, i.expires_at),
-            i.expires_at,
-        ))
+        rec.nonce = i.nonce;
+        rec.expires_at = i.expires_at;
+        Ok::<_, String>((rec, i.expires_at))
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
@@ -185,10 +185,6 @@ impl Failure {
             reason: reason.into(),
         }
     }
-}
-
-fn b64(b: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(b)
 }
 
 /// The action record of an admin purpose's challenge (enrol, remove,
@@ -480,7 +476,7 @@ async fn touch_record(ctx: &Ctx, peer: &PeerCred, input: &str, action: &str) -> 
 pub fn enrolled_record(mut rec: Record, c: &Credential, approved_by: &str) -> Record {
     let x = &mut rec.extra;
     x.insert("action".into(), "touch_enrolled".into());
-    x.insert("cred_id".into(), b64(&c.id).into());
+    x.insert("cred_id".into(), URL_SAFE_NO_PAD.encode(&c.id).into());
     x.insert("label".into(), c.label.clone().into());
     // `kind` is the record's own key ("touch"): the credential's is `cred_kind`.
     x.insert("cred_kind".into(), c.kind.clone().into());
@@ -488,7 +484,10 @@ pub fn enrolled_record(mut rec: Record, c: &Credential, approved_by: &str) -> Re
         "alg".into(),
         serde_json::to_value(c.public_key.alg()).unwrap_or(Value::Null),
     );
-    x.insert("public_key".into(), b64(&c.public_key.to_cose()).into());
+    x.insert(
+        "public_key".into(),
+        URL_SAFE_NO_PAD.encode(c.public_key.to_cose()).into(),
+    );
     x.insert("aaguid".into(), c.aaguid.clone().into());
     x.insert("rp_id".into(), c.rp_id.clone().into());
     if !c.origins.is_empty() {
@@ -563,7 +562,7 @@ async fn enrol(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
         if !matches!(undone, Some(Ok(Some(_)))) {
             eprintln!(
                 "saiife: warning: cannot remove the unrecorded touch device {}",
-                b64(&c.id)
+                URL_SAFE_NO_PAD.encode(&c.id)
             );
         }
         return err(
@@ -574,7 +573,7 @@ async fn enrol(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
     }
     ok(
         id,
-        json!({"id": b64(&c.id), "label": c.label, "approved_by": by})
+        json!({"id": URL_SAFE_NO_PAD.encode(&c.id), "label": c.label, "approved_by": by})
             .as_object()
             .cloned()
             .unwrap_or_default(),
@@ -597,7 +596,7 @@ async fn begin_remove(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
         return no_such_device(id);
     };
     let mut fields = BTreeMap::new();
-    fields.insert("credential".to_string(), b64(&target.id));
+    fields.insert("credential".to_string(), URL_SAFE_NO_PAD.encode(&target.id));
     fields.insert("label".to_string(), target.label.clone());
     fields.insert("uid".to_string(), uid.to_string());
     let summary = format!("remove {}", target.label);
@@ -685,7 +684,7 @@ async fn remove(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
                 unix_now(),
             )?;
             // The touch approved removing the device its challenge names.
-            if rec.fields.get("credential") != Some(&b64(&c)) {
+            if rec.fields.get("credential") != Some(&URL_SAFE_NO_PAD.encode(&c)) {
                 return Err(TouchError::Mismatch.into());
             }
             match t.remove(&c) {
@@ -703,7 +702,8 @@ async fn remove(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
     };
     let (c, by) = gone;
     let mut rec = touch_record(ctx, peer, &format!("remove {}", c.label), "touch_removed").await;
-    rec.extra.insert("cred_id".into(), b64(&c.id).into());
+    rec.extra
+        .insert("cred_id".into(), URL_SAFE_NO_PAD.encode(&c.id).into());
     rec.extra.insert("label".into(), c.label.clone().into());
     rec.extra.insert("owner_uid".into(), c.owner_uid.into());
     rec.extra.insert("approved_by".into(), by.clone().into());
@@ -714,7 +714,7 @@ async fn remove(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
         if !matches!(restored, Some(Ok(()))) {
             eprintln!(
                 "saiife: warning: cannot restore the unrecorded removal of {}",
-                b64(&c.id)
+                URL_SAFE_NO_PAD.encode(&c.id)
             );
         }
         return err(
@@ -725,7 +725,7 @@ async fn remove(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
     }
     ok(
         id,
-        json!({"id": b64(&c.id), "label": c.label, "approved_by": by})
+        json!({"id": URL_SAFE_NO_PAD.encode(&c.id), "label": c.label, "approved_by": by})
             .as_object()
             .cloned()
             .unwrap_or_default(),
@@ -759,7 +759,7 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: &Request) -> Value {
         .iter()
         .map(|c| {
             json!({
-                "id": b64(&c.id),
+                "id": URL_SAFE_NO_PAD.encode(&c.id),
                 "label": c.label,
                 "kind": c.kind,
                 "alg": serde_json::to_value(c.public_key.alg()).unwrap_or(Value::Null),
@@ -1189,6 +1189,76 @@ mod tests {
         assert_eq!(rec[0]["label"], "key");
         assert_eq!(rec[0]["approved_by"], id);
         assert!(listed(&list(&w.ctx, OWN, false).await).is_empty());
+    }
+
+    /// A removal is approved only for the device its challenge names: a
+    /// touch over the challenge for key2 cannot remove key1.
+    #[tokio::test]
+    async fn remove_challenge_for_another_device_is_refused() {
+        let w = world();
+        enrol_first(&w, &w.soft, "key1").await;
+        let key2 = SoftAuthenticator::new_ed25519();
+        let b = begin_enrol(&w.ctx, OWN, "key2").await;
+        let body = enrol_body(&b, &key2, "key2", Some(&w.soft));
+        let v = h::op(&w.ctx, OWN, OP_TOUCH_ENROL, body).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let id1 = b64(&w.soft.credential_id());
+        let id2 = b64(&key2.credential_id());
+
+        let b = begin(&w.ctx, OWN, json!({"purpose": "remove", "credential": id2})).await;
+        assert_eq!(b["ok"], true, "{b}");
+        let tr: TouchRequest = serde_json::from_value(b).unwrap();
+        let asr = w.soft.request(&tr).unwrap();
+        let v = h::op(
+            &w.ctx,
+            OWN,
+            OP_TOUCH_REMOVE,
+            json!({"credential": id1, "assertion": asr}),
+        )
+        .await;
+        assert_eq!(h::refused_rule(&v), "touch_mismatch");
+        assert_eq!(listed(&list(&w.ctx, OWN, false).await).len(), 2);
+        assert!(touch_records(&w, "touch_removed").is_empty());
+        let failed = touch_records(&w, "touch_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["rule"], "touch_mismatch");
+        assert_eq!(failed[0]["op"], "remove");
+    }
+
+    /// D6 at enrolment: another uid's device cannot approve a new device.
+    #[tokio::test]
+    async fn another_uids_device_cannot_approve_an_enrolment() {
+        let w = h::world_in(Mode::Locked, 999, LOCKED, false);
+        let ann = SoftAuthenticator::new_es256();
+        let bob = SoftAuthenticator::new_es256();
+        w.ctx
+            .touch
+            .add(ann.credential(LOCAL_RP_ID, 4242, "ann"))
+            .unwrap();
+        w.ctx
+            .touch
+            .add(bob.credential(LOCAL_RP_ID, 4343, "bob"))
+            .unwrap();
+        let new = SoftAuthenticator::new_ed25519();
+        let b = begin_enrol(&w.ctx, 4343, "new").await;
+        let aw = treq(&b, "approve_with");
+        assert_eq!(aw.allow, vec![bob.credential_id()]);
+        let mut body = enrol_body(&b, &new, "new", None);
+        // Ann's key signs Bob's approval request.
+        let a = ann.assert_ctap(&aw.rp_id, &aw.challenge);
+        body["approval"] = serde_json::to_value(&a).unwrap();
+        let v = h::op(&w.ctx, 4343, OP_TOUCH_ENROL, body).await;
+        assert_eq!(h::refused_rule(&v), "touch_mismatch");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enrolled for you"),
+            "{v}"
+        );
+        assert_eq!(w.ctx.touch.credentials_of(4343).len(), 1);
+        assert!(touch_records(&w, "touch_enrolled").is_empty());
+        assert_eq!(touch_records(&w, "touch_failed").len(), 1);
     }
 
     #[tokio::test]

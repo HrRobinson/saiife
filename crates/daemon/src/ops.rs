@@ -1180,6 +1180,10 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     match req.op.as_str() {
         OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
+        // Machine local only: the touch admin ops (enrol, remove, list,
+        // test) trust that this peer reached the local socket, the only
+        // transport `dispatch_conn` serves today (`Conn` names none). A
+        // future link transport (plan 29) must not route these ops here.
         saiife_ipc::msg::OP_TOUCH_BEGIN
         | saiife_ipc::msg::OP_TOUCH_ENROL
         | saiife_ipc::msg::OP_TOUCH_REMOVE

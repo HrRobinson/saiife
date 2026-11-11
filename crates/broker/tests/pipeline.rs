@@ -536,6 +536,8 @@ async fn ask_creates_pending_no_upstream_call() {
     assert_eq!(stored.stored.via, "cli");
     assert_eq!(stored.stored.env, None);
     assert_eq!(stored.capability.as_deref(), Some("refunds:write"));
+    // No mark: no touch class.
+    assert_eq!(stored.touch_class, None);
     assert_eq!(stored.params.get()["order_id"], "7");
     use base64::Engine as _;
     let body = base64::engine::general_purpose::STANDARD
@@ -577,6 +579,8 @@ async fn allowed_marked_call_asks() {
     assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
     assert_eq!(env.approvals.lock().unwrap().len(), 1);
+    // The class of the real capability goes to the daemon with the call.
+    assert_eq!(env.approvals.lock().unwrap()[0].touch_class, Some("deploy"));
     // The same call with no mark is sent.
     let (o, _) = run(
         &c,

@@ -143,6 +143,15 @@ fn display_is_faithful(p: &PendingCall) -> bool {
         && (p.body_sha256.is_none() || p.body_display.is_some())
 }
 
+/// The class a new connector request is stored with: the stronger of the
+/// broker's class (of the real capability) and the daemon's (of the masked
+/// one), so masking can never weaken it. A name this version cannot read
+/// is the strictest (`deploy`), as at decide.
+fn combined_class(broker: Option<&str>, daemon: Option<&str>) -> Option<String> {
+    let strictest = |n: &str| TouchClass::from_name(n).unwrap_or(TouchClass::Deploy);
+    TouchClass::stronger(broker.map(strictest), daemon.map(strictest)).map(|c| c.name().to_string())
+}
+
 /// Step 8 for the daemon: seal `p`'s exact request (bound to its id), store
 /// it with the masked display copy, and write its `approval`/`created`
 /// record. Errs with the deny rule; nothing is left pending on an error.
@@ -170,8 +179,9 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         if !cfg.services.contains_key(&p.stored.service) {
             return Err(UNCLASSIFIED.into());
         }
-        saiife_policy::touch::class_for_call(cfg, &p.stored.service, p.capability.as_deref())
-            .map(str::to_string)
+        let here =
+            saiife_policy::touch::class_for_call(cfg, &p.stored.service, p.capability.as_deref());
+        combined_class(p.touch_class, here)
     };
     let new = NewRequest {
         uid: p.stored.uid,
@@ -465,7 +475,12 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let mut m = Map::new();
     m.insert(
         "items".into(),
-        Value::Array(items.iter().map(brief).collect()),
+        Value::Array(
+            items
+                .iter()
+                .map(|r| with_effective_class(ctx, r, brief(r)))
+                .collect(),
+        ),
     );
     ok(id, m)
 }
@@ -513,16 +528,21 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Err(()) => unavailable(id, ctx),
         Ok(None) => unknown(id, rid),
         Ok(Some(r)) => {
-            let mut v = item(&r);
-            // The class a decision needs now (D8), not only the stored one.
-            if let (Some(c), Some(o)) = (effective_class(ctx, &r), v.as_object_mut()) {
-                o.insert("touch_class".into(), c.name().into());
-            }
             let mut m = Map::new();
-            m.insert("item".into(), v);
+            m.insert("item".into(), with_effective_class(ctx, &r, item(&r)));
             ok(id, m)
         }
     }
+}
+
+/// `v` (the [`item`] or [`brief`] of `r`) with `touch_class` the class a
+/// decision needs now (D8), not only the stored one: `approval.list` and
+/// `approval.show` agree.
+fn with_effective_class(ctx: &Ctx, r: &ApprovalRequest, mut v: Value) -> Value {
+    if let (Some(c), Some(o)) = (effective_class(ctx, r), v.as_object_mut()) {
+        o.insert("touch_class".into(), c.name().into());
+    }
+    v
 }
 
 /// The touch class approving `r` needs (D8): the stronger of the stored
@@ -680,6 +700,18 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         return refuse(ctx, &r, &peer, id, "truncated_not_acknowledged", why).await;
     }
 
+    // A touch-class approval needs a `touch` argument that is an assertion.
+    // Checked before who may decide, as the acknowledgement is: no
+    // re-authentication prompt for an approval refused anyway. It is
+    // verified (and its challenge spent) only after that, below.
+    let early_touch = match effective_class(ctx, &r).filter(|_| approve) {
+        None => None,
+        Some(class) => match touch_arg(&r, &req, class) {
+            Ok(a) => Some(a),
+            Err(e) => return touch_refused(ctx, &r, &peer, id, e).await,
+        },
+    };
+
     // The requester may always withdraw its own request: a rejection that
     // lets nothing through needs no approver and no re-authentication.
     let cancel = !approve && is_requester(&r, &peer);
@@ -750,16 +782,24 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
 
     // A touch-class approval needs an assertion over the challenge issued
     // for this request (`touch.begin`). A rejection or a withdrawal lets
-    // nothing through and needs none.
+    // nothing through and needs none. The class is taken again: a reload
+    // during the re-authentication can only make it stronger (D8), and a
+    // class that appeared meanwhile still needs its `touch` argument.
     let evidence = match effective_class(ctx, &r).filter(|_| approve) {
         None => None,
-        Some(class) => match touch_for(ctx, &r, &peer, &req, class).await {
-            Ok(ev) => Some(ev),
-            Err(TouchRefused::BadRequest(m)) => return err(id, ErrorCode::BadRequest, &m),
-            Err(TouchRefused::Refused(why)) => {
-                return refuse(ctx, &r, &peer, id, why.rule(), &why.to_string()).await
+        Some(class) => {
+            let asr = match early_touch {
+                Some(a) => Ok(a),
+                None => touch_arg(&r, &req, class),
+            };
+            match asr {
+                Ok(asr) => match touch_for(ctx, &r, &peer, asr, class).await {
+                    Ok(ev) => Some(ev),
+                    Err(e) => return touch_refused(ctx, &r, &peer, id, e).await,
+                },
+                Err(e) => return touch_refused(ctx, &r, &peer, id, e).await,
             }
-        },
+        }
     };
 
     let to = if approve {
@@ -843,19 +883,15 @@ enum TouchRefused {
     Refused(Refusal),
 }
 
-/// Verifies the `touch` argument of a decision on `r` as a touch of class
-/// `class` by `peer`, against the live `Approve(r.id)` challenge and the
-/// peer's own credentials (D6). The action record is built from `r`, the
-/// request `decide` loaded, and the challenge's nonce and expiry; nothing
-/// but the assertion comes from the client. The challenge is spent
-/// whatever the outcome.
-async fn touch_for(
-    ctx: &Arc<Ctx>,
+/// The `touch` argument of an approval of `r`, which needs a touch of
+/// class `class`. Absent or null: refused (`touch_unavailable`, recorded
+/// by [`touch_refused`]). Not an assertion: a bad request. Neither spends
+/// the challenge: nothing was verified.
+fn touch_arg(
     r: &ApprovalRequest,
-    peer: &PeerCred,
     req: &Request,
     class: TouchClass,
-) -> Result<TouchEvidence, TouchRefused> {
+) -> Result<Assertion, TouchRefused> {
     let rid = r.id;
     let Some(t) = req.args.get("touch").filter(|t| !t.is_null()) else {
         return Err(TouchRefused::Refused(Refusal::TouchUnavailable(format!(
@@ -863,8 +899,40 @@ async fn touch_for(
             class.name()
         ))));
     };
-    let asr: Assertion = serde_json::from_value(t.clone())
-        .map_err(|e| TouchRefused::BadRequest(format!("touch is not an assertion: {e}")))?;
+    serde_json::from_value(t.clone())
+        .map_err(|e| TouchRefused::BadRequest(format!("touch is not an assertion: {e}")))
+}
+
+/// The answer to a decision whose touch was refused: `bad_request`, or an
+/// `approval`/`refused` record and `forbidden`. The request stays pending.
+async fn touch_refused(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    peer: &PeerCred,
+    id: u64,
+    e: TouchRefused,
+) -> Value {
+    match e {
+        TouchRefused::BadRequest(m) => err(id, ErrorCode::BadRequest, &m),
+        TouchRefused::Refused(why) => refuse(ctx, r, peer, id, why.rule(), &why.to_string()).await,
+    }
+}
+
+/// Verifies `asr`, the parsed `touch` argument of a decision on `r` (see
+/// [`touch_arg`]), as a touch of class `class` by `peer`, against the live
+/// `Approve(r.id)` challenge and the peer's own credentials (D6). The
+/// action record is built from `r`, the request `decide` loaded, and the
+/// challenge's nonce and expiry; nothing but the assertion comes from the
+/// client. Once here the challenge is spent whatever the outcome; an
+/// absent or unparsable `touch` never gets here, so it spends nothing.
+async fn touch_for(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    peer: &PeerCred,
+    asr: Assertion,
+    class: TouchClass,
+) -> Result<TouchEvidence, TouchRefused> {
+    let rid = r.id;
     let c = Arc::clone(ctx);
     let r = r.clone();
     let uid = peer.uid;
@@ -2082,8 +2150,40 @@ mod tests {
             body_sha256: body_sha256.map(str::to_string),
             amount: None,
             headers: vec![],
+            touch_class: None,
             stored,
         }
+    }
+
+    /// The stored class is the stronger of the broker's and the daemon's;
+    /// an unreadable name is the strictest.
+    #[test]
+    fn combined_class_is_the_stronger() {
+        assert_eq!(combined_class(None, None), None);
+        assert_eq!(
+            combined_class(Some("deploy"), None).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(None, Some("deploy")).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(Some("egress:external"), Some("deploy")).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(Some("deploy"), Some("egress:external")).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(Some("egress:external"), None).as_deref(),
+            Some("egress:external")
+        );
+        assert_eq!(
+            combined_class(Some("future"), None).as_deref(),
+            Some("deploy")
+        );
     }
 
     /// Plan 15's binary raw body meets plan 17's dedupe: a body the
@@ -2154,6 +2254,16 @@ mod tests {
             let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
             assert_eq!(r.touch_class.as_deref(), Some("deploy"), "{cap:?}");
         }
+
+        // Final review Minor 2: the masked capability classifies weaker
+        // than the real one (the masker rewrote its qualifier); the broker's
+        // class of the real one still counts.
+        let mut masked = pending(Some("fourth"), None);
+        masked.capability = Some("objects:read".into());
+        masked.touch_class = Some("deploy");
+        let id = create(&ctx, &masked, "claude").await.unwrap();
+        let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+        assert_eq!(r.touch_class.as_deref(), Some("deploy"));
 
         // A service the snapshot does not know cannot be classified.
         let before = ctx
@@ -2592,6 +2702,9 @@ pub(crate) mod touch_tests {
             body_sha256: None,
             amount: None,
             headers: vec![],
+            // The daemon classifies alone here (the broker's class is
+            // tested in `connector_create_sets_the_class`).
+            touch_class: None,
             stored,
         }
     }
@@ -2914,6 +3027,97 @@ pub(crate) mod touch_tests {
         );
     }
 
+    /// D6: Bob's own live challenge answered by Ann's enrolled key. Ann's
+    /// key is enrolled, but not for Bob: refused, the request pending.
+    #[tokio::test]
+    async fn another_approvers_key_cannot_answer_my_challenge() {
+        let w = world_in(crate::ops::Mode::Locked, 0, LOCKED, false);
+        let ann = SoftAuthenticator::new_es256();
+        let bob = SoftAuthenticator::new_es256();
+        w.ctx
+            .touch
+            .add(ann.credential(LOCAL_RP_ID, 4242, "ann"))
+            .unwrap();
+        w.ctx
+            .touch
+            .add(bob.credential(LOCAL_RP_ID, 4343, "bob"))
+            .unwrap();
+        let rid = ask(&w, "a", "objects:write").await;
+        let tr = treq(&begin(&w.ctx, 4343, rid).await);
+        assert_eq!(tr.allow, vec![bob.credential_id()]);
+        // Ann's key signs Bob's request (a real key would refuse: it is not
+        // in `allow`).
+        let asr = ann.assert_ctap(&tr.rp_id, &tr.challenge);
+        let v = decide_with(&w.ctx, 4343, rid, "approve", Some(&asr)).await;
+        assert_eq!(refused_rule(&v), "touch_mismatch");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enrolled for you"),
+            "{v}"
+        );
+        assert_eq!(state(&w, rid), State::Pending);
+        let refused = approval_records(&w, rid, "refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["rule"], "touch_mismatch");
+        assert_eq!(refused[0]["by_uid"], 4343);
+        nothing_sent(&w, rid);
+        // Ann's counter did not move.
+        assert_eq!(w.ctx.touch.credentials_of(4242)[0].sign_count, 0);
+    }
+
+    /// Counts re-authentication prompts; every one is denied.
+    struct CountingReauth(std::sync::atomic::AtomicUsize);
+
+    impl Reauth for CountingReauth {
+        fn available(&self) -> bool {
+            true
+        }
+        fn check(&self, _who: &Subject, _d: &str, _t: Duration) -> ReauthResult {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ReauthResult::Denied("counted".into())
+        }
+    }
+
+    /// Final review Minor 5: a same-user approval in locked mode that has
+    /// no usable `touch` is refused before the re-authentication prompt.
+    #[tokio::test]
+    async fn missing_touch_is_refused_before_the_prompt() {
+        const SAME: &str = "version = 2\nlocked = true\n[approval]\n\
+                            approvers = [\"agent\"]\nsame_user = \"reauth\"\n\
+                            [services.s3_ask]\nconnector = \"s3\"\n\
+                            deploy = [\"objects:write\"]\n";
+        let mut w = world_in(crate::ops::Mode::Locked, 0, SAME, false);
+        let counter = Arc::new(CountingReauth(Default::default()));
+        Arc::get_mut(&mut w.ctx).unwrap().reauth = counter.clone();
+        let prompts = || counter.0.load(std::sync::atomic::Ordering::SeqCst);
+        let rid = ask(&w, "a", "objects:write").await;
+        // No touch: refused (`touch_unavailable`, recorded), no prompt.
+        let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
+        assert_eq!(refused_rule(&v), "touch_unavailable");
+        assert_eq!(prompts(), 0);
+        let refused = approval_records(&w, rid, "refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["rule"], "touch_unavailable");
+        // A touch that is no assertion: a bad request, no prompt.
+        let v = op(
+            &w.ctx,
+            OWN,
+            OP_APPROVAL_DECIDE,
+            json!({"request": rid, "action": "approve", "touch": {"kind": "nope"}}),
+        )
+        .await;
+        assert_eq!(v["error"], "bad_request", "{v}");
+        assert_eq!(prompts(), 0);
+        // With a parsable touch the prompt runs first (and is denied here).
+        let fake = SoftAuthenticator::new_es256().assert_ctap(LOCAL_RP_ID, &[0; 32]);
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&fake)).await;
+        assert_eq!(refused_rule(&v), "reauth_failed");
+        assert_eq!(prompts(), 1);
+        assert_eq!(state(&w, rid), State::Pending);
+    }
+
     #[tokio::test]
     async fn uv_missing_for_deploy() {
         let mut w = personal(MARKED);
@@ -2980,6 +3184,11 @@ pub(crate) mod touch_tests {
         set_policy(&w.ctx, MARKED);
         let s = op(&w.ctx, OWN, OP_APPROVAL_SHOW, json!({"request": rid})).await;
         assert_eq!(s["item"]["touch_class"], "deploy", "{s}");
+        // Final review Minor 10: the list shows the same, effective class.
+        let l = op(&w.ctx, OWN, OP_APPROVAL_LIST, json!({})).await;
+        let items = l["items"].as_array().unwrap();
+        let it = items.iter().find(|i| i["id"] == rid).unwrap();
+        assert_eq!(it["touch_class"], "deploy", "{l}");
         let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
         assert_eq!(refused_rule(&v), "touch_unavailable");
         assert_eq!(state(&w, rid), State::Pending);
