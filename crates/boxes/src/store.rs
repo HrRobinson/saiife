@@ -53,6 +53,9 @@ pub struct BoxRecord {
     pub image: Option<String>,
 }
 
+/// Single-writer by contract: the Manager's one Mutex serialises every Store
+/// call (spawn's `claim_id` plus first `save`, and gc, all run under it, so gc
+/// never sees a claimed-but-unsaved dir).
 pub struct Store {
     root: PathBuf,
 }
@@ -75,11 +78,17 @@ fn marker_text(id: &str) -> String {
     format!("saiife.managed box {id}\n")
 }
 
-/// Write `bytes` to `<final_path>.tmp.<pid>` (0600 on unix) then rename over `final_path`.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `bytes` to `<final_path>.tmp.<pid>.<n>` (0600 on unix) then rename over `final_path`.
 fn write_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), BoxesError> {
     use std::io::Write;
     let mut name = final_path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}", std::process::id()));
+    name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let tmp = final_path.with_file_name(name);
     let _ = fs::remove_file(&tmp);
     let mut opts = fs::OpenOptions::new();
@@ -146,7 +155,9 @@ impl Store {
             match b.create(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    n += 1;
+                    n = n
+                        .checked_add(1)
+                        .ok_or_else(|| state_err(&counter, "counter overflow"))?;
                     continue;
                 }
                 Err(e) => return Err(io_err(&dir, e)),
@@ -156,7 +167,10 @@ impl Store {
                 let _ = fs::remove_dir_all(&dir);
                 return Err(e);
             }
-            write_atomic(&counter, (n + 1).to_string().as_bytes())?;
+            let next = n
+                .checked_add(1)
+                .ok_or_else(|| state_err(&counter, "counter overflow"))?;
+            write_atomic(&counter, next.to_string().as_bytes())?;
             return Ok(id);
         }
     }
@@ -272,7 +286,9 @@ impl Store {
         fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))
     }
 
-    /// Labelled directories with no readable `box.json` (leftovers of a crash).
+    /// Labelled, non-symlink directories whose `box.json` is missing (leftovers
+    /// of a crash). A present but unreadable or unparsable record is never an
+    /// orphan: it stays a `list()` warning.
     pub fn orphans(&self) -> Result<Vec<BoxId>, BoxesError> {
         let mut out = Vec::new();
         for (name, symlink) in self.entries()? {
@@ -285,7 +301,7 @@ impl Store {
             if self.check_labelled(&id).is_err() {
                 continue;
             }
-            if !matches!(self.load(&id), Ok(Some(_))) {
+            if matches!(self.load(&id), Ok(None)) {
                 out.push(id);
             }
         }

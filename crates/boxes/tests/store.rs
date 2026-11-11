@@ -224,3 +224,49 @@ fn list_ignores_tmp_files() {
     assert_eq!(all.len(), 1);
     assert!(warns.is_empty(), "{warns:?}");
 }
+
+#[test]
+fn unreadable_records_are_not_orphans() {
+    let t = tempfile::tempdir().unwrap();
+    let s = open(&t);
+    let json = |i: &str| serde_json::to_value(rec(&id(i))).unwrap();
+    let mut v2 = json("b1");
+    v2["version"] = 2.into();
+    mk(&s, "b1", Some(&marker("b1")), Some(v2.to_string()));
+    let mut unk = json("b2");
+    unk["surprise"] = 1.into();
+    mk(&s, "b2", Some(&marker("b2")), Some(unk.to_string()));
+    mk(&s, "b3", Some(&marker("b3")), Some("{".into()));
+    mk(&s, "b4", Some(&marker("b4")), None);
+    assert_eq!(s.orphans().unwrap(), vec![id("b4")]);
+}
+
+#[test]
+fn tmp_names_are_unique_within_a_process() {
+    let t = tempfile::tempdir().unwrap();
+    let s = std::sync::Arc::new(open(&t));
+    let i = s.claim_id().unwrap();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let (s, i) = (s.clone(), i.clone());
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    s.save(&rec(&i)).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(s.load(&i).unwrap(), Some(rec(&i)));
+}
+
+#[test]
+fn hostile_counter_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let s = open(&t);
+    fs::write(s.root().join("next-id"), u64::MAX.to_string()).unwrap();
+    fs::create_dir(s.root().join(format!("b{}", u64::MAX))).ok();
+    assert!(s.claim_id().is_err());
+}
