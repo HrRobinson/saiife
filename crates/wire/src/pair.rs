@@ -129,14 +129,13 @@ fn check_label(l: &str) -> Result<(), WireError> {
 
 /// 65 bytes, 0x04 prefix, and ring accepts it as a P-256 point.
 fn check_device_pub(p: &[u8; 65]) -> Result<(), WireError> {
-    use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
-    let bad = || WireError::Malformed("device_pub is not a P-256 point".into());
-    if p[0] != 0x04 {
-        return Err(bad());
+    if crate::sig::is_p256_point(p) {
+        Ok(())
+    } else {
+        Err(WireError::Malformed(
+            "device_pub is not a P-256 point".into(),
+        ))
     }
-    let rng = ring::rand::SystemRandom::new();
-    let eph = EphemeralPrivateKey::generate(&ECDH_P256, &rng).map_err(|_| bad())?;
-    agree_ephemeral(eph, &UnparsedPublicKey::new(&ECDH_P256, p), |_| ()).map_err(|_| bad())
 }
 
 struct Entry {

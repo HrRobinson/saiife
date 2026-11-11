@@ -25,6 +25,7 @@ use saiife_wire::device::DeviceState;
 use saiife_wire::frame::{parse_body, SignedFrame, TouchProof};
 use saiife_wire::level::{actions as a, spawn_level, Level};
 use saiife_wire::pair::PairRequest;
+use saiife_wire::seal::{machine_hello_msg, SealBinding};
 use saiife_wire::source::{
     check_text, BoxError, BoxId, BoxSource, SpawnReq, Start, MAX_TASK_BYTES,
 };
@@ -213,7 +214,11 @@ async fn frame_record(
     rec.extra.insert("device".into(), device_id.into());
     rec.extra.insert("label".into(), json!(label));
     rec.extra.insert("via".into(), via.as_str().into());
-    rec.extra.insert("level".into(), json!(level));
+    // An action no table names: "unknown".
+    rec.extra.insert(
+        "level".into(),
+        level.map_or_else(|| "unknown".into(), |l| json!(l)),
+    );
     rec
 }
 
@@ -365,8 +370,9 @@ async fn frame(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             if after_signature(&e) {
                 // The body parsed and its signature verified.
                 if let Ok(f) = parse_body(sf.body.as_bytes()) {
+                    let level = saiife_wire::level_for(&f.action);
                     let mut rec =
-                        frame_record(ctx, Some(conn), &f.action, &f.device_id, via, None).await;
+                        frame_record(ctx, Some(conn), &f.action, &f.device_id, via, level).await;
                     deny(&mut rec, &r);
                     let _ = append(ctx, rec).await;
                 }
@@ -422,7 +428,9 @@ async fn frame(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
 /// refuses every Touch action (`touch_required`, also `box.spawn` with a
 /// template that reaches secrets or the network: no touch proof is verified
 /// before plan 31) and every name in [`LATER`], and records as the module
-/// says.
+/// says. Records written through `execute` carry no peer (no `uid`, `user`
+/// or `peer` field): it has no connection; `workspace.frame` on `link.sock`
+/// records its peer.
 pub async fn execute(ctx: &Arc<Ctx>, v: &Verified, via: Via) -> Result<Value, Refused> {
     run(ctx, v, via, None).await
 }
@@ -685,8 +693,8 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
             if let Err(e) = crate::lockdown::set_remote_on(ctx, &device, reason).await {
                 return Err(Fail::Source(Refused::new(
                     ErrorCode::Internal,
-                    "lockdown_not_saved",
-                    e,
+                    e.rule(),
+                    e.to_string(),
                 )));
             }
             Ok(json!({
@@ -701,45 +709,32 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
     }
 }
 
-/// `workspace.sign {purpose: "seal"|"hub_hello", data: b64u, device_id?}` ->
-/// `{sig, device_pub?}`. Only for a peer that owns an Active device, and
-/// only for the shapes link needs: a seal handshake (session id ‖
-/// uncompressed P-256 point, 81 bytes) or a hub hello (a 16..=64 byte
-/// nonce ‖ this machine's id). `device_id` (seal only) names the device the
-/// session is for; its key comes back as `device_pub`.
+/// `workspace.sign` -> `{sig, device_pub?}`, for the two things link needs
+/// and nothing else:
+/// - `{purpose: "seal", data, device_id | pair_id}`: `data` is session_id ‖
+///   machine_eph (81 bytes, a real P-256 point). Exactly one binding: a
+///   `device_id` must be an Active device of the peer's uid (its key comes
+///   back as `device_pub`); a `pair_id` an open offer begun by the peer's
+///   user. The machine key signs `seal::machine_hello_msg(session_id,
+///   machine_eph, binding)` (domain `MACHINE_HELLO_DOMAIN`), so the
+///   signature opens a session for that device or offer only.
+/// - `{purpose: "hub_hello", data}`: a 16..=64 byte nonce ‖ this machine's
+///   id, for a peer that owns an Active device.
 async fn sign(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
-    if ctx.workspace.locked() {
-        return locked().answer(id);
+    match sign_inner(ctx, conn, &req.args).await {
+        Ok(m) => ok(id, m),
+        Err(r) => r.answer(id),
     }
-    let args = &req.args;
-    if let Some(k) = args
-        .keys()
-        .find(|k| !["purpose", "data", "device_id"].contains(&k.as_str()))
-    {
-        return bad(format!("workspace.sign does not take {k:?}")).answer(id);
-    }
-    let purpose = match args.get("purpose").and_then(Value::as_str) {
-        Some("seal") => SignPurpose::Seal,
-        Some("hub_hello") => SignPurpose::HubHello,
-        _ => return bad("purpose is \"seal\" or \"hub_hello\"").answer(id),
-    };
-    let Some(data) = args
-        .get("data")
-        .and_then(Value::as_str)
-        .and_then(|s| b64::dec(s).ok())
-    else {
-        return bad("data is b64u").answer(id);
-    };
-    let device_id = match args.get("device_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(_) => return bad("device_id is a string").answer(id),
-    };
-    let peer_uid = conn.peer.uid;
-    // The peer must own an Active device.
+}
+
+fn forbidden(rule: &'static str, message: &str) -> Refused {
+    Refused::new(ErrorCode::Forbidden, rule, message)
+}
+
+/// Whether the peer's uid owns an Active device.
+async fn owns_active_device(ctx: &Arc<Ctx>, peer_uid: u32) -> bool {
     let mut uids: HashMap<String, Option<u32>> = HashMap::new();
-    let mut owns = false;
     for d in ctx.workspace.devices() {
         if d.state != DeviceState::Active {
             continue;
@@ -749,65 +744,134 @@ async fn sign(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             uids.insert(d.owner_user.clone(), u);
         }
         if uids[&d.owner_user] == Some(peer_uid) {
-            owns = true;
-            break;
+            return true;
         }
     }
-    if !owns {
-        return Refused::new(
-            ErrorCode::Forbidden,
+    false
+}
+
+async fn sign_inner(
+    ctx: &Arc<Ctx>,
+    conn: &Conn,
+    args: &Map<String, Value>,
+) -> Result<Map<String, Value>, Refused> {
+    if ctx.workspace.locked() {
+        return Err(locked());
+    }
+    const KEYS: [&str; 4] = ["purpose", "data", "device_id", "pair_id"];
+    if let Some(k) = args.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(format!("workspace.sign does not take {k:?}")));
+    }
+    let purpose = match args.get("purpose").and_then(Value::as_str) {
+        Some("seal") => SignPurpose::Seal,
+        Some("hub_hello") => SignPurpose::HubHello,
+        _ => return Err(bad("purpose is \"seal\" or \"hub_hello\"")),
+    };
+    let data = args
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|s| b64::dec(s).ok())
+        .ok_or_else(|| bad("data is b64u"))?;
+    let opt = |k: &str| match args.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(bad(format!("{k} is a string"))),
+    };
+    let (device_id, pair_id) = (opt("device_id")?, opt("pair_id")?);
+    let peer_uid = conn.peer.uid;
+    let no_device = || {
+        forbidden(
             "no_active_device",
             "the machine key signs only for a user with a paired device",
         )
-        .answer(id);
-    }
-    let shape_ok = match purpose {
-        SignPurpose::Seal => data.len() == 81 && data[16] == 0x04,
+    };
+    let mut m = Map::new();
+    let msg = match purpose {
         SignPurpose::HubHello => {
+            if device_id.is_some() || pair_id.is_some() {
+                return Err(bad("a hub hello takes no device_id or pair_id"));
+            }
             let mid = ctx.workspace.machine_id();
-            data.len() >= mid.len()
+            let shape_ok = data.len() >= mid.len()
                 && HUB_NONCE.contains(&(data.len() - mid.len()))
-                && data.ends_with(mid.as_bytes())
+                && data.ends_with(mid.as_bytes());
+            if !shape_ok {
+                return Err(bad("data is not a hub hello for this machine"));
+            }
+            if !owns_active_device(ctx, peer_uid).await {
+                return Err(no_device());
+            }
+            data
+        }
+        SignPurpose::Seal => {
+            let Ok(raw) = <[u8; 81]>::try_from(data.as_slice()) else {
+                return Err(bad("seal data is session_id (16) ‖ machine_eph (65)"));
+            };
+            let mut sid = [0u8; 16];
+            sid.copy_from_slice(&raw[..16]);
+            let mut eph = [0u8; 65];
+            eph.copy_from_slice(&raw[16..]);
+            if !saiife_wire::sig::is_p256_point(&eph) {
+                return Err(bad("machine_eph is not a P-256 point"));
+            }
+            let binding = match (device_id, pair_id) {
+                (Some(dev), None) => {
+                    if !owns_active_device(ctx, peer_uid).await {
+                        return Err(no_device());
+                    }
+                    let d = ctx
+                        .workspace
+                        .device(&dev)
+                        .ok_or_else(|| forbidden("unknown_device", "no such paired device"))?;
+                    match d.state {
+                        DeviceState::Active => {}
+                        DeviceState::Pending => {
+                            return Err(forbidden(
+                                "device_pending",
+                                "this device waits for confirmation on the machine",
+                            ))
+                        }
+                        DeviceState::Revoked => {
+                            return Err(forbidden("unknown_device", "no such paired device"))
+                        }
+                    }
+                    if uid_of(ctx, &d.owner_user).await != Some(peer_uid) {
+                        return Err(forbidden(
+                            "wrong_owner",
+                            "this device belongs to another user than the link process",
+                        ));
+                    }
+                    m.insert("device_pub".into(), d.public_key.into());
+                    SealBinding::Device(dev)
+                }
+                (None, Some(pid)) => {
+                    let now = ctx.workspace.now();
+                    // An offer that was spent (confirmed or rejected) is
+                    // Expired even while its owner entry lingers.
+                    let open = !matches!(
+                        ctx.workspace.pair_status(&pid, now),
+                        saiife_wire::pair::PairStatus::Expired
+                    );
+                    let Some(owner) = ctx.workspace.offer_owner(&pid, now).filter(|_| open) else {
+                        return Err(forbidden(
+                            "pair_expired",
+                            "no open pairing offer under this pair_id",
+                        ));
+                    };
+                    if uid_of(ctx, &owner).await != Some(peer_uid) {
+                        return Err(forbidden(
+                            "wrong_owner",
+                            "this pairing was begun by another user than the link process",
+                        ));
+                    }
+                    SealBinding::Pair(pid)
+                }
+                _ => return Err(bad("a seal takes exactly one of device_id and pair_id")),
+            };
+            machine_hello_msg(&sid, &eph, &binding)
         }
     };
-    if !shape_ok {
-        return bad("data is not a seal handshake or a hub hello for this machine").answer(id);
-    }
-    let mut m = Map::new();
-    match (purpose, device_id) {
-        (SignPurpose::HubHello, Some(_)) => {
-            return bad("a hub hello takes no device_id").answer(id);
-        }
-        (SignPurpose::Seal, Some(dev)) => {
-            let Some(d) = ctx
-                .workspace
-                .device(&dev)
-                .filter(|d| d.state == DeviceState::Active)
-            else {
-                return Refused::new(
-                    ErrorCode::Forbidden,
-                    "unknown_device",
-                    "no such paired device",
-                )
-                .answer(id);
-            };
-            if uid_of(ctx, &d.owner_user).await != Some(peer_uid) {
-                return Refused::new(
-                    ErrorCode::Forbidden,
-                    "wrong_owner",
-                    "this device belongs to another user than the link process",
-                )
-                .answer(id);
-            }
-            m.insert("device_pub".into(), d.public_key.into());
-        }
-        _ => {}
-    }
-    match ctx.workspace.sign(purpose, &data) {
-        Ok(sig) => {
-            m.insert("sig".into(), b64::enc(&sig).into());
-            ok(id, m)
-        }
-        Err(_) => locked().answer(id),
-    }
+    let sig = ctx.workspace.sign(purpose, &msg).map_err(|_| locked())?;
+    m.insert("sig".into(), b64::enc(&sig).into());
+    Ok(m)
 }

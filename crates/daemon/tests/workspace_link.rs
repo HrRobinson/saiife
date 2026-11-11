@@ -22,6 +22,7 @@ use saiife_policy::{Directory, Fsync, GroupEntry, UserEntry};
 use saiife_wire::fake::{FakeBoxSource, FakeCall};
 use saiife_wire::frame::{Frame, SignedFrame};
 use saiife_wire::level::{Level, REMOTE};
+use saiife_wire::seal::{MachineHandshake, SealBinding, TestBrowserEnd};
 use saiife_wire::sig::TestDevice;
 use saiife_wire::source::{BoxId, BoxSource, Start};
 use saiife_wire::{b64, pair};
@@ -483,24 +484,35 @@ async fn reads_are_not_recorded() {
 async fn unsigned_junk_is_not_recorded() {
     let (w, mut link, d) = paired().await;
     let before = records(&w).len();
+    let stranger = TestDevice::generate();
+    let mut rules = std::collections::BTreeSet::new();
     for i in 0..100u32 {
         let mut sf = frame_for(&w.ctx.workspace, &d, "box.stop", json!({"id": "b-run"}));
-        sf.sig = match i % 4 {
-            0 => b64::enc(&[7u8; 64]),
-            1 => "not b64!".into(),
-            2 => d.sign_body("another body"),
+        match i % 5 {
+            0 => sf.sig = b64::enc(&[7u8; 64]),
+            1 => sf.sig = "not b64!".into(),
+            2 => sf.sig = d.sign_body("another body"),
+            // Signed by another key in d's name.
+            3 => sf.sig = TestDevice::generate().sign_body(&sf.body),
+            // A device this machine never paired, signing for itself.
             _ => {
-                // Unknown device.
-                TestDevice::generate().sign_body(&sf.body)
+                sf = frame_for(
+                    &w.ctx.workspace,
+                    &stranger,
+                    "box.stop",
+                    json!({"id": "b-run"}),
+                )
             }
-        };
+        }
         let a = link.call(OP_WORKSPACE_FRAME, frame_args(&sf)).await;
         assert_eq!(a["ok"], false, "{a}");
+        rules.insert(a["rule"].as_str().unwrap().to_string());
         assert!(
-            ["bad_signature", "bad_frame"].contains(&a["rule"].as_str().unwrap()),
+            ["bad_signature", "bad_frame", "unknown_device"].contains(&a["rule"].as_str().unwrap()),
             "{a}"
         );
     }
+    assert_eq!(rules.len(), 3, "{rules:?}");
     assert_eq!(records(&w).len(), before);
     assert!(w.boxes.calls().is_empty());
     let s = control(&w, OP_STATUS, json!({})).await;
@@ -626,9 +638,28 @@ async fn lockdown_on_from_remote() {
     assert!(l.reason.contains("lost laptop"), "{}", l.reason);
     assert!(l.reason.contains(&d.device_id()), "{}", l.reason);
     let since = l.since.clone();
-    // Already `all`: a no-op that still answers ok.
+    let lockdowns = || {
+        w.ctx
+            .notifier
+            .queued_events()
+            .into_iter()
+            .filter(|e| e.event == saiife_policy::Event::Lockdown)
+            .collect::<Vec<_>>()
+    };
+    let n = lockdowns();
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert!(
+        n[0].summary
+            .starts_with("lockdown on (all) by Workspace device phone ("),
+        "{n:?}"
+    );
+    assert!(n[0].summary.contains(&d.device_id()), "{n:?}");
+    assert!(n[0].summary.contains("lost laptop"), "{n:?}");
+    assert_eq!(n[0].uid, Some(me()));
+    // Already `all`: a no-op that still answers ok, and says nothing.
     let a = send(&w, &mut link, &d, "lockdown.on", json!({})).await;
     assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(lockdowns().len(), 1);
     let l2 = w.ctx.lockdown.get().unwrap();
     assert_eq!(l2.since, since);
     assert!(l2.reason.contains("lost laptop"));
@@ -691,10 +722,13 @@ async fn machine_only_action_is_refused_after_signature() {
     assert_eq!(rec["decision"], "deny", "{rec}");
     assert_eq!(rec["rule"], "machine_only");
     assert_eq!(field(rec, "action"), "lockdown.off");
+    assert_eq!(field(rec, "level"), "machine_only", "{rec}");
     assert_eq!(field(rec, "device"), d.device_id().as_str());
     // An action no table names: refused too, after the signature.
     let a = send(&w, &mut link, &d, "box.reboot", json!({})).await;
     assert_eq!(a["rule"], "unknown_action", "{a}");
+    let last = records(&w).last().cloned().unwrap();
+    assert_eq!(field(&last, "level"), "unknown", "{last}");
 }
 
 #[tokio::test]
@@ -729,6 +763,7 @@ async fn restart_changes_epoch() {
     // A signed frame: the refusal is recorded.
     let last = records(&w2).last().cloned().unwrap();
     assert_eq!(last["rule"], "stale_epoch", "{last}");
+    assert_eq!(field(&last, "level"), "signed", "{last}");
     // A fresh frame for the new epoch works.
     let a = send(&w2, &mut link2, &d, "box.list", json!({})).await;
     assert_eq!(a["ok"], true, "{a}");
@@ -832,11 +867,34 @@ async fn hub_frame_for_another_device_is_refused() {
     assert_eq!(a["ok"], true, "{a}");
 }
 
+/// A real machine handshake and its 81 signed bytes (session_id ‖ eph).
+fn handshake() -> (MachineHandshake, Vec<u8>) {
+    let mh = MachineHandshake::new(&ring::rand::SystemRandom::new()).unwrap();
+    let mut v = mh.session_id().to_vec();
+    v.extend_from_slice(&mh.eph_pub());
+    (mh, v)
+}
+
 fn seal_data() -> Vec<u8> {
-    let mut v = vec![9u8; 16];
-    v.push(0x04);
-    v.extend_from_slice(&[5u8; 64]);
-    v
+    handshake().1
+}
+
+fn machine_pub(w: &World) -> [u8; 65] {
+    b64::dec_n::<65>(w.ctx.workspace.hello()["machine_pub"].as_str().unwrap()).unwrap()
+}
+
+/// Whether a browser expecting `expect` accepts the daemon's seal answer.
+fn browser_accepts(w: &World, mh: &MachineHandshake, a: &Value, expect: &SealBinding) -> bool {
+    let sig = b64::dec_n::<64>(a["sig"].as_str().unwrap()).unwrap();
+    TestBrowserEnd::new(None)
+        .finish(
+            &mh.eph_pub(),
+            &mh.session_id(),
+            &sig,
+            &machine_pub(w),
+            expect,
+        )
+        .is_ok()
 }
 
 async fn sign(link: &mut Link, args: Value) -> Value {
@@ -847,33 +905,16 @@ async fn sign(link: &mut Link, args: Value) -> Value {
 async fn sign_needs_an_active_device() {
     let w = world().await;
     let mut link = Link::open(&w).await;
+    let mut hh = vec![1u8; 32];
+    hh.extend_from_slice(w.ctx.workspace.machine_id().as_bytes());
     let a = sign(
         &mut link,
-        json!({"purpose": "seal", "data": b64::enc(&seal_data())}),
+        json!({"purpose": "hub_hello", "data": b64::enc(&hh)}),
     )
     .await;
     assert_eq!(a["error"], "forbidden", "{a}");
     assert_eq!(a["rule"], "no_active_device", "{a}");
     let d = pair_device(&w, &mut link).await;
-    let a = sign(
-        &mut link,
-        json!({"purpose": "seal", "data": b64::enc(&seal_data())}),
-    )
-    .await;
-    assert_eq!(a["ok"], true, "{a}");
-    assert!(a.get("device_pub").is_none(), "{a}");
-    let machine_pub =
-        b64::dec_n::<65>(w.ctx.workspace.hello()["machine_pub"].as_str().unwrap()).unwrap();
-    let sig = b64::dec_n::<64>(a["sig"].as_str().unwrap()).unwrap();
-    assert!(saiife_wire::sig::verify_p256_domain(
-        &machine_pub,
-        saiife_wire::seal::HANDSHAKE_DOMAIN,
-        &seal_data(),
-        &sig
-    ));
-    // Hub hello: a nonce, then this machine's id.
-    let mut hh = vec![1u8; 32];
-    hh.extend_from_slice(w.ctx.workspace.machine_id().as_bytes());
     let a = sign(
         &mut link,
         json!({"purpose": "hub_hello", "data": b64::enc(&hh)}),
@@ -882,24 +923,189 @@ async fn sign_needs_an_active_device() {
     assert_eq!(a["ok"], true, "{a}");
     let sig = b64::dec_n::<64>(a["sig"].as_str().unwrap()).unwrap();
     assert!(saiife_wire::sig::verify_p256_domain(
-        &machine_pub,
+        &machine_pub(&w),
         saiife_daemon::workspace::HUB_HELLO_DOMAIN,
         &hh,
         &sig
+    ));
+    let (mh, data) = handshake();
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&data), "device_id": d.device_id()}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(browser_accepts(
+        &w,
+        &mh,
+        &a,
+        &SealBinding::Device(d.device_id())
     ));
     // Revoked: no Active device left.
     control(&w, OP_WORKSPACE_REVOKE, json!({"device_id": d.device_id()})).await;
     let a = sign(
         &mut link,
-        json!({"purpose": "seal", "data": b64::enc(&seal_data())}),
+        json!({"purpose": "hub_hello", "data": b64::enc(&hh)}),
     )
     .await;
     assert_eq!(a["rule"], "no_active_device", "{a}");
 }
 
 #[tokio::test]
+async fn seal_signature_is_bound_to_its_device() {
+    let (w, mut link, a_dev) = paired().await;
+    let b_dev = pair_device(&w, &mut link).await;
+    let (mh, data) = handshake();
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&data), "device_id": a_dev.device_id()}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(browser_accepts(
+        &w,
+        &mh,
+        &a,
+        &SealBinding::Device(a_dev.device_id())
+    ));
+    assert!(!browser_accepts(
+        &w,
+        &mh,
+        &a,
+        &SealBinding::Device(b_dev.device_id())
+    ));
+    assert!(!browser_accepts(
+        &w,
+        &mh,
+        &a,
+        &SealBinding::Pair(a_dev.device_id())
+    ));
+}
+
+#[tokio::test]
+async fn seal_needs_exactly_one_binding() {
+    let (w, mut link, d) = paired().await;
+    let o = w.ctx.workspace.begin_pair(ME, None, now_secs()).unwrap();
+    for args in [
+        json!({"purpose": "seal", "data": b64::enc(&seal_data())}),
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "device_id": null, "pair_id": null}),
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()),
+               "device_id": d.device_id(), "pair_id": o.pair_id}),
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "device_id": 5}),
+    ] {
+        let a = sign(&mut link, args.clone()).await;
+        assert_eq!(a["error"], "bad_request", "{args}: {a}");
+    }
+}
+
+#[tokio::test]
+async fn seal_refuses_revoked_and_pending_devices() {
+    let (w, mut link, d) = paired().await;
+    // A second device stays pending: finished, never confirmed.
+    let b = control(&w, OP_WORKSPACE_PAIR_BEGIN, json!({})).await;
+    let (pair_id, secret, _, _) = pair::parse_fragment(b["fragment"].as_str().unwrap()).unwrap();
+    let pending = TestDevice::generate();
+    let pk = pending.public_raw();
+    let f = link
+        .call(
+            OP_WORKSPACE_PAIR_FINISH,
+            json!({"pair_id": pair_id, "device_pub": b64::enc(&pk), "label": "tab",
+                   "proof": b64::enc(&pair::proof(&secret, &pair_id, &pk))}),
+        )
+        .await;
+    assert_eq!(f["ok"], true, "{f}");
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "device_id": pending.device_id()}),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert!(
+        ["unknown_device", "device_pending"].contains(&a["rule"].as_str().unwrap()),
+        "{a}"
+    );
+    // A revoked device, while another Active device keeps the peer's gate open.
+    let other = pair_device(&w, &mut link).await;
+    control(&w, OP_WORKSPACE_REVOKE, json!({"device_id": d.device_id()})).await;
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "device_id": d.device_id()}),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "unknown_device", "{a}");
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "device_id": other.device_id()}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+}
+
+#[tokio::test]
+async fn seal_refuses_an_invalid_point() {
+    let (_w, mut link, d) = paired().await;
+    let mut data = seal_data();
+    data[16] = 0x04;
+    for b in &mut data[17..] {
+        *b = 0x5a;
+    }
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&data), "device_id": d.device_id()}),
+    )
+    .await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+}
+
+#[tokio::test]
+async fn seal_for_a_pairing_offer() {
+    // No device at all: an offer of the peer's own user is enough.
+    let w = world().await;
+    let mut link = Link::open(&w).await;
+    let o = w.ctx.workspace.begin_pair(ME, None, now_secs()).unwrap();
+    let (mh, data) = handshake();
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&data), "pair_id": o.pair_id}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("device_pub").is_none(), "{a}");
+    assert!(browser_accepts(
+        &w,
+        &mh,
+        &a,
+        &SealBinding::Pair(o.pair_id.clone())
+    ));
+    assert!(!browser_accepts(
+        &w,
+        &mh,
+        &a,
+        &SealBinding::Pair("p-other".into())
+    ));
+    // Another user's offer.
+    w.users.set("bob", me().wrapping_add(7));
+    let ob = w.ctx.workspace.begin_pair("bob", None, now_secs()).unwrap();
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "pair_id": ob.pair_id}),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "wrong_owner", "{a}");
+    // No such offer.
+    let a = sign(
+        &mut link,
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "pair_id": "p-nope"}),
+    )
+    .await;
+    assert_eq!(a["rule"], "pair_expired", "{a}");
+}
+
+#[tokio::test]
 async fn sign_refuses_arbitrary_data() {
-    let (w, mut link, _d) = paired().await;
+    let (w, mut link, d) = paired().await;
     let mid = w.ctx.workspace.machine_id();
     let with_mid = |n: usize| {
         let mut v = vec![1u8; n];
@@ -921,18 +1127,19 @@ async fn sign_refuses_arbitrary_data() {
         ("hub_hello", other_machine),
         ("hub_hello", seal_data()),
     ] {
-        let a = sign(
-            &mut link,
-            json!({"purpose": purpose, "data": b64::enc(&data)}),
-        )
-        .await;
+        let mut args = json!({"purpose": purpose, "data": b64::enc(&data)});
+        if purpose == "seal" {
+            args["device_id"] = d.device_id().into();
+        }
+        let a = sign(&mut link, args).await;
         assert_eq!(a["error"], "bad_request", "{purpose} {}: {a}", data.len());
     }
     for args in [
         json!({"purpose": "frame", "data": b64::enc(&seal_data())}),
-        json!({"purpose": "seal", "data": "not b64!"}),
-        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "extra": 1}),
-        json!({"purpose": "hub_hello", "data": b64::enc(&with_mid(16)), "device_id": "d-x"}),
+        json!({"purpose": "seal", "data": "not b64!", "device_id": d.device_id()}),
+        json!({"purpose": "seal", "data": b64::enc(&seal_data()), "device_id": d.device_id(), "extra": 1}),
+        json!({"purpose": "hub_hello", "data": b64::enc(&with_mid(16)), "device_id": d.device_id()}),
+        json!({"purpose": "hub_hello", "data": b64::enc(&with_mid(16)), "pair_id": "p-1"}),
     ] {
         let a = sign(&mut link, args.clone()).await;
         assert_eq!(a["error"], "bad_request", "{args}: {a}");
@@ -980,7 +1187,6 @@ async fn sign_refuses_other_owners_device() {
         }
     }
     std::fs::write(&path, serde_json::to_vec(&list).unwrap()).unwrap();
-    w.users.set("bob", me().wrapping_add(7));
     let w2 = world_in(Some(w.state.clone())).await;
     w2.users.set("bob", me().wrapping_add(7));
     let mut link2 = Link::open(&w2).await;

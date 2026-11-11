@@ -47,7 +47,8 @@ pub fn now_secs() -> u64 {
 /// What the machine key is asked to sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignPurpose {
-    /// The seal handshake (`saiife_wire::seal::HANDSHAKE_DOMAIN`).
+    /// The machine's seal handshake (`saiife_wire::seal::MACHINE_HELLO_DOMAIN`,
+    /// over `saiife_wire::seal::machine_hello_msg`).
     Seal,
     /// The hub hello (`b"saiife-hub-hello-v1\n"`).
     HubHello,
@@ -56,7 +57,7 @@ pub enum SignPurpose {
 impl SignPurpose {
     fn domain(self) -> &'static [u8] {
         match self {
-            SignPurpose::Seal => saiife_wire::seal::HANDSHAKE_DOMAIN,
+            SignPurpose::Seal => saiife_wire::seal::MACHINE_HELLO_DOMAIN,
             SignPurpose::HubHello => HUB_HELLO_DOMAIN,
         }
     }
@@ -704,7 +705,7 @@ mod tests {
         let sig = ws.sign(SignPurpose::Seal, b"x").unwrap();
         assert!(saiife_wire::sig::verify_p256_domain(
             &pubkey,
-            saiife_wire::seal::HANDSHAKE_DOMAIN,
+            saiife_wire::seal::MACHINE_HELLO_DOMAIN,
             b"x",
             &sig
         ));

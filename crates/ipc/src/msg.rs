@@ -125,9 +125,12 @@ pub const OP_WORKSPACE_PAIR_FINISH: &str = "workspace.pair.finish";
 /// seal channel was opened for; required for `via` = `hub`. The daemon reads
 /// the action out of `body` and decides by `saiife_wire::level_for`.
 pub const OP_WORKSPACE_FRAME: &str = "workspace.frame";
-/// link.sock only: the machine key signs for the link. `{purpose: "seal" |
-/// "hub_hello", data: b64u, device_id?}` -> `{sig: b64u, device_pub?: b64u}`.
-/// `device_pub` is only given when `device_id` was, for a `seal`.
+/// link.sock only: the machine key signs for the link. `{purpose: "seal",
+/// data: b64u (session_id ‖ machine_eph), device_id | pair_id}` (exactly one;
+/// signed as `saiife_wire::seal::machine_hello_msg`) or `{purpose:
+/// "hub_hello", data: b64u (nonce ‖ machine_id)}` -> `{sig: b64u,
+/// device_pub?: b64u}`. `device_pub` is only given for a `seal` with
+/// `device_id`.
 pub const OP_WORKSPACE_SIGN: &str = "workspace.sign";
 // Frame actions, dispatched inside `workspace.frame` (level from
 // `saiife_wire::level_for`, names equal `saiife_wire::level::actions`).
