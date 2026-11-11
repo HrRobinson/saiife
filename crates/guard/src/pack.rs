@@ -1584,11 +1584,17 @@ pub(crate) fn load_shipped_toml(
     )
 }
 
-fn parse_pack(toml_str: &str) -> Result<RawPackFile, PackError> {
+/// Count one pack compiled on this thread (for loaders outside this module).
+#[cfg(test)]
+pub(crate) fn note_compiled() {
+    COMPILED.with(|c| c.set(c.get() + 1));
+}
+
+pub(crate) fn parse_pack(toml_str: &str) -> Result<RawPackFile, PackError> {
     toml::from_str(toml_str).map_err(|e| PackError::Toml(e.to_string()))
 }
 
-fn load_raw(
+pub(crate) fn load_raw(
     source: &str,
     raw: &RawPackFile,
     style: PathStyle,
