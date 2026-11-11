@@ -58,7 +58,13 @@ pub struct SourceLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Command(Vec<String>),
-    Path { glob: String, access: RuleAccess },
+    Path {
+        glob: String,
+        access: RuleAccess,
+    },
+    /// A span with control, bidi or format characters (the sanitized text):
+    /// never proposed, listed as not enforced.
+    Rejected(String),
 }
 
 /// A never-line and what it names. No targets: a judgement line.

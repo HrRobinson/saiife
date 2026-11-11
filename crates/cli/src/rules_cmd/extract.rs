@@ -173,8 +173,39 @@ fn is_program_word(w: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
 }
 
+/// A character that must never reach a terminal or a rule: C0 controls
+/// (tab excepted), DEL, C1 controls, bidi controls and the other Unicode
+/// format characters (category Cf).
+pub(crate) fn is_unsafe_char(c: char) -> bool {
+    let u = c as u32;
+    (c.is_control() && c != '\t')
+        || matches!(u,
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x8E2 | 0x180E
+            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD
+            | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+pub(crate) fn has_unsafe_char(s: &str) -> bool {
+    s.chars().any(is_unsafe_char)
+}
+
+/// `s` made safe to print: every unsafe character becomes `?`. The one
+/// sanitizer every renderer of user-derived text shares.
+pub(crate) fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_unsafe_char(c) { '?' } else { c })
+        .collect()
+}
+
+/// Why a target was refused for its characters.
+pub(crate) const UNSAFE_WHY: &str = "contains a control or bidi character";
+
 /// Starts like an absolute, home or `$NAME/` path, with no whitespace.
 fn is_path_like(s: &str) -> bool {
+    if has_unsafe_char(s) {
+        return false;
+    }
     if s.is_empty() || s.contains(char::is_whitespace) || s.contains("://") {
         return false;
     }
@@ -195,6 +226,9 @@ fn is_path_like(s: &str) -> bool {
 
 pub(crate) fn span_target(span: &str, access: RuleAccess) -> Option<Target> {
     let span = span.trim();
+    if has_unsafe_char(span) {
+        return Some(Target::Rejected(clean(span)));
+    }
     if is_path_like(span) {
         return Some(Target::Path {
             glob: span.to_string(),
@@ -250,7 +284,13 @@ fn targets(masked: &str, spans: &[(usize, String)]) -> Vec<Target> {
         let start = offset;
         offset += token.len();
         let bare = token.trim_matches(|c: char| c.is_whitespace() || ",.;:()\"'".contains(c));
-        if is_path_like(bare) && !bare.contains(MASK) {
+        let plain: String = bare.chars().filter(|c| !is_unsafe_char(*c)).collect();
+        if has_unsafe_char(bare) && is_path_like(&plain) && !bare.contains(MASK) {
+            found.push((
+                start + token.find(bare).unwrap_or(0),
+                Target::Rejected(clean(bare)),
+            ));
+        } else if is_path_like(bare) && !bare.contains(MASK) {
             found.push((
                 start + token.find(bare).unwrap_or(0),
                 Target::Path {

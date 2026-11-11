@@ -9,20 +9,12 @@ use std::io::{BufRead, Write};
 use saiifeguard::pack::RuleWhere;
 use saiifeguard::pathrule::RuleAccess;
 
-use super::extract::span_target;
+use super::extract::{clean, span_target};
 use super::{Choice, Decided, Proposal, ProposalKind, SourceLine, Target, Unverified};
 
 /// Input ended (or failed) before the last answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Eof;
-
-/// Text from a file or the engine, safe to print: control characters are
-/// replaced, so a hostile line cannot drive the terminal.
-fn clean(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
-}
 
 fn access_name(a: RuleAccess) -> &'static str {
     match a {
@@ -35,9 +27,15 @@ fn access_name(a: RuleAccess) -> &'static str {
 
 fn rule_text(p: &Proposal) -> String {
     match &p.kind {
-        ProposalKind::Command { words, .. } => format!("deny command `{}`", words.join(" ")),
+        ProposalKind::Command { words, .. } => {
+            format!("deny command `{}`", clean(&words.join(" ")))
+        }
         ProposalKind::Path { globs, access } => {
-            format!("deny path {} ({})", globs.join(", "), access_name(*access))
+            format!(
+                "deny path {} ({})",
+                clean(&globs.join(", ")),
+                access_name(*access)
+            )
         }
     }
 }
@@ -181,7 +179,7 @@ pub fn confirm(
                         ProposalKind::Path { access, .. } => *access,
                         ProposalKind::Command { .. } => RuleAccess::Any,
                     };
-                    match span_target(&text, access) {
+                    match span_target(&text, access).filter(|t| !matches!(t, Target::Rejected(_))) {
                         None => {
                             let _ = writeln!(out, "not a command or a path: {}", clean(&text));
                         }
@@ -377,5 +375,37 @@ mod tests {
         assert!(t.contains("unverified: the rule does not block"), "{t}");
         assert!(t.contains("judgement"), "{t}");
         assert!(t.contains("2 proposed, 1 unverified, 1 judgement"), "{t}");
+    }
+
+    #[test]
+    fn hostile_text_never_reaches_the_terminal() {
+        let has_unsafe_char = |s: &str| {
+            s.replace('\n', "")
+                .chars()
+                .any(crate::rules_cmd::extract::is_unsafe_char)
+        };
+        let mut p = prop(1, cmd(&["shred"]));
+        p.src.text = "- Never \u{1b}[2Jrun\u{202e} x\u{200b}".to_string();
+        p.reason = "CLAUDE.md:1 \"x\u{1b}\"".to_string();
+        p.broad = Some("blocks \u{1b}[31m `ls`".to_string());
+        p.block = vec!["a\u{202e}b".into()];
+        p.kind = ProposalKind::Command {
+            words: vec!["sh\u{1b}[1mred".into(), "\u{2066}x".into()],
+            rules: vec![],
+            help_carve_out: false,
+        };
+        let bad = vec![Unverified {
+            src: p.src.clone(),
+            why: "w\u{1b}[0m".into(),
+        }];
+        let t = table(std::slice::from_ref(&p), &bad, std::slice::from_ref(&p.src));
+        assert!(!has_unsafe_char(&t), "{t:?}");
+        let (r, out) = run(vec![p], true, "z\u{1b}\ne\nyes\nh\n");
+        assert!(r.is_ok());
+        assert!(!has_unsafe_char(&out), "{out:?}");
+        let (r, out) = run(vec![prop(1, cmd(&["shred"]))], true, "x\nev\u{1b}il\ns\n");
+        assert!(r.is_ok());
+        assert!(!has_unsafe_char(&out), "{out:?}");
+        assert!(out.contains("not a command or a path"), "{out}");
     }
 }

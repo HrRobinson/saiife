@@ -144,10 +144,13 @@ fn path_proposal(
             .replace("**", "saiife-example")
             .replace('*', "saiife-example")
             .replace('?', "x");
-        let parent = glob
+        // The near miss is a sibling of the directory holding the first
+        // wildcard: outside the glob (`/etc/**` -> `/saiife-example-other`).
+        let first = glob.find(['*', '?', '[', '{']).unwrap_or(glob.len());
+        let parent = glob[..first]
             .rfind('/')
-            .map(|i| glob[..i].to_string())
-            .filter(|p| !has_wildcard(p));
+            .map(|i| &glob[..i])
+            .and_then(|dir| dir.rfind('/').map(|j| dir[..j].to_string()));
         (vec![glob.to_string()], block, parent)
     } else {
         let base = glob.trim_end_matches('/');
@@ -188,6 +191,7 @@ pub fn propose(c: &Candidate, file_name: &str, origin: Origin) -> Vec<Proposal> 
             Target::Path { glob, access } => {
                 Some(path_proposal(c, glob, *access, why.clone(), origin))
             }
+            Target::Rejected(_) => None,
         })
         .collect()
 }
@@ -361,6 +365,14 @@ pub fn proposals_for(
         if c.targets.is_empty() {
             judgement.push(c.src.clone());
             continue;
+        }
+        for t in &c.targets {
+            if let Target::Rejected(text) = t {
+                bad.push(Unverified {
+                    src: c.src.clone(),
+                    why: format!("`{text}` {}", crate::rules_cmd::extract::UNSAFE_WHY),
+                });
+            }
         }
         for mut p in propose(c, file_name, Origin::Rules) {
             match verify(&mut p, vars) {
@@ -595,5 +607,35 @@ mod tests {
         let (ok, bad, judge) = proposals_for(&[cand(vec![])], "CLAUDE.md", &vars());
         assert!(ok.is_empty() && bad.is_empty());
         assert_eq!(judge.len(), 1);
+    }
+
+    #[test]
+    fn wildcard_globs_verify() {
+        for g in ["/etc/**", "/etc/*.conf", "$HOME/.ssh/*"] {
+            let p = one(path(g, RuleAccess::Write));
+            let mut p = p;
+            assert_eq!(verify(&mut p, &vars()), Ok(()), "{g}");
+        }
+        assert_eq!(
+            one(path("/etc/**", RuleAccess::Write)).allow,
+            strs(&["/saiife-example-other"])
+        );
+    }
+
+    #[test]
+    fn unsafe_characters_are_listed_not_proposed() {
+        let text = "- Never run `rm\u{1b}[2J -rf` here.\n- Never write to /etc/pa\u{202e}sswd now.\n- Never run `shred`.\n";
+        let cands = crate::rules_cmd::extract::candidates(text);
+        assert_eq!(cands.len(), 3);
+        let (ok, bad, judgement) = proposals_for(&cands, "CLAUDE.md", &vars());
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert!(bad
+            .iter()
+            .all(|u| u.why.contains("control or bidi character")));
+        assert!(bad
+            .iter()
+            .all(|u| !crate::rules_cmd::extract::has_unsafe_char(&u.why)));
+        assert!(judgement.is_empty());
     }
 }
