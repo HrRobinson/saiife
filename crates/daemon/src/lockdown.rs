@@ -264,7 +264,7 @@ pub fn free_change(cur: Option<&Lockdown>, next: Option<LockScope>) -> bool {
 /// `"reauth"` it must pass re-authentication (an unavailable one refuses;
 /// `auth` is the CLI's authorization on macOS). Runs off the runtime thread
 /// (the prompt can take 120 s).
-async fn may_turn_off(
+pub(crate) async fn may_turn_off(
     ctx: &Arc<Ctx>,
     conn: &Conn,
     detail: &'static str,
@@ -313,7 +313,7 @@ async fn may_turn_off(
 
 /// The rule and message of a refused `lockdown off` (or change of an
 /// active lockdown) by an approver.
-fn off_refusal(r: &Refusal, what: &str) -> (&'static str, String) {
+pub(crate) fn off_refusal(r: &Refusal, what: &str) -> (&'static str, String) {
     match r {
         Refusal::SameUserDenied => (
             "reauth_required",

@@ -1205,6 +1205,14 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_MCP_LIST | OP_MCP_CALL => crate::mcp_ops::handle(ctx, peer, req).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
+        // Workspace (plan 29): machine side, control socket only.
+        saiife_ipc::msg::OP_WORKSPACE_PAIR_BEGIN
+        | saiife_ipc::msg::OP_WORKSPACE_PAIR_STATUS
+        | saiife_ipc::msg::OP_WORKSPACE_PAIR_CONFIRM
+        | saiife_ipc::msg::OP_WORKSPACE_DEVICES
+        | saiife_ipc::msg::OP_WORKSPACE_REVOKE => {
+            crate::workspace_ops::handle(ctx, conn, req).await
+        }
         other => err(
             req.id,
             ErrorCode::UnknownOp,

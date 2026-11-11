@@ -69,6 +69,8 @@ struct Inner {
     /// it yet; the next successful save (any write, or a retried revoke)
     /// clears it.
     dirty: bool,
+    /// Who began each open offer: `pair_id -> (owner_user, expires_at)`.
+    owners: std::collections::HashMap<String, (String, u64)>,
 }
 
 pub struct Workspace {
@@ -135,6 +137,7 @@ impl Workspace {
                 offers: Offers::new(),
                 verifier,
                 dirty: false,
+                owners: Default::default(),
             }),
             dir,
             locked,
@@ -185,9 +188,25 @@ impl Workspace {
         now: u64,
     ) -> Result<PairOffer, WireError> {
         self.unlocked()?;
-        self.inner()
+        let mut g = self.inner();
+        let offer = g
             .offers
-            .open(&self.machine, owner_user, label, &self.rng, now)
+            .open(&self.machine, owner_user, label, &self.rng, now)?;
+        g.owners.retain(|_, (_, exp)| now < *exp);
+        g.owners.insert(
+            offer.pair_id.clone(),
+            (owner_user.to_string(), offer.expires_at),
+        );
+        Ok(offer)
+    }
+
+    /// Who began the offer `pair_id`, while it is open.
+    pub fn offer_owner(&self, pair_id: &str, now: u64) -> Option<String> {
+        self.inner()
+            .owners
+            .get(pair_id)
+            .filter(|(_, exp)| now < *exp)
+            .map(|(o, _)| o.clone())
     }
 
     /// A device answers an offer. The device is Pending (not in the list)
