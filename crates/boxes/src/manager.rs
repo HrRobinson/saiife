@@ -263,6 +263,12 @@ impl Manager {
         u64::from(mins) * 60
     }
 
+    /// The guest channel, for the box source's terminal and diff reads. The
+    /// call is made outside the manager's lock.
+    pub fn guest(&self) -> Arc<dyn GuestLink> {
+        self.guest.clone()
+    }
+
     pub fn templates(&self) -> Vec<BoxTemplate> {
         self.templates.clone()
     }
