@@ -200,6 +200,17 @@ jobs:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
 
+  # Supply-chain gate: RustSec advisories, licenses, bans (no openssl-sys or
+  # aws-lc-sys), sources (crates.io only). Config in deny.toml.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # 0.20.2 is from 2026-07-09, older than the 14 day rule.
+      - run: cargo install cargo-deny --locked --version 0.20.2
+      - run: cargo deny check advisories licenses bans sources
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
