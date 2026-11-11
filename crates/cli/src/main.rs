@@ -68,6 +68,9 @@ mod status_cmd;
 mod system_cmd;
 mod system_view;
 mod text;
+mod touch_cmd;
+#[cfg(any(unix, windows))]
+mod tty;
 mod win_locked;
 
 use saiifeguard::builtins::builtin_packs;
