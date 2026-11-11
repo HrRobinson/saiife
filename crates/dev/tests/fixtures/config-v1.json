@@ -1,0 +1,16 @@
+{
+  "x-saiife-fixture": "hand-written from plan 22 facts F3 to F8 (compose-go v1.0 shape, numeric published); not captured from a real Compose",
+  "name": "shop",
+  "services": {
+    "web": {
+      "image": "node:20",
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "target": 3000, "published": 8080, "protocol": "tcp" }
+      ]
+    }
+  },
+  "networks": {
+    "default": { "name": "shop_default" }
+  }
+}

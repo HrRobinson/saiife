@@ -1,0 +1,28 @@
+[package]
+name = "saiife-dev"
+description = "saiife dev: compose stacks on one local proxy, by name instead of port."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_dev"
+path = "src/lib.rs"
+
+[features]
+fake = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+time = { version = "0.3", features = ["formatting", "macros"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+
+[dev-dependencies]
+tempfile = "3"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+
+[lints]
+workspace = true

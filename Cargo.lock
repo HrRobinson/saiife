@@ -1428,6 +1428,7 @@ dependencies = [
  "saiife-audit",
  "saiife-broker",
  "saiife-daemon",
+ "saiife-dev",
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",
@@ -1558,6 +1559,19 @@ name = "saiife-darwin"
 version = "0.2.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "saiife-dev"
+version = "0.2.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "toml",
 ]
 
 [[package]]
