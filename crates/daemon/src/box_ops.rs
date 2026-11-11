@@ -44,6 +44,9 @@ pub const TICK_SECS: u64 = 5;
 pub const UNAVAILABLE: &str = "boxes are not available in this version";
 /// Set to `1` (in a `fake-vmm` build) to run boxes on the fake VM.
 pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
+/// With [`FAKE_ENV`] (a `fake-vmm` build only): `<n>` pins the host to
+/// exactly `n` default boxes, so a test never depends on the machine's RAM.
+pub const FAKE_SLOTS_ENV: &str = "SAIIFE_BOX_FAKE_SLOTS";
 /// The stderr line of a daemon whose boxes run on the fake VM.
 pub const FAKE_NOTICE: &str = "saiifed: boxes use a fake VM (test build)";
 /// The longest template name and `repo_dir` taken.
@@ -246,12 +249,18 @@ fn build_fake(
     let (tdir, trust) = templates_dir(mode, config_path, env);
     let (templates, template_warnings) = saiife_boxes::template::load_dir(&tdir, trust);
     let prev = Mutex::new(None);
+    let pinned = env(FAKE_SLOTS_ENV)
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
+        .map(fake_host);
     let (mgr, mut warnings) = Manager::open(ManagerInit {
         store,
         vmm: Arc::new(FakeVmm::new()),
         guest: Arc::new(FakeGuest::new()),
         templates,
-        host: Arc::new(move || host_facts(&root, &prev)),
+        host: Arc::new(move || match &pinned {
+            Some(h) => h.clone(),
+            None => host_facts(&root, &prev),
+        }),
         clock: Arc::new(unix_now),
     })
     .map_err(|e| e.to_string())?;
@@ -265,6 +274,22 @@ fn build_fake(
         warnings,
         template_warnings,
     })
+}
+
+/// A host that holds exactly `n` default boxes (`SAIIFE_BOX_FAKE_SLOTS`).
+#[cfg(feature = "fake-vmm")]
+pub fn fake_host(n: u64) -> HostFacts {
+    let mem = 8192
+        + n.saturating_mul(capacity::charge_mib(
+            &saiife_boxes::template::Size::default(),
+        ));
+    HostFacts {
+        mem_total_mib: mem,
+        mem_avail_mib: mem,
+        threads: 12,
+        disk_free_mib: 1024 * 1024,
+        cpu_pct: None,
+    }
 }
 
 #[cfg(feature = "fake-vmm")]

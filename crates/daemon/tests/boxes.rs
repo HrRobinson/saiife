@@ -668,6 +668,27 @@ async fn templates_lists_warnings() {
 }
 
 #[tokio::test]
+async fn fake_slots_env_pins_the_host() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = |k: &str| -> Option<OsString> {
+        match k {
+            "SAIIFE_BOX_FAKE_VMM" => Some("1".into()),
+            "SAIIFE_BOX_FAKE_SLOTS" => Some("3".into()),
+            _ => None,
+        }
+    };
+    let built = box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &env)
+        .unwrap()
+        .expect("the fake VM is on");
+    let (host, committed) = built.manager.capacity();
+    assert_eq!(host.threads, 12);
+    assert_eq!(host.cpu_pct, None);
+    assert_eq!(host.mem_total_mib, host.mem_avail_mib);
+    assert_eq!(capacity::slots(&host, &committed), (3, 3));
+}
+
+#[tokio::test]
 async fn build_needs_the_fake_flag() {
     let tmp = scratch();
     let state = tmp.path().join("state");
