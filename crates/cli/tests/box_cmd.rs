@@ -213,6 +213,20 @@ fn hostile_task_is_sanitized_in_ls() {
 }
 
 #[test]
+fn json_output_is_ascii_and_round_trips_a_hostile_task() {
+    let d = world();
+    let task = "a\u{202e}b \u{1F600}";
+    assert_eq!(code(&bx(&d, &["spawn", "--task", task])), 0);
+    let o = bx(&d, &["ls", "--json"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let raw = out(&o);
+    assert!(raw.is_ascii(), "{raw:?}");
+    assert!(!raw.contains('\u{202e}'), "{raw:?}");
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["boxes"][0]["task"], task, "{v}");
+}
+
+#[test]
 fn long_task_is_cut_to_40_chars() {
     let d = world();
     bx(&d, &["spawn", "--task", &"x".repeat(100)]);

@@ -835,10 +835,26 @@ async fn run(
                 let (host, committed) = m.capacity();
                 let (total, free) = capacity::slots(&host, &committed);
                 let mut a = Map::new();
-                a.insert(
-                    "boxes".into(),
-                    serde_json::to_value(boxes).unwrap_or_default(),
-                );
+                // Each entry is the `BoxInfo` plus, for a box that failed, its
+                // record's `error` (the wire type has no such field; this
+                // answer is the control socket's own).
+                let errors: std::collections::HashMap<BoxId, String> = m
+                    .list()
+                    .into_iter()
+                    .filter_map(|r| r.error.filter(|e| !e.is_empty()).map(|e| (r.id, e)))
+                    .collect();
+                let boxes: Vec<Value> = boxes
+                    .into_iter()
+                    .map(|b| {
+                        let err = errors.get(&b.id).cloned();
+                        let mut v = serde_json::to_value(b).unwrap_or_default();
+                        if let (Some(e), Value::Object(o)) = (err, &mut v) {
+                            o.insert("error".into(), e.into());
+                        }
+                        v
+                    })
+                    .collect();
+                a.insert("boxes".into(), Value::Array(boxes));
                 a.insert("slots_total".into(), total.into());
                 a.insert("slots_free".into(), free.into());
                 Ok((a, None))

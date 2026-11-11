@@ -726,3 +726,17 @@ async fn gc_by_non_admin_removes_only_own() {
     assert!(new.iter().all(|r| r["action"] == "gc"), "{new:?}");
     assert_eq!(new[0]["removed"], json!(["b2"]));
 }
+
+#[tokio::test]
+async fn list_entry_of_a_boot_failed_box_carries_its_error() {
+    let w = world();
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    w.spawn(ALICE, "one").await;
+    let b = w.running(ALICE, "two").await;
+    let l = w.ok(ALICE, "box.list", json!({})).await;
+    let boxes = l["boxes"].as_array().unwrap();
+    let failed = boxes.iter().find(|x| x["id"] == "b1").unwrap();
+    assert_eq!(failed["error"], "boot failed: no kvm", "{l}");
+    let fine = boxes.iter().find(|x| x["id"] == b.as_str()).unwrap();
+    assert!(fine.get("error").is_none(), "{l}");
+}

@@ -194,11 +194,11 @@ mod imp {
                 if json {
                     outln!(
                         "{}",
-                        json!({
+                        ascii_json(&json!({
                             "boxes": a.get("boxes").cloned().unwrap_or(json!([])),
                             "slots_total": a.get("slots_total").cloned().unwrap_or(json!(0)),
                             "slots_free": a.get("slots_free").cloned().unwrap_or(json!(0)),
-                        })
+                        }))
                     );
                 } else {
                     print_table(&a);
@@ -242,10 +242,10 @@ mod imp {
                 if json {
                     outln!(
                         "{}",
-                        json!({
+                        ascii_json(&json!({
                             "templates": a.get("templates").cloned().unwrap_or(json!([])),
                             "warnings": a.get("warnings").cloned().unwrap_or(json!([])),
-                        })
+                        }))
                     );
                 } else {
                     print_templates(&a);
@@ -325,14 +325,16 @@ mod imp {
             .map_or(0, |d| d.as_secs())
     }
 
-    fn table(head: &[&str], rows: &[Vec<String>]) {
+    /// A table as lines: columns padded to the widest cell, the last one
+    /// not padded. A row's trailer, if any, is a line under it.
+    pub(super) fn render(head: &[&str], rows: &[(Vec<String>, Option<String>)]) -> Vec<String> {
         let mut w: Vec<usize> = head.iter().map(|h| h.chars().count()).collect();
-        for r in rows {
+        for (r, _) in rows {
             for (i, c) in r.iter().enumerate() {
                 w[i] = w[i].max(c.chars().count());
             }
         }
-        let line = |cells: Vec<&str>| {
+        let line = |cells: &[&str]| {
             let mut s = String::new();
             for (i, c) in cells.iter().enumerate() {
                 if i + 1 == cells.len() {
@@ -343,10 +345,42 @@ mod imp {
             }
             s.trim_end().to_string()
         };
-        outln!("{}", line(head.to_vec()));
-        for r in rows {
-            outln!("{}", line(r.iter().map(String::as_str).collect()));
+        let mut out = vec![line(head)];
+        for (r, trailer) in rows {
+            let cells: Vec<&str> = r.iter().map(String::as_str).collect();
+            out.push(line(&cells));
+            out.extend(trailer.clone());
         }
+        out
+    }
+
+    /// The `ls` table for a `box.list` answer's `boxes`, at time `now`.
+    pub(super) fn box_lines(boxes: &[Value], now: u64) -> Vec<String> {
+        let head = ["ID", "STATE", "TEMPLATE", "REPO", "AGE", "QUEUE", "TASK"];
+        let rows: Vec<(Vec<String>, Option<String>)> = boxes
+            .iter()
+            .map(|b| {
+                let created = b.get("created_at").and_then(Value::as_u64).unwrap_or(now);
+                let cells = vec![
+                    sanitize(text(b, "id")),
+                    sanitize(text(b, "state")),
+                    sanitize(text(b, "template")),
+                    sanitize(text(b, "repo")),
+                    age(now.saturating_sub(created)),
+                    b.get("queue_pos")
+                        .and_then(Value::as_u64)
+                        .map_or_else(|| "-".to_string(), |n| n.to_string()),
+                    short_task(text(b, "task")),
+                ];
+                let error = b
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| format!("  error: {}", sanitize(e)));
+                (cells, error)
+            })
+            .collect();
+        render(&head, &rows)
     }
 
     fn print_table(a: &Args) {
@@ -354,57 +388,44 @@ mod imp {
             .get("boxes")
             .and_then(Value::as_array)
             .map_or(&[], Vec::as_slice);
-        let now = now_secs();
-        let head = ["ID", "STATE", "TEMPLATE", "REPO", "AGE", "QUEUE", "TASK"];
-        // Rows and their error lines, in order.
-        let mut rows = Vec::new();
-        let mut errors: Vec<Option<String>> = Vec::new();
-        for b in boxes {
-            let created = b.get("created_at").and_then(Value::as_u64).unwrap_or(now);
-            rows.push(vec![
-                sanitize(text(b, "id")),
-                sanitize(text(b, "state")),
-                sanitize(text(b, "template")),
-                sanitize(text(b, "repo")),
-                age(now.saturating_sub(created)),
-                b.get("queue_pos")
-                    .and_then(Value::as_u64)
-                    .map_or_else(|| "-".to_string(), |n| n.to_string()),
-                short_task(text(b, "task")),
-            ]);
-            errors.push(
-                b.get("error")
-                    .and_then(Value::as_str)
-                    .filter(|e| !e.is_empty())
-                    .map(|e| format!("  error: {}", sanitize(e))),
-            );
-        }
-        let mut w: Vec<usize> = head.iter().map(|h| h.chars().count()).collect();
-        for r in &rows {
-            for (i, c) in r.iter().enumerate() {
-                w[i] = w[i].max(c.chars().count());
-            }
-        }
-        let fmt = |cells: Vec<&str>| {
-            let mut s = String::new();
-            for (i, c) in cells.iter().enumerate() {
-                if i + 1 == cells.len() {
-                    s.push_str(c);
-                } else {
-                    s.push_str(&format!("{:<w$}  ", c, w = w[i]));
-                }
-            }
-            s.trim_end().to_string()
-        };
-        outln!("{}", fmt(head.to_vec()));
-        for (r, e) in rows.iter().zip(&errors) {
-            outln!("{}", fmt(r.iter().map(String::as_str).collect()));
-            if let Some(e) = e {
-                outln!("{e}");
-            }
+        for l in box_lines(boxes, now_secs()) {
+            outln!("{l}");
         }
         let n = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);
         outln!("slots: {} of {} free", n("slots_free"), n("slots_total"));
+    }
+
+    /// `v` as JSON with every non-ASCII character of a string written as
+    /// `\uXXXX` (a surrogate pair above the BMP): same data, and a bidi or
+    /// format character from the daemon never reaches the terminal raw.
+    pub(super) fn ascii_json(v: &Value) -> String {
+        use serde::Serialize;
+        struct Ascii;
+        impl serde_json::ser::Formatter for Ascii {
+            fn write_string_fragment<W: ?Sized + std::io::Write>(
+                &mut self,
+                w: &mut W,
+                fragment: &str,
+            ) -> std::io::Result<()> {
+                let mut buf = [0u16; 2];
+                for c in fragment.chars() {
+                    if c.is_ascii() {
+                        w.write_all(&[c as u8])?;
+                    } else {
+                        for u in c.encode_utf16(&mut buf) {
+                            write!(w, "\\u{u:04x}")?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut out = Vec::new();
+        let mut ser = serde_json::Serializer::with_formatter(&mut out, Ascii);
+        if v.serialize(&mut ser).is_err() {
+            return "null".into();
+        }
+        String::from_utf8(out).unwrap_or_default()
     }
 
     fn print_templates(a: &Args) {
@@ -413,7 +434,7 @@ mod imp {
             .and_then(Value::as_array)
             .map_or(&[], Vec::as_slice);
         let flag = |t: &Value, k: &str| t.get(k).and_then(Value::as_bool).unwrap_or(false);
-        let rows: Vec<Vec<String>> = list
+        let rows: Vec<(Vec<String>, Option<String>)> = list
             .iter()
             .map(|t| {
                 let mut notes = Vec::new();
@@ -423,14 +444,19 @@ mod imp {
                 if flag(t, "has_egress") {
                     notes.push("egress");
                 }
-                vec![
-                    sanitize(text(t, "name")),
-                    notes.join(","),
-                    sanitize(text(t, "description")),
-                ]
+                (
+                    vec![
+                        sanitize(text(t, "name")),
+                        notes.join(","),
+                        sanitize(text(t, "description")),
+                    ],
+                    None,
+                )
             })
             .collect();
-        table(&["NAME", "NEEDS", "DESCRIPTION"], &rows);
+        for l in render(&["NAME", "NEEDS", "DESCRIPTION"], &rows) {
+            outln!("{l}");
+        }
         for w in a
             .get("warnings")
             .and_then(Value::as_array)
@@ -464,6 +490,34 @@ mod imp {
             assert_eq!(c.chars().count(), 40);
             assert!(c.ends_with('…'));
             assert!(!short_task("a\u{202e}").contains('\u{202e}'));
+        }
+
+        #[test]
+        fn table_shows_a_boxs_error_under_it() {
+            let boxes = vec![
+                json!({"id": "b1", "state": "discarded", "template": "claude-code",
+                       "repo": "r", "task": "t", "created_at": 0, "queue_pos": null,
+                       "error": "boot failed: no kvm\u{202e}"}),
+                json!({"id": "b2", "state": "running", "template": "claude-code",
+                       "repo": "r", "task": "u", "created_at": 0}),
+            ];
+            let lines = box_lines(&boxes, 7200);
+            assert_eq!(lines.len(), 4, "{lines:?}");
+            assert!(lines[0].starts_with("ID  STATE"), "{lines:?}");
+            assert!(lines[1].starts_with("b1  discarded"), "{lines:?}");
+            assert_eq!(lines[2], "  error: boot failed: no kvm\\u{202E}");
+            assert!(lines[3].starts_with("b2  running"), "{lines:?}");
+            assert!(lines[3].contains("2h"), "{lines:?}");
+        }
+
+        #[test]
+        fn ascii_json_escapes_and_round_trips() {
+            let v = json!({"k\u{e9}": "a\u{202e}b \u{1F600} \"q\" \n"});
+            let s = ascii_json(&v);
+            assert!(s.is_ascii(), "{s}");
+            assert!(s.contains("\\u202e"), "{s}");
+            assert!(s.contains("\\ud83d\\ude00"), "{s}");
+            assert_eq!(serde_json::from_str::<Value>(&s).unwrap(), v);
         }
 
         #[test]
