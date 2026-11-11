@@ -25,7 +25,7 @@ disk_gib = 50
 [egress]
 allow = ["registry.npmjs.org", "*.crates.io:8443"]
 [secrets]
-names = ["npm_token"]
+names = ["npm-token"]
 [rules]
 profile = "strict"
 [touch]
@@ -85,7 +85,7 @@ fn full_file_roundtrip() {
             }
         ]
     );
-    assert_eq!(t.secrets, vec!["npm_token"]);
+    assert_eq!(t.secrets, vec!["npm-token"]);
     assert_eq!(t.rules_profile, "strict");
     assert_eq!(t.touch, vec![TouchClass::Land]);
     assert_eq!(t.idle_stop_mins, 30);
