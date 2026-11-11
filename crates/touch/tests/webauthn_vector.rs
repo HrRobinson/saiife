@@ -101,3 +101,13 @@ fn l3_vector_flipped_bit_fails() {
         Err(TouchError::Mismatch)
     );
 }
+
+#[test]
+fn l3_vector_with_fido2_kind_is_mismatch() {
+    let mut v = load();
+    v.cred.kind = "fido2".into();
+    assert_eq!(
+        verify_parts(&v.cred, &v.asr, &v.rp_id, &v.challenge, false),
+        Err(TouchError::Mismatch)
+    );
+}

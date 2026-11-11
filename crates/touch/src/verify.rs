@@ -212,14 +212,27 @@ fn check_signature(key: &CoseKey, auth_data: &[u8], hash: &[u8; 32], sig: &[u8])
     }
 }
 
+/// Step 3, the kind binding (R5): a `fido2` credential accepts only a Ctap2
+/// assertion, a `webauthn` one only a WebAuthn assertion; any other kind
+/// string matches neither and fails closed.
+fn check_kind(cred: &Credential, asr: &Assertion) -> Result<(), TouchError> {
+    match (cred.kind.as_str(), asr) {
+        ("fido2", Assertion::Ctap2 { .. }) | ("webauthn", Assertion::WebAuthn { .. }) => Ok(()),
+        _ => Err(TouchError::Mismatch),
+    }
+}
+
 /// Steps 1-3 and 5-9 of [`verify`] against one credential, with a raw
 /// expected challenge: the Ctap2 branch compares `client_data_hash` with
 /// `SHA-256(expected_challenge)`, the WebAuthn branch compares
 /// `clientDataJSON.challenge` with base64url(`expected_challenge`).
 ///
+/// Step 3 checks the credential id, then its rp id, then that its kind matches
+/// the assertion's (R5), before any client-data or signature work.
+///
 /// `need_uv` is honoured as passed: the caller decides. (`verify` passes true
-/// for every WebAuthn assertion, D4; a published vector without UV passes
-/// false.) Returns the authData flags and the new sign counter.
+/// for every WebAuthn assertion or `webauthn` credential, D4; a published
+/// vector without UV passes false.) Returns the authData flags and the new sign counter.
 pub fn verify_parts(
     cred: &Credential,
     asr: &Assertion,
@@ -234,6 +247,7 @@ pub fn verify_parts(
     if cred.rp_id != rp_id {
         return Err(TouchError::Mismatch);
     }
+    check_kind(cred, asr)?;
     let hash = client_hash(cred, asr, expected_challenge)?;
     if ad.rp_id_hash != sha256(rp_id.as_bytes()) {
         return Err(TouchError::Mismatch);
@@ -257,8 +271,9 @@ pub fn verify_parts(
 /// Verifies `asr` as a touch for the action `a`, against the caller's
 /// enrolled credentials. Pure: the caller stores the new counter and spends
 /// the challenge. Checks, in order: the size caps, the authData parse, the
-/// credential and its rp id, the expiry, the client data (D1), the rp id
-/// hash, the signature, UP then UV (D4), and the counter (D5).
+/// credential, its rp id and its kind (R5), the expiry, the client data (D1), the rp id
+/// hash, the signature, UP then UV (D4: forced for a WebAuthn assertion or a
+/// `webauthn` credential), and the counter (D5).
 pub fn verify(
     creds: &[Credential],
     a: &ActionRecord,
@@ -274,12 +289,14 @@ pub fn verify(
     if cred.rp_id != rp_id {
         return Err(TouchError::Mismatch);
     }
+    check_kind(cred, asr)?;
     if now > a.expires_at {
         return Err(TouchError::Expired);
     }
     let c = challenge(a);
     let web = matches!(asr, Assertion::WebAuthn { .. });
-    let (flags, sign_count) = verify_parts(cred, asr, rp_id, &c, a.class.needs_uv() || web)?;
+    let need_uv = a.class.needs_uv() || web || cred.kind == "webauthn";
+    let (flags, sign_count) = verify_parts(cred, asr, rp_id, &c, need_uv)?;
     let (client_data, client_data_hash) = match asr {
         Assertion::Ctap2 { .. } => (None, sha256(&c)),
         Assertion::WebAuthn {

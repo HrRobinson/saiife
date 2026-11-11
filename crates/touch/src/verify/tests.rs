@@ -468,3 +468,73 @@ fn verify_parts_with_a_raw_challenge() {
         Err(TouchError::UnknownCredential)
     );
 }
+
+#[test]
+fn credential_kind_binds_assertion_kind() {
+    let a = fixture();
+    let c = challenge(&a);
+    let s = SoftAuthenticator::new_es256();
+    // (a) a webauthn credential cannot be used through a Ctap2 assertion.
+    let asr = s.assert_ctap(RP, &c);
+    assert_eq!(
+        verify(&[s.web_credential(RP, ORIGIN, 1000)], &a, &asr, RP, NOW),
+        Err(TouchError::Mismatch)
+    );
+    // (b) a fido2 credential cannot be used through a WebAuthn assertion, even
+    // with its origin listed: only the kind check fails.
+    let mut cred = s.credential(RP, 1000, "key");
+    cred.origins = vec![ORIGIN.into()];
+    let asr = s.assert_webauthn(RP, ORIGIN, &c);
+    assert_eq!(
+        verify(&[cred.clone()], &a, &asr, RP, NOW),
+        Err(TouchError::Mismatch)
+    );
+    cred.kind = "webauthn".into();
+    assert!(verify(&[cred.clone()], &a, &asr, RP, NOW).is_ok());
+    // An unknown kind fails closed for both assertion kinds.
+    cred.kind = "u2f".into();
+    assert_eq!(
+        verify(&[cred.clone()], &a, &asr, RP, NOW),
+        Err(TouchError::Mismatch)
+    );
+    let asr = s.assert_ctap(RP, &c);
+    assert_eq!(
+        verify(&[cred], &a, &asr, RP, NOW),
+        Err(TouchError::Mismatch)
+    );
+}
+
+#[test]
+fn uv_rule_follows_kind() {
+    // (c) class EgressExternal does not need UV itself.
+    let a = action(TouchClass::EgressExternal);
+    let mut s = SoftAuthenticator::new_es256();
+    s.uv = false;
+    let asr = s.assert_webauthn(RP, ORIGIN, &challenge(&a));
+    assert_eq!(
+        verify(&[s.web_credential(RP, ORIGIN, 1000)], &a, &asr, RP, NOW),
+        Err(TouchError::NotVerified)
+    );
+    assert!(ctap(&s, &a).is_ok());
+}
+
+#[test]
+fn verify_parts_kind_mismatch() {
+    // (d)
+    let s = SoftAuthenticator::new_ed25519();
+    let c = [0x42; 32];
+    let web_cred = s.web_credential(RP, ORIGIN, 1000);
+    let asr = s.assert_ctap(RP, &c);
+    assert_eq!(
+        verify_parts(&web_cred, &asr, RP, &c, false),
+        Err(TouchError::Mismatch)
+    );
+    let asr = s.assert_webauthn(RP, ORIGIN, &c);
+    let mut cred = s.credential(RP, 1000, "key");
+    cred.origins = vec![ORIGIN.into()];
+    assert_eq!(
+        verify_parts(&cred, &asr, RP, &c, false),
+        Err(TouchError::Mismatch)
+    );
+    assert_eq!(verify_parts(&web_cred, &asr, RP, &c, false), Ok((0x05, 2)));
+}
