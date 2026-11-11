@@ -95,8 +95,9 @@ use crate::canon::PathStyle;
 use crate::getopt::{Opt, OwnedSpec};
 use crate::pathrule::{validate_ancestors, validate_glob, PathRule};
 use crate::prefilter::Prefilter;
+use crate::profile::Profile;
 
-pub use crate::pack_raw::{OperandSyntax, RulePlatform};
+pub use crate::pack_raw::{OperandSyntax, RawSource, RulePlatform, RuleWhere, UnenforcedWhy};
 use crate::pack_raw::{RawPackFile, RawPathRule, RawRule, Str};
 
 impl RulePlatform {
@@ -826,6 +827,8 @@ pub struct Pack {
     /// `deny_path` rules (never from another pack's).
     pub allow_path: Vec<PathRule>,
     pub deny_path: Vec<PathRule>,
+    /// The ids of the kept `[[deny]]` rules with `ask = true` (user packs).
+    pub ask_ids: Vec<String>,
     /// Built once from `triggers` at load.
     prefilter: Prefilter,
     /// The host style the pack was loaded for, and how many of its rules carry
@@ -971,6 +974,10 @@ impl Pack {
 pub struct PackWarning {
     pub source: String,
     pub message: String,
+    /// A rule or a whole pack was dropped (an uncompilable regex, a bad glob,
+    /// a skipped pack). `false` for a rule that is only not in force on this
+    /// host (another OS, or the other profile).
+    pub dropped: bool,
 }
 
 impl PackError {
@@ -991,6 +998,8 @@ pub enum PackError {
     MissingId,
     #[error("no usable rules after compilation")]
     NoRules,
+    #[error("`ask = true` needs an `id`: {0:?}")]
+    AskWithoutId(String),
 }
 
 // ---- Raw (deserialized) shape: `crate::pack_raw` ---------------------------
@@ -1017,20 +1026,30 @@ struct HostFilter {
     left_out: usize,
     /// Rules with a `platform` marker, so far.
     marked: usize,
+    /// The profile the pack is loaded for: a `where = "host"` rule is left
+    /// out of [`Profile::Box`].
+    profile: Profile,
 }
 
 impl HostFilter {
-    /// `platform` of a rule: does it apply here?
-    fn notes(&mut self, platform: Option<RulePlatform>) -> bool {
-        let Some(p) = platform else {
-            return true;
-        };
-        self.marked += 1;
-        let here = p.applies_on(self.style);
+    /// `platform` and `where` of a rule: does it apply here? A rule left out
+    /// by either is counted in `left_out`.
+    fn notes(&mut self, platform: Option<RulePlatform>, where_: Option<RuleWhere>) -> bool {
+        if platform.is_some() {
+            self.marked += 1;
+        }
+        let here =
+            !self.platform_out(platform) && where_.is_none_or(|w| w.applies_in(self.profile));
         if !here {
             self.left_out += 1;
         }
         here
+    }
+
+    /// Is the rule for another OS (it is worth a warning, unlike one left out
+    /// by profile)?
+    fn platform_out(&self, platform: Option<RulePlatform>) -> bool {
+        platform.is_some_and(|p| !p.applies_on(self.style))
     }
 }
 
@@ -1048,6 +1067,7 @@ fn warn_left_out(
             "{kind} {rule:?} is not in force on this host: platform = {:?}",
             platform.map_or("", RulePlatform::name)
         ),
+        dropped: false,
     });
 }
 
@@ -1060,6 +1080,7 @@ fn compile_rules(
     raw: &[RawRule],
     require_reason: bool,
     filter: &mut HostFilter,
+    ask_ids: &mut Vec<String>,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Vec<Rule>, PackError> {
     let mut out = Vec::with_capacity(raw.len());
@@ -1071,7 +1092,7 @@ fn compile_rules(
     };
     for r in raw {
         let platform = r.platform;
-        let here = filter.notes(platform);
+        let here = filter.notes(platform, r.where_);
         if !here && filter.shipped {
             continue;
         }
@@ -1086,15 +1107,21 @@ fn compile_rules(
                         "rule {:?}: id {id:?} ignored (lowercase letters, digits and -)",
                         r.pattern
                     ),
+                    dropped: false,
                 });
             } else if !ids.insert(id.clone()) {
                 warnings.push(PackWarning {
                     source: source.to_string(),
                     message: format!("rule {:?}: id {id:?} ignored (used twice)", r.pattern),
+                    dropped: false,
                 });
             } else {
                 rule_id = Some(id.to_string());
             }
+        }
+        // Only a deny can be asked, and an ask is named by its id.
+        if r.ask && (!require_reason || rule_id.is_none()) {
+            return Err(PackError::AskWithoutId(r.pattern.to_string()));
         }
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(PackError::MissingReason(r.pattern.to_string()));
@@ -1125,6 +1152,7 @@ fn compile_rules(
                          (the other operand_ keys need them; a share is in (0, 1])",
                         r.pattern
                     ),
+                    dropped: true,
                 });
                 continue;
             }
@@ -1163,6 +1191,7 @@ fn compile_rules(
                                 "skipping rule {:?}: when_option names are `-x` or `--name`",
                                 r.pattern
                             ),
+                            dropped: true,
                         });
                         continue;
                     }
@@ -1170,6 +1199,7 @@ fn compile_rules(
                         warnings.push(PackWarning {
                             source: source.to_string(),
                             message: format!("skipping rule {:?}: {e}", r.pattern),
+                            dropped: true,
                         });
                         continue;
                     }
@@ -1185,6 +1215,7 @@ fn compile_rules(
                          when_no_operand)",
                         r.pattern
                     ),
+                    dropped: true,
                 });
                 continue;
             }
@@ -1195,7 +1226,9 @@ fn compile_rules(
             Compile::OnFirstUse => RuleRegex::default(),
             Compile::Now => match Regex::new(&r.pattern) {
                 Ok(_) if !here => {
-                    warn_left_out(source, kind, &r.pattern, platform, warnings);
+                    if filter.platform_out(platform) {
+                        warn_left_out(source, kind, &r.pattern, platform, warnings);
+                    }
                     continue;
                 }
                 Ok(regex) => RuleRegex::compiled(regex),
@@ -1203,11 +1236,15 @@ fn compile_rules(
                     warnings.push(PackWarning {
                         source: source.to_string(),
                         message: format!("skipping uncompilable regex {:?}: {e}", r.pattern),
+                        dropped: true,
                     });
                     continue;
                 }
             },
         };
+        if r.ask {
+            ask_ids.extend(rule_id.clone());
+        }
         out.push(Rule {
             id: rule_id,
             when_option,
@@ -1254,7 +1291,7 @@ fn check_path_rules(
         "allow_path rule"
     };
     for r in raw {
-        let here = filter.notes(r.platform);
+        let here = filter.notes(r.platform, r.where_);
         if !here && filter.shipped {
             continue;
         }
@@ -1267,7 +1304,11 @@ fn check_path_rules(
             validate_glob(&r.glob)
         };
         match valid {
-            Ok(()) if !here => warn_left_out(source, kind, &r.glob, r.platform, warnings),
+            Ok(()) if !here => {
+                if filter.platform_out(r.platform) {
+                    warn_left_out(source, kind, &r.glob, r.platform, warnings);
+                }
+            }
             Ok(()) => out.push(PathRule {
                 glob: r.glob.to_string(),
                 access: r.access,
@@ -1277,6 +1318,7 @@ fn check_path_rules(
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),
                 message: format!("skipping path rule: {e}"),
+                dropped: true,
             }),
         }
     }
@@ -1435,6 +1477,7 @@ pub(crate) fn lazy_pack(
         deny: Vec::new(),
         allow_path: Vec::new(),
         deny_path: Vec::new(),
+        ask_ids: Vec::new(),
         lazy: Some(std::sync::Arc::new(LazyRules {
             source,
             src,
@@ -1475,10 +1518,22 @@ pub fn load_pack_for(
     style: PathStyle,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Pack, PackError> {
+    load_pack_in(source, toml_str, style, Profile::Host, warnings)
+}
+
+/// [`load_pack_for`] under `profile`: a rule marked `where = "host"` is left
+/// out of [`Profile::Box`], with no warning.
+pub fn load_pack_in(
+    source: &str,
+    toml_str: &str,
+    style: PathStyle,
+    profile: Profile,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Pack, PackError> {
     #[cfg(test)]
     COMPILED.with(|c| c.set(c.get() + 1));
     let raw = parse_pack(toml_str)?;
-    load_raw(source, &raw, style, false, Compile::Now, warnings)
+    load_raw(source, &raw, style, profile, false, Compile::Now, warnings)
 }
 
 /// A shipped pack for a host of `style`: a rule for another OS is skipped
@@ -1500,11 +1555,12 @@ pub(crate) fn load_shipped(
             source,
             &parse_pack(text)?,
             style,
+            Profile::Host,
             true,
             Compile::Now,
             warnings,
         ),
-        Shipped::Data(raw) => load_raw(source, raw, style, true, compile, warnings),
+        Shipped::Data(raw) => load_raw(source, raw, style, Profile::Host, true, compile, warnings),
     }
 }
 
@@ -1521,6 +1577,7 @@ pub(crate) fn load_shipped_toml(
         source,
         &parse_pack(toml_str)?,
         style,
+        Profile::Host,
         true,
         Compile::Now,
         warnings,
@@ -1535,6 +1592,7 @@ fn load_raw(
     source: &str,
     raw: &RawPackFile,
     style: PathStyle,
+    profile: Profile,
     shipped: bool,
     compile: Compile,
     warnings: &mut Vec<PackWarning>,
@@ -1548,9 +1606,18 @@ fn load_raw(
         compile,
         left_out: 0,
         marked: 0,
+        profile,
     };
-    let allow = compile_rules(source, &raw.allow, false, &mut filter, warnings)?;
-    let deny = compile_rules(source, &raw.deny, true, &mut filter, warnings)?;
+    let mut ask_ids = Vec::new();
+    let allow = compile_rules(
+        source,
+        &raw.allow,
+        false,
+        &mut filter,
+        &mut ask_ids,
+        warnings,
+    )?;
+    let deny = compile_rules(source, &raw.deny, true, &mut filter, &mut ask_ids, warnings)?;
     let allow_path = check_path_rules(source, &raw.allow_path, false, &mut filter, warnings)?;
     let deny_path = check_path_rules(source, &raw.deny_path, true, &mut filter, warnings)?;
     // A pack with rules for another OS only is not broken; its warnings say so.
@@ -1582,6 +1649,7 @@ fn load_raw(
         deny,
         allow_path,
         deny_path,
+        ask_ids,
         lazy: None,
     })
 }
@@ -1598,6 +1666,7 @@ pub fn load_packs_dir(dir: &Path) -> (Vec<Pack>, Vec<PackWarning>) {
             warnings.push(PackWarning {
                 source: dir.display().to_string(),
                 message: format!("cannot read packs dir: {e}"),
+                dropped: true,
             });
             return (packs, warnings);
         }
@@ -1618,6 +1687,7 @@ pub fn load_packs_dir(dir: &Path) -> (Vec<Pack>, Vec<PackWarning>) {
                 warnings.push(PackWarning {
                     source,
                     message: format!("cannot read file: {e}"),
+                    dropped: true,
                 });
                 continue;
             }
@@ -1628,6 +1698,7 @@ pub fn load_packs_dir(dir: &Path) -> (Vec<Pack>, Vec<PackWarning>) {
                     warnings.push(PackWarning {
                         source,
                         message: format!("duplicate pack id {:?}; skipping", pack.id),
+                        dropped: true,
                     });
                     continue;
                 }
@@ -1636,6 +1707,7 @@ pub fn load_packs_dir(dir: &Path) -> (Vec<Pack>, Vec<PackWarning>) {
             Err(e) => warnings.push(PackWarning {
                 source,
                 message: format!("skipping pack: {e}"),
+                dropped: true,
             }),
         }
     }
@@ -2538,5 +2610,124 @@ reason = "r"
         p.push(format!("saiifeguard-test-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // ---- user-pack keys and the box profile (plan 32) ----------------------
+
+    fn load_in(toml: &str, profile: Profile) -> (Result<Pack, PackError>, Vec<PackWarning>) {
+        let mut w = Vec::new();
+        let r = load_pack_in("<t>", toml, PathStyle::Posix, profile, &mut w);
+        (r, w)
+    }
+
+    const SRC: &str = r#"source = { file = "/p/CLAUDE.md", line = 3, line_sha256 = "ab" }"#;
+
+    #[test]
+    fn where_and_source_parse() {
+        let toml = format!(
+            "[pack]\nid = \"user.t\"\n[[deny]]\nid = \"a\"\npattern = '^x\\b'\n\
+             reason = \"r\"\nwhere = \"host\"\n{SRC}\n"
+        );
+        let (r, w) = load_in(&toml, Profile::Host);
+        assert_eq!(r.unwrap().deny.len(), 1);
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn unknown_where_fails_the_load() {
+        let toml =
+            "[pack]\nid = \"user.t\"\n[[deny]]\npattern = 'x'\nreason = \"r\"\nwhere = \"vm\"\n";
+        let (r, _) = load_in(toml, Profile::Host);
+        assert!(matches!(r, Err(PackError::Toml(_))), "{r:?}");
+    }
+
+    #[test]
+    fn box_profile_drops_host_rules_only() {
+        let toml = r#"
+[pack]
+id = "user.t"
+[[deny]]
+pattern = 'aa'
+reason = "r"
+where = "host"
+[[deny]]
+pattern = 'bb'
+reason = "r"
+where = "everywhere"
+[[deny_path]]
+glob = "/h/**"
+reason = "r"
+where = "host"
+"#;
+        let (r, w) = load_in(toml, Profile::Box);
+        let p = r.unwrap();
+        assert_eq!((p.deny.len(), p.deny_path.len()), (1, 0));
+        assert_eq!(p.deny[0].pattern, "bb");
+        assert!(w.iter().all(|x| !x.dropped), "{w:?}");
+        let (r, _) = load_in(toml, Profile::Host);
+        let p = r.unwrap();
+        assert_eq!((p.deny.len(), p.deny_path.len()), (2, 1));
+        let only_host =
+            "[pack]\nid = \"user.t\"\n[[deny]]\npattern = 'x'\nreason = \"r\"\nwhere = \"host\"\n";
+        let (r, _) = load_in(only_host, Profile::Box);
+        let p = r.unwrap();
+        assert_eq!(p.rule_count(), 0);
+    }
+
+    #[test]
+    fn ask_ids_listed() {
+        let toml = "[pack]\nid = \"user.t\"\n[[deny]]\nid = \"a\"\npattern = 'x'\nreason = \"r\"\nask = true\n\
+                    [[deny]]\nid = \"b\"\npattern = 'y'\nreason = \"r\"\n";
+        let (r, _) = load_in(toml, Profile::Host);
+        assert_eq!(r.unwrap().ask_ids, vec!["a".to_string()]);
+        let noid = "[pack]\nid = \"user.t\"\n[[deny]]\npattern = 'x'\nreason = \"r\"\nask = true\n";
+        let (r, _) = load_in(noid, Profile::Host);
+        assert!(matches!(r, Err(PackError::AskWithoutId(p)) if p == "x"));
+        let allow = "[pack]\nid = \"user.t\"\n[[allow]]\nid = \"a\"\npattern = 'x'\nask = true\n\
+                     [[deny]]\npattern = 'y'\nreason = \"r\"\n";
+        let (r, _) = load_in(allow, Profile::Host);
+        assert!(matches!(r, Err(PackError::AskWithoutId(_))), "{r:?}");
+    }
+
+    #[test]
+    fn left_out_warning_is_not_dropped() {
+        let toml = r#"
+[pack]
+id = "user.t"
+[[deny]]
+pattern = 'ok'
+reason = "r"
+[[deny]]
+pattern = 'win'
+reason = "r"
+platform = "windows"
+[[deny]]
+pattern = '('
+reason = "r"
+"#;
+        let (r, w) = load_in(toml, Profile::Host);
+        r.unwrap();
+        let left = w
+            .iter()
+            .find(|x| x.message.contains("not in force"))
+            .unwrap();
+        assert!(!left.dropped);
+        let bad = w
+            .iter()
+            .find(|x| x.message.contains("uncompilable"))
+            .unwrap();
+        assert!(bad.dropped);
+    }
+
+    #[test]
+    fn import_and_unenforced_parse() {
+        let head = "[pack]\nid = \"user.t\"\n[import]\nfile = \"/p/CLAUDE.md\"\nsha256 = \"cd\"\n\
+                    [[deny]]\npattern = 'x'\nreason = \"r\"\n[[unenforced]]\n";
+        let ok = format!("{head}{SRC}\ntext = \"be nice\"\nwhy = \"judgement\"\n");
+        let (r, _) = load_in(&ok, Profile::Host);
+        r.unwrap();
+        let bad = format!("{head}{SRC}\ntext = \"be nice\"\nwhy = \"maybe\"\n");
+        let (r, _) = load_in(&bad, Profile::Host);
+        assert!(matches!(r, Err(PackError::Toml(_))), "{r:?}");
     }
 }

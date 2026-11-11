@@ -255,6 +255,7 @@ impl Catalog {
                     warnings.push(PackWarning {
                         source: e.source.to_string(),
                         message: format!("{what}: {err}"),
+                        dropped: true,
                     });
                 }
             }

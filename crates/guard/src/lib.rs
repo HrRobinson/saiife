@@ -32,6 +32,7 @@ pub mod prefilter;
 pub mod profile;
 pub mod pwsh;
 pub mod subst;
+pub mod userpack;
 pub mod winpath;
 pub mod wintable;
 pub mod wrappers;
