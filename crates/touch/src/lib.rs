@@ -14,6 +14,7 @@ pub mod soft;
 pub mod store;
 pub mod verify;
 
+pub use action::{challenge, short_code, ActionRecord, TouchClass};
 pub use cose::CoseKey;
 pub use error::TouchError;
 pub use store::CoseAlg;
