@@ -1,1 +1,758 @@
-//! The box manager (filled in by a later task).
+//! The box manager (spec §7.6, §7.7): the queue, admission, the lifecycle,
+//! guest events, the periodic tick, recovery after a daemon restart and gc.
+//!
+//! One `Mutex` guards every record and every `Store` call (the store is
+//! single-writer by contract). It is held across VMM and guest calls, which
+//! the trait contracts bound to about a second. Time comes from the injected
+//! [`Clock`]; the manager never reads the system clock.
+//!
+//! Each state change is saved before the method returns. When a save fails
+//! the in-memory record still follows what the VMM did, and the method
+//! returns the save error as `Unavailable`.
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use saiife_wire::source::{
+    check_text, BoxError, BoxId, BoxState, Start, MAX_STEER_BYTES, MAX_TASK_BYTES,
+};
+
+use crate::capacity::{self, Committed, HostFacts};
+use crate::error::BoxesError;
+use crate::guest::{GuestError, GuestEvent, GuestLink};
+use crate::state::{holds_capacity, transition, Event};
+use crate::store::{BoxRecord, Store};
+use crate::template::{BoxTemplate, ImageRef};
+use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
+
+/// No `Ready` this long after admission → the boot failed.
+pub const BOOT_TIMEOUT_SECS: u64 = 90;
+/// A finished turn with no activity for this long → `Done`.
+pub const DONE_IDLE_SECS: u64 = 30;
+/// Idle stop for a box whose template was deleted.
+pub const DEFAULT_IDLE_STOP_MINS: u32 = 120;
+/// Longest repo name accepted at spawn.
+pub const MAX_REPO_BYTES: usize = 256;
+
+const RECORD_VERSION: u32 = 1;
+const LOST: &str = "the VM was gone after a daemon restart";
+const REORDER: &str = "reorder must list every queued box once";
+
+/// Unix seconds.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+/// A live sample of the host.
+pub type HostProbe = Arc<dyn Fn() -> HostFacts + Send + Sync>;
+
+pub struct ManagerInit {
+    pub store: Store,
+    pub vmm: Arc<dyn Vmm>,
+    pub guest: Arc<dyn GuestLink>,
+    pub templates: Vec<BoxTemplate>,
+    pub host: HostProbe,
+    pub clock: Clock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnArgs {
+    pub template: String,
+    pub repo: String,
+    pub repo_dir: Option<String>,
+    pub task: String,
+    pub start: Start,
+    pub owner_uid: u32,
+    /// A repo disk image (plan 37); refused until then.
+    pub repo_image: Option<PathBuf>,
+    /// The base manifest of a repo disk (plan 37); refused until then.
+    pub base_manifest: Option<PathBuf>,
+}
+
+/// One state change, for the audit log. `from == to` is a change too when the
+/// VM turned off (idle stop of a done box) or a stop was idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub id: BoxId,
+    pub from: BoxState,
+    pub to: BoxState,
+    pub why: &'static str,
+    /// The base image id (plan 36); always `None` until then.
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GcReport {
+    pub removed: Vec<BoxId>,
+}
+
+struct Inner {
+    store: Store,
+    records: BTreeMap<BoxId, BoxRecord>,
+    next_seq: u64,
+}
+
+impl Inner {
+    fn get(&self, id: &BoxId) -> Result<&BoxRecord, BoxError> {
+        self.records.get(id).ok_or(BoxError::NotFound)
+    }
+
+    /// Keep `r` in memory and save it.
+    fn put(&mut self, r: BoxRecord) -> Result<(), BoxError> {
+        let saved = self.store.save(&r);
+        self.records.insert(r.id.clone(), r);
+        saved.map_err(BoxError::from)
+    }
+
+    fn committed(&self) -> Committed {
+        let mut c = Committed::default();
+        for r in self.records.values() {
+            if holds_capacity(r.state, r.vm_on) {
+                c.mem_mib = c.mem_mib.saturating_add(capacity::charge_mib(&r.size));
+                c.vcpus = c.vcpus.saturating_add(r.size.vcpus);
+            }
+        }
+        c
+    }
+
+    /// Queued ids, head first.
+    fn queue(&self) -> Vec<BoxId> {
+        let mut q: Vec<&BoxRecord> = self
+            .records
+            .values()
+            .filter(|r| r.state == BoxState::Queued)
+            .collect();
+        q.sort_by(|a, b| (a.queue_seq, &a.id).cmp(&(b.queue_seq, &b.id)));
+        q.into_iter().map(|r| r.id.clone()).collect()
+    }
+
+    fn take_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        s
+    }
+}
+
+pub struct Manager {
+    inner: Mutex<Inner>,
+    vmm: Arc<dyn Vmm>,
+    guest: Arc<dyn GuestLink>,
+    templates: Vec<BoxTemplate>,
+    host: HostProbe,
+    clock: Clock,
+}
+
+fn change(r: &BoxRecord, from: BoxState, why: &'static str) -> Change {
+    Change {
+        id: r.id.clone(),
+        from,
+        to: r.state,
+        why,
+        image: None,
+    }
+}
+
+fn vmm_msg(e: VmmError) -> String {
+    match e {
+        VmmError::Unavailable(m) | VmmError::Failed(m) => m,
+    }
+}
+
+fn guest_msg(e: GuestError) -> String {
+    match BoxError::from(e) {
+        BoxError::Unavailable(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// Plan 28's overview order: running, paused, done, queued, starting, the rest.
+fn rank(s: BoxState) -> u8 {
+    match s {
+        BoxState::Running => 0,
+        BoxState::Paused => 1,
+        BoxState::Done => 2,
+        BoxState::Queued => 3,
+        BoxState::Starting => 4,
+        _ => 5,
+    }
+}
+
+impl Manager {
+    /// Load the store and recover: every record whose VM was on is checked
+    /// against the VMM. Warnings are the store's plus one per recovered box.
+    pub fn open(init: ManagerInit) -> Result<(Manager, Vec<String>), BoxesError> {
+        let (loaded, mut warns) = init.store.list()?;
+        let now = (init.clock)();
+        let mut inner = Inner {
+            store: init.store,
+            records: BTreeMap::new(),
+            next_seq: 1,
+        };
+        let mut max_seq = 0;
+        for mut r in loaded {
+            if let Some(s) = r.queue_seq {
+                max_seq = max_seq.max(s);
+            }
+            let note = recover(init.vmm.as_ref(), &mut r);
+            if let Some(note) = note {
+                r.updated_at = now;
+                if let Err(e) = inner.store.save(&r) {
+                    warns.push(format!("{}: {e}", r.id.as_str()));
+                }
+                warns.push(format!("{}: {note}", r.id.as_str()));
+            }
+            inner.records.insert(r.id.clone(), r);
+        }
+        inner.next_seq = max_seq.saturating_add(1);
+        // A queued record without a position joins the tail.
+        let unplaced: Vec<BoxId> = inner
+            .records
+            .values()
+            .filter(|r| r.state == BoxState::Queued && r.queue_seq.is_none())
+            .map(|r| r.id.clone())
+            .collect();
+        for id in unplaced {
+            let mut r = inner.records[&id].clone();
+            r.queue_seq = Some(inner.take_seq());
+            r.updated_at = now;
+            if let Err(e) = inner.put(r) {
+                warns.push(format!("{}: {e}", id.as_str()));
+            }
+        }
+        let mgr = Manager {
+            inner: Mutex::new(inner),
+            vmm: init.vmm,
+            guest: init.guest,
+            templates: init.templates,
+            host: init.host,
+            clock: init.clock,
+        };
+        Ok((mgr, warns))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    fn template(&self, name: &str) -> Option<&BoxTemplate> {
+        self.templates.iter().find(|t| t.name == name)
+    }
+
+    fn idle_stop_secs(&self, template: &str) -> u64 {
+        let mins = self
+            .template(template)
+            .map_or(DEFAULT_IDLE_STOP_MINS, |t| t.idle_stop_mins);
+        u64::from(mins) * 60
+    }
+
+    pub fn templates(&self) -> Vec<BoxTemplate> {
+        self.templates.clone()
+    }
+
+    pub fn get(&self, id: &BoxId) -> Result<BoxRecord, BoxError> {
+        self.lock().get(id).cloned()
+    }
+
+    /// Plan 28's overview order; queued boxes by queue position; ties by id.
+    pub fn list(&self) -> Vec<BoxRecord> {
+        let g = self.lock();
+        let pos: BTreeMap<BoxId, usize> = g
+            .queue()
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
+        let mut out: Vec<BoxRecord> = g.records.values().cloned().collect();
+        out.sort_by_key(|r| (rank(r.state), pos.get(&r.id).copied(), r.id.clone()));
+        out
+    }
+
+    pub fn queue(&self) -> Vec<BoxId> {
+        self.lock().queue()
+    }
+
+    /// 1-based position in the queue.
+    pub fn queue_pos(&self, id: &BoxId) -> Option<u32> {
+        let q = self.lock().queue();
+        let i = q.iter().position(|q| q == id)?;
+        u32::try_from(i + 1).ok()
+    }
+
+    pub fn capacity(&self) -> (HostFacts, Committed) {
+        let host = (self.host)();
+        (host, self.lock().committed())
+    }
+
+    pub fn spawn(&self, a: &SpawnArgs) -> Result<BoxRecord, BoxError> {
+        if a.repo_image.is_some() || a.base_manifest.is_some() {
+            return Err(BoxError::Invalid("repo disks are not supported yet".into()));
+        }
+        if !a.task.is_empty() {
+            check_text(&a.task, MAX_TASK_BYTES)?;
+        }
+        check_text(&a.repo, MAX_REPO_BYTES)?;
+        let t = self
+            .template(&a.template)
+            .ok_or_else(|| BoxError::Invalid(format!("unknown template {}", a.template)))?;
+        let size = t.size;
+        let host = (self.host)();
+        capacity::fits_ever(&host, &size).map_err(|r| BoxError::Invalid(r.message()))?;
+        let now = self.now();
+        let mut g = self.lock();
+        if a.start == Start::Now
+            && (!g.queue().is_empty() || capacity::admit(&host, &g.committed(), &size).is_err())
+        {
+            return Err(BoxError::Busy);
+        }
+        let id = g.store.claim_id()?;
+        let seq = g.take_seq();
+        let r = BoxRecord {
+            version: RECORD_VERSION,
+            session: format!("box-{}", id.as_str()),
+            id: id.clone(),
+            state: BoxState::Queued,
+            owner_uid: a.owner_uid,
+            template: t.name.clone(),
+            size,
+            repo: a.repo.clone(),
+            repo_dir: a.repo_dir.clone(),
+            task: a.task.clone(),
+            created_at: now,
+            started_at: None,
+            updated_at: now,
+            queue_seq: Some(seq),
+            vm: None,
+            vm_on: false,
+            keep: false,
+            lands: 0,
+            last_activity: now,
+            turn_finished_at: None,
+            pending_prompt: (!a.task.is_empty()).then(|| a.task.clone()),
+            error: None,
+            image: None,
+        };
+        g.put(r)?;
+        self.admission(&mut g, &host, now);
+        g.get(&id).cloned()
+    }
+
+    /// Admit queue heads while they fit (strict FIFO: a head that does not
+    /// fit blocks the rest). A VMM error discards the box and goes on.
+    fn admission(&self, g: &mut Inner, host: &HostFacts, now: u64) -> Vec<Change> {
+        let mut out = Vec::new();
+        while let Some(head) = g.queue().into_iter().next() {
+            let mut r = g.records[&head].clone();
+            if capacity::admit(host, &g.committed(), &r.size).is_err() {
+                break;
+            }
+            let from = r.state;
+            let Ok(to) = transition(from, Event::Admit) else {
+                break;
+            };
+            r.state = to;
+            r.queue_seq = None;
+            r.started_at = Some(now);
+            r.last_activity = now;
+            r.turn_finished_at = None;
+            r.error = None;
+            r.updated_at = now;
+            out.push(change(&r, from, "admitted"));
+            // Saved before the VM exists: a crash now leaves a Starting box
+            // that the boot timeout cleans up.
+            let _ = g.put(r.clone());
+            let spec = VmSpec {
+                id: r.id.clone(),
+                size: r.size,
+                image: self
+                    .template(&r.template)
+                    .map_or(ImageRef::Default, |t| t.image.clone()),
+                dir: g.store.box_dir(&r.id),
+            };
+            let booted = self.vmm.create(&spec).and_then(|h| {
+                r.vm = Some(h.clone());
+                self.vmm.boot(&h)
+            });
+            match booted {
+                Ok(()) => r.vm_on = true,
+                Err(e) => {
+                    if let Some(h) = &r.vm {
+                        let _ = self.vmm.destroy(h);
+                    }
+                    let from = r.state;
+                    r.state = transition(from, Event::BootFailed).unwrap_or(BoxState::Discarded);
+                    r.vm_on = false;
+                    r.error = Some(format!("boot failed: {}", vmm_msg(e)));
+                    out.push(change(&r, from, "boot failed"));
+                }
+            }
+            r.updated_at = now;
+            let _ = g.put(r);
+        }
+        out
+    }
+
+    pub fn pause(&self, id: &BoxId) -> Result<Change, BoxError> {
+        self.vm_step(id, Event::Pause, "pause", |v, h| v.pause(h))
+    }
+
+    pub fn resume(&self, id: &BoxId) -> Result<Change, BoxError> {
+        self.vm_step(id, Event::Resume, "resume", |v, h| v.resume(h))
+    }
+
+    /// The transition first (so a wrong state costs no VMM call), then the
+    /// VMM; a VMM error leaves the box unchanged.
+    fn vm_step(
+        &self,
+        id: &BoxId,
+        ev: Event,
+        why: &'static str,
+        call: impl Fn(&dyn Vmm, &crate::vmm::VmHandle) -> Result<(), VmmError>,
+    ) -> Result<Change, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        let to = transition(from, ev)?;
+        let h =
+            r.vm.clone()
+                .filter(|_| r.vm_on)
+                .ok_or_else(|| BoxError::Unavailable("the box has no VM".into()))?;
+        call(self.vmm.as_ref(), &h).map_err(|e| BoxError::Unavailable(vmm_msg(e)))?;
+        r.state = to;
+        if ev == Event::Resume {
+            r.last_activity = now;
+        }
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(change(&r, from, why))
+    }
+
+    /// Turn the VM off; Starting/Running/Paused become `Done`. With `keep`,
+    /// a running VM is paused and snapshotted first (not while Starting).
+    pub fn stop(&self, id: &BoxId, keep: bool) -> Result<Change, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        let to = transition(from, Event::Stop)?;
+        let h = r.vm.clone().filter(|_| r.vm_on);
+        let Some(h) = h else {
+            if to != from || r.vm_on {
+                r.state = to;
+                r.vm_on = false;
+                r.updated_at = now;
+                g.put(r.clone())?;
+            }
+            return Ok(change(&r, from, "stop"));
+        };
+        let snap = keep && from != BoxState::Starting;
+        let paused_here = snap && from != BoxState::Paused;
+        if paused_here {
+            self.vmm
+                .pause(&h)
+                .map_err(|e| BoxError::Unavailable(format!("pause failed: {}", vmm_msg(e))))?;
+        }
+        if snap {
+            let dest = g.store.box_dir(id).join("snapshot");
+            if let Err(e) = self.vmm.snapshot(&h, &dest) {
+                if paused_here {
+                    let _ = self.vmm.resume(&h);
+                }
+                return Err(BoxError::Unavailable(format!(
+                    "snapshot failed: {}",
+                    vmm_msg(e)
+                )));
+            }
+        }
+        if let Err(e) = self.vmm.stop(&h) {
+            if paused_here {
+                let _ = self.vmm.resume(&h);
+            }
+            return Err(BoxError::Unavailable(format!(
+                "stop failed: {}",
+                vmm_msg(e)
+            )));
+        }
+        r.vm_on = false;
+        r.keep = snap;
+        r.state = to;
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(change(&r, from, "stop"))
+    }
+
+    /// Valid from Queued, Done, Landed and Discarded (R2). The VM is stopped
+    /// and destroyed (errors are not fatal), the dir removed and the record
+    /// dropped.
+    pub fn discard(&self, id: &BoxId) -> Result<Change, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        let to = transition(from, Event::Discard)?;
+        if let Some(h) = &r.vm {
+            if r.vm_on {
+                let _ = self.vmm.stop(h);
+            }
+            if from != BoxState::Discarded {
+                let _ = self.vmm.destroy(h);
+            }
+        }
+        r.state = to;
+        r.vm_on = false;
+        r.queue_seq = None;
+        r.updated_at = now;
+        if let Err(e) = g.store.remove(id) {
+            // Keep it as a Discarded record so gc retries.
+            let _ = g.put(r);
+            return Err(e.into());
+        }
+        g.records.remove(id);
+        Ok(change(&r, from, "discard"))
+    }
+
+    /// §7.7 `saiife box done`: Running → Done.
+    pub fn done(&self, id: &BoxId) -> Result<Change, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        r.state = transition(from, Event::Finish)?;
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(change(&r, from, "done"))
+    }
+
+    /// Steer a Running or Paused box (R3).
+    pub fn say(&self, id: &BoxId, msg: &str) -> Result<(), BoxError> {
+        check_text(msg, MAX_STEER_BYTES)?;
+        let g = self.lock();
+        let r = g.get(id)?;
+        if !matches!(r.state, BoxState::Running | BoxState::Paused) {
+            return Err(BoxError::WrongState { state: r.state });
+        }
+        self.guest.prompt(id, msg).map_err(BoxError::from)
+    }
+
+    /// Done or Landed only. VM on: the comment is sent and the box runs
+    /// again. VM off: the comment waits for `Ready` and the box rejoins the
+    /// queue at the tail.
+    pub fn revise(&self, id: &BoxId, comment: &str) -> Result<Change, BoxError> {
+        check_text(comment, MAX_STEER_BYTES)?;
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        if !matches!(from, BoxState::Done | BoxState::Landed) {
+            return Err(BoxError::WrongState { state: from });
+        }
+        let why = if r.vm_on {
+            self.guest.prompt(id, comment).map_err(BoxError::from)?;
+            r.state = transition(from, Event::Revise)?;
+            r.turn_finished_at = None;
+            r.last_activity = now;
+            "revise"
+        } else {
+            r.state = transition(from, Event::Requeue)?;
+            r.pending_prompt = Some(comment.to_string());
+            r.queue_seq = Some(g.take_seq());
+            "requeue"
+        };
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(change(&r, from, why))
+    }
+
+    /// `ids` must be exactly the queued set; positions follow its order.
+    pub fn reorder(&self, ids: &[BoxId]) -> Result<(), BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let q = g.queue();
+        let mut want = ids.to_vec();
+        want.sort();
+        want.dedup();
+        let mut have = q.clone();
+        have.sort();
+        if want.len() != ids.len() || want != have {
+            return Err(BoxError::Invalid(REORDER.into()));
+        }
+        let mut seqs: Vec<u64> = q
+            .iter()
+            .filter_map(|i| g.records.get(i).and_then(|r| r.queue_seq))
+            .collect();
+        seqs.sort_unstable();
+        if seqs.len() != ids.len() {
+            seqs = ids.iter().map(|_| g.take_seq()).collect();
+        }
+        let mut result = Ok(());
+        for (id, seq) in ids.iter().zip(seqs) {
+            let mut r = g.records[id].clone();
+            if r.queue_seq == Some(seq) {
+                continue;
+            }
+            r.queue_seq = Some(seq);
+            r.updated_at = now;
+            if let Err(e) = g.put(r) {
+                result = Err(e);
+            }
+        }
+        result
+    }
+
+    /// Ready and Exited are transitions (`Some(change)`); Activity and
+    /// TurnFinished only update the idle clocks.
+    pub fn guest_event(&self, id: &BoxId, ev: GuestEvent) -> Result<Option<Change>, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        let out = match ev {
+            GuestEvent::Ready => {
+                r.state = transition(from, Event::Ready)?;
+                r.last_activity = now;
+                r.turn_finished_at = None;
+                if let Some(p) = r.pending_prompt.take() {
+                    if let Err(e) = self.guest.prompt(id, &p) {
+                        r.error = Some(format!("prompt failed: {}", guest_msg(e)));
+                    }
+                }
+                Some(change(&r, from, "ready"))
+            }
+            GuestEvent::Activity => {
+                r.last_activity = now;
+                r.turn_finished_at = None;
+                None
+            }
+            GuestEvent::TurnFinished => {
+                r.turn_finished_at = Some(now);
+                None
+            }
+            GuestEvent::Exited => {
+                r.state = transition(from, Event::Finish)?;
+                Some(change(&r, from, "exited"))
+            }
+        };
+        r.updated_at = now;
+        g.put(r)?;
+        Ok(out)
+    }
+
+    /// Boot timeouts, finished turns, idle stops, then the admission pass.
+    pub fn tick(&self) -> Vec<Change> {
+        let now = self.now();
+        let host = (self.host)();
+        let mut g = self.lock();
+        let mut out = Vec::new();
+        let ids: Vec<BoxId> = g.records.keys().cloned().collect();
+        for id in ids {
+            let mut r = g.records[&id].clone();
+            let mut changed = false;
+            let started = r.started_at.unwrap_or(r.updated_at);
+            if r.state == BoxState::Starting && now.saturating_sub(started) >= BOOT_TIMEOUT_SECS {
+                if let Some(h) = &r.vm {
+                    let _ = self.vmm.stop(h);
+                    let _ = self.vmm.destroy(h);
+                }
+                let from = r.state;
+                r.state = transition(from, Event::BootFailed).unwrap_or(BoxState::Discarded);
+                r.vm_on = false;
+                r.error = Some("boot timed out".into());
+                r.updated_at = now;
+                out.push(change(&r, from, "boot timed out"));
+                let _ = g.put(r);
+                continue;
+            }
+            if r.state == BoxState::Running {
+                if let Some(t) = r.turn_finished_at {
+                    if now.saturating_sub(t.max(r.last_activity)) >= DONE_IDLE_SECS {
+                        let from = r.state;
+                        if let Ok(to) = transition(from, Event::Finish) {
+                            r.state = to;
+                            changed = true;
+                            out.push(change(&r, from, "turn finished"));
+                        }
+                    }
+                }
+            }
+            let idle = matches!(
+                r.state,
+                BoxState::Running | BoxState::Paused | BoxState::Done | BoxState::Landed
+            );
+            if r.vm_on
+                && idle
+                && now.saturating_sub(r.last_activity) >= self.idle_stop_secs(&r.template)
+            {
+                let stopped = r.vm.as_ref().is_none_or(|h| self.vmm.stop(h).is_ok());
+                if stopped {
+                    let from = r.state;
+                    if let Ok(to) = transition(from, Event::Stop) {
+                        r.state = to;
+                    }
+                    r.vm_on = false;
+                    changed = true;
+                    out.push(change(&r, from, "idle stop"));
+                }
+            }
+            if changed {
+                r.updated_at = now;
+                let _ = g.put(r);
+            }
+        }
+        out.extend(self.admission(&mut g, &host, now));
+        out
+    }
+
+    /// Remove every Discarded record's dir and every orphan dir.
+    pub fn gc(&self) -> Result<GcReport, BoxesError> {
+        let mut g = self.lock();
+        let mut removed = Vec::new();
+        let gone: Vec<BoxId> = g
+            .records
+            .values()
+            .filter(|r| r.state == BoxState::Discarded)
+            .map(|r| r.id.clone())
+            .collect();
+        for id in gone {
+            g.store.remove(&id)?;
+            g.records.remove(&id);
+            removed.push(id);
+        }
+        for id in g.store.orphans()? {
+            if g.records.contains_key(&id) {
+                continue;
+            }
+            g.store.remove(&id)?;
+            removed.push(id);
+        }
+        Ok(GcReport { removed })
+    }
+}
+
+/// Reconcile one loaded record whose VM was on with the VMM's answer.
+/// Returns a note when the record changed.
+fn recover(vmm: &dyn Vmm, r: &mut BoxRecord) -> Option<String> {
+    if !r.vm_on {
+        return None;
+    }
+    let status = r.vm.as_ref().map_or(VmStatus::Gone, |h| vmm.status(h));
+    match status {
+        VmStatus::Gone | VmStatus::Off => {
+            if let Ok(to) = transition(r.state, Event::VmLost) {
+                r.state = to;
+            }
+            r.vm_on = false;
+            r.error = Some(LOST.into());
+            Some(LOST.into())
+        }
+        VmStatus::Paused if r.state == BoxState::Running => {
+            r.state = BoxState::Paused;
+            Some("the VM was paused; the box is now paused".into())
+        }
+        VmStatus::Running if r.state == BoxState::Paused => {
+            r.state = BoxState::Running;
+            Some("the VM was running; the box is now running".into())
+        }
+        _ => None,
+    }
+}
