@@ -538,3 +538,47 @@ fn verify_parts_kind_mismatch() {
     );
     assert_eq!(verify_parts(&web_cred, &asr, RP, &c, false), Ok((0x05, 2)));
 }
+
+#[test]
+fn reverify_from_audit() {
+    let a = fixture();
+    for (s, web_kind) in [
+        (SoftAuthenticator::new_es256(), false),
+        (SoftAuthenticator::new_ed25519(), false),
+        (SoftAuthenticator::new_es256(), true),
+    ] {
+        let ev = if web_kind { web(&s, &a) } else { ctap(&s, &a) }.unwrap();
+        let audit = ev.to_audit();
+        assert_eq!(reverify(&audit, &s.public_key()), Ok(()));
+        let flip = |k: &str| {
+            let mut v = audit.clone();
+            let t = v[k].as_str().unwrap().to_string();
+            let mut b = t.into_bytes();
+            let i = b.len() / 2;
+            b[i] = if b[i] == b'A' { b'B' } else { b'A' };
+            v[k] = String::from_utf8(b).unwrap().into();
+            v
+        };
+        for k in ["action", "preimage", "signature", "auth_data"] {
+            assert!(reverify(&flip(k), &s.public_key()).is_err(), "{k}");
+        }
+        let other = SoftAuthenticator::new_es256().public_key();
+        assert_eq!(reverify(&audit, &other), Err(TouchError::BadSignature));
+        let mut missing = audit.clone();
+        missing.as_object_mut().unwrap().remove("challenge");
+        assert_eq!(
+            reverify(&missing, &s.public_key()),
+            Err(TouchError::Malformed)
+        );
+        let mut wrong = audit.clone();
+        wrong["kind"] = "nope".into();
+        assert_eq!(
+            reverify(&wrong, &s.public_key()),
+            Err(TouchError::Malformed)
+        );
+        assert_eq!(
+            reverify(&serde_json::json!([]), &s.public_key()),
+            Err(TouchError::Malformed)
+        );
+    }
+}

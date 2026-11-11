@@ -321,5 +321,8 @@ pub fn verify(
     })
 }
 
+mod reverify;
+pub use reverify::reverify;
+
 #[cfg(test)]
 mod tests;
