@@ -15,6 +15,8 @@ use saiife_broker::pipeline::limit_event;
 use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 #[cfg(unix)]
+use saiife_ipc::msg::LINK_SOCKET_NAME;
+#[cfg(unix)]
 use saiife_ipc::msg::{GATEWAY_SOCKET_NAME, SOCKET_NAME};
 use saiife_policy::PackInfo;
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
@@ -1661,6 +1663,8 @@ struct Endpoints {
     listener: UnixListener,
     sock_path: PathBuf,
     rest: UnixGateway,
+    // Workspace (plan 29): `link.sock` and its accept loop.
+    link: UnixGateway,
 }
 
 /// What is left to stop once the control socket stopped accepting.
@@ -1706,13 +1710,33 @@ impl Endpoints {
                     return Err(ExitCode::from(2));
                 }
             };
+        // Workspace (plan 29): `link.sock`, the same perms; every frame's
+        // device owner must be the peer's uid.
+        let (link_listener, link_path) =
+            match bind(&socket_dir, LINK_SOCKET_NAME, ctx.own_uid, perms) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("saiife: {e}");
+                    drop(listener);
+                    drop(gw_listener);
+                    let _ = std::fs::remove_file(&sock_path);
+                    let _ = std::fs::remove_file(&gw_path);
+                    let _ = ctx.writer.stop(None).await;
+                    return Err(ExitCode::from(2));
+                }
+            };
         let task = tokio::spawn(gateway::serve(gw_listener, Arc::clone(ctx)));
+        let link_task = tokio::spawn(server::serve_link(link_listener, Arc::clone(ctx)));
         Ok(Endpoints {
             listener,
             sock_path,
             rest: UnixGateway {
                 task,
                 path: gw_path,
+            },
+            link: UnixGateway {
+                task: link_task,
+                path: link_path,
             },
         })
     }
@@ -1725,6 +1749,10 @@ impl Endpoints {
     fn stop_accepting(self) -> UnixGateway {
         drop(self.listener);
         let _ = std::fs::remove_file(&self.sock_path);
+        // Workspace (plan 29): link.sock stops accepting with the control
+        // socket (its accept loop holds the listener).
+        self.link.task.abort();
+        let _ = std::fs::remove_file(&self.link.path);
         self.rest
     }
 }

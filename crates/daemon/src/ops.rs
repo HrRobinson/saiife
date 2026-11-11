@@ -1513,6 +1513,12 @@ fn status(ctx: &Ctx, id: u64) -> Value {
         m.insert("cosign".into(), c.status());
         m.insert("hooks_rejudge_denied".into(), c.rejudge_denied_status());
     }
+    // Workspace (plan 29): frames refused before their signature verified
+    // (never recorded).
+    m.insert(
+        "workspace".into(),
+        json!({"refused_unsigned": ctx.workspace.refused_unsigned()}),
+    );
     ok(id, m)
 }
 

@@ -13,7 +13,8 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ring::rand::SystemRandom;
 use saiife_wire::device::{Device, DeviceList, DeviceState};
@@ -81,7 +82,15 @@ pub struct Workspace {
     dir: Option<PathBuf>,
     /// Why this Workspace trusts no device and writes nothing.
     locked: Option<String>,
+    /// Frames refused before their signature verified (never recorded;
+    /// `status` shows the count as `workspace.refused_unsigned`).
+    unsigned: AtomicU64,
+    /// Tests: replaces [`now_secs`] for this Workspace.
+    clock: Option<Clock>,
 }
+
+/// A replacement clock, seconds since the epoch.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl Workspace {
     /// Loads or creates the machine key and loads `devices.json`. A file that
@@ -141,7 +150,33 @@ impl Workspace {
             }),
             dir,
             locked,
+            unsigned: AtomicU64::new(0),
+            clock: None,
         }
+    }
+
+    /// This Workspace reads the time from `clock` (tests).
+    pub fn with_clock(mut self, clock: Clock) -> Workspace {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// The time the Workspace ops use: [`now_secs`], or the test clock.
+    pub fn now(&self) -> u64 {
+        match &self.clock {
+            Some(c) => c(),
+            None => now_secs(),
+        }
+    }
+
+    /// Counts a frame refused before its signature verified.
+    pub fn note_unsigned(&self) {
+        self.unsigned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Frames refused before their signature verified, since this opened.
+    pub fn refused_unsigned(&self) -> u64 {
+        self.unsigned.load(Ordering::Relaxed)
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
@@ -311,6 +346,16 @@ impl Workspace {
                  again once the problem is fixed ({e})"
             ))),
         }
+    }
+
+    /// Whether `id` is revoked and nothing about it waits to be saved (a
+    /// revoke of it changes nothing).
+    pub fn revoked_and_saved(&self, id: &str) -> bool {
+        let g = self.inner();
+        !g.dirty
+            && g.devices
+                .get(id)
+                .is_some_and(|d| d.state == DeviceState::Revoked)
     }
 
     /// The gate every frame passes (`saiife_wire::verify::Verifier::check`).

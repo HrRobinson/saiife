@@ -4,8 +4,13 @@
 //! `workspace.pair.begin`, `.pair.status`, `.pair.confirm`, `workspace.devices`
 //! and `workspace.revoke`. These are the only ways to add or remove a
 //! trusted device; `link.sock` has no route to them.
+//!
+//! Task 4, `link.sock`: [`dispatch_link`] and [`execute`], in
+//! `crate::workspace_link` and re-exported here.
 
 use crate::ops::{Conn, Ctx};
+// Task 4, link.sock (`crate::workspace_link`).
+pub use crate::workspace_link::{dispatch_link, execute, Refused, Via, HANDLED, LATER};
 use saiife_audit::{DecisionKind, Record};
 use saiife_ipc::msg::{
     err, err_with, ok, ErrorCode, Request, OP_WORKSPACE_DEVICES, OP_WORKSPACE_PAIR_BEGIN,
@@ -212,7 +217,7 @@ async fn begin(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(w) => w,
         Err(e) => return e,
     };
-    let now = crate::workspace::now_secs();
+    let now = ctx.workspace.now();
     let offer = match ctx.workspace.begin_pair(&who.name, label.clone(), now) {
         Ok(o) => o,
         Err(e) => return err(id, wire_code(&e), &e.to_string()),
@@ -248,7 +253,7 @@ async fn status(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(w) => w,
         Err(e) => return e,
     };
-    let now = crate::workspace::now_secs();
+    let now = ctx.workspace.now();
     if ctx
         .workspace
         .offer_owner(&pair_id, now)
@@ -297,7 +302,7 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(w) => w,
         Err(e) => return e,
     };
-    let now = crate::workspace::now_secs();
+    let now = ctx.workspace.now();
     if !who.admin
         && ctx
             .workspace
@@ -312,6 +317,18 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             ErrorCode::Forbidden,
             "forbidden",
             "only the user who began this pairing, or an admin, can confirm it",
+        )
+        .await;
+    }
+    if accept && ctx.workspace.locked() {
+        return refuse(
+            ctx,
+            conn,
+            id,
+            action,
+            ErrorCode::Unavailable,
+            "workspace_locked",
+            "the Workspace is locked (see the daemon's start warning); nothing is paired",
         )
         .await;
     }
@@ -343,19 +360,26 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             return e;
         }
     }
+    // The prompt can take minutes: an offer that expired meanwhile is gone.
+    let now = ctx.workspace.now();
     let device = match ctx.workspace.confirm_pair(&pair_id, accept, now) {
         Ok(d) => d,
         Err(e) => {
+            let rule = if ctx.workspace.locked() {
+                "workspace_locked"
+            } else {
+                "workspace_not_saved"
+            };
             return refuse(
                 ctx,
                 conn,
                 id,
                 action,
                 ErrorCode::Internal,
-                "workspace_not_saved",
+                rule,
                 &format!("the device was not paired: {e}"),
             )
-            .await
+            .await;
         }
     };
     if accept && device.is_none() {
@@ -428,6 +452,10 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let Some(device) = ctx.workspace.device(&device_id) else {
         return err(id, ErrorCode::BadRequest, "no such device");
     };
+    // Already revoked and saved: nothing to grant, no prompt.
+    if ctx.workspace.revoked_and_saved(&device_id) {
+        return revoked_answer(id, device_id);
+    }
     if let Err(e) = power(
         ctx,
         conn,
@@ -1000,5 +1028,107 @@ mod tests {
         )
         .await;
         assert_eq!(a["error"], "bad_request", "{a}");
+    }
+
+    /// Re-authentication that takes `secs` of the Workspace clock.
+    struct SlowReauth {
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        secs: u64,
+    }
+
+    impl Reauth for SlowReauth {
+        fn available(&self) -> bool {
+            true
+        }
+        fn check(&self, _who: &Subject, _detail: &str, _t: Duration) -> ReauthResult {
+            self.clock
+                .fetch_add(self.secs, std::sync::atomic::Ordering::SeqCst);
+            ReauthResult::Authorized
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_that_expires_during_the_prompt_is_refused() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut f = fx("reauth", ReauthResult::Authorized);
+        let clock = Arc::new(AtomicU64::new(1_900_000_000));
+        let c2 = Arc::clone(&clock);
+        {
+            let c = Arc::get_mut(&mut f.ctx).unwrap();
+            c.workspace = Arc::new(
+                crate::workspace::Workspace::memory()
+                    .with_clock(Arc::new(move || c2.load(Ordering::SeqCst))),
+            );
+            c.reauth = Arc::new(SlowReauth {
+                clock: Arc::clone(&clock),
+                secs: pair::OFFER_TTL_SECS + 1,
+            });
+        }
+        let b = call(&f, ALICE, OP_WORKSPACE_PAIR_BEGIN, json!({})).await;
+        let d = TestDevice::generate();
+        f.ctx
+            .workspace
+            .finish_pair(
+                &device_request(&b, &d, "phone"),
+                clock.load(Ordering::SeqCst),
+            )
+            .unwrap();
+        let c = call(
+            &f,
+            ALICE,
+            OP_WORKSPACE_PAIR_CONFIRM,
+            json!({"pair_id": b["pair_id"], "accept": true}),
+        )
+        .await;
+        assert_eq!(c["ok"], false, "{c}");
+        assert!(c["message"].as_str().unwrap().contains("lapsed"), "{c}");
+        assert!(f.ctx.workspace.devices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_on_a_locked_workspace_says_locked() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = fx("deny", ReauthResult::Authorized);
+        let wdir = crate::workspace::dir_in(f.dir.path());
+        std::fs::create_dir_all(&wdir).unwrap();
+        let key = wdir.join(crate::workspace::KEY_FILE);
+        std::fs::write(&key, b"not a key").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (ws, w) = crate::workspace::Workspace::open(wdir);
+        assert!(w.is_some());
+        Arc::get_mut(&mut f.ctx).unwrap().workspace = Arc::new(ws);
+        let c = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_PAIR_CONFIRM,
+            json!({"pair_id": "x", "accept": true}),
+        )
+        .await;
+        assert_eq!(c["error"], "unavailable", "{c}");
+        assert_eq!(c["rule"], "workspace_locked", "{c}");
+        assert!(audit_text(&f).contains("workspace_locked"));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_revoked_device_needs_no_prompt() {
+        let f = fx("reauth", ReauthResult::Authorized);
+        let b = call(&f, ADMIN, OP_WORKSPACE_PAIR_BEGIN, json!({})).await;
+        let d = TestDevice::generate();
+        finish(&f, &b, &d);
+        call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_PAIR_CONFIRM,
+            json!({"pair_id": b["pair_id"], "accept": true}),
+        )
+        .await;
+        let args = json!({"device_id": d.device_id()});
+        let r = call(&f, ADMIN, OP_WORKSPACE_REVOKE, args.clone()).await;
+        assert_eq!(r["ok"], true, "{r}");
+        // An approver revoking it again: nothing to grant, no prompt.
+        let r = call(&f, ALICE, OP_WORKSPACE_REVOKE, args).await;
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["state"], "revoked");
+        assert!(f.reauth.calls.lock().unwrap().is_empty());
     }
 }

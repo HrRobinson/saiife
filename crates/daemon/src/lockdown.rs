@@ -323,6 +323,51 @@ pub(crate) fn off_refusal(r: &Refusal, what: &str) -> (&'static str, String) {
     }
 }
 
+/// `lockdown.on` from a paired Workspace device (plan 29): scope `all`,
+/// `by_uid` the device owner's uid, the reason naming the device. Applied
+/// only when it widens lockdown ([`free_change`], checked at the moment of
+/// the change); when lockdown is already `all` nothing changes and the
+/// answer is still `Ok`. `Err` when the owner cannot be resolved, or when
+/// the flag is on but its file could not be written. The caller records it.
+pub(crate) async fn set_remote_on(
+    ctx: &Arc<Ctx>,
+    device: &saiife_wire::device::Device,
+    reason: String,
+) -> Result<(), String> {
+    let dir = Arc::clone(&ctx.directory);
+    let owner = device.owner_user.clone();
+    let by_uid = tokio::task::spawn_blocking(move || dir.user(&owner).map(|u| u.uid))
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("cannot resolve the device owner {:?}", device.owner_user))?;
+    let from = format!("Workspace device {} ({})", device.label, device.id);
+    let reason = clean_reason(&if reason.trim().is_empty() {
+        format!("from {from}")
+    } else {
+        format!("{reason} (from {from})")
+    });
+    let next = Lockdown {
+        scope: LockScope::All,
+        reason,
+        by_uid,
+        since: now_ts(),
+    };
+    let c = Arc::clone(ctx);
+    let r = tokio::task::spawn_blocking(move || {
+        c.lockdown
+            .set_if(Some(next), |cur| free_change(cur, Some(LockScope::All)))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match r {
+        None | Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(format!(
+            "lockdown is ON but not saved; it will not survive a restart ({e})"
+        )),
+    }
+}
+
 /// `lockdown.set {on, scope?, reason?}`. Root and `[admin] groups` may do
 /// anything. An approver may turn it on when it is off or widen it
 /// (`connectors` to `all`); turning it off, narrowing it or replacing an
