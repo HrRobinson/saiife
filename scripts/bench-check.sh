@@ -19,7 +19,7 @@
 # the median of each of the hook's steps is printed (`timing <step>: ...`).
 #
 # With BENCH_MAX_P95_MS=<ms> it exits 1 when a payload's p95 is above that
-# budget (the macOS and Linux CI jobs use 40 for --managed, gating again since
+# budget (the Linux CI job uses 40 and macOS 50 for --managed, gating again since
 # plan 21; the windows-latest test job uses 130 for the developer hook, which
 # allows for slow runners). A call that does not allow fails whatever the budget.
 #
