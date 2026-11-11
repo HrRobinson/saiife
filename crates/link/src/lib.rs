@@ -10,7 +10,7 @@ pub mod hub;
 pub mod local;
 pub mod ws;
 
-pub use daemon::{Daemon, LinkError};
+pub use daemon::{Daemon, LinkError, MAX_DAEMON_CALLS};
 
 #[cfg(not(unix))]
 pub(crate) const WINDOWS_MSG: &str = "the Workspace link is not available on Windows yet";
@@ -33,6 +33,30 @@ pub struct HubConfig {
     /// Tests only: connect here instead of resolving the URL's host (SNI
     /// and `Host` still come from the URL).
     pub connect: Option<std::net::SocketAddr>,
+    /// Timings and rates; `HubOpts::default()` outside tests.
+    pub opts: HubOpts,
+}
+
+/// The hub client's timings and rates (the defaults are `hub`'s constants
+/// and `ws::PING_INTERVAL` / `ws::PONG_TIMEOUT`); the tests shorten them.
+#[derive(Debug, Clone, Copy)]
+pub struct HubOpts {
+    pub ping_interval: std::time::Duration,
+    /// The connection is dropped this long after the last pong.
+    pub pong_timeout: std::time::Duration,
+    /// From a session's `open` to its sealed channel.
+    pub handshake_timeout: std::time::Duration,
+    /// Hub `open`s accepted.
+    pub opens: Rate,
+    /// Session `seal_hello`s accepted (each asks the daemon to sign).
+    pub seal_hellos: Rate,
+}
+
+/// A token-bucket rate: `per_sec` a second, bursts of `burst`.
+#[derive(Debug, Clone, Copy)]
+pub struct Rate {
+    pub per_sec: f64,
+    pub burst: f64,
 }
 
 /// The platform's trusted roots; unreadable ones are skipped.
@@ -61,8 +85,11 @@ pub async fn run(cfg: LinkConfig) -> Result<(), String> {
         url,
         roots: roots.unwrap_or_else(native_roots),
         connect: None,
+        opts: HubOpts::default(),
     });
-    // `local::serve` never returns on its own.
+    // `local::serve` never returns on its own. Both share `daemon`, so its
+    // call permits bound the daemon load of the hub and the local server
+    // together (local's own cap is open connections, `local::MAX_CONNS`).
     let local = local::serve(listener, daemon.clone(), cfg.port);
     match hub {
         // Either end ends `run`: the hub's result, or the local server

@@ -310,9 +310,12 @@ async fn paired(w: &World, s: &Server) -> TestDevice {
         )
         .await;
     assert_eq!(st, StatusCode::OK);
-    let f = json_of(&body);
-    assert_eq!(f["device_id"], d.device_id(), "{f}");
-    assert_eq!(f["short_code"].as_str().unwrap().len(), 7, "{f}");
+    let a = json_of(&body);
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a.as_object().unwrap().len(), 2, "{a}");
+    let f = &a["result"];
+    assert_eq!(f["device_id"], d.device_id(), "{a}");
+    assert_eq!(f["short_code"].as_str().unwrap().len(), 7, "{a}");
     let c = control(
         w,
         OP_WORKSPACE_PAIR_CONFIRM,
@@ -384,11 +387,15 @@ async fn hello_and_pair_refusals() {
     let (_w, s) = up().await;
     let (st, _, body) = s.get("/api/hello").await;
     assert_eq!(st, StatusCode::OK);
-    let h = json_of(&body);
+    let a = json_of(&body);
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a.as_object().unwrap().len(), 2, "{a}");
+    let h = &a["result"];
     assert!(
         h["machine_id"].as_str().is_some_and(|m| !m.is_empty()),
-        "{h}"
+        "{a}"
     );
+    assert!(h.get("ok").is_none() && h.get("id").is_none(), "{a}");
     // A pair that was never begun: the daemon's refusal, as 200 ok:false.
     let (st, _, body) = s
         .post(
@@ -400,6 +407,7 @@ async fn hello_and_pair_refusals() {
     let a = json_of(&body);
     assert_eq!(a["ok"], false, "{a}");
     assert!(a.get("rule").is_some() && a["error"].is_string(), "{a}");
+    assert!(a["message"].is_string(), "{a}");
 }
 
 #[tokio::test]
@@ -409,7 +417,11 @@ async fn daemon_down_is_503() {
     let (st, h, body) = s.get("/api/hello").await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(h["content-security-policy"], CSP);
-    assert_eq!(json_of(&body)["ok"], false);
+    let a = json_of(&body);
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "unreachable", "{a}");
+    // `rule` is always present: null when the daemon did not answer.
+    assert!(a["rule"].is_null() && a.get("rule").is_some(), "{a}");
     let (st, _, _) = s
         .post("/api/frame", &json!({"body": "x", "sig": "y"}))
         .await;

@@ -25,7 +25,13 @@
 //! - link → hub `{"t":"hello","v":1,"machine_id","machine_pub",
 //!   "challenge_sig"}`, `challenge_sig` = the machine key's signature
 //!   (daemon `workspace.sign {purpose: "hub_hello"}`, domain
-//!   `HUB_HELLO_DOMAIN`) over nonce ‖ machine_id (ASCII).
+//!   `saiife_wire::seal::HUB_HELLO_DOMAIN`) over
+//!   `seal::hub_hello_msg(nonce, machine_id)` = nonce ‖ machine_id (ASCII).
+//!
+//! One hub link per machine (v3.0): the hub routes sessions by
+//! `machine_id`, and a second valid hello for the same `machine_id`
+//! replaces the older connection (latest wins; the hub closes the old one),
+//! so a reconnect after a network drop wins over a half-dead socket.
 //!
 //! Sessions (`S` is the hub's string id for one browser connection):
 //! - hub → link `{"t":"open","session":S}`, `{"t":"msg","session":S,
@@ -33,18 +39,21 @@
 //! - link → hub `{"t":"msg","session":S,"data":b64u}`,
 //!   `{"t":"close","session":S}`.
 //!
-//! An `open` beyond [`MAX_SESSIONS`] (or for a session that is open) is
+//! An `open` beyond [`MAX_SESSIONS`] (or for a session that is open), or
+//! over the rate ([`RATE_PER_SEC`] a second, bursts of [`RATE_BURST`]), is
 //! answered `close`. A `msg` for an unknown session is dropped. A message
 //! that is not one of the above, but names a session, closes that session;
 //! one that names none is dropped. The link connection stays in every case.
 //!
 //! Inside `data`, per session (the browser ↔ machine handshake, plaintext
 //! JSON, bounded by [`SESSION_HANDSHAKE_TIMEOUT`] from `open` to the
-//! channel being ready):
+//! channel being ready; a session still in its handshake then is closed):
 //! 1. browser → machine `{"t":"seal_hello","browser_eph":b64u,
 //!    "device_id"|"pair_id"}`: exactly one of `device_id` (a paired
 //!    device) and `pair_id` (an open pairing offer: a pairing-only
-//!    session);
+//!    session); a `seal_hello` over the rate ([`RATE_PER_SEC`] a second,
+//!    bursts of [`RATE_BURST`], counted apart from `open`) closes its
+//!    session before the daemon signs anything;
 //! 2. machine → browser `{"t":"seal_hello","machine_eph":b64u,
 //!    "session_id":b64u,"machine_sig":b64u}`, `machine_sig` = the machine
 //!    key over `seal::machine_hello_msg(session_id, machine_eph, binding)`
@@ -65,9 +74,10 @@
 //! Each gets one sealed answer, in order: `{"t":"result","ok":true,
 //! "result":…}` (a frame's result; `workspace.hello`'s machine_id,
 //! machine_pub, epoch, frame_version; a pairing's device_id and
-//! short_code), or `{"t":"result","ok":false,"error","rule"?,"message"}`
-//! (the daemon's refusal; `error: "unreachable"` when the daemon does not
-//! answer), the shape of the local server's `/api/frame`.
+//! short_code), or `{"t":"result","ok":false,"error":string,
+//! "rule":string|null,"message":string}` (the daemon's refusal; `error:
+//! "unreachable"` and `rule: null` when the daemon does not answer), the
+//! shape of the local server's `/api/hello`, `/api/frame` and `/api/pair`.
 //!
 //! Anything else — a malformed or out-of-order handshake message, a failed
 //! signature or seal, a daemon refusal during the handshake, a message
@@ -77,23 +87,24 @@
 //! [`SESSION_QUEUE`] waiting; a session that floods is closed.
 //!
 //! Keepalive: a ping every `ws::PING_INTERVAL`; the connection is dropped
-//! when no pong came for `ws::PONG_TIMEOUT`, on any WebSocket error, or
-//! when the hub closes, and made again after [`Backoff`].
+//! as soon as no pong came for `ws::PONG_TIMEOUT` (a deadline, not checked
+//! only on the ping tick), on any WebSocket error, or when the hub closes,
+//! and made again after [`Backoff`].
 //!
 //! Logs name what failed, never a session's contents, keys or signatures.
 
-use crate::ws::{Message, WsClient, PING_INTERVAL};
-use crate::{Daemon, HubConfig, LinkError};
+use crate::ws::{Message, WsClient, PING_INTERVAL, PONG_TIMEOUT};
+use crate::{Daemon, HubConfig, HubOpts, LinkError, Rate};
 use rustls::pki_types::ServerName;
 use saiife_ipc::msg::{
     OP_WORKSPACE_FRAME, OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_SIGN,
 };
 use saiife_wire::b64;
-use saiife_wire::seal::{Channel, MachineHandshake};
+use saiife_wire::seal::{hub_hello_msg, Channel, MachineHandshake};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -110,6 +121,11 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SESSION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Messages of one session waiting to be handled.
 pub const SESSION_QUEUE: usize = 4;
+/// Hub `open`s accepted a second, and (counted apart) `seal_hello`s: a
+/// hostile hub cannot churn sessions into the daemon faster.
+pub const RATE_PER_SEC: f64 = 10.0;
+/// The burst the rate allows.
+pub const RATE_BURST: f64 = 20.0;
 /// A write to the hub that takes longer drops the connection.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Answers of all sessions waiting to be written.
@@ -171,6 +187,67 @@ fn jitter() -> f64 {
         return 0.5;
     }
     (u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+impl Default for HubOpts {
+    fn default() -> HubOpts {
+        HubOpts {
+            ping_interval: PING_INTERVAL,
+            pong_timeout: PONG_TIMEOUT,
+            handshake_timeout: SESSION_HANDSHAKE_TIMEOUT,
+            opens: Rate {
+                per_sec: RATE_PER_SEC,
+                burst: RATE_BURST,
+            },
+            seal_hellos: Rate {
+                per_sec: RATE_PER_SEC,
+                burst: RATE_BURST,
+            },
+        }
+    }
+}
+
+/// A token bucket: `burst` tokens, refilled at `rate` a second.
+#[derive(Debug)]
+pub(crate) struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    pub(crate) fn new(r: Rate, now: Instant) -> Bucket {
+        Bucket {
+            rate: r.per_sec,
+            burst: r.burst,
+            tokens: r.burst,
+            last: now,
+        }
+    }
+
+    /// Takes a token at `now`; false when none is left.
+    pub(crate) fn take_at(&mut self, now: Instant) -> bool {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = self.last.max(now);
+        self.tokens = (self.tokens + dt * self.rate).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        self.take_at(Instant::now())
+    }
+}
+
+/// The rate limits of one link, kept across reconnects.
+struct Limits {
+    opens: Bucket,
+    seal_hellos: Arc<Mutex<Bucket>>,
 }
 
 /// Where the hub is, from its URL.
@@ -275,13 +352,19 @@ type Ws = WsClient<TlsStream<TcpStream>>;
 pub async fn run(cfg: HubConfig, daemon: Daemon) -> Result<(), String> {
     let target = parse_url(&cfg.url)?;
     let tls = TlsConnector::from(Arc::new(client_config(cfg.roots)?));
+    let opts = cfg.opts;
+    let now = Instant::now();
+    let mut limits = Limits {
+        opens: Bucket::new(opts.opens, now),
+        seal_hellos: Arc::new(Mutex::new(Bucket::new(opts.seal_hellos, now))),
+    };
     let mut backoff = Backoff::new();
     loop {
         match connect(&target, cfg.connect, &tls, &daemon).await {
             Ok(ws) => {
                 let up = Instant::now();
                 eprintln!("saiife: workspace hub connected");
-                let why = serve(ws, &daemon).await;
+                let why = serve(ws, &daemon, &opts, &mut limits).await;
                 backoff.connected_for(up.elapsed());
                 eprintln!("saiife: warning: workspace hub connection ended: {why}");
             }
@@ -340,8 +423,7 @@ async fn connect(
             _ => None,
         }
         .ok_or("the hub did not send a challenge")?;
-        let mut data = nonce;
-        data.extend_from_slice(machine_id.as_bytes());
+        let data = hub_hello_msg(&nonce, &machine_id);
         let mut a = Map::new();
         a.insert("purpose".into(), "hub_hello".into());
         a.insert("data".into(), b64::enc(&data).into());
@@ -444,26 +526,34 @@ fn close_msg(session: &str) -> Value {
 }
 
 /// Relays until the connection fails; returns why. Dropping `sessions`
-/// aborts every session task.
-async fn serve(mut ws: Ws, daemon: &Daemon) -> String {
+/// aborts every session task (their daemon calls still hold their permits
+/// until they end: see [`crate::daemon`]).
+async fn serve(mut ws: Ws, daemon: &Daemon, opts: &HubOpts, limits: &mut Limits) -> String {
     let (out_tx, mut out_rx) = mpsc::channel::<Out>(OUT_QUEUE);
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut gen: u64 = 0;
-    let mut tick =
-        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + opts.ping_interval,
+        opts.ping_interval,
+    );
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     enum Ev {
         In(Result<Message, crate::ws::WsError>),
         Out(Out),
         Tick,
+        PongDeadline,
     }
     loop {
-        // `recv`, `mpsc::recv` and `tick` are cancel-safe; writes happen
-        // outside the select.
+        // Re-armed every turn from the last pong; `recv` notes pongs
+        // without returning, so the deadline is checked again when it fires.
+        let pong_deadline = tokio::time::Instant::from_std(ws.last_pong() + opts.pong_timeout);
+        // `recv`, `mpsc::recv`, `tick` and `sleep_until` are cancel-safe;
+        // writes happen outside the select.
         let ev = tokio::select! {
             m = ws.recv() => Ev::In(m),
             Some(o) = out_rx.recv() => Ev::Out(o),
             _ = tick.tick() => Ev::Tick,
+            () = tokio::time::sleep_until(pong_deadline) => Ev::PongDeadline,
         };
         let r = match ev {
             Ev::In(Err(e)) => return e.to_string(),
@@ -474,7 +564,7 @@ async fn serve(mut ws: Ws, daemon: &Daemon) -> String {
                     if sessions.contains_key(&s) {
                         sessions.remove(&s);
                         send_json(&mut ws, close_msg(&s)).await
-                    } else if sessions.len() >= MAX_SESSIONS {
+                    } else if sessions.len() >= MAX_SESSIONS || !limits.opens.take() {
                         send_json(&mut ws, close_msg(&s)).await
                     } else {
                         gen += 1;
@@ -485,6 +575,10 @@ async fn serve(mut ws: Ws, daemon: &Daemon) -> String {
                             out_tx.clone(),
                             s.clone(),
                             gen,
+                            SessionCfg {
+                                handshake_timeout: opts.handshake_timeout,
+                                seal_hellos: Arc::clone(&limits.seal_hellos),
+                            },
                         ));
                         sessions.insert(s, Session { gen, tx, task });
                         Ok(())
@@ -531,16 +625,17 @@ async fn serve(mut ws: Ws, daemon: &Daemon) -> String {
                     Ok(())
                 }
             }
-            Ev::Tick => {
-                if ws.pong_overdue() {
+            Ev::PongDeadline => {
+                if Instant::now() >= ws.last_pong() + opts.pong_timeout {
                     return "no pong from the hub".into();
                 }
-                match tokio::time::timeout(SEND_TIMEOUT, ws.ping()).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("a ping to the hub timed out".into()),
-                }
+                Ok(())
             }
+            Ev::Tick => match tokio::time::timeout(SEND_TIMEOUT, ws.ping()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("a ping to the hub timed out".into()),
+            },
         };
         if let Err(e) = r {
             return e;
@@ -551,6 +646,12 @@ async fn serve(mut ws: Ws, daemon: &Daemon) -> String {
 /// Why a session closed (never sent; the hub only learns `close`).
 type Closed = ();
 
+/// What a session task needs from its connection.
+struct SessionCfg {
+    handshake_timeout: Duration,
+    seal_hellos: Arc<Mutex<Bucket>>,
+}
+
 /// One session: handshake, then sealed request/answer pairs, then `close`.
 async fn session(
     daemon: Daemon,
@@ -558,8 +659,9 @@ async fn session(
     out: mpsc::Sender<Out>,
     id: String,
     gen: u64,
+    cfg: SessionCfg,
 ) {
-    let _ = run_session(&daemon, &mut rx, &out, &id, gen).await;
+    let _ = run_session(&daemon, &mut rx, &out, &id, gen, &cfg).await;
     let _ = out.send(Out::Close { session: id, gen }).await;
 }
 
@@ -576,6 +678,7 @@ async fn run_session(
     out: &mpsc::Sender<Out>,
     id: &str,
     gen: u64,
+    cfg: &SessionCfg,
 ) -> Result<(), Closed> {
     let send = |data: Vec<u8>| {
         out.send(Out::Msg {
@@ -584,8 +687,8 @@ async fn run_session(
             data,
         })
     };
-    let hs = handshake(daemon, rx, &send);
-    let mut s = tokio::time::timeout(SESSION_HANDSHAKE_TIMEOUT, hs)
+    let hs = handshake(daemon, rx, &send, &cfg.seal_hellos);
+    let mut s = tokio::time::timeout(cfg.handshake_timeout, hs)
         .await
         .map_err(|_| ())??;
     while let Some(sealed) = rx.recv().await {
@@ -632,6 +735,7 @@ async fn handshake<F, Fut>(
     daemon: &Daemon,
     rx: &mut mpsc::Receiver<Vec<u8>>,
     send: &F,
+    seal_hellos: &Mutex<Bucket>,
 ) -> Result<Sealed, Closed>
 where
     F: Fn(Vec<u8>) -> Fut,
@@ -653,6 +757,10 @@ where
         }
     };
     let (device_id, pair_id) = (opt("device_id")?, opt("pair_id")?);
+    // Over the rate: closed before the daemon is asked to sign.
+    if !seal_hellos.lock().is_ok_and(|mut b| b.take()) {
+        return Err(());
+    }
     let mh = MachineHandshake::new(&ring::rand::SystemRandom::new()).map_err(|_| ())?;
     let mut data = mh.session_id().to_vec();
     data.extend_from_slice(&mh.eph_pub());
@@ -706,7 +814,7 @@ fn result(r: Result<Value, LinkError>) -> Value {
             message,
         }) => json!({"t": "result", "ok": false, "error": error, "rule": rule, "message": message}),
         Err(LinkError::Unreachable(_)) => json!({
-            "t": "result", "ok": false, "error": "unreachable",
+            "t": "result", "ok": false, "error": "unreachable", "rule": null,
             "message": "the saiife daemon is not reachable",
         }),
     }
@@ -809,6 +917,27 @@ mod tests {
         ));
         assert!(matches!(parse_hub(r#"{"t":"open"}"#), Err(None)));
         assert!(matches!(parse_hub("nope"), Err(None)));
+    }
+
+    #[test]
+    fn bucket_allows_the_burst_then_the_rate() {
+        let t0 = Instant::now();
+        let r = Rate {
+            per_sec: RATE_PER_SEC,
+            burst: RATE_BURST,
+        };
+        let mut b = Bucket::new(r, t0);
+        let taken = (0..30).filter(|_| b.take_at(t0)).count();
+        assert_eq!(taken, RATE_BURST as usize);
+        // 100 ms later: one more (10 a second).
+        assert!(b.take_at(t0 + Duration::from_millis(100)));
+        assert!(!b.take_at(t0 + Duration::from_millis(100)));
+        // A long pause refills to the burst, never beyond.
+        let later = t0 + Duration::from_secs(3600);
+        let taken = (0..30).filter(|_| b.take_at(later)).count();
+        assert_eq!(taken, RATE_BURST as usize);
+        // A clock that goes back adds nothing.
+        assert!(!b.take_at(t0));
     }
 
     #[test]

@@ -33,7 +33,8 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time a POST body may take to arrive (a trickling client gets a 408).
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Open connections at once; one over the cap is closed unanswered.
+/// Open connections at once; one over the cap is closed unanswered. The
+/// daemon calls they make share the link-wide [`crate::MAX_DAEMON_CALLS`].
 pub const MAX_CONNS: usize = 64;
 
 /// The server's limits; the tests shorten them.
@@ -155,7 +156,8 @@ async fn route(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts) -
             let r = daemon.call(OP_WORKSPACE_HELLO, Map::new()).await;
             answer(r.map(|mut m| {
                 m.remove("id");
-                Value::Object(m)
+                m.remove("ok");
+                json!({"ok": true, "result": m})
             }))
         }
         (&Method::POST, "/api/frame") => post(req, daemon, port, opts, Post::Frame).await,
@@ -165,8 +167,12 @@ async fn route(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts) -
     }
 }
 
-/// A daemon result as the UI reads it: success as is, a refusal as `200`
-/// with its `rule`, an unreachable daemon as `503`.
+/// A daemon result as the UI reads it. Every `/api/*` answer has one shape
+/// (the hub's sealed answers mirror it): success `{"ok":true,"result":…}`
+/// (`200`); a refusal `{"ok":false,"error":string,"rule":string|null,
+/// "message":string}` (`200`); an unreachable daemon the same with `error:
+/// "unreachable"` and `rule: null` (`503`). The link's own checks (host,
+/// origin, type, size, shape) answer `{"ok":false,"error":…}` with a 4xx.
 fn answer(r: Result<Value, LinkError>) -> Resp {
     match r {
         Ok(v) => json_resp(StatusCode::OK, &v),
@@ -183,6 +189,7 @@ fn answer(r: Result<Value, LinkError>) -> Resp {
             &json!({
                 "ok": false,
                 "error": "unreachable",
+                "rule": null,
                 "message": "the saiife daemon is not reachable",
             }),
         ),
@@ -292,9 +299,12 @@ async fn post(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts, ki
                 return json_error(StatusCode::BAD_REQUEST, "bad_request");
             }
             let r = daemon.call(OP_WORKSPACE_PAIR_FINISH, obj).await;
-            answer(r.map(
-                |m| json!({"device_id": m.get("device_id"), "short_code": m.get("short_code")}),
-            ))
+            answer(r.map(|m| {
+                json!({"ok": true, "result": {
+                    "device_id": m.get("device_id"),
+                    "short_code": m.get("short_code"),
+                }})
+            }))
         }
     }
 }

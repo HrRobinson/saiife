@@ -12,12 +12,12 @@ use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair}
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::RootCertStore;
 use saiife_ipc::msg::{
-    OP_WORKSPACE_PAIR_BEGIN, OP_WORKSPACE_PAIR_CONFIRM, OP_WORKSPACE_PAIR_FINISH,
+    LINK_SOCKET_NAME, OP_WORKSPACE_PAIR_BEGIN, OP_WORKSPACE_PAIR_CONFIRM, OP_WORKSPACE_PAIR_FINISH,
 };
 use saiife_link::hub::{self, Backoff, HUB_PATH, MAX_SESSIONS};
 use saiife_link::ws::server_side::{accept, AcceptOpts, ServerWs};
 use saiife_link::ws::Message;
-use saiife_link::{Daemon, HubConfig};
+use saiife_link::{Daemon, HubConfig, HubOpts, Rate, MAX_DAEMON_CALLS};
 use saiife_wire::frame::{Frame, SignedFrame};
 use saiife_wire::seal::{BrowserChannel, SealBinding, TestBrowserEnd};
 use saiife_wire::sig::{verify_p256_domain, TestDevice};
@@ -144,11 +144,12 @@ impl FakeHub {
             .unwrap()
     }
 
-    fn config(&self, roots: &RootCertStore) -> HubConfig {
+    fn config(&self, roots: &RootCertStore, opts: HubOpts) -> HubConfig {
         HubConfig {
             url: "wss://hub.test/v1/link".into(),
             roots: roots.clone(),
             connect: Some(self.addr),
+            opts,
         }
     }
 }
@@ -337,16 +338,26 @@ async fn paired(w: &World) -> TestDevice {
 
 /// A world, a fake hub and the link connected to it.
 async fn up() -> (World, FakeHub, Conn) {
+    let (w, hub, conn, _) = up_with(HubOpts::default()).await;
+    (w, hub, conn)
+}
+
+/// [`up`] with `opts`; also the link's `Daemon` (its call counters).
+async fn up_with(opts: HubOpts) -> (World, FakeHub, Conn, Daemon) {
     let w = world().await;
     let ca = ca();
     let mut hub = FakeHub::start(&ca).await;
-    tokio::spawn(hub::run(
-        hub.config(&ca.roots),
-        Daemon::new(w.run.clone(), me()),
-    ));
+    let daemon = Daemon::new(w.run.clone(), me());
+    tokio::spawn(hub::run(hub.config(&ca.roots, opts), daemon.clone()));
     let conn = hub.next().await;
-    (w, hub, conn)
+    (w, hub, conn, daemon)
 }
+
+/// No rate limit worth the name.
+const UNLIMITED: Rate = Rate {
+    per_sec: 1e9,
+    burst: 1e9,
+};
 
 #[tokio::test]
 async fn hello_is_signed_by_the_machine_key() {
@@ -364,12 +375,10 @@ async fn hello_is_signed_by_the_machine_key() {
     let mpub = b64::dec_n::<65>(h["machine_pub"].as_str().unwrap()).unwrap();
     assert_eq!(mpub, machine_pub(&w));
     let sig = b64::dec_n::<64>(h["challenge_sig"].as_str().unwrap()).unwrap();
-    let mut msg = c.nonce.clone();
-    msg.extend_from_slice(mid.as_bytes());
     assert!(verify_p256_domain(
         &mpub,
         saiife_wire::seal::HUB_HELLO_DOMAIN,
-        &msg,
+        &saiife_wire::seal::hub_hello_msg(&c.nonce, &mid),
         &sig
     ));
     // Not over another nonce.
@@ -543,7 +552,13 @@ async fn bad_seal_drops_the_session_not_the_link() {
 
 #[tokio::test]
 async fn ninth_session_is_refused() {
-    let (w, _hub, mut c) = up().await;
+    // s1..s7 never finish their handshake: a long timeout keeps them open
+    // however slow the machine is.
+    let opts = HubOpts {
+        handshake_timeout: Duration::from_secs(600),
+        ..HubOpts::default()
+    };
+    let (w, _hub, mut c, _) = up_with(opts).await;
     let d = paired(&w).await;
     for i in 0..MAX_SESSIONS {
         c.open(&format!("s{i}")).await;
@@ -625,6 +640,7 @@ async fn ws_url_is_refused() {
             url: url.into(),
             roots: RootCertStore::empty(),
             connect: None,
+            opts: HubOpts::default(),
         };
         let r = tokio::time::timeout(
             Duration::from_secs(1),
@@ -682,7 +698,7 @@ async fn hub_cert_must_chain() {
     let (trusted, other) = (ca(), ca());
     let mut hub = FakeHub::start(&other).await;
     tokio::spawn(hub::run(
-        hub.config(&trusted.roots),
+        hub.config(&trusted.roots, HubOpts::default()),
         Daemon::new(w.run.clone(), me()),
     ));
     let t = Instant::now();
@@ -697,4 +713,216 @@ async fn hub_cert_must_chain() {
         t.elapsed()
     );
     assert!(hub.conns.try_recv().is_err(), "a connection got through");
+}
+
+/// A session that never finishes its handshake is closed after the
+/// handshake timeout; the link and its other sessions go on.
+#[tokio::test]
+async fn unfinished_handshake_is_closed_after_the_timeout() {
+    let opts = HubOpts {
+        handshake_timeout: Duration::from_secs(2),
+        ..HubOpts::default()
+    };
+    let (w, hub, mut c, _) = up_with(opts).await;
+    let d = paired(&w).await;
+    let mut ready = c.device_session(&w, "ready", &d).await;
+    // One sends nothing; one stops after the machine's seal_hello.
+    let t = Instant::now();
+    c.open("idle").await;
+    let be = TestBrowserEnd::new(Some(&d));
+    let _ = c
+        .seal_hello("half", &be, &SealBinding::Device(d.device_id()))
+        .await;
+    let mut closed = vec![
+        c.recv().await["session"].as_str().unwrap().to_string(),
+        c.recv().await["session"].as_str().unwrap().to_string(),
+    ];
+    closed.sort();
+    assert_eq!(closed, ["half", "idle"]);
+    assert!(
+        t.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        t.elapsed()
+    );
+    // The ready session still answers, on the same connection.
+    let a = c.ask("ready", &mut ready, json!({"t": "hello"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
+}
+
+/// A hub that stops answering pings is dropped at the pong deadline, not
+/// at the next ping tick, and the link connects again.
+#[tokio::test]
+async fn missing_pong_closes_and_reconnects() {
+    let opts = HubOpts {
+        // Far beyond the test: only the pong deadline can end the link.
+        ping_interval: Duration::from_secs(60),
+        pong_timeout: Duration::from_millis(500),
+        ..HubOpts::default()
+    };
+    let (_w, mut hub, mut c, _) = up_with(opts).await;
+    let t = Instant::now();
+    // The fake hub sees the link go.
+    let end = tokio::time::timeout(WAIT, c.ws.recv())
+        .await
+        .expect("still up");
+    assert!(matches!(end, Ok(Message::Close(_)) | Err(_)), "{end:?}");
+    let c2 = hub.next().await;
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert_eq!(c2.hello["t"], "hello");
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 2);
+}
+
+/// A hub that answers pings keeps the link past many pong timeouts.
+#[tokio::test]
+async fn answered_pings_keep_the_link() {
+    let opts = HubOpts {
+        ping_interval: Duration::from_millis(100),
+        pong_timeout: Duration::from_millis(600),
+        ..HubOpts::default()
+    };
+    let (_w, mut hub, mut c, _) = up_with(opts).await;
+    let pongs = tokio::spawn(async move {
+        let mut n = 0usize;
+        while let Ok(f) = c.ws.recv_frame().await {
+            if f.opcode == 0x9 {
+                n += 1;
+                if c.ws.send_frame(true, 0xA, &f.payload).await.is_err() {
+                    break;
+                }
+            }
+        }
+        n
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
+    assert!(hub.conns.try_recv().is_err(), "the link reconnected");
+    assert!(!pongs.is_finished(), "the link closed");
+    pongs.abort();
+}
+
+/// `open`s over the rate are answered `close`, even with free slots.
+#[tokio::test]
+async fn opens_over_the_rate_are_closed() {
+    let opts = HubOpts {
+        opens: Rate {
+            per_sec: 0.001,
+            burst: 2.0,
+        },
+        handshake_timeout: Duration::from_secs(600),
+        ..HubOpts::default()
+    };
+    let (_w, hub, mut c, _) = up_with(opts).await;
+    c.open("a").await;
+    c.open("b").await;
+    c.quiet().await;
+    c.open("c").await;
+    c.expect_close("c").await;
+    // A free slot does not refill the bucket.
+    c.send(json!({"t": "close", "session": "a"})).await;
+    c.open("d").await;
+    c.expect_close("d").await;
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
+}
+
+/// A `seal_hello` over the rate closes its session before the daemon
+/// signs; the link and the sessions already sealed go on.
+#[tokio::test]
+async fn seal_hellos_over_the_rate_close_the_session() {
+    let opts = HubOpts {
+        opens: UNLIMITED,
+        seal_hellos: Rate {
+            per_sec: 0.001,
+            burst: 1.0,
+        },
+        ..HubOpts::default()
+    };
+    let (w, hub, mut c, _) = up_with(opts).await;
+    let d = paired(&w).await;
+    let mut ready = c.device_session(&w, "ready", &d).await;
+    let be = TestBrowserEnd::new(Some(&d));
+    c.open("over").await;
+    c.send_data(
+        "over",
+        json!({"t": "seal_hello", "browser_eph": b64::enc(&be.eph_pub()), "device_id": d.device_id()}),
+    )
+    .await;
+    c.expect_close("over").await;
+    let a = c.ask("ready", &mut ready, json!({"t": "hello"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
+}
+
+/// A `link.sock` in a dir of its own that forwards each connection to
+/// `w`'s after `delay`: a slow daemon.
+async fn slow_link_sock(w: &World, delay: Duration) -> tempfile::TempDir {
+    let dir = common::scratch();
+    let l = tokio::net::UnixListener::bind(dir.path().join(LINK_SOCKET_NAME)).unwrap();
+    let real = w.run.join(LINK_SOCKET_NAME);
+    tokio::spawn(async move {
+        while let Ok((mut a, _)) = l.accept().await {
+            let real = real.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut b) = tokio::net::UnixStream::connect(&real).await {
+                    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                }
+            });
+        }
+    });
+    dir
+}
+
+/// A hub churning sessions (open, seal_hello, close soon after, so each
+/// session task is aborted while its daemon call runs) against a slow
+/// daemon never has more than `MAX_DAEMON_CALLS` daemon calls in flight,
+/// and the link stays up.
+#[tokio::test]
+async fn session_churn_stays_within_the_daemon_permits() {
+    let opts = HubOpts {
+        opens: UNLIMITED,
+        seal_hellos: UNLIMITED,
+        ..HubOpts::default()
+    };
+    let w = world().await;
+    let slow = slow_link_sock(&w, Duration::from_millis(200)).await;
+    let ca = ca();
+    let mut hub = FakeHub::start(&ca).await;
+    let daemon = Daemon::new(slow.path().to_path_buf(), me());
+    tokio::spawn(hub::run(hub.config(&ca.roots, opts), daemon.clone()));
+    let mut c = hub.next().await;
+    let d = paired(&w).await;
+    let be = TestBrowserEnd::new(Some(&d));
+    let hello = json!({
+        "t": "seal_hello", "browser_eph": b64::enc(&be.eph_pub()), "device_id": d.device_id(),
+    });
+    // 500 sessions, a full table at a time: each batch's calls start, then
+    // the hub closes the batch while they wait on the slow daemon.
+    for batch in 0..500 / MAX_SESSIONS + 1 {
+        let ids: Vec<String> = (0..MAX_SESSIONS).map(|i| format!("c{batch}-{i}")).collect();
+        for s in &ids {
+            c.open(s).await;
+            c.send_data(s, hello.clone()).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for s in &ids {
+            c.send(json!({"t": "close", "session": s})).await;
+        }
+    }
+    // Whatever the link still sends for them; then quiet.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), c.ws.recv()).await {
+            Err(_) => break,
+            Ok(Ok(Message::Text(_))) => {}
+            Ok(other) => panic!("the link went: {other:?}"),
+        }
+    }
+    let peak = daemon.peak_calls();
+    assert!(peak >= 1, "no daemon call was made");
+    assert!(peak <= MAX_DAEMON_CALLS, "{peak} calls at once");
+    // Still the same connection, and it serves.
+    let mut bc = c.device_session(&w, "after", &d).await;
+    let a = c.ask("after", &mut bc, json!({"t": "hello"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
 }
