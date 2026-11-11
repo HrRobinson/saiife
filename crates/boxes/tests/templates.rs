@@ -137,6 +137,19 @@ fn size_bounds() {
     assert!(s("disk_gib = 2048").is_err());
     assert!(s("disk_gib = 9").is_err());
     assert!(s("disk_gib = 10").is_ok());
+    assert!(s("vcpus = 33").is_err());
+    assert!(s("vcpus = 32").is_ok());
+    assert!(s("mem_mib = 511\nmem_max_mib = 8192").is_err());
+    assert!(s("mem_mib = 512\nmem_max_mib = 8192").is_ok());
+}
+
+#[test]
+fn name_rule() {
+    let n = |name: &str| parse(name, &MIN.replace("\"m\"", &format!("\"{name}\"")));
+    assert!(n("a_b").is_err());
+    assert!(n(&"a".repeat(40)).is_ok());
+    assert!(n(&"a".repeat(41)).is_err());
+    assert!(n("-a").is_err());
 }
 
 #[test]

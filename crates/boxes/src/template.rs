@@ -216,15 +216,14 @@ fn default_idle() -> u32 {
     120
 }
 
-/// Lowercase letters, digits, `-` and `_`; starts alphanumeric; 1..=64 bytes.
+/// `[a-z0-9][a-z0-9-]{0,39}`.
 fn valid_name(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
-        && b.len() <= 64
-        && b[0].is_ascii_alphanumeric()
+        && b.len() <= 40
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
         && b.iter()
-            .all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
-        && !b.iter().any(u8::is_ascii_uppercase)
+            .all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
 
 fn parse_egress(s: &str) -> Result<EgressRule, String> {
@@ -306,11 +305,11 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
         return Err(format!("bad image base {:?}", raw.image.base));
     };
     let s = raw.size;
-    if !(1..=64).contains(&s.vcpus) {
-        return Err("vcpus must be 1..=64".into());
+    if !(1..=32).contains(&s.vcpus) {
+        return Err("vcpus must be 1..=32".into());
     }
-    if s.mem_mib < 256 || s.mem_max_mib < s.mem_mib || s.mem_max_mib > 1 << 20 {
-        return Err("memory: need 256 <= mem_mib <= mem_max_mib <= 1048576".into());
+    if !(512..=262_144).contains(&s.mem_mib) || s.mem_max_mib < s.mem_mib {
+        return Err("memory: need 512 <= mem_mib <= 262144 and mem_max_mib >= mem_mib".into());
     }
     if !(10..=1024).contains(&s.disk_gib) {
         return Err("disk_gib must be 10..=1024".into());
