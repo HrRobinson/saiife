@@ -14,6 +14,8 @@ path = "src/lib.rs"
 saiife-audit = { path = "../audit" }
 saiife-ipc = { path = "../ipc" }
 saiife-policy = { path = "../policy" }
+# Touch classes, action records and refusals (plan 26, Task 6).
+saiife-touch = { path = "../touch" }
 # `approval.create` checks that the claimed `[guard] ask` rule denies the
 # command (plan 11, Task 4).
 saiife-guard = { path = "../guard" }
@@ -68,6 +70,8 @@ saiife-darwin = { path = "../darwin" }
 
 [dev-dependencies]
 tempfile = "3"
+# Soft authenticators for the touch tests (plan 26).
+saiife-touch = { path = "../touch", features = ["soft"] }
 # The gateway tests: a hyper client over the socket and a loopback TLS
 # upstream; versions as in saiife-broker.
 # test-util: the hook table's tests run on a paused clock (plan 20).

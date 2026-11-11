@@ -38,6 +38,23 @@ pub enum Refusal {
     ReauthBusy,
     /// A recent re-authentication failed: seconds left before the next.
     ReauthCooldown(u64),
+    /// A touch assertion was refused (expired, replayed, bad signature ...).
+    TouchFailed(String),
+    /// No device or no live challenge: never falls back to a password.
+    TouchUnavailable(String),
+    /// A valid assertion for something else, or by an unknown device.
+    TouchMismatch(String),
+}
+
+impl From<saiife_touch::TouchError> for Refusal {
+    fn from(e: saiife_touch::TouchError) -> Self {
+        let d = e.to_string();
+        match e.rule() {
+            "touch_unavailable" => Refusal::TouchUnavailable(d),
+            "touch_mismatch" => Refusal::TouchMismatch(d),
+            _ => Refusal::TouchFailed(d),
+        }
+    }
 }
 
 impl Refusal {
@@ -51,6 +68,9 @@ impl Refusal {
             Refusal::ReauthError(_) => "reauth_error",
             Refusal::ReauthBusy => "reauth_busy",
             Refusal::ReauthCooldown(_) => "reauth_cooldown",
+            Refusal::TouchFailed(_) => "touch_failed",
+            Refusal::TouchUnavailable(_) => "touch_unavailable",
+            Refusal::TouchMismatch(_) => "touch_mismatch",
         }
     }
 }
@@ -74,6 +94,9 @@ impl fmt::Display for Refusal {
             Refusal::ReauthCooldown(s) => {
                 write!(f, "a recent re-authentication failed; try again in {s} s")
             }
+            Refusal::TouchFailed(d) => write!(f, "touch failed: {d}"),
+            Refusal::TouchUnavailable(d) => write!(f, "touch unavailable: {d}"),
+            Refusal::TouchMismatch(d) => write!(f, "touch mismatch: {d}"),
         }
     }
 }
@@ -268,6 +291,24 @@ mod requester_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn touch_refusal_rules() {
+        use saiife_touch::TouchError;
+        let m = Refusal::from(TouchError::UnknownCredential);
+        assert_eq!(m.rule(), "touch_mismatch");
+        assert_eq!(
+            m.to_string(),
+            "touch mismatch: this device is not enrolled for you"
+        );
+        assert_eq!(Refusal::from(TouchError::Expired).rule(), "touch_failed");
+        assert!(Refusal::from(TouchError::Expired)
+            .to_string()
+            .starts_with("touch failed: "));
+        let u = Refusal::from(TouchError::Unavailable);
+        assert_eq!(u.rule(), "touch_unavailable");
+        assert!(u.to_string().starts_with("touch unavailable: "));
+    }
     use super::*;
     use crate::sessions::ProcStat;
     use saiife_policy::FixedDirectory;

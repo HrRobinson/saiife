@@ -157,6 +157,17 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
     );
     let faithful = display_is_faithful(p);
+    // The environment-applied config the call was asked under: the gateway's
+    // snapshot for the call's env (policy `class_for` reads marks from it).
+    let touch_class = ctx.policy().gateway.as_deref().and_then(|g| {
+        let cap = saiife_policy::Capability::parse(p.capability.as_deref()?).ok()?;
+        saiife_policy::touch::class_for(
+            &g.snapshot_for(p.stored.env.as_deref()).config,
+            &p.stored.service,
+            &cap,
+        )
+        .map(str::to_string)
+    });
     let new = NewRequest {
         uid: p.stored.uid,
         sid: p.stored.sid.clone(),
@@ -173,6 +184,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class,
         send: SendDisplay {
             body_display: p.body_display.clone(),
             body_sha256: p.body_sha256.clone(),
@@ -228,6 +240,7 @@ pub(crate) async fn create_mcp(
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class: None,
         send: SendDisplay {
             body_display: Some(p.display.clone()),
             body_sha256: Some(p.stored.arguments_sha256.clone()),
@@ -1155,6 +1168,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         grant_key: Some(crate::grants::hex(&f.key(peer))),
         scope: Some(f.key_project.clone()),
         ask_rule: f.ask(),
+        touch_class: None,
         send: SendDisplay::default(),
     };
     match store_new(ctx, new, None, sys.approval.timeout).await {
@@ -1971,6 +1985,56 @@ mod tests {
         assert!(!display_is_faithful(&pending(None, Some(&h))));
     }
 
+    /// A connector call to a `deploy`-marked operation is stored with its
+    /// touch class; an unmarked one with none.
+    #[tokio::test]
+    async fn connector_create_sets_the_class() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        let key = d.path().join("vault-key");
+        std::fs::write(&key, [7u8; 32]).unwrap();
+        std::fs::set_permissions(
+            &key,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        let v = crate::vault::open(&key, &d.path().join("vault").join("vault.bin"));
+        assert!(matches!(v, crate::vault::VaultState::Ready(_)));
+        let c = Arc::get_mut(&mut ctx).unwrap();
+        c.approvals = Ok(store);
+        c.vault = crate::vault::Shared::new(v);
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[services.s3_ask]\nconnector = \"s3\"\n\
+             deploy = [\"objects:write\"]\n",
+        )
+        .unwrap();
+        let g = crate::ops::GatewayPolicy::build(
+            &cfg,
+            &[],
+            saiife_broker::Catalog::default(),
+            saiife_policy::Mode::Locked,
+        )
+        .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            ok: true,
+            system: Some(Arc::new(cfg)),
+            gateway: Some(Arc::new(g)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        let mut marked = pending(None, None);
+        marked.capability = Some("objects:write".into());
+        let id = create(&ctx, &marked, "claude").await.unwrap();
+        let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+        assert_eq!(r.touch_class.as_deref(), Some("deploy"));
+
+        let mut plain = pending(Some("other"), None);
+        plain.capability = Some("objects:read".into());
+        let id = create(&ctx, &plain, "claude").await.unwrap();
+        let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+        assert_eq!(r.touch_class, None);
+    }
+
     #[test]
     fn auth_arg_is_optional_hex() {
         let a = |v: Value| v.as_object().unwrap().clone();
@@ -2019,6 +2083,7 @@ mod tests {
             grant_key: None,
             scope: None,
             ask_rule: None,
+            touch_class: None,
             send: SendDisplay::default(),
         };
         let rid = ctx
@@ -2160,6 +2225,7 @@ mod tests {
             grant_key: None,
             scope: None,
             ask_rule: None,
+            touch_class: None,
             send: SendDisplay::default(),
         };
         let rid = ctx
