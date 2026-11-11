@@ -229,10 +229,15 @@ impl FakeState {
     fn set_state(&mut self, i: &BoxId, to: BoxState) -> Result<(), BoxError> {
         let now = self.now;
         let b = self.find(i)?;
+        let from = b.state;
         b.state = to;
         b.updated_at = now;
         if to != BoxState::Queued {
             b.queue_pos = None;
+        }
+        if from == BoxState::Done && to != BoxState::Done {
+            // A touch binds the diff of a Done box; leaving Done voids it.
+            self.pending.retain(|p| p.box_id.as_ref() != Some(i));
         }
         Ok(())
     }
@@ -345,8 +350,8 @@ impl FakeBoxSource {
             };
             let d3 = TermFrame::Delta {
                 seq: 3,
-                lines: vec![(2, "$ ".into())],
-                cursor: (2, 2),
+                lines: vec![(0, "$ ".into())],
+                cursor: (0, 2),
             };
             s.terminals.insert(id("b-run"), vec![snap, d2, d3]);
             s.terminals.insert(
@@ -363,7 +368,7 @@ impl FakeBoxSource {
         src
     }
 
-    /// Every mutating call so far, in order.
+    /// Every mutating call so far, in order (failed calls are recorded too).
     pub fn calls(&self) -> Vec<FakeCall> {
         self.lock().calls.clone()
     }
@@ -577,6 +582,10 @@ impl BoxSource for FakeBoxSource {
         let p = s.pending.remove(pos);
         if decision == Decision::Approve && p.class == TouchClass::Land {
             if let Some(bid) = p.box_id {
+                let state = s.find(&bid)?.state;
+                if state != BoxState::Done {
+                    return Err(BoxError::WrongState { state });
+                }
                 s.set_state(&bid, BoxState::Landed)?;
                 s.find(&bid)?.lands += 1;
             }

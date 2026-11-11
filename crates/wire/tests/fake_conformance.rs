@@ -292,3 +292,38 @@ fn broken_source_fails_conformance() {
     let err = check(&fixture(&src)).unwrap_err();
     assert!(err.contains("stop is idempotent"), "{err}");
 }
+
+#[test]
+fn land_after_discard_is_refused() {
+    let src = FakeBoxSource::demo(NOW);
+    let rid = src.pending_actions()[0].request_id;
+    src.discard(&id("b-done")).unwrap();
+    assert!(src.pending_actions().is_empty());
+    assert_eq!(
+        src.complete(rid, Decision::Approve, Some(evidence())),
+        Err(BoxError::NotFound)
+    );
+    assert_eq!(info(&src, "b-done").state, BoxState::Discarded);
+    assert_eq!(info(&src, "b-done").lands, 0);
+}
+
+#[test]
+fn land_after_revise_is_refused() {
+    let src = FakeBoxSource::demo(NOW);
+    let rid = src.pending_actions()[0].request_id;
+    src.revise(&id("b-done"), "more").unwrap();
+    assert_eq!(
+        src.complete(rid, Decision::Approve, Some(evidence())),
+        Err(BoxError::NotFound)
+    );
+    assert_eq!(info(&src, "b-done").state, BoxState::Running);
+    assert_eq!(info(&src, "b-done").lands, 0);
+}
+
+#[test]
+fn bad_fixture_is_named() {
+    let src = FakeBoxSource::demo(NOW);
+    let mut fx = fixture(&src);
+    fx.queued.pop();
+    assert!(check(&fx).unwrap_err().starts_with("fixture"));
+}
