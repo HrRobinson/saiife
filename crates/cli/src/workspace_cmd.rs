@@ -124,11 +124,12 @@ mod imp {
     }
 
     /// The exit code and message for a stop, as `lockdown`: refusals 2;
-    /// an unreachable daemon, or a change made but not on record, 5.
+    /// an unreachable daemon, or a change made but not on record, 5. The
+    /// message is the daemon's text: sanitized.
     fn exit_of(stop: Stop) -> (u8, String) {
         match stop {
-            Stop::Refused(m) | Stop::Forbidden(m) => (2, m),
-            Stop::Unavailable(m) | Stop::NotFound(m) | Stop::Unrecorded(m) => (5, m),
+            Stop::Refused(m) | Stop::Forbidden(m) => (2, sanitize(&m)),
+            Stop::Unavailable(m) | Stop::NotFound(m) | Stop::Unrecorded(m) => (5, sanitize(&m)),
         }
     }
 
@@ -173,7 +174,9 @@ mod imp {
             sleep: &|| std::thread::sleep(Duration::from_secs(1)),
             cancel: &cancel,
         };
-        pair_flow(&mut call, &mut io, label, local, port).map(|id| outln!("Paired {id}"))
+        pair_flow(&mut call, &mut io, label, local, port)
+            // The device id is the daemon's text: sanitized.
+            .map(|id| outln!("Paired {}", sanitize(&id)))
     }
 
     fn now_secs() -> u64 {
@@ -420,6 +423,9 @@ mod imp {
             assert_eq!(exit_of(Stop::Refused("x".into())).0, 2);
             assert_eq!(exit_of(Stop::Forbidden("x".into())).0, 2);
             assert_eq!(exit_of(Stop::Unavailable("x".into())).0, 5);
+            // The daemon's text is sanitized.
+            let (_, m) = exit_of(Stop::Refused("bad\x1b[2J\nnews".into()));
+            assert!(!m.contains('\x1b') && !m.contains('\n'), "{m:?}");
         }
     }
 }
