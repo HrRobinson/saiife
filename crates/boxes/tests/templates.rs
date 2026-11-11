@@ -264,3 +264,14 @@ fn locked_mode_trusts_only_root_owned_files() {
         .iter()
         .any(|w| w.file.ends_with("m.toml") && w.reason.contains("symlink")));
 }
+
+#[cfg(unix)]
+#[test]
+fn non_regular_entries_are_skipped_before_opening() {
+    let d = tempfile::tempdir().unwrap();
+    fs::create_dir(d.path().join("d.toml")).unwrap();
+    let (ts, ws) = load_dir(d.path(), Trust::OwnedBy(own_uid(d.path())));
+    assert_eq!(ts, builtin());
+    assert_eq!(ws.len(), 1);
+    assert!(ws[0].reason.contains("not a regular file"), "{ws:?}");
+}

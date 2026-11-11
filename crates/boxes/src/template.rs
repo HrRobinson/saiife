@@ -424,6 +424,9 @@ fn load_file(path: &Path, trust: Trust) -> Result<BoxTemplate, String> {
     if lmeta.file_type().is_symlink() {
         return Err("refusing a symlink".into());
     }
+    if !lmeta.is_file() {
+        return Err("not a regular file".into());
+    }
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
