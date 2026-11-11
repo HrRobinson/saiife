@@ -1671,6 +1671,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-boxes"
+version = "0.2.0"
+dependencies = [
+ "saiife-touch",
+ "saiife-wire",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "saiife-broker"
 version = "0.2.0"
 dependencies = [

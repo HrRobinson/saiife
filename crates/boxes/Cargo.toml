@@ -1,0 +1,27 @@
+[package]
+name = "saiife-boxes"
+description = "saiife boxes control plane: templates, capacity, the box store, the box state machine and the manager."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_boxes"
+path = "src/lib.rs"
+
+[features]
+fake = ["saiife-wire/fake"]
+
+[dependencies]
+saiife-wire = { path = "../wire" }
+saiife-touch = { path = "../touch" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
