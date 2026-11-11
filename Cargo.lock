@@ -1668,6 +1668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-touch"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.1",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "saiife-win"
 version = "0.2.0"
 dependencies = [
