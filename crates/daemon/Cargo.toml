@@ -17,6 +17,10 @@ saiife-policy = { path = "../policy" }
 # `approval.create` checks that the claimed `[guard] ask` rule denies the
 # command (plan 11, Task 4).
 saiife-guard = { path = "../guard" }
+# The Workspace link (plan 29): signed frames, pairing, the box source seam.
+saiife-wire = { path = "../wire" }
+# As in saiife-wire (already in Cargo.lock): the machine key's random source.
+ring = "=0.17.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
@@ -68,6 +72,7 @@ saiife-darwin = { path = "../darwin" }
 
 [dev-dependencies]
 tempfile = "3"
+saiife-wire = { path = "../wire", features = ["fake"] }
 # The gateway tests: a hyper client over the socket and a loopback TLS
 # upstream; versions as in saiife-broker.
 # test-util: the hook table's tests run on a paused clock (plan 20).
@@ -76,6 +81,11 @@ hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
+[features]
+# Test builds only (never in release CI): `SAIIFE_WORKSPACE_FAKE_BOXES=1`
+# serves the wire crate's demo boxes so the Workspace UI can be tried.
+fake-boxes = ["saiife-wire/fake"]
 
 [lints]
 workspace = true

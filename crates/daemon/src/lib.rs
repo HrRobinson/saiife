@@ -50,6 +50,8 @@ mod start;
 pub use start::VAULT_KEY_FILE;
 pub mod tokens;
 pub mod vault;
+pub mod workspace;
+pub mod workspace_ops;
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};

@@ -392,6 +392,11 @@ pub struct Ctx {
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
+    // Workspace (plan 29)
+    /// The machine key, paired devices, pairing offers and frame verifier.
+    pub workspace: Arc<crate::workspace::Workspace>,
+    /// What Workspace frames act on (no boxes unless a build wires some).
+    pub boxes: Arc<dyn saiife_wire::BoxSource>,
 }
 
 /// When each (uid, kind) notice was last written; shared with the hook
@@ -431,6 +436,9 @@ pub struct CtxInit {
     pub mcp: Arc<crate::mcp_gateway::Gateway>,
     /// See [`Ctx::refuse_own_uid_peers`]. `minimal` leaves it off.
     pub refuse_own_uid_peers: bool,
+    // Workspace (plan 29)
+    pub workspace: Arc<crate::workspace::Workspace>,
+    pub boxes: Arc<dyn saiife_wire::BoxSource>,
 }
 
 impl CtxInit {
@@ -483,6 +491,9 @@ impl CtxInit {
                 crate::mcp_gateway::GatewaySetup::in_state(state_dir),
             )),
             refuse_own_uid_peers: false,
+            // Workspace (plan 29)
+            workspace: Arc::new(crate::workspace::Workspace::memory()),
+            boxes: Arc::new(saiife_wire::source::NoBoxes),
         }
     }
 }
@@ -717,6 +728,9 @@ impl Ctx {
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
+            // Workspace (plan 29)
+            workspace: i.workspace,
+            boxes: i.boxes,
         }
     }
 

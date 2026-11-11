@@ -1010,6 +1010,25 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     if let Some(why) = &grants_unreadable {
         eprintln!("saiife: warning: {why}: approved commands need approval again");
     }
+    // The Workspace link's machine key and paired devices (plan 29); a
+    // file that cannot be used leaves the Workspace with no trusted device.
+    let (workspace, workspace_warning) =
+        crate::workspace::Workspace::open(crate::workspace::dir_in(&state_dir));
+    if let Some(why) = &workspace_warning {
+        eprintln!("saiife: warning: {why}: the Workspace trusts no device");
+    }
+    #[cfg(feature = "fake-boxes")]
+    let boxes: Arc<dyn saiife_wire::BoxSource> =
+        if std::env::var("SAIIFE_WORKSPACE_FAKE_BOXES").is_ok_and(|v| v == "1") {
+            eprintln!("saiifed: Workspace uses fake boxes (test build)");
+            Arc::new(saiife_wire::fake::FakeBoxSource::demo(
+                crate::workspace::now_secs(),
+            ))
+        } else {
+            Arc::new(saiife_wire::source::NoBoxes)
+        };
+    #[cfg(not(feature = "fake-boxes"))]
+    let boxes: Arc<dyn saiife_wire::BoxSource> = Arc::new(saiife_wire::source::NoBoxes);
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
     // The MCP gateway (plan 17): children never get read access to the
@@ -1072,6 +1091,9 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         refuse_own_uid_peers: mode == Mode::Locked
             && !crate::mcp_gateway::own_uid_peers_allowed()
             && !test_pipe_in_use,
+        // Workspace (plan 29)
+        workspace: Arc::new(workspace),
+        boxes,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
