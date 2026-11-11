@@ -25,6 +25,17 @@ Windows the locked directory is `C:\ProgramData\saiife\etc\policy.d\packs`.
 Packs are never read from a project: a repository cannot loosen or add
 rules for you.
 
+In developer mode the personal broker reads the same directory
+(`<broker dir>/policy.d/packs`) when it starts and when it reloads. It checks
+only each file's header there, and a header error (a bad or duplicate pack id,
+a symlink, more files or bytes than the limits below) stops the broker from
+starting or reloading until you fix the file.
+
+After you add or edit a pack in locked mode, run `saiife policy reload`. The
+hook reads the files on every call, but the daemon keeps the policy it loaded:
+until the reload it does not know a new `ask = true` rule and refuses the
+approval requests it makes.
+
 Limits, so the hook stays fast:
 
 - at most 32 files, and 256 KiB of pack text in total;
@@ -36,8 +47,9 @@ Limits, so the hook stays fast:
 
 The pack id is `user.<slug>`: 1 to 48 characters of `a-z`, `0-9` and `-`, not
 starting with `-`. A user pack is always on. `default_on = false` and
-`lazy = true` are errors. Unknown keys are errors too, so a typo cannot
-silently turn a rule off.
+`lazy = true` are errors. Unknown keys are errors too, at the top level
+(`[[deny_paths]]`), in `[pack]` and in each rule, so a typo cannot silently
+turn a rule off.
 
 ```toml
 [pack]
@@ -49,7 +61,8 @@ triggers = ["deploy-prod", "terraform"]   # see below
 # windows_triggers = ["deploy-prod.exe"]  # extra triggers on Windows
 # substitution_failsafe = true            # default true
 
-# A command rule. `id` is required on every [[deny]].
+# A command rule. `id` is required on every [[deny]]: 1 to 64 of a-z, 0-9
+# and -, not starting with -, and not used twice in the pack (an error).
 [[deny]]
 id = "deploy-prod"
 pattern = '^deploy-prod\b'    # a regex, matched against each command
@@ -76,8 +89,9 @@ reason = "A dry run changes nothing."
 ```
 
 `triggers` is a list of words. A command rule is only looked at for a command
-that contains one of them. A deny rule in a pack without `triggers` never
-fires, so every user pack with a `[[deny]]` needs them.
+that contains one of them, so a pack with a `[[deny]]` or an `[[allow]]` and
+no `triggers` is an error. `windows_triggers` count only on Windows. A pack of
+path rules only needs no triggers.
 
 `access` for a path rule: `read`, `write` (every write, a `chmod` included),
 `any`, `replace` (a write that changes what the file holds) and `content`
@@ -99,9 +113,16 @@ saiife packs                           # your packs are listed with DEFAULT "use
 saiife packs user.no-prod              # every rule of the pack
 ```
 
+`saiife test`, `saiife explain` and `saiife packs` read your personal packs
+(the developer-mode directory). For the locked packs, use the policy
+commands on the locked config:
+
 `saiife policy check <config>` compiles every user pack beside a locked
 policy, for the host and for the box profile, and prints each error. Its
 `ok:` line ends with `, N user packs)` when there are any.
+`saiife policy test <config>` judges each `[[example]]` with a `command =`
+with those user packs too, so an example can expect `deny` or `ask` from a
+`user.*` rule.
 
 ### A broken pack
 
@@ -132,7 +153,8 @@ request to approve:
 - **Locked mode with approvers:** the call becomes a pending request in
   [approvals](approvals.md). An approver can allow that one call. The rule is
   added to `[guard] ask` as `user.<slug>/<id>` for you; you do not edit
-  `config.toml`.
+  `config.toml`. Run `saiife policy reload` after adding the rule, or the
+  daemon refuses the request.
 - **Developer mode:** there are no approvals, so it is a plain deny, and the
   reason ends with `(needs approval; approvals need locked mode)`.
 

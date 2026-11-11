@@ -29,7 +29,7 @@ use saiife_policy::{
 use serde_json::Value;
 
 use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
-use crate::eval::{judge_with, Verdict as GuardVerdict};
+use crate::eval::{judge_with_user, user_pack_srcs, Verdict as GuardVerdict};
 use crate::paths::LockedPaths;
 
 /// Where `check` and `test` find users.
@@ -517,9 +517,11 @@ fn run_case(
             });
             // Long enough that a slow runner never fails open.
             let budget = Duration::from_millis(cfg.guard.budget_ms.max(10_000));
-            let a = judge_with(
+            // The policy's user packs too: `ids` names them.
+            let a = judge_with_user(
                 &payload,
                 &ids,
+                &user_pack_srcs(cfg),
                 budget,
                 locked.as_ref(),
                 &cfg.guard.ask,

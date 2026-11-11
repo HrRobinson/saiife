@@ -467,6 +467,7 @@ pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
 /// the engine, and a locked host's system paths (`locked`) bound as extra
 /// rule-variable values. A tool the guard does not judge is an `Allow` with
 /// reason `tool not judged` (§6.1.1).
+#[cfg(test)]
 pub fn judge_with(
     payload: &str,
     packs: &[String],
@@ -475,7 +476,20 @@ pub fn judge_with(
     ask: &[String],
     agent: Option<&str>,
 ) -> EvalAnswer {
-    judge_in(payload, packs, &[], budget, (locked, None), ask, agent)
+    judge_with_user(payload, packs, &[], budget, locked, ask, agent)
+}
+
+/// [`judge_with`], with the policy's user packs (`policy test`).
+pub fn judge_with_user(
+    payload: &str,
+    packs: &[String],
+    user: &[UserPackSrc],
+    budget: Duration,
+    locked: Option<&LockedPaths>,
+    ask: &[String],
+    agent: Option<&str>,
+) -> EvalAnswer {
+    judge_in(payload, packs, user, budget, (locked, None), ask, agent)
 }
 
 /// What the worker answers `req`. `env`: the environment a worker would be started
