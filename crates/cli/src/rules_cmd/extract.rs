@@ -300,12 +300,10 @@ fn split_list(list: &str) -> Vec<(usize, &str)> {
     while i < list.len() {
         let sep = if matches!(bytes[i], b',' | b';') {
             1
-        } else if list[i..].starts_with(" or ") || list[i..].starts_with(" and ") {
-            if list[i..].starts_with(" or ") {
-                4
-            } else {
-                5
-            }
+        } else if bytes[i..].starts_with(b" or ") {
+            4
+        } else if bytes[i..].starts_with(b" and ") {
+            5
         } else {
             0
         };
@@ -410,6 +408,14 @@ mod tests {
     fn unsafe_span_is_not_a_command() {
         let c = one("Never run `rm -rf $(cat x)`");
         assert!(!c.targets.iter().any(|t| matches!(t, Target::Command(_))));
+    }
+
+    #[test]
+    fn non_ascii_after_a_colon_does_not_panic() {
+        let c = one("Never run: kill \u{2014} now, sudo.");
+        assert_eq!(c.targets, vec![cmd(&["sudo"])]);
+        let c = one("Never touch: ~/.claude \u{2014} ever, caf\u{e9} or \u{201c}x\u{201d}");
+        assert_eq!(c.targets, vec![path("~/.claude", RuleAccess::Any)]);
     }
 
     #[test]
