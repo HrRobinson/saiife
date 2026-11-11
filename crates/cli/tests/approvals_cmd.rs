@@ -815,6 +815,7 @@ fn show_prints_the_scope_of_a_command_request() {
                 grant_key: Some("00".repeat(32)),
                 scope: Some("/srv/shop".into()),
                 ask_rule: Some("core.git/push-force".into()),
+                touch_class: None,
                 send: Default::default(),
             },
             |_| Ok(None),
@@ -855,6 +856,7 @@ fn show_and_list_print_the_env_of_a_connector_request() {
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class: None,
         send: SendDisplay {
             env: env.map(str::to_string),
             env_base,
@@ -938,6 +940,7 @@ fn show_prints_server_tool_and_masked_arguments_of_an_mcp_request() {
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class: None,
         send: SendDisplay {
             body_display: Some("{\"team\":\"ENG\",\"title\":\"Bug\"}".into()),
             body_sha256: Some("ab".repeat(32)),
