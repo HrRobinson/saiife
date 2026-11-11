@@ -1,5 +1,5 @@
-//! The embedded UI assets (plan 29, Task 7). Plan 30 replaces `ASSETS` with
-//! the real UI; the server serves whatever the table holds.
+//! The embedded UI assets (plan 29, Task 7). Plan 30 fills `ASSETS` with the
+//! real UI; the server serves whatever the table holds.
 
 use ring::digest::{digest, SHA256};
 
@@ -10,18 +10,49 @@ pub struct Asset {
     pub bytes: &'static [u8],
 }
 
-/// The placeholder UI: a page and a stylesheet, no script.
+/// Media type from the file extension (the `assets` test checks every entry).
+const fn mime_of(path: &str) -> &'static str {
+    let b = path.as_bytes();
+    let n = b.len();
+    if n >= 5
+        && b[n - 5] == b'.'
+        && b[n - 4] == b'h'
+        && b[n - 3] == b't'
+        && b[n - 2] == b'm'
+        && b[n - 1] == b'l'
+    {
+        "text/html; charset=utf-8"
+    } else if n >= 4 && b[n - 4] == b'.' && b[n - 3] == b'c' && b[n - 2] == b's' && b[n - 1] == b's'
+    {
+        "text/css; charset=utf-8"
+    } else if n >= 3 && b[n - 3] == b'.' && b[n - 2] == b'j' && b[n - 1] == b's' {
+        "text/javascript; charset=utf-8"
+    } else if n >= 4 && b[n - 4] == b'.' && b[n - 3] == b's' && b[n - 2] == b'v' && b[n - 1] == b'g'
+    {
+        "image/svg+xml"
+    } else {
+        "application/json"
+    }
+}
+
+macro_rules! asset {
+    ($path:literal) => {
+        Asset {
+            path: concat!("/", $path),
+            mime: mime_of($path),
+            bytes: include_bytes!(concat!("../assets/", $path)),
+        }
+    };
+}
+
+/// The Workspace UI: every file under `crates/link/assets/` except `tests/`.
 pub static ASSETS: &[Asset] = &[
-    Asset {
-        path: "/index.html",
-        mime: "text/html; charset=utf-8",
-        bytes: b"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>saiife Workspace</title>\n<link rel=\"stylesheet\" href=\"/app.css\">\n</head>\n<body>\n<main>\n<h1>saiife Workspace</h1>\n</main>\n</body>\n</html>\n",
-    },
-    Asset {
-        path: "/app.css",
-        mime: "text/css; charset=utf-8",
-        bytes: b"body { font-family: system-ui, sans-serif; margin: 2rem; }\n",
-    },
+    asset!("index.html"),
+    asset!("app.css"),
+    asset!("js/app.js"),
+    asset!("js/dom.js"),
+    asset!("js/format.js"),
+    asset!("js/views/placeholder.js"),
 ];
 
 /// The strong ETag: `"` + the first 16 hex digits of SHA-256(bytes) + `"`.
