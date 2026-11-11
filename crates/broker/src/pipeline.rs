@@ -203,6 +203,11 @@ pub struct PendingCall {
     pub amount: Option<(u64, String)>,
     /// The agent's headers (forwarded as the manifest allows), masked.
     pub headers: Vec<(String, String)>,
+    /// The touch class (`saiife_policy::touch::class_for`) of the call's
+    /// real, unmasked capability, or `None`. The daemon stores the stronger
+    /// of this and its own class of the masked capability, so a masked
+    /// qualifier can never make the class weaker.
+    pub touch_class: Option<&'static str>,
 }
 
 /// The longest masked body an approval request shows, in bytes: the whole
@@ -915,11 +920,15 @@ async fn steps(
         Some(q) => format!("{}:{}:{q}", cap.resource, cap.verb),
         None => format!("{}:{}", cap.resource, cap.verb),
     });
+    // The touch class of the real capability, before any masking.
+    let touch_class = saiife_policy::touch::class_for(cfg, &call.service, &cap);
     // Approved: `ask` or `allow` now both send.
     let ask = match verdict {
         Verdict::Deny { rule } => return changed(&rule),
         Verdict::Ask => stage == Stage::New,
-        Verdict::Allow => false,
+        // An allowed call that carries a touch mark asks all the same
+        // (spec §8.2). An approved one (`Stage::Approved`) is sent.
+        Verdict::Allow => stage == Stage::New && touch_class.is_some(),
     };
 
     // 7. Limits. An operation that moves money must carry its amount.
@@ -1002,6 +1011,7 @@ async fn steps(
                 .iter()
                 .map(|(k, v)| (masker.mask_text(k), masker.mask_text(v)))
                 .collect(),
+            touch_class,
         };
         return match env.create_approval(&pending).await {
             Ok(id) => Outcome::Pending { id },

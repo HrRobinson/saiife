@@ -49,6 +49,8 @@ pub use saiife_broker::mail::smtp;
 mod start;
 pub use start::VAULT_KEY_FILE;
 pub mod tokens;
+pub mod touch;
+pub mod touch_ops;
 pub mod vault;
 pub mod writer;
 

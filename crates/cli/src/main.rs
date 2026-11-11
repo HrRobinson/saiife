@@ -68,6 +68,9 @@ mod status_cmd;
 mod system_cmd;
 mod system_view;
 mod text;
+mod touch_cmd;
+#[cfg(any(unix, windows))]
+mod tty;
 mod win_locked;
 
 use saiifeguard::builtins::builtin_packs;
@@ -327,8 +330,17 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<approvals_cmd::ApprovalsAction>,
     },
+    /// Locked mode and the personal broker: enrol, list, remove and test the FIDO2 keys your touch approvals use.
+    Touch {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: touch_cmd::TouchAction,
+    },
     /// Locked mode (Linux, macOS, approver): approve request <id>. For your own
     /// request (`same_user = "reauth"`) you are asked to authenticate.
+    /// A touch-class request asks you to touch your enrolled key (saiife touch).
     Approve {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
@@ -427,6 +439,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Doctor { .. }
         | Cmd::Audit { .. }
         | Cmd::Approvals { .. }
+        | Cmd::Touch { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Check { .. }
@@ -619,6 +632,13 @@ fn main() -> ExitCode {
     {
         return approvals_cmd::run(system_config, list, action);
     }
+    if let Cmd::Touch {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return touch_cmd::run(system_config, action);
+    }
     if let Cmd::Approve {
         system_config,
         id,
@@ -723,6 +743,7 @@ fn main() -> ExitCode {
         | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
         | Cmd::Approvals { .. }
+        | Cmd::Touch { .. }
         | Cmd::Policy { .. }
         | Cmd::Env { .. }
         | Cmd::Dev { .. }

@@ -1010,6 +1010,13 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     if let Some(why) = &grants_unreadable {
         eprintln!("saiife: warning: {why}: approved commands need approval again");
     }
+    // The touch devices; an unusable directory or file is no devices (every
+    // touch is refused) and a `touch_unreadable` record.
+    let (touch, touch_unreadable) = crate::touch::TouchState::open(&state_dir);
+    if let Some(why) = &touch_unreadable {
+        eprintln!("saiife: warning: {why}: touch approvals are unavailable");
+    }
+    let touch = Arc::new(touch);
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
     // The MCP gateway (plan 17): children never get read access to the
@@ -1068,6 +1075,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         approvals,
         lockdown,
         grants,
+        touch,
         mcp,
         refuse_own_uid_peers: mode == Mode::Locked
             && !crate::mcp_gateway::own_uid_peers_allowed()
@@ -1106,6 +1114,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         ("tokens_reset", tokens_reset),
         ("lockdown_unreadable", lockdown_unreadable),
         ("grants_unreadable", grants_unreadable),
+        ("touch_unreadable", touch_unreadable),
     ]
     .into_iter()
     .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))

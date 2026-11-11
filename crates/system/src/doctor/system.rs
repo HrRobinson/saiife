@@ -2368,6 +2368,7 @@ mod tests {
             &DoctorOptions {
                 user: None,
                 home: Some(home.to_path_buf()),
+                ..Default::default()
             },
         )
     }
@@ -2890,7 +2891,7 @@ mod tests {
         let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["system.supported", "install.record"],
+            ["system.supported", "install.record", "touch-key"],
             "{}",
             r.to_text()
         );
@@ -3315,6 +3316,7 @@ mod macos_tests {
             DoctorOptions {
                 user: Some("agent".into()),
                 home: None,
+                ..Default::default()
             },
         )
     }

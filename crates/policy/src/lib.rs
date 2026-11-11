@@ -19,6 +19,7 @@ pub mod project;
 pub mod scope;
 pub mod service;
 pub mod system;
+pub mod touch;
 pub mod users;
 pub mod view;
 

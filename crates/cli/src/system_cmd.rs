@@ -134,7 +134,11 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
     // The profile comes from the registry by SID: the environment is the caller's.
     #[cfg(windows)]
     let (dir, home) = (saiife_policy::WinDirectory::system(), None);
-    let opts = DoctorOptions { user: None, home };
+    let opts = DoctorOptions {
+        user: None,
+        home,
+        touch_supported: cfg!(feature = "fido-hid"),
+    };
     let (text, failed) = doctor::after_install(layout, host, &dir, &opts);
     outln!();
     out!("{text}");

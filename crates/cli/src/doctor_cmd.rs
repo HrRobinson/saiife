@@ -52,7 +52,16 @@ pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode 
     // The profile comes from the registry by SID: the environment is the caller's.
     #[cfg(windows)]
     let home = None;
-    let report = doctor::run(&layout, host.as_ref(), &dir, &DoctorOptions { user, home });
+    let report = doctor::run(
+        &layout,
+        host.as_ref(),
+        &dir,
+        &DoctorOptions {
+            user,
+            home,
+            touch_supported: cfg!(feature = "fido-hid"),
+        },
+    );
     if json {
         outln!(
             "{}",

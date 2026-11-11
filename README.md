@@ -139,6 +139,7 @@ model.
 - [Fleet install](docs/fleet.md): `.deb`, `.rpm`, macOS `.pkg` and Windows `.msi`
   packages, with Ansible, Jamf, Intune and GPO recipes.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
+- [Touch approvals](docs/touch.md): approve with a FIDO2 key; `doctor` checks the key is usable.
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
   and [collections](docs/collections.md).
 - [Dev environments](docs/dev.md): saiife dev, compose stacks behind one HTTPS proxy (preview).
