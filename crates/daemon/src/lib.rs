@@ -11,6 +11,7 @@ pub mod approval_ops;
 pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
+pub mod box_ops;
 pub mod cloud_ops;
 pub mod cosign;
 pub mod disk;

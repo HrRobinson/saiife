@@ -211,6 +211,34 @@ pub const OP_HOOK_BEGIN: &str = "hook.begin";
 /// arguments beside `rec`; the daemon never writes those two.
 pub const OP_HOOK_BIND: &str = "hook.bind";
 
+// Frame actions (dispatched inside workspace.frame; level from saiife_wire::level_for):
+// (plan 29 Task 1's lines, one const per line; plan 34 Task 8 added them
+// first, so whichever plan lands second drops its copy.)
+pub const OP_BOX_OVERVIEW: &str = "box.overview";
+pub const OP_BOX_LIST: &str = "box.list";
+pub const OP_BOX_DIFF: &str = "box.diff";
+pub const OP_BOX_TERM_READ: &str = "box.term.read";
+pub const OP_BOX_STOP: &str = "box.stop";
+pub const OP_BOX_PAUSE: &str = "box.pause";
+pub const OP_BOX_RESUME: &str = "box.resume";
+pub const OP_BOX_DISCARD: &str = "box.discard";
+pub const OP_BOX_REORDER: &str = "box.reorder";
+pub const OP_BOX_STEER: &str = "box.steer";
+pub const OP_BOX_REVISE: &str = "box.revise";
+pub const OP_BOX_LAND: &str = "box.land";
+pub const OP_BOX_PUSH: &str = "box.push";
+pub const OP_BOX_PR: &str = "box.pr";
+pub const OP_BOX_SPAWN: &str = "box.spawn";
+pub const OP_BOX_TEMPLATES: &str = "box.templates";
+pub const OP_BOX_INBOX: &str = "box.inbox";
+/// `saiife box done` (control socket, machine local): `{id}` -> `BoxInfo`.
+/// A Running box becomes Done.
+pub const OP_BOX_DONE: &str = "box.done";
+/// Removes discarded boxes and orphan box dirs (control socket, machine
+/// local): `{}` -> `{removed: [id]}`. Root or an admin removes every one;
+/// anyone else only their own discarded boxes.
+pub const OP_BOX_GC: &str = "box.gc";
+
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
 /// `bad_request`; the managed hook shrinks its record to fit, so a denied
