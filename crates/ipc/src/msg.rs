@@ -94,6 +94,69 @@ pub const OP_HOOK_BEGIN: &str = "hook.begin";
 /// arguments beside `rec`; the daemon never writes those two.
 pub const OP_HOOK_BIND: &str = "hook.bind";
 
+// Workspace (plan 29)
+/// The Workspace link's socket, beside [`SOCKET_NAME`]; served by the daemon
+/// for the user's `saiife workspace serve` process only.
+pub const LINK_SOCKET_NAME: &str = "link.sock";
+/// Control socket, machine side (CLI): start a pairing. `{label?}` ->
+/// `{pair_id, fragment, machine_id, expires_at}`.
+pub const OP_WORKSPACE_PAIR_BEGIN: &str = "workspace.pair.begin";
+/// Control socket: where a pairing stands. `{pair_id}` -> the `PairStatus`
+/// JSON of saiife-wire.
+pub const OP_WORKSPACE_PAIR_STATUS: &str = "workspace.pair.status";
+/// Control socket: the machine owner accepts or rejects a pairing.
+/// `{pair_id, accept: bool, auth?}` -> `{device_id, state}` (`auth` as in
+/// [`OP_APPROVAL_DECIDE`]).
+pub const OP_WORKSPACE_PAIR_CONFIRM: &str = "workspace.pair.confirm";
+/// Control socket: the paired devices. `{}` -> `{devices: [Device without
+/// public_key]}`.
+pub const OP_WORKSPACE_DEVICES: &str = "workspace.devices";
+/// Control socket: revoke a device. `{device_id, auth?}` -> `{device_id,
+/// state: "revoked"}`.
+pub const OP_WORKSPACE_REVOKE: &str = "workspace.revoke";
+/// link.sock only: what a device needs to pair and seal. `{}` ->
+/// `{machine_id, machine_pub, epoch, frame_version: 1}`.
+pub const OP_WORKSPACE_HELLO: &str = "workspace.hello";
+/// link.sock only: a device's pairing request (the `PairRequest` fields) ->
+/// `{device_id, short_code}`.
+pub const OP_WORKSPACE_PAIR_FINISH: &str = "workspace.pair.finish";
+/// link.sock only: one signed frame. `{body, sig, touch?, via: "local"|"hub",
+/// channel_device?}` -> `{result}`. `channel_device` is the device id the hub
+/// seal channel was opened for; required for `via` = `hub`. The daemon reads
+/// the action out of `body` and decides by `saiife_wire::level_for`.
+pub const OP_WORKSPACE_FRAME: &str = "workspace.frame";
+/// link.sock only: the machine key signs for the link. `{purpose: "seal" |
+/// "hub_hello", data: b64u, device_id?}` -> `{sig: b64u, device_pub?: b64u}`.
+/// `device_pub` is only given when `device_id` was, for a `seal`.
+pub const OP_WORKSPACE_SIGN: &str = "workspace.sign";
+// Frame actions, dispatched inside `workspace.frame` (level from
+// `saiife_wire::level_for`, names equal `saiife_wire::level::actions`).
+pub const OP_BOX_OVERVIEW: &str = "box.overview";
+pub const OP_BOX_LIST: &str = "box.list";
+pub const OP_BOX_DIFF: &str = "box.diff";
+pub const OP_BOX_TERM_READ: &str = "box.term.read";
+pub const OP_BOX_STOP: &str = "box.stop";
+pub const OP_BOX_PAUSE: &str = "box.pause";
+pub const OP_BOX_RESUME: &str = "box.resume";
+pub const OP_BOX_DISCARD: &str = "box.discard";
+pub const OP_BOX_REORDER: &str = "box.reorder";
+pub const OP_BOX_STEER: &str = "box.steer";
+pub const OP_BOX_REVISE: &str = "box.revise";
+pub const OP_BOX_LAND: &str = "box.land";
+pub const OP_BOX_PUSH: &str = "box.push";
+pub const OP_BOX_PR: &str = "box.pr";
+pub const OP_BOX_SPAWN: &str = "box.spawn";
+pub const OP_BOX_TEMPLATES: &str = "box.templates";
+pub const OP_BOX_INBOX: &str = "box.inbox";
+/// The only ops link.sock answers; every other name is `unknown_op`.
+pub const LINK_OPS: &[&str] = &[
+    OP_HELLO,
+    OP_WORKSPACE_HELLO,
+    OP_WORKSPACE_PAIR_FINISH,
+    OP_WORKSPACE_FRAME,
+    OP_WORKSPACE_SIGN,
+];
+
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
 /// `bad_request`; the managed hook shrinks its record to fit, so a denied
@@ -253,6 +316,18 @@ mod tests {
             serde_json::to_value(ErrorCode::UpstreamFailed).unwrap(),
             "upstream_failed"
         );
+    }
+
+    #[test]
+    fn link_ops_are_few() {
+        assert_eq!(LINK_OPS.len(), 5);
+        for op in LINK_OPS {
+            assert!(
+                !op.starts_with("workspace.pair.") || *op == OP_WORKSPACE_PAIR_FINISH,
+                "{op}"
+            );
+        }
+        assert_eq!(LINK_SOCKET_NAME, "link.sock");
     }
 
     #[test]
