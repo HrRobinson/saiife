@@ -2192,6 +2192,17 @@ fn managed_broken_user_pack_denies_every_call() {
         reason.contains("user pack") && reason.contains("user.t.toml"),
         "{r}"
     );
+    // A tool the guard does not judge is denied too.
+    let home = common::FixtureHome::new();
+    let mcp = home.real(&fixture("claude/webfetch.json"));
+    let (o, _, _sb) = managed(&d.config(), &mcp);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "error_denied", "{r}");
+    assert!(
+        r["reason"].as_str().unwrap_or("").contains("user pack"),
+        "{r}"
+    );
 }
 
 #[test]

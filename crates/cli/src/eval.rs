@@ -565,7 +565,12 @@ fn judge_in(
             &format!("hook payload not usable: {e}"),
         ),
         Plan::NoPath => answer(Verdict::Unjudged, String::new(), "no path to judge"),
-        Plan::Other => answer(Verdict::Allow, String::new(), "tool not judged"),
+        // A tool the guard does not judge is still denied while a user pack
+        // is broken (every call is, like a broken config).
+        Plan::Other => match load_user(user, Profile::Host) {
+            Ok(_) => answer(Verdict::Allow, String::new(), "tool not judged"),
+            Err(reason) => answer(Verdict::Unjudged, String::new(), &reason),
+        },
         Plan::Shell { command, dialects } => {
             let (engine, _) = match engine() {
                 Ok(e) => e,
@@ -654,18 +659,7 @@ fn engine_for(
     };
     // Broken built-ins are skipped; their rules are not in force.
     let (mut packs, _warnings) = Catalog::builtin().load_active(packs);
-    if !user.is_empty() {
-        let srcs: Vec<UserSrc> = user
-            .iter()
-            .map(|u| UserSrc {
-                source: &u.source,
-                text: &u.text,
-            })
-            .collect();
-        packs.extend(
-            load_user_packs_cached(&srcs, PathStyle::host(), profile).map_err(|e| e.to_string())?,
-        );
-    }
+    packs.extend(load_user(user, profile)?);
     let vars = match env {
         Some(env) => path_vars_locked_env(start.as_deref(), project.as_deref(), locked, env),
         None => path_vars_locked(start.as_deref(), project.as_deref(), locked),
@@ -674,6 +668,22 @@ fn engine_for(
         .with_paths(vars.clone())
         .with_budget(budget);
     Ok((engine, vars))
+}
+
+/// The user packs, compiled for `profile` (cached on equal input). `Err`
+/// with the reason when any does not load.
+fn load_user(user: &[UserPackSrc], profile: Profile) -> Result<Vec<saiifeguard::Pack>, String> {
+    if user.is_empty() {
+        return Ok(Vec::new());
+    }
+    let srcs: Vec<UserSrc> = user
+        .iter()
+        .map(|u| UserSrc {
+            source: &u.source,
+            text: &u.text,
+        })
+        .collect();
+    load_user_packs_cached(&srcs, PathStyle::host(), profile).map_err(|e| e.to_string())
 }
 
 fn from_decision(input: String, tool: Option<String>, d: Decision) -> EvalAnswer {
@@ -2312,5 +2322,20 @@ mod tests {
             r.starts_with("user pack /etc/saiife/policy.d/packs/user.t.toml: "),
             "{r}"
         );
+    }
+
+    #[test]
+    fn a_broken_user_pack_also_stops_a_tool_the_guard_does_not_judge() {
+        let bad = UserPackSrc {
+            source: "/etc/saiife/policy.d/packs/user.t.toml".into(),
+            text: "[pack]\nid = \"user.t\"\n[[deny]]\nid = \"a\"\npattern = '('\nreason = \"r\"\n"
+                .into(),
+        };
+        let mut req = request_with(vec![bad]);
+        req.payload = payload("/tmp", "mcp__srv__tool", serde_json::json!({}));
+        let a = answer(&req, None);
+        assert_eq!(a.verdict, Verdict::Unjudged, "{a:?}");
+        req.user_packs.clear();
+        assert_eq!(answer(&req, None).verdict, Verdict::Allow);
     }
 }
