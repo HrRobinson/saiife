@@ -5,7 +5,7 @@
 pub mod assets;
 pub mod daemon;
 #[cfg(unix)]
-mod hub;
+pub mod hub;
 #[cfg(unix)]
 pub mod local;
 pub mod ws;
@@ -26,8 +26,27 @@ pub struct LinkConfig {
 
 /// Configuration of the hub client (`--hub`).
 pub struct HubConfig {
+    /// `wss://host[:port]/v1/link` (see [`hub`]).
     pub url: String,
-    pub roots: Option<rustls::RootCertStore>,
+    /// The roots the hub's certificate must chain to.
+    pub roots: rustls::RootCertStore,
+    /// Tests only: connect here instead of resolving the URL's host (SNI
+    /// and `Host` still come from the URL).
+    pub connect: Option<std::net::SocketAddr>,
+}
+
+/// The platform's trusted roots; unreadable ones are skipped.
+#[cfg(unix)]
+fn native_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    let found = rustls_native_certs::load_native_certs();
+    for c in found.certs {
+        let _ = roots.add(c);
+    }
+    if roots.is_empty() {
+        eprintln!("saiife: warning: no trusted root certificates found for the hub");
+    }
+    roots
 }
 
 /// The local server and the optional hub client, until both end.
@@ -37,9 +56,11 @@ pub async fn run(cfg: LinkConfig) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port))
         .await
         .map_err(|e| format!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
+    let roots = cfg.hub_roots;
     let hub = cfg.hub.map(|url| HubConfig {
         url,
-        roots: cfg.hub_roots,
+        roots: roots.unwrap_or_else(native_roots),
+        connect: None,
     });
     // `local::serve` never returns on its own.
     let local = local::serve(listener, daemon.clone(), cfg.port);
