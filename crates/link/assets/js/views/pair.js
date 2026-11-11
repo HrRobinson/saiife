@@ -4,9 +4,8 @@
 // address bar; it lives only in this closure.
 import { h } from "../dom.js";
 import { visible } from "../format.js";
-import { Client } from "../wire.js";
 import * as keystore from "../keystore.js";
-import { pair, watchConfirm, checkLabel, DEFAULT_LABEL, MAX_LABEL_CHARS, WAIT_MS } from "../pairing.js";
+import { pair, parseFragment, waitAndSave, checkLabel, DEFAULT_LABEL, MAX_LABEL_CHARS, WAIT_MS, FRAGMENT_INVALID } from "../pairing.js";
 
 const HOW = "On the machine, run saiife workspace pair --local and open the link it prints.";
 
@@ -41,7 +40,7 @@ function form(root, fragment) {
       status.replaceChildren(visible(r.error));
       return;
     }
-    waiting(root, r.shortCode);
+    waiting(root, r.shortCode, r.device);
   };
   show(
     root,
@@ -57,7 +56,10 @@ function form(root, fragment) {
   );
 }
 
-function waiting(root, code) {
+// The new device stays in memory until the owner confirms; only then is it
+// saved (replacing any older pairing). Leaving, a refusal or the deadline
+// drop it and leave the keystore as it was.
+function waiting(root, code, device) {
   const status = h("p", { class: "muted", role: "status", "aria-live": "polite" }, "Waiting for the machine…");
   show(
     root,
@@ -66,10 +68,11 @@ function waiting(root, code) {
     h("p", {}, "Check that your machine shows the same code, then confirm there."),
     status,
   );
-  const stop = watchConfirm({
-    client: new Client(),
+  const stop = waitAndSave({
+    device,
+    store: keystore,
     deadline: Date.now() + WAIT_MS,
-    onEnd: async (e) => {
+    onEnd: (e) => {
       window.removeEventListener("hashchange", stop);
       if (e.kind === "done") {
         location.hash = "#/overview";
@@ -77,30 +80,26 @@ function waiting(root, code) {
       }
       status.className = "error";
       if (e.kind === "timeout") {
-        // Never confirmed (or rejected): this key will never be let in.
-        try {
-          await keystore.forgetDevice();
-        } catch {
-          // Nothing kept is still nothing usable.
-        }
         status.replaceChildren(`The machine did not confirm this browser. ${HOW}`);
       } else {
         status.replaceChildren(visible(e.message));
       }
     },
   });
-  // Leaving the screen ends the polling.
+  // Leaving the screen ends the polling and drops the unconfirmed key.
   window.addEventListener("hashchange", stop, { once: true });
 }
 
 export function render(route) {
   const root = h("section", { class: "pair" });
   intro(root);
-  keystore.loadDevice().then((dev) => {
+  const offer = route.fragment ? parseFragment(route.fragment) : Promise.resolve(null);
+  Promise.all([keystore.loadDevice(), offer]).then(([dev, parsed]) => {
     if (!route.fragment) {
       if (dev) show(root, h("h1", {}, "This browser is paired"), h("p", {}, h("a", { href: "#/overview" }, "Go to the overview")));
       return;
     }
+    if (!parsed) return show(root, h("h1", {}, "Pair this browser"), h("p", { class: "error" }, FRAGMENT_INVALID));
     if (!dev) return form(root, route.fragment);
     const replace = h("button", { type: "button", class: "danger", on: { click: () => form(root, route.fragment) } }, "Replace this browser's pairing");
     show(

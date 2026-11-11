@@ -17,7 +17,8 @@ const history = {
 const fetch = (url, init = {}) =>
   globalThis.fetch(base + url, { ...init, headers: { ...(init.headers ?? {}), Origin: base } });
 const r = await pair({ hash, location: { pathname: "/", hash }, history, fetch, store, label: "Browser on this machine" });
-const rec = await store.loadDevice();
+// pair() saves nothing (ruling R-T3c); the device comes back in memory.
+const { device, ...rest } = r;
 process.stdout.write(
-  JSON.stringify({ ...r, devicePub: rec ? b64u(rec.publicRaw) : null, replaced }) + "\n",
+  JSON.stringify({ ...rest, devicePub: device ? b64u(device.publicRaw) : null, saved: (await store.loadDevice()) !== null, replaced }) + "\n",
 );

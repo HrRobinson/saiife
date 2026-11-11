@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseFragment, proof, shortCode, pair, checkLabel, watchConfirm, POLL_MS } from "../js/pairing.js";
+import { parseFragment, proof, shortCode, pair, checkLabel, watchConfirm, waitAndSave, POLL_MS } from "../js/pairing.js";
 import { b64u, unb64u, deviceIdOf } from "../js/wire.js";
 import { memoryStore } from "../js/keystore.js";
 
@@ -105,7 +105,7 @@ test("labels follow the daemon's rule", () => {
 });
 
 // The machine side in a box: /api/hello and /api/pair with the daemon's checks.
-function fakeMachine({ machineId = MACHINE_ID, code = (c) => c, pairAnswer, log = [] } = {}) {
+function fakeMachine({ machineId = MACHINE_ID, code = (c) => c, pairAnswer, frames = [], log = [] } = {}) {
   const calls = [];
   const f = async (url, init = {}) => {
     log.push("fetch " + url);
@@ -126,6 +126,8 @@ function fakeMachine({ machineId = MACHINE_ID, code = (c) => c, pairAnswer, log 
           result: { device_id: await deviceIdOf(devicePub), short_code: code(await shortCode(MACHINE_PUB, devicePub, SECRET)) },
         };
       }
+    } else if (url === "/api/frame" && frames.length > 0) {
+      payload = frames.length > 1 ? frames.shift() : frames[0];
     } else {
       status = 404;
       payload = { ok: false, error: "not_found" };
@@ -149,7 +151,7 @@ function fakeHistory(log) {
 
 const LOCATION = { pathname: "/", hash: GOOD };
 
-test("pair posts the bodies the daemon expects and saves the device", async () => {
+test("pair posts the bodies the daemon expects and saves nothing", async () => {
   const log = [];
   const fetch = fakeMachine({ log });
   const history = fakeHistory(log);
@@ -164,7 +166,9 @@ test("pair posts the bodies the daemon expects and saves the device", async () =
   assert.deepEqual(Object.keys(body).sort(), ["device_pub", "label", "pair_id", "proof"]);
   assert.equal(body.pair_id, vector.pair_id);
   assert.equal(body.label, "my laptop");
-  const rec = await store.loadDevice();
+  // Ruling R-T3c: the device is held in memory until the owner confirms.
+  assert.equal(await store.loadDevice(), null);
+  const rec = r.device;
   assert.equal(rec.deviceId, r.deviceId);
   assert.equal(rec.machineId, MACHINE_ID);
   assert.equal(b64u(rec.publicRaw), body.device_pub);
@@ -338,4 +342,69 @@ test("watchConfirm leaves no timer behind when stopped", async () => {
   assert.equal(t2.queue.length, 0);
   assert.deepEqual(ends, []);
   stop2(); // twice is harmless
+});
+
+// waitAndSave: the confirmed device is saved, nothing else ever is.
+const DONE = { ok: true, result: { device_id: "x", label: "x", owner_user: "me" } };
+const REFUSED = { ok: false, error: "forbidden", rule: "bad_signature", message: "the frame signature does not verify" };
+
+async function pairedInMemory(store) {
+  const r = await pair({ hash: GOOD, location: LOCATION, history: fakeHistory([]), fetch: fakeMachine(), store, label: "x" });
+  assert.ok(r.device, JSON.stringify(r));
+  return r.device;
+}
+
+async function runWait({ store, device, frames, deadline = 60000, stopAfter }) {
+  const t = fakeTimers();
+  const fetch = fakeMachine({ frames });
+  const ends = [];
+  const saved = [];
+  const spy = {
+    async loadDevice() { return store.loadDevice(); },
+    async saveDevice(d) { saved.push({ at: fetch.calls.filter((c) => c.url === "/api/frame").length, d }); return store.saveDevice(d); },
+    async forgetDevice() { throw new Error("forgetDevice must not be called"); },
+  };
+  const stop = waitAndSave({ device, store: spy, fetch, schedule: t.schedule, cancel: t.cancel, now: () => t.now, deadline, onEnd: (e) => ends.push(e) });
+  let n = 0;
+  while ((stopAfter === undefined || n < stopAfter) && (await t.step())) n++;
+  if (stopAfter !== undefined) stop();
+  await new Promise((r) => setImmediate(r));
+  return { ends, saved, fetch, t };
+}
+
+test("nothing is saved before done, and the device is saved on done", async () => {
+  const store = memoryStore();
+  const device = await pairedInMemory(store);
+  const { ends, saved, fetch } = await runWait({ store, device, frames: [NOT_YET, PENDING, DONE] });
+  assert.deepEqual(ends, [{ kind: "done" }]);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].at, 3, "saved only after the confirming answer");
+  assert.equal(await store.loadDevice(), device);
+  // The frames were signed with the in-memory device.
+  const f = JSON.parse(fetch.calls.find((c) => c.url === "/api/frame").init.body);
+  assert.equal(JSON.parse(f.body).device_id, device.deviceId);
+});
+
+test("old device survives a refused or timed out wait", async () => {
+  for (const [frames, kind] of [[[REFUSED], "refused"], [[NOT_YET], "timeout"]]) {
+    const store = memoryStore();
+    const old = await oldDevice();
+    await store.saveDevice(old);
+    const device = await pairedInMemory(store);
+    const { ends, saved } = await runWait({ store, device, frames, deadline: 10000 });
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].kind, kind);
+    assert.equal(saved.length, 0);
+    assert.equal(await store.loadDevice(), old);
+  }
+});
+
+test("leaving the view drops the unconfirmed device", async () => {
+  const store = memoryStore();
+  const device = await pairedInMemory(store);
+  const { ends, saved, t } = await runWait({ store, device, frames: [NOT_YET], stopAfter: 2 });
+  assert.deepEqual(ends, []);
+  assert.equal(saved.length, 0);
+  assert.equal(t.queue.length, 0);
+  assert.equal(await store.loadDevice(), null);
 });

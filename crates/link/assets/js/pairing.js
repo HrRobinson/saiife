@@ -22,8 +22,11 @@ const KEYS = ["machine_id", "machine_pub", "pair_id", "secret", "v"];
 // `check_label` refuses (Cf, plus the line and paragraph separators).
 const HIDDEN = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
 
+export const FRAGMENT_INVALID =
+  "This pairing link is not valid. Run saiife workspace pair --local on the machine and open the link it prints.";
+
 const SENTENCES = {
-  fragment: "This pairing link is not valid. Run saiife workspace pair --local on the machine and open the link it prints.",
+  fragment: FRAGMENT_INVALID,
   machine: "This pairing link is for another machine than this Workspace",
   answer: "The machine sent a pairing answer this page cannot read",
   crypto: "This browser cannot make a pairing key",
@@ -111,8 +114,11 @@ export function checkLabel(label) {
 }
 
 // The whole pairing, in this order: parse, clear the fragment, check the
-// machine, make the key, POST /api/pair, compare the codes, save. Nothing
-// is saved unless the codes agree. -> {deviceId, shortCode} | {error, rule?}
+// machine, make the key, POST /api/pair, compare the codes. Nothing is
+// saved here (ruling R-T3c): the new device is returned in memory, and
+// `waitAndSave` saves it only once the owner confirmed on the machine.
+// `store` is accepted for the brief's signature and never written.
+// -> {deviceId, shortCode, device} | {error, rule?}
 export async function pair({ hash, location, history, fetch, store, label }) {
   const offer = await parseFragment(hash);
   // The secret leaves the address bar (and this history entry) first.
@@ -159,13 +165,8 @@ export async function pair({ hash, location, history, fetch, store, label }) {
   // The key was never saved: dropping it here is forgetting it.
   if (r.short_code !== code) return { error: CODES_DIFFER };
   if (r.device_id !== deviceId) return { error: SENTENCES.answer };
-
-  try {
-    await store.saveDevice({ key: keys.privateKey, publicRaw, deviceId, machineId: offer.machineId });
-  } catch {
-    return { error: SENTENCES.store };
-  }
-  return { deviceId, shortCode: code };
+  const device = { key: keys.privateKey, publicRaw, deviceId, machineId: offer.machineId };
+  return { deviceId, shortCode: code, device };
 }
 
 // Polls workspace.whoami every POLL_MS until the owner confirms. While the
@@ -201,5 +202,47 @@ export function watchConfirm({ client, schedule = setTimeout, cancel = clearTime
     stopped = true;
     if (timer !== null) cancel(timer);
     timer = null;
+  };
+}
+
+// A store that holds one device in memory and never writes anywhere.
+function holding(device) {
+  return {
+    async loadDevice() {
+      return device;
+    },
+    async saveDevice() {
+      throw new Error("read only");
+    },
+    async forgetDevice() {},
+  };
+}
+
+// Waits for the owner's confirm with the new device held in memory, and
+// saves it to `store` only on done. A timeout, a refusal or stop() drop
+// it: whatever `store` held before (another pairing, another tab's) is
+// untouched. onEnd as watchConfirm; a failed save ends "refused".
+export function waitAndSave({ device, store, fetch, schedule, cancel, now, deadline, onEnd }) {
+  const client = new Client({ fetch, store: holding(device) });
+  let stopped = false;
+  const stop = watchConfirm({
+    client,
+    schedule,
+    cancel,
+    now,
+    deadline,
+    onEnd: async (e) => {
+      if (e.kind !== "done") return onEnd(e);
+      try {
+        await store.saveDevice(device);
+      } catch {
+        return onEnd({ kind: "refused", message: SENTENCES.store });
+      }
+      if (!stopped) onEnd(e);
+    },
+  });
+  return () => {
+    stopped = true;
+    stop();
   };
 }

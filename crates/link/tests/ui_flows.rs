@@ -216,6 +216,10 @@ async fn node_pairs_with_the_real_link() {
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["replaced"], "/", "{v}");
+    assert_eq!(
+        v["saved"], false,
+        "nothing is saved before the confirm: {v}"
+    );
     let device_pub = b64::dec_n::<65>(v["devicePub"].as_str().unwrap()).unwrap();
     assert_eq!(
         v["shortCode"],
