@@ -17,3 +17,4 @@ pub mod verify;
 
 mod error;
 pub use error::WireError;
+pub use source::BoxSource;
