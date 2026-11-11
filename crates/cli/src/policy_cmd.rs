@@ -295,21 +295,9 @@ fn unreadable(e: &PolicyError) -> bool {
 /// host profile and for the box profile (one message when both say the same).
 fn user_pack_errors(packs: &[saiife_policy::UserPackFile]) -> Vec<String> {
     use saiifeguard::profile::Profile;
-    let srcs: Vec<saiifeguard::userpack::UserSrc> = packs
-        .iter()
-        .map(|u| saiifeguard::userpack::UserSrc {
-            source: &u.path,
-            text: &u.text,
-        })
-        .collect();
     let mut errors: Vec<String> = Vec::new();
     for profile in [Profile::Host, Profile::Box] {
-        let loaded = saiifeguard::userpack::load_user_packs(
-            &srcs,
-            saiifeguard::canon::PathStyle::host(),
-            profile,
-        );
-        if let Err(e) = loaded {
+        if let Err(e) = crate::check::compile_user_packs(packs, profile) {
             let e = e.to_string();
             if !errors.contains(&e) {
                 errors.push(e);

@@ -128,7 +128,7 @@ pub fn run(
             );
         }
     };
-    let audit = Audit::new(
+    let mut audit = Audit::new(
         agent,
         context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
         cli_packs,
@@ -146,10 +146,11 @@ pub fn run(
             None,
         ),
         Plan::Shell { command, dialects } => {
-            let user = match DevUser::load(profile) {
+            let user = match user_or_absent(fail, &mut audit, profile, &command) {
                 Ok(u) => u,
-                Err(why) => return user_pack_unjudged(fail, &audit, &command, &why),
+                Err(code) => return code,
             };
+            let audit = audit;
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config, building the engine or hashing the policy
             // fails open too.
@@ -159,10 +160,11 @@ pub fn run(
             })
         }
         Plan::Files(call) => {
-            let user = match DevUser::load(profile) {
+            let user = match user_or_absent(fail, &mut audit, profile, &call.input()) {
                 Ok(u) => u,
-                Err(why) => return user_pack_unjudged(fail, &audit, &call.input(), &why),
+                Err(code) => return code,
             };
+            let audit = audit;
             decide(&audit, &call.input(), fail, |_| {
                 let (engine, vars) = active_engine(&audit, cli_packs, &user, profile);
                 user.note_ask(&engine, eval::judge_files(&engine, &vars, &call))
@@ -175,8 +177,8 @@ pub fn run(
             // A broken user pack is reported for a tool the guard does not
             // judge too, so the warning and the record do not depend on
             // which tool happened to be called first.
-            if let Err(why) = DevUser::load(profile) {
-                return user_pack_unjudged(fail, &audit, "", &why);
+            if let Err(code) = user_or_absent(fail, &mut audit, profile, "") {
+                return code;
             }
             audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
             allow()
@@ -269,15 +271,7 @@ impl DevUser {
         if files.is_empty() {
             return Ok(Self::default());
         }
-        let srcs: Vec<UserSrc> = files
-            .iter()
-            .map(|f| UserSrc {
-                source: &f.path,
-                text: &f.text,
-            })
-            .collect();
-        let packs =
-            load_user_packs(&srcs, PathStyle::host(), profile).map_err(|e| e.to_string())?;
+        let packs = compile_user_packs(&files, profile).map_err(|e| e.to_string())?;
         let ask = packs
             .iter()
             .flat_map(|p| p.ask_ids.iter().map(move |r| format!("{}/{r}", p.id)))
@@ -313,6 +307,22 @@ impl DevUser {
     }
 }
 
+/// `files` compiled strictly for `profile`: the one place a user pack file
+/// becomes a [`Pack`] outside the managed worker.
+pub(crate) fn compile_user_packs(
+    files: &[saiife_policy::userpacks::UserPackFile],
+    profile: Profile,
+) -> Result<Vec<Pack>, saiifeguard::userpack::UserPackError> {
+    let srcs: Vec<UserSrc> = files
+        .iter()
+        .map(|f| UserSrc {
+            source: &f.path,
+            text: &f.text,
+        })
+        .collect();
+    load_user_packs(&srcs, PathStyle::host(), profile)
+}
+
 /// The user pack files of this developer: `policy.d/packs` beside the
 /// personal broker config. No home directory means no packs.
 pub(crate) fn dev_user_packs() -> Result<Vec<saiife_policy::userpacks::UserPackFile>, String> {
@@ -333,16 +343,29 @@ pub(crate) fn dev_user_packs() -> Result<Vec<saiife_policy::userpacks::UserPackF
         .map_err(|e| format!("user pack {e}"))
 }
 
-/// A user pack did not load: answered like any call the guard could not
-/// judge, with the pack named. Fails open with a warning (D3), or closed
-/// when `/etc/saiife` asks for it.
-fn user_pack_unjudged(fail: Fail, audit: &Audit, input: &str, why: &str) -> ExitCode {
-    fail.unjudged(
-        audit,
-        input,
-        why,
-        Some(&format!("{why} (not loaded); failing open (allow)")),
-    )
+/// The user packs for this call. When they do not load, the built-in and
+/// project packs still judge the call (D3's fail-open covers the user-pack
+/// layer only): the user packs count as absent, stderr warns, and `audit`
+/// remembers the error so an allowed call is recorded as `error_allowed`
+/// naming it. A deny stays a normal deny. When `/etc/saiife` asks for fail
+/// closed, the call is denied instead (`Err`).
+fn user_or_absent(
+    fail: Fail,
+    audit: &mut Audit,
+    profile: Profile,
+    input: &str,
+) -> Result<DevUser, ExitCode> {
+    match DevUser::load(profile) {
+        Ok(u) => Ok(u),
+        Err(why) if fail.closed => Err(fail.unjudged(audit, input, &why, None)),
+        Err(why) => {
+            warn(&format!(
+                "{why} (not loaded); the user packs are off, the built-in packs still apply; failing open (allow)"
+            ));
+            audit.pack_error = Some(why);
+            Ok(DevUser::default())
+        }
+    }
 }
 
 /// `engine_for` the built-in packs and the payload's `cwd`: its warnings
@@ -540,6 +563,8 @@ struct Audit {
     /// Set by `active_engine` from the engine it built; a call that built
     /// none gets the `--pack` ids with the config `unavailable` marker.
     policy: OnceCell<String>,
+    /// Why the user packs are off for this call (they did not load).
+    pack_error: Option<String>,
 }
 
 impl Audit {
@@ -560,6 +585,7 @@ impl Audit {
             project,
             cli_packs: cli_packs.to_vec(),
             policy: OnceCell::new(),
+            pack_error: None,
         }
     }
 
@@ -588,6 +614,11 @@ impl Audit {
     ) {
         let Some(dir) = &self.dir else {
             return;
+        };
+        // The built-ins judged an allowed call without the user packs: say so.
+        let (decision, reason) = match (&self.pack_error, decision) {
+            (Some(e), DecisionKind::Allow) => (DecisionKind::ErrorAllowed, Some(e.as_str())),
+            _ => (decision, reason),
         };
         let rec = Record::new(
             NewRecord {
@@ -803,6 +834,7 @@ mod tests {
             project: "/p".into(),
             cli_packs: Vec::new(),
             policy: OnceCell::new(),
+            pack_error: None,
         }
     }
 

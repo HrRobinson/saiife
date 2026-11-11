@@ -719,7 +719,27 @@ fn dev_broken_user_pack_fails_open_with_warning() {
     assert!(err.contains("user pack"), "{err}");
     assert!(err.contains("failing open"), "{err}");
     let recs = read_all(env.audit.path()).records;
-    assert_eq!(recs.last().unwrap().decision, DecisionKind::ErrorAllowed);
+    let last = recs.last().unwrap();
+    assert_eq!(last.decision, DecisionKind::ErrorAllowed);
+    assert!(
+        last.reason.as_deref().unwrap_or("").contains("user pack"),
+        "{last:?}"
+    );
+}
+
+/// A broken user pack turns off the user packs only: the built-in packs still
+/// judge the call, and what they deny stays denied.
+#[test]
+fn dev_broken_user_pack_keeps_the_builtin_denies() {
+    let env = common::Env::new(&["claude"]);
+    put_user_pack(&env, &USER_PACK.replace(r"'^deploy-prod\b'", "'('"));
+    let (code, err) = personal_check(&env, "git reset --hard");
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("BLOCKED by core.git"), "{err}");
+    assert!(err.contains("user pack"), "{err}");
+    let recs = read_all(env.audit.path()).records;
+    assert_eq!(recs.last().unwrap().decision, DecisionKind::Deny);
+    assert_eq!(recs.last().unwrap().pack.as_deref(), Some("core.git"));
 }
 
 #[test]

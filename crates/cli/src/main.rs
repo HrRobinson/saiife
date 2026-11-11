@@ -1218,18 +1218,7 @@ fn dev_user_pack_list(profile: Profile) -> Vec<saiifeguard::Pack> {
             return Vec::new();
         }
     };
-    let srcs: Vec<saiifeguard::userpack::UserSrc> = files
-        .iter()
-        .map(|f| saiifeguard::userpack::UserSrc {
-            source: &f.path,
-            text: &f.text,
-        })
-        .collect();
-    match saiifeguard::userpack::load_user_packs(
-        &srcs,
-        saiifeguard::canon::PathStyle::host(),
-        profile,
-    ) {
+    match check::compile_user_packs(&files, profile) {
         Ok(p) => p,
         Err(e) => {
             warn(&format!("{e} (not loaded)"));

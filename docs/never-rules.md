@@ -20,7 +20,8 @@ One pack per file, `*.toml`, in a `policy.d/packs` directory:
 | Developer mode, Windows | `%LOCALAPPDATA%\saiife\personal\policy.d\packs\` |
 
 In locked mode root owns the directory (0755) and the files (0644), so the
-agent cannot edit them.
+agent cannot edit them, and `saiife doctor` checks it like `policy.d`. On
+Windows the locked directory is `C:\ProgramData\saiife\etc\policy.d\packs`.
 Packs are never read from a project: a repository cannot loosen or add
 rules for you.
 
@@ -112,10 +113,13 @@ skipped quietly. What happens depends on the mode:
   `where`, a file over the cap, a symlink: every hook call is denied with
   `user pack <file>: <why>`, and the audit log records `error_denied`. This is
   the same as a broken `config.toml`. Fix the file; the next call works.
-- **Developer mode: fail open, loudly.** The call goes through, stderr says
-  `user pack <file>: <why> (not loaded); failing open (allow)`, and the audit
-  log records `error_allowed`. This is how developer mode treats every error.
-  If `/etc/saiife` asks for fail closed, the call is denied instead.
+- **Developer mode: the user packs go off, loudly.** Only the user packs are
+  dropped: the built-in and project packs still judge the call, so a broken
+  user pack never turns off `rm -rf /` or a secret read. stderr says
+  `user pack <file>: <why> (not loaded); ... failing open (allow)`. A call the
+  built-ins deny is a normal deny. A call they allow goes through and the
+  audit log records `error_allowed` with the pack error as its reason. If
+  `/etc/saiife` asks for fail closed, the call is denied instead.
 
 A rule left out because of its `platform`, or because of the box profile, is
 not an error.
@@ -134,9 +138,12 @@ request to approve:
 
 ## Boxes
 
-A box (see [dev environments](dev.md)) runs the agent with its own hook. The
-hook for a box uses the box profile: `saiife check --profile box`, and
-`saiife explain --profile box "<command>"` shows what it would decide.
+Boxes are a planned use of user packs (see [dev environments](dev.md)). What
+exists today is the box profile itself: `saiife explain --profile box
+"<command>"` shows what a box would decide, and `saiife check --profile box`
+judges with it (the policy hash records `profile box`). The boxes step will
+write the hook that runs inside a box with this profile; until then no box
+runs it.
 
 Each rule says where it is in force with `where`:
 
@@ -154,7 +161,7 @@ What a user rule does inside a box is one of three things:
 | Status | Which rules | What it means |
 | --- | --- | --- |
 | off in boxes (host only) | `where = "host"` | Not enforced in a box. |
-| checked at diff review | a path rule with `where = "everywhere"` whose access covers writes (`write`, `any`, `replace`, `content`) | The box cannot stop the write, but when the box's changes come back for review, a file that such a rule forbids is flagged, and landing the changes always needs your approval. |
+| checked at diff review (planned) | a path rule with `where = "everywhere"` whose access covers writes (`write`, `any`, `replace`, `content`) | The box cannot stop the write. The design is that when the box's changes come back for review, a file such a rule forbids is flagged, and landing the changes needs your approval. The boxes step adds this; nothing flags files yet. |
 | advisory in boxes | every command rule, and read-only path rules | Not enforced in a box. |
 
 A rule shown as "advisory in boxes" is not enforced there. Do not count on it
