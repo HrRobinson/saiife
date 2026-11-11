@@ -69,6 +69,7 @@ mod system_cmd;
 mod system_view;
 mod text;
 mod win_locked;
+mod workspace_cmd;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -363,6 +364,15 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<lockdown_cmd::LockdownAction>,
     },
+    /// The Workspace link (Linux, macOS): pair a browser, list or remove
+    /// paired browsers, run the localhost UI and the hub client.
+    Workspace {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: workspace_cmd::WorkspaceAction,
+    },
     /// Check and test a policy kept in a file (`check`, `test`), or show
     /// and reload the one in force (`show`, `reload`: locked mode).
     Policy {
@@ -437,6 +447,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Api(_)
         | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
+        | Cmd::Workspace { .. }
         | Cmd::Env { .. }
         | Cmd::Dev { .. }
         | Cmd::Policy { .. }
@@ -611,6 +622,13 @@ fn main() -> ExitCode {
     {
         return lockdown_cmd::run(system_config, action);
     }
+    if let Cmd::Workspace {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return workspace_cmd::run(system_config, action);
+    }
     if let Cmd::Approvals {
         system_config,
         list,
@@ -722,6 +740,7 @@ fn main() -> ExitCode {
         | Cmd::Api(_)
         | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
+        | Cmd::Workspace { .. }
         | Cmd::Approvals { .. }
         | Cmd::Policy { .. }
         | Cmd::Env { .. }
