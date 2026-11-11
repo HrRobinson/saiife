@@ -151,6 +151,12 @@ pub(crate) use linux::prepare_reauth;
 #[cfg(any(unix, windows))]
 pub use linux::{decide, run};
 
+/// The daemon target and calls, for `saiife touch` (plan 27).
+#[cfg(any(unix, windows))]
+pub(crate) mod client {
+    pub(crate) use super::linux::{answer, call_raw, connect, finish, target, Stop};
+}
+
 #[cfg(any(unix, windows))]
 mod linux {
     use super::{ApprovalsAction, Decision, ListArgs};
@@ -177,7 +183,7 @@ mod linux {
     const WHAT_CHARS: usize = 60;
 
     /// Exit 2 (`Refused`) or 5 (`Unavailable`).
-    enum Stop {
+    pub(crate) enum Stop {
         Refused(Vec<String>),
         Unavailable(String),
     }
@@ -186,7 +192,7 @@ mod linux {
         Stop::Unavailable(m.into())
     }
 
-    fn finish(r: Result<(), Stop>) -> ExitCode {
+    pub(crate) fn finish(r: Result<(), Stop>) -> ExitCode {
         match r {
             Ok(()) => ExitCode::SUCCESS,
             Err(Stop::Refused(lines)) => {
@@ -202,23 +208,34 @@ mod linux {
         }
     }
 
-    fn connect(t: &Target) -> Result<Client, Stop> {
+    pub(crate) fn connect(t: &Target) -> Result<Client, Stop> {
         broker::connect(t, Instant::now() + CONNECT_TIMEOUT)
             .map_err(|e| unavailable(broker::unreachable(t, &e)))
     }
 
     /// One call; a refusal comes back as `Stop::Refused` (with the rule
     /// when there is one), anything else as `Unavailable`.
-    fn call(
+    pub(crate) fn call(
         c: &mut Client,
         op: &str,
         args: Map<String, Value>,
     ) -> Result<Map<String, Value>, Stop> {
-        let ans = c
-            .call_answer(op, args, Instant::now() + CALL_TIMEOUT)
-            .map_err(|e: ClientError| {
-                unavailable(format!("cannot reach the saiife daemon: {e}"))
-            })?;
+        answer(call_raw(c, op, args)?)
+    }
+
+    /// One call: the daemon's answer, whether ok or an error. Only a
+    /// daemon that cannot be reached is `Unavailable`.
+    pub(crate) fn call_raw(
+        c: &mut Client,
+        op: &str,
+        args: Map<String, Value>,
+    ) -> Result<Map<String, Value>, Stop> {
+        c.call_answer(op, args, Instant::now() + CALL_TIMEOUT)
+            .map_err(|e: ClientError| unavailable(format!("cannot reach the saiife daemon: {e}")))
+    }
+
+    /// An answer of [`call_raw`] as [`call`] gives it.
+    pub(crate) fn answer(ans: Map<String, Value>) -> Result<Map<String, Value>, Stop> {
         if ans.get("ok") == Some(&Value::Bool(true)) {
             return Ok(ans);
         }
@@ -237,7 +254,7 @@ mod linux {
     }
 
     /// The locked daemon (a flag or a locked host) or the personal broker.
-    fn target(config: Option<PathBuf>) -> Result<Target, Stop> {
+    pub(crate) fn target(config: Option<PathBuf>) -> Result<Target, Stop> {
         broker::resolve_here(config.as_deref()).map_err(Stop::Unavailable)
     }
 

@@ -1,15 +1,342 @@
-//! `saiife touch`: the key layer (plan 27). `pick` chooses the source of
-//! touches: the soft key seam (debug builds only), a FIDO2 key over USB HID
-//! (feature `fido-hid`), or none (D1).
-
-// Tasks 2 and 3 of plan 27 call the key layer (and drop this allow); until
-// then only its tests use parts of it.
-#![allow(dead_code)]
+//! `saiife touch enrol | ls | rm | test` (plan 27), and the key layer.
+//! `pick` chooses the source of touches: the soft key seam (debug builds
+//! only), a FIDO2 key over USB HID (feature `fido-hid`), or none (D1).
+//!
+//! Exit codes: 0 done, 2 refused (by the daemon or the key), 5 the daemon
+//! or the key cannot be reached (D5), as `saiife approvals`.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
+use clap::Subcommand;
 use saiife_touch::{Touch, TouchError, PROMPT_TIMEOUT_SECS};
+
+#[derive(Subcommand)]
+pub enum TouchAction {
+    /// Enrol the plugged-in key as a new touch device. A second device is
+    /// approved by a touch of one you have.
+    Enrol {
+        /// A name for the key (shown by `ls` and when it approves).
+        #[arg(long)]
+        label: String,
+    },
+    /// List your touch devices.
+    Ls {
+        /// Machine-readable output: one JSON array.
+        #[arg(long)]
+        json: bool,
+        /// Every device on this machine (root or an admin).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Remove one of your touch devices (a touch of one of them approves).
+    Rm {
+        /// The device's id, or a unique prefix of at least 8 characters.
+        /// A base64url id may start with `-`.
+        #[arg(allow_hyphen_values = true)]
+        id: String,
+        /// Remove without a touch, when every device is lost (root only).
+        #[arg(long)]
+        host: bool,
+    },
+    /// Touch an enrolled device, to check that it works.
+    Test,
+}
+
+/// Review Focus 4: a daemon that predates plan 26.
+const NO_DAEMON_SUPPORT: &str = "this saiife daemon has no touch support; update it";
+
+#[cfg(not(any(unix, windows)))]
+pub fn run(_config: Option<std::path::PathBuf>, _action: TouchAction) -> std::process::ExitCode {
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
+    std::process::ExitCode::from(5)
+}
+
+#[cfg(any(unix, windows))]
+pub use cmd::run;
+
+#[cfg(any(unix, windows))]
+mod cmd {
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+
+    use saiife_touch::{Assertion, EnrolRequest, Touch, TouchError, TouchRequest};
+    use serde::de::DeserializeOwned;
+    use serde_json::{json, Map, Value};
+
+    use super::{exit_for, pick, TouchAction, NO_DAEMON_SUPPORT};
+    use crate::approvals_cmd::client::{answer, call_raw, connect, finish, target, Stop};
+    use crate::broker::Target;
+    use crate::text::sanitize;
+
+    /// The shortest id prefix `rm` takes.
+    const MIN_PREFIX: usize = 8;
+    /// The ID column of `ls`, in characters.
+    const ID_CHARS: usize = 12;
+
+    pub fn run(config: Option<PathBuf>, action: TouchAction) -> ExitCode {
+        finish(target(config).and_then(|t| match action {
+            TouchAction::Enrol { label } => enrol(&t, &label),
+            TouchAction::Ls { json, all } => ls(&t, json, all),
+            TouchAction::Rm { id, host } => rm(&t, &id, host),
+            TouchAction::Test => test(&t),
+        }))
+    }
+
+    /// One `touch.*` op on a new connection: a touch may take up to 120 s,
+    /// and no connection waits idle for it (as D6). `unknown_op` names an
+    /// old daemon (Review Focus 4).
+    fn op(t: &Target, op: &str, args: Value) -> Result<Map<String, Value>, Stop> {
+        let Value::Object(args) = args else {
+            unreachable!("touch op arguments are an object")
+        };
+        let mut c = connect(t)?;
+        let ans = call_raw(&mut c, op, args)?;
+        if ans.get("error").and_then(Value::as_str) == Some("unknown_op") {
+            return Err(Stop::Unavailable(NO_DAEMON_SUPPORT.into()));
+        }
+        answer(ans)
+    }
+
+    /// A touch error: `saiife: touch: <error>`, exit 2 or 5 (D5).
+    fn touch_stop(e: TouchError) -> Stop {
+        let m = format!("touch: {e}");
+        match exit_for(e) {
+            5 => Stop::Unavailable(m),
+            _ => Stop::Refused(vec![m]),
+        }
+    }
+
+    /// The source of touches; none is exit 5 with its message (D1).
+    fn key() -> Result<Box<dyn Touch>, Stop> {
+        pick().map_err(Stop::Unavailable)
+    }
+
+    /// `v[k]` (or all of `v` when `k` is empty) as a `T`.
+    fn field<T: DeserializeOwned>(v: &Map<String, Value>, k: &str) -> Result<T, Stop> {
+        let x = if k.is_empty() {
+            Value::Object(v.clone())
+        } else {
+            v.get(k).cloned().unwrap_or(Value::Null)
+        };
+        serde_json::from_value(x).map_err(|e| {
+            Stop::Unavailable(format!(
+                "the saiife daemon sent a touch answer this saiife cannot read: {e}"
+            ))
+        })
+    }
+
+    fn s<'a>(v: &'a Map<String, Value>, k: &str) -> &'a str {
+        v.get(k).and_then(Value::as_str).unwrap_or_default()
+    }
+
+    fn json_of(a: &Assertion) -> Value {
+        serde_json::to_value(a).unwrap_or(Value::Null)
+    }
+
+    fn enrol(t: &Target, label: &str) -> Result<(), Stop> {
+        let k = key()?;
+        let b = op(
+            t,
+            "touch.begin",
+            json!({"purpose": "enrol", "label": label}),
+        )?;
+        let er: EnrolRequest = field(&b, "")?;
+        let proof_req: TouchRequest = field(&b, "touch")?;
+        let approve_with: Option<TouchRequest> = match b.get("approve_with") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(field(&b, "approve_with")?),
+        };
+        let shown = sanitize(label);
+        if approve_with.is_some() {
+            eprintln!(
+                "saiife: enrolling \"{shown}\": touch the new key twice, then one of your enrolled keys"
+            );
+        } else {
+            eprintln!("saiife: enrolling \"{shown}\": touch the new key twice");
+        }
+        let auth_data = k.enrol(&er).map_err(touch_stop)?;
+        let proof = k.request(&proof_req).map_err(touch_stop)?;
+        let mut args = json!({
+            "label": label,
+            "auth_data": base64_url(&auth_data),
+            "proof": json_of(&proof),
+        });
+        if let Some(r) = approve_with {
+            // D2: one key is plugged in at a time.
+            eprintln!("saiife: unplug the new key and plug in an enrolled one, then press Enter");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            let approval = k.request(&r).map_err(touch_stop)?;
+            args["approval"] = json_of(&approval);
+        }
+        let done = op(t, "touch.enrol", args)?;
+        // The new id is the proof's: the answer's `id` is the frame's own
+        // (`ok` keeps the frame id), so it never names the credential.
+        let id = base64_url(proof.credential_id());
+        outln!(
+            "enrolled \"{}\" ({})",
+            sanitize(s(&done, "label")),
+            &id[..id.len().min(8)]
+        );
+        // The first device: host access approved it, and no other device can.
+        if s(&done, "approved_by") == "host" {
+            eprintln!(
+                "saiife: add a second device (spec §8.4): a lost key leaves only root to remove it"
+            );
+        }
+        Ok(())
+    }
+
+    fn base64_url(b: &[u8]) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// The devices of `touch.list {all}`.
+    fn list(t: &Target, all: bool) -> Result<Vec<Value>, Stop> {
+        let ans = op(t, "touch.list", json!({"all": all}))?;
+        Ok(ans
+            .get("credentials")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn ls(t: &Target, as_json: bool, all: bool) -> Result<(), Stop> {
+        let items = list(t, all)?;
+        if as_json {
+            outln!("{}", Value::Array(items));
+        } else if items.is_empty() {
+            outln!("no touch devices enrolled; saiife touch enrol --label <name>");
+        } else {
+            table(&items, all);
+        }
+        // D1: listing needs no key, but nothing else works in this build.
+        #[cfg(not(feature = "fido-hid"))]
+        eprintln!("saiife: {}", super::NO_KEY_SUPPORT);
+        Ok(())
+    }
+
+    fn table(items: &[Value], all: bool) {
+        let mut head = vec!["ID", "LABEL", "KIND", "ALG", "ADDED", "COUNT"];
+        if all {
+            head.push("OWNER");
+        }
+        let text = |v: &Value| sanitize(v.as_str().unwrap_or_default());
+        let rows: Vec<Vec<String>> = items
+            .iter()
+            .map(|i| {
+                let mut r = vec![
+                    text(&i["id"]).chars().take(ID_CHARS).collect(),
+                    text(&i["label"]),
+                    text(&i["kind"]),
+                    text(&i["alg"]),
+                    text(&i["created"]).chars().take(10).collect(),
+                    i["sign_count"].as_u64().unwrap_or_default().to_string(),
+                ];
+                if all {
+                    r.push(i["owner_uid"].as_u64().unwrap_or_default().to_string());
+                }
+                r
+            })
+            .collect();
+        let head: Vec<String> = head.into_iter().map(String::from).collect();
+        let mut w = vec![0usize; head.len()];
+        for r in std::iter::once(&head).chain(rows.iter()) {
+            for (i, c) in r.iter().enumerate() {
+                w[i] = w[i].max(c.chars().count());
+            }
+        }
+        for r in std::iter::once(&head).chain(rows.iter()) {
+            let line: Vec<String> = r
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c}{}", " ".repeat(w[i] - c.chars().count())))
+                .collect();
+            outln!("{}", line.join("  ").trim_end());
+        }
+    }
+
+    /// The one device whose id starts with `prefix` (at least 8 characters).
+    fn resolve(items: Vec<Value>, prefix: &str) -> Result<Value, Stop> {
+        if prefix.chars().count() < MIN_PREFIX {
+            return Err(Stop::Refused(vec![format!(
+                "give at least {MIN_PREFIX} characters of the id (saiife touch ls)"
+            )]));
+        }
+        let mut hits: Vec<Value> = items
+            .into_iter()
+            .filter(|i| i["id"].as_str().is_some_and(|id| id.starts_with(prefix)))
+            .collect();
+        let shown = sanitize(prefix);
+        match hits.len() {
+            0 => Err(Stop::Refused(vec![format!(
+                "no enrolled device starts with \"{shown}\" (saiife touch ls)"
+            )])),
+            1 => Ok(hits.remove(0)),
+            _ => Err(Stop::Refused(vec![format!(
+                "more than one enrolled device starts with \"{shown}\"; give more of the id"
+            )])),
+        }
+    }
+
+    fn rm(t: &Target, prefix: &str, host: bool) -> Result<(), Stop> {
+        // `--host` (root's recovery) may remove any uid's device.
+        let dev = resolve(list(t, host)?, prefix)?;
+        let credential = dev["id"].as_str().unwrap_or_default().to_string();
+        let done = if host {
+            op(
+                t,
+                "touch.remove",
+                json!({"credential": credential, "host": true}),
+            )?
+        } else {
+            let k = key()?;
+            let b = op(
+                t,
+                "touch.begin",
+                json!({"purpose": "remove", "credential": credential}),
+            )?;
+            let r: TouchRequest = field(&b, "")?;
+            eprintln!(
+                "saiife: removing \"{}\": touch one of your enrolled keys",
+                sanitize(dev["label"].as_str().unwrap_or_default())
+            );
+            let asr = k.request(&r).map_err(touch_stop)?;
+            op(
+                t,
+                "touch.remove",
+                json!({"credential": credential, "assertion": json_of(&asr)}),
+            )?
+        };
+        outln!("removed \"{}\"", sanitize(s(&done, "label")));
+        Ok(())
+    }
+
+    fn test(t: &Target) -> Result<(), Stop> {
+        let k = key()?;
+        let b = op(t, "touch.begin", json!({"purpose": "test"}))?;
+        let r: TouchRequest = field(&b, "")?;
+        eprintln!("saiife: touch one of your enrolled keys");
+        let asr = k.request(&r).map_err(touch_stop)?;
+        let done = op(t, "touch.check", json!({"assertion": json_of(&asr)}))?;
+        let uv = if done.get("uv") == Some(&Value::Bool(true)) {
+            "yes"
+        } else {
+            "no"
+        };
+        outln!(
+            "ok: \"{}\" answered (user verified: {uv}, counter {})",
+            sanitize(s(&done, "label")),
+            done.get("sign_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        );
+        Ok(())
+    }
+}
 
 #[cfg(feature = "fido-hid")]
 mod hid;
@@ -45,6 +372,11 @@ fn device() -> Result<Box<dyn Touch>, String> {
 /// Runs `f` on a worker thread and waits at most `limit` for it (D4). When
 /// the limit passes it prints `no touch within <s> s` and gives
 /// `Unavailable`; the worker is left to end when the key gives up.
+// The soft key (debug builds) and the HID key call it.
+#[cfg_attr(
+    all(not(debug_assertions), not(feature = "fido-hid")),
+    allow(dead_code)
+)]
 pub(crate) fn run_touch<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, TouchError> + Send + 'static,
     limit: Duration,
@@ -74,6 +406,11 @@ pub(crate) fn exit_for(e: TouchError) -> u8 {
 
 /// How long one prompt waits for a touch: `PROMPT_TIMEOUT_SECS`, or in debug
 /// builds `SAIIFE_TEST_TOUCH_TIMEOUT_MS` when it is set.
+// The soft key (debug builds) and the HID key call it.
+#[cfg_attr(
+    all(not(debug_assertions), not(feature = "fido-hid")),
+    allow(dead_code)
+)]
 pub(crate) fn prompt_limit() -> Duration {
     #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var("SAIIFE_TEST_TOUCH_TIMEOUT_MS")
@@ -195,6 +532,7 @@ mod soft_file {
         }
 
         /// A new key file (tests only).
+        #[cfg(test)]
         pub(crate) fn create(p: &Path, alg: CoseAlg) -> Result<SoftFile, String> {
             let key = match alg {
                 CoseAlg::Es256 => SoftAuthenticator::new_es256(),
@@ -301,11 +639,12 @@ mod soft_file {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::Instant;
 
-    /// `pick` reads the environment; tests that touch it take this lock.
-    static ENV: Mutex<()> = Mutex::new(());
+    /// `pick` reads the environment; tests that touch it take this lock
+    /// (only those of a build without `fido-hid`, or a release build).
+    #[cfg(any(not(feature = "fido-hid"), not(debug_assertions)))]
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn slow_key_times_out() {
@@ -324,6 +663,31 @@ mod tests {
             run_touch::<()>(|| Err(TouchError::NotPresent), Duration::from_secs(5)),
             Err(TouchError::NotPresent)
         );
+    }
+
+    /// A base64url id may start with `-`: `rm` takes it as the id, and
+    /// `--host` still as the flag.
+    #[test]
+    fn rm_takes_an_id_with_a_leading_hyphen() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(subcommand)]
+            a: TouchAction,
+        }
+        for (argv, want_host) in [
+            (vec!["t", "rm", "-AbCdEfG"], false),
+            (vec!["t", "rm", "-AbCdEfG", "--host"], true),
+            (vec!["t", "rm", "--host", "-AbCdEfG"], true),
+        ] {
+            match T::try_parse_from(&argv).map(|t| t.a) {
+                Ok(TouchAction::Rm { id, host }) => {
+                    assert_eq!((id.as_str(), host), ("-AbCdEfG", want_host), "{argv:?}")
+                }
+                Ok(_) => panic!("{argv:?}: not rm"),
+                Err(e) => panic!("{argv:?}: {e}"),
+            }
+        }
     }
 
     #[test]
