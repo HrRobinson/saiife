@@ -29,13 +29,14 @@ use crate::canon::{
 };
 use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
+use crate::globlap;
 use crate::lexer::{
     fed_script_in, fed_script_may_be_stdin, find_all_substitution_kinds, literal_word, readable,
     split_segments_noted, split_substitution_noted, FedScript, PathKind, Word,
     BRACES_PAST_LINE_LIMIT, HIDDEN_PAST_LINE_LIMIT, UNREAD_SCRIPT,
 };
 use crate::normalize::{build_argv, windows_program_names};
-use crate::operands::{operands, Operand, Source};
+use crate::operands::{operands, operands_in, Operand, Source};
 use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{fish_input, inline_payload, watch_payload, Dialects};
@@ -146,6 +147,9 @@ pub struct Engine {
     path_rules: OnceLock<Vec<PackPaths>>,
     /// Some active pack has `deny_path` rules: `path_rules` is not empty.
     has_path_rules: bool,
+    /// Each `deny_path` rule's glob, bound to `vars`, as a pattern a shell
+    /// glob is compared with (`FsView::Lexical` only, built on first use).
+    deny_globs: OnceLock<Vec<(RuleAccess, globlap::Pattern)>>,
 }
 
 /// One pack's path rules with their globs compiled for this machine.
@@ -280,6 +284,7 @@ impl Engine {
             guarded_commands,
             vars: PathVars::default(),
             path_rules: OnceLock::new(),
+            deny_globs: OnceLock::new(),
         }
     }
 
@@ -299,6 +304,7 @@ impl Engine {
         );
         self.vars = vars;
         self.path_rules = OnceLock::new();
+        self.deny_globs = OnceLock::new();
         self
     }
 
@@ -430,7 +436,7 @@ impl Engine {
         if self.vars.style() != PathStyle::Windows || !self.has_path_rules {
             return None;
         }
-        match winpath::provider_access(raw, access == Access::Write) {
+        match winpath::provider_access(raw, access != Access::Read) {
             Some(Ok(())) => None,
             Some(Err(why)) => Some(Self::unreadable_deny(raw, why)),
             None => self.unreadable(raw, cwd),
@@ -481,6 +487,132 @@ impl Engine {
             Some(d) => JudgeOutcome::Decided(d),
             None => JudgeOutcome::Clean,
         }
+    }
+
+    /// `FsView::Lexical` only, which cannot list what the glob `raw` expands
+    /// to: a deny when some path it may expand to is denied (`globlap`). One
+    /// path both the glob and a `deny_path` rule match is built and judged
+    /// with every rule, so an `allow_path` carve-out still applies: `cat
+    /// ~/.ssh/id_*.pub` matches only public keys. Under `Host` the glob is
+    /// expanded and its matches judged instead, so this is `Clean` there.
+    fn lexical_glob(
+        &self,
+        access: Access,
+        raw: &str,
+        cwd: Option<&Path>,
+        dots: bool,
+        start: Instant,
+    ) -> JudgeOutcome {
+        if crate::canon::fs_view() != crate::canon::FsView::Lexical || !self.has_path_rules {
+            return JudgeOutcome::Clean;
+        }
+        let windows = self.vars.style() == PathStyle::Windows;
+        let abs = if windows {
+            // The host lists no share either (`canon::expand_alternatives`).
+            match winpath::canonical(raw, cwd, &self.vars) {
+                Some(c) if !c.starts_with("//") => c,
+                _ => return JudgeOutcome::Clean,
+            }
+        } else {
+            match lexical_form(raw, cwd, &self.vars) {
+                Some(p) => p.to_string_lossy().into_owned(),
+                None => return JudgeOutcome::Clean,
+            }
+        };
+        let Some(glob) = globlap::shell_pattern(&abs, windows) else {
+            return JudgeOutcome::Clean;
+        };
+        let nocase = PATHS_CASE_INSENSITIVE || windows;
+        // A witness that falls into a carve-out proves nothing about the
+        // glob's other matches: then the next is tried, with each star taking
+        // a character and other choices of character (`globlap::filled`,
+        // `rot`). A rule passes only when every witness is carved out.
+        let full = globlap::filled(&glob);
+        let variants = [
+            (&glob, 0),
+            (&full, 0),
+            (&glob, 1),
+            (&full, 1),
+            (&glob, 2),
+            (&full, 2),
+        ];
+        for (rule_access, rule) in self.deny_globs() {
+            if !rule_access.covers(access) {
+                continue;
+            }
+            for (g, rot) in variants {
+                if self.over_budget(start) {
+                    return JudgeOutcome::TimedOut;
+                }
+                let Some(comps) = globlap::witness(g, rule, dots, nocase, rot) else {
+                    continue;
+                };
+                let path = if windows {
+                    let p = comps.join("/");
+                    if comps.len() == 1 {
+                        format!("{p}/")
+                    } else {
+                        p
+                    }
+                } else {
+                    format!("/{}", comps.join("/"))
+                };
+                match self.judge_path(access, Path::new(&path), start) {
+                    JudgeOutcome::Decided(Decision::Deny {
+                        pack,
+                        pattern,
+                        reason,
+                        via_inline,
+                    }) => {
+                        let suffix = format!(" ({}: {path})", access.label());
+                        let base = reason.strip_suffix(&suffix).unwrap_or(&reason);
+                        return JudgeOutcome::Decided(Decision::Deny {
+                            pack,
+                            pattern,
+                            reason: format!(
+                                "{base} ({}: the glob {raw} may match such a path, and the \
+                                 saiife service judges without listing files)",
+                                access.label()
+                            ),
+                            via_inline,
+                        });
+                    }
+                    JudgeOutcome::TimedOut => return JudgeOutcome::TimedOut,
+                    // Carved out: try the next witness.
+                    JudgeOutcome::Decided(_) => {}
+                    // No rule matches it (it matches `rule`, so not expected).
+                    JudgeOutcome::Clean => break,
+                }
+            }
+        }
+        JudgeOutcome::Clean
+    }
+
+    /// `lexical_glob` for a file tool's path pattern (a search tool's
+    /// filter, `read_many_files`): a deny under `FsView::Lexical` when a
+    /// path `pattern` may match is denied; `None` otherwise (out of budget
+    /// included), and always under `Host`, which expands the pattern instead.
+    pub fn lexical_glob_deny(&self, access: Access, pattern: &str) -> Option<Decision> {
+        self.path_rules();
+        match self.lexical_glob(access, pattern, None, false, Instant::now()) {
+            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn deny_globs(&self) -> &[(RuleAccess, globlap::Pattern)] {
+        self.deny_globs.get_or_init(|| {
+            let fold = self.vars.style() == PathStyle::Windows;
+            self.packs
+                .iter()
+                .flat_map(|p| &p.deny_path)
+                .flat_map(|r| {
+                    crate::pathrule::bound_texts(&r.glob, &self.vars, r.ancestors)
+                        .into_iter()
+                        .map(|t| (r.access, globlap::rule_pattern(&t, fold)))
+                })
+                .collect()
+        })
     }
 
     /// Override the latency budget (mainly for tests).
@@ -607,6 +739,7 @@ impl Engine {
             env_changed: false,
             ifs_named: false,
             null_redirect_discards: undecided && !names_null(raw_cmd),
+            saiife_vars: SaiifeVars::default(),
         };
         let clock = Clock {
             start,
@@ -816,6 +949,11 @@ impl Engine {
         // the engine reasons about the *effective* command, not the
         // wrapper, so packs never need to know these wrappers exist.
         let effective = unwrap_transparent_prefix(seg);
+        // Noted before the phases below, which may end this segment early: a
+        // bare `x=$(which saiife)` is one.
+        if cx.dialect == Dialect::Posix {
+            state.saiife_vars.note(seg);
+        }
         // Both phases read a word's text as POSIX. The readers already made
         // segments of what a `$(…)` holds, and noted what they could not read.
         if cx.dialect == Dialect::Posix {
@@ -886,6 +1024,23 @@ impl Engine {
             );
             if let Some(d) = found.nested(nested) {
                 return Some(d);
+            }
+        }
+        // `$(which saiife) init --off`, `"$SAIIFE_BIN" init --off`,
+        // `x=$(which saiife); $x init --off`: the command word may expand to
+        // saiife, so it is judged as `saiife` as well. Only a deny (or the
+        // budget running out) comes of it; the segment is judged as written below.
+        if let Some(alt) =
+            saiife_named_command(seg, cx.dialect == Dialect::Posix, &state.saiife_vars)
+        {
+            let effective = unwrap_transparent_prefix(&alt);
+            let mut alt_state = state.clone();
+            let mut alt_found = Findings::default();
+            if let Some(d) = self.judge_command(&alt, effective, cx, &mut alt_state, &mut alt_found)
+            {
+                if d.is_deny() || is_timed_out(&d) {
+                    return Some(d);
+                }
             }
         }
         if let Some(without) = &without {
@@ -1790,6 +1945,11 @@ impl Engine {
                     return timed_out();
                 }
                 let words = if op.glob {
+                    match self.lexical_glob(op.access, &op.path, *cwd, op.dots, start) {
+                        JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                        JudgeOutcome::TimedOut => return timed_out(),
+                        _ => {}
+                    }
                     match expand_operand_glob_dots(&op.path, *cwd, &self.vars, op.dots) {
                         GlobExpansion::Matches(m) if !m.is_empty() => m
                             .into_iter()
@@ -1886,7 +2046,8 @@ impl Engine {
         }
         let seg = winpath::path_words(seg, &self.vars);
         let effective = winpath::path_words(effective, &self.vars);
-        let mut ops = operands(&seg, &effective, &self.path_argv(argv, &effective));
+        let windows = self.vars.style() == PathStyle::Windows;
+        let mut ops = operands_in(&seg, &effective, &self.path_argv(argv, &effective), windows);
         ops.extend(extra);
         ops
     }
@@ -2235,7 +2396,8 @@ impl Engine {
         self.path_rules();
         let argv = crate::normalize::build_argv(seg);
         let seg = winpath::path_words(seg, &self.vars);
-        let ops = operands(&seg, &seg, &self.path_argv(&argv, &seg));
+        let windows = self.vars.style() == PathStyle::Windows;
+        let ops = operands_in(&seg, &seg, &self.path_argv(&argv, &seg), windows);
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
         self.judge_operands(ops, &cwds, false, Instant::now(), false)
     }
@@ -2923,6 +3085,67 @@ fn without_leading_empty_expansions(seg: &[Word]) -> Option<Vec<Word>> {
     removed.then_some(kept)
 }
 
+/// `seg` with its command word read as `saiife`, if that word may expand to
+/// saiife (`saiife_named_word`). Wrappers and assignments in front are
+/// peeled as `effective_command` does; under POSIX, words in front that may
+/// expand to nothing are dropped and the next one is tried
+/// (`$(true) env $(which saiife) init --off`). Bounded: each step consumes a
+/// word.
+fn saiife_named_command(seg: &[Word], posix: bool, vars: &SaiifeVars) -> Option<Vec<Word>> {
+    let mut kept: Vec<Word> = Vec::new();
+    let mut cursor = seg;
+    loop {
+        #[cfg(test)]
+        crate::work::add(1);
+        let rest = effective_command(cursor);
+        kept.extend_from_slice(&cursor[..cursor.len() - rest.len()]);
+        let (first, after) = rest.split_first()?;
+        if saiife_named_word(first, vars) {
+            kept.push(Word {
+                text: "saiife".to_string(),
+                behind_reserved: first.behind_reserved,
+                ..Word::default()
+            });
+            kept.extend_from_slice(after);
+            return Some(kept);
+        }
+        if !posix || !may_expand_to_nothing(first) {
+            return None;
+        }
+        cursor = after;
+    }
+}
+
+/// A word the shell expands (a substitution, or a `$` not in single quotes)
+/// whose text names saiife (`$(which saiife)`, `$SAIIFE_BIN`), or that
+/// expands a variable set to such a value. Its value may be saiife's path.
+fn saiife_named_word(w: &Word, vars: &SaiifeVars) -> bool {
+    if w.redirect || w.assignment {
+        return false;
+    }
+    let expands = w.has_substitution || (w.text.contains('$') && !w.literal_dollars);
+    expands && (names_saiife(&w.text) || vars.expanded_in(&w.text))
+}
+
+fn names_saiife(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("saiife")
+}
+
+/// The names of the `$NAME` and `${NAME…}` parameters in `text` (`${!NAME}`
+/// gives `NAME` as well).
+fn parameter_names(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices('$').filter_map(move |(at, _)| {
+        let rest = &text[at + 1..];
+        let rest = rest
+            .strip_prefix('{')
+            .map_or(rest, |r| r.strip_prefix('!').unwrap_or(r));
+        let len = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        (len > 0).then(|| &rest[..len])
+    })
+}
+
 /// The last of `words` that is more than an assignment, a redirection with
 /// its target, or a word that may expand to nothing.
 fn last_command_word(words: &[Word]) -> Option<usize> {
@@ -3076,6 +3299,58 @@ struct ShellState {
     ifs_named: bool,
     /// `> $null` discards under a POSIX reading (`null_device_words`).
     null_redirect_discards: bool,
+    /// The variables an earlier segment set to a value that may name saiife
+    /// (`x=$(which saiife)`): `$x` as the command may run it.
+    saiife_vars: SaiifeVars,
+}
+
+/// The names in `ShellState::saiife_vars`, up to `MAX_SAIIFE_VARS`. Past
+/// that, every expansion in command position counts as naming saiife.
+#[derive(Clone, Default)]
+struct SaiifeVars {
+    names: Vec<String>,
+    overflow: bool,
+}
+
+const MAX_SAIIFE_VARS: usize = 32;
+
+impl SaiifeVars {
+    /// Does `text` (an assignment's value or a command word) expand a
+    /// variable held here?
+    fn expanded_in(&self, text: &str) -> bool {
+        if self.names.is_empty() && !self.overflow {
+            return false;
+        }
+        parameter_names(text).any(|n| self.overflow || self.names.iter().any(|v| v == n))
+    }
+
+    /// Note each `NAME=value` word of `seg` (in front of a command, or an
+    /// argument of `export`, `local`, …) whose value may name saiife.
+    fn note(&mut self, seg: &[Word]) {
+        for w in seg {
+            let Some((name, value)) = w.text.split_once('=') else {
+                continue;
+            };
+            let name = name.strip_suffix('+').unwrap_or(name);
+            let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid || !names_saiife(value) && !self.expanded_in(value) {
+                continue;
+            }
+            if self.names.iter().any(|v| v == name) {
+                continue;
+            }
+            if self.names.len() >= MAX_SAIIFE_VARS {
+                self.overflow = true;
+            } else {
+                self.names.push(name.to_string());
+            }
+        }
+    }
+
+    fn weight(&self) -> usize {
+        self.names.iter().map(String::len).sum()
+    }
 }
 
 impl ShellState {
@@ -3083,7 +3358,7 @@ impl ShellState {
     /// words themselves, in bytes.
     fn weight(&self) -> usize {
         let dirs: usize = self.cwds.iter().map(|c| c.as_os_str().len()).sum();
-        dirs + self.rule_cwd.weight()
+        dirs + self.rule_cwd.weight() + self.saiife_vars.weight()
     }
 }
 

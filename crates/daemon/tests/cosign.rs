@@ -458,25 +458,61 @@ async fn get_404() {
     assert_eq!(a.status, 404, "{a:?}");
 }
 
+/// Parallel sessions of one user: a burst over the uid's in-flight share
+/// and over the global cap waits for a slot, and every honest call is let
+/// through (each over the cap was answered `503` before, which Claude Code
+/// blocks through `onFailure`).
 #[tokio::test]
-async fn inflight_cap_answers_503() {
-    // The global cap, with one uid's share as large as it.
+async fn a_burst_over_the_caps_waits_and_is_let_through() {
+    let d = daemon(Some(Opts::default())).await;
+    let addr = d.addr.unwrap();
+    let n = cosign::MAX_INFLIGHT + cosign::MAX_INFLIGHT_PER_UID;
+    let bodies: Vec<String> = (0..n)
+        .map(|i| payload(&format!("toolu_b{i}"), "ls"))
+        .collect();
+    let asked: Vec<_> = bodies
+        .iter()
+        .map(|p| tokio::spawn(post(addr, p.clone())))
+        .collect();
+    // Each call's hook reports its allow while the co-sign requests wait.
+    for p in &bodies {
+        let mut h = Client::hook(&d.sock, p).await;
+        h.verdict(DecisionKind::Allow, "ls").await;
+    }
+    for a in asked {
+        assert_no_opinion(&a.await.unwrap());
+    }
+    assert!(records(&d.audit, "cosign_denied").is_empty());
+}
+
+/// A call that finds no free slot within its wait is answered `503`, and
+/// waits no longer than that.
+#[tokio::test]
+async fn inflight_cap_answers_503_after_the_wait() {
+    // The global cap, with one uid's share as large as it, held by slow
+    // bodies (they outlast the wait).
+    let wait = Duration::from_millis(500);
     let d = daemon(Some(Opts {
-        wait: Duration::from_secs(3),
+        wait,
         max_inflight_per_uid: cosign::MAX_INFLIGHT,
         ..Opts::default()
     }))
     .await;
     let addr = d.addr.unwrap();
-    let held: Vec<_> = (0..16)
-        .map(|n| tokio::spawn(post(addr, payload(&format!("toolu_h{n}"), "ls"))))
-        .collect();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let head = "POST /v1/cosign/claude HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"a\":";
+    let mut held = Vec::new();
+    for _ in 0..cosign::MAX_INFLIGHT {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        held.push(s);
+    }
+    // As the slow-body flood test below: the held requests take their slots.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let start = Instant::now();
     let a = post(addr, payload("toolu_17", "ls")).await;
     assert_eq!(a.status, 503, "{a:?}");
-    for h in held {
-        assert_deny(&h.await.unwrap(), CosignDeny::NoReport);
-    }
+    assert!(start.elapsed() >= wait, "{:?}", start.elapsed());
+    drop(held);
 }
 
 #[tokio::test]
@@ -496,6 +532,34 @@ async fn oversize_body_denied() {
     assert_deny(&a, CosignDeny::TooLarge);
     let got = wait_records(&d.audit, "cosign_denied", 1).await;
     assert_eq!(got[0].reason.as_deref(), Some(CosignDeny::TooLarge.text()));
+}
+
+/// Follow-up of PR #29: over the cap, a cut inside a multibyte character and a
+/// tool name past the cap (either spelling) are denied as too large too: the
+/// co-signer never parses a body it did not read whole.
+#[tokio::test]
+async fn oversize_body_denied_wherever_its_tool_is() {
+    let d = daemon(Some(Opts {
+        max_body: 1024,
+        ..Opts::default()
+    }))
+    .await;
+    let head = r#"{"session_id":"c-1","tool_use_id":"toolu_10","tool_input":{"command":""#;
+    let cut = format!(
+        "{head}{}{}\"}},\"tool_name\":\"Bash\"}}",
+        "a".repeat(1024 - head.len()),
+        "é".repeat(64)
+    );
+    assert_eq!(cut.as_bytes()[1024], 0xC3, "the cut is inside a character");
+    let camel = format!(r#"{head}{}"}},"toolName":"Bash"}}"#, "a".repeat(2048));
+    for body in [cut, camel] {
+        let a = post(d.addr.unwrap(), body.clone()).await;
+        assert_deny(&a, CosignDeny::TooLarge);
+        let chunked = "POST /v1/cosign/claude HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n";
+        let framed = format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+        let a = raw(d.addr.unwrap(), chunked, framed.as_bytes()).await;
+        assert_deny(&a, CosignDeny::TooLarge);
+    }
 }
 
 /// A port held by another socket: one record, status shows the error for
@@ -632,11 +696,14 @@ async fn slow_body_flood_from_one_uid_does_not_block_another() {
         s.bind(SocketAddr::from((src, 0))).unwrap();
         s.connect(addr).await.unwrap()
     }
+    // Shorter than the slow bodies' read timeout.
+    let wait = Duration::from_secs(1);
     let d = daemon(Some(Opts {
         peer_uid: Some(|peer| match peer.ip() {
             std::net::IpAddr::V4(ip) => Some(10_000 + u32::from(ip.octets()[3])),
             std::net::IpAddr::V6(_) => None,
         }),
+        wait,
         ..Opts::default()
     }))
     .await;
@@ -649,8 +716,9 @@ async fn slow_body_flood_from_one_uid_does_not_block_another() {
         s.write_all(head.as_bytes()).await.unwrap();
         flood.push(s);
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    // Those over its own share were answered 503 already.
+    tokio::time::sleep(Duration::from_millis(300) + wait).await;
+    // Those over its own share waited for a slot of that share (holding
+    // none of the global cap), and were answered 503 at the end of the wait.
     let mut busy = 0;
     for s in &mut flood {
         let mut out = Vec::new();

@@ -883,7 +883,7 @@ mod tests {
     fn allow_fixture_allows() {
         let s = Setup::new("");
         let pool = s.pool(&TestLaunch::new(vec![]), Limits::default());
-        assert_eq!(pool.workers(), 2);
+        assert_eq!(pool.workers(), REJUDGE_POOL);
         assert_eq!(
             ask(&pool, 4242, &fixture("bash-allow.json")),
             RejudgeAnswer::Allow
@@ -1084,32 +1084,72 @@ mod tests {
         assert_eq!(ask(&pool, 4242, &payload), RejudgeAnswer::Allow);
     }
 
-    /// One principal never holds more than its share: its second call waits
-    /// while another user's is judged at once.
+    /// Waits until `cond` holds of the pool's state. The bound only stops a
+    /// hung test; it is never a test of speed.
+    fn wait_for_state(pool: &Pool, cond: impl Fn(&State) -> bool) {
+        let guard = Instant::now() + Duration::from_secs(120);
+        while !cond(&pool.lock()) {
+            assert!(Instant::now() < guard, "the pool never got there");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// One principal's calls are judged `REJUDGE_PER_PRINCIPAL` at once
+    /// (parallel sessions of one user are not serialized), and never on
+    /// every worker: another user's call is judged while they run, and the
+    /// principal's next call waits for its own share.
     #[test]
-    fn one_principal_cannot_take_every_worker() {
+    fn one_principal_takes_its_share_and_no_more() {
         let s = Setup::new("");
-        let launch = TestLaunch::new(vec![(0, "hang"), (1, "hang")]);
-        let pool = Arc::new(s.pool(&launch, Limits::default()));
+        // Workers are taken last started first: the three taken first hang.
+        let launch = TestLaunch::new(vec![(1, "hang"), (2, "hang"), (3, "hang")]);
+        // The hung calls hold their workers to their deadline: long enough
+        // for the checks below on a loaded host.
+        let hold = Duration::from_secs(8);
+        let limits = Limits {
+            timeout: hold,
+            ..Limits::default()
+        };
+        let pool = Arc::new(s.pool(&launch, limits));
+        assert_eq!(pool.workers(), REJUDGE_POOL);
         let payload = fixture("bash-allow.json");
-        let hung = {
-            let (pool, payload) = (pool.clone(), payload.clone());
+        let hung: Vec<_> = (0..REJUDGE_PER_PRINCIPAL)
+            .map(|_| {
+                let (pool, payload) = (pool.clone(), payload.clone());
+                std::thread::spawn(move || ask_by(&pool, 4242, &payload, Instant::now() + hold))
+            })
+            .collect();
+        // All of uid 4242's calls are judged at once.
+        wait_for_state(&pool, |st| {
+            st.busy.get(&Principal::Uid(4242)) == Some(&REJUDGE_PER_PRINCIPAL)
+        });
+        // Another user's call still finds a worker.
+        assert_eq!(ask(&pool, 4343, &payload), RejudgeAnswer::Allow);
+        // Uid 4242's next call waits for its share, not for a free worker.
+        let cancel = Cancel::new();
+        let next = {
+            let (pool, payload, cancel) = (pool.clone(), payload.clone(), cancel.clone());
             std::thread::spawn(move || {
-                ask_by(
-                    &pool,
-                    4242,
-                    &payload,
-                    Instant::now() + Duration::from_secs(2),
-                )
+                pool.judge(RejudgeRequest {
+                    payload: Bytes::from(payload),
+                    principal: Principal::Uid(4242),
+                    groups: Vec::new(),
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    cancel,
+                })
             })
         };
-        std::thread::sleep(Duration::from_millis(200));
-        // Uid 4242's second call finds its share taken, and waits to its deadline.
-        let start = Instant::now();
-        let second = ask_by(&pool, 4242, &payload, start + Duration::from_millis(300));
-        assert!(matches!(second, RejudgeAnswer::Failed(ref w) if w.contains("in time")));
-        assert!(start.elapsed() >= Duration::from_millis(300));
-        assert!(matches!(hung.join().unwrap(), RejudgeAnswer::Failed(_)));
+        wait_for_state(&pool, |st| st.waiting == 1);
+        {
+            let st = pool.lock();
+            assert!(!st.idle.is_empty(), "a worker is free all the same");
+            assert_eq!(st.busy[&Principal::Uid(4242)], REJUDGE_PER_PRINCIPAL);
+        }
+        cancel.cancel();
+        assert_eq!(next.join().unwrap(), RejudgeAnswer::Failed(GONE.into()));
+        for h in hung {
+            assert!(matches!(h.join().unwrap(), RejudgeAnswer::Failed(_)));
+        }
     }
 
     /// Whole-branch review, F1: a full queue fails before any work is done
@@ -1223,6 +1263,118 @@ mod tests {
         ));
     }
 
+    /// What one burst of `n` calls of one principal got: each allowed
+    /// call's time from its start to its answer, and the calls refused.
+    struct Burst {
+        took: Vec<Duration>,
+        refused: Vec<RejudgeAnswer>,
+    }
+
+    /// `n` calls of uid 4242 at once (a barrier), each with the co-signer's
+    /// own deadline, `REJUDGE_TIMEOUT` from its start.
+    fn burst(pool: &Arc<Pool>, n: usize, payload: &str) -> Burst {
+        let gate = Arc::new(std::sync::Barrier::new(n));
+        let calls: Vec<_> = (0..n)
+            .map(|_| {
+                let (pool, gate, payload) = (pool.clone(), gate.clone(), payload.to_string());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let start = Instant::now();
+                    let answer = ask_by(&pool, 4242, &payload, start + REJUDGE_TIMEOUT);
+                    (start.elapsed(), answer)
+                })
+            })
+            .collect();
+        let mut out = Burst {
+            took: Vec::new(),
+            refused: Vec::new(),
+        };
+        for c in calls {
+            let (took, answer) = c.join().unwrap();
+            if answer == RejudgeAnswer::Allow {
+                out.took.push(took);
+            } else {
+                out.refused.push(answer);
+            }
+        }
+        out
+    }
+
+    fn pct(sorted: &[Duration], p: usize) -> Duration {
+        sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
+    }
+
+    /// The numbers behind the pool's bounds: bursts of `n` calls of one
+    /// principal (parallel Claude Code sessions of one user), each allowed
+    /// call's wait over the median of a lone call, and the calls refused.
+    /// Prints, asserts nothing on the clock. `RJ_SIZES=4/3,2/1` names the
+    /// pool sizes (workers/per principal; default the fixed values). Run with
+    /// `cargo test -p saiife --bin saiife rejudge::tests::measure_bursts -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: prints the numbers, asserts nothing"]
+    fn measure_bursts() {
+        let s = Setup::new("");
+        let payload = fixture("bash-allow.json");
+        let rounds = 20;
+        let sizes: Vec<(usize, usize)> = std::env::var("RJ_SIZES")
+            .unwrap_or_else(|_| format!("{REJUDGE_POOL}/{REJUDGE_PER_PRINCIPAL}"))
+            .split(',')
+            .filter_map(|p| p.split_once('/'))
+            .map(|(w, p)| (w.parse().unwrap(), p.parse().unwrap()))
+            .collect();
+        for (workers, per_principal) in sizes {
+            let limits = Limits {
+                workers,
+                per_principal,
+                ..Limits::default()
+            };
+            let pool = Arc::new(s.pool(&TestLaunch::new(vec![]), limits));
+            // Warm: the config cache and every worker's first judgment.
+            for _ in 0..4 {
+                burst(&pool, workers, &payload);
+            }
+            let mut lone: Vec<Duration> = (0..rounds * 4)
+                .flat_map(|_| burst(&pool, 1, &payload).took)
+                .collect();
+            lone.sort();
+            let base = pct(&lone, 50);
+            println!(
+                "\nworkers {workers}, per principal {per_principal}, waiting {}: lone call p50 {base:.1?}, p95 {:.1?}",
+                limits.waiting,
+                pct(&lone, 95)
+            );
+            println!("| N | allowed | p50 wait | p95 wait | max wait | refused |");
+            println!("|---|---|---|---|---|---|");
+            for n in [1, 4, 8, 16, 32, 48, 64, 96] {
+                let mut wait = Vec::new();
+                let mut refused = Vec::new();
+                for _ in 0..rounds {
+                    let b = burst(&pool, n, &payload);
+                    wait.extend(b.took.iter().map(|t| t.saturating_sub(base)));
+                    refused.extend(b.refused);
+                }
+                wait.sort();
+                let mut why: Vec<String> = refused
+                    .iter()
+                    .map(|a| match a {
+                        RejudgeAnswer::Failed(w) => w.clone(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect();
+                why.sort();
+                why.dedup();
+                println!(
+                    "| {n} | {} | {:.1?} | {:.1?} | {:.1?} | {} {why:?} |",
+                    wait.len(),
+                    pct(&wait, 50),
+                    pct(&wait, 95),
+                    wait[wait.len() - 1],
+                    refused.len(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_service_launcher_clears_the_environment() {
         let cmd = serve_command(Path::new("/x/saiife"));
@@ -1233,5 +1385,115 @@ mod tests {
             .filter(|(k, v)| v.is_some() && *k != "SAIIFE_EVAL_FAULT")
             .collect();
         assert!(set.is_empty(), "{set:?}");
+    }
+
+    /// The hook judges with `PATH=/usr/bin:/bin` (`check_managed::account_env`), the
+    /// re-judgment with no `PATH` at all. The only thing read from `PATH` is the
+    /// `saiife` on it, an extra `$SAIIFE_BIN` value (`paths::path_vars_locked_env`): the
+    /// guard expands no `$PATH` in a command and looks no command name up, so
+    /// `command -v`, `which` and `$PATH` judge the same, and a write to the binary
+    /// both judges run is denied by both. The hook can only deny more (a `saiife`
+    /// on its `PATH` that is another file), never allow more, so the co-signer
+    /// never denies an honest call the hook allowed.
+    #[test]
+    fn path_does_not_split_the_hook_and_the_rejudgment() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Setup::new("");
+        let pool = s.pool(&TestLaunch::new(vec![]), one());
+        // Another `saiife` the hook's `PATH` could find first.
+        let bin = s.dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let other = bin.join("saiife");
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let other = other.display().to_string();
+        // Both judges run in one binary, as the hook and the service do in
+        // locked mode (`/opt/saiife/bin/saiife`).
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let prepare = |command: &str| {
+            pool.prepare(&RejudgeRequest {
+                payload: Bytes::from(bash("/home/other/app", command)),
+                principal: Principal::Uid(4242),
+                groups: Vec::new(),
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancel: Cancel::new(),
+            })
+            .unwrap()
+        };
+        let verdict = |req: &EvalRequest| eval::answer(req, None).verdict;
+        // The hook's request: the re-judgment's, with `PATH` added.
+        let with_path = |command: &str, path: &str, view: View| {
+            let mut req = prepare(command);
+            let vars = req.vars.as_mut().unwrap();
+            assert!(vars.iter().all(|(k, _)| k != "PATH"), "{vars:?}");
+            vars.push(("PATH".into(), path.into()));
+            req.view = view;
+            req
+        };
+        let system = "/usr/bin:/bin".to_string();
+        let shadowed = format!("{}:/usr/bin:/bin", bin.display());
+        // (command, the verdict both judges give)
+        let same: Vec<(String, Verdict)> = [
+            ("saiife status", Verdict::Allow),
+            ("saiife audit verify", Verdict::Allow),
+            (&format!("{exe} status"), Verdict::Allow),
+            ("/opt/saiife/bin/saiife status", Verdict::Allow),
+            ("command -v saiife", Verdict::Allow),
+            ("which saiife", Verdict::Allow),
+            ("type -p saiife", Verdict::Allow),
+            ("echo $PATH", Verdict::Allow),
+            ("printenv PATH", Verdict::Allow),
+            ("ls $(dirname $(command -v saiife))", Verdict::Allow),
+            ("export PATH=$PATH:/home/other/.local/bin", Verdict::Allow),
+            ("PATH=$PATH:/home/other/bin cargo build", Verdict::Allow),
+            ("$(command -v saiife) status", Verdict::Allow),
+            ("saiife init --off", Verdict::Deny),
+            ("/opt/saiife/bin/saiife init --off", Verdict::Deny),
+            ("/usr/bin/saiife init --off", Verdict::Deny),
+            // A command word that may expand to saiife is judged as saiife
+            // by both (the same text, the same answer).
+            ("$(which saiife) init --off", Verdict::Deny),
+            ("PATH=/home/other/bin saiife status", Verdict::Deny),
+            ("PATH=$PATH claude", Verdict::Deny),
+            (&format!("rm {exe}"), Verdict::Deny),
+            (&format!("cp /home/other/x {exe}"), Verdict::Deny),
+        ]
+        .into_iter()
+        .map(|(c, v)| (c.to_string(), v))
+        .collect();
+        for (command, want) in &same {
+            let req = prepare(command);
+            assert_eq!(verdict(&req), *want, "re-judge: {command}");
+            for path in [&system, &shadowed] {
+                for view in [View::Lexical, View::Host] {
+                    let hook = with_path(command, path, view);
+                    assert_eq!(verdict(&hook), *want, "hook ({path}, {view:?}): {command}");
+                }
+            }
+        }
+        // The worker answers as judged here.
+        for (command, want) in same.iter().filter(|(c, _)| !c.contains(&exe)) {
+            let got = ask(&pool, 4242, &bash("/home/other/app", command));
+            let allowed = got == RejudgeAnswer::Allow;
+            assert_eq!(
+                allowed,
+                *want == Verdict::Allow,
+                "worker: {command}: {got:?}"
+            );
+        }
+        // Where `PATH` finds another `saiife`, only the hook guards it: the
+        // co-signed call is denied, the hook's own answer.
+        for command in [format!("rm {other}"), format!("cp /home/other/x {other}")] {
+            let req = prepare(&command);
+            assert_eq!(verdict(&req), Verdict::Allow, "re-judge: {command}");
+            let hook = with_path(&command, &shadowed, View::Lexical);
+            assert_eq!(verdict(&hook), Verdict::Deny, "hook: {command}");
+            let hook = with_path(&command, &system, View::Lexical);
+            assert_eq!(
+                verdict(&hook),
+                Verdict::Allow,
+                "hook, system PATH: {command}"
+            );
+        }
     }
 }

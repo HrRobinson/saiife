@@ -47,7 +47,10 @@
 //!                             # a signal or options is read both ways
 //! [[allow_path]] / [[deny_path]]
 //! glob = "~/.ssh/id_*"        # see `crate::pathrule`
-//! access = "read|write|any"
+//! access = "read|write|any|replace|content"
+//!                             # `replace`: a write that changes what the
+//!                             # file holds (not `chmod`/`chown`);
+//!                             # `content`: `read` and `replace`
 //! ancestors = true            # deny_path only: match the proper ancestors
 //!                             # of a variable-rooted, wildcard-free glob
 //!                             # (write access), e.g. `rm -rf ~/.local/share`
@@ -2317,7 +2320,13 @@ reason = "bad glob: dropped with a warning"
         let p = load_pack_str("<t>", ok, &mut w).expect("loads");
         assert!(w.is_empty(), "{w:?}");
         assert!(p.deny_path[0].ancestors);
+        let replace = ok.replace("\"write\"", "\"replace\"");
+        let p = load_pack_str("<t>", &replace, &mut w).expect("loads");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(p.deny_path[0].ancestors);
         for bad in [
+            "glob = \"$SAIIFE_DATA_DIR\"\naccess = \"content\"",
+            "glob = \"$SAIIFE_DATA_DIR\"\naccess = \"any\"",
             "glob = \"/etc/x\"\naccess = \"write\"",
             "glob = \"**/.env\"\naccess = \"write\"",
             "glob = \"$SAIIFE_DATA_DIR/*\"\naccess = \"write\"",

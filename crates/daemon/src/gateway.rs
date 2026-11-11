@@ -206,7 +206,7 @@ async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
         return;
     }
     // The control socket's open-connection caps, shared: idle HTTP
-    // connections count against the same 32 per uid.
+    // connections count against the same `MAX_CONNS_PER_UID` per uid.
     let _slot = match ctx.conns.try_open(peer.uid) {
         Ok(slot) => slot,
         Err(_) => {

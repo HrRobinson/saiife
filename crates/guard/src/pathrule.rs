@@ -27,14 +27,18 @@ use crate::winpath;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Read,
+    /// Creates, changes, replaces or removes it.
     Write,
+    /// Changes only its mode, owner or attributes (`chmod`, `chown`,
+    /// `chgrp`, `chattr`): a write to every rule but `replace` and `content`.
+    Attr,
 }
 
 impl Access {
     pub fn label(self) -> &'static str {
         match self {
             Access::Read => "read",
-            Access::Write => "write",
+            Access::Write | Access::Attr => "write",
         }
     }
 }
@@ -47,7 +51,9 @@ impl RuleAccess {
             (self, a),
             (RuleAccess::Any, _)
                 | (RuleAccess::Read, Access::Read)
-                | (RuleAccess::Write, Access::Write)
+                | (RuleAccess::Write, Access::Write | Access::Attr)
+                | (RuleAccess::Replace, Access::Write)
+                | (RuleAccess::Content, Access::Read | Access::Write)
         )
     }
 
@@ -56,6 +62,8 @@ impl RuleAccess {
             RuleAccess::Read => "read",
             RuleAccess::Write => "write",
             RuleAccess::Any => "any",
+            RuleAccess::Replace => "replace",
+            RuleAccess::Content => "content",
         }
     }
 }
@@ -157,7 +165,8 @@ pub fn validate_glob(glob: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check an `ancestors = true` rule: variable-rooted, wildcard-free, write.
+/// Check an `ancestors = true` rule: variable-rooted, wildcard-free, write
+/// or replace (a read of a parent, `ls ~`, is never denied by one).
 pub fn validate_ancestors(glob: &str, access: RuleAccess) -> Result<(), String> {
     validate_glob(glob)?;
     let (var, rest) = split_var(glob)?;
@@ -166,9 +175,9 @@ pub fn validate_ancestors(glob: &str, access: RuleAccess) -> Result<(), String> 
             "path glob {glob:?}: `ancestors = true` needs a variable-rooted glob without wildcards"
         ));
     }
-    if access != RuleAccess::Write {
+    if !matches!(access, RuleAccess::Write | RuleAccess::Replace) {
         return Err(format!(
-            "path glob {glob:?}: `ancestors = true` needs `access = \"write\"`"
+            "path glob {glob:?}: `ancestors = true` needs `access = \"write\"` or `\"replace\"`"
         ));
     }
     Ok(())
@@ -231,6 +240,46 @@ pub fn ancestors_source(
         "(?s)"
     };
     Ok(Some(format!("{flags}^(?:{})$", alts.join("|"))))
+}
+
+/// The globs `glob` stands for here, as text: its variable replaced by each
+/// of its values, as `glob_source` binds them (`ancestors_source`'s
+/// ancestors for an `ancestors` rule, `/` included). Empty when the variable
+/// has no value. For `globlap`, which compares them with a shell glob.
+pub(crate) fn bound_texts(glob: &str, vars: &PathVars, ancestors: bool) -> Vec<String> {
+    let Ok((var, rest)) = split_var(glob) else {
+        return Vec::new();
+    };
+    let windows = vars.style() == PathStyle::Windows;
+    let fulls: Vec<String> = match var {
+        None => vec![rest.to_string()],
+        Some(name) => vars
+            .values(name)
+            .into_iter()
+            .filter_map(|v| v.to_str())
+            .map(|v| {
+                let v = if windows {
+                    v.replace('\\', "/")
+                } else {
+                    v.to_string()
+                };
+                format!("{}{rest}", v.trim_end_matches('/'))
+            })
+            .collect(),
+    };
+    if !ancestors {
+        return fulls;
+    }
+    let mut out = Vec::new();
+    for full in fulls {
+        out.push("/".to_string());
+        for (i, c) in full.char_indices() {
+            if c == '/' && i > 0 {
+                out.push(full[..i].to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Translate a glob into an anchored regex over canonical paths, with its
@@ -606,6 +655,17 @@ mod tests {
         assert!(RuleAccess::Read.covers(Access::Read));
         assert!(!RuleAccess::Read.covers(Access::Write));
         assert!(!RuleAccess::Write.covers(Access::Read));
+        assert!(RuleAccess::Write.covers(Access::Attr));
+        assert!(RuleAccess::Any.covers(Access::Attr));
+        assert!(!RuleAccess::Read.covers(Access::Attr));
+        // `replace`: what the file holds, not its mode (`chmod 600 key`).
+        assert!(RuleAccess::Replace.covers(Access::Write));
+        assert!(!RuleAccess::Replace.covers(Access::Read));
+        assert!(!RuleAccess::Replace.covers(Access::Attr));
+        // `content`: `read` and `replace`.
+        assert!(RuleAccess::Content.covers(Access::Read));
+        assert!(RuleAccess::Content.covers(Access::Write));
+        assert!(!RuleAccess::Content.covers(Access::Attr));
     }
 
     // POSIX style reads `/home/u` through `std::path`, and a Windows host calls

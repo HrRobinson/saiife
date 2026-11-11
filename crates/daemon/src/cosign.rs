@@ -22,7 +22,9 @@
 //! connection and in-flight caps, so one user's flood leaves room for
 //! another's calls; on Windows each asking pid has its own share, and its
 //! `cosign_denied` records fold per pid and carry `asker_pid`. The global
-//! caps stay as the backstop.
+//! caps stay as the backstop. A request over an in-flight cap waits for a
+//! slot within [`COSIGN_WAIT`] before its body is read, and only then is
+//! refused: a burst of one user's parallel sessions is let through.
 
 use crate::hooks::{Bound, Principal, Waited};
 use crate::ops::{Ctx, VERSION};
@@ -46,7 +48,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 mod win;
@@ -61,16 +63,21 @@ pub const COSIGN_WAIT: Duration = Duration::from_secs(8);
 /// largest fixture, an `Edit`, is 325 bytes); at the global in-flight cap
 /// the bodies stay under 256 MiB.
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
-/// Requests in flight; one more is answered `503`.
+/// Requests in flight; one more waits for a slot within `COSIGN_WAIT`, then
+/// is answered `503`.
 pub const MAX_INFLIGHT: usize = 16;
 /// Requests in flight from one uid, where the uid is known; on Windows,
 /// from one pid ([`Asker::Process`]).
 pub const MAX_INFLIGHT_PER_UID: usize = 8;
 /// Open connections; one more is closed at once.
-pub const MAX_CONNS: usize = 64;
+pub const MAX_CONNS: usize = 128;
 /// Open connections from one uid, where the uid is known; on Windows, from
-/// one pid.
-pub const MAX_CONNS_PER_UID: usize = 32;
+/// one pid (owner's ruling, 2026-11-10: 48 parallel sessions of one user
+/// passed 32).
+pub const MAX_CONNS_PER_UID: usize = 64;
+// One asker's share leaves room for others, and holds its requests in flight.
+const _: () = assert!(MAX_CONNS_PER_UID < MAX_CONNS);
+const _: () = assert!(MAX_INFLIGHT_PER_UID <= MAX_CONNS_PER_UID);
 /// The longest session id a `cosign_denied` record keeps, in bytes
 /// (`hook.bind`'s own limit).
 pub const MAX_RECORDED_SESSION: usize = crate::sessions::MAX_SESSION_ID;
@@ -659,6 +666,8 @@ enum CapKey {
 #[derive(Debug, Default)]
 struct PerAsker {
     counts: Mutex<HashMap<CapKey, [usize; 2]>>,
+    /// Woken when a slot is given back ([`PerAsker::take_by`]).
+    freed: Notify,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -691,6 +700,29 @@ impl PerAsker {
             slot,
         })
     }
+
+    /// [`PerAsker::take`], waiting for a slot given back until `until`.
+    async fn take_by(
+        self: &Arc<Self>,
+        key: CapKey,
+        slot: Slot,
+        max: usize,
+        until: Instant,
+    ) -> Option<AskerSlot> {
+        loop {
+            // Registered before the check, so a slot given back between
+            // the check and the wait still wakes it.
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(s) = self.take(key, slot, max) {
+                return Some(s);
+            }
+            if tokio::time::timeout_at(until, freed).await.is_err() {
+                return self.take(key, slot, max);
+            }
+        }
+    }
 }
 
 impl Drop for AskerSlot {
@@ -702,6 +734,8 @@ impl Drop for AskerSlot {
                 m.remove(&self.key);
             }
         }
+        drop(m);
+        self.table.freed.notify_waiters();
     }
 }
 
@@ -934,18 +968,31 @@ async fn handle(
     if who == Asker::Unknown {
         return denied(ctx, CosignDeny::NoReport, &who, None).await;
     }
+    // Over a cap, a request waits for a slot (its asker's share first, then
+    // the global cap, first come first served) within its co-sign wait, and
+    // is answered `503` only once that ends: parallel sessions of one user
+    // burst past the shares. Its body is not read while it waits, so the
+    // caps still bound the bodies held; a closed connection ends the wait.
+    let until = arrival + opts.wait;
     let asker = match who.cap_key() {
         Some(k) => match lim
             .per_asker
-            .take(k, Slot::Inflight, opts.max_inflight_per_uid)
+            .take_by(k, Slot::Inflight, opts.max_inflight_per_uid, until)
+            .await
         {
             Some(g) => Some(g),
             None => return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n"),
         },
         None => None,
     };
-    let Ok(inflight) = Arc::clone(&lim.inflight).try_acquire_owned() else {
-        return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n");
+    let inflight = match Arc::clone(&lim.inflight).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            match tokio::time::timeout_at(until, Arc::clone(&lim.inflight).acquire_owned()).await {
+                Ok(Ok(p)) => p,
+                _ => return plain(StatusCode::SERVICE_UNAVAILABLE, "busy\n"),
+            }
+        }
     };
     let held = Held {
         _inflight: Some(inflight),
@@ -1497,7 +1544,8 @@ mod tests {
         assert_eq!(COSIGN_WAIT, Duration::from_secs(8));
         assert_eq!(MAX_INFLIGHT, 16);
         assert_eq!(MAX_INFLIGHT_PER_UID, 8);
-        assert_eq!(MAX_CONNS_PER_UID, 32);
+        assert_eq!(MAX_CONNS, 128);
+        assert_eq!(MAX_CONNS_PER_UID, 64);
         assert_eq!(Opts::default().max_body, 16 * 1024 * 1024);
         assert_eq!(MAX_RECORDED_SESSION, 128);
         assert_eq!(MAX_RECORDED_TOOL, 64);

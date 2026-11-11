@@ -721,9 +721,10 @@ fn an_oversize_write_is_still_judged() {
 }
 
 /// Past the parse cap nothing is parsed, but the first `tool_name` still says it is
-/// a shell line. A file tool past it stays what it was.
+/// a shell line. A file tool past it is denied too, in developer mode (owner's
+/// ruling, 2026-11-10).
 #[test]
-fn a_shell_line_past_the_parse_cap_is_denied_and_a_write_stays_open() {
+fn a_shell_line_and_a_write_past_the_parse_cap_are_denied() {
     let big = "a".repeat(65 * 1024 * 1024);
     let shell =
         format!(r#"{{"tool_name":"Bash","cwd":"/home/u/app","tool_input":{{"command":"{big}"}}}}"#);
@@ -735,8 +736,101 @@ fn a_shell_line_past_the_parse_cap_is_denied_and_a_write_stays_open() {
         r#"{{"tool_name":"Write","cwd":"/home/u/app","tool_input":{{"file_path":"/home/u/app/x","content":"{big}"}}}}"#
     );
     let (out, rec) = run_bytes("claude", write.as_bytes());
-    assert_eq!(out.code, 0);
-    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorDenied);
+    let reason = rec.reason.as_deref().unwrap_or("");
+    for said in [reason, out.stderr.as_str()] {
+        assert!(
+            said.contains("hook payload larger than 67108864 bytes; not judged"),
+            "{said}"
+        );
+    }
+}
+
+/// The parse cap (`PARSE_MAX_BYTES`).
+const PARSE_CAP: usize = 64 * 1024 * 1024;
+
+/// `head`, then `fill` repeated until the payload is past the parse cap, then
+/// `tail`. No `/home/u` in it, so its bytes reach the hook as built.
+fn past_the_cap(head: &str, fill: &str, tail: &str) -> Vec<u8> {
+    let n = (PARSE_CAP + 1024 - head.len()) / fill.len() + 1;
+    let mut b = Vec::with_capacity(head.len() + n * fill.len() + tail.len());
+    b.extend_from_slice(head.as_bytes());
+    for _ in 0..n {
+        b.extend_from_slice(fill.as_bytes());
+    }
+    b.extend_from_slice(tail.as_bytes());
+    b
+}
+
+/// Follow-up of PR #29: past the parse cap, a shell call whose cut lands inside a
+/// multibyte character, whose tool is spelled `toolName`, or whose tool name sits
+/// past the cap, is denied for every agent: what is not parsed is not allowed.
+#[test]
+fn past_the_parse_cap_an_unparsed_tool_fails_closed() {
+    for (agent, tool) in [
+        ("claude", "Bash"),
+        ("codex", "Bash"),
+        ("gemini", "run_shell_command"),
+    ] {
+        // The byte at the cap starts a two-byte character: the read ends inside it.
+        let head = format!(r#"{{"tool_name":"{tool}","tool_input":{{"command":""#);
+        let pad = "a".repeat(PARSE_CAP - head.len());
+        let cut = format!(r#"{head}{pad}{}"}}}}"#, "é".repeat(512)).into_bytes();
+        assert_eq!(cut[PARSE_CAP], 0xC3, "the cut is inside a character");
+        let named_late = past_the_cap(
+            r#"{"tool_input":{"command":""#,
+            "echo x; ",
+            &format!(r#""}},"tool_name":"{tool}"}}"#),
+        );
+        let camel = past_the_cap(
+            &format!(r#"{{"toolName":"{tool}","toolInput":{{"command":""#),
+            "echo x; ",
+            r#""}}"#,
+        );
+        for (case, stdin) in [("cut", cut), ("named late", named_late), ("camel", camel)] {
+            let (out, rec) = run_bytes(agent, &stdin);
+            assert_eq!(out.code, 2, "{agent} {case}: {}", out.stderr);
+            assert_eq!(rec.decision, DecisionKind::ErrorDenied, "{agent} {case}");
+            let reason = rec.reason.as_deref().unwrap_or("");
+            for said in [reason, out.stderr.as_str()] {
+                assert!(said.contains("not judged"), "{agent} {case}: {said}");
+                assert!(said.contains("67108864"), "{agent} {case}: {said}");
+            }
+        }
+    }
+    // A file tool named before the cap is denied too, however it is spelled
+    // (owner's ruling, 2026-11-10).
+    let camel_write = past_the_cap(
+        r#"{"toolName":"Write","toolInput":{"file_path":"/x","content":""#,
+        "aaaaaaaa",
+        r#""}}"#,
+    );
+    let (out, rec) = run_bytes("claude", &camel_write);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorDenied);
+}
+
+/// A short command in a payload over the shell limit is denied, but not told it is
+/// a long command.
+#[test]
+fn a_short_command_with_a_large_field_is_told_what_is_large() {
+    let stdin = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "junk": "a".repeat(300 * 1024),
+    })
+    .to_string();
+    let (out, rec) = run_bytes("claude", stdin.as_bytes());
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorDenied);
+    assert_eq!(rec.input, "ls");
+    let reason = rec.reason.as_deref().unwrap_or("");
+    for said in [reason, out.stderr.as_str()] {
+        assert!(!said.contains("shell command over"), "{said}");
+        assert!(said.contains("hook payload over 262144 bytes"), "{said}");
+        assert!(said.contains("not judged"), "{said}");
+    }
 }
 
 /// A broken payload stays as it was, small or large.

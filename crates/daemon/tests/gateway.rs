@@ -1174,7 +1174,7 @@ async fn walked_away_calls_keep_their_in_flight_slot() {
         .chain((0..15).map(|i| format!("s{i}")))
         .collect();
     // Each client sends a call to a hanging upstream and walks away once
-    // it is upstream (one at a time: the per-uid connection cap is 32).
+    // it is upstream (one at a time: the per-uid connection cap is 64).
     for i in 0..64 {
         let mut s = UnixStream::connect(&w.sock).await.unwrap();
         let req = format!(

@@ -164,6 +164,8 @@ fn path_rule(r: &RawPathRule) -> String {
         RuleAccess::Read => "RuleAccess::Read",
         RuleAccess::Write => "RuleAccess::Write",
         RuleAccess::Any => "RuleAccess::Any",
+        RuleAccess::Replace => "RuleAccess::Replace",
+        RuleAccess::Content => "RuleAccess::Content",
     };
     format!(
         "RawPathRule {{ platform: {}, glob: {}, access: {access}, reason: {}, \

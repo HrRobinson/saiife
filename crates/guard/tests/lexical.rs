@@ -146,9 +146,10 @@ fn lexical_windows_home_rules_still_deny() {
     });
 }
 
-/// A glob matches nothing, so it is judged as spelled: as the host judges it
-/// in a project where it matches nothing. (`cat .env*` with a `.env` on disk
-/// is the hook's to deny; the lexical view is never stricter, not as strict.)
+/// A glob the lexical view cannot expand is denied when a path it may expand
+/// to is one a rule denies, as the host denies it where such a file exists
+/// (`cat .e*` finds `.env`). Otherwise it is judged as spelled: as the host
+/// judges it in a project where it matches nothing.
 #[cfg(unix)]
 #[test]
 fn lexical_globs_are_judged_as_spelled() {
@@ -161,12 +162,7 @@ fn lexical_globs_are_judged_as_spelled() {
             .with_cwd(&empty)
             .with_var("HOME", &empty),
     );
-    let cmds = [
-        "cat .env*",
-        "cat *.txt",
-        "ls src/**/*.rs",
-        "cat ~/.ssh/id_*",
-    ];
+    let cmds = ["cat *.txt", "ls src/**/*.rs", "cat ~/.ssh/id_*.pub"];
     let host: Vec<bool> = cmds
         .iter()
         .map(|c| host_empty.evaluate(c).is_deny())
@@ -177,6 +173,189 @@ fn lexical_globs_are_judged_as_spelled() {
         let lexical: Vec<bool> = cmds.iter().map(|c| e.evaluate(c).is_deny()).collect();
         assert_eq!(lexical, host, "{cmds:?}");
         assert!(e.evaluate("cat .env").is_deny());
+        assert!(e.evaluate("cat .env*").is_deny());
+        assert!(e.evaluate("cat ~/.ssh/id_*").is_deny());
+        assert_eq!(fs_calls_made(), before);
+    });
+}
+
+/// The lexical gap (owner ruling 2026-11-09, "close it"): a glob whose
+/// spelling names no rule but which may expand to a secret. The host expands
+/// it on disk and denies; the lexical view now denies it too, with no file
+/// system call. A forged hook allow of these met the service's lexical allow.
+#[cfg(unix)]
+#[test]
+fn lexical_globs_that_may_match_a_secret_deny() {
+    let tree = Tree::new();
+    let gap = [
+        "cat .e*",
+        "cat ~/.aws/cred*",
+        "cat ~/.ssh/id_*",
+        "cat .[e]nv",
+        "cat ~/.s?h/id_rsa",
+        "head -n 3 ./.e?v",
+        "grep KEY .en*",
+        "cat ~/.*/credentials",
+        "cat src/../.e*",
+        "cp ~/.ssh/id_* /tmp/",
+        "cat .{e,x}*",
+        // `**` read as `*` (bash without globstar) still reaches the file.
+        "cat ~/.aws/**",
+    ];
+    let host = default_engine(tree.vars());
+    for cmd in gap {
+        assert!(host.evaluate(cmd).is_deny(), "host: {cmd}");
+    }
+    with_fs_view(FsView::Lexical, || {
+        let e = default_engine(tree.vars());
+        let before = fs_calls_made();
+        for cmd in gap {
+            let d = e.evaluate(cmd);
+            assert!(d.is_deny(), "lexical: {cmd}: {d:?}");
+        }
+        // Not on disk, so only the lexical view denies these.
+        // A first witness in a carve-out (`.env.example`, `id_rsa.pub`) is not
+        // the end: other matches (`.env.example#`, `id_rsa.pux`) are denied.
+        for cmd in [
+            "cat src/**/.env*",
+            "cat ~/.n*rc",
+            "cat ~/.config/gcl*/x.json",
+            "cat .e?v.example*",
+            "cat ~/.ssh/id_rsa.pu[bx]",
+        ] {
+            let d = e.evaluate(cmd);
+            assert!(d.is_deny(), "lexical: {cmd}: {d:?}");
+        }
+        let d = e.evaluate("cat .e*");
+        let saiifeguard::Decision::Deny { pack, reason, .. } = d else {
+            panic!("{d:?}")
+        };
+        assert_eq!(pack, "core.secrets");
+        assert!(
+            reason.contains("the glob") && reason.contains(".e*"),
+            "{reason}"
+        );
+        assert_eq!(fs_calls_made(), before);
+    });
+}
+
+/// What a glob cannot reach stays allowed: a wildcard skips a leading `.`
+/// as the shell's does, and an `allow_path` carve-out still applies (every
+/// match of `id_*.pub` is a public key). These are the honest calls the
+/// check must not block (a lexical deny blocks the call in locked mode).
+/// `head ./*.pem`: no built-in rule names `*.pem`, so the host allows it too.
+#[cfg(unix)]
+#[test]
+fn lexical_globs_that_cannot_match_a_secret_allow() {
+    let tree = Tree::new();
+    let fine = [
+        "ls *.rs",
+        "cat src/*.md",
+        "rm target/*.o",
+        "cat docs/*",
+        "cat *",
+        "wc -l src/**/*.rs",
+        "cat ~/.ssh/id_*.pub",
+        "cat ~/.ssh/*.pub",
+        "cat .e?v.exampl[e]",
+        "cat ~/**/credentials",
+        "cat ~/*.txt",
+        "head ./*.pem",
+        "cat [.]env",
+        "cat .e[!n]v",
+        "cat build/*/out.log",
+        "rm -rf build/*",
+    ];
+    // The host agrees, except on `cat *`: it finds `notes.txt`, a symlink to
+    // a secret, which the lexical view cannot see (A21).
+    let host = default_engine(tree.vars());
+    for cmd in fine.iter().filter(|c| **c != "cat *") {
+        assert!(!host.evaluate(cmd).is_deny(), "host: {cmd}");
+    }
+    with_fs_view(FsView::Lexical, || {
+        let e = default_engine(tree.vars());
+        for cmd in fine {
+            let d = e.evaluate(cmd);
+            assert!(!d.is_deny(), "lexical: {cmd}: {d:?}");
+        }
+    });
+}
+
+/// The check compares a glob with the rules in force, not with a fixed list:
+/// with a rule for `*.pem`, `head ./*.pem` may read one, and is denied.
+#[cfg(unix)]
+#[test]
+fn lexical_globs_meet_any_rule_in_force() {
+    let tree = Tree::new();
+    let mut warnings = Vec::new();
+    let pack = saiifeguard::pack::load_pack_str(
+        "<t>",
+        r#"
+[pack]
+id = "test.pem"
+
+[[deny_path]]
+glob = "**/*.pem"
+access = "read"
+reason = "keys"
+"#,
+        &mut warnings,
+    )
+    .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    with_fs_view(FsView::Lexical, || {
+        let e = Engine::new(vec![pack])
+            .with_budget(BUDGET)
+            .with_pattern_allowance(std::time::Duration::MAX)
+            .with_paths(tree.vars());
+        assert!(e.evaluate("head ./*.pem").is_deny());
+        assert!(e.evaluate("cat certs/s?rver.p*").is_deny());
+        assert!(!e.evaluate("head ./*.pem.txt").is_deny());
+        assert!(!e.evaluate("rm ./*.pem").is_deny(), "a read rule");
+    });
+}
+
+/// The Windows engine, on every host: names compare case-folded, and
+/// PowerShell's and cmd's wildcards match a leading `.`: `?` and `[…]` here
+/// too, and `*` for a name a rule spells out (`.env`, `.aws`), not for one it
+/// leaves open (`.env.*`, `.ssh/id_*`), or every `*.md` could be a
+/// `.env.md`. `Get-Content *.local` stays the hook's to deny (`globlap`).
+#[test]
+fn lexical_windows_globs_that_may_match_a_secret_deny() {
+    with_fs_view(FsView::Lexical, || {
+        let e = default_engine(corpus::windows_vars());
+        let before = fs_calls_made();
+        for (cmd, dialect) in [
+            (r"type %USERPROFILE%\.ssh\id_*", Dialect::Cmd),
+            (r"type .E*", Dialect::Cmd),
+            (
+                r"Get-Content $env:USERPROFILE\.aws\cred*",
+                Dialect::PowerShell,
+            ),
+            (r"Get-Content ?env", Dialect::PowerShell),
+            (r"Get-Content *env", Dialect::PowerShell),
+            (r"type %USERPROFILE%\*\credentials", Dialect::Cmd),
+            (r"Get-Content $env:USERPROFILE\.aws\**", Dialect::PowerShell),
+        ] {
+            let d = e.evaluate_in(cmd, Dialects::One(dialect));
+            assert!(d.is_deny(), "{cmd}: {d:?}");
+        }
+        // A bare `*` at the end ("everything here") stands for no dotfile.
+        for (cmd, dialect) in [
+            (r"type *", Dialect::Cmd),
+            (r"cd build && rm -rf *", Dialect::PowerShell),
+            (r"type src\*.md", Dialect::Cmd),
+            (r"Get-Content *.rs", Dialect::PowerShell),
+            (r"Get-Content src\**\*.ts", Dialect::PowerShell),
+            (r"Get-Content *.local", Dialect::PowerShell),
+            (
+                r"Get-Content $env:USERPROFILE\*\id_rsa",
+                Dialect::PowerShell,
+            ),
+        ] {
+            let d = e.evaluate_in(cmd, Dialects::One(dialect));
+            assert!(!d.is_deny(), "{cmd}: {d:?}");
+        }
         assert_eq!(fs_calls_made(), before);
     });
 }

@@ -18,16 +18,21 @@ pub use bytes::Bytes;
 use crate::hooks::Principal;
 
 /// Warm workers the pool keeps, in all.
-pub const REJUDGE_POOL: usize = 2;
+pub const REJUDGE_POOL: usize = 4;
 /// Requests one worker serves before it is replaced.
 pub const REJUDGE_MAX_USES: u32 = 500;
 /// The longest one request may take, as the hook's `WORKER_TIMEOUT`. The
 /// co-signer also keeps it inside `COSIGN_WAIT` from the request's arrival.
 pub const REJUDGE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Requests of one principal judged at once: one user never holds every
-/// worker, so another user's calls are still judged.
-pub const REJUDGE_PER_PRINCIPAL: usize = 1;
-/// Requests waiting for a worker, in all. One more is `Failed` at once.
+/// worker, so another user's calls are still judged. More than one, so the
+/// parallel sessions of one user are not judged one at a time (a burst of
+/// 8 calls waited 32 ms at p95 with 1 worker each, 10 ms with 3:
+/// `saiife::rejudge` `measure_bursts`).
+pub const REJUDGE_PER_PRINCIPAL: usize = 3;
+/// Requests waiting for a worker, in all. One more is `Failed` at once. At
+/// least the co-signer's `MAX_INFLIGHT`, so this never refuses a request
+/// the co-signer let in; it bounds the pool on its own.
 pub const REJUDGE_MAX_WAITING: usize = 32;
 
 /// One co-signed call to judge.
@@ -113,10 +118,15 @@ mod tests {
 
     // One principal never holds every worker.
     const _: () = assert!(REJUDGE_PER_PRINCIPAL < REJUDGE_POOL);
+    // The queue never refuses a request the co-signer let in: every
+    // request in flight there may wait here.
+    const _: () = assert!(REJUDGE_MAX_WAITING >= crate::cosign::MAX_INFLIGHT);
 
     #[test]
     fn the_fixed_values() {
-        assert_eq!(REJUDGE_POOL, 2);
+        assert_eq!(REJUDGE_POOL, 4);
+        assert_eq!(REJUDGE_PER_PRINCIPAL, 3);
+        assert_eq!(REJUDGE_MAX_WAITING, 32);
         assert_eq!(REJUDGE_MAX_USES, 500);
         assert_eq!(REJUDGE_TIMEOUT, Duration::from_secs(3));
         assert!(REJUDGE_TIMEOUT < crate::cosign::COSIGN_WAIT);

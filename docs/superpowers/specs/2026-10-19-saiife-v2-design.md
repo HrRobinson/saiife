@@ -427,7 +427,9 @@ Windows locked mode. What changed from the design while it was built:
   as an admin owner.
 - **Peers (W11, W12).** A pipe peer is an admin, uid 0, only at High integrity or above
   with no restricted SIDs; the same holds for a lowered SYSTEM token. The pipe has at
-  most 254 instances. Approver names and `[[scope]] users` match by SID;
+  most 254 instances, and one uid holds at most 64 of them (the control socket's
+  per-uid connection cap, `MAX_CONNS_PER_UID`), so three uids at the cap still
+  leave instances free. Approver names and `[[scope]] users` match by SID;
   `group:` approvers count by the token's groups only.
 - **Service (W10).** The restart action repeats for every failure past the third, so
   the restarts never run out.
@@ -844,6 +846,10 @@ applies and the engine is unchanged.
   ruling), `error_denied`, with a message telling the agent to split it, on any
   OS. Padding must not be a way past the guard. File tools are not affected, and
   a broken or unreadable stdin stays as it is.
+- **A hook payload over the parse cap (64 MiB) is denied in every mode**
+  (owner's ruling, 2026-11-10), `error_denied`, whatever tool it names: a huge
+  `Write` or `Edit` too, with "hook payload larger than 67108864 bytes; not
+  judged". Nothing past the cap is parsed, and what is not parsed is not allowed.
 - **Limits, written down** (as `cd` tracking is for POSIX in §10):
   aliases and functions defined in the same command (`Set-Alias`,
   `function f {…}`), `.ps1` script contents, .NET calls
@@ -1315,8 +1321,14 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     not tell who sent this call` (`AskerUnknown`).
   Only `POST /v1/cosign/claude` is served (else `404`). A request with an
   `Origin` header gets `403`, a `Content-Type` other than `application/json`
-  gets `415`, and more than 16 requests in flight get `503`. Each of these
-  blocks only the request it answers, through `onFailure`. Every deny except
+  gets `415`. A request over the in-flight caps (8 per uid, or per pid on
+  Windows, and 16 in all) waits for a slot, its asker's share first, before
+  its body is read, and gets `503` only when none is free within
+  `COSIGN_WAIT` from its arrival (since the re-judge concurrency review,
+  2026-11-10: ten or more parallel sessions of one user burst past 8). Open
+  connections are capped at 64 per uid (or per pid on Windows) and 128 in all
+  (owner's ruling, 2026-11-10; they were 32 and 64); one more is closed at once.
+  Each of these blocks only the request it answers, through `onFailure`. Every deny except
   `saiife denied this call` writes a `hook` record with `event:
   "cosign_denied"`, at most one per reason per 10 s, the next one carrying
   `suppressed: <n>`. The co-signer has no token: its answer can only take
@@ -1339,11 +1351,22 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     contents, and the project config's extra packs (A18 note). That is
     accepted: code of that user can change each of them after any judgment
     (A21), so they were never a boundary against it. The hook still judges
-    them and denies on its own. A move or copy target is judged both as
-    itself and as `target/name`, because the lexical view cannot tell a
-    folder from a file, and `-t`/`--target-directory` names a folder. One
-    corpus case is stricter than the hook, by owner ruling (`KNOWN_STRICTER`):
-    `cp review.md .claude`.
+    them and denies on its own. A glob is judged by what it may match: the
+    guard compares it with each `deny_path` pattern (`globlap`) and denies
+    when one path both match is denied, carve-outs applied, so `cat .e*` and
+    `cat ~/.ssh/id_*` are denied with no file on disk. A PowerShell or cmd
+    `*` is read as a leading dot only where the rule spells out the rest of
+    the path (`*env`, `*\credentials`), and never as a bare `*` that ends the
+    glob (`type *`), or every `*.md` could be a `.env.md` and every `rm -rf *`
+    a write onto a `.claude`. A glob's `**` stands for one folder a rule
+    names at most (bash without `globstar` reads it as `*`). When a witness
+    path falls into a carve-out, more are tried (stars filled, other class
+    members). A move or copy target is judged both
+    as itself and as `target/name`, because the lexical view cannot tell a
+    folder from a file, and `-t`/`--target-directory` names a folder. The
+    corpus cases stricter than the hook are accepted by name
+    (`KNOWN_STRICTER`): `cp review.md .claude`, and globs that may match a
+    protected path where the test's Windows engine has no file to find.
   - **As whom.** The principal is the asker (Linux, macOS: the socket's uid)
     or, on Windows, the SID and groups of the hook connection that bound the
     key, tied to the asker (§5.3a.2, W13). The path variables (`HOME`,
@@ -1360,13 +1383,16 @@ leftover project hooks, hard links in the tree, the members of `saiife-audit`).
     running as the service account (never root, never the agent user), with
     a cleared environment; on Windows in a kill-on-close job. They read
     length-prefixed `EvalRequest` frames (u32 big-endian, at most
-    `MAX_EVAL_BYTES`). Fixed values: `REJUDGE_POOL = 2` warm workers;
+    `MAX_EVAL_BYTES`). Fixed values: `REJUDGE_POOL = 4` warm workers;
     `REJUDGE_MAX_USES = 500` requests each, then replaced;
     `REJUDGE_TIMEOUT = 3 s` per request, always inside `COSIGN_WAIT` from
-    arrival; `REJUDGE_PER_PRINCIPAL = 1` request of one principal judged at
-    once, so one user never holds every worker; `REJUDGE_MAX_WAITING = 32`
-    requests waiting in all, and one more fails at once, before its request
-    is built. A request whose co-signed HTTP request is gone (answered, timed
+    arrival; `REJUDGE_PER_PRINCIPAL = 3` requests of one principal judged at
+    once, so one user never holds every worker and parallel sessions of one
+    user are not judged one at a time (2 and 1 before 2026-11-10: a burst of
+    8 calls waited 32 ms at p95, 10 ms with 4 and 3); `REJUDGE_MAX_WAITING = 32`
+    requests waiting in all (at least the co-signer's 16 in flight, so it
+    never refuses a request the co-signer let in), and one more fails at
+    once, before its request is built. A request whose co-signed HTTP request is gone (answered, timed
     out, or its connection closed) is cancelled: the pool checks before it
     builds the worker's request and while it waits for a worker, and gives
     up its place at once. The blocking work holds the HTTP request's
