@@ -41,10 +41,13 @@ pub const OP_POLICY_SHOW: &str = "policy.show";
 /// `{}` -> `{result: "loaded"}` or `{result: "rejected", reason}`.
 pub const OP_POLICY_RELOAD: &str = "policy.reload";
 /// Approval requests: approvers see all, a requester its own.
-/// `{states?: ["pending", ...], own?: bool}` -> `{items}`.
+/// `{states?: ["pending", ...], own?: bool}` -> `{items}`. An item's
+/// `touch_class` is the effective class (D8), as `approval.show` gives it.
 pub const OP_APPROVAL_LIST: &str = "approval.list";
 /// `{request}` -> `{item}` (the masked request). The id is `request`: a
-/// frame's `id` is its own.
+/// frame's `id` is its own. `touch_class`, when present, is the class a
+/// decision needs now: the stronger of the stored one and the current
+/// policy's (D8).
 pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// `{request, action: "approve"|"reject", note?, ack_truncated?, auth?}` ->
 /// `{request, state}`. `auth` (macOS) is the 64 lowercase hex characters
@@ -54,25 +57,120 @@ pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// approval is refused (`reauth_unavailable`); bad hex is `bad_request`.
 /// In this version the macOS daemon refuses every same-user approval
 /// (`reauth_unavailable`): its prompt cannot show which request it is.
-/// `touch` (an `Assertion` JSON, the signed answer of `touch.begin`) is
-/// optional: a request whose touch class needs one is refused without it
-/// (`touch_unavailable` / `touch_failed` / `touch_mismatch`), and the
-/// request stays pending.
+/// `touch` (an `Assertion` JSON: the device's answer to the `TouchRequest`
+/// of `touch.begin {purpose: "approve"}`) is optional. When approving needs
+/// a touch (the request's effective class, as `approval.show` gives it),
+/// it is checked before who may decide and before any re-authentication
+/// prompt: absent or null is refused (`touch_unavailable`, recorded) and
+/// not an `Assertion` is `bad_request`; neither spends the challenge. It is
+/// verified only after that: then the live challenge of the request is
+/// spent whatever the outcome, and only the decider's own devices count
+/// (D6). A failed verify is refused (`touch_failed` / `touch_mismatch` /
+/// `touch_unavailable`, recorded). The request stays pending on every
+/// refusal. A rejection or a withdrawal needs no touch.
 pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
-/// Starts a touch (plan 26). `{purpose: "approve", request} |
-/// {purpose: "enrol", label} | {purpose: "remove", credential} |
-/// {purpose: "test"}` -> a `TouchRequest` plus `{expires_at, class}`; for
-/// `enrol`, an `EnrolRequest` plus `{touch?: TouchRequest}` (the touch of an
-/// existing device, when the user has one). The challenge lives 300 s and is
-/// single use.
+/// Starts a touch (plan 26). Every challenge lives 300 s and is single use;
+/// a new `touch.begin` for the same purpose and target replaces the live
+/// one (per request for `approve`, shared by all approvers; per uid for the
+/// others). At most 32 are live, 4 per uid: over that is `busy`.
+///
+/// A `TouchRequest` is `{rp_id, challenge (hex), allow (base64url
+/// credential ids; empty: any device), uv, summary, short_code}`: what the
+/// client asks the device for.
+///
+/// - `{purpose: "approve", request}`: an approver (personal mode: the own
+///   user), for a pending request whose effective class needs a touch.
+///   Answers a `TouchRequest` (`allow`: the caller's own devices) plus
+///   `{expires_at, class}` (`class` is the effective touch class). A
+///   request id that is no u64, an unknown or invisible request, one not
+///   pending, or one that needs no touch is `bad_request`; no approver is
+///   `forbidden`; no device enrolled for the caller is refused
+///   (`touch_unavailable`, an `approval`/`refused` record); approvals
+///   unavailable is `unavailable`.
+/// - `{purpose: "enrol", label}`: answers an `EnrolRequest` `{rp_id,
+///   rp_name, user_id (base64url of the uid, 4 bytes big-endian),
+///   user_name, challenge (hex), exclude (base64url ids of every device
+///   enrolled on this machine)}` plus `{touch, approve_with?, expires_at}`.
+///   `touch` is the `TouchRequest` the *new* device answers (its `proof`,
+///   `allow` empty, `uv` true); `approve_with`, present only when the
+///   caller already has a device, is the `TouchRequest` one of those
+///   answers (its `approval`, `allow` its devices). All three carry the
+///   same challenge. A label that is no string or fails the label rules
+///   is `bad_request`.
+/// - `{purpose: "remove", credential}`: `credential` is the base64url id of
+///   one of the caller's own devices (else `bad_request`). Answers a
+///   `TouchRequest` (`allow`: all the caller's devices; the challenge names
+///   `credential`) plus `{expires_at}`; no `class`.
+/// - `{purpose: "test"}`: answers a `TouchRequest` (`allow`: the caller's
+///   devices) plus `{expires_at}`; no `class`. No device enrolled is
+///   refused (`touch_unavailable`, nothing recorded).
+///
+/// Every purpose but `approve` (and an unknown purpose, then
+/// `bad_request`) needs root, an `[admin] groups` member or an approver
+/// (personal mode: the own user), else `forbidden`, checked first.
+///
+/// Error rules of the touch ops: a refusal is `forbidden` with `rule` one
+/// of `touch_unavailable` (no device, no assertion sent, or the touch
+/// files cannot be written), `touch_failed` (no live challenge, expired,
+/// bad signature, no UV where needed, a replayed counter, malformed) or
+/// `touch_mismatch` (for another action, uid, device or origin, or a
+/// device not enrolled for the caller). A malformed argument is
+/// `bad_request` and spends no challenge. `touch.enrol` and
+/// `touch.remove` refusals after the argument checks write a `touch`
+/// record `{action: "touch_failed", op, rule, reason}`; `touch.check` and
+/// `touch.begin {purpose: "test"}` record nothing. Machine local only: a
+/// link transport must not route these ops.
 pub const OP_TOUCH_BEGIN: &str = "touch.begin";
-/// Finishes an enrolment (args and answer: plan 26, Task 9).
+/// Finishes an enrolment: `{label, auth_data, proof, approval?}`.
+/// `auth_data` is the base64url attestation authData of the new device
+/// (AT set); `proof` the new device's `Assertion` over the challenge
+/// (`touch` of the enrol answer; UV needed); `approval` an `Assertion` of
+/// one of the caller's own devices over the same challenge
+/// (`approve_with`), needed when the caller already has a device. The
+/// caller's live enrol challenge is spent in every case, and must name the
+/// same `label`. Answers `{id, label, approved_by}`: `id` the new base64url
+/// credential id, `approved_by` the approving device's base64url id or
+/// `"host"` (the first device: host access is the proof). A
+/// `touch_enrolled` record is written first; if it cannot be, the device
+/// is removed again and the answer is `unrecorded`. A missing label, bad
+/// base64url, or a `proof` / `approval` that is no `Assertion` is
+/// `bad_request`. Refusals (`forbidden` with `rule`, recorded): no live
+/// challenge or expired (`touch_failed`), another label (`touch_mismatch`),
+/// an unparsable attestation, a failed proof (no UV: `touch_failed`), a
+/// device enrolled already (`touch_failed`), no `approval` when one is
+/// needed (`touch_unavailable`), an approval by a device not the caller's
+/// (`touch_mismatch`), 16 devices already or unwritable files
+/// (`touch_failed`).
 pub const OP_TOUCH_ENROL: &str = "touch.enrol";
-/// Removes an enrolled device (plan 26, Task 9).
+/// Removes an enrolled device: `{credential, assertion?, host?}`.
+/// `credential` is a base64url credential id; `host` a boolean; anything
+/// else is `bad_request`. Without `host`: `credential` must be one of the
+/// caller's own devices (else `bad_request`), and `assertion` is the
+/// answer of one of them to `touch.begin {purpose: "remove", credential}`;
+/// without it the removal is refused (`touch_unavailable`). The caller's
+/// live remove challenge is spent whatever the outcome, and a challenge
+/// that names another device is `touch_mismatch`. `host: true` (recovery
+/// when every device is lost) is root only (else `forbidden`, nothing
+/// recorded) and removes any uid's device without a touch. Answers `{id,
+/// label, approved_by}`: the touching device's base64url id, or `"root"`.
+/// A `touch_removed` record is written first; if it cannot be, the device
+/// is restored and the answer is `unrecorded`.
 pub const OP_TOUCH_REMOVE: &str = "touch.remove";
-/// Lists the caller's enrolled devices (plan 26, Task 9).
+/// Lists enrolled devices: `{all?}` (a boolean, else `bad_request`). The
+/// caller's own devices, or with `all: true` (root or an admin only, else
+/// `forbidden`) every device on the machine. Answers `{credentials: [{id,
+/// label, kind, alg, rp_id, created, sign_count, owner_uid}]}`: `id`
+/// base64url, `kind` `"fido2"` or `"webauthn"`, `alg` `"es256"` or
+/// `"ed25519"`, `created` a UTC timestamp
+/// (`2026-11-11T09:30:00.000Z`). Never the public key. Touch files that
+/// cannot be read list nothing.
 pub const OP_TOUCH_LIST: &str = "touch.list";
-/// Checks a test touch (plan 26, Task 9).
+/// Checks a test touch: `{assertion}`, the answer to `touch.begin
+/// {purpose: "test"}` (missing or no `Assertion`: `bad_request`). Spends
+/// the caller's live test challenge, verifies the assertion against the
+/// caller's devices with UV and saves the counter. Answers `{label, uv,
+/// sign_count}`; a refusal is `forbidden` with `rule`. Nothing is
+/// recorded.
 pub const OP_TOUCH_CHECK: &str = "touch.check";
 /// The managed hook, for a call a `[guard] ask` rule denied: use up the
 /// caller's grant for it. `{rec}` (the guard record it will send; the

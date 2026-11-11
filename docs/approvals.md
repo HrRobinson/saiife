@@ -290,8 +290,10 @@ through. An approved request is sent; only a new call asks. Marks live in the
 system config; an environment cannot set or remove one (its keys are closed,
 so `real_system = false` there is a load error).
 
-- `deploy`, on a service: capability patterns, matched like `ask`. A call that
-  matches one has the class `deploy`.
+- `deploy`, on a service: capability patterns, matched like `ask` and checked
+  the same way when the config loads (a pattern that can never match, such as
+  `deploy:run`, is a load error). A call that matches one has the class
+  `deploy`.
 
   ```toml
   [services.erp]
@@ -319,3 +321,32 @@ so `real_system = false` there is a load error).
 
 When several apply, `deploy` wins, then `secret:sensitive`, then
 `egress:external`. A config without marks has the same policy hash as before.
+
+### Approving a marked request
+
+A marked request is approved only with a touch from a device enrolled for the
+approver who decides: a FIDO2 security key. The touch is
+bound to that one request on this machine and is single use. Other approvers'
+devices do not count.
+
+- **User verification (UV).** `deploy` and `secret:sensitive` need the device
+  to verify its user (a PIN or a fingerprint), not just a touch. Every WebAuthn
+  (browser) assertion needs UV, whatever the class. Enrolling a device needs UV
+  too, so a key without a PIN cannot be enrolled.
+- **No password fallback.** With no device enrolled, or no touch sent, the
+  approval is refused with `touch_unavailable`, and the request stays pending.
+  A password or polkit prompt never stands in for the touch. In locked mode a
+  same-user approval still needs its re-authentication as well, never instead.
+- **The class only gets stronger.** A policy reload that removes a mark does
+  not drop the touch of a request that is already pending, and one that adds a
+  mark makes a pending request need one. The daemon's `approval.list` and
+  `approval.show` answers give the class a decision needs now, as
+  `touch_class`.
+- **Not usable yet.** Until the touch CLI ships (plan 27), no client sends a
+  touch, so marked requests cannot be approved yet. They can still be rejected
+  or withdrawn, or they expire.
+- **Personal mode is a workflow aid**, not a security boundary (see
+  [personal-broker.md](personal-broker.md)). The first device is enrolled with
+  host access as its only proof, so any process running as you can enrol it,
+  and the device list (`credentials.json` in the state dir) is owned by you. If
+  every device is lost, deleting that file is the way back.
