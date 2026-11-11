@@ -1883,6 +1883,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-wire"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.1",
+ "ring",
+ "saiife-touch",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
