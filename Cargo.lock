@@ -1619,6 +1619,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-link"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "getrandom 0.3.4",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "saiife-audit",
+ "saiife-daemon",
+ "saiife-ipc",
+ "saiife-policy",
+ "saiife-wire",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "saiife-mcp"
 version = "0.2.0"
 dependencies = [
