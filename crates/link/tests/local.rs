@@ -10,7 +10,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use saiife_ipc::msg::{OP_WORKSPACE_PAIR_BEGIN, OP_WORKSPACE_PAIR_CONFIRM};
 use saiife_link::assets::{etag, ASSETS};
-use saiife_link::local::{serve, CSP, MAX_REQUEST_BYTES};
+use saiife_link::local::{serve, serve_with, Opts, CSP, MAX_REQUEST_BYTES};
 use saiife_link::Daemon;
 use saiife_wire::frame::{Frame, SignedFrame};
 use saiife_wire::sig::TestDevice;
@@ -437,4 +437,82 @@ async fn unknown_path_is_404() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (st, _, _) = s.post("/api/elsewhere", &json!({})).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trickled_body_times_out_408() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world().await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let opts = Opts {
+        body_read_timeout: std::time::Duration::from_millis(300),
+        ..Opts::default()
+    };
+    tokio::spawn(serve_with(
+        l,
+        Daemon::new(w.run.clone(), me()),
+        addr.port(),
+        opts,
+    ));
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /api/frame HTTP/1.1\r\nhost: localhost:{p}\r\norigin: http://localhost:{p}\r\ncontent-type: application/json\r\ncontent-length: 5000\r\n\r\n{{\"body\"",
+        p = addr.port()
+    );
+    c.write_all(head.as_bytes()).await.unwrap();
+    // ... and then nothing.
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut out))
+        .await
+        .expect("the server answers or closes");
+    assert!(
+        String::from_utf8_lossy(&out).starts_with("HTTP/1.1 408"),
+        "{:.200}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[tokio::test]
+async fn connections_over_the_cap_are_closed() {
+    use tokio::io::AsyncReadExt;
+    let w = world().await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let opts = Opts {
+        max_conns: 1,
+        ..Opts::default()
+    };
+    tokio::spawn(serve_with(
+        l,
+        Daemon::new(w.run.clone(), me()),
+        addr.port(),
+        opts,
+    ));
+    // The first connection is idle and holds the only slot.
+    let _first = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = Vec::new();
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        second.read_to_end(&mut buf),
+    )
+    .await
+    .expect("closed promptly")
+    .unwrap_or(0);
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn charset_without_space_is_accepted() {
+    let (_w, s) = up().await;
+    let (h, o) = (s.host(), s.origin());
+    let hs = [
+        ("host", h.as_str()),
+        ("origin", o.as_str()),
+        ("content-type", "application/json;charset=utf-8"),
+    ];
+    let (st, _, _) = s.send("POST", "/api/frame", &hs, b"[]".to_vec()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }

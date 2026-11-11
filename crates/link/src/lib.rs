@@ -41,10 +41,15 @@ pub async fn run(cfg: LinkConfig) -> Result<(), String> {
         url,
         roots: cfg.hub_roots,
     });
-    // `local::serve` never returns; only the hub client can end the pair.
+    // `local::serve` never returns on its own.
     let local = local::serve(listener, daemon.clone(), cfg.port);
     match hub {
-        Some(h) => tokio::join!(local, hub::run(h, daemon)).1,
+        // Either end ends `run`: the hub's result, or the local server
+        // (which only stops if its task is dropped).
+        Some(h) => tokio::select! {
+            r = hub::run(h, daemon) => r,
+            () = local => Err("the local server stopped".into()),
+        },
         None => {
             local.await;
             Ok(())

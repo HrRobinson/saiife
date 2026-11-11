@@ -19,7 +19,9 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use saiife_ipc::msg::{OP_WORKSPACE_FRAME, OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH};
 use serde_json::{json, Map, Value};
 use std::convert::Infallible;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Largest POST body the UI may send.
 pub const MAX_REQUEST_BYTES: usize = 96 * 1024;
@@ -29,11 +31,37 @@ pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; 
 /// Largest request head (request line and headers).
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time a POST body may take to arrive (a trickling client gets a 408).
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Open connections at once; one over the cap is closed unanswered.
+pub const MAX_CONNS: usize = 64;
+
+/// The server's limits; the tests shorten them.
+#[derive(Debug, Clone, Copy)]
+pub struct Opts {
+    pub body_read_timeout: Duration,
+    pub max_conns: usize,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            body_read_timeout: BODY_READ_TIMEOUT,
+            max_conns: MAX_CONNS,
+        }
+    }
+}
 
 /// Serves the UI on `listener` (bound on 127.0.0.1 only), one task per
 /// connection. It never returns: an accept error is retried after 50 ms,
 /// and the caller ends it by dropping the future.
 pub async fn serve(listener: tokio::net::TcpListener, daemon: Daemon, port: u16) {
+    serve_with(listener, daemon, port, Opts::default()).await
+}
+
+/// [`serve`] with explicit limits.
+pub async fn serve_with(listener: tokio::net::TcpListener, daemon: Daemon, port: u16, opts: Opts) {
+    let slots = Arc::new(Semaphore::new(opts.max_conns));
     loop {
         match listener.accept().await {
             Ok((s, addr)) => {
@@ -41,11 +69,17 @@ pub async fn serve(listener: tokio::net::TcpListener, daemon: Daemon, port: u16)
                 if !addr.ip().is_loopback() {
                     continue;
                 }
+                // Over the cap: closed unanswered, so a flood of idle
+                // connections cannot starve the ones in use.
+                let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                    continue;
+                };
                 let daemon = daemon.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let svc = service_fn(move |req| {
                         let daemon = daemon.clone();
-                        async move { Ok::<_, Infallible>(handle(req, &daemon, port).await) }
+                        async move { Ok::<_, Infallible>(handle(req, &daemon, port, opts).await) }
                     });
                     let _ = http1::Builder::new()
                         .timer(TokioTimer::new())
@@ -66,8 +100,8 @@ pub async fn serve(listener: tokio::net::TcpListener, daemon: Daemon, port: u16)
 
 type Resp = Response<Full<Bytes>>;
 
-async fn handle(req: Request<Incoming>, daemon: &Daemon, port: u16) -> Resp {
-    let mut resp = route(req, daemon, port).await;
+async fn handle(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts) -> Resp {
+    let mut resp = route(req, daemon, port, opts).await;
     let h = resp.headers_mut();
     for (k, v) in [
         ("content-security-policy", CSP),
@@ -107,13 +141,13 @@ fn json_resp(status: StatusCode, v: &Value) -> Resp {
     r
 }
 
-fn plain(status: StatusCode, msg: &str) -> Resp {
+fn json_error(status: StatusCode, msg: &str) -> Resp {
     json_resp(status, &json!({"ok": false, "error": msg}))
 }
 
-async fn route(req: Request<Incoming>, daemon: &Daemon, port: u16) -> Resp {
+async fn route(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts) -> Resp {
     if single(req.headers(), header::HOST) != Some(format!("localhost:{port}").as_str()) {
-        return plain(StatusCode::FORBIDDEN, "bad_host");
+        return json_error(StatusCode::FORBIDDEN, "bad_host");
     }
     let path = req.uri().path().to_string();
     match (req.method(), path.as_str()) {
@@ -124,10 +158,10 @@ async fn route(req: Request<Incoming>, daemon: &Daemon, port: u16) -> Resp {
                 Value::Object(m)
             }))
         }
-        (&Method::POST, "/api/frame") => post(req, daemon, port, Post::Frame).await,
-        (&Method::POST, "/api/pair") => post(req, daemon, port, Post::Pair).await,
+        (&Method::POST, "/api/frame") => post(req, daemon, port, opts, Post::Frame).await,
+        (&Method::POST, "/api/pair") => post(req, daemon, port, opts, Post::Pair).await,
         (&Method::GET, p) => static_file(p, req.headers()),
-        _ => plain(StatusCode::NOT_FOUND, "not_found"),
+        _ => json_error(StatusCode::NOT_FOUND, "not_found"),
     }
 }
 
@@ -155,12 +189,22 @@ fn answer(r: Result<Value, LinkError>) -> Resp {
     }
 }
 
+/// ETags are computed once per asset (the table is static).
+fn cached_etag(a: &Asset) -> String {
+    static TAGS: OnceLock<Vec<String>> = OnceLock::new();
+    let tags = TAGS.get_or_init(|| ASSETS.iter().map(etag).collect());
+    match ASSETS.iter().position(|x| x.path == a.path) {
+        Some(i) => tags[i].clone(),
+        None => etag(a),
+    }
+}
+
 fn static_file(path: &str, req_headers: &HeaderMap) -> Resp {
     let path = if path == "/" { "/index.html" } else { path };
     let Some(a) = ASSETS.iter().find(|a| a.path == path) else {
-        return plain(StatusCode::NOT_FOUND, "not_found");
+        return json_error(StatusCode::NOT_FOUND, "not_found");
     };
-    let tag = etag(a);
+    let tag = cached_etag(a);
     let fresh = req_headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
@@ -206,39 +250,38 @@ fn is_json_type(v: &str) -> bool {
     rest.is_empty() || rest.strip_prefix(';').map(str::trim) == Some("charset=utf-8")
 }
 
-async fn post(req: Request<Incoming>, daemon: &Daemon, port: u16, kind: Post) -> Resp {
+async fn post(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts, kind: Post) -> Resp {
     let h = req.headers();
     if single(h, header::ORIGIN) != Some(format!("http://localhost:{port}").as_str()) {
-        return plain(StatusCode::FORBIDDEN, "bad_origin");
+        return json_error(StatusCode::FORBIDDEN, "bad_origin");
     }
     if !single(h, header::CONTENT_TYPE).is_some_and(is_json_type) {
-        return plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type");
+        return json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type");
     }
     // A declared length over the cap is refused before any byte is read.
     let declared = single(h, header::CONTENT_LENGTH).and_then(|v| v.parse::<usize>().ok());
     if declared.is_some_and(|n| n > MAX_REQUEST_BYTES) {
-        return plain(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
     }
-    let body = match Limited::new(req.into_body(), MAX_REQUEST_BYTES)
-        .collect()
-        .await
-    {
-        Ok(b) => b.to_bytes(),
-        Err(e)
+    let read = Limited::new(req.into_body(), MAX_REQUEST_BYTES).collect();
+    let body = match tokio::time::timeout(opts.body_read_timeout, read).await {
+        Err(_) => return json_error(StatusCode::REQUEST_TIMEOUT, "body_timeout"),
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e))
             if e.downcast_ref::<http_body_util::LengthLimitError>()
                 .is_some() =>
         {
-            return plain(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
+            return json_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
         }
-        Err(_) => return plain(StatusCode::BAD_REQUEST, "bad_request"),
+        Ok(Err(_)) => return json_error(StatusCode::BAD_REQUEST, "bad_request"),
     };
     let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&body) else {
-        return plain(StatusCode::BAD_REQUEST, "bad_request");
+        return json_error(StatusCode::BAD_REQUEST, "bad_request");
     };
     match kind {
         Post::Frame => {
             if !keys_ok(&obj, &["body", "sig"], &["touch"]) {
-                return plain(StatusCode::BAD_REQUEST, "bad_request");
+                return json_error(StatusCode::BAD_REQUEST, "bad_request");
             }
             obj.insert("via".into(), "local".into());
             let r = daemon.call(OP_WORKSPACE_FRAME, obj).await;
@@ -246,7 +289,7 @@ async fn post(req: Request<Incoming>, daemon: &Daemon, port: u16, kind: Post) ->
         }
         Post::Pair => {
             if !keys_ok(&obj, &["pair_id", "device_pub", "label", "proof"], &[]) {
-                return plain(StatusCode::BAD_REQUEST, "bad_request");
+                return json_error(StatusCode::BAD_REQUEST, "bad_request");
             }
             let r = daemon.call(OP_WORKSPACE_PAIR_FINISH, obj).await;
             answer(r.map(
