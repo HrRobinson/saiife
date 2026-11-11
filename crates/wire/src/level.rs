@@ -117,6 +117,12 @@ const IPC_OPS: &[&str] = &[
     "secret.remove",
     "secret.rotate",
     "status",
+    // Touch (plan 26): sorted in with the rest.
+    "touch.begin",
+    "touch.check",
+    "touch.enrol",
+    "touch.list",
+    "touch.remove",
     // Workspace (plan 29): sorted in with the rest.
     "workspace.devices",
     "workspace.frame",
