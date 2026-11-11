@@ -327,7 +327,8 @@ When several apply, `deploy` wins, then `secret:sensitive`, then
 A marked request is approved only with a touch from a device enrolled for the
 approver who decides: a FIDO2 security key. The touch is
 bound to that one request on this machine and is single use. Other approvers'
-devices do not count.
+devices do not count. Setting up a key, and what a touch proves, is in
+[Touch approvals](touch.md).
 
 - **User verification (UV).** `deploy` and `secret:sensitive` need the device
   to verify its user (a PIN or a fingerprint), not just a touch. Every WebAuthn
@@ -342,9 +343,11 @@ devices do not count.
   mark makes a pending request need one. The daemon's `approval.list` and
   `approval.show` answers give the class a decision needs now, as
   `touch_class`.
-- **Not usable yet.** Until the touch CLI ships (plan 27), no client sends a
-  touch, so marked requests cannot be approved yet. They can still be rejected
-  or withdrawn, or they expire.
+- **Approving.** `saiife approve <id>` asks for the touch (see
+  [touch.md](touch.md)): it prints the class and a short code, asks for the
+  key's PIN when the class needs UV, then for the touch. `saiife approvals show
+  <id>` has a `touch:` line for a marked request. Rejecting or withdrawing
+  needs no touch.
 - **Personal mode is a workflow aid**, not a security boundary (see
   [personal-broker.md](personal-broker.md)). The first device is enrolled with
   host access as its only proof, so any process running as you can enrol it,

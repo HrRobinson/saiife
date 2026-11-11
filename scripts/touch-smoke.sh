@@ -58,6 +58,9 @@ else
 fi
 
 WORK=$(mktemp -d)
+# Audit checks look only at records written from here on (`ts` is UTC,
+# `2026-11-11T09:30:00.000Z`, so the strings compare in time order).
+START=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
 OKS=0
 FAILS=0
 ENROLLED=0
@@ -106,14 +109,15 @@ new_pending() {
   grep -oE '#[0-9]+' <<<"$out" | head -n 1 | tr -d '#'
 }
 
-# Every audit record of the month files, one JSON object per line.
+# The audit records of the month files written since the run started, one
+# JSON object per line.
 audit_records() {
-  cat "$AUDIT_DIR"/*.jsonl 2>/dev/null || true
+  cat "$AUDIT_DIR"/*.jsonl 2>/dev/null | jq -c --arg start "$START" 'select(.ts >= $start)' || true
 }
 
 # 1. doctor knows the key check and it passes.
 doc=$("$SAIIFE" doctor 2>&1 || true)
-if grep -i 'touch key' <<<"$doc" | grep -q 'PASS'; then
+if grep -iE 'touch[- ]key' <<<"$doc" | grep -q 'PASS'; then
   ok "doctor: touch key PASS"
 else
   bad "doctor: touch key PASS (plug the key in, at the seat)"
@@ -121,8 +125,9 @@ fi
 
 # 2. enrol the first key.
 echo "step 2: touch the key twice and type its PIN"
+# Set first: cleanup looks for smoke-* devices even if enrol fails half way.
+ENROLLED=1
 if "$SAIIFE" touch enrol --label smoke-1; then
-  ENROLLED=1
   ok "touch enrol smoke-1"
 else
   bad "touch enrol smoke-1"
@@ -152,13 +157,13 @@ else
   rc=0
   "$SAIIFE" approve "$id" 2> >(tee "$WORK/approve.err" >&2) || rc=$?
   sleep 1
-  if [ "$rc" = 0 ] && grep -qE 'touch needed \([a-z_]+\); code [0-9]{6}' "$WORK/approve.err"; then
+  if [ "$rc" = 0 ] && grep -qE 'touch needed \([a-z:_]+\); code [0-9]{6}; check that the same code shows wherever you started this' "$WORK/approve.err"; then
     ok "approve #$id: 6-digit code shown, approved after the touch"
   else
     bad "approve #$id: 6-digit code shown, approved after the touch (exit $rc)"
   fi
-  if audit_records | jq -e -s \
-    'any(.[]; .decision == "approved" and .touch.via == "local" and .touch.uv == true)' >/dev/null; then
+  if audit_records | jq -e -s --argjson id "$id" \
+    'any(.[]; .kind == "approval" and .action == "approved" and .approval == $id and .touch.via == "local" and .touch.uv == true)' >/dev/null; then
     ok "audit: approved record with touch.via local and touch.uv true"
   else
     bad "audit: approved record with touch.via local and touch.uv true (in $AUDIT_DIR)"
@@ -212,7 +217,7 @@ if [ -z "$rid" ]; then
   bad "touch rm: smoke-1 is not enrolled"
 else
   echo "step 8: PIN, then touch, to remove smoke-1"
-  if "$SAIIFE" touch rm "$rid" && ! smoke_ids | grep -q .; then
+  if "$SAIIFE" touch rm "$rid" && left=$(smoke_ids) && [ -z "$left" ]; then
     ok "touch rm removed smoke-1"
     ENROLLED=0
   else
@@ -224,10 +229,11 @@ echo "  sudo $SAIIFE touch rm <id-prefix> --host    # recorded with approved_by 
 
 # 9. both events are in the audit log.
 if audit_records | jq -e -s \
-  '(any(.[]; tostring | contains("touch_enrolled"))) and (any(.[]; tostring | contains("touch_removed")))' >/dev/null; then
-  ok "audit shows touch_enrolled and touch_removed"
+  '(any(.[]; .kind == "touch" and .action == "touch_enrolled" and .label == "smoke-1" and .cred_kind == "fido2"))
+   and (any(.[]; .kind == "touch" and .action == "touch_removed" and .label == "smoke-1"))' >/dev/null; then
+  ok "audit shows touch_enrolled (cred_kind fido2) and touch_removed for smoke-1"
 else
-  bad "audit shows touch_enrolled and touch_removed (in $AUDIT_DIR)"
+  bad "audit shows touch_enrolled (cred_kind fido2) and touch_removed for smoke-1 (in $AUDIT_DIR)"
 fi
 
 echo "$OKS ok, $FAILS bad"
