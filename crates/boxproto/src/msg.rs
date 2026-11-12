@@ -226,8 +226,15 @@ impl Setup {
             if !path_ok(&f.path) {
                 return Err(format!("file path {:?} is not allowed", f.path));
             }
-            if f.mode > 0o755 {
+            // Bits, not magnitude: no setuid/setgid/sticky, no group/other write.
+            if f.mode & !0o755 != 0 {
                 return Err(format!("file mode {:o} is too wide", f.mode));
+            }
+            if f.path.starts_with("/etc/saiife-guest/") && f.mode != 0o644 && f.mode != 0o755 {
+                return Err(format!(
+                    "file mode {:o} must be 644 or 755 under /etc/saiife-guest",
+                    f.mode
+                ));
             }
             if f.text.len() > MAX_FILE_TEXT {
                 return Err(format!("file {:?} is larger than 256 KiB", f.path));
@@ -426,7 +433,28 @@ mod tests {
         s.files[0].mode = 0o755;
         assert_eq!(s.check(), Ok(()));
         bad(&|s| s.files[0].mode = 0o756);
-        bad(&|s| s.files[0].mode = 0o4755);
+        // modes are checked by bits, not magnitude (home files)
+        for m in [
+            0o722, 0o733, 0o707, 0o757, 0o666, 0o4555, 0o2755, 0o1755, 0o4755,
+        ] {
+            bad(&|s| s.files[0].mode = m);
+        }
+        for m in [0o644, 0o755, 0o600, 0o700, 0o400] {
+            let mut s = setup();
+            s.files[0].mode = m;
+            assert_eq!(s.check(), Ok(()), "{m:o}");
+        }
+        // /etc/saiife-guest files are exactly 0644 or 0755
+        for m in [0o600, 0o700, 0o400, 0o640, 0o722] {
+            let mut s = setup();
+            s.files[0].path = "/etc/saiife-guest/a.json".into();
+            s.files[0].mode = m;
+            assert!(s.check().is_err(), "{m:o}");
+        }
+        let mut s = setup();
+        s.files[0].path = "/etc/saiife-guest/a.json".into();
+        s.files[0].mode = 0o644;
+        assert_eq!(s.check(), Ok(()));
         bad(&|s| s.files[0].text = "a\0".into());
         bad(&|s| s.files[0].text = "x".repeat(256 * 1024 + 1));
         let mut s = setup();
