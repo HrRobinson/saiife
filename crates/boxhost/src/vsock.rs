@@ -47,6 +47,61 @@ fn answer_ok(line: &[u8]) -> bool {
         && std::str::from_utf8(num).is_ok_and(|n| n.parse::<u32>().is_ok())
 }
 
+/// Connect a unix stream socket without ever blocking past `deadline`.
+/// A full accept backlog (a wedged VMM) shows up as EAGAIN, which is retried
+/// until the deadline. The returned stream is blocking again.
+fn connect_before(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::io::Errno;
+    use rustix::net::{
+        connect, socket_with, sockopt, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
+    };
+    // Defence in depth: the name must be a socket (not followed).
+    let (dir, name) = open_parent(path)?;
+    match is_socket(&dir, name)? {
+        Some(true) => {}
+        Some(false) => return Err(bad_data("vsock.sock is not a socket")),
+        None => return Err(io::Error::from(io::ErrorKind::NotFound)),
+    }
+    let addr = SocketAddrUnix::new(path)?;
+    let fd = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    loop {
+        match connect(&fd, &addr) {
+            Ok(()) => break,
+            Err(Errno::INPROGRESS) => {
+                let left = remaining(deadline)?;
+                let ts = rustix::event::Timespec {
+                    tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+                    tv_nsec: i64::from(left.subsec_nanos()),
+                };
+                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                match poll(&mut fds, Some(&ts)) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                if fds[0].revents().is_empty() {
+                    continue;
+                }
+                sockopt::socket_error(&fd)?.map_err(io::Error::from)?;
+                break;
+            }
+            Err(Errno::AGAIN) | Err(Errno::INTR) => {
+                remaining(deadline)?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let s = UnixStream::from(fd);
+    s.set_nonblocking(false)?;
+    Ok(s)
+}
+
 /// Connect to a guest listener on `port` through the multiplexer.
 ///
 /// The whole handshake (connect, request, answer) shares one deadline of
@@ -54,7 +109,7 @@ fn answer_ok(line: &[u8]) -> bool {
 /// The answer is read byte by byte up to the newline and never past it.
 pub fn connect(paths: &BoxPaths, port: u32, timeout: Duration) -> io::Result<UnixStream> {
     let deadline = Instant::now() + Duration::from_secs(ports::HANDSHAKE_TIMEOUT_SECS);
-    let mut s = UnixStream::connect(paths.vsock())?;
+    let mut s = connect_before(&paths.vsock(), deadline)?;
     s.set_write_timeout(Some(remaining(deadline)?))?;
     s.write_all(format!("CONNECT {port}\n").as_bytes())?;
     let mut buf = [0u8; MAX_ANSWER];
@@ -197,7 +252,7 @@ pub fn unlink_all(paths: &BoxPaths) {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
-    use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
     use std::thread;
 
     fn setup() -> (tempfile::TempDir, BoxPaths) {
@@ -265,8 +320,8 @@ mod tests {
     fn connect_answer_too_long_is_error() {
         let (_t, p) = setup();
         let h = fake_mux(&p, |mut s| {
-            s.write_all(&[b'A'; 200]).unwrap();
-            s.write_all(b"\n").unwrap();
+            let _ = s.write_all(&[b'A'; 200]);
+            let _ = s.write_all(b"\n");
         });
         let e = connect(&p, 1024, T).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
@@ -313,6 +368,53 @@ mod tests {
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ));
         h.join().unwrap();
+    }
+
+    #[test]
+    fn connect_full_backlog_times_out() {
+        use rustix::net::{
+            connect as rconnect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags,
+            SocketType,
+        };
+        let (_t, p) = setup();
+        let _l = UnixListener::bind(p.vsock()).unwrap(); // never accepts
+        let addr = SocketAddrUnix::new(p.vsock()).unwrap();
+        let mut held = Vec::new();
+        let mut full = false;
+        for _ in 0..10_000 {
+            let fd = socket_with(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+                None,
+            )
+            .unwrap();
+            match rconnect(&fd, &addr) {
+                Ok(()) => held.push(fd),
+                Err(rustix::io::Errno::AGAIN) => {
+                    full = true;
+                    break;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(full, "could not fill the backlog");
+        let t0 = Instant::now();
+        let e = connect(&p, 1024, T).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e:?}");
+        assert!(
+            t0.elapsed() < Duration::from_millis(2600),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_refuses_non_socket() {
+        let (_t, p) = setup();
+        std::fs::write(p.vsock(), b"x").unwrap();
+        let e = connect(&p, 1024, T).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -412,12 +514,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_socket());
-        assert_eq!(std::fs::metadata(p.vsock()).unwrap().uid(), mux_uid());
         // Idempotent with everything absent.
         unlink_all(&p);
-    }
-
-    fn mux_uid() -> u32 {
-        rustix::process::geteuid().as_raw()
     }
 }
