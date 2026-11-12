@@ -1,8 +1,12 @@
 //! The base image store: `<dir>/base-<sha256>.raw` (0440), `.json`, an
 //! optional `.vmlinuz`, and `<dir>/default` (one line: the id). The JSON
 //! file is written last, so an entry without one is not in the store.
+//! The store is also the Cloud Hypervisor driver's `ImageResolver`.
 
 use super::{parse_image_id, Manifest, ManifestBoot};
+use crate::launch::Boot;
+use crate::vmm::{ImageResolver, ResolvedImage};
+use saiife_boxes::template::ImageRef;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +14,18 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
+    /// The firmware a firmware-booting image boots with
+    /// (`<vmm>/CLOUDHV.fd`); see `with_firmware`.
+    fw: Option<PathBuf>,
+}
+
+/// Fails unless `p` is a regular file itself (not a symlink to one).
+fn regular_file(p: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!("{} is not a regular file", p.display())),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    }
 }
 
 #[cfg(unix)]
@@ -95,7 +111,16 @@ impl Store {
             b.create(&dir)
                 .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
-        Ok(Store { dir })
+        Ok(Store { dir, fw: None })
+    }
+
+    /// The firmware firmware-booting images resolve to: the caller passes
+    /// `<vmm>/CLOUDHV.fd`. Without it such an image does not resolve.
+    pub fn with_firmware(self, fw: PathBuf) -> Store {
+        Store {
+            fw: Some(fw),
+            ..self
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -272,12 +297,69 @@ impl Store {
     }
 }
 
+impl ImageResolver for Store {
+    /// The default or a pinned image, as the driver boots it. The raw disk
+    /// and the kernel must be regular files in the store (no symlinks); the
+    /// kernel is re-hashed against the manifest, the raw disk is not (it
+    /// was hashed on insert and is large).
+    fn resolve(&self, r: &ImageRef) -> Result<ResolvedImage, String> {
+        let id = match r {
+            ImageRef::Default => self.default_id().ok_or_else(|| {
+                "no default box image: saiife box image import --default <path>".to_string()
+            })?,
+            ImageRef::Pinned(id) => {
+                parse_image_id(id)?;
+                id.clone()
+            }
+        };
+        let m = self.get(&id)?;
+        let raw = self.path(&id, "raw");
+        regular_file(&raw)?;
+        let boot = match &m.boot {
+            ManifestBoot::Firmware => Boot::Firmware {
+                fw: self.fw.clone().ok_or_else(|| {
+                    format!("{id} boots from firmware but no firmware path is set")
+                })?,
+            },
+            ManifestBoot::Kernel {
+                sha256: want,
+                cmdline,
+                ..
+            } => {
+                let kernel = self.path(&id, "vmlinuz");
+                regular_file(&kernel)?;
+                let got = crate::pins::sha256_file(&kernel)
+                    .map_err(|e| format!("{}: {e}", kernel.display()))?;
+                if got != *want {
+                    return Err(format!(
+                        "{id}: the kernel's sha256 is {got}, the manifest says {want}"
+                    ));
+                }
+                Boot::Kernel {
+                    kernel,
+                    cmdline: cmdline.clone(),
+                }
+            }
+        };
+        Ok(ResolvedImage {
+            id,
+            raw,
+            sha256: m.sha256,
+            virtual_gib: m.virtual_gib,
+            boot,
+        })
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::image::tests::manifest_for;
     use crate::image::{image_id, ManifestBoot};
+    use crate::launch::Boot;
     use crate::pins::sha256_file;
+    use crate::vmm::{ImageResolver, ResolvedImage};
+    use saiife_boxes::template::ImageRef;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -444,9 +526,143 @@ mod tests {
         assert!(w.store.remove(&b.id).is_err());
         w.store.set_default(&a.id).unwrap();
         assert_eq!(names(w.store.dir()).len(), 3);
+        // The resolver takes the same default and the same pinned ids.
+        let store = w.store.clone().with_firmware(w.root.join("vmm/CLOUDHV.fd"));
+        let got = store.resolve(&ImageRef::Default).unwrap();
+        assert_eq!(
+            got,
+            ResolvedImage {
+                id: a.id.clone(),
+                raw: w.store.dir().join(format!("{}.raw", a.id)),
+                sha256: a.sha256.clone(),
+                virtual_gib: a.virtual_gib,
+                boot: Boot::Firmware {
+                    fw: w.root.join("vmm/CLOUDHV.fd"),
+                },
+            }
+        );
+        assert_eq!(store.resolve(&ImageRef::Pinned(a.id.clone())).unwrap(), got);
+        let e = store.resolve(&ImageRef::Pinned(b.id.clone())).unwrap_err();
+        assert!(e.contains("no image"), "{e}");
+        let e = store
+            .resolve(&ImageRef::Pinned("base-nope".into()))
+            .unwrap_err();
+        assert!(e.contains("bad image id"), "{e}");
         // A garbage default file reads as no default.
         fs::write(w.store.dir().join("default"), "../etc\n").unwrap();
         assert_eq!(w.store.default_id(), None);
+        let e = store.resolve(&ImageRef::Default).unwrap_err();
+        assert_eq!(
+            e,
+            "no default box image: saiife box image import --default <path>"
+        );
+    }
+
+    #[test]
+    fn resolver_without_default_is_a_clear_error() {
+        let w = world();
+        add(&w, "a.raw", "image-a\n");
+        let store = w.store.clone().with_firmware(w.root.join("fw"));
+        let e = store.resolve(&ImageRef::Default).unwrap_err();
+        assert_eq!(
+            e,
+            "no default box image: saiife box image import --default <path>"
+        );
+    }
+
+    #[test]
+    fn resolver_firmware_needs_with_firmware() {
+        let w = world();
+        let a = add(&w, "a.raw", "image-a\n");
+        let e = w
+            .store
+            .resolve(&ImageRef::Pinned(a.id.clone()))
+            .unwrap_err();
+        assert!(e.contains("firmware"), "{e}");
+    }
+
+    #[test]
+    fn resolver_refuses_a_symlinked_raw() {
+        let w = world();
+        let a = add(&w, "a.raw", "image-a\n");
+        let store = w.store.clone().with_firmware(w.root.join("fw"));
+        let raw = w.store.dir().join(format!("{}.raw", a.id));
+        let real = w.root.join("elsewhere.raw");
+        fs::rename(&raw, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &raw).unwrap();
+        // Store::get follows the link; the resolver does not.
+        assert!(w.store.get(&a.id).is_ok());
+        let e = store.resolve(&ImageRef::Pinned(a.id.clone())).unwrap_err();
+        assert!(e.contains("regular file"), "{e}");
+    }
+
+    /// Inserts a kernel-booting image and returns its manifest.
+    fn add_kernel(w: &W, kernel: &str) -> Manifest {
+        let (p, mut m) = src(w, "k.raw", "image-k\n");
+        let k = w.root.join("vmlinuz");
+        fs::write(&k, kernel).unwrap();
+        m.boot = ManifestBoot::Kernel {
+            kernel: format!("{}.vmlinuz", m.id),
+            sha256: sha256_file(&k).unwrap(),
+            cmdline: "console=ttyS0 root=/dev/vda1".into(),
+        };
+        w.store
+            .insert(
+                &mut File::open(&p).unwrap(),
+                &m,
+                Some(&mut File::open(&k).unwrap()),
+            )
+            .unwrap();
+        m
+    }
+
+    #[test]
+    fn resolver_kernel_boot() {
+        let w = world();
+        let m = add_kernel(&w, "kernel");
+        // No firmware is needed for a direct kernel boot.
+        let got = w.store.resolve(&ImageRef::Pinned(m.id.clone())).unwrap();
+        assert_eq!(
+            got,
+            ResolvedImage {
+                id: m.id.clone(),
+                raw: w.store.dir().join(format!("{}.raw", m.id)),
+                sha256: m.sha256.clone(),
+                virtual_gib: m.virtual_gib,
+                boot: Boot::Kernel {
+                    kernel: w.store.dir().join(format!("{}.vmlinuz", m.id)),
+                    cmdline: "console=ttyS0 root=/dev/vda1".into(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn resolver_refuses_a_changed_or_symlinked_kernel() {
+        let w = world();
+        let m = add_kernel(&w, "kernel");
+        let kp = w.store.dir().join(format!("{}.vmlinuz", m.id));
+        // A kernel whose content no longer matches the manifest.
+        set_mode(&kp, 0o640).unwrap();
+        fs::write(&kp, "tampered").unwrap();
+        let e = w
+            .store
+            .resolve(&ImageRef::Pinned(m.id.clone()))
+            .unwrap_err();
+        assert!(e.contains("kernel's sha256"), "{e}");
+        // The right content behind a symlink is refused too.
+        let real = w.root.join("real-vmlinuz");
+        fs::write(&real, "kernel").unwrap();
+        fs::remove_file(&kp).unwrap();
+        std::os::unix::fs::symlink(&real, &kp).unwrap();
+        let e = w
+            .store
+            .resolve(&ImageRef::Pinned(m.id.clone()))
+            .unwrap_err();
+        assert!(e.contains("regular file"), "{e}");
+        // A missing kernel is an error.
+        fs::remove_file(&kp).unwrap();
+        assert!(w.store.resolve(&ImageRef::Pinned(m.id.clone())).is_err());
     }
 
     #[test]
