@@ -710,3 +710,46 @@ async fn inbox_has_no_approve_url() {
     let sp = String::from_utf8(sp.to_vec()).unwrap();
     assert!(sp.contains("ACTIONS.spawn") && sp.contains("ACTIONS.templates"));
 }
+
+/// The whole flow on the fake boxes: pair, look, reorder, stop, read the
+/// diff, reject, spawn, read the inbox. Changes leave a `workspace` record
+/// with `via: "local"` and the device id; successful reads leave none (the
+/// daemon records a read only when it refuses it).
+#[tokio::test]
+async fn whole_flow_on_fake() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let before = records(&w).len();
+
+    let a = act(&w, &s, &d, "box.overview", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = act(&w, &s, &d, "box.reorder", json!({"ids": ["b-q2", "b-q1"]})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = act(&w, &s, &d, "box.stop", json!({"id": "b-run"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = act(&w, &s, &d, "box.diff", json!({"id": "b-done"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = act(&w, &s, &d, "box.discard", json!({"id": "b-done"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let args = json!({"template": "claude", "repo": "saiife", "task": "fix the flaky test", "start": "queue"});
+    let a = act(&w, &s, &d, "box.spawn", args).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = act(&w, &s, &d, "box.inbox", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+
+    let r = records(&w);
+    let new = &r[before..];
+    let actions: Vec<_> = new
+        .iter()
+        .map(|x| field(x, "action").as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        actions,
+        vec!["box.reorder", "box.stop", "box.discard", "box.spawn"],
+        "only changes are recorded: {new:?}"
+    );
+    for rec in new {
+        assert_eq!(field(rec, "via"), "local", "{rec}");
+        assert_eq!(field(rec, "device"), d.device_id().as_str(), "{rec}");
+    }
+}
