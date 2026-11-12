@@ -38,6 +38,17 @@ pub const MODE_BOXES: u32 = 0o3770;
 pub const MODE_RO: u32 = 0o2750;
 
 /// The template unit (`/etc/systemd/system/saiife-box@.service`).
+///
+/// Every box's VMM runs as the one `saiife-box` user, so file modes cannot
+/// keep one VMM out of another box's disks, serial log, API socket or
+/// sealed memory (final review I6): `ReadWritePaths=` limits writes only.
+/// Instead the unit sees an empty read-only tmpfs over
+/// `/var/lib/saiife-box` with only its own box dir bound in (writable), the
+/// images read-only, and only its own sealed snapshot in the vault
+/// read-only (`-`: absent unless a restore is due). Pid records, markers
+/// and other boxes are not in its namespace at all. `ProtectSystem=strict`
+/// keeps the rest of the tree read-only; `/opt/saiife/vmm` is named
+/// read-only for clarity.
 pub const BOX_UNIT: &str = "\
 [Unit]
 Description=saiife box %i (Cloud Hypervisor)
@@ -55,15 +66,19 @@ PrivateNetwork=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/saiife-box/boxes/%i
-ReadOnlyPaths=/var/lib/saiife-box/images /var/lib/saiife-box/vault /opt/saiife/vmm
+TemporaryFileSystem=/var/lib/saiife-box:ro
+BindPaths=/var/lib/saiife-box/boxes/%i
+BindReadOnlyPaths=/var/lib/saiife-box/images
+BindReadOnlyPaths=-/var/lib/saiife-box/vault/%i.snap
+ReadOnlyPaths=/opt/saiife/vmm
 TimeoutStopSec=30
 KillMode=control-group
 Restart=no
 ";
 
 /// The polkit rule: the daemon user may start and stop `saiife-box@b<N>`
-/// units, nothing else.
+/// units, nothing else. It names the Linux daemon user
+/// ([`crate::layout::DAEMON_USER`]); `install_boxes` refuses any other.
 pub const POLKIT_RULE: &str = r#"polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "saiife") {
     var unit = action.lookup("unit"), verb = action.lookup("verb");
@@ -246,6 +261,17 @@ pub(crate) fn install_boxes_with(
 ) -> Result<(), InstallError> {
     if layout.is_system() && host.euid() != 0 {
         return Err(InstallError::NotRoot);
+    }
+    // The polkit rule is text naming the Linux daemon user: a rule for
+    // another user would let no daemon start its units (M6).
+    if daemon_user != crate::layout::DAEMON_USER {
+        return Err(refused(
+            &layout.at(&polkit_rule_path()),
+            format!(
+                "the box polkit rule is for the daemon user {}, not {daemon_user}",
+                crate::layout::DAEMON_USER
+            ),
+        ));
     }
     // 1. Refusals before the first change (again: install ran them early).
     let vmm_bytes = preflight(layout, host, vmm_dir, pins)?;
@@ -620,10 +646,30 @@ User=saiife-box\nGroup=saiife-box\nSupplementaryGroups=kvm\n\
 ExecStart=/opt/saiife/bin/saiife __box-vmm /var/lib/saiife-box/boxes/%i --locked\n\
 UMask=0007\nNoNewPrivileges=yes\nDevicePolicy=closed\nDeviceAllow=/dev/kvm rw\n\
 PrivateNetwork=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\n\
-ReadWritePaths=/var/lib/saiife-box/boxes/%i\n\
-ReadOnlyPaths=/var/lib/saiife-box/images /var/lib/saiife-box/vault /opt/saiife/vmm\n\
+TemporaryFileSystem=/var/lib/saiife-box:ro\n\
+BindPaths=/var/lib/saiife-box/boxes/%i\n\
+BindReadOnlyPaths=/var/lib/saiife-box/images\n\
+BindReadOnlyPaths=-/var/lib/saiife-box/vault/%i.snap\n\
+ReadOnlyPaths=/opt/saiife/vmm\n\
 TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         assert_eq!(BOX_UNIT, want);
+    }
+
+    /// The polkit rule names the Linux daemon user; any other user would
+    /// install a rule that lets nobody start the units.
+    #[test]
+    fn install_boxes_refuses_another_daemon_user() {
+        let w = world();
+        let mut c = Created::default();
+        let e = install_boxes_with(&w.layout, &w.host, "other", Some(&w.src), &w.pins, &mut c)
+            .unwrap_err();
+        assert!(e.to_string().contains("saiife"), "{e}");
+        assert!(c.users.is_empty() && c.groups.is_empty());
+        assert!(!w.layout.at(BOX_UNIT_PATH).exists());
+        assert!(POLKIT_RULE.contains(&format!(
+            "subject.user == \"{}\"",
+            crate::layout::DAEMON_USER
+        )));
     }
 
     #[test]
