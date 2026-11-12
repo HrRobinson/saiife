@@ -83,6 +83,11 @@ pub enum BoxAction {
         #[command(subcommand)]
         action: crate::box_vmm_cmd::VmmAction,
     },
+    /// Base images for boxes.
+    Image {
+        #[command(subcommand)]
+        action: crate::box_image_cmd::ImageAction,
+    },
 }
 
 #[cfg(not(unix))]
@@ -103,6 +108,10 @@ pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
         Err(imp::Stop::Unavailable(m)) => {
             eprintln!("saiife: {}", crate::text::sanitize(&m));
             ExitCode::from(5)
+        }
+        Err(imp::Stop::Failed(m)) => {
+            eprintln!("saiife: {}", crate::text::sanitize(&m));
+            ExitCode::from(1)
         }
     }
 }
@@ -128,6 +137,8 @@ mod imp {
     pub(super) enum Stop {
         Refused(String),
         Unavailable(String),
+        /// A local job failed (`box image build`): exit 1.
+        Failed(String),
     }
 
     type Args = Map<String, Value>;
@@ -174,6 +185,13 @@ mod imp {
                 Ok(()) => Ok(()),
                 Err(crate::box_vmm_cmd::Fail::Refused(m)) => Err(Stop::Refused(m)),
                 Err(crate::box_vmm_cmd::Fail::Unavailable(m)) => Err(Stop::Unavailable(m)),
+            };
+        }
+        if let BoxAction::Image { action } = action {
+            return match crate::box_image_cmd::run(config, action) {
+                Ok(()) => Ok(()),
+                Err(crate::box_image_cmd::Fail::Failed(m)) => Err(Stop::Failed(m)),
+                Err(crate::box_image_cmd::Fail::Unavailable(m)) => Err(Stop::Unavailable(m)),
             };
         }
         let t = broker::resolve_here(config).map_err(Stop::Unavailable)?;
@@ -263,7 +281,7 @@ mod imp {
                     print_templates(&a);
                 }
             }
-            BoxAction::Vmm { .. } => unreachable!("handled above"),
+            BoxAction::Vmm { .. } | BoxAction::Image { .. } => unreachable!("handled above"),
             BoxAction::Gc => {
                 let a = call(&t, "box.gc", Args::new())?;
                 let removed: Vec<String> = a

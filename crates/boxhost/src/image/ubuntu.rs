@@ -24,7 +24,7 @@ fn valid_release(r: &str) -> bool {
         .is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
-fn is_fpr(s: &str) -> bool {
+pub(crate) fn is_fpr(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
 }
 

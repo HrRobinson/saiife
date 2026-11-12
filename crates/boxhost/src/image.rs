@@ -3,7 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod store;
 pub mod ubuntu;
+
+pub use store::Store;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
@@ -189,7 +192,7 @@ pub struct ManifestPackage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManifestBoot {
     Firmware,
     Kernel { kernel: String, cmdline: String },
@@ -241,6 +244,39 @@ impl Manifest {
         if m.id != image_id(&m.sha256) {
             return Err("manifest id does not match its sha256".into());
         }
+        let digests = [
+            ("recipe_sha256", &m.recipe_sha256),
+            ("ubuntu.image_sha256", &m.ubuntu.image_sha256),
+            ("vmm.ch_sha256", &m.vmm.ch_sha256),
+            ("vmm.fw_sha256", &m.vmm.fw_sha256),
+            ("saiife.sha256", &m.saiife.sha256),
+            ("claude.sha256", &m.claude.sha256),
+        ];
+        for (field, v) in digests {
+            if !is_sha256(v) {
+                return Err(format!("manifest {field} must be 64 lowercase hex"));
+            }
+        }
+        if !ubuntu::is_fpr(&m.ubuntu.sums_signer) {
+            return Err("manifest ubuntu.sums_signer must be 40 uppercase hex".into());
+        }
+        for i in &m.images {
+            let ok = i.digest.strip_prefix("sha256:").is_some_and(is_sha256);
+            if !ok || i.name.is_empty() {
+                return Err(format!(
+                    "manifest images: {:?} must have a sha256:<64 hex> digest",
+                    i.name
+                ));
+            }
+        }
+        if let ManifestBoot::Kernel { kernel, .. } = &m.boot {
+            if *kernel != format!("{}.vmlinuz", m.id) {
+                return Err(format!(
+                    "manifest boot.kernel must be {}.vmlinuz, not {kernel:?}",
+                    m.id
+                ));
+            }
+        }
         Ok(m)
     }
 
@@ -250,7 +286,7 @@ impl Manifest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn hex(c: char) -> String {
@@ -320,10 +356,20 @@ mod tests {
     }
 
     fn manifest() -> Manifest {
+        let mut m = manifest_for(&hex('c'));
+        m.boot = ManifestBoot::Kernel {
+            kernel: format!("{}.vmlinuz", m.id),
+            cmdline: "console=ttyS0".into(),
+        };
+        m
+    }
+
+    /// A valid firmware-boot manifest for an image with this digest.
+    pub(crate) fn manifest_for(sha: &str) -> Manifest {
         Manifest {
             version: 1,
-            id: image_id(&hex('c')),
-            sha256: hex('c'),
+            id: image_id(sha),
+            sha256: sha.to_string(),
             virtual_gib: 20,
             actual_bytes: 1234,
             built_at: "2026-01-01T00:00:00Z".into(),
@@ -332,7 +378,7 @@ mod tests {
             ubuntu: ManifestUbuntu {
                 release: "release-20261017".into(),
                 image_sha256: hex('e'),
-                sums_signer: "test-signer".into(),
+                sums_signer: ubuntu::UBUNTU_CLOUD_FPR.into(),
             },
             vmm: ManifestVmm {
                 ch_version: "v0".into(),
@@ -356,10 +402,7 @@ mod tests {
                 name: "busybox".into(),
                 digest: format!("sha256:{}", hex('5')),
             }],
-            boot: ManifestBoot::Kernel {
-                kernel: "vmlinuz".into(),
-                cmdline: "console=ttyS0".into(),
-            },
+            boot: ManifestBoot::Firmware,
             signature: None,
         }
     }
@@ -398,5 +441,47 @@ mod tests {
         assert!(parse_image_id("base-abc").is_err());
         assert!(parse_image_id(&format!("base-{}", "A".repeat(64))).is_err());
         assert!(parse_image_id(&h).is_err());
+    }
+
+    #[test]
+    fn manifest_digests_are_checked() {
+        type Edit = fn(&mut Manifest);
+        let bad: [(&str, Edit); 8] = [
+            ("recipe_sha256", |m| m.recipe_sha256 = "abc".into()),
+            ("ubuntu.image_sha256", |m| {
+                m.ubuntu.image_sha256 = "A".repeat(64)
+            }),
+            ("ubuntu.sums_signer", |m| {
+                m.ubuntu.sums_signer = "d2eb".repeat(10)
+            }),
+            ("vmm.ch_sha256", |m| m.vmm.ch_sha256 = String::new()),
+            ("vmm.fw_sha256", |m| m.vmm.fw_sha256 = "g".repeat(64)),
+            ("saiife.sha256", |m| m.saiife.sha256 = "0".repeat(63)),
+            ("claude.sha256", |m| m.claude.sha256 = "UNPINNED".into()),
+            ("images", |m| m.images[0].digest = hex('5')),
+        ];
+        for (field, edit) in bad {
+            let mut m = manifest();
+            edit(&mut m);
+            let e = Manifest::parse(&m.to_json()).unwrap_err();
+            assert!(e.contains(field), "{field}: {e}");
+        }
+    }
+
+    #[test]
+    fn kernel_boot_rules() {
+        let mut m = manifest();
+        m.boot = ManifestBoot::Kernel {
+            kernel: "vmlinuz".into(),
+            cmdline: "console=ttyS0".into(),
+        };
+        assert!(Manifest::parse(&m.to_json())
+            .unwrap_err()
+            .contains("vmlinuz"));
+        let json = manifest()
+            .to_json()
+            .replace("\"cmdline\":", "\"initrd\": \"x\", \"cmdline\":");
+        assert!(json.contains("initrd"));
+        assert!(Manifest::parse(&json).is_err());
     }
 }
