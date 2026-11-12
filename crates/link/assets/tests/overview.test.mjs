@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { headerLine, preview, hrefFor, reorderIds, counter, machineCommand, MAX_STEER_BYTES } from "../js/overviewlogic.js";
+import { headerLine, preview, hrefFor, reorderIds, counter, machineCommand, MAX_STEER_BYTES, doneText, stateClass, showsRuntime } from "../js/overviewlogic.js";
 
 const b = (id, state) => ({ id, state });
 const ov = {
@@ -36,6 +36,29 @@ test("reorder sends the full new order of queued boxes", () => {
   assert.equal(reorderIds(ov.boxes, "q1", -1), null);
   assert.equal(reorderIds(ov.boxes, "q2", 1), null);
   assert.equal(reorderIds(ov.boxes, "r", 1), null);
+});
+
+test("an action says what it did", () => {
+  assert.equal(doneText("lockdown.on"), "Lockdown is on. Every agent is stopped.");
+  assert.ok(doneText("box.reorder").length > 0);
+  assert.ok(doneText("box.anything").length > 0);
+});
+
+test("badge class only from the known states", () => {
+  assert.equal(stateClass("running"), "state-running");
+  assert.equal(stateClass("discarded"), "state-discarded");
+  assert.equal(stateClass("x onerror"), "state-other");
+  assert.equal(stateClass("constructor"), "state-other");
+  assert.equal(stateClass(undefined), "state-other");
+});
+
+test("running for only on running and paused boxes", () => {
+  assert.equal(showsRuntime({ state: "running", started_at: 5 }), true);
+  assert.equal(showsRuntime({ state: "paused", started_at: 5 }), true);
+  for (const state of ["done", "landed", "discarded", "queued", "starting"]) {
+    assert.equal(showsRuntime({ state, started_at: 5 }), false, state);
+  }
+  assert.equal(showsRuntime({ state: "running", started_at: null }), false);
 });
 
 test("steer counter counts bytes", () => {

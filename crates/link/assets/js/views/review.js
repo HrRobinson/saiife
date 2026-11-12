@@ -1,11 +1,12 @@
 // Review one done box: its diff and tests, then Approve / Reject / Revise.
 // One box.diff answer is shown as is; the renderer caps it at 2000 lines.
 import { h } from "../dom.js";
-import { visible, short } from "../format.js";
+import { visible, short, plural } from "../format.js";
 import { ACTIONS, outcome } from "../actions.js";
 import { Client } from "../wire.js";
 import { parse, render as renderDiff } from "../diff.js";
 import { show } from "../touchprompt.js";
+import { leaveIfUnpaired } from "../unpaired.js";
 
 const message = (a) => visible(a.message || "That did not work.");
 
@@ -49,19 +50,30 @@ export function view(client, id) {
   const body = h("div", {});
   const out = h("div", { role: "status", "aria-live": "polite" });
   const approve = h("button", { type: "button", class: "primary", disabled: true }, "Approve with touch");
-  const reject = h("button", { type: "button", class: "danger" }, "Reject");
+  const reject = h("button", { type: "button", class: "danger", disabled: true }, "Reject");
   const reviseBtn = h("button", { type: "button", "aria-expanded": "false" }, "Revise");
   const note = h("textarea", { id: "revise-comment", name: "comment", rows: 3 });
+  const submitRevise = h("button", { type: "submit", class: "primary" }, "Send for revision");
   const reviseForm = h(
     "form",
     {},
     h("label", { for: "revise-comment" }, "What should the box change?"),
     note,
-    h("p", {}, h("button", { type: "submit", class: "primary" }, "Send for revision")),
+    h("p", {}, submitRevise),
   );
   reviseForm.hidden = true;
   let sha = null;
+  let loaded = false; // the diff is on the page (Reject needs it)
+  let inFlight = false; // one request at a time
   let left = false;
+
+  // Approve needs the digest, Reject the diff; nothing while a request runs.
+  const buttons = () => {
+    approve.disabled = inFlight || sha === null;
+    reject.disabled = inFlight || !loaded;
+    reviseBtn.disabled = inFlight;
+    submitRevise.disabled = inFlight;
+  };
 
   const leave = () => {
     left = true;
@@ -69,9 +81,19 @@ export function view(client, id) {
   window.addEventListener("hashchange", leave, { once: true });
 
   async function run(action, args, summary, onDone) {
+    if (inFlight) return;
+    inFlight = true;
+    buttons();
     out.replaceChildren(h("p", { class: "muted" }, "Working…"));
-    const a = await client.send(action, args);
+    let a;
+    try {
+      a = await client.send(action, args);
+    } finally {
+      inFlight = false;
+      buttons();
+    }
     if (left) return;
+    if (await leaveIfUnpaired(a)) return;
     const o = outcome(a);
     // A touch-level action is never shown as done here.
     if (o === "needs_touch") return out.replaceChildren(show(a, { action, id, summary }));
@@ -86,6 +108,7 @@ export function view(client, id) {
     });
   });
   reject.addEventListener("click", () => {
+    if (!loaded || inFlight) return;
     if (!window.confirm("Discard this box's work?")) return;
     run(ACTIONS.discard, { id }, "Discard the box's work", () => {
       location.hash = "#/overview";
@@ -108,17 +131,17 @@ export function view(client, id) {
   async function load() {
     const a = await client.send(ACTIONS.diff, { id });
     if (left) return;
+    if (await leaveIfUnpaired(a)) return;
     if (!a.ok) {
       head.replaceChildren(h("p", { class: "error", role: "alert" }, `Could not load the diff. ${message(a)}`));
       return;
     }
     const d = a.result || {};
     sha = typeof d.diff_sha256 === "string" ? d.diff_sha256 : null;
-    approve.disabled = sha === null;
     const files = Array.isArray(d.files) ? d.files : [];
     const kids = [
       h("p", {}, `Base commit `, h("code", {}, short(visible(d.base_commit))), " · Diff ", sha === null ? "?" : digest(sha)),
-      h("p", {}, `${files.length} files changed`),
+      h("p", {}, `${plural(files.length, "file")} changed`),
       h("ul", { class: "files" }, files.map(fileRow)),
       testsLine(d.tests),
     ];
@@ -135,6 +158,8 @@ export function view(client, id) {
     head.replaceChildren(...kids);
     const r = renderDiff(parse(d.unified), h, {});
     body.replaceChildren(...r.nodes);
+    loaded = true;
+    buttons();
   }
 
   load();

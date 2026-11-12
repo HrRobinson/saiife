@@ -2,7 +2,7 @@
 // nodes only, through the h() it is given. Every path and line is hostile:
 // the renderer passes them through visible(), never resolves a path and
 // never makes a link.
-import { visible } from "./format.js";
+import { visible, plural } from "./format.js";
 
 export const MAX_LINES = 2000;
 
@@ -20,9 +20,10 @@ function side(s, prefix) {
 // exactly even when they hold " b/"; otherwise at the last " b/".
 function gitPaths(rest) {
   if (rest.startsWith("a/")) {
+    // "a/" + x + " b/" + x: n = 5 + 2 * len(x).
     const n = rest.length;
-    if ((n - 3) % 2 === 0) {
-      const half = (n - 3) / 2;
+    if ((n - 5) % 2 === 0) {
+      const half = (n - 5) / 2;
       const x = rest.slice(2, 2 + half);
       if (rest.slice(2 + half, 5 + half) === " b/" && rest.slice(5 + half) === x) return [x, x];
     }
@@ -151,7 +152,9 @@ function title(f) {
 }
 
 // -> {nodes, shownLines, hiddenLines}. Builds every node once; at most
-// maxLines diff lines become nodes, the rest are counted and said.
+// maxLines diff lines become nodes, the rest are counted and said. A file
+// cut by the cap says how many of its lines are not shown; a file past the
+// cap is its heading and that note only (bounded work on a 2 MB diff).
 export function render(files, h, { maxLines = MAX_LINES } = {}) {
   const nodes = [];
   let shown = 0;
@@ -159,10 +162,10 @@ export function render(files, h, { maxLines = MAX_LINES } = {}) {
   for (const f of files) {
     const kids = [h("h3", { class: "path" }, title(f))];
     if (f.binary) kids.push(h("p", { class: "muted" }, "binary"));
+    let cut = 0;
     for (const hk of f.hunks) {
-      const room = Math.max(0, maxLines - shown);
-      const take = Math.min(room, hk.lines.length);
-      hidden += hk.lines.length - take;
+      const take = Math.min(Math.max(0, maxLines - shown), hk.lines.length);
+      cut += hk.lines.length - take;
       if (take === 0) continue;
       const rows = [];
       if (hk.header !== null) rows.push(h("span", { class: "hh" }, visible(hk.header) + "\n"));
@@ -173,10 +176,13 @@ export function render(files, h, { maxLines = MAX_LINES } = {}) {
       shown += take;
       kids.push(h("div", { class: "hunk" }, h("pre", {}, rows)));
     }
+    if (cut > 0) kids.push(h("p", { class: "muted" }, `${plural(cut, "line")} not shown.`));
+    hidden += cut;
     nodes.push(h("section", { class: "diff" }, kids));
   }
   if (hidden > 0) {
-    nodes.push(h("p", { class: "muted" }, `${hidden} more lines are not shown here.`));
+    const what = hidden === 1 ? "1 more line is" : `${hidden} more lines are`;
+    nodes.push(h("p", { class: "muted" }, `${what} not shown here.`));
   }
   return { nodes, shownLines: shown, hiddenLines: hidden };
 }

@@ -25,6 +25,28 @@ export function preview(text) {
   return { text: chars.slice(0, TASK_PREVIEW_CHARS).join(""), cut: true };
 }
 
+const STATES = new Set(["queued", "starting", "running", "paused", "done", "landed", "discarded"]);
+
+// The badge class: only a known state names one; anything else is neutral.
+export function stateClass(state) {
+  return typeof state === "string" && STATES.has(state) ? `state-${state}` : "state-other";
+}
+
+// "Running for" is shown only while a box runs or is paused.
+export function showsRuntime(box) {
+  return (box.state === "running" || box.state === "paused") && Number.isFinite(box.started_at);
+}
+
+const DONE = {
+  "lockdown.on": "Lockdown is on. Every agent is stopped.",
+  "box.reorder": "The queue order is saved.",
+};
+
+// What the overview says after an action the daemon accepted.
+export function doneText(action) {
+  return Object.hasOwn(DONE, action) ? DONE[action] : "Done.";
+}
+
 // Where a card links to, or null.
 export function hrefFor(box) {
   if (box.state === "done") return `#/box/${box.id}`;

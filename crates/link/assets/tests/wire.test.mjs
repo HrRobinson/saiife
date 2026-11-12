@@ -294,3 +294,13 @@ test("an oversized body is refused before sending", async () => {
   assert.equal(a.error, "too_large");
   assert.equal(frames(fetch).length, 0);
 });
+
+test("send never rejects when signing fails", async () => {
+  const dev = await newDevice();
+  const { c, fetch } = await client([[200, HELLO("e1")]], { ...dev, key: {} });
+  const a = await c.send("box.overview");
+  assert.equal(a.ok, false);
+  assert.equal(a.error, "invalid");
+  assert.equal(typeof a.message, "string");
+  assert.equal(frames(fetch).length, 0);
+});

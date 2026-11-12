@@ -1,6 +1,6 @@
 // Pure text helpers. No DOM.
 
-const BIDI = new Set([0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f]);
+const BIDI = new Set([0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c]);
 
 // Show control and bidi characters as visible escapes. Tab and newline stay.
 export function visible(s) {
@@ -38,4 +38,9 @@ export function bytes(n) {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MiB`;
   return `${(n / 1073741824).toFixed(1)} GiB`;
+}
+
+// "1 file", "2 files".
+export function plural(n, one, many = `${one}s`) {
+  return `${n} ${n === 1 ? one : many}`;
 }

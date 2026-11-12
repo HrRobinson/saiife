@@ -180,3 +180,36 @@ test("diff render caps lines", () => {
   assert.equal(small.shownLines, 10);
   assert.equal(small.hiddenLines, 4990);
 });
+
+test("equal git names holding \" b/\" split exactly", () => {
+  const files = parse("diff --git a/x b/y b/x b/y\nBinary files a/x b/y and b/x b/y differ\n");
+  assert.equal(files.length, 1);
+  assert.equal(files[0].oldPath, "x b/y");
+  assert.equal(files[0].newPath, "x b/y");
+  assert.equal(files[0].binary, true);
+  const plain = parse("diff --git a/src/a.rs b/src/a.rs\n");
+  assert.equal(plain[0].oldPath, "src/a.rs");
+  assert.equal(plain[0].newPath, "src/a.rs");
+  const moved = parse("diff --git a/old.txt b/new.txt\n");
+  assert.deepEqual([moved[0].oldPath, moved[0].newPath], ["old.txt", "new.txt"]);
+});
+
+test("files cut by the cap say how many of their lines are not shown", () => {
+  const file = (name, n) =>
+    `--- a/${name}\n+++ b/${name}\n@@ -1,0 +1,${n} @@\n` +
+    Array.from({ length: n }, (_, i) => `+${name} ${i}`).join("\n") + "\n";
+  const files = parse(file("one", 2) + file("two", 4) + file("three", 5));
+  const r = render(files, h, { maxLines: 3 });
+  assert.equal(r.shownLines, 3);
+  assert.equal(r.hiddenLines, 8);
+  const [one, two, three] = r.nodes;
+  assert.ok(!texts([one]).some((x) => x.includes("not shown")));
+  assert.ok(texts([two]).some((x) => x === "3 lines not shown."), texts([two]).join("|"));
+  assert.ok(texts([two]).some((x) => x.includes("two 0")));
+  assert.ok(!texts([two]).some((x) => x.includes("two 1")));
+  const t3 = texts([three]);
+  assert.ok(t3.some((x) => x === "5 lines not shown."), t3.join("|"));
+  assert.ok(!t3.some((x) => x.includes("three 0")));
+  assert.ok(!tags([three]).has("pre"), "no line nodes past the cap");
+  assert.ok(texts(r.nodes).some((x) => x.includes("8 more lines are not shown")));
+});

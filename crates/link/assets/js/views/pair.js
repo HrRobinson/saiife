@@ -5,6 +5,7 @@
 import { h } from "../dom.js";
 import { visible } from "../format.js";
 import * as keystore from "../keystore.js";
+import { takeNotice, UNPAIRED, PAIR_AGAIN } from "../unpaired.js";
 import { pair, parseFragment, waitAndSave, checkLabel, DEFAULT_LABEL, MAX_LABEL_CHARS, WAIT_MS, FRAGMENT_INVALID } from "../pairing.js";
 
 const HOW = "On the machine, run saiife workspace pair --local and open the link it prints.";
@@ -92,11 +93,14 @@ function waiting(root, code, device) {
 
 export function render(route) {
   const root = h("section", { class: "pair" });
-  intro(root);
+  // A screen saw unknown_device (unpaired.js): the key is forgotten; say so.
+  const gone = takeNotice();
+  if (gone && !route.fragment) show(root, h("h1", {}, UNPAIRED), h("p", {}, PAIR_AGAIN));
+  else intro(root);
   const offer = route.fragment ? parseFragment(route.fragment) : Promise.resolve(null);
   Promise.all([keystore.loadDevice(), offer]).then(([dev, parsed]) => {
     if (!route.fragment) {
-      if (dev) show(root, h("h1", {}, "This browser is paired"), h("p", {}, h("a", { href: "#/overview" }, "Go to the overview")));
+      if (dev && !gone) show(root, h("h1", {}, "This browser is paired"), h("p", {}, h("a", { href: "#/overview" }, "Go to the overview")));
       return;
     }
     if (!parsed) return show(root, h("h1", {}, "Pair this browser"), h("p", { class: "error" }, FRAGMENT_INVALID));

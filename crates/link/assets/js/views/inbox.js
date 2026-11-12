@@ -6,6 +6,8 @@ import { ACTIONS } from "../actions.js";
 import { Client } from "../wire.js";
 import { className, promptAction, timeLeft } from "../inboxlogic.js";
 import { show } from "../touchprompt.js";
+import { leaveIfUnpaired } from "../unpaired.js";
+import { poller } from "../poller.js";
 
 export const POLL_MS = 5000;
 const BOX_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -18,7 +20,6 @@ export function view(client) {
   const root = h("section", { class: "inbox-screen" }, h("h1", {}, "Approve"), head, note, list, prompt);
   let timer = null;
   let stopped = false;
-  let busy = false;
 
   function row(p, now) {
     const t = timeLeft(p.expires_at, now);
@@ -44,11 +45,10 @@ export function view(client) {
   }
 
   async function poll() {
-    if (stopped || busy) return;
-    busy = true;
-    const a = await client.send(ACTIONS.inbox, {});
-    busy = false;
     if (stopped) return;
+    const a = await client.send(ACTIONS.inbox, {});
+    if (stopped) return;
+    if (await leaveIfUnpaired(a)) return;
     if (!a.ok) {
       head.replaceChildren("Could not load the inbox.");
       note.replaceChildren(visible(a.message || "That did not work."));
@@ -61,8 +61,10 @@ export function view(client) {
     list.replaceChildren(...items.map((p) => row(p, now)));
   }
 
+  const refresh = poller(poll);
+
   function tick() {
-    if (document.visibilityState === "visible") poll();
+    if (document.visibilityState === "visible") refresh.tick();
   }
 
   function stop() {
@@ -73,7 +75,7 @@ export function view(client) {
     document.removeEventListener("visibilitychange", tick);
   }
 
-  poll();
+  refresh.tick();
   timer = setInterval(tick, POLL_MS);
   document.addEventListener("visibilitychange", tick);
   window.addEventListener("hashchange", stop);

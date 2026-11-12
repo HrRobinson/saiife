@@ -167,7 +167,13 @@ export class Client {
       return no("invalid", SENTENCES.refused);
     }
     if (enc.encode(body).length > MAX_BODY_BYTES) return no("too_large", SENTENCES.large);
-    const frame = { body, sig: await sign(device.key, body) };
+    let sig;
+    try {
+      sig = await sign(device.key, body);
+    } catch {
+      return no("invalid", SENTENCES.refused);
+    }
+    const frame = { body, sig };
     if (touch !== undefined && touch !== null) frame.touch = touch;
     return this.request("/api/frame", {
       method: "POST",
@@ -177,8 +183,16 @@ export class Client {
   }
 
   // One frame; on stale_epoch the hello is refetched and the frame rebuilt
-  // with a new nonce, once.
+  // with a new nonce, once. Never rejects: any throw is a fixed refusal.
   async send(action, args = {}, opts = {}) {
+    try {
+      return await this.sendOnce(action, args, opts);
+    } catch {
+      return no("invalid", SENTENCES.refused);
+    }
+  }
+
+  async sendOnce(action, args, opts) {
     let device = null;
     try {
       device = await this.store.loadDevice();

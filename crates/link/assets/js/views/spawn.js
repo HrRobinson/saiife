@@ -5,6 +5,7 @@ import { ACTIONS, outcome } from "../actions.js";
 import { Client } from "../wire.js";
 import { taskCounter, checkRepo, checkTask, needsTouchBadge, spawnArgs } from "../inboxlogic.js";
 import { show } from "../touchprompt.js";
+import { leaveIfUnpaired } from "../unpaired.js";
 
 export function view(client) {
   const select = h("select", { id: "spawn-template", name: "template" });
@@ -35,6 +36,7 @@ export function view(client) {
 
   async function load() {
     const a = await client.send(ACTIONS.templates, {});
+    if (await leaveIfUnpaired(a)) return;
     if (!a.ok || !Array.isArray(a.result)) {
       out.replaceChildren(h("p", { class: "error", role: "alert" }, visible(a.message || "Could not load the templates.")));
       return;
@@ -54,9 +56,14 @@ export function view(client) {
     buttons(false);
     out.replaceChildren(h("p", { class: "muted" }, "Working…"));
     const args = spawnArgs(select.value, repo.value, task.value, startNow);
-    const a = await client.send(ACTIONS.spawn, args);
-    inFlight = false;
-    buttons(templates.length > 0);
+    let a;
+    try {
+      a = await client.send(ACTIONS.spawn, args);
+    } finally {
+      inFlight = false;
+      buttons(templates.length > 0);
+    }
+    if (await leaveIfUnpaired(a)) return;
     const o = outcome(a);
     if (o === "done") {
       location.hash = "#/overview";

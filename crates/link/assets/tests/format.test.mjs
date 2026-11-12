@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { visible, ago, runtime, short, bytes } from "../js/format.js";
+import { visible, ago, runtime, short, bytes, plural } from "../js/format.js";
 
 test("visible escapes bidi and controls", () => {
   assert.equal(visible("a‮b"), "a⟨U+202E⟩b");
@@ -8,7 +8,14 @@ test("visible escapes bidi and controls", () => {
   assert.equal(visible("x\u007f"), "x⟨U+007F⟩");
   assert.equal(visible("⁦⁩‎‏"), "⟨U+2066⟩⟨U+2069⟩⟨U+200E⟩⟨U+200F⟩");
   assert.equal(visible("plain\ttext\n"), "plain\ttext\n");
+  assert.equal(visible("a\u061cb"), "a⟨U+061C⟩b");
   assert.equal(visible(null), "");
+});
+
+test("plural counts", () => {
+  assert.equal(plural(1, "file"), "1 file");
+  assert.equal(plural(0, "file"), "0 files");
+  assert.equal(plural(2, "line"), "2 lines");
 });
 
 test("ago and runtime", () => {

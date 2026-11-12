@@ -5,6 +5,7 @@ import { ACTIONS, outcome } from "../actions.js";
 import { Client } from "../wire.js";
 import { counter } from "../overviewlogic.js";
 import { show } from "../touchprompt.js";
+import { leaveIfUnpaired } from "../unpaired.js";
 
 export function view(client, id) {
   const input = h("textarea", { id: "steer-msg", name: "msg", rows: 4 });
@@ -15,6 +16,7 @@ export function view(client, id) {
   async function run(action, args, summary, okText) {
     out.replaceChildren(h("p", { class: "muted" }, "Working…"));
     const a = await client.send(action, args);
+    if (await leaveIfUnpaired(a)) return;
     const o = outcome(a);
     if (o === "needs_touch") return out.replaceChildren(show(a, { action, id, summary }));
     if (o === "done") return out.replaceChildren(h("p", {}, okText));
