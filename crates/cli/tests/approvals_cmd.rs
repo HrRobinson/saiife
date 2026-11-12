@@ -24,10 +24,13 @@ mod common;
 
 use approvals_world::*;
 
-use common::daemon::{own_uid, own_user, wait_for};
+#[cfg(target_os = "linux")]
+use common::daemon::wait_for;
+use common::daemon::{own_uid, own_user};
 use saiife_daemon::approvals::{dir_in, State};
 use serde_json::{json, Value};
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::time::Duration;
 
