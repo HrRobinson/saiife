@@ -1,0 +1,8 @@
+# synthesized from the v54.0 OpenAPI; re-recorded by box-smoke.sh RECORD=1
+HTTP/1.1 200 OK
+Server: Cloud Hypervisor API
+Connection: close
+Content-Type: application/json
+Content-Length: 234
+
+{"config":{"cpus":{"boot_vcpus":1,"max_vcpus":1},"memory":{"size":536870912},"payload":{"kernel":"/k/vmlinux"},"disks":[{"path":"/b/root.img"}],"vsock":{"cid":3,"socket":"/b/ch.vsock"}},"state":"Paused","memory_actual_size":536870912}

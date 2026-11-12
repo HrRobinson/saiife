@@ -7,6 +7,9 @@ pub struct Layout {
     pub boxes: PathBuf,
     pub images: PathBuf,
     pub vmm: PathBuf,
+    /// Daemon-owned, never VMM-writable: snapshot markers, verified
+    /// snapshot copies and pid records (S3).
+    pub vault: PathBuf,
     pub locked: bool,
 }
 
@@ -17,6 +20,7 @@ impl Layout {
             boxes: PathBuf::from("/var/lib/saiife-box/boxes"),
             images: PathBuf::from("/var/lib/saiife-box/images"),
             vmm: PathBuf::from("/opt/saiife/vmm"),
+            vault: PathBuf::from("/var/lib/saiife-box/vault"),
             locked: true,
         }
     }
@@ -27,6 +31,7 @@ impl Layout {
             boxes: state_dir.join("boxes"),
             images: state_dir.join("images"),
             vmm: data_home.join("saiife").join("vmm"),
+            vault: state_dir.join("box-vault"),
             locked: false,
         }
     }
@@ -42,6 +47,7 @@ mod tests {
         assert_eq!(l.boxes, PathBuf::from("/var/lib/saiife-box/boxes"));
         assert_eq!(l.images, PathBuf::from("/var/lib/saiife-box/images"));
         assert_eq!(l.vmm, PathBuf::from("/opt/saiife/vmm"));
+        assert_eq!(l.vault, PathBuf::from("/var/lib/saiife-box/vault"));
         assert!(l.locked);
     }
 
@@ -51,6 +57,7 @@ mod tests {
         assert_eq!(l.boxes, PathBuf::from("/s/state/boxes"));
         assert_eq!(l.images, PathBuf::from("/s/state/images"));
         assert_eq!(l.vmm, PathBuf::from("/s/data/saiife/vmm"));
+        assert_eq!(l.vault, PathBuf::from("/s/state/box-vault"));
         assert!(!l.locked);
     }
 }

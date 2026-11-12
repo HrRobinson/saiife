@@ -33,6 +33,7 @@ mod audit_locked;
 mod box_cmd;
 mod box_image_cmd;
 mod box_vmm_cmd;
+mod box_vmm_helper;
 #[cfg(any(unix, windows))]
 mod broker;
 mod check;
@@ -264,6 +265,15 @@ enum Cmd {
     /// spec on stdin, confines itself, execs the server.
     #[command(name = "__mcp-spawn", hide = true)]
     McpSpawn,
+    /// The box VMM launcher (the daemon runs it): checks a box's vm.json,
+    /// then execs the pinned Cloud Hypervisor. Unix only.
+    #[command(name = "__box-vmm", hide = true)]
+    BoxVmm {
+        dir: std::path::PathBuf,
+        /// The locked layout (system install) instead of the user's own.
+        #[arg(long)]
+        locked: bool,
+    },
     /// Test seam (debug builds): a scripted MCP stdio server.
     #[cfg(debug_assertions)]
     #[command(name = "__fake-mcp-server", hide = true)]
@@ -473,6 +483,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
     const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
     match cmd {
         Cmd::McpSpawn => Some(NO_GATEWAY),
+        Cmd::BoxVmm { .. } => Some("saiife: __box-vmm: boxes need Linux or macOS"),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
         // No wildcard: a new subcommand must be put on one side or the other here, or this
@@ -567,6 +578,9 @@ fn main() -> ExitCode {
             true => eval::serve_main(),
             false => eval::worker_main(),
         };
+    }
+    if let Cmd::BoxVmm { dir, locked } = cli.command {
+        return box_vmm_helper::run(dir, locked);
     }
     if let Cmd::McpSpawn = cli.command {
         #[cfg(target_os = "linux")]
@@ -818,6 +832,7 @@ fn main() -> ExitCode {
         Cmd::Check { .. }
         | Cmd::Eval { .. }
         | Cmd::McpSpawn
+        | Cmd::BoxVmm { .. }
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
         | Cmd::Secret { .. }

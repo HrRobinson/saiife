@@ -12,10 +12,25 @@ path = "src/lib.rs"
 
 [dependencies]
 saiife-boxproto = { path = "../boxproto" }
-ring = "=0.17.14"
+# The Vmm trait ChVmm implements (boxes never depends on boxhost).
+saiife-boxes = { path = "../boxes" }
+# BoxId (tokio-free).
+saiife-wire = { path = "../wire" }
 serde = { version = "1", features = ["derive"] }
+# O_NOFOLLOW / O_NONBLOCK constants only; no unsafe.
+rustix = { version = "1", features = ["fs", "process"] }
+ring = "=0.17.14"
 serde_json = "1"
 toml = "0.8"
+
+[features]
+# Builds the saiife-fake-ch test binary.
+fake = []
+
+[[bin]]
+name = "saiife-fake-ch"
+path = "src/bin/fake_ch.rs"
+required-features = ["fake"]
 
 [dev-dependencies]
 tempfile = "3"
