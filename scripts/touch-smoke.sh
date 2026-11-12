@@ -30,6 +30,8 @@
 #     as `k=v` words (default none).
 #   - the binary: SAIIFE=${SAIIFE:-target/debug/saiife}, built with
 #       cargo build -p saiife --features fido-hid
+#     or an installed deb/rpm with its release binary (the FIDO helper at
+#     /usr/libexec/saiife/saiife-fido does the key work).
 #   - jq.
 #
 # Audit: the script reads the audit log's month files (*.jsonl) with jq, because
@@ -39,7 +41,7 @@
 #
 #   bash scripts/touch-smoke.sh
 #
-# Expect 11 "ok:" lines (9 without the second key) and exit 0. Step 8's optional
+# Expect 11 "ok:" lines (9 without the second key; one more when the helper is installed) and exit 0. Step 8's optional
 # --host removal needs root and is never run here; the script prints the line.
 set -euo pipefail
 
@@ -116,8 +118,17 @@ audit_records() {
   cat "$AUDIT_DIR"/*.jsonl 2>/dev/null | jq -c --arg start "$START" 'select(.ts >= $start)' || true
 }
 
-# 1. doctor knows the key check and it passes.
+# 0. with the package's helper installed, doctor shows touch-helper PASS.
 doc=$("$SAIIFE" doctor 2>&1 || true)
+if [ -e /usr/libexec/saiife/saiife-fido ]; then
+  if grep -iE 'touch[- ]helper' <<<"$doc" | grep -q 'PASS'; then
+    ok "doctor: touch helper PASS"
+  else
+    bad "doctor: touch helper PASS (reinstall the saiife deb or rpm)"
+  fi
+fi
+
+# 1. doctor knows the key check and it passes.
 if grep -iE 'touch[- ]key' <<<"$doc" | grep -q 'PASS'; then
   ok "doctor: touch key PASS"
 else

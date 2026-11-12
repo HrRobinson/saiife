@@ -80,6 +80,11 @@ plugged in but you cannot use it, or when more than one is plugged in. On a
 build without key support ([Builds](#7-builds)) a plugged-in key is Info. It only tests access and never opens the
 node. It is never a failure.
 
+On Linux, `saiife doctor` also has a `touch-helper` check for the FIDO helper
+of the deb and rpm: Pass when the helper is installed and safe to run, Info
+when it is not installed (or the build needs none), and Warn when it is not safe
+to run, is of another version, or cannot start.
+
 ## 3. Approving with a touch
 
 `saiife approvals show <id>` names the class of a request that needs a touch:
@@ -170,7 +175,7 @@ mode is a workflow aid, not a security boundary
 Key support is a build feature. A build without it refuses with (on Linux):
 
 ```
-this saiife build has no FIDO2 key support (a static Linux build); see docs/touch.md
+this saiife build has no FIDO2 key support (a static Linux build without the FIDO helper); install the saiife deb or rpm, see docs/touch.md
 ```
 
 The part in brackets names the build: `(a Windows build)` on Windows, and
@@ -184,9 +189,15 @@ still lists the devices and prints the line as a note.
 - The Windows release builds do not, and refuse with `(a Windows build)` in
   the line above. Key support there is planned: raw HID access to a FIDO key
   needs an elevated shell on Windows, and an elevated shell maps to the shared
-  admin uid 0, so every elevated admin would share the device.
-- The Linux release packages are static, and the main `saiife` binary stays
-  static. Key support for them is planned through a small dynamically linked
-  helper binary shipped in the Linux packages. It is not built yet.
+  admin uid 0, so every elevated admin would share the device. The route planned for Windows is
+  the platform WebAuthn API.
+- The Linux deb and rpm carry key support through
+  `/usr/libexec/saiife/saiife-fido`, a small helper linked against libudev that
+  only talks to the key. The main `saiife` binary stays static. It checks the
+  helper before running it (owned by root, not writable by others) and refuses
+  one of another version. You type the PIN into `saiife`, which passes it to the
+  helper over a pipe. The packages depend on libc 2.31 or newer and libudev.
+- The tarball and `install.sh` installs have no helper, and refuse with the
+  line above.
 - A Linux build from source has it with `cargo build --features fido-hid`. The
-  build needs the libudev development files and `pkg-config`.
+  build needs the libudev development files and `pkg-config`, and no helper.
