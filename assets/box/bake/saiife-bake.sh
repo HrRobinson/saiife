@@ -127,8 +127,15 @@ trim() {
   systemctl enable docker.socket
 }
 
-# Written after the pulls: the bake VM pulls directly, and the proxy only
-# exists in a running box.
+# Before the first Docker start: the classic image store only, so pulled
+# images land where the box runtime looks.
+write_docker_store_config() {
+  mkdir -p /etc/docker
+  printf '%s\n' '{"features":{"containerd-snapshotter":false}}' >/etc/docker/daemon.json
+}
+
+# Written after the pulls (final I6 content): the bake VM pulls directly,
+# and the proxy only exists in a running box.
 write_docker_config() {
   mkdir -p /etc/docker
   # proxy port 3128: source of truth is saiife_boxproto::ports (plan 38)
@@ -187,6 +194,7 @@ main() {
   install_growroot
   make_agent_user
   trim
+  write_docker_store_config
   pull_images
   write_docker_config
   export_outputs

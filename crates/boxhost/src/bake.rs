@@ -414,7 +414,17 @@ mod tests {
     #[test]
     fn script_pulls_before_the_proxy_config_and_is_glob_safe() {
         let main = BAKE_SCRIPT.split("\nmain() {").nth(1).unwrap();
+        let store = main.find("  write_docker_store_config\n").unwrap();
         let pull = main.find("  pull_images\n").unwrap();
+        assert!(store < pull);
+        let store_fn = BAKE_SCRIPT
+            .split("\nwrite_docker_store_config() {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(store_fn.contains("containerd-snapshotter") && !store_fn.contains("proxies"));
         let conf = main.find("  write_docker_config\n").unwrap();
         assert!(pull < conf);
         let trim = BAKE_SCRIPT
