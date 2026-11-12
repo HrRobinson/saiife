@@ -1,0 +1,8 @@
+# synthesized from the v54.0 OpenAPI; re-recorded by box-smoke.sh RECORD=1
+HTTP/1.1 500 Internal Server Error
+Server: Cloud Hypervisor API
+Connection: close
+Content-Type: application/json
+Content-Length: 22
+
+InvalidStateTransition
