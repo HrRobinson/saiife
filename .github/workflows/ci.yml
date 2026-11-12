@@ -502,6 +502,10 @@ jobs:
           key: nfpm-${{ steps.nfpm-pin.outputs.sha256 }}
       # old = the cargo version; new = the same build with an extra ELF
       # section, so its bytes differ and it stays static (upgrade phase).
+      # The dynamically linked FIDO helper (plan 41), built against glibc 2.31 in the pinned
+      # debian:bullseye container; both packages carry the same helper.
+      - name: build the FIDO helper
+        run: bash scripts/release/build-fido-helper.sh amd64 "$RUNNER_TEMP/fido-out"
       - name: build the old and the new package
         run: |
           set -euo pipefail
@@ -510,8 +514,8 @@ jobs:
           printf 'upgrade' > "$RUNNER_TEMP/p18-t3-ci-section"
           objcopy --add-section .saiife_ci="$RUNNER_TEMP/p18-t3-ci-section" "$bin" "$RUNNER_TEMP/saiife-ci1"
           rm -rf dist
-          bash packaging/linux/build.sh "$bin" "$ver" amd64 dist
-          bash packaging/linux/build.sh "$RUNNER_TEMP/saiife-ci1" "${ver}+ci1" amd64 dist
+          bash packaging/linux/build.sh "$bin" "$RUNNER_TEMP/fido-out/saiife-fido" "$ver" amd64 dist
+          bash packaging/linux/build.sh "$RUNNER_TEMP/saiife-ci1" "$RUNNER_TEMP/fido-out/saiife-fido" "${ver}+ci1" amd64 dist
           # build.sh writes a Cargo prerelease '-' as '~'.
           pv="$(printf '%s' "$ver" | tr '-' '~')"
           ext="${{ matrix.kind }}"
