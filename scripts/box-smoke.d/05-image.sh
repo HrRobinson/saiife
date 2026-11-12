@@ -83,25 +83,29 @@ p36_audit_dir() {
 p36_in_box() {
   local box=$1
   shift
-  saiife box say "$box" "$*"
+  timeout "${P36_SAY_T:-120}" saiife box say "$box" "$*"
 }
 
 # p36_spawn: start a box from the default image; sets P36_BOX. Needs plans
-# 37/38 (booting a box on the imported image).
-# TODO(plan 37/38): the id is read from `box ls --json` (last entry); adapt to
-# whatever spawn prints once it is settled.
+# 37/38 (booting a box on the imported image). `box spawn` prints one line
+# "box <id> <state>" (crates/cli/src/box_cmd.rs print_box); exactly one id must
+# come out of it, otherwise nothing is guessed and nothing is discarded.
 p36_spawn() {
+  local out ids n
   P36_BOX=""
-  saiife box spawn --now --repo "$SMOKE_WORK" >/dev/null || return 1
-  P36_BOX=$(saiife box ls --json | jq -er '.[-1].id') || return 1
-  [ -n "$P36_BOX" ]
+  out=$(timeout 120 saiife box spawn --now --repo "$SMOKE_WORK") || return 1
+  ids=$(printf '%s\n' "$out" | awk '$1 == "box" && $2 != "" {print $2}')
+  n=$(printf '%s\n' "$ids" | grep -c . || true)
+  [ "$n" = 1 ] || { p36_log "box spawn printed $n box ids, expected 1; not guessing"; return 1; }
+  [[ "$ids" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  P36_BOX=$ids
 }
 
 # p36_wait_ready BOX: poll until a command answers inside the box (180 s).
 p36_wait_ready() {
   local deadline=$(($(p36_now_ms) + 180000))
   while [ "$(p36_now_ms)" -lt "$deadline" ]; do
-    if p36_in_box "$1" true >/dev/null 2>&1; then return 0; fi
+    if P36_SAY_T=10 p36_in_box "$1" true >/dev/null 2>&1; then return 0; fi
     sleep 0.5
   done
   return 1
@@ -127,8 +131,8 @@ p36_boot_once() {
   P36_ONE_MS=$(($(p36_now_ms) - t0))
 }
 
-# p36_series N: N cold boots (fresh box each); prints the median on stdout and
-# the list on fd 3. Returns 1 if any boot failed.
+# p36_series N: N cold boots (fresh box each); sets P36_SERIES_MEDIAN and
+# P36_SERIES_ALL. Returns 1 if any boot failed.
 p36_series() {
   local i ms=()
   for i in $(seq 1 "$1"); do
@@ -141,6 +145,11 @@ p36_series() {
   done
   P36_SERIES_MEDIAN=$(p36_median "${ms[@]}")
   P36_SERIES_ALL=$(IFS=,; printf '%s' "${ms[*]}")
+}
+
+# the firmware boots only run when this import (as default) succeeded
+p36_import_fw() {
+  saiife box image import --default "$P36_RAW" && P36_FW_OK=1
 }
 
 p36_manifest_get() { jq -er "$2" "$1"; }
@@ -199,6 +208,8 @@ p36_cold_capture() {
   local a b
   p36_boot_once || { p36_end_box; return 1; }
   p36_result boot_first_ms "$P36_ONE_MS"
+  # systemd-analyze needs the boot finished; wait (bounded) for it first
+  P36_SAY_T=180 p36_in_box "$P36_BOX" 'systemctl is-system-running --wait' >/dev/null 2>&1 || true
   a=$(p36_in_box "$P36_BOX" systemd-analyze) || { p36_end_box; return 1; }
   b=$(p36_in_box "$P36_BOX" 'systemd-analyze blame | head -15') || { p36_end_box; return 1; }
   p36_result systemd_analyze_cold "$a"
@@ -215,22 +226,37 @@ p36_in_box_containerd() { [ "$(printf '%s' "$P36_CONTAINERD" | tr -d '[:space:]'
 p36_in_box_journal() { printf '%s\n' "$P36_JOURNAL" | grep -qi 'volatile\|/run/log/journal'; }
 p36_in_box_target() { [ "$(printf '%s' "$P36_TARGET" | tr -d '[:space:]')" = multi-user.target ]; }
 
+# p36_overlay_file BOX: the box's root overlay on the host. Personal layout
+# (plan 35 layout.rs/paths.rs): <state_dir>/boxes/<id>/root.qcow2 with
+# state_dir = $XDG_STATE_HOME or ~/.local/state, then saiife/broker.
+p36_overlay_file() {
+  printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/saiife/broker/boxes/$1/root.qcow2"
+}
+
+# p36_alloc FILE: allocated bytes (st_blocks * 512, as the spike's
+# disk_actual_bytes). Fails on a missing file or a non-numeric result.
+p36_alloc() {
+  local out
+  out=$(stat -c '%b %B' "$1" 2>/dev/null) || return 1
+  [[ "$out" =~ ^([0-9]+)\ ([0-9]+)$ ]] || return 1
+  printf '%s\n' $((BASH_REMATCH[1] * BASH_REMATCH[2]))
+}
+
 # Docker growth: busybox@sha256:<pin> plus a 200 MiB random RUN, as the spike's.
-# Growth is the guest root filesystem's used bytes before and after the build
-# (the overlay disk is not reachable by path from here); the spike measured 2.03
-# with the containerd image store, and the limit is 1.3.
+# Growth is the host overlay file's allocated bytes before and after the build
+# (what the spike measured: 2.03 with the containerd image store); limit 1.3.
 p36_docker_growth() {
-  local digest=$SAIIFE_SMOKE_BUSYBOX_DIGEST before after ratio
-  before=$(p36_in_box "$P36_BOX" "df --output=used -B1 / | tail -n1") || return 1
-  p36_in_box "$P36_BOX" "mkdir -p /root/b && printf 'FROM busybox@sha256:$digest\nRUN head -c $P36_BIG /dev/urandom > /big\nRUN echo built > /done\n' > /root/b/Dockerfile" || return 1
-  p36_in_box "$P36_BOX" "cd /root/b && docker build -q -t p36-big ." >/dev/null || return 1
+  local digest=$SAIIFE_SMOKE_BUSYBOX_DIGEST ov before after ratio
+  ov=$(p36_overlay_file "$P36_BOX")
+  before=$(p36_alloc "$ov") || { p36_log "cannot stat the overlay at $ov"; return 1; }
+  P36_SAY_T=120 p36_in_box "$P36_BOX" "mkdir -p /root/b && printf 'FROM busybox@sha256:$digest\nRUN head -c $P36_BIG /dev/urandom > /big\nRUN echo built > /done\n' > /root/b/Dockerfile" || return 1
+  P36_SAY_T=900 p36_in_box "$P36_BOX" "cd /root/b && docker build -q -t p36-big ." >/dev/null || return 1
   p36_in_box "$P36_BOX" sync >/dev/null || return 1
-  after=$(p36_in_box "$P36_BOX" "df --output=used -B1 / | tail -n1") || return 1
-  before=$(printf '%s' "$before" | tr -d '[:space:]')
-  after=$(printf '%s' "$after" | tr -d '[:space:]')
+  after=$(p36_alloc "$ov") || { p36_log "cannot stat the overlay at $ov"; return 1; }
   ratio=$(awk -v a="$after" -v b="$before" -v big="$P36_BIG" 'BEGIN {printf "%.2f", (a - b) / big}')
   p36_result overlay_growth_ratio "$ratio"
-  awk -v r="$ratio" 'BEGIN {exit !(r <= 1.3)}'
+  # below 1.0 cannot be: the 200 MiB of random data is written at least once
+  awk -v r="$ratio" 'BEGIN {exit !(r >= 1.0 && r <= 1.3)}'
 }
 
 p36_busybox_digest_ok() {
@@ -246,7 +272,7 @@ smoke_image() {
   P36_IMG_DIR="$SMOKE_WORK/image"
   P36_KIMG_DIR="$SMOKE_WORK/image-kernel"
   P36_CONTAINERD="" P36_JOURNAL="" P36_TARGET=""
-  P36_SERIES_MEDIAN="" P36_SERIES_ALL="" P36_LAST_BUILD_S="" P36_LAST_RAW=""
+  P36_FW_OK="" P36_SERIES_MEDIAN="" P36_SERIES_ALL="" P36_LAST_BUILD_S="" P36_LAST_RAW=""
   mkdir -p "$P36_IMG_DIR" "$P36_KIMG_DIR"
 
   # 1. build with the owner-pinned recipe (needs the owner's keyring and pin)
@@ -267,8 +293,9 @@ smoke_image() {
   check "image actual size <= 5 GiB" p36_check_size
 
   # 3. import as the default (plan 36 Task 5)
+  P36_FW_OK=""
   if p36_need "image import --default" 36 saiife box image import --help; then
-    check "image import --default" saiife box image import --default "$P36_RAW"
+    check "image import --default" p36_import_fw
     # 4. the audit record (plan 27: `saiife audit` has no JSON output, so jq)
     check "audit has image_import with the image sha256" p36_check_audit
   else
@@ -276,7 +303,9 @@ smoke_image() {
   fi
 
   # 5. cold boot: trim list and in-box settings (plans 37/38/40)
-  if p36_need "cold boot and in-box checks" "37/38/40" saiife box say --help; then
+  if [ -z "$P36_FW_OK" ]; then
+    check "firmware boots skipped: image import --default failed" false
+  elif p36_need "cold boot and in-box checks" "37/38/40" saiife box say --help; then
     if p36_cold_capture; then
       check "containerd.service is disabled" p36_in_box_containerd
       check "journal storage is volatile" p36_in_box_journal
@@ -289,6 +318,7 @@ smoke_image() {
       fi
       p36_end_box
     else
+      p36_end_box
       check "cold boot reaches ready and answers commands (plans 37/38/40)" false
     fi
 
@@ -301,22 +331,27 @@ smoke_image() {
       check "5 firmware cold boots (plans 37/38/40)" false
     fi
 
-    # 8. direct kernel stretch: the owner decides, this only reports
+    # 8. direct kernel stretch: the owner decides, this only reports. Boots
+    # are only recorded when the kernel image is the imported default.
     check "image build --direct-kernel" p36_build "$P36_KIMG_DIR" --direct-kernel
     if [ -n "$P36_LAST_RAW" ]; then
       P36_KRAW=$P36_LAST_RAW
       p36_result image_build_kernel_s "$P36_LAST_BUILD_S"
       if p36_need "import direct-kernel image" 36 saiife box image import --help; then
-        check "import direct-kernel image as default" saiife box image import --default "$P36_KRAW"
-        if p36_series 5; then
-          p36_result boot_kernel_ms_median "$P36_SERIES_MEDIAN"
-          p36_result boot_kernel_ms_all "$P36_SERIES_ALL"
-          check "5 direct-kernel cold boots" true
+        if saiife box image import --default "$P36_KRAW" >/dev/null 2>&1; then
+          check "import direct-kernel image as default" true
+          if p36_series 5; then
+            p36_result boot_kernel_ms_median "$P36_SERIES_MEDIAN"
+            p36_result boot_kernel_ms_all "$P36_SERIES_ALL"
+            check "5 direct-kernel cold boots" true
+          else
+            check "5 direct-kernel cold boots reach ready" false
+          fi
+          # put the firmware image back as the default
+          check "restore the firmware image as default" saiife box image import --default "$P36_RAW"
         else
-          check "5 direct-kernel cold boots reach ready" false
+          check "import direct-kernel image as default (kernel boots skipped)" false
         fi
-        # put the firmware image back as the default
-        check "restore the firmware image as default" saiife box image import --default "$P36_RAW"
       fi
     fi
   fi
