@@ -1680,6 +1680,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-boxes"
+version = "0.2.0"
+dependencies = [
+ "saiife-touch",
+ "saiife-wire",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "saiife-broker"
 version = "0.2.0"
 dependencies = [
@@ -1732,6 +1745,7 @@ dependencies = [
  "rustix",
  "rustls",
  "saiife-audit",
+ "saiife-boxes",
  "saiife-broker",
  "saiife-darwin",
  "saiife-guard",

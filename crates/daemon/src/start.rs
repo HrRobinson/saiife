@@ -990,6 +990,29 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
+    // The box manager (plan 34): only a `fake-vmm` test build with
+    // SAIIFE_BOX_FAKE_VMM=1 has one; every other daemon answers the box ops
+    // `unavailable`. Its problems are stderr lines, never a failed start.
+    let boxes = match crate::box_ops::build(&state_dir, &mode, &config) {
+        Ok(Some(b)) => {
+            eprintln!("{}", crate::box_ops::FAKE_NOTICE);
+            for w in &b.warnings {
+                eprintln!("saiifed: boxes: {w}");
+            }
+            Some(b)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("saiifed: boxes: {e}");
+            None
+        }
+    };
+    // The recovery's state changes are `box` records, written with the
+    // start records below (R29).
+    let (box_manager, box_template_warnings, box_recovered) = match boxes {
+        Some(b) => (Some(b.manager), b.template_warnings, b.changes),
+        None => (None, Vec::new(), Vec::new()),
+    };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
@@ -1104,6 +1127,8 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         // Workspace (plan 29)
         workspace: Arc::new(workspace),
         boxes,
+        box_manager,
+        box_template_warnings,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
@@ -1173,6 +1198,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     // Requests approved but not sent when the daemon stopped become
     // `send_failed` (`interrupted`); none is sent again by itself.
     more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
+    more.extend(crate::box_ops::change_records(&ctx, &box_recovered));
     #[cfg(unix)]
     let place = daemon_cfg.socket_dir.clone();
     let code = rt.block_on(serve(
@@ -1911,6 +1937,8 @@ async fn serve(
 
     // The notification delivery task; it holds only a weak reference.
     let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
+    // The box manager's tick (none without boxes); it holds the context weakly.
+    crate::box_ops::start_tick(Arc::clone(&ctx));
     // Audit forwarding, per the policy loaded at start (none while it is
     // invalid; a valid reload starts it).
     match ctx.policy().system {

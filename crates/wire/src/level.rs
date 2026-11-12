@@ -101,6 +101,8 @@ const IPC_OPS: &[&str] = &[
     "audit.append",
     "audit.query",
     "audit.rotate_key",
+    "box.done",
+    "box.gc",
     "cloud.lease",
     "grant.consume",
     "hello",
@@ -117,6 +119,11 @@ const IPC_OPS: &[&str] = &[
     "secret.remove",
     "secret.rotate",
     "status",
+    "touch.begin",
+    "touch.check",
+    "touch.enrol",
+    "touch.list",
+    "touch.remove",
     // Workspace (plan 29): sorted in with the rest.
     "workspace.devices",
     "workspace.frame",
@@ -207,6 +214,14 @@ mod tests {
     fn near_miss_names_are_unknown() {
         for a in ["", "box", "box.*", "BOX.LIST", "box.list.x", "box.stop "] {
             assert_eq!(level_for(a), None, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn box_done_and_gc_are_machine_only() {
+        for a in ["box.done", "box.gc"] {
+            assert_eq!(level_for(a), Some(Level::MachineOnly), "{a}");
+            assert!(!REMOTE.iter().any(|(n, _)| *n == a), "{a} is remote");
         }
     }
 

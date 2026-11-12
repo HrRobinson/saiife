@@ -30,6 +30,7 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+mod box_cmd;
 #[cfg(any(unix, windows))]
 mod broker;
 mod check;
@@ -411,6 +412,14 @@ enum Cmd {
         #[command(subcommand)]
         action: env_cmd::EnvAction,
     },
+    /// Boxes: sandboxed VMs where an agent works on a copy of a repo (preview).
+    Box {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: box_cmd::BoxAction,
+    },
     /// Local dev environments: compose stacks behind one HTTPS proxy (preview).
     Dev {
         #[command(subcommand)]
@@ -470,6 +479,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Lockdown { .. }
         | Cmd::Workspace { .. }
         | Cmd::Env { .. }
+        | Cmd::Box { .. }
         | Cmd::Dev { .. }
         | Cmd::Policy { .. }
         | Cmd::Test { .. }
@@ -716,6 +726,13 @@ fn main() -> ExitCode {
     {
         return env_cmd::run(system_config, action);
     }
+    if let Cmd::Box {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return box_cmd::run(system_config, action);
+    }
     if let Cmd::Dev { action } = cli.command {
         return dev_cmd::run(action);
     }
@@ -795,6 +812,7 @@ fn main() -> ExitCode {
         | Cmd::Touch { .. }
         | Cmd::Policy { .. }
         | Cmd::Env { .. }
+        | Cmd::Box { .. }
         | Cmd::Dev { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }

@@ -391,6 +391,11 @@ pub struct Ctx {
     /// The Claude Code co-signer's address or bind error, and its record
     /// folding (plan 20).
     pub cosign: Mutex<crate::cosign::CosignState>,
+    /// The box manager behind the `box.*` ops (plan 34); `None`: boxes are
+    /// unavailable (every release build).
+    pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
+    /// The template files skipped at start, for `box.templates`.
+    pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -443,6 +448,10 @@ pub struct CtxInit {
     // Workspace (plan 29)
     pub workspace: Arc<crate::workspace::Workspace>,
     pub boxes: Arc<dyn saiife_wire::BoxSource>,
+    /// See [`Ctx::box_manager`]. `minimal` leaves it `None`.
+    pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
+    /// See [`Ctx::box_template_warnings`].
+    pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
 }
 
 impl CtxInit {
@@ -499,6 +508,8 @@ impl CtxInit {
             // Workspace (plan 29)
             workspace: Arc::new(crate::workspace::Workspace::memory()),
             boxes: Arc::new(saiife_wire::source::NoBoxes),
+            box_manager: None,
+            box_template_warnings: Vec::new(),
         }
     }
 }
@@ -731,6 +742,8 @@ impl Ctx {
             refuse_own_uid_peers: i.refuse_own_uid_peers,
             hooks,
             cosign: Mutex::default(),
+            box_manager: i.box_manager,
+            box_template_warnings: i.box_template_warnings,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
@@ -1228,6 +1241,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         | saiife_ipc::msg::OP_WORKSPACE_REVOKE => {
             crate::workspace_ops::handle(ctx, conn, req).await
         }
+        op if crate::box_ops::OPS.contains(&op) => crate::box_ops::handle(ctx, conn, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,
