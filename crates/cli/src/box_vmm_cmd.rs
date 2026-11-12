@@ -23,7 +23,9 @@ pub enum Fail {
     Unavailable(String),
 }
 
+/// Not reached off unix (`box_cmd::run` refuses first); kept for the API.
 #[cfg(not(unix))]
+#[allow(dead_code)]
 pub fn run(_config: Option<&std::path::Path>, _action: VmmAction) -> Result<(), Fail> {
     Err(Fail::Unavailable(
         saiife_system::NOT_SUPPORTED_OS.to_string(),
