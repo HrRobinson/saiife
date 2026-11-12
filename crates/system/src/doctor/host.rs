@@ -924,6 +924,100 @@ fn hidepid(ctx: &Ctx) -> Check {
     }
 }
 
+/// The boxes section (plan 35): the box preflight's checks
+/// (`saiife_boxhost::preflight`), one per line, on the paths under the
+/// layout. Locked: only once `system install --boxes` wrote the box unit
+/// (boxes are optional), each failure a `fail`. Personal: the caller's box
+/// layout, each failure `info` (nothing personal needs boxes).
+#[cfg(target_os = "linux")]
+pub fn boxes(ctx: &Ctx) -> Vec<Check> {
+    boxes_with(ctx, &|k| std::env::var_os(k))
+}
+
+#[cfg(target_os = "linux")]
+fn boxes_with(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Check> {
+    use crate::boxes_install::{BOXES_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR};
+    use saiife_boxhost::layout::Layout as BoxLayout;
+    use saiife_boxhost::preflight;
+    use saiife_boxhost::tools::Tools;
+
+    const TITLE: &str = "boxes";
+    let at = |p: &Path| ctx.layout.try_at(p).unwrap_or_else(|_| p.to_path_buf());
+    let locked = ctx.locked();
+    let layout = if locked {
+        if fs::symlink_metadata(ctx.layout.at(BOX_UNIT_PATH)).is_err() {
+            return vec![Check::new(
+                "boxes.installed",
+                Status::Info,
+                TITLE,
+                format!(
+                    "boxes are not installed (optional): {}",
+                    preflight::INSTALL_HINT
+                ),
+            )];
+        }
+        BoxLayout {
+            boxes: ctx.layout.at(BOXES_DIR),
+            images: ctx.layout.at(IMAGES_DIR),
+            vmm: ctx.layout.at(VMM_DIR),
+            vault: ctx.layout.at(VAULT_DIR),
+            locked: true,
+        }
+    } else {
+        let home = ctx.opts.home.as_deref();
+        let data_home = env("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                home.filter(|h| h.is_absolute())
+                    .map(|h| h.join(".local/share"))
+            });
+        let paths = crate::personal::personal_paths(env, home);
+        let (Ok(paths), Some(data_home)) = (paths, data_home) else {
+            return vec![Check::new(
+                "boxes.installed",
+                Status::Info,
+                TITLE,
+                "cannot find your saiife dirs (HOME, XDG_RUNTIME_DIR): boxes not checked",
+            )];
+        };
+        let p = BoxLayout::personal(&paths.state_dir, &data_home);
+        BoxLayout {
+            boxes: at(&p.boxes),
+            images: at(&p.images),
+            vmm: at(&p.vmm),
+            vault: at(&p.vault),
+            locked: false,
+        }
+    };
+    let vmm = layout.vmm.clone();
+    let tools = Tools::system(&layout.vmm).map_paths(&|p| {
+        if p.starts_with(&vmm) {
+            p.to_path_buf()
+        } else {
+            at(p)
+        }
+    });
+    let found = preflight::checks(
+        &layout,
+        &tools,
+        &ctx.layout.at("/dev/kvm"),
+        crate::sandbox::landlock_abi(),
+    );
+    let failed = if locked { Status::Fail } else { Status::Info };
+    found
+        .into_iter()
+        .map(|c| {
+            Check::new(
+                format!("boxes.{}", c.name),
+                if c.ok { Status::Pass } else { failed },
+                format!("{TITLE}: {}", c.name),
+                sanitize(&c.detail),
+            )
+        })
+        .collect()
+}
+
 // The fixtures are a Linux machine's (`/etc/passwd`, `/proc`, nft).
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -1786,5 +1880,106 @@ mod tests {
         );
         assert!(r.checks.iter().all(|c| !c.id.starts_with("user.")));
         let _ = Path::new("/");
+    }
+
+    #[test]
+    fn boxes_not_installed_is_info() {
+        let t = T::new(false);
+        let r = t.doctor();
+        let c = get(&r, "boxes.installed");
+        assert_eq!(c.status, Status::Info, "{}", r.to_text());
+        assert!(c.detail.contains("install --boxes"), "{}", c.detail);
+        assert!(r
+            .checks
+            .iter()
+            .all(|c| c.id == "boxes.installed" || !c.id.starts_with("boxes.")));
+    }
+
+    #[test]
+    fn boxes_installed_reports_each_check() {
+        use crate::boxes_install::{BOXES_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR};
+        let t = T::new(false);
+        fs::create_dir_all(t.at("/etc/systemd/system")).unwrap();
+        fs::write(t.at(BOX_UNIT_PATH), "[Unit]\n").unwrap();
+        for d in [BOXES_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR] {
+            fs::create_dir_all(t.at(d)).unwrap();
+        }
+        let r = t.doctor();
+        assert_eq!(
+            status(&r, "boxes.installed"),
+            Status::Pass,
+            "{}",
+            r.to_text()
+        );
+        let v = get(&r, "boxes.vmm");
+        assert_eq!(v.status, Status::Fail, "{}", r.to_text());
+        assert!(
+            v.detail.contains("sudo saiife system install --boxes"),
+            "{}",
+            v.detail
+        );
+        assert_eq!(status(&r, "boxes.firmware"), Status::Fail);
+        assert_eq!(status(&r, "boxes.image"), Status::Fail);
+        assert!(
+            r.checks.iter().all(|c| c.id != "boxes.kvm"),
+            "locked: no kvm check"
+        );
+        fs::create_dir_all(t.at("/usr/bin")).unwrap();
+        fs::write(t.at("/usr/bin/qemu-img"), "").unwrap();
+        let r = t.doctor();
+        assert_eq!(
+            status(&r, "boxes.qemu-img"),
+            Status::Pass,
+            "{}",
+            r.to_text()
+        );
+        assert_eq!(status(&r, "boxes.mke2fs"), Status::Fail, "{}", r.to_text());
+        assert_eq!(r.exit_code(), 2);
+    }
+
+    #[test]
+    fn personal_boxes_are_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::under(dir.path());
+        let host = FakeHost::open(dir.path()).unwrap();
+        let fixed = FixedDirectory::from_text("", "");
+        let opts = DoctorOptions {
+            home: Some(PathBuf::from("/home/u")),
+            ..DoctorOptions::default()
+        };
+        let ctx = Ctx {
+            layout: &layout,
+            host: &host,
+            dir: &fixed,
+            installed: None,
+            installed_error: None,
+            config: Err("none".into()),
+            as_root: false,
+            opts: &opts,
+        };
+        let env = |k: &str| -> Option<std::ffi::OsString> {
+            (k == "XDG_RUNTIME_DIR").then(|| "/run/user/1".into())
+        };
+        let c = boxes_with(&ctx, &env);
+        let v = c.iter().find(|c| c.id == "boxes.vmm").expect("a vmm check");
+        assert_eq!(v.status, Status::Info, "{v:?}");
+        assert!(v.detail.contains("saiife box vmm fetch"), "{v:?}");
+        assert!(
+            v.detail.contains("/home/u/.local/share/saiife/vmm"),
+            "the personal vmm dir under the root: {v:?}"
+        );
+        assert!(c.iter().any(|c| c.id == "boxes.kvm"), "{c:?}");
+        assert!(c.iter().all(|c| c.status != Status::Fail), "{c:?}");
+        // the vmm dir is under the layout's root
+        fs::create_dir_all(dir.path().join("home/u/.local/share/saiife/vmm")).unwrap();
+        fs::write(
+            dir.path()
+                .join("home/u/.local/share/saiife/vmm/cloud-hypervisor"),
+            "x",
+        )
+        .unwrap();
+        let c = boxes_with(&ctx, &env);
+        let v = c.iter().find(|c| c.id == "boxes.vmm").unwrap();
+        assert!(v.detail.contains("does not match the pin"), "{v:?}");
     }
 }

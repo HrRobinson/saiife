@@ -1274,6 +1274,36 @@ fn locked_overlay_is_group_read_writable() {
     assert_ne!(mode_of(&w.paths("b2").root_disk()) & 0o060, 0o060);
 }
 
+/// R35: a kept overlay (a restart, or an earlier create whose fchmod
+/// failed) gets its locked mode again, through an fd; a link is refused.
+#[test]
+fn locked_overlay_mode_is_set_on_a_kept_overlay() {
+    let mut w = World::new();
+    w.layout.locked = true;
+    let (v, _l) = w.vmm(&[]);
+    let spec = w.spec("b1");
+    let root = w.paths("b1").root_disk();
+    std::fs::write(&root, b"qcow").unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let h = v.create(&spec).unwrap();
+    w.track(&v, &h);
+    assert_eq!(mode_of(&root), 0o660);
+    assert_eq!(
+        std::fs::read(&root).unwrap(),
+        b"qcow",
+        "the overlay is kept"
+    );
+    // a symlink in its place is not followed
+    let spec = w.spec("b2");
+    let target = w.root.join("elsewhere");
+    std::fs::write(&target, b"x").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&target, w.paths("b2").root_disk()).unwrap();
+    let m = failed(v.create(&spec));
+    assert!(m.contains("root disk"), "{m}");
+    assert_eq!(mode_of(&target), 0o600);
+}
+
 /// A memory-ranges larger than the box's memory plus slack is refused
 /// before it is copied (a host disk-fill), and nothing lands in the vault.
 #[test]

@@ -66,6 +66,8 @@ struct Setup {
     manager: bool,
     template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     built: Option<Arc<Manager>>,
+    /// Why boxes are unavailable (a failed preflight), with no manager.
+    unavailable: Option<String>,
 }
 
 fn world() -> World {
@@ -73,6 +75,7 @@ fn world() -> World {
         manager: true,
         template_warnings: Vec::new(),
         built: None,
+        unavailable: None,
     })
 }
 
@@ -117,7 +120,7 @@ fn world_with(s: Setup) -> World {
             let host = two_boxes();
             let g: Arc<dyn GuestLink> = guest.clone();
             let o = Manager::open(ManagerInit {
-                store: Store::open(box_ops::dir_in(&state)).unwrap(),
+                store: Store::open(box_ops::dir_in(&state, &Mode::Personal)).unwrap(),
                 vmm: vmm.clone(),
                 guest: g,
                 templates: template::builtin(),
@@ -140,6 +143,7 @@ fn world_with(s: Setup) -> World {
             ..PolicyState::invalid(0)
         },
         box_manager: mgr.clone(),
+        box_unavailable: s.unavailable,
         box_template_warnings: s.template_warnings,
         ..base
     }));
@@ -277,6 +281,7 @@ async fn unavailable_without_manager() {
         manager: false,
         template_warnings: Vec::new(),
         built: None,
+        unavailable: None,
     });
     for (op, args) in EVERY_OP {
         let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
@@ -651,6 +656,7 @@ async fn templates_lists_warnings() {
         manager: true,
         template_warnings: built.template_warnings.clone(),
         built: Some(built.manager),
+        unavailable: None,
     });
     let a = w.ok(ALICE, "box.templates", json!({})).await;
     let names: Vec<&str> = a["templates"]
@@ -695,11 +701,16 @@ async fn build_needs_the_fake_flag() {
     let tmp = scratch();
     let state = tmp.path().join("state");
     let off = |_: &str| -> Option<OsString> { None };
-    assert!(
-        box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &off)
-            .unwrap()
-            .is_none()
-    );
+    // Without it the real driver's preflight runs, and fails on a host
+    // without `system install --boxes` (read-only: nothing is created).
+    let why = box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &off)
+        .unwrap()
+        .err()
+        .expect("no boxes without the fake flag or an install");
+    if !Path::new("/var/lib/saiife-box/boxes").is_dir() {
+        assert!(why.contains("install --boxes"), "{why}");
+    }
+    assert!(!state.join("boxes").exists());
     let (dir, trust) =
         box_ops::templates_dir(&Mode::Locked, Path::new("/etc/saiife/config.toml"), &off);
     assert_eq!(dir, Path::new("/etc/saiife/templates.d"));
@@ -794,6 +805,7 @@ async fn restart_changes_are_recorded() {
         manager: true,
         template_warnings: Vec::new(),
         built: Some(second.manager),
+        unavailable: None,
     });
     for rec in box_ops::change_records(&w.ctx, &second.changes) {
         w.ctx.writer.append(rec).await.unwrap();
@@ -882,7 +894,7 @@ async fn gc_goes_on_past_a_box_it_cannot_remove() {
         let a = w.spawn(ALICE, "one").await;
         assert_eq!(a["box"]["state"], "discarded", "{a}");
     }
-    let root = box_ops::dir_in(&w._tmp.path().join("state"));
+    let root = box_ops::dir_in(&w._tmp.path().join("state"), &Mode::Personal);
     // Without its marker the store refuses to remove the dir.
     std::fs::remove_file(root.join("b1").join(".saiife-box")).unwrap();
     let before = w.records().len();
@@ -902,4 +914,135 @@ async fn gc_goes_on_past_a_box_it_cannot_remove() {
     assert_eq!(g["removed"], json!(["b4"]), "{g}");
     assert!(g["error"].is_string(), "{g}");
     assert!(w.mgr().get(&id("b1")).is_ok(), "the stuck box stays");
+}
+
+/// The env of a personal daemon whose data and home are under `tmp`.
+fn personal_env(tmp: &Path, fake: bool) -> impl Fn(&str) -> Option<OsString> {
+    let tmp = tmp.to_path_buf();
+    move |k: &str| -> Option<OsString> {
+        match k {
+            "SAIIFE_BOX_FAKE_VMM" if fake => Some("1".into()),
+            "SAIIFE_BOX_FAKE_SLOTS" if fake => Some("1".into()),
+            "XDG_DATA_HOME" => Some(tmp.join("data").into_os_string()),
+            "XDG_CONFIG_HOME" => Some(tmp.join("config").into_os_string()),
+            "HOME" => Some(tmp.join("home").into_os_string()),
+            _ => None,
+        }
+    }
+}
+
+/// No VMM in the personal layout and no fake flag: the preflight fails
+/// before anything is made or spawned, and every op answers its detail.
+#[tokio::test]
+async fn unavailable_message_names_the_failed_check() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = personal_env(tmp.path(), false);
+    let why = box_ops::build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+        .unwrap()
+        .err()
+        .expect("no VMM: boxes are unavailable");
+    assert!(why.contains("saiife box vmm fetch"), "{why}");
+    assert!(!state.join("boxes").exists(), "nothing is created");
+    assert!(!tmp.path().join("data").exists(), "nothing is created");
+    let w = world_with(Setup {
+        manager: false,
+        template_warnings: Vec::new(),
+        built: None,
+        unavailable: Some(why.clone()),
+    });
+    for (op, args) in EVERY_OP {
+        let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
+        assert_eq!(a["ok"], false, "{op}: {a}");
+        assert_eq!(a["error"], "unavailable", "{op}: {a}");
+        assert_eq!(a["message"], why.as_str(), "{op}: {a}");
+    }
+    assert!(w.records().is_empty());
+}
+
+/// The fake flag wins over the preflight: plan 34's fake manager, with no
+/// VMM anywhere.
+#[tokio::test]
+async fn fake_env_still_wins() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = personal_env(tmp.path(), true);
+    let built = box_ops::build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+        .unwrap()
+        .expect("the fake VM is on");
+    let b = built
+        .manager
+        .spawn(&saiife_boxes::manager::SpawnArgs {
+            template: "claude-code".into(),
+            repo: "shop".into(),
+            repo_dir: None,
+            task: "one".into(),
+            start: saiife_wire::source::Start::Queue,
+            owner_uid: ALICE,
+            repo_image: None,
+            base_manifest: None,
+        })
+        .unwrap();
+    assert_eq!(b.vm.as_ref().map(|h| h.driver.as_str()), Some("fake"));
+    assert!(state.join("boxes").join(b.id.as_str()).is_dir());
+}
+
+#[test]
+fn locked_dir_is_saiife_box() {
+    assert_eq!(
+        box_ops::dir_in(Path::new("/var/lib/saiife"), &Mode::Locked),
+        Path::new("/var/lib/saiife-box/boxes")
+    );
+}
+
+#[test]
+fn personal_dir_is_unchanged() {
+    assert_eq!(
+        box_ops::dir_in(Path::new("/s/state"), &Mode::Personal),
+        Path::new("/s/state/boxes")
+    );
+}
+
+/// R36: a snapshot the driver did not trust is a `box` record of the
+/// daemon, made from the box id alone (the hook runs under the manager's
+/// lock, inside its VMM call), with the reason sanitized.
+#[tokio::test]
+async fn restore_refused_is_audited() {
+    let w = world();
+    let link = Arc::new(box_ops::AuditLink::default());
+    // Before the context is attached: a stderr line, no record, no panic.
+    let l = Arc::clone(&link);
+    tokio::task::spawn_blocking(move || l.restore_refused(&id("b1"), "early"))
+        .await
+        .unwrap();
+    link.attach(&w.ctx);
+    #[cfg(target_os = "linux")]
+    let hook: Arc<dyn saiife_boxhost::vmm::VmHooks> =
+        Arc::new(saiife_daemon::box_vmm::AuditHooks::new(Arc::clone(&link)));
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "linux")]
+        hook.restore_refused(&id("b1"), "digest \u{1b}[31mmismatch");
+        #[cfg(not(target_os = "linux"))]
+        link.restore_refused(&id("b1"), "digest \u{1b}[31mmismatch");
+    })
+    .await
+    .unwrap();
+    let mut recs = Vec::new();
+    for _ in 0..100 {
+        recs = w.records();
+        if !recs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r["action"], "restore_refused", "{r}");
+    assert_eq!(r["box"], "b1");
+    assert_eq!(r["session"], "box-b1");
+    assert_eq!(r["via"], "vmm");
+    assert_eq!(r["uid"], 999, "the daemon's own record");
+    let why = r["reason"].as_str().unwrap();
+    assert!(why.contains("digest") && why.contains("mismatch"), "{r}");
+    assert!(!why.contains('\u{1b}'), "{r}");
 }

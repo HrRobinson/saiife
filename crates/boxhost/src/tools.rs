@@ -103,6 +103,14 @@ impl Tools {
         self
     }
 
+    /// Every path through `f` (doctor re-roots them under its layout).
+    pub fn map_paths(mut self, f: &dyn Fn(&Path) -> PathBuf) -> Tools {
+        for e in &mut self.paths {
+            e.1 = f(&e.1);
+        }
+        self
+    }
+
     pub fn path(&self, t: Tool) -> &Path {
         self.paths
             .iter()
@@ -198,6 +206,14 @@ mod tests {
         assert_eq!(t.path(Tool::MkfsVfat), Path::new("/usr/bin/mkfs.vfat"));
         assert_eq!(t.path(Tool::Mcopy), Path::new("/usr/bin/mcopy"));
         assert_eq!(t.path(Tool::Git), Path::new("/usr/bin/git"));
+    }
+
+    #[test]
+    fn map_paths_reroots_every_tool() {
+        let t = Tools::system(Path::new("/v"))
+            .map_paths(&|p| Path::new("/r").join(p.strip_prefix("/").unwrap()));
+        assert_eq!(t.path(Tool::Ch), Path::new("/r/v/cloud-hypervisor"));
+        assert_eq!(t.path(Tool::Mke2fs), Path::new("/r/usr/bin/mke2fs"));
     }
 
     #[test]

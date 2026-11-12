@@ -656,9 +656,11 @@ impl Vmm for ChVmm {
         if std::fs::symlink_metadata(&root).is_err() {
             make_overlay(&inner.tools, &image.raw, &root, spec.size.disk_gib)
                 .map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
-            if inner.layout.locked {
-                group_writable(&root).map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
-            }
+        }
+        // Also for a kept overlay: an earlier create whose fchmod failed is
+        // retried (R35). A link or a hard-linked file is refused.
+        if inner.layout.locked {
+            group_writable(&root).map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
         }
         // `restore` is decided at boot, from the marker (S1).
         let ls = LaunchSpec {

@@ -271,3 +271,58 @@ fn hostile_counter_is_refused() {
     fs::create_dir(s.root().join(format!("b{}", u64::MAX))).ok();
     assert!(s.claim_id().is_err());
 }
+
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// Personal mode: the root and every box dir are the user's alone.
+#[cfg(unix)]
+#[test]
+fn personal_store_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("boxes");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let s = Store::open(root.clone()).unwrap();
+    assert_eq!(mode_of(&root), 0o700);
+    let b = s.claim_id().unwrap();
+    assert_eq!(mode_of(&s.box_dir(&b)), 0o700);
+}
+
+/// Locked mode (R34): the installed root (saiife:saiife-box 3770) keeps its
+/// mode, and each box dir is 2770 so the VMM user's group reaches it.
+#[cfg(unix)]
+#[test]
+fn locked_store_keeps_the_root_and_shares_box_dirs() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("boxes");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o3770)).unwrap();
+    let s = Store::open_locked(root.clone()).unwrap();
+    assert_eq!(mode_of(&root), 0o3770);
+    let b = s.claim_id().unwrap();
+    assert_eq!(mode_of(&s.box_dir(&b)), 0o2770);
+    let mut r = rec(&b);
+    r.vm = None;
+    s.save(&r).unwrap();
+    assert_eq!(s.load(&b).unwrap().unwrap(), r);
+    assert_eq!(mode_of(&root), 0o3770, "still the install's mode");
+}
+
+/// Locked mode never creates the root: `system install --boxes` does.
+#[cfg(unix)]
+#[test]
+fn locked_store_needs_the_installed_root() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("boxes");
+    let e = Store::open_locked(root.clone()).err().expect("refused");
+    assert!(e.to_string().contains("install --boxes"), "{e}");
+    assert!(!root.exists());
+    fs::write(&root, "a file").unwrap();
+    assert!(Store::open_locked(root).is_err());
+}

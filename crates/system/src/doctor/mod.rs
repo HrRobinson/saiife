@@ -127,6 +127,8 @@ fn unix_checks(ctx: &Ctx) -> Vec<Check> {
     checks.extend(host::checks(ctx));
     #[cfg(target_os = "linux")]
     checks.extend(touch::checks(ctx));
+    #[cfg(target_os = "linux")]
+    checks.extend(host::boxes(ctx));
     checks
 }
 

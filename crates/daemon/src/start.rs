@@ -990,18 +990,40 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
-    // The box manager (plan 34): only a `fake-vmm` test build with
-    // SAIIFE_BOX_FAKE_VMM=1 has one; every other daemon answers the box ops
-    // `unavailable`. Its problems are stderr lines, never a failed start.
-    let boxes = match crate::box_ops::build(&state_dir, &mode, &config) {
-        Ok(Some(b)) => {
-            eprintln!("{}", crate::box_ops::FAKE_NOTICE);
+    // The box manager (plans 34, 35): on the fake VM in a `fake-vmm` test
+    // build with SAIIFE_BOX_FAKE_VMM=1, else on Linux the Cloud Hypervisor
+    // driver once the box preflight passed; otherwise the box ops answer
+    // `unavailable` with the failed check. Its problems are stderr lines,
+    // never a failed start. It runs on a blocking thread while this one
+    // drives the runtime: locked mode connects to the system bus, and the
+    // recovery asks the units' state over it.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the runtime: {e}"))?;
+    let built = {
+        let (s, c) = (state_dir.clone(), config.clone());
+        // spawn_blocking inside the future: it needs the runtime's context
+        rt.block_on(async move {
+            tokio::task::spawn_blocking(move || crate::box_ops::build(&s, &mode, &c)).await
+        })
+        .unwrap_or_else(|e| Err(format!("the box build did not finish: {e}")))
+    };
+    let mut box_unavailable = None;
+    let boxes = match built {
+        Ok(Ok(b)) => {
+            if b.fake {
+                eprintln!("{}", crate::box_ops::FAKE_NOTICE);
+            }
             for w in &b.warnings {
                 eprintln!("saiifed: boxes: {w}");
             }
             Some(b)
         }
-        Ok(None) => None,
+        Ok(Err(why)) => {
+            box_unavailable = Some(why);
+            None
+        }
         Err(e) => {
             eprintln!("saiifed: boxes: {e}");
             None
@@ -1009,9 +1031,14 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     };
     // The recovery's state changes are `box` records, written with the
     // start records below (R29).
-    let (box_manager, box_template_warnings, box_recovered) = match boxes {
-        Some(b) => (Some(b.manager), b.template_warnings, b.changes),
-        None => (None, Vec::new(), Vec::new()),
+    let (box_manager, box_template_warnings, box_recovered, box_audit) = match boxes {
+        Some(b) => (
+            Some(b.manager),
+            b.template_warnings,
+            b.changes,
+            Some(b.audit),
+        ),
+        None => (None, Vec::new(), Vec::new(), None),
     };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
@@ -1128,9 +1155,13 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         workspace: Arc::new(workspace),
         boxes,
         box_manager,
+        box_unavailable,
         box_template_warnings,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
+    if let Some(a) = &box_audit {
+        a.attach(&ctx);
+    }
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
     // The service's own judgment of each co-signed call (plan 21), for the
     // system daemon only: the personal broker has no co-signer.
@@ -1153,10 +1184,6 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         });
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("cannot start the runtime: {e}"))?;
     let loaded_files = loaded.as_ref().ok().map(|(l, _, _)| files_json(l));
     let notes: Vec<_> = [
         ("ca_refused", ca_refused),

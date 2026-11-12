@@ -285,11 +285,11 @@ fn unavailable_without_fake_env_is_exit_5() {
     fs::create_dir_all(d.path().join("project")).unwrap();
     let o = bx(&d, &["ls"]);
     assert_eq!(code(&o), 5, "{}", err(&o));
-    assert!(
-        err(&o).contains("boxes are not available in this version"),
-        "{}",
-        err(&o)
-    );
+    // Without the fake flag the real driver's preflight answers (plan 35):
+    // on a host without `system install --boxes` it names the install.
+    if !std::path::Path::new("/var/lib/saiife-box/boxes").is_dir() {
+        assert!(err(&o).contains("install --boxes"), "{}", err(&o));
+    }
 }
 
 #[test]

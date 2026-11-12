@@ -58,7 +58,18 @@ pub struct BoxRecord {
 /// never sees a claimed-but-unsaved dir).
 pub struct Store {
     root: PathBuf,
+    /// Locked mode (R34): the root is the install's and box dirs are shared
+    /// with the VMM user's group.
+    locked: bool,
 }
+
+/// A personal box dir: the user's alone.
+#[cfg(unix)]
+const MODE_PRIVATE: u32 = 0o700;
+/// A locked box dir: the daemon user and the `saiife-box` group (setgid, so
+/// what the VMM makes in it keeps the group).
+#[cfg(unix)]
+const MODE_SHARED: u32 = 0o2770;
 
 fn io_err(path: &Path, source: io::Error) -> BoxesError {
     BoxesError::Io {
@@ -111,15 +122,35 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), BoxesError> {
 }
 
 impl Store {
+    /// Personal mode: the root is created when missing and made 0700; box
+    /// dirs are 0700.
     pub fn open(root: PathBuf) -> Result<Store, BoxesError> {
         fs::create_dir_all(&root).map_err(|e| io_err(&root, e))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            fs::set_permissions(&root, fs::Permissions::from_mode(MODE_PRIVATE))
                 .map_err(|e| io_err(&root, e))?;
         }
-        Ok(Store { root })
+        Ok(Store {
+            root,
+            locked: false,
+        })
+    }
+
+    /// Locked mode (R34): the root (`/var/lib/saiife-box/boxes`, 3770 from
+    /// `system install --boxes`) must exist as a real directory and is never
+    /// created or chmodded here; box dirs are 2770.
+    pub fn open_locked(root: PathBuf) -> Result<Store, BoxesError> {
+        match fs::symlink_metadata(&root) {
+            Ok(m) if m.file_type().is_dir() => Ok(Store { root, locked: true }),
+            Ok(_) => Err(state_err(&root, "not a real directory")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(state_err(
+                &root,
+                "missing: run \"sudo saiife system install --boxes\"",
+            )),
+            Err(e) => Err(io_err(&root, e)),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -150,7 +181,8 @@ impl Store {
             let b = {
                 use std::os::unix::fs::DirBuilderExt;
                 let mut b = fs::DirBuilder::new();
-                b.mode(0o700);
+                // the umask may take bits off; a shared dir is set below
+                b.mode(MODE_PRIVATE);
                 b
             };
             #[cfg(not(unix))]
@@ -165,6 +197,10 @@ impl Store {
                 }
                 Err(e) => return Err(io_err(&dir, e)),
             }
+            if let Err(e) = self.share(&dir) {
+                let _ = fs::remove_dir(&dir);
+                return Err(e);
+            }
             let marker = dir.join(MARKER);
             if let Err(e) = write_atomic(&marker, marker_text(id.as_str()).as_bytes()) {
                 let _ = fs::remove_dir_all(&dir);
@@ -176,6 +212,20 @@ impl Store {
             write_atomic(&counter, next.to_string().as_bytes())?;
             return Ok(id);
         }
+    }
+
+    /// Locked mode: a new box dir becomes 2770 (the daemon made it, so it
+    /// can; nothing else is in it yet).
+    fn share(&self, dir: &Path) -> Result<(), BoxesError> {
+        #[cfg(unix)]
+        if self.locked {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(MODE_SHARED))
+                .map_err(|e| io_err(dir, e))?;
+        }
+        #[cfg(not(unix))]
+        let _ = (dir, self.locked);
+        Ok(())
     }
 
     /// Ok when `dir` is a real directory (not a symlink) labelled for `id`.

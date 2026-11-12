@@ -48,6 +48,22 @@ impl SystemdBus {
         })
     }
 
+    /// [`SystemdBus::connect`] from a thread that is not a task (the box
+    /// build runs on a `spawn_blocking` thread while the daemon's main
+    /// thread drives the runtime), bounded as every call is. Without a
+    /// runtime, or with nothing driving it, it fails instead of hanging.
+    pub fn connect_blocking() -> Result<SystemdBus, String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "system bus: no runtime to connect on".to_string())?;
+        bounded(WALL_CLOCK, move || {
+            handle.block_on(async {
+                tokio::time::timeout(CALL_TIMEOUT, SystemdBus::connect())
+                    .await
+                    .unwrap_or_else(|_| Err("system bus: the connect timed out".to_string()))
+            })
+        })?
+    }
+
     /// Runs `f` to completion on the runtime from a thread that is not a
     /// task, never for longer than [`WALL_CLOCK`].
     fn run<T, F, Fut>(&self, f: F) -> Result<T, String>
