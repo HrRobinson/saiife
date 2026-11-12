@@ -16,7 +16,8 @@ use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +53,12 @@ const RECORDER_FLUSH: Duration = Duration::from_secs(1);
 const JOIN_WAIT: Duration = Duration::from_secs(2);
 /// Guest-derived error text kept or logged, in bytes.
 const MAX_TEXT: usize = 512;
+/// Connection handler threads per run (events and PTY together); above it a
+/// new connection is accepted and closed at once.
+const MAX_CONNS: usize = 8;
+const SETUP_NONE: u8 = 0;
+const SETUP_IN_FLIGHT: u8 = 1;
+const SETUP_DONE: u8 = 2;
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
@@ -191,15 +198,28 @@ struct Run {
     welcomed: AtomicBool,
     /// Ready was queued this run (G3: once per run).
     ready_sent: AtomicBool,
+    /// SETUP_NONE, SETUP_IN_FLIGHT or SETUP_DONE: one setup at a time, once.
+    setup: AtomicU8,
+    /// Generation of the welcomed events session (0: none yet).
     events_gen: AtomicU64,
+    /// Last generation handed to an accepted events connection.
+    next_events_gen: AtomicU64,
     pty_gen: AtomicU64,
+    /// Connection handler threads alive (events and PTY), capped at MAX_CONNS.
+    conns: AtomicUsize,
     /// Clones of the current connections, kept to shut them down.
     events_conn: Mutex<Option<(u64, UnixStream)>>,
+    /// Events connections still in their hello, by generation.
+    hellos: Mutex<BTreeMap<u64, UnixStream>>,
     pty_conn: Mutex<Option<(u64, UnixStream)>>,
-    controls: Mutex<BTreeMap<u64, UnixStream>>,
+    /// Open control connections; a setup's carries its events generation and
+    /// is shut when that session is replaced.
+    controls: Mutex<BTreeMap<u64, (Option<u64>, UnixStream)>>,
     next_control: AtomicU64,
     term: Mutex<Term>,
-    /// Only the PTY threads and after_off take this lock.
+    /// Ruling R12: the recording's file I/O runs under this lock. It is per
+    /// box, only the PTY threads and after_off take it (never the request
+    /// path), and the file is a fresh O_EXCL regular file of ours.
     recorder: Mutex<Option<Recorder>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     last_error: Mutex<Option<String>>,
@@ -221,9 +241,39 @@ impl Run {
     fn shut_streams(&self) {
         let mut streams: Vec<UnixStream> = Vec::new();
         streams.extend(lock(&self.events_conn).take().map(|(_, s)| s));
+        streams.extend(std::mem::take(&mut *lock(&self.hellos)).into_values());
         streams.extend(lock(&self.pty_conn).take().map(|(_, s)| s));
-        streams.extend(std::mem::take(&mut *lock(&self.controls)).into_values());
+        streams.extend(
+            std::mem::take(&mut *lock(&self.controls))
+                .into_values()
+                .map(|(_, s)| s),
+        );
         for s in streams {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// A welcomed session becomes the current one: the old session and any
+    /// setup it still has in flight are shut down.
+    fn replace_events(&self, gen: u64, clone: UnixStream) {
+        let old = {
+            let mut slot = lock(&self.events_conn);
+            self.events_gen.store(gen, Ordering::SeqCst);
+            slot.replace((gen, clone))
+        };
+        let stale: Vec<UnixStream> = {
+            let mut c = lock(&self.controls);
+            let keys: Vec<u64> = c
+                .iter()
+                .filter(|(_, (tag, _))| tag.is_some_and(|t| t != gen))
+                .map(|(k, _)| *k)
+                .collect();
+            keys.iter()
+                .filter_map(|k| c.remove(k))
+                .map(|(_, s)| s)
+                .collect()
+        };
+        for s in old.map(|(_, s)| s).into_iter().chain(stale) {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -261,6 +311,14 @@ impl Drop for Live {
     }
 }
 
+/// Counts a connection handler of a run for as long as it is alive.
+struct ConnSlot(Arc<Run>);
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.conns.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Deregisters a control connection when the exchange ends.
 struct ControlGuard<'a> {
     run: &'a Run,
@@ -273,12 +331,18 @@ impl Drop for ControlGuard<'_> {
     }
 }
 
+/// Where a box's terminal recording goes (ruling R15): the default is
+/// `paths.term_cast()`; locked mode points it at daemon-only state, since the
+/// box runtime dir is writable by the VMM.
+pub type CastPath = Arc<dyn Fn(&BoxId, &BoxPaths) -> PathBuf + Send + Sync>;
+
 /// The host end of `saiife-guest/1` for every box.
 pub struct VsockGuest {
     me: Weak<VsockGuest>,
     setups: Arc<dyn SetupSource>,
     group_rw: bool,
     vmm_uid: u32,
+    cast_path: CastPath,
     runs: Mutex<BTreeMap<BoxId, Arc<Run>>>,
     queue: Mutex<VecDeque<(BoxId, GuestEvent)>>,
     queue_cv: Condvar,
@@ -288,8 +352,22 @@ pub struct VsockGuest {
 impl VsockGuest {
     /// `group_rw`: the host listeners are 0660 (locked mode) instead of 0600.
     /// `vmm_uid`: the uid that must own each box's `vsock.sock`.
+    /// The recording goes to each box's `term.cast`.
     pub fn new(setups: Arc<dyn SetupSource>, group_rw: bool, vmm_uid: u32) -> Arc<VsockGuest> {
+        let cast_path: CastPath = Arc::new(|_id: &BoxId, p: &BoxPaths| p.term_cast());
+        Self::with_cast_path(setups, group_rw, vmm_uid, cast_path)
+    }
+
+    /// As `new`, with the recording at `cast_path(id, paths)` (its parent
+    /// directory must exist; the file is created fresh, O_EXCL).
+    pub fn with_cast_path(
+        setups: Arc<dyn SetupSource>,
+        group_rw: bool,
+        vmm_uid: u32,
+        cast_path: CastPath,
+    ) -> Arc<VsockGuest> {
         Arc::new_cyclic(|me| VsockGuest {
+            cast_path,
             me: me.clone(),
             setups,
             group_rw,
@@ -316,6 +394,19 @@ impl VsockGuest {
         let run = self.run(id)?;
         let e = lock(&run.last_error).clone();
         e
+    }
+
+    /// Drops a stopped box's entry (its last screen and error); `false`, and
+    /// nothing changes, while its run is still on or the box is unknown.
+    pub fn forget(&self, id: &BoxId) -> bool {
+        let mut runs = lock(&self.runs);
+        match runs.get(id) {
+            Some(run) if run.stopped() => {
+                runs.remove(id);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Threads of all runs still alive (tests).
@@ -345,7 +436,7 @@ impl VsockGuest {
         timeout: Duration,
     ) -> Result<Reply, GuestError> {
         let run = self.live_run(id)?;
-        self.exchange(&run, req, timeout)
+        self.exchange(&run, req, timeout, None)
     }
 
     /// One request, then frames until `on_frame` returns `Ok(false)` or the
@@ -358,7 +449,7 @@ impl VsockGuest {
         on_frame: &mut dyn FnMut(Frame) -> Result<bool, String>,
     ) -> Result<(), GuestError> {
         let run = self.live_run(id)?;
-        let (s, _guard) = self.open_control(&run, req, timeout)?;
+        let (s, _guard) = self.open_control(&run, req, timeout, None)?;
         loop {
             let mut r = DeadlineReader {
                 s: &s,
@@ -379,7 +470,7 @@ impl VsockGuest {
     /// Sends the resize to the guest, then resizes the host screen.
     pub fn resize(&self, id: &BoxId, rows: u16, cols: u16) -> Result<(), GuestError> {
         let run = self.live_run(id)?;
-        match self.exchange(&run, &Request::Resize { rows, cols }, RESIZE_TIMEOUT)? {
+        match self.exchange(&run, &Request::Resize { rows, cols }, RESIZE_TIMEOUT, None)? {
             Reply::Ok => {
                 let now = run.now_ms();
                 lock(&run.term).resize(rows, cols, now);
@@ -396,17 +487,23 @@ impl VsockGuest {
         run: &'a Run,
         req: &Request,
         timeout: Duration,
+        session: Option<u64>,
     ) -> Result<(UnixStream, ControlGuard<'a>), GuestError> {
         let deadline = Instant::now() + timeout;
+        // A setup belongs to its events session: none once it was replaced.
+        let gone = || run.stopped() || session.is_some_and(|g| !Self::current(run, g));
+        if gone() {
+            return Err(GuestError::NotConnected);
+        }
         let s = vsock::connect(&run.paths, ports::CONTROL, timeout, self.vmm_uid)
             .map_err(|e| unavailable("the guest is not reachable", e))?;
         let key = run.next_control.fetch_add(1, Ordering::SeqCst);
         let clone = s
             .try_clone()
             .map_err(|e| unavailable("control connection", e))?;
-        lock(&run.controls).insert(key, clone);
+        lock(&run.controls).insert(key, (session, clone));
         let guard = ControlGuard { run, key };
-        if run.stopped() {
+        if gone() {
             return Err(GuestError::NotConnected);
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -421,9 +518,15 @@ impl VsockGuest {
         Ok((s, guard))
     }
 
-    fn exchange(&self, run: &Run, req: &Request, timeout: Duration) -> Result<Reply, GuestError> {
+    fn exchange(
+        &self,
+        run: &Run,
+        req: &Request,
+        timeout: Duration,
+        session: Option<u64>,
+    ) -> Result<Reply, GuestError> {
         let deadline = Instant::now() + timeout;
-        let (s, _guard) = self.open_control(run, req, timeout)?;
+        let (s, _guard) = self.open_control(run, req, timeout, session)?;
         let mut r = DeadlineReader { s: &s, deadline };
         match read_msg::<Reply>(&mut r) {
             Ok(Some(rep)) => Ok(rep),
@@ -534,12 +637,17 @@ impl VsockGuest {
                     if run.stopped() {
                         break;
                     }
+                    let Some(slot) = Self::conn_slot(&run) else {
+                        drop(s);
+                        continue;
+                    };
                     let _ = s.set_nonblocking(false);
-                    let gen = run.events_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    let gen = run.next_events_gen.fetch_add(1, Ordering::SeqCst) + 1;
                     let Ok(clone) = s.try_clone() else { continue };
-                    Run::replace(&run.events_conn, gen, clone);
+                    lock(&run.hellos).insert(gen, clone);
                     let (me2, run2) = (me.clone(), run.clone());
                     if let Err(e) = g.spawn(&run, "saiife-guest-events", move || {
+                        let _slot = slot;
                         VsockGuest::events_conn(me2, run2, gen, s)
                     }) {
                         log(&run.id, &format!("events thread: {e}"));
@@ -555,6 +663,16 @@ impl VsockGuest {
                 }
             }
         }
+    }
+
+    /// A handler slot under the per-run cap, or `None` (close the connection).
+    fn conn_slot(run: &Arc<Run>) -> Option<ConnSlot> {
+        if run.conns.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+            run.conns.fetch_sub(1, Ordering::SeqCst);
+            log(&run.id, "too many guest connections; closing a new one");
+            return None;
+        }
+        Some(ConnSlot(run.clone()))
     }
 
     fn current(run: &Run, gen: u64) -> bool {
@@ -584,6 +702,8 @@ impl VsockGuest {
 
     fn events_conn(me: Weak<VsockGuest>, run: Arc<Run>, gen: u64, s: UnixStream) {
         Self::events_session(&me, &run, gen, &s);
+        let hello = lock(&run.hellos).remove(&gen);
+        drop(hello);
         Run::release(&run.events_conn, gen, &s);
     }
 
@@ -592,14 +712,48 @@ impl VsockGuest {
         let set_up = match Self::read_hello(s) {
             Ok(set_up) => set_up,
             Err(why) => {
-                if Self::current(run, gen) {
+                if !run.stopped() {
                     let _ = write_msg(&mut &*s, &HostReply::Refuse { why: why.clone() });
                     run.set_error(&format!("refused the guest hello: {why}"));
                 }
                 return;
             }
         };
+        if run.stopped() {
+            return;
+        }
+        // One setup per run, one at a time: a set_up:false hello while one is
+        // in flight, or after it succeeded, is refused (it would not replace
+        // the session, so the setup in flight is left alone).
+        if !set_up {
+            if let Err(state) = run.setup.compare_exchange(
+                SETUP_NONE,
+                SETUP_IN_FLIGHT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                let why = if state == SETUP_DONE {
+                    "already set up"
+                } else {
+                    "setup already in progress"
+                };
+                log(&run.id, &format!("refused a guest hello: {why}"));
+                let _ = write_msg(&mut &*s, &HostReply::Refuse { why: why.into() });
+                return;
+            }
+        }
+        let unclaim = || {
+            if !set_up {
+                run.setup.store(SETUP_NONE, Ordering::SeqCst);
+            }
+        };
+        let Some(clone) = lock(&run.hellos).remove(&gen) else {
+            unclaim();
+            return;
+        };
+        run.replace_events(gen, clone);
         if !Self::current(run, gen) {
+            unclaim();
             return;
         }
         let welcome = HostReply::Welcome {
@@ -607,16 +761,24 @@ impl VsockGuest {
         };
         if let Err(e) = write_msg(&mut &*s, &welcome) {
             log(&run.id, &format!("welcome not sent: {e}"));
+            unclaim();
             return;
         }
         run.welcomed.store(true, Ordering::SeqCst);
         if !set_up {
-            let Some(g) = me.upgrade() else { return };
-            if let Err(e) = g.do_setup(run) {
-                if Self::current(run, gen) {
-                    run.set_error(&e);
-                }
+            let Some(g) = me.upgrade() else {
+                unclaim();
                 return;
+            };
+            match g.do_setup(run, gen) {
+                Ok(()) => run.setup.store(SETUP_DONE, Ordering::SeqCst),
+                Err(e) => {
+                    unclaim();
+                    if Self::current(run, gen) {
+                        run.set_error(&e);
+                    }
+                    return;
+                }
             }
         }
         // An idle agent sends nothing for long: block, bounded by the codec;
@@ -659,7 +821,7 @@ impl VsockGuest {
         }
     }
 
-    fn do_setup(&self, run: &Run) -> Result<(), String> {
+    fn do_setup(&self, run: &Run, gen: u64) -> Result<(), String> {
         let setup = self
             .setups
             .setup_for(&run.id)
@@ -668,7 +830,7 @@ impl VsockGuest {
             .check()
             .map_err(|e| format!("the box setup is not valid: {e}"))?;
         let (rows, cols) = (setup.rows, setup.cols);
-        match self.exchange(run, &Request::Setup(setup), SETUP_TIMEOUT) {
+        match self.exchange(run, &Request::Setup(setup), SETUP_TIMEOUT, Some(gen)) {
             Ok(Reply::Ok) => {}
             Ok(Reply::Err { why }) => return Err(format!("the guest setup failed: {why}")),
             Err(GuestError::Unavailable(m)) => return Err(format!("the guest setup failed: {m}")),
@@ -694,12 +856,17 @@ impl VsockGuest {
                     if run.stopped() {
                         break;
                     }
+                    let Some(slot) = Self::conn_slot(&run) else {
+                        drop(s);
+                        continue;
+                    };
                     let _ = s.set_nonblocking(false);
                     let gen = run.pty_gen.fetch_add(1, Ordering::SeqCst) + 1;
                     let Ok(clone) = s.try_clone() else { continue };
                     Run::replace(&run.pty_conn, gen, clone);
                     let run2 = run.clone();
                     if let Err(e) = g.spawn(&run, "saiife-guest-pty", move || {
+                        let _slot = slot;
                         VsockGuest::pty_conn(run2, gen, s)
                     }) {
                         log(&run.id, &format!("pty thread: {e}"));
@@ -771,9 +938,13 @@ impl VmHooks for VsockGuest {
             exited: AtomicBool::new(false),
             welcomed: AtomicBool::new(false),
             ready_sent: AtomicBool::new(false),
+            setup: AtomicU8::new(SETUP_NONE),
             events_gen: AtomicU64::new(0),
+            next_events_gen: AtomicU64::new(0),
             pty_gen: AtomicU64::new(0),
+            conns: AtomicUsize::new(0),
             events_conn: Mutex::new(None),
+            hellos: Mutex::new(BTreeMap::new()),
             pty_conn: Mutex::new(None),
             controls: Mutex::new(BTreeMap::new()),
             next_control: AtomicU64::new(0),
@@ -796,7 +967,7 @@ impl VmHooks for VsockGuest {
         let unix_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let rec = Recorder::create(&paths.term_cast(), ROWS, COLS, unix_now)
+        let rec = Recorder::create(&(self.cast_path)(id, paths), ROWS, COLS, unix_now)
             .map_err(|e| fail("the terminal recording", e))?;
         *lock(&run.recorder) = Some(rec);
         lock(&self.runs).insert(id.clone(), run.clone());

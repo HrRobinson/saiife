@@ -657,3 +657,114 @@ fn reboot_resets_the_run() {
     assert_eq!(w.requests().len(), 2);
     g.after_off(&b1());
 }
+
+/// Says a hello on a fresh events connection and returns the host's answer
+/// (`None` when the host closed without one).
+fn try_hello(w: &World, set_up: bool) -> (UnixStream, Option<HostReply>) {
+    let mut s = w.connect(ports::EVENTS);
+    let _ = write_msg(&mut s, &hello_msg(PROTO, set_up));
+    let r = read_msg::<HostReply>(&mut s).ok().flatten();
+    (s, r)
+}
+
+#[test]
+fn setup_flood_is_bounded() {
+    // The guest's control end accepts the setup and never answers.
+    let w = World::new(Arc::new(|_r, _s| thread::sleep(Duration::from_secs(30))));
+    let g = w.guest(Ok(setup()));
+    let _first = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    let (_s, r) = try_hello(&w, false);
+    assert_eq!(
+        r,
+        Some(HostReply::Refuse {
+            why: "setup already in progress".into()
+        })
+    );
+    // Silent connections hold hello threads; hello floods reconnect.
+    let mut held = Vec::new();
+    let mut max_live = 0;
+    for i in 0..60 {
+        let mut s = w.connect(ports::EVENTS);
+        if i % 3 != 0 {
+            let _ = write_msg(&mut s, &hello_msg(PROTO, false));
+        }
+        held.push(s);
+        max_live = max_live.max(g.live_threads());
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    max_live = max_live.max(g.live_threads());
+    // Two acceptors plus at most eight connection handlers.
+    assert!(max_live <= 10, "{max_live} threads");
+    let setups = w
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::Setup(_)))
+        .count();
+    assert_eq!(setups, 1, "setup sent {setups} times");
+    let t0 = Instant::now();
+    g.after_off(&b1());
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert_eq!(g.live_threads(), 0);
+}
+
+#[test]
+fn setup_hello_after_setup_is_refused() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    let (_s2, r) = try_hello(&w, false);
+    assert_eq!(
+        r,
+        Some(HostReply::Refuse {
+            why: "already set up".into()
+        })
+    );
+    // The refused hello did not replace the session.
+    write_msg(&mut s, &Event::Activity).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Activity]);
+    assert_eq!(w.requests().len(), 1);
+    g.after_off(&b1());
+}
+
+#[test]
+fn forget_drops_only_a_stopped_box() {
+    let w = World::new(ok_handler());
+    let g = VsockGuest::new(Arc::new(Setups(Ok(setup()))), false, me());
+    assert!(!g.forget(&b1()));
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert!(!g.forget(&b1()));
+    assert!(g.terminal(&b1(), None).is_ok());
+    g.after_off(&b1());
+    assert!(g.forget(&b1()));
+    assert_eq!(g.terminal(&b1(), None), Err(GuestError::NotConnected));
+    assert!(!g.forget(&b1()));
+}
+
+#[test]
+fn cast_goes_to_the_configured_dir() {
+    let w = World::new(ok_handler());
+    let base = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    let state = tempfile::Builder::new()
+        .prefix("s")
+        .tempdir_in(base)
+        .unwrap();
+    let dir = state.path().to_path_buf();
+    let g = VsockGuest::with_cast_path(
+        Arc::new(Setups(Ok(setup()))),
+        false,
+        me(),
+        Arc::new(move |id: &BoxId, _p: &BoxPaths| dir.join(format!("{}.cast", id.as_str()))),
+    );
+    g.before_boot(&b1(), &w.paths).unwrap();
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"kept apart".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("kept apart"));
+    g.after_off(&b1());
+    let cast = std::fs::read_to_string(state.path().join("b1.cast")).unwrap();
+    assert!(cast.contains("kept apart"), "{cast}");
+    assert!(std::fs::symlink_metadata(w.paths.term_cast()).is_err());
+}
