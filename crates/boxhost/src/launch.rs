@@ -2,11 +2,14 @@
 //! `saiife __box-vmm` makes before it execs (V7, V8, V9; Review Focus 1-2).
 //! Ported from the spike's `ch_boot` and `ch_restore`.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 
 use saiife_wire::source::BoxId;
 use serde::{Deserialize, Serialize};
@@ -304,6 +307,138 @@ pub fn read_spec(paths: &BoxPaths) -> Result<LaunchSpec, String> {
         return Err(format!("vm.json: larger than {MAX_SPEC_BYTES} bytes"));
     }
     serde_json::from_slice(&buf).map_err(|e| format!("vm.json: {e}"))
+}
+
+/// Starts and stops the VMM process of a box.
+pub trait Launcher: Send + Sync {
+    /// Returns once the process is started.
+    fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String>;
+    /// `None`: not started by this launcher (e.g. after a daemon restart).
+    fn exited(&self, id: &BoxId) -> Option<bool>;
+    /// Ends the process; Ok when it already exited.
+    fn force_stop(&self, id: &BoxId) -> Result<(), String>;
+    /// "child" | "unit"
+    fn kind(&self) -> &'static str;
+}
+
+enum Mode {
+    /// `<saiife> __box-vmm <dir>`: the helper checks `vm.json`, then execs.
+    Helper,
+    /// `<program> <argv(read_spec)>` (tests).
+    Direct,
+}
+
+/// Runs the VMM as a child process of the daemon, stdout and stderr in
+/// `ch.log`. Children are reaped through `try_wait` in `exited`, and
+/// `force_stop` is `Child::kill` plus `wait` of its own child only.
+pub struct ChildLauncher {
+    program: PathBuf,
+    mode: Mode,
+    env: Vec<(OsString, OsString)>,
+    children: Mutex<BTreeMap<BoxId, Child>>,
+}
+
+impl ChildLauncher {
+    pub fn helper(saiife_bin: PathBuf) -> ChildLauncher {
+        ChildLauncher::with_mode(saiife_bin, Mode::Helper)
+    }
+
+    pub fn direct(program: PathBuf) -> ChildLauncher {
+        ChildLauncher::with_mode(program, Mode::Direct)
+    }
+
+    fn with_mode(program: PathBuf, mode: Mode) -> ChildLauncher {
+        ChildLauncher {
+            program,
+            mode,
+            env: Vec::new(),
+            children: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// An extra environment variable for every child (tests' fake knobs).
+    pub fn env(mut self, k: impl Into<OsString>, v: impl Into<OsString>) -> ChildLauncher {
+        self.env.push((k.into(), v.into()));
+        self
+    }
+
+    /// The exit status of the box's child once it has exited and been reaped.
+    pub fn exit_status(&self, id: &BoxId) -> Option<ExitStatus> {
+        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_mut(id).and_then(|c| c.try_wait().ok().flatten())
+    }
+
+    fn command(&self, paths: &BoxPaths) -> Result<Command, String> {
+        let mut c = Command::new(&self.program);
+        match self.mode {
+            Mode::Helper => {
+                c.arg("__box-vmm").arg(&paths.dir);
+            }
+            Mode::Direct => {
+                let spec = read_spec(paths)?;
+                c.args(argv(&spec, paths));
+            }
+        }
+        let log = open_log(&paths.ch_log())?;
+        let log2 = log.try_clone().map_err(|e| format!("ch.log: {e}"))?;
+        c.envs(self.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(log2);
+        Ok(c)
+    }
+}
+
+fn open_log(p: &Path) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o640)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(p)
+        .map_err(|e| format!("ch.log: {}: {e}", p.display()))
+}
+
+impl Launcher for ChildLauncher {
+    fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
+        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.get_mut(id) {
+            if matches!(c.try_wait(), Ok(None)) {
+                return Err("the VMM of this box is already running".into());
+            }
+        }
+        let child = self
+            .command(paths)?
+            .spawn()
+            .map_err(|e| format!("cannot start {}: {e}", self.program.display()))?;
+        g.insert(id.clone(), child);
+        Ok(())
+    }
+
+    fn exited(&self, id: &BoxId) -> Option<bool> {
+        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.get_mut(id)?;
+        Some(!matches!(c.try_wait(), Ok(None)))
+    }
+
+    fn force_stop(&self, id: &BoxId) -> Result<(), String> {
+        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g
+            .get_mut(id)
+            .ok_or("the VMM was not started by this daemon")?;
+        if !matches!(c.try_wait(), Ok(None)) {
+            return Ok(());
+        }
+        // Our own child: kill(2) on its pid, then reap it.
+        let _ = c.kill();
+        c.wait()
+            .map(|_| ())
+            .map_err(|e| format!("wait for the VMM: {e}"))
+    }
+
+    fn kind(&self) -> &'static str {
+        "child"
+    }
 }
 
 #[cfg(test)]

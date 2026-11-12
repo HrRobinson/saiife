@@ -12,6 +12,8 @@ path = "src/lib.rs"
 
 [dependencies]
 saiife-boxproto = { path = "../boxproto" }
+# The Vmm trait ChVmm implements (boxes never depends on boxhost).
+saiife-boxes = { path = "../boxes" }
 # BoxId (tokio-free).
 saiife-wire = { path = "../wire" }
 serde = { version = "1", features = ["derive"] }
