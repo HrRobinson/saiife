@@ -155,6 +155,10 @@ fn serve(mut s: UnixStream, sh: Arc<Shared>) {
             fx!("vm.pause.204.http")
         }
         ("PUT", "/api/v1/vm.snapshot") => {
+            if !paused {
+                let _ = s.write_all(fx!("vm.pause.500.http").as_bytes());
+                return;
+            }
             let dest = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| {
@@ -193,15 +197,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(dir) = sock.parent() {
+        let lines: String = args.iter().map(|a| json_str(a) + "\n").collect();
+        let _ = std::fs::write(dir.join("fake-ch.argv"), lines);
+    }
     if let Some(code) = std::env::var("FAKE_CH_EXIT_AT_START")
         .ok()
         .and_then(|c| c.parse::<i32>().ok())
     {
         std::process::exit(code);
-    }
-    if let Some(dir) = sock.parent() {
-        let lines: String = args.iter().map(|a| json_str(a) + "\n").collect();
-        let _ = std::fs::write(dir.join("fake-ch.argv"), lines);
     }
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {

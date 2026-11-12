@@ -61,11 +61,11 @@ fn ping_state_pause_resume() {
     assert_eq!(a.state().unwrap(), VmState::Running);
     a.put(Action::Pause, None, T).unwrap();
     assert_eq!(a.state().unwrap(), VmState::Paused);
-    a.put(Action::Resume, None, T).unwrap();
-    assert_eq!(a.state().unwrap(), VmState::Running);
     let snap = f.dir.join("snap");
     a.snapshot(&snap).unwrap();
     assert!(snap.join("config.json").exists());
+    a.put(Action::Resume, None, T).unwrap();
+    assert_eq!(a.state().unwrap(), VmState::Running);
     let argv = std::fs::read_to_string(f.dir.join("fake-ch.argv")).unwrap();
     assert!(argv.contains("\"--landlock\"\n"));
 }
@@ -105,4 +105,25 @@ fn power_button_exits_the_fake() {
         assert!(t.elapsed() < Duration::from_secs(5), "fake did not exit");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn snapshot_when_running_is_http_500() {
+    let f = Fake::start(&[]);
+    let r = f.api().snapshot(&f.dir.join("snap"));
+    assert_eq!(
+        r,
+        Err(ApiError::Http {
+            status: 500,
+            body: "InvalidStateTransition".into()
+        })
+    );
+    assert!(!f.dir.join("snap").exists());
+}
+
+#[test]
+fn argv_is_written_before_exit_at_start() {
+    let mut f = Fake::start(&[("FAKE_CH_EXIT_AT_START", "3")]);
+    assert_eq!(f.child.wait().unwrap().code(), Some(3));
+    assert!(f.dir.join("fake-ch.argv").exists());
 }
