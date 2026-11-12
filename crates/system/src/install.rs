@@ -556,6 +556,15 @@ fn install_unlocked(
         step: "binary".into(),
         detail: format!("{}: {e}", binary.display()),
     })?;
+    // `--boxes`: its read-only refusals too, before the first change.
+    if opts.boxes {
+        boxes_install::preflight(
+            layout,
+            host,
+            opts.vmm_dir.as_deref(),
+            &boxes_install::vmm_pins(),
+        )?;
+    }
     let strict = layout.is_system() && !opts.allow_test_build;
     let warnings: Vec<String> = if mac {
         check_macho(binary, &binary_bytes, strict)?

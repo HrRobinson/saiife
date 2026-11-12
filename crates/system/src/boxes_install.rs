@@ -26,7 +26,7 @@ pub const VMM_DIR: &str = "/opt/saiife/vmm";
 pub const VMM_CH: &str = "/opt/saiife/vmm/cloud-hypervisor";
 pub const VMM_FW: &str = "/opt/saiife/vmm/CLOUDHV.fd";
 pub const BOX_UNIT_PATH: &str = "/etc/systemd/system/saiife-box@.service";
-pub const POLKIT_RULE_NAME: &str = "49-saiife-box.rules";
+pub const POLKIT_RULE_NAME: &str = "50-saiife-box.rules";
 
 /// `/var/lib/saiife-box`: root:saiife-box. The VMM user cannot rename
 /// entries in it (R26).
@@ -191,24 +191,25 @@ fn read_checked(dir: &Path, name: &str, want: &str) -> Result<Vec<u8>, InstallEr
     Ok(bytes)
 }
 
-pub(crate) fn install_boxes_with(
+/// The checked `cloud-hypervisor` and `CLOUDHV.fd` bytes.
+pub(crate) type VmmBytes = (Vec<u8>, Vec<u8>);
+
+/// The read-only refusals of `--boxes`, none of which needs the accounts the
+/// v2 install creates: the platform, the VMM files against the pins, polkit
+/// and the `kvm` group. `system install` runs it before its first change,
+/// so a refused `--boxes` changes nothing. Returns the checked VMM bytes.
+pub(crate) fn preflight(
     layout: &Layout,
     host: &dyn Host,
-    daemon_user: &str,
     vmm_dir: Option<&Path>,
     pins: &VmmPins,
-    created: &mut Created,
-) -> Result<(), InstallError> {
+) -> Result<Option<VmmBytes>, InstallError> {
     if layout.platform() != Platform::Linux {
         return Err(InstallError::Unsupported(
             "boxes (--boxes) are for Linux only".into(),
         ));
     }
-    if layout.is_system() && host.euid() != 0 {
-        return Err(InstallError::NotRoot);
-    }
-    // 1. Refusals before the first change: the VMM bytes checked are the
-    // bytes copied; polkit and kvm must be there; the daemon user exists.
+    // The bytes checked are the bytes copied.
     let vmm_bytes = match vmm_dir {
         Some(d) => Some((
             read_checked(d, "cloud-hypervisor", pins.ch_sha256)?,
@@ -232,6 +233,22 @@ pub(crate) fn install_boxes_with(
             "no group kvm: this host has no KVM access group for boxes",
         ));
     }
+    Ok(vmm_bytes)
+}
+
+pub(crate) fn install_boxes_with(
+    layout: &Layout,
+    host: &dyn Host,
+    daemon_user: &str,
+    vmm_dir: Option<&Path>,
+    pins: &VmmPins,
+    created: &mut Created,
+) -> Result<(), InstallError> {
+    if layout.is_system() && host.euid() != 0 {
+        return Err(InstallError::NotRoot);
+    }
+    // 1. Refusals before the first change (again: install ran them early).
+    let vmm_bytes = preflight(layout, host, vmm_dir, pins)?;
     let daemon_uid = host
         .user(daemon_user)
         .map(|u| u.uid)
@@ -288,6 +305,7 @@ pub(crate) fn install_boxes_with(
         BOX_STATE_DIR,
         MODE_STATE,
         (root_uid, box_gid),
+        true,
         created,
     )?;
     for (abs, mode) in [
@@ -295,12 +313,36 @@ pub(crate) fn install_boxes_with(
         (IMAGES_DIR, MODE_RO),
         (VAULT_DIR, MODE_RO),
     ] {
-        ensure_dir(layout, host, abs, mode, (daemon_uid, box_gid), created)?;
+        ensure_dir(
+            layout,
+            host,
+            abs,
+            mode,
+            (daemon_uid, box_gid),
+            true,
+            created,
+        )?;
     }
 
     // 4. The VMM.
-    ensure_dir(layout, host, OPT_DIR, 0o755, (root_uid, root_gid), created)?;
-    ensure_dir(layout, host, VMM_DIR, 0o755, (root_uid, root_gid), created)?;
+    ensure_dir(
+        layout,
+        host,
+        OPT_DIR,
+        0o755,
+        (root_uid, root_gid),
+        false,
+        created,
+    )?;
+    ensure_dir(
+        layout,
+        host,
+        VMM_DIR,
+        0o755,
+        (root_uid, root_gid),
+        true,
+        created,
+    )?;
     let (ch, fw) = (layout.at(VMM_CH), layout.at(VMM_FW));
     match vmm_bytes {
         Some((chb, fwb)) => {
@@ -330,7 +372,15 @@ pub(crate) fn install_boxes_with(
         .parent()
         .and_then(Path::to_str)
         .unwrap_or("/");
-    ensure_dir(layout, host, unit_dir, 0o755, (root_uid, root_gid), created)?;
+    ensure_dir(
+        layout,
+        host,
+        unit_dir,
+        0o755,
+        (root_uid, root_gid),
+        false,
+        created,
+    )?;
     let unit_path = layout.at(BOX_UNIT_PATH);
     let unit_new = fsops::lstat(&unit_path)
         .map_err(|e| refused(&unit_path, e.to_string()))?
@@ -417,14 +467,15 @@ fn put(
 }
 
 /// Ensures the directory `abs` (missing ancestors 0755 root:root) with
-/// `mode` and owner `(uid, gid)`; an existing one gets the mode and owner
-/// again. A symlink anywhere on the way is refused.
+/// `mode` and owner `(uid, gid)`. A directory that was there is left as it
+/// is unless `enforce` (the box dirs saiife-box owns and sets). A symlink anywhere on the way is refused.
 fn ensure_dir(
     layout: &Layout,
     host: &dyn Host,
     abs: &str,
     mode: u32,
     (uid, gid): (u32, u32),
+    enforce: bool,
     created: &mut Created,
 ) -> Result<(), InstallError> {
     let root = (
@@ -448,7 +499,7 @@ fn ensure_dir(
         if made {
             host.chown(&p, owner.0, owner.1).map_err(step("dirs"))?;
             created.changed.push(logical.display().to_string());
-        } else if last {
+        } else if last && enforce {
             let before = fsops::mode_of(&p).map_err(step("dirs"))?;
             fsops::set_dir_mode(&p, m).map_err(|e| refused(&p, e.to_string()))?;
             host.chown(&p, owner.0, owner.1).map_err(step("dirs"))?;
@@ -656,6 +707,10 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         );
         assert_eq!(mode(&at(BOX_UNIT_PATH)), 0o644);
         let rule = at(&polkit_rule_path());
+        assert_eq!(
+            polkit_rule_path(),
+            "/etc/polkit-1/rules.d/50-saiife-box.rules"
+        );
         assert!(rule.starts_with(w.layout.at("/etc/polkit-1/rules.d")));
         assert_eq!(std::fs::read_to_string(&rule).unwrap(), POLKIT_RULE);
         assert_eq!(
@@ -676,6 +731,41 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         assert!(again.groups.is_empty() && again.users.is_empty());
         assert!(again.memberships.is_empty());
         assert!(again.changed.is_empty(), "{:?}", again.changed);
+    }
+
+    /// F5: dirs it does not own keep the mode and owner they have.
+    #[test]
+    fn existing_foreign_dirs_are_left_alone() {
+        let w = world();
+        let foreign = [
+            w.layout.at("/etc/systemd/system"),
+            w.layout.at("/opt/saiife"),
+            w.layout.at(POLKIT_RULES_DIRS[0]),
+        ];
+        for d in &foreign {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        run(&w, &mut Created::default()).unwrap();
+        for d in &foreign {
+            assert_eq!(mode(d), 0o700, "{}", d.display());
+            assert!(chowns(&w, d).is_empty(), "{}", d.display());
+        }
+        // The box dirs it owns are enforced.
+        assert_eq!(mode(&w.layout.at(BOXES_DIR)), 0o3770);
+    }
+
+    /// F4: the read-only refusals come first.
+    #[test]
+    fn preflight_refuses_without_changing_anything() {
+        let w = world();
+        w.host.set(|s| s.missing_groups.push(KVM_GROUP.into()));
+        let e = preflight(&w.layout, &w.host, Some(&w.src), &w.pins).unwrap_err();
+        assert!(e.to_string().contains("kvm"), "{e}");
+        w.host.set(|s| s.missing_groups.clear());
+        assert!(preflight(&w.layout, &w.host, Some(&w.src), &w.pins).is_ok());
+        std::fs::remove_dir(w.layout.at(POLKIT_RULES_DIRS[0])).unwrap();
+        let e = preflight(&w.layout, &w.host, Some(&w.src), &w.pins).unwrap_err();
+        assert!(e.to_string().contains("polkit"), "{e}");
     }
 
     #[test]
@@ -766,6 +856,30 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             let rec = e.installed();
             assert!(!recorded(&rec));
             assert!(!rec.users.iter().any(|u| u == BOX_USER));
+        }
+
+        #[test]
+        fn refused_boxes_change_nothing_of_the_v2_install() {
+            let e = env(255);
+            let (_src, opts) = with_boxes(&e);
+            e.host.set(|s| s.missing_groups.push(KVM_GROUP.into()));
+            // The empty install lock file is the one thing a refused install leaves.
+            let tree = || {
+                let mut t = e.tree();
+                t.remove("etc/saiife-install.lock");
+                t
+            };
+            let before = tree();
+            let r = e.run(&opts);
+            assert!(r.unwrap_err().to_string().contains("kvm"));
+            assert_eq!(tree(), before);
+            assert!(e.host.user("saiife").is_none());
+            assert!(e.host.state().chowns.is_empty());
+            // A wrong VMM digest, likewise.
+            e.host.set(|s| s.missing_groups.clear());
+            std::fs::write(opts.vmm_dir.as_ref().unwrap().join("CLOUDHV.fd"), b"x").unwrap();
+            assert!(e.run(&opts).is_err());
+            assert_eq!(tree(), before);
         }
 
         #[test]

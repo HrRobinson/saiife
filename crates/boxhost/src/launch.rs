@@ -697,7 +697,11 @@ impl Launcher for ChildLauncher {
 pub trait UnitBus: Send + Sync {
     fn start(&self, unit: &str) -> Result<(), String>;
     fn stop(&self, unit: &str) -> Result<(), String>;
-    /// True while the unit is `active` or `activating`.
+    /// `Ok(false)` only when the unit is known to have no process: `inactive`
+    /// or `failed`, or not loaded at all (systemd drops inactive units).
+    /// Every other state is `Ok(true)`, and anything that cannot be told (a
+    /// bus error, an odd answer) is an `Err`: `UnitLauncher::exited` then
+    /// says "cannot tell", and a boot is refused.
     fn active(&self, unit: &str) -> Result<bool, String>;
 }
 

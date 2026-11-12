@@ -2,12 +2,17 @@
 //! units over the system bus (plan 35, Task 6). The polkit rule the install
 //! writes lets the daemon user do exactly `start` and `stop` on those units.
 //!
-//! [`UnitBus`] is sync and is called from tokio worker threads, where
-//! `Handle::block_on` panics: each call runs on a short-lived thread of its
-//! own that blocks on the runtime handle, with a 5 s timeout. No unit test
-//! (it needs a system bus); the box smoke fragment exercises it.
+//! [`UnitBus`] is sync and is called from `spawn_blocking` threads (every box
+//! manager call is), never from an async task: `Handle::block_on` panics in a
+//! runtime thread's task context, so each call runs on a helper thread that
+//! blocks on the runtime handle with a 5 s timeout, and the caller waits at
+//! most 6 s of wall-clock time. Called from the one thread of a current-thread
+//! runtime, nothing would drive the bus: the call then ends in an error after
+//! the wall-clock bound instead of hanging. No unit test of the bus itself (it
+//! needs a system bus); the box smoke fragment exercises it.
 
 use std::future::Future;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use saiife_boxhost::launch::UnitBus;
@@ -22,6 +27,8 @@ const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 /// Each bus call gives up after this long.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The caller's wall-clock bound, a little over the call's own.
+const WALL_CLOCK: Duration = Duration::from_secs(6);
 
 pub struct SystemdBus {
     conn: Connection,
@@ -41,28 +48,41 @@ impl SystemdBus {
         })
     }
 
-    /// Runs `f` on a short-lived thread that blocks on the runtime, so it is
-    /// safe from a runtime thread, and joins it.
+    /// Runs `f` to completion on the runtime from a thread that is not a
+    /// task, never for longer than [`WALL_CLOCK`].
     fn run<T, F, Fut>(&self, f: F) -> Result<T, String>
     where
-        T: Send,
-        F: FnOnce(Connection) -> Fut + Send,
-        Fut: Future<Output = Result<T, String>> + Send,
+        T: Send + 'static,
+        F: FnOnce(Connection) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, String>> + Send + 'static,
     {
         let conn = self.conn.clone();
         let handle = self.handle.clone();
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                handle.block_on(async move {
-                    tokio::time::timeout(CALL_TIMEOUT, f(conn))
-                        .await
-                        .unwrap_or_else(|_| Err("system bus call timed out".to_string()))
-                })
+        bounded(WALL_CLOCK, move || {
+            handle.block_on(async move {
+                tokio::time::timeout(CALL_TIMEOUT, f(conn))
+                    .await
+                    .unwrap_or_else(|_| Err("system bus call timed out".to_string()))
             })
-            .join()
-            .unwrap_or_else(|_| Err("system bus call panicked".to_string()))
-        })
+        })?
     }
+}
+
+/// Runs `work` on its own thread and waits at most `wall` for it. The thread
+/// is left behind when the time is up.
+fn bounded<T: Send + 'static>(
+    wall: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("saiife-box-bus".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|e| format!("system bus call: cannot start a thread: {e}"))?;
+    rx.recv_timeout(wall)
+        .map_err(|_| "system bus call did not finish in time".to_string())
 }
 
 /// `StartUnit` / `StopUnit` with `mode`.
@@ -119,13 +139,11 @@ async fn is_active(conn: Connection, unit: String) -> Result<bool, String> {
     Ok(alive(&state))
 }
 
-/// A unit in any of these states may still have its process: "gone" is only
-/// `inactive` and `failed` (fail closed).
+/// Only `inactive` and `failed` mean the unit has no process. Any other
+/// state, a state systemd adds later, or an empty or odd answer counts as
+/// alive: a wrong "gone" starts a second VMM on the same disks (fail closed).
 fn alive(state: &str) -> bool {
-    matches!(
-        state,
-        "active" | "activating" | "deactivating" | "reloading"
-    )
+    !matches!(state, "inactive" | "failed")
 }
 
 impl UnitBus for SystemdBus {
@@ -147,15 +165,35 @@ impl UnitBus for SystemdBus {
 
 #[cfg(test)]
 mod tests {
-    use super::alive;
+    use super::*;
 
     #[test]
     fn only_inactive_and_failed_are_gone() {
-        for s in ["active", "activating", "deactivating", "reloading"] {
-            assert!(alive(s), "{s}");
+        for s in [
+            "active",
+            "reloading",
+            "activating",
+            "deactivating",
+            "refreshing",
+            "maintenance",
+            "",
+            "frobnicating",
+        ] {
+            assert!(alive(s), "{s:?}");
         }
         for s in ["inactive", "failed"] {
             assert!(!alive(s), "{s}");
         }
+    }
+
+    #[test]
+    fn a_call_cannot_hang_without_limit() {
+        assert_eq!(bounded(Duration::from_secs(5), || 7).unwrap(), 7);
+        let t = std::time::Instant::now();
+        let r = bounded(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        assert!(r.is_err());
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
 }

@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use saiife_boxes::template::{ImageRef, Size};
 use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
-use saiife_boxhost::launch::{argv, read_spec, Boot, ChildLauncher, Launcher};
+use saiife_boxhost::launch::{
+    argv, read_spec, Boot, ChildLauncher, FakeUnitBus, Launcher, UnitLauncher,
+};
 use saiife_boxhost::layout::Layout;
 use saiife_boxhost::paths::BoxPaths;
 use saiife_boxhost::pins::sha256_file;
@@ -140,13 +142,17 @@ impl World {
         l
     }
 
-    fn vmm_with(&self, launcher: Arc<ChildLauncher>, hooks: Vec<Arc<dyn VmHooks>>) -> Arc<ChVmm> {
+    fn vmm_with<L: Launcher + 'static>(
+        &self,
+        launcher: Arc<L>,
+        hooks: Vec<Arc<dyn VmHooks>>,
+    ) -> Arc<ChVmm> {
         self.vmm_uid(launcher, hooks, rustix::process::geteuid().as_raw())
     }
 
-    fn vmm_uid(
+    fn vmm_uid<L: Launcher + 'static>(
         &self,
-        launcher: Arc<ChildLauncher>,
+        launcher: Arc<L>,
         hooks: Vec<Arc<dyn VmHooks>>,
         vmm_uid: u32,
     ) -> Arc<ChVmm> {
@@ -400,6 +406,27 @@ fn create_refuses_long_socket_paths() {
     let mut spec = w.spec("b1");
     spec.dir = w.root.join("i");
     assert!(v.create(&spec).is_err(), "a dir that is not <boxes>/<id>");
+}
+
+/// F1: a bus that cannot say whether the unit runs is "still running": the
+/// boot is refused, no second VMM on the same disks.
+#[test]
+fn unit_bus_error_refuses_boot() {
+    let w = World::new();
+    let (v0, _l) = w.vmm(&[]);
+    let h = w.create(&v0, "b1");
+    let bus = Arc::new(FakeUnitBus::new());
+    *bus.active.lock().unwrap() = Err("bus unreachable".into());
+    let v = w.vmm_with(Arc::new(UnitLauncher::new(bus.clone())), vec![]);
+    let m = failed(v.boot(&h));
+    assert!(m.contains("still running"), "{m}");
+    assert!(!bus
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("start")));
+    assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
 }
 
 #[test]
