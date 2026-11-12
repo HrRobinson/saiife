@@ -47,23 +47,54 @@ fn answer_ok(line: &[u8]) -> bool {
         && std::str::from_utf8(num).is_ok_and(|n| n.parse::<u32>().is_ok())
 }
 
-/// Connect a unix stream socket without ever blocking past `deadline`.
-/// A full accept backlog (a wedged VMM) shows up as EAGAIN, which is retried
-/// until the deadline. The returned stream is blocking again.
-fn connect_before(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+/// Pin `name` in `dir` (O_PATH, no follow) and require a socket owned by
+/// `uid`. Nothing is opened for I/O, so a FIFO cannot block. The returned fd
+/// is the exact object that was checked.
+fn open_checked(
+    dir: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    uid: u32,
+) -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::fs::{fstat, openat, FileType, Mode, OFlags};
+    let fd = openat(
+        dir,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::LOOP {
+            bad_data("vsock.sock is a symlink")
+        } else {
+            e.into()
+        }
+    })?;
+    let st = fstat(&fd)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::Socket {
+        return Err(bad_data("vsock.sock is not a socket"));
+    }
+    if st.st_uid != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "vsock.sock is not owned by the expected uid",
+        ));
+    }
+    Ok(fd)
+}
+
+/// Connect a unix stream socket to the object `target` (an O_PATH fd, reached
+/// as `/proc/self/fd/N`, so the path cannot be re-resolved to something else)
+/// without ever blocking past `deadline`. A full accept backlog (a wedged
+/// VMM) shows up as EAGAIN, which is retried until the deadline. The returned
+/// stream is blocking again.
+fn connect_fd(target: &rustix::fd::OwnedFd, deadline: Instant) -> io::Result<UnixStream> {
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::io::Errno;
     use rustix::net::{
         connect, socket_with, sockopt, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
     };
-    // Defence in depth: the name must be a socket (not followed).
-    let (dir, name) = open_parent(path)?;
-    match is_socket(&dir, name)? {
-        Some(true) => {}
-        Some(false) => return Err(bad_data("vsock.sock is not a socket")),
-        None => return Err(io::Error::from(io::ErrorKind::NotFound)),
-    }
-    let addr = SocketAddrUnix::new(path)?;
+    use std::os::fd::AsRawFd;
+    let addr = SocketAddrUnix::new(format!("/proc/self/fd/{}", target.as_raw_fd()))?;
     let fd = socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
@@ -107,9 +138,23 @@ fn connect_before(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
 /// The whole handshake (connect, request, answer) shares one deadline of
 /// `HANDSHAKE_TIMEOUT_SECS`, so a peer that trickles bytes cannot extend it.
 /// The answer is read byte by byte up to the newline and never past it.
-pub fn connect(paths: &BoxPaths, port: u32, timeout: Duration) -> io::Result<UnixStream> {
+///
+/// `vmm_uid` is the uid that must own `vsock.sock` (the daemon's euid in
+/// personal mode, the saiife-box uid in locked mode). The entry is pinned
+/// with O_PATH|O_NOFOLLOW, checked, and connected to through that fd, so the
+/// VMM swapping it for a symlink cannot redirect the connection.
+pub fn connect(
+    paths: &BoxPaths,
+    port: u32,
+    timeout: Duration,
+    vmm_uid: u32,
+) -> io::Result<UnixStream> {
     let deadline = Instant::now() + Duration::from_secs(ports::HANDSHAKE_TIMEOUT_SECS);
-    let mut s = connect_before(&paths.vsock(), deadline)?;
+    let sock_path = paths.vsock();
+    let (dir, name) = open_parent(&sock_path)?;
+    let pinned = open_checked(&dir, name, vmm_uid)?;
+    let mut s = connect_fd(&pinned, deadline)?;
+    drop(pinned);
     s.set_write_timeout(Some(remaining(deadline)?))?;
     s.write_all(format!("CONNECT {port}\n").as_bytes())?;
     let mut buf = [0u8; MAX_ANSWER];
@@ -207,7 +252,21 @@ pub fn listen(paths: &BoxPaths, port: u32, group_rw: bool) -> io::Result<UnixLis
             ))
         }
     }
-    let listener = UnixListener::bind(&path)?;
+    // Bind relative to the dirfd we checked (via /proc, a short path), on a
+    // socket whose mode is set first so it is never wider than wanted.
+    let mode = if group_rw { 0o660 } else { 0o600 };
+    let sock = rustix::net::socket_with(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    rustix::fs::fchmod(&sock, Mode::from_raw_mode(mode))?;
+    let mut rel = std::ffi::OsString::from(format!("/proc/self/fd/{}/", dir.as_raw_fd()));
+    rel.push(name);
+    rustix::net::bind(&sock, &rustix::net::SocketAddrUnix::new(&rel)?)?;
+    rustix::net::listen(&sock, 128)?;
+    let listener = UnixListener::from(sock);
     // Pin what is at the name now (O_PATH, no follow) and check it is our
     // fresh socket before chmod, so a swap by the VMM cannot redirect it.
     let fd = openat(
@@ -225,7 +284,7 @@ pub fn listen(paths: &BoxPaths, port: u32, group_rw: bool) -> io::Result<UnixLis
             "vsock path is not a socket of ours after bind",
         ));
     }
-    let mode = if group_rw { 0o660 } else { 0o600 };
+    // The umask can only have narrowed the pre-bind mode; set it exactly.
     std::fs::set_permissions(
         format!("/proc/self/fd/{}", fd.as_raw_fd()),
         std::fs::Permissions::from_mode(mode),
@@ -280,6 +339,10 @@ mod tests {
         })
     }
 
+    fn me() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
     const T: Duration = Duration::from_secs(5);
 
     #[test]
@@ -289,7 +352,7 @@ mod tests {
             s.write_all(b"OK 1073741824\nrest").unwrap();
             thread::sleep(Duration::from_millis(200));
         });
-        let mut s = connect(&p, 5000, T).unwrap();
+        let mut s = connect(&p, 5000, T, me()).unwrap();
         assert_eq!(s.read_timeout().unwrap(), Some(T));
         assert_eq!(s.write_timeout().unwrap(), Some(T));
         // Bytes after the newline belong to the stream.
@@ -310,7 +373,7 @@ mod tests {
         ] {
             let (_t, p) = setup();
             let h = fake_mux(&p, move |mut s| s.write_all(ans).unwrap());
-            let e = connect(&p, 1024, T).unwrap_err();
+            let e = connect(&p, 1024, T, me()).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{ans:?}");
             h.join().unwrap();
         }
@@ -323,7 +386,7 @@ mod tests {
             let _ = s.write_all(&[b'A'; 200]);
             let _ = s.write_all(b"\n");
         });
-        let e = connect(&p, 1024, T).unwrap_err();
+        let e = connect(&p, 1024, T, me()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         h.join().unwrap();
     }
@@ -333,7 +396,7 @@ mod tests {
         let (_t, p) = setup();
         let h = fake_mux(&p, |_s| thread::sleep(Duration::from_millis(3000)));
         let t0 = Instant::now();
-        let e = connect(&p, 1024, T).unwrap_err();
+        let e = connect(&p, 1024, T, me()).unwrap_err();
         assert!(
             matches!(
                 e.kind(),
@@ -357,7 +420,7 @@ mod tests {
             }
         });
         let t0 = Instant::now();
-        let e = connect(&p, 1024, T).unwrap_err();
+        let e = connect(&p, 1024, T, me()).unwrap_err();
         assert!(
             t0.elapsed() < Duration::from_millis(2600),
             "{:?}",
@@ -400,7 +463,7 @@ mod tests {
         }
         assert!(full, "could not fill the backlog");
         let t0 = Instant::now();
-        let e = connect(&p, 1024, T).unwrap_err();
+        let e = connect(&p, 1024, T, me()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e:?}");
         assert!(
             t0.elapsed() < Duration::from_millis(2600),
@@ -410,10 +473,58 @@ mod tests {
     }
 
     #[test]
+    fn connect_ignores_swapped_symlink() {
+        let (t, p) = setup();
+        let h = fake_mux(&p, |mut s| s.write_all(b"OK 1\n").unwrap());
+        let decoy_path = t.path().join("decoy");
+        let decoy = UnixListener::bind(&decoy_path).unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        let sp = p.vsock();
+        let (dir, name) = open_parent(&sp).unwrap();
+        let pinned = open_checked(&dir, name, me()).unwrap();
+        // The VMM swaps the entry for a symlink to another socket.
+        std::fs::remove_file(p.vsock()).unwrap();
+        symlink(&decoy_path, p.vsock()).unwrap();
+        let mut s = connect_fd(&pinned, Instant::now() + T).unwrap();
+        s.write_all(b"CONNECT 1\n").unwrap();
+        assert_eq!(h.join().unwrap(), "CONNECT 1\n");
+        assert!(decoy.accept().is_err(), "decoy got a connection");
+        // And a fresh connect() refuses the symlink outright.
+        let e = connect(&p, 1024, T, me()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(decoy.accept().is_err());
+    }
+
+    #[test]
+    fn connect_refuses_wrong_owner() {
+        let (_t, p) = setup();
+        let _l = UnixListener::bind(p.vsock()).unwrap();
+        let e = connect(&p, 1024, T, me() + 1).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn connect_refuses_fifo_without_blocking() {
+        let (_t, p) = setup();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            p.vsock(),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        let e = connect(&p, 1024, T, me()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn connect_refuses_non_socket() {
         let (_t, p) = setup();
         std::fs::write(p.vsock(), b"x").unwrap();
-        let e = connect(&p, 1024, T).unwrap_err();
+        let e = connect(&p, 1024, T, me()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
