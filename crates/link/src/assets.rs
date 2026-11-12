@@ -62,6 +62,8 @@ pub static ASSETS: &[Asset] = &[
     asset!("js/touchprompt.js"),
     asset!("js/views/overview.js"),
     asset!("js/views/steer.js"),
+    asset!("js/diff.js"),
+    asset!("js/views/review.js"),
 ];
 
 /// The strong ETag: `"` + the first 16 hex digits of SHA-256(bytes) + `"`.

@@ -444,3 +444,155 @@ async fn lockdown_on_from_ui() {
         .expect("lockdown.on recorded");
     assert_eq!(field(&rec, "device"), d.device_id().as_str(), "{rec}");
 }
+
+/// The Review screen's `box.diff {id}` for the demo's done box: the hostile
+/// names arrive byte for byte (the page escapes them, not the daemon), and
+/// the 2.5 MB diff is cut to one 2 MB answer with `truncated`.
+#[tokio::test]
+async fn diff_of_done_box() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let sf = frame_with(&w, &d, "box.diff", common::args(json!({"id": "b-done"})));
+    let (st, _, body) = s
+        .post("/api/frame", &json!({"body": sf.body, "sig": sf.sig}))
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let needle = b"<img src=x onerror=alert(1)>.md";
+    assert!(
+        body.windows(needle.len()).any(|x| x == needle),
+        "the hostile name is in the answer as is"
+    );
+    let a = json_of(&body);
+    assert_eq!(a["ok"], true, "{}", a["error"]);
+    let r = &a["result"];
+    assert_eq!(r["id"], "b-done");
+    assert_eq!(r["truncated"], true);
+    let unified = r["unified"].as_str().unwrap();
+    assert!(unified.len() <= saiife_wire::source::MAX_DIFF_BYTES);
+    assert!(unified.ends_with('\n'));
+    assert!(unified.contains("+\u{1b}]52;c;ZXZpbA==\u{7} a clipboard attempt\n"));
+    let sha = r["diff_sha256"].as_str().unwrap();
+    assert!(
+        sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{sha}"
+    );
+    assert_eq!(r["base_commit"].as_str().unwrap().len(), 40);
+    let paths: Vec<_> = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "../../.ssh/authorized_keys",
+            "<img src=x onerror=alert(1)>.md",
+            "logo.png",
+            "src/big.rs"
+        ]
+    );
+    assert_eq!(r["files"][2]["binary"], true);
+    assert_eq!(r["files"][0]["added"], 1);
+    assert_eq!(r["files"][0]["removed"], 0);
+    assert_eq!(r["tests"]["passed"], 41);
+    assert_eq!(r["tests"]["failed"], 0);
+    assert_eq!(r["tests"]["skipped"], 2);
+    assert_eq!(r["tests"]["summary"], "41 passed, 2 skipped");
+    // Reading the diff changes nothing.
+    assert_eq!(w.boxes.calls(), vec![]);
+}
+
+/// "Approve with touch" sends `box.land {id, diff_sha256}`; until plan 31
+/// the daemon refuses it `touch_required` and the box stays done.
+#[tokio::test]
+async fn land_is_refused_touch_required() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let diff = act(&w, &s, &d, "box.diff", json!({"id": "b-done"})).await;
+    let sha = diff["result"]["diff_sha256"].as_str().unwrap().to_string();
+    let a = act(
+        &w,
+        &s,
+        &d,
+        "box.land",
+        json!({"id": "b-done", "diff_sha256": sha}),
+    )
+    .await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    assert!(a["message"].as_str().is_some_and(|m| !m.is_empty()), "{a}");
+    assert_eq!(w.boxes.calls(), vec![]);
+    let ov = act(&w, &s, &d, "box.overview", json!({})).await;
+    let done = ov["result"]["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == "b-done")
+        .cloned()
+        .unwrap();
+    assert_eq!(done["state"], "done", "{ov}");
+}
+
+/// "Reject" (after the confirm) sends `box.discard {id}`.
+#[tokio::test]
+async fn reject_discards() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let a = act(&w, &s, &d, "box.discard", json!({"id": "b-done"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(w.boxes.calls(), vec![FakeCall::Discard(bid("b-done"))]);
+    let rec = records(&w)
+        .into_iter()
+        .rev()
+        .find(|r| field(r, "action") == "box.discard")
+        .expect("box.discard recorded");
+    assert_eq!(field(&rec, "box"), "b-done", "{rec}");
+    assert_eq!(field(&rec, "device"), d.device_id().as_str(), "{rec}");
+}
+
+/// "Revise" sends `box.revise {id, comment}`: touch level, refused for now.
+#[tokio::test]
+async fn revise_is_refused_touch_required() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let a = act(
+        &w,
+        &s,
+        &d,
+        "box.revise",
+        json!({"id": "b-done", "comment": "rename the helper"}),
+    )
+    .await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    assert!(a["message"].as_str().is_some_and(|m| !m.is_empty()), "{a}");
+    assert_eq!(w.boxes.calls(), vec![]);
+}
+
+/// `#/box/<id>` loads the Review screen, which builds on the diff renderer;
+/// both are served, and the frames above are the ones it sends.
+#[tokio::test]
+async fn review_screen_is_served() {
+    let (_w, s) = up().await;
+    let (st, _, app) = s.get("/js/app.js").await;
+    assert_eq!(st, StatusCode::OK);
+    let app = String::from_utf8(app.to_vec()).unwrap();
+    assert!(
+        app.contains("import { render as review } from \"./views/review.js\";"),
+        "app.js routes #/box/<id> to the Review screen"
+    );
+    let (st, _, view) = s.get("/js/views/review.js").await;
+    assert_eq!(st, StatusCode::OK);
+    let view = String::from_utf8(view.to_vec()).unwrap();
+    for sent in [
+        "ACTIONS.diff, { id }",
+        "ACTIONS.land, { id, diff_sha256: ",
+        "ACTIONS.discard, { id }",
+        "ACTIONS.revise, { id, comment }",
+    ] {
+        assert!(view.contains(sent), "review.js sends {sent}");
+    }
+    let (st, _, _) = s.get("/js/diff.js").await;
+    assert_eq!(st, StatusCode::OK);
+}

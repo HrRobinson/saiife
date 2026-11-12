@@ -2,7 +2,7 @@
 import { mount, h } from "./dom.js";
 import { loadDevice } from "./keystore.js";
 import { render as overview } from "./views/overview.js";
-import { render as review } from "./views/placeholder.js";
+import { render as review } from "./views/review.js";
 import { render as steer } from "./views/steer.js";
 import { render as inbox } from "./views/placeholder.js";
 import { render as spawn } from "./views/placeholder.js";

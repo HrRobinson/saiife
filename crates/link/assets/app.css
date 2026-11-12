@@ -38,3 +38,9 @@ label{display:block;margin:12px 0 4px;color:var(--muted)}
 #toast:empty{display:none}
 #toast>*{background:var(--fg);color:var(--bg);padding:8px 12px;border-radius:6px}
 .code{font:700 2.4rem/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.08em;margin:16px 0}
+.diff .path{font:600 .95rem/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;margin:16px 0 4px}
+.diff .hh{color:var(--accent)}
+.diff .note{color:var(--muted)}
+.files{padding-left:20px;overflow-wrap:anywhere}
+.banner{border:1px solid var(--warn);color:var(--warn);border-radius:6px;padding:8px 12px}
+button.digest{min-height:32px;padding:2px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;text-align:left}
