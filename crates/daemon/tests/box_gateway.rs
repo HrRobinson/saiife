@@ -18,7 +18,7 @@ use saiife_boxhost::paths::BoxPaths;
 use saiife_boxhost::vmm::VmHooks;
 use saiife_boxproto::ports;
 use saiife_broker::pipeline::{LockScope, Lockdown};
-use saiife_daemon::box_gateway::{GatewayConfig, GatewayHooks, Limits, Resolve};
+use saiife_daemon::box_gateway::{GatewayConfig, GatewayHooks, Limits, LookupHold, Resolve};
 use saiife_daemon::box_ops;
 use saiife_daemon::ops::{Ctx, CtxInit, Mode};
 use saiife_daemon::writer::{self, WriterConfig};
@@ -30,7 +30,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,6 +56,7 @@ fn scratch() -> tempfile::TempDir {
 struct FakeResolve {
     names: HashMap<String, Vec<SocketAddr>>,
     hang: bool,
+    calls: Arc<AtomicUsize>,
 }
 
 impl Resolve for FakeResolve {
@@ -63,10 +64,18 @@ impl Resolve for FakeResolve {
         &self,
         host: &str,
         _port: u16,
+        hold: LookupHold,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + '_>> {
-        if self.hang {
-            return Box::pin(std::future::pending());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // Names starting with `hang` (or all, with `hang`) never resolve;
+        // the permits stay held until the gateway drops the future.
+        if self.hang || host.starts_with("hang") {
+            return Box::pin(async move {
+                let _hold = hold;
+                std::future::pending().await
+            });
         }
+        drop(hold);
         let v = self
             .names
             .get(host)
@@ -105,6 +114,10 @@ struct W {
     id: BoxId,
     session: String,
     paths: BoxPaths,
+    /// A second box with the same template.
+    id2: BoxId,
+    paths2: BoxPaths,
+    calls: Arc<AtomicUsize>,
     port: u16,
     clock: Arc<AtomicU64>,
     audit: PathBuf,
@@ -191,8 +204,8 @@ async fn world(o: Opts) -> W {
     })
     .unwrap()
     .manager;
-    let rec = mgr
-        .spawn(&SpawnArgs {
+    let spawn = || {
+        mgr.spawn(&SpawnArgs {
             template: "egress-test".into(),
             repo: "shop".into(),
             repo_dir: None,
@@ -202,7 +215,10 @@ async fn world(o: Opts) -> W {
             repo_image: None,
             base_manifest: None,
         })
-        .unwrap();
+        .unwrap()
+    };
+    let rec = spawn();
+    let rec2 = spawn();
     let base = CtxInit::minimal(handle, cfg, dirs, &state);
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
@@ -221,7 +237,9 @@ async fn world(o: Opts) -> W {
             .map(|(n, a)| (n.to_string(), a))
             .collect(),
         hang: o.hang,
+        calls: Arc::new(AtomicUsize::new(0)),
     });
+    let calls = Arc::clone(&resolve.calls);
     let gw = GatewayHooks::new(
         Arc::clone(&ctx),
         tokio::runtime::Handle::current(),
@@ -236,12 +254,19 @@ async fn world(o: Opts) -> W {
     std::fs::create_dir(&dir).unwrap();
     let paths = BoxPaths::new(dir);
     gw.before_boot(&rec.id, &paths).unwrap();
+    let dir2 = tmp.path().join("b2");
+    std::fs::create_dir(&dir2).unwrap();
+    let paths2 = BoxPaths::new(dir2);
+    gw.before_boot(&rec2.id, &paths2).unwrap();
     W {
         ctx,
         gw,
         id: rec.id,
         session: rec.session,
         paths,
+        id2: rec2.id,
+        paths2,
+        calls,
         port: o.port,
         clock,
         audit,
@@ -277,6 +302,49 @@ impl W {
     /// `host:<upstream port>`.
     fn t(&self, host: &str) -> String {
         format!("{host}:{}", self.port)
+    }
+
+    /// A CONNECT on box 2's egress port; the whole answer.
+    async fn connect2(&self, target: &str) -> (u16, String) {
+        let mut s = UnixStream::connect(self.paths2.vsock_port(ports::EGRESS))
+            .await
+            .unwrap();
+        s.write_all(format!("CONNECT {target} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        // Up to the end of the answer's head: a tunnel stays open.
+        let mut a = Vec::new();
+        let mut b = [0u8; 256];
+        while !a.windows(4).any(|w| w == b"\r\n\r\n") {
+            match tokio::time::timeout(Duration::from_secs(10), s.read(&mut b)).await {
+                Ok(Ok(n)) if n > 0 => a.extend_from_slice(&b[..n]),
+                _ => break,
+            }
+        }
+        (status(&a), String::from_utf8_lossy(&a).into_owned())
+    }
+
+    /// `n` CONNECTs to `target` left waiting on their lookups.
+    async fn hold_lookups(&self, target: &str, n: usize) -> Vec<UnixStream> {
+        let before = self.calls.load(Ordering::SeqCst);
+        let mut held = Vec::new();
+        for _ in 0..n {
+            let mut s = self.dial(ports::EGRESS).await;
+            s.write_all(format!("CONNECT {target} HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            held.push(s);
+        }
+        // Every one has reached its lookup.
+        let t0 = Instant::now();
+        while self.calls.load(Ordering::SeqCst) < before + n {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "lookups never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        held
     }
 
     async fn dial(&self, port: u32) -> UnixStream {
@@ -719,6 +787,8 @@ async fn lookups_are_bounded() {
         limits: Limits {
             new_per_sec: 10_000,
             new_burst: 10_000,
+            // The gateway-wide cap is what this test exercises.
+            lookups_per_box: 1_000,
             ..Limits::default()
         },
         ..Opts::default()
@@ -749,7 +819,8 @@ async fn lookups_are_bounded() {
         assert_eq!(status(&a), 504);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(w.connect("example.test:443").await.0, 504);
+    // A new name (example.test's timeout is cached now) takes a permit again.
+    assert_eq!(w.connect("other.crates.test:443").await.0, 504);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -908,4 +979,116 @@ async fn model_port_is_503_until_plan_40() {
         let m = std::fs::symlink_metadata(w.paths.vsock_port(port)).unwrap();
         assert_eq!(m.permissions().mode() & 0o777, 0o660);
     }
+}
+
+/// Box A's hung lookups take only A's permits: box B still resolves and
+/// tunnels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_box_cannot_starve_lookups() {
+    let up = echo().await;
+    let w = world(Opts {
+        names: vec![("example.test", vec![up])],
+        port: up.port(),
+        ..Opts::default()
+    })
+    .await;
+    let names = ["hang1", "hang2", "hang3", "hang4"];
+    let mut held = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        held.extend(w.hold_lookups(&format!("{n}.crates.test:443"), 1).await);
+        assert!(w.calls.load(Ordering::SeqCst) > i);
+    }
+    let (code, _) = w.connect2(&w.t("example.test")).await;
+    // B's tunnel to the echo upstream opens (the 200), then closes with us.
+    assert_eq!(code, 200);
+    let recs = w.wait_records("egress", 1).await;
+    assert_eq!(recs[0]["box"], w.id2.as_str());
+    drop(held);
+}
+
+/// The 5th concurrent lookup of one box is `503 lookup_busy`, for that box
+/// only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_box_lookup_cap() {
+    let up = echo().await;
+    let w = world(Opts {
+        names: vec![("example.test", vec![up])],
+        port: up.port(),
+        ..Opts::default()
+    })
+    .await;
+    let mut held = Vec::new();
+    for i in 0..4 {
+        held.extend(w.hold_lookups(&format!("hang{i}.crates.test:443"), 1).await);
+    }
+    let calls = w.calls.load(Ordering::SeqCst);
+    let t0 = Instant::now();
+    let (code, body) = w.connect("hang9.crates.test:443").await;
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("too many name lookups in progress"));
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    assert_eq!(w.calls.load(Ordering::SeqCst), calls, "no lookup was made");
+    let recs = w.wait_records("egress_denied", 1).await;
+    assert_eq!(recs[0]["reason"], "lookup_busy");
+    assert_eq!(recs[0]["box"], w.id.as_str());
+    // Box B is not affected.
+    let (code, _) = w.connect2(&w.t("example.test")).await;
+    assert_eq!(code, 200);
+    drop(held);
+}
+
+/// A refused lookup (no answer, timeout) is answered from the box's
+/// negative cache for 30 s of the clock: no permit, no resolver call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negative_cache_takes_no_permit() {
+    let w = world(Opts {
+        limits: Limits {
+            resolve_secs: 1,
+            ..Limits::default()
+        },
+        ..Opts::default()
+    })
+    .await;
+    // No answer.
+    assert_eq!(w.connect("example.test:443").await.0, 502);
+    assert_eq!(w.calls.load(Ordering::SeqCst), 1);
+    for _ in 0..3 {
+        let (code, body) = w.connect("example.test:443").await;
+        assert_eq!(code, 502);
+        assert!(body.contains("example.test did not resolve"));
+    }
+    assert_eq!(w.calls.load(Ordering::SeqCst), 1);
+    // A timeout.
+    assert_eq!(w.connect("hang.crates.test:443").await.0, 504);
+    assert_eq!(w.calls.load(Ordering::SeqCst), 2);
+    let t0 = Instant::now();
+    assert_eq!(w.connect("hang.crates.test:443").await.0, 504);
+    assert!(
+        t0.elapsed() < Duration::from_millis(900),
+        "answered from the cache"
+    );
+    assert_eq!(w.calls.load(Ordering::SeqCst), 2);
+    // Another box has its own cache.
+    assert_eq!(w.connect2("example.test:443").await.0, 502);
+    assert_eq!(w.calls.load(Ordering::SeqCst), 3);
+    // Refusals from the cache are still recorded (and rate-limited).
+    let recs = w.wait_records("egress_denied", 3).await;
+    assert_eq!(recs.len(), 3, "{recs:?}");
+    // Just inside 30 s: still cached.
+    w.clock.fetch_add(29_999, Ordering::SeqCst);
+    assert_eq!(w.connect("example.test:443").await.0, 502);
+    assert_eq!(w.calls.load(Ordering::SeqCst), 3);
+    // At 30 s the resolver is asked again (the record window is 60 s, so
+    // that refusal is still held back).
+    w.clock.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(w.connect("example.test:443").await.0, 502);
+    assert_eq!(w.calls.load(Ordering::SeqCst), 4);
+    // At 60 s: asked again, and the record says what it held back.
+    w.clock.fetch_add(30_000, Ordering::SeqCst);
+    assert_eq!(w.connect("example.test:443").await.0, 502);
+    assert_eq!(w.calls.load(Ordering::SeqCst), 5);
+    let recs = w.wait_records("egress_denied", 4).await;
+    assert_eq!(recs.len(), 4, "{recs:?}");
+    assert_eq!(recs[3]["dest_host"], "example.test");
+    assert_eq!(recs[3]["suppressed"], 5);
 }

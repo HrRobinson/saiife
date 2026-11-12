@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::runtime::Handle;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 /// How often an open tunnel checks for lockdown (G8).
@@ -55,18 +55,43 @@ const MAX_DENIED_KEYS_PER_BOX: usize = 128;
 
 /// Name resolution, injected: [`SystemResolve`] in production, a fixed map
 /// in the tests.
+///
+/// `hold` carries the lookup permits (the box's and the gateway's). A
+/// resolver keeps it until its lookup has really ended: an async one just
+/// holds it in its future, one that runs on a thread moves it there.
 pub trait Resolve: Send + Sync {
     fn lookup(
         &self,
         host: &str,
         port: u16,
+        hold: LookupHold,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + '_>>;
 }
+
+/// The permits one lookup holds; dropping it frees them.
+pub struct LookupHold {
+    /// Never read: held only to be dropped.
+    pub(crate) _permits: Vec<OwnedSemaphorePermit>,
+}
+
+/// Concurrent name lookups per box: past it that box (only) gets
+/// `503 lookup_busy`. 8 boxes at their cap use every gateway-wide permit
+/// ([`LOOKUP_PERMITS`]); with more than 8 boxes looking up names at once
+/// the global cap is oversubscribed, and a busy host's boxes can see
+/// `lookup_busy` from it, at most 4 lookups' worth per box.
+pub const LOOKUP_PERMITS_PER_BOX: usize = 4;
+/// A box's refused lookups (no answer, timeout, private answer) are
+/// answered from its negative cache for this long, without a permit or a
+/// lookup.
+pub const NEG_TTL_MS: u64 = 30_000;
+/// Negative cache entries per box; the oldest goes first.
+pub const NEG_ENTRIES_PER_BOX: usize = 256;
 
 /// Name lookups in flight at once, gateway-wide (every box together).
 /// Past it a CONNECT gets `503` "too many name lookups in progress" at
 /// once. `getaddrinfo` cannot be cancelled: a lookup that outlives
-/// [`RESOLVE_SECS`] keeps its thread (and [`SystemResolve`]'s permit) until
+/// [`RESOLVE_SECS`] keeps its thread, and with it its [`LookupHold`] (the
+/// box's and the gateway's permits) and [`SystemResolve`]'s own permit, until
 /// it ends, so this also bounds the threads a dead resolver can hold, and
 /// keeps them from starving the daemon's other `spawn_blocking` work.
 pub const LOOKUP_PERMITS: usize = 32;
@@ -102,6 +127,7 @@ impl Resolve for SystemResolve {
         &self,
         host: &str,
         port: u16,
+        hold: LookupHold,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + '_>> {
         let host = host.to_string();
         let permit = Arc::clone(&self.permits).try_acquire_owned();
@@ -109,7 +135,8 @@ impl Resolve for SystemResolve {
             let permit = permit
                 .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "too many name lookups"))?;
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                // Every permit lives as long as getaddrinfo does.
+                let _permits = (permit, hold);
                 use std::net::ToSocketAddrs;
                 Ok((host.as_str(), port)
                     .to_socket_addrs()?
@@ -136,6 +163,12 @@ pub struct Limits {
     pub new_per_sec: u64,
     /// The bucket's size.
     pub new_burst: u64,
+    /// Name lookups in flight, gateway-wide ([`LOOKUP_PERMITS`]).
+    pub lookups: usize,
+    /// Name lookups in flight per box ([`LOOKUP_PERMITS_PER_BOX`]).
+    pub lookups_per_box: usize,
+    /// Each lookup's deadline ([`RESOLVE_SECS`]).
+    pub resolve_secs: u64,
 }
 
 impl Default for Limits {
@@ -148,6 +181,9 @@ impl Default for Limits {
             idle_secs: 300,
             new_per_sec: 10,
             new_burst: 20,
+            lookups: LOOKUP_PERMITS,
+            lookups_per_box: LOOKUP_PERMITS_PER_BOX,
+            resolve_secs: RESOLVE_SECS,
         }
     }
 }
@@ -215,11 +251,53 @@ pub struct BoxRun {
     open: AtomicUsize,
     bucket: Mutex<Bucket>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// [`Limits::lookups_per_box`], taken before the gateway's.
+    pub(crate) lookups: Arc<Semaphore>,
+    neg: Mutex<NegCache>,
+}
+
+/// A box's remembered lookup refusals, by host.
+#[derive(Default)]
+struct NegCache(HashMap<String, (u64, egress::Neg)>);
+
+impl NegCache {
+    fn get(&mut self, host: &str, now: u64) -> Option<egress::Neg> {
+        match self.0.get(host) {
+            Some((at, n)) if now.saturating_sub(*at) < NEG_TTL_MS => Some(*n),
+            Some(_) => {
+                self.0.remove(host);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn put(&mut self, host: &str, neg: egress::Neg, now: u64) {
+        if !self.0.contains_key(host) && self.0.len() >= NEG_ENTRIES_PER_BOX {
+            let oldest = self
+                .0
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(h, _)| h.clone());
+            if let Some(h) = oldest {
+                self.0.remove(&h);
+            }
+        }
+        self.0.insert(host.to_string(), (now, neg));
+    }
 }
 
 impl BoxRun {
     pub(crate) fn take_token(&self, now: u64, l: &Limits) -> bool {
         lock(&self.bucket).take(now, l)
+    }
+
+    pub(crate) fn neg_get(&self, host: &str, now: u64) -> Option<egress::Neg> {
+        lock(&self.neg).get(host, now)
+    }
+
+    pub(crate) fn neg_put(&self, host: &str, neg: egress::Neg, now: u64) {
+        lock(&self.neg).put(host, neg, now);
     }
 
     fn halt(&self) {
@@ -425,6 +503,7 @@ impl GatewayHooks {
         #[cfg(not(debug_assertions))]
         let allow_loopback = false;
         let group_rw = ctx.mode == Mode::Locked;
+        let lookups = Arc::new(Semaphore::new(cfg.limits.lookups));
         Arc::new(GatewayHooks {
             shared: Arc::new(GatewayShared {
                 ctx,
@@ -434,7 +513,7 @@ impl GatewayHooks {
                 clock: cfg.clock,
                 denied: Mutex::new(Denied::default()),
                 runs: Mutex::new(BTreeMap::new()),
-                lookups: Arc::new(Semaphore::new(LOOKUP_PERMITS)),
+                lookups,
             }),
             rt,
             group_rw,
@@ -481,6 +560,8 @@ impl VmHooks for GatewayHooks {
                 at_ms: (self.shared.clock)(),
             }),
             tasks: Mutex::new(Vec::new()),
+            lookups: Arc::new(Semaphore::new(self.shared.limits.lookups_per_box)),
+            neg: Mutex::new(NegCache::default()),
         });
         lock(&self.shared.runs).insert(id.clone(), Arc::clone(&run));
         let tasks = [(egress, Port::Egress), (model, Port::Model)].map(|(l, port)| {
@@ -575,7 +656,35 @@ mod tests {
     #[tokio::test]
     async fn system_resolve_without_a_permit_spawns_nothing() {
         let r = SystemResolve::with_permits(0);
-        let e = r.lookup("localhost", 443).await.unwrap_err();
+        let e = r
+            .lookup(
+                "localhost",
+                443,
+                LookupHold {
+                    _permits: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn negative_cache_ttl_and_bound() {
+        use egress::Neg;
+        let mut c = NegCache::default();
+        c.put("a.test", Neg::NoAddress, 0);
+        assert_eq!(c.get("a.test", NEG_TTL_MS - 1), Some(Neg::NoAddress));
+        assert_eq!(c.get("a.test", NEG_TTL_MS), None);
+        assert!(c.0.is_empty());
+        for i in 0..NEG_ENTRIES_PER_BOX as u64 {
+            c.put(&format!("h{i}.test"), Neg::Timeout, i);
+        }
+        c.put("new.test", Neg::Private, 1_000);
+        assert_eq!(c.0.len(), NEG_ENTRIES_PER_BOX);
+        // The oldest went.
+        assert_eq!(c.get("h0.test", 1_000), None);
+        assert_eq!(c.get("h1.test", 1_000), Some(Neg::Timeout));
+        assert_eq!(c.get("new.test", 1_000), Some(Neg::Private));
     }
 }

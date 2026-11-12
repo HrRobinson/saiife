@@ -462,50 +462,8 @@ async fn prepare(
         )
         .to(&host, port));
     }
-    let busy =
-        || Refusal::new(503, "too many name lookups in progress", "lookup_busy").to(&host, port);
-    // Held until the lookup ends or times out (a resolver that runs on a
-    // thread bounds its threads itself; see `SystemResolve`).
-    let Ok(permit) = Arc::clone(&gw.lookups).try_acquire_owned() else {
-        return Err(busy());
-    };
-    let looked = tokio::time::timeout(
-        Duration::from_secs(super::RESOLVE_SECS),
-        gw.resolve.lookup(&host, port),
-    )
-    .await;
-    drop(permit);
-    let answers = match looked {
-        Err(_) => {
-            return Err(Refusal::new(
-                504,
-                format!("{host} did not resolve in time"),
-                "resolve_timeout",
-            )
-            .to(&host, port))
-        }
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
-        Ok(r) => r.unwrap_or_default(),
-    };
-    // The port is the one asked for, never the resolver's.
-    let answers: Vec<SocketAddr> = answers
-        .into_iter()
-        .take(super::MAX_ANSWERS)
-        .map(|a| SocketAddr::new(a.ip(), port))
-        .collect();
-    let Some(first) = answers.first().copied() else {
-        return Err(
-            Refusal::new(502, format!("{host} did not resolve"), "no_address").to(&host, port),
-        );
-    };
-    if !answers.iter().all(|a| gw.address_ok(&a.ip())) {
-        return Err(Refusal::new(
-            403,
-            format!("{host} resolves to a private address"),
-            "private_address",
-        )
-        .to(&host, port));
-    }
+    let answers = resolve_checked(&host, port, run, gw).await?;
+    let first = answers[0];
     // The checked address itself, never the name again.
     let upstream = tokio::time::timeout(
         Duration::from_secs(lim.connect_secs),
@@ -539,6 +497,96 @@ async fn prepare(
         addr: first,
         session,
     }))
+}
+
+/// A lookup's refusal that the box's negative cache remembers for
+/// [`super::NEG_TTL_MS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Neg {
+    /// No answer (NXDOMAIN, empty, or a resolver error).
+    NoAddress,
+    Timeout,
+    Private,
+}
+
+impl Neg {
+    fn refusal(self, host: &str, port: u16) -> Refusal {
+        let r = match self {
+            Neg::NoAddress => Refusal::new(502, format!("{host} did not resolve"), "no_address"),
+            Neg::Timeout => Refusal::new(
+                504,
+                format!("{host} did not resolve in time"),
+                "resolve_timeout",
+            ),
+            Neg::Private => Refusal::new(
+                403,
+                format!("{host} resolves to a private address"),
+                "private_address",
+            ),
+        };
+        r.to(host, port)
+    }
+}
+
+/// The answers for `host`, every one public (G7), on `port`.
+///
+/// A refusal remembered in the box's negative cache is answered again
+/// without a permit or a lookup. Otherwise the lookup takes one of the
+/// box's permits, then one of the gateway's (none free: `503 lookup_busy`,
+/// for this box only when it is the box's own cap), and gets
+/// `resolve_secs`. The permits go to the resolver in a [`super::LookupHold`]:
+/// an async resolver drops them with its future at the deadline, and
+/// [`super::SystemResolve`] keeps them until its thread really ends, so a
+/// box's stuck `getaddrinfo` threads count against that box.
+async fn resolve_checked(
+    host: &str,
+    port: u16,
+    run: &BoxRun,
+    gw: &GatewayShared,
+) -> Result<Vec<SocketAddr>, Refusal> {
+    if let Some(neg) = run.neg_get(host, (gw.clock)()) {
+        return Err(neg.refusal(host, port));
+    }
+    let busy =
+        || Refusal::new(503, "too many name lookups in progress", "lookup_busy").to(host, port);
+    let Ok(mine) = Arc::clone(&run.lookups).try_acquire_owned() else {
+        return Err(busy());
+    };
+    let Ok(all) = Arc::clone(&gw.lookups).try_acquire_owned() else {
+        return Err(busy());
+    };
+    let hold = super::LookupHold {
+        _permits: vec![mine, all],
+    };
+    let looked = tokio::time::timeout(
+        Duration::from_secs(gw.limits.resolve_secs),
+        gw.resolve.lookup(host, port, hold),
+    )
+    .await;
+    let found = match looked {
+        Err(_) => Err(Neg::Timeout),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+        Ok(Err(_)) => Err(Neg::NoAddress),
+        Ok(Ok(v)) => {
+            // The port is the one asked for, never the resolver's.
+            let v: Vec<SocketAddr> = v
+                .into_iter()
+                .take(super::MAX_ANSWERS)
+                .map(|a| SocketAddr::new(a.ip(), port))
+                .collect();
+            if v.is_empty() {
+                Err(Neg::NoAddress)
+            } else if !v.iter().all(|a| gw.address_ok(&a.ip())) {
+                Err(Neg::Private)
+            } else {
+                Ok(v)
+            }
+        }
+    };
+    found.map_err(|neg| {
+        run.neg_put(host, neg, (gw.clock)());
+        neg.refusal(host, port)
+    })
 }
 
 /// Copy `r` to `w` until EOF (then shut `w`), counting bytes into `n` and
