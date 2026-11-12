@@ -27,6 +27,8 @@ zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "1"
 
 [target.'cfg(unix)'.dependencies]
+# The pinned VMM digests and the checked download (plan 35); tokio-free.
+saiife-boxhost = { path = "../boxhost" }
 rustix = { version = "1", features = ["fs", "process", "system", "thread"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

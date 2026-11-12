@@ -106,6 +106,8 @@ pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions,
         approvers: fleet.approvers,
         non_interactive: true,
         allow_test_build: false,
+        boxes: false,
+        vmm_dir: None,
     })
 }
 

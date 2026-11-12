@@ -1765,6 +1765,7 @@ dependencies = [
  "rustls",
  "saiife-audit",
  "saiife-boxes",
+ "saiife-boxhost",
  "saiife-broker",
  "saiife-darwin",
  "saiife-guard",
@@ -1784,6 +1785,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "zbus",
  "zeroize",
 ]
 
@@ -1920,6 +1922,7 @@ dependencies = [
  "rustix",
  "saiife-agents",
  "saiife-audit",
+ "saiife-boxhost",
  "saiife-ipc",
  "saiife-policy",
  "saiife-win",

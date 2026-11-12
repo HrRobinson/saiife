@@ -1706,7 +1706,9 @@ const STATE_FILE: &str = ".fakehost.json";
 
 /// The names install creates. In a [`FakeHost`] they exist only once
 /// created; every other name resolves to the test user.
-const CREATED_NAMES: [&str; 6] = [
+const CREATED_NAMES: [&str; 7] = [
+    // `system install --boxes` (plan 35): the VMM user and its group.
+    "saiife-box",
     DAEMON_USER,
     DAEMON_GROUP,
     AUDIT_GROUP,

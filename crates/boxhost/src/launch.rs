@@ -692,10 +692,171 @@ impl Launcher for ChildLauncher {
     }
 }
 
+/// The systemd calls `UnitLauncher` needs (locked mode). Methods are sync;
+/// the daemon's implementation runs each call on a short-lived thread.
+pub trait UnitBus: Send + Sync {
+    fn start(&self, unit: &str) -> Result<(), String>;
+    fn stop(&self, unit: &str) -> Result<(), String>;
+    /// True while the unit is `active` or `activating`.
+    fn active(&self, unit: &str) -> Result<bool, String>;
+}
+
+/// `saiife-box@<id>.service`; the id must be `b` and 1 to 9 digits (the
+/// polkit rule allows exactly that shape, so nothing else is ever asked).
+pub fn unit_name(id: &BoxId) -> Result<String, String> {
+    let s = id.as_str();
+    let b = s.as_bytes();
+    let ok = (2..=10).contains(&b.len()) && b[0] == b'b' && b[1..].iter().all(u8::is_ascii_digit);
+    if ok {
+        Ok(format!("saiife-box@{s}.service"))
+    } else {
+        Err(format!("box id {s:?} cannot name a unit (b<digits>)"))
+    }
+}
+
+/// Locked mode: the VMM runs as the systemd unit `saiife-box@<id>.service`
+/// under the `saiife-box` user, started and stopped over the system bus.
+pub struct UnitLauncher {
+    bus: std::sync::Arc<dyn UnitBus>,
+}
+
+impl UnitLauncher {
+    pub fn new(bus: std::sync::Arc<dyn UnitBus>) -> UnitLauncher {
+        UnitLauncher { bus }
+    }
+}
+
+impl Launcher for UnitLauncher {
+    fn start(&self, id: &BoxId, _paths: &BoxPaths) -> Result<(), String> {
+        self.bus.start(&unit_name(id)?)
+    }
+
+    /// Fails closed: a bus error is "cannot tell", never "gone".
+    fn exited(&self, id: &BoxId) -> Option<bool> {
+        let Ok(unit) = unit_name(id) else {
+            return Some(false);
+        };
+        match self.bus.active(&unit) {
+            Ok(true) | Err(_) => Some(false),
+            Ok(false) => Some(true),
+        }
+    }
+
+    fn force_stop(&self, id: &BoxId) -> Result<(), String> {
+        self.bus.stop(&unit_name(id)?)
+    }
+
+    fn kind(&self) -> &'static str {
+        "unit"
+    }
+}
+
+/// A `UnitBus` that records its calls as `"start <unit>"` lines (tests).
+#[cfg(any(test, feature = "fake"))]
+pub struct FakeUnitBus {
+    pub calls: Mutex<Vec<String>>,
+    /// What `active` answers.
+    pub active: Mutex<Result<bool, String>>,
+}
+
+#[cfg(any(test, feature = "fake"))]
+impl FakeUnitBus {
+    pub fn new() -> FakeUnitBus {
+        FakeUnitBus {
+            calls: Mutex::new(Vec::new()),
+            active: Mutex::new(Ok(false)),
+        }
+    }
+
+    fn record(&self, verb: &str, unit: &str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{verb} {unit}"));
+    }
+}
+
+#[cfg(any(test, feature = "fake"))]
+impl Default for FakeUnitBus {
+    fn default() -> Self {
+        FakeUnitBus::new()
+    }
+}
+
+#[cfg(any(test, feature = "fake"))]
+impl UnitBus for FakeUnitBus {
+    fn start(&self, unit: &str) -> Result<(), String> {
+        self.record("start", unit);
+        Ok(())
+    }
+    fn stop(&self, unit: &str) -> Result<(), String> {
+        self.record("stop", unit);
+        Ok(())
+    }
+    fn active(&self, unit: &str) -> Result<bool, String> {
+        self.record("active", unit);
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn unit_name_rules() {
+        let id = |s: &str| BoxId::parse(s).unwrap();
+        assert_eq!(
+            unit_name(&id("b3")).unwrap(),
+            "saiife-box@b3.service".to_string()
+        );
+        assert_eq!(
+            unit_name(&id("b123456789")).unwrap(),
+            "saiife-box@b123456789.service"
+        );
+        for bad in ["b", "x1", "b1234567890", "b1-2", "b1x", "1b"] {
+            assert!(unit_name(&id(bad)).is_err(), "{bad}");
+        }
+        // Not even a box id: never reaches a unit name.
+        assert!(BoxId::parse("b1/../x").is_err());
+    }
+
+    #[test]
+    fn unit_launcher_calls_the_bus() {
+        let bus = std::sync::Arc::new(FakeUnitBus::new());
+        let l = UnitLauncher::new(bus.clone());
+        let id = BoxId::parse("b7").unwrap();
+        let paths = BoxPaths::new(PathBuf::from("/x/boxes/b7"));
+        assert_eq!(l.kind(), "unit");
+        l.start(&id, &paths).unwrap();
+        l.force_stop(&id).unwrap();
+        // inactive: gone; active: alive; bus error: alive (fail closed)
+        assert_eq!(l.exited(&id), Some(true));
+        *bus.active.lock().unwrap() = Ok(true);
+        assert_eq!(l.exited(&id), Some(false));
+        *bus.active.lock().unwrap() = Err("no bus".into());
+        assert_eq!(l.exited(&id), Some(false));
+        assert_eq!(
+            bus.calls.lock().unwrap().clone(),
+            [
+                "start saiife-box@b7.service",
+                "stop saiife-box@b7.service",
+                "active saiife-box@b7.service",
+                "active saiife-box@b7.service",
+                "active saiife-box@b7.service",
+            ]
+        );
+        // A bad id never reaches the bus.
+        let bad = BoxId::parse("x1").unwrap();
+        assert!(l.start(&bad, &paths).is_err());
+        assert!(l.force_stop(&bad).is_err());
+        assert_eq!(l.exited(&bad), Some(false));
+        assert_eq!(bus.calls.lock().unwrap().len(), 5);
+    }
 
     struct Env {
         _t: tempfile::TempDir,
