@@ -145,6 +145,9 @@ pub fn to_proposal(
     file_name: &str,
     vars: &PathVars,
 ) -> Result<Proposal, String> {
+    if has_unsafe_char(&line.text) {
+        return Err(format!("the line {UNSAFE_WHY}"));
+    }
     let (block, allow) = r.examples();
     if [r.target()]
         .into_iter()
@@ -216,7 +219,7 @@ pub fn run_claude(lines: &[SourceLine], timeout: Duration) -> Result<String, Str
     let exe = saiife_agents::detect::which("claude")
         .ok_or("claude is not on PATH; the LLM pass needs Claude Code")?;
     let mut child = Command::new(exe)
-        .args(["-p", "--tools", "", INSTRUCTIONS])
+        .args(["-p", INSTRUCTIONS, "--tools", ""])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -275,20 +278,22 @@ pub fn run_claude(lines: &[SourceLine], timeout: Duration) -> Result<String, Str
         }
         Err(_) => return timed_out(&mut child),
     };
-    // Stdout is closed: the exit follows, or stderr closes with it.
-    let (status, head) = match child.try_wait() {
-        Ok(Some(s)) => (s, err_rx.recv_timeout(Duration::from_millis(200)).ok()),
-        Ok(None) => match err_rx.recv_timeout(left(deadline)) {
-            Err(_) => return timed_out(&mut child),
-            // Both pipes are closed, so the exit is imminent.
-            Ok(head) => match child.wait() {
-                Ok(s) => (s, Some(head)),
-                Err(e) => return Err(format!("could not wait for claude: {e}")),
-            },
-        },
-        Err(e) => return Err(format!("could not wait for claude: {e}")),
+    // Stdout is closed: wait for the exit itself, until the deadline. Stderr
+    // is never waited on: a grandchild may hold it open long after claude
+    // has answered and gone.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if left(deadline).is_zero() => return timed_out(&mut child),
+            Ok(None) => std::thread::sleep(left(deadline).min(Duration::from_millis(10))),
+            Err(e) => {
+                stop(&mut child);
+                return Err(format!("could not wait for claude: {e}"));
+            }
+        }
     };
     if !status.success() {
+        let head = err_rx.recv_timeout(Duration::from_millis(200)).ok();
         let text = String::from_utf8_lossy(&head.unwrap_or_default()).into_owned();
         return Err(format!("claude failed ({status}): {}", text.trim()));
     }

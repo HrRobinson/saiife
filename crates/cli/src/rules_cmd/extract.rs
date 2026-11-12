@@ -180,10 +180,10 @@ pub(crate) fn is_unsafe_char(c: char) -> bool {
     let u = c as u32;
     (c.is_control() && c != '\t')
         || matches!(u,
-            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x8E2 | 0x180E
-            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
-            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD
-            | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2
+            | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD
+            | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
 pub(crate) fn has_unsafe_char(s: &str) -> bool {
@@ -476,6 +476,21 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert_eq!((l[1].line, l[1].text.as_str()), (2, "b"));
         assert_eq!(l[0].line_sha256, line_sha256("a"));
+    }
+
+    #[test]
+    fn newer_format_characters_are_unsafe() {
+        for c in [
+            '\u{890}',
+            '\u{891}',
+            '\u{110CD}',
+            '\u{13430}',
+            '\u{1343F}',
+            '\u{202E}',
+        ] {
+            assert!(is_unsafe_char(c), "{:x}", c as u32);
+        }
+        assert!(!is_unsafe_char('\u{892}') && !is_unsafe_char('\u{13440}'));
     }
 
     #[test]

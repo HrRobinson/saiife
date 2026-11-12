@@ -257,7 +257,7 @@ pub fn run(config: Option<PathBuf>, json: bool) -> ExitCode {
     } else if packs.is_empty() {
         outln!("no user packs; saiife rules import <file> makes one");
     } else {
-        print!("{}", render_list(&packs, target.is_locked(), &source_state));
+        out!("{}", render_list(&packs, target.is_locked(), &source_state));
     }
     ExitCode::SUCCESS
 }

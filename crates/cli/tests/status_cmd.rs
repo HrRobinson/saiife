@@ -1484,7 +1484,7 @@ fn status_plain(env: &Env) -> (i32, String) {
 fn status_notes_a_changed_source() {
     let env = initialized(&["claude"]);
     env.write("CLAUDE.md", "Never run `deploy-prod`.\n");
-    let o = rules_cmd(&env, &["import", "CLAUDE.md"], "e\n\n");
+    let o = rules_cmd(&env, &["import", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
     let (c0, t0) = status_plain(&env);
     assert_eq!(c0, 0, "{t0}");

@@ -120,7 +120,7 @@ const DEPLOY: &str = "Never run `deploy-prod`.\n";
 fn import_writes_a_pack_the_hook_enforces() {
     let env = Env::new(&["claude"]);
     env.write("CLAUDE.md", DEPLOY);
-    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let files = pack_files(&personal_packs(&env));
     assert_eq!(files.len(), 1, "{files:?}");
@@ -161,15 +161,15 @@ fn import_writes_a_pack_the_hook_enforces() {
 fn carve_out_is_help_only_and_own_pack_only() {
     let env = Env::new(&["claude"]);
     env.write("CLAUDE.md", "Never run `shutdown`.\nNever run `mkfs`.\n");
-    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ne\n\n");
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ny\ne\n\ny\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(
-        out.contains(r"(allow ^shutdown\s+(?:--help|--version)$)"),
+        out.contains(r"(optional allow ^shutdown\s+(?:--help|--version)$)"),
         "{out}"
     );
     assert!(
-        stderr(&o).contains("and (allow ^shutdown"),
+        stderr(&o).contains("also allow shutdown --help and --version? [y/N]: "),
         "{}",
         stderr(&o)
     );
@@ -213,7 +213,7 @@ fn import_all_skipped_writes_nothing() {
 fn second_import_is_refused() {
     let env = Env::new(&[]);
     env.write("CLAUDE.md", DEPLOY);
-    assert_eq!(code(&rules(&env, &["import", "CLAUDE.md"], "e\n\n")), 0);
+    assert_eq!(code(&rules(&env, &["import", "CLAUDE.md"], "e\n\ny\n")), 0);
     // The same file by another way there is the same source.
     fs::create_dir_all(env.root().join("sub")).unwrap();
     let again = if cfg!(unix) {
@@ -221,7 +221,7 @@ fn second_import_is_refused() {
     } else {
         "CLAUDE.md"
     };
-    let o = rules(&env, &["import", again], "e\n\n");
+    let o = rules(&env, &["import", again], "e\n\ny\n");
     assert_eq!(code(&o), 1, "{}", stderr(&o));
     let err = stderr(&o);
     assert!(err.contains("already imported as user.claude-md-"), "{err}");
@@ -238,7 +238,7 @@ fn default_files_are_found_in_the_project() {
         assert!(stderr(&o).contains(n), "{n}: {}", stderr(&o));
     }
     env.write("AGENTS.md", DEPLOY);
-    let o = rules(&env, &["import"], "e\n\n");
+    let o = rules(&env, &["import"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let files = pack_files(&personal_packs(&env));
     assert_eq!(files.len(), 1);
@@ -256,11 +256,15 @@ fn bad_name_is_bad_input() {
     let o = rules(
         &env,
         &["import", "--name", "Bad_Name", "CLAUDE.md"],
-        "e\n\n",
+        "e\n\ny\n",
     );
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(pack_files(&personal_packs(&env)).is_empty());
-    let o = rules(&env, &["import", "--name", "no-prod", "CLAUDE.md"], "e\n\n");
+    let o = rules(
+        &env,
+        &["import", "--name", "no-prod", "CLAUDE.md"],
+        "e\n\ny\n",
+    );
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(personal_packs(&env).join("user.no-prod.toml").is_file());
 }
@@ -286,7 +290,7 @@ fn llm_pass_adds_verified_rules() {
         &env,
         r#"{"rules":[{"kind":"command","line":3,"command":"terraform destroy","block":["terraform destroy"],"allow":["terraform plan"]}]}"#,
     );
-    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(
         stderr(&o).contains("sending 1 lines of CLAUDE.md to claude -p"),
@@ -317,11 +321,73 @@ fn llm_bad_rule_is_listed_unverified() {
     assert!(pack_files(&personal_packs(&env)).is_empty());
 }
 
+/// `claude` gets `-p <instructions> --tools ""`, in that order.
+#[cfg(unix)]
+#[test]
+fn llm_argv_order() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", NEVER_JUDGE);
+    let argv = env.home.path().join("claude-argv");
+    common::fake_exe(
+        env.bin.path(),
+        "claude",
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}'; /bin/cat >/dev/null; printf '%s' '{{\"rules\":[]}}'",
+            argv.display()
+        ),
+    );
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let got = fs::read_to_string(&argv).unwrap();
+    let lines: Vec<&str> = got.split('\n').collect();
+    assert_eq!(lines.len(), 5, "{got:?}");
+    assert_eq!(lines[0], "-p", "{got:?}");
+    assert!(
+        lines[1].starts_with("Turn each numbered rule line"),
+        "{got:?}"
+    );
+    assert_eq!(&lines[2..], ["--tools", "", ""], "{got:?}");
+}
+
+/// A grandchild that keeps claude's stderr open after a good answer does
+/// not turn it into a timeout.
+#[cfg(unix)]
+#[test]
+fn llm_held_stderr_does_not_time_out() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", NEVER_JUDGE);
+    common::fake_exe(
+        env.bin.path(),
+        "claude",
+        r#"/bin/cat >/dev/null; printf '%s' '{"rules":[{"kind":"command","line":3,"command":"terraform destroy","block":["terraform destroy"],"allow":["terraform plan"]}]}'; (/bin/sleep 30 >&2 &)"#,
+    );
+    let absent = common::absent_system_config(env.home.path());
+    let start = std::time::Instant::now();
+    let mut child = env
+        .command_in(env.root(), &["rules", "import", "--llm", "CLAUDE.md"])
+        .env("SAIIFE_TEST_SYSTEM_CONFIG", &absent)
+        .env("SAIIFE_TEST_LLM_TIMEOUT_MS", "8000")
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"e\n\n").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(start.elapsed().as_secs() < 6, "{:?}", start.elapsed());
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("did not answer"), "{}", stderr(&o));
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 1, "{}", stderr(&o));
+    assert!(fs::read_to_string(&files[0]).unwrap().contains("terraform"));
+}
+
 #[test]
 fn llm_missing_claude_warns_and_goes_on() {
     let env = Env::new(&[]);
     env.write("CLAUDE.md", &format!("{DEPLOY}{NEVER_JUDGE}"));
-    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(
         stderr(&o).contains(
@@ -355,7 +421,7 @@ fn llm_timeout_kills_and_goes_on() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"e\n\n").unwrap();
+    child.stdin.take().unwrap().write_all(b"e\n\ny\n").unwrap();
     let o = child.wait_with_output().unwrap();
     assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -377,7 +443,7 @@ fn llm_huge_output_is_refused() {
         "claude",
         "/bin/cat >/dev/null; i=0; while [ $i -lt 300 ]; do printf '%01024d' 0; i=$((i+1)); done",
     );
-    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(
         stderr(&o).contains("claude answered more than 256 KiB; continuing without the LLM pass"),
@@ -397,7 +463,7 @@ fn llm_nonzero_exit_quotes_stderr_cleaned() {
         "claude",
         "/bin/cat >/dev/null; printf 'login \\033[2J needed' >&2; exit 3",
     );
-    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let err = stderr(&o);
     assert!(err.contains("login ?[2J needed"), "{err}");
@@ -412,7 +478,7 @@ fn over_the_rule_cap_writes_nothing() {
         "CLAUDE.md",
         &format!("Never run these: {}.\n", progs.join(", ")),
     );
-    let o = rules(&env, &["import", "CLAUDE.md"], &"e\n\n".repeat(70));
+    let o = rules(&env, &["import", "CLAUDE.md"], &"e\n\ny\n".repeat(70));
     let out = stdout(&o);
     assert!(out.contains("70 proposed"), "{out}");
     assert_eq!(code(&o), 1, "{out}\n{}", stderr(&o));
@@ -427,21 +493,171 @@ fn symlinked_source_is_refused() {
     let env = Env::new(&[]);
     env.write("real.md", DEPLOY);
     std::os::unix::fs::symlink(env.root().join("real.md"), env.root().join("CLAUDE.md")).unwrap();
-    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 1, "{}", stderr(&o));
     assert!(stderr(&o).contains("symlink"), "{}", stderr(&o));
     assert!(pack_files(&personal_packs(&env)).is_empty());
 }
 
+/// A control or bidi character anywhere in a line, even outside its
+/// backticks: the line is listed as not enforced and no rule is written.
 #[test]
 fn escapes_in_the_source_never_reach_the_terminal() {
     let env = Env::new(&[]);
     env.write("CLAUDE.md", "Never run `deploy-prod`. \u{1b}[2J\u{202e}\n");
-    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\n");
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     for s in [stdout(&o), stderr(&o)] {
         assert!(!s.contains('\u{1b}') && !s.contains('\u{202e}'), "{s:?}");
     }
+    let out = stdout(&o);
+    assert!(
+        out.contains("unverified: the line contains a control or bidi character"),
+        "{out}"
+    );
+    assert!(out.contains("0 proposed, 1 unverified"), "{out}");
+    assert!(!stderr(&o).contains("[1/"), "{}", stderr(&o));
+    assert!(pack_files(&personal_packs(&env)).is_empty());
+}
+
+/// The pack and the hook's deny never carry a raw escape or bidi control:
+/// a hostile line is stored cleaned, as not enforced, beside a real rule.
+#[cfg(unix)]
+#[test]
+fn no_pack_reason_carries_raw_escapes() {
+    let env = Env::new(&[]);
+    env.write(
+        "CLAUDE.md",
+        "Never run `deploy-prod`.\nNever run `frob-tool` \u{1b}[2J\u{202e} now.\n",
+    );
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\ny\n");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 1);
+    let text = fs::read_to_string(&files[0]).unwrap();
+    for bad in [
+        "\u{1b}", "\u{202e}", "\\u001b", "\\u001B", "\\u202e", "\\u202E",
+    ] {
+        assert!(!text.contains(bad), "{bad:?} in {text}");
+    }
+    assert_eq!(text.matches("[[deny]]").count(), 1, "{text}");
+    assert!(text.contains("why = \"unverified\""), "{text}");
+    for cmd in ["deploy-prod now", "frob-tool x"] {
+        let (_, err) = hook(&env, cmd);
+        assert!(
+            !err.contains('\u{1b}') && !err.contains('\u{202e}'),
+            "{err:?}"
+        );
+    }
+    assert_eq!(hook(&env, "deploy-prod now").0, 2);
+    assert_eq!(hook(&env, "frob-tool x").0, 0);
+}
+
+/// Two files: the second stops after the first one's pack was written,
+/// and the error says so instead of "nothing written".
+#[test]
+fn import_stop_after_a_write_says_what_was_written() {
+    let env = Env::new(&[]);
+    env.write("A.md", DEPLOY);
+    env.write("B.md", "Never run `terraform apply`.\n");
+    let o = rules(&env, &["import", "A.md", "B.md"], "e\n\ny\n");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 1, "{files:?}");
+    let id = files[0].file_stem().unwrap().to_string_lossy().into_owned();
+    assert!(id.starts_with("user.a-md-"), "{id}");
+    let err = stderr(&o);
+    assert!(
+        err.contains(&format!(
+            "stopped before the last rule; earlier packs written: {id}; this and later files unchanged"
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("nothing written"), "{err}");
+    // A stop on the first file still says nothing was written.
+    let env = Env::new(&[]);
+    env.write("A.md", DEPLOY);
+    env.write("B.md", "Never run `terraform apply`.\n");
+    let o = rules(&env, &["import", "A.md", "B.md"], "");
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("; nothing written"), "{}", stderr(&o));
+}
+
+/// Bare `import`: `CLAUDE.md -> AGENTS.md` imports AGENTS.md once.
+#[cfg(unix)]
+#[test]
+fn default_symlink_is_skipped_with_a_note() {
+    let env = Env::new(&[]);
+    env.write("AGENTS.md", DEPLOY);
+    std::os::unix::fs::symlink("AGENTS.md", env.root().join("CLAUDE.md")).unwrap();
+    let o = rules(&env, &["import"], "e\n\ny\n");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("note: ") && err.contains("CLAUDE.md is a symlink; skipped"),
+        "{err}"
+    );
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(
+        files[0].to_string_lossy().contains("user.agents-md-"),
+        "{files:?}"
+    );
+    // A named symlink is still refused.
+    let o = rules(&env, &["import", "CLAUDE.md"], "");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+}
+
+/// Bare `import` after CLAUDE.md was imported: AGENTS.md is imported, and
+/// CLAUDE.md is a note pointing at sync.
+#[test]
+fn default_already_imported_is_a_note() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", DEPLOY);
+    assert_eq!(code(&rules(&env, &["import", "CLAUDE.md"], "e\n\ny\n")), 0);
+    env.write("AGENTS.md", "Never run `terraform apply`.\n");
+    let o = rules(&env, &["import"], "e\n\n");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("CLAUDE.md is already imported (user.claude-md-"),
+        "{err}"
+    );
+    assert!(err.contains("); run saiife rules sync"), "{err}");
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(files
+        .iter()
+        .any(|f| f.to_string_lossy().contains("user.agents-md-")));
+    // Named, the same file is still refused.
+    let o = rules(&env, &["import", "CLAUDE.md"], "");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+}
+
+/// The carve-out is its own question and defaults to no: no `[[allow]]`,
+/// and `shutdown --help` stays denied.
+#[cfg(unix)]
+#[test]
+fn carve_out_default_no_writes_no_allow() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", "Never run `shutdown`.\n");
+    let o = rules(&env, &["import", "CLAUDE.md"], "e\n\n\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("also allow shutdown --help and --version? [y/N]: "),
+        "{}",
+        stderr(&o)
+    );
+    let files = pack_files(&personal_packs(&env));
+    let text = fs::read_to_string(&files[0]).unwrap();
+    assert!(!text.contains("[[allow]]"), "{text}");
+    assert!(
+        stdout(&o).contains("wrote ") && stdout(&o).contains(": 1 rules"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(hook(&env, "shutdown --help").0, 2);
+    assert_eq!(hook(&env, "shutdown -h now").0, 2);
 }
 
 // ---- import, locked target (a test daemon and --config) ----
@@ -547,7 +763,7 @@ fn sha_of(text: &str) -> String {
 #[test]
 fn unchanged_source_says_so() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     let before = fs::read(&pack).unwrap();
     let o = rules(&env, &["sync"], "");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -558,7 +774,7 @@ fn unchanged_source_says_so() {
 #[test]
 fn gone_line_kept_by_default() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     env.write("CLAUDE.md", "nothing to see\n");
     let o = rules(&env, &["sync"], "\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -579,7 +795,7 @@ fn gone_line_removed_on_r() {
     let pack = imported_pack(
         &env,
         "Never run `deploy-prod`.\nNever run `terraform apply`.\n",
-        "e\n\ne\n\n",
+        "e\n\ny\ne\n\ny\n",
     );
     env.write("CLAUDE.md", "Never run `terraform apply`.\n");
     let o = rules(&env, &["sync"], "r\n");
@@ -597,7 +813,7 @@ fn gone_line_removed_on_r() {
 #[test]
 fn gone_line_removed_last_rule_deletes_the_pack() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     env.write("CLAUDE.md", "nothing\n");
     let o = rules(&env, &["sync"], "r\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -613,7 +829,7 @@ fn gone_line_removed_last_rule_deletes_the_pack() {
 #[test]
 fn new_line_is_only_proposed() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     let deny = |t: &str| t.matches("[[deny]]").count();
     let before = deny(&fs::read_to_string(&pack).unwrap());
     env.write("CLAUDE.md", "Never run `deploy-prod`.\nNever run `x2`.\n");
@@ -633,7 +849,7 @@ fn new_line_is_only_proposed() {
         "CLAUDE.md",
         "Never run `deploy-prod`.\nNever run `x2`.\nNever run `x3`.\n",
     );
-    let o = rules(&env, &["sync"], "e\n\n");
+    let o = rules(&env, &["sync"], "e\n\ny\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let text = fs::read_to_string(&pack).unwrap();
     assert!(text.contains("id = \"l3-1\""), "{text}");
@@ -642,7 +858,7 @@ fn new_line_is_only_proposed() {
 #[test]
 fn sync_eof_writes_nothing() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     let before = fs::read(&pack).unwrap();
     env.write("CLAUDE.md", "nothing\n");
     let o = rules(&env, &["sync"], "");
@@ -650,10 +866,35 @@ fn sync_eof_writes_nothing() {
     assert_eq!(fs::read(&pack).unwrap(), before);
 }
 
+/// Sync checks the pack dir is writable before it asks anything.
+#[cfg(unix)]
+#[test]
+fn sync_unwritable_dir_asks_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
+    let dir = pack.parent().unwrap().to_path_buf();
+    env.write("CLAUDE.md", "nothing\n");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    // Root writes anyway: nothing to test then.
+    let probe = dir.join("probe");
+    let as_root = fs::write(&probe, "").is_ok();
+    let o = rules(&env, &["sync"], "r\n");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    if as_root {
+        return;
+    }
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("cannot write to"), "{err}");
+    assert!(!err.contains("keep? [K/r]"), "{err}");
+    assert!(pack.exists());
+}
+
 #[test]
 fn sync_unknown_pack_is_bad_input() {
     let env = Env::new(&[]);
-    imported_pack(&env, DEPLOY, "e\n\n");
+    imported_pack(&env, DEPLOY, "e\n\ny\n");
     let o = rules(&env, &["sync", "--pack", "user.nope"], "");
     assert_eq!(code(&o), 2, "{}", stderr(&o));
 }
@@ -661,7 +902,7 @@ fn sync_unknown_pack_is_bad_input() {
 #[test]
 fn sync_missing_source_keeps_rules() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     fs::remove_file(env.root().join("CLAUDE.md")).unwrap();
     let before = fs::read(&pack).unwrap();
     let o = rules(&env, &["sync"], "");
@@ -678,7 +919,7 @@ fn sync_missing_source_keeps_rules() {
 fn sync_output_never_carries_control_bytes() {
     let env = Env::new(&[]);
     let esc = "Never run `rm\u{1b}[31m` or \u{202e}x.\n";
-    imported_pack(&env, &format!("{DEPLOY}{esc}"), "e\n\n");
+    imported_pack(&env, &format!("{DEPLOY}{esc}"), "e\n\ny\n");
     env.write("CLAUDE.md", &format!("{DEPLOY}Never run `new\u{1b}[2J`.\n"));
     let o = rules(&env, &["sync"], "\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -697,7 +938,7 @@ fn sync_stop_after_a_write_says_what_was_written() {
     env.write("AGENTS.md", DEPLOY);
     env.write("CLAUDE.md", "Never run `terraform apply`.\n");
     for f in ["AGENTS.md", "CLAUDE.md"] {
-        let o = rules(&env, &["import", f], "e\n\n");
+        let o = rules(&env, &["import", f], "e\n\ny\n");
         assert_eq!(code(&o), 0, "{}", stderr(&o));
     }
     let files = pack_files(&personal_packs(&env));
@@ -727,7 +968,7 @@ const MIXED: &str = "Never run `deploy-prod`.\nNever run `terraform apply`.\nNev
 #[test]
 fn list_shows_host_and_box_status() {
     let env = Env::new(&[]);
-    imported_pack(&env, MIXED, "e\n\ne\nh\ne\n\n");
+    imported_pack(&env, MIXED, "e\n\ny\ne\nh\ne\n\n");
     let o = rules(&env, &[], "");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
@@ -753,7 +994,7 @@ fn list_shows_host_and_box_status() {
 #[test]
 fn list_json_shape() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     let o = rules(&env, &["list", "--json"], "");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let got: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
@@ -801,7 +1042,7 @@ fn list_json_shape() {
 fn list_flags_broad_rules() {
     let env = Env::new(&[]);
     // `ls` is an everyday command: a typed `yes` enforces it anyway.
-    imported_pack(&env, "Never run `ls`.\n", "e\nyes\n\n");
+    imported_pack(&env, "Never run `ls`.\n", "e\nyes\n\ny\n");
     let o = rules(&env, &[], "");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(
@@ -823,7 +1064,7 @@ fn list_with_no_packs_says_so() {
 #[test]
 fn list_marks_changed_and_gone_sources() {
     let env = Env::new(&[]);
-    imported_pack(&env, DEPLOY, "e\n\n");
+    imported_pack(&env, DEPLOY, "e\n\ny\n");
     env.write("CLAUDE.md", &format!("{DEPLOY}Never run `x`.\n"));
     let o = rules(&env, &[], "");
     assert!(
@@ -841,7 +1082,7 @@ fn list_marks_changed_and_gone_sources() {
 #[test]
 fn list_output_never_carries_control_bytes() {
     let env = Env::new(&[]);
-    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let pack = imported_pack(&env, DEPLOY, "e\n\ny\n");
     let text = fs::read_to_string(&pack).unwrap();
     let text = text
         .replace("reason = \"", "reason = \"a\\u001b[2Jb\\u202ec")

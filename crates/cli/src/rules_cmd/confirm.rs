@@ -41,13 +41,49 @@ fn rule_text(p: &Proposal) -> String {
     }
 }
 
-/// The exact `[[allow]]` pattern a proposal writes (its `--help` carve-out),
-/// shown so the human confirms it too.
+/// The exact `[[allow]]` pattern a proposal may write (its `--help`
+/// carve-out), shown so the human sees what the separate question adds.
 fn carve_out(p: &Proposal) -> Option<String> {
     pack_rules(p).into_iter().find_map(|r| match r {
-        PackRule::HelpAllow { pattern, .. } => Some(format!("(allow {})", clean(&pattern))),
+        PackRule::HelpAllow { pattern, .. } => {
+            Some(format!("(optional allow {})", clean(&pattern)))
+        }
         _ => None,
     })
+}
+
+/// The separate carve-out question, after the rule itself is confirmed:
+/// only `y` keeps it; anything else (the default) drops it.
+fn ask_carve_out(
+    p: &mut Proposal,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<(), Eof> {
+    let ProposalKind::Command {
+        words,
+        help_carve_out,
+        ..
+    } = &mut p.kind
+    else {
+        return Ok(());
+    };
+    if !*help_carve_out {
+        return Ok(());
+    }
+    let first = words.first().cloned().unwrap_or_default();
+    let _ = write!(
+        out,
+        "also allow {} --help and --version? [y/N]: ",
+        clean(&first)
+    );
+    let _ = out.flush();
+    if read_answer(input)?.to_lowercase() == "y" {
+        return Ok(());
+    }
+    *help_carve_out = false;
+    let help = [format!("{first} --help"), format!("{first} --version")];
+    p.allow.retain(|a| !help.contains(a));
+    Ok(())
 }
 
 /// `file:line` of a proposal, from the start of its reason.
@@ -162,7 +198,7 @@ pub fn confirm(
             );
             let _ = writeln!(out, "      {}", rule_text(&p));
             if let Some(c) = carve_out(&p) {
-                let _ = writeln!(out, "      and {c}");
+                let _ = writeln!(out, "      {c}");
             }
             let _ = write!(
                 out,
@@ -229,6 +265,7 @@ pub fn confirm(
                 }
             }
             let where_ = ask_where(&p, input, out)?;
+            ask_carve_out(&mut p, input, out)?;
             decided.push(Decided { p, choice, where_ });
             break 'question;
         }
@@ -288,7 +325,7 @@ mod tests {
     #[test]
     fn defaults_skip_and_everywhere() {
         let ps = vec![prop(1, cmd(&["pkill"])), prop(2, cmd(&["shred"]))];
-        let (r, out) = run(ps, true, "\ne\n\n");
+        let (r, out) = run(ps, true, "\ne\n\n\n");
         let d = r.unwrap();
         assert_eq!(d.len(), 2);
         assert_eq!(d[0].choice, Choice::Skip);
@@ -303,7 +340,7 @@ mod tests {
 
     #[test]
     fn host_only_answer() {
-        let (r, _) = run(vec![prop(1, cmd(&["shred"]))], true, "e\nh\n");
+        let (r, _) = run(vec![prop(1, cmd(&["shred"]))], true, "e\nh\n\n");
         let d = r.unwrap();
         assert_eq!(
             (d[0].choice, d[0].where_),
@@ -313,7 +350,7 @@ mod tests {
 
     #[test]
     fn ask_only_where_offered() {
-        let (r, out) = run(vec![prop(1, cmd(&["shred"]))], false, "a\ne\n\n");
+        let (r, out) = run(vec![prop(1, cmd(&["shred"]))], false, "a\ne\n\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Enforce);
         assert!(out.contains("enforce, skip, edit? [e/s/x] (s): "), "{out}");
         let path = Target::Path {
@@ -322,7 +359,7 @@ mod tests {
         };
         let (r, _) = run(vec![prop(1, path)], true, "a\ne\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Enforce);
-        let (r, _) = run(vec![prop(1, cmd(&["shred"]))], true, "a\n\n");
+        let (r, _) = run(vec![prop(1, cmd(&["shred"]))], true, "a\n\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Ask);
     }
 
@@ -334,7 +371,7 @@ mod tests {
         assert_eq!(r, Err(Eof));
         assert!(out.contains("BROAD: blocks everyday"), "{out}");
         assert!(out.matches("[e/a/s/x]").count() >= 2, "{out}");
-        let (r, _) = run(vec![broad.clone()], true, "e\nyes\n\n");
+        let (r, _) = run(vec![broad.clone()], true, "e\nyes\n\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Enforce);
         let (r, _) = run(vec![broad], true, "e\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Skip);
@@ -393,18 +430,58 @@ mod tests {
         // The carve-out is shown as the exact pattern written.
         assert!(
             t.contains(
-                r"allows `echo pkill`, `pkill --help`, `pkill --version` (allow ^pkill\s+(?:--help|--version)$)"
+                r"allows `echo pkill`, `pkill --help`, `pkill --version` (optional allow ^pkill\s+(?:--help|--version)$)"
             ),
             "{t}"
         );
         assert!(!t.contains("-h|"), "{t}");
         let (_, out) = run(vec![prop(1, cmd(&["pkill"]))], false, "s\n");
         assert!(
-            out.contains(r"and (allow ^pkill\s+(?:--help|--version)$)"),
+            out.contains(r"      (optional allow ^pkill\s+(?:--help|--version)$)"),
             "{out}"
         );
         let (_, out) = run(vec![prop(1, cmd(&["git", "push"]))], false, "s\n");
-        assert!(!out.contains("(allow "), "{out}");
+        assert!(!out.contains("allow ^"), "{out}");
+    }
+
+    #[test]
+    fn carve_out_is_a_separate_question_default_no() {
+        let carve = |d: &Decided| {
+            pack_rules(&d.p)
+                .iter()
+                .any(|r| matches!(r, PackRule::HelpAllow { .. }))
+        };
+        let (r, out) = run(vec![prop(1, cmd(&["pkill"]))], true, "e\n\ny\n");
+        let d = r.unwrap();
+        assert!(carve(&d[0]), "{out}");
+        assert!(
+            out.contains("[E/h]: also allow pkill --help and --version? [y/N]: "),
+            "{out}"
+        );
+        // The default, and any answer but y, writes no allow.
+        for no in ["\n", "n\n", "yes\n"] {
+            let (r, _) = run(vec![prop(1, cmd(&["pkill"]))], true, &format!("a\nh\n{no}"));
+            let d = r.unwrap();
+            assert_eq!((d[0].choice, d[0].where_), (Choice::Ask, RuleWhere::Host));
+            assert!(!carve(&d[0]), "{no:?}");
+            assert!(
+                !d[0].p.allow.iter().any(|a| a.contains("--help")),
+                "{:?}",
+                d[0].p.allow
+            );
+        }
+        // Input that ends at the question writes nothing.
+        assert_eq!(
+            run(vec![prop(1, cmd(&["pkill"]))], true, "e\n\n").0,
+            Err(Eof)
+        );
+        // A skip, a rule with no carve-out, and a broad rule after its yes.
+        let (r, out) = run(vec![prop(1, cmd(&["pkill"]))], true, "s\n");
+        assert!(r.is_ok() && !out.contains("also allow"), "{out}");
+        let (r, out) = run(vec![prop(1, cmd(&["git", "push"]))], true, "e\n\n");
+        assert!(r.is_ok() && !out.contains("also allow"), "{out}");
+        let (r, out) = run(vec![prop(1, cmd(&["ls"]))], true, "e\nyes\n\ny\n");
+        assert!(carve(&r.unwrap()[0]), "{out}");
     }
 
     #[test]
@@ -430,7 +507,7 @@ mod tests {
         }];
         let t = table(std::slice::from_ref(&p), &bad, std::slice::from_ref(&p.src));
         assert!(!has_unsafe_char(&t), "{t:?}");
-        let (r, out) = run(vec![p], true, "z\u{1b}\ne\nyes\nh\n");
+        let (r, out) = run(vec![p], true, "z\u{1b}\ne\nyes\nh\ny\n");
         assert!(r.is_ok());
         assert!(!has_unsafe_char(&out), "{out:?}");
         let (r, out) = run(vec![prop(1, cmd(&["shred"]))], true, "x\nev\u{1b}il\ns\n");

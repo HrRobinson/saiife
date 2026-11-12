@@ -32,6 +32,7 @@ const HOST_HINT_COMMANDS: &[&str] = &[
 
 /// `<file>:<line> "<text>"`: the source line quoted as the rule's reason.
 pub fn reason(file_name: &str, line: u32, text: &str) -> String {
+    let text = super::extract::clean(text);
     let t = text.trim();
     let t = ["- ", "* ", "+ "]
         .iter()
@@ -418,6 +419,15 @@ pub fn proposals_for(
     let mut bad = Vec::new();
     let mut judgement = Vec::new();
     for c in cands {
+        // A control, bidi or format character anywhere in the line: the
+        // whole line is listed, never proposed nor sent to the LLM pass.
+        if super::extract::has_unsafe_char(&c.src.text) {
+            bad.push(Unverified {
+                src: c.src.clone(),
+                why: format!("the line {}", super::extract::UNSAFE_WHY),
+            });
+            continue;
+        }
         if c.targets.is_empty() {
             judgement.push(c.src.clone());
             continue;
@@ -700,5 +710,27 @@ mod tests {
             .iter()
             .all(|u| !crate::rules_cmd::extract::has_unsafe_char(&u.why)));
         assert!(judgement.is_empty());
+    }
+
+    #[test]
+    fn an_unsafe_character_anywhere_lists_the_whole_line() {
+        // Outside every span and token, with good targets beside it, and on
+        // a judgement line: one unverified entry each, nothing proposed.
+        let text = "- Never run `shred` or `pkill` \u{1b}[2J here.\n- Never be \u{202e}rude.\n- Never write to /etc/x\u{200b} y.\n";
+        let cands = crate::rules_cmd::extract::candidates(text);
+        assert_eq!(cands.len(), 3);
+        let (ok, bad, judgement) = proposals_for(&cands, "CLAUDE.md", &vars());
+        assert!(ok.is_empty(), "{ok:?}");
+        assert!(judgement.is_empty(), "{judgement:?}");
+        assert_eq!(bad.len(), 3, "{bad:?}");
+        assert!(bad
+            .iter()
+            .all(|u| u.why == "the line contains a control or bidi character"));
+    }
+
+    #[test]
+    fn reason_is_clean() {
+        let r = reason("CLAUDE.md", 1, "Never \u{1b}[2J run \u{202e}`x`");
+        assert!(!crate::rules_cmd::extract::has_unsafe_char(&r), "{r:?}");
     }
 }

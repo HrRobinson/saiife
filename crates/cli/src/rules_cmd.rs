@@ -170,13 +170,15 @@ fn import(
     let project = cwd
         .as_deref()
         .and_then(saiife_agents::config::find_project_root);
-    // 2. The files.
-    let files = if files.is_empty() {
+    // 2. The files. Found by default, a symlink (`CLAUDE.md -> AGENTS.md`)
+    // or a file already imported is a note, not an error.
+    let defaults = files.is_empty();
+    let files = if defaults {
         let root = project.clone().or_else(|| cwd.clone()).unwrap_or_default();
-        let found: Vec<PathBuf> = DEFAULT_FILES
+        let found: Vec<(PathBuf, std::fs::Metadata)> = DEFAULT_FILES
             .iter()
             .map(|n| root.join(n))
-            .filter(|p| std::fs::symlink_metadata(p).is_ok())
+            .filter_map(|p| std::fs::symlink_metadata(&p).ok().map(|m| (p, m)))
             .collect();
         if found.is_empty() {
             return stop(Stop(
@@ -188,7 +190,15 @@ fn import(
                 ),
             ));
         }
-        found
+        let mut keep = Vec::new();
+        for (p, m) in found {
+            if m.file_type().is_symlink() {
+                crate::warn(&format!("note: {} is a symlink; skipped", shown(&p)));
+            } else {
+                keep.push(p);
+            }
+        }
+        keep
     } else {
         files
     };
@@ -196,9 +206,23 @@ fn import(
         return stop(Stop(2, "--name names one pack; give one file".into()));
     }
     let vars = crate::paths::path_vars(cwd.as_deref(), project.as_deref());
+    let mut written: Vec<String> = Vec::new();
     for f in &files {
-        if let Err(s) = import_one(&target, f, name.as_deref(), llm, &vars) {
-            return stop(s);
+        match import_one(&target, f, name.as_deref(), llm, defaults, &vars) {
+            Ok(Some(id)) => written.push(id),
+            Ok(None) => {}
+            Err(Stop(code, m)) if !written.is_empty() => {
+                // Say what really happened: "nothing written" is no longer true.
+                let reason = m.strip_suffix("; nothing written").unwrap_or(&m);
+                return stop(Stop(
+                    code,
+                    format!(
+                        "{reason}; earlier packs written: {}; this and later files unchanged",
+                        written.join(", ")
+                    ),
+                ));
+            }
+            Err(s) => return stop(s),
         }
     }
     ExitCode::SUCCESS
@@ -275,13 +299,16 @@ fn source_path(file: &Path) -> std::io::Result<PathBuf> {
     Ok(abs)
 }
 
+/// One file's import: `Some(id)` when its pack was written, `None` when
+/// nothing was (all skipped, or a default file already imported).
 fn import_one(
     target: &crate::broker::Target,
     file: &Path,
     name: Option<&str>,
     llm: bool,
+    found_by_default: bool,
     vars: &saiifeguard::canon::PathVars,
-) -> Result<(), Stop> {
+) -> Result<Option<String>, Stop> {
     use saiifeguard::canon::PathStyle;
     use saiifeguard::profile::Profile;
     use saiifeguard::userpack::{load_user_packs, view, UnenforcedWhy, UserSrc};
@@ -307,6 +334,14 @@ fn import_one(
     for e in &existing {
         if let Ok(v) = view(&e.text) {
             if v.import.as_ref().is_some_and(|i| i.file == abs_text) {
+                if found_by_default {
+                    crate::warn(&format!(
+                        "note: {} is already imported ({}); run saiife rules sync",
+                        shown(&abs),
+                        extract::clean(&v.id)
+                    ));
+                    return Ok(None);
+                }
                 return Err(Stop(
                     1,
                     format!(
@@ -338,7 +373,7 @@ fn import_one(
 
     // 7. The table, then one question per proposal.
     outln!("{}", shown(&abs));
-    print!("{}", confirm::table(&props, &unverified, &judgement));
+    out!("{}", confirm::table(&props, &unverified, &judgement));
     let repropose = |src: &SourceLine, t: Target| repropose(src, t, &file_name, vars);
     let stdin = std::io::stdin();
     let decided = confirm::confirm(
@@ -351,7 +386,7 @@ fn import_one(
     .map_err(|confirm::Eof| Stop(1, "stopped before the last rule; nothing written".into()))?;
     if decided.iter().all(|d| d.choice == Choice::Skip) {
         outln!("no rule confirmed; nothing written");
-        return Ok(());
+        return Ok(None);
     }
 
     // 8. The pack.
@@ -413,7 +448,7 @@ fn import_one(
     if target.is_locked() && ask > 0 {
         outln!("next: saiife policy reload");
     }
-    Ok(())
+    Ok(Some(extract::clean(&id)))
 }
 
 /// An edited answer in the confirm loop: one new target for `src`.
@@ -490,6 +525,10 @@ fn sync(config: Option<PathBuf>, packs: Vec<String>, llm: bool) -> ExitCode {
     if chosen.is_empty() {
         outln!("no imported packs; nothing to sync");
         return ExitCode::SUCCESS;
+    }
+    // The packs must be writable before the human answers anything.
+    if let Err(e) = store::check_writable(&dir) {
+        return stop(Stop(1, extract::clean(&e)));
     }
     let mut updated: Vec<String> = Vec::new();
     for path in chosen {
@@ -620,7 +659,7 @@ fn sync_one(
     );
     let mut decided = Vec::new();
     if !(props.is_empty() && unverified.is_empty() && judgement.is_empty()) {
-        print!("{}", confirm::table(&props, &unverified, &judgement));
+        out!("{}", confirm::table(&props, &unverified, &judgement));
         let rp = |src: &SourceLine, t: Target| repropose(src, t, &file_name, vars);
         decided = confirm::confirm(
             props,

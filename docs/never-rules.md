@@ -166,13 +166,16 @@ ones saiife can enforce into a user pack. With no file named it looks for
 `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` in the project root. It never reads
 `~/.claude/CLAUDE.md` unless you name it. `--name <slug>` names the pack
 `user.<slug>` and takes one file; by default the id is
-`user.<file name>-<8 hex of the path hash>`, one pack per file.
+`user.<file name>-<8 hex of the path hash>`, one pack per file. When it looks
+for the files itself, a file that is a symlink (`CLAUDE.md -> AGENTS.md`) or
+one already imported is skipped with a one-line note and the others go on; a
+file you name is refused in both cases.
 
 A line is a candidate when it says `never`, `don't`, `do not`, `must not` and
 the like, or starts with `no`. Code fences and HTML comments are skipped.
 Commands in backticks (and short lists after a colon) become command rules;
 paths starting with `/`, `~/` or `$VAR/` become path rules. A path becomes two
-rules, the path and `path/**`. The access (`read`, `write` or `any`) comes from
+rules, the path and `path/**` (`/` becomes only `/**`). The access (`read`, `write` or `any`) comes from
 the words of the line. A line with a control, bidi or format character is never
 turned into a rule.
 
@@ -192,12 +195,17 @@ After `e` or `a` you choose `everywhere or host only? [E/h]`; the default is
 everywhere. A hint such as `(often host only)` is only a hint. A rule that
 would block an everyday command or path (`ls`, `git status`, a write under
 `$PROJECT/src`) is shown as `BROAD` and needs the word `yes` typed after `e`
-or `a`. A one-word command rule also gets a carve-out in its own pack that
+or `a`. A one-word command rule can also get a carve-out in its own pack that
 lets `<command> --help` and `<command> --version` through (never `-h`, which
 is an action for some commands); it lifts only that pack's own deny, never a
-built-in. Answers from a pipe can only add restrictions or make a rule host
+built-in. The table shows its exact pattern as optional, and after the rule is
+confirmed a separate question asks `also allow <command> --help and
+--version? [y/N]`. The default is no: only `y` writes the carve-out. Answers from a pipe can only add restrictions or make a rule host
 only. If the input ends before the last question, nothing is written and the
-exit code is 1. Nothing is written unless every user pack still loads, for the
+exit code is 1. When several files are imported and one stops after an
+earlier file's pack was written, the error names the packs already written
+(`earlier packs written: <ids>; this and later files unchanged`). Nothing is
+written unless every user pack still loads, for the
 host and for the box profile.
 
 The pack records the source file (`source.file` is an absolute path), its
@@ -210,7 +218,7 @@ written root-owned; run `saiife policy reload` after adding an `ask` rule.
 
 `saiife rules import --llm` is opt-in. After the deterministic pass, only the
 candidate lines it could not use are sent (never the whole file) to
-`claude -p --tools ""`, your own Claude Code login, and the terminal says
+`claude -p <instructions> --tools ""`, your own Claude Code login, and the terminal says
 `sending N lines of <file> to claude -p (your Claude Code login)` first. The
 answer must fit a strict schema with two kinds, `command` and `path`; the LLM
 never writes a regex and cannot add an allow. Its rules go through the same

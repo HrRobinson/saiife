@@ -185,7 +185,7 @@ pub(crate) struct RuleTables {
 pub(crate) fn unenforced_table(file: &str, s: &SourceLine, why: &str) -> Table {
     let mut t = Table::new();
     t["source"] = source_of(file, s);
-    t["text"] = value(s.text.as_str());
+    t["text"] = value(clean(&s.text));
     t["why"] = value(why);
     t
 }
@@ -596,6 +596,12 @@ mod tests {
         assert_eq!(ids, ["l9-1", "l9-2"]);
         assert_eq!(v.unenforced.len(), 1);
         assert_eq!(v.unenforced[0].why, UnenforcedWhy::Unverified);
+        // The text is stored cleaned; the hash is of the line as written.
+        assert_eq!(v.unenforced[0].text, "- Never run `x?`.");
+        assert_eq!(
+            v.unenforced[0].source.line_sha256,
+            line_sha256("- Never run `x\u{1b}`.")
+        );
     }
 
     #[test]
