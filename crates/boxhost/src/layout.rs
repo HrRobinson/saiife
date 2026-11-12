@@ -25,6 +25,20 @@ impl Layout {
         }
     }
 
+    /// [`Layout::locked`] with every path under `root` (tests: no test
+    /// reads the host's install, M1).
+    pub fn locked_under(root: &Path) -> Layout {
+        let at = |p: PathBuf| root.join(p.strip_prefix("/").unwrap_or(&p));
+        let l = Layout::locked();
+        Layout {
+            boxes: at(l.boxes),
+            images: at(l.images),
+            vmm: at(l.vmm),
+            vault: at(l.vault),
+            locked: true,
+        }
+    }
+
     /// The personal layout under the user's state dir and XDG data home.
     ///
     /// `boxes` is the VMM's runtime root, `<state>/box-run` (R37), apart from
@@ -54,6 +68,15 @@ mod tests {
         assert_eq!(l.images, PathBuf::from("/var/lib/saiife-box/images"));
         assert_eq!(l.vmm, PathBuf::from("/opt/saiife/vmm"));
         assert_eq!(l.vault, PathBuf::from("/var/lib/saiife-box/vault"));
+        assert!(l.locked);
+    }
+
+    #[test]
+    fn layout_locked_under_a_root() {
+        let l = Layout::locked_under(Path::new("/t/r"));
+        assert_eq!(l.boxes, PathBuf::from("/t/r/var/lib/saiife-box/boxes"));
+        assert_eq!(l.vmm, PathBuf::from("/t/r/opt/saiife/vmm"));
+        assert_eq!(l.vault, PathBuf::from("/t/r/var/lib/saiife-box/vault"));
         assert!(l.locked);
     }
 

@@ -27,6 +27,10 @@ use crate::ops::Mode;
 
 /// The user every locked VMM runs as (`system install --boxes` makes it).
 pub const BOX_USER: &str = "saiife-box";
+/// Debug builds only (like `SAIIFE_TOOL_*`): an absolute dir the locked
+/// layout is re-rooted under, so tests never read the host's
+/// `/var/lib/saiife-box` or `/opt/saiife` (M1). Release builds ignore it.
+pub const TEST_BOX_ROOT_ENV: &str = "SAIIFE_TEST_BOX_ROOT";
 /// The device a personal VMM opens.
 pub const KVM: &str = "/dev/kvm";
 
@@ -40,7 +44,15 @@ pub fn layout_for(
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Layout, String> {
     match mode {
-        Mode::Locked => Ok(Layout::locked()),
+        Mode::Locked => Ok(
+            match env(TEST_BOX_ROOT_ENV)
+                .map(std::path::PathBuf::from)
+                .filter(|p| cfg!(debug_assertions) && p.is_absolute())
+            {
+                Some(root) => Layout::locked_under(&root),
+                None => Layout::locked(),
+            },
+        ),
         Mode::Personal => {
             let abs = |k: &str| {
                 env(k)
@@ -91,6 +103,10 @@ pub fn real_vmm_with(
             )
         }
         Mode::Locked => {
+            // A re-rooted (test) layout never reaches the system bus (M1).
+            if layout != &Layout::locked() {
+                return Err("a locked test layout never reaches the system bus".into());
+            }
             // Fail closed: snapshot files are checked against this uid.
             let uid = saiife_ipc::client::system_uid(BOX_USER).ok_or_else(|| {
                 format!(

@@ -1,7 +1,9 @@
 //! `saiife-fake-ch`: a stand-in for cloud-hypervisor in tests. Accepts the
 //! flags `launch::argv` produces, serves canned v54.0 responses on the API
 //! socket and keeps a Running/Paused state machine.
-//! Env knobs: FAKE_CH_IGNORE_POWER=1, FAKE_CH_HANG=1, FAKE_CH_EXIT_AT_START=<code>.
+//! Env knobs: FAKE_CH_IGNORE_POWER=1, FAKE_CH_HANG=1, FAKE_CH_EXIT_AT_START=<code>,
+//! FAKE_CH_SAYS_SHUTDOWN=1 (alive, but vm.info answers Shutdown and neither
+//! the power button nor vmm.shutdown ends it: a lying VMM).
 
 #[cfg(unix)]
 mod imp {
@@ -194,6 +196,7 @@ mod imp {
     struct Shared {
         paused: Mutex<bool>,
         ignore_power: bool,
+        says_shutdown: bool,
         /// The VmConfig a snapshot writes (from the argv, or the restored one).
         config: String,
     }
@@ -294,7 +297,9 @@ mod imp {
         let resp: &str = match (method.as_str(), path.as_str()) {
             ("GET", "/api/v1/vmm.ping") => fx!("vmm.ping.200.http"),
             ("GET", "/api/v1/vm.info") => {
-                if paused {
+                if sh.says_shutdown {
+                    fx!("vm.info.shutdown.200.http")
+                } else if paused {
                     fx!("vm.info.paused.200.http")
                 } else {
                     fx!("vm.info.running.200.http")
@@ -311,7 +316,7 @@ mod imp {
                 }
             }
             ("PUT", "/api/v1/vm.power-button") => {
-                if !sh.ignore_power {
+                if !sh.ignore_power && !sh.says_shutdown {
                     exit_after(200);
                 }
                 fx!("vm.pause.204.http")
@@ -335,7 +340,7 @@ mod imp {
                 }
             }
             ("PUT", "/api/v1/vmm.shutdown") => {
-                then_exit = true;
+                then_exit = !sh.says_shutdown;
                 fx!("vm.pause.204.http")
             }
             _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -385,6 +390,7 @@ mod imp {
         let sh = Arc::new(Shared {
             paused: Mutex::new(restore),
             ignore_power: std::env::var("FAKE_CH_IGNORE_POWER").is_ok_and(|v| v == "1"),
+            says_shutdown: std::env::var("FAKE_CH_SAYS_SHUTDOWN").is_ok_and(|v| v == "1"),
             config,
         });
         let held: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));

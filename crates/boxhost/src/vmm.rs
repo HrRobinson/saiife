@@ -278,12 +278,14 @@ fn group_writable(p: &Path) -> Result<(), String> {
     rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o660)).map_err(|e| e.to_string())
 }
 
+/// The API's state of a VMM the launcher says is alive. Never Off: only the
+/// launcher's word ends a VMM (R19), so a live VMM that says Shutdown (after
+/// `vm.shutdown`, or lying) is Running until it exits.
 fn map_state(s: VmState) -> VmStatus {
     match s {
         VmState::Created => VmStatus::Created,
-        VmState::Running => VmStatus::Running,
+        VmState::Running | VmState::Shutdown => VmStatus::Running,
         VmState::Paused => VmStatus::Paused,
-        VmState::Shutdown => VmStatus::Off,
     }
 }
 
@@ -341,6 +343,9 @@ impl ChVmmInit {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
         let dir = &paths.dir;
         let me = rustix::process::geteuid().as_raw();
+        if !self.layout.locked {
+            self.private_root()?;
+        }
         match std::fs::symlink_metadata(dir) {
             Ok(m) if !m.file_type().is_dir() => {
                 return Err(format!(
@@ -357,13 +362,6 @@ impl ChVmmInit {
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !self.layout.locked {
-                    std::fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(&self.layout.boxes)
-                        .map_err(|e| format!("box runtime root: {e}"))?;
-                }
                 std::fs::DirBuilder::new()
                     .mode(0o700)
                     .create(dir)
@@ -374,6 +372,42 @@ impl ChVmmInit {
         if self.layout.locked {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770))
                 .map_err(|e| format!("box runtime dir {}: {e}", dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Personal mode: the runtime root (`<state>/box-run`) is made 0700 when
+    /// missing, an existing one of this uid made 0700, a symlinked, non-dir
+    /// or foreign one refused (M2).
+    fn private_root(&self) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let root = &self.layout.boxes;
+        let me = rustix::process::geteuid().as_raw();
+        if std::fs::symlink_metadata(root).is_err() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(root)
+                .map_err(|e| format!("box runtime root {}: {e}", root.display()))?;
+        }
+        let m = std::fs::symlink_metadata(root)
+            .map_err(|e| format!("box runtime root {}: {e}", root.display()))?;
+        if !m.file_type().is_dir() {
+            return Err(format!(
+                "the box runtime root {} is not a directory (or is a symlink)",
+                root.display()
+            ));
+        }
+        if m.uid() != me {
+            return Err(format!(
+                "the box runtime root {} is owned by uid {}, not {me}",
+                root.display(),
+                m.uid()
+            ));
+        }
+        if m.mode() & 0o7777 != 0o700 {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("box runtime root {}: {e}", root.display()))?;
         }
         Ok(())
     }
@@ -892,7 +926,9 @@ impl Vmm for ChVmm {
                     g.insert(h.id.clone(), other);
                     return Err(VmmError::Failed("the VM is booting".into()));
                 }
-                None => return self.inner.remove_runtime(&h.id),
+                // no run: only the launcher's word lets the state go
+                None if self.inner.gone(&h.id) => return self.inner.remove_runtime(&h.id),
+                None => return Err(VmmError::Failed("the VMM has not stopped yet".into())),
             }
         };
         let s = self.inner.stop;

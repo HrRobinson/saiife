@@ -989,6 +989,49 @@ fn destroy_removes_the_runtime_dir_after_a_confirmed_exit() {
     std::fs::remove_dir(w.paths("b2").dir.join("planted")).unwrap();
 }
 
+/// I1 (R19): after a daemon restart (a new ChVmm and launcher, no run), a
+/// live VMM whose API says Shutdown is not Off, and destroy neither skips
+/// the stop nor removes its runtime dir or pid record while the launcher
+/// says it is alive.
+#[test]
+fn a_live_vmm_saying_shutdown_is_not_off_and_not_destroyed() {
+    let w = World::new();
+    let (v1, _l1) = w.vmm(&[("FAKE_CH_SAYS_SHUTDOWN", "1")]);
+    let h = w.create(&v1, "b1");
+    v1.boot(&h).unwrap();
+    let l2 = w.launcher(&[]);
+    let v2 = w.vmm_with(Arc::clone(&l2), vec![]);
+    assert_eq!(l2.exited(&h.id), Some(false), "alive by the pid record");
+    assert_ne!(v2.status(&h), VmStatus::Off);
+    assert!(v2.destroy(&h).is_err());
+    assert!(w.paths("b1").vm_json().exists(), "the runtime dir is kept");
+    assert!(w.pid_record("b1").exists(), "the pid record is kept");
+    assert_eq!(l2.exited(&h.id), Some(false));
+    // v1 owns the child; the World guard stops it
+}
+
+/// M2: the personal runtime root is the user's alone: a looser one of ours
+/// is made 0700, a symlinked one refused.
+#[test]
+fn personal_runtime_root_is_made_private() {
+    let mut w = World::new();
+    let rt = w.root.join("rt");
+    std::fs::create_dir(&rt).unwrap();
+    std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+    w.layout.boxes = rt.clone();
+    let (v, _l) = w.vmm(&[]);
+    let spec = w.spec("b1");
+    let h = v.create(&spec).unwrap();
+    w.track(&v, &h);
+    assert_eq!(mode_of(&rt), 0o700);
+    let link = w.root.join("rtlink");
+    std::os::unix::fs::symlink(&rt, &link).unwrap();
+    w.layout.boxes = link;
+    let (v, _l) = w.vmm(&[]);
+    let m = failed(v.create(&w.spec("b2")));
+    assert!(m.contains("runtime root"), "{m}");
+}
+
 /// R37: `VmSpec.dir` must be the record dir `<records>/<id>`; the runtime
 /// dir is the driver's own (`<layout.boxes>/<id>`), made 0700 personal,
 /// 2770 locked, and refused when it is a link or not this uid's.

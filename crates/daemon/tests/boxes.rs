@@ -701,16 +701,24 @@ async fn build_needs_the_fake_flag() {
     let tmp = scratch();
     let state = tmp.path().join("state");
     let off = |_: &str| -> Option<OsString> { None };
-    // Without it the real driver's preflight runs, and fails on a host
-    // without `system install --boxes` (read-only: nothing is created).
-    let why = box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &off)
+    // Without it the real driver's preflight runs: on the test's own locked
+    // root (M1: never the host's /var/lib/saiife-box or /opt/saiife), which
+    // has no install (read-only: nothing is created).
+    let root = tmp.path().join("box-root");
+    let seam = |k: &str| -> Option<OsString> {
+        (k == "SAIIFE_TEST_BOX_ROOT").then(|| root.clone().into_os_string())
+    };
+    let why = box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &seam)
         .unwrap()
         .err()
         .expect("no boxes without the fake flag or an install");
-    if cfg!(all(target_os = "linux", feature = "boxes"))
-        && !Path::new("/var/lib/saiife-box/boxes").is_dir()
-    {
+    if cfg!(all(target_os = "linux", feature = "boxes")) {
         assert!(why.contains("install --boxes"), "{why}");
+        assert!(
+            why.contains(&root.display().to_string()),
+            "the test root: {why}"
+        );
+        assert!(!root.exists());
     }
     assert!(!state.join("boxes").exists());
     let (dir, trust) =
@@ -1086,4 +1094,31 @@ async fn restore_refused_is_audited() {
     let why = r["reason"].as_str().unwrap();
     assert!(why.contains("digest") && why.contains("mismatch"), "{r}");
     assert!(!why.contains('\u{1b}'), "{r}");
+}
+
+/// M1: the debug-only locked layout seam re-roots every locked path, and a
+/// locked layout that is not the real one never reaches the system bus.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn locked_test_layout_never_reaches_the_bus() {
+    use saiife_daemon::box_vmm::{layout_for, real_vmm_with};
+    let tmp = scratch();
+    let root = tmp.path().join("box-root");
+    let seam = |k: &str| -> Option<OsString> {
+        (k == "SAIIFE_TEST_BOX_ROOT").then(|| root.clone().into_os_string())
+    };
+    let l = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &seam).unwrap();
+    assert!(l.locked);
+    for p in [&l.boxes, &l.images, &l.vmm, &l.vault] {
+        assert!(p.starts_with(&root), "{}", p.display());
+    }
+    assert_eq!(l.boxes, root.join("var/lib/saiife-box/boxes"));
+    for p in [&l.images, &l.vmm, &l.vault] {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let records = tmp.path().join("records");
+    let e = real_vmm_with(&l, &records, &Mode::Locked, Vec::new(), &seam)
+        .err()
+        .expect("refused");
+    assert!(e.contains("system bus"), "{e}");
 }

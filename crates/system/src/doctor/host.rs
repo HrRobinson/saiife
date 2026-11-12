@@ -934,8 +934,26 @@ pub fn boxes(ctx: &Ctx) -> Vec<Check> {
     boxes_with(ctx, &|k| std::env::var_os(k))
 }
 
+/// M5: a build without the `boxes` feature says so first.
 #[cfg(target_os = "linux")]
 fn boxes_with(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Check> {
+    let mut out = boxes_checks(ctx, env);
+    if !ctx.opts.boxes_enabled {
+        out.insert(
+            0,
+            Check::new(
+                "boxes.build",
+                Status::Info,
+                "boxes",
+                "this build has boxes disabled (feature `boxes`)",
+            ),
+        );
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn boxes_checks(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Check> {
     use crate::boxes_install::{BOXES_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR};
     use saiife_boxhost::layout::Layout as BoxLayout;
     use saiife_boxhost::preflight;
@@ -1889,10 +1907,10 @@ mod tests {
         let c = get(&r, "boxes.installed");
         assert_eq!(c.status, Status::Info, "{}", r.to_text());
         assert!(c.detail.contains("install --boxes"), "{}", c.detail);
-        assert!(r
-            .checks
-            .iter()
-            .all(|c| c.id == "boxes.installed" || !c.id.starts_with("boxes.")));
+        assert!(r.checks.iter().all(|c| matches!(
+            c.id.as_str(),
+            "boxes.installed" | "boxes.build"
+        ) || !c.id.starts_with("boxes.")));
     }
 
     #[test]
@@ -1981,5 +1999,49 @@ mod tests {
         let c = boxes_with(&ctx, &env);
         let v = c.iter().find(|c| c.id == "boxes.vmm").unwrap();
         assert!(v.detail.contains("does not match the pin"), "{v:?}");
+    }
+
+    /// M5: a build without the `boxes` feature says so in the boxes section,
+    /// so a list of PASS lines does not read as "boxes work here".
+    #[test]
+    fn boxes_disabled_build_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::under(dir.path());
+        let host = FakeHost::open(dir.path()).unwrap();
+        let fixed = FixedDirectory::from_text("", "");
+        let ctx = |opts| Ctx {
+            layout: &layout,
+            host: &host,
+            dir: &fixed,
+            installed: None,
+            installed_error: None,
+            config: Err("none".into()),
+            as_root: false,
+            opts,
+        };
+        let env = |k: &str| -> Option<std::ffi::OsString> {
+            (k == "XDG_RUNTIME_DIR").then(|| "/run/user/1".into())
+        };
+        let off = DoctorOptions {
+            home: Some(PathBuf::from("/home/u")),
+            ..DoctorOptions::default()
+        };
+        let c = boxes_with(&ctx(&off), &env);
+        let b = c
+            .iter()
+            .find(|c| c.id == "boxes.build")
+            .expect("a build line");
+        assert_eq!(b.status, Status::Info);
+        assert!(
+            b.detail
+                .contains("this build has boxes disabled (feature `boxes`)"),
+            "{b:?}"
+        );
+        let on = DoctorOptions {
+            boxes_enabled: true,
+            ..off.clone()
+        };
+        let c = boxes_with(&ctx(&on), &env);
+        assert!(c.iter().all(|c| c.id != "boxes.build"), "{c:?}");
     }
 }

@@ -147,6 +147,7 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
         user: None,
         home,
         touch_supported: cfg!(feature = "fido-hid"),
+        boxes_enabled: cfg!(feature = "boxes"),
     };
     let (text, failed) = doctor::after_install(layout, host, &dir, &opts);
     outln!();

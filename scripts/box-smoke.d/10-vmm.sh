@@ -9,6 +9,12 @@
 # dirs (personal <state>/box-run/<id>, locked /var/lib/saiife-box/boxes/<id>);
 # the box records stay in the daemon's state dir (R37).
 #
+# Locked mode: the runtime dirs, the vault and the VMM's /proc files belong
+# to saiife / saiife-box, so every read there goes through `sudo -n` (or run
+# it as a member of the saiife-box group with sudo configured not to ask);
+# a refused `sudo -n` is a FAIL naming the read, never a prompt. Personal
+# mode reads everything as you.
+#
 # Run it in personal mode first, then again after
 #   sudo saiife system install --boxes
 # in locked mode (the fragment sees /etc/systemd/system/saiife-box@.service
@@ -20,10 +26,10 @@
 # is /proc/<pid> missing, the pid read from the box's pid record (personal)
 # or `systemctl show -p MainPID` (locked; read-only).
 #
-# RECORD=1 re-records the Cloud Hypervisor API fixtures (vm.info,
-# vmm.ping, a snapshot's config.json and state.json file names) with
-# `curl --unix-socket` into crates/boxhost/tests/fixtures/ch-v54.0/ for the
-# owner to review and commit.
+# RECORD=1 re-records the Cloud Hypervisor API fixtures (vm.info and
+# vmm.ping with `curl --unix-socket`; a snapshot's file names and its
+# config.json from the sealed vault copy <vault>/<id>.snap/) into
+# crates/boxhost/tests/fixtures/ch-v54.0/ for the owner to review and commit.
 #
 # Results keys: boot_cold_ms_median, boot_cold_ms_all, rss_idle_kib.
 #
@@ -58,6 +64,16 @@ p35_median() {
     printf '%s\n' "${sorted[$((n / 2))]}"
   else
     printf '%s\n' "$(((sorted[n / 2 - 1] + sorted[n / 2]) / 2))"
+  fi
+}
+
+# p35_as CMD...: run a read under /var/lib/saiife-box or of the VMM's /proc
+# entry: `sudo -n` in locked mode (never prompts), as you in personal mode.
+p35_as() {
+  if [ -n "$P35_LOCKED" ]; then
+    sudo -n "$@"
+  else
+    "$@"
   fi
 }
 
@@ -115,8 +131,8 @@ p35_spawn() {
 p35_ping() {
   local sock
   sock="$(p35_box_dir "$1")/api.sock"
-  [ -S "$sock" ] || return 1
-  curl -fsS --max-time 2 --unix-socket "$sock" http://localhost/api/v1/vmm.ping >/dev/null 2>&1
+  p35_as test -S "$sock" || return 1
+  p35_as curl -fsS --max-time 2 --unix-socket "$sock" http://localhost/api/v1/vmm.ping >/dev/null 2>&1
 }
 
 # p35_wait_vmm BOX: api.sock answers within the boot limit; prints the ms
@@ -182,8 +198,10 @@ p35_running_or_timed_out() {
 p35_landlock_on() {
   local log
   log="$(p35_box_dir "$1")/ch.log"
-  [ -r "$log" ] || { p35_log "cannot read $log"; return 1; }
-  ! grep -qi 'landlock' "$log" || ! grep -i 'landlock' "$log" | grep -qi 'error\|fail'
+  local text
+  text=$(p35_as cat "$log") || { p35_log "cannot read $log"; return 1; }
+  ! printf '%s\n' "$text" | grep -qi 'landlock' ||
+    ! printf '%s\n' "$text" | grep -i 'landlock' | grep -qi 'error\|fail'
 }
 
 # p35_gone PID: /proc/PID disappears within the stop limit
@@ -199,7 +217,7 @@ p35_gone() {
 
 # the VMM's resident memory, idle, from smaps_rollup (KiB)
 p35_rss() {
-  awk '/^Rss:/ {print $2; exit}' "/proc/$1/smaps_rollup" 2>/dev/null
+  p35_as cat "/proc/$1/smaps_rollup" 2>/dev/null | awk '/^Rss:/ {print $2; exit}'
 }
 
 p35_end_box() {
@@ -216,16 +234,23 @@ p35_record() {
   sock="$(p35_box_dir "$1")/api.sock"
   dir="$P35_FIXTURES"
   mkdir -p "$dir"
-  curl -fsS --max-time 2 --unix-socket "$sock" http://localhost/api/v1/vmm.ping >"$dir/vmm.ping.json" &&
-    curl -fsS --max-time 2 --unix-socket "$sock" http://localhost/api/v1/vm.info >"$dir/vm.info.json"
+  p35_as curl -fsS --max-time 2 --unix-socket "$sock" http://localhost/api/v1/vmm.ping >"$dir/vmm.ping.json" &&
+    p35_as curl -fsS --max-time 2 --unix-socket "$sock" http://localhost/api/v1/vm.info >"$dir/vm.info.json"
 }
 
+# The snapshot as the daemon sealed it: ChVmm copies the VMM's snapshot into
+# <vault>/<id>.snap/ and empties the runtime snapshot/, so the capture reads
+# the vault copy. An empty listing or a missing config.json is a FAIL.
 p35_record_snapshot() {
-  local snap
-  snap="$(p35_box_dir "$1")/snapshot"
-  [ -d "$snap" ] || return 1
-  ls -1 "$snap" >"$P35_FIXTURES/snapshot-files.txt" &&
-    { [ ! -r "$snap/config.json" ] || cp "$snap/config.json" "$P35_FIXTURES/snapshot-config.json"; }
+  local snap names
+  snap="$(p35_vault_dir)/$1.snap"
+  names=$(p35_as ls -1 "$snap") || { p35_log "cannot list $snap"; return 1; }
+  [ -n "$names" ] || { p35_log "$snap is empty"; return 1; }
+  printf '%s\n' "$names" | grep -qx 'config.json' || { p35_log "no config.json in $snap"; return 1; }
+  mkdir -p "$P35_FIXTURES"
+  printf '%s\n' "$names" >"$P35_FIXTURES/snapshot-files.txt" &&
+    p35_as cat "$snap/config.json" >"$P35_FIXTURES/snapshot-config.json" &&
+    [ -s "$P35_FIXTURES/snapshot-config.json" ]
 }
 
 # p35_refused CMD...: CMD fails
