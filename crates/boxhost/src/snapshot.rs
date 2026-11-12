@@ -1,16 +1,20 @@
 //! When a snapshot may be restored (S1, S3 / ruling R20). CH writes its
 //! snapshot into `<box>/snapshot`, which the VMM can write. So right after
-//! the daemon's own `vm.snapshot`, while the VM is paused, `seal` moves it
-//! into the vault (`<vault>/<id>.snap`, which no VMM can write), makes it
-//! read-only and records the SHA-256 of every file in `<vault>/<id>.marker`.
+//! the daemon's own `vm.snapshot`, while the VM is paused, `seal` copies it
+//! into the vault (`<vault>/<id>.snap`, which no VMM can write) through file
+//! descriptors only (S4), read-only, and records the SHA-256 of every file
+//! in `<vault>/<id>.marker`.
 //! At boot `verify` re-hashes the vault copy, compares, and runs
 //! `check_config` on the very bytes it hashed; the restore reads only that
 //! copy. The box dir's `snapshot/` is never a restore source.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{AtFlags, Mode, OFlags, CWD};
 
 use saiife_wire::source::BoxId;
 use serde::{Deserialize, Serialize};
@@ -25,7 +29,8 @@ pub const MAX_CONFIG: u64 = 16 * 1024 * 1024;
 /// A snapshot with more entries than this is refused.
 pub const MAX_FILES: usize = 64;
 const MAX_MARKER: u64 = 64 * 1024;
-const EXDEV: i32 = 18;
+/// The files a CH v54 snapshot holds; any other name is refused.
+pub const NAMES: &[&str] = &["config.json", "memory-ranges", "state.json"];
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +68,8 @@ fn hash_file(f: &mut std::fs::File, len: u64) -> Result<String, String> {
     Ok(hex(ctx.finish()))
 }
 
-/// The entries of a snapshot dir: at most 64, regular files only.
+/// The entries of a vault copy (daemon-owned, path lookups are safe there):
+/// at most 64, regular files with one link, names CH v54 writes only.
 fn entries(dir: &Path) -> Result<Vec<String>, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut names = Vec::new();
@@ -74,56 +80,25 @@ fn entries(dir: &Path) -> Result<Vec<String>, String> {
             .into_string()
             .map_err(|_| "a snapshot file name is not UTF-8".to_string())?;
         let m = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
-        if !m.file_type().is_file() {
-            return Err(format!("snapshot entry {name}: not a regular file"));
+        if !m.file_type().is_file() || m.nlink() != 1 || m.uid() != euid() {
+            return Err(format!(
+                "snapshot entry {name}: not a plain file of the daemon's"
+            ));
         }
         names.push(name);
     }
     if names.len() > MAX_FILES {
         return Err(format!("snapshot: more than {MAX_FILES} entries"));
     }
+    if let Some(n) = names.iter().find(|n| !NAMES.contains(&n.as_str())) {
+        return Err(format!("snapshot: unexpected file {n}"));
+    }
     names.sort();
     Ok(names)
 }
 
-/// Every entry of `dir` and its own dir are ours, unlinked elsewhere.
-fn all_ours(dir: &Path, names: &[String]) -> bool {
-    let me = euid();
-    let ok = |p: &Path, file: bool| {
-        std::fs::symlink_metadata(p)
-            .is_ok_and(|m| m.uid() == me && (!file || (m.file_type().is_file() && m.nlink() == 1)))
-    };
-    ok(dir, false) && names.iter().all(|n| ok(&dir.join(n), true))
-}
-
-/// A bounded copy of `src`'s regular files into a new `dst` (0750) the daemon
-/// owns. Each file is read up to its size when opened.
-fn copy_dir(src: &Path, dst: &Path, names: &[String]) -> Result<(), String> {
-    std::fs::DirBuilder::new()
-        .mode(0o750)
-        .create(dst)
-        .map_err(|e| format!("{}: {e}", dst.display()))?;
-    for n in names {
-        let mut f = open_ro(&src.join(n))?;
-        let m = f.metadata().map_err(|e| e.to_string())?;
-        if !m.file_type().is_file() {
-            return Err(format!("snapshot entry {n}: not a regular file"));
-        }
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o640)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(dst.join(n))
-            .map_err(|e| format!("{n}: {e}"))?;
-        std::io::copy(&mut (&mut f).take(m.len()), &mut out).map_err(|e| format!("{n}: {e}"))?;
-        out.flush().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 fn remove_tree(p: &Path) {
-    // std's remove_dir_all does not follow symlinks.
+    // Inside the vault only. std's remove_dir_all does not follow symlinks.
     let _ = std::fs::remove_dir_all(p);
     let _ = std::fs::remove_file(p);
 }
@@ -143,53 +118,139 @@ pub fn remove_marker(vault: &Path, id: &BoxId) {
     let _ = std::fs::remove_file(marker_path(vault, id));
 }
 
+fn dir_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// Open the directory `name` under `at` without following a symlink.
+fn open_dir_at<Fd: AsFd>(at: Fd, name: &Path) -> std::io::Result<OwnedFd> {
+    Ok(rustix::fs::openat(at, name, dir_flags(), Mode::empty())?)
+}
+
+/// The names in the VMM-written snapshot dir, read from its fd.
+fn list_fd(dir: &OwnedFd) -> Result<Vec<String>, String> {
+    let rd = rustix::fs::Dir::read_from(dir).map_err(|e| format!("snapshot: {e}"))?;
+    let mut names = Vec::new();
+    for e in rd {
+        let e = e.map_err(|e| format!("snapshot: {e}"))?;
+        let name = e
+            .file_name()
+            .to_str()
+            .map_err(|_| "a snapshot file name is not UTF-8".to_string())?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        if names.len() == MAX_FILES {
+            return Err(format!("snapshot: more than {MAX_FILES} entries"));
+        }
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Copy one VMM-written file into the vault copy, hashing as it goes. The
+/// source is opened relative to the snapshot dir's fd, never followed, never
+/// blocking; it must be a regular file of the VMM user with one link.
+fn copy_entry(src: &OwnedFd, dst: &OwnedFd, name: &str, vmm_uid: u32) -> Result<String, String> {
+    let bad = |why: String| format!("snapshot entry {name}: {why}");
+    let fd = rustix::fs::openat(
+        src,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| bad(format!("{e} (a symlink?)")))?;
+    let mut f = std::fs::File::from(fd);
+    let m = f.metadata().map_err(|e| bad(e.to_string()))?;
+    if !m.file_type().is_file() {
+        return Err(bad("not a regular file".into()));
+    }
+    if m.uid() != vmm_uid {
+        return Err(bad("its owner is not the VMM user".into()));
+    }
+    if m.nlink() != 1 {
+        return Err(bad("hard-linked".into()));
+    }
+    let out = rustix::fs::openat(
+        dst,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| bad(e.to_string()))?;
+    let mut out = std::fs::File::from(out);
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut r = (&mut f).take(m.len());
+    loop {
+        let n = r.read(&mut buf).map_err(|e| bad(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+        out.write_all(&buf[..n]).map_err(|e| bad(e.to_string()))?;
+    }
+    rustix::fs::fchmod(&out, Mode::from_raw_mode(0o640)).map_err(|e| bad(e.to_string()))?;
+    out.sync_all().map_err(|e| bad(e.to_string()))?;
+    Ok(hex(ctx.finish()))
+}
+
 /// After the daemon's own `vm.snapshot` into `<box>/snapshot`, with the VM
-/// paused: move it into the vault (rename; a bounded copy across
-/// filesystems or when a file is not the daemon's own, e.g. written by the
-/// locked-mode VMM user, or hard-linked), make it read-only (files 0640,
-/// dir 0750) and write the marker last.
-pub fn seal(vault: &Path, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
+/// paused: copy it into the vault, every step relative to file descriptors
+/// (S4). The box dir is opened O_DIRECTORY|O_NOFOLLOW (its parent, the
+/// boxes dir, is the daemon's), `snapshot` under it the same way, so a
+/// symlink anywhere the VMM controls is refused, never followed. Each entry
+/// must be one of the names CH v54 writes, a regular file of `vmm_uid`
+/// with one link. The copy goes into a fresh daemon-owned
+/// `<vault>/<id>.snap` (mkdirat; files O_CREAT|O_EXCL, fchmod 0640, dir
+/// 0750), hashed while copying; the marker is written last. Nothing is
+/// renamed or chmodded by path, so this also works when the dir belongs to
+/// the locked-mode VMM user. The source files are then removed
+/// (best effort, by fd).
+pub fn seal(vault: &Path, id: &BoxId, paths: &BoxPaths, vmm_uid: u32) -> Result<(), String> {
     vault::ensure(vault)?;
     discard(vault, id)?;
-    let src = paths.snapshot_dir();
-    let dst = snap_dir(vault, id);
-    let incoming = vault.join(format!("{}.snap.in", id.as_str()));
-    remove_tree(&incoming);
-    let names = match std::fs::rename(&src, &incoming) {
-        Ok(()) => {
-            let names = entries(&incoming)?;
-            if all_ours(&incoming, &names) {
-                std::fs::rename(&incoming, &dst).map_err(|e| format!("snapshot: {e}"))?;
-            } else {
-                let r = copy_dir(&incoming, &dst, &names);
-                remove_tree(&incoming);
-                r?;
-            }
-            names
-        }
-        Err(e) if e.raw_os_error() == Some(EXDEV) => {
-            let names = entries(&src)?;
-            copy_dir(&src, &dst, &names)?;
-            remove_tree(&src);
-            names
-        }
-        Err(e) => return Err(format!("move the snapshot into the vault: {e}")),
-    };
-    let mut files = BTreeMap::new();
-    for n in &names {
-        let p = dst.join(n);
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640))
-            .map_err(|e| format!("{n}: {e}"))?;
-        let mut f = open_ro(&p)?;
-        let len = f.metadata().map_err(|e| e.to_string())?.len();
-        files.insert(n.clone(), hash_file(&mut f, len)?);
+    let boxfd = open_dir_at(CWD, &paths.dir).map_err(|e| format!("box dir: {e}"))?;
+    let src = open_dir_at(&boxfd, Path::new("snapshot"))
+        .map_err(|e| format!("snapshot: not a directory ({e}); a symlink is refused"))?;
+    let st = rustix::fs::fstat(&src).map_err(|e| format!("snapshot: {e}"))?;
+    if st.st_uid != vmm_uid {
+        return Err("snapshot: its owner is not the VMM user".into());
     }
-    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o750))
-        .map_err(|e| format!("snapshot dir: {e}"))?;
-    if !files.contains_key("config.json") {
-        let _ = discard(vault, id);
+    let names = list_fd(&src)?;
+    if let Some(n) = names.iter().find(|n| !NAMES.contains(&n.as_str())) {
+        return Err(format!("snapshot: unexpected file {n}"));
+    }
+    if !names.iter().any(|n| n == "config.json") {
         return Err("snapshot: no config.json".into());
     }
+    let vfd = open_dir_at(CWD, vault).map_err(|e| format!("box vault: {e}"))?;
+    let leaf = format!("{}.snap", id.as_str());
+    rustix::fs::mkdirat(&vfd, leaf.as_str(), Mode::from_raw_mode(0o700))
+        .map_err(|e| format!("vault copy: {e}"))?;
+    let copied = (|| -> Result<BTreeMap<String, String>, String> {
+        let dst = open_dir_at(&vfd, Path::new(&leaf)).map_err(|e| format!("vault copy: {e}"))?;
+        let mut files = BTreeMap::new();
+        for n in &names {
+            files.insert(n.clone(), copy_entry(&src, &dst, n, vmm_uid)?);
+        }
+        rustix::fs::fchmod(&dst, Mode::from_raw_mode(0o750))
+            .map_err(|e| format!("vault copy: {e}"))?;
+        rustix::fs::fsync(&dst).map_err(|e| format!("vault copy: {e}"))?;
+        Ok(files)
+    })();
+    let files = match copied {
+        Ok(f) => f,
+        Err(e) => {
+            remove_tree(&snap_dir(vault, id));
+            return Err(e);
+        }
+    };
+    for n in &names {
+        let _ = rustix::fs::unlinkat(&src, n.as_str(), AtFlags::empty());
+    }
+    let _ = rustix::fs::unlinkat(&boxfd, "snapshot", AtFlags::REMOVEDIR);
     let body = serde_json::to_vec(&Marker { version: 2, files }).map_err(|e| e.to_string())?;
     vault::write_atomic(&marker_path(vault, id), &body)
 }
@@ -211,9 +272,6 @@ pub fn verify(
     }
     let dir = snap_dir(vault, id);
     let names = entries(&dir)?;
-    if !all_ours(&dir, &names) {
-        return Err("snapshot: a file in the vault copy is not the daemon's own".into());
-    }
     if names.iter().collect::<Vec<_>>() != m.files.keys().collect::<Vec<_>>() {
         return Err("snapshot: the vault copy's files differ from the marker".into());
     }

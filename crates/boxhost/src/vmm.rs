@@ -33,7 +33,7 @@ use saiife_wire::source::BoxId;
 
 use crate::ch::{Action, Api, ApiError, VmState};
 use crate::disk::make_overlay;
-use crate::launch::{read_spec, write_spec, Boot, LaunchSpec, Launcher, MAX_SOCK_PATH};
+use crate::launch::{self, read_spec, write_spec, Boot, LaunchSpec, Launcher, MAX_SOCK_PATH};
 use crate::layout::Layout;
 use crate::paths::BoxPaths;
 use crate::pins::CH_VERSION;
@@ -101,6 +101,9 @@ pub struct ChVmmInit {
     pub images: Arc<dyn ImageResolver>,
     pub launcher: Arc<dyn Launcher>,
     pub hooks: Vec<Arc<dyn VmHooks>>,
+    /// The uid the VMM runs as: the daemon's euid in personal mode, the
+    /// saiife-box VMM user in locked mode. Snapshot files must be its.
+    pub vmm_uid: u32,
     pub landlock: bool,
     pub stop: StopTimes,
 }
@@ -279,7 +282,7 @@ impl ChVmmInit {
     /// created, never booted or exited box), else Gone.
     fn status_of(&self, id: &BoxId, paths: &BoxPaths) -> VmStatus {
         if self.gone(id) {
-            return if paths.vm_json().exists() {
+            return if std::fs::symlink_metadata(paths.vm_json()).is_ok() {
                 VmStatus::Off
             } else {
                 VmStatus::Gone
@@ -434,12 +437,26 @@ impl ChVmm {
         let inner = &self.inner;
         let id = &h.id;
         if inner.launcher.exited(id) == Some(false) {
-            return Err(VmmError::Failed(
-                "the VMM of this box is still running (or its liveness cannot be determined)"
-                    .into(),
-            ));
+            return Err(VmmError::Failed(format!(
+                "the VMM of this box is still running, or its liveness cannot be determined; \
+                 if you are sure no VMM of this box runs, remove {}",
+                crate::vault::pid_path(&inner.layout.vault, id).display()
+            )));
         }
         let mut spec = read_spec(paths).map_err(VmmError::Failed)?;
+        // CH opens these by path and follows links (S4 sweep): serial.log is
+        // replaced when it is not a plain file (unlink removes a link, not its
+        // target); the disks hold the box's data, so they are refused.
+        if launch::check_plain("serial.log", &paths.serial()).is_err() {
+            let _ = std::fs::remove_file(paths.serial());
+        }
+        let mut disks = vec![("root.qcow2", paths.root_disk())];
+        if spec.repo {
+            disks.push(("repo.img", paths.repo_disk()));
+        }
+        for (name, p) in disks {
+            launch::check_plain(name, &p).map_err(VmmError::Failed)?;
+        }
         // `ch_launch`: stale sockets of an earlier VMM (CH binds without unlink)
         remove_sockets(paths);
         for (i, hook) in inner.hooks.iter().enumerate() {
@@ -574,7 +591,8 @@ impl Vmm for ChVmm {
             vcpus: spec.size.vcpus,
             mem_mib: spec.size.mem_mib,
             base: image.raw.clone(),
-            repo: paths.repo_disk().exists(),
+            // not followed: a symlink here is refused at boot (check_plain)
+            repo: std::fs::symlink_metadata(paths.repo_disk()).is_ok(),
             boot: image.boot.clone(),
             landlock: inner.landlock,
             restore: None,
@@ -691,7 +709,7 @@ impl Vmm for ChVmm {
             Err(e) => return Err(VmmError::Failed(format!("remove the old snapshot: {e}"))),
         }
         api.snapshot(dest).map_err(failed_api)?;
-        snapshot::seal(&inner.layout.vault, &h.id, &paths).map_err(VmmError::Failed)
+        snapshot::seal(&inner.layout.vault, &h.id, &paths, inner.vmm_uid).map_err(VmmError::Failed)
     }
 
     fn status(&self, h: &VmHandle) -> VmStatus {

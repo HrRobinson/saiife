@@ -165,6 +165,18 @@ pub fn check_spec(spec: &LaunchSpec, paths: &BoxPaths, allowed: &Allowed) -> Res
     if !MEM_MIB.contains(&spec.mem_mib) {
         return Err(format!("mem_mib: {} is outside 512..=262144", spec.mem_mib));
     }
+    // CH opens these by path, following links: a VMM-planted symlink or hard
+    // link would hand the next VMM another file (S4 sweep).
+    let mut files = vec![
+        ("root.qcow2", paths.root_disk()),
+        ("serial.log", paths.serial()),
+    ];
+    if spec.repo {
+        files.push(("repo.img", paths.repo_disk()));
+    }
+    for (name, p) in files {
+        check_plain(name, &p)?;
+    }
     if let Some(src) = &spec.restore {
         // Only the verified copy in the vault, never the box's own
         // VMM-writable snapshot dir (S3).
@@ -185,6 +197,20 @@ pub fn check_spec(spec: &LaunchSpec, paths: &BoxPaths, allowed: &Allowed) -> Res
         ));
     }
     Ok(())
+}
+
+/// Absent, or a regular file with one link (not a symlink, FIFO, device or
+/// hard link).
+pub fn check_plain(name: &str, p: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{name}: {e}")),
+        Ok(m) if m.file_type().is_file() && m.nlink() == 1 => Ok(()),
+        Ok(_) => Err(format!(
+            "{name}: not a plain file (a symlink, special file or hard link)"
+        )),
+    }
 }
 
 fn check_boot_file(field: &str, p: &Path, allowed: &Allowed) -> Result<(), String> {
@@ -430,6 +456,8 @@ pub struct ChildLauncher {
     vault: PathBuf,
     env: Vec<(OsString, OsString)>,
     children: Mutex<BTreeMap<BoxId, Slot>>,
+    /// Serialises pid-record writes and removals (never the map lock).
+    records: Mutex<()>,
     #[cfg(test)]
     pre_spawn: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -450,6 +478,7 @@ impl ChildLauncher {
             vault,
             env: Vec::new(),
             children: Mutex::new(BTreeMap::new()),
+            records: Mutex::new(()),
             #[cfg(test)]
             pre_spawn: None,
         }
@@ -465,30 +494,48 @@ impl ChildLauncher {
         self.children.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Reap a running child without blocking (waitpid WNOHANG); a reaped
-    /// child's pid record goes with it.
-    fn poll(&self, id: &BoxId, slot: &mut Slot) {
+    /// Reap a running child without blocking (waitpid WNOHANG). True when
+    /// it was reaped now: the caller then calls `drop_record` after
+    /// releasing the map lock.
+    fn poll(slot: &mut Slot) -> bool {
         if let Slot::Running(c) = slot {
             let status = match c.try_wait() {
                 Ok(Some(s)) => s,
-                Ok(None) => return,
+                Ok(None) => return false,
                 // not waitable any more: reaped elsewhere
                 Err(_) => ExitStatus::default(),
             };
             *slot = Slot::Exited(status);
+            return true;
+        }
+        false
+    }
+
+    /// Remove a reaped child's pid record, outside the map lock. A start
+    /// that reserved the box since then keeps its own record.
+    fn drop_record(&self, id: &BoxId) {
+        let _r = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(self.slots().get(id), Some(Slot::Exited(_))) {
             vault::remove_pid(&self.vault, id);
         }
     }
 
     /// The exit status of the box's child once it has exited and been reaped.
     pub fn exit_status(&self, id: &BoxId) -> Option<ExitStatus> {
-        let mut g = self.slots();
-        let slot = g.get_mut(id)?;
-        self.poll(id, slot);
-        match slot {
-            Slot::Exited(s) => Some(*s),
-            _ => None,
+        let (reaped, st) = {
+            let mut g = self.slots();
+            let slot = g.get_mut(id)?;
+            let reaped = Self::poll(slot);
+            let st = match slot {
+                Slot::Exited(s) => Some(*s),
+                _ => None,
+            };
+            (reaped, st)
+        };
+        if reaped {
+            self.drop_record(id);
         }
+        st
     }
 
     fn command(&self, paths: &BoxPaths) -> Result<Command, String> {
@@ -515,11 +562,12 @@ impl ChildLauncher {
     fn reserve(&self, id: &BoxId) -> Result<(), String> {
         let mut g = self.slots();
         if let Some(slot) = g.get_mut(id) {
-            self.poll(id, slot);
+            Self::poll(slot);
             if !matches!(slot, Slot::Exited(_)) {
                 return Err("the VMM of this box is already running".into());
             }
         }
+        // (a record of a child reaped just now is replaced by `starting`)
         g.insert(id.clone(), Slot::Starting);
         Ok(())
     }
@@ -540,6 +588,7 @@ impl ChildLauncher {
         let pid = child.id();
         let r = vault::proc_starttime(pid).and_then(|t| {
             let starttime = t.ok_or("the VMM's /proc entry is gone")?;
+            let _r = self.records.lock().unwrap_or_else(|e| e.into_inner());
             vault::write_pid(&self.vault, id, PidRecord { pid, starttime })
         });
         if r.is_err() {
@@ -553,45 +602,66 @@ impl ChildLauncher {
 impl Launcher for ChildLauncher {
     fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
         self.reserve(id)?;
-        // File I/O and the spawn happen outside the lock.
-        let r = self.spawn(paths).and_then(|mut c| {
-            self.record(id, &mut c)?;
-            Ok(c)
-        });
-        let mut g = self.slots();
+        // File I/O and the spawn happen outside the map lock. A `starting`
+        // record goes first, so a daemon that dies before the pid record
+        // leaves a record that fails closed (L2).
+        let starting = {
+            let _r = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            vault::write_starting(&self.vault, id)
+        };
+        let r = starting
+            .map_err(|e| format!("pid record: {e}"))
+            .and_then(|()| self.spawn(paths))
+            .and_then(|mut c| {
+                self.record(id, &mut c)?;
+                Ok(c)
+            });
         match r {
             Ok(c) => {
-                g.insert(id.clone(), Slot::Running(c));
+                self.slots().insert(id.clone(), Slot::Running(c));
                 Ok(())
             }
             Err(e) => {
-                g.remove(id);
+                // nothing runs (spawn failed, or `record` killed and reaped it)
+                {
+                    let _r = self.records.lock().unwrap_or_else(|e| e.into_inner());
+                    vault::remove_pid(&self.vault, id);
+                }
+                self.slots().remove(id);
                 Err(e)
             }
         }
     }
 
     fn exited(&self, id: &BoxId) -> Option<bool> {
-        {
+        let known = {
             let mut g = self.slots();
-            if let Some(slot) = g.get_mut(id) {
-                self.poll(id, slot);
-                return Some(matches!(slot, Slot::Exited(_)));
+            g.get_mut(id).map(|slot| {
+                let reaped = Self::poll(slot);
+                (reaped, matches!(slot, Slot::Exited(_)))
+            })
+        };
+        match known {
+            Some((reaped, gone)) => {
+                if reaped {
+                    self.drop_record(id);
+                }
+                Some(gone)
             }
+            // Not ours (a daemon restart): the pid record answers.
+            None => vault::pid_exited(&self.vault, id),
         }
-        // Not ours (a daemon restart): the pid record answers.
-        vault::pid_exited(&self.vault, id)
     }
 
     fn force_stop(&self, id: &BoxId) -> Result<(), String> {
-        let mut c = {
+        let (mut c, reaped) = {
             let mut g = self.slots();
             let Some(slot) = g.get_mut(id) else {
                 return Err("the VMM was not started by this daemon".into());
             };
-            self.poll(id, slot);
+            let reaped = Self::poll(slot);
             match std::mem::replace(slot, Slot::Killing) {
-                Slot::Running(c) => c,
+                Slot::Running(c) => (c, reaped),
                 Slot::Starting => {
                     *slot = Slot::Starting;
                     return Err("the VMM is being started".into());
@@ -599,19 +669,21 @@ impl Launcher for ChildLauncher {
                 other => {
                     // Exited: nothing to do. Killing: another caller has it.
                     *slot = other;
+                    drop(g);
+                    if reaped {
+                        self.drop_record(id);
+                    }
                     return Ok(());
                 }
             }
         };
+        debug_assert!(!reaped);
         // Our own child: kill(2) on its pid, then reap it, outside the lock.
         let _ = c.kill();
         let r = c.wait();
         let status = r.as_ref().map_or(ExitStatus::default(), |s| *s);
-        {
-            let mut g = self.slots();
-            g.insert(id.clone(), Slot::Exited(status));
-            vault::remove_pid(&self.vault, id);
-        }
+        self.slots().insert(id.clone(), Slot::Exited(status));
+        self.drop_record(id);
         r.map(|_| ()).map_err(|e| format!("wait for the VMM: {e}"))
     }
 
@@ -944,6 +1016,56 @@ mod tests {
             let p = BoxPaths::new(d);
             assert!(check_spec(&s, &p, &allowed).unwrap_err().contains("socket"));
         }
+    }
+
+    #[test]
+    fn a_starting_record_comes_before_the_spawn() {
+        use std::sync::Arc;
+        let e = env();
+        let p = mkbox(&e, "b1");
+        let vault = e.root.join("vault");
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut l = ChildLauncher::helper(PathBuf::from("/usr/bin/true"), vault.clone());
+        let (s2, rec) = (Arc::clone(&seen), vault.join("b1.pid"));
+        l.pre_spawn = Some(Box::new(move || {
+            *s2.lock().unwrap() = std::fs::read_to_string(&rec).unwrap_or_default();
+        }));
+        let id = BoxId::parse("b1").unwrap();
+        l.start(&id, &p).unwrap();
+        assert!(
+            seen.lock().unwrap().contains("starting"),
+            "{}",
+            seen.lock().unwrap()
+        );
+        let after = std::fs::read_to_string(vault.join("b1.pid")).unwrap_or_default();
+        assert!(after.is_empty() || after.contains("\"pid\""), "{after}");
+        let _ = l.force_stop(&id);
+    }
+
+    #[test]
+    fn disks_and_serial_must_be_plain_files() {
+        let e = env();
+        let p = mkbox(&e, "b1");
+        let s = spec(&e, "b1");
+        let outside = e.root.join("elsewhere/f");
+        std::fs::write(&outside, b"x").unwrap();
+        // missing files are CH's business; present ones must be plain
+        check_spec(&s, &p, &e.allowed).unwrap();
+        std::os::unix::fs::symlink(&outside, p.root_disk()).unwrap();
+        assert!(check_spec(&s, &p, &e.allowed)
+            .unwrap_err()
+            .contains("root.qcow2"));
+        std::fs::remove_file(p.root_disk()).unwrap();
+        std::fs::write(p.root_disk(), b"q").unwrap();
+        std::fs::hard_link(&outside, p.repo_disk()).unwrap();
+        assert!(check_spec(&s, &p, &e.allowed)
+            .unwrap_err()
+            .contains("repo.img"));
+        std::fs::remove_file(p.repo_disk()).unwrap();
+        std::os::unix::fs::symlink(&outside, p.serial()).unwrap();
+        assert!(check_spec(&s, &p, &e.allowed)
+            .unwrap_err()
+            .contains("serial.log"));
     }
 
     #[test]

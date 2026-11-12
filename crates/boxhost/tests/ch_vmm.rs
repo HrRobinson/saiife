@@ -141,7 +141,17 @@ impl World {
     }
 
     fn vmm_with(&self, launcher: Arc<ChildLauncher>, hooks: Vec<Arc<dyn VmHooks>>) -> Arc<ChVmm> {
+        self.vmm_uid(launcher, hooks, rustix::process::geteuid().as_raw())
+    }
+
+    fn vmm_uid(
+        &self,
+        launcher: Arc<ChildLauncher>,
+        hooks: Vec<Arc<dyn VmHooks>>,
+        vmm_uid: u32,
+    ) -> Arc<ChVmm> {
         Arc::new(ChVmm::new(ChVmmInit {
+            vmm_uid,
             layout: self.layout.clone(),
             tools: self.tools.clone(),
             images: Arc::new(Fixed(self.image.clone())),
@@ -1012,4 +1022,159 @@ fn pid_record_tracks_the_child_across_launchers() {
     l3.start(&h.id, &p).unwrap();
     assert!(wait_for(LONG, || l3.exited(&h.id) == Some(true)));
     assert!(!rec.exists());
+}
+
+/// An outside file the daemon owns (a stand-in for /etc/passwd), mode 0600.
+fn outside(w: &World, name: &str) -> PathBuf {
+    let p = w.root.join("t").join(name);
+    std::fs::write(&p, b"keep").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    p
+}
+
+fn mode_of(p: &Path) -> u32 {
+    std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// Boot, pause and snapshot with a hostile fake; the snapshot must fail and
+/// leave no marker or vault copy.
+fn hostile_snapshot(w: &World, evil: &str) -> String {
+    let (v, _l) = w.vmm(&[("FAKE_CH_SNAP_EVIL", evil)]);
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    v.pause(&h).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (v2, h2, dest) = (Arc::clone(&v), h.clone(), w.paths("b1").snapshot_dir());
+    std::thread::spawn(move || {
+        let _ = tx.send(v2.snapshot(&h2, &dest));
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the snapshot blocked");
+    let m = failed(r);
+    assert!(!w.marker("b1").exists(), "{evil}: no marker");
+    assert!(!w.snap("b1").exists(), "{evil}: no vault copy");
+    m
+}
+
+#[test]
+fn seal_refuses_a_symlinked_snapshot_dir() {
+    let w = World::new();
+    let target = w.root.join("t/owned");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let f = outside(&w, "owned/secret");
+    let m = hostile_snapshot(&w, &format!("dirlink:{}", target.display()));
+    assert!(m.contains("snapshot"), "{m}");
+    assert_eq!(mode_of(&target), 0o700);
+    assert_eq!(mode_of(&f), 0o600);
+    // the target was neither moved nor emptied
+    assert!(target.join("config.json").exists());
+}
+
+#[test]
+fn seal_refuses_a_symlinked_entry() {
+    let w = World::new();
+    let f = outside(&w, "passwd");
+    let passwd = mode_of(Path::new("/etc/passwd"));
+    let m = hostile_snapshot(&w, &format!("link:{}", f.display()));
+    assert!(m.contains("memory-ranges"), "{m}");
+    assert_eq!(mode_of(&f), 0o600);
+    assert_eq!(std::fs::read(&f).unwrap(), b"keep");
+    assert_eq!(mode_of(Path::new("/etc/passwd")), passwd);
+}
+
+#[test]
+fn seal_refuses_a_fifo_without_blocking() {
+    let w = World::new();
+    let m = hostile_snapshot(&w, "fifo");
+    assert!(m.contains("memory-ranges"), "{m}");
+}
+
+#[test]
+fn seal_refuses_a_hardlinked_entry() {
+    let w = World::new();
+    let f = outside(&w, "linked");
+    let m = hostile_snapshot(&w, &format!("hardlink:{}", f.display()));
+    assert!(m.contains("memory-ranges"), "{m}");
+    assert_eq!(mode_of(&f), 0o600);
+}
+
+#[test]
+fn seal_refuses_an_unexpected_file() {
+    let w = World::new();
+    let m = hostile_snapshot(&w, "extra");
+    assert!(m.contains("extra"), "{m}");
+}
+
+#[test]
+fn seal_checks_the_vmm_uid_and_copies() {
+    // a VMM user other than the daemon (locked mode): files it did not
+    // write are refused; the copy path never renames its dir
+    let w = World::new();
+    let me = rustix::process::geteuid().as_raw();
+    let l = w.launcher(&[]);
+    let v = w.vmm_uid(l, vec![w.hook("h", false)], me + 1);
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    v.pause(&h).unwrap();
+    let m = failed(v.snapshot(&h, &w.paths("b1").snapshot_dir()));
+    assert!(m.contains("owner"), "{m}");
+    assert!(!w.marker("b1").exists());
+    // with the right uid: a daemon-owned copy, the source dir removed
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b2");
+    v.boot(&h).unwrap();
+    v.pause(&h).unwrap();
+    v.snapshot(&h, &w.paths("b2").snapshot_dir()).unwrap();
+    let meta = std::fs::metadata(w.snap("b2").join("state.json")).unwrap();
+    assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), me);
+    assert!(!w.paths("b2").snapshot_dir().exists());
+}
+
+#[test]
+fn boot_refuses_a_symlinked_root_disk() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let f = outside(&w, "disk");
+    let root = w.paths("b1").root_disk();
+    std::fs::remove_file(&root).unwrap();
+    std::os::unix::fs::symlink(&f, &root).unwrap();
+    let m = failed(v.boot(&h));
+    assert!(m.contains("root.qcow2"), "{m}");
+    assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
+    // a hard link is refused too
+    std::fs::remove_file(&root).unwrap();
+    std::fs::hard_link(&f, &root).unwrap();
+    let m = failed(v.boot(&h));
+    assert!(m.contains("root.qcow2"), "{m}");
+}
+
+#[test]
+fn serial_log_symlink_is_not_followed() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let f = outside(&w, "bashrc");
+    let serial = w.paths("b1").serial();
+    std::os::unix::fs::symlink(&f, &serial).unwrap();
+    v.boot(&h).unwrap();
+    assert!(!std::fs::symlink_metadata(&serial).is_ok_and(|m| m.file_type().is_symlink()));
+    assert_eq!(std::fs::read(&f).unwrap(), b"keep");
+}
+
+#[test]
+fn starting_record_fails_closed() {
+    let w = World::new();
+    let (v, l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    std::fs::create_dir_all(&w.layout.vault).unwrap();
+    // the daemon died between spawn and the pid record
+    std::fs::write(w.pid_record("b1"), br#"{"starting":true}"#).unwrap();
+    assert_eq!(l.exited(&h.id), Some(false));
+    assert_ne!(v.status(&h), VmStatus::Off);
+    let m = failed(v.boot(&h));
+    assert!(m.contains("b1.pid"), "{m}");
+    std::fs::remove_file(w.pid_record("b1")).unwrap();
 }

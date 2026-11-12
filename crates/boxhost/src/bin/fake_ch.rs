@@ -224,6 +224,51 @@ fn read_request(s: &mut UnixStream) -> Option<(String, String, String)> {
     Some((method, path, String::from_utf8_lossy(&body).into_owned()))
 }
 
+/// The snapshot files; FAKE_CH_SNAP_EVIL plays a hostile VMM:
+/// `dirlink:<dir>` (the snapshot dir is a symlink to `<dir>`),
+/// `link:<file>` / `hardlink:<file>` (memory-ranges links to `<file>`),
+/// `fifo` (memory-ranges is a FIFO), `extra` (an unexpected file).
+fn write_snapshot(d: &std::path::Path, config: &str) -> bool {
+    let evil = std::env::var("FAKE_CH_SNAP_EVIL").unwrap_or_default();
+    let dir = match evil.strip_prefix("dirlink:") {
+        Some(target) => {
+            let t = PathBuf::from(target);
+            if std::os::unix::fs::symlink(&t, d).is_err() {
+                return false;
+            }
+            t
+        }
+        None => {
+            if std::fs::create_dir_all(d).is_err() {
+                return false;
+            }
+            d.to_path_buf()
+        }
+    };
+    let _ = std::fs::write(dir.join("config.json"), config.as_bytes());
+    let _ = std::fs::write(dir.join("state.json"), b"{\"fake_state\":true}\n");
+    let mem = dir.join("memory-ranges");
+    if let Some(t) = evil.strip_prefix("link:") {
+        let _ = std::os::unix::fs::symlink(t, &mem);
+    } else if let Some(t) = evil.strip_prefix("hardlink:") {
+        let _ = std::fs::hard_link(t, &mem);
+    } else if evil == "fifo" {
+        let _ = rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &mem,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        );
+    } else {
+        let _ = std::fs::write(&mem, b"guest memory");
+    }
+    if evil == "extra" {
+        let _ = std::fs::write(dir.join("extra"), b"x");
+    }
+    true
+}
+
 fn exit_after(ms: u64) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(ms));
@@ -276,12 +321,7 @@ fn serve(mut s: UnixStream, sh: Arc<Shared>) {
                         .map(PathBuf::from)
                 });
             match dest {
-                Some(d) if std::fs::create_dir_all(&d).is_ok() => {
-                    let _ = std::fs::write(d.join("config.json"), sh.config.as_bytes());
-                    let _ = std::fs::write(d.join("state.json"), b"{\"fake_state\":true}\n");
-                    let _ = std::fs::write(d.join("memory-ranges"), b"guest memory");
-                    fx!("vm.snapshot.204.http")
-                }
+                Some(d) if write_snapshot(&d, &sh.config) => fx!("vm.snapshot.204.http"),
                 _ => fx!("vm.pause.500.http"),
             }
         }

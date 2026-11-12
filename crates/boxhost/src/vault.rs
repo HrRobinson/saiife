@@ -158,6 +158,14 @@ pub fn write_pid(vault: &Path, id: &BoxId, rec: PidRecord) -> Result<(), String>
     write_atomic(&pid_path(vault, id), &body)
 }
 
+/// Written before the spawn (L2): a daemon that dies between the spawn and
+/// `write_pid` leaves this, which reads as alive (fail closed) until the
+/// owner confirms no VMM runs and removes it.
+pub fn write_starting(vault: &Path, id: &BoxId) -> Result<(), String> {
+    ensure(vault)?;
+    write_atomic(&pid_path(vault, id), br#"{"starting":true}"#)
+}
+
 pub fn remove_pid(vault: &Path, id: &BoxId) {
     let _ = std::fs::remove_file(pid_path(vault, id));
 }
@@ -165,7 +173,8 @@ pub fn remove_pid(vault: &Path, id: &BoxId) {
 /// Liveness from the record (ruling R19): `None` when there is no record;
 /// `Some(true)` when its process is gone (no such pid, or a pid reused by a
 /// process with another start time); `Some(false)` when it is alive, or
-/// when anything is unreadable or inconsistent (fail closed).
+/// when anything is unreadable or inconsistent, or a `starting` record
+/// has no pid yet (fail closed).
 pub fn pid_exited(vault: &Path, id: &BoxId) -> Option<bool> {
     let p = pid_path(vault, id);
     match std::fs::symlink_metadata(&p) {
@@ -246,6 +255,8 @@ mod tests {
         assert_eq!(pid_exited(&v, &id), Some(true));
         std::fs::write(pid_path(&v, &id), b"{").unwrap();
         assert_eq!(pid_exited(&v, &id), Some(false));
+        write_starting(&v, &id).unwrap();
+        assert_eq!(pid_exited(&v, &id), Some(false), "starting: fail closed");
         remove_pid(&v, &id);
         assert_eq!(pid_exited(&v, &id), None);
     }
