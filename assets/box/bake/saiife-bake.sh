@@ -43,9 +43,13 @@ read_recipe() {
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  # APT_PACKAGES is a space separated list of validated package names
-  # shellcheck disable=SC2086
-  apt-get install -y --no-install-recommends $APT_PACKAGES
+  # APT_PACKAGES is a space separated list of validated package names;
+  # globbing is off so nothing expands as root
+  local pkgs
+  set -f
+  read -ra pkgs <<<"$APT_PACKAGES"
+  set +f
+  apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
 
 install_binaries() {
@@ -67,11 +71,11 @@ install_guest_units() {
     while IFS= read -r u || [ -n "$u" ]; do
       [ -n "$u" ] || continue
       case $u in \#*) continue ;; esac
-      if ! [[ $u =~ ^[A-Za-z0-9@._-]+$ ]]; then
+      if ! [[ $u =~ ^[A-Za-z0-9][A-Za-z0-9@._-]*$ ]]; then
         echo "enable.list: bad unit name" >&2
         return 1
       fi
-      systemctl enable "$u"
+      systemctl enable -- "$u"
     done <"$MNT/guest/enable.list"
   fi
 }
@@ -110,11 +114,7 @@ make_agent_user() {
 }
 
 trim() {
-  mkdir -p /etc/docker /etc/systemd/journald.conf.d
-  # proxy port 3128: source of truth is saiife_boxproto::ports (plan 38)
-  cat >/etc/docker/daemon.json <<'JSON'
-{"features":{"containerd-snapshotter":false},"proxies":{"http-proxy":"http://127.0.0.1:3128","https-proxy":"http://127.0.0.1:3128","no-proxy":"localhost,127.0.0.0/8"}}
-JSON
+  mkdir -p /etc/systemd/journald.conf.d
   printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=32M\n' \
     >/etc/systemd/journald.conf.d/saiife.conf
   # mask works on units that are not installed
@@ -125,6 +125,16 @@ JSON
   systemctl set-default multi-user.target
   systemctl disable containerd.service docker.service
   systemctl enable docker.socket
+}
+
+# Written after the pulls: the bake VM pulls directly, and the proxy only
+# exists in a running box.
+write_docker_config() {
+  mkdir -p /etc/docker
+  # proxy port 3128: source of truth is saiife_boxproto::ports (plan 38)
+  cat >/etc/docker/daemon.json <<'JSON'
+{"features":{"containerd-snapshotter":false},"proxies":{"http-proxy":"http://127.0.0.1:3128","https-proxy":"http://127.0.0.1:3128","no-proxy":"localhost,127.0.0.0/8"}}
+JSON
 }
 
 start_docker() {
@@ -138,14 +148,20 @@ start_docker() {
 }
 
 pull_images() {
-  local ref want got
+  local ref want got imgs found
   start_docker
-  for ref in $PULL_IMAGES; do
-    want=$ref
+  set -f
+  read -ra imgs <<<"$PULL_IMAGES"
+  set +f
+  for ref in "${imgs[@]}"; do
+    want=${ref#*@}
     docker pull "$ref"
-    got=$(docker image inspect --format '{{index .RepoDigests 0}}' "$ref")
-    if [ "$got" != "$want" ]; then
-      echo "digest mismatch for $ref: got $got" >&2
+    found=0
+    while IFS= read -r got; do
+      [ "${got#*@}" = "$want" ] && found=1
+    done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref")
+    if [ "$found" != 1 ]; then
+      echo "digest mismatch for $ref" >&2
       return 1
     fi
   done
@@ -172,6 +188,7 @@ main() {
   make_agent_user
   trim
   pull_images
+  write_docker_config
   export_outputs
   mkdir -p /etc/cloud
   touch /etc/cloud/cloud-init.disabled

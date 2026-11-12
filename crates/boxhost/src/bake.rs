@@ -412,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn script_pulls_before_the_proxy_config_and_is_glob_safe() {
+        let main = BAKE_SCRIPT.split("\nmain() {").nth(1).unwrap();
+        let pull = main.find("  pull_images\n").unwrap();
+        let conf = main.find("  write_docker_config\n").unwrap();
+        assert!(pull < conf);
+        let trim = BAKE_SCRIPT
+            .split("\ntrim() {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!trim.contains("daemon.json"));
+        assert!(BAKE_SCRIPT.contains("systemctl enable -- \"$u\""));
+        assert!(BAKE_SCRIPT.contains("^[A-Za-z0-9][A-Za-z0-9@._-]*$"));
+        assert!(BAKE_SCRIPT.contains("read -ra pkgs"));
+        assert!(BAKE_SCRIPT.contains("read -ra imgs"));
+        assert!(!BAKE_SCRIPT.contains("$APT_PACKAGES\n"));
+    }
+
+    #[test]
     fn seed_and_payload_call_mkfs_and_mcopy() {
         let (d, tools, log) = world();
         let seed = d.path().join("seed.img");
