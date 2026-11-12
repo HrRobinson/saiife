@@ -1,0 +1,31 @@
+[package]
+name = "saiife-fido"
+description = "saiife FIDO helper: the wire protocol, the CTAP error table and the HID calls shared by the CLI and saiife-fido-helper."
+edition.workspace = true
+# The CLI and the helper must share one version (the hello checks it).
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_fido"
+path = "src/lib.rs"
+
+[features]
+# CTAP2 over USB HID (hidapi needs libudev on Linux).
+hid = ["dep:ctap-hid-fido2"]
+# A scripted key for tests (filled by plan 41 task 2).
+fake = []
+
+[dependencies]
+saiife-touch = { path = "../touch" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "=0.23.1"
+# zeroize 1.9.1 is from 2026-10-06 (already in Cargo.lock): PINs are wiped on drop.
+zeroize = { version = "=1.9.1", features = ["serde"] }
+# 3.6.0 as in plan 27.
+ctap-hid-fido2 = { version = "=3.6.0", optional = true }
+
+[lints]
+workspace = true

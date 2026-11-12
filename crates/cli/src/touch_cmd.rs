@@ -9,6 +9,15 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use clap::Subcommand;
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+#[cfg_attr(not(feature = "fido-hid"), allow(unused_imports))]
+use saiife_fido::errors::{classify, credential_of, first_line, one_of, DID_NOT_ANSWER};
+#[cfg_attr(not(feature = "fido-hid"), allow(unused_imports))]
+use saiife_fido::proto::{AssertParts, AssertReq, EnrolReq};
+#[cfg_attr(not(feature = "fido-hid"), allow(unused_imports))]
+use saiife_touch::{Assertion, EnrolRequest, TouchRequest};
 use saiife_touch::{Touch, TouchError, PROMPT_TIMEOUT_SECS};
 
 #[derive(Subcommand)]
@@ -341,6 +350,111 @@ mod cmd {
 #[cfg(feature = "fido-hid")]
 mod hid;
 
+/// Asks for the key's PIN (D3): `tty::read_hidden` outside tests.
+type PinPrompt = Box<dyn Fn() -> Result<Zeroizing<String>, String> + Send + Sync>;
+
+/// How the CTAP calls reach a key: in this process (`hid::InProcess`), or
+/// through the helper. The outer `Err` is a failure to reach the key (already
+/// reported to the user); the inner `Err` is the CTAP error text, which
+/// `KeyTouch` classifies.
+#[cfg_attr(not(feature = "fido-hid"), allow(dead_code))]
+pub(crate) trait Transport: Send + Sync {
+    fn devices(&self) -> Result<usize, TouchError>;
+    fn assert(
+        &self,
+        r: AssertReq,
+        limit: Duration,
+    ) -> Result<Result<AssertParts, String>, TouchError>;
+    fn enrol(&self, r: EnrolReq, limit: Duration) -> Result<Result<Vec<u8>, String>, TouchError>;
+}
+
+/// A FIDO2 key (D2: exactly one plugged in), reached through a `Transport`.
+#[cfg_attr(not(feature = "fido-hid"), allow(dead_code))]
+pub(crate) struct KeyTouch<T: Transport> {
+    transport: T,
+    pin: PinPrompt,
+}
+
+#[cfg_attr(not(feature = "fido-hid"), allow(dead_code))]
+impl<T: Transport> KeyTouch<T> {
+    pub(crate) fn new(transport: T, pin: PinPrompt) -> Self {
+        Self { transport, pin }
+    }
+
+    /// D2, on the devices plugged in now.
+    fn one_device(&self) -> Result<(), TouchError> {
+        one_of(self.transport.devices()?).map_err(|(e, hint)| {
+            eprintln!("saiife: {hint}");
+            e
+        })
+    }
+
+    /// D3: no PIN at the prompt is `NotVerified`, and nothing is sent.
+    fn ask_pin(&self) -> Result<Zeroizing<String>, TouchError> {
+        (self.pin)().map_err(|e| {
+            eprintln!("saiife: {e}");
+            TouchError::NotVerified
+        })
+    }
+
+    /// Prints `saiife: <hint>` for a CTAP error text and gives its error.
+    fn fail(msg: &str) -> TouchError {
+        let (err, hint) = classify(msg);
+        if hint == DID_NOT_ANSWER {
+            eprintln!("saiife: {hint}: {}", crate::text::sanitize(first_line(msg)));
+        } else {
+            eprintln!("saiife: {hint}");
+        }
+        err
+    }
+}
+
+#[cfg_attr(not(feature = "fido-hid"), allow(dead_code))]
+fn sha256(b: &[u8]) -> [u8; 32] {
+    Sha256::digest(b).into()
+}
+
+impl<T: Transport> Touch for KeyTouch<T> {
+    fn request(&self, r: &TouchRequest) -> Result<Assertion, TouchError> {
+        self.one_device()?;
+        let pin = if r.uv { Some(self.ask_pin()?) } else { None };
+        eprintln!("saiife: touch your key now");
+        let req = AssertReq {
+            rp_id: r.rp_id.clone(),
+            challenge: r.challenge,
+            allow: r.allow.clone(),
+            pin,
+        };
+        match self.transport.assert(req, prompt_limit())? {
+            Ok((credential_id, auth_data, signature)) => Ok(Assertion::Ctap2 {
+                credential_id: credential_of(credential_id, &r.allow),
+                auth_data,
+                signature,
+                client_data_hash: sha256(&r.challenge),
+            }),
+            Err(msg) => Err(Self::fail(&msg)),
+        }
+    }
+
+    fn enrol(&self, r: &EnrolRequest) -> Result<Vec<u8>, TouchError> {
+        self.one_device()?;
+        let pin = self.ask_pin()?;
+        eprintln!("saiife: touch your key now");
+        let req = EnrolReq {
+            rp_id: r.rp_id.clone(),
+            challenge: r.challenge,
+            user_id: r.user_id.clone(),
+            user_name: r.user_name.clone(),
+            exclude: r.exclude.clone(),
+            pin,
+        };
+        match self.transport.enrol(req, prompt_limit())? {
+            Ok(auth_data) => Ok(auth_data),
+            Err(msg) => Err(Self::fail(&msg)),
+        }
+    }
+}
+
 /// D1: a build without `fido-hid`, named by its target (R-O).
 #[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
 pub(crate) const NO_KEY_SUPPORT: &str =
@@ -365,9 +479,10 @@ pub(crate) fn pick() -> Result<Box<dyn Touch>, String> {
 
 #[cfg(feature = "fido-hid")]
 fn device() -> Result<Box<dyn Touch>, String> {
-    Ok(Box::new(hid::HidAuthenticator::new(Box::new(|| {
-        crate::tty::read_hidden("PIN for your security key: ")
-    }))))
+    Ok(Box::new(KeyTouch::new(
+        hid::InProcess,
+        Box::new(|| crate::tty::read_hidden("PIN for your security key: ")),
+    )))
 }
 
 #[cfg(not(feature = "fido-hid"))]
@@ -650,7 +765,90 @@ mod soft_file {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Instant;
+
+    /// A transport double: `n` devices, and a fixed inner answer.
+    struct Double {
+        n: usize,
+        inner: Result<AssertParts, String>,
+    }
+
+    impl Transport for Double {
+        fn devices(&self) -> Result<usize, TouchError> {
+            Ok(self.n)
+        }
+        fn assert(
+            &self,
+            _: AssertReq,
+            _: Duration,
+        ) -> Result<Result<AssertParts, String>, TouchError> {
+            Ok(self.inner.clone())
+        }
+        fn enrol(&self, _: EnrolReq, _: Duration) -> Result<Result<Vec<u8>, String>, TouchError> {
+            Ok(self.inner.clone().map(|(_, a, _)| a))
+        }
+    }
+
+    fn request(uv: bool) -> TouchRequest {
+        TouchRequest {
+            rp_id: "saiife.local".into(),
+            challenge: [1; 32],
+            allow: vec![vec![9]],
+            uv,
+            summary: String::new(),
+            short_code: String::new(),
+        }
+    }
+
+    #[test]
+    fn key_touch_checks_devices_before_the_pin() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let k = KeyTouch::new(
+            Double {
+                n: 2,
+                inner: Ok((vec![], vec![], vec![])),
+            },
+            Box::new(move || {
+                a.fetch_add(1, Ordering::SeqCst);
+                Ok(Zeroizing::new("1234".to_string()))
+            }),
+        );
+        assert_eq!(
+            k.request(&request(true)).unwrap_err(),
+            TouchError::Unavailable
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn key_touch_classifies_inner_errors() {
+        let k = KeyTouch::new(
+            Double {
+                n: 1,
+                inner: Err("0x31 CTAP2_ERR_PIN_INVALID   PIN Invalid.".into()),
+            },
+            Box::new(|| Ok(Zeroizing::new("0000".to_string()))),
+        );
+        assert_eq!(
+            k.request(&request(true)).unwrap_err(),
+            TouchError::NotVerified
+        );
+        // An omitted id is the one allowed (R-F).
+        let k = KeyTouch::new(
+            Double {
+                n: 1,
+                inner: Ok((vec![], vec![1], vec![2])),
+            },
+            Box::new(|| Err("no tty".into())),
+        );
+        match k.request(&request(false)).unwrap() {
+            Assertion::Ctap2 { credential_id, .. } => assert_eq!(credential_id, vec![9]),
+            _ => panic!("not ctap2"),
+        }
+    }
 
     /// `pick` reads the environment; tests that touch it take this lock
     /// (only those of a build without `fido-hid`, or a release build).

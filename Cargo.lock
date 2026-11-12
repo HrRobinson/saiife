@@ -1610,7 +1610,6 @@ dependencies = [
  "assert_cmd",
  "base64 0.23.1",
  "clap",
- "ctap-hid-fido2",
  "libc",
  "predicates",
  "qrcode",
@@ -1623,6 +1622,7 @@ dependencies = [
  "saiife-broker",
  "saiife-daemon",
  "saiife-dev",
+ "saiife-fido",
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",
@@ -1772,6 +1772,18 @@ dependencies = [
  "tempfile",
  "time",
  "toml",
+]
+
+[[package]]
+name = "saiife-fido"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.1",
+ "ctap-hid-fido2",
+ "saiife-touch",
+ "serde",
+ "serde_json",
+ "zeroize",
 ]
 
 [[package]]
