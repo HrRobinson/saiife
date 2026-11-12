@@ -1,15 +1,15 @@
-//! When a snapshot may be restored (S1). The box dir, and the snapshot in
-//! it, is writable by the VMM; a compromised VMM could plant or edit a
-//! snapshot whose config points the next VMM at other files or turns
-//! Landlock off. So a restore needs:
-//! - a marker in the daemon-private `marks` dir, written right after the
-//!   daemon's own `vm.snapshot`, holding the SHA-256 of `config.json` and
-//!   `state.json` (`memory-ranges` is the guest's own memory, not hashed);
-//! - both digests matching now;
-//! - `config.json` naming only this box's files and devices (`check_config`).
+//! When a snapshot may be restored (S1, S3 / ruling R20). CH writes its
+//! snapshot into `<box>/snapshot`, which the VMM can write. So right after
+//! the daemon's own `vm.snapshot`, while the VM is paused, `seal` moves it
+//! into the vault (`<vault>/<id>.snap`, which no VMM can write), makes it
+//! read-only and records the SHA-256 of every file in `<vault>/<id>.marker`.
+//! At boot `verify` re-hashes the vault copy, compares, and runs
+//! `check_config` on the very bytes it hashed; the restore reads only that
+//! copy. The box dir's `snapshot/` is never a restore source.
 
-use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use saiife_wire::source::BoxId;
@@ -18,129 +18,226 @@ use serde_json::Value;
 
 use crate::launch::{Boot, LaunchSpec};
 use crate::paths::BoxPaths;
+use crate::vault::{self, euid, marker_path, read_bounded, snap_dir};
 
-/// `config.json` and `state.json` larger than this are refused.
-pub const MAX_SNAPSHOT_JSON: u64 = 16 * 1024 * 1024;
-const MAX_MARKER: u64 = 4096;
+/// `config.json` larger than this is refused (it is parsed in memory).
+pub const MAX_CONFIG: u64 = 16 * 1024 * 1024;
+/// A snapshot with more entries than this is refused.
+pub const MAX_FILES: usize = 64;
+const MAX_MARKER: u64 = 64 * 1024;
+const EXDEV: i32 = 18;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Marker {
     version: u32,
-    config: String,
-    state: String,
+    /// File name -> lowercase hex SHA-256.
+    files: BTreeMap<String, String>,
 }
 
-pub fn marker_path(marks: &Path, id: &BoxId) -> PathBuf {
-    marks.join(format!("{}.snapshot", id.as_str()))
-}
-
-pub fn remove_marker(marks: &Path, id: &BoxId) -> Result<(), String> {
-    match std::fs::remove_file(marker_path(marks, id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("snapshot marker: {e}")),
-    }
-}
-
-/// A regular file (no symlink, no FIFO) of at most `cap` bytes.
-fn read_bounded(p: &Path, cap: u64) -> Result<Vec<u8>, String> {
-    let name = p
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(p)
-        .map_err(|e| format!("{name}: {e}"))?;
-    let m = f.metadata().map_err(|e| format!("{name}: {e}"))?;
-    if !m.file_type().is_file() {
-        return Err(format!("{name}: not a regular file"));
-    }
-    if m.len() > cap {
-        return Err(format!("{name}: larger than {cap} bytes"));
-    }
-    let mut buf = Vec::new();
-    f.take(cap + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("{name}: {e}"))?;
-    if buf.len() as u64 > cap {
-        return Err(format!("{name}: larger than {cap} bytes"));
-    }
-    Ok(buf)
-}
-
-fn sha_hex(b: &[u8]) -> String {
-    let d = ring::digest::digest(&ring::digest::SHA256, b);
+fn hex(d: ring::digest::Digest) -> String {
     d.as_ref().iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn digests(paths: &BoxPaths) -> Result<(Vec<u8>, String, String), String> {
-    let dir = paths.snapshot_dir();
-    let config = read_bounded(&dir.join("config.json"), MAX_SNAPSHOT_JSON)?;
-    let state = read_bounded(&dir.join("state.json"), MAX_SNAPSHOT_JSON)?;
-    let (c, s) = (sha_hex(&config), sha_hex(&state));
-    Ok((config, c, s))
+fn open_ro(p: &Path) -> Result<std::fs::File, String> {
+    let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(p)
+        .map_err(|e| format!("{}: {e}", p.display()))
 }
 
-/// After the daemon's own `vm.snapshot`: record the digests (tmp + rename,
-/// 0600). The `marks` dir is created 0700 when missing.
-pub fn write_marker(marks: &Path, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
-    let (_, config, state) = digests(paths)?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(marks)
-        .map_err(|e| format!("marks dir {}: {e}", marks.display()))?;
-    let m = std::fs::symlink_metadata(marks).map_err(|e| format!("marks dir: {e}"))?;
-    if !m.file_type().is_dir() {
-        return Err(format!("marks dir {} is not a directory", marks.display()));
+/// SHA-256 of an open file, streamed, at most `len` bytes (its fstat size).
+fn hash_file(f: &mut std::fs::File, len: u64) -> Result<String, String> {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut r = f.take(len);
+    loop {
+        let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
     }
-    let body = serde_json::to_vec(&Marker {
-        version: 1,
-        config,
-        state,
-    })
-    .map_err(|e| e.to_string())?;
-    let dest = marker_path(marks, id);
-    let tmp = marks.join(format!("{}.snapshot.tmp", id.as_str()));
-    let _ = std::fs::remove_file(&tmp);
-    let write = || -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
+    Ok(hex(ctx.finish()))
+}
+
+/// The entries of a snapshot dir: at most 64, regular files only.
+fn entries(dir: &Path) -> Result<Vec<String>, String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut names = Vec::new();
+    for e in rd.take(MAX_FILES + 1) {
+        let e = e.map_err(|e| e.to_string())?;
+        let name = e
+            .file_name()
+            .into_string()
+            .map_err(|_| "a snapshot file name is not UTF-8".to_string())?;
+        let m = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
+        if !m.file_type().is_file() {
+            return Err(format!("snapshot entry {name}: not a regular file"));
+        }
+        names.push(name);
+    }
+    if names.len() > MAX_FILES {
+        return Err(format!("snapshot: more than {MAX_FILES} entries"));
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Every entry of `dir` and its own dir are ours, unlinked elsewhere.
+fn all_ours(dir: &Path, names: &[String]) -> bool {
+    let me = euid();
+    let ok = |p: &Path, file: bool| {
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.uid() == me && (!file || (m.file_type().is_file() && m.nlink() == 1)))
+    };
+    ok(dir, false) && names.iter().all(|n| ok(&dir.join(n), true))
+}
+
+/// A bounded copy of `src`'s regular files into a new `dst` (0750) the daemon
+/// owns. Each file is read up to its size when opened.
+fn copy_dir(src: &Path, dst: &Path, names: &[String]) -> Result<(), String> {
+    std::fs::DirBuilder::new()
+        .mode(0o750)
+        .create(dst)
+        .map_err(|e| format!("{}: {e}", dst.display()))?;
+    for n in names {
+        let mut f = open_ro(&src.join(n))?;
+        let m = f.metadata().map_err(|e| e.to_string())?;
+        if !m.file_type().is_file() {
+            return Err(format!("snapshot entry {n}: not a regular file"));
+        }
+        let mut out = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(0o640)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&tmp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &dest)
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("snapshot marker: {e}")
-    })
+            .open(dst.join(n))
+            .map_err(|e| format!("{n}: {e}"))?;
+        std::io::copy(&mut (&mut f).take(m.len()), &mut out).map_err(|e| format!("{n}: {e}"))?;
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
-/// Ok when the box's snapshot may be restored with `spec`; Err says why not.
-pub fn check(marks: &Path, id: &BoxId, paths: &BoxPaths, spec: &LaunchSpec) -> Result<(), String> {
-    let raw = read_bounded(&marker_path(marks, id), MAX_MARKER)
+fn remove_tree(p: &Path) {
+    // std's remove_dir_all does not follow symlinks.
+    let _ = std::fs::remove_dir_all(p);
+    let _ = std::fs::remove_file(p);
+}
+
+/// Remove the box's marker, then its vault copy.
+pub fn discard(vault: &Path, id: &BoxId) -> Result<(), String> {
+    match std::fs::remove_file(marker_path(vault, id)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("snapshot marker: {e}")),
+    }
+    remove_tree(&snap_dir(vault, id));
+    Ok(())
+}
+
+pub fn remove_marker(vault: &Path, id: &BoxId) {
+    let _ = std::fs::remove_file(marker_path(vault, id));
+}
+
+/// After the daemon's own `vm.snapshot` into `<box>/snapshot`, with the VM
+/// paused: move it into the vault (rename; a bounded copy across
+/// filesystems or when a file is not the daemon's own, e.g. written by the
+/// locked-mode VMM user, or hard-linked), make it read-only (files 0640,
+/// dir 0750) and write the marker last.
+pub fn seal(vault: &Path, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
+    vault::ensure(vault)?;
+    discard(vault, id)?;
+    let src = paths.snapshot_dir();
+    let dst = snap_dir(vault, id);
+    let incoming = vault.join(format!("{}.snap.in", id.as_str()));
+    remove_tree(&incoming);
+    let names = match std::fs::rename(&src, &incoming) {
+        Ok(()) => {
+            let names = entries(&incoming)?;
+            if all_ours(&incoming, &names) {
+                std::fs::rename(&incoming, &dst).map_err(|e| format!("snapshot: {e}"))?;
+            } else {
+                let r = copy_dir(&incoming, &dst, &names);
+                remove_tree(&incoming);
+                r?;
+            }
+            names
+        }
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            let names = entries(&src)?;
+            copy_dir(&src, &dst, &names)?;
+            remove_tree(&src);
+            names
+        }
+        Err(e) => return Err(format!("move the snapshot into the vault: {e}")),
+    };
+    let mut files = BTreeMap::new();
+    for n in &names {
+        let p = dst.join(n);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640))
+            .map_err(|e| format!("{n}: {e}"))?;
+        let mut f = open_ro(&p)?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len();
+        files.insert(n.clone(), hash_file(&mut f, len)?);
+    }
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o750))
+        .map_err(|e| format!("snapshot dir: {e}"))?;
+    if !files.contains_key("config.json") {
+        let _ = discard(vault, id);
+        return Err("snapshot: no config.json".into());
+    }
+    let body = serde_json::to_vec(&Marker { version: 2, files }).map_err(|e| e.to_string())?;
+    vault::write_atomic(&marker_path(vault, id), &body)
+}
+
+/// The vault copy to restore from, when the marker matches every file in it
+/// and its config names only this box's files and devices; Err says why
+/// not. Called right before the start, with no VMM of this box running.
+pub fn verify(
+    vault: &Path,
+    id: &BoxId,
+    paths: &BoxPaths,
+    spec: &LaunchSpec,
+) -> Result<PathBuf, String> {
+    let raw = read_bounded(&marker_path(vault, id), MAX_MARKER)
         .map_err(|_| "no marker: the snapshot was not taken by this daemon".to_string())?;
     let m: Marker = serde_json::from_slice(&raw).map_err(|e| format!("bad marker: {e}"))?;
-    if m.version != 1 {
+    if m.version != 2 {
         return Err("bad marker version".into());
     }
-    let (config, c, s) = digests(paths)?;
-    if c != m.config {
-        return Err("config.json differs from the snapshot the daemon took".into());
+    let dir = snap_dir(vault, id);
+    let names = entries(&dir)?;
+    if !all_ours(&dir, &names) {
+        return Err("snapshot: a file in the vault copy is not the daemon's own".into());
     }
-    if s != m.state {
-        return Err("state.json differs from the snapshot the daemon took".into());
+    if names.iter().collect::<Vec<_>>() != m.files.keys().collect::<Vec<_>>() {
+        return Err("snapshot: the vault copy's files differ from the marker".into());
     }
+    let mut config = None;
+    for n in &names {
+        let p = dir.join(n);
+        let got = if n == "config.json" {
+            let b = read_bounded(&p, MAX_CONFIG)?;
+            let h = hex(ring::digest::digest(&ring::digest::SHA256, &b));
+            config = Some(b);
+            h
+        } else {
+            let mut f = open_ro(&p)?;
+            let len = f.metadata().map_err(|e| e.to_string())?.len();
+            hash_file(&mut f, len)?
+        };
+        if m.files.get(n) != Some(&got) {
+            return Err(format!("{n} differs from the snapshot the daemon took"));
+        }
+    }
+    let config = config.ok_or("snapshot: no config.json")?;
     let v: Value = serde_json::from_slice(&config).map_err(|e| format!("config.json: {e}"))?;
-    check_config(&v, paths, spec)
+    check_config(&v, paths, spec)?;
+    Ok(dir)
 }
 
 /// Absent, null, false, `[]` or `{}`.
@@ -326,7 +423,7 @@ mod tests {
                 fw: PathBuf::from("/v/CLOUDHV.fd"),
             },
             landlock: true,
-            restore: true,
+            restore: None,
         };
         let v = serde_json::json!({
             "cpus": {"boot_vcpus": 2},

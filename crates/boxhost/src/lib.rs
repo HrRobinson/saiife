@@ -16,5 +16,6 @@ pub mod review;
 pub mod snapshot;
 pub mod term;
 pub mod tools;
+pub mod vault;
 pub mod vmm;
 pub mod vsock;

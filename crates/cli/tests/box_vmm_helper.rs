@@ -56,7 +56,7 @@ fn fx() -> Fx {
         repo: false,
         boot: Boot::Firmware { fw },
         landlock: true,
-        restore: false,
+        restore: None,
     };
     launch::write_spec(&spec, &paths).unwrap();
     Fx {
@@ -199,4 +199,32 @@ fn helper_refuses_a_symlinked_log() {
     assert!(stderr(&o).contains("ch.log"), "{}", stderr(&o));
     assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     assert!(!f.out.exists());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn helper_restores_only_from_the_vault() {
+    let f = fx();
+    let mut s = f.spec.clone();
+    // the VMM-writable snapshot in the box dir is never a restore source
+    std::fs::create_dir(f.paths.snapshot_dir()).unwrap();
+    s.restore = Some(f.paths.snapshot_dir());
+    launch::write_spec(&s, &f.paths).unwrap();
+    let o = run(&f, true);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).contains("restore"), "{}", stderr(&o));
+    assert!(!f.out.exists());
+    // the vault copy is
+    let vault = f.root.join("s/saiife/broker/box-vault");
+    let snap = vault.join("b1.snap");
+    std::fs::create_dir_all(&snap).unwrap();
+    s.restore = Some(snap.clone());
+    launch::write_spec(&s, &f.paths).unwrap();
+    let o = run(&f, true);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let got = std::fs::read_to_string(&f.out).unwrap();
+    assert!(
+        got.contains(&format!("source_url=file://{}", snap.display())),
+        "{got}"
+    );
 }

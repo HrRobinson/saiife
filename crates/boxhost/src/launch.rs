@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::layout::Layout;
 use crate::paths::BoxPaths;
+#[cfg(test)]
+use crate::vault::parse_starttime;
+use crate::vault::{self, PidRecord};
 
 /// V7: the longest socket path a spec may produce (sun_path is 108 bytes).
 pub const MAX_SOCK_PATH: usize = 100;
@@ -44,7 +47,8 @@ pub struct LaunchSpec {
     pub repo: bool,
     pub boot: Boot,
     pub landlock: bool,
-    pub restore: bool,
+    /// The verified snapshot copy to restore from: `<vault>/<id>.snap`.
+    pub restore: Option<PathBuf>,
 }
 
 /// The directories a spec's paths must lie in.
@@ -53,6 +57,7 @@ pub struct Allowed {
     pub boxes: PathBuf,
     pub images: PathBuf,
     pub vmm: PathBuf,
+    pub vault: PathBuf,
 }
 
 impl Allowed {
@@ -61,6 +66,7 @@ impl Allowed {
             boxes: l.boxes.clone(),
             images: l.images.clone(),
             vmm: l.vmm.clone(),
+            vault: l.vault.clone(),
         }
     }
 }
@@ -159,6 +165,19 @@ pub fn check_spec(spec: &LaunchSpec, paths: &BoxPaths, allowed: &Allowed) -> Res
     if !MEM_MIB.contains(&spec.mem_mib) {
         return Err(format!("mem_mib: {} is outside 512..=262144", spec.mem_mib));
     }
+    if let Some(src) = &spec.restore {
+        // Only the verified copy in the vault, never the box's own
+        // VMM-writable snapshot dir (S3).
+        check_path("restore", src)?;
+        check_path("allowed vault dir", &allowed.vault)?;
+        if *src != allowed.vault.join(format!("{}.snap", spec.id.as_str())) {
+            return Err("restore: not this box's snapshot in the vault".into());
+        }
+        match std::fs::symlink_metadata(src) {
+            Ok(m) if m.file_type().is_dir() => {}
+            _ => return Err("restore: the vault copy is not a directory".into()),
+        }
+    }
     let n = paths.longest_socket().as_os_str().as_bytes().len();
     if n > MAX_SOCK_PATH {
         return Err(format!(
@@ -189,13 +208,10 @@ fn arg(parts: &[&OsStr]) -> OsString {
 pub fn argv(spec: &LaunchSpec, paths: &BoxPaths) -> Vec<OsString> {
     let o = |s: &str| OsString::from(s);
     let api = arg(&[OsStr::new("path="), paths.api_sock().as_os_str()]);
-    if spec.restore {
+    if let Some(src) = &spec.restore {
         return vec![
             o("--restore"),
-            arg(&[
-                OsStr::new("source_url=file://"),
-                paths.snapshot_dir().as_os_str(),
-            ]),
+            arg(&[OsStr::new("source_url=file://"), src.as_os_str()]),
             o("--api-socket"),
             api,
         ];
@@ -313,7 +329,10 @@ pub fn read_spec(paths: &BoxPaths) -> Result<LaunchSpec, String> {
 pub trait Launcher: Send + Sync {
     /// Returns once the process is started.
     fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String>;
-    /// `None`: not started by this launcher (e.g. after a daemon restart).
+    /// The only liveness source (S3, ruling R19); never the VMM's API.
+    /// `Some(false)`: alive, or cannot tell (fail closed). `Some(true)`:
+    /// gone. `None`: no process of this box is known to any launcher (never
+    /// started, or reaped by the launcher that started it).
     fn exited(&self, id: &BoxId) -> Option<bool>;
     /// Ends the process; Ok when it already exited.
     fn force_stop(&self, id: &BoxId) -> Result<(), String>;
@@ -389,6 +408,8 @@ enum Mode {
 }
 
 enum Slot {
+    /// `start` reserved the box and is spawning.
+    Starting,
     Running(Child),
     /// `force_stop` has taken the child out to kill and reap it.
     Killing,
@@ -399,10 +420,14 @@ enum Slot {
 /// Runs the VMM as a child process of the daemon, stdout and stderr in
 /// `ch.log`. Children are reaped through `try_wait` in `exited`, and
 /// `force_stop` is `Child::kill` plus `wait` of its own child only. The
-/// map lock covers bookkeeping only: no file I/O, spawn or wait under it.
+/// map lock covers bookkeeping only: no blocking I/O, spawn or wait under it
+/// (unlinking a pid record in the daemon-owned vault is the one file call).
+/// Each child gets a `<vault>/<id>.pid` record so a restarted daemon can
+/// tell whether it still runs.
 pub struct ChildLauncher {
     program: PathBuf,
     mode: Mode,
+    vault: PathBuf,
     env: Vec<(OsString, OsString)>,
     children: Mutex<BTreeMap<BoxId, Slot>>,
     #[cfg(test)]
@@ -410,18 +435,19 @@ pub struct ChildLauncher {
 }
 
 impl ChildLauncher {
-    pub fn helper(saiife_bin: PathBuf) -> ChildLauncher {
-        ChildLauncher::with_mode(saiife_bin, Mode::Helper)
+    pub fn helper(saiife_bin: PathBuf, vault: PathBuf) -> ChildLauncher {
+        ChildLauncher::with_mode(saiife_bin, Mode::Helper, vault)
     }
 
-    pub fn direct(program: PathBuf) -> ChildLauncher {
-        ChildLauncher::with_mode(program, Mode::Direct)
+    pub fn direct(program: PathBuf, vault: PathBuf) -> ChildLauncher {
+        ChildLauncher::with_mode(program, Mode::Direct, vault)
     }
 
-    fn with_mode(program: PathBuf, mode: Mode) -> ChildLauncher {
+    fn with_mode(program: PathBuf, mode: Mode, vault: PathBuf) -> ChildLauncher {
         ChildLauncher {
             program,
             mode,
+            vault,
             env: Vec::new(),
             children: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -439,15 +465,18 @@ impl ChildLauncher {
         self.children.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Reap a running child without blocking (waitpid WNOHANG).
-    fn poll(slot: &mut Slot) {
+    /// Reap a running child without blocking (waitpid WNOHANG); a reaped
+    /// child's pid record goes with it.
+    fn poll(&self, id: &BoxId, slot: &mut Slot) {
         if let Slot::Running(c) = slot {
-            match c.try_wait() {
-                Ok(Some(s)) => *slot = Slot::Exited(s),
-                Ok(None) => {}
+            let status = match c.try_wait() {
+                Ok(Some(s)) => s,
+                Ok(None) => return,
                 // not waitable any more: reaped elsewhere
-                Err(_) => *slot = Slot::Exited(ExitStatus::default()),
-            }
+                Err(_) => ExitStatus::default(),
+            };
+            *slot = Slot::Exited(status);
+            vault::remove_pid(&self.vault, id);
         }
     }
 
@@ -455,7 +484,7 @@ impl ChildLauncher {
     pub fn exit_status(&self, id: &BoxId) -> Option<ExitStatus> {
         let mut g = self.slots();
         let slot = g.get_mut(id)?;
-        Self::poll(slot);
+        self.poll(id, slot);
         match slot {
             Slot::Exited(s) => Some(*s),
             _ => None,
@@ -482,45 +511,76 @@ impl ChildLauncher {
         Ok(c)
     }
 
-    fn busy(&self, id: &BoxId) -> bool {
+    /// Reserve the box (`Starting`) unless a child of it is still around.
+    fn reserve(&self, id: &BoxId) -> Result<(), String> {
         let mut g = self.slots();
-        match g.get_mut(id) {
-            Some(slot) => {
-                Self::poll(slot);
-                !matches!(slot, Slot::Exited(_))
+        if let Some(slot) = g.get_mut(id) {
+            self.poll(id, slot);
+            if !matches!(slot, Slot::Exited(_)) {
+                return Err("the VMM of this box is already running".into());
             }
-            None => false,
         }
+        g.insert(id.clone(), Slot::Starting);
+        Ok(())
     }
-}
 
-impl Launcher for ChildLauncher {
-    fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
-        const RUNNING: &str = "the VMM of this box is already running";
-        if self.busy(id) {
-            return Err(RUNNING.into());
-        }
-        // File I/O and the spawn happen outside the lock.
+    fn spawn(&self, paths: &BoxPaths) -> Result<Child, String> {
         let mut cmd = self.command(paths)?;
         #[cfg(test)]
         if let Some(f) = &self.pre_spawn {
             f();
         }
-        if self.busy(id) {
-            return Err(RUNNING.into());
+        cmd.spawn()
+            .map_err(|e| format!("cannot start {}: {e}", self.program.display()))
+    }
+
+    /// Record `{pid, starttime}`; without a record a restarted daemon could
+    /// not tell the VMM runs, so a failure kills our own child.
+    fn record(&self, id: &BoxId, child: &mut Child) -> Result<(), String> {
+        let pid = child.id();
+        let r = vault::proc_starttime(pid).and_then(|t| {
+            let starttime = t.ok_or("the VMM's /proc entry is gone")?;
+            vault::write_pid(&self.vault, id, PidRecord { pid, starttime })
+        });
+        if r.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("cannot start {}: {e}", self.program.display()))?;
-        self.slots().insert(id.clone(), Slot::Running(child));
-        Ok(())
+        r.map_err(|e| format!("pid record: {e}"))
+    }
+}
+
+impl Launcher for ChildLauncher {
+    fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
+        self.reserve(id)?;
+        // File I/O and the spawn happen outside the lock.
+        let r = self.spawn(paths).and_then(|mut c| {
+            self.record(id, &mut c)?;
+            Ok(c)
+        });
+        let mut g = self.slots();
+        match r {
+            Ok(c) => {
+                g.insert(id.clone(), Slot::Running(c));
+                Ok(())
+            }
+            Err(e) => {
+                g.remove(id);
+                Err(e)
+            }
+        }
     }
 
     fn exited(&self, id: &BoxId) -> Option<bool> {
-        let mut g = self.slots();
-        let slot = g.get_mut(id)?;
-        Self::poll(slot);
-        Some(matches!(slot, Slot::Exited(_)))
+        {
+            let mut g = self.slots();
+            if let Some(slot) = g.get_mut(id) {
+                self.poll(id, slot);
+                return Some(matches!(slot, Slot::Exited(_)));
+            }
+        }
+        // Not ours (a daemon restart): the pid record answers.
+        vault::pid_exited(&self.vault, id)
     }
 
     fn force_stop(&self, id: &BoxId) -> Result<(), String> {
@@ -529,9 +589,13 @@ impl Launcher for ChildLauncher {
             let Some(slot) = g.get_mut(id) else {
                 return Err("the VMM was not started by this daemon".into());
             };
-            Self::poll(slot);
+            self.poll(id, slot);
             match std::mem::replace(slot, Slot::Killing) {
                 Slot::Running(c) => c,
+                Slot::Starting => {
+                    *slot = Slot::Starting;
+                    return Err("the VMM is being started".into());
+                }
                 other => {
                     // Exited: nothing to do. Killing: another caller has it.
                     *slot = other;
@@ -543,7 +607,11 @@ impl Launcher for ChildLauncher {
         let _ = c.kill();
         let r = c.wait();
         let status = r.as_ref().map_or(ExitStatus::default(), |s| *s);
-        self.slots().insert(id.clone(), Slot::Exited(status));
+        {
+            let mut g = self.slots();
+            g.insert(id.clone(), Slot::Exited(status));
+            vault::remove_pid(&self.vault, id);
+        }
         r.map(|_| ()).map_err(|e| format!("wait for the VMM: {e}"))
     }
 
@@ -571,7 +639,7 @@ mod tests {
         );
         let t = t.unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
-        for d in ["boxes", "images", "vmm", "elsewhere"] {
+        for d in ["boxes", "images", "vmm", "vault", "elsewhere"] {
             std::fs::create_dir(root.join(d)).unwrap();
         }
         std::fs::write(root.join("images/base.qcow2"), b"x").unwrap();
@@ -580,6 +648,7 @@ mod tests {
             boxes: root.join("boxes"),
             images: root.join("images"),
             vmm: root.join("vmm"),
+            vault: root.join("vault"),
         };
         Env {
             _t: t,
@@ -600,7 +669,7 @@ mod tests {
                 fw: e.root.join("vmm/CLOUDHV.fd"),
             },
             landlock: true,
-            restore: false,
+            restore: None,
         }
     }
 
@@ -626,7 +695,7 @@ mod tests {
                 fw: PathBuf::from("/v/CLOUDHV.fd"),
             },
             landlock: true,
-            restore: false,
+            restore: None,
         };
         (s, BoxPaths::new(PathBuf::from("/b/b1")))
     }
@@ -691,12 +760,12 @@ mod tests {
     #[test]
     fn argv_restore_is_short() {
         let (mut s, p) = fixed();
-        s.restore = true;
+        s.restore = Some(PathBuf::from("/vault/b1.snap"));
         assert_eq!(
             strs(argv(&s, &p)),
             [
                 "--restore",
-                "source_url=file:///b/b1/snapshot",
+                "source_url=file:///vault/b1.snap",
                 "--api-socket",
                 "path=/b/b1/api.sock"
             ]
@@ -886,7 +955,7 @@ mod tests {
         let _p2 = mkbox(&e, "b2");
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let go_rx = Mutex::new(go_rx);
-        let mut l = ChildLauncher::helper(PathBuf::from("/usr/bin/true"));
+        let mut l = ChildLauncher::helper(PathBuf::from("/usr/bin/true"), e.root.join("vault"));
         l.pre_spawn = Some(Box::new(move || {
             let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
         }));
@@ -911,6 +980,43 @@ mod tests {
         assert_eq!(l.exited(&id1), Some(true));
         assert!(l.exit_status(&id1).unwrap().success());
         l.force_stop(&id1).unwrap();
+    }
+
+    #[test]
+    fn restore_must_be_the_vault_copy() {
+        let e = env();
+        let p = mkbox(&e, "b1");
+        let mut s = spec(&e, "b1");
+        let snap = e.root.join("vault/b1.snap");
+        std::fs::create_dir(&snap).unwrap();
+        s.restore = Some(snap.clone());
+        check_spec(&s, &p, &e.allowed).unwrap();
+        for bad in [
+            p.snapshot_dir(),
+            e.root.join("vault/b2.snap"),
+            e.root.join("vault/../vault/b1.snap"),
+            e.root.join("vault/b1.snap,x=y"),
+            PathBuf::from("vault/b1.snap"),
+        ] {
+            s.restore = Some(bad.clone());
+            let err = check_spec(&s, &p, &e.allowed).unwrap_err();
+            assert!(err.starts_with("restore:"), "{bad:?}: {err}");
+        }
+        // a symlink at the vault path is not the copy
+        std::fs::remove_dir(&snap).unwrap();
+        std::os::unix::fs::symlink(e.root.join("elsewhere"), &snap).unwrap();
+        s.restore = Some(snap);
+        assert!(check_spec(&s, &p, &e.allowed)
+            .unwrap_err()
+            .starts_with("restore:"));
+    }
+
+    #[test]
+    fn proc_starttime_skips_the_comm_field() {
+        let stat = "1234 (a) b) c (d) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 20 21";
+        assert_eq!(parse_starttime(stat), Some(987654));
+        assert_eq!(parse_starttime("1234 (x"), None);
+        assert_eq!(parse_starttime("1234 (x) S 1 2"), None);
     }
 
     #[test]

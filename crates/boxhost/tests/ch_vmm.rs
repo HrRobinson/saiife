@@ -104,6 +104,7 @@ impl World {
             boxes: root.clone(),
             images: root.join("i"),
             vmm: root.join("v"),
+            vault: root.join("vault"),
             locked: false,
         };
         let image = ResolvedImage {
@@ -127,7 +128,10 @@ impl World {
     }
 
     fn launcher(&self, env: &[(&str, &str)]) -> Arc<ChildLauncher> {
-        let mut l = ChildLauncher::direct(PathBuf::from(env!("CARGO_BIN_EXE_saiife-fake-ch")));
+        let mut l = ChildLauncher::direct(
+            PathBuf::from(env!("CARGO_BIN_EXE_saiife-fake-ch")),
+            self.layout.vault.clone(),
+        );
         for (k, v) in env {
             l = l.env(k, v);
         }
@@ -143,7 +147,6 @@ impl World {
             images: Arc::new(Fixed(self.image.clone())),
             launcher,
             hooks,
-            marks: self.root.join("m"),
             landlock: true,
             stop: StopTimes {
                 power_s: 1,
@@ -166,7 +169,30 @@ impl World {
     }
 
     fn marker(&self, id: &str) -> PathBuf {
-        self.root.join("m").join(format!("{id}.snapshot"))
+        self.layout.vault.join(format!("{id}.marker"))
+    }
+
+    /// The verified snapshot copy in the vault.
+    fn snap(&self, id: &str) -> PathBuf {
+        self.layout.vault.join(format!("{id}.snap"))
+    }
+
+    fn pid_record(&self, id: &str) -> PathBuf {
+        self.layout.vault.join(format!("{id}.pid"))
+    }
+
+    /// Re-sign the marker over the vault copy as it is now.
+    fn resign(&self, id: &str) {
+        let mut files = serde_json::Map::new();
+        for e in std::fs::read_dir(self.snap(id)).unwrap() {
+            let e = e.unwrap();
+            files.insert(
+                e.file_name().into_string().unwrap(),
+                sha256_file(&e.path()).unwrap().into(),
+            );
+        }
+        let m = serde_json::json!({"version": 2, "files": files});
+        std::fs::write(self.marker(id), m.to_string()).unwrap();
     }
 
     /// Boot, pause, snapshot, stop: a box with a good snapshot and marker.
@@ -176,6 +202,14 @@ impl World {
         v.pause(&h).unwrap();
         v.snapshot(&h, &self.paths(id).snapshot_dir()).unwrap();
         assert!(self.marker(id).exists(), "snapshot writes the marker");
+        assert!(
+            self.snap(id).join("config.json").exists(),
+            "and the vault copy"
+        );
+        assert!(
+            !self.paths(id).snapshot_dir().exists(),
+            "moved out of the box dir"
+        );
         v.destroy(&h).unwrap();
         std::fs::remove_file(self.paths(id).dir.join("fake-ch.argv")).unwrap();
         self.log.lock().unwrap().clear();
@@ -186,18 +220,12 @@ impl World {
     /// VMM that could forge the marker would (it cannot; this isolates the
     /// config checks from the digest check).
     fn forge(&self, id: &str, edit: impl FnOnce(&mut serde_json::Value)) {
-        let cfg = self.paths(id).snapshot_dir().join("config.json");
+        let cfg = self.snap(id).join("config.json");
         let mut v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&cfg).unwrap()).unwrap();
         edit(&mut v);
         std::fs::write(&cfg, serde_json::to_vec(&v).unwrap()).unwrap();
-        let state = self.paths(id).snapshot_dir().join("state.json");
-        let m = serde_json::json!({
-            "version": 1,
-            "config": sha256_file(&cfg).unwrap(),
-            "state": sha256_file(&state).unwrap(),
-        });
-        std::fs::write(self.marker(id), m.to_string()).unwrap();
+        self.resign(id);
     }
 
     fn booted_cold(&self, id: &str) -> bool {
@@ -313,7 +341,7 @@ fn create_writes_spec_and_overlay() {
     assert_eq!(s.base, w.image.raw);
     assert_eq!(s.boot, w.image.boot);
     assert!(s.landlock);
-    assert!(!s.repo && !s.restore);
+    assert!(!s.repo && s.restore.is_none());
     // repo.img is picked up on the next create; a snapshot is not trusted
     // by create (boot decides, from the marker)
     std::fs::write(p.repo_disk(), b"r").unwrap();
@@ -321,7 +349,7 @@ fn create_writes_spec_and_overlay() {
     std::fs::write(p.snapshot_dir().join("config.json"), b"{}").unwrap();
     v.create(&w.spec("b1")).unwrap();
     let s = read_spec(&p).unwrap();
-    assert!(s.repo && !s.restore);
+    assert!(s.repo && s.restore.is_none());
 }
 
 #[test]
@@ -514,8 +542,17 @@ fn snapshot_needs_pause() {
     std::fs::write(p.snapshot_dir().join("stale"), b"x").unwrap();
     v.pause(&h).unwrap();
     v.snapshot(&h, &p.snapshot_dir()).unwrap();
-    assert!(p.snapshot_dir().join("config.json").exists());
-    assert!(!p.snapshot_dir().join("stale").exists());
+    // sealed into the vault, read-only, the stale file gone
+    let snap = w.snap("b1");
+    assert!(snap.join("config.json").exists());
+    assert!(!snap.join("stale").exists() && !p.snapshot_dir().exists());
+    let mode = |q: &Path| std::fs::metadata(q).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&snap), 0o750);
+    assert_eq!(mode(&snap.join("memory-ranges")), 0o640);
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(w.marker("b1")).unwrap()).unwrap();
+    let names: Vec<&String> = m["files"].as_object().unwrap().keys().collect();
+    assert_eq!(names, ["config.json", "memory-ranges", "state.json"]);
 }
 
 #[test]
@@ -540,16 +577,18 @@ fn restore_boots_paused_then_resumes() {
     v.boot(&h).unwrap();
     let argv = std::fs::read_to_string(p.dir.join("fake-ch.argv")).unwrap();
     assert!(argv.starts_with("\"--restore\"\n"), "{argv}");
-    assert!(read_spec(&p).unwrap().restore);
+    let src = format!("source_url=file://{}", w.snap("b1").display());
+    assert!(argv.contains(&format!("\"{src}\"")), "{argv}");
+    assert_eq!(read_spec(&p).unwrap().restore, Some(w.snap("b1")));
     assert_eq!(v.status(&h), VmStatus::Running);
     assert!(!w.events().iter().any(|e| e.ends_with(".refused")));
     // one-shot: the marker is gone, the next boot is cold
     assert!(!w.marker("b1").exists());
-    assert!(!p.snapshot_dir().exists(), "a spent snapshot is discarded");
+    assert!(!w.snap("b1").exists(), "a spent snapshot is discarded");
     v.destroy(&h).unwrap();
     v.boot(&h).unwrap();
     assert!(w.booted_cold("b1"));
-    assert!(!read_spec(&p).unwrap().restore);
+    assert!(read_spec(&p).unwrap().restore.is_none());
 }
 
 #[test]
@@ -560,7 +599,7 @@ fn restore_refuses_a_planted_snapshot() {
     std::fs::remove_file(w.marker("b1")).unwrap();
     v.boot(&h).unwrap();
     assert!(w.booted_cold("b1"));
-    assert!(!read_spec(&w.paths("b1")).unwrap().restore);
+    assert!(read_spec(&w.paths("b1")).unwrap().restore.is_none());
     assert!(
         w.events().contains(&"h.refused".to_string()),
         "{:?}",
@@ -573,7 +612,7 @@ fn restore_refuses_a_tampered_config() {
     let w = World::new();
     let (v, _l) = w.vmm(&[]);
     let h = w.snapshotted(&v, "b1");
-    let cfg = w.paths("b1").snapshot_dir().join("config.json");
+    let cfg = w.snap("b1").join("config.json");
     let mut c = std::fs::read(&cfg).unwrap();
     c.push(b' ');
     std::fs::write(&cfg, c).unwrap();
@@ -847,4 +886,130 @@ fn destroy_is_idempotent() {
     v.destroy(&h).unwrap();
     assert!(w.paths("b1").vm_json().exists(), "destroy keeps files");
     assert!(w.paths("b1").root_disk().exists());
+}
+
+#[test]
+fn api_gone_but_child_alive_refuses_start() {
+    let w = World::new();
+    let (v1, _l1) = w.vmm(&[]);
+    let h = w.create(&v1, "b1");
+    v1.boot(&h).unwrap();
+    assert!(w.pid_record("b1").exists(), "the launcher records the pid");
+    // a VMM that unlinks its API socket is still alive
+    std::fs::remove_file(w.paths("b1").api_sock()).unwrap();
+    let (v2, _l2) = w.vmm(&[]);
+    w.track(&v2, &h);
+    assert_ne!(v2.status(&h), VmStatus::Off);
+    let m = failed(v2.boot(&h));
+    assert!(m.contains("running"), "{m}");
+    assert_ne!(v1.status(&h), VmStatus::Off);
+}
+
+#[test]
+fn pid_record_with_other_starttime_is_gone() {
+    let w = World::new();
+    let (v, l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    std::fs::create_dir_all(&w.layout.vault).unwrap();
+    // a live pid (this test) with another start time: a reused pid
+    let rec = serde_json::json!({"pid": std::process::id(), "starttime": 1});
+    std::fs::write(w.pid_record("b1"), rec.to_string()).unwrap();
+    assert_eq!(l.exited(&h.id), Some(true));
+    assert_eq!(v.status(&h), VmStatus::Off);
+    v.boot(&h).unwrap();
+    assert_eq!(v.status(&h), VmStatus::Running);
+}
+
+#[test]
+fn unreadable_pid_record_fails_closed() {
+    let w = World::new();
+    let (v, l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    std::fs::create_dir_all(&w.layout.vault).unwrap();
+    std::fs::write(w.pid_record("b1"), b"not json").unwrap();
+    assert_eq!(l.exited(&h.id), Some(false));
+    assert_ne!(v.status(&h), VmStatus::Off);
+    assert!(v.boot(&h).is_err());
+    assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
+    std::fs::remove_file(w.pid_record("b1")).unwrap();
+}
+
+#[test]
+fn swapped_config_after_snapshot_is_not_used() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
+    let p = w.paths("b1");
+    std::fs::create_dir_all(p.snapshot_dir()).unwrap();
+    std::fs::write(
+        p.snapshot_dir().join("config.json"),
+        br#"{"disks":[{"path":"/etc/shadow"}]}"#,
+    )
+    .unwrap();
+    v.boot(&h).unwrap();
+    let argv = std::fs::read_to_string(p.dir.join("fake-ch.argv")).unwrap();
+    let src = format!("source_url=file://{}", w.snap("b1").display());
+    assert!(argv.contains(&format!("\"{src}\"")), "{argv}");
+    assert!(
+        !argv.contains(&p.snapshot_dir().display().to_string()),
+        "{argv}"
+    );
+    assert_eq!(v.status(&h), VmStatus::Running);
+}
+
+#[test]
+fn tampered_vault_copy_cold_boots() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
+    std::fs::write(w.snap("b1").join("state.json"), b"{}").unwrap();
+    v.boot(&h).unwrap();
+    assert!(w.booted_cold("b1"));
+    assert!(
+        w.events().contains(&"h.refused".to_string()),
+        "{:?}",
+        w.events()
+    );
+    assert!(!w.marker("b1").exists() && !w.snap("b1").exists());
+    // an extra file in the copy is refused too
+    v.destroy(&h).unwrap();
+    let h = w.snapshotted(&v, "b1");
+    std::fs::write(w.snap("b1").join("extra"), b"x").unwrap();
+    v.boot(&h).unwrap();
+    assert!(w.booted_cold("b1"));
+}
+
+#[test]
+fn pid_record_tracks_the_child_across_launchers() {
+    let w = World::new();
+    let (v, l1) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let p = w.paths("b1");
+    l1.start(&h.id, &p).unwrap();
+    let rec = w.pid_record("b1");
+    assert!(rec.exists());
+    let mode = std::fs::metadata(&rec).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let vmode = std::fs::metadata(&w.layout.vault)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(vmode & 0o777, 0o700);
+    // a fresh launcher (a daemon restart) sees it alive from the record
+    let l2 = w.launcher(&[]);
+    assert_eq!(l2.exited(&h.id), Some(false));
+    assert!(l2.force_stop(&h.id).is_err(), "never signals a non-child");
+    assert_eq!(l2.exited(&h.id), Some(false));
+    // the owner reaps it and drops the record
+    l1.force_stop(&h.id).unwrap();
+    assert!(!rec.exists());
+    assert_eq!(l2.exited(&h.id), None);
+    // a pid that no longer exists is gone
+    std::fs::write(&rec, r#"{"pid":4194303,"starttime":5}"#).unwrap();
+    assert_eq!(l2.exited(&h.id), Some(true));
+    // a child that exits on its own loses its record when reaped
+    let l3 = w.launcher(&[("FAKE_CH_EXIT_AT_START", "0")]);
+    l3.start(&h.id, &p).unwrap();
+    assert!(wait_for(LONG, || l3.exited(&h.id) == Some(true)));
+    assert!(!rec.exists());
 }

@@ -10,8 +10,11 @@
 //! through an `Arc`, runs the stop ladder, and is the only caller of the
 //! hooks' `after_off` for that run, once its exit is confirmed.
 //!
-//! A snapshot is restored only when `crate::snapshot::check` trusts it
-//! (S1); a restore is one-shot.
+//! Liveness comes only from `Launcher::exited` (S3, ruling R19): the VMM's
+//! own API socket refines Running/Paused/Created once the launcher says the
+//! process is alive, and never proves it dead. A snapshot is restored only
+//! from its verified copy in the vault (`crate::snapshot::verify`, R20);
+//! a restore is one-shot.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -98,7 +101,6 @@ pub struct ChVmmInit {
     pub images: Arc<dyn ImageResolver>,
     pub launcher: Arc<dyn Launcher>,
     pub hooks: Vec<Arc<dyn VmHooks>>,
-    pub marks: PathBuf,
     pub landlock: bool,
     pub stop: StopTimes,
 }
@@ -248,18 +250,15 @@ impl ChVmmInit {
         BoxPaths::new(self.layout.boxes.join(id.as_str()))
     }
 
-    /// Whether the VMM has exited: the launcher's word for its own process,
-    /// else (no process of ours) the API socket refusing.
-    fn exited(&self, id: &BoxId, paths: &BoxPaths) -> bool {
-        match self.launcher.exited(id) {
-            Some(x) => x,
-            None => matches!(Api::new(paths.api_sock()).ping(), Err(ApiError::NoSocket)),
-        }
+    /// Whether the VMM is gone, by the launcher's word only (`None`: no
+    /// process of this box is known to any launcher).
+    fn gone(&self, id: &BoxId) -> bool {
+        !matches!(self.launcher.exited(id), Some(false))
     }
 
     fn wait_exit(&self, run: &Run, until: Instant) -> bool {
         loop {
-            if self.exited(&run.id, &run.paths) {
+            if self.gone(&run.id) {
                 return true;
             }
             if Instant::now() >= until {
@@ -275,18 +274,20 @@ impl ChVmmInit {
         }
     }
 
-    /// Status of a VM with no run in this process (e.g. after a daemon
-    /// restart): ask the API. `vm.json` tells a known box from a gone one.
-    fn status_unknown(&self, paths: &BoxPaths) -> VmStatus {
+    /// Status from the launcher's liveness, refined by the API while the
+    /// process is alive. Gone or unknown: Off when `vm.json` is there (a
+    /// created, never booted or exited box), else Gone.
+    fn status_of(&self, id: &BoxId, paths: &BoxPaths) -> VmStatus {
+        if self.gone(id) {
+            return if paths.vm_json().exists() {
+                VmStatus::Off
+            } else {
+                VmStatus::Gone
+            };
+        }
         match Api::new(paths.api_sock()).state() {
             Ok(s) => map_state(s),
-            Err(ApiError::NoSocket) => {
-                if paths.vm_json().exists() {
-                    VmStatus::Off
-                } else {
-                    VmStatus::Gone
-                }
-            }
+            // alive but not answering: never Off
             Err(_) => VmStatus::Running,
         }
     }
@@ -304,7 +305,7 @@ impl ChVmmInit {
             }
             Err(e) => log(&run.id, &format!("power button: {}", api_text(&e))),
         }
-        if self.exited(&run.id, &run.paths) {
+        if self.gone(&run.id) {
             return;
         }
         let t1 = Instant::now();
@@ -327,7 +328,7 @@ impl ChVmmInit {
     fn reap(&self, run: &Run, rx: &Receiver<()>, stopping: bool) {
         if !stopping {
             loop {
-                if self.exited(&run.id, &run.paths) {
+                if self.gone(&run.id) {
                     break;
                 }
                 match rx.recv_timeout(POLL) {
@@ -343,7 +344,7 @@ impl ChVmmInit {
         } else {
             self.ladder(run);
         }
-        if self.exited(&run.id, &run.paths) {
+        if self.gone(&run.id) {
             self.after_off(&run.id);
             remove_sockets(&run.paths);
             run.confirmed.store(true, Ordering::SeqCst);
@@ -364,36 +365,32 @@ impl ChVmmInit {
         remove_sockets(paths);
     }
 
-    /// Whether to restore this boot (the VMM of the box is not running). A
-    /// snapshot that is not trusted is discarded with its marker, noted to
+    /// The snapshot to restore this boot from, if any (the VMM of the box is
+    /// confirmed gone). Not trusted: discarded with its marker, noted to
     /// the hooks, and the box cold-boots.
-    fn decide_restore(&self, id: &BoxId, paths: &BoxPaths, spec: &LaunchSpec) -> bool {
-        let marker = snapshot::marker_path(&self.marks, id);
-        let snap = paths.snapshot_dir();
+    fn decide_restore(&self, id: &BoxId, paths: &BoxPaths, spec: &LaunchSpec) -> Option<PathBuf> {
+        let vault = &self.layout.vault;
         let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-        if !present(&marker) && !present(&snap) {
-            return false;
+        if !present(&crate::vault::marker_path(vault, id))
+            && !present(&crate::vault::snap_dir(vault, id))
+        {
+            return None;
         }
-        let Err(why) = snapshot::check(&self.marks, id, paths, spec) else {
-            return true;
+        let why = match snapshot::verify(vault, id, paths, spec) {
+            Ok(dir) => return Some(dir),
+            Err(why) => why,
         };
         log(id, &format!("not restoring the snapshot: {why}"));
         for h in &self.hooks {
             h.restore_refused(id, &clean_line(&why));
         }
-        self.discard_snapshot(id, paths);
-        false
+        self.discard_snapshot(id);
+        None
     }
 
-    fn discard_snapshot(&self, id: &BoxId, paths: &BoxPaths) {
-        if let Err(e) = snapshot::remove_marker(&self.marks, id) {
+    fn discard_snapshot(&self, id: &BoxId) {
+        if let Err(e) = snapshot::discard(&self.layout.vault, id) {
             log(id, &e);
-        }
-        // std's remove_dir_all does not follow symlinks.
-        match std::fs::remove_dir_all(paths.snapshot_dir()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log(id, &format!("remove the snapshot: {e}")),
         }
     }
 }
@@ -436,11 +433,11 @@ impl ChVmm {
     fn boot_inner(&self, h: &VmHandle, paths: &BoxPaths) -> Result<(), VmmError> {
         let inner = &self.inner;
         let id = &h.id;
-        if matches!(
-            inner.status_unknown(paths),
-            VmStatus::Running | VmStatus::Paused | VmStatus::Created
-        ) {
-            return Err(VmmError::Failed("the VM is already running".into()));
+        if inner.launcher.exited(id) == Some(false) {
+            return Err(VmmError::Failed(
+                "the VMM of this box is still running (or its liveness cannot be determined)"
+                    .into(),
+            ));
         }
         let mut spec = read_spec(paths).map_err(VmmError::Failed)?;
         // `ch_launch`: stale sockets of an earlier VMM (CH binds without unlink)
@@ -462,11 +459,9 @@ impl ChVmm {
             inner.unwind(id, paths, false);
             return Err(VmmError::Failed(e));
         }
-        if spec.restore {
+        if spec.restore.is_some() {
             // One-shot: whatever happens next, this snapshot is used up.
-            if let Err(e) = snapshot::remove_marker(&inner.marks, id) {
-                log(id, &e);
-            }
+            snapshot::remove_marker(&inner.layout.vault, id);
         }
         let deadline = Instant::now() + SOCKET_WAIT;
         while !is_socket(&paths.api_sock()) {
@@ -489,7 +484,7 @@ impl ChVmm {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if spec.restore {
+        if spec.restore.is_some() {
             // `ch_restore`: the restored VM starts paused.
             let api = Api::new(paths.api_sock());
             let until = Instant::now() + RESUME_RETRY;
@@ -509,7 +504,7 @@ impl ChVmm {
                 )));
             }
             // Linux keeps files CH still has open; the snapshot is spent.
-            inner.discard_snapshot(id, paths);
+            inner.discard_snapshot(id);
         }
         Ok(())
     }
@@ -519,7 +514,7 @@ impl ChVmm {
     fn stop_unknown(&self, h: &VmHandle) -> Result<(), VmmError> {
         let paths = self.inner.paths(&h.id);
         if matches!(
-            self.inner.status_unknown(&paths),
+            self.inner.status_of(&h.id, &paths),
             VmStatus::Off | VmStatus::Gone
         ) {
             return Ok(());
@@ -582,7 +577,7 @@ impl Vmm for ChVmm {
             repo: paths.repo_disk().exists(),
             boot: image.boot.clone(),
             landlock: inner.landlock,
-            restore: false,
+            restore: None,
         };
         write_spec(&ls, &paths).map_err(VmmError::Failed)?;
         let data = serde_json::json!({
@@ -670,9 +665,10 @@ impl Vmm for ChVmm {
     }
 
     /// The exception to the trait's one-second rule: CH writes the whole
-    /// guest memory, bounded by `Api::snapshot`'s 120 s. The box's marker
-    /// is removed first and written after a successful snapshot, so only a
-    /// snapshot the daemon took is ever restored.
+    /// guest memory, bounded by `Api::snapshot`'s 120 s, plus one SHA-256
+    /// pass over it. The box's marker and vault copy are removed first; the
+    /// new snapshot is sealed into the vault (`snapshot::seal`) while the VM
+    /// is still paused, so only a snapshot the daemon took is ever restored.
     fn snapshot(&self, h: &VmHandle, dest: &Path) -> Result<(), VmmError> {
         let inner = &self.inner;
         let paths = inner.paths(&h.id);
@@ -688,43 +684,21 @@ impl Vmm for ChVmm {
             Ok(_) => return Err(VmmError::Failed("pause first".into())),
             Err(e) => return Err(failed_api(e)),
         }
-        snapshot::remove_marker(&inner.marks, &h.id).map_err(VmmError::Failed)?;
+        snapshot::discard(&inner.layout.vault, &h.id).map_err(VmmError::Failed)?;
         match std::fs::remove_dir_all(dest) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(VmmError::Failed(format!("remove the old snapshot: {e}"))),
         }
         api.snapshot(dest).map_err(failed_api)?;
-        snapshot::write_marker(&inner.marks, &h.id, &paths).map_err(VmmError::Failed)
+        snapshot::seal(&inner.layout.vault, &h.id, &paths).map_err(VmmError::Failed)
     }
 
     fn status(&self, h: &VmHandle) -> VmStatus {
-        let run = match self.runs().get(&h.id) {
-            Some(Slot::Starting { .. }) => return VmStatus::Running,
-            Some(Slot::Run(e)) => Arc::clone(&e.run),
-            None => return self.inner.status_unknown(&self.inner.paths(&h.id)),
-        };
-        if run.off() {
-            return VmStatus::Off;
+        if matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
+            return VmStatus::Running;
         }
-        if run.done() {
-            // the reaper could not confirm the exit
-            return self.inner.status_unknown(&run.paths);
-        }
-        if self.inner.launcher.exited(&h.id) == Some(true) {
-            return VmStatus::Off;
-        }
-        match Api::new(run.paths.api_sock()).state() {
-            Ok(s) => map_state(s),
-            Err(ApiError::NoSocket | ApiError::Timeout) => {
-                if self.inner.exited(&run.id, &run.paths) {
-                    VmStatus::Off
-                } else {
-                    VmStatus::Running
-                }
-            }
-            Err(_) => VmStatus::Running,
-        }
+        self.inner.status_of(&h.id, &self.inner.paths(&h.id))
     }
 
     /// Stops the VM if needed, waits for its reaper (at most
@@ -765,7 +739,7 @@ impl Vmm for ChVmm {
         }
         if !e.run.off()
             && !matches!(
-                self.inner.status_unknown(&e.run.paths),
+                self.inner.status_of(&h.id, &e.run.paths),
                 VmStatus::Off | VmStatus::Gone
             )
         {
