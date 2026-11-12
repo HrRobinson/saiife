@@ -716,7 +716,7 @@ fn main() -> ExitCode {
         return dev_cmd::run(action);
     }
     if let Cmd::Rules { config, action } = cli.command {
-        return rules_cmd::run(config, action);
+        return rules_cmd::run(config, cli.packs, action);
     }
     #[cfg(any(unix, windows))]
     if let Cmd::System { action } = cli.command {

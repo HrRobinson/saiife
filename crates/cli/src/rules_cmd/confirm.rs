@@ -113,7 +113,7 @@ pub fn table(props: &[Proposal], unverified: &[Unverified], judgement: &[SourceL
     out
 }
 
-fn read_answer(input: &mut dyn BufRead) -> Result<String, Eof> {
+pub(crate) fn read_answer(input: &mut dyn BufRead) -> Result<String, Eof> {
     let mut line = String::new();
     match input.read_line(&mut line) {
         Ok(0) | Err(_) => Err(Eof),

@@ -34,7 +34,7 @@ pub fn packs_dir(t: &crate::broker::Target) -> PathBuf {
         .join(saiife_policy::USER_PACKS_DIR)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -173,6 +173,66 @@ fn common(t: &mut Table, reason: &str, file: &str, d: &Decided) {
     }
 }
 
+/// The rule tables a set of decisions becomes.
+#[derive(Default)]
+pub(crate) struct RuleTables {
+    pub deny: ArrayOfTables,
+    pub allow: ArrayOfTables,
+    pub deny_path: ArrayOfTables,
+}
+
+/// An `[[unenforced]]` entry; `why` is `skipped`, `unverified` or `judgement`.
+pub(crate) fn unenforced_table(file: &str, s: &SourceLine, why: &str) -> Table {
+    let mut t = Table::new();
+    t["source"] = source_of(file, s);
+    t["text"] = value(s.text.as_str());
+    t["why"] = value(why);
+    t
+}
+
+/// The rule tables of one enforced decision, from the shared `pack_rules`
+/// enumeration (import and sync both render through this). `next_id` gives
+/// the id of each `[[deny]]` of the given source line.
+pub(crate) fn push_decided(
+    out: &mut RuleTables,
+    file: &str,
+    d: &Decided,
+    next_id: &mut dyn FnMut(u32) -> String,
+) {
+    for r in pack_rules(&d.p) {
+        let mut t = Table::new();
+        match r {
+            PackRule::Deny(c) => {
+                t["id"] = value(next_id(d.p.src.line));
+                t["pattern"] = value(&c.pattern);
+                common(&mut t, &d.p.reason, file, d);
+                if d.choice == Choice::Ask {
+                    t["ask"] = value(true);
+                }
+                if c.whole_segment {
+                    t["whole_segment"] = value(true);
+                }
+                if c.peeled_wrappers {
+                    t["peeled_wrappers"] = value(true);
+                }
+                out.deny.push(t);
+            }
+            PackRule::HelpAllow { pattern, reason } => {
+                t["pattern"] = value(pattern);
+                common(&mut t, &reason, file, d);
+                t["whole_segment"] = value(true);
+                out.allow.push(t);
+            }
+            PackRule::DenyPath { glob, access } => {
+                t["glob"] = value(glob);
+                t["access"] = value(access_word(access));
+                common(&mut t, &d.p.reason, file, d);
+                out.deny_path.push(t);
+            }
+        }
+    }
+}
+
 /// The pack text: `[pack]`, `[import]`, the confirmed rules and an
 /// `[[unenforced]]` entry per skipped, unverified or judgement line.
 pub fn render(p: &NewPack) -> String {
@@ -202,49 +262,21 @@ pub fn render(p: &NewPack) -> String {
     import["sha256"] = value(&p.file_sha256);
     doc["import"] = Item::Table(import);
 
-    let (mut deny, mut allow, mut deny_path) = (
-        ArrayOfTables::new(),
-        ArrayOfTables::new(),
-        ArrayOfTables::new(),
-    );
+    let mut tables = RuleTables::default();
     // The next `k` of each line's `l<line>-<k>` ids.
     let mut used: BTreeMap<u32, usize> = BTreeMap::new();
     for d in enforced {
-        for r in pack_rules(&d.p) {
-            let mut t = Table::new();
-            match r {
-                PackRule::Deny(c) => {
-                    let k = used.entry(d.p.src.line).or_insert(0);
-                    *k += 1;
-                    t["id"] = value(rule_id(d.p.src.line, *k));
-                    t["pattern"] = value(&c.pattern);
-                    common(&mut t, &d.p.reason, &p.file, d);
-                    if d.choice == Choice::Ask {
-                        t["ask"] = value(true);
-                    }
-                    if c.whole_segment {
-                        t["whole_segment"] = value(true);
-                    }
-                    if c.peeled_wrappers {
-                        t["peeled_wrappers"] = value(true);
-                    }
-                    deny.push(t);
-                }
-                PackRule::HelpAllow { pattern, reason } => {
-                    t["pattern"] = value(pattern);
-                    common(&mut t, &reason, &p.file, d);
-                    t["whole_segment"] = value(true);
-                    allow.push(t);
-                }
-                PackRule::DenyPath { glob, access } => {
-                    t["glob"] = value(glob);
-                    t["access"] = value(access_word(access));
-                    common(&mut t, &d.p.reason, &p.file, d);
-                    deny_path.push(t);
-                }
-            }
-        }
+        push_decided(&mut tables, &p.file, d, &mut |line| {
+            let k = used.entry(line).or_insert(0);
+            *k += 1;
+            rule_id(line, *k)
+        });
     }
+    let RuleTables {
+        deny,
+        allow,
+        deny_path,
+    } = tables;
 
     // One entry per line and why, in line order.
     let mut unenforced: Vec<(&SourceLine, &str)> = Vec::new();
@@ -261,11 +293,7 @@ pub fn render(p: &NewPack) -> String {
     unenforced.dedup_by(|a, b| a.0.line == b.0.line && a.1 == b.1);
     let mut un = ArrayOfTables::new();
     for (s, why) in unenforced {
-        let mut t = Table::new();
-        t["source"] = source_of(&p.file, s);
-        t["text"] = value(s.text.as_str());
-        t["why"] = value(why);
-        un.push(t);
+        un.push(unenforced_table(&p.file, s, why));
     }
 
     for (key, aot) in [
@@ -365,6 +393,35 @@ pub fn write_pack(dir: &Path, id: &str, text: &str, locked: bool) -> Result<Path
         let _ = d.sync_all();
     }
     Ok(target)
+}
+
+/// Replaces the pack file `path` with `text`: a temp file beside it
+/// (`O_EXCL`, `O_NOFOLLOW`, mode 0644 locked or 0600), fsynced, renamed over.
+pub fn replace_pack(path: &Path, text: &str, locked: bool) -> Result<(), String> {
+    let shown = |p: &Path| clean(&p.display().to_string());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp"));
+    if std::fs::symlink_metadata(&tmp).is_ok() {
+        std::fs::remove_file(&tmp).map_err(|e| format!("cannot remove {}: {e}", shown(&tmp)))?;
+    }
+    let wrote = create_tmp(&tmp, locked).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    });
+    let done = wrote.and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot write {}: {e}", shown(path)));
+    }
+    #[cfg(unix)]
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

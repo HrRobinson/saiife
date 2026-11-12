@@ -32,9 +32,9 @@ pub enum RulesAction {
         name: Option<String>,
     },
     /// Follow changes to the imported files.
+    ///
+    /// Only the pack(s) named by the global `--pack <ID>` when given.
     Sync {
-        #[arg(long, value_name = "PACK_ID")]
-        pack: Option<String>,
         #[arg(long)]
         llm: bool,
     },
@@ -139,10 +139,11 @@ fn todo_unavailable(action: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
-pub fn run(config: Option<PathBuf>, action: Option<RulesAction>) -> ExitCode {
+/// `packs` is the global `--pack` list: `sync` follows only those packs.
+pub fn run(config: Option<PathBuf>, packs: Vec<String>, action: Option<RulesAction>) -> ExitCode {
     match action.unwrap_or(RulesAction::List { json: false }) {
         RulesAction::Import { files, llm, name } => import(config, files, llm, name),
-        RulesAction::Sync { .. } => todo_unavailable("sync"),
+        RulesAction::Sync { llm } => sync(config, packs, llm),
         RulesAction::List { .. } => todo_unavailable("list"),
     }
 }
@@ -348,18 +349,7 @@ fn import_one(
     // 7. The table, then one question per proposal.
     outln!("{}", shown(&abs));
     print!("{}", confirm::table(&props, &unverified, &judgement));
-    let repropose = |src: &SourceLine, t: Target| -> Result<Proposal, String> {
-        let c = Candidate {
-            src: src.clone(),
-            targets: vec![t],
-        };
-        let mut p = propose::propose(&c, &file_name, Origin::Rules)
-            .into_iter()
-            .next()
-            .ok_or_else(|| "no rule for that".to_string())?;
-        propose::verify(&mut p, vars)?;
-        Ok(p)
-    };
+    let repropose = |src: &SourceLine, t: Target| repropose(src, t, &file_name, vars);
     let stdin = std::io::stdin();
     let decided = confirm::confirm(
         props,
@@ -429,6 +419,273 @@ fn import_one(
         why(UnenforcedWhy::Judgement),
         why(UnenforcedWhy::Skipped),
         why(UnenforcedWhy::Unverified)
+    );
+    if target.is_locked() && ask > 0 {
+        outln!("next: saiife policy reload");
+    }
+    Ok(())
+}
+
+/// An edited answer in the confirm loop: one new target for `src`.
+fn repropose(
+    src: &SourceLine,
+    t: Target,
+    file_name: &str,
+    vars: &saiifeguard::canon::PathVars,
+) -> Result<Proposal, String> {
+    let c = Candidate {
+        src: src.clone(),
+        targets: vec![t],
+    };
+    let mut p = propose::propose(&c, file_name, Origin::Rules)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no rule for that".to_string())?;
+    propose::verify(&mut p, vars)?;
+    Ok(p)
+}
+
+/// `saiife rules sync`: each imported pack follows its source file (D7).
+fn sync(config: Option<PathBuf>, packs: Vec<String>, llm: bool) -> ExitCode {
+    let stop = |Stop(code, m): Stop| {
+        eprintln!("saiife: {m}");
+        ExitCode::from(code)
+    };
+    let target = match crate::broker::resolve_here(config.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return stop(Stop(1, extract::clean(&e))),
+    };
+    let cwd = std::env::current_dir().ok();
+    let project = cwd
+        .as_deref()
+        .and_then(saiife_agents::config::find_project_root);
+    let vars = crate::paths::path_vars(cwd.as_deref(), project.as_deref());
+    let dir = store::packs_dir(&target);
+    let existing = match saiife_policy::userpacks::read_user_packs(&dir, &mut Vec::new()) {
+        Ok(e) => e,
+        Err(e) => return stop(Stop(1, extract::clean(&format!("user pack {e}")))),
+    };
+    // The imported packs, by id.
+    let mut imported: Vec<String> = Vec::new();
+    for e in &existing {
+        if let Ok(v) = saiifeguard::userpack::view(&e.text) {
+            if v.import.is_some() {
+                imported.push(e.path.clone());
+            }
+        }
+    }
+    let chosen: Vec<String> = if packs.is_empty() {
+        imported
+    } else {
+        let mut out = Vec::new();
+        for id in &packs {
+            match existing
+                .iter()
+                .find(|e| &e.id == id && imported.contains(&e.path))
+            {
+                Some(e) => out.push(e.path.clone()),
+                None => {
+                    return stop(Stop(
+                        2,
+                        format!(
+                            "no imported pack {}; see saiife rules list",
+                            extract::clean(id)
+                        ),
+                    ))
+                }
+            }
+        }
+        out
+    };
+    if chosen.is_empty() {
+        outln!("no imported packs; nothing to sync");
+        return ExitCode::SUCCESS;
+    }
+    for path in chosen {
+        if let Err(s) = sync_one(&target, &dir, &path, llm, &vars) {
+            return stop(s);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn sync_one(
+    target: &crate::broker::Target,
+    dir: &Path,
+    path: &str,
+    llm: bool,
+    vars: &saiifeguard::canon::PathVars,
+) -> Result<(), Stop> {
+    use saiifeguard::canon::PathStyle;
+    use saiifeguard::profile::Profile;
+    use saiifeguard::userpack::{load_user_packs, view, UnenforcedWhy, UserSrc};
+
+    // Read again: the pack may have changed since the directory was listed.
+    let existing = saiife_policy::userpacks::read_user_packs(dir, &mut Vec::new())
+        .map_err(|e| Stop(1, extract::clean(&format!("user pack {e}"))))?;
+    let me = existing
+        .iter()
+        .find(|e| e.path == path)
+        .ok_or_else(|| Stop(1, format!("{} is gone", extract::clean(path))))?;
+    let v = view(&me.text).map_err(|e| Stop(1, extract::clean(&e.to_string())))?;
+    let import = v
+        .import
+        .clone()
+        .ok_or_else(|| Stop(1, "pack has no [import]".into()))?;
+    let id = extract::clean(&v.id);
+    let src_path = Path::new(&import.file);
+    let shown_src = shown(src_path);
+    let file_name = src_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| import.file.clone());
+
+    // 1. The source.
+    if matches!(std::fs::symlink_metadata(src_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        crate::warn(&format!("warning: {shown_src}: source gone; rules kept"));
+        return Ok(());
+    }
+    let (text, sha) = store::read_source(src_path)
+        .map_err(|e| Stop(1, format!("{shown_src}: {}", extract::clean(&e))))?;
+    outln!("{id}: {shown_src}");
+    if sha == import.sha256 {
+        outln!("unchanged");
+        return Ok(());
+    }
+
+    // 2. What changed.
+    let plan = sync::plan(&v, &text);
+    for (h, from, to) in &plan.moved {
+        let _ = h;
+        outln!("~ line {from} \u{2192} {to}");
+    }
+    for (s, t, k) in &plan.gone {
+        outln!(
+            "- line {} gone: \"{}\" ({k} rules)",
+            s.line,
+            extract::clean(t)
+        );
+    }
+    let lines =
+        |c: &Candidate| outln!("+ line {}: \"{}\"", c.src.line, extract::clean(&c.src.text));
+    for c in &plan.new {
+        lines(c);
+    }
+
+    // 3. The gone lines that carry rules: keep (default) or remove.
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let eof = |confirm::Eof| {
+        Stop(
+            1,
+            "stopped before the last question; nothing written".into(),
+        )
+    };
+    let mut removed: Vec<String> = Vec::new();
+    for (s, t, k) in plan.gone.iter().filter(|(_, _, k)| *k > 0) {
+        loop {
+            eprint!(
+                "line {} is gone: \"{}\" ({k} rules). keep? [K/r]: ",
+                s.line,
+                extract::clean(t)
+            );
+            let a = confirm::read_answer(&mut input)
+                .map_err(eof)?
+                .to_lowercase();
+            match a.as_str() {
+                "" | "k" => break,
+                "r" => {
+                    removed.push(s.line_sha256.clone());
+                    break;
+                }
+                _ => eprintln!("answer k or r"),
+            }
+        }
+    }
+
+    // 4. The new lines: proposed and confirmed like an import.
+    let (mut props, mut unverified, mut judgement) =
+        propose::proposals_for(&plan.new, &file_name, vars);
+    llm_pass(
+        llm,
+        &file_name,
+        vars,
+        &mut props,
+        &mut unverified,
+        &mut judgement,
+    );
+    let mut decided = Vec::new();
+    if !(props.is_empty() && unverified.is_empty() && judgement.is_empty()) {
+        print!("{}", confirm::table(&props, &unverified, &judgement));
+        let rp = |src: &SourceLine, t: Target| repropose(src, t, &file_name, vars);
+        decided = confirm::confirm(
+            props,
+            target.is_locked(),
+            &mut input,
+            &mut std::io::stderr(),
+            &rp,
+        )
+        .map_err(eof)?;
+    }
+    let mut unenforced: Vec<(SourceLine, UnenforcedWhy)> = Vec::new();
+    for u in &unverified {
+        unenforced.push((u.src.clone(), UnenforcedWhy::Unverified));
+    }
+    for j in &judgement {
+        unenforced.push((j.clone(), UnenforcedWhy::Judgement));
+    }
+
+    // 5. The new pack text; every pack with it must load, host and box.
+    let new_text = sync::apply(&me.text, &plan, &removed, &decided, &unenforced)
+        .map_err(|e| Stop(1, format!("{}; nothing written", extract::clean(&e))))?;
+    let nv = view(&new_text).map_err(|e| Stop(1, extract::clean(&e.to_string())))?;
+    let remove_pack = nv.rules.is_empty();
+    let refuse = |m: String| Stop(1, format!("{}; nothing written", extract::clean(&m)));
+    let bytes = existing
+        .iter()
+        .filter(|e| e.path != path)
+        .map(|e| e.text.len())
+        .sum::<usize>()
+        + if remove_pack { 0 } else { new_text.len() };
+    if bytes > saiife_policy::userpacks::MAX_USER_PACK_BYTES {
+        return Err(refuse(format!(
+            "pack files would total more than {} KiB",
+            saiife_policy::userpacks::MAX_USER_PACK_BYTES / 1024
+        )));
+    }
+    let mut srcs: Vec<UserSrc> = existing
+        .iter()
+        .filter(|e| e.path != path)
+        .map(|e| UserSrc {
+            source: &e.path,
+            text: &e.text,
+        })
+        .collect();
+    if !remove_pack {
+        srcs.push(UserSrc {
+            source: path,
+            text: &new_text,
+        });
+    }
+    for profile in [Profile::Host, Profile::Box] {
+        load_user_packs(&srcs, PathStyle::host(), profile).map_err(|e| refuse(e.to_string()))?;
+    }
+
+    // 6. Write (or delete).
+    let shown_pack = extract::clean(path);
+    if remove_pack {
+        std::fs::remove_file(path)
+            .map_err(|e| Stop(1, format!("cannot remove {shown_pack}: {e}")))?;
+        outln!("{id} removed: no rules left");
+        return Ok(());
+    }
+    store::replace_pack(Path::new(path), &new_text, target.is_locked()).map_err(|e| Stop(1, e))?;
+    let ask = nv.rules.iter().filter(|r| r.ask).count();
+    outln!(
+        "updated {shown_pack}: {} rules ({ask} ask), {} not enforced",
+        nv.rules.len(),
+        nv.unenforced.len()
     );
     if target.is_locked() && ask > 0 {
         outln!("next: saiife policy reload");

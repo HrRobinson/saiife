@@ -526,3 +526,165 @@ mod locked {
         assert!(stdout(&s).contains(&format!("{id}/l1-1")), "{}", stdout(&s));
     }
 }
+
+// ---- sync ----
+
+fn imported_pack(env: &Env, md: &str, answers: &str) -> PathBuf {
+    env.write("CLAUDE.md", md);
+    let o = rules(env, &["import", "CLAUDE.md"], answers);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    pack_files(&personal_packs(env)).remove(0)
+}
+
+fn sha_of(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn unchanged_source_says_so() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let before = fs::read(&pack).unwrap();
+    let o = rules(&env, &["sync"], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("unchanged"), "{}", stdout(&o));
+    assert_eq!(fs::read(&pack).unwrap(), before);
+}
+
+#[test]
+fn gone_line_kept_by_default() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    env.write("CLAUDE.md", "nothing to see\n");
+    let o = rules(&env, &["sync"], "\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("- line 1 gone"), "{out}");
+    assert!(out.contains("Never run `deploy-prod`."), "{out}");
+    let text = fs::read_to_string(&pack).unwrap();
+    assert!(text.contains("deploy-prod"), "{text}");
+    assert!(
+        text.contains(&format!("sha256 = \"{}\"", sha_of("nothing to see\n"))),
+        "{text}"
+    );
+}
+
+#[test]
+fn gone_line_removed_on_r() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(
+        &env,
+        "Never run `deploy-prod`.\nNever run `terraform apply`.\n",
+        "e\n\ne\n\n",
+    );
+    env.write("CLAUDE.md", "Never run `terraform apply`.\n");
+    let o = rules(&env, &["sync"], "r\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = fs::read_to_string(&pack).unwrap();
+    assert!(!text.contains("deploy-prod"), "{text}");
+    assert!(text.contains("terraform"), "{text}");
+    assert!(text.contains("line = 1"), "moved up: {text}");
+    // The carve-out `[[allow]]` went with its deny.
+    assert!(!text.contains("deploy-prod\\s"), "{text}");
+}
+
+#[test]
+fn gone_line_removed_last_rule_deletes_the_pack() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    env.write("CLAUDE.md", "nothing\n");
+    let o = rules(&env, &["sync"], "r\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains(" removed: no rules left"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(stdout(&o).contains("user."), "{}", stdout(&o));
+    assert!(!pack.exists());
+}
+
+#[test]
+fn new_line_is_only_proposed() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let deny = |t: &str| t.matches("[[deny]]").count();
+    let before = deny(&fs::read_to_string(&pack).unwrap());
+    env.write("CLAUDE.md", "Never run `deploy-prod`.\nNever run `x2`.\n");
+    let o = rules(&env, &["sync"], "s\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("+ line 2: \"Never run `x2`.\""),
+        "{}",
+        stdout(&o)
+    );
+    let text = fs::read_to_string(&pack).unwrap();
+    assert_eq!(deny(&text), before, "{text}");
+    assert!(text.contains("why = \"skipped\""), "{text}");
+
+    // Skipped lines are known now; a new one is enforced on `e`.
+    env.write(
+        "CLAUDE.md",
+        "Never run `deploy-prod`.\nNever run `x2`.\nNever run `x3`.\n",
+    );
+    let o = rules(&env, &["sync"], "e\n\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = fs::read_to_string(&pack).unwrap();
+    assert!(text.contains("id = \"l3-1\""), "{text}");
+}
+
+#[test]
+fn sync_eof_writes_nothing() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let before = fs::read(&pack).unwrap();
+    env.write("CLAUDE.md", "nothing\n");
+    let o = rules(&env, &["sync"], "");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert_eq!(fs::read(&pack).unwrap(), before);
+}
+
+#[test]
+fn sync_unknown_pack_is_bad_input() {
+    let env = Env::new(&[]);
+    imported_pack(&env, DEPLOY, "e\n\n");
+    let o = rules(&env, &["sync", "--pack", "user.nope"], "");
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+}
+
+#[test]
+fn sync_missing_source_keeps_rules() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    fs::remove_file(env.root().join("CLAUDE.md")).unwrap();
+    let before = fs::read(&pack).unwrap();
+    let o = rules(&env, &["sync"], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("source gone; rules kept"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(fs::read(&pack).unwrap(), before);
+}
+
+#[test]
+fn sync_output_never_carries_control_bytes() {
+    let env = Env::new(&[]);
+    let esc = "Never run `rm\u{1b}[31m` or \u{202e}x.\n";
+    imported_pack(&env, &format!("{DEPLOY}{esc}"), "e\n\n");
+    env.write("CLAUDE.md", &format!("{DEPLOY}Never run `new\u{1b}[2J`.\n"));
+    let o = rules(&env, &["sync"], "\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(all.contains("- line 2 gone"), "{all}");
+    assert!(
+        !all.chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t' || c == '\u{202e}'),
+        "{all:?}"
+    );
+}

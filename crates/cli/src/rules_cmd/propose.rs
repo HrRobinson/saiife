@@ -55,7 +55,7 @@ pub fn reason(file_name: &str, line: u32, text: &str) -> String {
 }
 
 /// `w` as a literal in a regex.
-fn escape(w: &str) -> String {
+pub(crate) fn escape(w: &str) -> String {
     let mut out = String::with_capacity(w.len());
     for c in w.chars() {
         if r"\.+*?()|[]{}^$#&-~".contains(c) {
