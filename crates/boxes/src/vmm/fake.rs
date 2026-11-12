@@ -28,6 +28,8 @@ pub struct VmCall {
 #[derive(Default)]
 struct State {
     status: HashMap<BoxId, VmStatus>,
+    /// Whether `<dir>/repo.img` was there when `create` ran.
+    repo_disk: HashMap<BoxId, bool>,
     fail: Vec<(VmOp, String)>,
     calls: Vec<VmCall>,
 }
@@ -54,6 +56,12 @@ impl FakeVmm {
     /// Force a status, e.g. `Gone` to simulate a crash.
     pub fn set_status(&self, id: &BoxId, s: VmStatus) {
         self.lock().status.insert(id.clone(), s);
+    }
+
+    /// Whether the box's repo disk was in its dir at `create` (`None`: no
+    /// create yet).
+    pub fn saw_repo_disk(&self, id: &BoxId) -> Option<bool> {
+        self.lock().repo_disk.get(id).copied()
     }
 
     pub fn calls(&self) -> Vec<VmCall> {
@@ -93,7 +101,9 @@ impl FakeVmm {
 
 impl Vmm for FakeVmm {
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
+        let disk = spec.dir.join(crate::manager::REPO_IMAGE).is_file();
         let mut s = self.enter(VmOp::Create, &spec.id)?;
+        s.repo_disk.insert(spec.id.clone(), disk);
         s.status.insert(spec.id.clone(), VmStatus::Created);
         Ok(VmHandle {
             id: spec.id.clone(),

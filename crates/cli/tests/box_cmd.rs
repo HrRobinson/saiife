@@ -1,6 +1,10 @@
 //! `saiife box ...` against a real locked-mode daemon (plan 34, Task 9) whose
 //! boxes run on the fake VM (`fake-vmm` build, `SAIIFE_BOX_FAKE_VMM=1`). The
 //! host is pinned to one default box with `SAIIFE_BOX_FAKE_SLOTS=1`.
+//!
+//! The project is a git repo (real git, no global or system config): spawn
+//! snapshots it into a repo disk (plan 37), built by a fake `mke2fs` that
+//! writes the ext4 magic and nothing else.
 #![cfg(all(unix, feature = "fake-vmm"))]
 
 mod common;
@@ -19,8 +23,48 @@ fn daemon_with(slots: Option<u32>) -> TestDaemon {
         env,
         ..Opts::default()
     });
-    fs::create_dir_all(d.path().join("project")).unwrap();
+    let project = d.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    git(&d, &["init", "-q", "-b", "main"]);
+    fs::write(project.join("README"), "hello\n").unwrap();
+    fs::create_dir_all(d.path().join("bin")).unwrap();
+    exec(
+        &d.path().join("bin/mke2fs"),
+        "#!/bin/sh\nhead -c 1080 /dev/zero > \"$8\" && printf '\\123\\357' >> \"$8\" \
+         && head -c 4096 /dev/zero >> \"$8\"\n",
+    );
+    exec(
+        &d.path().join("bin/mke2fs-fails"),
+        "#!/bin/sh\necho 'mke2fs: no space' >&2\nexit 1\n",
+    );
     d
+}
+
+fn exec(p: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(p, body).unwrap();
+    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Git's environment here: no global or system config, HOME in the world.
+fn git_env(c: &mut Command, d: &TestDaemon) {
+    c.env("HOME", d.path().join("home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+/// Real git in the project; its stdout.
+fn git(d: &TestDaemon, args: &[&str]) -> String {
+    let mut c = Command::new("/usr/bin/git");
+    c.arg("-C").arg(d.path().join("project")).args(args);
+    git_env(&mut c, d);
+    let o = c.output().unwrap();
+    assert!(
+        o.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
 /// One slot.
@@ -29,8 +73,19 @@ fn world() -> TestDaemon {
 }
 
 fn bx(d: &TestDaemon, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_saiife"))
-        .arg("box")
+    bx_with(d, args, &[])
+}
+
+/// `bx` with `extra` environment.
+fn bx_with(d: &TestDaemon, args: &[&str], extra: &[(&str, std::path::PathBuf)]) -> Output {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    git_env(&mut c, d);
+    c.env("XDG_CACHE_HOME", d.path().join("cache"))
+        .env("SAIIFE_TOOL_MKE2FS", d.path().join("bin/mke2fs"));
+    for (k, v) in extra {
+        c.env(k, v);
+    }
+    c.arg("box")
         .arg("--system-config")
         .arg(d.config())
         .args(args)
@@ -336,4 +391,74 @@ fn restart_recovery_is_recorded() {
     assert_eq!(r["box"], "b1");
     assert_eq!(r["from"], "running");
     assert_eq!(r["to"], "done");
+}
+
+/// What is left under the CLI's staging root.
+fn staging_left(d: &TestDaemon) -> Vec<std::path::PathBuf> {
+    match fs::read_dir(d.path().join("cache/saiife/box-spawn")) {
+        Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Plan 37: spawn snapshots the project into a repo disk, passes it and
+/// its manifest to the daemon (which places both in the box dir), points
+/// `refs/saiife/box-<id>/base` at the snapshot commit and removes its
+/// staging.
+#[test]
+fn spawn_sends_repo_and_sets_base_ref() {
+    let d = world();
+    fs::write(d.path().join("project/new.txt"), "untracked\n").unwrap();
+    let o = bx(&d, &["spawn", "--task", "t", "--timings"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).starts_with("box b1 "), "{}", out(&o));
+    for step in ["snapshot", "image", "snapshot commit", "spawn", "base ref"] {
+        assert!(
+            err(&o).contains(&format!("saiife: timing {step} ")),
+            "{step}: {}",
+            err(&o)
+        );
+    }
+    let dir = d.state_dir().join("boxes/b1");
+    let disk = fs::read(dir.join("repo.img")).unwrap();
+    assert_eq!(&disk[1080..1082], &[0x53, 0xEF]);
+    let base: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("base.json")).unwrap()).unwrap();
+    assert_eq!(base["repo"], "project", "{base}");
+    let entries: Vec<&String> = base["entries"].as_object().unwrap().keys().collect();
+    assert_eq!(entries, ["README", "new.txt"], "{base}");
+    let commit = base["snapshot_commit"].as_str().unwrap();
+    let r = git(&d, &["rev-parse", "refs/saiife/box-b1/base"]);
+    assert_eq!(r.trim(), commit);
+    let tree = git(&d, &["ls-tree", "--name-only", commit]);
+    assert_eq!(tree, "README\nnew.txt\n");
+    assert!(staging_left(&d).is_empty(), "{:?}", staging_left(&d));
+    let v = ls_json(&d);
+    assert_eq!(v["boxes"][0]["repo"], "project", "{v}");
+}
+
+/// Every failure removes the staging: the daemon refusing the spawn (no
+/// box, so no base ref) and the disk build failing.
+#[test]
+fn spawn_cleans_staging_on_error() {
+    let d = world();
+    let o = bx(&d, &["spawn", "--template", "nope"]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(err(&o).contains("nope"), "{}", err(&o));
+    assert!(staging_left(&d).is_empty(), "{:?}", staging_left(&d));
+    assert!(!d.state_dir().join("boxes/b1").exists());
+    assert!(!git(&d, &["for-each-ref", "refs/saiife"]).contains("box-"));
+    let fails = d.path().join("bin/mke2fs-fails");
+    let o = bx_with(&d, &["spawn"], &[("SAIIFE_TOOL_MKE2FS", fails)]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("no space"), "{}", err(&o));
+    assert!(staging_left(&d).is_empty(), "{:?}", staging_left(&d));
+    // Not a git repo: refused before anything is staged.
+    let plain = d.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let o = bx(&d, &["spawn", "--repo", plain.to_str().unwrap()]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(staging_left(&d).is_empty());
+    // The daemon has nothing of these.
+    assert!(ls_json(&d)["boxes"].as_array().unwrap().is_empty());
 }

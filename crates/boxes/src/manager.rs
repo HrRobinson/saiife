@@ -19,8 +19,9 @@
 //! A Discarded record whose `vm` is still `Some` means the VMM resource may
 //! still exist (its destroy failed); gc retries the destroy before removing
 //! the record.
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use saiife_wire::source::{
@@ -43,6 +44,13 @@ pub const DONE_IDLE_SECS: u64 = 30;
 pub const DEFAULT_IDLE_STOP_MINS: u32 = 120;
 /// Longest repo name accepted at spawn.
 pub const MAX_REPO_BYTES: usize = 256;
+/// The repo disk's name in a box dir (plan 37).
+pub const REPO_IMAGE: &str = "repo.img";
+/// The base manifest's name in a box dir (plan 37).
+pub const BASE_MANIFEST: &str = "base.json";
+const PAIR: &str = "a repo disk and its base manifest come together, or neither";
+const NOT_INCOMING: &str =
+    "the repo disk and its base manifest must be in one dir of the box store's .incoming";
 
 const RECORD_VERSION: u32 = 1;
 const LOST: &str = "the VM was gone after a daemon restart";
@@ -73,9 +81,11 @@ pub struct SpawnArgs {
     pub task: String,
     pub start: Start,
     pub owner_uid: u32,
-    /// A repo disk image (plan 37); refused until then.
+    /// A repo disk image (plan 37) in `<store root>/.incoming/<dir>/`;
+    /// spawn moves it to `<box dir>/repo.img` before admission.
     pub repo_image: Option<PathBuf>,
-    /// The base manifest of a repo disk (plan 37); refused until then.
+    /// The base manifest of that disk, in the same dir; it becomes
+    /// `<box dir>/base.json`. Both or neither.
     pub base_manifest: Option<PathBuf>,
 }
 
@@ -112,6 +122,10 @@ struct Inner {
     store: Store,
     records: BTreeMap<BoxId, BoxRecord>,
     next_seq: u64,
+    /// Ids claimed by a spawn that is moving its repo disk in, outside the
+    /// lock: their dirs have no record yet, and gc must not take them for
+    /// orphans.
+    placing: BTreeSet<BoxId>,
 }
 
 impl Inner {
@@ -164,6 +178,8 @@ impl Inner {
 
 pub struct Manager {
     inner: Mutex<Inner>,
+    /// The store root, for the work done outside the lock.
+    root: PathBuf,
     vmm: Arc<dyn Vmm>,
     guest: Arc<dyn GuestLink>,
     templates: Vec<BoxTemplate>,
@@ -212,10 +228,12 @@ impl Manager {
     pub fn open(init: ManagerInit) -> Result<Opened, BoxesError> {
         let (loaded, mut warns) = init.store.list()?;
         let now = (init.clock)();
+        let root = init.store.root().to_path_buf();
         let mut inner = Inner {
             store: init.store,
             records: BTreeMap::new(),
             next_seq: 1,
+            placing: BTreeSet::new(),
         };
         let mut max_seq = 0;
         let mut changes = Vec::new();
@@ -252,6 +270,7 @@ impl Manager {
         }
         let mgr = Manager {
             inner: Mutex::new(inner),
+            root,
             vmm: init.vmm,
             guest: init.guest,
             templates: init.templates,
@@ -271,6 +290,38 @@ impl Manager {
 
     fn now(&self) -> u64 {
         (self.clock)()
+    }
+
+    /// The box store's root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `(dir, image name, manifest name)` of a repo disk spawn takes: both
+    /// files in one dir right under `<root>/.incoming`.
+    fn incoming<'a>(
+        &self,
+        image: &'a Path,
+        manifest: &'a Path,
+    ) -> Result<(&'a OsStr, &'a OsStr, &'a OsStr), BoxError> {
+        let bad = || BoxError::Invalid(NOT_INCOMING.into());
+        let inc = self.root.join(crate::place::INCOMING);
+        let split = |p: &'a Path| -> Option<(&'a OsStr, &'a OsStr)> {
+            let name = p.file_name()?;
+            let dir = p.parent()?;
+            (dir.parent()? == inc).then_some((dir.file_name()?, name))
+        };
+        let (d1, image) = split(image).ok_or_else(bad)?;
+        let (d2, manifest) = split(manifest).ok_or_else(bad)?;
+        if d1 != d2 || image == manifest {
+            return Err(bad());
+        }
+        Ok((d1, image, manifest))
+    }
+
+    /// Whether a `Start::Now` spawn must be refused.
+    fn now_busy(g: &Inner, host: &HostFacts, size: &crate::template::Size) -> bool {
+        !g.queue().is_empty() || capacity::admit(host, &g.committed(), size).is_err()
     }
 
     fn template(&self, name: &str) -> Option<&BoxTemplate> {
@@ -336,10 +387,17 @@ impl Manager {
     /// admission and any earlier queue heads it admitted (or discarded on a
     /// boot failure), which may belong to other owners. The audit log needs
     /// those, since the tick never sees them.
+    ///
+    /// With a repo disk the id is claimed under the lock, the lock let go
+    /// while the disk and manifest are renamed into the box dir (gc leaves
+    /// that id alone meanwhile), and taken again to save the record and
+    /// admit. A rename error releases the id's dir and is `Unavailable`.
     pub fn spawn_changes(&self, a: &SpawnArgs) -> Result<(BoxRecord, Vec<Change>), BoxError> {
-        if a.repo_image.is_some() || a.base_manifest.is_some() {
-            return Err(BoxError::Invalid("repo disks are not supported yet".into()));
-        }
+        let disk = match (&a.repo_image, &a.base_manifest) {
+            (None, None) => None,
+            (Some(i), Some(m)) => Some(self.incoming(i, m)?),
+            _ => return Err(BoxError::Invalid(PAIR.into())),
+        };
         if !a.task.is_empty() {
             check_text(&a.task, MAX_TASK_BYTES)?;
         }
@@ -352,12 +410,33 @@ impl Manager {
         capacity::fits_ever(&host, &size).map_err(|r| BoxError::Invalid(r.message()))?;
         let now = self.now();
         let mut g = self.lock();
-        if a.start == Start::Now
-            && (!g.queue().is_empty() || capacity::admit(&host, &g.committed(), &size).is_err())
-        {
+        if a.start == Start::Now && Self::now_busy(&g, &host, &size) {
             return Err(BoxError::Busy);
         }
         let id = g.store.claim_id()?;
+        if let Some((sub, image, manifest)) = disk {
+            g.placing.insert(id.clone());
+            drop(g);
+            let moved = crate::place::place(
+                &self.root,
+                id.as_str(),
+                sub,
+                &[(image, REPO_IMAGE), (manifest, BASE_MANIFEST)],
+            );
+            g = self.lock();
+            g.placing.remove(&id);
+            if let Err(e) = moved {
+                let _ = g.store.remove(&id);
+                return Err(BoxError::Unavailable(format!(
+                    "cannot move the repo disk into the box: {e}"
+                )));
+            }
+            // Another spawn may have taken the room meanwhile.
+            if a.start == Start::Now && Self::now_busy(&g, &host, &size) {
+                let _ = g.store.remove(&id);
+                return Err(BoxError::Busy);
+            }
+        }
         let seq = g.take_seq();
         let r = BoxRecord {
             version: RECORD_VERSION,
@@ -832,13 +911,21 @@ impl Manager {
     /// that fails again the record stays, with the error updated. A store
     /// error does not stop the pass: the report has every id removed and
     /// the first error.
+    ///
+    /// First, outside the lock, every `<root>/.incoming` entry older than
+    /// [`crate::place::INCOMING_MAX_AGE_SECS`] goes: what a daemon that died
+    /// mid-spawn left there.
     pub fn gc(&self) -> GcReport {
         let now = self.now();
-        let mut g = self.lock();
         let mut rep = GcReport::default();
         let fail = |rep: &mut GcReport, e: String| {
             rep.error.get_or_insert(e);
         };
+        for e in crate::place::sweep_incoming(&self.root, now, crate::place::INCOMING_MAX_AGE_SECS)
+        {
+            fail(&mut rep, e);
+        }
+        let mut g = self.lock();
         let gone: Vec<BoxId> = g
             .records
             .values()
@@ -871,7 +958,7 @@ impl Manager {
         match g.store.orphans() {
             Ok(orphans) => {
                 for id in orphans {
-                    if g.records.contains_key(&id) {
+                    if g.records.contains_key(&id) || g.placing.contains(&id) {
                         continue;
                     }
                     match g.store.remove(&id) {

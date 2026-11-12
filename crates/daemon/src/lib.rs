@@ -12,6 +12,8 @@ pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
 pub mod box_ops;
+#[cfg(unix)]
+pub mod box_repo;
 pub mod cloud_ops;
 pub mod cosign;
 pub mod disk;

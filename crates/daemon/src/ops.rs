@@ -1335,11 +1335,16 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             crate::workspace_ops::handle(ctx, conn, req).await
         }
         op if crate::box_ops::OPS.contains(&op) => crate::box_ops::handle(ctx, conn, req).await,
-        other => err(
-            req.id,
-            ErrorCode::UnknownOp,
-            &format!("unknown op {other:?}"),
-        ),
+        other => {
+            // An fd op this daemon does not serve: what it was passed goes.
+            #[cfg(unix)]
+            drop(conn.take_fds());
+            err(
+                req.id,
+                ErrorCode::UnknownOp,
+                &format!("unknown op {other:?}"),
+            )
+        }
     }
 }
 

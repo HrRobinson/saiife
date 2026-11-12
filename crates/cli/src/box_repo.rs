@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// D5: the most a box repo may hold, summed as in D4.
-pub const REPO_MAX_BYTES: u64 = 8 << 30;
+pub use saiife_boxproto::manifest::REPO_MAX_BYTES;
 /// D5: the most files (and symlinks) a box repo may hold.
 pub const REPO_MAX_FILES: u64 = 200_000;
 

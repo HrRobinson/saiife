@@ -1686,6 +1686,7 @@ dependencies = [
 name = "saiife-boxes"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "saiife-touch",
  "saiife-wire",
  "serde",
@@ -1773,6 +1774,8 @@ dependencies = [
  "rustls",
  "saiife-audit",
  "saiife-boxes",
+ "saiife-boxhost",
+ "saiife-boxproto",
  "saiife-broker",
  "saiife-darwin",
  "saiife-guard",

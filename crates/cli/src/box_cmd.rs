@@ -25,6 +25,9 @@ pub enum BoxAction {
         /// Start now or fail; never queue.
         #[arg(long)]
         now: bool,
+        /// Print each step's milliseconds to stderr (the smoke script's).
+        #[arg(long, hide = true)]
+        timings: bool,
     },
     /// List your boxes (all boxes for an admin with --all).
     Ls {
@@ -150,16 +153,179 @@ mod imp {
     /// One call on a fresh connection. `unavailable` (no boxes in this
     /// version) is exit 5 like an unreachable daemon; every other refusal is 2.
     fn call(t: &Target, op: &str, a: Args) -> Result<Args, Stop> {
+        call_passing(t, op, a, &[])
+    }
+
+    /// [`call`], with `fds` passed to the daemon for this op (none: a
+    /// plain call).
+    fn call_passing(
+        t: &Target,
+        op: &str,
+        a: Args,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<Args, Stop> {
         let down = |e: &ClientError| Stop::Unavailable(broker::unreachable(t, e));
         let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
-        c.call(op, a, Instant::now() + CALL_TIMEOUT)
-            .map_err(|e| match e {
-                ClientError::Refused { code, message } if code == "unavailable" => {
-                    Stop::Unavailable(message)
+        let deadline = Instant::now() + CALL_TIMEOUT;
+        let r = if fds.is_empty() {
+            c.call(op, a, deadline)
+        } else {
+            c.call_with_fds(op, a, fds, deadline)
+        };
+        r.map_err(|e| match e {
+            ClientError::Refused { code, message } if code == "unavailable" => {
+                Stop::Unavailable(message)
+            }
+            ClientError::Refused { message, .. } => Stop::Refused(message),
+            other => down(&other),
+        })
+    }
+
+    /// `saiife box spawn` (plan 37): the repo disk is built here, as the
+    /// user, and handed to the daemon as descriptors.
+    mod spawn {
+        use super::{args, call_passing, sanitize, Args, Stop};
+        use crate::box_repo::{self, Snapshot};
+        use crate::broker::Target;
+        use saiife_boxhost::layout::Layout;
+        use saiife_boxhost::tools::Tools;
+        use saiife_wire::source::BoxId;
+        use serde_json::{json, Value};
+        use std::os::fd::AsFd;
+        use std::path::{Path, PathBuf};
+        use std::time::Instant;
+
+        /// `--timings`: each step's milliseconds on stderr.
+        struct Clock {
+            on: bool,
+            last: Instant,
+        }
+
+        impl Clock {
+            fn step(&mut self, what: &str) {
+                let now = Instant::now();
+                if self.on {
+                    let ms = now.duration_since(self.last).as_millis();
+                    eprintln!("saiife: timing {what} {ms} ms");
                 }
-                ClientError::Refused { message, .. } => Stop::Refused(message),
-                other => down(&other),
-            })
+                self.last = now;
+            }
+        }
+
+        /// The staging dir, removed however the spawn ends.
+        struct Staged(Option<Snapshot>);
+
+        impl Drop for Staged {
+            fn drop(&mut self) {
+                if let Some(s) = self.0.take() {
+                    s.remove();
+                }
+            }
+        }
+
+        /// `$XDG_CACHE_HOME/saiife` (an absolute one), else
+        /// `$HOME/.cache/saiife`.
+        fn cache_dir() -> Result<PathBuf, Stop> {
+            let abs = |k: &str| {
+                std::env::var_os(k)
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+            };
+            abs("XDG_CACHE_HOME")
+                .or_else(|| abs("HOME").map(|h| h.join(".cache")))
+                .map(|c| c.join("saiife"))
+                .ok_or_else(|| Stop::Failed("cannot find your cache dir (HOME is not set)".into()))
+        }
+
+        /// The base manifest as a file of the staging dir (0600), open for
+        /// reading.
+        fn manifest_file(s: &Snapshot) -> Result<std::fs::File, Stop> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let p = s.dir().join("base.json");
+            let text = serde_json::to_vec(&s.manifest)
+                .map_err(|e| Stop::Failed(format!("the base manifest: {e}")))?;
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(&p)
+                .map_err(|e| Stop::Failed(format!("{}: {e}", p.display())))?;
+            f.write_all(&text)
+                .map_err(|e| Stop::Failed(format!("{}: {e}", p.display())))?;
+            Ok(f)
+        }
+
+        pub(in super::super) fn run(
+            t: &Target,
+            template: &str,
+            repo: &Path,
+            task: Option<String>,
+            now: bool,
+            timings: bool,
+        ) -> Result<Args, Stop> {
+            let mut clock = Clock {
+                on: timings,
+                last: Instant::now(),
+            };
+            let abs = std::fs::canonicalize(repo).map_err(|e| {
+                Stop::Refused(format!("cannot read the repo {}: {e}", repo.display()))
+            })?;
+            let cache = cache_dir()?;
+            let tools = Tools::system(&Layout::locked().vmm).with_env(&|k| std::env::var_os(k));
+            let snap = box_repo::snapshot(&tools, &abs, &cache).map_err(Stop::Refused)?;
+            for w in &snap.warnings {
+                eprintln!("saiife: warning: {}", sanitize(w));
+            }
+            clock.step("snapshot");
+            let mut staged = Staged(Some(snap));
+            let Some(snap) = staged.0.as_mut() else {
+                return Err(Stop::Failed("the snapshot went away".into()));
+            };
+            let img = box_repo::make_repo_image(&tools, snap).map_err(Stop::Failed)?;
+            clock.step("image");
+            let commit = box_repo::snapshot_commit(&tools, &abs, snap).map_err(Stop::Failed)?;
+            clock.step("snapshot commit");
+            let image = std::fs::File::open(&img)
+                .map_err(|e| Stop::Failed(format!("{}: {e}", img.display())))?;
+            let manifest = manifest_file(snap)?;
+            let mut a = args([
+                ("template", json!(template)),
+                ("repo", json!(snap.manifest.repo)),
+                ("repo_dir", json!(abs.to_string_lossy())),
+                ("start", json!(if now { "now" } else { "queue" })),
+            ]);
+            if let Some(task) = task {
+                a.insert("task".into(), json!(task));
+            }
+            let answer = call_passing(t, "box.spawn", a, &[image.as_fd(), manifest.as_fd()])?;
+            drop((image, manifest));
+            clock.step("spawn");
+            let id = answer
+                .get("box")
+                .and_then(|b| b.get("id"))
+                .and_then(Value::as_str)
+                .and_then(|s| BoxId::parse(s).ok());
+            match id {
+                Some(id) => {
+                    if let Err(e) = box_repo::set_base_ref(&tools, &abs, &id, &commit) {
+                        eprintln!(
+                            "saiife: warning: the box's base ref is not set ({}); land will recreate it",
+                            sanitize(&e)
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "saiife: warning: the daemon named no box; land will recreate the base ref"
+                ),
+            }
+            clock.step("base ref");
+            drop(staged);
+            clock.step("cleanup");
+            Ok(answer)
+        }
     }
 
     fn text<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -201,23 +367,10 @@ mod imp {
                 repo,
                 task,
                 now,
+                timings,
             } => {
-                let abs = std::fs::canonicalize(&repo).map_err(|e| {
-                    Stop::Refused(format!("cannot read the repo {}: {e}", repo.display()))
-                })?;
-                let name = abs
-                    .file_name()
-                    .map_or_else(|| "repo".to_string(), |n| n.to_string_lossy().into_owned());
-                let mut a = args([
-                    ("template", json!(template)),
-                    ("repo", json!(name)),
-                    ("repo_dir", json!(abs.to_string_lossy())),
-                    ("start", json!(if now { "now" } else { "queue" })),
-                ]);
-                if let Some(task) = task {
-                    a.insert("task".into(), json!(task));
-                }
-                print_box(&call(&t, "box.spawn", a)?, "");
+                let a = spawn::run(&t, &template, &repo, task, now, timings)?;
+                print_box(&a, "");
             }
             BoxAction::Ls { json, all } => {
                 let a = call(&t, "box.list", args([("all", json!(all))]))?;

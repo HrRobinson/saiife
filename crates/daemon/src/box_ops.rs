@@ -50,6 +50,13 @@ pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
 pub const FAKE_SLOTS_ENV: &str = "SAIIFE_BOX_FAKE_SLOTS";
 /// The stderr line of a daemon whose boxes run on the fake VM.
 pub const FAKE_NOTICE: &str = "saiifed: boxes use a fake VM (test build)";
+/// What a `box.spawn` was passed (plan 37): the repo disk and its base
+/// manifest. Descriptors pass on unix only.
+#[cfg(unix)]
+type Passed = Vec<std::os::fd::OwnedFd>;
+#[cfg(not(unix))]
+type Passed = Vec<()>;
+
 /// The longest template name and `repo_dir` taken.
 const MAX_TEMPLATE_BYTES: usize = 64;
 const MAX_REPO_DIR_BYTES: usize = 4096;
@@ -555,7 +562,9 @@ enum Op {
 }
 
 impl Op {
-    fn parse(op: &str, a: &Map<String, Value>, uid: u32) -> Result<Op, BoxError> {
+    /// `disk`: a repo disk was passed, whose manifest names the repo, so
+    /// `box.spawn` may leave `repo` out.
+    fn parse(op: &str, a: &Map<String, Value>, uid: u32, disk: bool) -> Result<Op, BoxError> {
         Ok(match op {
             OP_BOX_SPAWN => {
                 let task = match a.get("task") {
@@ -581,9 +590,13 @@ impl Op {
                     Some(Value::String(s)) if s == "now" => Start::Now,
                     Some(_) => return Err(invalid("start is \"now\" or \"queue\"")),
                 };
+                let repo = match a.get("repo") {
+                    None | Some(Value::Null) if disk => String::new(),
+                    _ => arg_text(a, "repo", MAX_REPO_BYTES)?,
+                };
                 Op::Spawn(SpawnArgs {
                     template: arg_text(a, "template", MAX_TEMPLATE_BYTES)?,
-                    repo: arg_text(a, "repo", MAX_REPO_BYTES)?,
+                    repo,
                     repo_dir,
                     task,
                     start,
@@ -720,9 +733,19 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let Some(mgr) = ctx.box_manager.clone() else {
         return err(id, ErrorCode::Unavailable, UNAVAILABLE);
     };
+    // The descriptors a `box.fds` passed are this op's: `box.spawn` takes
+    // them, any other box op closes them now. Every refusal below closes
+    // them too.
+    #[cfg(unix)]
+    let mut passed: Passed = conn.take_fds();
+    #[cfg(not(unix))]
+    let mut passed: Passed = Vec::new();
+    if req.op != OP_BOX_SPAWN {
+        passed.clear();
+    }
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
-    let op = match Op::parse(&req.op, &req.args, peer.uid) {
+    let op = match Op::parse(&req.op, &req.args, peer.uid, !passed.is_empty()) {
         Ok(op) => op,
         Err(e) => return refusal(id, &e),
     };
@@ -790,7 +813,7 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         None => None,
     };
 
-    let done = run(ctx, &mgr, &caller, op, before).await;
+    let done = run(ctx, &mgr, &caller, op, before, passed).await;
     let (answer, rec) = match done {
         Ok(x) => x,
         Err(e) => return refusal(id, &e),
@@ -813,14 +836,55 @@ type Done = (Map<String, Value>, Option<Record>);
 /// A manager call that changes one box.
 type Step = Box<dyn FnOnce(&Manager) -> Result<Change, BoxError> + Send>;
 
+/// The repo disk a `box.spawn` was passed, taken in (`crate::box_repo`)
+/// and named in `args`, with the repo's name from its manifest. `None`
+/// when nothing was passed. A refused disk is `Invalid` (`bad_request`).
+#[cfg(unix)]
+fn take_disk(
+    root: &Path,
+    passed: Passed,
+    args: &mut SpawnArgs,
+) -> Result<Option<PathBuf>, BoxError> {
+    if passed.is_empty() {
+        return Ok(None);
+    }
+    let (image, manifest, parsed) =
+        crate::box_repo::intake(root, passed).map_err(BoxError::Invalid)?;
+    args.repo = parsed.repo;
+    args.repo_image = Some(image.clone());
+    args.base_manifest = Some(manifest);
+    Ok(Some(image))
+}
+
+#[cfg(not(unix))]
+fn take_disk(
+    root: &Path,
+    passed: Passed,
+    args: &mut SpawnArgs,
+) -> Result<Option<PathBuf>, BoxError> {
+    let _ = (root, passed, args);
+    Ok(None)
+}
+
+/// What [`take_disk`] left in `.incoming`, once the spawn is over.
+fn discard_disk(root: &Path, image: Option<&Path>) {
+    #[cfg(unix)]
+    if let Some(i) = image {
+        crate::box_repo::discard(root, i);
+    }
+    #[cfg(not(unix))]
+    let _ = (root, image);
+}
+
 /// One op, past its argument, lockdown and owner checks. `before` is the
-/// target box as the owner check read it.
+/// target box as the owner check read it; `passed`, a spawn's repo disk.
 async fn run(
     ctx: &Ctx,
     mgr: &Arc<Manager>,
     caller: &Arc<Caller>,
     op: Op,
     before: Option<BoxRecord>,
+    passed: Passed,
 ) -> Result<Done, BoxError> {
     let m = Arc::clone(mgr);
     let c = Arc::clone(caller);
@@ -853,9 +917,15 @@ async fn run(
         }
     };
     match op {
-        Op::Spawn(args) => {
+        Op::Spawn(mut args) => {
             let (r, answer, others) = blocking(move || {
-                let (r, changes) = m.spawn_changes(&args)?;
+                // The copy runs here, off the runtime and outside every
+                // lock; the manager moves it into the box dir.
+                let root = m.root().to_path_buf();
+                let staged = take_disk(&root, passed, &mut args)?;
+                let spawned = m.spawn_changes(&args);
+                discard_disk(&root, staged.as_deref());
+                let (r, changes) = spawned?;
                 let answer = info_of(&m, &r, Some(r.owner_uid));
                 // Earlier queue heads this spawn's admission pass moved
                 // (possibly other owners' boxes): the tick never sees them.

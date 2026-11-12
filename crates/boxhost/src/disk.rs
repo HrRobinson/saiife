@@ -81,6 +81,19 @@ pub fn make_overlay(
 /// search is copied whole. A source that shrinks meanwhile is an error.
 #[cfg(unix)]
 pub fn copy_sparse(src: &std::fs::File, dst: &std::fs::File) -> std::io::Result<u64> {
+    copy_sparse_upto(src, dst, u64::MAX)
+}
+
+/// [`copy_sparse`] of a source at most `max` bytes long (its length as the
+/// copy's own `fstat` reads it): a longer one is refused before a byte is
+/// written, so a sender that grows a passed file after it was checked
+/// cannot make the copy bigger than the check allowed.
+#[cfg(unix)]
+pub fn copy_sparse_upto(
+    src: &std::fs::File,
+    dst: &std::fs::File,
+    max: u64,
+) -> std::io::Result<u64> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{FileExt, MetadataExt};
     // fstat, never a path: these may be descriptors passed in.
@@ -100,6 +113,12 @@ pub fn copy_sparse(src: &std::fs::File, dst: &std::fs::File) -> std::io::Result<
         ));
     }
     let len = sm.len();
+    if len > max {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("the source is {len} bytes, more than {max}"),
+        ));
+    }
     // Emptied first: stale bytes of `dst` would otherwise show in its holes.
     dst.set_len(0)?;
     dst.set_len(len)?;
@@ -340,6 +359,21 @@ mod tests {
         assert!(same_bytes(&src, &dst));
         let blocks = dst.metadata().unwrap().blocks();
         assert!(blocks * 512 < 1 << 20, "{blocks} blocks");
+    }
+
+    #[test]
+    fn copy_sparse_upto_refuses_a_longer_source() {
+        use std::os::unix::fs::FileExt;
+        let d = tempfile::tempdir().unwrap();
+        let src = blank(d.path(), "src");
+        src.write_all_at(&[7; 100], 0).unwrap();
+        let dst = blank(d.path(), "dst");
+        dst.write_all_at(&[1; 10], 0).unwrap();
+        let e = copy_sparse_upto(&src, &dst, 99).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(dst.metadata().unwrap().len(), 10, "dst untouched");
+        assert_eq!(copy_sparse_upto(&src, &dst, 100).unwrap(), 100);
+        assert!(same_bytes(&src, &dst));
     }
 
     #[test]

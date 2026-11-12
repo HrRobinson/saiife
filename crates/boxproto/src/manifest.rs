@@ -13,6 +13,10 @@ use std::collections::BTreeMap;
 /// The only manifest version.
 pub const VERSION: u32 = 1;
 
+/// D5: the most a box repo may hold, summed as in D4 (the CLI's cap on the
+/// snapshot; the daemon bounds the repo disk it takes by it).
+pub const REPO_MAX_BYTES: u64 = 8 << 30;
+
 /// The longest path [`check_path`] accepts, in bytes.
 pub const PATH_MAX: usize = 4096;
 
