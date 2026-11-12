@@ -1,0 +1,21 @@
+[package]
+name = "saiife-boxhost"
+description = "saiife box host side: the Cloud Hypervisor Vmm driver, disks, images, vsock and terminal."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_boxhost"
+path = "src/lib.rs"
+
+[dependencies]
+saiife-boxproto = { path = "../boxproto" }
+ring = "=0.17.14"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -31,6 +31,7 @@ mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
 mod box_cmd;
+mod box_vmm_cmd;
 #[cfg(any(unix, windows))]
 mod broker;
 mod check;

@@ -1620,6 +1620,7 @@ dependencies = [
  "rustls",
  "saiife-agents",
  "saiife-audit",
+ "saiife-boxhost",
  "saiife-broker",
  "saiife-daemon",
  "saiife-dev",
@@ -1691,6 +1692,19 @@ dependencies = [
  "tempfile",
  "toml",
 ]
+
+[[package]]
+name = "saiife-boxhost"
+version = "0.2.0"
+dependencies = [
+ "ring",
+ "saiife-boxproto",
+ "tempfile",
+]
+
+[[package]]
+name = "saiife-boxproto"
+version = "0.2.0"
 
 [[package]]
 name = "saiife-broker"
@@ -1799,6 +1813,13 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+]
+
+[[package]]
+name = "saiife-guest"
+version = "0.2.0"
+dependencies = [
+ "saiife-boxproto",
 ]
 
 [[package]]

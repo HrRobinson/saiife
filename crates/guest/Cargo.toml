@@ -1,0 +1,17 @@
+[package]
+name = "saiife-guest"
+description = "saiife guest agent: runs inside the box VM (Linux in practice, compiles everywhere)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_guest"
+path = "src/lib.rs"
+
+[dependencies]
+saiife-boxproto = { path = "../boxproto" }
+
+[lints]
+workspace = true

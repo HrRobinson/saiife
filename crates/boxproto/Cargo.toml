@@ -1,0 +1,14 @@
+[package]
+name = "saiife-boxproto"
+description = "saiife box guest protocol: frames, messages, ports, deltas and manifests shared by host and guest."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_boxproto"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
