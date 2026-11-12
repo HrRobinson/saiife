@@ -74,6 +74,10 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process", "net", "system"] }
+# The per-box gateway (plan 38, Task 6): VmHooks, BoxPaths and the vsock
+# listeners (tokio-free; unix-only on plan 35's branch), and the fixed ports.
+saiife-boxhost = { path = "../boxhost" }
+saiife-boxproto = { path = "../boxproto" }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]

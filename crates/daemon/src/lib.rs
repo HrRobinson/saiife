@@ -11,6 +11,9 @@ pub mod approval_ops;
 pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
+// The per-box gateway: allow-listed CONNECT egress and the model port (plan 38).
+#[cfg(unix)]
+pub mod box_gateway;
 pub mod box_ops;
 pub mod cloud_ops;
 pub mod cosign;
