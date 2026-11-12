@@ -50,10 +50,14 @@ jobs:
       # The box manager behind its fake VM (plan 34): nothing in the workspace
       # turns on saiife-boxes/fake or saiife-daemon/fake-vmm, so the step above
       # never builds these tests. Test builds only; release never sets them.
+      # saiife-boxhost/fake builds the saiife-fake-ch stand-in for Cloud
+      # Hypervisor (plan 35); its ch_api and ch_vmm suites need it, and the
+      # snapshot tests make a FIFO (mknodat), so Linux only.
       - name: box manager and box.* ops (fake VM)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
           cargo test -p saiife-boxes --features fake --no-fail-fast
+          cargo test -p saiife-boxhost --features fake --no-fail-fast
           cargo test -p saiife-daemon --features fake-vmm --test boxes
           cargo test -p saiife --features fake-vmm --test box_cmd
         env:
