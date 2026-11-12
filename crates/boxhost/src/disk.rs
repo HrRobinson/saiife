@@ -70,6 +70,139 @@ pub fn make_overlay(
     std::fs::rename(&tmp, out).map_err(|e| fail(&tmp, format!("rename overlay: {e}")))
 }
 
+/// Copies the regular file `src` into the regular file `dst`, keeping its
+/// holes: `dst` is emptied and set to `src`'s length, taken once at the
+/// start, then only `src`'s data runs (`SEEK_DATA` / `SEEK_HOLE`) are read
+/// and written, at their own offsets. Returns the bytes copied.
+///
+/// Reads and writes are positional, so neither file's offset matters to the
+/// copy; the data search does move `src`'s offset (a passed descriptor's
+/// offset is shared with its sender). A filesystem that cannot answer the
+/// search is copied whole. A source that shrinks meanwhile is an error.
+#[cfg(unix)]
+pub fn copy_sparse(src: &std::fs::File, dst: &std::fs::File) -> std::io::Result<u64> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    // fstat, never a path: these may be descriptors passed in.
+    for (what, f) in [("source", src), ("target", dst)] {
+        if !f.metadata()?.file_type().is_file() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("the {what} is not a regular file"),
+            ));
+        }
+    }
+    let (sm, dm) = (src.metadata()?, dst.metadata()?);
+    if (sm.dev(), sm.ino()) == (dm.dev(), dm.ino()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "the source and the target are the same file",
+        ));
+    }
+    let len = sm.len();
+    // Emptied first: stale bytes of `dst` would otherwise show in its holes.
+    dst.set_len(0)?;
+    dst.set_len(len)?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut copied = 0u64;
+    let mut off = 0u64;
+    while off < len {
+        let Some(start) = next_data(src, off, len)? else {
+            break;
+        };
+        if start >= len {
+            break;
+        }
+        let end = next_hole(src, start, len)?.min(len);
+        let mut pos = start;
+        while pos < end {
+            let want = (end - pos).min(buf.len() as u64) as usize;
+            let n = match src.read_at(&mut buf[..want], pos) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "the source shrank while it was copied",
+                    ))
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            dst.write_all_at(&buf[..n], pos)?;
+            pos += n as u64;
+            copied += n as u64;
+        }
+        off = end.max(start + 1);
+    }
+    Ok(copied)
+}
+
+/// One read and write of [`copy_sparse`].
+#[cfg(unix)]
+const COPY_CHUNK: usize = 1 << 20;
+
+/// The next data offset at or after `off`; `None` when only a hole is left
+/// (`ENXIO`). A filesystem without the search (`EINVAL`) is all data.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+))]
+fn next_data(f: &std::fs::File, off: u64, _len: u64) -> std::io::Result<Option<u64>> {
+    use rustix::io::Errno;
+    match rustix::fs::seek(f, rustix::fs::SeekFrom::Data(off)) {
+        Ok(p) => Ok(Some(p)),
+        Err(Errno::NXIO) => Ok(None),
+        Err(Errno::INVAL) => Ok(Some(off)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The next hole at or after `off`, the end counting as one. A filesystem
+/// without the search (`EINVAL`) has none before `len`.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+))]
+fn next_hole(f: &std::fs::File, off: u64, len: u64) -> std::io::Result<u64> {
+    use rustix::io::Errno;
+    match rustix::fs::seek(f, rustix::fs::SeekFrom::Hole(off)) {
+        Ok(p) => Ok(p),
+        Err(Errno::INVAL | Errno::NXIO) => Ok(len),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// No data search on this system: the whole file is data.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd"
+    ))
+))]
+fn next_data(_f: &std::fs::File, off: u64, _len: u64) -> std::io::Result<Option<u64>> {
+    Ok(Some(off))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd"
+    ))
+))]
+fn next_hole(_f: &std::fs::File, _off: u64, len: u64) -> std::io::Result<u64> {
+    Ok(len)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -158,5 +291,92 @@ mod tests {
         assert!(e.contains("bad base"), "{e}");
         assert!(!out.exists());
         assert!(!d.path().join("o.qcow2.tmp").exists());
+    }
+
+    fn blank(dir: &Path, name: &str) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.join(name))
+            .unwrap()
+    }
+
+    /// Whether the two files read the same, in chunks.
+    fn same_bytes(a: &std::fs::File, b: &std::fs::File) -> bool {
+        use std::os::unix::fs::FileExt;
+        let len = a.metadata().unwrap().len();
+        if b.metadata().unwrap().len() != len {
+            return false;
+        }
+        let (mut x, mut y) = (vec![0u8; 4 << 20], vec![0u8; 4 << 20]);
+        let mut off = 0;
+        while off < len {
+            let n = (len - off).min(x.len() as u64) as usize;
+            a.read_exact_at(&mut x[..n], off).unwrap();
+            b.read_exact_at(&mut y[..n], off).unwrap();
+            if x[..n] != y[..n] {
+                return false;
+            }
+            off += n as u64;
+        }
+        true
+    }
+
+    #[test]
+    fn copy_sparse_keeps_holes() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let d = tempfile::tempdir().unwrap();
+        let src = blank(d.path(), "src");
+        src.set_len(1 << 30).unwrap();
+        src.write_all_at(&[0xa5; 4096], 0).unwrap();
+        src.write_all_at(&[0x5a; 4096], 512 << 20).unwrap();
+        let dst = blank(d.path(), "dst");
+        // Stale bytes in dst must not survive in its holes.
+        dst.write_all_at(&[0xff; 4096], 256 << 20).unwrap();
+        let copied = copy_sparse(&src, &dst).unwrap();
+        assert!((8192..1 << 20).contains(&copied), "{copied}");
+        assert_eq!(dst.metadata().unwrap().len(), 1 << 30);
+        assert!(same_bytes(&src, &dst));
+        let blocks = dst.metadata().unwrap().blocks();
+        assert!(blocks * 512 < 1 << 20, "{blocks} blocks");
+    }
+
+    #[test]
+    fn copy_sparse_of_dense_file() {
+        use std::os::unix::fs::FileExt;
+        let d = tempfile::tempdir().unwrap();
+        let src = blank(d.path(), "src");
+        let body: Vec<u8> = (0..(3 << 20) + 17).map(|i| (i % 251) as u8).collect();
+        src.write_all_at(&body, 0).unwrap();
+        let dst = blank(d.path(), "dst");
+        assert_eq!(copy_sparse(&src, &dst).unwrap(), body.len() as u64);
+        assert!(same_bytes(&src, &dst));
+        // An empty source gives an empty copy.
+        let empty = blank(d.path(), "empty");
+        assert_eq!(copy_sparse(&empty, &dst).unwrap(), 0);
+        assert_eq!(dst.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn copy_sparse_refuses_a_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = std::fs::File::open(d.path()).unwrap();
+        let dst = blank(d.path(), "dst");
+        let e = copy_sparse(&dir, &dst).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        // Nor onto itself, which emptying would destroy.
+        std::fs::write(d.path().join("self"), "keep").unwrap();
+        let a = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(d.path().join("self"))
+            .unwrap();
+        let e = copy_sparse(&a, &a).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("self")).unwrap(),
+            "keep"
+        );
     }
 }

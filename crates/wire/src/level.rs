@@ -102,6 +102,8 @@ const IPC_OPS: &[&str] = &[
     "audit.query",
     "audit.rotate_key",
     "box.done",
+    // fd passing (plan 37): control socket only.
+    "box.fds",
     "box.gc",
     "cloud.lease",
     "grant.consume",
@@ -224,6 +226,12 @@ mod tests {
             assert_eq!(level_for(a), Some(Level::MachineOnly), "{a}");
             assert!(!REMOTE.iter().any(|(n, _)| *n == a), "{a} is remote");
         }
+    }
+
+    #[test]
+    fn box_fds_is_machine_only() {
+        assert_eq!(level_for("box.fds"), Some(Level::MachineOnly));
+        assert!(!REMOTE.iter().any(|(n, _)| *n == "box.fds"));
     }
 
     #[test]
