@@ -768,7 +768,7 @@ fn describe(e: &ToolError) -> String {
 /// <staging> <img> <mib>M` (D4). On failure the whole staging dir is
 /// removed.
 pub fn make_repo_image(tools: &Tools, s: &Snapshot) -> Result<PathBuf, String> {
-    let img = s.dir().join("repo.img");
+    let img = s.dir().join(saiife_boxhost::paths::REPO_DISK);
     let mib = repo_image_mib(&s.manifest, staging_dirs(&s.manifest));
     let size = format!("{mib}M");
     let args: [&OsStr; 9] = [

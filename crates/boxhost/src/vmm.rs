@@ -250,7 +250,7 @@ fn map_state(s: VmState) -> VmStatus {
 
 impl ChVmmInit {
     fn paths(&self, id: &BoxId) -> BoxPaths {
-        BoxPaths::new(self.layout.boxes.join(id.as_str()))
+        self.layout.box_paths(id)
     }
 
     /// Whether the VMM is gone, by the launcher's word only (`None`: no
@@ -450,9 +450,9 @@ impl ChVmm {
         if launch::check_plain("serial.log", &paths.serial()).is_err() {
             let _ = std::fs::remove_file(paths.serial());
         }
-        let mut disks = vec![("root.qcow2", paths.root_disk())];
+        let mut disks = vec![(crate::paths::ROOT_DISK, paths.root_disk())];
         if spec.repo {
-            disks.push(("repo.img", paths.repo_disk()));
+            disks.push((crate::paths::REPO_DISK, paths.repo_disk()));
         }
         for (name, p) in disks {
             launch::check_plain(name, &p).map_err(VmmError::Failed)?;
@@ -554,7 +554,7 @@ impl ChVmm {
 impl Vmm for ChVmm {
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
         let inner = &self.inner;
-        let want = inner.layout.boxes.join(spec.id.as_str());
+        let want = inner.layout.box_paths(&spec.id).dir;
         if spec.dir != want {
             return Err(VmmError::Failed(format!(
                 "the box dir must be {}",

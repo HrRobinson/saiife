@@ -2,7 +2,8 @@
 //!
 //! The daemon copies the disk and the base manifest a CLI passed into
 //! `<root>/.incoming/<16 hex>/`; spawn moves them into the box dir before
-//! admission. A box dir is a path the VMM can write, so every step here is
+//! admission, under the names the manager's `DiskPlacer` gives (the
+//! daemon's come from its layout helpers; nothing here names a disk). A box dir is a path the VMM can write, so every step here is
 //! relative to directory descriptors opened `O_NOFOLLOW`, a rename never
 //! replaces what is there, and the sweep never follows a symlink. Nothing
 //! here runs under the manager's lock.
@@ -36,13 +37,13 @@ mod imp {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn rename_new(src: &OwnedFd, from: &OsStr, dst: &OwnedFd, to: &str) -> io::Result<()> {
+    fn rename_new(src: &OwnedFd, from: &OsStr, dst: &OwnedFd, to: &OsStr) -> io::Result<()> {
         use rustix::fs::{renameat_with, RenameFlags};
         Ok(renameat_with(src, from, dst, to, RenameFlags::NOREPLACE)?)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn rename_new(src: &OwnedFd, from: &OsStr, dst: &OwnedFd, to: &str) -> io::Result<()> {
+    fn rename_new(src: &OwnedFd, from: &OsStr, dst: &OwnedFd, to: &OsStr) -> io::Result<()> {
         match statat(dst, to, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
             Err(Errno::NOENT) => {}
@@ -51,7 +52,7 @@ mod imp {
         Ok(rustix::fs::renameat(src, from, dst, to)?)
     }
 
-    pub fn place(root: &Path, id: &str, sub: &OsStr, moves: &[(&OsStr, &str)]) -> io::Result<()> {
+    pub fn place(root: &Path, id: &str, sub: &OsStr, moves: &[(&OsStr, &OsStr)]) -> io::Result<()> {
         let root = open_dir(CWD, root)?;
         let dst = open_dir(&root, id)?;
         let inc = open_dir(&root, INCOMING)?;
@@ -166,7 +167,7 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub fn place(root: &Path, id: &str, sub: &OsStr, moves: &[(&OsStr, &str)]) -> io::Result<()> {
+    pub fn place(root: &Path, id: &str, sub: &OsStr, moves: &[(&OsStr, &OsStr)]) -> io::Result<()> {
         let src = root.join(INCOMING).join(sub);
         let dst = root.join(id);
         for (from, to) in moves {
@@ -215,7 +216,7 @@ mod imp {
 /// Move each `(from, to)` of `<root>/.incoming/<sub>/` into the box dir
 /// `<root>/<id>/`, never replacing an entry there; `from` must be a regular
 /// file. Then the emptied `sub` goes (best effort).
-pub fn place(root: &Path, id: &str, sub: &OsStr, moves: &[(&OsStr, &str)]) -> io::Result<()> {
+pub fn place(root: &Path, id: &str, sub: &OsStr, moves: &[(&OsStr, &OsStr)]) -> io::Result<()> {
     imp::place(root, id, sub, moves)
 }
 

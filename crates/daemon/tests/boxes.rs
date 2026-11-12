@@ -127,6 +127,7 @@ fn world_with(s: Setup) -> World {
                 templates: template::builtin(),
                 host: Arc::new(move || host),
                 clock: Arc::new(move || c.load(Ordering::SeqCst)),
+                disk_place: box_ops::disk_place(),
             })
             .unwrap();
             assert!(o.warnings.is_empty(), "{:?}", o.warnings);
@@ -581,6 +582,7 @@ async fn disk_floor_pauses_running_boxes() {
             ..two_boxes_host(3)
         }),
         clock: Arc::new(|| T0),
+        disk_place: None,
     })
     .unwrap();
     let w = world_with(Setup {
@@ -1174,4 +1176,20 @@ async fn spawn_with_fds_roundtrip() {
     assert_eq!(two["box"]["id"], "b2", "{two}");
     assert!(!w.mgr().root().join("b2/repo.img").exists());
     server.abort();
+}
+
+/// Plan 37 Task 4b: the store root the daemon hands to intake, gc and
+/// `disk::usage` is the personal Layout's, and the disk placer is BoxPaths'.
+#[test]
+fn the_box_root_and_disk_places_are_the_layouts() {
+    use saiife_boxhost::layout::Layout;
+    use saiife_boxhost::paths::BoxPaths;
+    let state = Path::new("/s/state");
+    let root = box_ops::dir_in(state);
+    assert_eq!(root, Layout::personal(state, Path::new("/s/data")).boxes);
+    let place = box_ops::disk_place().expect("a placer on unix");
+    let got = place(&root, &id("b4"));
+    let want = BoxPaths::of(&root, &id("b4"));
+    assert_eq!(got.repo_image, want.repo_disk());
+    assert_eq!(got.base_manifest, want.base_manifest());
 }

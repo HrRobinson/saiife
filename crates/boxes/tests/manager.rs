@@ -9,7 +9,7 @@ use common::{id, template_sized, world, world_with, World};
 use saiife_boxes::capacity::{self, Committed};
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::{
-    Change, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS,
+    Change, DiskPlace, DiskPlacer, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS,
 };
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::Size;
@@ -289,6 +289,51 @@ fn rename_failure_releases_the_id() {
     assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
     assert!(!w.root.join("b2").exists());
     // Ids are never reused.
+    assert_eq!(w.spawn("a").id, id("b3"));
+}
+
+/// `w`'s manager reopened with `place` as its disk placer.
+fn with_placer(w: &mut World, place: Option<DiskPlacer>) {
+    let guest: Arc<dyn saiife_boxes::guest::GuestLink> = w.guest.clone();
+    let mut init = w.init(guest);
+    init.disk_place = place;
+    w.mgr = Arc::new(Manager::open(init).unwrap().manager);
+}
+
+#[test]
+fn spawn_places_the_disk_where_the_placer_says() {
+    let mut w = world(1);
+    with_placer(
+        &mut w,
+        Some(Arc::new(|root: &Path, i: &BoxId| DiskPlace {
+            repo_image: root.join(i.as_str()).join("disk.img"),
+            base_manifest: root.join(i.as_str()).join("m.json"),
+        })),
+    );
+    let (img, man) = incoming(&w, "00112233aabbccdd");
+    let r = w.mgr.spawn(&with_disk(&w, &img, &man)).unwrap();
+    let dir = w.root.join(r.id.as_str());
+    assert_eq!(std::fs::read(dir.join("disk.img")).unwrap(), b"disk");
+    assert_eq!(std::fs::read(dir.join("m.json")).unwrap(), b"{}");
+    assert!(!dir.join("repo.img").exists() && !dir.join("base.json").exists());
+    // A place outside the box dir: refused once the id is claimed, which
+    // is then released; the disk stays for the caller to discard.
+    with_placer(
+        &mut w,
+        Some(Arc::new(|root: &Path, i: &BoxId| DiskPlace {
+            repo_image: root.join(i.as_str()).join("repo.img"),
+            base_manifest: root.join("elsewhere").join("base.json"),
+        })),
+    );
+    let (img, man) = incoming(&w, "1111111111111111");
+    let e = w.mgr.spawn(&with_disk(&w, &img, &man));
+    assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
+    assert!(!w.root.join("b2").exists());
+    assert!(img.exists() && man.exists());
+    // No placer: a repo disk is refused before any id is claimed.
+    with_placer(&mut w, None);
+    let e = w.mgr.spawn(&with_disk(&w, &img, &man));
+    assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
     assert_eq!(w.spawn("a").id, id("b3"));
 }
 

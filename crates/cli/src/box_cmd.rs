@@ -242,7 +242,7 @@ mod imp {
         fn manifest_file(s: &Snapshot) -> Result<std::fs::File, Stop> {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
-            let p = s.dir().join("base.json");
+            let p = s.dir().join(saiife_boxhost::paths::BASE_MANIFEST);
             let text = serde_json::to_vec(&s.manifest)
                 .map_err(|e| Stop::Failed(format!("the base manifest: {e}")))?;
             let mut f = std::fs::OpenOptions::new()

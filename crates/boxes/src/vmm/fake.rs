@@ -8,6 +8,12 @@ use saiife_wire::source::BoxId;
 
 use super::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 
+/// The repo disk the fake looks for in the box dir. Test support only: the
+/// real name is `saiife_boxhost::paths::REPO_DISK`, which this crate cannot
+/// use; the daemon's repo-disk spawn test (`saw_repo_disk` after a placement
+/// through `BoxPaths`) fails if the two drift apart.
+const REPO_DISK_NAME: &str = "repo.img";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmOp {
     Create,
@@ -101,7 +107,7 @@ impl FakeVmm {
 
 impl Vmm for FakeVmm {
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
-        let disk = spec.dir.join(crate::manager::REPO_IMAGE).is_file();
+        let disk = spec.dir.join(REPO_DISK_NAME).is_file();
         let mut s = self.enter(VmOp::Create, &spec.id)?;
         s.repo_disk.insert(spec.id.clone(), disk);
         s.status.insert(spec.id.clone(), VmStatus::Created);

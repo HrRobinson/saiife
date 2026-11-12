@@ -11,8 +11,15 @@
 //! with positional writes only. Any failure removes the incoming dir. A
 //! daemon that dies midway leaves it for gc, which sweeps `.incoming`
 //! entries older than an hour.
+//!
+//! Every path comes from the layout helpers (`saiife_boxhost::layout`,
+//! `saiife_boxhost::paths`). What the daemon trusts (a base manifest,
+//! anything in `.incoming`) it reads only through [`read_trusted`]: opened
+//! `O_NOFOLLOW|O_NONBLOCK` relative to its dir (itself opened
+//! `O_DIRECTORY|O_NOFOLLOW`), and fstat'd for type, owner and size.
 
-use saiife_boxes::place::INCOMING;
+use saiife_boxhost::layout::incoming_in;
+use saiife_boxhost::paths::{BoxPaths, BASE_MANIFEST, REPO_DISK};
 use saiife_boxproto::manifest::{BaseManifest, REPO_MAX_BYTES};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -28,9 +35,6 @@ use rustix::io::Errno;
 pub const IMAGE_MAX_BYTES: u64 = 2 * REPO_MAX_BYTES + (256 << 20);
 /// The largest base manifest taken.
 pub const MANIFEST_MAX_BYTES: u64 = 64 << 20;
-/// The copies' names in the incoming dir.
-pub const IMAGE_NAME: &str = "repo.img";
-pub const MANIFEST_NAME: &str = "base.json";
 /// The ext4 superblock magic, little-endian `0xEF53` at offset 1024 + 56.
 const EXT4_MAGIC_AT: u64 = 1080;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xEF];
@@ -43,23 +47,90 @@ fn open_dir(at: impl rustix::fd::AsFd, name: impl rustix::path::Arg) -> io::Resu
     Ok(openat(at, name, dir_flags(), Mode::empty())?)
 }
 
-/// `<boxes>/.incoming`, made 0700 if missing; it must be a real directory
-/// (not a symlink) owned by this process's uid.
-fn incoming_dir(root: &OwnedFd) -> Result<OwnedFd, String> {
-    match mkdirat(root, INCOMING, Mode::from_raw_mode(0o700)) {
-        Ok(()) | Err(Errno::EXIST) => {}
-        Err(e) => return Err(format!("cannot make {INCOMING}: {e}")),
+/// `p`'s parent dir, opened `O_NOFOLLOW`, and `p`'s last component.
+fn open_parent(p: &Path) -> io::Result<(OwnedFd, &OsStr)> {
+    match (p.parent(), p.file_name()) {
+        (Some(up), Some(name)) => Ok((open_dir(CWD, up)?, name)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "no parent dir")),
     }
-    let d = open_dir(root, INCOMING).map_err(|e| format!("cannot open {INCOMING}: {e}"))?;
-    let st = rustix::fs::fstat(&d).map_err(|e| format!("{INCOMING}: {e}"))?;
+}
+
+/// The incoming dir of `boxes_root` ([`incoming_in`]), opened; with
+/// `make`, made 0700 if missing. It must be a real directory (not a
+/// symlink) owned by this process's uid.
+fn incoming_dir(boxes_root: &Path, make: bool) -> Result<OwnedFd, String> {
+    let inc = incoming_in(boxes_root);
+    let shown = inc.display();
+    let (up, name) = open_parent(&inc).map_err(|e| format!("cannot open {shown}: {e}"))?;
+    if make {
+        match mkdirat(&up, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(format!("cannot make {shown}: {e}")),
+        }
+    }
+    let d = open_dir(&up, name).map_err(|e| format!("cannot open {shown}: {e}"))?;
+    let st = rustix::fs::fstat(&d).map_err(|e| format!("{shown}: {e}"))?;
     if st.st_uid != rustix::process::geteuid().as_raw() {
-        return Err(format!("{INCOMING} is not the daemon's own"));
+        return Err(format!("{shown} is not the daemon's own"));
     }
-    if st.st_mode & 0o077 != 0 {
-        rustix::fs::fchmod(&d, Mode::from_raw_mode(0o700))
-            .map_err(|e| format!("{INCOMING}: {e}"))?;
+    if make && st.st_mode & 0o077 != 0 {
+        rustix::fs::fchmod(&d, Mode::from_raw_mode(0o700)).map_err(|e| format!("{shown}: {e}"))?;
     }
     Ok(d)
+}
+
+/// The bytes of a file the daemon trusts, read through `f` itself: it must
+/// be a regular file owned by this process's euid, of at most `max` bytes.
+fn read_fd(f: &File, what: &str, max: u64) -> Result<Vec<u8>, String> {
+    let st = rustix::fs::fstat(f).map_err(|e| format!("the {what}: {e}"))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(format!("the {what} is not a regular file"));
+    }
+    if st.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(format!("the {what} is not the daemon's own"));
+    }
+    let len = u64::try_from(st.st_size).unwrap_or(u64::MAX);
+    if len > max {
+        return Err(format!(
+            "the {what} is {len} bytes, more than the {max} taken"
+        ));
+    }
+    // Positional reads from 0, bounded even if it grows meanwhile.
+    let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    let mut buf = vec![0u8; 64 << 10];
+    let mut at = 0u64;
+    loop {
+        let n = match f.read_at(&mut buf, at) {
+            Ok(0) => return Ok(out),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("cannot read the {what}: {e}")),
+        };
+        at = at.saturating_add(n as u64);
+        if at > max {
+            return Err(format!("the {what} grew past the {max} bytes taken"));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// Read a file the daemon trusts at `path` (a base manifest, anything in
+/// `.incoming`): its dir opened `O_DIRECTORY|O_NOFOLLOW`, the file
+/// `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` relative to it (a symlink fails, a
+/// FIFO never blocks), then [`read_fd`]'s checks through that descriptor.
+pub fn read_trusted(path: &Path, what: &str, max: u64) -> Result<Vec<u8>, String> {
+    let (up, name) = open_parent(path).map_err(|e| format!("the {what}: {e}"))?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = openat(&up, name, flags, Mode::empty()).map_err(|e| format!("the {what}: {e}"))?;
+    read_fd(&File::from(fd), what, max)
+}
+
+/// A box's base manifest ([`BoxPaths::base_manifest`], daemon-trusted),
+/// read with [`read_trusted`] and parsed.
+pub fn read_base_manifest(paths: &BoxPaths) -> Result<BaseManifest, String> {
+    let text = read_trusted(&paths.base_manifest(), "base manifest", MANIFEST_MAX_BYTES)?;
+    let text = String::from_utf8(text).map_err(|_| "the base manifest is not UTF-8")?;
+    BaseManifest::parse(&text)
 }
 
 fn random_hex() -> Result<String, String> {
@@ -106,7 +177,7 @@ fn copy_in(dir: &OwnedFd, name: &str, mode: u32, src: &File, len: u64) -> Result
 /// Remove `<.incoming>/<sub>` and the files [`intake`] makes in it.
 fn remove_sub(inc: &OwnedFd, sub: &str) {
     if let Ok(d) = open_dir(inc, sub) {
-        for n in [IMAGE_NAME, MANIFEST_NAME] {
+        for n in [REPO_DISK, BASE_MANIFEST] {
             let _ = rustix::fs::unlinkat(&d, n, AtFlags::empty());
         }
     }
@@ -114,7 +185,7 @@ fn remove_sub(inc: &OwnedFd, sub: &str) {
 }
 
 /// Take the two descriptors `box.spawn` was passed (the repo disk, then
-/// its base manifest) into a fresh `<boxes_root>/.incoming/<16 hex>/`:
+/// its base manifest) into a fresh `<incoming>/<16 hex>/` ([`incoming_in`]):
 /// exactly two, each a regular file, the disk at most [`IMAGE_MAX_BYTES`]
 /// and the manifest at most [`MANIFEST_MAX_BYTES`]; both copied (the disk
 /// 0640 keeping its holes, the manifest 0600); then the copy of the disk
@@ -137,34 +208,29 @@ pub fn intake(
     };
     let image_len = regular(&image, "repo disk", IMAGE_MAX_BYTES)?;
     let manifest_len = regular(&manifest, "base manifest", MANIFEST_MAX_BYTES)?;
-    let root = open_dir(CWD, boxes_root)
-        .map_err(|e| format!("cannot open {}: {e}", boxes_root.display()))?;
-    let inc = incoming_dir(&root)?;
-    let sub = random_hex()?;
-    mkdirat(&inc, sub.as_str(), Mode::from_raw_mode(0o700))
-        .map_err(|e| format!("cannot make {INCOMING}/{sub}: {e}"))?;
+    let inc = incoming_dir(boxes_root, true)?;
+    let dir = incoming_in(boxes_root).join(random_hex()?);
+    let sub = dir.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    mkdirat(&inc, sub, Mode::from_raw_mode(0o700))
+        .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     let made = (|| {
-        let d = open_dir(&inc, sub.as_str()).map_err(|e| format!("{INCOMING}/{sub}: {e}"))?;
-        let img = copy_in(&d, IMAGE_NAME, 0o640, &image, image_len)?;
+        let d = open_dir(&inc, sub).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let img = copy_in(&d, REPO_DISK, 0o640, &image, image_len)?;
         let mut magic = [0u8; 2];
         let ext4 = matches!(img.read_at(&mut magic, EXT4_MAGIC_AT), Ok(2)) && magic == EXT4_MAGIC;
         if !ext4 {
             return Err("the repo disk is not an ext4 image".to_string());
         }
-        let man = copy_in(&d, MANIFEST_NAME, 0o600, &manifest, manifest_len)?;
-        let mut text = vec![0u8; usize::try_from(manifest_len).unwrap_or(0)];
-        man.read_exact_at(&mut text, 0)
-            .map_err(|e| format!("cannot read the base manifest: {e}"))?;
+        let man = copy_in(&d, BASE_MANIFEST, 0o600, &manifest, manifest_len)?;
+        // Read through the copy's own descriptor, with the trusted checks.
+        let text = read_fd(&man, "base manifest", MANIFEST_MAX_BYTES)?;
         let text = String::from_utf8(text).map_err(|_| "the base manifest is not UTF-8")?;
         BaseManifest::parse(&text)
     })();
     match made {
-        Ok(m) => {
-            let dir = boxes_root.join(INCOMING).join(&sub);
-            Ok((dir.join(IMAGE_NAME), dir.join(MANIFEST_NAME), m))
-        }
+        Ok(m) => Ok((dir.join(REPO_DISK), dir.join(BASE_MANIFEST), m)),
         Err(e) => {
-            remove_sub(&inc, &sub);
+            remove_sub(&inc, sub);
             Err(e)
         }
     }
@@ -172,20 +238,17 @@ pub fn intake(
 
 /// Remove the incoming dir [`intake`] made for `image` (best effort): the
 /// spawn is over, and whatever the manager did not move in goes. Only a
-/// dir right under `<boxes_root>/.incoming` is touched.
+/// dir right under [`incoming_in`] of `boxes_root` is touched.
 pub fn discard(boxes_root: &Path, image: &Path) {
     let Some(sub) = image
         .parent()
-        .filter(|d| d.parent() == Some(boxes_root.join(INCOMING).as_path()))
+        .filter(|d| d.parent() == Some(incoming_in(boxes_root).as_path()))
         .and_then(Path::file_name)
         .and_then(OsStr::to_str)
     else {
         return;
     };
-    let Ok(root) = open_dir(CWD, boxes_root) else {
-        return;
-    };
-    if let Ok(inc) = open_dir(&root, INCOMING) {
+    if let Ok(inc) = incoming_dir(boxes_root, false) {
         remove_sub(&inc, sub);
     }
 }
@@ -193,6 +256,7 @@ pub fn discard(boxes_root: &Path, image: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saiife_boxes::place::INCOMING;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     /// A sparse file with the ext4 magic where the superblock has it.
@@ -345,5 +409,65 @@ mod tests {
         let e = intake(&root, vec![img, fd(File::open(&p).unwrap())]).unwrap_err();
         assert!(e.contains(INCOMING), "{e}");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    fn box_with_manifest(t: &Path) -> saiife_boxhost::paths::BoxPaths {
+        let paths = saiife_boxhost::paths::BoxPaths::new(t.join("b1"));
+        std::fs::create_dir(&paths.dir).unwrap();
+        std::fs::write(paths.base_manifest(), manifest_text()).unwrap();
+        paths
+    }
+
+    #[test]
+    fn base_manifest_read_refuses_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = box_with_manifest(t.path());
+        assert_eq!(read_base_manifest(&paths).unwrap().repo, "shop");
+        // The manifest swapped for a link to a good one: refused.
+        let far = t.path().join("far.json");
+        std::fs::write(&far, manifest_text()).unwrap();
+        std::fs::remove_file(paths.base_manifest()).unwrap();
+        std::os::unix::fs::symlink(&far, paths.base_manifest()).unwrap();
+        let e = read_base_manifest(&paths).unwrap_err();
+        assert!(e.contains("base manifest"), "{e}");
+        // The box dir swapped for a link to a dir with a good one: refused.
+        let x = t.path().join("x");
+        std::fs::create_dir(&x).unwrap();
+        let other = box_with_manifest(&x);
+        let linked = saiife_boxhost::paths::BoxPaths::new(t.path().join("b2"));
+        std::os::unix::fs::symlink(&other.dir, &linked.dir).unwrap();
+        assert!(read_base_manifest(&linked).is_err());
+    }
+
+    #[test]
+    fn base_manifest_read_refuses_what_is_no_plain_file() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = box_with_manifest(t.path());
+        // A FIFO: refused, and the open does not block.
+        std::fs::remove_file(paths.base_manifest()).unwrap();
+        rustix::fs::mknodat(
+            CWD,
+            paths.base_manifest(),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let e = read_base_manifest(&paths).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        // A directory.
+        std::fs::remove_file(paths.base_manifest()).unwrap();
+        std::fs::create_dir(paths.base_manifest()).unwrap();
+        let e = read_base_manifest(&paths).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        // Over the cap (sparse).
+        std::fs::remove_dir(paths.base_manifest()).unwrap();
+        let f = File::create(paths.base_manifest()).unwrap();
+        f.set_len(MANIFEST_MAX_BYTES + 1).unwrap();
+        let e = read_base_manifest(&paths).unwrap_err();
+        assert!(e.contains("more than"), "{e}");
+        // Missing.
+        std::fs::remove_file(paths.base_manifest()).unwrap();
+        assert!(read_base_manifest(&paths).is_err());
     }
 }

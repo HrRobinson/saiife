@@ -25,38 +25,91 @@ impl DiskUsage {
     }
 }
 
-/// Allocated bytes of a regular file. The box dir is VMM-writable, so this
-/// is an lstat that never follows a link and never opens the file: a
-/// symlink, FIFO, socket, directory or a missing name counts 0.
-fn allocated(p: &Path) -> u64 {
-    let Ok(m) = std::fs::symlink_metadata(p) else {
-        return 0;
-    };
-    if !m.file_type().is_file() {
-        return 0;
+/// Allocated bytes of the regular files a box dir holds, never following a
+/// link. The box dir is VMM-writable (a VMM can swap `snapshot/`, or the
+/// box dir itself, for a symlink), so on Unix every name is looked up
+/// relative to a directory descriptor opened `O_DIRECTORY|O_NOFOLLOW`, with
+/// `fstatat(AT_SYMLINK_NOFOLLOW)`, and nothing is opened but directories: a
+/// symlink (to a file or a dir), FIFO, socket, directory or a missing name
+/// counts 0.
+#[cfg(unix)]
+mod at {
+    use rustix::fs::{openat, statat, AtFlags, FileType, Mode, OFlags, CWD};
+    use std::os::fd::OwnedFd;
+    use std::path::Path;
+
+    /// `p` as a real directory: its last component is never followed.
+    pub fn open_dir(at: impl rustix::fd::AsFd, p: &Path) -> Option<OwnedFd> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        openat(at, p, flags, Mode::empty()).ok()
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        m.blocks().saturating_mul(512)
+
+    /// Allocated bytes of `name` in `dir` when it is a regular file.
+    pub fn allocated_at(dir: &OwnedFd, name: &std::ffi::OsStr) -> u64 {
+        match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile => {
+                #[allow(clippy::unnecessary_cast)]
+                let blocks = st.st_blocks as u64;
+                blocks.saturating_mul(512)
+            }
+            _ => 0,
+        }
     }
-    #[cfg(not(unix))]
-    {
-        m.len()
+
+    /// Allocated bytes of the regular file `p`, looked up relative to its
+    /// parent dir.
+    pub fn allocated(p: &Path) -> u64 {
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+            return 0;
+        };
+        open_dir(CWD, parent).map_or(0, |d| allocated_at(&d, name))
+    }
+
+    /// The sum over `names` in the dir `p` (itself never followed).
+    pub fn allocated_in(p: &Path, names: &[&str]) -> u64 {
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+            return 0;
+        };
+        let Some(d) = open_dir(CWD, parent).and_then(|up| open_dir(&up, Path::new(name))) else {
+            return 0;
+        };
+        names
+            .iter()
+            .map(|n| allocated_at(&d, n.as_ref()))
+            .fold(0, u64::saturating_add)
+    }
+}
+
+#[cfg(not(unix))]
+mod at {
+    use std::path::Path;
+
+    pub fn allocated(p: &Path) -> u64 {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_file() => m.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn allocated_in(p: &Path, names: &[&str]) -> u64 {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => names
+                .iter()
+                .map(|n| allocated(&p.join(n)))
+                .fold(0, u64::saturating_add),
+            _ => 0,
+        }
     }
 }
 
 /// The disk a box dir uses: `root.qcow2`, `repo.img` and the snapshot files
-/// ([`crate::snapshot::NAMES`] in `snapshot/`, named, never listed).
+/// ([`crate::snapshot::NAMES`] in `snapshot/`, named, never listed). A
+/// symlinked box dir or `snapshot/` counts 0 (see [`at`]).
 pub fn usage(paths: &BoxPaths) -> DiskUsage {
-    let snap = paths.snapshot_dir();
     DiskUsage {
-        root_bytes: allocated(&paths.root_disk()),
-        repo_bytes: allocated(&paths.repo_disk()),
-        snapshot_bytes: crate::snapshot::NAMES
-            .iter()
-            .map(|n| allocated(&snap.join(n)))
-            .fold(0, u64::saturating_add),
+        root_bytes: at::allocated(&paths.root_disk()),
+        repo_bytes: at::allocated(&paths.repo_disk()),
+        snapshot_bytes: at::allocated_in(&paths.snapshot_dir(), crate::snapshot::NAMES),
     }
 }
 
@@ -331,6 +384,29 @@ mod tests {
         std::fs::remove_file(paths.root_disk()).unwrap();
         symlink(&big, paths.root_disk()).unwrap();
         assert_eq!(usage(&paths).root_bytes, 0);
+    }
+
+    #[test]
+    fn usage_never_follows_a_symlinked_dir() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        // A real snapshot dir elsewhere, full of data.
+        let far = d.path().join("far");
+        std::fs::create_dir(&far).unwrap();
+        for n in crate::snapshot::NAMES {
+            std::fs::write(far.join(n), vec![1u8; 1 << 20]).unwrap();
+        }
+        std::fs::write(far.join("root.qcow2"), vec![1u8; 1 << 20]).unwrap();
+        // The VMM swapped `snapshot/` for a symlink: it counts 0.
+        let boxdir = d.path().join("b1");
+        std::fs::create_dir(&boxdir).unwrap();
+        let paths = BoxPaths::new(boxdir.clone());
+        symlink(&far, paths.snapshot_dir()).unwrap();
+        assert_eq!(usage(&paths).snapshot_bytes, 0);
+        // A symlinked box dir: nothing in it is counted.
+        let linked = BoxPaths::new(d.path().join("b2"));
+        symlink(&far, &linked.dir).unwrap();
+        assert_eq!(usage(&linked), DiskUsage::default());
     }
 
     // Writes the last-but-one argument (the tmp path).

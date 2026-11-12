@@ -83,7 +83,36 @@ pub const OPS: &[&str] = &[
 
 /// `<state_dir>/boxes`.
 pub fn dir_in(state_dir: &Path) -> PathBuf {
-    state_dir.join("boxes")
+    #[cfg(unix)]
+    {
+        saiife_boxhost::layout::boxes_in(state_dir)
+    }
+    // No boxes off Unix (no box host crate there); the same path.
+    #[cfg(not(unix))]
+    {
+        state_dir.join("boxes")
+    }
+}
+
+/// Where spawn moves a box's repo disk and base manifest: the box's
+/// [`saiife_boxhost::paths::BoxPaths`]. `None` off Unix, where a box takes
+/// no repo disk.
+pub fn disk_place() -> Option<saiife_boxes::manager::DiskPlacer> {
+    #[cfg(unix)]
+    {
+        use saiife_boxes::manager::DiskPlace;
+        Some(Arc::new(|root: &Path, id: &BoxId| {
+            let p = saiife_boxhost::paths::BoxPaths::of(root, id);
+            DiskPlace {
+                repo_image: p.repo_disk(),
+                base_manifest: p.base_manifest(),
+            }
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Where box templates come from (B11). Locked: `<dir of config_path>/templates.d`,
@@ -275,6 +304,7 @@ fn build_fake(
             None => host_facts(&root, &prev),
         }),
         clock: Arc::new(unix_now),
+        disk_place: disk_place(),
     })
     .map_err(|e| e.to_string())?;
     let mut warnings = opened.warnings;
@@ -736,8 +766,7 @@ fn obj<T: Serialize>(t: &T) -> Map<String, Value> {
 /// Allocated MiB (rounded up) of a box's disks; lstat only, no lock held.
 #[cfg(unix)]
 fn disk_mib(root: &Path, id: &BoxId) -> u64 {
-    let paths = saiife_boxhost::paths::BoxPaths::new(root.join(id.as_str()));
-    saiife_boxhost::disk::usage(&paths)
+    saiife_boxhost::disk::usage(&saiife_boxhost::paths::BoxPaths::of(root, id))
         .total()
         .div_ceil(1 << 20)
 }

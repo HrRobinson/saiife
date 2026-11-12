@@ -44,13 +44,11 @@ pub const DONE_IDLE_SECS: u64 = 30;
 pub const DEFAULT_IDLE_STOP_MINS: u32 = 120;
 /// Longest repo name accepted at spawn.
 pub const MAX_REPO_BYTES: usize = 256;
-/// The repo disk's name in a box dir (plan 37).
-pub const REPO_IMAGE: &str = "repo.img";
-/// The base manifest's name in a box dir (plan 37).
-pub const BASE_MANIFEST: &str = "base.json";
 const PAIR: &str = "a repo disk and its base manifest come together, or neither";
 const NOT_INCOMING: &str =
     "the repo disk and its base manifest must be in one dir of the box store's .incoming";
+const NO_PLACER: &str = "this box manager takes no repo disk";
+const NOT_IN_BOX: &str = "the repo disk's place is not in the box dir";
 
 const RECORD_VERSION: u32 = 1;
 const LOST: &str = "the VM was gone after a daemon restart";
@@ -64,6 +62,19 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// A live sample of the host.
 pub type HostProbe = Arc<dyn Fn() -> HostFacts + Send + Sync>;
 
+/// Where spawn moves a box's repo disk and its base manifest (plan 37).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskPlace {
+    pub repo_image: PathBuf,
+    pub base_manifest: PathBuf,
+}
+
+/// `(store root, box id)` to the [`DiskPlace`] of that box. The manager
+/// never names these files itself: the daemon's placer comes from its
+/// layout helpers (`saiife_boxhost::paths::BoxPaths`). Both places must be
+/// in the box dir (`<root>/<id>`), where the move is directory-relative.
+pub type DiskPlacer = Arc<dyn Fn(&Path, &BoxId) -> DiskPlace + Send + Sync>;
+
 pub struct ManagerInit {
     pub store: Store,
     pub vmm: Arc<dyn Vmm>,
@@ -71,6 +82,9 @@ pub struct ManagerInit {
     pub templates: Vec<BoxTemplate>,
     pub host: HostProbe,
     pub clock: Clock,
+    /// Where a spawn's repo disk goes; `None`: a spawn with one is
+    /// `Unavailable`.
+    pub disk_place: Option<DiskPlacer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,10 +96,10 @@ pub struct SpawnArgs {
     pub start: Start,
     pub owner_uid: u32,
     /// A repo disk image (plan 37) in `<store root>/.incoming/<dir>/`;
-    /// spawn moves it to `<box dir>/repo.img` before admission.
+    /// spawn moves it to its [`DiskPlace`] before admission.
     pub repo_image: Option<PathBuf>,
-    /// The base manifest of that disk, in the same dir; it becomes
-    /// `<box dir>/base.json`. Both or neither.
+    /// The base manifest of that disk, in the same dir; it goes to its
+    /// [`DiskPlace`] too. Both or neither.
     pub base_manifest: Option<PathBuf>,
 }
 
@@ -185,6 +199,7 @@ pub struct Manager {
     templates: Vec<BoxTemplate>,
     host: HostProbe,
     clock: Clock,
+    disk_place: Option<DiskPlacer>,
 }
 
 fn change(r: &BoxRecord, from: BoxState, why: &'static str) -> Change {
@@ -276,6 +291,7 @@ impl Manager {
             templates: init.templates,
             host: init.host,
             clock: init.clock,
+            disk_place: init.disk_place,
         };
         Ok(Opened {
             manager: mgr,
@@ -317,6 +333,19 @@ impl Manager {
             return Err(bad());
         }
         Ok((d1, image, manifest))
+    }
+
+    /// The names of `to` in the box dir `dir`: both right in it, and two.
+    fn names_in<'a>(dir: &Path, to: &'a DiskPlace) -> Option<(&'a OsStr, &'a OsStr)> {
+        let name = |p: &'a Path| {
+            if p.parent()? == dir {
+                p.file_name()
+            } else {
+                None
+            }
+        };
+        let (i, m) = (name(&to.repo_image)?, name(&to.base_manifest)?);
+        (i != m).then_some((i, m))
     }
 
     /// Whether a `Start::Now` spawn must be refused.
@@ -398,6 +427,9 @@ impl Manager {
             (Some(i), Some(m)) => Some(self.incoming(i, m)?),
             _ => return Err(BoxError::Invalid(PAIR.into())),
         };
+        if disk.is_some() && self.disk_place.is_none() {
+            return Err(BoxError::Unavailable(NO_PLACER.into()));
+        }
         if !a.task.is_empty() {
             check_text(&a.task, MAX_TASK_BYTES)?;
         }
@@ -414,15 +446,23 @@ impl Manager {
             return Err(BoxError::Busy);
         }
         let id = g.store.claim_id()?;
-        if let Some((sub, image, manifest)) = disk {
+        if let (Some((sub, image, manifest)), Some(placer)) = (disk, &self.disk_place) {
             g.placing.insert(id.clone());
+            let dir = g.store.box_dir(&id);
             drop(g);
-            let moved = crate::place::place(
-                &self.root,
-                id.as_str(),
-                sub,
-                &[(image, REPO_IMAGE), (manifest, BASE_MANIFEST)],
-            );
+            let to = placer(&self.root, &id);
+            let moved = match Self::names_in(&dir, &to) {
+                Some((ti, tm)) => crate::place::place(
+                    &self.root,
+                    id.as_str(),
+                    sub,
+                    &[(image, ti), (manifest, tm)],
+                ),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    NOT_IN_BOX,
+                )),
+            };
             g = self.lock();
             g.placing.remove(&id);
             if let Err(e) = moved {
