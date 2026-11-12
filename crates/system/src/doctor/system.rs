@@ -2911,12 +2911,11 @@ mod tests {
         let t = T::empty();
         let r = t.doctor();
         let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["system.supported", "install.record", "touch-key"],
-            "{}",
-            r.to_text()
-        );
+        let mut want = vec!["system.supported", "install.record", "touch-key"];
+        if cfg!(target_os = "linux") {
+            want.push("touch-helper");
+        }
+        assert_eq!(ids, want, "{}", r.to_text());
         let c = get(&r, "install.record");
         assert_eq!(c.status, Status::Info);
         assert_eq!(

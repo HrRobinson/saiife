@@ -532,7 +532,7 @@ fn key_note() -> Option<String> {
 /// How this build reaches a key, for `saiife doctor` (plan 41 Task 4). The
 /// helper is started and closed (its hello), never sent a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Built by `support`; `doctor` (plan 41 Task 4) reads it.
+// Which variants are built depends on the features, the profile and the OS.
 #[allow(dead_code)]
 pub(crate) enum KeySupport {
     /// The soft key seam (debug builds).
@@ -549,8 +549,6 @@ pub(crate) enum KeySupport {
     None,
 }
 
-// `doctor` (plan 41 Task 4) calls it.
-#[allow(dead_code)]
 pub(crate) fn support() -> KeySupport {
     #[cfg(debug_assertions)]
     if std::env::var_os("SAIIFE_TEST_TOUCH_SOFT").is_some_and(|p| !p.is_empty()) {
@@ -560,19 +558,16 @@ pub(crate) fn support() -> KeySupport {
 }
 
 #[cfg(feature = "fido-hid")]
-#[allow(dead_code)]
 fn device_support() -> KeySupport {
     KeySupport::InProcess
 }
 
 #[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
-#[allow(dead_code)]
 fn device_support() -> KeySupport {
     helper::support()
 }
 
 #[cfg(all(not(feature = "fido-hid"), not(target_os = "linux")))]
-#[allow(dead_code)]
 fn device_support() -> KeySupport {
     KeySupport::None
 }
