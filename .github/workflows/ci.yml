@@ -66,6 +66,9 @@ jobs:
         run: cargo test -p saiife-darwin -- --exact macos::tests::own_connection_has_own_uid
         env:
           TMPDIR: ${{ runner.temp }}
+      - name: Workspace UI node tests (offline)
+        if: matrix.os == 'ubuntu-latest'
+        run: node --version && node --test crates/link/assets/tests/
       - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-macos-sign.sh

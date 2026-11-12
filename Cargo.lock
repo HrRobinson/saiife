@@ -1851,6 +1851,7 @@ dependencies = [
  "saiife-daemon",
  "saiife-ipc",
  "saiife-policy",
+ "saiife-touch",
  "saiife-wire",
  "serde_json",
  "sha1",
