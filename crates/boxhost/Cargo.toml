@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 saiife-boxproto = { path = "../boxproto" }
+ring = "=0.17.14"
 
 [dev-dependencies]
 tempfile = "3"

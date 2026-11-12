@@ -1620,6 +1620,7 @@ dependencies = [
  "rustls",
  "saiife-agents",
  "saiife-audit",
+ "saiife-boxhost",
  "saiife-broker",
  "saiife-daemon",
  "saiife-dev",
@@ -1696,6 +1697,7 @@ dependencies = [
 name = "saiife-boxhost"
 version = "0.2.0"
 dependencies = [
+ "ring",
  "saiife-boxproto",
  "tempfile",
 ]

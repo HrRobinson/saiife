@@ -60,6 +60,7 @@ fido-hid = ["dep:ctap-hid-fido2"]
 fake-vmm = ["saiife-daemon/fake-vmm"]
 
 [target.'cfg(unix)'.dependencies]
+saiife-boxhost = { path = "../boxhost" }
 # Signals for the worker fault seam (debug builds); no unsafe calls.
 rustix = { version = "1", features = ["process", "termios", "fs"] }
 base64 = "=0.23.1"

@@ -78,6 +78,11 @@ pub enum BoxAction {
     },
     /// Delete discarded boxes and the leftovers of failed starts.
     Gc,
+    /// The pinned Cloud Hypervisor and firmware the boxes run on.
+    Vmm {
+        #[command(subcommand)]
+        action: crate::box_vmm_cmd::VmmAction,
+    },
 }
 
 #[cfg(not(unix))]
@@ -164,6 +169,13 @@ mod imp {
     }
 
     pub(super) fn go(config: Option<&Path>, action: BoxAction) -> Result<(), Stop> {
+        if let BoxAction::Vmm { action } = action {
+            return match crate::box_vmm_cmd::run(config, action) {
+                Ok(()) => Ok(()),
+                Err(crate::box_vmm_cmd::Fail::Refused(m)) => Err(Stop::Refused(m)),
+                Err(crate::box_vmm_cmd::Fail::Unavailable(m)) => Err(Stop::Unavailable(m)),
+            };
+        }
         let t = broker::resolve_here(config).map_err(Stop::Unavailable)?;
         match action {
             BoxAction::Spawn {
@@ -251,6 +263,7 @@ mod imp {
                     print_templates(&a);
                 }
             }
+            BoxAction::Vmm { .. } => unreachable!("handled above"),
             BoxAction::Gc => {
                 let a = call(&t, "box.gc", Args::new())?;
                 let removed: Vec<String> = a
