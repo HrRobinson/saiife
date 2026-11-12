@@ -155,14 +155,22 @@ type Stream = NamedPipeServer;
 
 /// The descriptors that follow a `box.fds` frame (plan 37): exactly one
 /// byte is read, so the next frame stays in the stream. `Err` leaves the
-/// stream out of step: the connection must close.
+/// stream out of step: the connection must close. `Ok(None)`: the hook
+/// table closed the connection meanwhile (its overrun), which ends it now.
 #[cfg(unix)]
-async fn recv_box_fds(s: &Stream) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
+async fn recv_box_fds(
+    s: &Stream,
+    conn: &ops::Conn,
+) -> std::io::Result<Option<Vec<std::os::fd::OwnedFd>>> {
     use saiife_ipc::fdpass::{recv_fds, MAX_FDS};
     let byte = s.async_io(tokio::io::Interest::READABLE, || recv_fds(s, MAX_FDS));
-    match timeout(FRAME_TIMEOUT, byte).await {
-        Ok(r) => r,
-        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    tokio::select! {
+        biased;
+        _ = conn.close.notified() => Ok(None),
+        r = timeout(FRAME_TIMEOUT, byte) => match r {
+            Ok(r) => r.map(Some),
+            Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+        },
     }
 }
 
@@ -237,6 +245,10 @@ async fn serve_peer(mut s: Stream, peer: PeerCred, ctx: Arc<Ctx>, listener: List
         let req = match Request::from_map(frame) {
             Ok(r) => r,
             Err(code) => {
+                // Not dispatched: descriptors a `box.fds` left are for this
+                // frame, so they go with it.
+                #[cfg(unix)]
+                drop(conn.take_fds());
                 let msg = "a request needs a u64 id and a string op";
                 if !write(&mut s, &err(id_hint, code, msg)).await || !greeted {
                     return;
@@ -267,8 +279,9 @@ async fn serve_peer(mut s: Stream, peer: PeerCred, ctx: Arc<Ctx>, listener: List
         // descriptors) closes the stash and, once answered, the connection.
         #[cfg(unix)]
         let passed = if listener == Listener::Control && req.op == OP_BOX_FDS {
-            match recv_box_fds(&s).await {
-                Ok(fds) => Some(fds),
+            match recv_box_fds(&s, &conn).await {
+                Ok(Some(fds)) => Some(fds),
+                Ok(None) => return,
                 Err(e) => {
                     drop(conn.take_fds());
                     let msg = format!("box.fds: the descriptors did not come: {e}");
@@ -514,6 +527,49 @@ mod tests {
         assert_eq!(r["error"], "bad_request", "{r}");
         assert_eq!(answer(&mut ours).await, None, "closed");
         task.await.unwrap();
+    }
+
+    /// R8 (M1): a frame that is no request is not dispatched, and the
+    /// descriptors a `box.fds` left go with it: none reach a later op.
+    #[tokio::test]
+    async fn malformed_request_drops_the_stash() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(ctx).await;
+        let (pass, far) = witness();
+        let r = ask(&mut ours, fds_req(2, 1.into()), &[pass.as_fd()]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        drop(pass);
+        assert!(!closed(&far));
+        let r = ask(&mut ours, json!({"id": 3, "op": 5}), &[]).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(closed(&far), "the stash went with the malformed frame");
+        let r = ask(&mut ours, json!({"id": 4, "op": ops::TEST_FDS_OP}), &[]).await;
+        assert_eq!(r["texts"], json!([]), "{r}");
+        drop(ours);
+        task.await.unwrap();
+    }
+
+    /// R8 (M2): the hook table closing the connection (its overrun) while
+    /// the daemon waits for a `box.fds` byte ends the wait at once, not at
+    /// the frame timeout.
+    #[tokio::test]
+    async fn overrun_during_box_fds_closes_at_once() {
+        let (_ours, theirs) = UnixStream::pair().unwrap();
+        let peer = saiife_ipc::peer::peer_cred(&theirs).unwrap();
+        let conn = ops::Conn::new(peer, None);
+        let close = Arc::clone(&conn.close);
+        let start = Instant::now();
+        let wait = async { recv_box_fds(&theirs, &conn).await };
+        let fire = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            close.notify_one();
+        };
+        let (got, ()) = tokio::join!(wait, fire);
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        assert!(start.elapsed() < FRAME_TIMEOUT / 2, "{:?}", start.elapsed());
     }
 
     #[tokio::test]
