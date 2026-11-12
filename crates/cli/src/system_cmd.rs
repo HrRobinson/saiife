@@ -137,7 +137,12 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
     let opts = DoctorOptions {
         user: None,
         home,
-        touch_supported: cfg!(feature = "fido-hid"),
+        // Install's doctor does not probe keys (no helper start).
+        touch: if cfg!(feature = "fido-hid") {
+            saiife_system::doctor::TouchSupport::InProcess
+        } else {
+            saiife_system::doctor::TouchSupport::None
+        },
     };
     let (text, failed) = doctor::after_install(layout, host, &dir, &opts);
     outln!();

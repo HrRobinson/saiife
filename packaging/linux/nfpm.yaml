@@ -1,5 +1,5 @@
 # nfpm config for the saiife deb and rpm (plan 18, decisions 1 and 3).
-# The package owns only the staging binary, its symlink and the docs.
+# The package owns only the staging binary, its symlink, the FIDO helper and the docs.
 # Everything locked mode lays down is written by `saiife system install --fleet`
 # in postinst and recorded in installed.toml; no packaged path may overlap it.
 # build.sh stages the files and exports SAIIFE_STAGE, SAIIFE_VERSION, SAIIFE_ARCH
@@ -28,6 +28,15 @@ contents:
   - src: ${SAIIFE_STAGE}/saiife
     expand: true
     dst: /usr/libexec/saiife/saiife
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  # The dynamically linked FIDO helper (plan 41): a static saiife cannot load
+  # libudev, so it spawns this root-owned helper to talk to a key.
+  - src: ${SAIIFE_STAGE}/saiife-fido
+    expand: true
+    dst: /usr/libexec/saiife/saiife-fido
     file_info:
       mode: 0755
       owner: root
@@ -75,8 +84,14 @@ rpm:
     key_file: ${NFPM_RPM_KEY_FILE}
 overrides:
   deb:
+    depends:
+      - libc6 (>= 2.31)
+      - libudev1
     recommends:
       - polkitd | policykit-1
   rpm:
+    depends:
+      - glibc >= 2.31
+      - "libudev.so.1()(64bit)"
     recommends:
       - polkit

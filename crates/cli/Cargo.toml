@@ -10,6 +10,11 @@ repository.workspace = true
 name = "saiife"
 path = "src/main.rs"
 
+[[bin]]
+name = "saiife-fake-fido"
+path = "src/bin/saiife-fake-fido.rs"
+required-features = ["fake-fido"]
+
 [dependencies]
 saiife-guard = { path = "../guard" }
 saiife-audit = { path = "../audit" }
@@ -48,12 +53,15 @@ zeroize = "=1.9.1"
 # `saiife touch` and touch approvals: the soft key is compiled in; only debug
 # builds pick it (the `SAIIFE_TEST_TOUCH_SOFT` seam).
 saiife-touch = { path = "../touch", features = ["soft"] }
-# CTAP2 over USB HID for FIDO2 keys (`fido-hid`, off by default: the static
-# musl Linux builds have no libudev).
-ctap-hid-fido2 = { version = "=3.6.0", optional = true }
+# The FIDO key transport (protocol types, error table, and with `fido-hid` the
+# CTAP2 calls over USB HID; off by default: the static musl Linux builds have
+# no libudev). Same version as saiife: the helper's hello checks it.
+saiife-fido = { path = "../fido" }
 
 [features]
-fido-hid = ["dep:ctap-hid-fido2"]
+fido-hid = ["saiife-fido/hid"]
+# The scripted helper `saiife-fake-fido` for CLI tests.
+fake-fido = ["saiife-fido/fake"]
 # A fake VM behind the daemon's box manager (plan 34): test builds only. The
 # release workflows never enable it. The daemon runs inside this binary
 # (`saiife daemon`), so the feature reaches the daemon the tests start.

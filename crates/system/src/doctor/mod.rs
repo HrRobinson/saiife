@@ -37,9 +37,33 @@ pub struct DoctorOptions {
     /// The caller's home (`$HOME`) for a self-check. Ignored as root, where
     /// every home comes from `/etc/passwd`.
     pub home: Option<std::path::PathBuf>,
-    /// This CLI build can use a FIDO2 key (`cfg!(feature = "fido-hid")` in
-    /// the CLI). Read by the `touch-key` check only.
-    pub touch_supported: bool,
+    /// How this CLI build reaches a FIDO2 key. Read by the `touch-key` and
+    /// `touch-helper` checks only.
+    pub touch: TouchSupport,
+}
+
+/// How a build reaches a FIDO2 key (plan 41 Task 4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TouchSupport {
+    /// No key support.
+    #[default]
+    None,
+    /// The build talks to keys itself.
+    InProcess,
+    /// The packaged helper answered its hello.
+    Helper { version: String },
+    /// Linux: no helper installed.
+    HelperMissing,
+    /// The helper is there but is unsafe, of another version, or cannot
+    /// start: its line.
+    HelperBroken(String),
+}
+
+impl TouchSupport {
+    /// A plugged-in key can be used.
+    pub fn usable(&self) -> bool {
+        matches!(self, Self::InProcess | Self::Helper { .. })
+    }
 }
 
 /// What every check reads.

@@ -1,6 +1,7 @@
 //! `saiife touch enrol | ls | rm | test` (plan 27), and the key layer.
 //! `pick` chooses the source of touches: the soft key seam (debug builds
-//! only), a FIDO2 key over USB HID (feature `fido-hid`), or none (D1).
+//! only), a FIDO2 key over USB HID (feature `fido-hid`), on Linux without it
+//! the key through the packaged FIDO helper (plan 41), or none (D1).
 //!
 //! Exit codes: 0 done, 2 refused (by the daemon or the key), 5 the daemon
 //! or the key cannot be reached (D5), as `saiife approvals`.
@@ -9,6 +10,25 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use clap::Subcommand;
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+// Only the key transports use these: none on macOS or Windows without `fido-hid`.
+#[cfg_attr(
+    not(any(feature = "fido-hid", target_os = "linux")),
+    allow(unused_imports)
+)]
+use saiife_fido::errors::{classify, credential_of, first_line, one_of, DID_NOT_ANSWER};
+#[cfg_attr(
+    not(any(feature = "fido-hid", target_os = "linux")),
+    allow(unused_imports)
+)]
+use saiife_fido::proto::{AssertParts, AssertReq, EnrolReq};
+#[cfg_attr(
+    not(any(feature = "fido-hid", target_os = "linux")),
+    allow(unused_imports)
+)]
+use saiife_touch::{Assertion, EnrolRequest, TouchRequest};
 use saiife_touch::{Touch, TouchError, PROMPT_TIMEOUT_SECS};
 
 #[derive(Subcommand)]
@@ -213,9 +233,10 @@ mod cmd {
         } else {
             table(&items, all);
         }
-        // D1: listing needs no key, but nothing else works in this build.
-        #[cfg(not(feature = "fido-hid"))]
-        eprintln!("saiife: {}", super::NO_KEY_SUPPORT);
+        // D1: listing needs no key, but nothing else works without one.
+        if let Some(note) = super::key_note() {
+            eprintln!("saiife: {note}");
+        }
         Ok(())
     }
 
@@ -338,13 +359,120 @@ mod cmd {
     }
 }
 
+#[cfg(all(target_os = "linux", not(feature = "fido-hid")))]
+mod helper;
 #[cfg(feature = "fido-hid")]
 mod hid;
 
-/// D1: a build without `fido-hid`, named by its target (R-O).
+/// Asks for the key's PIN (D3): `tty::read_hidden` outside tests.
+type PinPrompt = Box<dyn Fn() -> Result<Zeroizing<String>, String> + Send + Sync>;
+
+/// How the CTAP calls reach a key: in this process (`hid::InProcess`), or
+/// through the helper (`helper::Helper`). The outer `Err` is a failure to reach the key (already
+/// reported to the user); the inner `Err` is the CTAP error text, which
+/// `KeyTouch` classifies.
+#[cfg_attr(not(any(feature = "fido-hid", target_os = "linux")), allow(dead_code))]
+pub(crate) trait Transport: Send + Sync {
+    fn devices(&self) -> Result<usize, TouchError>;
+    fn assert(
+        &self,
+        r: AssertReq,
+        limit: Duration,
+    ) -> Result<Result<AssertParts, String>, TouchError>;
+    fn enrol(&self, r: EnrolReq, limit: Duration) -> Result<Result<Vec<u8>, String>, TouchError>;
+}
+
+/// A FIDO2 key (D2: exactly one plugged in), reached through a `Transport`.
+#[cfg_attr(not(any(feature = "fido-hid", target_os = "linux")), allow(dead_code))]
+pub(crate) struct KeyTouch<T: Transport> {
+    transport: T,
+    pin: PinPrompt,
+}
+
+#[cfg_attr(not(any(feature = "fido-hid", target_os = "linux")), allow(dead_code))]
+impl<T: Transport> KeyTouch<T> {
+    pub(crate) fn new(transport: T, pin: PinPrompt) -> Self {
+        Self { transport, pin }
+    }
+
+    /// D2, on the devices plugged in now.
+    fn one_device(&self) -> Result<(), TouchError> {
+        one_of(self.transport.devices()?).map_err(|(e, hint)| {
+            eprintln!("saiife: {hint}");
+            e
+        })
+    }
+
+    /// D3: no PIN at the prompt is `NotVerified`, and nothing is sent.
+    fn ask_pin(&self) -> Result<Zeroizing<String>, TouchError> {
+        (self.pin)().map_err(|e| {
+            eprintln!("saiife: {e}");
+            TouchError::NotVerified
+        })
+    }
+
+    /// Prints `saiife: <hint>` for a CTAP error text and gives its error.
+    fn fail(msg: &str) -> TouchError {
+        let (err, hint) = classify(msg);
+        if hint == DID_NOT_ANSWER {
+            eprintln!("saiife: {hint}: {}", crate::text::sanitize(first_line(msg)));
+        } else {
+            eprintln!("saiife: {hint}");
+        }
+        err
+    }
+}
+
+#[cfg_attr(not(any(feature = "fido-hid", target_os = "linux")), allow(dead_code))]
+fn sha256(b: &[u8]) -> [u8; 32] {
+    Sha256::digest(b).into()
+}
+
+impl<T: Transport> Touch for KeyTouch<T> {
+    fn request(&self, r: &TouchRequest) -> Result<Assertion, TouchError> {
+        self.one_device()?;
+        let pin = if r.uv { Some(self.ask_pin()?) } else { None };
+        eprintln!("saiife: touch your key now");
+        let req = AssertReq {
+            rp_id: r.rp_id.clone(),
+            challenge: r.challenge,
+            allow: r.allow.clone(),
+            pin,
+        };
+        match self.transport.assert(req, prompt_limit())? {
+            Ok((credential_id, auth_data, signature)) => Ok(Assertion::Ctap2 {
+                credential_id: credential_of(credential_id, &r.allow),
+                auth_data,
+                signature,
+                client_data_hash: sha256(&r.challenge),
+            }),
+            Err(msg) => Err(Self::fail(&msg)),
+        }
+    }
+
+    fn enrol(&self, r: &EnrolRequest) -> Result<Vec<u8>, TouchError> {
+        self.one_device()?;
+        let pin = self.ask_pin()?;
+        eprintln!("saiife: touch your key now");
+        let req = EnrolReq {
+            rp_id: r.rp_id.clone(),
+            challenge: r.challenge,
+            user_id: r.user_id.clone(),
+            user_name: r.user_name.clone(),
+            exclude: r.exclude.clone(),
+            pin,
+        };
+        match self.transport.enrol(req, prompt_limit())? {
+            Ok(auth_data) => Ok(auth_data),
+            Err(msg) => Err(Self::fail(&msg)),
+        }
+    }
+}
+
+/// D1: a build without `fido-hid`, named by its target (R-O). On Linux: no
+/// FIDO helper is installed (plan 41).
 #[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
-pub(crate) const NO_KEY_SUPPORT: &str =
-    "this saiife build has no FIDO2 key support (a static Linux build); see docs/touch.md";
+pub(crate) const NO_KEY_SUPPORT: &str = "this saiife build has no FIDO2 key support (a static Linux build without the FIDO helper); install the saiife deb or rpm, see docs/touch.md";
 #[cfg(all(not(feature = "fido-hid"), windows))]
 pub(crate) const NO_KEY_SUPPORT: &str =
     "this saiife build has no FIDO2 key support (a Windows build); see docs/touch.md";
@@ -353,8 +481,11 @@ pub(crate) const NO_KEY_SUPPORT: &str =
     "this saiife build has no FIDO2 key support (built without fido-hid); see docs/touch.md";
 
 /// The source of touches, in order: the soft key seam (debug builds only),
-/// the plugged-in FIDO2 key (`fido-hid`), or `Err` (D1). A seam file that is
-/// missing or does not parse is `Err` too; callers exit 5 with the message.
+/// the plugged-in FIDO2 key (`fido-hid`), on Linux without `fido-hid` the
+/// FIDO helper once it passes F2 (it is run only when a touch is asked),
+/// or `Err` (D1). A seam file that is missing or does not parse, or a
+/// helper that is missing or not safe to run, is `Err` too; callers exit 5
+/// with the message.
 pub(crate) fn pick() -> Result<Box<dyn Touch>, String> {
     #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("SAIIFE_TEST_TOUCH_SOFT").filter(|p| !p.is_empty()) {
@@ -365,14 +496,109 @@ pub(crate) fn pick() -> Result<Box<dyn Touch>, String> {
 
 #[cfg(feature = "fido-hid")]
 fn device() -> Result<Box<dyn Touch>, String> {
-    Ok(Box::new(hid::HidAuthenticator::new(Box::new(|| {
-        crate::tty::read_hidden("PIN for your security key: ")
-    }))))
+    Ok(Box::new(KeyTouch::new(hid::InProcess, pin_prompt())))
 }
 
-#[cfg(not(feature = "fido-hid"))]
+#[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
+fn device() -> Result<Box<dyn Touch>, String> {
+    let path = helper::checked()?;
+    Ok(Box::new(KeyTouch::new(
+        helper::Helper::new(path),
+        pin_prompt(),
+    )))
+}
+
+#[cfg(all(not(feature = "fido-hid"), not(target_os = "linux")))]
 fn device() -> Result<Box<dyn Touch>, String> {
     Err(NO_KEY_SUPPORT.into())
+}
+
+/// The note `touch ls` prints when no key can be used (D1).
+#[cfg(feature = "fido-hid")]
+fn key_note() -> Option<String> {
+    None
+}
+
+#[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
+fn key_note() -> Option<String> {
+    helper::checked().err()
+}
+
+#[cfg(all(not(feature = "fido-hid"), not(target_os = "linux")))]
+fn key_note() -> Option<String> {
+    Some(NO_KEY_SUPPORT.into())
+}
+
+/// How this build reaches a key, for `saiife doctor` (plan 41 Task 4). The
+/// helper is started and closed (its hello), never sent a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Which variants are built depends on the features, the profile and the OS.
+#[allow(dead_code)]
+pub(crate) enum KeySupport {
+    /// The soft key seam (debug builds).
+    Soft,
+    InProcess,
+    Helper {
+        version: String,
+        devices: usize,
+    },
+    /// The helper is there but is not safe, of another version, or cannot
+    /// start: its line.
+    HelperBroken(String),
+    /// No key support (on Linux: no helper installed).
+    None,
+}
+
+pub(crate) fn support() -> KeySupport {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SAIIFE_TEST_TOUCH_SOFT").is_some_and(|p| !p.is_empty()) {
+        return KeySupport::Soft;
+    }
+    device_support()
+}
+
+#[cfg(feature = "fido-hid")]
+fn device_support() -> KeySupport {
+    KeySupport::InProcess
+}
+
+#[cfg(all(not(feature = "fido-hid"), target_os = "linux"))]
+fn device_support() -> KeySupport {
+    helper::support()
+}
+
+#[cfg(all(not(feature = "fido-hid"), not(target_os = "linux")))]
+fn device_support() -> KeySupport {
+    KeySupport::None
+}
+
+#[cfg(any(feature = "fido-hid", target_os = "linux"))]
+const PIN_LABEL: &str = "PIN for your security key: ";
+
+/// The key's PIN from the terminal (D3, plan 41 F3).
+#[cfg(any(feature = "fido-hid", target_os = "linux"))]
+fn pin_prompt() -> PinPrompt {
+    Box::new(|| match pin_seam() {
+        Some(r) => r,
+        None => crate::tty::read_hidden(PIN_LABEL),
+    })
+}
+
+/// The PIN seam (debug builds only): `SAIIFE_TEST_TOUCH_PIN=<text>` types
+/// the PIN (tests have no terminal); empty is no PIN typed. The prompt is
+/// still printed. `None` when unset, and always in release builds.
+#[cfg(any(feature = "fido-hid", target_os = "linux"))]
+fn pin_seam() -> Option<Result<Zeroizing<String>, String>> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = std::env::var_os("SAIIFE_TEST_TOUCH_PIN")?;
+    eprintln!("{PIN_LABEL}");
+    Some(match v.into_string() {
+        Ok(p) if p.is_empty() => Err("no value read".into()),
+        Ok(p) => Ok(Zeroizing::new(p)),
+        Err(_) => Err("the value is not UTF-8 text".into()),
+    })
 }
 
 /// Runs `f` on a worker thread and waits at most `limit` for it (D4). When
@@ -412,9 +638,12 @@ pub(crate) fn exit_for(e: TouchError) -> u8 {
 
 /// How long one prompt waits for a touch: `PROMPT_TIMEOUT_SECS`, or in debug
 /// builds `SAIIFE_TEST_TOUCH_TIMEOUT_MS` when it is set.
-// The soft key (debug builds) and the HID key call it.
+// The soft key (debug builds) and the key transports call it.
 #[cfg_attr(
-    all(not(debug_assertions), not(feature = "fido-hid")),
+    all(
+        not(debug_assertions),
+        not(any(feature = "fido-hid", target_os = "linux"))
+    ),
     allow(dead_code)
 )]
 pub(crate) fn prompt_limit() -> Duration {
@@ -650,7 +879,90 @@ mod soft_file {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Instant;
+
+    /// A transport double: `n` devices, and a fixed inner answer.
+    struct Double {
+        n: usize,
+        inner: Result<AssertParts, String>,
+    }
+
+    impl Transport for Double {
+        fn devices(&self) -> Result<usize, TouchError> {
+            Ok(self.n)
+        }
+        fn assert(
+            &self,
+            _: AssertReq,
+            _: Duration,
+        ) -> Result<Result<AssertParts, String>, TouchError> {
+            Ok(self.inner.clone())
+        }
+        fn enrol(&self, _: EnrolReq, _: Duration) -> Result<Result<Vec<u8>, String>, TouchError> {
+            Ok(self.inner.clone().map(|(_, a, _)| a))
+        }
+    }
+
+    fn request(uv: bool) -> TouchRequest {
+        TouchRequest {
+            rp_id: "saiife.local".into(),
+            challenge: [1; 32],
+            allow: vec![vec![9]],
+            uv,
+            summary: String::new(),
+            short_code: String::new(),
+        }
+    }
+
+    #[test]
+    fn key_touch_checks_devices_before_the_pin() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let k = KeyTouch::new(
+            Double {
+                n: 2,
+                inner: Ok((vec![], vec![], vec![])),
+            },
+            Box::new(move || {
+                a.fetch_add(1, Ordering::SeqCst);
+                Ok(Zeroizing::new("1234".to_string()))
+            }),
+        );
+        assert_eq!(
+            k.request(&request(true)).unwrap_err(),
+            TouchError::Unavailable
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn key_touch_classifies_inner_errors() {
+        let k = KeyTouch::new(
+            Double {
+                n: 1,
+                inner: Err("0x31 CTAP2_ERR_PIN_INVALID   PIN Invalid.".into()),
+            },
+            Box::new(|| Ok(Zeroizing::new("0000".to_string()))),
+        );
+        assert_eq!(
+            k.request(&request(true)).unwrap_err(),
+            TouchError::NotVerified
+        );
+        // An omitted id is the one allowed (R-F).
+        let k = KeyTouch::new(
+            Double {
+                n: 1,
+                inner: Ok((vec![], vec![1], vec![2])),
+            },
+            Box::new(|| Err("no tty".into())),
+        );
+        match k.request(&request(false)).unwrap() {
+            Assertion::Ctap2 { credential_id, .. } => assert_eq!(credential_id, vec![9]),
+            _ => panic!("not ctap2"),
+        }
+    }
 
     /// `pick` reads the environment; tests that touch it take this lock
     /// (only those of a build without `fido-hid`, or a release build).
@@ -708,25 +1020,94 @@ mod tests {
         assert_eq!(exit_for(TouchError::NotVerified), 2);
     }
 
+    /// A host with the packaged helper installed (the owner's, after the
+    /// deb): the release path is there, so "no helper" cannot be checked.
+    #[cfg(not(feature = "fido-hid"))]
+    fn helper_installed() -> bool {
+        cfg!(target_os = "linux")
+            && std::fs::symlink_metadata(saiife_system::layout::FIDO_HELPER).is_ok()
+    }
+
     #[cfg(not(feature = "fido-hid"))]
     #[test]
     fn pick_without_hid_names_the_build() {
         let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("SAIIFE_TEST_TOUCH_SOFT");
+        std::env::remove_var("SAIIFE_TEST_FIDO_HELPER");
+        if helper_installed() {
+            return;
+        }
         let e = pick().err().expect("no key source in this build");
         assert!(e.contains("no FIDO2 key support"), "{e}");
         assert_eq!(e, NO_KEY_SUPPORT);
-        let build = if cfg!(target_os = "linux") {
-            "a static Linux build"
+        let want = if cfg!(target_os = "linux") {
+            "this saiife build has no FIDO2 key support (a static Linux build without the FIDO helper); install the saiife deb or rpm, see docs/touch.md"
         } else if cfg!(windows) {
-            "a Windows build"
+            "this saiife build has no FIDO2 key support (a Windows build); see docs/touch.md"
         } else {
-            "built without fido-hid"
+            "this saiife build has no FIDO2 key support (built without fido-hid); see docs/touch.md"
         };
-        assert_eq!(
-            e,
-            format!("this saiife build has no FIDO2 key support ({build}); see docs/touch.md")
-        );
+        assert_eq!(e, want);
+        assert_eq!(key_note().as_deref(), Some(want));
+    }
+
+    /// The debug seams pick a safe helper and type the PIN.
+    #[cfg(all(debug_assertions, target_os = "linux", not(feature = "fido-hid")))]
+    #[test]
+    fn helper_seams_in_debug_builds() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SAIIFE_TEST_TOUCH_SOFT");
+        let dir = safe_helper_dir();
+        std::env::set_var("SAIIFE_TEST_FIDO_HELPER", dir.path().join("saiife-fido"));
+        assert!(pick().is_ok());
+        assert_eq!(key_note(), None);
+        std::env::set_var("SAIIFE_TEST_FIDO_HELPER", dir.path().join("missing"));
+        assert_eq!(pick().err().as_deref(), Some(NO_KEY_SUPPORT));
+        assert_eq!(support(), KeySupport::None);
+        std::env::remove_var("SAIIFE_TEST_FIDO_HELPER");
+
+        std::env::set_var("SAIIFE_TEST_TOUCH_PIN", "2468");
+        assert_eq!(pin_seam().unwrap().unwrap().as_str(), "2468");
+        std::env::set_var("SAIIFE_TEST_TOUCH_PIN", "");
+        assert_eq!(pin_seam().unwrap().unwrap_err(), "no value read");
+        std::env::remove_var("SAIIFE_TEST_TOUCH_PIN");
+        assert!(pin_seam().is_none());
+    }
+
+    /// A dir (0700) with a safe helper file `saiife-fido` (0755) in it.
+    #[cfg(all(target_os = "linux", not(feature = "fido-hid")))]
+    fn safe_helper_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::var_os("SAIIFE_TEST_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let perm = |m| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(dir.path(), perm(0o700)).unwrap();
+        let f = dir.path().join("saiife-fido");
+        std::fs::write(&f, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&f, perm(0o755)).unwrap();
+        dir
+    }
+
+    /// Review Focus 2 and 5: a release build ignores the helper and PIN
+    /// seams (the helper is always `FIDO_HELPER`, the PIN always the terminal).
+    #[cfg(all(not(debug_assertions), target_os = "linux", not(feature = "fido-hid")))]
+    #[test]
+    fn helper_seam_is_debug_only() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SAIIFE_TEST_TOUCH_SOFT");
+        let dir = safe_helper_dir();
+        std::env::set_var("SAIIFE_TEST_FIDO_HELPER", dir.path().join("saiife-fido"));
+        std::env::set_var("SAIIFE_TEST_TOUCH_PIN", "2468");
+        let (r, note, pin) = (pick(), key_note(), pin_seam());
+        std::env::remove_var("SAIIFE_TEST_FIDO_HELPER");
+        std::env::remove_var("SAIIFE_TEST_TOUCH_PIN");
+        assert!(pin.is_none());
+        if !helper_installed() {
+            assert_eq!(r.err().as_deref(), Some(NO_KEY_SUPPORT));
+            assert_eq!(note.as_deref(), Some(NO_KEY_SUPPORT));
+        }
     }
 
     /// Review Focus 5: a release build ignores the soft key seam.

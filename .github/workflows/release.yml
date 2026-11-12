@@ -91,7 +91,8 @@ jobs:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.check-version.outputs.version }}
       EXE: ${{ contains(matrix.target, 'windows') && '.exe' || '' }}
-      # FIDO2 key support (plan 27, D1, R-O): on for macOS only. Off for the static musl Linux builds,
+      # FIDO2 key support (plan 27, D1, R-O): on for macOS only. Off for the static musl Linux builds
+      # (Linux key support comes from the packaged saiife-fido helper, plan 41, built by the fido-helper job),
       # and off for Windows, where raw HID access to a FIDO key needs an elevated shell (shared uid 0).
       # Written as darwin && flag || '': an '' in the middle of a && / || chain is falsy and would fall through to the flag.
       FEATURES: ${{ contains(matrix.target, 'apple-darwin') && '--features fido-hid' || '' }}
@@ -321,8 +322,41 @@ jobs:
             dist/SIGNING-*.txt
           if-no-files-found: error
 
+  # The dynamically linked saiife-fido helper (plan 41, F5), built against glibc 2.31 in a
+  # pinned debian:bullseye container on a native runner per architecture. Only the deb and
+  # rpm carry it; the tarballs do not.
+  fido-helper:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: build the helper
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/build-fido-helper.sh "$ARCH" fido-out
+          ls -l fido-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fido-helper-${{ matrix.arch }}
+          path: fido-out/saiife-fido
+          if-no-files-found: error
+
   linux-packages:
-    needs: [check-version, build]
+    needs: [check-version, build, fido-helper]
     strategy:
       fail-fast: false
       matrix:
@@ -344,6 +378,10 @@ jobs:
         with:
           name: dist-${{ matrix.target }}
           path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fido-helper-${{ matrix.arch }}
+          path: fido-helper
       - name: extract the release binary
         shell: bash
         run: |
@@ -416,7 +454,7 @@ jobs:
           NFPM_RPM_PASSPHRASE: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.PKG_GPG_PASSPHRASE || '' }}
         run: |
           set -euo pipefail
-          bash packaging/linux/build.sh "$SAIIFE_BIN" "$VERSION" "$ARCH" pkg
+          bash packaging/linux/build.sh "$SAIIFE_BIN" fido-helper/saiife-fido "$VERSION" "$ARCH" pkg
           ls -l pkg
       # With a key, an unsigned rpm is a failed release, never a quiet one.
       - name: check the rpm signature

@@ -8,6 +8,7 @@
 # WORK (a scratch dir).
 
 PKG_BIN=/usr/libexec/saiife/saiife
+FIDO_BIN=/usr/libexec/saiife/saiife-fido
 FLEET_DIR=/etc/saiife/fleet
 SYS_CONFIG=/etc/saiife/config.toml
 INSTALLED_TOML=/etc/saiife/installed.toml
@@ -180,6 +181,16 @@ phase_fresh() {
     [[ -n "$rec" && "$rec" == "$opt" ]] || fail "installed.toml records '$rec' for /opt/saiife/bin/saiife, the file is $opt"
     ok "staging copy, /opt binary and installed.toml agree on $opt"
 
+    # The FIDO helper (plan 41) is dynamically linked: EOF on stdin after its
+    # hello line proves the loader, glibc and libudev resolve; it touches no key.
+    [[ "$(stat -c '%U:%G %a %F' "$FIDO_BIN")" == "root:root 755 regular file" ]] || fail "$FIDO_BIN is not a regular file, 0755 root:root: $(stat -c '%U:%G %a %F' "$FIDO_BIN")"
+    local hello
+    hello="$("$FIDO_BIN" </dev/null)" || fail "$FIDO_BIN </dev/null did not exit 0"
+    if ! { [[ "$(printf '%s\n' "$hello" | wc -l)" -eq 1 ]] && grep -Eq '^\{"t":"hello","proto":1,' <<<"$hello"; }; then
+        fail "$FIDO_BIN printed no single hello line: $hello"
+    fi
+    ok "$FIDO_BIN is 0755 root:root and prints its hello"
+
     local rc=0
     # shellcheck disable=SC2024 # the redirect is meant to run as the runner user: the output file is in $WORK, the runner's
     sudo -n /usr/bin/saiife doctor >"$WORK/p18-t3-doctor.out" 2>&1 || rc=$?
@@ -343,6 +354,8 @@ phase_remove() {
     if sudo -n test -e "$CLAUDE_MANAGED"; then fail "the Claude managed file is still there"; fi
     if sudo -n test -e "$CODEX_MANAGED" && sudo -n grep -qi saiife "$CODEX_MANAGED"; then fail "the Codex managed file still has saiife's entry"; fi
     ok "unit, /opt binary and managed files are gone"
+    if sudo -n test -e "$FIDO_BIN"; then fail "$FIDO_BIN is still there after remove"; fi
+    ok "the FIDO helper is gone"
     sudo -n test -d /var/log/saiife/audit || fail "the audit dir is gone"
     sudo -n test -f "$SYS_CONFIG" || fail "$SYS_CONFIG is gone"
     sudo -n test -f "$FLEET_DIR/config.toml" || fail "the fleet config is gone"
@@ -383,7 +396,7 @@ phase_purge() {
     local left="" p
     for p in /opt/saiife "$SYS_CONFIG" "$INSTALLED_TOML" /etc/saiife/credstore /var/lib/saiife /var/log/saiife \
         /run/saiife /etc/systemd/system/saiifed.service /usr/share/polkit-1/actions/com.saiife.approve.policy \
-        "$CLAUDE_MANAGED" /usr/libexec/saiife /usr/bin/saiife; do
+        "$CLAUDE_MANAGED" /usr/libexec/saiife "$FIDO_BIN" /usr/bin/saiife; do
         if sudo -n test -e "$p" || sudo -n test -L "$p"; then left="$left $p"; fi
     done
     [[ -z "$left" ]] || fail "left behind after purge:$left"

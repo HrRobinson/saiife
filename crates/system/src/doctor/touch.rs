@@ -4,10 +4,10 @@
 //! (`06 D0 F1`) is a FIDO key. This is an access test only: the node is never
 //! opened. It is Info or Pass, and a Warn at worst: touch is optional until a
 //! policy marks something. A CLI build without key support
-//! (`DoctorOptions::touch_supported`) gives Info for a plugged-in key.
+//! (`DoctorOptions::touch`) gives Info for a plugged-in key.
 
 use super::report::{Check, Status};
-use super::Ctx;
+use super::{Ctx, TouchSupport};
 use rustix::fs::{access, Access};
 use std::fs;
 use std::io::Read;
@@ -20,6 +20,38 @@ const ID: &str = "touch-key";
 const TITLE: &str = "touch key";
 
 pub(super) fn checks(ctx: &Ctx) -> Vec<Check> {
+    let mut out = key_checks(ctx);
+    #[cfg(target_os = "linux")]
+    out.push(helper_check(&ctx.opts.touch));
+    out
+}
+
+/// The `touch-helper` check (plan 41 Task 4), Linux only. Never a Fail:
+/// touch is optional.
+#[cfg(target_os = "linux")]
+fn helper_check(touch: &TouchSupport) -> Check {
+    let (status, detail) = match touch {
+        TouchSupport::InProcess => (Status::Info, "this build talks to keys itself".to_string()),
+        TouchSupport::Helper { version } => (
+            Status::Pass,
+            format!("/usr/libexec/saiife/saiife-fido {version}, protocol 1"),
+        ),
+        // The post-install doctor passes None: it did not look.
+        TouchSupport::None => (
+            Status::Info,
+            "not checked here; run saiife doctor".to_string(),
+        ),
+        TouchSupport::HelperMissing => (
+            Status::Info,
+            "no FIDO helper: install the saiife deb or rpm for key support (docs/touch.md)"
+                .to_string(),
+        ),
+        TouchSupport::HelperBroken(why) => (Status::Warn, why.clone()),
+    };
+    Check::new("touch-helper", status, "touch helper", detail)
+}
+
+fn key_checks(ctx: &Ctx) -> Vec<Check> {
     let mut nodes = fido_nodes(ctx);
     nodes.sort();
     if nodes.is_empty() {
@@ -30,7 +62,7 @@ pub(super) fn checks(ctx: &Ctx) -> Vec<Check> {
             "no FIDO key plugged in",
         )];
     }
-    if !ctx.opts.touch_supported {
+    if !ctx.opts.touch.usable() {
         return vec![Check::new(
             ID,
             Status::Info,
@@ -92,7 +124,7 @@ fn fido_nodes(ctx: &Ctx) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doctor::DoctorOptions;
+    use crate::doctor::{DoctorOptions, TouchSupport};
     use crate::host::FakeHost;
     use crate::layout::Layout;
     use saiife_policy::FixedDirectory;
@@ -101,15 +133,15 @@ mod tests {
 
     /// The check in a build with key support.
     fn run(root: &std::path::Path) -> Check {
-        run_with(root, true)
+        run_with(root, TouchSupport::InProcess)
     }
 
-    fn run_with(root: &std::path::Path, touch_supported: bool) -> Check {
+    fn run_all(root: &std::path::Path, touch: TouchSupport) -> Vec<Check> {
         let layout = Layout::under(root);
         let host = FakeHost::open(root).unwrap();
         let dir = FixedDirectory::from_text("", "");
         let opts = DoctorOptions {
-            touch_supported,
+            touch,
             ..Default::default()
         };
         let ctx = Ctx {
@@ -122,9 +154,66 @@ mod tests {
             as_root: false,
             opts: &opts,
         };
-        let mut cs = checks(&ctx);
-        assert_eq!(cs.len(), 1);
-        cs.pop().unwrap()
+        checks(&ctx)
+    }
+
+    fn run_with(root: &std::path::Path, touch: TouchSupport) -> Check {
+        let cs = run_all(root, touch);
+        cs.into_iter().find(|c| c.id == "touch-key").unwrap()
+    }
+
+    /// The `touch-helper` row for a support value (Linux only).
+    #[cfg(target_os = "linux")]
+    fn helper_row(touch: TouchSupport) -> Check {
+        let t = TempDir::new().unwrap();
+        run_all(t.path(), touch)
+            .into_iter()
+            .find(|c| c.id == "touch-helper")
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_check_rows() {
+        let c = helper_row(TouchSupport::InProcess);
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.detail, "this build talks to keys itself");
+        let c = helper_row(TouchSupport::Helper {
+            version: "0.3.1".into(),
+        });
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(
+            c.detail,
+            "/usr/libexec/saiife/saiife-fido 0.3.1, protocol 1"
+        );
+        let c = helper_row(TouchSupport::HelperMissing);
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(
+            c.detail,
+            "no FIDO helper: install the saiife deb or rpm for key support (docs/touch.md)"
+        );
+        // The post-install doctor passes None: it did not look.
+        let c = helper_row(TouchSupport::None);
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.detail, "not checked here; run saiife doctor");
+        let c = helper_row(TouchSupport::HelperBroken("the helper is unsafe".into()));
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.detail, "the helper is unsafe");
+        assert_eq!(c.title, "touch helper");
+    }
+
+    #[test]
+    fn touch_key_uses_helper_support() {
+        let t = TempDir::new().unwrap();
+        node(t.path(), "hidraw3", &[0x06, 0xD0, 0xF1, 0x09, 0x01], 0o600);
+        let c = run_with(
+            t.path(),
+            TouchSupport::Helper {
+                version: "0.3.1".into(),
+            },
+        );
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.detail, "hidraw3 is usable by you");
     }
 
     fn node(root: &std::path::Path, n: &str, desc: &[u8], mode: u32) {
@@ -177,7 +266,7 @@ mod tests {
     fn key_without_build_support_is_info() {
         let t = TempDir::new().unwrap();
         node(t.path(), "hidraw3", &[0x06, 0xD0, 0xF1, 0x09, 0x01], 0o600);
-        let c = run_with(t.path(), false);
+        let c = run_with(t.path(), TouchSupport::None);
         assert_eq!(c.status, Status::Info);
         assert_eq!(
             c.detail,
@@ -186,7 +275,10 @@ mod tests {
         // No key: the same line as in a build with support.
         let t = TempDir::new().unwrap();
         fs::create_dir_all(t.path().join("sys/class/hidraw")).unwrap();
-        assert_eq!(run_with(t.path(), false).detail, "no FIDO key plugged in");
+        assert_eq!(
+            run_with(t.path(), TouchSupport::None).detail,
+            "no FIDO key plugged in"
+        );
     }
 
     /// M2 and D2: one key at a time.

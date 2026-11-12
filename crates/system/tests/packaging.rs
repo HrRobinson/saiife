@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 // matches layout::PACKAGE_BINARY (Task 1)
 const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
+const FIDO_HELPER: &str = "/usr/libexec/saiife/saiife-fido";
 
 fn linux_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux")
@@ -92,6 +93,34 @@ fn guard_catches_bad_paths() {
 #[test]
 fn package_ships_the_staging_binary() {
     assert!(dsts().iter().any(|d| d == PACKAGE_BINARY));
+}
+
+#[test]
+fn package_ships_the_fido_helper() {
+    let yaml = read("nfpm.yaml");
+    assert!(dsts().iter().any(|d| d == FIDO_HELPER));
+    let entry = yaml
+        .split("  - ")
+        .find(|e| e.contains(&format!("dst: {FIDO_HELPER}")))
+        .expect("fido helper entry");
+    assert!(
+        entry.contains("src: ${SAIIFE_STAGE}/saiife-fido"),
+        "{entry}"
+    );
+    assert!(entry.contains("mode: 0755"), "{entry}");
+    assert!(
+        entry.contains("owner: root") && entry.contains("group: root"),
+        "{entry}"
+    );
+    check_dst(FIDO_HELPER).unwrap();
+    for dep in [
+        "- libc6 (>= 2.31)",
+        "- libudev1",
+        "- glibc >= 2.31",
+        "- \"libudev.so.1()(64bit)\"",
+    ] {
+        assert!(yaml.contains(dep), "nfpm.yaml lacks {dep}");
+    }
 }
 
 #[test]
@@ -190,7 +219,12 @@ fn rpm_key_file_is_in_the_yaml() {
 fn build_sh(version: &str) -> (Option<i32>, String) {
     let out = std::process::Command::new("bash")
         .arg(linux_dir().join("build.sh"))
-        .args(["/nonexistent/p18-saiife", version, "amd64"])
+        .args([
+            "/nonexistent/p18-saiife",
+            "/nonexistent/p41-saiife-fido",
+            version,
+            "amd64",
+        ])
         .arg(linux_dir().join("../../target/p18-never-written"))
         .output()
         .expect("bash");
