@@ -69,6 +69,8 @@ impl VmHooks for Rec {
 
 struct World {
     root: PathBuf,
+    /// The daemon's record dirs (R37): `VmSpec.dir` is `<records>/<id>`.
+    records: PathBuf,
     layout: Layout,
     tools: Tools,
     image: ResolvedImage,
@@ -86,7 +88,7 @@ impl World {
             .unwrap()
             .keep();
         let root = std::fs::canonicalize(root).unwrap();
-        for d in ["i", "v", "t"] {
+        for d in ["i", "v", "t", "r"] {
             std::fs::create_dir(root.join(d)).unwrap();
         }
         std::fs::write(root.join("i/base"), b"x").unwrap();
@@ -119,6 +121,7 @@ impl World {
             },
         };
         World {
+            records: root.join("r"),
             root,
             layout,
             tools,
@@ -158,6 +161,7 @@ impl World {
     ) -> Arc<ChVmm> {
         Arc::new(ChVmm::new(ChVmmInit {
             vmm_uid,
+            records: self.records.clone(),
             layout: self.layout.clone(),
             tools: self.tools.clone(),
             images: Arc::new(Fixed(self.image.clone())),
@@ -217,7 +221,7 @@ impl World {
         let h = self.create(v, id);
         v.boot(&h).unwrap();
         v.pause(&h).unwrap();
-        v.snapshot(&h, &self.paths(id).snapshot_dir()).unwrap();
+        v.snapshot(&h, &self.dest(id)).unwrap();
         assert!(self.marker(id).exists(), "snapshot writes the marker");
         assert!(
             self.snap(id).join("config.json").exists(),
@@ -227,10 +231,20 @@ impl World {
             is_empty_dir(&self.paths(id).snapshot_dir()),
             "copied out of the box dir, which is kept empty"
         );
-        v.destroy(&h).unwrap();
+        self.halt(v, &h);
         std::fs::remove_file(self.paths(id).dir.join("fake-ch.argv")).unwrap();
         self.log.lock().unwrap().clear();
         h
+    }
+
+    /// Stop the VM and wait for its exit and its `after_off` (hook "h"):
+    /// what `destroy` used to be before it removed the runtime dir (R37).
+    fn halt(&self, v: &Arc<ChVmm>, h: &VmHandle) {
+        let offs = || self.events().iter().filter(|e| *e == "h.off").count();
+        let before = offs();
+        v.stop(h).unwrap();
+        assert!(wait_for(LONG, || v.status(h) == VmStatus::Off));
+        assert!(wait_for(LONG, || offs() > before), "{:?}", self.events());
     }
 
     /// Edit the snapshot's config.json and re-sign the marker to match, as a
@@ -256,8 +270,20 @@ impl World {
         (self.vmm_with(Arc::clone(&l), vec![h]), l)
     }
 
+    /// The record dir's `snapshot`: what the manager passes to `snapshot`.
+    fn dest(&self, id: &str) -> PathBuf {
+        self.records.join(id).join("snapshot")
+    }
+
+    /// The spec of a box: `dir` is its record dir (made here, as the store
+    /// does). Its runtime dir is made too, so tests can plant files in it
+    /// before `create`; `create` accepts a runtime dir of this uid.
     fn spec(&self, id: &str) -> VmSpec {
-        let dir = self.root.join(id);
+        let rt = self.root.join(id);
+        if !rt.exists() {
+            std::fs::create_dir(&rt).unwrap();
+        }
+        let dir = self.records.join(id);
         if !dir.exists() {
             std::fs::create_dir(&dir).unwrap();
         }
@@ -574,12 +600,12 @@ fn snapshot_needs_pause() {
     let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
     let p = w.paths("b1");
-    let m = failed(v.snapshot(&h, &p.snapshot_dir()));
+    let m = failed(v.snapshot(&h, &w.dest("b1")));
     assert!(m.contains("pause first"), "{m}");
     // the launcher made the dir; a stale file in it is cleared first
     std::fs::write(p.snapshot_dir().join("stale"), b"x").unwrap();
     v.pause(&h).unwrap();
-    v.snapshot(&h, &p.snapshot_dir()).unwrap();
+    v.snapshot(&h, &w.dest("b1")).unwrap();
     // sealed into the vault, read-only, the stale file gone
     let snap = w.snap("b1");
     assert!(snap.join("config.json").exists());
@@ -623,7 +649,7 @@ fn restore_boots_paused_then_resumes() {
     // one-shot: the marker is gone, the next boot is cold
     assert!(!w.marker("b1").exists());
     assert!(!w.snap("b1").exists(), "a spent snapshot is discarded");
-    v.destroy(&h).unwrap();
+    w.halt(&v, &h);
     v.boot(&h).unwrap();
     assert!(w.booted_cold("b1"));
     assert!(read_spec(&p).unwrap().restore.is_none());
@@ -901,8 +927,9 @@ fn after_off_runs_once() {
     v.destroy(&h).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(w.events(), ["h.before", "h.off"]);
-    // a second run gets its own after_off
-    std::fs::remove_file(w.paths("b1").dir.join("fake-ch.argv")).unwrap();
+    // a second run gets its own after_off (destroy removed the runtime dir:
+    // the box is created again)
+    let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
     v.destroy(&h).unwrap();
     assert_eq!(w.events(), ["h.before", "h.off", "h.before", "h.off"]);
@@ -914,16 +941,108 @@ fn destroy_is_idempotent() {
     let (v, l) = w.vmm(&[]);
     let h = w.create(&v, "b1");
     v.destroy(&h).unwrap();
+    v.destroy(&h).unwrap();
+    assert_eq!(v.status(&h), VmStatus::Gone);
+    let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
     v.destroy(&h).unwrap();
     assert!(
         l.exit_status(&h.id).is_some(),
         "destroy waited for the exit"
     );
-    assert_eq!(v.status(&h), VmStatus::Off);
+    assert_eq!(v.status(&h), VmStatus::Gone);
     v.destroy(&h).unwrap();
-    assert!(w.paths("b1").vm_json().exists(), "destroy keeps files");
-    assert!(w.paths("b1").root_disk().exists());
+}
+
+/// R37: after a confirmed exit, destroy removes the box's runtime dir (by
+/// fd, `snapshot/` emptied first) and its vault entries; the record dir is
+/// the store's and is left alone.
+#[test]
+fn destroy_removes_the_runtime_dir_after_a_confirmed_exit() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
+    assert!(w.marker("b1").exists());
+    std::fs::write(w.paths("b1").snapshot_dir().join("left"), b"x").unwrap();
+    std::fs::write(w.records.join("b1").join("box.json"), b"{}").unwrap();
+    let outside = w.root.join("outside");
+    std::fs::write(&outside, b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, w.paths("b1").dir.join("link")).unwrap();
+    v.destroy(&h).unwrap();
+    assert!(!w.paths("b1").dir.exists(), "the runtime dir is gone");
+    assert!(!w.marker("b1").exists() && !w.snap("b1").exists());
+    assert!(!w.pid_record("b1").exists());
+    assert!(
+        w.records.join("b1").join("box.json").exists(),
+        "records stay"
+    );
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"keep",
+        "a link is unlinked, not followed"
+    );
+    // an unexpected subdirectory keeps the runtime dir (and destroy fails)
+    let h = w.create(&v, "b2");
+    std::fs::create_dir(w.paths("b2").dir.join("planted")).unwrap();
+    assert!(v.destroy(&h).is_err());
+    assert!(w.paths("b2").vm_json().exists());
+    std::fs::remove_dir(w.paths("b2").dir.join("planted")).unwrap();
+}
+
+/// R37: `VmSpec.dir` must be the record dir `<records>/<id>`; the runtime
+/// dir is the driver's own (`<layout.boxes>/<id>`), made 0700 personal,
+/// 2770 locked, and refused when it is a link or not this uid's.
+#[test]
+fn create_takes_the_record_dir_and_makes_the_runtime_dir() {
+    let mut w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let mut spec = w.spec("b1");
+    spec.dir = w.paths("b1").dir;
+    let m = failed(v.create(&spec));
+    assert!(m.contains("record dir"), "{m}");
+    let spec = w.spec("b2");
+    std::fs::remove_dir(w.paths("b2").dir).unwrap();
+    let h = v.create(&spec).unwrap();
+    w.track(&v, &h);
+    assert_eq!(mode_of(&w.paths("b2").dir), 0o700);
+    assert!(w.paths("b2").vm_json().exists());
+    assert!(
+        !w.records.join("b2").join("vm.json").exists(),
+        "nothing VMM-side in records"
+    );
+    // a symlinked runtime dir is refused, its target untouched
+    let spec = w.spec("b3");
+    std::fs::remove_dir(w.paths("b3").dir).unwrap();
+    let elsewhere = w.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, w.paths("b3").dir).unwrap();
+    let m = failed(v.create(&spec));
+    assert!(m.contains("runtime dir"), "{m}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    // locked: 2770 (setgid: the VMM user's group is kept)
+    w.layout.locked = true;
+    let (v, _l) = w.vmm(&[]);
+    let spec = w.spec("b4");
+    std::fs::remove_dir(w.paths("b4").dir).unwrap();
+    let h = v.create(&spec).unwrap();
+    w.track(&v, &h);
+    assert_eq!(mode_of(&w.paths("b4").dir), 0o2770);
+}
+
+/// R37: the manager's dest is the record dir's `snapshot`; the VMM writes
+/// into the runtime `snapshot/` and the copy is sealed into the vault. The
+/// record dir gets nothing.
+#[test]
+fn snapshot_dest_is_checked_never_written() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    v.pause(&h).unwrap();
+    assert!(v.snapshot(&h, &w.paths("b1").snapshot_dir()).is_err());
+    v.snapshot(&h, &w.dest("b1")).unwrap();
+    assert!(!w.dest("b1").exists(), "the record dir gets no snapshot");
+    assert!(w.snap("b1").join("config.json").exists());
 }
 
 #[test]
@@ -1072,7 +1191,7 @@ fn hostile_snapshot(w: &World, evil: &str) -> String {
     v.boot(&h).unwrap();
     v.pause(&h).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    let (v2, h2, dest) = (Arc::clone(&v), h.clone(), w.paths("b1").snapshot_dir());
+    let (v2, h2, dest) = (Arc::clone(&v), h.clone(), w.dest("b1"));
     std::thread::spawn(move || {
         let _ = tx.send(v2.snapshot(&h2, &dest));
     });
@@ -1146,7 +1265,7 @@ fn seal_checks_the_vmm_uid_and_copies() {
     let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
     v.pause(&h).unwrap();
-    let m = failed(v.snapshot(&h, &w.paths("b1").snapshot_dir()));
+    let m = failed(v.snapshot(&h, &w.dest("b1")));
     assert!(m.contains("owner"), "{m}");
     assert!(!w.marker("b1").exists());
     // with the right uid: a daemon-owned copy, the source dir emptied
@@ -1154,7 +1273,7 @@ fn seal_checks_the_vmm_uid_and_copies() {
     let h = w.create(&v, "b2");
     v.boot(&h).unwrap();
     v.pause(&h).unwrap();
-    v.snapshot(&h, &w.paths("b2").snapshot_dir()).unwrap();
+    v.snapshot(&h, &w.dest("b2")).unwrap();
     let meta = std::fs::metadata(w.snap("b2").join("state.json")).unwrap();
     assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), me);
     assert!(is_empty_dir(&w.paths("b2").snapshot_dir()));
@@ -1228,11 +1347,11 @@ fn snapshot_dir_survives_seal_and_a_second_snapshot() {
     assert!(is_empty_dir(&dir), "the launcher made the snapshot dir");
     let before = ino(&dir);
     v.pause(&h).unwrap();
-    v.snapshot(&h, &dir).unwrap();
+    v.snapshot(&h, &w.dest("b1")).unwrap();
     assert!(is_empty_dir(&dir), "seal empties, never removes");
     assert_eq!(ino(&dir), before);
     std::fs::write(dir.join("stale"), b"x").unwrap();
-    v.snapshot(&h, &dir).unwrap();
+    v.snapshot(&h, &w.dest("b1")).unwrap();
     assert!(is_empty_dir(&dir));
     assert_eq!(ino(&dir), before);
     assert!(w.snap("b1").join("config.json").exists());
@@ -1252,7 +1371,7 @@ fn snapshot_dir_symlink_is_refused() {
     let dir = w.paths("b1").snapshot_dir();
     std::fs::remove_dir(&dir).unwrap();
     std::os::unix::fs::symlink(&target, &dir).unwrap();
-    let m = failed(v.snapshot(&h, &dir));
+    let m = failed(v.snapshot(&h, &w.dest("b1")));
     assert!(m.contains("snapshot"), "{m}");
     assert_eq!(std::fs::read(&keep).unwrap(), b"keep");
     assert!(!w.marker("b1").exists());
@@ -1317,7 +1436,7 @@ fn seal_refuses_an_oversized_memory_file() {
     v.boot(&h).unwrap();
     v.pause(&h).unwrap();
     let t = Instant::now();
-    let m = failed(v.snapshot(&h, &w.paths("b1").snapshot_dir()));
+    let m = failed(v.snapshot(&h, &w.dest("b1")));
     assert!(m.contains("memory-ranges") && m.contains("larger"), "{m}");
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     assert!(!w.marker("b1").exists());
@@ -1407,6 +1526,10 @@ fn a_late_exit_still_gets_after_off_once() {
     v.boot(&h).unwrap();
     v.stop(&h).unwrap();
     assert!(v.destroy(&h).is_err());
+    assert!(
+        w.paths("b1").vm_json().exists(),
+        "an unconfirmed exit keeps the runtime dir"
+    );
     assert_eq!(offs(&w), 0, "{:?}", w.events());
     assert!(wait_for(LONG, || matches!(
         v.status(&h),

@@ -26,9 +26,15 @@ impl Layout {
     }
 
     /// The personal layout under the user's state dir and XDG data home.
+    ///
+    /// `boxes` is the VMM's runtime root, `<state>/box-run` (R37), apart from
+    /// the daemon's record dirs (`<state>/boxes`, the box store's). The VMM
+    /// runs as the user here, so its Landlock rules are the boundary: they
+    /// cover only its runtime dir, the disks and (read-only) its vault copy,
+    /// never the record dirs.
     pub fn personal(state_dir: &Path, data_home: &Path) -> Layout {
         Layout {
-            boxes: state_dir.join("boxes"),
+            boxes: state_dir.join("box-run"),
             images: state_dir.join("images"),
             vmm: data_home.join("saiife").join("vmm"),
             vault: state_dir.join("box-vault"),
@@ -54,7 +60,7 @@ mod tests {
     #[test]
     fn layout_personal_paths() {
         let l = Layout::personal(Path::new("/s/state"), Path::new("/s/data"));
-        assert_eq!(l.boxes, PathBuf::from("/s/state/boxes"));
+        assert_eq!(l.boxes, PathBuf::from("/s/state/box-run"));
         assert_eq!(l.images, PathBuf::from("/s/state/images"));
         assert_eq!(l.vmm, PathBuf::from("/s/data/saiife/vmm"));
         assert_eq!(l.vault, PathBuf::from("/s/state/box-vault"));

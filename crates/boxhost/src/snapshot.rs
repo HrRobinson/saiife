@@ -182,6 +182,44 @@ pub fn clear_dir(paths: &BoxPaths) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove a box's runtime dir once its VMM is confirmed gone (R37): opened
+/// O_DIRECTORY|O_NOFOLLOW, at most `MAX_FILES` entries, each unlinked by fd
+/// (a link is removed, never followed); `snapshot/` is emptied by
+/// [`clear_dir`] and removed; any other directory in it is refused and the
+/// dir is kept. A missing dir is fine.
+pub fn remove_runtime_dir(paths: &BoxPaths) -> Result<(), String> {
+    let boxfd = match open_dir_at(CWD, &paths.dir) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", paths.dir.display())),
+    };
+    let names = list_fd(&boxfd)?;
+    let mut snapshot = false;
+    for n in &names {
+        let st = rustix::fs::statat(&boxfd, n.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| format!("{n}: {e}"))?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory {
+            if n != "snapshot" {
+                return Err(format!("an unexpected directory {n}"));
+            }
+            snapshot = true;
+        }
+    }
+    if snapshot {
+        clear_dir(paths)?;
+    }
+    for n in &names {
+        let flags = if snapshot && n == "snapshot" {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        rustix::fs::unlinkat(&boxfd, n.as_str(), flags).map_err(|e| format!("{n}: {e}"))?;
+    }
+    drop(boxfd);
+    std::fs::remove_dir(&paths.dir).map_err(|e| format!("{}: {e}", paths.dir.display()))
+}
+
 /// Copy one VMM-written file into the vault copy, hashing as it goes. The
 /// source is opened relative to the snapshot dir's fd, never followed, never
 /// blocking; it must be a regular file of the VMM user with one link, of at

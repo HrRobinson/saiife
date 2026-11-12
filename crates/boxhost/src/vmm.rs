@@ -104,6 +104,9 @@ const FORCE_POLL: Duration = Duration::from_millis(250);
 
 pub struct ChVmmInit {
     pub layout: Layout,
+    /// The daemon's record dirs (the box store's root, R37): `VmSpec.dir`
+    /// must be `<records>/<id>`. Nothing VMM-side is ever written there.
+    pub records: PathBuf,
     pub tools: Tools,
     pub images: Arc<dyn ImageResolver>,
     pub launcher: Arc<dyn Launcher>,
@@ -328,6 +331,61 @@ impl ChVmmInit {
             self.after_off(&run.id);
             remove_sockets(&run.paths);
         }
+    }
+
+    /// The runtime dir of a box (R37): made when missing (personal 0700,
+    /// locked 2770 so the VMM user's group gets in; setgid keeps the group);
+    /// an existing one must be a real dir of this uid. Its root is made
+    /// 0700 in personal mode; locked, `system install --boxes` made it.
+    fn runtime_dir(&self, paths: &BoxPaths) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let dir = &paths.dir;
+        let me = rustix::process::geteuid().as_raw();
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if !m.file_type().is_dir() => {
+                return Err(format!(
+                    "the box runtime dir {} is not a directory (or is a symlink)",
+                    dir.display()
+                ));
+            }
+            Ok(m) if m.uid() != me => {
+                return Err(format!(
+                    "the box runtime dir {} is owned by uid {}, not {me}",
+                    dir.display(),
+                    m.uid()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !self.layout.locked {
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(&self.layout.boxes)
+                        .map_err(|e| format!("box runtime root: {e}"))?;
+                }
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(dir)
+                    .map_err(|e| format!("box runtime dir {}: {e}", dir.display()))?;
+            }
+            Err(e) => return Err(format!("box runtime dir {}: {e}", dir.display())),
+        }
+        if self.layout.locked {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770))
+                .map_err(|e| format!("box runtime dir {}: {e}", dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// After a confirmed exit: the runtime dir (by fd, never following a
+    /// link) and the box's vault entries. A failure keeps the rest.
+    fn remove_runtime(&self, id: &BoxId) -> Result<(), VmmError> {
+        snapshot::remove_runtime_dir(&self.paths(id))
+            .map_err(|e| VmmError::Failed(format!("the box runtime dir is kept: {e}")))?;
+        snapshot::discard(&self.layout.vault, id).map_err(VmmError::Failed)?;
+        crate::vault::remove_pid(&self.layout.vault, id);
+        Ok(())
     }
 
     fn after_off(&self, id: &BoxId) {
@@ -625,22 +683,26 @@ impl ChVmm {
 }
 
 impl Vmm for ChVmm {
+    /// `spec.dir` is the box's record dir (the store's, R37), only
+    /// checked; everything the VMM touches goes to the runtime dir
+    /// `<layout.boxes>/<id>`, made here.
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
         let inner = &self.inner;
-        let want = inner.layout.boxes.join(spec.id.as_str());
+        let want = inner.records.join(spec.id.as_str());
         if spec.dir != want {
             return Err(VmmError::Failed(format!(
-                "the box dir must be {}",
+                "the box record dir must be {}",
                 want.display()
             )));
         }
-        let paths = BoxPaths::new(spec.dir.clone());
+        let paths = inner.paths(&spec.id);
         let n = paths.longest_socket().as_os_str().as_bytes().len();
         if n > MAX_SOCK_PATH {
             return Err(VmmError::Failed(format!(
                 "the box dir is too long: a socket path would be {n} bytes, over {MAX_SOCK_PATH}"
             )));
         }
+        inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
         let image = inner
             .images
             .resolve(&spec.image)
@@ -774,10 +836,13 @@ impl Vmm for ChVmm {
     fn snapshot(&self, h: &VmHandle, dest: &Path) -> Result<(), VmmError> {
         let inner = &self.inner;
         let paths = inner.paths(&h.id);
-        if dest != paths.snapshot_dir() {
+        // the manager's dest (the record dir's) is checked, never written:
+        // the VMM writes into the runtime `snapshot/` (R37)
+        let want = inner.records.join(h.id.as_str()).join("snapshot");
+        if dest != want {
             return Err(VmmError::Failed(format!(
                 "a snapshot goes to {} only",
-                paths.snapshot_dir().display()
+                want.display()
             )));
         }
         let api = Api::new(paths.api_sock());
@@ -790,7 +855,7 @@ impl Vmm for ChVmm {
         snapshot::discard(&inner.layout.vault, &h.id).map_err(VmmError::Failed)?;
         // emptied by fd, never removed: Landlock's rule is bound to the dir
         snapshot::clear_dir(&paths).map_err(VmmError::Failed)?;
-        api.snapshot(dest).map_err(failed_api)?;
+        api.snapshot(&paths.snapshot_dir()).map_err(failed_api)?;
         snapshot::seal(&inner.layout.vault, &h.id, &paths, inner.vmm_uid, mem_mib)
             .map_err(VmmError::Failed)
     }
@@ -804,9 +869,10 @@ impl Vmm for ChVmm {
     }
 
     /// Stops the VM if needed, waits for its reaper (at most
-    /// `power_s + shutdown_s + force_s + 5` s) and forgets the run. Never deletes
-    /// files. Fails, keeping the run, when the exit was not confirmed: the
-    /// store must not remove the dir under a live VMM.
+    /// `power_s + shutdown_s + force_s + 5` s) and forgets the run; then
+    /// removes the runtime dir and the vault entries (R37). Fails, keeping
+    /// the run and every file, when the exit was not confirmed: nothing is
+    /// removed under a live VMM.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
         let until = Instant::now() + BOOT_WAIT;
         while matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
@@ -826,7 +892,7 @@ impl Vmm for ChVmm {
                     g.insert(h.id.clone(), other);
                     return Err(VmmError::Failed("the VM is booting".into()));
                 }
-                None => return Ok(()),
+                None => return self.inner.remove_runtime(&h.id),
             }
         };
         let s = self.inner.stop;
@@ -848,6 +914,6 @@ impl Vmm for ChVmm {
             ));
         }
         let _ = e.reaper.join();
-        Ok(())
+        self.inner.remove_runtime(&h.id)
     }
 }

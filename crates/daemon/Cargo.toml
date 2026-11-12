@@ -14,6 +14,11 @@ path = "src/lib.rs"
 # A fake VM behind the box manager (plan 34, Task 8): test builds only. The
 # release workflows never enable it, so a release daemon has no boxes.
 fake-vmm = ["saiife-boxes/fake"]
+# Real boxes (plan 35, ruling R38): the Cloud Hypervisor driver behind the
+# box preflight. Off by default until plan 41 ships: the Linux CI step runs
+# the box tests with it, the release workflows never set it, so a release
+# daemon answers every box op "boxes are not enabled in this build".
+boxes = []
 # Test builds only (never in release CI): `SAIIFE_WORKSPACE_FAKE_BOXES=1`
 # serves the wire crate's demo boxes so the Workspace UI can be tried (plan 29).
 fake-boxes = ["saiife-wire/fake"]

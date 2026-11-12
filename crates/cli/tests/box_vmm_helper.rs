@@ -31,7 +31,7 @@ fn fx() -> Fx {
     let root = std::fs::canonicalize(t.path()).unwrap();
     let state = root.join("s/saiife/broker");
     let data = root.join("d/saiife/vmm");
-    for d in [state.join("boxes/b1"), state.join("images"), data.clone()] {
+    for d in [state.join("box-run/b1"), state.join("images"), data.clone()] {
         std::fs::create_dir_all(&d).unwrap();
     }
     let base_img = state.join("images/base.qcow2");
@@ -46,7 +46,7 @@ fn fx() -> Fx {
     )
     .unwrap();
     std::fs::set_permissions(&ch, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let paths = BoxPaths::new(state.join("boxes/b1"));
+    let paths = BoxPaths::new(state.join("box-run/b1"));
     let spec = LaunchSpec {
         version: 1,
         id: BoxId::parse("b1").unwrap(),

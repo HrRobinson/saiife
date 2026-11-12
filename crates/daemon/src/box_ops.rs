@@ -2,8 +2,9 @@
 //! manager of `saiife-boxes`, and its 5 s tick.
 //!
 //! [`build`] gives the manager: on the fake VM in a `fake-vmm` build with
-//! `SAIIFE_BOX_FAKE_VMM=1` (tests), else on Linux the Cloud Hypervisor
-//! driver once the box preflight passed (plan 35). Without a manager every
+//! `SAIIFE_BOX_FAKE_VMM=1` (tests), else on Linux in a `boxes` build the
+//! Cloud Hypervisor driver once the box preflight passed (plan 35; `boxes`
+//! is off by default and in every release until plan 41, R38). Without a manager every
 //! op answers `unavailable`, with the failed check's detail when there is
 //! one.
 //!
@@ -45,6 +46,8 @@ use std::time::Duration;
 pub const TICK_SECS: u64 = 5;
 /// The answer of every box op when there is no manager.
 pub const UNAVAILABLE: &str = "boxes are not available in this version";
+/// Why a Linux build without the `boxes` feature has no boxes (R38).
+pub const NOT_ENABLED: &str = "boxes are not enabled in this build";
 /// Set to `1` (in a `fake-vmm` build) to run boxes on the fake VM.
 pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
 /// With [`FAKE_ENV`] (a `fake-vmm` build only): `<n>` pins the host to
@@ -74,18 +77,10 @@ pub const OPS: &[&str] = &[
     OP_BOX_TERM_READ,
 ];
 
-/// The locked boxes root (V5): `saiife_boxhost::layout::Layout::locked().boxes`,
-/// made by `system install --boxes` for the `saiife-box` VMM user.
-pub const LOCKED_BOXES_DIR: &str = "/var/lib/saiife-box/boxes";
-
-/// Where the mode's boxes live: personal `<state_dir>/boxes`, locked
-/// [`LOCKED_BOXES_DIR`] (the daemon's own state dir is 0700, which the VMM
-/// user cannot enter).
-pub fn dir_in(state_dir: &Path, mode: &Mode) -> PathBuf {
-    match mode {
-        Mode::Personal => state_dir.join("boxes"),
-        Mode::Locked => PathBuf::from(LOCKED_BOXES_DIR),
-    }
+/// `<state_dir>/boxes`: the box records, the daemon's own in both modes
+/// (R37). The VMM's runtime dirs are `saiife_boxhost::layout::Layout.boxes`.
+pub fn dir_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("boxes")
 }
 
 /// Where box templates come from (B11). Locked: `<dir of config_path>/templates.d`,
@@ -254,8 +249,9 @@ pub fn build_with(
 }
 
 /// The preflight, then `ChVmm` (personal: a child of the daemon; locked:
-/// the `saiife-box@` unit) with no guest channel yet (plan 38).
-#[cfg(target_os = "linux")]
+/// the `saiife-box@` unit) with no guest channel yet (plan 38). Only in a
+/// build with the `boxes` feature (R38).
+#[cfg(all(target_os = "linux", feature = "boxes"))]
 fn build_real(
     state_dir: &Path,
     mode: &Mode,
@@ -283,15 +279,15 @@ fn build_real(
     let hooks: Vec<Arc<dyn saiife_boxhost::vmm::VmHooks>> = vec![Arc::new(
         crate::box_vmm::AuditHooks::new(Arc::clone(&audit)),
     )];
-    let vmm = match crate::box_vmm::real_vmm_with(&layout, mode, hooks, env) {
+    // records in the daemon's own state dir, runtime dirs in the layout
+    // (R37): nothing the VMM can write is ever read as a record
+    let records = dir_in(state_dir);
+    let vmm = match crate::box_vmm::real_vmm_with(&layout, &records, mode, hooks, env) {
         Ok(v) => v,
         Err(why) => return Ok(Err(why)),
     };
-    let store = match mode {
-        Mode::Personal => Store::open(layout.boxes.clone()),
-        Mode::Locked => Store::open_locked(layout.boxes.clone()),
-    }
-    .map_err(|e| e.to_string())?;
+    let store = Store::open(records).map_err(|e| e.to_string())?;
+    // the disks are in the runtime dirs
     let root = layout.boxes.clone();
     let prev = Mutex::new(None);
     open_manager(
@@ -305,8 +301,9 @@ fn build_real(
     .map(Ok)
 }
 
-/// Not Linux: plan 34's answer.
-#[cfg(not(target_os = "linux"))]
+/// Without real boxes: plan 34's answer; on Linux it says the build has
+/// them off (R38: `boxes` is off until plan 41 ships).
+#[cfg(not(all(target_os = "linux", feature = "boxes")))]
 fn build_real(
     state_dir: &Path,
     mode: &Mode,
@@ -314,14 +311,21 @@ fn build_real(
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Result<Built, String>, String> {
     let _ = (state_dir, mode, config_path, env);
-    Ok(Err(UNAVAILABLE.into()))
+    if cfg!(target_os = "linux") {
+        Ok(Err(format!("{UNAVAILABLE} ({NOT_ENABLED})")))
+    } else {
+        Ok(Err(UNAVAILABLE.into()))
+    }
 }
 
 /// The environment as a function.
 type EnvFn<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
 /// The manager over `store` and `vmm`, with the mode's templates.
-#[cfg_attr(not(any(target_os = "linux", feature = "fake-vmm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(all(target_os = "linux", feature = "boxes"), feature = "fake-vmm")),
+    allow(dead_code)
+)]
 fn open_manager(
     store: saiife_boxes::store::Store,
     vmm: Arc<dyn saiife_boxes::vmm::Vmm>,
@@ -372,7 +376,7 @@ fn build_fake(
     use saiife_boxes::store::Store;
     use saiife_boxes::vmm::fake::FakeVmm;
 
-    let root = dir_in(state_dir, &Mode::Personal);
+    let root = dir_in(state_dir);
     let store = Store::open(root.clone()).map_err(|e| e.to_string())?;
     let prev = Mutex::new(None);
     let pinned = env(FAKE_SLOTS_ENV)
@@ -444,7 +448,10 @@ pub fn fake_host(n: u64) -> HostFacts {
     }
 }
 
-#[cfg_attr(not(any(target_os = "linux", feature = "fake-vmm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(all(target_os = "linux", feature = "boxes"), feature = "fake-vmm")),
+    allow(dead_code)
+)]
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1224,21 +1231,14 @@ mod tests {
             .unwrap()
             .err()
             .expect("unavailable");
-        if cfg!(target_os = "linux") {
+        if cfg!(all(target_os = "linux", feature = "boxes")) {
             assert!(why.contains("saiife box vmm fetch"), "{why}");
+        } else if cfg!(target_os = "linux") {
+            assert!(why.contains(NOT_ENABLED), "{why}");
         } else {
             assert_eq!(why, UNAVAILABLE);
         }
         assert!(!state.exists() && !data.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn locked_boxes_dir_is_the_layouts() {
-        assert_eq!(
-            Path::new(LOCKED_BOXES_DIR),
-            saiife_boxhost::layout::Layout::locked().boxes
-        );
     }
 
     #[test]

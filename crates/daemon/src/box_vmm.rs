@@ -32,7 +32,8 @@ pub const KVM: &str = "/dev/kvm";
 
 /// The box layout of this daemon: [`Layout::locked`], or the personal one
 /// under `state_dir` and the XDG data home (as `saiife box vmm fetch` and
-/// `saiife __box-vmm` find it).
+/// `saiife __box-vmm` find it). Its `boxes` are the VMM's runtime dirs; the
+/// records stay in [`crate::box_ops::dir_in`] (R37).
 pub fn layout_for(
     state_dir: &Path,
     mode: &Mode,
@@ -54,21 +55,24 @@ pub fn layout_for(
     }
 }
 
-/// `ChVmm` for `layout`: the pinned tools of its VMM dir, the image store
-/// (firmware `<vmm>/CLOUDHV.fd`), the mode's launcher and VMM uid, the
-/// hooks, Landlock on (R23) and the default stop ladder.
+/// `ChVmm` for `layout` and the box store's `records` root (R37): the
+/// pinned tools of its VMM dir, the image store (firmware
+/// `<vmm>/CLOUDHV.fd`), the mode's launcher and VMM uid, the hooks,
+/// Landlock on (R23) and the default stop ladder.
 pub fn real_vmm(
     layout: &Layout,
+    records: &Path,
     mode: &Mode,
     hooks: Vec<Arc<dyn VmHooks>>,
 ) -> Result<Arc<dyn Vmm>, String> {
-    real_vmm_with(layout, mode, hooks, &|k| std::env::var_os(k))
+    real_vmm_with(layout, records, mode, hooks, &|k| std::env::var_os(k))
 }
 
 /// [`real_vmm`] with the environment as a function (the debug-only
 /// `SAIIFE_TOOL_*` overrides read it).
 pub fn real_vmm_with(
     layout: &Layout,
+    records: &Path,
     mode: &Mode,
     hooks: Vec<Arc<dyn VmHooks>>,
     env: &dyn Fn(&str) -> Option<OsString>,
@@ -100,6 +104,7 @@ pub fn real_vmm_with(
     };
     Ok(Arc::new(ChVmm::new(ChVmmInit {
         layout: layout.clone(),
+        records: records.to_path_buf(),
         tools,
         images: Arc::new(images),
         launcher,

@@ -4,6 +4,11 @@
 # again, pause and resume, Landlock on, the cold boot time and the VMM's idle
 # memory. Defines smoke_vmm; no top-level effects.
 #
+# Needs a saiife built with `--features boxes` (plan 35 R38: off by default
+# and in every release until plan 41). The VMM's files are in the runtime
+# dirs (personal <state>/box-run/<id>, locked /var/lib/saiife-box/boxes/<id>);
+# the box records stay in the daemon's state dir (R37).
+#
 # Run it in personal mode first, then again after
 #   sudo saiife system install --boxes
 # in locked mode (the fragment sees /etc/systemd/system/saiife-box@.service
@@ -61,7 +66,7 @@ p35_boxes_dir() {
   if [ -n "$P35_LOCKED" ]; then
     printf '%s\n' /var/lib/saiife-box/boxes
   else
-    printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/saiife/broker/boxes"
+    printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/saiife/broker/box-run"
   fi
 }
 

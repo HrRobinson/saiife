@@ -120,7 +120,7 @@ fn world_with(s: Setup) -> World {
             let host = two_boxes();
             let g: Arc<dyn GuestLink> = guest.clone();
             let o = Manager::open(ManagerInit {
-                store: Store::open(box_ops::dir_in(&state, &Mode::Personal)).unwrap(),
+                store: Store::open(box_ops::dir_in(&state)).unwrap(),
                 vmm: vmm.clone(),
                 guest: g,
                 templates: template::builtin(),
@@ -707,7 +707,9 @@ async fn build_needs_the_fake_flag() {
         .unwrap()
         .err()
         .expect("no boxes without the fake flag or an install");
-    if !Path::new("/var/lib/saiife-box/boxes").is_dir() {
+    if cfg!(all(target_os = "linux", feature = "boxes"))
+        && !Path::new("/var/lib/saiife-box/boxes").is_dir()
+    {
         assert!(why.contains("install --boxes"), "{why}");
     }
     assert!(!state.join("boxes").exists());
@@ -894,7 +896,7 @@ async fn gc_goes_on_past_a_box_it_cannot_remove() {
         let a = w.spawn(ALICE, "one").await;
         assert_eq!(a["box"]["state"], "discarded", "{a}");
     }
-    let root = box_ops::dir_in(&w._tmp.path().join("state"), &Mode::Personal);
+    let root = box_ops::dir_in(&w._tmp.path().join("state"));
     // Without its marker the store refuses to remove the dir.
     std::fs::remove_file(root.join("b1").join(".saiife-box")).unwrap();
     let before = w.records().len();
@@ -931,8 +933,34 @@ fn personal_env(tmp: &Path, fake: bool) -> impl Fn(&str) -> Option<OsString> {
     }
 }
 
+/// R38: a build without the `boxes` feature never runs the real driver: no
+/// fake flag is plan 34's answer, saying boxes are not enabled.
+#[cfg(not(feature = "boxes"))]
+#[tokio::test]
+async fn without_the_boxes_feature_boxes_are_not_enabled() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = personal_env(tmp.path(), false);
+    let why = box_ops::build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+        .unwrap()
+        .err()
+        .expect("no boxes");
+    assert!(why.starts_with(box_ops::UNAVAILABLE), "{why}");
+    assert!(why.contains("boxes are not enabled in this build"), "{why}");
+    let w = world_with(Setup {
+        manager: false,
+        template_warnings: Vec::new(),
+        built: None,
+        unavailable: Some(why.clone()),
+    });
+    let a = w.call(ALICE, "box.list", json!({})).await;
+    assert_eq!(a["error"], "unavailable", "{a}");
+    assert_eq!(a["message"], why.as_str(), "{a}");
+}
+
 /// No VMM in the personal layout and no fake flag: the preflight fails
 /// before anything is made or spawned, and every op answers its detail.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
 #[tokio::test]
 async fn unavailable_message_names_the_failed_check() {
     let tmp = scratch();
@@ -987,20 +1015,32 @@ async fn fake_env_still_wins() {
     assert!(state.join("boxes").join(b.id.as_str()).is_dir());
 }
 
+/// R37: the box records stay in the daemon's own state dir in both modes;
+/// only the VMM's runtime dirs differ (`/var/lib/saiife-box/boxes` locked,
+/// `<state>/box-run` personal).
 #[test]
-fn locked_dir_is_saiife_box() {
+fn records_stay_in_the_state_dir() {
     assert_eq!(
-        box_ops::dir_in(Path::new("/var/lib/saiife"), &Mode::Locked),
-        Path::new("/var/lib/saiife-box/boxes")
+        box_ops::dir_in(Path::new("/var/lib/saiife")),
+        Path::new("/var/lib/saiife/boxes")
+    );
+    assert_eq!(
+        box_ops::dir_in(Path::new("/s/state")),
+        Path::new("/s/state/boxes")
     );
 }
 
+#[cfg(all(target_os = "linux", feature = "boxes"))]
 #[test]
-fn personal_dir_is_unchanged() {
-    assert_eq!(
-        box_ops::dir_in(Path::new("/s/state"), &Mode::Personal),
-        Path::new("/s/state/boxes")
-    );
+fn runtime_dirs_are_apart_from_the_records() {
+    use saiife_daemon::box_vmm::layout_for;
+    let none = |_: &str| -> Option<OsString> { None };
+    let locked = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &none).unwrap();
+    assert_eq!(locked.boxes, Path::new("/var/lib/saiife-box/boxes"));
+    let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
+    let personal = layout_for(Path::new("/s/state"), &Mode::Personal, &home).unwrap();
+    assert_eq!(personal.boxes, Path::new("/s/state/box-run"));
+    assert_ne!(personal.boxes, box_ops::dir_in(Path::new("/s/state")));
 }
 
 /// R36: a snapshot the driver did not trust is a `box` record of the
@@ -1008,6 +1048,7 @@ fn personal_dir_is_unchanged() {
 /// lock, inside its VMM call), with the reason sanitized.
 #[tokio::test]
 async fn restore_refused_is_audited() {
+    // (the hook type exists in `boxes` builds on Linux; the link everywhere)
     let w = world();
     let link = Arc::new(box_ops::AuditLink::default());
     // Before the context is attached: a stderr line, no record, no panic.
@@ -1016,13 +1057,13 @@ async fn restore_refused_is_audited() {
         .await
         .unwrap();
     link.attach(&w.ctx);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "boxes"))]
     let hook: Arc<dyn saiife_boxhost::vmm::VmHooks> =
         Arc::new(saiife_daemon::box_vmm::AuditHooks::new(Arc::clone(&link)));
     tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "boxes"))]
         hook.restore_refused(&id("b1"), "digest \u{1b}[31mmismatch");
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", feature = "boxes")))]
         link.restore_refused(&id("b1"), "digest \u{1b}[31mmismatch");
     })
     .await
