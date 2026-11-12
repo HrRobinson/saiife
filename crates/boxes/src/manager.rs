@@ -567,11 +567,21 @@ impl Manager {
     }
 
     pub fn pause(&self, id: &BoxId) -> Result<Change, BoxError> {
-        self.vm_step(id, Event::Pause, "pause", |v, h| v.pause(h))
+        self.vm_step(id, Event::Pause, "pause", None, |v, h| v.pause(h))
+    }
+
+    /// `pause`, with the record's `error` set to `why` in the same save.
+    pub fn pause_for(&self, id: &BoxId, why: &str) -> Result<Change, BoxError> {
+        self.vm_step(id, Event::Pause, "pause", Some(why), |v, h| v.pause(h))
+    }
+
+    /// The host as probed now, without the manager lock.
+    pub fn host_facts(&self) -> HostFacts {
+        (self.host)()
     }
 
     pub fn resume(&self, id: &BoxId) -> Result<Change, BoxError> {
-        self.vm_step(id, Event::Resume, "resume", |v, h| v.resume(h))
+        self.vm_step(id, Event::Resume, "resume", None, |v, h| v.resume(h))
     }
 
     /// The transition first (so a wrong state costs no VMM call), then the
@@ -581,6 +591,7 @@ impl Manager {
         id: &BoxId,
         ev: Event,
         why: &'static str,
+        error: Option<&str>,
         call: impl Fn(&dyn Vmm, &crate::vmm::VmHandle) -> Result<(), VmmError>,
     ) -> Result<Change, BoxError> {
         let now = self.now();
@@ -594,8 +605,16 @@ impl Manager {
                 .ok_or_else(|| BoxError::Unavailable("the box has no VM".into()))?;
         call(self.vmm.as_ref(), &h).map_err(|e| BoxError::Unavailable(vmm_msg(e)))?;
         r.state = to;
-        if ev == Event::Resume {
-            r.last_activity = now;
+        match ev {
+            Event::Resume => {
+                r.last_activity = now;
+                r.error = None;
+            }
+            _ => {
+                if let Some(e) = error {
+                    r.error = Some(e.to_string());
+                }
+            }
         }
         r.updated_at = now;
         g.put(r.clone())?;

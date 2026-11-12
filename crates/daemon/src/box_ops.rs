@@ -48,6 +48,8 @@ pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
 /// With [`FAKE_ENV`] (a `fake-vmm` build only): `<n>` pins the host to
 /// exactly `n` default boxes, so a test never depends on the machine's RAM.
 pub const FAKE_SLOTS_ENV: &str = "SAIIFE_BOX_FAKE_SLOTS";
+/// Why the tick paused a box when the boxes filesystem ran low.
+pub const DISK_LOW_WHY: &str = "paused: the host disk is almost full";
 /// The stderr line of a daemon whose boxes run on the fake VM.
 pub const FAKE_NOTICE: &str = "saiifed: boxes use a fake VM (test build)";
 /// What a `box.spawn` was passed (plan 37): the repo disk and its base
@@ -384,7 +386,7 @@ pub async fn guest_event(
     })
     .await?;
     if let Some(c) = &c {
-        write_tick_records(ctx, vec![(c.clone(), template)]).await;
+        write_tick_records(ctx, "tick", None, vec![(c.clone(), template)]).await;
     }
     Ok(c)
 }
@@ -399,33 +401,68 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
     };
     let admit = !locked_all(ctx);
     let done = tokio::task::spawn_blocking(move || {
-        let changes = mgr.tick_with(admit);
-        changes
+        // The floor first: the free-space read and the pauses hold no lock
+        // while the host is probed; a box newly Running is paused (and
+        // recorded) once, a box already Paused is not touched again.
+        let low = floor_pauses(&mgr);
+        let changes = mgr
+            .tick_with(admit)
             .into_iter()
             .map(|c| {
                 let template = mgr.get(&c.id).ok().map(|r| r.template);
                 (c, template)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (low, changes)
     })
     .await;
-    let changes = match done {
+    let (low, changes) = match done {
         Ok(c) => c,
         Err(e) => {
             eprintln!("saiifed: boxes: the tick did not finish: {e}");
             return 0;
         }
     };
-    let n = changes.len();
-    write_tick_records(ctx, changes).await;
+    let n = low.len() + changes.len();
+    write_tick_records(ctx, "disk_low", Some(DISK_LOW_WHY), low).await;
+    write_tick_records(ctx, "tick", None, changes).await;
     n
+}
+
+/// Below the disk floor: pause every `Running` box with [`DISK_LOW_WHY`].
+fn floor_pauses(mgr: &Manager) -> Vec<(Change, Option<String>)> {
+    if !capacity::below_floor(&mgr.host_facts()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for r in mgr.list() {
+        if r.state != BoxState::Running {
+            continue;
+        }
+        match mgr.pause_for(&r.id, DISK_LOW_WHY) {
+            Ok(c) => out.push((c, Some(r.template))),
+            Err(e) => eprintln!(
+                "saiifed: boxes: cannot pause {} on low disk: {e}",
+                r.id.as_str()
+            ),
+        }
+    }
+    out
 }
 
 /// The daemon's own `box` records (`action`/`via` "tick", `reason` = why),
 /// one per change, each with the box's template when it is still known.
-async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
+async fn write_tick_records(
+    ctx: &Ctx,
+    action: &str,
+    reason: Option<&str>,
+    changes: Vec<(Change, Option<String>)>,
+) {
     for (c, template) in changes {
-        let rec = tick_record(ctx, &c, template.as_deref());
+        let mut rec = tick_record(ctx, action, &c, template.as_deref());
+        if let Some(r) = reason {
+            rec.reason = Some(r.to_string());
+        }
         if let Err(e) = ctx.writer.append(rec).await {
             eprintln!("saiifed: warning: cannot write a box tick record: {e}");
         }
@@ -433,10 +470,10 @@ async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
 }
 
 /// One daemon-made change as its `box` record.
-fn tick_record(ctx: &Ctx, c: &Change, template: Option<&str>) -> Record {
+fn tick_record(ctx: &Ctx, action: &str, c: &Change, template: Option<&str>) -> Record {
     let mut rec = box_rec(
         ctx,
-        "tick",
+        action,
         Some(&c.id),
         template,
         Some(c.from),
@@ -459,7 +496,7 @@ pub fn change_records(ctx: &Ctx, changes: &[Change]) -> Vec<Record> {
                 .as_ref()
                 .and_then(|m| m.get(&c.id).ok())
                 .map(|r| r.template);
-            tick_record(ctx, c, template.as_deref())
+            tick_record(ctx, "tick", c, template.as_deref())
         })
         .collect()
 }
@@ -694,6 +731,21 @@ fn obj<T: Serialize>(t: &T) -> Map<String, Value> {
         Ok(Value::Object(m)) => m,
         _ => Map::new(),
     }
+}
+
+/// Allocated MiB (rounded up) of a box's disks; lstat only, no lock held.
+#[cfg(unix)]
+fn disk_mib(root: &Path, id: &BoxId) -> u64 {
+    let paths = saiife_boxhost::paths::BoxPaths::new(root.join(id.as_str()));
+    saiife_boxhost::disk::usage(&paths)
+        .total()
+        .div_ceil(1 << 20)
+}
+
+#[cfg(not(unix))]
+fn disk_mib(root: &Path, id: &BoxId) -> u64 {
+    let _ = (root, id);
+    0
 }
 
 /// `{box: BoxInfo}`: box `r` as `scope` sees it (queue positions among
@@ -942,7 +994,7 @@ async fn run(
                 Ok((r, answer, others))
             })
             .await?;
-            write_tick_records(ctx, others).await;
+            write_tick_records(ctx, "tick", None, others).await;
             let mut rec = box_rec(
                 ctx,
                 "spawn",
@@ -961,6 +1013,9 @@ async fn run(
             let scope = (!(all && caller.privileged)).then_some(uid);
             blocking(move || {
                 let boxes = ManagerSource::new(Arc::clone(&m), scope).list();
+                // Usage is read from the box dirs after every manager lock
+                // is released (the lists above are snapshots).
+                let root = m.root().to_path_buf();
                 let (host, committed) = m.capacity();
                 let (total, free) = capacity::slots(&host, &committed);
                 let mut a = Map::new();
@@ -976,9 +1031,13 @@ async fn run(
                     .into_iter()
                     .map(|b| {
                         let err = errors.get(&b.id).cloned();
+                        let disk = disk_mib(&root, &b.id);
                         let mut v = serde_json::to_value(b).unwrap_or_default();
-                        if let (Some(e), Value::Object(o)) = (err, &mut v) {
-                            o.insert("error".into(), e.into());
+                        if let Value::Object(o) = &mut v {
+                            if let Some(e) = err {
+                                o.insert("error".into(), e.into());
+                            }
+                            o.insert("disk_mib".into(), disk.into());
                         }
                         v
                     })

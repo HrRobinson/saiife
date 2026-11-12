@@ -153,7 +153,9 @@ fn spawn_then_ls_shows_the_box() {
     assert_eq!(code(&o), 0);
     let t = out(&o);
     let head = t.lines().next().unwrap();
-    for col in ["ID", "STATE", "TEMPLATE", "REPO", "AGE", "QUEUE", "TASK"] {
+    for col in [
+        "ID", "STATE", "TEMPLATE", "REPO", "AGE", "DISK", "QUEUE", "TASK",
+    ] {
         assert!(head.contains(col), "{head}");
     }
     assert!(t.contains("b1"), "{t}");

@@ -43,8 +43,12 @@ fn scratch() -> tempfile::TempDir {
 
 /// A host that holds exactly two default boxes.
 fn two_boxes() -> HostFacts {
+    two_boxes_host(2)
+}
+
+fn two_boxes_host(n: u64) -> HostFacts {
     HostFacts {
-        mem_total_mib: 8192 + 2 * capacity::charge_mib(&Size::default()),
+        mem_total_mib: 8192 + n * capacity::charge_mib(&Size::default()),
         mem_avail_mib: 4096,
         threads: 12,
         disk_free_mib: 1024 * 1024,
@@ -558,6 +562,88 @@ async fn tick_records_changes() {
     // Nothing more to do: no record.
     assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
     assert_eq!(w.records().len(), before + 1);
+}
+
+#[tokio::test]
+async fn disk_floor_pauses_running_boxes() {
+    // A manager whose free disk the test moves (spawn needs the headroom).
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let free = Arc::new(AtomicU64::new(1024 * 1024));
+    let f = Arc::clone(&free);
+    let o = Manager::open(ManagerInit {
+        store: Store::open(box_ops::dir_in(&state)).unwrap(),
+        vmm: Arc::new(FakeVmm::new()),
+        guest: Arc::new(FakeGuest::new()),
+        templates: template::builtin(),
+        host: Arc::new(move || HostFacts {
+            disk_free_mib: f.load(Ordering::SeqCst),
+            ..two_boxes_host(3)
+        }),
+        clock: Arc::new(|| T0),
+    })
+    .unwrap();
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(Arc::new(o.manager)),
+    });
+    let a = w.running(ALICE, "one").await;
+    let b = w.running(ALICE, "two").await;
+    let c = w.running(ALICE, "three").await;
+    let before = w.records().len();
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0, "plenty of disk");
+    free.store(9 * 1024, Ordering::SeqCst);
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 3);
+    for i in [&a, &b, &c] {
+        let r = w.mgr().get(&id(i)).unwrap();
+        assert_eq!(r.state.to_string_lossy(), "paused");
+        assert_eq!(
+            r.error.as_deref(),
+            Some("paused: the host disk is almost full")
+        );
+    }
+    let recs = w.records();
+    let new = &recs[before..];
+    assert_eq!(new.len(), 3, "{new:?}");
+    for (r, i) in new.iter().zip([&a, &b, &c]) {
+        assert_eq!(r["action"], "disk_low");
+        assert_eq!(r["via"], "tick");
+        assert_eq!(r["box"], i.as_str());
+        assert_eq!(r["from"], "running");
+        assert_eq!(r["to"], "paused");
+        assert_eq!(r["reason"], "paused: the host disk is almost full");
+    }
+    // Still low: the paused boxes are not recorded again.
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
+    assert_eq!(w.records().len(), before + 3);
+    // One resumed by hand while still low is paused again, with its record.
+    w.mgr().resume(&id(&c)).unwrap();
+    assert_eq!(w.mgr().get(&id(&c)).unwrap().error, None);
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 1);
+    assert_eq!(w.records().len(), before + 4);
+    // Back above the floor: nothing more.
+    free.store(20 * 1024, Ordering::SeqCst);
+    w.mgr().resume(&id(&c)).unwrap();
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
+    assert_eq!(
+        w.mgr().get(&id(&c)).unwrap().state.to_string_lossy(),
+        "running"
+    );
+}
+
+#[tokio::test]
+async fn list_reports_disk_per_entry() {
+    let w = world();
+    let b = w.running(ALICE, "one").await;
+    let dir = w.mgr().root().join(&b);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("root.qcow2"), vec![7u8; 3 << 20]).unwrap();
+    let l = w.ok(ALICE, "box.list", json!({})).await;
+    assert!(l.get("disk").is_none(), "{l}");
+    let e = &l["boxes"][0];
+    let mib = e["disk_mib"].as_u64().expect("disk_mib present");
+    assert!((3..=4).contains(&mib), "{l}");
 }
 
 #[tokio::test]

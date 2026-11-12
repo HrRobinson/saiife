@@ -2,10 +2,63 @@
 //! image (spec §7.3, the spike layout): the base is never written, each box
 //! gets its own copy-on-write layer.
 
+use crate::paths::BoxPaths;
 use crate::tools::{Tool, ToolError, Tools};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// What a box dir holds on the host's disk, as allocated bytes
+/// (`st_blocks` x 512), not apparent size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiskUsage {
+    pub root_bytes: u64,
+    pub repo_bytes: u64,
+    pub snapshot_bytes: u64,
+}
+
+impl DiskUsage {
+    pub fn total(&self) -> u64 {
+        self.root_bytes
+            .saturating_add(self.repo_bytes)
+            .saturating_add(self.snapshot_bytes)
+    }
+}
+
+/// Allocated bytes of a regular file. The box dir is VMM-writable, so this
+/// is an lstat that never follows a link and never opens the file: a
+/// symlink, FIFO, socket, directory or a missing name counts 0.
+fn allocated(p: &Path) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if !m.file_type().is_file() {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        m.len()
+    }
+}
+
+/// The disk a box dir uses: `root.qcow2`, `repo.img` and the snapshot files
+/// ([`crate::snapshot::NAMES`] in `snapshot/`, named, never listed).
+pub fn usage(paths: &BoxPaths) -> DiskUsage {
+    let snap = paths.snapshot_dir();
+    DiskUsage {
+        root_bytes: allocated(&paths.root_disk()),
+        repo_bytes: allocated(&paths.repo_disk()),
+        snapshot_bytes: crate::snapshot::NAMES
+            .iter()
+            .map(|n| allocated(&snap.join(n)))
+            .fold(0, u64::saturating_add),
+    }
+}
 
 const QEMU_IMG_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -242,6 +295,42 @@ mod tests {
         };
         let tools = Tools::system(dir.path()).with_env(&env);
         (dir, tools)
+    }
+
+    #[test]
+    fn usage_counts_allocated_bytes() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let paths = BoxPaths::new(d.path().to_path_buf());
+        assert_eq!(usage(&paths), DiskUsage::default());
+        // 1 MiB of real data: allocated, at least that.
+        std::fs::write(paths.root_disk(), vec![1u8; 1 << 20]).unwrap();
+        // A sparse file: big apparent size, almost nothing allocated.
+        let f = std::fs::File::create(paths.repo_disk()).unwrap();
+        f.set_len(1 << 30).unwrap();
+        std::fs::create_dir(paths.snapshot_dir()).unwrap();
+        std::fs::write(paths.snapshot_dir().join("state.json"), b"{}").unwrap();
+        // A symlink to a big file and a FIFO count 0.
+        let big = d.path().join("big");
+        std::fs::write(&big, vec![1u8; 1 << 20]).unwrap();
+        symlink(&big, paths.snapshot_dir().join("config.json")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            paths.snapshot_dir().join("memory-ranges"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let u = usage(&paths);
+        assert!(u.root_bytes >= 1 << 20 && u.root_bytes < 2 << 20, "{u:?}");
+        assert!(u.repo_bytes < 1 << 20, "sparse: {u:?}");
+        assert!(u.snapshot_bytes > 0 && u.snapshot_bytes <= 8192, "{u:?}");
+        assert_eq!(u.total(), u.root_bytes + u.repo_bytes + u.snapshot_bytes);
+        // The symlinked root counts 0 too.
+        std::fs::remove_file(paths.root_disk()).unwrap();
+        symlink(&big, paths.root_disk()).unwrap();
+        assert_eq!(usage(&paths).root_bytes, 0);
     }
 
     // Writes the last-but-one argument (the tmp path).

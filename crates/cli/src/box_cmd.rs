@@ -497,6 +497,15 @@ mod imp {
         }
     }
 
+    /// Allocated MiB as `412M`, or `3.1G` from 1 GiB.
+    pub(super) fn disk(mib: u64) -> String {
+        if mib < 1024 {
+            format!("{mib}M")
+        } else {
+            format!("{:.1}G", mib as f64 / 1024.0)
+        }
+    }
+
     /// The sanitized task, at most [`TASK_COLS`] characters.
     pub(super) fn short_task(task: &str) -> String {
         let t = sanitize(task);
@@ -545,7 +554,9 @@ mod imp {
 
     /// The `ls` table for a `box.list` answer's `boxes`, at time `now`.
     pub(super) fn box_lines(boxes: &[Value], now: u64) -> Vec<String> {
-        let head = ["ID", "STATE", "TEMPLATE", "REPO", "AGE", "QUEUE", "TASK"];
+        let head = [
+            "ID", "STATE", "TEMPLATE", "REPO", "AGE", "DISK", "QUEUE", "TASK",
+        ];
         let rows: Vec<(Vec<String>, Option<String>)> = boxes
             .iter()
             .map(|b| {
@@ -556,6 +567,9 @@ mod imp {
                     sanitize(text(b, "template")),
                     sanitize(text(b, "repo")),
                     age(now.saturating_sub(created)),
+                    b.get("disk_mib")
+                        .and_then(Value::as_u64)
+                        .map_or_else(|| "-".to_string(), disk),
                     b.get("queue_pos")
                         .and_then(Value::as_u64)
                         .map_or_else(|| "-".to_string(), |n| n.to_string()),
@@ -662,6 +676,13 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn disk_units() {
+            assert_eq!(disk(0), "0M");
+            assert_eq!(disk(412), "412M");
+            assert_eq!(disk(3174), "3.1G");
+        }
 
         #[test]
         fn age_units() {

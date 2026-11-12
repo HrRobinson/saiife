@@ -724,6 +724,27 @@ fn pause_resume_roundtrip() {
 }
 
 #[test]
+fn pause_for_sets_error() {
+    let w = world(1);
+    let i = running(&w, "a");
+    let c = w
+        .mgr
+        .pause_for(&i, "paused: the host disk is almost full")
+        .unwrap();
+    assert_eq!(c, change(&i, BoxState::Running, BoxState::Paused, "pause"));
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!(r.state, BoxState::Paused);
+    assert_eq!(
+        r.error.as_deref(),
+        Some("paused: the host disk is almost full")
+    );
+    assert_eq!(w.vmm.status(&handle(&i)), VmStatus::Paused);
+    w.assert_saved(&i);
+    w.mgr.resume(&i).unwrap();
+    assert_eq!(w.mgr.get(&i).unwrap().error, None);
+}
+
+#[test]
 fn pause_wrong_state_makes_no_vmm_call() {
     let w = world(1);
     let a = w.spawn("a");
