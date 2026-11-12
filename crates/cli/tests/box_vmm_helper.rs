@@ -132,3 +132,71 @@ fn helper_refuses_a_tampered_spec_before_exec() {
     assert!(stderr(&o).contains("base"), "{}", stderr(&o));
     assert!(!f.out.exists());
 }
+
+/// Runs the helper with a bound: a stuck open would hang it forever.
+#[cfg(debug_assertions)]
+fn run_bounded(f: &Fx) -> Option<std::process::ExitStatus> {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    c.args(["__box-vmm"])
+        .arg(&f.paths.dir)
+        .env_clear()
+        .env("HOME", f.root.join("home"))
+        .env("XDG_STATE_HOME", f.root.join("s"))
+        .env("XDG_DATA_HOME", f.root.join("d"))
+        .env("XDG_RUNTIME_DIR", f.root.join("r"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_TOOL_CH", &f.ch)
+        .env("SAIIFE_TEST_NO_PIN", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().unwrap();
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(10) {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // our own child
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn helper_replaces_a_fifo_log() {
+    let f = fx();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        f.paths.ch_log(),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    let s = run_bounded(&f).expect("the helper blocked on a FIFO ch.log");
+    if s.code() == Some(0) {
+        let m = std::fs::symlink_metadata(f.paths.ch_log()).unwrap();
+        assert!(m.file_type().is_file());
+        assert!(f.out.exists());
+    } else {
+        assert_eq!(s.code(), Some(3));
+        assert!(!f.out.exists());
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn helper_refuses_a_symlinked_log() {
+    let f = fx();
+    let target = f.root.join("target");
+    std::fs::write(&target, b"keep").unwrap();
+    std::os::unix::fs::symlink(&target, f.paths.ch_log()).unwrap();
+    let o = run(&f, true);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).contains("ch.log"), "{}", stderr(&o));
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    assert!(!f.out.exists());
+}

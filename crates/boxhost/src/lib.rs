@@ -13,6 +13,7 @@ pub mod paths;
 pub mod pins;
 pub mod preflight;
 pub mod review;
+pub mod snapshot;
 pub mod term;
 pub mod tools;
 pub mod vmm;

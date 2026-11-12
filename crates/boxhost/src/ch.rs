@@ -202,7 +202,17 @@ impl Read for Deadline<'_> {
 /// Connect, giving up after `CONNECT_TIMEOUT`. `UnixStream::connect` blocks
 /// when the listener backlog is full, so it runs on a helper thread that is
 /// left to finish on its own after a timeout.
+/// `api.sock` lives in a directory the VMM can write: only a socket is
+/// connected to, never a symlink (which could lead to another box's VMM).
+/// The check and the connect are not atomic; the VMM of this box could swap
+/// the path in between, but only while it runs, and then it already holds
+/// its own API.
 fn connect(sock: &Path) -> Result<UnixStream, ApiError> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(sock) {
+        Ok(m) if m.file_type().is_socket() => {}
+        _ => return Err(ApiError::NoSocket),
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let p = sock.to_path_buf();
     std::thread::spawn(move || {
@@ -517,6 +527,19 @@ mod tests {
             .put(Action::Pause, None, Duration::from_secs(2))
             .unwrap();
         assert!(t.elapsed() < Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn symlinked_socket_is_not_followed() {
+        let (d, s) = tmp_sock("real");
+        let _l = UnixListener::bind(&s).unwrap();
+        let link = s.with_file_name("link");
+        std::os::unix::fs::symlink(&s, &link).unwrap();
+        assert_eq!(Api::new(link.clone()).ping(), Err(ApiError::NoSocket));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"x").unwrap();
+        assert_eq!(Api::new(link).ping(), Err(ApiError::NoSocket));
         let _ = std::fs::remove_dir_all(d);
     }
 

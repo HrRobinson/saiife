@@ -12,9 +12,11 @@ use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 use saiife_boxhost::launch::{argv, read_spec, Boot, ChildLauncher, Launcher};
 use saiife_boxhost::layout::Layout;
 use saiife_boxhost::paths::BoxPaths;
+use saiife_boxhost::pins::sha256_file;
 use saiife_boxhost::tools::Tools;
 use saiife_boxhost::vmm::{ChVmm, ChVmmInit, ImageResolver, ResolvedImage, StopTimes, VmHooks};
 use saiife_wire::source::BoxId;
+use std::os::unix::fs::OpenOptionsExt;
 
 const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -25,11 +27,12 @@ impl ImageResolver for Fixed {
     }
 }
 
-/// Records hook calls as "<name>.before" / "<name>.off".
+/// Records hook calls as "<name>.before" / "<name>.off" / "<name>.refused".
 struct Rec {
     name: &'static str,
     log: Arc<Mutex<Vec<String>>>,
     fail: bool,
+    delay: Duration,
 }
 impl VmHooks for Rec {
     fn before_boot(&self, _id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
@@ -43,6 +46,7 @@ impl VmHooks for Rec {
             .lock()
             .unwrap()
             .push(format!("{}.before{up}", self.name));
+        std::thread::sleep(self.delay);
         if self.fail {
             Err("bind failed".into())
         } else {
@@ -51,6 +55,13 @@ impl VmHooks for Rec {
     }
     fn after_off(&self, _id: &BoxId) {
         self.log.lock().unwrap().push(format!("{}.off", self.name));
+    }
+    fn restore_refused(&self, _id: &BoxId, why: &str) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}.refused", self.name));
+        self.log.lock().unwrap().push(format!("why: {why}"));
     }
 }
 
@@ -132,6 +143,7 @@ impl World {
             images: Arc::new(Fixed(self.image.clone())),
             launcher,
             hooks,
+            marks: self.root.join("m"),
             landlock: true,
             stop: StopTimes {
                 power_s: 1,
@@ -141,11 +153,56 @@ impl World {
     }
 
     fn hook(&self, name: &'static str, fail: bool) -> Arc<dyn VmHooks> {
+        self.slow_hook(name, fail, Duration::ZERO)
+    }
+
+    fn slow_hook(&self, name: &'static str, fail: bool, delay: Duration) -> Arc<dyn VmHooks> {
         Arc::new(Rec {
             name,
             log: Arc::clone(&self.log),
             fail,
+            delay,
         })
+    }
+
+    fn marker(&self, id: &str) -> PathBuf {
+        self.root.join("m").join(format!("{id}.snapshot"))
+    }
+
+    /// Boot, pause, snapshot, stop: a box with a good snapshot and marker.
+    fn snapshotted(&self, v: &Arc<ChVmm>, id: &str) -> VmHandle {
+        let h = self.create(v, id);
+        v.boot(&h).unwrap();
+        v.pause(&h).unwrap();
+        v.snapshot(&h, &self.paths(id).snapshot_dir()).unwrap();
+        assert!(self.marker(id).exists(), "snapshot writes the marker");
+        v.destroy(&h).unwrap();
+        std::fs::remove_file(self.paths(id).dir.join("fake-ch.argv")).unwrap();
+        self.log.lock().unwrap().clear();
+        h
+    }
+
+    /// Edit the snapshot's config.json and re-sign the marker to match, as a
+    /// VMM that could forge the marker would (it cannot; this isolates the
+    /// config checks from the digest check).
+    fn forge(&self, id: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let cfg = self.paths(id).snapshot_dir().join("config.json");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cfg).unwrap()).unwrap();
+        edit(&mut v);
+        std::fs::write(&cfg, serde_json::to_vec(&v).unwrap()).unwrap();
+        let state = self.paths(id).snapshot_dir().join("state.json");
+        let m = serde_json::json!({
+            "version": 1,
+            "config": sha256_file(&cfg).unwrap(),
+            "state": sha256_file(&state).unwrap(),
+        });
+        std::fs::write(self.marker(id), m.to_string()).unwrap();
+    }
+
+    fn booted_cold(&self, id: &str) -> bool {
+        let argv = std::fs::read_to_string(self.paths(id).dir.join("fake-ch.argv")).unwrap();
+        !argv.contains("\"--restore\"")
     }
 
     fn vmm(&self, env: &[(&str, &str)]) -> (Arc<ChVmm>, Arc<ChildLauncher>) {
@@ -257,13 +314,14 @@ fn create_writes_spec_and_overlay() {
     assert_eq!(s.boot, w.image.boot);
     assert!(s.landlock);
     assert!(!s.repo && !s.restore);
-    // repo.img and a snapshot are picked up on the next create
+    // repo.img is picked up on the next create; a snapshot is not trusted
+    // by create (boot decides, from the marker)
     std::fs::write(p.repo_disk(), b"r").unwrap();
     std::fs::create_dir(p.snapshot_dir()).unwrap();
     std::fs::write(p.snapshot_dir().join("config.json"), b"{}").unwrap();
     v.create(&w.spec("b1")).unwrap();
     let s = read_spec(&p).unwrap();
-    assert!(s.repo && s.restore);
+    assert!(s.repo && !s.restore);
 }
 
 #[test]
@@ -477,15 +535,233 @@ fn snapshot_refuses_other_dest() {
 fn restore_boots_paused_then_resumes() {
     let w = World::new();
     let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
     let p = w.paths("b1");
-    w.spec("b1");
-    std::fs::create_dir(p.snapshot_dir()).unwrap();
-    std::fs::write(p.snapshot_dir().join("config.json"), b"{}").unwrap();
-    let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
     let argv = std::fs::read_to_string(p.dir.join("fake-ch.argv")).unwrap();
     assert!(argv.starts_with("\"--restore\"\n"), "{argv}");
+    assert!(read_spec(&p).unwrap().restore);
     assert_eq!(v.status(&h), VmStatus::Running);
+    assert!(!w.events().iter().any(|e| e.ends_with(".refused")));
+    // one-shot: the marker is gone, the next boot is cold
+    assert!(!w.marker("b1").exists());
+    assert!(!p.snapshot_dir().exists(), "a spent snapshot is discarded");
+    v.destroy(&h).unwrap();
+    v.boot(&h).unwrap();
+    assert!(w.booted_cold("b1"));
+    assert!(!read_spec(&p).unwrap().restore);
+}
+
+#[test]
+fn restore_refuses_a_planted_snapshot() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
+    std::fs::remove_file(w.marker("b1")).unwrap();
+    v.boot(&h).unwrap();
+    assert!(w.booted_cold("b1"));
+    assert!(!read_spec(&w.paths("b1")).unwrap().restore);
+    assert!(
+        w.events().contains(&"h.refused".to_string()),
+        "{:?}",
+        w.events()
+    );
+}
+
+#[test]
+fn restore_refuses_a_tampered_config() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
+    let cfg = w.paths("b1").snapshot_dir().join("config.json");
+    let mut c = std::fs::read(&cfg).unwrap();
+    c.push(b' ');
+    std::fs::write(&cfg, c).unwrap();
+    v.boot(&h).unwrap();
+    assert!(w.booted_cold("b1"));
+    assert!(
+        w.events().contains(&"h.refused".to_string()),
+        "{:?}",
+        w.events()
+    );
+    assert!(!w.marker("b1").exists(), "a refused marker is dropped");
+}
+
+#[test]
+fn restore_refuses_a_foreign_disk() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.snapshotted(&v, "b1");
+    w.forge("b1", |c| {
+        c["disks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"path": "/etc/shadow"}));
+    });
+    v.boot(&h).unwrap();
+    assert!(w.booted_cold("b1"));
+    let ev = w.events();
+    assert!(ev.contains(&"h.refused".to_string()), "{ev:?}");
+    assert!(
+        ev.iter()
+            .any(|e| e.starts_with("why:") && e.contains("disk")),
+        "{ev:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_landlock_off_and_extra_devices() {
+    type Edit = fn(&mut serde_json::Value);
+    let edits: [(&str, Edit); 5] = [
+        ("landlock", |c| c["landlock_enable"] = false.into()),
+        ("landlock", |c| {
+            c["landlock_rules"] = serde_json::json!([{"path": "/", "access": "rw"}])
+        }),
+        ("net", |c| c["net"] = serde_json::json!([{"tap": "tap0"}])),
+        ("payload", |c| {
+            c["payload"]["firmware"] = "/etc/passwd".into()
+        }),
+        ("vsock", |c| c["vsock"]["socket"] = "/elsewhere.sock".into()),
+    ];
+    for (what, edit) in edits {
+        let w = World::new();
+        let (v, _l) = w.vmm(&[]);
+        let h = w.snapshotted(&v, "b1");
+        w.forge("b1", edit);
+        v.boot(&h).unwrap();
+        assert!(w.booted_cold("b1"), "{what}");
+        let ev = w.events();
+        assert!(
+            ev.iter().any(|e| e.starts_with("why:") && e.contains(what)),
+            "{what}: {ev:?}"
+        );
+    }
+}
+
+#[test]
+fn ch_log_fifo_does_not_block_start() {
+    let w = World::new();
+    let (v, l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let p = w.paths("b1");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        p.ch_log(),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (l2, id, p2) = (Arc::clone(&l), h.id.clone(), p.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(l2.start(&id, &p2));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    if got.is_err() {
+        // unblock the stuck open before failing
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(p.ch_log());
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        let _ = l.force_stop(&h.id);
+        panic!("start blocked on a FIFO ch.log");
+    }
+    match got.unwrap() {
+        Ok(()) => {
+            let m = std::fs::symlink_metadata(p.ch_log()).unwrap();
+            assert!(m.file_type().is_file(), "the FIFO was replaced");
+            l.force_stop(&h.id).unwrap();
+        }
+        Err(e) => assert!(e.contains("ch.log"), "{e}"),
+    }
+}
+
+#[test]
+fn ch_log_symlink_is_refused() {
+    let w = World::new();
+    let (v, l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let p = w.paths("b1");
+    let target = w.root.join("t/target");
+    std::fs::write(&target, b"keep").unwrap();
+    std::os::unix::fs::symlink(&target, p.ch_log()).unwrap();
+    let e = l.start(&h.id, &p).unwrap_err();
+    assert!(e.contains("ch.log"), "{e}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    assert!(!p.dir.join("fake-ch.argv").exists(), "nothing started");
+    let m = failed(v.boot(&h));
+    assert!(m.contains("ch.log"), "{m}");
+}
+
+#[test]
+fn api_sock_symlink_is_not_followed() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h1 = w.create(&v, "b1");
+    let h2 = w.create(&v, "b2");
+    v.boot(&h2).unwrap();
+    std::os::unix::fs::symlink(w.paths("b2").api_sock(), w.paths("b1").api_sock()).unwrap();
+    assert_eq!(v.status(&h1), VmStatus::Off);
+    assert!(v.pause(&h1).is_err());
+    v.stop(&h1).unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        v.status(&h2),
+        VmStatus::Running,
+        "the other box was untouched"
+    );
+}
+
+#[test]
+fn unconfirmed_stop_is_not_off() {
+    let w = World::new();
+    let (v1, _l1) = w.vmm(&[("FAKE_CH_HANG", "1")]);
+    let h = w.create(&v1, "b1");
+    v1.boot(&h).unwrap();
+    let (v2, _l2) = w.vmm(&[]);
+    w.track(&v2, &h);
+    v2.stop(&h).unwrap();
+    // v2 has no child to force-stop: the ladder cannot confirm the exit
+    assert!(v2.destroy(&h).is_err());
+    assert_ne!(v2.status(&h), VmStatus::Off);
+    // v1 owns the child; the World guard stops it
+}
+
+#[test]
+fn concurrent_boots_have_one_winner() {
+    let w = World::new();
+    let l = w.launcher(&[]);
+    let v = w.vmm_with(l, vec![w.slow_hook("h", false, Duration::from_millis(300))]);
+    let h = w.create(&v, "b1");
+    let (a, b) = std::thread::scope(|s| {
+        let a = s.spawn(|| v.boot(&h));
+        std::thread::sleep(Duration::from_millis(50));
+        let b = s.spawn(|| v.boot(&h));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(a.is_ok(), "{a:?}");
+    let m = failed(b);
+    assert!(m.contains("already"), "{m}");
+    assert_eq!(w.events(), ["h.before"]);
+    assert!(w.paths("b1").api_sock().exists());
+    assert_eq!(v.status(&h), VmStatus::Running);
+}
+
+#[test]
+fn stop_during_boot_is_applied() {
+    let w = World::new();
+    let l = w.launcher(&[]);
+    let v = w.vmm_with(l, vec![w.slow_hook("h", false, Duration::from_millis(300))]);
+    let h = w.create(&v, "b1");
+    std::thread::scope(|s| {
+        let a = s.spawn(|| v.boot(&h));
+        std::thread::sleep(Duration::from_millis(100));
+        v.stop(&h).unwrap();
+        a.join().unwrap().unwrap();
+    });
+    assert!(wait_for(LONG, || v.status(&h) == VmStatus::Off));
 }
 
 #[test]

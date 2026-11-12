@@ -31,8 +31,7 @@ pub fn run(dir: PathBuf, locked: bool) -> ExitCode {
 #[cfg(unix)]
 mod imp {
     use std::ffi::OsString;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
     use saiife_boxhost::launch::{self, Allowed, Boot};
@@ -79,7 +78,7 @@ mod imp {
                 pins::verify(fw, pins::FW_SHA256)?;
             }
         }
-        let log = open_log(&paths.ch_log())?;
+        let log = launch::open_ch_log(&paths.ch_log())?;
         let log2 = log.try_clone().map_err(|e| format!("ch.log: {e}"))?;
         let mut cmd = Command::new(&ch);
         cmd.args(launch::argv(&spec, &paths))
@@ -89,15 +88,5 @@ mod imp {
             .stdout(log)
             .stderr(log2);
         Ok(cmd)
-    }
-
-    fn open_log(p: &Path) -> Result<std::fs::File, String> {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o640)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(p)
-            .map_err(|e| format!("ch.log: {}: {e}", p.display()))
     }
 }

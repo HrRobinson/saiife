@@ -321,6 +321,66 @@ pub trait Launcher: Send + Sync {
     fn kind(&self) -> &'static str;
 }
 
+/// Opens `ch.log` for the VMM's stdout and stderr. The box dir is VMM
+/// writable, so the path may be anything: a symlink is refused (O_NOFOLLOW;
+/// the target is never touched), a FIFO or other non-regular file never
+/// blocks the open (O_NONBLOCK) and, like a file owned by someone else, is
+/// unlinked and created afresh (O_EXCL). Used by `ChildLauncher` and by
+/// `saiife __box-vmm`.
+pub fn open_ch_log(p: &Path) -> Result<std::fs::File, String> {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::MetadataExt;
+    let err = |e: std::io::Error| format!("ch.log: {}: {e}", p.display());
+    let base = (OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC).bits() as i32;
+    let open = |excl: bool| {
+        let mut o = std::fs::OpenOptions::new();
+        o.append(true).mode(0o640).custom_flags(base);
+        if excl {
+            o.create_new(true);
+        } else {
+            o.create(true);
+        }
+        o.open(p)
+    };
+    let euid = rustix::process::geteuid().as_raw();
+    let ours = |f: &std::fs::File| {
+        f.metadata()
+            .is_ok_and(|m| m.file_type().is_file() && m.uid() == euid)
+    };
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!("ch.log: {} is a symlink", p.display()))
+        }
+        Ok(m) if m.file_type().is_file() => {
+            // A path swapped since (ELOOP for a symlink, ENXIO for a FIFO
+            // without a reader) falls through to the replace path below.
+            if let Ok(f) = open(false) {
+                if ours(&f) {
+                    return Ok(f);
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(err(e)),
+    }
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!("ch.log: {} is a symlink", p.display()))
+        }
+        Ok(_) => std::fs::remove_file(p).map_err(err)?,
+        Err(_) => {}
+    }
+    let f = open(true).map_err(err)?;
+    if !ours(&f) {
+        return Err(format!(
+            "ch.log: {} is not a regular file of ours",
+            p.display()
+        ));
+    }
+    Ok(f)
+}
+
 enum Mode {
     /// `<saiife> __box-vmm <dir>`: the helper checks `vm.json`, then execs.
     Helper,
@@ -328,14 +388,25 @@ enum Mode {
     Direct,
 }
 
+enum Slot {
+    Running(Child),
+    /// `force_stop` has taken the child out to kill and reap it.
+    Killing,
+    /// Reaped; the `Child` is dropped, its status kept.
+    Exited(ExitStatus),
+}
+
 /// Runs the VMM as a child process of the daemon, stdout and stderr in
 /// `ch.log`. Children are reaped through `try_wait` in `exited`, and
-/// `force_stop` is `Child::kill` plus `wait` of its own child only.
+/// `force_stop` is `Child::kill` plus `wait` of its own child only. The
+/// map lock covers bookkeeping only: no file I/O, spawn or wait under it.
 pub struct ChildLauncher {
     program: PathBuf,
     mode: Mode,
     env: Vec<(OsString, OsString)>,
-    children: Mutex<BTreeMap<BoxId, Child>>,
+    children: Mutex<BTreeMap<BoxId, Slot>>,
+    #[cfg(test)]
+    pre_spawn: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl ChildLauncher {
@@ -353,6 +424,8 @@ impl ChildLauncher {
             mode,
             env: Vec::new(),
             children: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            pre_spawn: None,
         }
     }
 
@@ -362,10 +435,31 @@ impl ChildLauncher {
         self
     }
 
+    fn slots(&self) -> std::sync::MutexGuard<'_, BTreeMap<BoxId, Slot>> {
+        self.children.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reap a running child without blocking (waitpid WNOHANG).
+    fn poll(slot: &mut Slot) {
+        if let Slot::Running(c) = slot {
+            match c.try_wait() {
+                Ok(Some(s)) => *slot = Slot::Exited(s),
+                Ok(None) => {}
+                // not waitable any more: reaped elsewhere
+                Err(_) => *slot = Slot::Exited(ExitStatus::default()),
+            }
+        }
+    }
+
     /// The exit status of the box's child once it has exited and been reaped.
     pub fn exit_status(&self, id: &BoxId) -> Option<ExitStatus> {
-        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        g.get_mut(id).and_then(|c| c.try_wait().ok().flatten())
+        let mut g = self.slots();
+        let slot = g.get_mut(id)?;
+        Self::poll(slot);
+        match slot {
+            Slot::Exited(s) => Some(*s),
+            _ => None,
+        }
     }
 
     fn command(&self, paths: &BoxPaths) -> Result<Command, String> {
@@ -379,7 +473,7 @@ impl ChildLauncher {
                 c.args(argv(&spec, paths));
             }
         }
-        let log = open_log(&paths.ch_log())?;
+        let log = open_ch_log(&paths.ch_log())?;
         let log2 = log.try_clone().map_err(|e| format!("ch.log: {e}"))?;
         c.envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
@@ -387,53 +481,70 @@ impl ChildLauncher {
             .stderr(log2);
         Ok(c)
     }
-}
 
-fn open_log(p: &Path) -> Result<std::fs::File, String> {
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o640)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(p)
-        .map_err(|e| format!("ch.log: {}: {e}", p.display()))
+    fn busy(&self, id: &BoxId) -> bool {
+        let mut g = self.slots();
+        match g.get_mut(id) {
+            Some(slot) => {
+                Self::poll(slot);
+                !matches!(slot, Slot::Exited(_))
+            }
+            None => false,
+        }
+    }
 }
 
 impl Launcher for ChildLauncher {
     fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
-        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = g.get_mut(id) {
-            if matches!(c.try_wait(), Ok(None)) {
-                return Err("the VMM of this box is already running".into());
-            }
+        const RUNNING: &str = "the VMM of this box is already running";
+        if self.busy(id) {
+            return Err(RUNNING.into());
         }
-        let child = self
-            .command(paths)?
+        // File I/O and the spawn happen outside the lock.
+        let mut cmd = self.command(paths)?;
+        #[cfg(test)]
+        if let Some(f) = &self.pre_spawn {
+            f();
+        }
+        if self.busy(id) {
+            return Err(RUNNING.into());
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| format!("cannot start {}: {e}", self.program.display()))?;
-        g.insert(id.clone(), child);
+        self.slots().insert(id.clone(), Slot::Running(child));
         Ok(())
     }
 
     fn exited(&self, id: &BoxId) -> Option<bool> {
-        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        let c = g.get_mut(id)?;
-        Some(!matches!(c.try_wait(), Ok(None)))
+        let mut g = self.slots();
+        let slot = g.get_mut(id)?;
+        Self::poll(slot);
+        Some(matches!(slot, Slot::Exited(_)))
     }
 
     fn force_stop(&self, id: &BoxId) -> Result<(), String> {
-        let mut g = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        let c = g
-            .get_mut(id)
-            .ok_or("the VMM was not started by this daemon")?;
-        if !matches!(c.try_wait(), Ok(None)) {
-            return Ok(());
-        }
-        // Our own child: kill(2) on its pid, then reap it.
+        let mut c = {
+            let mut g = self.slots();
+            let Some(slot) = g.get_mut(id) else {
+                return Err("the VMM was not started by this daemon".into());
+            };
+            Self::poll(slot);
+            match std::mem::replace(slot, Slot::Killing) {
+                Slot::Running(c) => c,
+                other => {
+                    // Exited: nothing to do. Killing: another caller has it.
+                    *slot = other;
+                    return Ok(());
+                }
+            }
+        };
+        // Our own child: kill(2) on its pid, then reap it, outside the lock.
         let _ = c.kill();
-        c.wait()
-            .map(|_| ())
-            .map_err(|e| format!("wait for the VMM: {e}"))
+        let r = c.wait();
+        let status = r.as_ref().map_or(ExitStatus::default(), |s| *s);
+        self.slots().insert(id.clone(), Slot::Exited(status));
+        r.map(|_| ()).map_err(|e| format!("wait for the VMM: {e}"))
     }
 
     fn kind(&self) -> &'static str {
@@ -764,6 +875,42 @@ mod tests {
             let p = BoxPaths::new(d);
             assert!(check_spec(&s, &p, &allowed).unwrap_err().contains("socket"));
         }
+    }
+
+    #[test]
+    fn start_does_its_io_outside_the_lock() {
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+        let e = env();
+        let p1 = mkbox(&e, "b1");
+        let _p2 = mkbox(&e, "b2");
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let mut l = ChildLauncher::helper(PathBuf::from("/usr/bin/true"));
+        l.pre_spawn = Some(Box::new(move || {
+            let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        }));
+        let l = Arc::new(l);
+        let id1 = BoxId::parse("b1").unwrap();
+        let id2 = BoxId::parse("b2").unwrap();
+        let (l2, i2) = (Arc::clone(&l), id1.clone());
+        let t = std::thread::spawn(move || l2.start(&i2, &p1));
+        std::thread::sleep(Duration::from_millis(100));
+        let t0 = Instant::now();
+        assert_eq!(l.exited(&id2), None);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "exited waited on start"
+        );
+        go_tx.send(()).unwrap();
+        t.join().unwrap().unwrap();
+        let t0 = Instant::now();
+        while l.exited(&id1) != Some(true) && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(l.exited(&id1), Some(true));
+        assert!(l.exit_status(&id1).unwrap().success());
+        l.force_stop(&id1).unwrap();
     }
 
     #[test]
