@@ -13,6 +13,8 @@
 > 8. `box.diff` on real boxes stays unavailable until plan 39 (`ManagerSource::diff` asks `GuestLink::diff`, `source.rs:135-138`, which `VsockGuest` refuses).
 > 9. Global Constraints: branch `v3-p38`; builds with `CARGO_PROFILE_DEV_DEBUG=0`.
 
+> **Owner-approved contract additions (2026-11-12):** `TouchClass::Steer` (plan 31), `IssueKey::{Web, Land, Push}` (plans 31, 39), `Vmm::image_id` (plan 36). This plan adds none of them; it builds on a manager whose `BoxRecord.image` comes from `Vmm::image_id`. Boxes do not ship in a release before plan 41 is done (plan 35 header).
+
 > **Depends on:** plan 34 merged (`GuestLink`, `GuestEvent`, `Manager::guest_event`, template `egress`); plan 35 Task 1 (scaffold) and Task 5 (`VmHooks`) and Task 7 (`real_vmm(…, hooks)`). The in-box hook needs **plan 32 Task 6** (`saiife check --profile box`) at smoke time only; the code here only writes the hook config. Plan 39 uses Task 4's `request_stream`; plan 40 fills Task 6's model listener.
 
 **Goal:** The box talks to the host, and only through channels the daemon owns:

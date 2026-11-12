@@ -15,6 +15,10 @@
 > 10. The manager never parses `VmHandle.data` (`store.rs:17`): the image id reaches it through plan 36's `Vmm::image_id`, not by reading the JSON.
 > 11. Task 7: a failed preflight is reported through a new `Ctx.box_unavailable` (plan 34's `handle` answers a fixed `UNAVAILABLE` when `box_manager` is `None`, `box_ops.rs:661-663`).
 
+> **Build order (owner ruling 2026-11-12):** boxes (plans 35–40) do not ship in a release before plan 41 (`2026-11-12-plan-41-linux-fido-helper.md`, the Linux FIDO helper) is done: without it a Linux release `saiife box land` cannot touch a key. They may be built and merged into `v3-dev` before then; the release that first enables them must contain plan 41.
+
+> **Owner-approved contract additions (2026-11-12):** `TouchClass::Steer` (plan 31), `IssueKey::{Web, Land, Push}` (plans 31, 39), `Vmm::image_id` (plan 36; this plan's `ChVmm` answers it from its handle's `image`, note 10). No longer flagged.
+
 > **Depends on plan 34 being merged into `v3-dev`** (`crates/boxes`: `Vmm`, `VmSpec`, `VmHandle`, `VmStatus`, `VmmError`, `Manager`, `box_ops::build`, the boxes `fake` feature behind the daemon's `fake-vmm`). Task 5 also needs **plan 37 Task 1** (`disk::make_overlay`) and Task 7 needs **plan 36 Task 4** (`image::Store` as `ImageResolver`). Task 1 of this plan is the scaffold every other VM-half plan (36–40) builds on: it runs first, alone.
 
 **Goal:** Replace `FakeVmm` with a real driver:

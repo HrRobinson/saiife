@@ -1,4 +1,4 @@
-# v3 plan errata: plans 28 and 29 as built (2026-11-12)
+# v3 plan errata: plans 28 and 29 as built, and the owner rulings of 2026-11-12
 
 Plans 28 (`2026-11-11-plan-28-workspace-wire.md`) and 29 (`2026-11-11-plan-29-workspace-link.md`) are built and merged into `v3-dev` (`8086dee`). Their text is left as written; this file lists the statements in them that no longer match the code. **The code and the ledger rulings win.** Each row cites where the built behaviour is (paths on `v3-dev` unless noted) and the ruling that changed it (plan 28 ledger `R-P*`/`R-T*`/`R-F*`; plan 29 ledger `R-P*`/`R-T*`/`R-F*`/`R-X*`, prefixed "29:" where the names clash).
 
@@ -51,3 +51,15 @@ Plans 28 (`2026-11-11-plan-28-workspace-wire.md`) and 29 (`2026-11-11-plan-29-wo
 | 29-19 | Task 2: `Ctx.boxes` default `NoBoxes`, `fake-boxes` for plan 30 | As written, but plan 34's box manager is never placed in `Ctx.boxes` (`start.rs:1029-1040`), and plan 34's `ManagerSource` writes no audit and hides other boxes' spawn admissions from the frame layer: open hand-off, now plan 31 Task 1 | `crates/daemon/src/start.rs:1029-1040`; plan 34 R22 and final-review note |
 | 29-20 | Contract changes: "Step 3 may route [`box.*`] on the control socket for `saiife box` with the same names" | Plan 34 does, but the control-socket ops take the box id as `box`, not `id` (the request envelope's `id` overwrites it), and nest answers that carry an `id` (`{box: BoxInfo}`, `{diff: …}`); frame actions keep `id` inside the signed body | `crates/daemon/src/box_ops.rs:454-460`, `:612-637` on `v3-p34`; `crates/ipc/src/msg.rs:318-322`, `:384-393`; plan 34 R20, R25 |
 | 29-21 | Task 1: `msg.rs` docs `workspace.pair.confirm … -> {device_id, state}` etc. | Fine for the workspace ops; note plan 26's `touch.enrol` doc still promises an `id` that `msg::ok` drops (plan 27 R-J, a plan 26 follow-up) | `msg.rs:131`, `:154-155`, `:384-393` |
+
+## Owner rulings 2026-11-12 (binding)
+
+| # | Ruling | Where it lands |
+|---|---|---|
+| R-1 | **Build order:** boxes (plans 35–40) do not ship in a release before plan 41 (the Linux FIDO helper, `2026-11-12-plan-41-linux-fido-helper.md`) is done. They may merge into `v3-dev` earlier; the first release that enables boxes contains plan 41. | plan 35 header; plan 39 soft dependency |
+| R-2 | Plan 26's per-uid live touch challenge limit goes from 4 to 8: `const MAX_PER_UID: usize = 4;` at `crates/daemon/src/touch.rs:28` becomes `8`, with its tests. | plan 31 Task 2, Step 3a |
+| R-3 | Plan 39's land records go back to 4 `Done` boxes per owner (the reconciliation's 2 is withdrawn). | plan 39 L8, Task 4 |
+| R-4 | On a Linux release without the helper, `saiife box land` refuses and points to the Workspace (Face ID) plus `saiife box apply`, until plan 41 lands (and afterwards on installs without the helper). | plan 39 Task 6 |
+| R-5 | Approved contract additions: `TouchClass::Steer`, `IssueKey::{Web, Land, Push}`, `Vmm::image_id`. | plans 31, 35, 38, 39 headers |
+| R-6 | Plan 31 Task 1 (the real box manager in `Ctx.boxes`, audit at the frame layer through `ManagerSource::with_changes`) is confirmed. | plan 31 header |
+| R-7 | Windows keeps plan 27 R-O (no key support in release builds); the helper pattern does not help there (raw HID needs elevation for any process). The Windows route is the platform WebAuthn API, a later plan. | plan 41 F6 |

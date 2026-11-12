@@ -4,17 +4,22 @@
 
 > **Reconciled 2026-11-12** (outline turned into a full plan against `v3-dev` at `8086dee` with plans 26–29 and 32 merged, plan 30 on `v3-p30` at `c9eed15`, plan 34 on `v3-p34` at `ee5e264`). Changes from the outline:
 > 1. Frame execution lives in `crates/daemon/src/workspace_link.rs` (`LATER` `:83`, `HANDLED` `:98`, `execute` `:435`, `act` `:554`, `touch_required` `:505`), not `workspace_ops.rs` (that file holds the machine-side pairing ops).
-> 2. `TouchState` caps are plan 26's: 32 live entries in all and 4 per uid (`crates/daemon/src/touch.rs:27-28`), shared by every `IssueKey`; the outline's "64 open `Web` entries" is dropped.
+> 2. `TouchState` caps are plan 26's: 32 live entries in all (`MAX_LIVE`, `crates/daemon/src/touch.rs:27`) and per uid `MAX_PER_UID` (`touch.rs:28`), shared by every `IssueKey`; the outline's "64 open `Web` entries" is dropped. **Owner ruling 2026-11-12:** `MAX_PER_UID` goes from 4 to 8 (Task 2, Step 3a).
 > 3. `TouchProof` (`crates/wire/src/frame.rs:38-44`) has no `origin`: the daemon reads it from `clientDataJSON` and checks it against `[workspace] origins` before `verify` (which checks it against the credential's `origins`, `crates/touch/src/verify.rs:182-185`).
 > 4. UV: `saiife_touch::verify` already forces UV for every WebAuthn assertion (`verify.rs:296`); a clear UV flag is `TouchError::NotVerified`, rule `touch_failed` (`error.rs:21-27`). The outline's custom message is UI copy only.
 > 5. Which record a proof names is decided by the frame's **action**, not by trying three stores in turn: request ids of `workspace.touch.begin`, of `BoxSource::pending_actions` and of v2 approvals are separate number spaces and can collide.
 > 6. Pending box actions are verified with `TouchState::verify_counted` (`touch.rs:263`) against the `PendingAction.record`, plus a daemon-side spent-challenge set (passkeys may keep a zero counter, `verify.rs:262-265`).
 > 7. Passkey enrolment uses `getAuthenticatorData()` (no CBOR parse; plan 26 keeps `cbor` `pub(crate)`) and `credential_from_attestation` (`store.rs:216`), and the device key signs the attestation so a relay cannot swap it.
 > 8. New Task 1: `Ctx.boxes` is still `NoBoxes`/`FakeBoxSource` (`crates/daemon/src/start.rs:1029-1040`); plan 34's `ManagerSource` writes no audit and its spawn hides other boxes' admission changes (plan 34 R22 and final-review note). This plan wires it.
-> 9. `TouchClass::Steer` is added here (plan 26's crate has no class for steer, revise or resume; `action.rs:14-23`). Flagged.
+> 9. `TouchClass::Steer` is added here (plan 26's crate has no class for steer, revise or resume; `action.rs:14-23`). Owner-approved 2026-11-12.
 > 10. `box.push` and `box.pr` stay in `LATER`: plan 39 gives push a CLI-only path (`box.push.*` control-socket ops) and builds no PR; the Workspace cannot run `git push` as the user.
 > 11. Plan 30 R-1 answer shape (`{ok:false,error,rule,message}`, `crates/link/src/local.rs`) is the contract; `wire.js` `readAnswer` (`crates/link/assets/js/wire.js:101-121` on `v3-p30`) drops every other field, so it is widened for `touch` and `short_code` (Task 7).
 > 12. Approver check: `approvers::is_approver(cfg, dir, user)` (`crates/daemon/src/approvers.rs:107`), not `:84`; the touch record helper is `approvals::record_with_touch` (`approvals.rs:476`).
+
+> **Owner rulings 2026-11-12 (binding):**
+> - The per-user live touch challenge limit is raised from 4 to 8: `const MAX_PER_UID: usize = 4;` at `crates/daemon/src/touch.rs:28` (on `v3-dev`) becomes `8`, in Task 2 (the task that already edits `TouchState`), with its test.
+> - Confirmed and approved: Task 1 wires the real box manager into `Ctx.boxes`, with audit at the frame layer through `ManagerSource::with_changes`.
+> - Owner-approved contract additions (no longer "flagged"): `TouchClass::Steer` (this plan), `IssueKey::Web` (this plan), `IssueKey::{Land, Push}` (plan 39), `Vmm::image_id` (plan 36, used by plans 35 and 38).
 
 **Goal:** Make the Workspace's Touch-level actions real and add the read-only terminal:
 - a WebAuthn passkey is enrolled **with** the browser at pairing (confirmed at the machine), so no remote action ever enrols a device;
@@ -33,12 +38,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-10-saiife-v3-design.md` §8.1, §8.3–§8.6, §9.3, §9.4, §9.5, §9.6, §12, §15. Contract: `v3-step4-6-contract.md`. Ledgers read: plan 26 (R2–R19), 27 (R-J), 28 (R-P*, R-T*, R-F*), 29 (R-P3, R-P5, R-T4a, R-T9b), 30 (R-1, R-2, R-T2a), 34 (R1–R31).
 
-## Contract changes (flagged)
+## Contract changes (owner-approved 2026-11-12)
 
 | Item | Change | Why |
 |---|---|---|
-| `saiife_touch::TouchClass` (`action.rs:14`) | `+ Steer`, name `"steer"`, `needs_uv() == true` | steer, revise and resume have no §8.2 class; the outline asked plan 26's owner, whose crate is merged |
-| daemon `touch::IssueKey` (`touch.rs:40`) | `+ Web { device: String, request_id: u64 }` | plan 26 reserved it for this plan; plan 39 adds `Land(u64)`, `Push(u64)` to the same enum |
+| `saiife_touch::TouchClass` (`action.rs:14`) | `+ Steer`, name `"steer"`, `needs_uv() == true` | steer, revise and resume have no §8.2 class; owner-approved 2026-11-12 |
+| daemon `touch::IssueKey` (`touch.rs:40`) | `+ Web { device: String, request_id: u64 }` | plan 26 reserved it for this plan; plan 39 adds `Land(u64)`, `Push(u64)` to the same enum; all three owner-approved 2026-11-12 |
+| daemon `touch::MAX_PER_UID` (`touch.rs:28`) | `4` → `8` | owner ruling 2026-11-12: Workspace, CLI, land and push touches share it |
 | `saiife_wire::pair::PairRequest` (`pair.rs:84`) | `+ #[serde(default)] passkey: Option<PasskeyAttestation>` (`deny_unknown_fields` stays) | enrol with the pairing |
 | link `POST /api/pair` key list (`local.rs:298`) and hub `pair` message (`hub.rs:853`) | `passkey` allowed as an optional key | they whitelist keys |
 | system config | `[workspace] origins = ["http://localhost:47810"]` (`crates/policy/src/system.rs:17-45`, a new `WorkspaceCfg`) | machine-only, like all config |
@@ -129,7 +135,7 @@ pub(crate) async fn write_change_records(ctx: &Ctx, changes: Vec<(Change, Option
 
 ### Task 2: contract additions: `TouchClass::Steer`, `IssueKey::Web`, `[workspace] origins`, the web assertion (size S)
 
-**Files:** Modify `crates/touch/src/action.rs` (`Steer`), `crates/daemon/src/touch.rs:40` (`IssueKey::Web`), `crates/policy/src/system.rs` (`WorkspaceCfg`), `crates/wire/src/pair.rs` (`PasskeyAttestation`, `PASSKEY_DOMAIN`); create `crates/daemon/src/workspace_touch.rs` (`pub mod` in `lib.rs`).
+**Files:** Modify `crates/touch/src/action.rs` (`Steer`), `crates/daemon/src/touch.rs:28` (`MAX_PER_UID` 4 → 8), `crates/daemon/src/touch.rs:40` (`IssueKey::Web`), `crates/policy/src/system.rs` (`WorkspaceCfg`), `crates/wire/src/pair.rs` (`PasskeyAttestation`, `PASSKEY_DOMAIN`); create `crates/daemon/src/workspace_touch.rs` (`pub mod` in `lib.rs`).
 
 **Interfaces (Produces):**
 ```rust
@@ -154,8 +160,10 @@ pub fn web_assertion(p: &saiife_wire::frame::TouchProof, origins: &[String]) -> 
 ```
 `web_assertion`: decode the four b64u fields (`Malformed` on failure); parse `client_data_json` as a JSON object and read `origin` (a string, else `Malformed`); `origin ∉ origins` → `Mismatch`; build `Assertion::WebAuthn { credential_id, auth_data, signature, client_data_json, origin }`. The rest (type, challenge, crossOrigin, rp id hash, UV, counter) is `verify`'s.
 
-- [ ] **Step 1: Write the failing tests:** touch `steer_class_roundtrip` (`name`, `from_name`, serde, `needs_uv`), `stronger_with_steer`; daemon `web_key_is_distinct_per_device` (two `Web` keys with the same request id and different devices both issue), `web_entries_share_the_caps` (four `Web` entries for one uid, the fifth `issue` errs "too many touches in progress"); policy `workspace_origins_default_and_parse` (no section → the default; `["http://localhost:9000"]` ok; `"http://evil.test"`, `"http://localhost:9000/"`, `"javascript:x"` refused at load), `workspace_unknown_key_is_refused`; wire `passkey_challenge_vector` (fixed pair id and key → pinned hex in `tests/vectors/pair-v1.json` as a new key `passkey_challenge_hex`), `passkey_sig_msg_layout`, `pair_request_without_passkey_still_parses` (plan 28's frozen pair vector unchanged); daemon unit `web_assertion_rules` (bad b64, non-object JSON, missing origin, origin outside the list → `Mismatch`, a good one keeps every byte).
-- [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** Grep the tree for every `match` on `TouchClass` and add the `Steer` arm (strictest handling where a class decides an approval, as `approval_ops.rs:557`'s `strictest`). **Step 4: Run** → PASS; `bash scripts/check-windows.sh -p saiife-touch -p saiife-policy -p saiife-wire`.
+- [ ] **Step 1: Write the failing tests:** touch `steer_class_roundtrip` (`name`, `from_name`, serde, `needs_uv`), `stronger_with_steer`; daemon `web_key_is_distinct_per_device` (two `Web` keys with the same request id and different devices both issue), `web_entries_share_the_caps` (eight `Web` entries for one uid, the ninth `issue` errs "too many touches in progress"); policy `workspace_origins_default_and_parse` (no section → the default; `["http://localhost:9000"]` ok; `"http://evil.test"`, `"http://localhost:9000/"`, `"javascript:x"` refused at load), `workspace_unknown_key_is_refused`; wire `passkey_challenge_vector` (fixed pair id and key → pinned hex in `tests/vectors/pair-v1.json` as a new key `passkey_challenge_hex`), `passkey_sig_msg_layout`, `pair_request_without_passkey_still_parses` (plan 28's frozen pair vector unchanged); daemon unit `web_assertion_rules` (bad b64, non-object JSON, missing origin, origin outside the list → `Mismatch`, a good one keeps every byte).
+- [ ] **Step 2: Run** → FAIL.
+- [ ] **Step 3a: Raise the per-user limit (owner ruling 2026-11-12).** `crates/daemon/src/touch.rs:28`: `const MAX_PER_UID: usize = 8;` (doc line above unchanged: "Live challenges in all, and per uid"). Update plan 26's tests in the same file: `issue_caps` (`touch.rs:363`) issues `Approve(0..8)` for uid 1000 and asserts `Approve(8)` errs; its global part fills 32 as 4 uids × 8 and asserts the 33rd (a fifth uid) errs `"too many touches in progress"`; the cap-replace part of the test at `touch.rs:515-519` issues `Approve(20..28)` for uid 3000 before re-issuing `Approve(20)`, and fills 32 as 4 uids × 8. New test `per_uid_cap_is_eight` (8 live for one uid ok, the 9th refused, another uid still issues). `cargo test -p saiife-daemon touch::` → PASS.
+- [ ] **Step 3b: Implement** the rest. Grep the tree for every `match` on `TouchClass` and add the `Steer` arm (strictest handling where a class decides an approval, as `approval_ops.rs:557`'s `strictest`). **Step 4: Run** → PASS; `bash scripts/check-windows.sh -p saiife-touch -p saiife-policy -p saiife-wire`.
 - [ ] **Step 5: Commit** `feat(touch,wire,policy): steer class, web issue key, workspace origins, passkey attestation types`.
 
 ---
@@ -211,7 +219,7 @@ pub fn bind(ctx: &Ctx, action: &str, args: &Map<String, Value>) -> Result<(Touch
 - `ctx.touch.issue(IssueKey::Web { device, request_id }, owner_uid, class, summary, fields, now)` (`spawn_blocking`); an `Err` ("too many touches in progress") → `busy`. The answer: `TouchRequest { rp_id, challenge: saiife_touch::challenge(&record), allow: device.touch_credentials decoded, uv: true, summary, short_code }` + `request_id` (decimal), `expires_at`, `class` (name). The `ActionRecord` is built as plan 26 does (`instance_id = ctx.touch.instance_id()`, the issued nonce and expiry; `touch_ops.rs:120-135`).
 - `begin` is recorded (`workspace` record, `extra.touch_begin = {request_id, class}`).
 
-- [ ] **Step 1: Write the failing tests** (`tests/workspace_link.rs` additions, `FakeBoxSource::demo`, a paired `TestDevice` with a soft passkey from Task 3): `begin_for_steer_answers_a_touch_request` (`rp_id == "localhost"`, `allow == [the passkey id]`, `uv`, `short_code == saiife_touch::short_code(&challenge)`), `begin_binds_daemon_fields` (args with an extra `fields` key → `invalid`; the issued record's fields are `{action, box}` only), `begin_for_land_is_refused`, `begin_for_approval_binds_the_stored_request` (a pending v2 connector request with class `deploy`: the challenge equals `challenge(&approvals::action_record(..))` with the issued nonce; an `id` with no touch class → `invalid`), `begin_for_signed_action_is_refused` (`box.stop` → `invalid`), `begin_for_plain_spawn_is_refused` (template without secrets → `invalid`: it needs no touch), `begin_without_passkey_is_unavailable`, `fifth_open_touch_is_busy` (four begins for one owner, the fifth `busy`), `begin_is_recorded`.
+- [ ] **Step 1: Write the failing tests** (`tests/workspace_link.rs` additions, `FakeBoxSource::demo`, a paired `TestDevice` with a soft passkey from Task 3): `begin_for_steer_answers_a_touch_request` (`rp_id == "localhost"`, `allow == [the passkey id]`, `uv`, `short_code == saiife_touch::short_code(&challenge)`), `begin_binds_daemon_fields` (args with an extra `fields` key → `invalid`; the issued record's fields are `{action, box}` only), `begin_for_land_is_refused`, `begin_for_approval_binds_the_stored_request` (a pending v2 connector request with class `deploy`: the challenge equals `challenge(&approvals::action_record(..))` with the issued nonce; an `id` with no touch class → `invalid`), `begin_for_signed_action_is_refused` (`box.stop` → `invalid`), `begin_for_plain_spawn_is_refused` (template without secrets → `invalid`: it needs no touch), `begin_without_passkey_is_unavailable`, `ninth_open_touch_is_busy` (eight begins for one owner, the ninth `busy`), `begin_is_recorded`.
 - [ ] **Step 2: Run** `cargo test -p saiife-daemon --features fake-boxes --test workspace_link` → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat(workspace): workspace.touch.begin binds a challenge to the daemon's own view of the action`.
 
@@ -315,7 +323,8 @@ export function poller({ client, id, schedule, now })   // at most one box.term.
 
 ## Owner handwork
 
-- [ ] Decide `TouchClass::Steer` (one touch opens a 10-minute window per box) and the `[workspace] origins` default.
+- [x] `TouchClass::Steer` (one touch opens a 10-minute window per box): owner-approved 2026-11-12, with `IssueKey::Web` and the per-uid limit of 8.
+- [ ] Decide the `[workspace] origins` default.
 - [ ] Run `scripts/workspace-smoke.sh` with a phone (Face ID) and a security key with a PIN.
 - [ ] After plan 39: the real `land` through `complete` (its `Lands::complete` burns the CLI entry, plan 39 Task 4) and a smoke spawn → review → land with touch → `saiife box apply`.
 
