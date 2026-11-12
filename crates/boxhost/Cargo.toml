@@ -12,6 +12,11 @@ path = "src/lib.rs"
 
 [dependencies]
 saiife-boxproto = { path = "../boxproto" }
+# BoxId (tokio-free).
+saiife-wire = { path = "../wire" }
+serde = { version = "1", features = ["derive"] }
+# O_NOFOLLOW / O_NONBLOCK constants only; no unsafe.
+rustix = { version = "1", features = ["fs"] }
 ring = "=0.17.14"
 serde_json = "1"
 

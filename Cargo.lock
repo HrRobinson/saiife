@@ -1698,7 +1698,10 @@ name = "saiife-boxhost"
 version = "0.2.0"
 dependencies = [
  "ring",
+ "rustix",
  "saiife-boxproto",
+ "saiife-wire",
+ "serde",
  "serde_json",
  "tempfile",
 ]
