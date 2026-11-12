@@ -145,7 +145,9 @@ JSON
 }
 
 start_docker() {
-  systemctl start docker.service
+  # restart: the docker.io postinst may already have started dockerd with
+  # the default image store, before daemon.json was written
+  systemctl restart docker.service
   for _ in $(seq 1 60); do
     docker info >/dev/null 2>&1 && return 0
     sleep 1

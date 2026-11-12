@@ -417,6 +417,15 @@ mod tests {
         let store = main.find("  write_docker_store_config\n").unwrap();
         let pull = main.find("  pull_images\n").unwrap();
         assert!(store < pull);
+        let start_fn = BAKE_SCRIPT
+            .split("\nstart_docker() {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(start_fn.contains("systemctl restart docker.service"));
+        assert!(!start_fn.contains("systemctl start docker.service"));
         let store_fn = BAKE_SCRIPT
             .split("\nwrite_docker_store_config() {")
             .nth(1)
