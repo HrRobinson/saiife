@@ -265,18 +265,143 @@ fn bad_name_is_bad_input() {
     assert!(personal_packs(&env).join("user.no-prod.toml").is_file());
 }
 
+const NEVER_JUDGE: &str = "# Rules\n\nNever destroy the staging infra.\n";
+
+/// A fake `claude` that prints `json` and ignores stdin.
+#[cfg(unix)]
+fn fake_claude(env: &Env, json: &str) {
+    common::fake_exe(
+        env.bin.path(),
+        "claude",
+        &format!("/bin/cat >/dev/null; printf '%s' '{json}'"),
+    );
+}
+
+#[cfg(unix)]
 #[test]
-fn llm_flag_warns_until_built() {
+fn llm_pass_adds_verified_rules() {
     let env = Env::new(&[]);
-    env.write("CLAUDE.md", DEPLOY);
+    env.write("CLAUDE.md", NEVER_JUDGE);
+    fake_claude(
+        &env,
+        r#"{"rules":[{"kind":"command","line":3,"command":"terraform destroy","block":["terraform destroy"],"allow":["terraform plan"]}]}"#,
+    );
     let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
-    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(
-        stderr(&o).contains("warning: the LLM pass is not built yet; continuing without it"),
+        stderr(&o).contains("sending 1 lines of CLAUDE.md to claude -p"),
+        "{}",
+        stderr(&o)
+    );
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 1, "{}", stderr(&o));
+    let pack = fs::read_to_string(&files[0]).unwrap();
+    assert!(pack.contains("terraform"), "{pack}");
+    assert!(pack.contains("line = 3"), "{pack}");
+    assert!(!pack.contains("[[allow]]"), "{pack}");
+    assert!(stdout(&o).contains("0 judgement"), "{}", stdout(&o));
+}
+
+#[cfg(unix)]
+#[test]
+fn llm_bad_rule_is_listed_unverified() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", NEVER_JUDGE);
+    fake_claude(
+        &env,
+        r#"{"rules":[{"kind":"command","line":3,"command":"terraform destroy","block":["terraform destroy"],"allow":["terraform destroy -auto-approve"]}]}"#,
+    );
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("unverified: llm:"), "{}", stdout(&o));
+    assert!(pack_files(&personal_packs(&env)).is_empty());
+}
+
+#[test]
+fn llm_missing_claude_warns_and_goes_on() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", &format!("{DEPLOY}{NEVER_JUDGE}"));
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains(
+            "warning: claude is not on PATH; the LLM pass needs Claude Code; continuing without the LLM pass"
+        ),
         "{}",
         stderr(&o)
     );
     assert_eq!(pack_files(&personal_packs(&env)).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn llm_timeout_kills_and_goes_on() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", &format!("{DEPLOY}{NEVER_JUDGE}"));
+    common::fake_exe(
+        env.bin.path(),
+        "claude",
+        "/bin/cat >/dev/null; exec /bin/sleep 30",
+    );
+    let absent = common::absent_system_config(env.home.path());
+    let start = std::time::Instant::now();
+    let mut child = env
+        .command_in(env.root(), &["rules", "import", "--llm", "CLAUDE.md"])
+        .env("SAIIFE_TEST_SYSTEM_CONFIG", &absent)
+        .env("SAIIFE_TEST_LLM_TIMEOUT_MS", "300")
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"e\n\n").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("claude did not answer in 1 s; continuing without the LLM pass"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(pack_files(&personal_packs(&env)).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn llm_huge_output_is_refused() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", &format!("{DEPLOY}{NEVER_JUDGE}"));
+    common::fake_exe(
+        env.bin.path(),
+        "claude",
+        "/bin/cat >/dev/null; i=0; while [ $i -lt 300 ]; do printf '%01024d' 0; i=$((i+1)); done",
+    );
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("claude answered more than 256 KiB; continuing without the LLM pass"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(pack_files(&personal_packs(&env)).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn llm_nonzero_exit_quotes_stderr_cleaned() {
+    let env = Env::new(&[]);
+    env.write("CLAUDE.md", &format!("{DEPLOY}{NEVER_JUDGE}"));
+    common::fake_exe(
+        env.bin.path(),
+        "claude",
+        "/bin/cat >/dev/null; printf 'login \\033[2J needed' >&2; exit 3",
+    );
+    let o = rules(&env, &["import", "--llm", "CLAUDE.md"], "e\n\n");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("login ?[2J needed"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
 }
 
 #[test]

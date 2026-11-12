@@ -213,20 +213,63 @@ fn import(
     ExitCode::SUCCESS
 }
 
-/// The opt-in LLM pass (`--llm`) over the lines the rules could not use: the
-/// one place it joins the import. Plan 33 task 3 builds it.
-/// It may add proposals and take their lines out of `judgement`.
+/// The opt-in LLM pass (`--llm`) over the judgement lines: the one place it
+/// joins the import. Each verified answer becomes an offered proposal and
+/// its line leaves `judgement`; a rule that fails its checks is listed as
+/// unverified. Any failure of the pass itself is one warning, and the
+/// import goes on with what the rules found.
 fn llm_pass(
     llm: bool,
     file_name: &str,
     vars: &saiifeguard::canon::PathVars,
     props: &mut Vec<Proposal>,
+    unverified: &mut Vec<Unverified>,
     judgement: &mut Vec<SourceLine>,
 ) {
-    let _ = (file_name, vars, props, judgement);
-    if llm {
-        crate::warn("warning: the LLM pass is not built yet; continuing without it");
+    use std::io::Write as _;
+    if !llm || judgement.is_empty() {
+        return;
     }
+    let skip = |msg: &str| {
+        crate::warn(&format!(
+            "warning: {}; continuing without the LLM pass",
+            extract::clean(msg)
+        ));
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "sending {} lines of {} to claude -p (your Claude Code login)",
+        judgement.len(),
+        extract::clean(file_name)
+    );
+    let sent: Vec<u32> = judgement.iter().map(|j| j.line).collect();
+    let answer = match llm::run_claude(judgement, llm::timeout()) {
+        Ok(a) => a,
+        Err(e) => return skip(&e),
+    };
+    let rules = match llm::parse(&answer, &sent) {
+        Ok(r) => r,
+        Err(e) => return skip(&e),
+    };
+    let mut done = Vec::new();
+    for (rule, status) in rules {
+        let Some(line) = judgement.iter().find(|j| j.line == rule.line()).cloned() else {
+            crate::warn(&format!(
+                "warning: llm: a rule names line {}, which was not sent; dropped",
+                rule.line()
+            ));
+            continue;
+        };
+        match status.and_then(|()| llm::to_proposal(&rule, &line, file_name, vars)) {
+            Ok(p) => props.push(p),
+            Err(why) => unverified.push(Unverified {
+                src: line.clone(),
+                why: format!("llm: {}", extract::clean(&why)),
+            }),
+        }
+        done.push(line.line);
+    }
+    judgement.retain(|j| !done.contains(&j.line));
 }
 
 /// `file` as an absolute path, the one an import is known by: its directory
@@ -291,8 +334,16 @@ fn import_one(
         store::read_source(&abs).map_err(|e| Stop(1, format!("{}: {}", shown(&abs), e)))?;
     let cands = extract::candidates(&text);
     // 6. Proposals that pass their own examples (and the LLM pass).
-    let (mut props, unverified, mut judgement) = propose::proposals_for(&cands, &file_name, vars);
-    llm_pass(llm, &file_name, vars, &mut props, &mut judgement);
+    let (mut props, mut unverified, mut judgement) =
+        propose::proposals_for(&cands, &file_name, vars);
+    llm_pass(
+        llm,
+        &file_name,
+        vars,
+        &mut props,
+        &mut unverified,
+        &mut judgement,
+    );
 
     // 7. The table, then one question per proposal.
     outln!("{}", shown(&abs));
