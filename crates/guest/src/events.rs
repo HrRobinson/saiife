@@ -8,6 +8,7 @@ use saiife_boxproto::frame::{read_msg, write_msg, FrameError};
 use saiife_boxproto::msg::{Event, HostReply};
 use saiife_boxproto::ports::GUEST_EVENTS_SOCK;
 use saiife_boxproto::PROTO;
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,9 @@ use std::time::{Duration, Instant};
 const TICK: Duration = Duration::from_millis(50);
 /// How often it checks that the host is still there.
 const PROBE_EVERY: Duration = Duration::from_millis(500);
+/// Unsent events kept across a lost link (they are few: activity is
+/// throttled and turn_finished coalesced).
+const MAX_PENDING: usize = 64;
 /// Write deadline on the events connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -182,23 +186,9 @@ pub fn run(
         last_activity: None,
     };
     let mut last_probe = Instant::now();
-    let send = |conn: &mut Option<UnixStream>, ev: &Event| -> Result<(), String> {
-        for _ in 0..2 {
-            if conn.is_none() {
-                match hello(&env) {
-                    Ok(s) => *conn = Some(s),
-                    Err(e) => return Err(e.into_message()),
-                }
-            }
-            if let Some(c) = conn.as_mut() {
-                if write_msg(c, ev).is_ok() {
-                    return Ok(());
-                }
-            }
-            *conn = None;
-        }
-        Ok(())
-    };
+    // Events not yet written; kept across a lost link and sent after the
+    // re-hello, oldest first.
+    let mut pending: VecDeque<Event> = VecDeque::new();
     loop {
         let now = Instant::now();
         let wait = match (st.spawned, st.started) {
@@ -255,6 +245,10 @@ pub fn run(
             st.spawned = None;
             out.push(e);
         }
+        pending.extend(out);
+        while pending.len() > MAX_PENDING {
+            pending.pop_front();
+        }
         if now.duration_since(last_probe) >= PROBE_EVERY {
             last_probe = now;
             if conn.as_ref().is_some_and(|c| !peer_open(c)) {
@@ -271,11 +265,13 @@ pub fn run(
                 }
             }
         }
-        for ev in &out {
-            if let Err(e) = send(&mut conn, ev) {
-                *fatal.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                return;
+        while let (Some(c), Some(ev)) = (conn.as_mut(), pending.front()) {
+            if write_msg(c, ev).is_err() {
+                // Kept; the next probe says hello again and resends it.
+                conn = None;
+                break;
             }
+            pending.pop_front();
         }
     }
 }

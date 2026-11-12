@@ -119,16 +119,25 @@ fn run_tool(env: &GuestEnv, tool: &Path, args: &[&std::ffi::OsStr]) -> Result<()
 
 /// The service main.
 pub fn run(env: &GuestEnv) -> Result<(), String> {
+    // Bound before the hello: the host sends Setup right after its Welcome,
+    // and a connection that arrives before the loop below waits in the backlog.
+    let control = bind(env, GUEST_CONTROL_SOCK, 0o600)?;
+    let local = bind(env, GUEST_LOCAL_SOCK, 0o666)?;
+    // A fresh process with the marker present was restarted (or the VM
+    // rebooted): it hellos `set_up: true`, so the host does not set it up
+    // again, but the agent of the earlier process is gone. Say so first.
+    let restarted = env.path(SETUP_MARKER).exists();
     let conn = events::hello(env).map_err(|e| {
         let m = e.into_message();
         eprintln!("saiife-guest: {m}");
         m
     })?;
-    let control = bind(env, GUEST_CONTROL_SOCK, 0o600)?;
-    let local = bind(env, GUEST_LOCAL_SOCK, 0o666)?;
     let signals = Arc::new(Signals::default());
     let fatal = Arc::new(Mutex::new(None));
     let (notes, rx) = mpsc::channel();
+    if restarted {
+        let _ = notes.send(Note::Exited(None));
+    }
     {
         let (env, signals, fatal) = (env.clone(), signals.clone(), fatal.clone());
         thread::Builder::new()

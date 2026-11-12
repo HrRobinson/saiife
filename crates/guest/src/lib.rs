@@ -14,6 +14,12 @@ pub use saiife_boxproto::msg::Event;
 
 /// The service main (`saiife __guest init`). Returns only on a fatal error;
 /// systemd restarts it.
+///
+/// A restarted init (the setup marker exists but this process never spawned
+/// an agent) hellos `set_up: true`, so the host does not set the box up again,
+/// and then reports `Exited { code: None }` first: the earlier agent died with
+/// the earlier process (its PTY master was that process's). A re-hello within
+/// one process (the events link dropped and came back) reports nothing extra.
 pub fn run_init(env: &GuestEnv) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     return control::run(env);

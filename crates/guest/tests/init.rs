@@ -741,8 +741,81 @@ fn rehello_reports_set_up() {
     // A guest restarted after its setup: the marker is there.
     let h = host_with(fast(), true);
     let _init = start(&h.env);
-    let (_s, ev) = hello(&h);
+    let (mut s, ev) = hello(&h);
     assert!(matches!(ev, Event::Hello { set_up: true, .. }), "{ev:?}");
+    write_msg(
+        &mut s,
+        &HostReply::Welcome {
+            proto: PROTO.into(),
+        },
+    )
+    .unwrap();
+    // This process never ran the agent: the earlier one's is gone.
+    assert_eq!(next_event(&mut s, T), Some(Event::Exited { code: None }));
+}
+
+#[test]
+fn restarted_init_reports_exited() {
+    let h = host();
+    let (mut first, _pty) = running(&h, &["/bin/sh", "-c", "echo a; sleep 3"]);
+    assert_eq!(next_event(&mut first, T), Some(Event::Started));
+    // A second init against the same root (systemd restarted the service).
+    let _second = start(&h.env);
+    let (mut s, ev) = hello(&h);
+    assert!(matches!(ev, Event::Hello { set_up: true, .. }), "{ev:?}");
+    write_msg(
+        &mut s,
+        &HostReply::Welcome {
+            proto: PROTO.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(next_event(&mut s, T), Some(Event::Exited { code: None }));
+    // Nothing else follows from the new process.
+    assert_eq!(next_event(&mut s, Duration::from_millis(500)), None);
+}
+
+#[test]
+fn setup_right_after_welcome() {
+    let h = host();
+    let _init = start(&h.env);
+    let _ev = welcomed(&h);
+    // No retry, no sleep: control.sock is up before the hello.
+    let mut c = UnixStream::connect(h.env.path(GUEST_CONTROL_SOCK)).unwrap();
+    c.set_read_timeout(Some(T)).unwrap();
+    write_msg(
+        &mut c,
+        &Request::Setup(setup(&["/bin/sh", "-c", "sleep 1"])),
+    )
+    .unwrap();
+    let r: Reply = read_msg(&mut c).unwrap().unwrap();
+    assert_eq!(r, Reply::Ok);
+}
+
+#[test]
+fn exited_survives_a_dropped_link() {
+    let h = host();
+    let (ev, _pty) = running(&h, &["/bin/sh", "-c", "sleep 1; exit 4"]);
+    // The link drops just before the agent exits.
+    drop(ev);
+    thread::sleep(Duration::from_millis(900));
+    let (mut s, e) = hello(&h);
+    assert!(matches!(e, Event::Hello { set_up: true, .. }), "{e:?}");
+    write_msg(
+        &mut s,
+        &HostReply::Welcome {
+            proto: PROTO.into(),
+        },
+    )
+    .unwrap();
+    let until = Instant::now() + T;
+    let mut got = None;
+    while Instant::now() < until && got.is_none() {
+        if let Some(Event::Exited { code }) = next_event(&mut s, Duration::from_millis(200)) {
+            got = Some(code);
+        }
+    }
+    assert_eq!(got, Some(Some(4)));
 }
 
 #[test]
