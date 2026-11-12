@@ -168,7 +168,7 @@ jobs:
             echo "::warning::managed hook bench round $round of 3 over the 50 ms p95 budget"
           done
           exit 1
-      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin, saiife-win, saiife-wire and saiife-boxes must not
+      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin, saiife-win, saiife-wire, saiife-boxes, saiife-boxhost, saiife-boxproto and saiife-guest must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
         if: ${{ success() || (!cancelled() && matrix.os == 'windows-latest') }}

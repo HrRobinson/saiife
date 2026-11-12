@@ -1693,6 +1693,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-boxhost"
+version = "0.2.0"
+dependencies = [
+ "saiife-boxproto",
+ "tempfile",
+]
+
+[[package]]
+name = "saiife-boxproto"
+version = "0.2.0"
+
+[[package]]
 name = "saiife-broker"
 version = "0.2.0"
 dependencies = [
@@ -1799,6 +1811,13 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+]
+
+[[package]]
+name = "saiife-guest"
+version = "0.2.0"
+dependencies = [
+ "saiife-boxproto",
 ]
 
 [[package]]
