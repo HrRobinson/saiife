@@ -79,11 +79,14 @@ pub trait VmHooks: Send + Sync {
 }
 
 /// The stop ladder: wait `power_s` after the power button, then
-/// `shutdown_s` after `vmm.shutdown`, then force-stop.
+/// `shutdown_s` after `vmm.shutdown`, then force-stop and wait up to
+/// `force_s` for the launcher to see the exit (a unit's StopUnit returns
+/// once the job is queued; systemd's own TimeoutStopSec is 30 s).
 #[derive(Debug, Clone, Copy)]
 pub struct StopTimes {
     pub power_s: u64,
     pub shutdown_s: u64,
+    pub force_s: u64,
 }
 
 impl Default for StopTimes {
@@ -91,9 +94,13 @@ impl Default for StopTimes {
         StopTimes {
             power_s: 60,
             shutdown_s: 30,
+            force_s: 35,
         }
     }
 }
+
+/// How often the force-stop wait asks the launcher.
+const FORCE_POLL: Duration = Duration::from_millis(250);
 
 pub struct ChVmmInit {
     pub layout: Layout,
@@ -239,6 +246,35 @@ fn remove_sockets(paths: &BoxPaths) {
     }
 }
 
+/// `mem_mib` from the handle `create` made (daemon-stored, unlike vm.json).
+fn handle_mem_mib(h: &VmHandle) -> Result<u64, VmmError> {
+    serde_json::from_str::<serde_json::Value>(&h.data)
+        .ok()
+        .and_then(|v| v.get("mem_mib")?.as_u64())
+        .ok_or_else(|| VmmError::Failed("the box handle has no mem_mib; recreate the box".into()))
+}
+
+/// Locked mode: the overlay the daemon just made is read and written by
+/// the VMM user through the group (0660, I5). Set through an fd opened
+/// without following links; only a regular file with one link is touched.
+fn group_writable(p: &Path) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags, CWD};
+    let fd = rustix::fs::openat(
+        CWD,
+        p,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{}: {e}", p.display()))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| e.to_string())?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile
+        || st.st_nlink != 1
+    {
+        return Err(format!("{} is not a plain file", p.display()));
+    }
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o660)).map_err(|e| e.to_string())
+}
+
 fn map_state(s: VmState) -> VmStatus {
     match s {
         VmState::Created => VmStatus::Created,
@@ -260,14 +296,37 @@ impl ChVmmInit {
     }
 
     fn wait_exit(&self, run: &Run, until: Instant) -> bool {
+        self.wait_exit_every(run, until, POLL)
+    }
+
+    fn wait_exit_every(&self, run: &Run, until: Instant, step: Duration) -> bool {
         loop {
             if self.gone(&run.id) {
                 return true;
             }
-            if Instant::now() >= until {
+            let now = Instant::now();
+            if now >= until {
                 return false;
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(step.min(until - now));
+        }
+    }
+
+    /// A run whose reaper ended without seeing the exit: once the launcher
+    /// says the VMM is gone, confirm it and run `after_off`, exactly once
+    /// (the reaper is done, and the flag is taken by compare-exchange).
+    fn settle(&self, run: &Run) {
+        if !run.done() || run.off() || !self.gone(&run.id) {
+            return;
+        }
+        if run
+            .confirmed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            log(&run.id, "the VMM has stopped after all");
+            self.after_off(&run.id);
+            remove_sockets(&run.paths);
         }
     }
 
@@ -322,6 +381,9 @@ impl ChVmmInit {
         if let Err(e) = self.launcher.force_stop(&run.id) {
             log(&run.id, &format!("force stop: {e}"));
         }
+        // A unit's stop job may still be running: wait for it, bounded.
+        let until = Instant::now() + Duration::from_secs(self.stop.force_s);
+        self.wait_exit_every(run, until, FORCE_POLL);
     }
 
     /// The reaper: watch for the exit (or a stop request), run the ladder,
@@ -352,6 +414,7 @@ impl ChVmmInit {
             remove_sockets(&run.paths);
             run.confirmed.store(true, Ordering::SeqCst);
         } else {
+            // `ChVmm::settle` confirms it later (status, stop, boot, destroy).
             log(&run.id, "the VMM did not stop; it may still be running");
         }
         run.done.store(true, Ordering::SeqCst);
@@ -408,6 +471,16 @@ impl ChVmm {
 
     fn runs(&self) -> std::sync::MutexGuard<'_, BTreeMap<BoxId, Slot>> {
         self.runs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `ChVmmInit::settle` for the box's done, unconfirmed run, if any
+    /// (the hooks run outside the map lock).
+    fn settle(&self, id: &BoxId) {
+        let run = match self.runs().get(id) {
+            Some(Slot::Run(e)) if e.run.done() && !e.run.off() => Arc::clone(&e.run),
+            _ => return,
+        };
+        self.inner.settle(&run);
     }
 
     fn spawn_reaper(&self, id: &BoxId, paths: BoxPaths, stopping: bool) -> Result<Entry, VmmError> {
@@ -583,6 +656,9 @@ impl Vmm for ChVmm {
         if std::fs::symlink_metadata(&root).is_err() {
             make_overlay(&inner.tools, &image.raw, &root, spec.size.disk_gib)
                 .map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
+            if inner.layout.locked {
+                group_writable(&root).map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
+            }
         }
         // `restore` is decided at boot, from the marker (S1).
         let ls = LaunchSpec {
@@ -598,9 +674,12 @@ impl Vmm for ChVmm {
             restore: None,
         };
         write_spec(&ls, &paths).map_err(VmmError::Failed)?;
+        // mem_mib bounds the snapshot copy (`snapshot::seal`); the
+        // VMM-writable vm.json is not asked for it.
         let data = serde_json::json!({
             "launcher": inner.launcher.kind(),
             "image": image.id,
+            "mem_mib": spec.size.mem_mib,
         });
         Ok(VmHandle {
             id: spec.id.clone(),
@@ -613,6 +692,8 @@ impl Vmm for ChVmm {
     /// for its API socket and returns; the guest's readiness arrives later.
     fn boot(&self, h: &VmHandle) -> Result<(), VmmError> {
         let paths = self.inner.paths(&h.id);
+        // an earlier run that is gone by now gets its after_off first
+        self.settle(&h.id);
         let old = {
             let mut g = self.runs();
             match g.get(&h.id) {
@@ -664,6 +745,7 @@ impl Vmm for ChVmm {
     /// Asks for the stop and returns; the reaper sends the power button and
     /// escalates (`StopTimes`). During a boot, the stop follows the start.
     fn stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.settle(&h.id);
         {
             let mut g = self.runs();
             match g.get_mut(&h.id) {
@@ -702,25 +784,25 @@ impl Vmm for ChVmm {
             Ok(_) => return Err(VmmError::Failed("pause first".into())),
             Err(e) => return Err(failed_api(e)),
         }
+        let mem_mib = handle_mem_mib(h)?;
         snapshot::discard(&inner.layout.vault, &h.id).map_err(VmmError::Failed)?;
-        match std::fs::remove_dir_all(dest) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(VmmError::Failed(format!("remove the old snapshot: {e}"))),
-        }
+        // emptied by fd, never removed: Landlock's rule is bound to the dir
+        snapshot::clear_dir(&paths).map_err(VmmError::Failed)?;
         api.snapshot(dest).map_err(failed_api)?;
-        snapshot::seal(&inner.layout.vault, &h.id, &paths, inner.vmm_uid).map_err(VmmError::Failed)
+        snapshot::seal(&inner.layout.vault, &h.id, &paths, inner.vmm_uid, mem_mib)
+            .map_err(VmmError::Failed)
     }
 
     fn status(&self, h: &VmHandle) -> VmStatus {
         if matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             return VmStatus::Running;
         }
+        self.settle(&h.id);
         self.inner.status_of(&h.id, &self.inner.paths(&h.id))
     }
 
     /// Stops the VM if needed, waits for its reaper (at most
-    /// `power_s + shutdown_s + 5` s) and forgets the run. Never deletes
+    /// `power_s + shutdown_s + force_s + 5` s) and forgets the run. Never deletes
     /// files. Fails, keeping the run, when the exit was not confirmed: the
     /// store must not remove the dir under a live VMM.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
@@ -746,7 +828,7 @@ impl Vmm for ChVmm {
             }
         };
         let s = self.inner.stop;
-        let until = Instant::now() + Duration::from_secs(s.power_s + s.shutdown_s + 5);
+        let until = Instant::now() + Duration::from_secs(s.power_s + s.shutdown_s + s.force_s + 5);
         while !e.run.done() {
             if Instant::now() >= until {
                 log(&h.id, "the VMM has not stopped yet");
@@ -755,12 +837,9 @@ impl Vmm for ChVmm {
             }
             std::thread::sleep(POLL);
         }
-        if !e.run.off()
-            && !matches!(
-                self.inner.status_of(&h.id, &e.run.paths),
-                VmStatus::Off | VmStatus::Gone
-            )
-        {
+        // gone by now: confirmed here, with its after_off
+        self.inner.settle(&e.run);
+        if !e.run.off() {
             self.runs().entry(h.id.clone()).or_insert(Slot::Run(e));
             return Err(VmmError::Failed(
                 "the VMM did not stop; it may still be running".into(),

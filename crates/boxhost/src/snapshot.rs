@@ -6,7 +6,8 @@
 //! in `<vault>/<id>.marker`.
 //! At boot `verify` re-hashes the vault copy, compares, and runs
 //! `check_config` on the very bytes it hashed; the restore reads only that
-//! copy. The box dir's `snapshot/` is never a restore source.
+//! copy. The box dir's `snapshot/` is never a restore source; it is made
+//! before the VMM starts (`launch::ensure_snapshot_dir`) and only emptied.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -24,8 +25,12 @@ use crate::launch::{Boot, LaunchSpec};
 use crate::paths::BoxPaths;
 use crate::vault::{self, euid, marker_path, read_bounded, snap_dir};
 
-/// `config.json` larger than this is refused (it is parsed in memory).
+/// `config.json` larger than this is refused (it is parsed in memory);
+/// `state.json` is held to the same cap.
 pub const MAX_CONFIG: u64 = 16 * 1024 * 1024;
+/// A snapshot may hold the guest memory plus this much (I8): beyond it the
+/// copy into the vault (on /var in locked mode) is refused, not made.
+pub const SLACK_MIB: u64 = 64;
 /// A snapshot with more entries than this is refused.
 pub const MAX_FILES: usize = 64;
 const MAX_MARKER: u64 = 64 * 1024;
@@ -149,10 +154,47 @@ fn list_fd(dir: &OwnedFd) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// The most bytes a snapshot of a `mem_mib` MiB guest may hold in all.
+pub fn max_total(mem_mib: u64) -> u64 {
+    mem_mib.saturating_add(SLACK_MIB).saturating_mul(1 << 20)
+}
+
+/// Empty the box's `snapshot/` before a new `vm.snapshot`, by fd: the box
+/// dir and `snapshot` are opened O_DIRECTORY|O_NOFOLLOW (a symlink is
+/// refused, never followed) and each entry, at most `MAX_FILES`, is
+/// unlinked (unlinkat removes a link, never its target). The dir itself
+/// stays: the VMM's Landlock rule is bound to it (I4). A missing dir or a
+/// subdirectory is refused.
+pub fn clear_dir(paths: &BoxPaths) -> Result<(), String> {
+    let boxfd = open_dir_at(CWD, &paths.dir).map_err(|e| format!("box dir: {e}"))?;
+    let dir = open_dir_at(&boxfd, Path::new("snapshot")).map_err(|e| {
+        format!("snapshot: not a directory ({e}); a symlink is refused, a missing one is made when the VMM starts")
+    })?;
+    for n in list_fd(&dir)? {
+        let st = rustix::fs::statat(&dir, n.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| format!("snapshot entry {n}: {e}"))?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory {
+            return Err(format!("snapshot entry {n}: a directory"));
+        }
+        rustix::fs::unlinkat(&dir, n.as_str(), AtFlags::empty())
+            .map_err(|e| format!("snapshot entry {n}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Copy one VMM-written file into the vault copy, hashing as it goes. The
 /// source is opened relative to the snapshot dir's fd, never followed, never
-/// blocking; it must be a regular file of the VMM user with one link.
-fn copy_entry(src: &OwnedFd, dst: &OwnedFd, name: &str, vmm_uid: u32) -> Result<String, String> {
+/// blocking; it must be a regular file of the VMM user with one link, of at
+/// most `cap` bytes (fstat, checked before a byte is copied) and within
+/// what is left of `budget`; no more than that fstat size is ever read.
+fn copy_entry(
+    src: &OwnedFd,
+    dst: &OwnedFd,
+    name: &str,
+    vmm_uid: u32,
+    cap: u64,
+    budget: &mut u64,
+) -> Result<String, String> {
     let bad = |why: String| format!("snapshot entry {name}: {why}");
     let fd = rustix::fs::openat(
         src,
@@ -172,6 +214,13 @@ fn copy_entry(src: &OwnedFd, dst: &OwnedFd, name: &str, vmm_uid: u32) -> Result<
     if m.nlink() != 1 {
         return Err(bad("hard-linked".into()));
     }
+    let limit = cap.min(*budget);
+    if m.len() > limit {
+        return Err(bad(format!(
+            "larger than {limit} bytes (the box's memory plus {SLACK_MIB} MiB in all)"
+        )));
+    }
+    *budget -= m.len();
     let out = rustix::fs::openat(
         dst,
         name,
@@ -206,9 +255,18 @@ fn copy_entry(src: &OwnedFd, dst: &OwnedFd, name: &str, vmm_uid: u32) -> Result<
 /// `<vault>/<id>.snap` (mkdirat; files O_CREAT|O_EXCL, fchmod 0640, dir
 /// 0750), hashed while copying; the marker is written last. Nothing is
 /// renamed or chmodded by path, so this also works when the dir belongs to
-/// the locked-mode VMM user. The source files are then removed
-/// (best effort, by fd).
-pub fn seal(vault: &Path, id: &BoxId, paths: &BoxPaths, vmm_uid: u32) -> Result<(), String> {
+/// the locked-mode VMM user. The source files are then removed (best
+/// effort, by fd); the `snapshot` dir itself stays (its inode carries the
+/// VMM's Landlock rule). The whole copy is capped at `max_total(mem_mib)`
+/// bytes, `config.json` and `state.json` at `MAX_CONFIG` each, all checked
+/// on the fstat size before copying.
+pub fn seal(
+    vault: &Path,
+    id: &BoxId,
+    paths: &BoxPaths,
+    vmm_uid: u32,
+    mem_mib: u64,
+) -> Result<(), String> {
     vault::ensure(vault)?;
     discard(vault, id)?;
     let boxfd = open_dir_at(CWD, &paths.dir).map_err(|e| format!("box dir: {e}"))?;
@@ -232,8 +290,15 @@ pub fn seal(vault: &Path, id: &BoxId, paths: &BoxPaths, vmm_uid: u32) -> Result<
     let copied = (|| -> Result<BTreeMap<String, String>, String> {
         let dst = open_dir_at(&vfd, Path::new(&leaf)).map_err(|e| format!("vault copy: {e}"))?;
         let mut files = BTreeMap::new();
+        let mut budget = max_total(mem_mib);
         for n in &names {
-            files.insert(n.clone(), copy_entry(&src, &dst, n, vmm_uid)?);
+            let cap = if n == "memory-ranges" {
+                u64::MAX
+            } else {
+                MAX_CONFIG
+            };
+            let h = copy_entry(&src, &dst, n, vmm_uid, cap, &mut budget)?;
+            files.insert(n.clone(), h);
         }
         rustix::fs::fchmod(&dst, Mode::from_raw_mode(0o750))
             .map_err(|e| format!("vault copy: {e}"))?;
@@ -250,7 +315,6 @@ pub fn seal(vault: &Path, id: &BoxId, paths: &BoxPaths, vmm_uid: u32) -> Result<
     for n in &names {
         let _ = rustix::fs::unlinkat(&src, n.as_str(), AtFlags::empty());
     }
-    let _ = rustix::fs::unlinkat(&boxfd, "snapshot", AtFlags::REMOVEDIR);
     let body = serde_json::to_vec(&Marker { version: 2, files }).map_err(|e| e.to_string())?;
     vault::write_atomic(&marker_path(vault, id), &body)
 }

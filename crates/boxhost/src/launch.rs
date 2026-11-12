@@ -370,7 +370,8 @@ pub trait Launcher: Send + Sync {
 /// writable, so the path may be anything: a symlink is refused (O_NOFOLLOW;
 /// the target is never touched), a FIFO or other non-regular file never
 /// blocks the open (O_NONBLOCK) and, like a file owned by someone else, is
-/// unlinked and created afresh (O_EXCL). Used by `ChildLauncher` and by
+/// unlinked and created afresh (O_EXCL); so is a hard-linked one, whose
+/// other name is left alone. Used by `ChildLauncher` and by
 /// `saiife __box-vmm`.
 pub fn open_ch_log(p: &Path) -> Result<std::fs::File, String> {
     use rustix::fs::OFlags;
@@ -390,7 +391,7 @@ pub fn open_ch_log(p: &Path) -> Result<std::fs::File, String> {
     let euid = rustix::process::geteuid().as_raw();
     let ours = |f: &std::fs::File| {
         f.metadata()
-            .is_ok_and(|m| m.file_type().is_file() && m.uid() == euid)
+            .is_ok_and(|m| m.file_type().is_file() && m.uid() == euid && m.nlink() == 1)
     };
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -424,6 +425,33 @@ pub fn open_ch_log(p: &Path) -> Result<std::fs::File, String> {
         ));
     }
     Ok(f)
+}
+
+/// `<dir>/snapshot`, the path of the Landlock `rw` rule. Landlock binds a
+/// rule to the inode when the VM is made, so the dir exists before the VMM
+/// starts and is afterwards only emptied, never removed
+/// (`snapshot::clear_dir`, `snapshot::seal`). Made 0770 by the process
+/// that execs the VMM (the helper runs as the VMM user, so `seal`'s owner
+/// check holds). A symlink or non-directory there is refused, never
+/// followed; an existing dir must be ours. Every step is relative to the
+/// box dir's fd.
+pub fn ensure_snapshot_dir(paths: &BoxPaths) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags, CWD};
+    let bad = |e: String| format!("snapshot: {}: {e}", paths.snapshot_dir().display());
+    let dir = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let boxfd = rustix::fs::openat(CWD, &paths.dir, dir, Mode::empty())
+        .map_err(|e| format!("box dir: {}: {e}", paths.dir.display()))?;
+    match rustix::fs::mkdirat(&boxfd, "snapshot", Mode::from_raw_mode(0o770)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(bad(e.to_string())),
+    }
+    let fd = rustix::fs::openat(&boxfd, "snapshot", dir, Mode::empty())
+        .map_err(|e| bad(format!("not a directory ({e}); a symlink is refused")))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| bad(e.to_string()))?;
+    if st.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(bad("not owned by the VMM user".into()));
+    }
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o770)).map_err(|e| bad(e.to_string()))
 }
 
 enum Mode {
@@ -546,6 +574,8 @@ impl ChildLauncher {
             }
             Mode::Direct => {
                 let spec = read_spec(paths)?;
+                // the helper does this in Helper mode, as the VMM user
+                ensure_snapshot_dir(paths)?;
                 c.args(argv(&spec, paths));
             }
         }
@@ -869,12 +899,9 @@ mod tests {
     }
 
     fn env() -> Env {
-        let t = tempfile::tempdir_in(
-            std::env::var_os("SAIIFE_TEST_TMP")
-                .unwrap_or_else(|| "/".into())
-                .as_os_str(),
-        );
-        let t = t.unwrap();
+        let base =
+            std::env::var_os("SAIIFE_TEST_TMP").map_or_else(std::env::temp_dir, PathBuf::from);
+        let t = tempfile::tempdir_in(base).unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         for d in ["boxes", "images", "vmm", "vault", "elsewhere"] {
             std::fs::create_dir(root.join(d)).unwrap();
@@ -1311,5 +1338,53 @@ mod tests {
         let on = |k: &str| (k == "SAIIFE_TEST_NO_PIN").then(|| OsString::from("1"));
         assert_eq!(pin_check_skipped(&on), cfg!(debug_assertions));
         assert!(!pin_check_skipped(&|_| None));
+    }
+
+    /// A ch.log hard-linked to a file elsewhere is replaced, never appended
+    /// to: the other name keeps its bytes.
+    #[test]
+    fn hard_linked_ch_log_is_replaced() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let e = env();
+        let p = mkbox(&e, "b1");
+        let other = e.root.join("elsewhere/kept");
+        std::fs::write(&other, b"keep").unwrap();
+        std::fs::hard_link(&other, p.ch_log()).unwrap();
+        let mut f = open_ch_log(&p.ch_log()).unwrap();
+        f.write_all(b"log").unwrap();
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep");
+        assert_eq!(std::fs::metadata(&other).unwrap().nlink(), 1);
+        assert_eq!(std::fs::read(p.ch_log()).unwrap(), b"log");
+    }
+
+    /// The snapshot dir the Landlock rule names is made before the VMM
+    /// starts (0770, ours), kept when it is there, and refused when it is a
+    /// symlink or not a directory.
+    #[test]
+    fn snapshot_dir_is_made_kept_or_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let e = env();
+        let p = mkbox(&e, "b1");
+        let d = p.snapshot_dir();
+        ensure_snapshot_dir(&p).unwrap();
+        let m = std::fs::symlink_metadata(&d).unwrap();
+        assert!(m.file_type().is_dir());
+        assert_eq!(m.mode() & 0o7777, 0o770);
+        assert_eq!(m.uid(), rustix::process::geteuid().as_raw());
+        std::fs::write(d.join("x"), b"x").unwrap();
+        ensure_snapshot_dir(&p).unwrap();
+        assert_eq!(std::fs::symlink_metadata(&d).unwrap().ino(), m.ino());
+        std::fs::remove_file(d.join("x")).unwrap();
+        std::fs::remove_dir(&d).unwrap();
+        let target = e.root.join("elsewhere");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, &d).unwrap();
+        assert!(ensure_snapshot_dir(&p).unwrap_err().contains("snapshot"));
+        // the target's mode is untouched (nothing is chmodded through a link)
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o700);
+        std::fs::remove_file(&d).unwrap();
+        std::fs::write(&d, b"x").unwrap();
+        assert!(ensure_snapshot_dir(&p).unwrap_err().contains("snapshot"));
     }
 }

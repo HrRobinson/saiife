@@ -1,4 +1,4 @@
-#![cfg(feature = "fake")]
+#![cfg(all(unix, feature = "fake"))]
 //! `ChVmm` against `saiife-fake-ch` (plan 35, Task 5). No real VMM runs.
 
 use std::os::unix::fs::PermissionsExt;
@@ -167,6 +167,7 @@ impl World {
             stop: StopTimes {
                 power_s: 1,
                 shutdown_s: 1,
+                force_s: 2,
             },
         }))
     }
@@ -223,8 +224,8 @@ impl World {
             "and the vault copy"
         );
         assert!(
-            !self.paths(id).snapshot_dir().exists(),
-            "moved out of the box dir"
+            is_empty_dir(&self.paths(id).snapshot_dir()),
+            "copied out of the box dir, which is kept empty"
         );
         v.destroy(&h).unwrap();
         std::fs::remove_file(self.paths(id).dir.join("fake-ch.argv")).unwrap();
@@ -344,7 +345,7 @@ fn create_writes_spec_and_overlay() {
     let data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
     assert_eq!(
         data,
-        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}")})
+        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096})
     );
     let p = w.paths("b1");
     assert_eq!(std::fs::read_to_string(p.root_disk()).unwrap(), "qcow\n");
@@ -575,14 +576,14 @@ fn snapshot_needs_pause() {
     let p = w.paths("b1");
     let m = failed(v.snapshot(&h, &p.snapshot_dir()));
     assert!(m.contains("pause first"), "{m}");
-    std::fs::create_dir(p.snapshot_dir()).unwrap();
+    // the launcher made the dir; a stale file in it is cleared first
     std::fs::write(p.snapshot_dir().join("stale"), b"x").unwrap();
     v.pause(&h).unwrap();
     v.snapshot(&h, &p.snapshot_dir()).unwrap();
     // sealed into the vault, read-only, the stale file gone
     let snap = w.snap("b1");
     assert!(snap.join("config.json").exists());
-    assert!(!snap.join("stale").exists() && !p.snapshot_dir().exists());
+    assert!(!snap.join("stale").exists() && is_empty_dir(&p.snapshot_dir()));
     let mode = |q: &Path| std::fs::metadata(q).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&snap), 0o750);
     assert_eq!(mode(&snap.join("memory-ranges")), 0o640);
@@ -1148,7 +1149,7 @@ fn seal_checks_the_vmm_uid_and_copies() {
     let m = failed(v.snapshot(&h, &w.paths("b1").snapshot_dir()));
     assert!(m.contains("owner"), "{m}");
     assert!(!w.marker("b1").exists());
-    // with the right uid: a daemon-owned copy, the source dir removed
+    // with the right uid: a daemon-owned copy, the source dir emptied
     let (v, _l) = w.vmm(&[]);
     let h = w.create(&v, "b2");
     v.boot(&h).unwrap();
@@ -1156,7 +1157,7 @@ fn seal_checks_the_vmm_uid_and_copies() {
     v.snapshot(&h, &w.paths("b2").snapshot_dir()).unwrap();
     let meta = std::fs::metadata(w.snap("b2").join("state.json")).unwrap();
     assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), me);
-    assert!(!w.paths("b2").snapshot_dir().exists());
+    assert!(is_empty_dir(&w.paths("b2").snapshot_dir()));
 }
 
 #[test]
@@ -1204,4 +1205,186 @@ fn starting_record_fails_closed() {
     let m = failed(v.boot(&h));
     assert!(m.contains("b1.pid"), "{m}");
     std::fs::remove_file(w.pid_record("b1")).unwrap();
+}
+
+fn ino(p: &Path) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(&std::fs::symlink_metadata(p).unwrap())
+}
+
+fn is_empty_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir())
+        && std::fs::read_dir(p).unwrap().next().is_none()
+}
+
+/// Landlock binds its rule to the snapshot dir's inode when the VM is made:
+/// the launcher makes the dir, and snapshot and seal only empty it.
+#[test]
+fn snapshot_dir_survives_seal_and_a_second_snapshot() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    let dir = w.paths("b1").snapshot_dir();
+    assert!(is_empty_dir(&dir), "the launcher made the snapshot dir");
+    let before = ino(&dir);
+    v.pause(&h).unwrap();
+    v.snapshot(&h, &dir).unwrap();
+    assert!(is_empty_dir(&dir), "seal empties, never removes");
+    assert_eq!(ino(&dir), before);
+    std::fs::write(dir.join("stale"), b"x").unwrap();
+    v.snapshot(&h, &dir).unwrap();
+    assert!(is_empty_dir(&dir));
+    assert_eq!(ino(&dir), before);
+    assert!(w.snap("b1").join("config.json").exists());
+    assert!(!w.snap("b1").join("stale").exists());
+}
+
+#[test]
+fn snapshot_dir_symlink_is_refused() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    v.pause(&h).unwrap();
+    let target = w.root.join("t/elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    let keep = outside(&w, "elsewhere/keep");
+    let dir = w.paths("b1").snapshot_dir();
+    std::fs::remove_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(&target, &dir).unwrap();
+    let m = failed(v.snapshot(&h, &dir));
+    assert!(m.contains("snapshot"), "{m}");
+    assert_eq!(std::fs::read(&keep).unwrap(), b"keep");
+    assert!(!w.marker("b1").exists());
+}
+
+/// Locked mode: the VMM user is in the group, the overlay must be
+/// group-writable (0660), set through an fd.
+#[test]
+fn locked_overlay_is_group_read_writable() {
+    let mut w = World::new();
+    w.layout.locked = true;
+    let (v, _l) = w.vmm(&[]);
+    let _h = w.create(&v, "b1");
+    assert_eq!(mode_of(&w.paths("b1").root_disk()), 0o660);
+    // personal mode leaves the tool's mode alone
+    w.layout.locked = false;
+    let (v, _l) = w.vmm(&[]);
+    let _h = w.create(&v, "b2");
+    assert_ne!(mode_of(&w.paths("b2").root_disk()) & 0o060, 0o060);
+}
+
+/// A memory-ranges larger than the box's memory plus slack is refused
+/// before it is copied (a host disk-fill), and nothing lands in the vault.
+#[test]
+fn seal_refuses_an_oversized_memory_file() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[("FAKE_CH_SNAP_EVIL", "huge:577")]);
+    let mut spec = w.spec("b1");
+    spec.size.mem_mib = 512;
+    let h = v.create(&spec).unwrap();
+    w.track(&v, &h);
+    v.boot(&h).unwrap();
+    v.pause(&h).unwrap();
+    let t = Instant::now();
+    let m = failed(v.snapshot(&h, &w.paths("b1").snapshot_dir()));
+    assert!(m.contains("memory-ranges") && m.contains("larger"), "{m}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(!w.marker("b1").exists());
+    assert!(!w.snap("b1").exists());
+}
+
+/// A unit bus whose `stop` only queues the job, as StopUnit "replace"
+/// does: the unit stays active for `delay` after the call. `start` runs
+/// the fake CH as a child so the API socket appears.
+struct QueuedStopBus {
+    fake: FakeUnitBus,
+    child: Arc<ChildLauncher>,
+    paths: BoxPaths,
+    id: BoxId,
+    delay: Duration,
+    active: Arc<Mutex<bool>>,
+}
+
+impl saiife_boxhost::launch::UnitBus for QueuedStopBus {
+    fn start(&self, unit: &str) -> Result<(), String> {
+        self.fake.start(unit)?;
+        self.child.start(&self.id, &self.paths)?;
+        *self.active.lock().unwrap() = true;
+        Ok(())
+    }
+    fn stop(&self, unit: &str) -> Result<(), String> {
+        self.fake.stop(unit)?;
+        let (active, child, id, delay) = (
+            Arc::clone(&self.active),
+            Arc::clone(&self.child),
+            self.id.clone(),
+            self.delay,
+        );
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = child.force_stop(&id);
+            *active.lock().unwrap() = false;
+        });
+        Ok(())
+    }
+    fn active(&self, unit: &str) -> Result<bool, String> {
+        self.fake.active(unit)?;
+        Ok(*self.active.lock().unwrap())
+    }
+}
+
+fn queued_vmm(w: &World, delay: Duration) -> (Arc<ChVmm>, VmHandle) {
+    // the fake ignores the power button and vmm.shutdown alike
+    let child = w.launcher(&[("FAKE_CH_HANG", "1")]);
+    let id = BoxId::parse("b1").unwrap();
+    let bus = Arc::new(QueuedStopBus {
+        fake: FakeUnitBus::new(),
+        child,
+        paths: w.paths("b1"),
+        id,
+        delay,
+        active: Arc::new(Mutex::new(false)),
+    });
+    let v = w.vmm_with(Arc::new(UnitLauncher::new(bus)), vec![w.hook("h", false)]);
+    let h = w.create(&v, "b1");
+    (v, h)
+}
+
+fn offs(w: &World) -> usize {
+    w.events().iter().filter(|e| *e == "h.off").count()
+}
+
+/// The force stop returns once the job is queued; the reaper waits (bounded)
+/// for the unit to go inactive and then runs after_off.
+#[test]
+fn unit_force_stop_waits_for_the_queued_job() {
+    let w = World::new();
+    let (v, h) = queued_vmm(&w, Duration::from_secs(1));
+    v.boot(&h).unwrap();
+    v.stop(&h).unwrap();
+    v.destroy(&h).unwrap();
+    assert_eq!(offs(&w), 1, "{:?}", w.events());
+}
+
+/// A unit that goes inactive only after the bound: destroy fails (the exit
+/// is unconfirmed, the dir is kept), and once it is gone the next status
+/// confirms it and runs after_off exactly once.
+#[test]
+fn a_late_exit_still_gets_after_off_once() {
+    let w = World::new();
+    let (v, h) = queued_vmm(&w, Duration::from_secs(5));
+    v.boot(&h).unwrap();
+    v.stop(&h).unwrap();
+    assert!(v.destroy(&h).is_err());
+    assert_eq!(offs(&w), 0, "{:?}", w.events());
+    assert!(wait_for(LONG, || matches!(
+        v.status(&h),
+        VmStatus::Off | VmStatus::Gone
+    )));
+    assert!(wait_for(Duration::from_secs(2), || offs(&w) == 1));
+    let _ = v.status(&h);
+    v.stop(&h).unwrap();
+    v.destroy(&h).unwrap();
+    assert_eq!(offs(&w), 1, "{:?}", w.events());
 }
