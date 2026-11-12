@@ -70,11 +70,11 @@ struct RawBoot {
 
 const UNPINNED: &str = "UNPINNED";
 
-fn is_sha256(s: &str) -> bool {
+pub(crate) fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn valid_apt_name(s: &str) -> bool {
+pub(crate) fn valid_apt_name(s: &str) -> bool {
     let b = s.as_bytes();
     if b.is_empty() || b.len() > 63 {
         return false;
@@ -86,7 +86,7 @@ fn valid_apt_name(s: &str) -> bool {
         })
 }
 
-fn parse_pinned_image(s: &str) -> Result<PinnedImage, String> {
+pub(crate) fn parse_pinned_image(s: &str) -> Result<PinnedImage, String> {
     let (name, digest) = s
         .split_once("@sha256:")
         .ok_or_else(|| format!("images.pull: {s:?} must be name@sha256:<64 hex>"))?;
