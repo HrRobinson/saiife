@@ -65,6 +65,7 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/home"
 
 # Runs inside the container as the invoking user.
+# shellcheck disable=SC2016 # expanded by the inner shell
 inner='set -euo pipefail
 export HOME=/work/home CARGO_HOME=/work/cargo RUSTUP_HOME=/work/rustup CARGO_TARGET_DIR=/work/target
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -80,6 +81,7 @@ install -m 0755 "$CARGO_TARGET_DIR/release/saiife-fido" /out/saiife-fido'
 
 # apt needs root, so the container starts as root, installs the packages, then
 # drops to the invoking uid:gid (setpriv, from util-linux) for the build.
+# shellcheck disable=SC2016 # expanded by the inner shell
 docker run --rm \
   -v "$root:/src:ro" -v "$work:/work" -v "$out:/out" \
   -e RUSTUP_VERSION="$RUSTUP_VERSION" -e TRIPLE="$triple" -e RUSTUP_SHA256="$rustup_sha" \

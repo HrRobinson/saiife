@@ -186,7 +186,9 @@ phase_fresh() {
     [[ "$(stat -c '%U:%G %a %F' "$FIDO_BIN")" == "root:root 755 regular file" ]] || fail "$FIDO_BIN is not a regular file, 0755 root:root: $(stat -c '%U:%G %a %F' "$FIDO_BIN")"
     local hello
     hello="$("$FIDO_BIN" </dev/null)" || fail "$FIDO_BIN </dev/null did not exit 0"
-    [[ "$(printf '%s\n' "$hello" | wc -l)" -eq 1 ]] && grep -Eq '^\{"t":"hello","proto":1,' <<<"$hello" || fail "$FIDO_BIN printed no single hello line: $hello"
+    if ! { [[ "$(printf '%s\n' "$hello" | wc -l)" -eq 1 ]] && grep -Eq '^\{"t":"hello","proto":1,' <<<"$hello"; }; then
+        fail "$FIDO_BIN printed no single hello line: $hello"
+    fi
     ok "$FIDO_BIN is 0755 root:root and prints its hello"
 
     local rc=0

@@ -69,11 +69,13 @@ phase_fresh() {
     grep -qx -- "-rwxr-xr-x root root $PKG_BIN" "$OUT/files.txt" || fail "$PKG_BIN is not 0755 root:root in the rpm"
     ok "$PKG_BIN is 0755 root:root"
     grep -qx -- "-rwxr-xr-x root root $FIDO_BIN" "$OUT/files.txt" || fail "$FIDO_BIN is not 0755 root:root in the rpm"
-    [ -f "$FIDO_BIN" ] && [ ! -L "$FIDO_BIN" ] || fail "$FIDO_BIN is not a regular file"
+    if ! { [ -f "$FIDO_BIN" ] && [ ! -L "$FIDO_BIN" ]; }; then fail "$FIDO_BIN is not a regular file"; fi
     # EOF on stdin after the hello line proves the loader, glibc and libudev
     # resolve; the helper touches no key.
     hello="$("$FIDO_BIN" </dev/null)" || fail "$FIDO_BIN </dev/null did not exit 0"
-    [ "$(printf '%s\n' "$hello" | wc -l)" -eq 1 ] && printf '%s\n' "$hello" | grep -Eq '^\{"t":"hello","proto":1,' || fail "$FIDO_BIN printed no single hello line: $hello"
+    if ! { [ "$(printf '%s\n' "$hello" | wc -l)" -eq 1 ] && printf '%s\n' "$hello" | grep -Eq '^\{"t":"hello","proto":1,'; }; then
+        fail "$FIDO_BIN printed no single hello line: $hello"
+    fi
     ok "$FIDO_BIN is 0755 root:root and prints its hello"
     [ ! -e /opt/saiife ] || fail "/opt/saiife exists in a container"
     [ ! -e /etc/systemd/system/saiifed.service ] || fail "the unit exists in a container"
