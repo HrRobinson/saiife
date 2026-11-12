@@ -2,14 +2,16 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
 use common::{id, template_sized, world, world_with, World};
 use saiife_boxes::capacity::{self, Committed};
 use saiife_boxes::guest::GuestEvent;
-use saiife_boxes::manager::{Change, GcReport, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS};
-use saiife_boxes::store::Store;
+use saiife_boxes::manager::{Change, GcReport, Manager, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS};
+use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::Size;
-use saiife_boxes::vmm::fake::VmOp;
-use saiife_boxes::vmm::{VmHandle, VmStatus, Vmm};
+use saiife_boxes::vmm::fake::{FakeVmm, VmOp};
+use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 use saiife_boxes::{BoxError, BoxId, BoxState};
 use saiife_wire::source::Start;
 
@@ -941,16 +943,17 @@ fn gc_removes_discarded_and_orphans() {
     // A claimed dir with no box.json: a crash between claim and save.
     let orphan = Store::open(w.root.clone()).unwrap().claim_id().unwrap();
     assert_eq!(
-        w.mgr.gc().unwrap(),
+        w.mgr.gc(),
         GcReport {
-            removed: vec![failed.clone(), orphan.clone()]
+            removed: vec![failed.clone(), orphan.clone()],
+            error: None,
         }
     );
     assert!(!w.root.join(failed.as_str()).exists());
     assert!(!w.root.join(orphan.as_str()).exists());
     assert_eq!(w.mgr.get(&failed), Err(BoxError::NotFound));
     assert!(w.root.join(live.as_str()).join("box.json").exists());
-    assert_eq!(w.mgr.gc().unwrap(), GcReport::default());
+    assert_eq!(w.mgr.gc(), GcReport::default());
     // Ids are never reused.
     assert_eq!(w.spawn("c").id, id("b4"));
 }
@@ -978,16 +981,17 @@ fn discard_destroy_failure_keeps_record_for_gc() {
     assert_eq!(w.mgr.capacity().1, Committed::default());
     // gc retries the destroy; a second failure keeps the record.
     w.vmm.fail_next(VmOp::Destroy, "still busy");
-    assert_eq!(w.mgr.gc().unwrap(), GcReport::default());
+    assert_eq!(w.mgr.gc(), GcReport::default());
     assert_eq!(
         w.mgr.get(&a).unwrap().error.as_deref(),
         Some("gc: the VM could not be destroyed: still busy")
     );
     w.assert_saved(&a);
     assert_eq!(
-        w.mgr.gc().unwrap(),
+        w.mgr.gc(),
         GcReport {
-            removed: vec![a.clone()]
+            removed: vec![a.clone()],
+            error: None,
         }
     );
     assert_eq!(count(&w, &a, VmOp::Destroy), 3);
@@ -1031,9 +1035,10 @@ fn boot_timeout_destroy_failure_is_recorded() {
     assert!(g.vm.is_some());
     w.assert_saved(&r.id);
     assert_eq!(
-        w.mgr.gc().unwrap(),
+        w.mgr.gc(),
         GcReport {
-            removed: vec![r.id.clone()]
+            removed: vec![r.id.clone()],
+            error: None,
         }
     );
     assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
@@ -1067,4 +1072,247 @@ fn admission_save_failure_leaves_box_queued() {
     assert_eq!(w.mgr.queue(), vec![b.id.clone()]);
     assert!(ops(&w, &b.id).is_empty());
     assert_eq!(w.mgr.capacity().1, Committed::default());
+}
+
+#[test]
+fn restart_returns_its_changes() {
+    let mut w = world(3);
+    let a = running(&w, "a");
+    let p = running(&w, "p");
+    w.mgr.pause(&p).unwrap();
+    let d = running(&w, "d");
+    w.mgr.done(&d).unwrap();
+    w.vmm.set_status(&a, VmStatus::Gone);
+    w.vmm.set_status(&p, VmStatus::Running);
+    w.vmm.set_status(&d, VmStatus::Gone);
+    let (warns, changes) = w.reopen_changes();
+    assert_eq!(warns.len(), 3, "{warns:?}");
+    assert_eq!(
+        changes,
+        vec![
+            change(
+                &a,
+                BoxState::Running,
+                BoxState::Done,
+                "vm lost after restart"
+            ),
+            change(&p, BoxState::Paused, BoxState::Running, "reconciled"),
+            change(&d, BoxState::Done, BoxState::Done, "vm lost after restart"),
+        ]
+    );
+    // Nothing more to recover on the next start.
+    assert_eq!(w.reopen_changes(), (Vec::new(), Vec::new()));
+}
+
+/// A VMM that reads the box's record from disk when asked to boot it.
+struct PeekVmm {
+    inner: Arc<FakeVmm>,
+    root: std::path::PathBuf,
+    seen: Mutex<Vec<BoxRecord>>,
+}
+
+impl Vmm for PeekVmm {
+    fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
+        self.inner.create(spec)
+    }
+    fn boot(&self, h: &VmHandle) -> Result<(), VmmError> {
+        let r = Store::open(self.root.clone()).unwrap().load(&h.id).unwrap();
+        self.seen.lock().unwrap().extend(r);
+        self.inner.boot(h)
+    }
+    fn pause(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.inner.pause(h)
+    }
+    fn resume(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.inner.resume(h)
+    }
+    fn stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.inner.stop(h)
+    }
+    fn snapshot(&self, h: &VmHandle, dest: &std::path::Path) -> Result<(), VmmError> {
+        self.inner.snapshot(h, dest)
+    }
+    fn status(&self, h: &VmHandle) -> VmStatus {
+        self.inner.status(h)
+    }
+    fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.inner.destroy(h)
+    }
+}
+
+#[test]
+fn the_handle_is_saved_before_boot() {
+    let w = world(1);
+    let peek = Arc::new(PeekVmm {
+        inner: w.vmm.clone(),
+        root: w.root.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut init = w.init(w.guest.clone());
+    init.vmm = peek.clone();
+    let mgr = Manager::open(init).unwrap().manager;
+    let r = mgr
+        .spawn(&w.args("claude-code", "a", Start::Queue))
+        .unwrap();
+    assert_eq!(r.state, BoxState::Starting);
+    let seen = peek.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "boot read the record once");
+    assert_eq!(seen[0].state, BoxState::Starting);
+    assert_eq!(seen[0].vm, Some(handle(&r.id)), "saved before boot");
+    assert!(!seen[0].vm_on);
+}
+
+/// A crash after `create` (and maybe `boot`) but before the save of
+/// `vm_on`: the record is Starting, names its VM and says it is off.
+fn crash_after_create(w: &World) -> BoxId {
+    let r = w.spawn("a");
+    let mut d = w.on_disk(&r.id).unwrap();
+    assert_eq!(d.vm, Some(handle(&r.id)));
+    d.vm_on = false;
+    Store::open(w.root.clone()).unwrap().save(&d).unwrap();
+    r.id
+}
+
+#[test]
+fn restart_with_a_created_vm_lets_the_boot_timeout_destroy_it() {
+    let mut w = world(1);
+    let i = crash_after_create(&w);
+    w.vmm.set_status(&i, VmStatus::Created);
+    let (warns, changes) = w.reopen_changes();
+    assert!(
+        warns.is_empty() && changes.is_empty(),
+        "{warns:?} {changes:?}"
+    );
+    assert_eq!(state(&w, &i), BoxState::Starting);
+    w.advance(BOOT_TIMEOUT_SECS);
+    assert_eq!(
+        w.mgr.tick(),
+        vec![change(
+            &i,
+            BoxState::Starting,
+            BoxState::Discarded,
+            "boot timed out"
+        )]
+    );
+    let g = w.mgr.get(&i).unwrap();
+    assert_eq!(g.vm, None, "the VM was destroyed");
+    assert_eq!(w.vmm.status(&handle(&i)), VmStatus::Gone);
+    w.assert_saved(&i);
+}
+
+#[test]
+fn restart_with_a_booted_vm_marks_it_on() {
+    let mut w = world(1);
+    let i = crash_after_create(&w);
+    // The fake VM is running (boot happened before the crash).
+    assert_eq!(w.vmm.status(&handle(&i)), VmStatus::Running);
+    let (warns, changes) = w.reopen_changes();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert_eq!(
+        changes,
+        vec![change(
+            &i,
+            BoxState::Starting,
+            BoxState::Starting,
+            "reconciled"
+        )]
+    );
+    assert!(w.mgr.get(&i).unwrap().vm_on);
+    w.assert_saved(&i);
+    assert_ne!(
+        w.mgr.capacity().1,
+        Committed::default(),
+        "it holds its slot"
+    );
+}
+
+#[test]
+fn tick_without_admit_holds_the_queue() {
+    let w = world(1);
+    let a = running(&w, "a");
+    let b = w.spawn("b").id;
+    w.mgr.stop(&a, false).unwrap();
+    assert!(w.mgr.tick_with(false).is_empty());
+    assert_eq!(state(&w, &b), BoxState::Queued);
+    assert!(ops(&w, &b).is_empty());
+    assert_eq!(
+        w.mgr.tick_with(true),
+        vec![change(&b, BoxState::Queued, BoxState::Starting, "admitted")]
+    );
+}
+
+#[test]
+fn tick_without_admit_still_takes_power_away() {
+    let w = world(2);
+    let s = w.spawn("s").id;
+    let r = running(&w, "r");
+    w.mgr.guest_event(&r, GuestEvent::TurnFinished).unwrap();
+    w.advance(BOOT_TIMEOUT_SECS);
+    let changes = w.mgr.tick_with(false);
+    assert_eq!(
+        changes,
+        vec![
+            change(
+                &s,
+                BoxState::Starting,
+                BoxState::Discarded,
+                "boot timed out"
+            ),
+            change(&r, BoxState::Running, BoxState::Done, "turn finished"),
+        ]
+    );
+}
+
+#[test]
+fn ready_without_prompt_holds_it_until_an_admitting_tick() {
+    let w = world(1);
+    let r = w.spawn("do it");
+    let c = w
+        .mgr
+        .guest_event_with(&r.id, GuestEvent::Ready, false)
+        .unwrap();
+    assert_eq!(
+        c,
+        Some(change(
+            &r.id,
+            BoxState::Starting,
+            BoxState::Running,
+            "ready"
+        ))
+    );
+    assert!(w.guest.prompts().is_empty());
+    assert_eq!(
+        w.mgr.get(&r.id).unwrap().pending_prompt.as_deref(),
+        Some("do it")
+    );
+    w.assert_saved(&r.id);
+    w.advance(5);
+    assert!(w.mgr.tick_with(false).is_empty());
+    assert!(w.guest.prompts().is_empty());
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(w.guest.prompts(), vec![(r.id.clone(), "do it".to_string())]);
+    let g = w.mgr.get(&r.id).unwrap();
+    assert_eq!(g.pending_prompt, None);
+    assert_eq!(g.last_activity, w.now());
+    w.assert_saved(&r.id);
+    w.mgr.tick();
+    assert_eq!(w.guest.prompts().len(), 1, "sent once");
+}
+
+#[test]
+fn gc_goes_on_past_a_box_it_cannot_remove() {
+    let w = world(1);
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let stuck = w.spawn("a").id;
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let next = w.spawn("b").id;
+    let orphan = Store::open(w.root.clone()).unwrap().claim_id().unwrap();
+    // Without its marker the store refuses to remove the dir.
+    std::fs::remove_file(w.root.join(stuck.as_str()).join(".saiife-box")).unwrap();
+    let rep = w.mgr.gc();
+    assert_eq!(rep.removed, vec![next.clone(), orphan.clone()]);
+    assert!(rep.error.is_some(), "{rep:?}");
+    assert!(w.mgr.get(&stuck).is_ok(), "the stuck box stays");
+    assert!(!w.root.join(next.as_str()).exists());
+    assert!(!w.root.join(orphan.as_str()).exists());
 }

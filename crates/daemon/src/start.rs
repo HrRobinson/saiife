@@ -1005,9 +1005,11 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
             None
         }
     };
-    let (box_manager, box_template_warnings) = match boxes {
-        Some(b) => (Some(b.manager), b.template_warnings),
-        None => (None, Vec::new()),
+    // The recovery's state changes are `box` records, written with the
+    // start records below (R29).
+    let (box_manager, box_template_warnings, box_recovered) = match boxes {
+        Some(b) => (Some(b.manager), b.template_warnings, b.changes),
+        None => (None, Vec::new(), Vec::new()),
     };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
@@ -1172,6 +1174,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     // Requests approved but not sent when the daemon stopped become
     // `send_failed` (`interrupted`); none is sent again by itself.
     more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
+    more.extend(crate::box_ops::change_records(&ctx, &box_recovered));
     #[cfg(unix)]
     let place = daemon_cfg.socket_dir.clone();
     let code = rt.block_on(serve(

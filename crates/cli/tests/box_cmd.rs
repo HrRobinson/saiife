@@ -312,3 +312,28 @@ fn daemon_not_running_is_exit_5() {
         .unwrap();
     assert_eq!(code(&o), 5, "{}", err(&o));
 }
+
+/// R29: a box whose VM is gone after a daemon restart is a `box` record of
+/// the new daemon (the fake VMM forgets every VM when the daemon stops).
+#[test]
+fn restart_recovery_is_recorded() {
+    let mut d = world();
+    assert_eq!(code(&bx(&d, &["spawn"])), 0);
+    running(&d, "b1");
+    d.signal("TERM");
+    assert!(d.wait_exit(common::daemon::HANG_GUARD).is_some());
+    d.spawn_and_wait_with(&[("SAIIFE_BOX_FAKE_VMM", "1"), ("SAIIFE_BOX_FAKE_SLOTS", "1")]);
+    assert_eq!(state_of(&d, "b1"), "done");
+    let recs = d.of_kind("box");
+    let lost: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["reason"] == "vm lost after restart")
+        .collect();
+    assert_eq!(lost.len(), 1, "{recs:?}");
+    let r = lost[0];
+    assert_eq!(r["action"], "tick");
+    assert_eq!(r["via"], "tick");
+    assert_eq!(r["box"], "b1");
+    assert_eq!(r["from"], "running");
+    assert_eq!(r["to"], "done");
+}

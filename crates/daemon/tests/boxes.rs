@@ -56,6 +56,7 @@ struct World {
     ctx: Arc<Ctx>,
     mgr: Option<Arc<Manager>>,
     vmm: Arc<FakeVmm>,
+    guest: Arc<FakeGuest>,
     clock: Arc<AtomicU64>,
     audit: PathBuf,
     _tmp: tempfile::TempDir,
@@ -115,7 +116,7 @@ fn world_with(s: Setup) -> World {
             let c = Arc::clone(&clock);
             let host = two_boxes();
             let g: Arc<dyn GuestLink> = guest.clone();
-            let (m, warns) = Manager::open(ManagerInit {
+            let o = Manager::open(ManagerInit {
                 store: Store::open(box_ops::dir_in(&state)).unwrap(),
                 vmm: vmm.clone(),
                 guest: g,
@@ -124,8 +125,8 @@ fn world_with(s: Setup) -> World {
                 clock: Arc::new(move || c.load(Ordering::SeqCst)),
             })
             .unwrap();
-            assert!(warns.is_empty(), "{warns:?}");
-            Some(Arc::new(m))
+            assert!(o.warnings.is_empty(), "{:?}", o.warnings);
+            Some(Arc::new(o.manager))
         }
     };
     let base = CtxInit::minimal(handle, cfg, dirs, &state);
@@ -146,6 +147,7 @@ fn world_with(s: Setup) -> World {
         ctx,
         mgr,
         vmm,
+        guest,
         clock,
         audit,
         _tmp: tmp,
@@ -739,4 +741,165 @@ async fn list_entry_of_a_boot_failed_box_carries_its_error() {
     assert_eq!(failed["error"], "boot failed: no kvm", "{l}");
     let fine = boxes.iter().find(|x| x["id"] == b.as_str()).unwrap();
     assert!(fine.get("error").is_none(), "{l}");
+}
+
+fn lock_all(w: &World) {
+    w.ctx
+        .lockdown
+        .set(Some(Lockdown {
+            scope: LockScope::All,
+            reason: "incident".into(),
+            by_uid: 0,
+            since: "t".into(),
+        }))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn restart_changes_are_recorded() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = |k: &str| -> Option<OsString> {
+        match k {
+            "SAIIFE_BOX_FAKE_VMM" => Some("1".into()),
+            "SAIIFE_BOX_FAKE_SLOTS" => Some("2".into()),
+            _ => None,
+        }
+    };
+    let cfg = state.join("config.toml");
+    let first = box_ops::build_with(&state, &Mode::Locked, &cfg, &env)
+        .unwrap()
+        .expect("the fake VM is on");
+    assert!(first.changes.is_empty(), "{:?}", first.changes);
+    let m = &first.manager;
+    let args = saiife_boxes::manager::SpawnArgs {
+        template: "claude-code".into(),
+        repo: "shop".into(),
+        repo_dir: None,
+        task: "one".into(),
+        start: saiife_wire::source::Start::Queue,
+        owner_uid: ALICE,
+        repo_image: None,
+        base_manifest: None,
+    };
+    let b = m.spawn(&args).unwrap().id;
+    m.guest_event(&b, GuestEvent::Ready).unwrap();
+    drop(first);
+    // A new daemon: a new fake VMM, which knows no VM.
+    let second = box_ops::build_with(&state, &Mode::Locked, &cfg, &env)
+        .unwrap()
+        .expect("the fake VM is on");
+    assert_eq!(second.changes.len(), 1, "{:?}", second.changes);
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(second.manager),
+    });
+    for rec in box_ops::change_records(&w.ctx, &second.changes) {
+        w.ctx.writer.append(rec).await.unwrap();
+    }
+    let recs = w.records();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r["action"], "tick");
+    assert_eq!(r["via"], "tick");
+    assert_eq!(r["box"], b.as_str());
+    assert_eq!(r["session"], format!("box-{}", b.as_str()));
+    assert_eq!(r["template"], "claude-code");
+    assert_eq!(r["from"], "running");
+    assert_eq!(r["to"], "done");
+    assert_eq!(r["reason"], "vm lost after restart");
+    assert_eq!(r["uid"], 999, "the daemon's own record");
+}
+
+#[tokio::test]
+async fn lockdown_holds_the_queue() {
+    let w = world();
+    let b1 = w.running(ALICE, "one").await;
+    w.running(ALICE, "two").await;
+    let q = w.spawn(BOB, "three").await;
+    assert_eq!(q["box"]["state"], "queued");
+    let b3 = q["box"]["id"].as_str().unwrap().to_string();
+    lock_all(&w);
+    // Allowed under lockdown, and it frees a slot.
+    w.ok(ALICE, "box.stop", json!({"box": b1})).await;
+    let before = w.vmm.calls().len();
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
+    assert_eq!(
+        w.mgr().get(&id(&b3)).unwrap().state.to_string_lossy(),
+        "queued"
+    );
+    assert_eq!(w.vmm.calls().len(), before, "no VM was made");
+    w.ctx.lockdown.set(None).unwrap();
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 1);
+    assert_eq!(
+        w.mgr().get(&id(&b3)).unwrap().state.to_string_lossy(),
+        "starting"
+    );
+    let recs = w.records();
+    let last = recs.last().unwrap();
+    assert_eq!(
+        (&last["box"], &last["reason"]),
+        (&json!(b3), &json!("admitted"))
+    );
+}
+
+#[tokio::test]
+async fn lockdown_holds_the_prompt() {
+    let w = world();
+    let a = w.spawn(ALICE, "add a cart").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    lock_all(&w);
+    let c = box_ops::guest_event(&w.ctx, b.clone(), GuestEvent::Ready)
+        .await
+        .unwrap()
+        .expect("ready is a change");
+    assert_eq!(c.why, "ready");
+    let r = w.mgr().get(&b).unwrap();
+    assert_eq!(r.state.to_string_lossy(), "running");
+    assert_eq!(r.pending_prompt.as_deref(), Some("add a cart"));
+    assert!(w.guest.prompts().is_empty(), "held under lockdown");
+    let recs = w.records();
+    assert_eq!(recs.last().unwrap()["reason"], "ready");
+    box_ops::tick_once(&w.ctx).await;
+    assert!(w.guest.prompts().is_empty(), "still held");
+    w.ctx.lockdown.set(None).unwrap();
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(
+        w.guest.prompts(),
+        vec![(b.clone(), "add a cart".to_string())]
+    );
+    assert_eq!(w.mgr().get(&b).unwrap().pending_prompt, None);
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(w.guest.prompts().len(), 1, "sent once");
+}
+
+#[tokio::test]
+async fn gc_goes_on_past_a_box_it_cannot_remove() {
+    let w = world();
+    for _ in 0..3 {
+        w.vmm.fail_next(VmOp::Boot, "no kvm");
+        let a = w.spawn(ALICE, "one").await;
+        assert_eq!(a["box"]["state"], "discarded", "{a}");
+    }
+    let root = box_ops::dir_in(&w._tmp.path().join("state"));
+    // Without its marker the store refuses to remove the dir.
+    std::fs::remove_file(root.join("b1").join(".saiife-box")).unwrap();
+    let before = w.records().len();
+    let g = w.ok(ALICE, "box.gc", json!({})).await;
+    assert_eq!(g["removed"], json!(["b2", "b3"]), "{g}");
+    assert!(g["error"].is_string(), "{g}");
+    let recs = w.records();
+    let new = &recs[before..];
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["action"], "gc");
+    assert_eq!(new[0]["removed"], json!(["b2", "b3"]));
+    assert_eq!(new[0]["reason"], g["error"]);
+    // The admin path goes on the same way.
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    w.spawn(BOB, "two").await;
+    let g = w.ok(CAROL, "box.gc", json!({})).await;
+    assert_eq!(g["removed"], json!(["b4"]), "{g}");
+    assert!(g["error"].is_string(), "{g}");
+    assert!(w.mgr().get(&id("b1")).is_ok(), "the stuck box stays");
 }

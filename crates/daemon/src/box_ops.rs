@@ -11,7 +11,8 @@
 //! box's owner, root or an `[admin] groups` member gets `not_found` for it,
 //! the answer of a missing id (B8). Under lockdown `all`, the ops that give a
 //! box power (spawn, resume, revise, steer) are refused with a deny record;
-//! the ones that take it away stay allowed. Every change is a `box` record
+//! the ones that take it away stay allowed, and the tick admits no queued
+//! box and sends no prompt a `Ready` held (R30). Every change is a `box` record
 //! with `extra = {action, box, template, from, to, via}` and `session =
 //! "box-<id>"`.
 
@@ -197,11 +198,14 @@ fn cpu_pct(a: (u64, u64), b: (u64, u64)) -> Option<u8> {
 }
 
 /// What [`build`] made: the manager, the start warnings (store, recovery,
-/// templates) for stderr, and the template warnings `box.templates` shows.
+/// templates) for stderr, the template warnings `box.templates` shows and
+/// the recovery's state changes, which the daemon records with its start
+/// records ([`change_records`], R29).
 pub struct Built {
     pub manager: Arc<Manager>,
     pub warnings: Vec<String>,
     pub template_warnings: Vec<TemplateWarning>,
+    pub changes: Vec<Change>,
 }
 
 /// The box manager, or `None`: only a `fake-vmm` build with
@@ -252,7 +256,7 @@ fn build_fake(
     let pinned = env(FAKE_SLOTS_ENV)
         .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
         .map(fake_host);
-    let (mgr, mut warnings) = Manager::open(ManagerInit {
+    let opened = Manager::open(ManagerInit {
         store,
         vmm: Arc::new(FakeVmm::new()),
         guest: Arc::new(FakeGuest::new()),
@@ -264,15 +268,17 @@ fn build_fake(
         clock: Arc::new(unix_now),
     })
     .map_err(|e| e.to_string())?;
+    let mut warnings = opened.warnings;
     warnings.extend(
         template_warnings
             .iter()
             .map(|w| format!("template {}: {}", w.file.display(), w.reason)),
     );
     Ok(Built {
-        manager: Arc::new(mgr),
+        manager: Arc::new(opened.manager),
         warnings,
         template_warnings,
+        changes: opened.changes,
     })
 }
 
@@ -323,40 +329,70 @@ pub fn start_tick(ctx: Arc<Ctx>) {
 
 /// The fake VM "boots" at once: its guest says `Ready` for every box that
 /// is Starting, at the next tick (there is no guest process to say it). Test
-/// builds only; the CLI tests need a Running box. Recorded like any tick
-/// change.
+/// builds only; the CLI tests need a Running box. Each goes through
+/// [`guest_event`], so lockdown holds the prompt here too.
 #[cfg(feature = "fake-vmm")]
 async fn fake_ready(ctx: &Ctx) {
     let Some(mgr) = ctx.box_manager.clone() else {
         return;
     };
-    let done = tokio::task::spawn_blocking(move || {
+    let starting = tokio::task::spawn_blocking(move || {
         mgr.list()
             .into_iter()
             .filter(|r| r.state == BoxState::Starting)
-            .filter_map(|r| {
-                let c = mgr
-                    .guest_event(&r.id, saiife_boxes::guest::GuestEvent::Ready)
-                    .ok()
-                    .flatten()?;
-                Some((c, Some(r.template)))
-            })
+            .map(|r| r.id)
             .collect::<Vec<_>>()
     })
-    .await;
-    if let Ok(changes) = done {
-        write_tick_records(ctx, changes).await;
+    .await
+    .unwrap_or_default();
+    for id in starting {
+        let _ = guest_event(ctx, id, saiife_boxes::guest::GuestEvent::Ready).await;
     }
 }
 
+/// Lockdown `all`: the scheduler gives no box power (R30).
+fn locked_all(ctx: &Ctx) -> bool {
+    ctx.lockdown
+        .get()
+        .is_some_and(|l| l.scope == LockScope::All)
+}
+
+/// One event from a box's guest, and its `box` record (`via: "tick"`) when
+/// it is a state change. Under lockdown `all` a `Ready` keeps the box's
+/// pending prompt unsent; the first tick after lockdown lifts sends it
+/// (R30). Every guest event the daemon takes comes through here.
+pub async fn guest_event(
+    ctx: &Ctx,
+    id: BoxId,
+    ev: saiife_boxes::guest::GuestEvent,
+) -> Result<Option<Change>, BoxError> {
+    let Some(mgr) = ctx.box_manager.clone() else {
+        return Err(BoxError::Unavailable(UNAVAILABLE.into()));
+    };
+    let prompt = !locked_all(ctx);
+    let (c, template) = blocking(move || {
+        let c = mgr.guest_event_with(&id, ev, prompt)?;
+        let template = mgr.get(&id).ok().map(|r| r.template);
+        Ok((c, template))
+    })
+    .await?;
+    if let Some(c) = &c {
+        write_tick_records(ctx, vec![(c.clone(), template)]).await;
+    }
+    Ok(c)
+}
+
 /// One tick: the manager's tick off the runtime thread, then one `box`
-/// record (`via: "tick"`) per change. Returns the number of changes.
+/// record (`via: "tick"`) per change. Returns the number of changes. Under
+/// lockdown `all` the tick only takes power away: no admission, and no
+/// held prompt is sent (R30).
 pub async fn tick_once(ctx: &Ctx) -> usize {
     let Some(mgr) = ctx.box_manager.clone() else {
         return 0;
     };
+    let admit = !locked_all(ctx);
     let done = tokio::task::spawn_blocking(move || {
-        let changes = mgr.tick();
+        let changes = mgr.tick_with(admit);
         changes
             .into_iter()
             .map(|c| {
@@ -382,20 +418,43 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
 /// one per change, each with the box's template when it is still known.
 async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
     for (c, template) in changes {
-        let mut rec = box_rec(
-            ctx,
-            "tick",
-            Some(&c.id),
-            template.as_deref(),
-            Some(c.from),
-            Some(c.to),
-            "tick",
-        );
-        rec.reason = Some(c.why.to_string());
+        let rec = tick_record(ctx, &c, template.as_deref());
         if let Err(e) = ctx.writer.append(rec).await {
             eprintln!("saiifed: warning: cannot write a box tick record: {e}");
         }
     }
+}
+
+/// One daemon-made change as its `box` record.
+fn tick_record(ctx: &Ctx, c: &Change, template: Option<&str>) -> Record {
+    let mut rec = box_rec(
+        ctx,
+        "tick",
+        Some(&c.id),
+        template,
+        Some(c.from),
+        Some(c.to),
+        "tick",
+    );
+    rec.reason = Some(c.why.to_string());
+    rec
+}
+
+/// The records of the restart recovery's changes ([`Built::changes`]): the
+/// same `box` records as the tick's (R29). The daemon writes them with its
+/// start records, once the audit writer exists.
+pub fn change_records(ctx: &Ctx, changes: &[Change]) -> Vec<Record> {
+    changes
+        .iter()
+        .map(|c| {
+            let template = ctx
+                .box_manager
+                .as_ref()
+                .and_then(|m| m.get(&c.id).ok())
+                .map(|r| r.template);
+            tick_record(ctx, c, template.as_deref())
+        })
+        .collect()
 }
 
 fn state_value(s: BoxState) -> Value {
@@ -928,9 +987,12 @@ async fn run(
             Ok((Map::new(), Some(rec)))
         }
         Op::Gc => {
-            let removed = blocking(move || {
+            // gc goes on past a box it cannot remove (R31): the answer and
+            // the record list every id removed, plus the first error.
+            let (removed, error) = blocking(move || {
                 if c.privileged {
-                    return m.gc().map(|g| g.removed).map_err(BoxError::from);
+                    let g = m.gc();
+                    return Ok((g.removed, g.error));
                 }
                 // Only the caller's own discarded boxes; orphan dirs have no
                 // owner, so they wait for an admin.
@@ -941,20 +1003,27 @@ async fn run(
                     .map(|r| r.id)
                     .collect();
                 let mut removed = Vec::new();
+                let mut error = None;
                 for i in mine {
-                    m.discard(&i)?;
+                    if let Err(e) = m.discard(&i) {
+                        error.get_or_insert_with(|| e.to_string());
+                    }
                     if matches!(m.get(&i), Err(BoxError::NotFound)) {
                         removed.push(i);
                     }
                 }
-                Ok(removed)
+                Ok((removed, error))
             })
             .await?;
             let ids: Vec<&str> = removed.iter().map(|i| i.as_str()).collect();
             let mut rec = box_rec(ctx, "gc", None, None, None, None, "cli");
             rec.extra.insert("removed".into(), ids.clone().into());
+            rec.reason = error.clone();
             let mut a = Map::new();
             a.insert("removed".into(), ids.into());
+            if let Some(e) = error {
+                a.insert("error".into(), e.into());
+            }
             Ok((a, Some(rec)))
         }
         Op::Diff(i) => {

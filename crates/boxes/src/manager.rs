@@ -46,6 +46,9 @@ pub const MAX_REPO_BYTES: usize = 256;
 
 const RECORD_VERSION: u32 = 1;
 const LOST: &str = "the VM was gone after a daemon restart";
+/// The `why` of a restart's changes (R29).
+pub const WHY_LOST: &str = "vm lost after restart";
+pub const WHY_RECONCILED: &str = "reconciled";
 const REORDER: &str = "reorder must list every queued box once";
 
 /// Unix seconds.
@@ -88,9 +91,21 @@ pub struct Change {
     pub image: Option<String>,
 }
 
+/// What gc did. It goes on past a box it cannot remove: `removed` is every
+/// id it did remove, `error` the first failure (R31).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GcReport {
     pub removed: Vec<BoxId>,
+    pub error: Option<String>,
+}
+
+/// What [`Manager::open`] made: the manager, the warnings (the store's plus
+/// one per recovered box) and the recovery's state changes, for the audit
+/// log (R29).
+pub struct Opened {
+    pub manager: Manager,
+    pub warnings: Vec<String>,
+    pub changes: Vec<Change>,
 }
 
 struct Inner {
@@ -192,9 +207,9 @@ fn rank(s: BoxState) -> u8 {
 }
 
 impl Manager {
-    /// Load the store and recover: every record whose VM was on is checked
-    /// against the VMM. Warnings are the store's plus one per recovered box.
-    pub fn open(init: ManagerInit) -> Result<(Manager, Vec<String>), BoxesError> {
+    /// Load the store and recover: every record whose VM was on, and every
+    /// Starting record with a VM handle, is checked against the VMM.
+    pub fn open(init: ManagerInit) -> Result<Opened, BoxesError> {
         let (loaded, mut warns) = init.store.list()?;
         let now = (init.clock)();
         let mut inner = Inner {
@@ -203,17 +218,19 @@ impl Manager {
             next_seq: 1,
         };
         let mut max_seq = 0;
+        let mut changes = Vec::new();
         for mut r in loaded {
             if let Some(s) = r.queue_seq {
                 max_seq = max_seq.max(s);
             }
-            let note = recover(init.vmm.as_ref(), &mut r);
-            if let Some(note) = note {
+            let from = r.state;
+            if let Some((note, why)) = recover(init.vmm.as_ref(), &mut r) {
                 r.updated_at = now;
                 if let Err(e) = inner.store.save(&r) {
                     warns.push(format!("{}: {e}", r.id.as_str()));
                 }
                 warns.push(format!("{}: {note}", r.id.as_str()));
+                changes.push(change(&r, from, why));
             }
             inner.records.insert(r.id.clone(), r);
         }
@@ -241,7 +258,11 @@ impl Manager {
             host: init.host,
             clock: init.clock,
         };
-        Ok((mgr, warns))
+        Ok(Opened {
+            manager: mgr,
+            warnings: warns,
+            changes,
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -391,9 +412,13 @@ impl Manager {
             r.turn_finished_at = None;
             r.error = None;
             r.updated_at = now;
-            // Saved before the VM exists: a crash now leaves a Starting box
-            // that the boot timeout cleans up. A failed save leaves the box
-            // Queued and stops the pass, so no VM exists without a record.
+            // Saved before the VM exists: a failed save leaves the box
+            // Queued and stops the pass. The handle is saved right after
+            // `create` and before `boot`, so a crash after `create` leaves a
+            // Starting record that names its VM, and the boot timeout stops
+            // and destroys it (recovery marks it on when the VMM says it
+            // runs). A crash inside `create` itself can still leave a VMM
+            // resource no record names.
             if g.save_new(r.clone()).is_err() {
                 break;
             }
@@ -408,6 +433,8 @@ impl Manager {
             };
             let booted = self.vmm.create(&spec).and_then(|h| {
                 r.vm = Some(h.clone());
+                // Best effort, like every save after a VMM call.
+                let _ = g.put(r.clone());
                 self.vmm.boot(&h)
             });
             match booted {
@@ -670,6 +697,18 @@ impl Manager {
     /// Ready and Exited are transitions (`Some(change)`); Activity and
     /// TurnFinished only update the idle clocks.
     pub fn guest_event(&self, id: &BoxId, ev: GuestEvent) -> Result<Option<Change>, BoxError> {
+        self.guest_event_with(id, ev, true)
+    }
+
+    /// [`Manager::guest_event`]; with `prompt = false` (lockdown `all`, R30)
+    /// a `Ready` keeps the box's pending prompt unsent. The next
+    /// [`Manager::tick_with`] that may admit sends it, once the box runs.
+    pub fn guest_event_with(
+        &self,
+        id: &BoxId,
+        ev: GuestEvent,
+        prompt: bool,
+    ) -> Result<Option<Change>, BoxError> {
         let now = self.now();
         let mut g = self.lock();
         let mut r = g.get(id)?.clone();
@@ -679,10 +718,8 @@ impl Manager {
                 r.state = transition(from, Event::Ready)?;
                 r.last_activity = now;
                 r.turn_finished_at = None;
-                if let Some(p) = r.pending_prompt.take() {
-                    if let Err(e) = self.guest.prompt(id, &p) {
-                        r.error = Some(format!("prompt failed: {}", guest_msg(e)));
-                    }
+                if prompt {
+                    self.send_pending(&mut r);
                 }
                 Some(change(&r, from, "ready"))
             }
@@ -705,8 +742,26 @@ impl Manager {
         Ok(out)
     }
 
-    /// Boot timeouts, finished turns, idle stops, then the admission pass.
+    /// Send and clear `r`'s pending prompt; a failure goes to `error`.
+    fn send_pending(&self, r: &mut BoxRecord) {
+        if let Some(p) = r.pending_prompt.take() {
+            if let Err(e) = self.guest.prompt(&r.id, &p) {
+                r.error = Some(format!("prompt failed: {}", guest_msg(e)));
+            }
+        }
+    }
+
+    /// `tick_with(true)`.
     pub fn tick(&self) -> Vec<Change> {
+        self.tick_with(true)
+    }
+
+    /// Boot timeouts, finished turns and idle stops, which only take power
+    /// away; then, with `admit`, the prompts a `Ready` under lockdown held
+    /// (for Running boxes) and the admission pass. The daemon passes
+    /// `admit = false` under lockdown `all` (R30): the queue and held
+    /// prompts wait until it lifts.
+    pub fn tick_with(&self, admit: bool) -> Vec<Change> {
         let now = self.now();
         let host = (self.host)();
         let mut g = self.lock();
@@ -755,22 +810,35 @@ impl Manager {
                     out.push(change(&r, from, "idle stop"));
                 }
             }
+            if admit && r.state == BoxState::Running && r.vm_on && r.pending_prompt.is_some() {
+                self.send_pending(&mut r);
+                r.last_activity = now;
+                r.turn_finished_at = None;
+                changed = true;
+            }
             if changed {
                 r.updated_at = now;
                 let _ = g.put(r);
             }
         }
-        out.extend(self.admission(&mut g, &host, now));
+        if admit {
+            out.extend(self.admission(&mut g, &host, now));
+        }
         out
     }
 
     /// Remove every Discarded record's dir and every orphan dir. A Discarded
     /// record that still holds a VM handle has its destroy retried first; if
-    /// that fails again the record stays, with the error updated.
-    pub fn gc(&self) -> Result<GcReport, BoxesError> {
+    /// that fails again the record stays, with the error updated. A store
+    /// error does not stop the pass: the report has every id removed and
+    /// the first error.
+    pub fn gc(&self) -> GcReport {
         let now = self.now();
         let mut g = self.lock();
-        let mut removed = Vec::new();
+        let mut rep = GcReport::default();
+        let fail = |rep: &mut GcReport, e: String| {
+            rep.error.get_or_insert(e);
+        };
         let gone: Vec<BoxId> = g
             .records
             .values()
@@ -783,31 +851,60 @@ impl Manager {
                 if let Err(e) = self.vmm.destroy(&h) {
                     r.error = Some(format!("gc: the VM could not be destroyed: {}", vmm_msg(e)));
                     r.updated_at = now;
-                    g.store.save(&r)?;
+                    if let Err(e) = g.store.save(&r) {
+                        fail(&mut rep, e.to_string());
+                    }
                     g.records.insert(id, r);
                     continue;
                 }
+                r.vm = None;
+                g.records.insert(id.clone(), r);
             }
-            g.store.remove(&id)?;
-            g.records.remove(&id);
-            removed.push(id);
-        }
-        for id in g.store.orphans()? {
-            if g.records.contains_key(&id) {
-                continue;
+            match g.store.remove(&id) {
+                Ok(()) => {
+                    g.records.remove(&id);
+                    rep.removed.push(id);
+                }
+                Err(e) => fail(&mut rep, e.to_string()),
             }
-            g.store.remove(&id)?;
-            removed.push(id);
         }
-        Ok(GcReport { removed })
+        match g.store.orphans() {
+            Ok(orphans) => {
+                for id in orphans {
+                    if g.records.contains_key(&id) {
+                        continue;
+                    }
+                    match g.store.remove(&id) {
+                        Ok(()) => rep.removed.push(id),
+                        Err(e) => fail(&mut rep, e.to_string()),
+                    }
+                }
+            }
+            Err(e) => fail(&mut rep, e.to_string()),
+        }
+        rep
     }
 }
 
-/// Reconcile one loaded record whose VM was on with the VMM's answer.
-/// Returns a note when the record changed.
-fn recover(vmm: &dyn Vmm, r: &mut BoxRecord) -> Option<String> {
+/// Reconcile one loaded record with the VMM's answer: a record whose VM
+/// was on, or a Starting one that names a VM (a crash between `create` or
+/// `boot` and the save that follows). Returns a note and the change's `why`
+/// when the record changed.
+fn recover(vmm: &dyn Vmm, r: &mut BoxRecord) -> Option<(String, &'static str)> {
     if !r.vm_on {
-        return None;
+        if r.state != BoxState::Starting {
+            return None;
+        }
+        // Booted, but the crash came before `vm_on` was saved: the box holds
+        // capacity again. Otherwise the boot timeout stops and destroys it.
+        let h = r.vm.as_ref()?;
+        return match vmm.status(h) {
+            VmStatus::Running | VmStatus::Paused => {
+                r.vm_on = true;
+                Some(("the VM was on; the box is starting".into(), WHY_RECONCILED))
+            }
+            _ => None,
+        };
     }
     let status = r.vm.as_ref().map_or(VmStatus::Gone, |h| vmm.status(h));
     match status {
@@ -817,15 +914,21 @@ fn recover(vmm: &dyn Vmm, r: &mut BoxRecord) -> Option<String> {
             }
             r.vm_on = false;
             r.error = Some(LOST.into());
-            Some(LOST.into())
+            Some((LOST.into(), WHY_LOST))
         }
         VmStatus::Paused if r.state == BoxState::Running => {
             r.state = BoxState::Paused;
-            Some("the VM was paused; the box is now paused".into())
+            Some((
+                "the VM was paused; the box is now paused".into(),
+                WHY_RECONCILED,
+            ))
         }
         VmStatus::Running if r.state == BoxState::Paused => {
             r.state = BoxState::Running;
-            Some("the VM was running; the box is now running".into())
+            Some((
+                "the VM was running; the box is now running".into(),
+                WHY_RECONCILED,
+            ))
         }
         _ => None,
     }

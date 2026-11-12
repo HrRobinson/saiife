@@ -263,6 +263,11 @@ mod imp {
                 } else {
                     outln!("removed {}", removed.join(", "));
                 }
+                // gc goes on past a box it cannot remove; the first failure
+                // comes after what it did remove.
+                if let Some(e) = a.get("error").and_then(Value::as_str) {
+                    return Err(Stop::Unavailable(format!("gc: {e}")));
+                }
             }
         }
         Ok(())

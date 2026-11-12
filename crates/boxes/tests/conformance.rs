@@ -160,7 +160,7 @@ fn diff_goes_through_the_guest() {
     let src = ManagerSource::new(w.mgr.clone(), Some(1000));
     assert_eq!(src.diff(&b2), Ok(d));
 
-    let (mgr, _) = Manager::open(w.init(Arc::new(NoGuest))).unwrap();
+    let mgr = Manager::open(w.init(Arc::new(NoGuest))).unwrap().manager;
     let src = ManagerSource::new(Arc::new(mgr), Some(1000));
     assert!(matches!(src.diff(&b2), Err(BoxError::Unavailable(_))));
     // Ended box with no guest: empty ended batch; live box: unavailable.
@@ -181,7 +181,7 @@ fn overview_load_and_slots() {
     host.cpu_pct = Some(42);
     host.mem_avail_mib = 1000;
     init.host = Arc::new(move || host);
-    let (mgr, _) = Manager::open(init).unwrap();
+    let mgr = Manager::open(init).unwrap().manager;
     let src = ManagerSource::new(Arc::new(mgr), Some(1000));
     let o = src.overview();
     let l = o.load.expect("load when the host reports cpu");

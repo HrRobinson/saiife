@@ -8,7 +8,7 @@ use std::sync::Arc;
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::fake::FakeGuest;
 use saiife_boxes::guest::GuestLink;
-use saiife_boxes::manager::{Manager, ManagerInit, SpawnArgs};
+use saiife_boxes::manager::{Change, Manager, ManagerInit, SpawnArgs};
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::{self, BoxTemplate, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
@@ -57,10 +57,11 @@ pub fn world_with(n: u32, extra: Vec<BoxTemplate>) -> World {
     let host = host(n);
     let g: Arc<dyn GuestLink> = guest.clone();
     let init = make_init(&root, &vmm, g, &templates, host, &clock);
-    let (mgr, warns) = Manager::open(init).unwrap();
-    assert!(warns.is_empty(), "{warns:?}");
+    let o = Manager::open(init).unwrap();
+    assert!(o.warnings.is_empty(), "{:?}", o.warnings);
+    assert!(o.changes.is_empty(), "{:?}", o.changes);
     World {
-        mgr: Arc::new(mgr),
+        mgr: Arc::new(o.manager),
         vmm,
         guest,
         clock,
@@ -117,10 +118,15 @@ impl World {
 
     /// Simulate a daemon restart: a new manager over the same store and VMM.
     pub fn reopen(&mut self) -> Vec<String> {
+        self.reopen_changes().0
+    }
+
+    /// `reopen`, with the recovery's state changes too.
+    pub fn reopen_changes(&mut self) -> (Vec<String>, Vec<Change>) {
         let guest: Arc<dyn GuestLink> = self.guest.clone();
-        let (mgr, warns) = Manager::open(self.init(guest)).unwrap();
-        self.mgr = Arc::new(mgr);
-        warns
+        let o = Manager::open(self.init(guest)).unwrap();
+        self.mgr = Arc::new(o.manager);
+        (o.warnings, o.changes)
     }
 
     pub fn now(&self) -> u64 {
