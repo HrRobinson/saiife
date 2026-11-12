@@ -719,3 +719,140 @@ fn sync_stop_after_a_write_says_what_was_written() {
     assert_ne!(fs::read(p1).unwrap(), b1);
     assert_eq!(fs::read(p2).unwrap(), b2);
 }
+
+// ---- list ----
+
+const MIXED: &str = "Never run `deploy-prod`.\nNever run `terraform apply`.\nNever write to `~/billing`.\nNever skip the tests.\n";
+
+#[test]
+fn list_shows_host_and_box_status() {
+    let env = Env::new(&[]);
+    imported_pack(&env, MIXED, "e\n\ne\nh\ne\n\n");
+    let o = rules(&env, &[], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    for want in [
+        "box: advisory in boxes",
+        "box: off in boxes (host only)",
+        "box: checked at diff review",
+        "where=host",
+        "where=everywhere",
+        "host: enforced",
+        "not enforced: ",
+        "CLAUDE.md:4",
+        "\"Never skip the tests.\"",
+        "CLAUDE.md  5 rules (0 ask), 1 not enforced",
+    ] {
+        assert!(out.contains(want), "{want:?} missing:\n{out}");
+    }
+    assert!(!out.contains("source changed"), "{out}");
+    let j = rules(&env, &["list"], "");
+    assert_eq!(stdout(&j), out);
+}
+
+#[test]
+fn list_json_shape() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let o = rules(&env, &["list", "--json"], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let got: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let id = pack.file_stem().unwrap().to_string_lossy().into_owned();
+    let file = fs::canonicalize(env.root().join("CLAUDE.md"))
+        .unwrap()
+        .display()
+        .to_string();
+    let p = &got["packs"][0];
+    assert_eq!(got["packs"].as_array().unwrap().len(), 1);
+    assert_eq!(p["id"], id);
+    assert_eq!(p["path"], pack.display().to_string());
+    assert_eq!(p["import"]["file"], file);
+    assert_eq!(p["import"]["sha256"], sha_of(DEPLOY));
+    assert_eq!(p["import"]["state"], "same");
+    assert_eq!(p["unenforced"], serde_json::json!([]));
+    let r = &p["rules"];
+    assert_eq!(r.as_array().unwrap().len(), 2, "{got}");
+    // The carve-out comes first, then the deny.
+    assert_eq!(r[0]["kind"], "allow");
+    assert_eq!(r[1]["id"], "l1-1");
+    assert_eq!(r[1]["kind"], "deny");
+    assert_eq!(r[1]["where"], "everywhere");
+    assert_eq!(r[1]["mode"], "enforce");
+    assert_eq!(r[1]["host"], "enforced");
+    assert_eq!(r[1]["box"], "advisory in boxes");
+    assert_eq!(r[1]["source"]["line"], 1);
+    assert_eq!(r[1]["source"]["file"], file);
+    assert_eq!(r[1]["text"], r"^deploy\-prod(?:\s|$)");
+    // Exactly the documented keys.
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(keys(&got), ["packs"]);
+    assert_eq!(keys(p), ["id", "import", "path", "rules", "unenforced"]);
+    assert_eq!(
+        keys(&r[1]),
+        ["box", "host", "id", "kind", "mode", "source", "text", "where"]
+    );
+}
+
+#[test]
+fn list_flags_broad_rules() {
+    let env = Env::new(&[]);
+    // `ls` is an everyday command: a typed `yes` enforces it anyway.
+    imported_pack(&env, "Never run `ls`.\n", "e\nyes\n\n");
+    let o = rules(&env, &[], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("BROAD: blocks everyday `ls`")
+            || stdout(&o).contains("BROAD: blocks everyday"),
+        "{}",
+        stdout(&o)
+    );
+}
+
+#[test]
+fn list_with_no_packs_says_so() {
+    let env = Env::new(&[]);
+    let o = rules(&env, &[], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("no user packs"), "{}", stdout(&o));
+}
+
+#[test]
+fn list_marks_changed_and_gone_sources() {
+    let env = Env::new(&[]);
+    imported_pack(&env, DEPLOY, "e\n\n");
+    env.write("CLAUDE.md", &format!("{DEPLOY}Never run `x`.\n"));
+    let o = rules(&env, &[], "");
+    assert!(
+        stdout(&o).contains("[source changed: run saiife rules sync]"),
+        "{}",
+        stdout(&o)
+    );
+    fs::remove_file(env.root().join("CLAUDE.md")).unwrap();
+    let o = rules(&env, &[], "");
+    assert!(stdout(&o).contains("[source gone]"), "{}", stdout(&o));
+}
+
+/// A hand-edited pack with escape and bidi characters: nothing raw reaches
+/// the terminal in text mode.
+#[test]
+fn list_output_never_carries_control_bytes() {
+    let env = Env::new(&[]);
+    let pack = imported_pack(&env, DEPLOY, "e\n\n");
+    let text = fs::read_to_string(&pack).unwrap();
+    let text = text
+        .replace("reason = \"", "reason = \"a\\u001b[2Jb\\u202ec")
+        .replace("text = \"", "text = \"a\\u001b[31m\\u202e");
+    fs::write(&pack, &text).unwrap();
+    let o = rules(&env, &[], "");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !all.chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t' || c == '\u{202e}'),
+        "{all:?}"
+    );
+}

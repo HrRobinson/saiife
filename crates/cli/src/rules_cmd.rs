@@ -2,10 +2,6 @@
 //! AGENTS.md, GEMINI.md and rules files, as enforced user packs.
 //!
 //! This module holds the clap surface and the types the submodules share.
-// The shared types and the extraction are used by tasks 2 to 7; until they
-// land, only the tests use them. Remove this allow when the last task does.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -15,10 +11,10 @@ use saiifeguard::pathrule::RuleAccess;
 
 mod confirm;
 pub mod extract;
-mod list;
+pub(crate) mod list;
 mod llm;
 mod propose;
-mod store;
+pub(crate) mod store;
 mod sync;
 
 #[derive(Subcommand, Debug)]
@@ -133,18 +129,12 @@ pub struct Decided {
     pub where_: RuleWhere,
 }
 
-/// The stub for the actions later tasks fill.
-fn todo_unavailable(action: &str) -> ExitCode {
-    eprintln!("saiife: rules {action} is not built yet");
-    ExitCode::from(1)
-}
-
 /// `packs` is the global `--pack` list: `sync` follows only those packs.
 pub fn run(config: Option<PathBuf>, packs: Vec<String>, action: Option<RulesAction>) -> ExitCode {
     match action.unwrap_or(RulesAction::List { json: false }) {
         RulesAction::Import { files, llm, name } => import(config, files, llm, name),
         RulesAction::Sync { llm } => sync(config, packs, llm),
-        RulesAction::List { .. } => todo_unavailable("list"),
+        RulesAction::List { json } => list::run(config, json),
     }
 }
 

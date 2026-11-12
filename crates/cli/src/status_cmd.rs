@@ -111,7 +111,7 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
             // nearest nested config: check them as for a hooked project.
             let mut problems = Vec::new();
             let mut notes = Vec::new();
-            check_project_packs(&root, builtin, &mut problems);
+            check_project_packs(&root, builtin, &layout, &mut problems);
             check_nested_configs(&root, &mut problems, &mut notes);
             for n in &notes {
                 outln!("\nNote: {n}");
@@ -328,7 +328,7 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
             fix: "run `saiife init --agent <claude|codex|gemini>`".into(),
         });
     }
-    check_config(&root, &record, builtin, &mut problems);
+    check_config(&root, &record, builtin, &layout, &mut problems);
     check_nested_configs(&root, &mut problems, &mut notes);
     check_binary(&record, &mut problems);
 
@@ -500,7 +500,13 @@ fn config_drift(
     }
 }
 
-fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {
+fn check_config(
+    root: &Path,
+    record: &Integrity,
+    builtin: &[Pack],
+    layout: &Layout,
+    problems: &mut Vec<Problem>,
+) {
     problems.extend(config_drift(
         root,
         &record.config_sha256,
@@ -508,12 +514,17 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
         "`saiife init`",
         restore(root),
     ));
-    check_project_packs(root, builtin, problems);
+    check_project_packs(root, builtin, layout, problems);
 }
 
 /// The project's packs: unknown ids are problems; the packs line and the
 /// rules whose variables are unbound are printed.
-fn check_project_packs(root: &Path, builtin: &[Pack], problems: &mut Vec<Problem>) {
+fn check_project_packs(
+    root: &Path,
+    builtin: &[Pack],
+    layout: &Layout,
+    problems: &mut Vec<Problem>,
+) {
     let project = project_packs(root, builtin);
     for w in project.warnings {
         problems.push(Problem {
@@ -530,6 +541,52 @@ fn check_project_packs(root: &Path, builtin: &[Pack], problems: &mut Vec<Problem
     outln!("{}", packs_line(root, project.root.as_deref(), &ids));
     let vars = crate::paths::path_vars(Some(root), Some(root));
     out!("{}", inactive_lines(&active, &vars));
+    for n in rules_notes(layout) {
+        outln!("{n}");
+    }
+}
+
+/// One note per imported rules file that changed or is gone (plan 33): for
+/// each user pack in the personal dir, and in the locked dir when it can be
+/// read. A note never changes the exit code. Everything printed from a pack
+/// goes through the shared sanitizer.
+fn rules_notes(layout: &Layout) -> Vec<String> {
+    use crate::rules_cmd::extract::clean;
+    use crate::rules_cmd::list::{source_state, SourceState};
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(t) = crate::broker::personal(&|k| std::env::var_os(k)) {
+        dirs.push(crate::rules_cmd::store::packs_dir(&t));
+    }
+    if let Some(parent) = layout.at(CONFIG).parent() {
+        dirs.push(parent.join("policy.d").join(saiife_policy::USER_PACKS_DIR));
+    }
+    let mut notes = Vec::new();
+    for dir in dirs {
+        let Ok(files) = saiife_policy::userpacks::read_user_packs(&dir, &mut Vec::new()) else {
+            continue;
+        };
+        for f in files {
+            let Ok(v) = saiifeguard::userpack::view(&f.text) else {
+                continue;
+            };
+            let Some(i) = &v.import else { continue };
+            let name = Path::new(&i.file)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| i.file.clone());
+            let (file, id) = (clean(&name), clean(&v.id));
+            match source_state(i) {
+                SourceState::Same => {}
+                SourceState::Changed => notes.push(format!(
+                    "rules: {file} changed since it was imported ({id}); run saiife rules sync"
+                )),
+                SourceState::Gone => notes.push(format!(
+                    "rules: {file} is gone; its rules stay in force ({id})"
+                )),
+            }
+        }
+    }
+    notes
 }
 
 /// `SCAN_LIMIT`; debug builds (tests) may lower it with `SAIIFE_SCAN_LIMIT`.
