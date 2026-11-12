@@ -30,6 +30,8 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+#[cfg(unix)]
+mod box_attach;
 mod box_cmd;
 mod box_image_cmd;
 mod box_vmm_cmd;

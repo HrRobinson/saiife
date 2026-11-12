@@ -1712,8 +1712,10 @@ version = "0.2.0"
 dependencies = [
  "ring",
  "rustix",
+ "saiife-agents",
  "saiife-boxes",
  "saiife-boxproto",
+ "saiife-policy",
  "saiife-wire",
  "serde",
  "serde_json",

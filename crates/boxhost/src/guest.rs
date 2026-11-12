@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use saiife_boxes::guest::{GuestError, GuestEvent, GuestLink};
 use saiife_boxproto::frame::{read_frame, read_msg, write_msg, Frame, FrameError};
-use saiife_boxproto::msg::{Event, HostReply, Reply, Request, Setup};
+use saiife_boxproto::msg::{Event, HostReply, Reply, Request, Setup, SetupFile};
 use saiife_boxproto::{ports, PROTO};
 use saiife_wire::source::{BoxId, DiffSummary, TermBatch};
 
@@ -1048,5 +1048,114 @@ impl GuestLink for VsockGuest {
         Err(GuestError::Unavailable(
             "the diff is read through the land book".into(),
         ))
+    }
+}
+
+/// `/home/agent/.claude/settings.json` for the agent in the box (G11): the
+/// PreToolUse hook (advisory; the box is the boundary) and the Stop hook that
+/// tells the host a turn finished. The matcher and timeout are the ones
+/// `saiife init` writes for a project.
+pub fn claude_settings() -> String {
+    use saiife_agents::claude::{MATCHER, TIMEOUT_SECS};
+    let v = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": MATCHER,
+                "hooks": [{
+                    "type": "command",
+                    "command": "/usr/local/bin/saiife check --hook-exit --agent claude --profile box",
+                    "timeout": TIMEOUT_SECS,
+                }]
+            }],
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/usr/local/bin/saiife __guest event turn-finished",
+                    "timeout": TIMEOUT_SECS,
+                }]
+            }]
+        }
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
+/// The setup files for user packs: `(id, toml text)` to
+/// `/home/agent/.config/saiife/packs/<id>.toml`, mode 0644. A pair whose id
+/// is not a valid user pack id is left out (an id is a file name, so it
+/// must never carry a path).
+pub fn pack_files(packs: &[(String, String)]) -> Vec<SetupFile> {
+    packs
+        .iter()
+        .filter(|(id, _)| saiife_policy::userpacks::valid_user_pack_id(id))
+        .map(|(id, text)| SetupFile {
+            path: format!("/home/agent/.config/saiife/packs/{id}.toml"),
+            mode: 0o644,
+            text: text.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn claude_settings_are_pinned() {
+        let want = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/saiife check --hook-exit --agent claude --profile box",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/saiife __guest event turn-finished",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+        assert_eq!(claude_settings(), want);
+    }
+
+    #[test]
+    fn pack_files_paths_and_bad_ids() {
+        let packs = vec![
+            ("user.mine".to_string(), "a = 1".to_string()),
+            ("user.../../etc/x".to_string(), "bad".to_string()),
+            ("builtin.x".to_string(), "bad".to_string()),
+            ("user.-lead".to_string(), "bad".to_string()),
+            ("user.".to_string(), "bad".to_string()),
+        ];
+        let f = pack_files(&packs);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].path, "/home/agent/.config/saiife/packs/user.mine.toml");
+        assert_eq!(f[0].mode, 0o644);
+        assert_eq!(f[0].text, "a = 1");
+        let s = Setup {
+            agent: saiife_boxproto::msg::AgentSpec {
+                command: vec!["/bin/true".into()],
+                user: "agent".into(),
+                cwd: "/work".into(),
+            },
+            env: vec![],
+            files: f,
+            rows: 40,
+            cols: 120,
+        };
+        assert_eq!(s.check(), Ok(()));
     }
 }

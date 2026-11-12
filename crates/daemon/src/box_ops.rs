@@ -48,6 +48,9 @@ pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
 /// With [`FAKE_ENV`] (a `fake-vmm` build only): `<n>` pins the host to
 /// exactly `n` default boxes, so a test never depends on the machine's RAM.
 pub const FAKE_SLOTS_ENV: &str = "SAIIFE_BOX_FAKE_SLOTS";
+/// With [`FAKE_ENV`]: a JSON array of terminal frames the fake guest serves
+/// for box `b1` (the CLI tests cannot reach the daemon's `FakeGuest`).
+pub const FAKE_TERMINAL_ENV: &str = "SAIIFE_BOX_FAKE_TERMINAL";
 /// The stderr line of a daemon whose boxes run on the fake VM.
 pub const FAKE_NOTICE: &str = "saiifed: boxes use a fake VM (test build)";
 /// The longest template name and `repo_dir` taken.
@@ -256,10 +259,19 @@ fn build_fake(
     let pinned = env(FAKE_SLOTS_ENV)
         .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
         .map(fake_host);
+    let guest = Arc::new(FakeGuest::new());
+    if let Some(frames) = env(FAKE_TERMINAL_ENV)
+        .and_then(|v| v.to_str().map(str::to_string))
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        if let Ok(b1) = saiife_wire::source::BoxId::parse("b1") {
+            guest.set_terminal(&b1, frames);
+        }
+    }
     let opened = Manager::open(ManagerInit {
         store,
         vmm: Arc::new(FakeVmm::new()),
-        guest: Arc::new(FakeGuest::new()),
+        guest,
         templates,
         host: Arc::new(move || match &pinned {
             Some(h) => *h,
