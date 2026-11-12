@@ -10,6 +10,11 @@ repository.workspace = true
 name = "saiife"
 path = "src/main.rs"
 
+[[bin]]
+name = "saiife-fake-fido"
+path = "src/bin/saiife-fake-fido.rs"
+required-features = ["fake-fido"]
+
 [dependencies]
 saiife-guard = { path = "../guard" }
 saiife-audit = { path = "../audit" }
@@ -55,6 +60,8 @@ saiife-fido = { path = "../fido" }
 
 [features]
 fido-hid = ["saiife-fido/hid"]
+# The scripted helper `saiife-fake-fido` for CLI tests.
+fake-fido = ["saiife-fido/fake"]
 
 [target.'cfg(unix)'.dependencies]
 # Signals for the worker fault seam (debug builds); no unsafe calls.

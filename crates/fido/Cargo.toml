@@ -14,8 +14,13 @@ path = "src/lib.rs"
 [features]
 # CTAP2 over USB HID (hidapi needs libudev on Linux).
 hid = ["dep:ctap-hid-fido2"]
-# A scripted key for tests (filled by plan 41 task 2).
-fake = []
+# A scripted helper for tests: a soft key behind the helper protocol.
+fake = ["saiife-touch/soft"]
+
+[[bin]]
+name = "saiife-fido"
+path = "src/bin/saiife-fido.rs"
+required-features = ["hid"]
 
 [dependencies]
 saiife-touch = { path = "../touch" }
