@@ -11,7 +11,7 @@ use sha2::Digest as _;
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, TableLike, Value};
 
 use super::extract::{all_lines, candidates};
-use super::propose::{escape, trigger};
+use super::propose::trigger;
 use super::store::{hex, push_decided, unenforced_table, RuleTables};
 use super::{Candidate, Choice, Decided, SourceLine};
 
@@ -182,8 +182,8 @@ pub fn apply(
         .collect();
     let removed: HashSet<&str> = removed.iter().map(String::as_str).collect();
 
-    // Patterns of the rules dropped here, to prune triggers nothing uses.
-    let mut dropped: Vec<String> = Vec::new();
+    // Triggers are never pruned: a kept rule may need a word its pattern
+    // does not start with, and a stale trigger only costs a little speed.
     for key in RULE_KEYS.into_iter().chain(["unenforced"]) {
         let Some(a) = aot(&mut doc, key)? else {
             continue;
@@ -191,15 +191,7 @@ pub fn apply(
         if key == "unenforced" {
             a.retain(|t| hash_of(t).is_none_or(|h| !gone.contains(h.as_str())));
         } else {
-            a.retain(|t| {
-                let drop = hash_of(t).is_some_and(|h| removed.contains(h.as_str()));
-                if drop {
-                    if let Some(p) = t.get("pattern").and_then(Item::as_str) {
-                        dropped.push(p.to_string());
-                    }
-                }
-                !drop
-            });
+            a.retain(|t| hash_of(t).is_none_or(|h| !removed.contains(h.as_str())));
         }
         for t in a.iter_mut() {
             if let (Some(h), Some(l)) = (hash_of(t), line_of(t)) {
@@ -214,30 +206,6 @@ pub fn apply(
         if a.is_empty() {
             doc.remove(key);
         }
-    }
-
-    // A trigger word only a dropped rule used is dropped with it.
-    let mut kept: Vec<String> = Vec::new();
-    for key in ["deny", "allow"] {
-        if let Some(a) = aot(&mut doc, key)? {
-            kept.extend(
-                a.iter()
-                    .filter_map(|t| t.get("pattern")?.as_str().map(str::to_string)),
-            );
-        }
-    }
-    if let Some(tr) = doc
-        .get_mut("pack")
-        .and_then(Item::as_table_like_mut)
-        .and_then(|p| p.get_mut("triggers"))
-        .and_then(Item::as_array_mut)
-    {
-        tr.retain(|v| {
-            let Some(w) = v.as_str() else { return true };
-            let pre = format!("^{}", escape(w));
-            !(dropped.iter().any(|p| p.starts_with(&pre))
-                && !kept.iter().any(|p| p.starts_with(&pre)))
-        });
     }
 
     // New rules take the first free ids; the pack's triggers learn the new
@@ -421,6 +389,42 @@ mod tests {
         let h = line_sha256("Never run `x1`.");
         let out = apply(&pack, &p, &[h], &[], &[]).unwrap();
         assert!(view(&out).unwrap().rules.is_empty(), "{out}");
+    }
+
+    #[test]
+    fn kept_hand_edited_rule_keeps_its_trigger_and_still_denies() {
+        let md = "Never run `rm`.\nNever run `ls`.\n";
+        let pack = pack_of(md, &[("Never run `rm`.", "rm"), ("Never run `ls`.", "ls")]);
+        // Hand edit: the ls rule now also covers `rm` behind sudo, written
+        // so that it does not start with `^rm`.
+        let pack = pack.replacen(
+            "pattern = '^ls(?:\\s|$)'",
+            "pattern = '(?:sudo\\s+)?rm\\b'",
+            1,
+        );
+        assert!(pack.contains("(?:sudo\\s+)?rm\\b"), "{pack}");
+        let rm_hash = line_sha256("Never run `rm`.");
+        let p = plan(&view(&pack).unwrap(), "Never run `ls`.\n");
+        let out = apply(&pack, &p, &[rm_hash], &[], &[]).unwrap();
+        let triggers = out.lines().find(|l| l.starts_with("triggers")).unwrap();
+        assert!(triggers.contains("\"rm\""), "{triggers}");
+        let srcs = [saiifeguard::userpack::UserSrc {
+            source: "user.claude-md-test.toml",
+            text: &out,
+        }];
+        let packs = saiifeguard::userpack::load_user_packs(
+            &srcs,
+            saiifeguard::canon::PathStyle::host(),
+            saiifeguard::profile::Profile::Host,
+        )
+        .unwrap();
+        let e = saiifeguard::engine::Engine::new(packs).with_paths(vars());
+        for cmd in ["rm x", "sudo rm x"] {
+            assert!(
+                matches!(e.evaluate(cmd), saiifeguard::engine::Decision::Deny { .. }),
+                "{cmd}: {out}"
+            );
+        }
     }
 
     #[test]
