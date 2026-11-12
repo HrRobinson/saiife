@@ -53,6 +53,9 @@ pub const FLEET_INSTALL: &str = "/etc/saiife/fleet/install.toml";
 pub const INSTALL_LOCK: &str = "/etc/saiife-install.lock";
 /// The staging copy a package ships; `install` copies it to [`BINARY`].
 pub const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
+/// The FIDO helper the Linux deb and rpm ship (plan 41 F2): root-owned, run
+/// by the static `saiife` for key touches. Linux only (no macOS or Windows path).
+pub const FIDO_HELPER: &str = "/usr/libexec/saiife/saiife-fido";
 
 /// The polkit action file, byte for byte. `auth_self`, never
 /// `auth_self_keep`: every approval asks for the password again. The
@@ -625,7 +628,7 @@ mod windows_tests {
 
     /// The constants W9 gives no Windows path, those it does not name, and a
     /// string that is no constant.
-    const NO_WINDOWS_PATH: [&str; 9] = [
+    const NO_WINDOWS_PATH: [&str; 10] = [
         RUN_DIR,
         SOCKET,
         UNIT,
@@ -634,6 +637,7 @@ mod windows_tests {
         PKCHECK,
         CREDSTORE,
         INSTALL_LOCK,
+        FIDO_HELPER,
         "/etc/saiife/other",
     ];
 
@@ -990,6 +994,7 @@ mod tests {
         assert_eq!(FLEET_CONFIG, "/etc/saiife/fleet/config.toml");
         assert_eq!(FLEET_INSTALL, "/etc/saiife/fleet/install.toml");
         assert_eq!(PACKAGE_BINARY, "/usr/libexec/saiife/saiife");
+        assert_eq!(FIDO_HELPER, "/usr/libexec/saiife/saiife-fido");
     }
 
     /// The Linux constants that differ on macOS, with their §5.3 value.
@@ -1066,6 +1071,7 @@ mod tests {
             assert_eq!(macos_path(p), None, "{p} is the same on macOS");
         }
         assert_eq!(macos_path("/etc/saiife/other"), None);
+        assert_eq!(macos_path(FIDO_HELPER), None);
         assert_eq!(DAEMON_LOG, "/var/log/saiife/daemon.log");
         assert_eq!(
             CLAUDE_MDM_PROFILE,

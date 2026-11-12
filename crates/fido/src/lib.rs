@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+pub mod client;
 pub mod errors;
 #[cfg(feature = "fake")]
 pub mod fake;
