@@ -5,7 +5,8 @@ a browser. Today it runs on your own machine, at `http://localhost:47810`. When
 the hub ships, the same page will also be served from app.saiife.com.
 
 Boxes themselves arrive in a later release. Until then the page has nothing to
-show, except on the demo build (see [Try it before boxes ship](#try-it-before-boxes-ship)).
+show, except on the demo build (see
+[Try it before boxes ship](#try-it-before-boxes-ship)).
 
 ## Start it
 
@@ -24,7 +25,9 @@ saiife workspace pair --local
 ```
 
 This shows a QR code and a link. Open the link in the browser you want to
-pair. Use `--label` to name the browser, and `--port` if you changed the port.
+pair. Use `--port` if you changed the port. `--label` is a note on the offer,
+kept in its audit record. The name the device list shows is the one typed in
+the page when you pair.
 
 ## Pairing
 
@@ -48,23 +51,28 @@ saiife workspace revoke <device id>
 ```
 
 `devices` lists paired browsers with their ids (`d-...`). `revoke` removes
-one. A revoked browser sees "This browser is no longer paired". Revoking is
-done on the machine, never from the page.
+one. Revoking is done on the machine, never from the page.
+
+When the daemon no longer knows a browser (for example, it was revoked), the
+page forgets its key and shows the pair screen:
+"This browser is no longer paired." To pair it again, run
+`saiife workspace pair --local` on the machine and open the link it prints.
 
 ## What the page does
 
 | Screen | What you can do |
 |---|---|
-| Overview | See boxes, load and free slots. Reorder queued boxes. "Stop every agent" (`lockdown.on`) asks you to confirm first. The page asks again every 3 s while the tab is visible. It does not use push. |
+| Overview | See boxes, load and free slots. Reorder queued boxes. "Lockdown on" (`lockdown.on`) asks "Stop every agent on this machine?" first. The page asks again every 3 s while the tab is visible. It does not use push. |
 | Review | Read the diff and the test result of a finished box. Reject it (discards the box). |
 | Spawn | Start a box from a template. |
 | Inbox | See what waits for you. The page asks again every 5 s while the tab is visible. |
 | Steer | Pause or stop a box. Both work. Sending a message and Resume need a touch, so they are refused for now. |
 | Pair | Pair this browser. |
 
-The diff shows the first 2000 lines. If the daemon cut the diff, the page says
-so. File names and text from a box are shown as plain text. Control and
-direction characters appear as visible escapes.
+The diff shows the first 2000 lines. A file cut by that limit says how many of
+its lines are not shown. If the daemon cut the diff, the page says so. File
+names and text from a box are shown as plain text. Control and direction
+characters appear as visible escapes.
 
 ## What needs a touch
 
@@ -89,7 +97,8 @@ one is refused.
 ## The audit
 
 Every change from the page is recorded by the daemon: reorder, stop, pause,
-discard, spawn, lockdown on and so on. Each record has the device id and `via: "local"`.
+discard, spawn, lockdown on and so on. Each record has the device id and
+`via: "local"`.
 Successful reads (overview, diff, inbox) are not recorded. A read the daemon
 refuses is recorded.
 
