@@ -14,16 +14,17 @@ const WHAT = {
 export function show(refusal, { action, id, summary } = {}) {
   const code = refusal && typeof refusal.short_code === "string" ? refusal.short_code : null;
   const what = summary || WHAT[action] || String(action);
+  const cmd = id ? machineCommand(action, id) : null;
   return h(
     "section",
     { class: "touchprompt", role: "alert" },
     h("h2", {}, "Not done yet"),
     h("p", {}, `Asked: ${visible(what)}`),
-    h("p", {}, `Box: ${visible(id)}`),
+    id ? h("p", {}, `Box: ${visible(id)}`) : null,
     code ? h("p", {}, "Code: ", h("span", { class: "code" }, visible(code))) : null,
     h("p", {}, "Needs a touch on a paired passkey."),
-    h("p", { class: "muted" }, "On the machine, run:"),
-    h("pre", {}, machineCommand(action, id)),
+    cmd ? h("p", { class: "muted" }, "On the machine, run:") : h("p", { class: "muted" }, "Approve it on the machine."),
+    cmd ? h("pre", {}, cmd) : null,
     refusal && refusal.message ? h("p", { class: "muted" }, visible(refusal.message)) : null,
   );
 }

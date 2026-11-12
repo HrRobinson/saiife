@@ -45,3 +45,9 @@ test("spawn args", () => {
   assert.deepEqual(spawnArgs("claude", "r", "t", true), { template: "claude", repo: "r", task: "t", start: "now" });
   assert.deepEqual(spawnArgs("claude", "r", "t", false).start, "queue");
 });
+
+import { promptAction } from "../js/inboxlogic.js";
+test("prompt action", () => {
+  assert.equal(promptAction("land"), "box.land");
+  assert.equal(promptAction("push_protected"), "class:push_protected");
+});

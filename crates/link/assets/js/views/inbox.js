@@ -4,7 +4,7 @@ import { h } from "../dom.js";
 import { visible } from "../format.js";
 import { ACTIONS } from "../actions.js";
 import { Client } from "../wire.js";
-import { className, timeLeft } from "../inboxlogic.js";
+import { className, promptAction, timeLeft } from "../inboxlogic.js";
 import { show } from "../touchprompt.js";
 
 export const POLL_MS = 5000;
@@ -24,7 +24,7 @@ export function view(client) {
     const t = timeLeft(p.expires_at, now);
     const boxId = typeof p.box_id === "string" && BOX_ID.test(p.box_id) ? p.box_id : null;
     const kids = [
-      h("h2", {}, className(p.class)),
+      h("h2", {}, visible(className(p.class))),
       h("p", {}, visible(p.summary)),
       boxId ? h("p", {}, "Box: ", h("a", { href: `#/box/${boxId}` }, boxId)) : null,
       h("p", {}, "Code: ", h("span", { class: "code" }, visible(p.short_code))),
@@ -35,7 +35,7 @@ export function view(client) {
         prompt.replaceChildren(
           show(
             { short_code: p.short_code },
-            { action: `box.${p.class}`, id: boxId ?? "", summary: `${className(p.class)}: ${p.summary}` },
+            { action: promptAction(p.class), id: boxId ?? "", summary: `${visible(className(p.class))}: ${p.summary}` },
           ),
         );
       kids.push(h("p", {}, h("button", { type: "button", class: "primary", on: { click: open } }, "Open")));

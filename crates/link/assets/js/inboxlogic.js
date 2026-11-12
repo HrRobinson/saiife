@@ -58,3 +58,9 @@ export function needsTouchBadge(t) {
 export function spawnArgs(template, repo, task, now) {
   return { template, repo, task, start: now ? "now" : "queue" };
 }
+
+// The action name the touch prompt gets for an inbox row: only land has a
+// known machine command; any other class is not an action name.
+export function promptAction(cls) {
+  return cls === "land" ? "box.land" : `class:${cls}`;
+}

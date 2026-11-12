@@ -68,3 +68,22 @@ test("touch prompt shows the ask, the box, the code and the command, never succe
   const none = texts(show({}, { action: "box.steer", id: "b-2" })).join("|");
   assert.ok(!none.includes("Code:"));
 });
+
+test("no invented machine commands", () => {
+  assert.equal(machineCommand("box.spawn", ""), null);
+  assert.equal(machineCommand("class:push_protected", "b-1"), null);
+  assert.equal(machineCommand("box.land", "b-1"), "saiife box land b-1");
+});
+
+test("prompt for spawn and push_protected has no command and no empty Box line", async () => {
+  const { show } = await import("../js/touchprompt.js");
+  for (const [action, id] of [["box.spawn", ""], ["class:push_protected", "b-1"]]) {
+    const all = texts(show({ short_code: "123456" }, { action, id, summary: "x" })).join("|");
+    assert.ok(!all.includes("saiife box"), all);
+    assert.ok(!all.includes("On the machine, run:"), all);
+    assert.ok(all.includes("Approve it on the machine."), all);
+    assert.ok(id ? all.includes("Box: b-1") : !all.includes("Box:"), all);
+  }
+  const land = texts(show({}, { action: "box.land", id: "b-1" })).join("|");
+  assert.ok(land.includes("saiife box land b-1"));
+});

@@ -53,12 +53,12 @@ export function counter(s) {
   return { text: `${n} / ${MAX_STEER_BYTES} bytes`, over: n > MAX_STEER_BYTES };
 }
 
-// What the machine command is for a refused action.
+// The machine command for a refused action, or null when none is known.
 export function machineCommand(action, id) {
   switch (action) {
     case "box.steer": return `saiife box say ${id} "…"`;
     case "box.resume": return `saiife box resume ${id}`;
     case "box.land": return `saiife box land ${id}`;
-    default: return `saiife box ${String(action).replace(/^box\./, "")} ${id}`;
+    default: return null;
   }
 }
