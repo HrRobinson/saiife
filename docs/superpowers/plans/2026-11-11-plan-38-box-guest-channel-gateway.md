@@ -2,6 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Reconciled 2026-11-12** against plan 34 as built on `v3-p34` (`ee5e264`), its rulings R2, R3, R25, R26, R30, and plan 32 as merged. Changes:
+> 1. Names checked: `GuestLink { prompt, terminal, diff }`, `GuestEvent { Ready, Activity, TurnFinished, Exited }`, `GuestError { Unavailable, NotConnected }`, `NoGuest` (`crates/boxes/src/guest.rs:9-45`); `Manager::guest_event(&self, id, ev) -> Result<Option<Change>, BoxError>` (`manager.rs:672`); `ManagerInit.guest: Arc<dyn GuestLink>` (`manager.rs:59`); `EgressRule { host, port }` (`template.rs:50`); `DONE_IDLE_SECS = 30` (`manager.rs:41`).
+> 2. `saiife box attach` polls `box.term.read {box, after}` (R25: the box id is `box` on the control socket, `box_ops.rs:454-460`, `:562-571`); the answer is the `TermBatch` fields at top level, `{frames, next, ended}` (`box_ops.rs:967-972`).
+> 3. Lockdown `all` (R30, plan 34 final fix wave): a `Ready` box keeps its `pending_prompt` unsent until lockdown lifts and the tick admits nothing; the event forwarder only calls `Manager::guest_event`, so this holds without code here (test added).
+> 4. `fake_ready` (R26) is the `fake-vmm` build's stand-in for `Ready`; Task 8's forwarder replaces it only for the real VMM path and must not run beside it.
+> 5. Tick-style records: plan 34's `write_tick_records` hardcodes `action`/`via = "tick"` (`box_ops.rs:383-399`); Task 8 generalises it to take `via` (`"guest"`), shared with plan 37 Task 5 and plan 31 Task 1 (whichever lands first adds the parameter).
+> 6. Template egress strings are loose at load (plan 34 Task 2 deferred minors: `*.com` accepted, `+443` parses as a port); `allowed` re-checks each rule itself (a wildcard needs at least two labels after `*.`; ports are taken as parsed) and the test covers `*.com`.
+> 7. Plan 32 names as merged: the in-box hook is `saiife check --hook-exit --agent claude --profile box` (`crates/cli/src/main.rs:113-116`, `Profile::Box` in `crates/guard/src/profile.rs:14`); user packs are read with `saiife_policy::userpacks::read_user_packs(dir, files)` (`userpacks.rs:47`) and ids checked with `valid_user_pack_id` (`userpacks.rs:34`).
+> 8. `box.diff` on real boxes stays unavailable until plan 39 (`ManagerSource::diff` asks `GuestLink::diff`, `source.rs:135-138`, which `VsockGuest` refuses).
+> 9. Global Constraints: branch `v3-p38`; builds with `CARGO_PROFILE_DEV_DEBUG=0`.
+
+> **Owner-approved contract additions (2026-11-12):** `TouchClass::Steer` (plan 31), `IssueKey::{Web, Land, Push}` (plans 31, 39), `Vmm::image_id` (plan 36). This plan adds none of them; it builds on a manager whose `BoxRecord.image` comes from `Vmm::image_id`. Boxes do not ship in a release before plan 41 is done (plan 35 header).
+
 > **Depends on:** plan 34 merged (`GuestLink`, `GuestEvent`, `Manager::guest_event`, template `egress`); plan 35 Task 1 (scaffold) and Task 5 (`VmHooks`) and Task 7 (`real_vmm(…, hooks)`). The in-box hook needs **plan 32 Task 6** (`saiife check --profile box`) at smoke time only; the code here only writes the hook config. Plan 39 uses Task 4's `request_stream`; plan 40 fills Task 6's model listener.
 
 **Goal:** The box talks to the host, and only through channels the daemon owns:
@@ -37,7 +50,7 @@
 
 ## Global Constraints
 
-Plan 35's Global Constraints apply, with worktree `.worktrees/p38`, branch `p38-box-guest`, scratch prefix `p38-tN-`. In addition:
+Plan 35's Global Constraints apply (including `CARGO_PROFILE_DEV_DEBUG=0`), with worktree `.worktrees/p38`, branch `v3-p38`, scratch prefix `p38-tN-`. In addition:
 - **Guest code is tested on the host against a tempdir root** (`GuestEnv.root`), with fake `setsid`, `runuser`, `systemctl`, `chown` scripts. A test may open a real PTY and run `/bin/cat` or `/bin/sh -c` as the "agent" through the fake wrappers; never run `systemctl`, never run anything as another user.
 - **Gateway tests never use the network:** the resolver is injected (`Resolve` trait) and upstreams are loopback listeners started by the test; the public-address rule is bypassed only through a debug-only `allow_loopback_for_tests` flag on the gateway config.
 - `vt100 = "=0.15.2"` is the only new dependency; record it in the report.
@@ -251,14 +264,14 @@ impl GatewayHooks { pub fn new(ctx: Arc<Ctx>, rt: Handle, resolve: Arc<dyn Resol
 impl saiife_boxhost::vmm::VmHooks for GatewayHooks { /* before_boot: bind vsock_port(EGRESS) and vsock_port(MODEL) (0660, group per layout), spawn accept loops; after_off: abort them and every open tunnel, unlink */ }
 // egress.rs
 pub fn parse_connect(head: &[u8]) -> Result<(String, u16), &'static str>;   // "CONNECT host:port HTTP/1.x" + headers to CRLFCRLF
-pub fn allowed(rules: &[EgressRule], host: &str, port: u16) -> bool;        // exact name, or "*.<suffix>" for names with ≥ 1 more label; port equal
+pub fn allowed(rules: &[EgressRule], host: &str, port: u16) -> bool;        // exact name, or "*.<suffix>" (suffix of ≥ 2 labels: plan 34's loader accepts "*.com", this does not) for names with ≥ 1 more label; port equal
 pub fn public(ip: &IpAddr) -> bool;                                          // G7 list
 pub async fn serve(stream: UnixStream, id: BoxId, gw: Arc<GatewayShared>);
 // model.rs: plan 40 fills; here every model connection gets "HTTP/1.1 503 Service Unavailable" with body "model access is not set up yet" and closes
 ```
 `serve`: read the head (G9) → `parse_connect` (error → `400`); non-CONNECT → G6 `403`; lockdown (G8) → `503`; the box's template egress via `spawn_blocking(mgr.get(id))` (unknown box → `403`); `allowed` (no → `403 "<host>:<port> is not in this box's allow-list"`); `lookup` → every answer `public` (else `403 "<host> resolves to a private address"`); connect the first answer (timeout → `504`, error → `502`); `HTTP/1.1 200 Connection established\r\n\r\n`; `copy_bidirectional` with byte counters, idle timeout and a 5 s lockdown check; on close the `egress` record (G10). The template's rule list is read once per connection (a template change applies to new tunnels).
 
-- [ ] **Step 1: Write the failing tests** (`tests/box_gateway.rs`: `test_ctx` with a FakeVmm manager and a template whose egress is `["example.test:443", "*.crates.test:443"]`; a fake `Resolve` map; a loopback TCP echo server as upstream with `allow_loopback_for_tests`): `connect_tunnels_bytes_both_ways` (and one `egress` record with `bytes_up`/`bytes_down` equal to what was sent), `not_allowed_is_403_and_audited`, `wildcard_rules` (`a.crates.test` ok, `crates.test` refused, `a.b.crates.test` ok), `port_must_match`, `private_answers_are_refused` (allow-loopback off: `127.0.0.1`, `10.0.0.5`, `::1`, `::ffff:192.168.1.1`, `100.64.0.1`, `fe80::1`), `mixed_answers_are_refused`, `ip_literal_is_refused`, `plain_http_is_refused`, `oversized_head_is_refused`, `slow_head_times_out`, `denied_records_are_rate_limited` (5 refusals in a second → 1 record; the next after 60 s of the injected clock carries `suppressed: 4`), `lockdown_refuses_new_tunnels`, `lockdown_closes_open_tunnels` (outcome `lockdown` within 6 s), `tunnel_cap` (the 65th gets `429`), `idle_tunnel_closes` (idle lowered to 1 s), `gateway_after_off_closes_tunnels`, `model_port_is_503_until_plan_40`; unit `public_rules` (each range of G7, plus `8.8.8.8` and `2606:4700::1111` public).
+- [ ] **Step 1: Write the failing tests** (`tests/box_gateway.rs`: `test_ctx` with a FakeVmm manager and a template whose egress is `["example.test:443", "*.crates.test:443"]`; a fake `Resolve` map; a loopback TCP echo server as upstream with `allow_loopback_for_tests`): `connect_tunnels_bytes_both_ways` (and one `egress` record with `bytes_up`/`bytes_down` equal to what was sent), `not_allowed_is_403_and_audited`, `wildcard_rules` (`a.crates.test` ok, `crates.test` refused, `a.b.crates.test` ok; a rule `*.com` allows nothing), `port_must_match`, `private_answers_are_refused` (allow-loopback off: `127.0.0.1`, `10.0.0.5`, `::1`, `::ffff:192.168.1.1`, `100.64.0.1`, `fe80::1`), `mixed_answers_are_refused`, `ip_literal_is_refused`, `plain_http_is_refused`, `oversized_head_is_refused`, `slow_head_times_out`, `denied_records_are_rate_limited` (5 refusals in a second → 1 record; the next after 60 s of the injected clock carries `suppressed: 4`), `lockdown_refuses_new_tunnels`, `lockdown_closes_open_tunnels` (outcome `lockdown` within 6 s), `tunnel_cap` (the 65th gets `429`), `idle_tunnel_closes` (idle lowered to 1 s), `gateway_after_off_closes_tunnels`, `model_port_is_503_until_plan_40`; unit `public_rules` (each range of G7, plus `8.8.8.8` and `2606:4700::1111` public).
 - [ ] **Step 2: Run** `cargo test -p saiife-daemon --features fake-vmm --test box_gateway -j 4 -- --test-threads=4` → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat(daemon): per-box gateway listener and allow-listed CONNECT proxy (spec §7.4)`.
 
@@ -277,9 +290,9 @@ pub fn pack_files(packs: &[(String, String)] /* (id, toml text) */) -> Vec<Setup
 pub fn run(client: &mut Client, id: &BoxId, tty: bool) -> ExitCode;
 pub fn apply(screen: &mut Vec<String>, f: &TermFrame);     // snapshot replaces, delta patches
 ```
-`attach`: polls `box.term.read {id, after}` every 250 ms; on change redraws the whole screen (clear, then each line through `crate::text::sanitize`), with a header `box <id> (<state>): read-only, q quits; type into it with saiife box say <id> "…"`; raw mode through `rustix::termios` only to read `q` / Ctrl-C, restored on exit and on panic; without a TTY prints the current screen once and exits 0; `ended` prints `the box's terminal has ended` and exits 0.
+`attach`: polls `box.term.read {box, after}` every 250 ms (plan 34 R25: never an `id` argument on the control socket; the answer is `{frames, next, ended}` at top level, `box_ops.rs:967-972`); on change redraws the whole screen (clear, then each line through `crate::text::sanitize`), with a header `box <id> (<state>): read-only, q quits; type into it with saiife box say <id> "…"`; raw mode through `rustix::termios` only to read `q` / Ctrl-C, restored on exit and on panic; without a TTY prints the current screen once and exits 0; `ended` prints `the box's terminal has ended` and exits 0.
 
-- [ ] **Step 1: Write the failing tests:** `claude_settings_are_pinned` (exact JSON: the `PreToolUse` command with `--profile box`, the `Stop` command), `pack_files_paths_and_bad_ids`, `apply_snapshot_and_delta`, `attach_prints_sanitized_lines` (CLI test with `--features fake-vmm`: a `FakeGuest` terminal with a line holding `\u{202e}` and an ESC; output shows the escaped forms only), `attach_without_tty_prints_once`.
+- [ ] **Step 1: Write the failing tests:** `claude_settings_are_pinned` (exact JSON: the `PreToolUse` command with `--profile box`, the `Stop` command), `pack_files_paths_and_bad_ids`, `apply_snapshot_and_delta`, `attach_sends_box_not_id` (the recorded request args are `{box, after}`), `attach_prints_sanitized_lines` (CLI test with `--features fake-vmm`: a `FakeGuest` terminal with a line holding `\u{202e}` and an ESC; output shows the escaped forms only), `attach_without_tty_prints_once`.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat(cli): saiife box attach (read-only); in-box hook config with --profile box`.
 
@@ -290,18 +303,18 @@ pub fn apply(screen: &mut Vec<String>, f: &TermFrame);     // snapshot replaces,
 **Files:** Modify `crates/daemon/src/box_ops.rs` (build `VsockGuest` + `GatewayHooks`, pass both to `real_vmm`, start the event forwarder), `crates/daemon/src/box_vmm.rs`; create `crates/daemon/src/box_setup.rs`, `scripts/box-smoke.d/30-guest.sh`.
 
 **Interfaces:**
-- Consumes: Tasks 4, 6, 7; plan 35 `real_vmm(layout, mode, hooks)`; plan 32 Task 4's user-pack reader (`crates/policy/src/userpacks.rs`).
+- Consumes: Tasks 4, 6, 7; plan 35 `real_vmm(layout, mode, hooks)`; plan 32's user-pack reader `saiife_policy::userpacks::read_user_packs(dir, files)` (`crates/policy/src/userpacks.rs:47`); plan 34's `write_tick_records` (`box_ops.rs:383`), generalised to take `via`.
 - Produces:
 ```rust
 pub struct TemplateSetup { /* Arc<Manager>, packs reader */ }
 impl saiife_boxhost::guest::SetupSource for TemplateSetup { /* command from the template, env = [] (plan 40 adds the model env), files = [claude_settings at /home/agent/.claude/settings.json (0644)] + pack_files(user packs), rows 40, cols 120 */ }
 pub fn start_event_forwarder(ctx: Arc<Ctx>, guest: Arc<VsockGuest>);   // spawn_blocking loop: recv_events(1 s) -> mgr.guest_event -> one tick-style record per Change (via "guest")
 ```
-`Manager` is built with `guest = VsockGuest` when the real VMM is used (FakeGuest stays for the `fake-vmm` path). `box.term.read` (plan 29 / plan 34 name) reaches `GuestLink::terminal` through `ManagerSource`, unchanged.
+`Manager` is built with `guest = VsockGuest` when the real VMM is used (`FakeGuest` and plan 34's `fake_ready` tick, R26, stay for the `fake-vmm` path only). `box.term.read` (plan 29 / plan 34 name) reaches `GuestLink::terminal` through `ManagerSource`, unchanged. The forwarder changes state only through `Manager::guest_event`, so plan 34's lockdown rule (R30: under lockdown `all` a `Ready` box's `pending_prompt` is not sent) holds.
 
 `30-guest.sh` (owner-run; result keys): time from spawn to `Ready` (`ready_ms`); `saiife box say` types into the TUI (`say_ok`); `saiife box attach` shows the screen (by eye; the script pauses for the owner); inside the box (`say` a shell command when the template command is `bash`, the smoke uses a `bash` template from `scripts/box-smoke.d/templates/bash.toml`): `printf '\e]52;c;aGVsbG8=\a'` leaves the host clipboard unchanged and `box.term.read` has no `\x1b` (`osc52_inert`); `curl -sS https://registry.npmjs.org/ -o /dev/null -w '%{http_code}'` with npm allow-listed → `200`, a host not on the list → proxy `403` (`egress_allow`, `egress_deny`); `localtest.me` (a public name that resolves to `127.0.0.1`), allow-listed in the smoke template → `403` (`egress_private`); `docker pull busybox@sha256:<pin>` through the proxy with Docker Hub's three hosts allow-listed (`docker_pull_ok`); the audit has `egress` records with byte counts; a Claude Code `Stop` hook moves the box to `done` within ~30 s of the turn (needs plan 40; skipped with a note if the template is `bash`).
 
-- [ ] **Step 1: Write the failing tests:** daemon `setup_for_has_settings_and_packs` (a user pack in the personal packs dir → a `SetupFile` at the expected path), `forwarder_moves_ready_box_to_running` (VsockGuest replaced by a test `SetupSource` + test guest on a fake multiplexer, or: `start_event_forwarder` over a stub that yields `(b1, Ready)` → `mgr.get(b1).state == Running` and one record with `via: "guest"`).
+- [ ] **Step 1: Write the failing tests:** daemon `setup_for_has_settings_and_packs` (a user pack in the personal packs dir → a `SetupFile` at the expected path), `forwarder_moves_ready_box_to_running` (VsockGuest replaced by a test `SetupSource` + test guest on a fake multiplexer, or: `start_event_forwarder` over a stub that yields `(b1, Ready)` → `mgr.get(b1).state == Running` and one record with `via: "guest"`), `ready_under_lockdown_keeps_the_prompt` (lockdown `all` on, `(b1, Ready)` → the stub guest received no `prompt`; after lockdown off and a tick it did).
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement**; write the fragment and `templates/bash.toml` (`command = ["bash"]`, egress for the checks above); `bash -n`; shellcheck if installed. **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat(daemon): wire the guest channel and the gateway into real boxes; guest smoke`.
 
