@@ -138,14 +138,24 @@ pub(crate) fn describe(path: &Path, e: &HelperError, limit: Duration) -> String 
 /// The `Transport` over the helper at `path` (already checked, F2).
 pub(crate) struct Helper {
     path: PathBuf,
+    /// The uid that must own the helper and the highest directory checked.
+    owner: u32,
+    root: PathBuf,
     /// The helper `devices` started, for the next `assert` or `enrol`.
     running: Mutex<Option<Running>>,
 }
 
 impl Helper {
     pub(crate) fn new(path: PathBuf) -> Self {
+        let (_, owner, root) = located();
+        Self::with_owner(path, owner, root)
+    }
+
+    fn with_owner(path: PathBuf, owner: u32, root: PathBuf) -> Self {
         Self {
             path,
+            owner,
+            root,
             running: Mutex::new(None),
         }
     }
@@ -178,8 +188,10 @@ impl Helper {
 
 /// An error answer's text: the helper's (raw) library text, cut and
 /// sanitized before `KeyTouch` classifies and prints it.
+/// Lines stay lines (each sanitized), so `KeyTouch` prints only the first.
 fn ctap_text(error: &str) -> String {
-    shown(error, MAX_ERROR_CHARS)
+    let capped: String = error.chars().take(MAX_ERROR_CHARS).collect();
+    capped.lines().map(sanitize).collect::<Vec<_>>().join("\n")
 }
 
 impl Transport for Helper {
@@ -188,6 +200,9 @@ impl Transport for Helper {
     /// closed now, and `KeyTouch` refuses (D2) before the PIN.
     fn devices(&self) -> Result<usize, TouchError> {
         self.close_left();
+        // F2 is before every run: check again, as `checked` did.
+        check_helper(&self.path, self.owner, &self.root)
+            .map_err(|e| self.fail(&e, Duration::ZERO))?;
         let (run, hello) = Running::start(&self.path).map_err(|e| self.fail(&e, Duration::ZERO))?;
         if hello.devices == 1 {
             *self.slot() = Some(run);
@@ -324,5 +339,36 @@ mod tests {
                 .1,
             "wrong PIN"
         );
+    }
+
+    /// F2 is "before every run": a helper made unsafe after `checked` is
+    /// not started by `devices`.
+    #[test]
+    fn devices_checks_the_helper_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let path = dir.path().join("saiife-fido");
+        std::fs::write(&path, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let h = Helper::with_owner(path, uid, dir.path().to_path_buf());
+        assert!(matches!(h.devices(), Err(TouchError::Unavailable)));
+        assert!(!marker.exists(), "the unsafe helper was started");
+    }
+
+    /// The printed line is the first line; the classifier still sees the rest.
+    #[test]
+    fn ctap_text_keeps_lines_for_the_first_line_cut() {
+        let t = ctap_text("0x31 CTAP2_ERR_PIN_INVALID\n\u{1b}[31msecond");
+        assert_eq!(
+            saiife_fido::errors::first_line(&t),
+            "0x31 CTAP2_ERR_PIN_INVALID"
+        );
+        assert!(
+            !t.contains('\u{1b}') && t.contains("\\x1b[31msecond"),
+            "{t:?}"
+        );
+        assert_eq!(t.lines().count(), 2);
     }
 }

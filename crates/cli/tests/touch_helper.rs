@@ -25,7 +25,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 /// The PIN the seam types.
-const PIN: &str = "4321";
+const PIN: &str = "qzxwvkpin";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NO_HELPER: &str = "this saiife build has no FIDO2 key support (a static Linux build without the FIDO helper); install the saiife deb or rpm, see docs/touch.md";
 const ONLY_ONE: &str = "more than one FIDO key is plugged in; leave only the one to use";

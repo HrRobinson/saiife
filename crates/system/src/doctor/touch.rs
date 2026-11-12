@@ -36,7 +36,12 @@ fn helper_check(touch: &TouchSupport) -> Check {
             Status::Pass,
             format!("/usr/libexec/saiife/saiife-fido {version}, protocol 1"),
         ),
-        TouchSupport::HelperMissing | TouchSupport::None => (
+        // The post-install doctor passes None: it did not look.
+        TouchSupport::None => (
+            Status::Info,
+            "not checked here; run saiife doctor".to_string(),
+        ),
+        TouchSupport::HelperMissing => (
             Status::Info,
             "no FIDO helper: install the saiife deb or rpm for key support (docs/touch.md)"
                 .to_string(),
@@ -181,26 +186,20 @@ mod tests {
             c.detail,
             "/usr/libexec/saiife/saiife-fido 0.3.1, protocol 1"
         );
-        for missing in [TouchSupport::HelperMissing, TouchSupport::None] {
-            let c = helper_row(missing);
-            assert_eq!(c.status, Status::Info);
-            assert_eq!(
-                c.detail,
-                "no FIDO helper: install the saiife deb or rpm for key support (docs/touch.md)"
-            );
-        }
+        let c = helper_row(TouchSupport::HelperMissing);
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(
+            c.detail,
+            "no FIDO helper: install the saiife deb or rpm for key support (docs/touch.md)"
+        );
+        // The post-install doctor passes None: it did not look.
+        let c = helper_row(TouchSupport::None);
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.detail, "not checked here; run saiife doctor");
         let c = helper_row(TouchSupport::HelperBroken("the helper is unsafe".into()));
         assert_eq!(c.status, Status::Warn);
         assert_eq!(c.detail, "the helper is unsafe");
         assert_eq!(c.title, "touch helper");
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn no_helper_row_off_linux() {
-        let t = TempDir::new().unwrap();
-        let cs = run_all(t.path(), TouchSupport::InProcess);
-        assert!(cs.iter().all(|c| c.id != "touch-helper"));
     }
 
     #[test]

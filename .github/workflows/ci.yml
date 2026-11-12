@@ -31,6 +31,19 @@ jobs:
       - name: fido-hid unit tests
         if: runner.os == 'Linux'
         run: cargo test -p saiife-fido --features hid
+      # The Linux FIDO helper (plan 41): the helper bins and the fake-helper integration
+      # tests are features, so the workspace steps above build and run none of them.
+      - name: FIDO helper (clippy, tests with the fake helper)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo clippy -p saiife-fido --features hid,fake --all-targets -- -D warnings
+          cargo clippy -p saiife --features fake-fido --all-targets -- -D warnings
+          cargo test -p saiife-fido --features hid,fake
+          cargo test -p saiife --features fake-fido --test touch_helper
+        env:
+          SAIIFE_TEST_TMP: ${{ runner.temp }}/s
+          TMPDIR: ${{ runner.temp }}
       # --no-fail-fast: one failing test binary must not hide the rest.
       # A short temp base keeps unix socket paths under 108 bytes.
       # TMPDIR too: tempfile::tempdir() (and anything else using the
@@ -500,12 +513,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/nfpm-cache
           key: nfpm-${{ steps.nfpm-pin.outputs.sha256 }}
-      # old = the cargo version; new = the same build with an extra ELF
-      # section, so its bytes differ and it stays static (upgrade phase).
       # The dynamically linked FIDO helper (plan 41), built against glibc 2.31 in the pinned
       # debian:bullseye container; both packages carry the same helper.
       - name: build the FIDO helper
         run: bash scripts/release/build-fido-helper.sh amd64 "$RUNNER_TEMP/fido-out"
+      # old = the cargo version; new = the same build with an extra ELF
+      # section, so its bytes differ and it stays static (upgrade phase).
       - name: build the old and the new package
         run: |
           set -euo pipefail

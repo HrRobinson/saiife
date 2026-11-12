@@ -120,7 +120,8 @@ audit_records() {
 
 # 0. with the package's helper installed, doctor shows touch-helper PASS.
 doc=$("$SAIIFE" doctor 2>&1 || true)
-if [ -e /usr/libexec/saiife/saiife-fido ]; then
+# A fido-hid build talks to keys itself: touch-helper is Info there, not PASS.
+if [ -e /usr/libexec/saiife/saiife-fido ] && ! grep -qF 'this build talks to keys itself' <<<"$doc"; then
   if grep -iE 'touch[- ]helper' <<<"$doc" | grep -q 'PASS'; then
     ok "doctor: touch helper PASS"
   else
