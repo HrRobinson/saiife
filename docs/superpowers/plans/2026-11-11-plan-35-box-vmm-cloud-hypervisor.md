@@ -15,6 +15,17 @@
 > 10. The manager never parses `VmHandle.data` (`store.rs:17`): the image id reaches it through plan 36's `Vmm::image_id`, not by reading the JSON.
 > 11. Task 7: a failed preflight is reported through a new `Ctx.box_unavailable` (plan 34's `handle` answers a fixed `UNAVAILABLE` when `box_manager` is `None`, `box_ops.rs:661-663`).
 
+> **As built on `v3-p35` (2026-11-12): what Task 7 and later plans must know.**
+> 1. `Layout.vault` (R18): daemon-owned, never VMM-writable; it holds `<id>.marker`, `<id>.snap/` and `<id>.pid`. Locked dir modes (R26): `/var/lib/saiife-box` root:saiife-box 0750, `boxes/` saiife:saiife-box 3770, `images/` and `vault/` 2750.
+> 2. Liveness comes only from `Launcher::exited` (R19); this supersedes Review Focus 4's "status answers from the API socket". The API only refines Running/Paused/Created of a live process. Unit bus: `NoSuchUnit` = gone, any other bus error = alive (R27).
+> 3. Restore only from the hashed vault copy: `LaunchSpec.restore: Option<PathBuf>` = `<vault>/<id>.snap` (R20), one-shot (R13); `VmHooks::restore_refused` must be audited by the daemon (R14).
+> 4. `ChVmmInit.vmm_uid` must be the `saiife-box` uid in locked mode; `landlock = true` unconditionally outside tests (R23). `StopTimes` has `force_s` (35 s): the wait after a unit's force stop; a run whose exit shows up later still gets `after_off` once, on the next `status`/`stop`/`boot`/`destroy`.
+> 5. `destroy` may return `Failed` when the exit is unconfirmed: keep the box dir then.
+> 6. `<box>/snapshot` is made by `saiife __box-vmm` (0770, as the VMM user) before the exec and only ever emptied by fd, never removed (Landlock binds its rule to that inode). A snapshot copy is capped at `mem_mib` + 64 MiB (`mem_mib` from the handle's `data`), `config.json`/`state.json` at 16 MiB.
+> 7. Locked mode, Task 7: `crates/boxes` `Store` must not chmod the locked boxes root to 0700, and must create locked box dirs 2770 (final review I5); the overlay is already fchmodded 0660 by `ChVmm::create`. The box unit sees only its own box dir (rw), `images/` (ro) and its own `vault/<id>.snap` (ro) under a read-only tmpfs over `/var/lib/saiife-box` (final review I6). `system install --boxes` refuses a daemon user other than `saiife` (the polkit rule names it).
+> 8. Owner-smoke checks (not testable here): CH v54 snapshot file names and `VmConfig` fields against `check_config`; Landlock with the pre-made snapshot dir (CH writes a snapshot under `--landlock`); CH reading the vault copy at restore under Landlock and the unit's binds; the unit's `BindPaths` box dir is writable under `ProtectSystem=strict`.
+> 9. `check_spec`'s symlink walk starts at `/`: a user whose state dir has a symlinked ancestor is refused. Before personal boxes ship, walk only below the canonicalised `allowed.boxes`.
+
 > **Build order (owner ruling 2026-11-12):** boxes (plans 35–40) do not ship in a release before plan 41 (`2026-11-12-plan-41-linux-fido-helper.md`, the Linux FIDO helper) is done: without it a Linux release `saiife box land` cannot touch a key. They may be built and merged into `v3-dev` before then; the release that first enables them must contain plan 41.
 
 > **Owner-approved contract additions (2026-11-12):** `TouchClass::Steer` (plan 31), `IssueKey::{Web, Land, Push}` (plans 31, 39), `Vmm::image_id` (plan 36; this plan's `ChVmm` answers it from its handle's `image`, note 10). No longer flagged.

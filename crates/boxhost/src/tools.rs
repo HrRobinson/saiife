@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn run_times_out_and_kills_own_child() {
         let d = tempfile::tempdir().unwrap();
-        let t = script(d.path(), "sleep 30");
+        let t = script(d.path(), "exec sleep 30");
         let start = std::time::Instant::now();
         let r = t.run(Tool::Git, &[], Duration::from_secs(1));
         assert!(
