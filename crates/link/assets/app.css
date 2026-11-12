@@ -44,3 +44,4 @@ label{display:block;margin:12px 0 4px;color:var(--muted)}
 .files{padding-left:20px;overflow-wrap:anywhere}
 .banner{border:1px solid var(--warn);color:var(--warn);border-radius:6px;padding:8px 12px}
 button.digest{min-height:32px;padding:2px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;text-align:left}
+.card.expired{opacity:.55}

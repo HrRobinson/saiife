@@ -64,6 +64,9 @@ pub static ASSETS: &[Asset] = &[
     asset!("js/views/steer.js"),
     asset!("js/diff.js"),
     asset!("js/views/review.js"),
+    asset!("js/inboxlogic.js"),
+    asset!("js/views/inbox.js"),
+    asset!("js/views/spawn.js"),
 ];
 
 /// The strong ETag: `"` + the first 16 hex digits of SHA-256(bytes) + `"`.

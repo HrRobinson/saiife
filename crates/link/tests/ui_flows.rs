@@ -596,3 +596,117 @@ async fn review_screen_is_served() {
     let (st, _, _) = s.get("/js/diff.js").await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// The Approve inbox lists what the daemon holds; the code is the one the
+/// touch challenge yields (plan 26).
+#[tokio::test]
+async fn inbox_lists_demo_land() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let a = act(&w, &s, &d, "box.inbox", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let items = a["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{a}");
+    let it = &items[0];
+    assert_eq!(it["class"], "land", "{a}");
+    assert!(it["box_id"].is_string() && it["expires_at"].is_u64(), "{a}");
+    let ch: [u8; 32] = b64_hex(it["challenge_hex"].as_str().unwrap());
+    assert_eq!(
+        it["short_code"].as_str().unwrap(),
+        saiife_touch::short_code(&ch),
+        "{a}"
+    );
+    assert_eq!(it["short_code"].as_str().unwrap().len(), 6, "{a}");
+}
+
+fn b64_hex(h: &str) -> [u8; 32] {
+    assert_eq!(h.len(), 64, "{h}");
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap();
+    }
+    out
+}
+
+#[tokio::test]
+async fn spawn_plain_template_queues() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let t = act(&w, &s, &d, "box.templates", json!({})).await;
+    assert_eq!(t["result"].as_array().unwrap().len(), 2, "{t}");
+    let args = json!({"template": "claude", "repo": "saiife", "task": "fix the flaky test", "start": "queue"});
+    let a = act(&w, &s, &d, "box.spawn", args).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a["result"]["id"].is_string(), "{a}");
+    assert_eq!(
+        w.boxes.calls(),
+        vec![FakeCall::Spawn(SpawnReq {
+            template: "claude".into(),
+            repo: "saiife".into(),
+            task: "fix the flaky test".into(),
+            start: Start::Queue,
+        })]
+    );
+}
+
+#[tokio::test]
+async fn spawn_secret_template_needs_touch() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let args =
+        json!({"template": "claude-gh", "repo": "saiife", "task": "open a PR", "start": "now"});
+    let a = act(&w, &s, &d, "box.spawn", args).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    assert_eq!(w.boxes.calls(), vec![]);
+}
+
+#[tokio::test]
+async fn spawn_task_with_escape_is_refused() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let args =
+        json!({"template": "claude", "repo": "saiife", "task": "hi \u{1b}[2J", "start": "queue"});
+    let a = act(&w, &s, &d, "box.spawn", args).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "invalid", "{a}");
+    assert!(a["message"].as_str().is_some_and(|m| !m.is_empty()), "{a}");
+}
+
+/// §9.6: no row is a link that approves. inbox.js builds one `href`, to the
+/// box page, and calls nothing but `box.inbox`.
+#[tokio::test]
+async fn inbox_has_no_approve_url() {
+    let (_w, s) = up().await;
+    let (st, _, v) = s.get("/js/views/inbox.js").await;
+    assert_eq!(st, StatusCode::OK);
+    let v = String::from_utf8(v.to_vec()).unwrap();
+    let hrefs: Vec<_> = v.match_indices("href").collect();
+    assert_eq!(hrefs.len(), 1, "one href in inbox.js");
+    assert!(
+        v.contains("href: `#/box/${boxId}`"),
+        "the one href is the box page"
+    );
+    assert!(!v.contains("request_id"), "no href built from a request id");
+    assert!(
+        !v.contains("ACTIONS.land") && !v.contains("box.land\""),
+        "no land call"
+    );
+    assert!(
+        v.contains("ACTIONS.inbox") && v.contains("show("),
+        "reads, then the prompt"
+    );
+    assert_eq!(
+        v.matches("client.send(").count(),
+        1,
+        "the only send is the inbox read"
+    );
+    let (st, _, app) = s.get("/js/app.js").await;
+    assert_eq!(st, StatusCode::OK);
+    let app = String::from_utf8(app.to_vec()).unwrap();
+    assert!(app.contains("import { render as inbox } from \"./views/inbox.js\";"));
+    assert!(app.contains("import { render as spawn } from \"./views/spawn.js\";"));
+    let (_, _, sp) = s.get("/js/views/spawn.js").await;
+    let sp = String::from_utf8(sp.to_vec()).unwrap();
+    assert!(sp.contains("ACTIONS.spawn") && sp.contains("ACTIONS.templates"));
+}

@@ -4,8 +4,8 @@ import { loadDevice } from "./keystore.js";
 import { render as overview } from "./views/overview.js";
 import { render as review } from "./views/review.js";
 import { render as steer } from "./views/steer.js";
-import { render as inbox } from "./views/placeholder.js";
-import { render as spawn } from "./views/placeholder.js";
+import { render as inbox } from "./views/inbox.js";
+import { render as spawn } from "./views/spawn.js";
 import { render as pair } from "./views/pair.js";
 
 const BOX_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
