@@ -501,9 +501,21 @@ fn sync(config: Option<PathBuf>, packs: Vec<String>, llm: bool) -> ExitCode {
         outln!("no imported packs; nothing to sync");
         return ExitCode::SUCCESS;
     }
+    let mut updated: Vec<String> = Vec::new();
     for path in chosen {
-        if let Err(s) = sync_one(&target, &dir, &path, llm, &vars) {
-            return stop(s);
+        if let Err(Stop(code, m)) = sync_one(&target, &dir, &path, llm, &vars, &mut updated) {
+            if updated.is_empty() {
+                return stop(Stop(code, m));
+            }
+            // Say what really happened: "nothing written" is no longer true.
+            let reason = m.strip_suffix("; nothing written").unwrap_or(&m);
+            return stop(Stop(
+                code,
+                format!(
+                    "{reason}; earlier packs updated: {}; this and later packs unchanged",
+                    updated.join(", ")
+                ),
+            ));
         }
     }
     ExitCode::SUCCESS
@@ -515,6 +527,7 @@ fn sync_one(
     path: &str,
     llm: bool,
     vars: &saiifeguard::canon::PathVars,
+    updated: &mut Vec<String>,
 ) -> Result<(), Stop> {
     use saiifeguard::canon::PathStyle;
     use saiifeguard::profile::Profile;
@@ -677,10 +690,12 @@ fn sync_one(
     if remove_pack {
         std::fs::remove_file(path)
             .map_err(|e| Stop(1, format!("cannot remove {shown_pack}: {e}")))?;
+        updated.push(id.clone());
         outln!("{id} removed: no rules left");
         return Ok(());
     }
     store::replace_pack(Path::new(path), &new_text, target.is_locked()).map_err(|e| Stop(1, e))?;
+    updated.push(id.clone());
     let ask = nv.rules.iter().filter(|r| r.ask).count();
     outln!(
         "updated {shown_pack}: {} rules ({ask} ask), {} not enforced",

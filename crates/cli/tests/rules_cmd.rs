@@ -585,7 +585,9 @@ fn gone_line_removed_on_r() {
     let o = rules(&env, &["sync"], "r\n");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let text = fs::read_to_string(&pack).unwrap();
-    assert!(!text.contains("deploy-prod"), "{text}");
+    // Triggers are never pruned; no rule or carve-out for it is left.
+    assert!(!text.contains("^deploy-prod"), "{text}");
+    assert!(!text.contains("Never run `deploy-prod`"), "{text}");
     assert!(text.contains("terraform"), "{text}");
     assert!(text.contains("line = 1"), "moved up: {text}");
     // The carve-out `[[allow]]` went with its deny.
@@ -687,4 +689,33 @@ fn sync_output_never_carries_control_bytes() {
             .any(|c| c.is_control() && c != '\n' && c != '\t' || c == '\u{202e}'),
         "{all:?}"
     );
+}
+
+#[test]
+fn sync_stop_after_a_write_says_what_was_written() {
+    let env = Env::new(&[]);
+    env.write("AGENTS.md", DEPLOY);
+    env.write("CLAUDE.md", "Never run `terraform apply`.\n");
+    for f in ["AGENTS.md", "CLAUDE.md"] {
+        let o = rules(&env, &["import", f], "e\n\n");
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    let files = pack_files(&personal_packs(&env));
+    assert_eq!(files.len(), 2);
+    let (p1, p2) = (&files[0], &files[1]);
+    assert!(p1.file_name().unwrap().to_string_lossy().contains("agents"));
+    let (b1, b2) = (fs::read(p1).unwrap(), fs::read(p2).unwrap());
+    env.write("AGENTS.md", "gone\n");
+    env.write("CLAUDE.md", "gone too\n");
+    // The first pack's one question is answered (keep); input ends at the second.
+    let o = rules(&env, &["sync"], "\n");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    let id1 = p1.file_stem().unwrap().to_string_lossy().into_owned();
+    assert!(err.contains("earlier packs updated:"), "{err}");
+    assert!(err.contains(&id1), "{err}");
+    assert!(err.contains("this and later packs unchanged"), "{err}");
+    assert!(!err.contains("nothing written"), "{err}");
+    assert_ne!(fs::read(p1).unwrap(), b1);
+    assert_eq!(fs::read(p2).unwrap(), b2);
 }
