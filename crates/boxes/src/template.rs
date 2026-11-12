@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude-code.toml");
 /// Largest template file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
+/// The longest `[idle] stop_after_mins`: a week.
+pub const MAX_IDLE_STOP_MINS: u32 = 7 * 24 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Size {
@@ -324,6 +326,11 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
         if !valid_name(n) {
             return Err(format!("bad secret name {n:?}"));
         }
+    }
+    if !(1..=MAX_IDLE_STOP_MINS).contains(&raw.idle.stop_after_mins) {
+        return Err(format!(
+            "[idle] stop_after_mins must be 1..={MAX_IDLE_STOP_MINS}"
+        ));
     }
     if !valid_name(&raw.rules.profile) {
         return Err(format!("bad rules profile {:?}", raw.rules.profile));

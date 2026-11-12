@@ -30,8 +30,8 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
-#[cfg(any(unix, windows))]
 mod box_cmd;
+#[cfg(any(unix, windows))]
 mod broker;
 mod check;
 mod check_managed;

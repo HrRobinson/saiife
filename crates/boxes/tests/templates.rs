@@ -146,6 +146,16 @@ fn size_bounds() {
 }
 
 #[test]
+fn idle_stop_bounds() {
+    let s = |body: &str| parse("m", &with(&format!("[idle]\n{body}")));
+    assert!(s("stop_after_mins = 0").is_err());
+    assert_eq!(s("stop_after_mins = 1").unwrap().idle_stop_mins, 1);
+    assert_eq!(s("stop_after_mins = 10080").unwrap().idle_stop_mins, 10080);
+    assert!(s("stop_after_mins = 10081").is_err());
+    assert!(s("stop_after_mins = 4294967295").is_err());
+}
+
+#[test]
 fn name_rule() {
     let n = |name: &str| parse(name, &MIN.replace("\"m\"", &format!("\"{name}\"")));
     assert!(n("a_b").is_err());
