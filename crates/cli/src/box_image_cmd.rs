@@ -64,7 +64,7 @@ mod imp {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File};
     use std::io;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -125,6 +125,8 @@ mod imp {
         /// The debug seam's free-space reading.
         pub free_bytes: Option<u64>,
         pub bake_timeout: Duration,
+        /// How long passt has to make its socket.
+        pub passt_wait: Duration,
         /// False when the CH tool is overridden (debug builds only).
         pub verify_vmm: bool,
         /// UTC, for `work-<stamp>` and `logs-<stamp>`.
@@ -190,6 +192,9 @@ mod imp {
         let bake_timeout = test_env("SAIIFE_TEST_BAKE_TIMEOUT")
             .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
             .map_or(BAKE_TIMEOUT, Duration::from_secs);
+        let passt_wait = test_env("SAIIFE_TEST_PASST_WAIT")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .map_or(PASST_WAIT, Duration::from_secs);
         let verify_vmm = test_env("SAIIFE_TOOL_CH").is_none();
         let tools = Tools::system(&vmm).with_env(&|k| std::env::var_os(k));
         let now = time::OffsetDateTime::now_utc();
@@ -214,6 +219,7 @@ mod imp {
             kvm,
             free_bytes,
             bake_timeout,
+            passt_wait,
             verify_vmm,
             stamp,
             built_at,
@@ -265,6 +271,7 @@ mod imp {
         actual_size: fn(&Path) -> io::Result<u64>,
     ) -> Result<Built, String> {
         let out = preflight(tools, b)?;
+        let _lock = OutLock::take(&out)?;
         let recipe = load_recipe(b)?;
         check_saiife_bin(&b.saiife_bin)?;
         check_vmm(b)?;
@@ -306,6 +313,41 @@ mod imp {
         });
         let _ = fs::remove_dir_all(&work);
         r
+    }
+
+    /// `<out>/.build.lock`, created exclusively with our pid in it, so two
+    /// builds never share `base.tmp`. Removed on drop.
+    struct OutLock(PathBuf);
+
+    impl OutLock {
+        fn take(out: &Path) -> Result<OutLock, String> {
+            use std::io::Write as _;
+            let p = out.join(".build.lock");
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&p)
+                .map_err(|e| match e.kind() {
+                    io::ErrorKind::AlreadyExists => format!(
+                        "another build is using {}: {} exists; if no build is running, remove it (rm {})",
+                        out.display(),
+                        p.display(),
+                        p.display()
+                    ),
+                    _ => format!("cannot create {}: {e}", p.display()),
+                })?;
+            let lock = OutLock(p);
+            writeln!(f, "{}", std::process::id())
+                .map_err(|e| format!("{}: {e}", lock.0.display()))?;
+            Ok(lock)
+        }
+    }
+
+    impl Drop for OutLock {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 
     /// Paths, tools, /dev/kvm and free space. Returns the absolute `out`.
@@ -467,7 +509,11 @@ mod imp {
 
         run_vm(tools, b, work, base_tmp, &seed, &payload)?;
 
-        let serial = fs::read_to_string(work.join("serial.log")).unwrap_or_default();
+        let serial_log = work.join("serial.log");
+        // Boot noise on the console may be any bytes; the marker is ASCII.
+        let serial = fs::read(&serial_log)
+            .map_err(|e| format!("cannot read the bake's {}: {e}", serial_log.display()))?;
+        let serial = String::from_utf8_lossy(&serial);
         if !bake::bake_check(&serial) {
             return Err(
                 "the bake did not finish: no SAIIFE-BAKE-OK line on the serial console".into(),
@@ -644,7 +690,7 @@ mod imp {
             &passt_args,
             &work.join("passt.log"),
         )?);
-        let deadline = Instant::now() + PASST_WAIT;
+        let deadline = Instant::now() + b.passt_wait;
         while !sock.exists() {
             if let Some(p) = kids.passt.as_mut() {
                 if let Ok(Some(st)) = p.try_wait() {
@@ -654,7 +700,7 @@ mod imp {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "passt made no socket within {} s",
-                    PASST_WAIT.as_secs()
+                    b.passt_wait.as_secs()
                 ));
             }
             std::thread::sleep(Duration::from_millis(50));

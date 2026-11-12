@@ -24,11 +24,17 @@ const IMAGE: &str = "fake-qcow2-image\n";
 const CLAUDE: &str = "fake-claude-binary\n";
 const PACKAGES: &str = "socat 1.8.0\ngit 1:2.43.0\n";
 
-/// What the fake Cloud Hypervisor does.
-#[derive(Clone, Copy)]
+/// What the fake Cloud Hypervisor (and passt) do.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Ch {
     /// Writes the marker to the serial file and exits 0.
     Ok,
+    /// Like `Ok`, with bytes that are not UTF-8 on the serial console.
+    Binary,
+    /// passt blocks without ever making its socket.
+    PasstNoSocket,
+    /// passt exits 3 without making its socket.
+    PasstExits,
     /// Exits 0 with only the `set -x` trace of the marker.
     NoMarker,
     /// Blocks until killed.
@@ -125,16 +131,26 @@ fn world(ch: Ch) -> W {
             PACKAGES.replace('\n', "\\n")
         ),
     );
+    let make_sock = match ch {
+        Ch::PasstNoSocket => "",
+        Ch::PasstExits => "echo 'passt: no' >&2\nexit 3\n",
+        _ => ": >\"$sock\"\n",
+    };
     exec(
         &t.join("passt"),
         &format!(
-            "#!/bin/sh\necho \"passt $*\" >>'{l}'\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --socket-path ]; then sock=$2; fi\n  shift\ndone\nexec 3<>'{a}'\n: >\"$sock\"\nread -r x <&3\n"
+            "#!/bin/sh\necho \"passt $*\" >>'{l}'\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --socket-path ]; then sock=$2; fi\n  shift\ndone\nexec 3<>'{a}'\n{make_sock}read -r x <&3\n"
         ),
     );
     let serial = "prev=\nfor a; do\n  if [ \"$prev\" = --serial ]; then serial=${a#file=}; fi\n  prev=$a\ndone\n";
     let tail = match ch {
-        Ch::Ok => "printf 'booting\\r\\nSAIIFE-BAKE-OK\\r\\n' >\"$serial\"\necho 'ch says hi'\n"
-            .to_string(),
+        Ch::Binary => {
+            "printf 'boot\\377\\376\\300\\r\\nSAIIFE-BAKE-OK\\r\\n\\377' >\"$serial\"\n".to_string()
+        }
+        Ch::Ok | Ch::PasstNoSocket | Ch::PasstExits => {
+            "printf 'booting\\r\\nSAIIFE-BAKE-OK\\r\\n' >\"$serial\"\necho 'ch says hi'\n"
+                .to_string()
+        }
         Ch::NoMarker => {
             "printf '+ echo SAIIFE-BAKE-OK\\nboom\\n' >\"$serial\"\necho 'ch failed'\n".to_string()
         }
@@ -462,4 +478,63 @@ fn direct_kernel_keeps_the_kernel() {
     let k = w.p().join(format!("{}.vmlinuz", m.id));
     assert_eq!(std::fs::read_to_string(k).unwrap(), "kernel");
     assert!(w.names("base.").is_empty(), "{:?}", w.names("base."));
+}
+
+#[test]
+fn serial_log_with_invalid_utf8_still_passes() {
+    let w = world(Ch::Binary);
+    let o = w.pinned(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}\n{err}");
+    w.assert_children_gone();
+    assert_eq!(w.names("base-").len(), 2, "{:?}", w.names("base-"));
+}
+
+fn assert_passt_failure(ch: Ch, want: &str) {
+    let w = world(ch);
+    let start = Instant::now();
+    let o = w.pinned(&[("SAIIFE_TEST_PASST_WAIT", "1")]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains(want), "{err}");
+    assert!(start.elapsed() < Duration::from_secs(20));
+    w.assert_children_gone();
+    w.assert_no_image();
+    assert!(!w.log().contains("ch "), "CH must not start: {}", w.log());
+    let logs = w.names("logs-");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert!(logs[0].join("passt.log").is_file());
+    assert!(w.names(".build.lock").is_empty());
+}
+
+#[test]
+fn passt_without_a_socket_fails_the_build() {
+    assert_passt_failure(Ch::PasstNoSocket, "no socket within 1 s");
+}
+
+#[test]
+fn passt_that_exits_fails_the_build() {
+    assert_passt_failure(Ch::PasstExits, "passt exited");
+}
+
+#[test]
+fn a_second_build_into_the_same_out_is_refused() {
+    let w = world(Ch::Ok);
+    let lock = w.p().join(".build.lock");
+    std::fs::write(&lock, "12345\n").unwrap();
+    let o = w.pinned(&[]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains(&lock.display().to_string()), "{err}");
+    assert!(err.contains("rm "), "{err}");
+    assert_eq!(w.log(), "", "nothing ran");
+    assert_eq!(
+        std::fs::read_to_string(&lock).unwrap(),
+        "12345\n",
+        "not ours to remove"
+    );
+    std::fs::remove_file(&lock).unwrap();
+    let o = w.pinned(&[]);
+    assert_eq!(o.status.code(), Some(0), "{:?}", text(&o));
+    assert!(!lock.exists(), "the build removes its lock");
 }
