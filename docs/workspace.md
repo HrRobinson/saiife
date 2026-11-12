@@ -55,11 +55,11 @@ done on the machine, never from the page.
 
 | Screen | What you can do |
 |---|---|
-| Overview | See boxes, load and free slots. Pause or stop a box. Reorder the queue. The page asks again every 3 s while the tab is visible. It does not use push. |
+| Overview | See boxes, load and free slots. Reorder queued boxes. "Stop every agent" (`lockdown.on`) asks you to confirm first. The page asks again every 3 s while the tab is visible. It does not use push. |
 | Review | Read the diff and the test result of a finished box. Reject it (discards the box). |
 | Spawn | Start a box from a template. |
-| Inbox | See what waits for you. Polled like the overview. |
-| Steer | Type to an agent. Needs a touch, so it is refused for now. |
+| Inbox | See what waits for you. The page asks again every 5 s while the tab is visible. |
+| Steer | Pause or stop a box. Both work. Sending a message and Resume need a touch, so they are refused for now. |
 | Pair | Pair this browser. |
 
 The diff shows the first 2000 lines. If the daemon cut the diff, the page says
@@ -89,7 +89,7 @@ one is refused.
 ## The audit
 
 Every change from the page is recorded by the daemon: reorder, stop, pause,
-discard, spawn and so on. Each record has the device id and `via: "local"`.
+discard, spawn, lockdown on and so on. Each record has the device id and `via: "local"`.
 Successful reads (overview, diff, inbox) are not recorded. A read the daemon
 refuses is recorded.
 
