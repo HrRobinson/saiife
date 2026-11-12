@@ -50,8 +50,13 @@ fn scratch() -> tempfile::TempDir {
         .unwrap()
 }
 
-/// A fixed name -> answers map; a missing name has no answers.
-struct FakeResolve(HashMap<String, Vec<SocketAddr>>);
+/// A fixed name -> answers map; a missing name has no answers. Every
+/// answer carries port 9, so a tunnel that works shows the gateway used the
+/// port asked for, not the resolver's. With `hang`, no lookup ever ends.
+struct FakeResolve {
+    names: HashMap<String, Vec<SocketAddr>>,
+    hang: bool,
+}
 
 impl Resolve for FakeResolve {
     fn lookup(
@@ -59,7 +64,17 @@ impl Resolve for FakeResolve {
         host: &str,
         _port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + '_>> {
-        let v = self.0.get(host).cloned().unwrap_or_default();
+        if self.hang {
+            return Box::pin(std::future::pending());
+        }
+        let v = self
+            .names
+            .get(host)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| SocketAddr::new(a.ip(), 9))
+            .collect();
         Box::pin(async move { Ok(v) })
     }
 }
@@ -90,6 +105,7 @@ struct W {
     id: BoxId,
     session: String,
     paths: BoxPaths,
+    port: u16,
     clock: Arc<AtomicU64>,
     audit: PathBuf,
     _tmp: tempfile::TempDir,
@@ -99,6 +115,9 @@ struct Opts {
     limits: Limits,
     loopback: bool,
     names: Vec<(&'static str, Vec<SocketAddr>)>,
+    /// The upstream's port: every rule is allowed on it as well as on 443.
+    port: u16,
+    hang: bool,
 }
 
 impl Default for Opts {
@@ -107,6 +126,8 @@ impl Default for Opts {
             limits: Limits::default(),
             loopback: true,
             names: Vec::new(),
+            port: 443,
+            hang: false,
         }
     }
 }
@@ -154,12 +175,10 @@ async fn world(o: Opts) -> W {
     );
     let mut t = template::builtin().remove(0);
     t.name = "egress-test".into();
-    t.egress = vec![
-        rule("example.test", 443),
-        rule("*.crates.test", 443),
-        rule("*.com", 443),
-        rule("*.private.test", 443),
-    ];
+    t.egress = ["example.test", "*.crates.test", "*.com", "*.private.test"]
+        .into_iter()
+        .flat_map(|h| [rule(h, 443), rule(h, o.port)])
+        .collect();
     let host = host_facts();
     let guest: Arc<dyn GuestLink> = Arc::new(FakeGuest::new());
     let mgr = Manager::open(ManagerInit {
@@ -195,12 +214,14 @@ async fn world(o: Opts) -> W {
     }));
     let clock = Arc::new(AtomicU64::new(T0));
     let c = Arc::clone(&clock);
-    let resolve = Arc::new(FakeResolve(
-        o.names
+    let resolve = Arc::new(FakeResolve {
+        names: o
+            .names
             .into_iter()
             .map(|(n, a)| (n.to_string(), a))
             .collect(),
-    ));
+        hang: o.hang,
+    });
     let gw = GatewayHooks::new(
         Arc::clone(&ctx),
         tokio::runtime::Handle::current(),
@@ -221,6 +242,7 @@ async fn world(o: Opts) -> W {
         id: rec.id,
         session: rec.session,
         paths,
+        port: o.port,
         clock,
         audit,
         _tmp: tmp,
@@ -252,6 +274,11 @@ fn status(answer: &[u8]) -> u16 {
 }
 
 impl W {
+    /// `host:<upstream port>`.
+    fn t(&self, host: &str) -> String {
+        format!("{host}:{}", self.port)
+    }
+
     async fn dial(&self, port: u32) -> UnixStream {
         UnixStream::connect(self.paths.vsock_port(port))
             .await
@@ -346,14 +373,21 @@ async fn connect_tunnels_bytes_both_ways() {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         ..Opts::default()
     })
     .await;
     let mut s = w.dial(ports::EGRESS).await;
     // Bytes after the head in the same write go upstream after the 200.
-    s.write_all(b"CONNECT Example.Test.:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic c2VjcmV0\r\n\r\nearly")
-        .await
-        .unwrap();
+    s.write_all(
+        format!(
+            "CONNECT Example.Test.:{} HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic c2VjcmV0\r\n\r\nearly",
+            up.port()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
     let mut b = vec![0u8; OK_200.len() + 5];
     s.read_exact(&mut b).await.unwrap();
     assert_eq!(&b[..OK_200.len()], OK_200);
@@ -370,7 +404,7 @@ async fn connect_tunnels_bytes_both_ways() {
     assert_eq!(extra(r, "box"), w.id.as_str());
     assert_eq!(extra(r, "session"), w.session.as_str());
     assert_eq!(extra(r, "dest_host"), "example.test");
-    assert_eq!(extra(r, "port"), 443);
+    assert_eq!(extra(r, "port"), up.port());
     assert_eq!(extra(r, "addr"), up.to_string());
     assert_eq!(extra(r, "bytes_up"), 16);
     assert_eq!(extra(r, "bytes_down"), 16);
@@ -417,11 +451,12 @@ async fn wildcard_rules() {
             ("evilcrates.test", vec![up]),
             ("a.com", vec![up]),
         ],
+        port: up.port(),
         ..Opts::default()
     })
     .await;
-    drop(w.tunnel("a.crates.test:443").await);
-    drop(w.tunnel("a.b.crates.test:443").await);
+    drop(w.tunnel(&w.t("a.crates.test")).await);
+    drop(w.tunnel(&w.t("a.b.crates.test")).await);
     assert_eq!(w.connect("crates.test:443").await.0, 403);
     assert_eq!(w.connect("evilcrates.test:443").await.0, 403);
     // A `*.com` rule allows nothing.
@@ -433,6 +468,7 @@ async fn port_must_match() {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         ..Opts::default()
     })
     .await;
@@ -490,7 +526,7 @@ async fn mixed_answers_are_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_answers_is_502() {
     let w = world(Opts::default()).await;
-    let (code, body) = w.connect("example.test:443").await;
+    let (code, body) = w.connect(&w.t("example.test")).await;
     assert_eq!(code, 502);
     assert!(body.contains("example.test did not resolve"), "{body}");
 }
@@ -607,30 +643,31 @@ async fn lockdown_refuses_new_tunnels() {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         ..Opts::default()
     })
     .await;
     w.lockdown(LockScope::Connectors);
-    let (code, _) = w.connect("example.test:443").await;
+    let (code, _) = w.connect(&w.t("example.test")).await;
     assert_eq!(code, 503);
     let recs = w.wait_records("egress_denied", 1).await;
     assert_eq!(recs[0]["reason"], "lockdown");
     w.ctx.lockdown.set(None).unwrap();
-    drop(w.tunnel("example.test:443").await);
+    drop(w.tunnel(&w.t("example.test")).await);
     w.lockdown(LockScope::All);
-    assert_eq!(w.connect("example.test:443").await.0, 503);
+    assert_eq!(w.connect(&w.t("example.test")).await.0, 503);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lockdown_closes_open_tunnels() {
+async fn lockdown_closes_open_tunnels_of(scope: LockScope) {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         ..Opts::default()
     })
     .await;
-    let mut s = w.tunnel("example.test:443").await;
-    w.lockdown(LockScope::Connectors);
+    let mut s = w.tunnel(&w.t("example.test")).await;
+    w.lockdown(scope);
     let t0 = Instant::now();
     let _ = read_all(&mut s).await;
     assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
@@ -639,10 +676,88 @@ async fn lockdown_closes_open_tunnels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lockdown_closes_open_tunnels() {
+    lockdown_closes_open_tunnels_of(LockScope::Connectors).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lockdown_all_closes_open_tunnels() {
+    lockdown_closes_open_tunnels_of(LockScope::All).await;
+}
+
+/// The test flag lets plain loopback through and nothing else: not other
+/// private answers, not an IPv4-mapped loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_flag_is_only_plain_loopback() {
+    let w = world(Opts {
+        names: vec![
+            ("a.private.test", vec![sa("10.0.0.5:443")]),
+            ("b.private.test", vec![sa("[::ffff:127.0.0.1]:443")]),
+            (
+                "c.private.test",
+                vec![sa("127.0.0.1:443"), sa("10.0.0.5:443")],
+            ),
+        ],
+        loopback: true,
+        ..Opts::default()
+    })
+    .await;
+    for h in ["a.private.test", "b.private.test", "c.private.test"] {
+        let (code, body) = w.connect(&format!("{h}:443")).await;
+        assert_eq!(code, 403, "{h}: {body}");
+        assert!(body.contains("resolves to a private address"), "{body}");
+    }
+}
+
+/// Lookups that never end hold at most LOOKUP_PERMITS slots; the rest are
+/// refused at once instead of piling up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookups_are_bounded() {
+    use saiife_daemon::box_gateway::LOOKUP_PERMITS;
+    let w = world(Opts {
+        hang: true,
+        limits: Limits {
+            new_per_sec: 10_000,
+            new_burst: 10_000,
+            ..Limits::default()
+        },
+        ..Opts::default()
+    })
+    .await;
+    let mut held = Vec::new();
+    for _ in 0..LOOKUP_PERMITS {
+        let mut s = w.dial(ports::EGRESS).await;
+        s.write_all(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        held.push(s);
+    }
+    // Every held lookup has started (their records cannot exist yet).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let t0 = Instant::now();
+    for _ in 0..3 {
+        let (code, body) = w.connect("example.test:443").await;
+        assert_eq!(code, 503, "{body}");
+        assert!(body.contains("too many name lookups in progress"), "{body}");
+    }
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    let recs = w.wait_records("egress_denied", 1).await;
+    assert_eq!(recs[0]["reason"], "lookup_busy");
+    // The held ones time out after RESOLVE_SECS and free their permits.
+    for mut s in held {
+        let a = read_all(&mut s).await;
+        assert_eq!(status(&a), 504);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(w.connect("example.test:443").await.0, 504);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tunnel_cap() {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         limits: Limits {
             new_per_sec: 10_000,
             new_burst: 10_000,
@@ -653,9 +768,9 @@ async fn tunnel_cap() {
     .await;
     let mut open = Vec::new();
     for _ in 0..64 {
-        open.push(w.tunnel("example.test:443").await);
+        open.push(w.tunnel(&w.t("example.test")).await);
     }
-    let (code, body) = w.connect("example.test:443").await;
+    let (code, body) = w.connect(&w.t("example.test")).await;
     assert_eq!(code, 429);
     assert!(body.contains("too many open tunnels"), "{body}");
     // Closing one frees its slot.
@@ -666,7 +781,7 @@ async fn tunnel_cap() {
     let t0 = Instant::now();
     loop {
         let mut s = w.dial(ports::EGRESS).await;
-        s.write_all(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n")
+        s.write_all(format!("CONNECT {} HTTP/1.1\r\n\r\n", w.t("example.test")).as_bytes())
             .await
             .unwrap();
         let mut b = vec![0u8; 12];
@@ -704,6 +819,7 @@ async fn idle_tunnel_closes() {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         limits: Limits {
             idle_secs: 1,
             ..Limits::default()
@@ -711,7 +827,7 @@ async fn idle_tunnel_closes() {
         ..Opts::default()
     })
     .await;
-    let mut s = w.tunnel("example.test:443").await;
+    let mut s = w.tunnel(&w.t("example.test")).await;
     // Traffic keeps it open past the idle time.
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -732,10 +848,11 @@ async fn gateway_after_off_closes_tunnels() {
     let up = echo().await;
     let w = world(Opts {
         names: vec![("example.test", vec![up])],
+        port: up.port(),
         ..Opts::default()
     })
     .await;
-    let mut s = w.tunnel("example.test:443").await;
+    let mut s = w.tunnel(&w.t("example.test")).await;
     // A connection still sending its head ends too.
     let mut half = w.dial(ports::EGRESS).await;
     half.write_all(b"CONNECT exa").await.unwrap();

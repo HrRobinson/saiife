@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 /// How often an open tunnel checks for lockdown (G8).
@@ -50,6 +50,8 @@ pub const MAX_ANSWERS: usize = 16;
 pub const DENIED_WINDOW_MS: u64 = 60_000;
 /// The rate limiter's keys; past it the host is dropped from new keys.
 const MAX_DENIED_KEYS: usize = 1024;
+/// The same, per box, so one box cannot crowd out the others' records.
+const MAX_DENIED_KEYS_PER_BOX: usize = 128;
 
 /// Name resolution, injected: [`SystemResolve`] in production, a fixed map
 /// in the tests.
@@ -61,8 +63,39 @@ pub trait Resolve: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + '_>>;
 }
 
-/// `tokio::net::lookup_host` (the gateway bounds it with [`RESOLVE_SECS`]).
-pub struct SystemResolve;
+/// Name lookups in flight at once, gateway-wide (every box together).
+/// Past it a CONNECT gets `503` "too many name lookups in progress" at
+/// once. `getaddrinfo` cannot be cancelled: a lookup that outlives
+/// [`RESOLVE_SECS`] keeps its thread (and [`SystemResolve`]'s permit) until
+/// it ends, so this also bounds the threads a dead resolver can hold, and
+/// keeps them from starving the daemon's other `spawn_blocking` work.
+pub const LOOKUP_PERMITS: usize = 32;
+
+/// `std::net::ToSocketAddrs` on the blocking pool, at most
+/// [`LOOKUP_PERMITS`] threads at once. The permit moves into the thread and
+/// is released only when `getaddrinfo` returns, not when the gateway stops
+/// waiting. No permit free: `WouldBlock`, and nothing is spawned.
+pub struct SystemResolve {
+    permits: Arc<Semaphore>,
+}
+
+impl SystemResolve {
+    pub fn new() -> SystemResolve {
+        SystemResolve::with_permits(LOOKUP_PERMITS)
+    }
+
+    pub fn with_permits(n: usize) -> SystemResolve {
+        SystemResolve {
+            permits: Arc::new(Semaphore::new(n)),
+        }
+    }
+}
+
+impl Default for SystemResolve {
+    fn default() -> SystemResolve {
+        SystemResolve::new()
+    }
+}
 
 impl Resolve for SystemResolve {
     fn lookup(
@@ -71,11 +104,20 @@ impl Resolve for SystemResolve {
         port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + '_>> {
         let host = host.to_string();
+        let permit = Arc::clone(&self.permits).try_acquire_owned();
         Box::pin(async move {
-            Ok(tokio::net::lookup_host((host.as_str(), port))
-                .await?
-                .take(MAX_ANSWERS)
-                .collect())
+            let permit = permit
+                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "too many name lookups"))?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                use std::net::ToSocketAddrs;
+                Ok((host.as_str(), port)
+                    .to_socket_addrs()?
+                    .take(MAX_ANSWERS)
+                    .collect())
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("name lookup did not finish: {e}")))?
         })
     }
 }
@@ -225,10 +267,14 @@ struct Denied(HashMap<DeniedKey, (u64, u64)>);
 impl Denied {
     /// `Some(suppressed)` when a record is due.
     fn admit(&mut self, mut key: DeniedKey, now: u64) -> Option<u64> {
-        if !self.0.contains_key(&key) && self.0.len() >= MAX_DENIED_KEYS {
-            self.0
-                .retain(|_, (at, _)| now.saturating_sub(*at) < DENIED_WINDOW_MS);
-            if self.0.len() >= MAX_DENIED_KEYS {
+        if !self.0.contains_key(&key) {
+            let per_box =
+                |m: &HashMap<DeniedKey, (u64, u64)>| m.keys().filter(|k| k.0 == key.0).count();
+            if self.0.len() >= MAX_DENIED_KEYS || per_box(&self.0) >= MAX_DENIED_KEYS_PER_BOX {
+                self.0
+                    .retain(|_, (at, _)| now.saturating_sub(*at) < DENIED_WINDOW_MS);
+            }
+            if self.0.len() >= MAX_DENIED_KEYS || per_box(&self.0) >= MAX_DENIED_KEYS_PER_BOX {
                 // Bounded: one key per (box, reason) from here.
                 key.1 = None;
             }
@@ -260,6 +306,9 @@ pub struct GatewayShared {
     pub(crate) clock: Clock,
     denied: Mutex<Denied>,
     runs: Mutex<BTreeMap<BoxId, Arc<BoxRun>>>,
+    /// [`LOOKUP_PERMITS`] around every [`Resolve::lookup`], whatever the
+    /// resolver.
+    pub(crate) lookups: Arc<Semaphore>,
 }
 
 impl GatewayShared {
@@ -272,7 +321,9 @@ impl GatewayShared {
         self.ctx.lockdown.get().is_some()
     }
 
-    /// The address rule (G7), with the debug-only loopback exception.
+    /// The address rule (G7), with the debug-only loopback exception. Only
+    /// a plain loopback address (127/8, `::1`) is excepted: an IPv4-mapped
+    /// `::ffff:127.0.0.1` is not (`Ipv6Addr::is_loopback` is `::1` only).
     pub(crate) fn address_ok(&self, ip: &IpAddr) -> bool {
         egress::public(ip) || (self.allow_loopback && ip.is_loopback())
     }
@@ -383,6 +434,7 @@ impl GatewayHooks {
                 clock: cfg.clock,
                 denied: Mutex::new(Denied::default()),
                 runs: Mutex::new(BTreeMap::new()),
+                lookups: Arc::new(Semaphore::new(LOOKUP_PERMITS)),
             }),
             rt,
             group_rw,
@@ -490,12 +542,40 @@ mod tests {
         assert_eq!(d.admit(k("b"), 10), Some(0));
         assert_eq!(d.admit(k("a"), DENIED_WINDOW_MS), Some(4));
         assert_eq!(d.admit(k("a"), DENIED_WINDOW_MS + 1), None);
+        // The global bound: 16 boxes of 64 keys each.
         let mut d = Denied::default();
+        let kb = |b: usize, h: &str| {
+            (
+                BoxId::parse(&format!("g{b}")).unwrap(),
+                Some(h.to_string()),
+                "not_allowed",
+            )
+        };
         for i in 0..MAX_DENIED_KEYS {
+            assert_eq!(d.admit(kb(i % 16, &i.to_string()), 0), Some(0));
+        }
+        assert_eq!(d.admit(kb(0, "new"), 0), Some(0));
+        assert_eq!(d.admit(kb(0, "newer"), 0), None);
+        assert!(d.0.len() <= MAX_DENIED_KEYS + 1);
+        // One box's keys never crowd out another's.
+        let mut d = Denied::default();
+        for i in 0..MAX_DENIED_KEYS_PER_BOX {
             assert_eq!(d.admit(k(&i.to_string()), 0), Some(0));
         }
-        assert_eq!(d.admit(k("new"), 0), Some(0));
-        assert_eq!(d.admit(k("newer"), 0), None);
-        assert!(d.0.len() <= MAX_DENIED_KEYS + 1);
+        assert_eq!(d.admit(k("more"), 0), Some(0));
+        assert_eq!(d.admit(k("more2"), 0), None);
+        let other = BoxId::parse("b2").unwrap();
+        let k2 = |h: &str| (other.clone(), Some(h.to_string()), "not_allowed");
+        assert_eq!(d.admit(k2("x"), 0), Some(0));
+        assert_eq!(d.admit(k2("y"), 0), Some(0));
+        // Expired keys of the box make room again.
+        assert_eq!(d.admit(k("late"), DENIED_WINDOW_MS), Some(0));
+    }
+
+    #[tokio::test]
+    async fn system_resolve_without_a_permit_spawns_nothing() {
+        let r = SystemResolve::with_permits(0);
+        let e = r.lookup("localhost", 443).await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
     }
 }

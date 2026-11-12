@@ -462,21 +462,37 @@ async fn prepare(
         )
         .to(&host, port));
     }
-    let answers = tokio::time::timeout(
+    let busy =
+        || Refusal::new(503, "too many name lookups in progress", "lookup_busy").to(&host, port);
+    // Held until the lookup ends or times out (a resolver that runs on a
+    // thread bounds its threads itself; see `SystemResolve`).
+    let Ok(permit) = Arc::clone(&gw.lookups).try_acquire_owned() else {
+        return Err(busy());
+    };
+    let looked = tokio::time::timeout(
         Duration::from_secs(super::RESOLVE_SECS),
         gw.resolve.lookup(&host, port),
     )
-    .await
-    .map_err(|_| {
-        Refusal::new(
-            504,
-            format!("{host} did not resolve in time"),
-            "resolve_timeout",
-        )
-        .to(&host, port)
-    })?
-    .unwrap_or_default();
-    let answers: Vec<SocketAddr> = answers.into_iter().take(super::MAX_ANSWERS).collect();
+    .await;
+    drop(permit);
+    let answers = match looked {
+        Err(_) => {
+            return Err(Refusal::new(
+                504,
+                format!("{host} did not resolve in time"),
+                "resolve_timeout",
+            )
+            .to(&host, port))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+        Ok(r) => r.unwrap_or_default(),
+    };
+    // The port is the one asked for, never the resolver's.
+    let answers: Vec<SocketAddr> = answers
+        .into_iter()
+        .take(super::MAX_ANSWERS)
+        .map(|a| SocketAddr::new(a.ip(), port))
+        .collect();
     let Some(first) = answers.first().copied() else {
         return Err(
             Refusal::new(502, format!("{host} did not resolve"), "no_address").to(&host, port),
