@@ -32,6 +32,10 @@ mod audit_cmd;
 mod audit_locked;
 mod box_cmd;
 mod box_image_cmd;
+// The repo disk of `box spawn` (plan 37 Task 3); Task 4 wires it in.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod box_repo;
 mod box_vmm_cmd;
 mod box_vmm_helper;
 #[cfg(any(unix, windows))]

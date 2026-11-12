@@ -1615,12 +1615,14 @@ dependencies = [
  "predicates",
  "qrcode",
  "rcgen",
+ "ring",
  "rpassword",
  "rustix",
  "rustls",
  "saiife-agents",
  "saiife-audit",
  "saiife-boxhost",
+ "saiife-boxproto",
  "saiife-broker",
  "saiife-daemon",
  "saiife-dev",
@@ -1711,6 +1713,11 @@ dependencies = [
 [[package]]
 name = "saiife-boxproto"
 version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "saiife-broker"

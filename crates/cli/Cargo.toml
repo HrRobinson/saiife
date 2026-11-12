@@ -61,6 +61,11 @@ fake-vmm = ["saiife-daemon/fake-vmm"]
 
 [target.'cfg(unix)'.dependencies]
 saiife-boxhost = { path = "../boxhost" }
+# The base manifest of a box's repo disk (plan 37), and the BoxId its base ref names.
+saiife-boxproto = { path = "../boxproto" }
+saiife-wire = { path = "../wire" }
+# The random name of a spawn's staging dir; the version saiife-boxhost uses.
+ring = "=0.17.14"
 # Signals for the worker fault seam (debug builds); no unsafe calls.
 rustix = { version = "1", features = ["process", "termios", "fs"] }
 base64 = "=0.23.1"
