@@ -56,6 +56,9 @@ const MAX_TEXT: usize = 512;
 /// Connection handler threads per run (events and PTY together); above it a
 /// new connection is accepted and closed at once.
 const MAX_CONNS: usize = 8;
+/// Pause after each accepted connection, refused or served: a reconnecting
+/// guest cannot spin the acceptor.
+const ACCEPT_THROTTLE: Duration = Duration::from_millis(20);
 const SETUP_NONE: u8 = 0;
 const SETUP_IN_FLIGHT: u8 = 1;
 const SETUP_DONE: u8 = 2;
@@ -207,6 +210,8 @@ struct Run {
     pty_gen: AtomicU64,
     /// Connection handler threads alive (events and PTY), capped at MAX_CONNS.
     conns: AtomicUsize,
+    /// The cap was logged this run (once per run).
+    cap_logged: AtomicBool,
     /// Clones of the current connections, kept to shut them down.
     events_conn: Mutex<Option<(u64, UnixStream)>>,
     /// Events connections still in their hello, by generation.
@@ -231,6 +236,13 @@ impl Run {
     }
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+    fn set_error_if_empty(&self, msg: &str) {
+        log(&self.id, msg);
+        let mut e = lock(&self.last_error);
+        if e.is_none() {
+            *e = Some(sanitize(msg));
+        }
     }
     fn set_error(&self, msg: &str) {
         log(&self.id, msg);
@@ -639,6 +651,8 @@ impl VsockGuest {
                     }
                     let Some(slot) = Self::conn_slot(&run) else {
                         drop(s);
+                        // Over the cap too: no faster than one per throttle.
+                        std::thread::sleep(ACCEPT_THROTTLE);
                         continue;
                     };
                     let _ = s.set_nonblocking(false);
@@ -650,10 +664,12 @@ impl VsockGuest {
                         let _slot = slot;
                         VsockGuest::events_conn(me2, run2, gen, s)
                     }) {
+                        let hello = lock(&run.hellos).remove(&gen);
+                        drop(hello);
                         log(&run.id, &format!("events thread: {e}"));
                     }
                     // A reconnecting guest cannot make threads faster than this.
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(ACCEPT_THROTTLE);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -669,7 +685,12 @@ impl VsockGuest {
     fn conn_slot(run: &Arc<Run>) -> Option<ConnSlot> {
         if run.conns.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
             run.conns.fetch_sub(1, Ordering::SeqCst);
-            log(&run.id, "too many guest connections; closing a new one");
+            if !run.cap_logged.swap(true, Ordering::SeqCst) {
+                log(
+                    &run.id,
+                    "too many guest connections; closing new ones (logged once per run)",
+                );
+            }
             return None;
         }
         Some(ConnSlot(run.clone()))
@@ -714,7 +735,9 @@ impl VsockGuest {
             Err(why) => {
                 if !run.stopped() {
                     let _ = write_msg(&mut &*s, &HostReply::Refuse { why: why.clone() });
-                    run.set_error(&format!("refused the guest hello: {why}"));
+                    // Never over an earlier error of this run (a failed
+                    // setup is what the daemon must see).
+                    run.set_error_if_empty(&format!("refused the guest hello: {why}"));
                 }
                 return;
             }
@@ -858,6 +881,8 @@ impl VsockGuest {
                     }
                     let Some(slot) = Self::conn_slot(&run) else {
                         drop(s);
+                        // Over the cap too: no faster than one per throttle.
+                        std::thread::sleep(ACCEPT_THROTTLE);
                         continue;
                     };
                     let _ = s.set_nonblocking(false);
@@ -871,7 +896,7 @@ impl VsockGuest {
                     }) {
                         log(&run.id, &format!("pty thread: {e}"));
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(ACCEPT_THROTTLE);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -943,6 +968,7 @@ impl VmHooks for VsockGuest {
             next_events_gen: AtomicU64::new(0),
             pty_gen: AtomicU64::new(0),
             conns: AtomicUsize::new(0),
+            cap_logged: AtomicBool::new(false),
             events_conn: Mutex::new(None),
             hellos: Mutex::new(BTreeMap::new()),
             pty_conn: Mutex::new(None),

@@ -768,3 +768,63 @@ fn cast_goes_to_the_configured_dir() {
     assert!(cast.contains("kept apart"), "{cast}");
     assert!(std::fs::symlink_metadata(w.paths.term_cast()).is_err());
 }
+
+#[test]
+fn over_cap_rejections_are_throttled() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    // Eight silent hellos hold every connection slot (10 s each).
+    let held: Vec<UnixStream> = (0..8).map(|_| w.connect(ports::EVENTS)).collect();
+    wait_for("slots held", T, || g.live_threads() == 10);
+    let n = 20;
+    let t0 = Instant::now();
+    let mut burst: Vec<UnixStream> = (0..n).map(|_| w.connect(ports::EVENTS)).collect();
+    for s in &mut burst {
+        assert!(closed_by_host(s), "an over-cap connection was kept");
+    }
+    let took = t0.elapsed();
+    // One rejection per 20 ms at most.
+    assert!(
+        took >= Duration::from_millis(20 * (n as u64 - 1)),
+        "{n} rejections in {took:?}"
+    );
+    assert!(g.live_threads() <= 10);
+    drop(held);
+    g.after_off(&b1());
+}
+
+#[test]
+fn failed_setup_allows_retry() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let w = World::new(Arc::new(move |_r, s| {
+        let reply = if c.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::Err {
+                why: "chown of /work failed".into(),
+            }
+        } else {
+            Reply::Ok
+        };
+        let _ = write_msg(s, &reply);
+    }));
+    let g = w.guest(Ok(setup()));
+    let _s1 = w.hello(false);
+    wait_for("setup error", T, || g.last_error(&b1()).is_some());
+    // A later bad hello does not hide the setup failure.
+    let (_bad, r) = {
+        let mut s = w.connect(ports::EVENTS);
+        write_msg(&mut s, &hello_msg("saiife-guest/9", false)).unwrap();
+        let r = read_msg::<HostReply>(&mut s).ok().flatten();
+        (s, r)
+    };
+    assert!(matches!(r, Some(HostReply::Refuse { .. })), "{r:?}");
+    let e = g.last_error(&b1()).unwrap();
+    assert!(e.contains("chown of /work failed"), "{e}");
+    // A retry is welcomed and set up again.
+    let mut s2 = w.hello(false);
+    wait_for("second setup", T, || w.requests().len() == 2);
+    assert!(matches!(w.requests()[1], Request::Setup(_)));
+    write_msg(&mut s2, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    g.after_off(&b1());
+}
