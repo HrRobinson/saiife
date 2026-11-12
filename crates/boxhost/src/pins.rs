@@ -59,6 +59,27 @@ fn describe(e: &ToolError) -> String {
     }
 }
 
+/// Run curl with the hardened flags (https only, TLS 1.2+, fail on HTTP
+/// errors, two retries), writing `url` to `out`.
+pub fn curl_to(tools: &Tools, url: &str, out: &Path) -> Result<(), String> {
+    let args: [&OsStr; 10] = [
+        "--proto".as_ref(),
+        "=https".as_ref(),
+        "--tlsv1.2".as_ref(),
+        "-fsSL".as_ref(),
+        "--retry".as_ref(),
+        "2".as_ref(),
+        "-o".as_ref(),
+        out.as_os_str(),
+        "--".as_ref(),
+        url.as_ref(),
+    ];
+    tools
+        .run(Tool::Curl, &args, FETCH_TIMEOUT)
+        .map(|_| ())
+        .map_err(|e| format!("download failed: {url}: {}", describe(&e)))
+}
+
 /// Download `url` to `dest` unless `dest` already has the digest `want`:
 /// into `<dest>.part`, verified, chmod `mode`, then renamed. A wrong digest
 /// removes the part file and fails.
@@ -70,21 +91,9 @@ pub fn fetch(tools: &Tools, url: &str, want: &str, dest: &Path, mode: u32) -> Re
     let mut part: PathBuf = dest.as_os_str().to_owned().into();
     part.as_mut_os_string().push(".part");
     let _ = std::fs::remove_file(&part);
-    let args: [&OsStr; 10] = [
-        "--proto".as_ref(),
-        "=https".as_ref(),
-        "--tlsv1.2".as_ref(),
-        "-fsSL".as_ref(),
-        "--retry".as_ref(),
-        "2".as_ref(),
-        "-o".as_ref(),
-        part.as_os_str(),
-        "--".as_ref(),
-        url.as_ref(),
-    ];
-    if let Err(e) = tools.run(Tool::Curl, &args, FETCH_TIMEOUT) {
+    if let Err(e) = curl_to(tools, url, &part) {
         let _ = std::fs::remove_file(&part);
-        return Err(format!("download failed: {url}: {}", describe(&e)));
+        return Err(e);
     }
     if let Err(e) = verify(&part, want) {
         let _ = std::fs::remove_file(&part);

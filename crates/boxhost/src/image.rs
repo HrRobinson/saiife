@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod ubuntu;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
     pub ubuntu_release: String,
