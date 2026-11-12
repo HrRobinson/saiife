@@ -1637,6 +1637,7 @@ dependencies = [
  "saiife-daemon",
  "saiife-dev",
  "saiife-guard",
+ "saiife-guest",
  "saiife-ipc",
  "saiife-keychain",
  "saiife-link",
@@ -1842,7 +1843,9 @@ dependencies = [
 name = "saiife-guest"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "saiife-boxproto",
+ "tempfile",
 ]
 
 [[package]]

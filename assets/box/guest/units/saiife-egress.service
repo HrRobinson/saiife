@@ -1,0 +1,12 @@
+[Unit]
+Description=saiife guest channel: egress proxy to the host gateway (tcp 3128, vsock 5001)
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:3128,bind=0.0.0.0,reuseaddr,fork VSOCK-CONNECT:2:5001
+RuntimeDirectory=saiife-guest
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

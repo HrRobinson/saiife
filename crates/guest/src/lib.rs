@@ -8,3 +8,29 @@ pub mod events;
 pub mod export;
 pub mod pty;
 pub mod setup;
+
+pub use env::{GuestEnv, GuestTools, Timing};
+pub use saiife_boxproto::msg::Event;
+
+/// The service main (`saiife __guest init`). Returns only on a fatal error;
+/// systemd restarts it.
+pub fn run_init(env: &GuestEnv) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return control::run(env);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = env;
+        Err("saiife-guest runs only inside the Linux box VM".into())
+    }
+}
+
+/// `saiife __guest event turn-finished`: one event to local.sock.
+pub fn send_local_event(env: &GuestEnv, ev: &Event) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return control::send_local(env, ev);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (env, ev);
+        Err("saiife-guest runs only inside the Linux box VM".into())
+    }
+}

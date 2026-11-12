@@ -13,5 +13,14 @@ path = "src/lib.rs"
 [dependencies]
 saiife-boxproto = { path = "../boxproto" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The agent's PTY, its window size, dirfd-relative setup writes, and a
+# nonblocking peek at the events connection. Safe API only.
+rustix = { version = "1", features = ["pty", "termios", "fs", "process", "net"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"
+rustix = { version = "1", features = ["process"] }
+
 [lints]
 workspace = true
