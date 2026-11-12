@@ -158,6 +158,131 @@ request to approve:
 - **Developer mode:** there are no approvals, so it is a plain deny, and the
   reason ends with `(needs approval; approvals need locked mode)`.
 
+## Import
+
+`saiife rules import [FILE...]` reads the never-lines of a rules file
+(`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or any file you name) and turns the
+ones saiife can enforce into a user pack. With no file named it looks for
+`CLAUDE.md`, `AGENTS.md` and `GEMINI.md` in the project root. It never reads
+`~/.claude/CLAUDE.md` unless you name it. `--name <slug>` names the pack
+`user.<slug>` and takes one file; by default the id is
+`user.<file name>-<8 hex of the path hash>`, one pack per file. When it looks
+for the files itself, a file that is a symlink (`CLAUDE.md -> AGENTS.md`) or
+one already imported is skipped with a one-line note and the others go on; a
+file you name is refused in both cases.
+
+A line is a candidate when it says `never`, `don't`, `do not`, `must not` and
+the like, or starts with `no`. Code fences and HTML comments are skipped.
+Commands in backticks (and short lists after a colon) become command rules;
+paths starting with `/`, `~/` or `$VAR/` become path rules. A path becomes two
+rules, the path and `path/**` (`/` becomes only `/**`). The access (`read`, `write` or `any`) comes from
+the words of the line. A line with a control, bidi or format character is never
+turned into a rule.
+
+Every proposal is compiled as a one-rule pack and must pass its own examples:
+it blocks what it should and allows a near miss. One that fails is listed as
+unverified and never offered. The table shows each proposal with what it
+blocks and what it allows, then one question per rule:
+
+| Answer | Meaning |
+| --- | --- |
+| `e` | enforce |
+| `a` | ask: a request to approve; offered for command rules on a locked target only |
+| `s` or empty | skip (the line is kept in the pack as not enforced) |
+| `x` | edit: give another target for the line |
+
+After `e` or `a` you choose `everywhere or host only? [E/h]`; the default is
+everywhere. A hint such as `(often host only)` is only a hint. A rule that
+would block an everyday command or path (`ls`, `git status`, a write under
+`$PROJECT/src`) is shown as `BROAD` and needs the word `yes` typed after `e`
+or `a`. A one-word command rule can also get a carve-out in its own pack that
+lets `<command> --help` and `<command> --version` through (never `-h`, which
+is an action for some commands); it lifts only that pack's own deny, never a
+built-in. The table shows its exact pattern as optional, and after the rule is
+confirmed a separate question asks `also allow <command> --help and
+--version? [y/N]`. The default is no: only `y` writes the carve-out. Answers from a pipe can only add restrictions or make a rule host
+only. If the input ends before the last question, nothing is written and the
+exit code is 1. When several files are imported and one stops after an
+earlier file's pack was written, the error names the packs already written
+(`earlier packs written: <ids>; this and later files unchanged`). Nothing is
+written unless every user pack still loads, for the
+host and for the box profile.
+
+The pack records the source file (`source.file` is an absolute path), its
+SHA-256 and, for each rule, the line it came from; the reason shown when the
+rule blocks is that line quoted. A source already imported is refused with
+`already imported as <id>; use saiife rules sync`. In locked mode the pack is
+written root-owned; run `saiife policy reload` after adding an `ask` rule.
+
+### The LLM pass
+
+`saiife rules import --llm` is opt-in. After the deterministic pass, only the
+candidate lines it could not use are sent (never the whole file) to
+`claude -p <instructions> --tools ""`, your own Claude Code login, and the terminal says
+`sending N lines of <file> to claude -p (your Claude Code login)` first. The
+answer must fit a strict schema with two kinds, `command` and `path`; the LLM
+never writes a regex and cannot add an allow. Its rules go through the same
+builder and the same examples as the others. A missing `claude`, a timeout, a
+huge or malformed answer is one warning, and the import goes on without it.
+
+## Sync
+
+`saiife rules sync` (all imported packs, or those named with `--pack <ID>`)
+follows the source files:
+
+- a line that moved keeps its rule; the stored line number is updated
+  silently, since that loosens nothing;
+- a line that is gone asks `line N is gone: "<text>" (k rules). keep? [K/r]`.
+  The default is keep; `r` removes every rule from that line, carve-outs
+  included. Gone `not enforced` entries are dropped;
+- a new candidate line goes through the same proposals and questions as an
+  import, and is never enforced unasked;
+- the stored hash is updated only when the whole run finished. A missing
+  source file is a warning (`source gone; rules kept`) and changes nothing;
+- sync never prunes triggers (the pack's `triggers` list only grows);
+- a pack left with no rules is deleted. If the input ends early, nothing is
+  written for that pack.
+
+`saiife status` prints `rules: <file> changed since it was imported (<id>);
+run saiife rules sync` for a changed source and `rules: <file> is gone; its
+rules stay in force (<id>)` for a missing one. It is a note: the exit code
+does not change.
+
+## Seeing what is in force
+
+`saiife rules` (or `saiife rules list`) lists each user pack with its source
+file, its rules and what is not enforced. For each rule it says where it
+applies (`where=host` or `where=everywhere`), what the host does (`enforced`,
+`ask`, or `ask (denied: approvals need locked mode)` in developer mode) and
+what a box does (the three statuses under Boxes), the source `file:line`, and
+`BROAD: blocks everyday <example>` when the rule denies an everyday command or
+path. A pack whose source file changed shows `[source changed: run saiife
+rules sync]`, or `[source gone]`. `--json` prints the same as data.
+
+## What is not enforced
+
+Import enforces only what a rule can express: a command prefix or a path. Most
+of a typical rules file is something else.
+
+- Judgement lines ("never guess", "never leave a task half done") get no rule.
+  They are kept in the pack as `not enforced` entries with their line, and
+  `saiife rules` lists them. In a real hard-rules file about half the
+  never-lines are enforceable now; the rest are judgement or need rule types
+  that do not exist yet (a tool name, a working directory, a file's content).
+- A line saiife could not turn into a rule that passes its own examples is
+  `unverified`; a rule you skipped is `skipped`. Both stay listed.
+- A command rule is a prefix: `never use git push --force` blocks
+  `git push --force origin` and allows `git push --force-with-lease`, but it
+  also allows `git push origin --force`. Word order is not understood.
+- A line containing a control, bidi or format character is not enforced: it is
+  listed with the character replaced, never turned into a rule.
+- A rule you answered `a` (ask) only asks in locked mode with approvers; in
+  developer mode it is a plain deny.
+- Obfuscation and interpreters (python -c) can still slip past a command rule.
+- A rule marked "advisory in boxes" is not enforced in a box (see Boxes).
+- Answers piped to `import` can only add restrictions; they cannot loosen
+  anything or skip the `yes` for a broad rule.
+
 ## Boxes
 
 Boxes are a planned use of user packs (see [dev environments](dev.md)). What

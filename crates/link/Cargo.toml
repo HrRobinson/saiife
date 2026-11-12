@@ -34,6 +34,7 @@ hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 saiife-wire = { path = "../wire", features = ["fake"] }
 saiife-daemon = { path = "../daemon", features = ["fake-boxes"] }
 saiife-audit = { path = "../audit" }
+saiife-touch = { path = "../touch" }
 saiife-policy = { path = "../policy" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 tempfile = "3"

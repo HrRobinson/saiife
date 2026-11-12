@@ -31,6 +31,7 @@ mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
 mod box_cmd;
+mod box_image_cmd;
 mod box_vmm_cmd;
 mod box_vmm_helper;
 #[cfg(any(unix, windows))]
@@ -64,6 +65,7 @@ mod read_segments_cmd;
 mod rejudge;
 mod report;
 mod report_html;
+mod rules_cmd;
 mod run_cmd;
 mod secret_cmd;
 mod status_cmd;
@@ -436,6 +438,18 @@ enum Cmd {
         #[command(subcommand)]
         action: dev_cmd::DevAction,
     },
+    /// Never-rules from CLAUDE.md, AGENTS.md, GEMINI.md and rules files, as enforced packs.
+    Rules {
+        #[arg(
+            long = "config",
+            visible_alias = "system-config",
+            value_name = "FILE",
+            global = true
+        )]
+        config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<rules_cmd::RulesAction>,
+    },
     /// Locked mode: install or uninstall the system setup (root, or an elevated
     /// administrator on Windows).
     #[cfg(any(unix, windows))]
@@ -493,6 +507,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Env { .. }
         | Cmd::Box { .. }
         | Cmd::Dev { .. }
+        | Cmd::Rules { .. }
         | Cmd::Policy { .. }
         | Cmd::Test { .. }
         | Cmd::Explain { .. }
@@ -751,6 +766,9 @@ fn main() -> ExitCode {
     if let Cmd::Dev { action } = cli.command {
         return dev_cmd::run(action);
     }
+    if let Cmd::Rules { config, action } = cli.command {
+        return rules_cmd::run(config, cli.packs, action);
+    }
     #[cfg(any(unix, windows))]
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
@@ -830,6 +848,7 @@ fn main() -> ExitCode {
         | Cmd::Env { .. }
         | Cmd::Box { .. }
         | Cmd::Dev { .. }
+        | Cmd::Rules { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {
