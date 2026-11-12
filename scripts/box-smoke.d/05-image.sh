@@ -154,6 +154,15 @@ p36_import_fw() {
 
 p36_manifest_get() { jq -er "$2" "$1"; }
 
+# p36_restore_fw_default: make the firmware image (by its manifest id) the
+# default again with `saiife box image default`.
+p36_restore_fw_default() {
+  local id
+  id=$(p36_manifest_get "$P36_MANIFEST" .id) || return 1
+  [[ "$id" =~ ^base-[0-9a-f]{64}$ ]] || return 1
+  saiife box image default "$id"
+}
+
 p36_build() { # DIR [extra build args...]
   local dir=$1 t0 out
   shift
@@ -214,6 +223,8 @@ p36_cold_capture() {
   b=$(p36_in_box "$P36_BOX" 'systemd-analyze blame | head -15') || { p36_end_box; return 1; }
   p36_result systemd_analyze_cold "$a"
   p36_result systemd_blame_cold "$b"
+  # which kernel the firmware (grub) boot picked: the generic flavour expected
+  p36_result guest_kernel "$(p36_in_box "$P36_BOX" uname -r || true)"
   # in-box settings, on the same cold boot
   P36_CONTAINERD=$(p36_in_box "$P36_BOX" systemctl is-enabled containerd.service || true)
   P36_JOURNAL=$(p36_in_box "$P36_BOX" journalctl --header || true)
@@ -347,8 +358,11 @@ smoke_image() {
           else
             check "5 direct-kernel cold boots reach ready" false
           fi
-          # put the firmware image back as the default
-          check "restore the firmware image as default" saiife box image import --default "$P36_RAW"
+          # put the firmware image back as the default (it is already in
+          # the store, so a re-import would be refused)
+          if p36_need "image default" "36 Task 5" saiife box image default --help; then
+            check "restore the firmware image as default" p36_restore_fw_default
+          fi
         else
           check "import direct-kernel image as default (kernel boots skipped)" false
         fi

@@ -195,7 +195,11 @@ pub struct ManifestPackage {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManifestBoot {
     Firmware,
-    Kernel { kernel: String, cmdline: String },
+    Kernel {
+        kernel: String,
+        sha256: String,
+        cmdline: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,12 +273,15 @@ impl Manifest {
                 ));
             }
         }
-        if let ManifestBoot::Kernel { kernel, .. } = &m.boot {
+        if let ManifestBoot::Kernel { kernel, sha256, .. } = &m.boot {
             if *kernel != format!("{}.vmlinuz", m.id) {
                 return Err(format!(
                     "manifest boot.kernel must be {}.vmlinuz, not {kernel:?}",
                     m.id
                 ));
+            }
+            if !is_sha256(sha256) {
+                return Err("manifest boot.sha256 must be 64 lowercase hex".into());
             }
         }
         Ok(m)
@@ -325,7 +332,11 @@ pub(crate) mod tests {
     #[test]
     fn tag_without_digest_is_refused() {
         let t = pinned_text().replace("pull = []", "pull = [\"busybox:1.36\"]");
-        assert!(parse_recipe(&t).is_err());
+        let e = parse_recipe(&t).unwrap_err();
+        assert!(
+            e.contains("images.pull") && e.contains("busybox:1.36"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -359,6 +370,7 @@ pub(crate) mod tests {
         let mut m = manifest_for(&hex('c'));
         m.boot = ManifestBoot::Kernel {
             kernel: format!("{}.vmlinuz", m.id),
+            sha256: hex('6'),
             cmdline: "console=ttyS0".into(),
         };
         m
@@ -446,7 +458,7 @@ pub(crate) mod tests {
     #[test]
     fn manifest_digests_are_checked() {
         type Edit = fn(&mut Manifest);
-        let bad: [(&str, Edit); 8] = [
+        let bad: [(&str, Edit); 10] = [
             ("recipe_sha256", |m| m.recipe_sha256 = "abc".into()),
             ("ubuntu.image_sha256", |m| {
                 m.ubuntu.image_sha256 = "A".repeat(64)
@@ -459,6 +471,16 @@ pub(crate) mod tests {
             ("saiife.sha256", |m| m.saiife.sha256 = "0".repeat(63)),
             ("claude.sha256", |m| m.claude.sha256 = "UNPINNED".into()),
             ("images", |m| m.images[0].digest = hex('5')),
+            ("boot.sha256", |m| {
+                if let ManifestBoot::Kernel { sha256, .. } = &mut m.boot {
+                    *sha256 = "B".repeat(64);
+                }
+            }),
+            ("boot.sha256", |m| {
+                if let ManifestBoot::Kernel { sha256, .. } = &mut m.boot {
+                    sha256.clear();
+                }
+            }),
         ];
         for (field, edit) in bad {
             let mut m = manifest();
@@ -473,6 +495,7 @@ pub(crate) mod tests {
         let mut m = manifest();
         m.boot = ManifestBoot::Kernel {
             kernel: "vmlinuz".into(),
+            sha256: hex('6'),
             cmdline: "console=ttyS0".into(),
         };
         assert!(Manifest::parse(&m.to_json())

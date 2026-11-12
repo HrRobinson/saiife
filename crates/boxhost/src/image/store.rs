@@ -187,8 +187,9 @@ impl Store {
 
     /// Copies an image into the store: the raw disk into `.<id>.raw.tmp`
     /// (hashed as it is copied and checked against `manifest.sha256`, then
-    /// 0440 and renamed), the kernel when the manifest boots one, and the
-    /// manifest last. On failure nothing new is left in the store.
+    /// 0440 and renamed), the kernel when the manifest boots one (hashed
+    /// the same way and checked against `boot.sha256`), and the manifest
+    /// last. On failure nothing new is left in the store.
     pub fn insert(
         &self,
         raw_src: &mut File,
@@ -227,8 +228,13 @@ impl Store {
         }
         let e = |p: &Path, x: io::Error| format!("{}: {x}", p.display());
         set_mode(&raw_tmp, 0o440).map_err(|x| e(&raw_tmp, x))?;
-        if let Some(k) = kernel {
-            copy_hashing(k, &k_tmp)?;
+        if let (Some(k), ManifestBoot::Kernel { sha256: want, .. }) = (kernel, &m.boot) {
+            let got = copy_hashing(k, &k_tmp)?;
+            if got != *want {
+                return Err(format!(
+                    "the kernel's sha256 is {got}, the manifest says {want}"
+                ));
+            }
             set_mode(&k_tmp, 0o440).map_err(|x| e(&k_tmp, x))?;
         }
         guard.0.push(raw.clone());
@@ -377,6 +383,7 @@ mod tests {
         assert!(e.contains("kernel"), "{e}");
         m.boot = ManifestBoot::Kernel {
             kernel: format!("{}.vmlinuz", m.id),
+            sha256: sha256_file(&k).unwrap(),
             cmdline: "console=ttyS0".into(),
         };
         let e = w
@@ -385,6 +392,23 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("kernel"), "{e}");
         assert!(names(w.store.dir()).is_empty());
+        // A kernel whose hash is not the manifest's is refused, and nothing is left.
+        let other = w.root.join("vmlinuz-other");
+        fs::write(&other, "another kernel").unwrap();
+        let e = w
+            .store
+            .insert(
+                &mut File::open(&p).unwrap(),
+                &m,
+                Some(&mut File::open(&other).unwrap()),
+            )
+            .unwrap_err();
+        assert!(e.contains("kernel's sha256"), "{e}");
+        assert!(
+            names(w.store.dir()).is_empty(),
+            "{:?}",
+            names(w.store.dir())
+        );
         w.store
             .insert(
                 &mut File::open(&p).unwrap(),

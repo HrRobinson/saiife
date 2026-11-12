@@ -269,10 +269,16 @@ pub fn is_static_elf(path: &Path) -> Result<bool, String> {
     let mut f = File::open(path).map_err(|x| e(&x.to_string()))?;
     let mut h = [0u8; 64];
     f.read_exact(&mut h).map_err(|_| e("not an ELF file"))?;
-    if &h[..4] != b"\x7fELF" || h[4] != 2 || h[5] != 1 {
-        return Err(e("not an ELF64 little-endian file"));
+    if &h[..4] != b"\x7fELF" {
+        return Err(e("not an ELF file"));
     }
     let u16at = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]) as usize;
+    // ELFCLASS64, little-endian, e_machine EM_X86_64 (62).
+    if h[4] != 2 || h[5] != 1 || u16at(18) != 62 {
+        return Err(e(
+            "not an x86-64 ELF (a 64-bit little-endian EM_X86_64 file)",
+        ));
+    }
     let phoff = u64::from_le_bytes(h[32..40].try_into().unwrap());
     let phentsize = u16at(54);
     let phnum = u16at(56);
@@ -451,6 +457,54 @@ mod tests {
         assert!(!BAKE_SCRIPT.contains("$APT_PACKAGES\n"));
     }
 
+    fn script_fn(name: &str) -> &'static str {
+        BAKE_SCRIPT
+            .split(&format!("\n{name}() {{"))
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn kvm_kernel_only_for_direct_boot() {
+        assert!(!crate::image::DEFAULT_RECIPE.contains("linux-image-kvm"));
+        let out = script_fn("export_outputs");
+        let direct = out
+            .split("if [ \"$DIRECT_KERNEL\" = 1 ]; then")
+            .nth(1)
+            .unwrap();
+        let install = direct
+            .find("apt-get install -y --no-install-recommends linux-image-kvm")
+            .unwrap();
+        assert!(install < direct.find("cp \"$k\"").unwrap());
+        assert_eq!(BAKE_SCRIPT.matches("linux-image-kvm\n").count(), 1);
+    }
+
+    #[test]
+    fn script_generalises_the_image() {
+        let g = script_fn("generalise");
+        for l in [
+            "cloud-init clean --logs --seed",
+            "command -v cloud-init",
+            "truncate -s 0 /etc/machine-id",
+            "rm -f /var/lib/dbus/machine-id",
+            "ln -s /etc/machine-id /var/lib/dbus/machine-id",
+            "rm -f /etc/ssh/ssh_host_*",
+            "systemctl mask ssh.service ssh.socket",
+            "rm -f /var/lib/docker/engine-id",
+        ] {
+            assert!(g.contains(l), "{l}");
+        }
+        let main = script_fn("main");
+        let pull = main.find("  pull_images\n").unwrap();
+        let gen = main.find("  generalise\n").unwrap();
+        let disable = main.find("touch /etc/cloud/cloud-init.disabled").unwrap();
+        assert!(pull < gen && gen < disable);
+        assert!(script_fn("pull_images").contains("systemctl stop docker.service docker.socket"));
+    }
+
     #[test]
     fn seed_and_payload_call_mkfs_and_mcopy() {
         let (d, tools, log) = world();
@@ -568,6 +622,7 @@ mod tests {
         v[..4].copy_from_slice(b"\x7fELF");
         v[4] = 2;
         v[5] = 1;
+        v[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         v[32..40].copy_from_slice(&64u64.to_le_bytes());
         v[54..56].copy_from_slice(&56u16.to_le_bytes());
         v[56..58].copy_from_slice(&2u16.to_le_bytes());
@@ -587,6 +642,17 @@ mod tests {
         assert_eq!(is_static_elf(&p), Ok(false));
         fs::write(&p, b"#!/bin/sh\n").unwrap();
         assert!(is_static_elf(&p).is_err());
+        // A static aarch64 (EM_AARCH64 = 183) binary, and a 32-bit one.
+        let mut arm = elf(false);
+        arm[18..20].copy_from_slice(&183u16.to_le_bytes());
+        fs::write(&p, arm).unwrap();
+        let err = is_static_elf(&p).unwrap_err();
+        assert!(err.contains("not an x86-64 ELF"), "{err}");
+        let mut c32 = elf(false);
+        c32[4] = 1;
+        fs::write(&p, c32).unwrap();
+        let err = is_static_elf(&p).unwrap_err();
+        assert!(err.contains("not an x86-64 ELF"), "{err}");
         let mut big = elf(false);
         big[56..58].copy_from_slice(&257u16.to_le_bytes());
         fs::write(&p, big).unwrap();

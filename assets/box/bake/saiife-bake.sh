@@ -181,10 +181,29 @@ export_outputs() {
   local k
   mkdir -p "$MNT/out"
   if [ "$DIRECT_KERNEL" = 1 ]; then
+    # only the direct-boot image carries the -kvm flavour: on a firmware
+    # boot grub would otherwise pick it over the generic kernel
+    apt-get install -y --no-install-recommends linux-image-kvm
     k=$(ls -1 /boot/vmlinuz-*-kvm | sort -V | tail -n 1)
     cp "$k" "$MNT/out/vmlinuz"
   fi
   dpkg-query -W -f '${Package} ${Version}\n' >"$MNT/out/packages.txt"
+}
+
+# Every box boots from this image: drop what identifies the bake VM.
+# Runs after Docker is stopped.
+generalise() {
+  if command -v cloud-init >/dev/null 2>&1; then
+    cloud-init clean --logs --seed
+  fi
+  truncate -s 0 /etc/machine-id
+  rm -f /var/lib/dbus/machine-id
+  mkdir -p /var/lib/dbus
+  ln -s /etc/machine-id /var/lib/dbus/machine-id
+  rm -f /etc/ssh/ssh_host_*
+  # no inbound use for sshd in a box
+  systemctl mask ssh.service ssh.socket
+  rm -f /var/lib/docker/engine-id
 }
 
 main() {
@@ -200,6 +219,7 @@ main() {
   pull_images
   write_docker_config
   export_outputs
+  generalise
   mkdir -p /etc/cloud
   touch /etc/cloud/cloud-init.disabled
   apt-get clean

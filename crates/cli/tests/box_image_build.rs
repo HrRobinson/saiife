@@ -59,6 +59,7 @@ fn exec(p: &Path, body: &str) {
 fn elf(interp: bool) -> Vec<u8> {
     let mut h = vec![0u8; 64];
     h[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    h[18..20].copy_from_slice(&62u16.to_le_bytes());
     if interp {
         h[32..40].copy_from_slice(&64u64.to_le_bytes());
         h[54..56].copy_from_slice(&56u16.to_le_bytes());
@@ -468,14 +469,15 @@ fn direct_kernel_keeps_the_kernel() {
         .find(|p| p.extension().unwrap() == "json")
         .unwrap();
     let m = Manifest::parse(&std::fs::read_to_string(json).unwrap()).unwrap();
+    let k = w.p().join(format!("{}.vmlinuz", m.id));
     assert_eq!(
         m.boot,
         ManifestBoot::Kernel {
             kernel: format!("{}.vmlinuz", m.id),
-            cmdline: "console=ttyS0 root=LABEL=cloudimg-rootfs rw quiet".into(),
+            sha256: sha256_file(&k).unwrap(),
+            cmdline: "console=ttyS0 root=/dev/vda1 rw quiet".into(),
         }
     );
-    let k = w.p().join(format!("{}.vmlinuz", m.id));
     assert_eq!(std::fs::read_to_string(k).unwrap(), "kernel");
     assert!(w.names("base.").is_empty(), "{:?}", w.names("base."));
 }
@@ -521,7 +523,9 @@ fn passt_that_exits_fails_the_build() {
 fn a_second_build_into_the_same_out_is_refused() {
     let w = world(Ch::Ok);
     let lock = w.p().join(".build.lock");
-    std::fs::write(&lock, "12345\n").unwrap();
+    // Our own pid: a build that is certainly still running.
+    let live = format!("{}\n", std::process::id());
+    std::fs::write(&lock, &live).unwrap();
     let o = w.pinned(&[]);
     let (_, err) = text(&o);
     assert_eq!(o.status.code(), Some(1), "{err}");
@@ -530,11 +534,28 @@ fn a_second_build_into_the_same_out_is_refused() {
     assert_eq!(w.log(), "", "nothing ran");
     assert_eq!(
         std::fs::read_to_string(&lock).unwrap(),
-        "12345\n",
+        live,
         "not ours to remove"
     );
     std::fs::remove_file(&lock).unwrap();
     let o = w.pinned(&[]);
     assert_eq!(o.status.code(), Some(0), "{:?}", text(&o));
     assert!(!lock.exists(), "the build removes its lock");
+}
+
+#[test]
+fn a_stale_build_lock_is_removed() {
+    // Above the kernel's pid_max (2^22), so no such process can exist; and
+    // a lock whose content is not a pid at all.
+    for content in ["4194305\n", "not-a-pid\n"] {
+        let w = world(Ch::Ok);
+        let lock = w.p().join(".build.lock");
+        std::fs::write(&lock, content).unwrap();
+        let o = w.pinned(&[]);
+        let (out, err) = text(&o);
+        assert_eq!(o.status.code(), Some(0), "{content}: {out}\n{err}");
+        assert!(err.contains("stale"), "{content}: {err}");
+        assert!(!lock.exists(), "{content}: the build removes its lock");
+        assert_eq!(w.names("base-").len(), 2, "{:?}", w.names("base-"));
+    }
 }

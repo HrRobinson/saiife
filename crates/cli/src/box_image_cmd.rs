@@ -76,7 +76,7 @@ mod imp {
     const MAX_ACTUAL_BYTES: u64 = 5 << 30;
     const BASE_VIRTUAL_GIB: u64 = 10;
     const SOCK_MAX: usize = 100;
-    const KERNEL_CMDLINE: &str = "console=ttyS0 root=LABEL=cloudimg-rootfs rw quiet";
+    const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda1 rw quiet";
     const KEYRING: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../assets/box/ubuntu-cloudimage-keyring.gpg"
@@ -323,6 +323,7 @@ mod imp {
         fn take(out: &Path) -> Result<OutLock, String> {
             use std::io::Write as _;
             let p = out.join(".build.lock");
+            clear_stale_lock(&p);
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -341,6 +342,26 @@ mod imp {
             writeln!(f, "{}", std::process::id())
                 .map_err(|e| format!("{}: {e}", lock.0.display()))?;
             Ok(lock)
+        }
+    }
+
+    /// Removes `lock` when the build that wrote it is gone: its pid is not
+    /// a decimal number, or `/proc/<pid>` does not exist. A live pid is
+    /// left alone (the exclusive create then refuses). No signal is sent.
+    fn clear_stale_lock(lock: &Path) {
+        let Ok(text) = fs::read_to_string(lock) else {
+            return;
+        };
+        let pid = text.trim();
+        let alive = !pid.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && Path::new("/proc").join(pid).exists();
+        if !alive {
+            eprintln!(
+                "note: removing a stale {} (pid {pid:?} is not running)",
+                lock.display()
+            );
+            let _ = fs::remove_file(lock);
         }
     }
 
@@ -539,8 +560,11 @@ mod imp {
         }
         let id = image::image_id(&sha);
         let boot = if recipe.direct_kernel {
+            let kernel_sha = pins::sha256_file(kernel_tmp)
+                .map_err(|e| format!("{}: {e}", kernel_tmp.display()))?;
             ManifestBoot::Kernel {
                 kernel: format!("{id}.vmlinuz"),
+                sha256: kernel_sha,
                 cmdline: KERNEL_CMDLINE.into(),
             }
         } else {
