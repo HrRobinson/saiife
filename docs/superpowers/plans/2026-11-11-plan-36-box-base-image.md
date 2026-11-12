@@ -2,6 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Reconciled 2026-11-12** against plan 34 as built on `v3-p34` (`ee5e264`) and its rulings R8, R20, R22, R25. Changes:
+> 1. **Already in plan 34 (not rebuilt here):** `BoxRecord.image: Option<String>` with `#[serde(default)]` (`crates/boxes/src/store.rs:53`) and `Change.image: Option<String>` (`manager.rs:88`), both always `None` today (R8). Task 5 fills them; it adds no field.
+> 2. `VmHandle.data` is opaque to the manager (`store.rs:17`): the manager learns the image through a new `Vmm::image_id(&self, h: &VmHandle) -> Option<String>` with a default `None` (flagged contract addition on plan 34's trait), which `ChVmm` answers from its own `data` and `FakeVmm` from a settable field. The manager never parses `data`.
+> 3. Control-socket arguments: the request envelope's `id` overwrites an `id` argument (`Request::from_map` removes it, `crates/ipc/src/msg.rs:318-322`; plan 34 R25), and `msg::ok` drops an answer field named `id` (`msg.rs:384-393`; plan 27 R-J, plan 34 R20). So `box.image.default` and `box.image.rm` take `{image}`, and `box.image.import` answers `{image}`.
+> 4. Audit records: there is no `ctx.record("box", …)` helper for box ops; plan 34 writes `ctx.record("box", input)` with `extra = {action, box, template, from, to, via}` through its private `box_rec` (`crates/daemon/src/box_ops.rs:406-428`) and `ctx.writer.append`. Image records follow that shape (`box: null`) with the image keys added; `box_rec` becomes `pub(crate)`.
+> 5. Admission records: a box admitted at its own spawn is covered by the spawn record (plan 34 R22, `box_ops.rs:797-829`), queue heads by tick records (`write_tick_records`, `box_ops.rs:383`). `extra.image` goes into both; the test checks both paths.
+> 6. Admin check: `(peer.sid.is_none() && peer.uid == 0) || ctx.peer_is_admin(&peer)` as plan 34's `handle` (`box_ops.rs:707`).
+> 7. `every_ipc_op_is_classified` fails on `v3-dev` today (plan 26's `touch.*` ops are missing from `IPC_OPS`, fixed on `v3-p30` `30eaa5a` and `v3-p34` `b66e829`); Task 5's gate assumes those merged.
+> 8. Global Constraints: branch `v3-p36`; builds with `CARGO_PROFILE_DEV_DEBUG=0`.
+> 9. Smoke: audit queries use `jq` over the audit `*.jsonl` (`saiife audit` has no JSON output; plan 27 R-I).
+
 > **Depends on:** plan 34 merged; plan 35 Task 1 (scaffold) and Task 2 (`pins::fetch`, `Tools`); plan 37 Task 2 (`saiife_ipc::fdpass`, `disk::copy_sparse`) for Task 5 only. The guest files it bakes (`assets/box/guest/**`) are plan 38's; this plan copies that directory as it finds it, so it builds in parallel with plan 38 and only the smoke run needs both.
 
 **Goal:** A developer can build the box base image locally and hand it to the daemon:
@@ -34,7 +45,7 @@
 
 ## Global Constraints
 
-Plan 35's Global Constraints apply unchanged, with worktree `.worktrees/p36`, branch `p36-box-image`, scratch prefix `p36-tN-`. In particular: **never run passt, Cloud Hypervisor, `qemu-img`, `gpgv`, `curl`, `mkfs.vfat` or `mcopy` for real in a test** (every one is a fake script under `$TMPDIR` named through plan 35's debug-only `SAIIFE_TOOL_*` seams); never fetch over the network; never touch `/dev/kvm`. The bake script is checked with `bash -n` and shellcheck only.
+Plan 35's Global Constraints apply unchanged (including `CARGO_PROFILE_DEV_DEBUG=0`), with worktree `.worktrees/p36`, branch `v3-p36`, scratch prefix `p36-tN-`. In particular: **never run passt, Cloud Hypervisor, `qemu-img`, `gpgv`, `curl`, `mkfs.vfat` or `mcopy` for real in a test** (every one is a fake script under `$TMPDIR` named through plan 35's debug-only `SAIIFE_TOOL_*` seams); never fetch over the network; never touch `/dev/kvm`. The bake script is checked with `bash -n` and shellcheck only.
 
 ### Fixed values
 
@@ -53,7 +64,7 @@ Plan 35's Global Constraints apply unchanged, with worktree `.worktrees/p36`, br
 | success marker | `SAIIFE-BAKE-OK` alone on a serial line | spike `bake_check` |
 | package list | payload `out/packages.txt` (`dpkg-query -W -f '${Package} ${Version}\n'`) | I9 |
 | store | `<images>/base-<sha256>.raw` (0440), `.json`, optional `.vmlinuz`; `<images>/default` (one line: the id) | |
-| audit | `kind = "box"`, action `image_import` / `image_default` / `image_remove`, `extra = {image, sha256, signed, ubuntu, claude}`; box admission records add `extra.image` = `base-<sha256>` | ruling |
+| audit | `kind = "box"`, action `image_import` / `image_default` / `image_remove`, plan 34's `extra = {action, box: null, template: null, from: null, to: null, via: "cli"}` (`box_ops.rs:406`) plus `{image, sha256, signed, ubuntu, claude}`; box admission records (spawn and tick) add `extra.image` = `base-<sha256>` | ruling |
 
 Manifest fields: `version, id, sha256, virtual_gib, actual_bytes, built_at, builder ("saiife <version>"), recipe_sha256, ubuntu {release, image_sha256, sums_signer}, vmm {ch_version, ch_sha256, fw_version, fw_sha256}, saiife {version, sha256}, claude {version, sha256}, packages [{name, version}], images [{name, digest}], boot ("firmware" | {kernel: file name, cmdline}), signature (null)`.
 
@@ -201,26 +212,26 @@ impl ImageResolver for Store { /* ImageRef::Default -> default_id; Pinned(id) ->
 
 ### Task 5: daemon image store ops, import and audit (size M)
 
-**Files:** Create `crates/daemon/src/box_images.rs`; modify `crates/daemon/src/box_ops.rs` (route `box.image.*`), `crates/ipc/src/msg.rs` (ops), `crates/wire/src/level.rs` (`IPC_OPS`), `crates/boxes/src/manager.rs` (an `image` field on the admission `Change`, see below), `crates/cli/src/box_image_cmd.rs` (`Import`, `Ls`, `Default`, `Rm`).
+**Files:** Create `crates/daemon/src/box_images.rs`; modify `crates/daemon/src/box_ops.rs` (route `box.image.*`; `box_rec` `pub(crate)`; `extra.image` in the spawn record and in `write_tick_records`), `crates/ipc/src/msg.rs` (ops), `crates/wire/src/level.rs` (`IPC_OPS`), `crates/boxes/src/vmm.rs` (`Vmm::image_id`), `crates/boxes/src/vmm/fake.rs` (a settable image), `crates/boxes/src/manager.rs` (fill the existing `image` fields at admission), `crates/boxhost/src/vmm.rs` (`ChVmm::image_id`), `crates/cli/src/box_image_cmd.rs` (`Import`, `Ls`, `Default`, `Rm`).
 
 **Interfaces:**
-- Consumes: `Store` (Task 4); `saiife_ipc::Client::call_with_fds`, the daemon's `Conn::take_fds` and `saiife_boxhost::disk::copy_sparse` (plan 37 Task 2); plan 34 audit pattern (`ctx.record("box", …)`).
+- Consumes: `Store` (Task 4); `saiife_ipc::Client::call_with_fds`, the daemon's `Conn::take_fds` and `saiife_boxhost::disk::copy_sparse` (plan 37 Task 2); plan 34's `box_rec` (`box_ops.rs:406`), `BoxRecord.image` (`store.rs:53`) and `Change.image` (`manager.rs:88`), both already present.
 - Produces:
 ```rust
-// ipc msg.rs (MachineOnly)
+// ipc msg.rs (MachineOnly). Never an argument or answer key named `id` (msg.rs:318-322, :384-393).
 pub const OP_BOX_IMAGE_LS: &str = "box.image.ls";           // {} -> {images: [Manifest + {default: bool, in_use: [box id]}], warnings}
-pub const OP_BOX_IMAGE_IMPORT: &str = "box.image.import";   // {manifest, default?} + fds [raw, kernel?] -> {id}
-pub const OP_BOX_IMAGE_DEFAULT: &str = "box.image.default"; // {id} -> {}
-pub const OP_BOX_IMAGE_RM: &str = "box.image.rm";           // {id} -> {}
-// boxes manager.rs (plan 34 addition)
-pub struct Change { /* plan 34 fields */ pub image: Option<String> }   // Some(image id) on Queued -> Starting
+pub const OP_BOX_IMAGE_IMPORT: &str = "box.image.import";   // {manifest, default?} + fds [raw, kernel?] -> {image}
+pub const OP_BOX_IMAGE_DEFAULT: &str = "box.image.default"; // {image} -> {}
+pub const OP_BOX_IMAGE_RM: &str = "box.image.rm";           // {image} -> {}
+// boxes vmm.rs (addition to plan 34's trait, default keeps FakeVmm-free impls compiling)
+fn image_id(&self, h: &VmHandle) -> Option<String> { None }
 ```
-- Import: the peer must be root or an `[admin]` member in locked mode (any local peer of the daemon's own uid in personal mode); the manifest parses; `fds[0]` is a regular file (`fstat`), its SHA-256 equals `manifest.sha256`; `Store::insert`; audit `image_import` with `signed: manifest.signature.is_some()` (always `false` in this plan). `--default` also sets the default (one more record).
-- Rm: refused when any box record names the image (resolved at admission and kept in a new `BoxRecord.image: Option<String>`, a `#[serde(default)]` addition to plan 34's record, so old records still load), or when it is the default.
-- Admission: `Manager` sets `BoxRecord.image` and `Change.image` from `ChVmm::create`'s resolved id (the `VmHandle.data` JSON gains `"image": "<id>"`, read back by the manager), and `box_ops`' tick records put it in `extra.image` (ruling: the base image SHA-256 is in the audit log for every box start).
+- Import: the peer must be root or an `[admin]` member in locked mode (`(peer.sid.is_none() && peer.uid == 0) || ctx.peer_is_admin(&peer)`, as `box_ops.rs:707`; any local peer of the daemon's own uid in personal mode); the manifest parses; `fds[0]` is a regular file (`fstat`), its SHA-256 equals `manifest.sha256`; `Store::insert`; audit `image_import` with `signed: manifest.signature.is_some()` (always `false` in this plan). `--default` also sets the default (one more record).
+- Rm: refused when any box record names the image (`BoxRecord.image`, plan 34's field, resolved at admission), or when it is the default.
+- Admission: right after `vmm.create`, `Manager` sets `BoxRecord.image` and `Change.image` from `vmm.image_id(&h)` (`ChVmm` reads its own `data` JSON `"image"`), and `box_ops` puts it in `extra.image` of the spawn record (a box admitted at its own spawn, R22) and of tick records (queue heads) (ruling: the base image SHA-256 is in the audit log for every box start).
 - The CLI `Import` opens the file read-only with `O_NOFOLLOW` and sends it with `Client::call_with_fds` (plan 37 Task 2); `Ls` prints `ID  DEFAULT  UBUNTU  CLAUDE  SIZE  IN USE`.
 
-- [ ] **Step 1: Write the failing tests** (daemon `tests/box_images.rs`, personal and locked `test_ctx`): `import_checks_sha256`, `import_refuses_a_symlink_fd_target` (the CLI side refuses to open a symlink: `O_NOFOLLOW`), `import_refuses_bad_manifest`, `import_is_admin_only_locked`, `import_writes_one_record_with_sha256`, `default_and_ls`, `rm_refuses_an_image_in_use`, `rm_refuses_the_default`, `admission_record_names_the_image` (FakeVmm returns `data` with an `image`; the tick record has `extra.image`), `old_box_json_without_image_loads` (plan 34's record shape).
+- [ ] **Step 1: Write the failing tests** (daemon `tests/box_images.rs`, personal and locked `test_ctx`): `import_checks_sha256`, `import_refuses_a_symlink_fd_target` (the CLI side refuses to open a symlink: `O_NOFOLLOW`), `import_refuses_bad_manifest`, `import_is_admin_only_locked`, `import_writes_one_record_with_sha256`, `default_and_ls`, `default_and_rm_take_image_not_id` (over the real socket through `Client::call`: `{image: "base-…"}` works; the answer of `import` has `image`), `rm_refuses_an_image_in_use`, `rm_refuses_the_default`, `admission_record_names_the_image` (`FakeVmm` set to answer `image_id = Some("base-…")`: a box spawned with room has `extra.image` on its spawn record; a queued box admitted later has it on its tick record; `BoxRecord.image` is set), `manager_never_parses_handle_data` (a `FakeVmm` handle whose `data` is not JSON still admits), `old_box_json_without_image_loads` (plan 34's record shape).
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS; `every_ipc_op_is_classified` passes.
 - [ ] **Step 5: Commit** `feat(daemon): box image store, import over a passed fd, image hash in the audit log`.
 
@@ -230,7 +241,7 @@ pub struct Change { /* plan 34 fields */ pub image: Option<String> }   // Some(i
 
 **Files:** Create `scripts/box-smoke.d/05-image.sh`.
 
-Owner-run checks, in order, each a result key: `saiife box image build` with the owner-pinned recipe succeeds (`image_build_s`); the manifest's `sums_signer` is `UBUNTU_CLOUD_FPR`; actual size (`image_actual_bytes`) ≤ 5 GiB; `saiife box image import --default`; the audit log has the `image_import` record with the SHA-256 (`saiife audit` query); a box boots and `systemd-analyze` and `systemd-analyze blame` on its **cold** boot are captured into results (`systemd_analyze_cold`, `systemd_blame_cold`; this finishes the spike's trim list); inside the box (through plan 38's channel or plan 40's `say`): `systemctl is-enabled containerd.service` is `disabled`, `journalctl --header` shows volatile storage, `systemctl get-default` is `multi-user.target`; **Docker growth check:** `docker build` of `FROM busybox@sha256:<pin>` with a 200 MiB random `RUN` (as the spike's) grows the overlay by ≤ 1.3 × 200 MiB (`overlay_growth_ratio`; the spike measured 2.03 with the containerd store); **direct kernel stretch:** rebuild with `--direct-kernel`, boot 5 times, `boot_kernel_ms_median` beside the firmware `boot_cold_ms_median`; the owner keeps direct boot only if it reaches ready and is faster (target ≤ 2 s, ceiling 5 s).
+Owner-run checks, in order, each a result key: `saiife box image build` with the owner-pinned recipe succeeds (`image_build_s`); the manifest's `sums_signer` is `UBUNTU_CLOUD_FPR`; actual size (`image_actual_bytes`) ≤ 5 GiB; `saiife box image import --default`; the audit log has the `image_import` record with the SHA-256 (`jq` over the audit `*.jsonl`: `saiife audit` has no JSON output, plan 27 R-I); a box boots and `systemd-analyze` and `systemd-analyze blame` on its **cold** boot are captured into results (`systemd_analyze_cold`, `systemd_blame_cold`; this finishes the spike's trim list); inside the box (through plan 38's channel or plan 40's `say`): `systemctl is-enabled containerd.service` is `disabled`, `journalctl --header` shows volatile storage, `systemctl get-default` is `multi-user.target`; **Docker growth check:** `docker build` of `FROM busybox@sha256:<pin>` with a 200 MiB random `RUN` (as the spike's) grows the overlay by ≤ 1.3 × 200 MiB (`overlay_growth_ratio`; the spike measured 2.03 with the containerd store); **direct kernel stretch:** rebuild with `--direct-kernel`, boot 5 times, `boot_kernel_ms_median` beside the firmware `boot_cold_ms_median`; the owner keeps direct boot only if it reaches ready and is faster (target ≤ 2 s, ceiling 5 s).
 
 - [ ] **Step 1:** write the fragment; `bash -n`; shellcheck if installed.
 - [ ] **Step 2: Commit** `test(boxes): owner smoke for the base image, trim list, Docker growth and direct boot`.
