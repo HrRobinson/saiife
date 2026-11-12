@@ -32,6 +32,11 @@ const TEST_MAX_FILES: usize = 50;
 /// set once, before any git runs, to the same values for every test.
 fn env() {
     static ONCE: Once = Once::new();
+    // The child of `snapshot_commit_without_identity_is_saiife` gets its
+    // environment from its parent, whole.
+    if std::env::var_os(NO_IDENT_CHILD).is_some() {
+        return;
+    }
     ONCE.call_once(|| {
         let base = std::env::var_os("SAIIFE_TEST_TMP")
             .map(PathBuf::from)
@@ -672,6 +677,75 @@ fn base_ref_can_be_recreated() {
     assert_eq!(git(&w.repo, &["rev-parse", r]).trim(), one);
     // Not a commit id.
     assert!(set_base_ref(&w.tools, &w.repo, &id, "HEAD").is_err());
+}
+
+/// Set in the child run of `snapshot_commit_without_identity_is_saiife`.
+const NO_IDENT_CHILD: &str = "SAIIFE_P37_NO_IDENT_CHILD";
+
+/// R13: with no git identity (no user.email, no EMAIL, no GIT_* names,
+/// HOME empty, no global or system config, auto-detection off) the snapshot
+/// commit is still written, as `saiife <saiife@localhost>`. The work runs
+/// in a child of this test binary, so the cleared environment is its own.
+#[test]
+fn snapshot_commit_without_identity_is_saiife() {
+    if std::env::var_os(NO_IDENT_CHILD).is_none() {
+        env();
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args([
+            "--exact",
+            "snapshot_commit_without_identity_is_saiife",
+            "--test-threads=1",
+        ])
+        .env(NO_IDENT_CHILD, "1")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Git's own auto-detection (user@host) off: no identity at all.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+        .env("GIT_CONFIG_VALUE_0", "true")
+        .env("SAIIFE_TEST_REPO_MAX_FILES", TEST_MAX_FILES.to_string());
+        for v in [
+            "EMAIL",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ] {
+            c.env_remove(v);
+        }
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        return;
+    }
+    let w = world();
+    w.write("a.txt", b"a\n");
+    let mut s = snapshot(&w.tools, &w.repo, &w.cache).unwrap();
+    let c = snapshot_commit(&w.tools, &w.repo, &mut s).unwrap();
+    let body = git(&w.repo, &["cat-file", "commit", &c]);
+    assert!(
+        body.contains("\nauthor saiife <saiife@localhost> "),
+        "{body}"
+    );
+    assert!(
+        body.contains("\ncommitter saiife <saiife@localhost> "),
+        "{body}"
+    );
+    s.remove();
 }
 
 /// `Snapshot` is a plain value the caller removes.

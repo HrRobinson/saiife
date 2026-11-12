@@ -157,7 +157,20 @@ fn git_run(
     args: &[&OsStr],
     input: Option<Vec<u8>>,
 ) -> Result<std::process::Output, String> {
+    git_run_env(tools, repo, index, args, input, &[])
+}
+
+/// [`git_run`] with `env` set for this one call.
+fn git_run_env(
+    tools: &Tools,
+    repo: &Path,
+    index: Option<&Path>,
+    args: &[&OsStr],
+    input: Option<Vec<u8>>,
+    env: &[(&str, &str)],
+) -> Result<std::process::Output, String> {
     let mut c = git_cmd(tools, repo, index);
+    c.envs(env.iter().copied());
     c.args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -189,8 +202,20 @@ fn git_ok(
     args: &[&str],
     input: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, String> {
+    git_ok_env(tools, repo, index, args, input, &[])
+}
+
+/// [`git_ok`] with `env` set for this one call.
+fn git_ok_env(
+    tools: &Tools,
+    repo: &Path,
+    index: Option<&Path>,
+    args: &[&str],
+    input: Option<Vec<u8>>,
+    env: &[(&str, &str)],
+) -> Result<Vec<u8>, String> {
     let a: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let out = git_run(tools, repo, index, &a, input)?;
+    let out = git_run_env(tools, repo, index, &a, input, env)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -890,11 +915,31 @@ fn commit_in(
         args.extend(["-p", b.as_str()]);
     }
     args.extend(["-F", "-"]);
+    // The user's own identity when git has one; otherwise (no user.email,
+    // say) the snapshot is saiife's, for this call only (R13).
+    let has_ident = git_run(
+        tools,
+        repo,
+        ix,
+        &[OsStr::new("var"), OsStr::new("GIT_COMMITTER_IDENT")],
+        None,
+    )?
+    .status
+    .success();
+    let env: &[(&str, &str)] = if has_ident { &[] } else { &FALLBACK_IDENT };
     one_oid(
-        git_ok(tools, repo, ix, &args, Some(msg.into_bytes()))?,
+        git_ok_env(tools, repo, ix, &args, Some(msg.into_bytes()), env)?,
         "commit-tree",
     )
 }
+
+/// The snapshot commit's identity when the user has none (R13).
+const FALLBACK_IDENT: [(&str, &str); 4] = [
+    ("GIT_AUTHOR_NAME", "saiife"),
+    ("GIT_AUTHOR_EMAIL", "saiife@localhost"),
+    ("GIT_COMMITTER_NAME", "saiife"),
+    ("GIT_COMMITTER_EMAIL", "saiife@localhost"),
+];
 
 /// Point `refs/saiife/box-<id>/base` at `commit`, create only (`git
 /// update-ref <ref> <commit> ""`). When the ref already points at `commit`
