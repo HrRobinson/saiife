@@ -1255,15 +1255,17 @@ async fn run(
             let book = lands.clone();
             let (_, rec) = change(
                 "discard",
-                Box::new(move |m| {
-                    if !force {
-                        if let Some(b) = &book {
-                            if b.unapplied(&i) > 0 {
-                                return Err(saiife_boxes::source::unapplied_refusal(&i));
-                            }
-                        }
+                Box::new(move |m| match &book {
+                    // Checked and discarded under the book's box lock.
+                    Some(b) => {
+                        let mut done = None;
+                        b.discard_with(&i, force, &mut || {
+                            done = Some(m.discard(&i)?);
+                            Ok(())
+                        })?;
+                        done.ok_or(BoxError::NotFound)
                     }
-                    m.discard(&i)
+                    None => m.discard(&i),
                 }),
             )
             .await?;

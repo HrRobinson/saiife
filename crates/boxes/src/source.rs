@@ -47,6 +47,21 @@ pub trait LandBook: Send + Sync {
     ) -> Result<(), BoxError>;
     /// Approved lands of the box not applied yet (L4).
     fn unapplied(&self, id: &BoxId) -> u32;
+    /// Runs `discard` unless the box has an unapplied land (`force` skips
+    /// that check). A book that approves lands overrides it to hold its
+    /// per-box lock across the check and the discard, so an approval
+    /// cannot slip in between (L4).
+    fn discard_with(
+        &self,
+        id: &BoxId,
+        force: bool,
+        discard: &mut dyn FnMut() -> Result<(), BoxError>,
+    ) -> Result<(), BoxError> {
+        if !force && self.unapplied(id) > 0 {
+            return Err(unapplied_refusal(id));
+        }
+        discard()
+    }
     /// The box a request is for, `None` for an unknown request: lets an
     /// owner-scoped source refuse another owner's request as `NotFound`.
     fn box_of(&self, request_id: u64) -> Option<BoxId> {
@@ -213,10 +228,10 @@ impl BoxSource for ManagerSource {
 
     fn discard(&self, id: &BoxId) -> Result<(), BoxError> {
         self.visible(id)?;
-        if self.lands.as_ref().is_some_and(|l| l.unapplied(id) > 0) {
-            return Err(unapplied_refusal(id));
+        match &self.lands {
+            Some(l) => l.discard_with(id, false, &mut || self.mgr.discard(id).map(|_| ())),
+            None => self.mgr.discard(id).map(|_| ()),
         }
-        self.mgr.discard(id).map(|_| ())
     }
 
     /// With an owner filter `queue` must list exactly that user's queued

@@ -72,7 +72,7 @@ const RECORD_MAX: u64 = 64 << 10;
 /// `review.json` (the unified text is at most 2 MiB; 20 000 entry heads).
 const REVIEW_MAX: u64 = 64 << 20;
 /// The guest's base advance (git plumbing over `/work`'s export).
-const ADVANCE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const ADVANCE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Guest text kept in an error, in bytes.
 const MAX_WHY: usize = 512;
 /// receive's refusal when the box has no live guest channel.
@@ -656,9 +656,11 @@ impl Lands {
         let v = match review::receive(&self.guest, id, &paths, &cur.base, n) {
             Ok(v) => v,
             Err(e) => {
-                lock(&self.state).reviews.remove(id);
                 let reason = e.to_string();
+                // A guest that is not connected (a flap, an idle stop on
+                // the way) refused nothing: the cached review stays.
                 if !(e.path.is_none() && e.reason == NOT_CONNECTED) {
+                    lock(&self.state).reviews.remove(id);
                     let mut r = self.record(&ctx, "diff_rejected", id, None);
                     r.reason = Some(reason.clone());
                     r.extra.insert("reason".into(), reason.clone().into());
@@ -685,7 +687,39 @@ impl Lands {
                 base: cur.base,
             }),
         );
+        let live: BTreeSet<u32> = st
+            .requests
+            .values()
+            .filter(|q| q.req.id == *id && q.decided.is_none())
+            .map(|q| q.req.n)
+            .collect();
+        drop(st);
+        self.prune(id, &paths, n, &live);
         Ok(rev)
+    }
+
+    /// Removes every `lands/<m>`, `m < n`, that is not an approved land and
+    /// that no undecided request names (I-3): each refresh stores a whole
+    /// export, so dead ones would fill the state disk. The newest (`n`)
+    /// always stays, so the highest number on disk only grows. Runs under
+    /// the box lock; a dir that cannot be read or removed is left.
+    fn prune(&self, id: &BoxId, paths: &BoxPaths, n: u32, live: &BTreeSet<u32>) {
+        let Ok(ns) = land_numbers(paths) else {
+            return;
+        };
+        for m in ns.into_iter().filter(|m| *m < n && !live.contains(m)) {
+            match exists(&paths.land_approved(m)) {
+                Ok(false) => {}
+                // Approved (a land), or unreadable (fail closed): kept.
+                Ok(true) | Err(_) => continue,
+            }
+            if let Err(e) = fs::remove_dir_all(paths.land_dir(m)) {
+                eprintln!(
+                    "saiifed: boxes: box {}: cannot remove the unused export {m}: {e}",
+                    id.as_str()
+                );
+            }
+        }
     }
 
     /// A land request for box `id` (Done or Landed) by `owner`, over its
@@ -792,15 +826,42 @@ impl Lands {
             let _ = ctx.touch.take(&IssueKey::Land(rid), owner);
             return Err(unavailable(format!("cannot write the land request: {e}")));
         }
-        lock(&self.state).requests.insert(
-            rid,
-            Req {
-                req,
-                record: record.clone(),
-                review: land.clone(),
-                decided: None,
-            },
-        );
+        let review_sha = req.review_sha256.clone();
+        let whole = req.only.is_none();
+        let superseded: Vec<(u64, u32)> = {
+            let mut st = lock(&self.state);
+            st.requests.insert(
+                rid,
+                Req {
+                    req,
+                    record: record.clone(),
+                    review: land.clone(),
+                    decided: None,
+                },
+            );
+            // The box's older undecided requests of the same kind (whole
+            // or partial), and any over another review, are superseded:
+            // gone with their touch entries, so they cannot fill the
+            // owner's touch cap and drop boxes from `pending()`.
+            let old: Vec<(u64, u32)> = st
+                .requests
+                .values()
+                .filter(|q| {
+                    q.req.request_id != rid
+                        && q.req.id == *id
+                        && q.decided.is_none()
+                        && (q.req.only.is_none() == whole || q.req.review_sha256 != review_sha)
+                })
+                .map(|q| (q.req.request_id, q.req.owner))
+                .collect();
+            for (r, _) in &old {
+                st.requests.remove(r);
+            }
+            old
+        };
+        for (r, o) in superseded {
+            let _ = ctx.touch.take(&IssueKey::Land(r), o);
+        }
         Ok((rid, record, land))
     }
 
@@ -1329,10 +1390,15 @@ impl LandBook for Lands {
         d: Decision,
         ev: Option<TouchEvidence>,
     ) -> Result<(), BoxError> {
-        let (id, owner, decided) = {
+        let (id, owner, decided, git_config) = {
             let st = lock(&self.state);
             let q = st.requests.get(&request_id).ok_or(BoxError::NotFound)?;
-            (q.req.id.clone(), q.req.owner, q.decided)
+            (
+                q.req.id.clone(),
+                q.req.owner,
+                q.decided,
+                q.req.git_config.is_some(),
+            )
         };
         let ctx = self.ctx()?;
         match (d, ev) {
@@ -1342,6 +1408,14 @@ impl LandBook for Lands {
             (Decision::Reject, Some(_)) => Err(BoxError::Invalid(
                 "a rejection takes no touch evidence".into(),
             )),
+            (Decision::Approve, Some(_)) if git_config => {
+                // R-T6e: the Workspace never lands git config, whatever
+                // request it is handed (a CLI-begun one included).
+                let i = id.as_str();
+                Err(BoxError::Invalid(format!(
+                    "land {i} changes git config; land it from the CLI: saiife box land {i} --allow-git-config"
+                )))
+            }
             (Decision::Approve, Some(ev)) => {
                 if decided.is_some() || !self.is_current(request_id) {
                     return Err(BoxError::WrongState {
@@ -1366,6 +1440,22 @@ impl LandBook for Lands {
         u32::try_from(l.len())
             .unwrap_or(u32::MAX)
             .saturating_add(unreadable)
+    }
+
+    /// Under the box's lock: no approval of the box runs between the
+    /// check and the discard (an approval re-checks the box's state).
+    fn discard_with(
+        &self,
+        id: &BoxId,
+        force: bool,
+        discard: &mut dyn FnMut() -> Result<(), BoxError>,
+    ) -> Result<(), BoxError> {
+        let bl = self.box_lock(id);
+        let _held = lock(&bl);
+        if !force && self.unapplied(id) > 0 {
+            return Err(saiife_boxes::source::unapplied_refusal(id));
+        }
+        discard()
     }
 
     fn box_of(&self, request_id: u64) -> Option<BoxId> {

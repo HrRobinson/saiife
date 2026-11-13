@@ -335,6 +335,11 @@ fn host(n: u64) -> HostFacts {
 }
 
 fn world(slots: u64) -> World {
+    world_with(slots, true)
+}
+
+/// A world whose land book is attached to the context or not (`attach`).
+fn world_with(slots: u64, attach: bool) -> World {
     let tmp = scratch();
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
@@ -415,7 +420,9 @@ fn world(slots: u64) -> World {
         layout,
         Arc::new(move || c.load(Ordering::SeqCst)),
     );
-    assert!(ctx.box_lands.set(Arc::clone(&lands)).is_ok());
+    if attach {
+        assert!(ctx.box_lands.set(Arc::clone(&lands)).is_ok());
+    }
     World {
         ctx,
         mgr,
@@ -2036,4 +2043,153 @@ fn github_workflow_is_protected_not_git_config() {
             .contains("--allow-git-config"),
         "{a}"
     );
+}
+
+// ---- final fix wave ----
+
+/// I-3: every refresh stores a whole export; the unused ones go, the
+/// newest stays (its number is the highest on disk).
+#[test]
+fn three_refreshes_leave_one_unapproved_land_dir() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    w.lands.refresh(&i).unwrap();
+    let r = w.lands.refresh(&i).unwrap();
+    let dirs: Vec<String> = std::fs::read_dir(w.paths(&i).lands_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(dirs, [r.n.to_string()], "{dirs:?}");
+    // An approved land and a land an undecided request names stay.
+    let p = w.pending_of(&i);
+    let n = w.lands.request(p.request_id).unwrap().0.n;
+    assert_eq!(n, r.n);
+    w.lands.refresh(&i).unwrap();
+    let r = w.lands.refresh(&i).unwrap();
+    assert!(w.paths(&i).land_dir(n).exists());
+    assert!(!w.paths(&i).land_dir(n + 1).exists());
+    assert!(w.paths(&i).land_dir(r.n).exists());
+    let p = w.pending_of(&i);
+    let approved = w.lands.request(p.request_id).unwrap().0.n;
+    let ev = w.evidence(ALICE, &p);
+    w.lands
+        .complete(p.request_id, Decision::Approve, Some(ev))
+        .unwrap();
+    w.with_repo(&i, |g| {
+        g.work.insert("more.txt".into(), C(b"more\n".to_vec()));
+    });
+    w.mgr.revise(&i, "more").unwrap();
+    w.mgr.done(&i).unwrap();
+    let last = w.lands.refresh(&i).unwrap();
+    assert!(w.paths(&i).land_approved(approved).exists());
+    assert!(w.paths(&i).land_dir(last.n).exists());
+    // Only the approved land and the newest are left.
+    let mut ns: Vec<u32> = std::fs::read_dir(w.paths(&i).lands_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().parse().unwrap())
+        .collect();
+    ns.sort_unstable();
+    assert_eq!(ns, [approved, last.n]);
+}
+
+/// I-4: the Workspace never approves a land that changes git config, even
+/// a CLI-begun request it was handed.
+#[test]
+fn complete_refuses_git_config_request() {
+    let w = world(2);
+    let i = w.done(ALICE, &with_git_config(".gitattributes"));
+    let (rid, record, _) = w.lands.begin(&i, ALICE, None, true, w.now()).unwrap();
+    let asr = w.keys[&ALICE].assert_ctap(RP, &challenge(&record));
+    let ev = w
+        .ctx
+        .touch
+        .verify_counted(ALICE, &record, &asr, RP, w.now())
+        .unwrap();
+    let s = i.as_str();
+    assert_eq!(
+        w.lands.complete(rid, Decision::Approve, Some(ev)),
+        Err(BoxError::Invalid(format!(
+            "land {s} changes git config; land it from the CLI: saiife box land {s} --allow-git-config"
+        )))
+    );
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!((r.state, r.lands), (BoxState::Done, 0));
+    assert!(w.actions("land").is_empty());
+    // Rejecting it from the Workspace still works.
+    w.lands.complete(rid, Decision::Reject, None).unwrap();
+}
+
+/// M-2: a guest that is not connected refused nothing: the cached review
+/// stays, and no diff_rejected record is written.
+#[test]
+fn not_connected_keeps_the_cached_review() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let before = w.lands.latest(&i).unwrap();
+    w.guest.after_off(&i);
+    let e = w.lands.refresh(&i).unwrap_err();
+    assert!(e.to_string().contains("not connected"), "{e}");
+    assert_eq!(
+        w.lands.latest(&i).unwrap().summary.diff_sha256,
+        before.summary.diff_sha256
+    );
+    assert!(w.actions("diff_rejected").is_empty());
+}
+
+/// Item 7: a request issued again for the same box supersedes the older
+/// undecided one, touch entry and all, so re-issues cannot fill the
+/// owner's touch cap and drop boxes from pending().
+#[test]
+fn superseded_requests_release_their_touch() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let first = w.lands.begin(&i, ALICE, None, false, w.now()).unwrap().0;
+    // Well past the per-uid cap of 8.
+    let mut last = first;
+    for _ in 0..12 {
+        last = w.lands.begin(&i, ALICE, None, false, w.now()).unwrap().0;
+    }
+    assert!(w.lands.request(first).is_none());
+    assert!(w.lands.request(last).is_some());
+    assert_eq!(
+        w.ctx.touch.take(&IssueKey::Land(first), ALICE).unwrap_err(),
+        TouchError::Expired
+    );
+    // The owner still gets a pending land for another box.
+    w.clock.fetch_add(1, Ordering::SeqCst);
+    let j = w.done(ALICE, &changed());
+    w.pending_of(&j);
+    w.pending_of(&i);
+    // A partial request does not supersede the whole one (nor the reverse).
+    let part = w
+        .lands
+        .begin(
+            &i,
+            ALICE,
+            Some(BTreeSet::from(["NEW.md".to_string()])),
+            false,
+            w.now(),
+        )
+        .unwrap()
+        .0;
+    let whole = w.pending_of(&i).request_id;
+    assert!(w.lands.request(whole).is_some());
+    assert!(w.lands.request(part).is_some());
+}
+
+/// Item 9: a daemon whose land book is not attached answers every land and
+/// push op with `unavailable` and NO_LANDS.
+#[test]
+fn unattached_book_answers_no_lands() {
+    let w = world_with(2, false);
+    let i = w.done(ALICE, &changed());
+    for op in box_land::OPS {
+        let a = w.call(
+            ALICE,
+            op,
+            json!({"box": i.as_str(), "request_id": "4294967297"}),
+        );
+        assert_eq!(a["error"], "unavailable", "{op}: {a}");
+        assert_eq!(a["message"], box_land::NO_LANDS, "{op}: {a}");
+    }
 }
