@@ -472,6 +472,7 @@ pub fn check_config(v: &Value, paths: &BoxPaths, spec: &LaunchSpec) -> Result<()
             return Err("memory: a file-backed zone".into());
         }
     }
+    check_sizes(v, spec)?;
     check_payload(v.get("payload"), spec)?;
     check_disks(v.get("disks"), paths, spec)?;
     if let Some(rng) = v.get("rng").filter(|r| !nullish(Some(r))) {
@@ -494,6 +495,35 @@ pub fn check_config(v: &Value, paths: &BoxPaths, spec: &LaunchSpec) -> Result<()
         return Err("vsock: socket is not the box's vsock.sock".into());
     }
     check_landlock(v, paths, spec)
+}
+
+/// On restore Cloud Hypervisor takes the vCPUs and memory from the
+/// snapshot's config, which the VMM wrote, not from argv: they must be
+/// what the box was admitted with (`spec`, the daemon's), with no hotplug
+/// room, shared or hugepage memory and no NUMA or memory zones.
+fn check_sizes(v: &Value, spec: &LaunchSpec) -> Result<(), String> {
+    let n = |p: &str| v.pointer(p).and_then(Value::as_u64);
+    let vcpus = u64::from(spec.vcpus);
+    if n("/cpus/boot_vcpus") != Some(vcpus) || n("/cpus/max_vcpus") != Some(vcpus) {
+        return Err(format!("cpus: not the box's {} vCPUs", spec.vcpus));
+    }
+    if n("/memory/size") != Some(spec.mem_mib << 20) {
+        return Err(format!("memory: not the box's {} MiB", spec.mem_mib));
+    }
+    for k in ["hotplug_size", "hotplugged_size", "zones"] {
+        if !nullish(v.pointer(&format!("/memory/{k}"))) {
+            return Err(format!("memory: {k} is set"));
+        }
+    }
+    for k in ["shared", "hugepages"] {
+        if v.pointer(&format!("/memory/{k}")).and_then(Value::as_bool) == Some(true) {
+            return Err(format!("memory: {k} is on"));
+        }
+    }
+    if !nullish(v.get("numa")) {
+        return Err("numa: set".into());
+    }
+    Ok(())
 }
 
 fn check_payload(p: Option<&Value>, spec: &LaunchSpec) -> Result<(), String> {
@@ -586,7 +616,7 @@ mod tests {
             restore: None,
         };
         let v = serde_json::json!({
-            "cpus": {"boot_vcpus": 2},
+            "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
             "memory": {"size": 1u64 << 30, "zones": null},
             "payload": {"firmware": "/v/CLOUDHV.fd", "kernel": null, "cmdline": null, "initramfs": null},
             "disks": [{"path": "/b/b1/root.qcow2", "vhost_user": false}, {"path": "/b/b1/repo.img"}],
@@ -628,6 +658,17 @@ mod tests {
             ("payload", |v| v["payload"]["kernel"] = "/v/vmlinux".into()),
             ("memory", |v| {
                 v["memory"]["zones"] = serde_json::json!([{"file": "/dev/shm/x"}])
+            }),
+            ("cpus", |v| v["cpus"]["boot_vcpus"] = 32.into()),
+            ("cpus", |v| v["cpus"]["max_vcpus"] = 32.into()),
+            ("memory", |v| v["memory"]["size"] = (4u64 << 30).into()),
+            ("memory", |v| {
+                v["memory"]["hotplug_size"] = (1u64 << 34).into()
+            }),
+            ("memory", |v| v["memory"]["shared"] = true.into()),
+            ("memory", |v| v["memory"]["hugepages"] = true.into()),
+            ("numa", |v| {
+                v["numa"] = serde_json::json!([{"guest_numa_id": 0}])
             }),
             ("rng", |v| v["rng"]["src"] = "/etc/shadow".into()),
             ("serial", |v| v["serial"]["file"] = "/etc/x".into()),

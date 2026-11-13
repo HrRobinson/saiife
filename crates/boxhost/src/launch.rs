@@ -25,8 +25,9 @@ pub const MAX_SOCK_PATH: usize = 100;
 /// A `vm.json` larger than this is refused.
 pub const MAX_SPEC_BYTES: u64 = 16 * 1024;
 /// Plan 34's bounds (`crates/boxes/src/template.rs`, size validation).
-const VCPUS: std::ops::RangeInclusive<u32> = 1..=32;
-const MEM_MIB: std::ops::RangeInclusive<u64> = 512..=262_144;
+const VCPUS: std::ops::RangeInclusive<u32> = 1..=saiife_boxes::template::MAX_VCPUS;
+const MEM_MIB: std::ops::RangeInclusive<u64> =
+    saiife_boxes::template::MIN_MEM_MIB..=saiife_boxes::template::MAX_MEM_MIB;
 const CMDLINE_MAX: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,15 +118,16 @@ fn is_plain_file(p: &Path) -> bool {
 }
 
 /// The helper's fail-closed limits on a spec it reads from the
-/// VMM-writable runtime dir, whatever wrote it: a locked VMM always runs
-/// under Landlock, and no VMM gets more vCPUs or memory than any template
-/// may ask for (`saiife_boxes::template::MAX_VCPUS`, `MAX_MEM_MIB`). The
-/// daemon never reads the spec back (it rebuilds it every boot); this is
-/// the second line.
-pub fn check_limits(spec: &LaunchSpec, locked: bool) -> Result<(), String> {
+/// VMM-writable runtime dir, whatever wrote it: a VMM always runs under
+/// Landlock (R23; the driver never turns it off, in either mode), and no
+/// VMM gets more vCPUs or memory than any template may ask for
+/// (`saiife_boxes::template::MAX_VCPUS`, `MAX_MEM_MIB`). The daemon never
+/// reads the spec back (it rebuilds it every boot); this is the second
+/// line.
+pub fn check_limits(spec: &LaunchSpec) -> Result<(), String> {
     use saiife_boxes::template::{MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB};
-    if locked && !spec.landlock {
-        return Err("landlock: a locked box VMM always runs under Landlock".into());
+    if !spec.landlock {
+        return Err("landlock: a box VMM always runs under Landlock".into());
     }
     if !(1..=MAX_VCPUS).contains(&spec.vcpus) {
         return Err(format!("vcpus: {} is not 1..={MAX_VCPUS}", spec.vcpus));
@@ -350,6 +352,14 @@ pub fn write_spec(spec: &LaunchSpec, paths: &BoxPaths) -> Result<(), String> {
 
 /// Reads `vm.json`: a regular file (not a symlink, no FIFO), at most 16 KiB.
 pub fn read_spec(paths: &BoxPaths) -> Result<LaunchSpec, String> {
+    read_spec_owned(paths, None)
+}
+
+/// [`read_spec`]; with `not_uid`, the open file must also have one link
+/// and an owner other than `not_uid` (locked: the helper's own user, the
+/// VMM user, never writes the spec; the daemon does), checked on the same
+/// descriptor that is read, so a file swapped in is never read.
+pub fn read_spec_owned(paths: &BoxPaths, not_uid: Option<u32>) -> Result<LaunchSpec, String> {
     let p = paths.vm_json();
     let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32;
     let f = std::fs::OpenOptions::new()
@@ -360,6 +370,16 @@ pub fn read_spec(paths: &BoxPaths) -> Result<LaunchSpec, String> {
     let m = f.metadata().map_err(|e| format!("vm.json: {e}"))?;
     if !m.file_type().is_file() {
         return Err("vm.json: not a regular file".into());
+    }
+    if let Some(u) = not_uid {
+        use std::os::unix::fs::MetadataExt;
+        if m.uid() == u || m.nlink() != 1 {
+            return Err(format!(
+                "vm.json: owned by uid {} with {} links, not written by the daemon",
+                m.uid(),
+                m.nlink()
+            ));
+        }
     }
     if m.len() > MAX_SPEC_BYTES {
         return Err(format!("vm.json: larger than {MAX_SPEC_BYTES} bytes"));
@@ -964,25 +984,23 @@ mod tests {
     /// daemon's rebuild regressed): Landlock on when locked, sizes within
     /// the template ceilings.
     #[test]
-    fn limits_refuse_landlock_off_locked_and_oversize() {
+    fn limits_refuse_landlock_off_and_oversize() {
         let e = env();
         let ok = spec(&e, "b1");
-        assert_eq!(check_limits(&ok, true), Ok(()));
+        assert_eq!(check_limits(&ok), Ok(()));
         let off = LaunchSpec {
             landlock: false,
             ..ok.clone()
         };
-        assert!(check_limits(&off, true).unwrap_err().contains("landlock"));
-        assert_eq!(check_limits(&off, false), Ok(()));
+        // in both modes: the driver always runs the VMM under Landlock (R23)
+        assert!(check_limits(&off).unwrap_err().contains("landlock"));
         for (vcpus, mem_mib) in [(33, 4096), (0, 4096), (2, 262_145), (2, 511)] {
             let big = LaunchSpec {
                 vcpus,
                 mem_mib,
                 ..ok.clone()
             };
-            for locked in [true, false] {
-                assert!(check_limits(&big, locked).is_err(), "{vcpus} {mem_mib}");
-            }
+            assert!(check_limits(&big).is_err(), "{vcpus} {mem_mib}");
         }
     }
 

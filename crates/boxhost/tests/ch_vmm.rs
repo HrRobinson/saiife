@@ -396,7 +396,7 @@ fn create_writes_spec_and_overlay() {
     let data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
     assert_eq!(
         data,
-        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096, "vcpus": 2})
+        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096, "vcpus": 2, "repo": false})
     );
     // The manager learns the image through the driver (plan 36).
     assert_eq!(v.image_id(&h), Some(format!("base-{HEX}")));
@@ -1836,5 +1836,53 @@ fn a_handle_without_its_sizes_does_not_boot() {
     };
     let e = failed(v.boot(&old));
     assert!(e.contains("record"), "{e}");
+    assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
+}
+
+/// A snapshot's config.json is the VMM's own (sealed, but written by
+/// it): on restore Cloud Hypervisor takes the vCPUs and memory from it,
+/// not from argv. More vCPUs, more memory, hotplug, shared or hugepage
+/// memory than the box was admitted with are refused; the box boots cold.
+#[test]
+fn restore_refuses_sizes_the_box_was_not_admitted_with() {
+    type Edit = fn(&mut serde_json::Value);
+    let edits: &[(&str, Edit)] = &[
+        ("vcpus", |c| c["cpus"]["boot_vcpus"] = 32.into()),
+        ("max vcpus", |c| c["cpus"]["max_vcpus"] = 32.into()),
+        ("memory", |c| {
+            c["memory"]["size"] = ((4096u64 * 4) << 20).into()
+        }),
+        ("hotplug", |c| {
+            c["memory"]["hotplug_size"] = (1u64 << 34).into()
+        }),
+        ("shared", |c| c["memory"]["shared"] = true.into()),
+        ("hugepages", |c| c["memory"]["hugepages"] = true.into()),
+    ];
+    for (what, edit) in edits {
+        let w = World::new();
+        let (v, _l) = w.vmm(&[]);
+        let h = w.snapshotted(&v, "b1");
+        w.forge("b1", edit);
+        v.boot(&h).unwrap();
+        assert!(w.booted_cold("b1"), "{what}");
+        assert!(
+            w.events().contains(&"h.refused".to_string()),
+            "{what}: {:?}",
+            w.events()
+        );
+    }
+}
+
+/// Whether a box has a repo disk is the daemon's record, not what the
+/// VMM-writable runtime dir holds at boot: a repo.img planted there for
+/// a box created without one is refused.
+#[test]
+fn boot_refuses_a_repo_disk_the_box_was_not_created_with() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    std::fs::write(w.paths("b1").repo_disk(), b"planted").unwrap();
+    let e = failed(v.boot(&h));
+    assert!(e.contains("repo"), "{e}");
     assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
 }

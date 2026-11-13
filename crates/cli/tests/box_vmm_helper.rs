@@ -282,10 +282,13 @@ fn helper_refuses_landlock_off_locked_and_oversize() {
         ..f.spec.clone()
     };
     launch::write_spec(&off, &f.paths).unwrap();
-    let o = run_args(&f, &["--locked"]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    for args in [&[][..], &["--locked"][..]] {
+        let o = run_args(&f, args);
+        assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+        assert!(!f.out.exists(), "the VMM was not started");
+    }
+    let o = run_args(&f, &[]);
     assert!(stderr(&o).contains("landlock"), "{}", stderr(&o));
-    assert!(!f.out.exists(), "the VMM was not started");
     for (vcpus, mem_mib) in [(64, 1024), (2, 1 << 20)] {
         let big = LaunchSpec {
             vcpus,
@@ -295,6 +298,20 @@ fn helper_refuses_landlock_off_locked_and_oversize() {
         launch::write_spec(&big, &f.paths).unwrap();
         let o = run(&f, true);
         assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains("vcpus") || e.contains("mem_mib"), "{e}");
         assert!(!f.out.exists(), "the VMM was not started");
     }
+}
+
+/// Locked, the daemon writes vm.json and the VMM user runs the helper: a
+/// vm.json the helper's own user owns (made or replaced by a VMM in the
+/// group-writable runtime dir) is refused, checked on the open file.
+#[test]
+fn helper_refuses_a_spec_its_own_user_wrote_when_locked() {
+    let f = fx();
+    let o = run_args(&f, &["--locked"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).contains("owned by"), "{}", stderr(&o));
+    assert!(!f.out.exists(), "the VMM was not started");
 }

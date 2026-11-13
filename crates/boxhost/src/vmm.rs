@@ -535,7 +535,8 @@ impl ChVmmInit {
     /// `restore` is the caller's (from the vault marker).
     fn launch_spec(&self, h: &VmHandle, paths: &BoxPaths) -> Result<LaunchSpec, String> {
         let stale = || {
-            "the box's VM record has no image or sizes (made by an older saiife):              discard the box and spawn it again"
+            "the box's VM record has no image, sizes or repo flag (made by an older saiife): \
+             discard the box and spawn it again"
                 .to_string()
         };
         let image = image_of_data(&h.data).ok_or_else(stale)?;
@@ -545,9 +546,20 @@ impl ChVmmInit {
             .get("vcpus")
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok());
-        let (Some(mem_mib), Some(vcpus)) = (mem_mib, vcpus) else {
+        let repo = v.get("repo").and_then(serde_json::Value::as_bool);
+        let (Some(mem_mib), Some(vcpus), Some(repo)) = (mem_mib, vcpus, repo) else {
             return Err(stale());
         };
+        // the runtime dir is VMM-writable: its repo.img must be the one
+        // create handed over, no more, no less (not followed: check_plain)
+        let present = std::fs::symlink_metadata(paths.repo_disk()).is_ok();
+        if present != repo {
+            return Err(if repo {
+                "the box's repo disk is missing from its runtime dir".into()
+            } else {
+                "a repo disk the box was not created with is in its runtime dir".into()
+            });
+        }
         let resolved = self.images.resolve(&ImageRef::Pinned(image.clone()))?;
         if resolved.id != image {
             return Err(format!(
@@ -561,13 +573,12 @@ impl ChVmmInit {
             vcpus,
             mem_mib,
             base: resolved.raw,
-            // not followed: a symlink here is refused below (check_plain)
-            repo: std::fs::symlink_metadata(paths.repo_disk()).is_ok(),
+            repo,
             boot: resolved.boot,
             landlock: self.landlock,
             restore: None,
         };
-        launch::check_limits(&spec, self.layout.locked)?;
+        launch::check_limits(&spec)?;
         Ok(spec)
     }
 
@@ -883,6 +894,7 @@ impl Vmm for ChVmm {
             "image": image.id,
             "mem_mib": spec.size.mem_mib,
             "vcpus": spec.size.vcpus,
+            "repo": ls.repo,
         });
         Ok(VmHandle {
             id: spec.id.clone(),
