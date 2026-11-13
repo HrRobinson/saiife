@@ -919,7 +919,8 @@ type Step = Box<dyn FnOnce(&Manager) -> Result<Change, BoxError> + Send>;
 
 /// The repo disk a `box.spawn` was passed, taken in (`crate::box_repo`)
 /// and named in `args`, with the repo's name from its manifest. `None`
-/// when nothing was passed. A refused disk is `Invalid` (`bad_request`).
+/// when nothing was passed. A refused disk is `Invalid` (`bad_request`);
+/// a disk the daemon failed to take in (I/O) is `Unavailable`.
 #[cfg(unix)]
 fn take_disk(
     root: &Path,
@@ -929,8 +930,11 @@ fn take_disk(
     if passed.is_empty() {
         return Ok(None);
     }
-    let (image, manifest, parsed) =
-        crate::box_repo::intake(root, passed).map_err(BoxError::Invalid)?;
+    use crate::box_repo::IntakeError;
+    let (image, manifest, parsed) = crate::box_repo::intake(root, passed).map_err(|e| match e {
+        IntakeError::Refused(m) => BoxError::Invalid(m),
+        IntakeError::Failed(m) => BoxError::Unavailable(m),
+    })?;
     args.repo = parsed.repo;
     args.repo_image = Some(image.clone());
     args.base_manifest = Some(manifest);

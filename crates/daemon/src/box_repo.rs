@@ -39,6 +39,25 @@ pub const MANIFEST_MAX_BYTES: u64 = 64 << 20;
 const EXT4_MAGIC_AT: u64 = 1080;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xEF];
 
+/// Why [`intake`] did not take a repo disk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IntakeError {
+    /// What was passed is not a repo disk this daemon takes (descriptor
+    /// count, type, size, ext4 magic, manifest): the caller's request.
+    Refused(String),
+    /// The daemon could not take it in for its own reasons (`.incoming`
+    /// cannot be made or used, disk full, I/O errors while copying).
+    Failed(String),
+}
+
+impl std::fmt::Display for IntakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IntakeError::Refused(m) | IntakeError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
 fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
@@ -158,18 +177,33 @@ fn regular(f: &File, what: &str, max: u64) -> Result<u64, String> {
 /// A new file `name` in `dir` with `mode`, never through a symlink, and
 /// `src` copied into it (at most `len` bytes, the length checked); the
 /// copy, open for reading.
-fn copy_in(dir: &OwnedFd, name: &str, mode: u32, src: &File, len: u64) -> Result<File, String> {
+/// I/O errors are [`IntakeError::Failed`]; a source whose length changed
+/// during the copy is [`IntakeError::Refused`].
+fn copy_in(
+    dir: &OwnedFd,
+    name: &str,
+    mode: u32,
+    src: &File,
+    len: u64,
+) -> Result<File, IntakeError> {
+    let failed = IntakeError::Failed;
     let flags = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = openat(dir, name, flags, Mode::from_raw_mode(mode))
-        .map_err(|e| format!("cannot make {name}: {e}"))?;
+        .map_err(|e| failed(format!("cannot make {name}: {e}")))?;
     // The umask may have taken bits: the mode is set as asked.
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode)).map_err(|e| format!("{name}: {e}"))?;
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
+        .map_err(|e| failed(format!("{name}: {e}")))?;
     let dst = File::from(fd);
     saiife_boxhost::disk::copy_sparse_upto(src, &dst, len)
-        .map_err(|e| format!("cannot copy {name}: {e}"))?;
-    let got = dst.metadata().map_err(|e| format!("{name}: {e}"))?.len();
+        .map_err(|e| failed(format!("cannot copy {name}: {e}")))?;
+    let got = dst
+        .metadata()
+        .map_err(|e| failed(format!("{name}: {e}")))?
+        .len();
     if got != len {
-        return Err(format!("{name} changed while it was copied"));
+        return Err(IntakeError::Refused(format!(
+            "{name} changed while it was copied"
+        )));
     }
     Ok(dst)
 }
@@ -191,41 +225,49 @@ fn remove_sub(inc: &OwnedFd, sub: &str) {
 /// 0640 keeping its holes, the manifest 0600); then the copy of the disk
 /// must carry the ext4 magic and the copy of the manifest must parse.
 /// Returns the copies' paths and the parsed manifest. On any failure
-/// nothing stays in `.incoming`.
+/// nothing stays in `.incoming`. What was passed failing a check is
+/// [`IntakeError::Refused`]; the daemon failing to take it in (making or
+/// using `.incoming`, copying, reading its own copy back) is
+/// [`IntakeError::Failed`].
 pub fn intake(
     boxes_root: &Path,
     fds: Vec<OwnedFd>,
-) -> Result<(PathBuf, PathBuf, BaseManifest), String> {
+) -> Result<(PathBuf, PathBuf, BaseManifest), IntakeError> {
+    use IntakeError::{Failed, Refused};
     if fds.len() != 2 {
-        return Err(format!(
+        return Err(Refused(format!(
             "box.spawn takes two descriptors (the repo disk and its base manifest), not {}",
             fds.len()
-        ));
+        )));
     }
     let mut it = fds.into_iter().map(File::from);
     let (Some(image), Some(manifest)) = (it.next(), it.next()) else {
-        return Err("box.spawn takes two descriptors".into());
+        return Err(Refused("box.spawn takes two descriptors".into()));
     };
-    let image_len = regular(&image, "repo disk", IMAGE_MAX_BYTES)?;
-    let manifest_len = regular(&manifest, "base manifest", MANIFEST_MAX_BYTES)?;
-    let inc = incoming_dir(boxes_root, true)?;
-    let dir = incoming_in(boxes_root).join(random_hex()?);
+    let image_len = regular(&image, "repo disk", IMAGE_MAX_BYTES).map_err(Refused)?;
+    let manifest_len = regular(&manifest, "base manifest", MANIFEST_MAX_BYTES).map_err(Refused)?;
+    let inc = incoming_dir(boxes_root, true).map_err(Failed)?;
+    let dir = incoming_in(boxes_root).join(random_hex().map_err(Failed)?);
     let sub = dir.file_name().and_then(OsStr::to_str).unwrap_or_default();
     mkdirat(&inc, sub, Mode::from_raw_mode(0o700))
-        .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        .map_err(|e| Failed(format!("cannot make {}: {e}", dir.display())))?;
     let made = (|| {
-        let d = open_dir(&inc, sub).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let d = open_dir(&inc, sub).map_err(|e| Failed(format!("{}: {e}", dir.display())))?;
         let img = copy_in(&d, REPO_DISK, 0o640, &image, image_len)?;
         let mut magic = [0u8; 2];
-        let ext4 = matches!(img.read_at(&mut magic, EXT4_MAGIC_AT), Ok(2)) && magic == EXT4_MAGIC;
+        let ext4 = match img.read_at(&mut magic, EXT4_MAGIC_AT) {
+            Ok(n) => n == 2 && magic == EXT4_MAGIC,
+            Err(e) => return Err(Failed(format!("cannot read the repo disk's copy: {e}"))),
+        };
         if !ext4 {
-            return Err("the repo disk is not an ext4 image".to_string());
+            return Err(Refused("the repo disk is not an ext4 image".to_string()));
         }
         let man = copy_in(&d, BASE_MANIFEST, 0o600, &manifest, manifest_len)?;
         // Read through the copy's own descriptor, with the trusted checks.
-        let text = read_fd(&man, "base manifest", MANIFEST_MAX_BYTES)?;
-        let text = String::from_utf8(text).map_err(|_| "the base manifest is not UTF-8")?;
-        BaseManifest::parse(&text)
+        let text = read_fd(&man, "base manifest", MANIFEST_MAX_BYTES).map_err(Failed)?;
+        let text = String::from_utf8(text)
+            .map_err(|_| Refused("the base manifest is not UTF-8".into()))?;
+        BaseManifest::parse(&text).map_err(Refused)
     })();
     match made {
         Ok(m) => Ok((dir.join(REPO_DISK), dir.join(BASE_MANIFEST), m)),
@@ -340,7 +382,10 @@ mod tests {
             fd(File::open(&p).unwrap())
         };
         let refused = |fds: Vec<OwnedFd>, want: &str| {
-            let e = intake(&root, fds).unwrap_err();
+            let e = match intake(&root, fds) {
+                Err(IntakeError::Refused(e)) => e,
+                other => panic!("{want}: {other:?}"),
+            };
             assert!(e.contains(want), "{e}");
             assert!(incoming_left(&root).is_empty(), "{e}");
         };
@@ -406,9 +451,45 @@ mod tests {
         let img = fd(ext4_file(&t.path().join("i"), 1 << 20));
         let p = t.path().join("m");
         std::fs::write(&p, manifest_text()).unwrap();
-        let e = intake(&root, vec![img, fd(File::open(&p).unwrap())]).unwrap_err();
+        // The daemon's own state, not the caller's request: a failure.
+        let e = match intake(&root, vec![img, fd(File::open(&p).unwrap())]) {
+            Err(IntakeError::Failed(e)) => e,
+            other => panic!("{other:?}"),
+        };
         assert!(e.contains(INCOMING), "{e}");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn intake_io_errors_are_failures() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("boxes");
+        std::fs::create_dir(&root).unwrap();
+        let fds = |n: &str| {
+            let img = fd(ext4_file(&t.path().join(format!("{n}.img")), 1 << 20));
+            let p = t.path().join(format!("{n}.json"));
+            std::fs::write(&p, manifest_text()).unwrap();
+            vec![img, fd(File::open(&p).unwrap())]
+        };
+        let failed = |r: Result<(PathBuf, PathBuf, BaseManifest), IntakeError>, want: &str| match r
+        {
+            Err(IntakeError::Failed(e)) => assert!(e.contains(want), "{e}"),
+            other => panic!("{want}: {other:?}"),
+        };
+        // `.incoming` cannot take the new dir (EACCES on its mkdir).
+        let inc = root.join(INCOMING);
+        std::fs::create_dir(&inc).unwrap();
+        std::fs::set_permissions(&inc, std::fs::Permissions::from_mode(0o500)).unwrap();
+        failed(intake(&root, fds("a")), "cannot make");
+        std::fs::set_permissions(&inc, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(incoming_left(&root).is_empty());
+        // `.incoming` is a file: it cannot be made or opened.
+        std::fs::remove_dir(&inc).unwrap();
+        std::fs::write(&inc, b"x").unwrap();
+        failed(intake(&root, fds("b")), INCOMING);
+        // A good intake still works once `.incoming` is back.
+        std::fs::remove_file(&inc).unwrap();
+        assert!(intake(&root, fds("c")).is_ok());
     }
 
     fn box_with_manifest(t: &Path) -> saiife_boxhost::paths::BoxPaths {

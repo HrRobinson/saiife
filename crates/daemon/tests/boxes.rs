@@ -1101,6 +1101,36 @@ async fn repo_fd_must_be_an_ext4_file() {
     assert!(incoming_entries(&w).is_empty());
 }
 
+/// A disk the daemon cannot take in for its own reasons (here `.incoming`
+/// cannot hold a new dir) is `unavailable`, not the caller's `bad_request`.
+#[tokio::test]
+async fn intake_io_error_is_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world();
+    let t = scratch();
+    let inc = w.mgr().root().join(".incoming");
+    std::fs::create_dir(&inc).unwrap();
+    std::fs::set_permissions(&inc, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let a = spawn_passing(
+        &w,
+        vec![
+            ext4_image(&t.path().join("i1"), 4 << 20).into(),
+            manifest_file(&t.path().join("m1"), "shop").into(),
+        ],
+    )
+    .await;
+    std::fs::set_permissions(&inc, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "unavailable", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("cannot make"),
+        "{a}"
+    );
+    assert!(w.mgr().list().is_empty());
+    assert!(incoming_entries(&w).is_empty());
+    assert!(w.records().is_empty());
+}
+
 /// The whole path over a real control connection: hello, `box.fds` with the
 /// disk and manifest, `box.spawn`. The box dir holds both before the VM's
 /// create, the repo's name comes from the manifest and `.incoming` is empty
