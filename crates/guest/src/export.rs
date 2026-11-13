@@ -251,18 +251,16 @@ enum Pumped {
 }
 
 /// Sets a pipe end nonblocking.
+#[cfg(target_os = "linux")]
 fn nonblocking(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        rustix::io::ioctl_fionbio(fd, true).map_err(io::Error::from)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = fd;
-        Err(io::Error::other(
-            "the export runs only inside the Linux box VM",
-        ))
-    }
+    rustix::io::ioctl_fionbio(fd, true).map_err(io::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nonblocking<T>(_: &T) -> io::Result<()> {
+    Err(io::Error::other(
+        "the export runs only inside the Linux box VM",
+    ))
 }
 
 /// Reads what `r` has now into `buf` (at most `cap` bytes kept; past it
