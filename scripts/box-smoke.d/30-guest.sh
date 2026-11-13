@@ -42,11 +42,23 @@ p38_result() { RESULTS+=("$1=${2-}"); }
 
 p38_now_ms() { date +%s%3N; }
 
-p38_audit_dir() {
+# The audit dirs the daemon's egress records can be in, one per line: as
+# 05-image's p36_audit_dir ($SAIIFE_AUDIT_DIR when absolute, else
+# <data base>/saiife/audit), the personal daemon's own dir
+# (<data base>/saiife/broker/audit, crates/system/src/personal.rs) and, when
+# the daemon is locked (10-vmm's test: the saiife-box@ unit is installed),
+# the locked audit dir (/var/log/saiife/audit, crates/system/src/default_config.rs).
+P38_LOCKED_UNIT=/etc/systemd/system/saiife-box@.service
+P38_LOCKED_AUDIT=/var/log/saiife/audit
+
+p38_audit_dirs() {
+  local data=${XDG_DATA_HOME:-$HOME/.local/share}
   case "${SAIIFE_AUDIT_DIR:-}" in
     /*) printf '%s\n' "$SAIIFE_AUDIT_DIR" ;;
-    *) printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/saiife/audit" ;;
+    *) printf '%s\n' "$data/saiife/audit" ;;
   esac
+  printf '%s\n' "$data/saiife/broker/audit"
+  [ ! -e "$P38_LOCKED_UNIT" ] || printf '%s\n' "$P38_LOCKED_AUDIT"
 }
 
 p38_state() {
@@ -180,14 +192,23 @@ p38_osc52_inert() {
 }
 
 p38_egress_audit() {
-  local dir
-  dir=$(p38_audit_dir)
-  compgen -G "$dir/*.jsonl" >/dev/null || return 1
+  local dir f files=()
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    if [ -d "$dir" ] && [ ! -r "$dir" ]; then
+      p38_log "audit dir $dir is not readable by you (locked: rerun as a user who can read it)"
+      continue
+    fi
+    for f in "$dir"/*.jsonl; do
+      [ -r "$f" ] && files+=("$f")
+    done
+  done < <(p38_audit_dirs)
+  [ "${#files[@]}" -gt 0 ] || { p38_log "no readable audit files in: $(p38_audit_dirs | tr '\n' ' ')"; return 1; }
   jq -en --arg b "$P38_BOX" \
     '[inputs | select(.kind == "egress" and .extra.box == $b
        and (.extra.bytes_up | type) == "number"
        and (.extra.bytes_down | type) == "number")] | length > 0' \
-    "$dir"/*.jsonl >/dev/null
+    "${files[@]}" >/dev/null
 }
 
 p38_end_box() {
