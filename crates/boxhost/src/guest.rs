@@ -344,8 +344,8 @@ impl Drop for ControlGuard<'_> {
 }
 
 /// Where a box's terminal recording goes (ruling R15): the default is
-/// `paths.term_cast()`; locked mode points it at daemon-only state, since the
-/// box runtime dir is writable by the VMM.
+/// `term.cast` in the box's runtime dir; the daemon points it at the box's
+/// record dir (plan 35, R37), since the runtime dir is writable by the VMM.
 pub type CastPath = Arc<dyn Fn(&BoxId, &BoxPaths) -> PathBuf + Send + Sync>;
 
 /// The host end of `saiife-guest/1` for every box.
@@ -364,9 +364,10 @@ pub struct VsockGuest {
 impl VsockGuest {
     /// `group_rw`: the host listeners are 0660 (locked mode) instead of 0600.
     /// `vmm_uid`: the uid that must own each box's `vsock.sock`.
-    /// The recording goes to each box's `term.cast`.
+    /// The recording goes to `term.cast` in each box's runtime dir (tests;
+    /// the daemon uses [`VsockGuest::with_cast_path`]).
     pub fn new(setups: Arc<dyn SetupSource>, group_rw: bool, vmm_uid: u32) -> Arc<VsockGuest> {
-        let cast_path: CastPath = Arc::new(|_id: &BoxId, p: &BoxPaths| p.term_cast());
+        let cast_path: CastPath = Arc::new(|_id: &BoxId, p: &BoxPaths| p.dir.join("term.cast"));
         Self::with_cast_path(setups, group_rw, vmm_uid, cast_path)
     }
 

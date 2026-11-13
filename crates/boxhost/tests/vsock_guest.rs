@@ -593,7 +593,7 @@ fn after_off_cleans_up() {
     assert!(w.paths.vsock().exists(), "vsock.sock belongs to the VMM");
     assert!(closed_by_host(&mut s));
     assert!(closed_by_host(&mut p));
-    let cast = std::fs::read_to_string(w.paths.term_cast()).unwrap();
+    let cast = std::fs::read_to_string(w.paths.dir.join("term.cast")).unwrap();
     assert!(
         cast.lines().next().unwrap().contains("\"version\":2"),
         "{cast}"
@@ -766,7 +766,7 @@ fn cast_goes_to_the_configured_dir() {
     g.after_off(&b1());
     let cast = std::fs::read_to_string(state.path().join("b1.cast")).unwrap();
     assert!(cast.contains("kept apart"), "{cast}");
-    assert!(std::fs::symlink_metadata(w.paths.term_cast()).is_err());
+    assert!(std::fs::symlink_metadata(w.paths.dir.join("term.cast")).is_err());
 }
 
 #[test]
