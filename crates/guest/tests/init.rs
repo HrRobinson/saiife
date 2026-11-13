@@ -736,13 +736,15 @@ fn poweroff_replies_then_calls_systemctl() {
     );
 }
 
+/// Ruling R22: a fresh init on a box set up before (a cold boot keeps the
+/// disk and its marker) asks for the setup again; the second setup skips
+/// the first-time chown of /work and spawns the agent.
 #[test]
 fn rehello_reports_set_up() {
-    // A guest restarted after its setup: the marker is there.
     let h = host_with(fast(), true);
     let _init = start(&h.env);
     let (mut s, ev) = hello(&h);
-    assert!(matches!(ev, Event::Hello { set_up: true, .. }), "{ev:?}");
+    assert!(matches!(ev, Event::Hello { set_up: false, .. }), "{ev:?}");
     write_msg(
         &mut s,
         &HostReply::Welcome {
@@ -750,19 +752,33 @@ fn rehello_reports_set_up() {
         },
     )
     .unwrap();
-    // This process never ran the agent: the earlier one's is gone.
-    assert_eq!(next_event(&mut s, T), Some(Event::Exited { code: None }));
+    // No Exited: this process has no earlier agent to report.
+    assert_eq!(next_event(&mut s, Duration::from_millis(300)), None);
+    assert_eq!(
+        request(
+            &h.env,
+            &Request::Setup(setup(&["/bin/sh", "-c", "echo up; sleep 3"]))
+        ),
+        Reply::Ok
+    );
+    let _pty = accept(&h.pty, T);
+    assert_eq!(next_event(&mut s, T), Some(Event::Started));
+    assert!(
+        !calls(&h.env).contains("chown -R"),
+        "the second setup ran chown: {}",
+        calls(&h.env)
+    );
 }
 
 #[test]
-fn restarted_init_reports_exited() {
+fn restarted_init_asks_for_setup() {
     let h = host();
     let (mut first, _pty) = running(&h, &["/bin/sh", "-c", "echo a; sleep 3"]);
     assert_eq!(next_event(&mut first, T), Some(Event::Started));
     // A second init against the same root (systemd restarted the service).
     let _second = start(&h.env);
     let (mut s, ev) = hello(&h);
-    assert!(matches!(ev, Event::Hello { set_up: true, .. }), "{ev:?}");
+    assert!(matches!(ev, Event::Hello { set_up: false, .. }), "{ev:?}");
     write_msg(
         &mut s,
         &HostReply::Welcome {
@@ -770,8 +786,7 @@ fn restarted_init_reports_exited() {
         },
     )
     .unwrap();
-    assert_eq!(next_event(&mut s, T), Some(Event::Exited { code: None }));
-    // Nothing else follows from the new process.
+    // Nothing follows from the new process until it is set up.
     assert_eq!(next_event(&mut s, Duration::from_millis(500)), None);
 }
 

@@ -15,11 +15,12 @@ pub use saiife_boxproto::msg::Event;
 /// The service main (`saiife __guest init`). Returns only on a fatal error;
 /// systemd restarts it.
 ///
-/// A restarted init (the setup marker exists but this process never spawned
-/// an agent) hellos `set_up: true`, so the host does not set the box up again,
-/// and then reports `Exited { code: None }` first: the earlier agent died with
-/// the earlier process (its PTY master was that process's). A re-hello within
-/// one process (the events link dropped and came back) reports nothing extra.
+/// Ruling R22 (supersedes R10): a fresh init process (a cold boot, or systemd
+/// restarting the service) always hellos `set_up: false` and is set up again,
+/// spawning a new agent; the setup marker only skips the first-time `chown -R
+/// /work` and base commit. A re-hello within one process (the events link
+/// dropped and came back, as after a snapshot restore) says `set_up: true`
+/// once that process has spawned its agent, and reports nothing extra.
 pub fn run_init(env: &GuestEnv) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     return control::run(env);

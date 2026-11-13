@@ -876,3 +876,61 @@ fn guest_link_last_error_and_forget() {
     GuestLink::forget(&*g, &b1());
     assert_eq!(GuestLink::last_error(&*g, &b1()), None);
 }
+
+/// Ruling R22: a cold boot is a new run; its fresh init asks for the setup
+/// (set_up:false) and gets it, and its Started is a Ready again.
+#[test]
+fn cold_boot_sets_up_again() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    drop(s);
+    g.after_off(&b1());
+    g.before_boot(&b1(), &w.paths).unwrap();
+    let mut s = w.hello(false);
+    wait_for("second setup", T, || w.requests().len() == 2);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    assert!(!GuestLink::restored(&*g, &b1()));
+    g.after_off(&b1());
+}
+
+/// Ruling R22: within a run, a restarted guest init (its events session
+/// ended with the old process) is set up again; Ready stays once per run.
+#[test]
+fn restarted_init_in_run_is_set_up_again() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    // While the first session is live, a set_up:false hello is refused.
+    let (_x, r) = try_hello(&w, false);
+    assert_eq!(
+        r,
+        Some(HostReply::Refuse {
+            why: "already set up".into()
+        })
+    );
+    // The old init process dies: its session ends.
+    drop(s);
+    let end = Instant::now() + T;
+    let mut s2 = loop {
+        let (s2, r) = try_hello(&w, false);
+        if r == Some(HostReply::Welcome {
+            proto: PROTO.into(),
+        }) {
+            break s2;
+        }
+        assert!(Instant::now() < end, "never welcomed again: {r:?}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    wait_for("second setup", T, || w.requests().len() == 2);
+    assert!(matches!(w.requests()[1], Request::Setup(_)));
+    write_msg(&mut s2, &Event::Started).unwrap();
+    write_msg(&mut s2, &Event::Activity).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Activity]);
+    g.after_off(&b1());
+}

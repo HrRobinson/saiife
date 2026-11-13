@@ -15,7 +15,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,6 +45,8 @@ struct Init {
     next_id: u64,
     notes: Sender<Note>,
     signals: Arc<Signals>,
+    /// This process set up and spawned an agent (the re-hello's `set_up`).
+    set_up: Arc<AtomicBool>,
 }
 
 /// What to do after the reply is sent.
@@ -123,11 +125,12 @@ pub fn run(env: &GuestEnv) -> Result<(), String> {
     // and a connection that arrives before the loop below waits in the backlog.
     let control = bind(env, GUEST_CONTROL_SOCK, 0o600)?;
     let local = bind(env, GUEST_LOCAL_SOCK, 0o666)?;
-    // A fresh process with the marker present was restarted (or the VM
-    // rebooted): it hellos `set_up: true`, so the host does not set it up
-    // again, but the agent of the earlier process is gone. Say so first.
-    let restarted = env.path(SETUP_MARKER).exists();
-    let conn = events::hello(env).map_err(|e| {
+    // Ruling R22: a fresh process has no agent (an earlier one died with
+    // its process, a cold boot has none), so it always asks for the setup;
+    // the marker only skips the first-time work. A re-hello within this
+    // process, once its agent was spawned, says `set_up: true`.
+    let set_up = Arc::new(AtomicBool::new(false));
+    let conn = events::hello(env, false).map_err(|e| {
         let m = e.into_message();
         eprintln!("saiife-guest: {m}");
         m
@@ -135,14 +138,12 @@ pub fn run(env: &GuestEnv) -> Result<(), String> {
     let signals = Arc::new(Signals::default());
     let fatal = Arc::new(Mutex::new(None));
     let (notes, rx) = mpsc::channel();
-    if restarted {
-        let _ = notes.send(Note::Exited(None));
-    }
     {
         let (env, signals, fatal) = (env.clone(), signals.clone(), fatal.clone());
+        let set_up = set_up.clone();
         thread::Builder::new()
             .name("guest-events".into())
-            .spawn(move || events::run(env, conn, rx, signals, fatal))
+            .spawn(move || events::run(env, conn, set_up, rx, signals, fatal))
             .map_err(|e| format!("events thread: {e}"))?;
     }
     {
@@ -158,6 +159,7 @@ pub fn run(env: &GuestEnv) -> Result<(), String> {
         next_id: 0,
         notes,
         signals,
+        set_up,
     };
     control
         .set_nonblocking(true)
@@ -315,7 +317,9 @@ impl Init {
             }
             std::fs::write(&marker, b"").map_err(|e| format!("{SETUP_MARKER}: {e}"))?;
         }
-        self.spawn(s, &vars)
+        self.spawn(s, &vars)?;
+        self.set_up.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn spawn(&mut self, s: &Setup, vars: &[(String, String)]) -> Result<(), String> {

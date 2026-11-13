@@ -39,6 +39,8 @@ use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
 
 /// No `Ready` this long after admission → the boot failed.
 pub const BOOT_TIMEOUT_SECS: u64 = 90;
+/// The `why` (and error) of a box the boot timeout ended.
+pub const WHY_BOOT_TIMED_OUT: &str = "boot timed out";
 /// A finished turn with no activity for this long → `Done`.
 pub const DONE_IDLE_SECS: u64 = 30;
 /// Idle stop for a box whose template was deleted.
@@ -718,6 +720,9 @@ impl Manager {
         let out = match ev {
             GuestEvent::Ready => {
                 r.state = transition(from, Event::Ready)?;
+                // A kept snapshot is restored at most once (or not at all on
+                // a cold boot): once the box runs, it is no longer kept.
+                r.keep = false;
                 r.last_activity = now;
                 r.turn_finished_at = None;
                 if prompt {
@@ -756,6 +761,41 @@ impl Manager {
         });
         r.updated_at = now;
         g.put(r)
+    }
+
+    /// One step under the lock: a box that is still Starting is stopped
+    /// (Done, its VM off and kept, no snapshot) with `note` added to its
+    /// error; any other state is left alone (`None`). For a guest whose
+    /// agent exited before it was ready.
+    pub fn stop_if_starting(
+        &self,
+        id: &BoxId,
+        note: &str,
+        why: &'static str,
+    ) -> Result<Option<Change>, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        if from != BoxState::Starting {
+            return Ok(None);
+        }
+        let to = transition(from, Event::Stop)?;
+        if let Some(h) = r.vm.clone().filter(|_| r.vm_on) {
+            self.vmm
+                .stop(&h)
+                .map_err(|e| BoxError::Unavailable(format!("stop failed: {}", vmm_msg(e))))?;
+        }
+        r.state = to;
+        r.vm_on = false;
+        r.keep = false;
+        r.error = Some(match r.error.take().filter(|e| !e.is_empty()) {
+            Some(e) => format!("{e}; {note}"),
+            None => note.to_string(),
+        });
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(Some(change(&r, from, why)))
     }
 
     /// Send and clear `r`'s pending prompt; a failure goes to `error`.
@@ -802,9 +842,9 @@ impl Manager {
             let started = r.started_at.unwrap_or(r.updated_at);
             if r.state == BoxState::Starting && now.saturating_sub(started) >= BOOT_TIMEOUT_SECS {
                 let from = r.state;
-                self.boot_failed(&mut r, "boot timed out".into(), true);
+                self.boot_failed(&mut r, WHY_BOOT_TIMED_OUT.into(), true);
                 r.updated_at = now;
-                out.push(change(&r, from, "boot timed out"));
+                out.push(change(&r, from, WHY_BOOT_TIMED_OUT));
                 let _ = g.put(r);
                 continue;
             }

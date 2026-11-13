@@ -3,7 +3,7 @@
 //! (G3) when the connection goes away.
 #![cfg(target_os = "linux")]
 
-use crate::env::{GuestEnv, SETUP_MARKER};
+use crate::env::GuestEnv;
 use saiife_boxproto::frame::{read_msg, write_msg, FrameError};
 use saiife_boxproto::msg::{Event, HostReply};
 use saiife_boxproto::ports::GUEST_EVENTS_SOCK;
@@ -101,7 +101,7 @@ fn uptime_ms(env: &GuestEnv) -> u64 {
         .map_or(0, |s| (s * 1000.0).round() as u64)
 }
 
-fn hello_once(env: &GuestEnv) -> Result<UnixStream, Result<String, String>> {
+fn hello_once(env: &GuestEnv, set_up: bool) -> Result<UnixStream, Result<String, String>> {
     let s = UnixStream::connect(env.path(GUEST_EVENTS_SOCK))
         .map_err(|e| Ok(format!("connect events.sock: {e}")))?;
     s.set_write_timeout(Some(WRITE_TIMEOUT))
@@ -110,7 +110,7 @@ fn hello_once(env: &GuestEnv) -> Result<UnixStream, Result<String, String>> {
         proto: PROTO.into(),
         guest: env.version.clone(),
         uptime_ms: uptime_ms(env),
-        set_up: env.path(SETUP_MARKER).exists(),
+        set_up,
     };
     write_msg(&mut &s, &hello).map_err(|e| Ok(format!("send hello: {e}")))?;
     let mut r = DeadlineReader::new(&s, env.timing.hello_reply);
@@ -126,14 +126,16 @@ fn hello_once(env: &GuestEnv) -> Result<UnixStream, Result<String, String>> {
     }
 }
 
-/// Says hello, retrying `hello_tries` times, `hello_retry` apart.
-pub fn hello(env: &GuestEnv) -> Result<UnixStream, HelloError> {
+/// Says hello, retrying `hello_tries` times, `hello_retry` apart. `set_up`:
+/// this process has set up and spawned the agent (ruling R22: a fresh
+/// process always says `false`, so the host sets it up again).
+pub fn hello(env: &GuestEnv, set_up: bool) -> Result<UnixStream, HelloError> {
     let mut last = String::from("no hello tried");
     for i in 0..env.timing.hello_tries.max(1) {
         if i > 0 {
             std::thread::sleep(env.timing.hello_retry);
         }
-        match hello_once(env) {
+        match hello_once(env, set_up) {
             Ok(s) => return Ok(s),
             Err(Err(fatal)) => return Err(HelloError::Refused(fatal)),
             Err(Ok(why)) => last = why,
@@ -173,6 +175,7 @@ struct Ready {
 pub fn run(
     env: GuestEnv,
     conn: UnixStream,
+    set_up: Arc<AtomicBool>,
     notes: Receiver<Note>,
     signals: Arc<Signals>,
     fatal: Arc<Mutex<Option<String>>>,
@@ -256,7 +259,7 @@ pub fn run(
             }
             if conn.is_none() {
                 // Re-hello now (G3), even with nothing to say.
-                match hello(&env) {
+                match hello(&env, set_up.load(Ordering::SeqCst)) {
                     Ok(s) => conn = Some(s),
                     Err(e) => {
                         *fatal.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.into_message());

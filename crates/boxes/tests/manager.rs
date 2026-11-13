@@ -1392,3 +1392,37 @@ fn note_error_appends() {
         Err(BoxError::NotFound)
     ));
 }
+
+#[test]
+fn stop_if_starting_only_stops_a_starting_box() {
+    let w = world(2);
+    let b = w.spawn("t").id;
+    let c = w
+        .mgr
+        .stop_if_starting(&b, "agent gone", "why")
+        .unwrap()
+        .unwrap();
+    assert_eq!(c, change(&b, BoxState::Starting, BoxState::Done, "why"));
+    let r = w.mgr.get(&b).unwrap();
+    assert!(!r.vm_on);
+    assert!(r.vm.is_some(), "the VM is kept");
+    assert_eq!(r.error.as_deref(), Some("agent gone"));
+    assert_eq!(count(&w, &b, VmOp::Stop), 1);
+    assert_eq!(count(&w, &b, VmOp::Destroy), 0);
+    let run = running(&w, "u");
+    assert_eq!(w.mgr.stop_if_starting(&run, "x", "why").unwrap(), None);
+    assert_eq!(state(&w, &run), BoxState::Running);
+}
+
+#[test]
+fn ready_clears_keep() {
+    let w = world(1);
+    let i = running(&w, "a");
+    w.mgr.stop(&i, true).unwrap();
+    assert!(w.mgr.get(&i).unwrap().keep);
+    w.mgr.revise(&i, "again").unwrap();
+    w.mgr.tick();
+    assert_eq!(state(&w, &i), BoxState::Starting);
+    w.mgr.guest_event(&i, GuestEvent::Ready).unwrap();
+    assert!(!w.mgr.get(&i).unwrap().keep);
+}

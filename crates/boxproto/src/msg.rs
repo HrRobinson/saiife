@@ -167,9 +167,12 @@ pub struct SetupFile {
     pub text: String,
 }
 
-const MAX_ENV: usize = 64;
-const MAX_FILES: usize = 64;
-const MAX_FILE_TEXT: usize = 256 * 1024;
+/// The most environment variables a setup carries.
+pub const MAX_ENV: usize = 64;
+/// The most files a setup carries.
+pub const MAX_FILES: usize = 64;
+/// The most bytes of one setup file's text.
+pub const MAX_FILE_TEXT: usize = 256 * 1024;
 const FILE_ROOTS: [&str; 2] = ["/home/agent/", "/etc/saiife-guest/"];
 
 fn env_name_ok(n: &str) -> bool {

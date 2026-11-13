@@ -759,16 +759,34 @@ impl VsockGuest {
         if run.stopped() {
             return;
         }
-        // One setup per run, one at a time: a set_up:false hello while one is
-        // in flight, or after it succeeded, is refused (it would not replace
-        // the session, so the setup in flight is left alone).
+        // One setup at a time: a set_up:false hello while one is in flight
+        // is refused (it would not replace the session, so the setup in
+        // flight is left alone). After a setup succeeded, a set_up:false
+        // hello is a fresh guest init (ruling R22: the agent died with the
+        // earlier init process) and is set up again, but only once no
+        // welcomed events session is live; while one is, it is refused.
         if !set_up {
-            if let Err(state) = run.setup.compare_exchange(
-                SETUP_NONE,
-                SETUP_IN_FLIGHT,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            let claimed = run
+                .setup
+                .compare_exchange(
+                    SETUP_NONE,
+                    SETUP_IN_FLIGHT,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .or_else(|state| {
+                    if state == SETUP_DONE && lock(&run.events_conn).is_none() {
+                        run.setup.compare_exchange(
+                            SETUP_DONE,
+                            SETUP_IN_FLIGHT,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                    } else {
+                        Err(state)
+                    }
+                });
+            if let Err(state) = claimed {
                 let why = if state == SETUP_DONE {
                     "already set up"
                 } else {
@@ -802,9 +820,8 @@ impl VsockGuest {
             return;
         }
         run.welcomed.store(true, Ordering::SeqCst);
-        if set_up {
-            run.restored.store(true, Ordering::SeqCst);
-        }
+        // a set_up:false hello (a fresh init) ends any restored state
+        run.restored.store(set_up, Ordering::SeqCst);
         if !set_up {
             let Some(g) = me.upgrade() else {
                 unclaim();
