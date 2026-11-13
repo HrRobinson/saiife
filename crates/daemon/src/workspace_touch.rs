@@ -131,7 +131,7 @@ pub fn passkey_credential(
     let mut c = saiife_touch::credential_from_attestation(
         &auth_data, &rp_id, label, owner_uid, None, now_ts,
     )
-    .map_err(|e| format!("the passkey's authenticator data is not usable: {e:?}"))?;
+    .map_err(|_| bad("the passkey's authenticator data is not usable"))?;
     let ad = saiife_touch::authdata::parse(&auth_data)
         .map_err(|_| bad("the passkey's authenticator data is not usable"))?;
     if ad.flags & saiife_touch::authdata::UV == 0 {

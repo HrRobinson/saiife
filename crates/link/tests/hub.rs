@@ -472,6 +472,32 @@ async fn pairing_channel_is_pair_only() {
     assert_eq!(a["ok"], true, "{a}");
 }
 
+/// A refused passkey comes back over the hub with its rule, so the browser
+/// (pairing.js) can retry the pairing without one; the offer stays open.
+#[tokio::test]
+async fn refused_passkey_keeps_its_rule_over_the_hub() {
+    let (w, _hub, mut c) = up().await;
+    let (pair_id, secret) = offer(&w).await;
+    let d = TestDevice::generate();
+    let mut req = pair_request(&pair_id, &secret, &d);
+    req.as_object_mut().unwrap().insert(
+        "passkey".into(),
+        json!({"credential_id": "AA", "authenticator_data": "AA",
+               "client_data_json": "AA", "device_sig": "AA"}),
+    );
+    let mut bc = c.pair_session(&w, "pk1", &pair_id).await;
+    let a = c.ask("pk1", &mut bc, req).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "passkey_refused", "{a}");
+    assert!(a["message"].is_string(), "{a}");
+    // The same session pairs without the passkey.
+    let mut bc = c.pair_session(&w, "pk2", &pair_id).await;
+    let a = c
+        .ask("pk2", &mut bc, pair_request(&pair_id, &secret, &d))
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+}
+
 #[tokio::test]
 async fn bad_seal_drops_the_session_not_the_link() {
     let (w, hub, mut c) = up().await;

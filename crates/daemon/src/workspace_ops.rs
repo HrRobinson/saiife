@@ -389,10 +389,20 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
     };
+    // A device save that failed after the credential was stored takes the
+    // credential out again; a rollback that fails is logged and audited.
+    let mut orphan = String::new();
     if confirmed.is_err() {
         let stored = added.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(cid) = stored {
-            let _ = ctx.touch.remove(&cid);
+            let r = take_passkeys(ctx, &[saiife_wire::b64::enc(&cid)]).await;
+            audit_removal(ctx, conn, &device_id, &r, PAIR_KEEPS).await;
+            if !r.failed.is_empty() {
+                orphan = format!(
+                    "; its passkey {} could not be removed again and stays in the touch store",
+                    r.failed[0].0
+                );
+            }
         }
     }
     let device = match confirmed {
@@ -410,7 +420,7 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                 action,
                 ErrorCode::Internal,
                 rule,
-                &format!("the device was not paired: {e}"),
+                &format!("the device was not paired: {e}{orphan}"),
             )
             .await;
         }
@@ -502,7 +512,8 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     // Already revoked and saved: nothing to grant, no prompt. Any passkey a
     // failed removal left behind is taken out now (a retry).
     if ctx.workspace.revoked_and_saved(&device_id) {
-        remove_passkeys(ctx, conn, &device_id, &device.touch_credentials).await;
+        let r = take_passkeys(ctx, &device.touch_credentials).await;
+        audit_removal(ctx, conn, &device_id, &r, REVOKED_KEEPS).await;
         return revoked_answer(id, device_id);
     }
     if let Err(e) = power(
@@ -521,13 +532,14 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let outcome = ctx.workspace.revoke(&device_id);
     // The revoke is in effect in memory now (plan 29 ordering). Its passkeys
     // leave the touch store next; a failure there never undoes the revoke.
-    remove_passkeys(ctx, conn, &device_id, &device.touch_credentials).await;
+    let removal = take_passkeys(ctx, &device.touch_credentials).await;
     let mut rec = record(ctx, conn, "revoked").await;
     rec.extra.insert("device".into(), device_id.clone().into());
     rec.extra.insert("label".into(), device.label.into());
     rec.extra.insert("owner".into(), device.owner_user.into());
     // Already revoked and saved: nothing changed, nothing to record.
     if matches!(outcome, Ok(false)) {
+        audit_removal(ctx, conn, &device_id, &removal, REVOKED_KEEPS).await;
         return revoked_answer(id, device_id);
     }
     let mut problem = None;
@@ -537,6 +549,8 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         problem = Some(e.to_string());
     }
     let recorded = ctx.writer.append(rec).await;
+    // The removal reads after the revoke in the audit.
+    audit_removal(ctx, conn, &device_id, &removal, REVOKED_KEEPS).await;
     if let Some(m) = problem {
         return err(id, ErrorCode::Internal, &m);
     }
@@ -546,18 +560,25 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     revoked_answer(id, device_id)
 }
 
-/// Removes a revoked device's passkeys from the touch store (in a blocking
-/// task) and audits `touch_removed {device, credentials, failed?, reason?}`
-/// (credential ids b64u). Nothing is audited when none of them was in the
-/// store. A failed removal is logged and audited and leaves the revoke as it
-/// is (fail closed).
-async fn remove_passkeys(ctx: &Arc<Ctx>, conn: &Conn, device_id: &str, creds: &[String]) {
+/// The outcome of taking passkeys out of the touch store: the ids (b64u)
+/// removed, and `(id, why)` for each one that could not be.
+struct Removal {
+    removed: Vec<String>,
+    failed: Vec<(String, String)>,
+}
+
+/// Removes credentials (b64u ids) from the touch store in a blocking task.
+/// An id the store does not hold is neither removed nor failed.
+async fn take_passkeys(ctx: &Arc<Ctx>, creds: &[String]) -> Removal {
     if creds.is_empty() {
-        return;
+        return Removal {
+            removed: Vec::new(),
+            failed: Vec::new(),
+        };
     }
     let ids: Vec<String> = creds.to_vec();
     let c = Arc::clone(ctx);
-    let (removed, failed) = tokio::task::spawn_blocking(move || {
+    let done = tokio::task::spawn_blocking(move || {
         let (mut removed, mut failed) = (Vec::new(), Vec::new());
         for id in ids {
             let Ok(raw) = saiife_wire::b64::dec(&id) else {
@@ -570,40 +591,46 @@ async fn remove_passkeys(ctx: &Arc<Ctx>, conn: &Conn, device_id: &str, creds: &[
                 Err(e) => failed.push((id, e)),
             }
         }
-        (removed, failed)
+        Removal { removed, failed }
     })
-    .await
-    .unwrap_or_else(|e| {
-        (
-            Vec::new(),
-            creds.iter().map(|c| (c.clone(), e.to_string())).collect(),
-        )
-    });
-    if removed.is_empty() && failed.is_empty() {
+    .await;
+    done.unwrap_or_else(|e| Removal {
+        removed: Vec::new(),
+        failed: creds.iter().map(|c| (c.clone(), e.to_string())).collect(),
+    })
+}
+
+/// Audits a [`Removal`] as `touch_removed {device, credentials, failed?}`.
+/// A failure is a Deny record (`touch_not_removed`, with `why` first), logged
+/// as well. Nothing is written when nothing was in the store.
+async fn audit_removal(ctx: &Arc<Ctx>, conn: &Conn, device_id: &str, r: &Removal, why: &str) {
+    if r.removed.is_empty() && r.failed.is_empty() {
         return;
     }
     let mut rec = record(ctx, conn, "touch_removed").await;
     rec.extra.insert("device".into(), device_id.into());
-    rec.extra.insert("credentials".into(), json!(removed));
-    if !failed.is_empty() {
-        let ids: Vec<&String> = failed.iter().map(|(i, _)| i).collect();
+    rec.extra.insert("credentials".into(), json!(r.removed));
+    if !r.failed.is_empty() {
+        let ids: Vec<&String> = r.failed.iter().map(|(i, _)| i).collect();
         rec.extra.insert("failed".into(), json!(ids));
-        let why = failed
+        let causes = r
+            .failed
             .iter()
             .map(|(_, e)| e.as_str())
             .collect::<Vec<_>>()
             .join("; ");
         rec.decision = DecisionKind::Deny;
         rec.rule = Some("touch_not_removed".into());
-        rec.reason = Some(format!(
-            "the device is revoked, but its passkey stays in the touch store: {why}"
-        ));
-        eprintln!("saiifed: warning: revoked device {device_id}: cannot remove its passkey: {why}");
+        rec.reason = Some(format!("{why}: {causes}"));
+        eprintln!("saiifed: warning: device {device_id}: {why}: {causes}");
     }
     if let Err(e) = ctx.writer.append(rec).await {
         eprintln!("saiifed: warning: cannot write the touch_removed record: {e}");
     }
 }
+
+const PAIR_KEEPS: &str = "the device was not paired, but its passkey stays in the touch store";
+const REVOKED_KEEPS: &str = "the device is revoked, but its passkey stays in the touch store";
 
 fn revoked_answer(id: u64, device_id: String) -> Value {
     let mut m = Map::new();
@@ -1586,5 +1613,111 @@ mod tests {
             f.ctx.workspace.device(&d.device_id()).unwrap().state,
             saiife_wire::device::DeviceState::Revoked
         );
+    }
+
+    #[tokio::test]
+    async fn device_save_failure_after_add_removes_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = fx("deny", ReauthResult::Authorized);
+        let wdir = crate::workspace::dir_in(dir.path());
+        let (ws, _) = crate::workspace::Workspace::open(wdir.clone());
+        Arc::get_mut(&mut f.ctx).unwrap().workspace = Arc::new(ws);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        assert_eq!(link_finish(&f, pk.args).await["ok"], true);
+        // devices.json cannot be written: the save after `add` fails.
+        std::fs::create_dir(wdir.join(format!(".{}.tmp", crate::workspace::DEVICES_FILE))).unwrap();
+        let c = confirm_accept(&f, &b).await;
+        assert_eq!(c["ok"], false, "{c}");
+        assert!(c["message"].as_str().unwrap().contains("not paired"), "{c}");
+        // The credential `add` stored is gone again, and no device is listed.
+        assert!(f.ctx.touch.all().is_empty());
+        assert!(f.ctx.workspace.devices().is_empty());
+        // The rollback worked: nothing says a passkey stayed behind.
+        assert!(!audit_text(&f).contains("touch_not_removed"));
+    }
+
+    #[tokio::test]
+    async fn offer_expiring_before_confirm_stores_nothing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = fx("deny", ReauthResult::Authorized);
+        let now = Arc::new(AtomicU64::new(crate::workspace::now_secs()));
+        let clock = Arc::clone(&now);
+        let (ws, _) = crate::workspace::Workspace::open(crate::workspace::dir_in(dir.path()));
+        let ws = ws.with_clock(Arc::new(move || clock.load(Ordering::SeqCst)));
+        Arc::get_mut(&mut f.ctx).unwrap().workspace = Arc::new(ws);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        assert_eq!(link_finish(&f, pk.args).await["ok"], true);
+        now.fetch_add(pair::OFFER_TTL_SECS + 1, Ordering::SeqCst);
+        // Through the op: nothing waits any more.
+        let c = confirm_accept(&f, &b).await;
+        assert_eq!(c["ok"], false, "{c}");
+        // And on the Workspace itself `add` is never called for the lapsed offer.
+        let at = f.ctx.workspace.now();
+        let r = f
+            .ctx
+            .workspace
+            .confirm_pair_with(b["pair_id"].as_str().unwrap(), true, at, &|_| {
+                panic!("a lapsed offer's passkey must not be stored")
+            })
+            .unwrap();
+        assert!(r.is_none());
+        assert!(f.ctx.touch.all().is_empty());
+        assert!(f.ctx.workspace.devices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_record_comes_before_the_removal_record() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let d = TestDevice::generate();
+        paired_with_passkey(&f, &d).await;
+        let r = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_REVOKE,
+            json!({"device_id": d.device_id()}),
+        )
+        .await;
+        assert_eq!(r["ok"], true, "{r}");
+        let text = audit_text(&f);
+        let at = |needle: &str| {
+            text.lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} record: {text}"))
+        };
+        assert!(at("\"revoked\"") < at("touch_removed"), "{text}");
+    }
+
+    /// The rollback after a failed device save is `take_passkeys` +
+    /// `audit_removal(PAIR_KEEPS)`; the store cannot be made to fail between
+    /// `add` and the save, so this runs the pair with the touch dir
+    /// unwritable: `touch_not_removed` names the credential id.
+    #[tokio::test]
+    async fn failed_rollback_removal_is_audited_by_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let f = fx("deny", ReauthResult::Authorized);
+        let d = TestDevice::generate();
+        let (_, cid) = paired_with_passkey(&f, &d).await;
+        let touch_dir = f.dir.path().join("state").join("state").join("touch");
+        std::fs::set_permissions(&touch_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = take_passkeys(&f.ctx, &[b64::enc(&cid)]).await;
+        std::fs::set_permissions(&touch_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.removed.is_empty());
+        assert_eq!(r.failed.len(), 1);
+        audit_removal(&f.ctx, &conn(ADMIN), &d.device_id(), &r, PAIR_KEEPS).await;
+        let text = audit_text(&f);
+        let line = text
+            .lines()
+            .find(|l| l.contains("touch_not_removed"))
+            .unwrap_or_else(|| panic!("no touch_not_removed record: {text}"));
+        assert!(line.contains(&b64::enc(&cid)), "{line}");
+        assert!(line.contains("was not paired"), "{line}");
     }
 }

@@ -63,6 +63,7 @@ pub fn me() -> u32 {
 /// A scratch dir outside /tmp: `SAIIFE_TEST_TMP`, else cargo's target tmp.
 pub fn scratch() -> tempfile::TempDir {
     let base = std::env::var_os("SAIIFE_TEST_TMP")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
     std::fs::create_dir_all(&base).unwrap();
