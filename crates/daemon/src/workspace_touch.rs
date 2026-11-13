@@ -6,18 +6,21 @@
 //! derived from the configured origin, never from the browser.
 
 use crate::ops::Ctx;
+use crate::touch::IssueKey;
 use crate::workspace_link::{
     blocking, id_arg, invalid, only, str_arg, text_arg, uid_of, Fail, Refused,
 };
 use saiife_ipc::msg::ErrorCode;
 use saiife_touch::{
     challenge, short_code, ActionRecord, Assertion, Credential, TouchClass, TouchError,
-    TouchRequest,
+    TouchEvidence, TouchRequest,
 };
+use saiife_wire::device::DeviceState;
 use saiife_wire::frame::TouchProof;
 use saiife_wire::level::{actions as a, spawn_level, Level};
 use saiife_wire::pair::{passkey_challenge, passkey_sig_msg, PasskeyAttestation, PASSKEY_DOMAIN};
 use saiife_wire::sig::verify_p256_domain;
+use saiife_wire::source::PendingAction;
 use saiife_wire::source::{BoxId, BoxSource, MAX_TASK_BYTES};
 use saiife_wire::verify::Verified;
 use serde_json::{json, Map, Value};
@@ -374,6 +377,242 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
     }
     m.insert("touch_begin".into(), tb);
     Ok(json!(m))
+}
+
+/// A verified touch, by what it was for.
+pub enum Proven {
+    /// A touch the daemon issued for a steer, revise, resume or spawn
+    /// (`workspace.touch.begin`): its record, which equals what `bind` builds
+    /// for the frame.
+    Web(TouchEvidence, ActionRecord),
+    /// A touch for a pending action a box source created (`box.land`).
+    Pending(TouchEvidence, PendingAction),
+    /// A touch for a v2 approval request (its id).
+    Approval(TouchEvidence, u64),
+}
+
+impl Proven {
+    pub fn evidence(&self) -> &TouchEvidence {
+        match self {
+            Proven::Web(e, _) | Proven::Pending(e, _) | Proven::Approval(e, _) => e,
+        }
+    }
+}
+
+fn touch_refused(e: TouchError) -> Refused {
+    let code = match e {
+        TouchError::Unavailable => ErrorCode::Unavailable,
+        _ => ErrorCode::Forbidden,
+    };
+    Refused::new(code, e.rule(), e.to_string())
+}
+
+fn mismatch(why: &str) -> Refused {
+    Refused::new(ErrorCode::Forbidden, "touch_mismatch", why)
+}
+
+fn internal(e: impl std::fmt::Display) -> Refused {
+    Refused::new(ErrorCode::Internal, "internal", e.to_string())
+}
+
+/// The `args` a steer-class touch binds: the box id only (the text of a
+/// steer or a revise is not bound; the touch opens the box's window).
+fn bound_args(action: &str, args: &Map<String, Value>) -> Map<String, Value> {
+    if matches!(action, a::BOX_STEER | a::BOX_REVISE | a::BOX_RESUME) {
+        let mut m = Map::new();
+        if let Some(id) = args.get("id") {
+            m.insert("id".into(), id.clone());
+        }
+        m
+    } else {
+        args.clone()
+    }
+}
+
+/// Verifies the touch proof of a Touch frame, in order: the request id, the
+/// web assertion (origin from the configured list), the credential (the
+/// frame's own ACTIVE device holds it, and the device owner's touch store
+/// does), then the action's own binding. `src` is the frame's owner-scoped
+/// box source. The challenge entry is burned whatever the outcome.
+///
+/// `[approval] same_user` is not checked here: `approval_ops::decide_remote`
+/// (Task 6) is the single site that decides who may approve a request.
+pub async fn verify_frame(
+    ctx: &Arc<Ctx>,
+    v: &Verified,
+    owner_uid: u32,
+    src: &Arc<dyn BoxSource>,
+    proof: &TouchProof,
+) -> Result<Proven, Refused> {
+    let action = v.frame.action.as_str();
+    let args = &v.frame.args;
+    // 1. A decimal request id.
+    let rid = Some(proof.request_id.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| {
+            Refused::new(
+                ErrorCode::BadRequest,
+                "invalid",
+                "request_id is a decimal number",
+            )
+        })?;
+    // 2. The assertion, with an origin from the configured list.
+    let (asr, _origin) = web_assertion(proof, &origins(ctx)).map_err(touch_refused)?;
+    // 3. The credential: held by the frame's verified, ACTIVE device and by
+    // the owner's touch store (R-T3b).
+    let device = ctx
+        .workspace
+        .device(&v.device_id)
+        .filter(|d| d.state == DeviceState::Active && d.owner_user == v.owner_user)
+        .ok_or_else(|| mismatch("this device is not paired"))?;
+    let cid = saiife_wire::b64::enc(asr.credential_id());
+    if !device.touch_credentials.contains(&cid) {
+        return Err(touch_refused(TouchError::Mismatch));
+    }
+    let c = Arc::clone(ctx);
+    let want = asr.credential_id().to_vec();
+    let cred = tokio::task::spawn_blocking(move || {
+        c.touch
+            .credentials_of(owner_uid)
+            .into_iter()
+            .find(|k| k.id == want)
+    })
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| touch_refused(TouchError::Mismatch))?;
+    let rp_id = cred.rp_id;
+    let now = ctx.workspace.now();
+    let tk = |e| touch_refused(e);
+    match action {
+        a::BOX_STEER | a::BOX_REVISE | a::BOX_RESUME | a::BOX_SPAWN => {
+            let key = IssueKey::Web {
+                device: v.device_id.clone(),
+                request_id: rid,
+            };
+            let c = Arc::clone(ctx);
+            let (ev, record) = tokio::task::spawn_blocking(move || {
+                let iid = c.touch.instance_id();
+                c.touch.consume(
+                    &key,
+                    owner_uid,
+                    |e| ActionRecord {
+                        instance_id: iid,
+                        request_id: rid,
+                        class: e.class,
+                        summary: e.summary.clone(),
+                        fields: e.fields.clone(),
+                        nonce: e.nonce,
+                        expires_at: e.expires_at,
+                    },
+                    &asr,
+                    &rp_id,
+                    now,
+                )
+            })
+            .await
+            .map_err(internal)?
+            .map_err(tk)?;
+            let (class, summary, fields) =
+                bind(ctx, owner_uid, src, action, &bound_args(action, args)).await?;
+            if record.fields != fields || record.class != class || record.summary != summary {
+                return Err(mismatch(
+                    "the touch was for a different action than this frame's",
+                ));
+            }
+            Ok(Proven::Web(ev, record))
+        }
+        a::BOX_LAND => {
+            only(args, &["id", "diff_sha256"]).map_err(refused)?;
+            let id = id_arg(args).map_err(refused)?;
+            let diff = str_arg(args, "diff_sha256").map_err(refused)?.to_string();
+            let s = Arc::clone(src);
+            let pa = tokio::task::spawn_blocking(move || {
+                s.pending_actions()
+                    .into_iter()
+                    .find(|p| p.request_id == rid)
+            })
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                Refused::new(
+                    ErrorCode::Forbidden,
+                    "touch_failed",
+                    "no pending action: it expired or was decided",
+                )
+            })?;
+            if pa.record.fields.get("diff_sha256") != Some(&diff) || pa.box_id.as_ref() != Some(&id)
+            {
+                return Err(mismatch(
+                    "the touch was for another box or another diff than this frame's",
+                ));
+            }
+            // Verified before the challenge is spent, so a proof that does
+            // not verify cannot burn the daemon's own pending challenge; a
+            // second valid assertion for it stops at `spend`.
+            let c = Arc::clone(ctx);
+            let rec = pa.record.clone();
+            let ev = tokio::task::spawn_blocking(move || {
+                c.touch.verify_counted(owner_uid, &rec, &asr, &rp_id, now)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(tk)?;
+            if !ctx
+                .web_touch
+                .spend(&challenge(&pa.record), pa.record.expires_at, now)
+            {
+                return Err(Refused::new(
+                    ErrorCode::Forbidden,
+                    "touch_failed",
+                    "the touch was used before",
+                ));
+            }
+            Ok(Proven::Pending(ev, pa))
+        }
+        a::APPROVAL_APPROVE => {
+            only(args, &["id", "note"]).map_err(refused)?;
+            let id = args.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                Refused::new(ErrorCode::BadRequest, "invalid", "id is a request number")
+            })?;
+            let r = pending_request(ctx, owner_uid, id).await.map_err(refused)?;
+            let class = crate::approval_ops::effective_class(ctx, &r).ok_or_else(|| {
+                Refused::new(
+                    ErrorCode::BadRequest,
+                    "invalid",
+                    format!("request #{id} needs no touch"),
+                )
+            })?;
+            let key = IssueKey::Web {
+                device: v.device_id.clone(),
+                request_id: rid,
+            };
+            let c = Arc::clone(ctx);
+            let (ev, record) = tokio::task::spawn_blocking(move || {
+                let iid = c.touch.instance_id();
+                c.touch.consume(
+                    &key,
+                    owner_uid,
+                    |e| crate::approvals::action_record(&r, class, iid, e.nonce, e.expires_at),
+                    &asr,
+                    &rp_id,
+                    now,
+                )
+            })
+            .await
+            .map_err(internal)?
+            .map_err(tk)?;
+            if record.request_id != id {
+                return Err(mismatch("the touch was for another request"));
+            }
+            Ok(Proven::Approval(ev, id))
+        }
+        other => Err(Refused::new(
+            ErrorCode::BadRequest,
+            "invalid",
+            format!("{other} takes no touch"),
+        )),
+    }
 }
 
 /// `[workspace] origins` of the loaded policy, else the default.

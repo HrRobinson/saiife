@@ -262,7 +262,7 @@ fn nonce() -> String {
 
 fn frame_for(ws: &Workspace, d: &TestDevice, action: &str, args: Value) -> SignedFrame {
     let h = ws.hello();
-    let now = now_secs();
+    let now = ws.now();
     d.frame(&Frame {
         v: 1,
         machine_id: h["machine_id"].as_str().unwrap().into(),
@@ -555,7 +555,7 @@ async fn touch_action_is_refused_touch_required() {
 }
 
 #[tokio::test]
-async fn touch_action_with_a_touch_proof_is_still_refused() {
+async fn touch_action_with_a_junk_touch_proof_is_refused() {
     let (w, mut link, d) = paired().await;
     let sf = frame_for(&w.ctx.workspace, &d, "box.land", json!({"id": "b-done"}));
     let mut args = frame_args(&sf);
@@ -568,7 +568,7 @@ async fn touch_action_with_a_touch_proof_is_still_refused() {
     });
     let a = link.call(OP_WORKSPACE_FRAME, args).await;
     assert_eq!(a["error"], "forbidden", "{a}");
-    assert_eq!(a["rule"], "touch_required", "{a}");
+    assert_eq!(a["rule"], "touch_failed", "{a}");
     assert!(w.boxes.calls().is_empty());
 }
 
@@ -1324,6 +1324,16 @@ const ORIGIN: &str = "http://localhost:47810";
 /// challenge, and the device key's signature over both. Returns the
 /// credential id.
 async fn pair_with_passkey(w: &World, link: &mut Link) -> (TestDevice, Vec<u8>) {
+    let (d, auth) = pair_with_soft(w, link).await;
+    let cid = auth.credential_id();
+    (d, cid)
+}
+
+/// [`pair_with_passkey`], keeping the soft authenticator to sign with.
+async fn pair_with_soft(
+    w: &World,
+    link: &mut Link,
+) -> (TestDevice, saiife_touch::soft::SoftAuthenticator) {
     use saiife_touch::{EnrolRequest, Touch};
     let b = control(w, OP_WORKSPACE_PAIR_BEGIN, json!({"label": "laptop"})).await;
     assert_eq!(b["ok"], true, "{b}");
@@ -1374,7 +1384,7 @@ async fn pair_with_passkey(w: &World, link: &mut Link) -> (TestDevice, Vec<u8>) 
     .await;
     assert_eq!(c["ok"], true, "{c}");
     assert_eq!(c["passkey"], b64::enc(&auth.credential_id()), "{c}");
-    (d, auth.credential_id())
+    (d, auth)
 }
 
 async fn paired_with_passkey() -> (World, Link, TestDevice, Vec<u8>) {
@@ -1799,4 +1809,669 @@ async fn begin_is_recorded() {
     assert_eq!(field(last, "touch_begin")["box"], "b-run", "{last}");
     // The audit detail is not part of the answer.
     assert!(a["result"].get("touch_begin").is_none(), "{a}");
+}
+
+// ---- verify Touch frames (plan 31, Task 5) ----
+
+use saiife_touch::soft::SoftAuthenticator;
+use saiife_touch::{challenge, Assertion};
+use saiife_wire::frame::TouchProof;
+
+/// The proof a browser would send for `asr` as touch request `rid`.
+fn proof_json(rid: u64, asr: &Assertion) -> Value {
+    match asr {
+        Assertion::WebAuthn {
+            credential_id,
+            auth_data,
+            signature,
+            client_data_json,
+            ..
+        } => json!({
+            "request_id": rid.to_string(),
+            "credential_id": b64::enc(credential_id),
+            "authenticator_data": b64::enc(auth_data),
+            "client_data_json": b64::enc(client_data_json),
+            "signature": b64::enc(signature),
+        }),
+        other => panic!("not a web assertion: {other:?}"),
+    }
+}
+
+fn sign_for(soft: &SoftAuthenticator, rid: u64, ch: &[u8; 32]) -> Value {
+    proof_json(rid, &soft.assert_webauthn("localhost", ORIGIN, ch))
+}
+
+/// A frame with a touch proof, sent over the link.
+async fn send_touch(
+    w: &World,
+    link: &mut Link,
+    d: &TestDevice,
+    action: &str,
+    args: Value,
+    proof: Value,
+) -> Value {
+    let sf = frame_for(&w.ctx.workspace, d, action, args);
+    let mut a = frame_args(&sf);
+    a["touch"] = proof;
+    link.call(OP_WORKSPACE_FRAME, a).await
+}
+
+/// `workspace.touch.begin` for `action`: the request id and the challenge.
+async fn begin_touch(
+    w: &World,
+    link: &mut Link,
+    d: &TestDevice,
+    action: &str,
+    args: Value,
+) -> (u64, [u8; 32]) {
+    let a = send(
+        w,
+        link,
+        d,
+        "workspace.touch.begin",
+        begin_args(action, args),
+    )
+    .await;
+    let tr = touch_request(&a);
+    (
+        a["result"]["request_id"].as_str().unwrap().parse().unwrap(),
+        tr.challenge,
+    )
+}
+
+/// The pending `land` of `b-done` in the demo fake.
+fn pending_land(w: &World) -> saiife_wire::source::PendingAction {
+    let p = w.boxes.pending_actions();
+    assert_eq!(p.len(), 1, "{p:?}");
+    p.into_iter().next().unwrap()
+}
+
+fn land_args(pa: &saiife_wire::source::PendingAction) -> Value {
+    json!({"id": "b-done", "diff_sha256": pa.record.fields["diff_sha256"]})
+}
+
+fn completes(w: &World) -> usize {
+    w.boxes
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, FakeCall::Complete(..)))
+        .count()
+}
+
+async fn paired_soft() -> (World, Link, TestDevice, SoftAuthenticator) {
+    let w = world().await;
+    let mut link = Link::open(&w).await;
+    let (d, soft) = pair_with_soft(&w, &mut link).await;
+    (w, link, d, soft)
+}
+
+#[tokio::test]
+async fn land_with_touch_completes() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"], json!({}), "{a}");
+    assert_eq!(
+        w.boxes.calls(),
+        vec![FakeCall::Complete(
+            pa.request_id,
+            saiife_wire::source::Decision::Approve,
+            true
+        )]
+    );
+    assert!(w.boxes.pending_actions().is_empty());
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.land", "{last}");
+    assert_eq!(last["decision"], "allow", "{last}");
+    assert_eq!(field(last, "box"), "b-done", "{last}");
+    assert_eq!(field(last, "touch")["kind"], "webauthn", "{last}");
+    assert_eq!(field(last, "touch")["via"], "web", "{last}");
+    assert_eq!(field(last, "touch")["uv"], true, "{last}");
+    assert_eq!(
+        field(last, "touch")["challenge"],
+        challenge(&pa.record)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "{last}"
+    );
+}
+
+#[tokio::test]
+async fn touch_for_other_box_is_mismatch() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.steer", json!({"id": "b-run"})).await;
+    let proof = sign_for(&soft, rid, &ch);
+    // Box A's touch on box B.
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-q1", "msg": "hi"}),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    // The entry is burned: the right frame with the same proof is refused too.
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "hi"}),
+        proof,
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(a["message"].as_str().unwrap().contains("no live"), "{a}");
+    assert!(w.boxes.calls().is_empty());
+}
+
+#[tokio::test]
+async fn land_proof_on_revise_is_mismatch() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let rid = pa.request_id;
+    let proof = sign_for(&soft, rid, &challenge(&pa.record));
+    // R-P1: a live Web entry for this device under the land's request id,
+    // bound to a revise: the refusal is the challenge compare.
+    let fields = fields(&[("action", "box.revise"), ("box", "b-run")]);
+    w.ctx
+        .touch
+        .issue(
+            saiife_daemon::touch::IssueKey::Web {
+                device: d.device_id(),
+                request_id: rid,
+            },
+            me(),
+            saiife_touch::TouchClass::Steer,
+            "box.revise box b-run".into(),
+            fields,
+            saiife_daemon::touch::unix_now(),
+        )
+        .unwrap();
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.revise",
+        json!({"id": "b-run", "comment": "go"}),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    // No entry (it was burned): the same proof is Expired, touch_failed.
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.revise",
+        json!({"id": "b-run", "comment": "go"}),
+        proof,
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    // Nothing ran, and the pending land is untouched.
+    assert!(w.boxes.calls().is_empty(), "{:?}", w.boxes.calls());
+    assert_eq!(w.boxes.pending_actions().len(), 1);
+}
+
+#[tokio::test]
+async fn assertion_reuse_is_refused() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    // A web touch: verified once (the action is not available yet), then
+    // the same frame body re-signed with a new nonce and the same proof.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.resume", json!({"id": "b-run"})).await;
+    let proof = sign_for(&soft, rid, &ch);
+    let first = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.resume",
+        json!({"id": "b-run"}),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(first["rule"], "unavailable", "{first}");
+    let again = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.resume",
+        json!({"id": "b-run"}),
+        proof,
+    )
+    .await;
+    assert_eq!(again["error"], "forbidden", "{again}");
+    assert_eq!(again["rule"], "touch_failed", "{again}");
+    // A land: the pending action goes with the first completion; the same
+    // proof again finds none.
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof.clone()).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(a["message"].as_str().unwrap().contains("no pending"), "{a}");
+    assert_eq!(completes(&w), 1);
+}
+
+#[tokio::test]
+async fn a_replayed_counter_is_refused() {
+    let (w, mut link, d, mut soft) = paired_soft().await;
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.resume", json!({"id": "b-run"})).await;
+    let ok = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.resume",
+        json!({"id": "b-run"}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(ok["rule"], "unavailable", "{ok}");
+    // A counter that does not advance past the stored one.
+    soft.counter_step = 0;
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.resume", json!({"id": "b-run"})).await;
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.resume",
+        json!({"id": "b-run"}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("used before"),
+        "{a}"
+    );
+}
+
+/// A frame as the daemon would hand `verify_frame`, for direct calls.
+fn verified(w: &World, d: &TestDevice, action: &str, args: Value) -> saiife_wire::verify::Verified {
+    let h = w.ctx.workspace.hello();
+    let now = w.ctx.workspace.now();
+    saiife_wire::verify::Verified {
+        frame: Frame {
+            v: 1,
+            machine_id: h["machine_id"].as_str().unwrap().into(),
+            epoch: h["epoch"].as_str().unwrap().into(),
+            device_id: d.device_id(),
+            action: action.into(),
+            args: args.as_object().unwrap().clone(),
+            nonce: nonce(),
+            issued_at: now,
+            expires_at: now + 60,
+        },
+        device_id: d.device_id(),
+        owner_user: ME.into(),
+        level: Level::Touch,
+    }
+}
+
+fn proof_of(v: &Value) -> TouchProof {
+    serde_json::from_value(v.clone()).unwrap()
+}
+
+#[tokio::test]
+async fn a_second_valid_assertion_for_a_spent_land_is_refused() {
+    use saiife_daemon::workspace_touch::{verify_frame, Proven};
+    let (w, _link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let ch = challenge(&pa.record);
+    let v = verified(&w, &d, "box.land", land_args(&pa));
+    let src = Arc::clone(&w.ctx.boxes);
+    // Two different valid assertions (the counter advances) for one challenge:
+    // the first verifies, the second finds the challenge spent.
+    let p1 = proof_of(&sign_for(&soft, pa.request_id, &ch));
+    let p2 = proof_of(&sign_for(&soft, pa.request_id, &ch));
+    let first = verify_frame(&w.ctx, &v, me(), &src, &p1).await;
+    assert!(matches!(first, Ok(Proven::Pending(..))));
+    let second = verify_frame(&w.ctx, &v, me(), &src, &p2)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(second.rule, "touch_failed");
+    assert!(second.message.contains("used before"), "{second:?}");
+}
+
+#[tokio::test]
+async fn uv_clear_is_refused() {
+    let (w, mut link, d, mut soft) = paired_soft().await;
+    soft.uv = false;
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("user verification"),
+        "{a}"
+    );
+    // The pending land can still be touched (a bad proof burns nothing).
+    soft.uv = true;
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["ok"], true, "{a}");
+    // A steer touch without UV is refused the same way.
+    soft.uv = false;
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.steer", json!({"id": "b-run"})).await;
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "x"}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("user verification"),
+        "{a}"
+    );
+}
+
+#[tokio::test]
+async fn foreign_origin_is_refused() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let asr = soft.assert_webauthn(
+        "localhost",
+        "https://app.saiife.com",
+        &challenge(&pa.record),
+    );
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.land",
+        land_args(&pa),
+        proof_json(pa.request_id, &asr),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    assert_eq!(completes(&w), 0);
+}
+
+#[tokio::test]
+async fn rp_id_of_other_host_is_refused() {
+    let (w, mut link, d, mut soft) = paired_soft().await;
+    soft.rp_override = Some("soft.rs".into());
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    assert_eq!(completes(&w), 0);
+}
+
+#[tokio::test]
+async fn other_devices_passkey_is_refused() {
+    let (w, mut link, a_dev, _soft_a) = paired_soft().await;
+    let (_b_dev, soft_b) = pair_with_soft(&w, &mut link).await;
+    // Both belong to the same user and both credentials are in the store;
+    // B's passkey on A's frame is still refused.
+    assert_eq!(w.ctx.touch.credentials_of(me()).len(), 2);
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft_b, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &a_dev, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    assert_eq!(completes(&w), 0);
+    // Through begin too: A's request lists only A's passkey.
+    let a = send(
+        &w,
+        &mut link,
+        &a_dev,
+        "workspace.touch.begin",
+        begin_args("box.steer", json!({"id": "b-run"})),
+    )
+    .await;
+    assert_eq!(touch_request(&a).allow.len(), 1);
+}
+
+#[tokio::test]
+async fn revoked_devices_credential_is_refused() {
+    use saiife_daemon::workspace_touch::verify_frame;
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().as_raw() == 0 {
+        return; // root writes through a read-only directory
+    }
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let proof = proof_of(&sign_for(&soft, pa.request_id, &challenge(&pa.record)));
+    // Revoke with the credential removal failing: the credential stays in
+    // the touch store.
+    let touch_dir = w.state.join("state").join("touch");
+    std::fs::set_permissions(&touch_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let r = control(&w, OP_WORKSPACE_REVOKE, json!({"device_id": d.device_id()})).await;
+    std::fs::set_permissions(&touch_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(w.ctx.touch.credentials_of(me()).len(), 1);
+    // The frame never gets that far...
+    let sf = frame_for(&w.ctx.workspace, &d, "box.land", land_args(&pa));
+    let mut args = frame_args(&sf);
+    args["touch"] = serde_json::to_value(&proof).unwrap();
+    let a = link.call(OP_WORKSPACE_FRAME, args).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(completes(&w), 0);
+    // ...and if it did, the gate holds on its own (R-T3b).
+    let v = verified(&w, &d, "box.land", land_args(&pa));
+    let src = Arc::clone(&w.ctx.boxes);
+    let e = verify_frame(&w.ctx, &v, me(), &src, &proof)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(e.rule, "touch_mismatch", "{e:?}");
+    assert_eq!(w.boxes.pending_actions().len(), 1);
+}
+
+#[tokio::test]
+async fn expired_challenge_is_refused() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let skew = Arc::new(AtomicU64::new(0));
+    let s2 = Arc::clone(&skew);
+    let (ws, warning) = Workspace::open(dir_in(&state));
+    assert!(warning.is_none(), "{warning:?}");
+    let ws = ws.with_clock(Arc::new(move || now_secs() + s2.load(Ordering::SeqCst)));
+    let w = build(tmp, state, ws).await;
+    let mut link = Link::open(&w).await;
+    let (d, soft) = pair_with_soft(&w, &mut link).await;
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.steer", json!({"id": "b-run"})).await;
+    let proof = sign_for(&soft, rid, &ch);
+    skew.store(301, Ordering::SeqCst);
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "x"}),
+        proof,
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(a["message"].as_str().unwrap().contains("no live"), "{a}");
+}
+
+#[tokio::test]
+async fn diff_hash_mismatch_is_refused() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let other = "0".repeat(64);
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.land",
+        json!({"id": "b-done", "diff_sha256": other}),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    // Another box than the pending action's.
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.land",
+        json!({"id": "b-run", "diff_sha256": pa.record.fields["diff_sha256"]}),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    // The frame's args are exactly id and diff_sha256.
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.land",
+        json!({"id": "b-done", "diff_sha256": pa.record.fields["diff_sha256"], "x": 1}),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+    assert_eq!(completes(&w), 0);
+    // Nothing was spent: the right frame still lands.
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["ok"], true, "{a}");
+}
+
+#[tokio::test]
+async fn land_without_a_pending_action_is_refused() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id + 100, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    assert!(
+        a["message"]
+            .as_str()
+            .unwrap()
+            .contains("expired or was decided"),
+        "{a}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_proof_envelope_is_refused() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let pa = pending_land(&w);
+    let good = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    for rid in ["", "x1", "+1", "-1", "1.0", "99999999999999999999999"] {
+        let mut p = good.clone();
+        p["request_id"] = json!(rid);
+        let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), p).await;
+        assert_eq!(a["error"], "bad_request", "{rid}: {a}");
+        assert_eq!(a["rule"], "invalid", "{rid}: {a}");
+    }
+    // The origin comes from the signed client data; junk there is Malformed.
+    let mut p = good.clone();
+    p["client_data_json"] = json!(b64::enc(b"{}"));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), p).await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    // A touch on a Signed action is ignored, not acted on as a land.
+    assert_eq!(completes(&w), 0);
+}
+
+#[tokio::test]
+async fn approval_proof_verifies_for_its_request_only() {
+    use saiife_daemon::workspace_touch::{verify_frame, Proven};
+    let (w, mut link, d, soft) = paired_soft().await;
+    let r1 = make_request(&w, Some("deploy"));
+    let r2 = make_request(&w, Some("deploy"));
+    let src = Arc::clone(&w.ctx.boxes);
+    // A touch begun for r1, shown for r2: its challenge is not r2's.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "approval.approve", json!({"id": r1.id})).await;
+    let p = proof_of(&sign_for(&soft, rid, &ch));
+    let v2 = verified(&w, &d, "approval.approve", json!({"id": r2.id}));
+    let e = verify_frame(&w.ctx, &v2, me(), &src, &p)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(e.rule, "touch_mismatch", "{e:?}");
+    // Burned: the right frame with a fresh signature has no live entry.
+    let p = proof_of(&sign_for(&soft, rid, &ch));
+    let v1 = verified(&w, &d, "approval.approve", json!({"id": r1.id}));
+    let e = verify_frame(&w.ctx, &v1, me(), &src, &p)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(e.rule, "touch_failed", "{e:?}");
+    // A fresh begin and the right frame verifies.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "approval.approve", json!({"id": r1.id})).await;
+    let p = proof_of(&sign_for(&soft, rid, &ch));
+    match verify_frame(&w.ctx, &v1, me(), &src, &p).await {
+        Ok(Proven::Approval(ev, id)) => {
+            assert_eq!(id, r1.id);
+            assert_eq!(ev.via, "web");
+        }
+        other => panic!("not an approval proof: {:?}", other.err()),
+    }
+    // A steer touch cannot approve a request.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.steer", json!({"id": "b-run"})).await;
+    let p = proof_of(&sign_for(&soft, rid, &ch));
+    let e = verify_frame(&w.ctx, &v1, me(), &src, &p)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(e.rule, "touch_mismatch", "{e:?}");
+    // Over the link the approval is verified, then unavailable until
+    // the action exists; the evidence is still recorded.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "approval.approve", json!({"id": r1.id})).await;
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "approval.approve",
+        json!({"id": r1.id}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(a["rule"], "unavailable", "{a}");
+    let rs = records(&w);
+    assert_eq!(field(rs.last().unwrap(), "touch")["kind"], "webauthn");
+}
+
+#[tokio::test]
+async fn refusal_records_the_rule() {
+    let (w, mut link, d, mut soft) = paired_soft().await;
+    soft.uv = false;
+    let pa = pending_land(&w);
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let sig = proof["signature"].as_str().unwrap().to_string();
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.land", "{last}");
+    assert_eq!(last["decision"], "deny", "{last}");
+    assert_eq!(last["rule"], "touch_failed", "{last}");
+    assert_eq!(field(last, "level"), "touch", "{last}");
+    // The proof's bytes are not in the record.
+    assert!(field(last, "touch").is_null(), "{last}");
+    assert!(!last.to_string().contains(&sig), "{last}");
+    // A malformed proof records its rule too, with no assertion bytes.
+    let mut p = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    p["client_data_json"] = json!(b64::enc(b"nope"));
+    let junk = p["authenticator_data"].as_str().unwrap().to_string();
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), p).await;
+    assert_eq!(a["rule"], "touch_failed", "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(last["rule"], "touch_failed", "{last}");
+    assert!(field(last, "touch").is_null(), "{last}");
+    assert!(!last.to_string().contains(&junk), "{last}");
 }

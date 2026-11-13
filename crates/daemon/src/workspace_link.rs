@@ -27,7 +27,7 @@ use saiife_wire::level::{actions as a, spawn_level, Level};
 use saiife_wire::pair::PairRequest;
 use saiife_wire::seal::{machine_hello_msg, SealBinding};
 use saiife_wire::source::{
-    check_text, BoxError, BoxId, BoxSource, SpawnReq, Start, MAX_TASK_BYTES,
+    check_text, BoxError, BoxId, BoxSource, Decision, SpawnReq, Start, MAX_TASK_BYTES,
 };
 use saiife_wire::verify::Verified;
 use saiife_wire::{b64, WireError};
@@ -81,7 +81,6 @@ impl Refused {
 /// Until then every one is refused: Touch ones `touch_required`, the Signed
 /// ones `unavailable`.
 pub const LATER: &[&str] = &[
-    "box.land",
     "box.push",
     "box.pr",
     "box.steer",
@@ -113,11 +112,13 @@ pub const HANDLED: &[&str] = &[
 
 /// The handled actions that change something: always recorded.
 const CHANGES: &[&str] = &[
+    a::BOX_LAND,
     a::BOX_STOP,
     a::BOX_PAUSE,
     a::BOX_DISCARD,
     a::BOX_REORDER,
     a::BOX_SPAWN,
+    a::BOX_LAND,
     a::LOCKDOWN_ON,
     a::WORKSPACE_TOUCH_BEGIN,
 ];
@@ -466,7 +467,7 @@ async fn frame(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         let _ = append(ctx, rec).await;
         return r.answer(id);
     }
-    match run(ctx, &v, via, Some(conn)).await {
+    match run(ctx, &v, via, Some(conn), sf.touch.as_ref()).await {
         Ok(result) => {
             let mut m = Map::new();
             m.insert("result".into(), result);
@@ -478,14 +479,18 @@ async fn frame(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
 
 /// One verified frame -> the answer's `result`. Exposed for plan 30's
 /// tests. The caller has run `Workspace::check` and checked the peer; this
-/// refuses every Touch action (`touch_required`, also `box.spawn` with a
-/// template that reaches secrets or the network: no touch proof is verified
-/// before plan 31) and every name in [`LATER`], and records as the module
-/// says. Records written through `execute` carry no peer (no `uid`, `user`
+/// refuses a Touch action without a verified `touch` proof (`touch_required`,
+/// also `box.spawn` with a template that reaches secrets or the network) and
+/// every name in [`LATER`], and records as the module says. Records written through `execute` carry no peer (no `uid`, `user`
 /// or `peer` field): it has no connection; `workspace.frame` on `link.sock`
 /// records its peer.
-pub async fn execute(ctx: &Arc<Ctx>, v: &Verified, via: Via) -> Result<Value, Refused> {
-    run(ctx, v, via, None).await
+pub async fn execute(
+    ctx: &Arc<Ctx>,
+    v: &Verified,
+    via: Via,
+    touch: Option<&TouchProof>,
+) -> Result<Value, Refused> {
+    run(ctx, v, via, None, touch).await
 }
 
 /// Why an action failed: a refusal by the daemon (always recorded), or the
@@ -500,10 +505,14 @@ async fn run(
     v: &Verified,
     via: Via,
     conn: Option<&Conn>,
+    touch: Option<&TouchProof>,
 ) -> Result<Value, Refused> {
     let action = v.frame.action.as_str();
     let mut level = v.level;
-    let mut out = act(ctx, v, &mut level).await;
+    // The evidence of a touch that verified, kept for the record even when
+    // the action then fails.
+    let mut evidence: Option<Value> = None;
+    let mut out = act(ctx, v, &mut level, touch, &mut evidence).await;
     // The begin's audit detail is not part of its answer.
     let begun = match (&mut out, action) {
         (Ok(Value::Object(m)), a::WORKSPACE_TOUCH_BEGIN) => m.remove("touch_begin"),
@@ -524,6 +533,9 @@ async fn run(
         }
         if let Some(tb) = begun {
             rec.extra.insert("touch_begin".into(), tb);
+        }
+        if let Some(ev) = evidence {
+            rec.extra.insert("touch".into(), ev);
         }
         if let Some(r) = refused {
             deny(&mut rec, r);
@@ -680,7 +692,54 @@ pub(crate) async fn source_for(
     Ok(Arc::new(crate::box_ops::workspace_source(m, scope, cell)))
 }
 
-async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, Fail> {
+/// A Touch action: without a proof `touch_required`; with one, the proof
+/// is verified (`workspace_touch::verify_frame`) and only then is anything
+/// done. `box.land` completes its pending action with the evidence; the
+/// other touch-bound actions are not available until the next step.
+async fn touched(
+    ctx: &Arc<Ctx>,
+    v: &Verified,
+    proof: Option<&TouchProof>,
+    evidence: &mut Option<Value>,
+) -> Result<Value, Fail> {
+    use crate::workspace_touch::Proven;
+    let action = v.frame.action.as_str();
+    let Some(proof) = proof else {
+        return Err(touch_required(action));
+    };
+    let Some(owner_uid) = uid_of(ctx, &v.owner_user).await else {
+        return Err(Fail::Policy(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_owner",
+            "the device owner is not a user of this machine",
+        )));
+    };
+    let src = source_for(ctx, v, action, &v.frame.args).await?;
+    let proven = crate::workspace_touch::verify_frame(ctx, v, owner_uid, &src, proof)
+        .await
+        .map_err(Fail::Policy)?;
+    *evidence = Some(proven.evidence().to_audit());
+    match proven {
+        Proven::Pending(ev, pa) if action == a::BOX_LAND => {
+            let rid = pa.request_id;
+            blocking(&src, move |b| b.complete(rid, Decision::Approve, Some(ev))).await?;
+            Ok(json!({}))
+        }
+        _ => Err(Fail::Policy(Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            format!("{action} is not available in this version"),
+        ))),
+    }
+}
+
+async fn act(
+    ctx: &Arc<Ctx>,
+    v: &Verified,
+    level: &mut Level,
+    touch: Option<&TouchProof>,
+    evidence: &mut Option<Value>,
+) -> Result<Value, Fail> {
     let action = v.frame.action.as_str();
     let args = &v.frame.args;
     // One lockdown gate for box power, shared with the control socket.
@@ -692,8 +751,9 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
         )));
     }
     match v.level {
-        // Plan 31 verifies touch proofs; until then none is acted on.
-        Level::Touch => return Err(touch_required(action)),
+        // box.push and box.pr stay unavailable (the LATER check below).
+        Level::Touch if matches!(action, a::BOX_PUSH | a::BOX_PR) => {}
+        Level::Touch => return touched(ctx, v, touch, evidence).await,
         Level::MachineOnly => {
             return Err(Fail::Policy(Refused::new(
                 ErrorCode::Forbidden,
@@ -804,7 +864,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
             };
             *level = spawn_level(t);
             if *level != Level::Signed {
-                return Err(touch_required(action));
+                return touched(ctx, v, touch, evidence).await;
             }
             let req = SpawnReq {
                 template,
