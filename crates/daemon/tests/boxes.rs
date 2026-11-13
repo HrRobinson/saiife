@@ -1354,6 +1354,12 @@ async fn fake_env_still_wins() {
     assert!(state.join("boxes").join(b.id.as_str()).is_dir());
     // the fake VM keeps its disks in the record dirs: box.list reads them there
     assert_eq!(built.disk_root, state.join("boxes"));
+    // and its image store under the state dir in both modes
+    for mode in [Mode::Personal, Mode::Locked] {
+        let p = box_ops::image_paths(&state, &mode, &env).unwrap();
+        assert_eq!(p.images, state.join("images"));
+        assert_eq!(p.records, state.join("image-records"));
+    }
 }
 
 /// R37: the box records stay in the daemon's own state dir in both modes;

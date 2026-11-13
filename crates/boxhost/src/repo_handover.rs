@@ -64,8 +64,11 @@ impl Handover {
 
     fn finish(&mut self) -> Result<(), String> {
         match (self.moved, self.dirs.take()) {
-            (Moved::Copied, Some((rec, _))) => {
+            (Moved::Copied, Some((rec, rt))) => {
                 rustix::fs::unlinkat(&rec, REPO_DISK, rustix::fs::AtFlags::empty()).map_err(|e| {
+                    // the record keeps the original: the copy goes, so a
+                    // failed create leaves no disk in the runtime dir
+                    let _ = rustix::fs::unlinkat(&rt, REPO_DISK, rustix::fs::AtFlags::empty());
                     format!("the repo disk was copied but not removed from the record: {e}")
                 })
             }

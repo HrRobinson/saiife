@@ -267,7 +267,11 @@ pub struct Built {
 /// without a default image gets one. Records: `box_images::paths_for`
 /// (the daemon's own); images: the box layout's (`box_vmm::layout_for`,
 /// which honours the debug-only `SAIIFE_TEST_BOX_ROOT`), so the preflight,
-/// the driver and the image ops agree. `None` without boxes.
+/// the driver and the image ops agree. The fake VM has no VMM user: its
+/// image store stays under the state dir in both modes (records
+/// `<state>/image-records`, images `<state>/images`), as its boxes do, so a
+/// locked test daemon never touches the host's install. `None` without
+/// boxes.
 pub fn image_paths(
     state_dir: &Path,
     mode: &Mode,
@@ -275,7 +279,7 @@ pub fn image_paths(
 ) -> Option<crate::box_images::ImagePaths> {
     #[cfg(feature = "fake-vmm")]
     if env(FAKE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
-        return Some(crate::box_images::paths_for(state_dir, mode));
+        return Some(crate::box_images::paths_for(state_dir, &Mode::Personal));
     }
     #[cfg(all(target_os = "linux", feature = "boxes"))]
     {
