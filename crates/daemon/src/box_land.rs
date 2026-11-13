@@ -1434,7 +1434,8 @@ enum LandOp {
     Begin(BoxId, Option<BTreeSet<String>>),
     Land(u64, saiife_touch::Assertion),
     Reject(u64),
-    Fetch(BoxId, u32),
+    /// `None`: list the approved, unapplied lands (no descriptor).
+    Fetch(BoxId, Option<u32>),
     Applied(BoxId, u32, String),
     PushBegin(BoxId, String, String),
     Push(u64, saiife_touch::Assertion),
@@ -1534,7 +1535,11 @@ impl LandOp {
             }
             m::OP_BOX_LAND => LandOp::Land(arg_rid(a)?, arg_assertion(a)?),
             m::OP_BOX_LAND_REJECT => LandOp::Reject(arg_rid(a)?),
-            m::OP_BOX_LAND_FETCH => LandOp::Fetch(arg_box(a)?, arg_n(a)?),
+            // Without `n`: the numbers of the approved, unapplied lands.
+            m::OP_BOX_LAND_FETCH => match a.get("n") {
+                None | Some(Value::Null) => LandOp::Fetch(arg_box(a)?, None),
+                Some(_) => LandOp::Fetch(arg_box(a)?, Some(arg_n(a)?)),
+            },
             m::OP_BOX_LAND_APPLIED => {
                 LandOp::Applied(arg_box(a)?, arg_n(a)?, arg_str(a, "commit")?)
             }
@@ -1836,7 +1841,15 @@ fn run(ctx: &Ctx, lands: &Lands, uid: u32, op: LandOp) -> Out {
             let _ = ctx.touch.take(&IssueKey::Land(rid), uid);
             Out::Answer(serde_json::Map::new())
         }
-        LandOp::Fetch(b, n) => {
+        LandOp::Fetch(b, None) => {
+            let (waiting, unreadable) = lands.scan_unapplied(&b);
+            let ns: Vec<u32> = waiting.iter().map(|l| l.n).collect();
+            let mut a = serde_json::Map::new();
+            a.insert("waiting".into(), ns.into());
+            a.insert("unreadable".into(), unreadable.into());
+            Out::Answer(a)
+        }
+        LandOp::Fetch(b, Some(n)) => {
             let Some(info) = lands.approved_unapplied(&b).into_iter().find(|l| l.n == n) else {
                 return invalid(format!(
                     "land {n} of box {} is not an approved land waiting to be applied",

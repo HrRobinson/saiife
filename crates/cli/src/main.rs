@@ -34,6 +34,9 @@ mod audit_locked;
 mod box_attach;
 mod box_cmd;
 mod box_image_cmd;
+// `box diff | land | apply | push` and the land commit (plan 39).
+#[cfg(unix)]
+mod box_land_cmd;
 // The repo disk of `box spawn` (plan 37).
 #[cfg(unix)]
 mod box_repo;

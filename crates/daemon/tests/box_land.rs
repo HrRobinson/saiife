@@ -1499,6 +1499,12 @@ fn fetch_for_web_approved_land() {
         .complete(p.request_id, Decision::Approve, Some(ev))
         .unwrap();
     let n = w.lands.approved_unapplied(&i)[0].n;
+    // Without `n`: the list, and no descriptor.
+    let (a, fds) = w.op(ALICE, "box.land.fetch", json!({"box": s}));
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["waiting"], json!([n]), "{a}");
+    assert_eq!(a["unreadable"], 0, "{a}");
+    assert!(fds.is_empty());
     let (a, fds) = w.op(ALICE, "box.land.fetch", json!({"box": s, "n": n}));
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(a["land"]["id"], s);
@@ -1517,6 +1523,8 @@ fn fetch_for_web_approved_land() {
     );
     let a = w.call(ALICE, "box.land.fetch", json!({"box": s, "n": n}));
     assert_eq!(a["error"], "bad_request", "applied: {a}");
+    let a = w.call(ALICE, "box.land.fetch", json!({"box": s}));
+    assert_eq!(a["waiting"], json!([]), "{a}");
 }
 
 #[test]
