@@ -27,6 +27,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - run: cargo clippy -p saiife --features fido-hid --all-targets -- -D warnings
+      # The real box driver's wiring and the fake VM (plan 35, M-1): the
+      # workspace clippy above never turns these features on. CI only,
+      # never a release workflow.
+      - name: clippy with boxes and the fake VM
+        if: runner.os == 'Linux'
+        run: cargo clippy -p saiife-daemon -p saiife --features saiife-daemon/boxes,saiife-daemon/fake-vmm,saiife/boxes,saiife/fake-vmm --all-targets -- -D warnings
       # The HID key's pure parts (classify, one_of, credential_of); no key is opened.
       - name: fido-hid unit tests
         if: runner.os == 'Linux'

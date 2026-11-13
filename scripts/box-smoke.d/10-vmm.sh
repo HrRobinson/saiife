@@ -48,6 +48,7 @@ P35_STOP_LIMIT_S=95
 P35_BOX=""
 P35_LOCKED=""
 P35_FIXTURES=""
+P35_PID_SEEN=""
 
 p35_log() { printf '%s\n' "$*" >&2; }
 
@@ -204,12 +205,65 @@ p35_landlock_on() {
     ! printf '%s\n' "$text" | grep -i 'landlock' | grep -qi 'error\|fail'
 }
 
-# p35_gone PID: /proc/PID disappears within the stop limit
+# p35_proc PID: "alive" when /proc/PID is visible, "gone" when it is not,
+# empty when the probe itself did not run (sudo -n refused). Read only.
+p35_proc() {
+  # shellcheck disable=SC2016
+  p35_as sh -c 'if [ -e "/proc/$1" ]; then echo alive; else echo gone; fi' p35-proc "$1" \
+    2>/dev/null || true
+}
+
+# p35_seen PID: the VMM's /proc entry is visible now (before the stop), so
+# a later "gone" is not hidepid hiding it; sets P35_PID_SEEN
+p35_seen() {
+  P35_PID_SEEN=""
+  case "$(p35_proc "$1")" in
+    alive) P35_PID_SEEN=1 ;;
+    *)
+      p35_log "cannot see /proc/$1 (hidepid or sudo -n refused)"
+      return 1
+      ;;
+  esac
+}
+
+# p35_unit_off BOX: locked, the unit is inactive or failed with MainPID 0
+# (systemctl show: read only)
+p35_unit_off() {
+  local out active main
+  out=$(systemctl show -p ActiveState,MainPID "saiife-box@$1.service" 2>/dev/null) || return 1
+  active=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')
+  main=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p')
+  case "$active" in
+    inactive | failed) [ "$main" = 0 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# p35_gone PID BOX: /proc/PID disappears within the stop limit; locked, the
+# unit is also inactive|failed with MainPID 0. Fails closed: the pid must
+# have been seen alive before the stop (p35_seen), and a probe that cannot
+# run is a FAIL, never "gone".
 p35_gone() {
-  local deadline
+  local deadline ans
+  if [ "${P35_PID_SEEN:-}" != 1 ]; then
+    p35_log "cannot see /proc/$1 (hidepid or sudo -n refused): never seen alive"
+    return 1
+  fi
   deadline=$(($(p35_now_ms) + P35_STOP_LIMIT_S * 1000))
   while [ "$(p35_now_ms)" -lt "$deadline" ]; do
-    [ -e "/proc/$1" ] || return 0
+    ans=$(p35_proc "$1")
+    case "$ans" in
+      alive) ;;
+      gone)
+        if [ -z "$P35_LOCKED" ] || p35_unit_off "$2"; then
+          return 0
+        fi
+        ;;
+      *)
+        p35_log "cannot see /proc/$1 (hidepid or sudo -n refused)"
+        return 1
+        ;;
+    esac
     sleep 0.5
   done
   return 1
@@ -283,7 +337,11 @@ smoke_vmm() {
     check "VMM up within ${P35_BOOT_LIMIT_S} s (api.sock answers vmm.ping)" false
   fi
   pid=$(p35_pid "$P35_BOX") || pid=""
+  P35_PID_SEEN=""
   check "VMM pid known (read, never signalled)" test -n "$pid"
+  if [ -n "$pid" ]; then
+    check "VMM pid visible in /proc (not hidden by hidepid, sudo -n works)" p35_seen "$pid"
+  fi
   check "ch.log shows Landlock on (no landlock error)" p35_landlock_on "$P35_BOX"
   if [ -n "$P35_LOCKED" ]; then
     check "locked: the unit runs as saiife-box" p35_unit_user "$P35_BOX"
@@ -314,7 +372,8 @@ smoke_vmm() {
     check "box stop" saiife box stop "$P35_BOX"
   fi
   if [ -n "$pid" ]; then
-    check "VMM process gone within ${P35_STOP_LIMIT_S} s (/proc/$pid)" p35_gone "$pid"
+    check "VMM process gone within ${P35_STOP_LIMIT_S} s (/proc/$pid; locked: the unit too)" \
+      p35_gone "$pid" "$P35_BOX"
   fi
   p35_end_box
 
