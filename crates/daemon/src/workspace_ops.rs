@@ -499,8 +499,10 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let Some(device) = ctx.workspace.device(&device_id) else {
         return err(id, ErrorCode::BadRequest, "no such device");
     };
-    // Already revoked and saved: nothing to grant, no prompt.
+    // Already revoked and saved: nothing to grant, no prompt. Any passkey a
+    // failed removal left behind is taken out now (a retry).
     if ctx.workspace.revoked_and_saved(&device_id) {
+        remove_passkeys(ctx, conn, &device_id, &device.touch_credentials).await;
         return revoked_answer(id, device_id);
     }
     if let Err(e) = power(
@@ -517,6 +519,9 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         return e;
     }
     let outcome = ctx.workspace.revoke(&device_id);
+    // The revoke is in effect in memory now (plan 29 ordering). Its passkeys
+    // leave the touch store next; a failure there never undoes the revoke.
+    remove_passkeys(ctx, conn, &device_id, &device.touch_credentials).await;
     let mut rec = record(ctx, conn, "revoked").await;
     rec.extra.insert("device".into(), device_id.clone().into());
     rec.extra.insert("label".into(), device.label.into());
@@ -539,6 +544,65 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         return unrecorded(id, "the device is revoked", &e);
     }
     revoked_answer(id, device_id)
+}
+
+/// Removes a revoked device's passkeys from the touch store (in a blocking
+/// task) and audits `touch_removed {device, credentials, failed?, reason?}`
+/// (credential ids b64u). Nothing is audited when none of them was in the
+/// store. A failed removal is logged and audited and leaves the revoke as it
+/// is (fail closed).
+async fn remove_passkeys(ctx: &Arc<Ctx>, conn: &Conn, device_id: &str, creds: &[String]) {
+    if creds.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = creds.to_vec();
+    let c = Arc::clone(ctx);
+    let (removed, failed) = tokio::task::spawn_blocking(move || {
+        let (mut removed, mut failed) = (Vec::new(), Vec::new());
+        for id in ids {
+            let Ok(raw) = saiife_wire::b64::dec(&id) else {
+                failed.push((id, "not a credential id".to_string()));
+                continue;
+            };
+            match c.touch.remove(&raw) {
+                Ok(Some(_)) => removed.push(id),
+                Ok(None) => {}
+                Err(e) => failed.push((id, e)),
+            }
+        }
+        (removed, failed)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        (
+            Vec::new(),
+            creds.iter().map(|c| (c.clone(), e.to_string())).collect(),
+        )
+    });
+    if removed.is_empty() && failed.is_empty() {
+        return;
+    }
+    let mut rec = record(ctx, conn, "touch_removed").await;
+    rec.extra.insert("device".into(), device_id.into());
+    rec.extra.insert("credentials".into(), json!(removed));
+    if !failed.is_empty() {
+        let ids: Vec<&String> = failed.iter().map(|(i, _)| i).collect();
+        rec.extra.insert("failed".into(), json!(ids));
+        let why = failed
+            .iter()
+            .map(|(_, e)| e.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        rec.decision = DecisionKind::Deny;
+        rec.rule = Some("touch_not_removed".into());
+        rec.reason = Some(format!(
+            "the device is revoked, but its passkey stays in the touch store: {why}"
+        ));
+        eprintln!("saiifed: warning: revoked device {device_id}: cannot remove its passkey: {why}");
+    }
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!("saiifed: warning: cannot write the touch_removed record: {e}");
+    }
 }
 
 fn revoked_answer(id: u64, device_id: String) -> Value {
@@ -1414,5 +1478,113 @@ mod tests {
         let devs = f.ctx.workspace.devices();
         assert_eq!(devs[0].state, saiife_wire::device::DeviceState::Active);
         assert!(devs[0].touch_credentials.is_empty());
+    }
+
+    /// Pairs `d` with a passkey and confirms; returns the credential id.
+    async fn paired_with_passkey(f: &Fx, d: &TestDevice) -> (Value, Vec<u8>) {
+        let b = begin(f).await;
+        let pk = passkey_req(&b, d, d, &|_, _, _| {});
+        assert_eq!(link_finish(f, pk.args).await["ok"], true);
+        let c = confirm_accept(f, &b).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["passkey"], b64::enc(&pk.id), "{c}");
+        (b, pk.id)
+    }
+
+    #[tokio::test]
+    async fn revoke_removes_the_passkey_and_audits_it() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let d = TestDevice::generate();
+        let (_, cid) = paired_with_passkey(&f, &d).await;
+        assert_eq!(f.ctx.touch.credentials_of(0).len(), 1);
+        let r = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_REVOKE,
+            json!({"device_id": d.device_id()}),
+        )
+        .await;
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+        assert!(f.ctx.touch.all().is_empty());
+        let text = audit_text(&f);
+        let line = text
+            .lines()
+            .find(|l| l.contains("touch_removed"))
+            .unwrap_or_else(|| panic!("no touch_removed record: {text}"));
+        assert!(line.contains(&d.device_id()), "{line}");
+        assert!(line.contains(&b64::enc(&cid)), "{line}");
+    }
+
+    #[tokio::test]
+    async fn revoke_with_a_removal_failure_still_revokes_and_audits_it() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return; // root writes through a read-only directory
+        }
+        let f = fx("deny", ReauthResult::Authorized);
+        let d = TestDevice::generate();
+        let (_, cid) = paired_with_passkey(&f, &d).await;
+        let touch_dir = f.dir.path().join("state").join("state").join("touch");
+        std::fs::set_permissions(&touch_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_REVOKE,
+            json!({"device_id": d.device_id()}),
+        )
+        .await;
+        std::fs::set_permissions(&touch_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(
+            f.ctx.workspace.device(&d.device_id()).unwrap().state,
+            saiife_wire::device::DeviceState::Revoked
+        );
+        // The credential is still there (fail closed on the revoke, not on the store).
+        assert_eq!(f.ctx.touch.credentials_of(0).len(), 1);
+        let text = audit_text(&f);
+        let line = text
+            .lines()
+            .find(|l| l.contains("touch_removed"))
+            .unwrap_or_else(|| panic!("no touch_removed record: {text}"));
+        assert!(line.contains("touch_not_removed"), "{line}");
+        assert!(line.contains(&d.device_id()), "{line}");
+        assert!(line.contains(&b64::enc(&cid)), "{line}");
+        // A repeated revoke retries the removal.
+        let r = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_REVOKE,
+            json!({"device_id": d.device_id()}),
+        )
+        .await;
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_device_cannot_pair_again_with_a_passkey() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let d = TestDevice::generate();
+        paired_with_passkey(&f, &d).await;
+        let r = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_REVOKE,
+            json!({"device_id": d.device_id()}),
+        )
+        .await;
+        assert_eq!(r["ok"], true, "{r}");
+        let b = begin(&f).await;
+        let pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        let r = link_finish(&f, pk.args).await;
+        assert_eq!(r["ok"], false, "{r}");
+        let c = confirm_accept(&f, &b).await;
+        assert_eq!(c["ok"], false, "{c}");
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+        assert_eq!(
+            f.ctx.workspace.device(&d.device_id()).unwrap().state,
+            saiife_wire::device::DeviceState::Revoked
+        );
     }
 }
