@@ -1353,7 +1353,7 @@ async fn boot_timeout_keeps_the_guest_error() {
     box_ops::tick_once(&w.ctx).await;
     assert_eq!(
         w.mgr().get(&b2).unwrap().error.as_deref(),
-        Some("boot timed out")
+        Some(saiife_boxes::manager::WHY_BOOT_TIMED_OUT)
     );
 }
 

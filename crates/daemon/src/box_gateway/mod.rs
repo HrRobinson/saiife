@@ -543,6 +543,9 @@ impl GatewayHooks {
     }
 }
 
+/// The host listeners the gateway binds (the guest channel binds the others).
+const OUR_PORTS: [u32; 2] = [ports::EGRESS, ports::MODEL];
+
 impl VmHooks for GatewayHooks {
     fn before_boot(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
         // A run left over (no after_off seen) ends first.
@@ -550,7 +553,7 @@ impl VmHooks for GatewayHooks {
             old.halt();
         }
         let fail = |what: &str, e: io::Error| {
-            vsock::unlink_all(paths);
+            vsock::unlink_ports(paths, &OUR_PORTS);
             format!("the box gateway's {what} listener: {e}")
         };
         let egress = self
@@ -590,7 +593,8 @@ impl VmHooks for GatewayHooks {
         let run = lock(&self.shared.runs).remove(id);
         if let Some(run) = run {
             run.halt();
-            vsock::unlink_all(&run.paths);
+            // Only ours: the guest channel's listeners are its own.
+            vsock::unlink_ports(&run.paths, &OUR_PORTS);
         }
     }
 }

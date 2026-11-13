@@ -945,6 +945,21 @@ async fn gateway_after_off_closes_tunnels() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// m5: the gateway's after_off unlinks only its own listeners (egress,
+/// model); the guest channel's (events, pty) are left to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_after_off_leaves_the_guest_channels_sockets() {
+    let w = world(Opts::default()).await;
+    let ev = saiife_boxhost::vsock::listen(&w.paths, ports::EVENTS, false).unwrap();
+    let pty = saiife_boxhost::vsock::listen(&w.paths, ports::PTY, false).unwrap();
+    w.gw.after_off(&w.id);
+    assert!(!w.paths.vsock_port(ports::EGRESS).exists());
+    assert!(!w.paths.vsock_port(ports::MODEL).exists());
+    assert!(w.paths.vsock_port(ports::EVENTS).exists());
+    assert!(w.paths.vsock_port(ports::PTY).exists());
+    drop((ev, pty));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_box_is_403() {
     let w = world(Opts::default()).await;
