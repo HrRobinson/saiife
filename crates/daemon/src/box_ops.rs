@@ -703,8 +703,29 @@ async fn write_tick_records(
     reason: Option<&str>,
     changes: Vec<(Change, Option<String>)>,
 ) {
+    write_records(ctx, action, reason, "tick", changes).await;
+}
+
+/// The `box` records of changes made on a caller's behalf (`via` names it,
+/// e.g. `"workspace"`), one per change, `reason` = the change's why.
+pub(crate) async fn write_change_records(
+    ctx: &Ctx,
+    changes: Vec<(Change, Option<String>)>,
+    action: &str,
+    via: &str,
+) {
+    write_records(ctx, action, None, via, changes).await;
+}
+
+async fn write_records(
+    ctx: &Ctx,
+    action: &str,
+    reason: Option<&str>,
+    via: &str,
+    changes: Vec<(Change, Option<String>)>,
+) {
     for (c, template) in changes {
-        let mut rec = tick_record(ctx, action, &c, template.as_deref());
+        let mut rec = tick_record(ctx, action, &c, template.as_deref(), via);
         if let Some(r) = reason {
             rec.reason = Some(r.to_string());
         }
@@ -715,7 +736,7 @@ async fn write_tick_records(
 }
 
 /// One daemon-made change as its `box` record.
-fn tick_record(ctx: &Ctx, action: &str, c: &Change, template: Option<&str>) -> Record {
+fn tick_record(ctx: &Ctx, action: &str, c: &Change, template: Option<&str>, via: &str) -> Record {
     let mut rec = box_rec(
         ctx,
         action,
@@ -723,7 +744,7 @@ fn tick_record(ctx: &Ctx, action: &str, c: &Change, template: Option<&str>) -> R
         template,
         Some(c.from),
         Some(c.to),
-        "tick",
+        via,
     );
     rec.reason = Some(c.why.to_string());
     // A queue head admitted here: the base image its VM was created from.
@@ -745,7 +766,7 @@ pub fn change_records(ctx: &Ctx, changes: &[Change]) -> Vec<Record> {
                 .as_ref()
                 .and_then(|m| m.get(&c.id).ok())
                 .map(|r| r.template);
-            tick_record(ctx, "tick", c, template.as_deref())
+            tick_record(ctx, "tick", c, template.as_deref(), "tick")
         })
         .collect()
 }
@@ -1444,6 +1465,66 @@ async fn run(
             })
             .await
         }
+    }
+}
+
+/// The ctx a [`workspace_sink`] writes through, set once the context exists
+/// (the box source is built first).
+pub type CtxCell = Arc<std::sync::OnceLock<std::sync::Weak<Ctx>>>;
+
+/// The change sink of the Workspace's box source: each batch becomes one
+/// `box` record per change (`action: "tick"`, `via: "workspace"`), written
+/// by a task on the runtime. A sink called with no runtime or a dropped
+/// context writes nothing and says so.
+pub fn workspace_sink(cell: CtxCell) -> saiife_boxes::source::ChangeSink {
+    Arc::new(move |changes: &[Change]| {
+        let Some(ctx) = cell.get().and_then(std::sync::Weak::upgrade) else {
+            eprintln!("saiifed: warning: Workspace box changes not recorded: no context");
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            eprintln!("saiifed: warning: Workspace box changes not recorded: no runtime");
+            return;
+        };
+        let batch: Vec<(Change, Option<String>)> = changes
+            .iter()
+            .map(|c| {
+                let t = ctx
+                    .box_manager
+                    .as_ref()
+                    .and_then(|m| m.get(&c.id).ok())
+                    .map(|r| r.template);
+                (c.clone(), t)
+            })
+            .collect();
+        rt.spawn(async move {
+            write_change_records(&ctx, batch, "tick", "workspace").await;
+        });
+    })
+}
+
+/// The Workspace's box source over `mgr`, auditing through `cell`. One place
+/// builds it, so later plans chain onto it.
+pub fn workspace_source(mgr: Arc<Manager>, owner: Option<u32>, cell: CtxCell) -> ManagerSource {
+    ManagerSource::new(mgr, owner).with_changes(workspace_sink(cell))
+}
+
+/// The Workspace's box source: the demo (`fake_demo`, test builds) wins,
+/// else the real manager when there is one (locked mode `owner = None`,
+/// personal the daemon's uid), else `fallback`.
+pub fn pick_workspace_boxes(
+    fallback: Arc<dyn BoxSource>,
+    manager: Option<&Arc<Manager>>,
+    owner: Option<u32>,
+    cell: CtxCell,
+    fake_demo: Option<Arc<dyn BoxSource>>,
+) -> Arc<dyn BoxSource> {
+    if let Some(d) = fake_demo {
+        return d;
+    }
+    match manager {
+        Some(m) => Arc::new(workspace_source(Arc::clone(m), owner, cell)),
+        None => fallback,
     }
 }
 

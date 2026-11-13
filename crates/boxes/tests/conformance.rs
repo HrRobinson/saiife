@@ -195,3 +195,37 @@ fn overview_load_and_slots() {
         .load
         .is_none());
 }
+
+#[test]
+fn with_changes_receives_spawn_admissions() {
+    use std::sync::Mutex;
+    let w = world(1);
+    let got: Arc<Mutex<Vec<(saiife_boxes::BoxId, BoxState)>>> = Arc::default();
+    let sink: saiife_boxes::source::ChangeSink = {
+        let got = Arc::clone(&got);
+        Arc::new(move |cs| {
+            let mut g = got.lock().unwrap();
+            g.extend(cs.iter().map(|c| (c.id.clone(), c.to)));
+        })
+    };
+    let src = ManagerSource::new(w.mgr.clone(), Some(1000)).with_changes(sink);
+    let req = |t: &str| SpawnReq {
+        template: "claude-code".into(),
+        repo: "shop".into(),
+        task: t.into(),
+        start: Start::Queue,
+    };
+    // The new box's own admission is not the sink's.
+    let a = src.spawn(&req("a")).unwrap();
+    assert!(got.lock().unwrap().is_empty());
+    let b = src.spawn(&req("b")).unwrap();
+    assert!(got.lock().unwrap().is_empty());
+    // A slot frees; the next spawn's pass admits the head, B.
+    w.mgr.stop(&a, false).unwrap();
+    let c = src.spawn(&req("c")).unwrap();
+    assert_eq!(
+        *got.lock().unwrap(),
+        vec![(b.clone(), BoxState::Starting)],
+        "only the earlier head, never the new box {c:?}"
+    );
+}

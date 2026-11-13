@@ -15,12 +15,17 @@ use saiife_wire::source::{
 };
 
 use crate::capacity;
-use crate::manager::{Manager, SpawnArgs};
+use crate::manager::{Change, Manager, SpawnArgs};
 use crate::store::BoxRecord;
+
+/// Where a [`ManagerSource`] hands the state changes an op made to boxes
+/// other than the one it was asked about (the frame layer audits them).
+pub type ChangeSink = Arc<dyn Fn(&[Change]) + Send + Sync>;
 
 pub struct ManagerSource {
     mgr: Arc<Manager>,
     owner: Option<u32>,
+    sink: Option<ChangeSink>,
 }
 
 /// The wire view of a record. `queue_pos` is the caller's choice (see
@@ -52,7 +57,19 @@ fn is_over(s: BoxState) -> bool {
 
 impl ManagerSource {
     pub fn new(mgr: Arc<Manager>, owner: Option<u32>) -> ManagerSource {
-        ManagerSource { mgr, owner }
+        ManagerSource {
+            mgr,
+            owner,
+            sink: None,
+        }
+    }
+
+    /// Hand `sink` every change `spawn` makes to a box other than the new
+    /// one (queue heads its admission pass moved); the caller's own record
+    /// covers the new box.
+    pub fn with_changes(mut self, sink: ChangeSink) -> ManagerSource {
+        self.sink = Some(sink);
+        self
     }
 
     fn sees(&self, r: &BoxRecord) -> bool {
@@ -243,13 +260,19 @@ impl BoxSource for ManagerSource {
             repo_image: None,
             base_manifest: None,
         };
-        let rec = match self.mgr.spawn(&args) {
+        let (rec, changes) = match self.mgr.spawn_changes(&args) {
             Err(BoxError::Busy) if req.start == Start::Now => {
                 args.start = Start::Queue;
-                self.mgr.spawn(&args)?
+                self.mgr.spawn_changes(&args)?
             }
             other => other?,
         };
+        if let Some(sink) = &self.sink {
+            let others: Vec<Change> = changes.into_iter().filter(|c| c.id != rec.id).collect();
+            if !others.is_empty() {
+                sink(&others);
+            }
+        }
         Ok(rec.id)
     }
 }

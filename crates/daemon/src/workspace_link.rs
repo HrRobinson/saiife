@@ -674,7 +674,28 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
                 task,
                 start,
             };
-            let id = blocking(ctx, move |b| b.spawn(&req)).await?;
+            let id = match ctx.box_manager.clone() {
+                // The frame knows the device owner: a source scoped to them
+                // spawns (the shared one cannot in locked mode) and audits.
+                Some(m) => {
+                    let Some(owner) = uid_of(ctx, &v.owner_user).await else {
+                        return Err(Fail::Policy(Refused::new(
+                            ErrorCode::Forbidden,
+                            "unknown_owner",
+                            "the device owner is not a user of this machine",
+                        )));
+                    };
+                    let cell: crate::box_ops::CtxCell = Arc::default();
+                    let _ = cell.set(Arc::downgrade(ctx));
+                    let src = crate::box_ops::workspace_source(m, Some(owner), cell);
+                    match tokio::task::spawn_blocking(move || src.spawn(&req)).await {
+                        Ok(Ok(id)) => id,
+                        Ok(Err(e)) => return Err(source_error(&e)),
+                        Err(e) => return Err(internal(e)),
+                    }
+                }
+                None => blocking(ctx, move |b| b.spawn(&req)).await?,
+            };
             Ok(json!({ "id": id }))
         }
         a::LOCKDOWN_ON => {
