@@ -145,6 +145,8 @@ async fn build_as(
         socket_dir: run.clone(),
         workspace: Arc::new(ws),
         boxes: boxes.clone() as Arc<dyn BoxSource>,
+        approvals: saiife_daemon::approvals::Store::open(&saiife_daemon::approvals::dir_in(&state))
+            .map_err(|e| e.to_string()),
         ..CtxInit::minimal(handle, cfg, Arc::new(Dir(Arc::clone(&users))), &state)
     }));
     let listener = UnixListener::bind(run.join(LINK_SOCKET_NAME)).unwrap();
@@ -1311,4 +1313,443 @@ async fn a_locked_workspace_refuses_hello_sign_and_pair() {
         assert_eq!(a["error"], "unavailable", "{op}: {a}");
         assert_eq!(a["rule"], "workspace_locked", "{op}: {a}");
     }
+}
+
+// ---- workspace.touch.begin (plan 31, Task 4) ----
+
+const ORIGIN: &str = "http://localhost:47810";
+
+/// Pairs a device with a soft passkey made for `localhost`, as the browser
+/// does: a create-side authData, a clientDataJSON for this pairing's
+/// challenge, and the device key's signature over both. Returns the
+/// credential id.
+async fn pair_with_passkey(w: &World, link: &mut Link) -> (TestDevice, Vec<u8>) {
+    use saiife_touch::{EnrolRequest, Touch};
+    let b = control(w, OP_WORKSPACE_PAIR_BEGIN, json!({"label": "laptop"})).await;
+    assert_eq!(b["ok"], true, "{b}");
+    let (pair_id, secret, _, _) = pair::parse_fragment(b["fragment"].as_str().unwrap()).unwrap();
+    let d = TestDevice::generate();
+    let pubkey = d.public_raw();
+    let auth = saiife_touch::soft::SoftAuthenticator::new_es256();
+    let ad = auth
+        .enrol(&EnrolRequest {
+            rp_id: "localhost".into(),
+            rp_name: "saiife".into(),
+            user_id: vec![1],
+            user_name: "phone".into(),
+            challenge: [0; 32],
+            exclude: vec![],
+        })
+        .unwrap();
+    let challenge = b64::enc(&pair::passkey_challenge(&pair_id, &pubkey));
+    let cdj = format!(
+        "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}"
+    );
+    let mut att = pair::PasskeyAttestation {
+        credential_id: b64::enc(&auth.credential_id()),
+        authenticator_data: b64::enc(&ad),
+        client_data_json: b64::enc(cdj.as_bytes()),
+        device_sig: String::new(),
+    };
+    let msg = pair::passkey_sig_msg(&pair_id, &att).unwrap();
+    att.device_sig = b64::enc(&d.sign_domain(pair::PASSKEY_DOMAIN, &msg));
+    let f = link
+        .call(
+            OP_WORKSPACE_PAIR_FINISH,
+            json!({
+                "pair_id": pair_id,
+                "device_pub": b64::enc(&pubkey),
+                "label": "phone",
+                "proof": b64::enc(&pair::proof(&secret, &pair_id, &pubkey)),
+                "passkey": att,
+            }),
+        )
+        .await;
+    assert_eq!(f["ok"], true, "{f}");
+    let c = control(
+        w,
+        OP_WORKSPACE_PAIR_CONFIRM,
+        json!({"pair_id": pair_id, "accept": true}),
+    )
+    .await;
+    assert_eq!(c["ok"], true, "{c}");
+    assert_eq!(c["passkey"], b64::enc(&auth.credential_id()), "{c}");
+    (d, auth.credential_id())
+}
+
+async fn paired_with_passkey() -> (World, Link, TestDevice, Vec<u8>) {
+    let w = world().await;
+    let mut link = Link::open(&w).await;
+    let (d, cid) = pair_with_passkey(&w, &mut link).await;
+    (w, link, d, cid)
+}
+
+fn begin_args(action: &str, args: Value) -> Value {
+    json!({"action": action, "args": args})
+}
+
+fn touch_request(a: &Value) -> saiife_touch::TouchRequest {
+    assert_eq!(a["ok"], true, "{a}");
+    serde_json::from_value(a["result"].clone()).unwrap()
+}
+
+/// The challenge entry the daemon issued for web request `rid`.
+fn issued(w: &World, d: &TestDevice, rid: u64) -> saiife_daemon::touch::Issued {
+    w.ctx
+        .touch
+        .take(
+            &saiife_daemon::touch::IssueKey::Web {
+                device: d.device_id(),
+                request_id: rid,
+            },
+            me(),
+        )
+        .unwrap()
+}
+
+fn fields(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn begin_for_steer_answers_a_touch_request() {
+    let (w, mut link, d, cid) = paired_with_passkey().await;
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.steer", json!({"id": "b-run"})),
+    )
+    .await;
+    let tr = touch_request(&a);
+    assert_eq!(tr.rp_id, "localhost");
+    assert_eq!(tr.allow, vec![cid]);
+    assert!(tr.uv);
+    assert_eq!(tr.short_code, saiife_touch::short_code(&tr.challenge));
+    assert_eq!(tr.summary, "box.steer box b-run");
+    assert_eq!(a["result"]["request_id"], "1");
+    assert_eq!(a["result"]["class"], "steer");
+    assert!(a["result"]["expires_at"].as_u64().unwrap() > now_secs());
+    // No box action ran.
+    assert!(w.boxes.calls().is_empty());
+}
+
+#[tokio::test]
+async fn begin_binds_daemon_fields() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    for args in [
+        json!({"id": "b-run", "fields": {"action": "box.stop"}}),
+        json!({"id": "b-run", "msg": "hello"}),
+        json!({}),
+    ] {
+        let a = send(
+            &w,
+            &mut link,
+            &d,
+            "workspace.touch.begin",
+            begin_args("box.steer", args.clone()),
+        )
+        .await;
+        assert_eq!(a["error"], "bad_request", "{args}: {a}");
+        assert_eq!(a["rule"], "invalid", "{args}: {a}");
+    }
+    // A box that does not exist is refused, not bound.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.steer", json!({"id": "b-nope"})),
+    )
+    .await;
+    assert_eq!(a["rule"], "not_found", "{a}");
+    // The envelope takes only action and args.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        json!({"action": "box.steer", "args": {"id": "b-run"}, "fields": {}}),
+    )
+    .await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.revise", json!({"id": "b-run"})),
+    )
+    .await;
+    let tr = touch_request(&a);
+    let rid: u64 = a["result"]["request_id"].as_str().unwrap().parse().unwrap();
+    let i = issued(&w, &d, rid);
+    assert_eq!(
+        i.fields,
+        fields(&[("action", "box.revise"), ("box", "b-run")])
+    );
+    assert_eq!(i.class, saiife_touch::TouchClass::Steer);
+    let rec = saiife_touch::ActionRecord {
+        instance_id: w.ctx.touch.instance_id(),
+        request_id: rid,
+        class: i.class,
+        summary: i.summary.clone(),
+        fields: i.fields.clone(),
+        nonce: i.nonce,
+        expires_at: i.expires_at,
+    };
+    assert_eq!(tr.challenge, saiife_touch::challenge(&rec));
+}
+
+#[tokio::test]
+async fn begin_for_spawn_binds_the_task_hash() {
+    use sha2::{Digest, Sha256};
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args(
+            "box.spawn",
+            json!({"template": "claude-gh", "repo": "erp", "task": "push it", "start": "now"}),
+        ),
+    )
+    .await;
+    let tr = touch_request(&a);
+    assert_eq!(tr.summary, "spawn claude-gh on erp");
+    let i = issued(&w, &d, 1);
+    let digest: String = Sha256::digest(b"push it")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        i.fields,
+        fields(&[
+            ("action", "box.spawn"),
+            ("template", "claude-gh"),
+            ("repo", "erp"),
+            ("task_sha256", &digest),
+            ("start", "now"),
+        ])
+    );
+    assert!(w.boxes.calls().is_empty());
+}
+
+#[tokio::test]
+async fn begin_for_land_is_refused() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.land", json!({"id": "b-done"})),
+    )
+    .await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(a["rule"], "invalid", "{a}");
+    assert!(a["message"].as_str().unwrap().contains("inbox"), "{a}");
+}
+
+fn new_connector(touch_class: Option<&str>) -> saiife_daemon::approvals::NewRequest {
+    saiife_daemon::approvals::NewRequest {
+        uid: me(),
+        sid: None,
+        user: ME.into(),
+        session: None,
+        agent: "agent".into(),
+        project: "erp".into(),
+        kind: saiife_daemon::approvals::ApprovalType::Connector,
+        service: Some("stripe".into()),
+        operation: Some("refund".into()),
+        capability: None,
+        params: Default::default(),
+        input: None,
+        grant_key: None,
+        scope: None,
+        ask_rule: None,
+        touch_class: touch_class.map(String::from),
+        send: Default::default(),
+    }
+}
+
+fn make_request(w: &World, touch_class: Option<&str>) -> saiife_daemon::approvals::Request {
+    w.ctx
+        .approvals
+        .as_ref()
+        .unwrap()
+        .create(
+            new_connector(touch_class),
+            |_| Ok(None),
+            Duration::from_secs(600),
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn begin_for_approval_binds_the_stored_request() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    let r = make_request(&w, Some("deploy"));
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": r.id})),
+    )
+    .await;
+    let tr = touch_request(&a);
+    assert_eq!(a["result"]["class"], "deploy", "{a}");
+    let i = issued(&w, &d, 1);
+    let rec = saiife_daemon::approvals::action_record(
+        &r,
+        saiife_touch::TouchClass::Deploy,
+        w.ctx.touch.instance_id(),
+        i.nonce,
+        i.expires_at,
+    );
+    assert_eq!(tr.challenge, saiife_touch::challenge(&rec));
+    assert_eq!(tr.summary, rec.summary);
+    // A request with no touch class, an unknown one and extra args.
+    let plain = make_request(&w, None);
+    for args in [
+        json!({"id": plain.id}),
+        json!({"id": 999}),
+        json!({"id": r.id, "class": "land"}),
+        json!({"id": "1"}),
+    ] {
+        let a = send(
+            &w,
+            &mut link,
+            &d,
+            "workspace.touch.begin",
+            begin_args("approval.approve", args.clone()),
+        )
+        .await;
+        assert_eq!(a["ok"], false, "{args}: {a}");
+        assert!(
+            a["rule"] == "invalid" || a["rule"] == "not_found",
+            "{args}: {a}"
+        );
+    }
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": plain.id})),
+    )
+    .await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+}
+
+#[tokio::test]
+async fn begin_for_signed_action_is_refused() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    for action in [
+        "box.stop",
+        "box.pause",
+        "box.push",
+        "lockdown.on",
+        "workspace.touch.begin",
+        "nonsense",
+    ] {
+        let a = send(
+            &w,
+            &mut link,
+            &d,
+            "workspace.touch.begin",
+            begin_args(action, json!({"id": "b-run"})),
+        )
+        .await;
+        assert_eq!(a["error"], "bad_request", "{action}: {a}");
+        assert_eq!(a["rule"], "invalid", "{action}: {a}");
+    }
+}
+
+#[tokio::test]
+async fn begin_for_plain_spawn_is_refused() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args(
+            "box.spawn",
+            json!({"template": "claude", "repo": "web", "task": "x", "start": "now"}),
+        ),
+    )
+    .await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(a["rule"], "invalid", "{a}");
+    assert!(w.boxes.calls().is_empty());
+}
+
+#[tokio::test]
+async fn begin_without_passkey_is_unavailable() {
+    let (w, mut link, d) = paired().await;
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.steer", json!({"id": "b-run"})),
+    )
+    .await;
+    assert_eq!(a["error"], "unavailable", "{a}");
+    assert_eq!(a["rule"], "touch_unavailable", "{a}");
+    assert!(a["message"].as_str().unwrap().contains("pair it again"));
+}
+
+#[tokio::test]
+async fn ninth_open_touch_is_busy() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    for n in 0..8 {
+        let a = send(
+            &w,
+            &mut link,
+            &d,
+            "workspace.touch.begin",
+            begin_args("box.steer", json!({"id": "b-run"})),
+        )
+        .await;
+        assert_eq!(a["ok"], true, "begin {n}: {a}");
+    }
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.steer", json!({"id": "b-run"})),
+    )
+    .await;
+    assert_eq!(a["error"], "busy", "{a}");
+    assert_eq!(a["rule"], "busy", "{a}");
+}
+
+#[tokio::test]
+async fn begin_is_recorded() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("box.resume", json!({"id": "b-run"})),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "workspace.touch.begin", "{last}");
+    assert_eq!(last["decision"], "allow", "{last}");
+    assert_eq!(field(last, "touch_begin")["request_id"], "1", "{last}");
+    assert_eq!(field(last, "touch_begin")["class"], "steer", "{last}");
 }

@@ -370,6 +370,9 @@ pub struct Ctx {
     pub grants: crate::grants::Grants,
     /// The touch devices, the instance id and the live touch challenges.
     pub touch: Arc<crate::touch::TouchState>,
+    /// The Workspace's web touches: request ids, spent challenges and steer
+    /// windows (plan 31).
+    pub web_touch: Arc<crate::workspace_touch::WebTouches>,
     /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
     pub signals: crate::signals::Signals,
     /// Held for the whole of a policy reload (SIGHUP and `policy.reload`),
@@ -761,6 +764,7 @@ impl Ctx {
             reauth_cooldowns: Mutex::default(),
             grants: i.grants,
             touch: i.touch,
+            web_touch: Arc::new(crate::workspace_touch::WebTouches::new()),
             signals: Default::default(),
             reloads: tokio::sync::Mutex::new(()),
             mcp: i.mcp,

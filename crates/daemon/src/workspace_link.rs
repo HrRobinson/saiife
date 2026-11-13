@@ -62,7 +62,7 @@ pub struct Refused {
 }
 
 impl Refused {
-    fn new(code: ErrorCode, rule: &'static str, message: impl Into<String>) -> Refused {
+    pub(crate) fn new(code: ErrorCode, rule: &'static str, message: impl Into<String>) -> Refused {
         Refused {
             code,
             rule,
@@ -90,7 +90,6 @@ pub const LATER: &[&str] = &[
     "approval.list",
     "approval.approve",
     "approval.reject",
-    "workspace.touch.begin",
 ];
 
 /// The Signed actions [`execute`] carries out (every other Signed entry of
@@ -109,6 +108,7 @@ pub const HANDLED: &[&str] = &[
     a::BOX_REORDER,
     a::BOX_SPAWN,
     a::LOCKDOWN_ON,
+    a::WORKSPACE_TOUCH_BEGIN,
 ];
 
 /// The handled actions that change something: always recorded.
@@ -119,6 +119,7 @@ const CHANGES: &[&str] = &[
     a::BOX_REORDER,
     a::BOX_SPAWN,
     a::LOCKDOWN_ON,
+    a::WORKSPACE_TOUCH_BEGIN,
 ];
 
 /// The most box ids a `box.reorder` takes.
@@ -166,7 +167,7 @@ fn bad(message: impl Into<String>) -> Refused {
 }
 
 /// The uid of the account `user`, by the daemon's own lookup.
-async fn uid_of(ctx: &Arc<Ctx>, user: &str) -> Option<u32> {
+pub(crate) async fn uid_of(ctx: &Arc<Ctx>, user: &str) -> Option<u32> {
     let dir = Arc::clone(&ctx.directory);
     let user = user.to_string();
     tokio::task::spawn_blocking(move || dir.user(&user).map(|u| u.uid))
@@ -489,7 +490,7 @@ pub async fn execute(ctx: &Arc<Ctx>, v: &Verified, via: Via) -> Result<Value, Re
 
 /// Why an action failed: a refusal by the daemon (always recorded), or the
 /// box source's error (recorded for a change only).
-enum Fail {
+pub(crate) enum Fail {
     Policy(Refused),
     Source(Refused),
 }
@@ -516,6 +517,12 @@ async fn run(
                 rec.extra.insert("box".into(), b.into());
             }
         }
+        if let (Ok(res), a::WORKSPACE_TOUCH_BEGIN) = (&out, action) {
+            rec.extra.insert(
+                "touch_begin".into(),
+                json!({ "request_id": res["request_id"], "class": res["class"] }),
+            );
+        }
         if let Some(r) = refused {
             deny(&mut rec, r);
         }
@@ -534,7 +541,7 @@ async fn run(
     })
 }
 
-fn invalid(message: impl Into<String>) -> Fail {
+pub(crate) fn invalid(message: impl Into<String>) -> Fail {
     Fail::Policy(Refused::new(ErrorCode::BadRequest, "invalid", message))
 }
 
@@ -562,24 +569,28 @@ fn touch_required(action: &str) -> Fail {
 }
 
 /// The frame's args take only `keys`.
-fn only(args: &Map<String, Value>, keys: &[&str]) -> Result<(), Fail> {
+pub(crate) fn only(args: &Map<String, Value>, keys: &[&str]) -> Result<(), Fail> {
     match args.keys().find(|k| !keys.contains(&k.as_str())) {
         Some(k) => Err(invalid(format!("unexpected argument {k:?}"))),
         None => Ok(()),
     }
 }
 
-fn str_arg<'a>(args: &'a Map<String, Value>, k: &str) -> Result<&'a str, Fail> {
+pub(crate) fn str_arg<'a>(args: &'a Map<String, Value>, k: &str) -> Result<&'a str, Fail> {
     args.get(k)
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(format!("{k} is a string")))
 }
 
-fn id_arg(args: &Map<String, Value>) -> Result<BoxId, Fail> {
+pub(crate) fn id_arg(args: &Map<String, Value>) -> Result<BoxId, Fail> {
     BoxId::parse(str_arg(args, "id")?).map_err(|e| invalid(e.to_string()))
 }
 
-fn text_arg<'a>(args: &'a Map<String, Value>, k: &str, max: usize) -> Result<&'a str, Fail> {
+pub(crate) fn text_arg<'a>(
+    args: &'a Map<String, Value>,
+    k: &str,
+    max: usize,
+) -> Result<&'a str, Fail> {
     let s = str_arg(args, k)?;
     check_text(s, max).map_err(|e| invalid(format!("{k}: {e}")))?;
     Ok(s)
@@ -590,7 +601,7 @@ fn to_value<T: serde::Serialize>(t: &T) -> Result<Value, Fail> {
 }
 
 /// A box source call, off the runtime thread.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     boxes: &Arc<dyn BoxSource>,
     f: impl FnOnce(&dyn BoxSource) -> Result<T, BoxError> + Send + 'static,
 ) -> Result<T, Fail> {
@@ -607,7 +618,7 @@ async fn blocking<T: Send + 'static>(
 /// sees and changes their own boxes, another user's box is `not_found`. An
 /// admin or root owner also SEES every box (reads only); changing another
 /// user's box is `forbidden` (plan 34 R18). Audited by `run` like any refusal.
-async fn source_for(
+pub(crate) async fn source_for(
     ctx: &Arc<Ctx>,
     v: &Verified,
     action: &str,
@@ -803,6 +814,9 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
             let id = blocking(&src, move |b| b.spawn(&req)).await?;
             Ok(json!({ "id": id }))
         }
+        a::WORKSPACE_TOUCH_BEGIN => crate::workspace_touch::begin(ctx, v)
+            .await
+            .map_err(Fail::Policy),
         a::LOCKDOWN_ON => {
             only(args, &["reason"])?;
             let reason = match args.get("reason") {

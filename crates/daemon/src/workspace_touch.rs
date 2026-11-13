@@ -6,11 +6,364 @@
 //! derived from the configured origin, never from the browser.
 
 use crate::ops::Ctx;
-use saiife_touch::Credential;
-use saiife_touch::{Assertion, TouchError};
+use crate::workspace_link::{
+    blocking, id_arg, invalid, only, str_arg, text_arg, uid_of, Fail, Refused,
+};
+use saiife_ipc::msg::ErrorCode;
+use saiife_touch::{
+    challenge, short_code, ActionRecord, Assertion, Credential, TouchClass, TouchError,
+    TouchRequest,
+};
 use saiife_wire::frame::TouchProof;
+use saiife_wire::level::{actions as a, spawn_level, Level};
 use saiife_wire::pair::{passkey_challenge, passkey_sig_msg, PasskeyAttestation, PASSKEY_DOMAIN};
 use saiife_wire::sig::verify_p256_domain;
+use saiife_wire::source::{BoxId, BoxSource, MAX_TASK_BYTES};
+use saiife_wire::verify::Verified;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// How long a touch on a box keeps that box's steer actions open, in seconds.
+pub const STEER_WINDOW_SECS: u64 = 600;
+/// The longest template or repo name a bound spawn takes.
+const MAX_NAME_BYTES: usize = 256;
+/// The longest summary the browser is shown.
+const MAX_SUMMARY: usize = 200;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The Workspace's web touches: the next request id, challenges already
+/// spent (so one assertion is never used twice), and the steer windows a
+/// touch opened, per (device, box), each with its expiry.
+pub struct WebTouches {
+    next: AtomicU64,
+    spent: Mutex<BTreeMap<[u8; 32], u64>>,
+    windows: Mutex<BTreeMap<(String, BoxId), u64>>,
+}
+
+impl Default for WebTouches {
+    fn default() -> Self {
+        WebTouches::new()
+    }
+}
+
+impl WebTouches {
+    pub fn new() -> WebTouches {
+        WebTouches {
+            next: AtomicU64::new(1),
+            spent: Mutex::new(BTreeMap::new()),
+            windows: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The next request id (from 1, never repeated within a run).
+    pub fn next_id(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Marks `challenge` spent until `expires_at`. False when it already was
+    /// (and not yet expired). Expired entries are dropped first.
+    pub fn spend(&self, challenge: &[u8; 32], expires_at: u64, now: u64) -> bool {
+        let mut m = lock(&self.spent);
+        m.retain(|_, e| *e >= now);
+        if m.contains_key(challenge) {
+            return false;
+        }
+        m.insert(*challenge, expires_at);
+        true
+    }
+
+    /// Opens (or renews) the steer window of `device` on box `id`.
+    pub fn open_window(&self, device: &str, id: &BoxId, now: u64) {
+        let mut m = lock(&self.windows);
+        m.retain(|_, e| *e > now);
+        m.insert(
+            (device.to_string(), id.clone()),
+            now.saturating_add(STEER_WINDOW_SECS),
+        );
+    }
+
+    /// Whether `device` has an unexpired window on box `id`.
+    pub fn window_open(&self, device: &str, id: &BoxId, now: u64) -> bool {
+        lock(&self.windows)
+            .get(&(device.to_string(), id.clone()))
+            .is_some_and(|e| *e > now)
+    }
+
+    /// Closes every window of `device` (revoke).
+    pub fn close_device(&self, device: &str) {
+        lock(&self.windows).retain(|(d, _), _| d != device);
+    }
+}
+
+fn refused(f: Fail) -> Refused {
+    match f {
+        Fail::Policy(r) | Fail::Source(r) => r,
+    }
+}
+
+fn not_found(what: &str) -> Fail {
+    Fail::Policy(Refused::new(
+        ErrorCode::BadRequest,
+        "not_found",
+        format!("no such {what}"),
+    ))
+}
+
+/// The class, summary and fields the daemon binds for a Touch action, from
+/// its own view: nothing is taken from `args` beyond ids and the spawn's
+/// own parameters, and any other key is `invalid`. `src` is the frame's
+/// owner-scoped box source, `owner_uid` the device owner.
+pub async fn bind(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    src: &Arc<dyn BoxSource>,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<(TouchClass, String, BTreeMap<String, String>), Refused> {
+    bind_inner(ctx, owner_uid, src, action, args)
+        .await
+        .map_err(refused)
+}
+
+async fn bind_inner(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    src: &Arc<dyn BoxSource>,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<(TouchClass, String, BTreeMap<String, String>), Fail> {
+    let mut f: BTreeMap<String, String> = BTreeMap::new();
+    f.insert("action".into(), action.into());
+    match action {
+        a::BOX_STEER | a::BOX_REVISE | a::BOX_RESUME => {
+            only(args, &["id"])?;
+            let id = id_arg(args)?;
+            let list = blocking(src, |b| Ok(b.list())).await?;
+            if !list.iter().any(|b| b.id == id) {
+                return Err(not_found("box"));
+            }
+            f.insert("box".into(), id.as_str().into());
+            Ok((
+                TouchClass::Steer,
+                format!("{action} box {}", id.as_str()),
+                f,
+            ))
+        }
+        a::BOX_SPAWN => {
+            only(args, &["template", "repo", "task", "start"])?;
+            let template = text_arg(args, "template", MAX_NAME_BYTES)?;
+            let repo = text_arg(args, "repo", MAX_NAME_BYTES)?;
+            let task = text_arg(args, "task", MAX_TASK_BYTES)?;
+            let start = match args.get("start").and_then(Value::as_str) {
+                Some(s @ ("now" | "queue")) => s,
+                _ => return Err(invalid("start is \"now\" or \"queue\"")),
+            };
+            // The summary is plain text the browser shows: no control
+            // characters at all (a newline would pass `check_text`).
+            if template.chars().chain(repo.chars()).any(char::is_control) {
+                return Err(invalid("template and repo are single-line text"));
+            }
+            let templates = blocking(src, |b| Ok(b.templates())).await?;
+            let Some(t) = templates.iter().find(|t| t.name == template) else {
+                return Err(invalid(format!("no template {template:?}")));
+            };
+            if spawn_level(t) != Level::Touch {
+                return Err(invalid(format!(
+                    "{template} needs no touch: spawn it with a signed frame"
+                )));
+            }
+            let class = TouchClass::stronger(
+                t.has_secrets.then_some(TouchClass::SecretSensitive),
+                t.has_egress.then_some(TouchClass::EgressExternal),
+            )
+            .unwrap_or(TouchClass::SecretSensitive);
+            let summary = format!("spawn {template} on {repo}");
+            if summary.len() > MAX_SUMMARY {
+                return Err(invalid("template and repo are too long to show"));
+            }
+            f.insert("template".into(), template.into());
+            f.insert("repo".into(), repo.into());
+            let digest: [u8; 32] = Sha256::digest(task.as_bytes()).into();
+            f.insert("task_sha256".into(), crate::grants::hex(&digest));
+            f.insert("start".into(), start.into());
+            Ok((class, summary, f))
+        }
+        a::APPROVAL_APPROVE => {
+            only(args, &["id"])?;
+            let rid = args
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("id is a request number"))?;
+            let r = pending_request(ctx, owner_uid, rid).await?;
+            let class = crate::approval_ops::effective_class(ctx, &r)
+                .ok_or_else(|| invalid(format!("request #{rid} needs no touch")))?;
+            let rec = crate::approvals::action_record(&r, class, [0; 16], [0; 32], 0);
+            Ok((class, rec.summary, rec.fields))
+        }
+        a::BOX_LAND => Err(invalid(
+            "use the request id from the inbox: box.land is touched through its own request",
+        )),
+        other => Err(invalid(format!("{other} cannot be begun as a touch"))),
+    }
+}
+
+/// Pending approval request `rid`, when the device owner may decide it.
+async fn pending_request(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    rid: u64,
+) -> Result<crate::approvals::Request, Fail> {
+    use crate::approval_ops as ops;
+    let peer = saiife_ipc::peer::PeerCred {
+        uid: owner_uid,
+        gid: owner_uid,
+        pid: 0,
+        sid: None,
+        group_sids: Vec::new(),
+    };
+    let r = match ops::visible(ctx, &peer, rid).await {
+        Err(()) => {
+            return Err(Fail::Policy(Refused::new(
+                ErrorCode::Unavailable,
+                "unavailable",
+                "approvals are not available on this machine",
+            )))
+        }
+        Ok(None) => return Err(not_found("approval request")),
+        Ok(Some(r)) => r,
+    };
+    if r.state != crate::approvals::State::Pending {
+        return Err(invalid(format!("request #{rid} is not pending")));
+    }
+    if !ops::is_approver(ctx, &peer).await {
+        return Err(Fail::Policy(Refused::new(
+            ErrorCode::Forbidden,
+            "not_approver",
+            format!("only an approver can touch for request #{rid}"),
+        )));
+    }
+    Ok(r)
+}
+
+/// `workspace.touch.begin {action, args}`: issues a challenge bound to the
+/// action as the daemon sees it, for the device's own passkey. The answer is
+/// a `TouchRequest` plus `request_id`, `expires_at` and `class`.
+pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused> {
+    let args = &v.frame.args;
+    only(args, &["action", "args"]).map_err(refused)?;
+    let action = str_arg(args, "action").map_err(refused)?.to_string();
+    let inner = match args.get("args") {
+        Some(Value::Object(m)) => m.clone(),
+        _ => return Err(refused(invalid("args is an object"))),
+    };
+    let Some(owner_uid) = uid_of(ctx, &v.owner_user).await else {
+        return Err(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_owner",
+            "the device owner is not a user of this machine",
+        ));
+    };
+    let Some(device) = ctx.workspace.device(&v.device_id) else {
+        return Err(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_device",
+            "this device is no longer paired",
+        ));
+    };
+    // The box source scoped to the device owner, as the action itself would
+    // use it (a bound box must be one the owner may touch).
+    let src = crate::workspace_link::source_for(ctx, v, &action)
+        .await
+        .map_err(refused)?;
+    let (class, summary, fields) = bind(ctx, owner_uid, &src, &action, &inner).await?;
+    // The device's passkeys that the touch store still holds, for one RP id.
+    let held = device.touch_credentials;
+    let c = Arc::clone(ctx);
+    let creds: Vec<Credential> =
+        tokio::task::spawn_blocking(move || c.touch.credentials_of(owner_uid))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.kind == "webauthn" && held.contains(&saiife_wire::b64::enc(&c.id)))
+            .collect();
+    let Some(rp_id) = creds.first().map(|c| c.rp_id.clone()) else {
+        return Err(Refused::new(
+            ErrorCode::Unavailable,
+            "touch_unavailable",
+            "this browser has no passkey: pair it again to add one",
+        ));
+    };
+    let allow: Vec<Vec<u8>> = creds
+        .into_iter()
+        .filter(|c| c.rp_id == rp_id)
+        .map(|c| c.id)
+        .collect();
+    let request_id = ctx.web_touch.next_id();
+    // An approval's record carries the approval's own id (what the machine
+    // prompt would show); every other touch carries the web request id.
+    let record_id = if action == a::APPROVAL_APPROVE {
+        inner.get("id").and_then(Value::as_u64).unwrap_or(0)
+    } else {
+        request_id
+    };
+    let key = crate::touch::IssueKey::Web {
+        device: v.device_id.clone(),
+        request_id,
+    };
+    let c = Arc::clone(ctx);
+    let issued = tokio::task::spawn_blocking(move || {
+        let t = &c.touch;
+        let i = t.issue(
+            key,
+            owner_uid,
+            class,
+            summary.clone(),
+            fields.clone(),
+            crate::touch::unix_now(),
+        )?;
+        Ok::<_, String>(ActionRecord {
+            instance_id: t.instance_id(),
+            request_id: record_id,
+            class,
+            summary,
+            fields,
+            nonce: i.nonce,
+            expires_at: i.expires_at,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let rec = issued.map_err(|e| Refused::new(ErrorCode::Busy, "busy", e))?;
+    let ch = challenge(&rec);
+    let tr = TouchRequest {
+        rp_id,
+        challenge: ch,
+        allow,
+        uv: true,
+        summary: rec.summary.clone(),
+        short_code: short_code(&ch),
+    };
+    let mut m = match serde_json::to_value(&tr) {
+        Ok(Value::Object(m)) => m,
+        _ => {
+            return Err(Refused::new(
+                ErrorCode::Internal,
+                "internal",
+                "cannot encode the touch request",
+            ))
+        }
+    };
+    m.insert("request_id".into(), request_id.to_string().into());
+    m.insert("expires_at".into(), rec.expires_at.into());
+    m.insert("class".into(), class.name().into());
+    Ok(json!(m))
+}
 
 /// `[workspace] origins` of the loaded policy, else the default.
 pub fn origins(ctx: &Ctx) -> Vec<String> {
@@ -158,6 +511,33 @@ mod tests {
             client_data_json: b64::enc(cdj),
             signature: b64::enc(b"sig"),
         }
+    }
+
+    #[test]
+    fn web_touches_ids_spend_and_windows() {
+        let w = WebTouches::new();
+        assert_eq!((w.next_id(), w.next_id()), (1, 2));
+        let c = [7u8; 32];
+        assert!(w.spend(&c, 100, 50));
+        assert!(!w.spend(&c, 100, 60));
+        assert!(w.spend(&[8u8; 32], 100, 60));
+        // An expired entry is pruned, so the challenge can be recorded again.
+        assert!(w.spend(&c, 300, 101));
+        let a = BoxId::parse("b-run").unwrap();
+        let b = BoxId::parse("b-done").unwrap();
+        assert!(!w.window_open("d1", &a, 1000));
+        w.open_window("d1", &a, 1000);
+        assert!(w.window_open("d1", &a, 1000));
+        assert!(w.window_open("d1", &a, 1000 + STEER_WINDOW_SECS - 1));
+        assert!(!w.window_open("d1", &a, 1000 + STEER_WINDOW_SECS));
+        assert!(!w.window_open("d1", &b, 1000));
+        assert!(!w.window_open("d2", &a, 1000));
+        w.open_window("d1", &a, 1000);
+        w.open_window("d1", &b, 1000);
+        w.open_window("d2", &a, 1000);
+        w.close_device("d1");
+        assert!(!w.window_open("d1", &a, 1001) && !w.window_open("d1", &b, 1001));
+        assert!(w.window_open("d2", &a, 1001));
     }
 
     fn list() -> Vec<String> {
