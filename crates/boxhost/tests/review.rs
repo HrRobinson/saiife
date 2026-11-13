@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use saiife_boxhost::guest::{SetupSource, VsockGuest};
 use saiife_boxhost::paths::BoxPaths;
 use saiife_boxhost::review::{
-    check_subset, protected, receive, receive_within, render, review, write_land_files, Flag,
-    Review,
+    check_subset, git_config, protected, receive, receive_within, render, review, write_land_files,
+    Flag, Review,
 };
 use saiife_boxhost::vmm::VmHooks;
 use saiife_boxproto::delta::{
@@ -698,6 +698,10 @@ fn flags_protected_and_hits() {
         ".codex/config.toml",
         ".gitlab/ci.yml",
         ".circleci/config.yml",
+        // R-T6e: git-lfs's config.
+        ".lfsconfig",
+        "a/.lfsconfig",
+        ".LFSCONFIG.",
     ] {
         assert!(protected(p), "{p}");
     }
@@ -749,9 +753,9 @@ fn flags_protected_and_hits() {
     assert_eq!(
         got,
         vec![
-            (".github/workflows/ci.yml", "protected path"),
+            (".github/workflows/ci.yml", "protected path (git config)"),
             ("CLAUDE.md", "protected path"),
-            ("sub/.gitattributes", "protected path"),
+            ("sub/.gitattributes", "protected path (git config)"),
             ("src/x.rs", "rule mypack: no writes to src"),
         ]
     );
@@ -1234,4 +1238,33 @@ fn existing_land_is_not_replaced() {
         .filter(|r| matches!(r, Request::Export { .. }))
         .count();
     assert_eq!(exports, 1);
+}
+
+#[test]
+fn git_config_paths() {
+    for p in [
+        ".gitattributes",
+        "a/b/.gitattributes",
+        ".gitmodules",
+        ".gitconfig",
+        ".lfsconfig",
+        "sub/.lfsconfig",
+        ".LfsConfig",
+        ".G\u{130}TATTRIBUTES",
+        ".gitattributes.",
+        ".github/workflows/ci.yml",
+        ".gitignore/x",
+    ] {
+        assert!(git_config(p), "{p}");
+        assert!(protected(p), "{p}");
+    }
+    for p in [
+        ".gitignore",
+        "a/.gitignore",
+        "CLAUDE.md",
+        "src/lfsconfig",
+        "x.git",
+    ] {
+        assert!(!git_config(p), "{p}");
+    }
 }

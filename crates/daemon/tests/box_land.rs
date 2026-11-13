@@ -1049,7 +1049,9 @@ fn inconsistent_subset_begin_is_refused() {
     work.insert("NEW.md".into(), C(b"new\n".to_vec()));
     let i = w.done(ALICE, &work);
     let set = |ps: &[&str]| Some(ps.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>());
-    let e = w.lands.begin(&i, ALICE, set(&["old.txt/x"]), w.now());
+    let e = w
+        .lands
+        .begin(&i, ALICE, set(&["old.txt/x"]), false, w.now());
     match e {
         Err(BoxError::Invalid(m)) => {
             assert!(m.contains("select the change of"), "{m}");
@@ -1057,7 +1059,10 @@ fn inconsistent_subset_begin_is_refused() {
         }
         other => panic!("{other:?}"),
     }
-    match w.lands.begin(&i, ALICE, set(&["nope\u{1b}[31m"]), w.now()) {
+    match w
+        .lands
+        .begin(&i, ALICE, set(&["nope\u{1b}[31m"]), false, w.now())
+    {
         Err(BoxError::Invalid(m)) => {
             assert!(m.contains("is not in the diff"), "{m}");
             assert!(!m.contains('\u{1b}'), "unescaped guest text: {m:?}");
@@ -1065,11 +1070,14 @@ fn inconsistent_subset_begin_is_refused() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(
-        w.lands.begin(&i, ALICE, set(&[]), w.now()),
+        w.lands.begin(&i, ALICE, set(&[]), false, w.now()),
         Err(BoxError::Invalid(_))
     ));
     // A consistent subset lands alone, with its own hash.
-    let (rid, rec, rev) = w.lands.begin(&i, ALICE, set(&["NEW.md"]), w.now()).unwrap();
+    let (rid, rec, rev) = w
+        .lands
+        .begin(&i, ALICE, set(&["NEW.md"]), false, w.now())
+        .unwrap();
     let full = w.lands.latest(&i).unwrap();
     assert_ne!(rev.summary.diff_sha256, full.summary.diff_sha256);
     assert_eq!(rec.fields["diff_sha256"], rev.summary.diff_sha256);
@@ -1787,7 +1795,7 @@ fn failed_partial_land_restores_the_whole_export() {
     let review_before = std::fs::read(paths.land_review(n)).unwrap();
     let delta_before = std::fs::read(paths.land_delta(n)).unwrap();
     let only = Some(BTreeSet::from(["NEW.md".to_string()]));
-    let (rid, rec, _) = w.lands.begin(&i, ALICE, only, w.now()).unwrap();
+    let (rid, rec, _) = w.lands.begin(&i, ALICE, only, false, w.now()).unwrap();
     let p = PendingAction {
         request_id: rid,
         class: TouchClass::Land,
@@ -1816,7 +1824,7 @@ fn failed_partial_land_restores_the_whole_export() {
     assert_eq!(std::fs::read(paths.land_delta(n)).unwrap(), delta_before);
     // A whole land of the same export then takes every change.
     std::fs::remove_dir(paths.land_approved(n)).unwrap();
-    let (rid, rec, _) = w.lands.begin(&i, ALICE, None, w.now()).unwrap();
+    let (rid, rec, _) = w.lands.begin(&i, ALICE, None, false, w.now()).unwrap();
     let p = PendingAction {
         request_id: rid,
         record: rec.clone(),
@@ -1911,4 +1919,85 @@ fn per_box_ops_take_box_not_id() {
     .unwrap();
     drop(c);
     server.abort();
+}
+
+/// `changed()` plus a box-written `.gitattributes` naming a filter.
+fn with_git_config(name: &str) -> Tree {
+    let mut t = changed();
+    t.insert(
+        name.into(),
+        C(b"* filter=lfs diff=lfs merge=lfs\n".to_vec()),
+    );
+    t
+}
+
+#[test]
+fn git_config_needs_the_cli_flag() {
+    let w = world(2);
+    let i = w.done(ALICE, &with_git_config(".gitattributes"));
+    let s = i.as_str();
+    let d = w.ok(ALICE, "box.diff", json!({"box": s}));
+    assert_eq!(d["review"]["git_config"], json!([".gitattributes"]), "{d}");
+    let a = w.call(ALICE, "box.land.begin", json!({"box": s}));
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let m = a["message"].as_str().unwrap();
+    assert!(m.contains("changes git config (.gitattributes)"), "{m}");
+    assert!(
+        m.contains(&format!("saiife box land {s} --allow-git-config")),
+        "{m}"
+    );
+    let a = w.call(
+        ALICE,
+        "box.land.begin",
+        json!({"box": s, "allow_git_config": "yes"}),
+    );
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let b = w.ok(
+        ALICE,
+        "box.land.begin",
+        json!({"box": s, "allow_git_config": true}),
+    );
+    let rid: u64 = b["request_id"].as_str().unwrap().parse().unwrap();
+    let (req, rec) = w.lands.request(rid).unwrap();
+    assert_eq!(rec.fields["git_config"], "allowed");
+    assert_eq!(req.git_config.as_deref(), Some("allowed"));
+    assert!(
+        rec.summary.contains("; git config: .gitattributes"),
+        "{}",
+        rec.summary
+    );
+    assert_eq!(b["touch"]["summary"], rec.summary.as_str());
+    let asr = w.assert_for(ALICE, &b);
+    let (a, fds) = w.op(
+        ALICE,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(fds.len(), 1);
+    // A box without git config needs no flag, and its record has none.
+    let j = w.done(ALICE, &changed());
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": j.as_str()}));
+    let rid: u64 = b["request_id"].as_str().unwrap().parse().unwrap();
+    let (req, rec) = w.lands.request(rid).unwrap();
+    assert!(!rec.fields.contains_key("git_config"));
+    assert_eq!(req.git_config, None);
+}
+
+#[test]
+fn pending_skips_git_config() {
+    let w = world(3);
+    let i = w.done(ALICE, &with_git_config(".lfsconfig"));
+    assert!(w.lands.pending().is_empty());
+    w.clock.fetch_add(1, Ordering::SeqCst);
+    let j = w.done(ALICE, &changed());
+    let p = w.lands.pending();
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].box_id.as_ref(), Some(&j));
+    let f = &w.lands.latest(&i).unwrap().flags;
+    assert!(
+        f.iter()
+            .any(|x| x.path == ".lfsconfig" && x.why == "protected path (git config)"),
+        "{f:?}"
+    );
 }

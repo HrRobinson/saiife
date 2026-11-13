@@ -53,6 +53,9 @@ struct State {
     credential: Vec<u8>,
     /// The box's repo display name (`box.list`).
     repo: String,
+    /// The git-config paths of the next land (R-T6e): `box.land.begin`
+    /// refuses them without `allow_git_config`, as the daemon does.
+    git_config: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -166,9 +169,18 @@ impl Stub {
                 (ok(id, Map::new()), None)
             }
             "box.land.begin" => {
+                if !st.git_config.is_empty() && a.get("allow_git_config") != Some(&json!(true)) {
+                    return refuse(
+                        ErrorCode::BadRequest,
+                        &format!(
+                            "land b1 changes git config ({}), which git and your filters read once it is checked out; review it, then run: saiife box land b1 --allow-git-config",
+                            st.git_config.join(", ")
+                        ),
+                    );
+                }
                 let n = st.next.unwrap();
                 let review = json!({"n": n, "flags": [{"path": "CLAUDE.md", "why": "protected path"}],
-                    "entries": [], "base_head": null});
+                    "entries": [], "base_head": null, "git_config": st.git_config});
                 let diff = st.diff.get("diff").cloned().unwrap_or(Value::Null);
                 (
                     ok(
@@ -531,7 +543,7 @@ fn build_commit_tree_is_exact() {
     let o = w.apply_ok();
     let tip = w.tip();
     assert!(
-        o.contains(&format!("applied b1 #1: {tip} on saiife/box-b1 (worktree ")),
+        o.contains(&format!("applied b1 #1: {tip} on saiife/box-b1\n")),
         "{o}"
     );
     let mut want = before.clone();
@@ -583,20 +595,12 @@ fn deletes_and_symlinks_and_modes() {
     assert_eq!(t["ln"], ("120000".into(), w.blob(b"README")));
     assert_eq!(t["script.sh"], ("100755".into(), w.blob(b"echo hi\n")));
     assert_eq!(t["src/main.rs"], ("120000".into(), w.blob(b"../README")));
-    assert_eq!(
-        fs::read_link(w.wt().join("ln")).unwrap(),
-        Path::new("README")
-    );
-    let mode = fs::metadata(w.wt().join("script.sh"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o111, 0o111);
-    assert!(!w.wt().join("docs/a.txt").exists());
+    // Nothing was checked out (R-T6d).
+    assert!(!w.wt().exists());
 }
 
 #[test]
-fn first_land_creates_branch_and_worktree() {
+fn first_land_creates_branch() {
     let w = world();
     w.next(3, vec![file("README", Op::Modify, 0o644, b"landed\n")]);
     let o = w.bx(&["land", "b1"]);
@@ -613,21 +617,21 @@ fn first_land_creates_branch_and_worktree() {
         out(&o)
     );
     assert!(
+        out(&o).contains(&format!("landed b1 #3: {tip} on saiife/box-b1\n")),
+        "{}",
+        out(&o)
+    );
+    assert!(
         out(&o).contains(&format!(
-            "landed b1 #3: {tip} on saiife/box-b1 (worktree {})",
+            "to check it out: git -C {} worktree add --detach {} saiife/box-b1",
+            w.project().display(),
             w.wt().display()
         )),
         "{}",
         out(&o)
     );
-    assert_eq!(
-        fs::read_to_string(w.wt().join("README")).unwrap(),
-        "landed\n"
-    );
-    assert_eq!(
-        git_in(&w.d, &w.wt(), &["rev-parse", "--abbrev-ref", "HEAD"]),
-        "saiife/box-b1"
-    );
+    assert_eq!(w.tree(&tip)["README"].1, w.blob(b"landed\n"));
+    assert!(!w.wt().exists(), "saiife checks nothing out");
     let ops = w.stub.ops();
     let i = |op: &str| ops.iter().position(|o| o == op).unwrap();
     assert!(i("box.land.fetch") < i("box.land.begin"), "{ops:?}");
@@ -642,7 +646,7 @@ fn first_land_creates_branch_and_worktree() {
 }
 
 #[test]
-fn second_land_fast_forwards_the_worktree() {
+fn second_land_advances_the_branch() {
     let w = world();
     w.approved(1, vec![file("README", Op::Modify, 0o644, b"one\n")]);
     w.apply_ok();
@@ -652,48 +656,69 @@ fn second_land_fast_forwards_the_worktree() {
     let second = w.tip();
     assert_ne!(first, second);
     assert_eq!(w.git(&["rev-parse", &format!("{second}^")]), first);
-    assert_eq!(fs::read_to_string(w.wt().join("README")).unwrap(), "two\n");
-    assert_eq!(git_in(&w.d, &w.wt(), &["rev-parse", "HEAD"]), second);
+    assert_eq!(w.tree(&second)["README"].1, w.blob(b"two\n"));
     assert_eq!(w.stub.applied(), vec![(1, first), (2, second)]);
 }
 
 #[test]
-fn dirty_worktree_keeps_commit_and_explains() {
+fn existing_worktree_is_not_touched() {
     let w = world();
     w.approved(1, vec![file("README", Op::Modify, 0o644, b"one\n")]);
     w.apply_ok();
     let first = w.tip();
-    fs::write(w.wt().join("README"), "my edit\n").unwrap();
-    w.approved(
-        2,
-        vec![file(
-            "src/main.rs",
-            Op::Modify,
-            0o644,
-            b"fn main() { run(); }\n",
-        )],
+    // The user checks it out as told (detached: the branch stays movable).
+    let wt = w.wt().to_str().unwrap().to_string();
+    w.git(&["worktree", "add", "-q", "--detach", &wt, "saiife/box-b1"]);
+    w.approved(2, vec![file("README", Op::Modify, 0o644, b"two\n")]);
+    let o = w.apply_ok();
+    let second = w.tip();
+    assert_eq!(w.git(&["rev-parse", &format!("{second}^")]), first);
+    assert!(
+        o.contains(&format!(
+            "the worktree {wt} is not updated; to update it: git -C {wt} merge --ff-only saiife/box-b1"
+        )),
+        "{o}"
     );
+    assert_eq!(fs::read_to_string(w.wt().join("README")).unwrap(), "one\n");
+    assert_eq!(git_in(&w.d, &w.wt(), &["rev-parse", "HEAD"]), first);
+    git_in(
+        &w.d,
+        &w.wt(),
+        &["merge", "-q", "--ff-only", "saiife/box-b1"],
+    );
+    assert_eq!(fs::read_to_string(w.wt().join("README")).unwrap(), "two\n");
+}
+
+#[test]
+fn checked_out_branch_is_not_moved() {
+    let w = world();
+    w.approved(1, vec![file("README", Op::Modify, 0o644, b"one\n")]);
+    w.apply_ok();
+    let first = w.tip();
+    let co = w.d.path().join("co");
+    w.git(&[
+        "worktree",
+        "add",
+        "-q",
+        co.to_str().unwrap(),
+        "saiife/box-b1",
+    ]);
+    w.approved(2, vec![file("README", Op::Modify, 0o644, b"two\n")]);
     let o = w.bx(&["apply", "b1"]);
     assert_eq!(code(&o), 1, "{}{}", out(&o), err(&o));
     let kept = w.git(&["rev-parse", "refs/saiife/box-b1/land-2"]);
     assert_eq!(w.git(&["rev-parse", &format!("{kept}^")]), first);
+    let co = fs::canonicalize(&co).unwrap();
     assert!(
-        err(&o).contains(&format!(
-            "git -C {} merge --ff-only {kept}",
-            w.wt().display()
-        )),
+        err(&o).contains(&format!("git -C {} merge --ff-only {kept}", co.display())),
         "{}",
         err(&o)
     );
-    assert!(err(&o).contains("saiife box apply b1"), "{}", err(&o));
     assert_eq!(w.tip(), first, "the branch did not move");
-    assert_eq!(
-        fs::read_to_string(w.wt().join("README")).unwrap(),
-        "my edit\n"
-    );
+    assert_eq!(fs::read_to_string(co.join("README")).unwrap(), "one\n");
     assert_eq!(w.stub.applied().len(), 1);
-    // Once the worktree is clean, the same commit lands.
-    git_in(&w.d, &w.wt(), &["checkout", "--", "README"]);
+    // The user fast-forwards it; the next apply records the same commit.
+    git_in(&w.d, &co, &["merge", "-q", "--ff-only", &kept]);
     w.apply_ok();
     assert_eq!(w.tip(), kept);
     assert_eq!(w.stub.applied()[1], (2, kept));
@@ -966,4 +991,109 @@ fn land_that_does_not_fit_the_branch_is_refused() {
     assert!(err(&o).contains("delta refused"), "{}", err(&o));
     assert!(w.git(&["for-each-ref", "refs/heads/saiife"]).is_empty());
     assert!(w.stub.applied().is_empty());
+}
+
+/// A box-written `.gitattributes` naming filters the user's config defines
+/// (a fake one, and `lfs`): saiife's land and apply never run them; the
+/// user's own checkout afterwards would.
+#[test]
+fn git_config_filters_never_run() {
+    let w = world();
+    let marks = w.d.path().join("marks");
+    fs::create_dir_all(&marks).unwrap();
+    let script = w.d.path().join("bin/filter");
+    exec(
+        &script,
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {}\ncat\n",
+            marks.join("filter").display()
+        ),
+    );
+    let sc = script.to_str().unwrap();
+    for (k, v) in [
+        ("filter.fake.clean", format!("{sc} clean")),
+        ("filter.fake.smudge", format!("{sc} smudge")),
+        ("filter.fake.process", format!("{sc} process")),
+        ("filter.lfs.clean", format!("{sc} lfs-clean %f")),
+        ("filter.lfs.smudge", format!("{sc} lfs-smudge %f")),
+        ("filter.lfs.process", format!("{sc} lfs-process")),
+    ] {
+        w.git(&["config", k, &v]);
+    }
+    let attrs = b"* filter=fake\n*.bin filter=lfs diff=lfs merge=lfs\n";
+    w.stub.0.lock().unwrap().git_config = vec![".gitattributes".into(), ".lfsconfig".into()];
+    w.next(
+        1,
+        vec![
+            file(".gitattributes", Op::Add, 0o644, attrs),
+            file(
+                ".lfsconfig",
+                Op::Add,
+                0o644,
+                b"[lfs]\n\turl = http://192.0.2.1/x\n",
+            ),
+            file("x.txt", Op::Add, 0o644, b"text\n"),
+            file("y.bin", Op::Add, 0o644, b"bin\n"),
+        ],
+    );
+    // Without the flag: refused at begin, no touch asked.
+    let o = w.bx(&["land", "b1"]);
+    assert_eq!(code(&o), 2, "{}{}", out(&o), err(&o));
+    assert!(
+        err(&o).contains("saiife box land b1 --allow-git-config"),
+        "{}",
+        err(&o)
+    );
+    assert!(!w.stub.ops().contains(&"box.land".to_string()));
+    let begin = &w
+        .stub
+        .seen()
+        .into_iter()
+        .find(|(o, _)| o == "box.land.begin")
+        .unwrap()
+        .1;
+    assert!(begin.get("allow_git_config").is_none(), "{begin}");
+    // With it: landed; then a second land through apply.
+    let o = w.bx(&["land", "b1", "--allow-git-config"]);
+    assert_eq!(code(&o), 0, "{}{}", out(&o), err(&o));
+    let begin = w
+        .stub
+        .seen()
+        .into_iter()
+        .filter(|(o, _)| o == "box.land.begin")
+        .nth(1)
+        .unwrap()
+        .1;
+    assert_eq!(begin["allow_git_config"], true);
+    w.approved(2, vec![file("z.bin", Op::Add, 0o644, b"more\n")]);
+    w.apply_ok();
+    let t = w.tree(&w.tip());
+    assert_eq!(t["y.bin"].1, w.blob(b"bin\n"));
+    assert_eq!(t["z.bin"].1, w.blob(b"more\n"));
+    assert!(!marks.join("filter").exists(), "a filter ran");
+    // The user's own checkout of it is where their filters act.
+    let wt = w.wt().to_str().unwrap().to_string();
+    let _ = git_raw(
+        &w.d,
+        &w.project(),
+        &["worktree", "add", "-q", "--detach", &wt, "saiife/box-b1"],
+    );
+    assert!(marks.join("filter").exists(), "the filters are live");
+}
+
+#[test]
+fn diff_names_git_config() {
+    let w = world();
+    let mut d = hostile_diff();
+    d["review"]["git_config"] = json!([".gitattributes"]);
+    w.stub.0.lock().unwrap().diff = d;
+    let o = w.bx(&["diff", "b1", "--stat"]);
+    assert_eq!(code(&o), 0, "{}{}", out(&o), err(&o));
+    assert!(
+        out(&o).contains(
+            "this land changes git config (.gitattributes); it lands only from the CLI: saiife box land b1 --allow-git-config"
+        ),
+        "{}",
+        out(&o)
+    );
 }

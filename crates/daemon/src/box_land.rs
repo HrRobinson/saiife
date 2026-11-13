@@ -118,6 +118,10 @@ pub struct LandRequest {
     pub summary: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// R-T6e: `"allowed"` when what lands touches git-config paths and the
+    /// CLI passed `allow_git_config` (also a field of the touch record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_config: Option<String>,
 }
 
 /// A push request (L7): the touch binds `{repo, target_ref, remote,
@@ -257,6 +261,12 @@ fn guest_text(s: &str) -> String {
 /// `land <id>: <k> files (+a −r)[; flagged: <path> (<why>), …]`, every
 /// guest string escaped, cut at [`MAX_SUMMARY`] chars.
 pub fn summary(id: &BoxId, r: &Review) -> String {
+    summary_with(id, r, &[])
+}
+
+/// [`summary`], naming the git-config paths (escaped) that land (R-T6e)
+/// before the flags, so the cut never drops them first.
+fn summary_with(id: &BoxId, r: &Review, git: &[String]) -> String {
     let files = &r.summary.files;
     let added: u64 = files.iter().map(|f| u64::from(f.added)).sum();
     let removed: u64 = files.iter().map(|f| u64::from(f.removed)).sum();
@@ -265,6 +275,10 @@ pub fn summary(id: &BoxId, r: &Review) -> String {
         id.as_str(),
         files.len()
     );
+    if !git.is_empty() {
+        s.push_str("; git config: ");
+        s.push_str(&git.join(", "));
+    }
     if !r.flags.is_empty() {
         let flagged: Vec<String> = r
             .flags
@@ -683,6 +697,7 @@ impl Lands {
         id: &BoxId,
         owner: u32,
         only: Option<BTreeSet<String>>,
+        allow_git_config: bool,
         now: u64,
     ) -> Result<(u64, ActionRecord, Review), BoxError> {
         let ctx = self.ctx()?;
@@ -719,8 +734,22 @@ impl Lands {
                 review::review(id, &cached.base, &v, &blobs, Some(o), &hits)
             }
         };
-        let summary = summary(id, &land);
-        let fields = fields(id, &cached.base, &land);
+        // R-T6e: git config (attributes, submodules, LFS) reaches git and
+        // the user's filters once checked out; only an explicit CLI flag
+        // lands it, and the touch record says so.
+        let git = git_config_paths(&land);
+        if !git.is_empty() && !allow_git_config {
+            return Err(BoxError::Invalid(format!(
+                "land {i} changes git config ({}), which git and your filters read once it is checked out; review it, then run: saiife box land {i} --allow-git-config",
+                list_some(&git),
+                i = id.as_str()
+            )));
+        }
+        let summary = summary_with(id, &land, &git);
+        let mut fields = fields(id, &cached.base, &land);
+        if !git.is_empty() {
+            fields.insert("git_config".into(), "allowed".into());
+        }
         let rid = self.next_rid();
         let issued = ctx
             .touch
@@ -756,6 +785,7 @@ impl Lands {
             summary,
             created_at: now,
             expires_at: issued.expires_at,
+            git_config: (!git.is_empty()).then(|| "allowed".to_string()),
         };
         let body = serde_json::to_vec_pretty(&req).map_err(|e| unavailable(e.to_string()))?;
         if let Err(e) = write_over(&self.paths(id).land_request(full.n), &body) {
@@ -1246,6 +1276,10 @@ impl LandBook for Lands {
                 if c.review.summary.files.is_empty() || st.rejected.get(&r.id) == Some(&sha) {
                     continue;
                 }
+                // R-T6e: git config lands from the CLI only.
+                if !git_config_paths(&c.review).is_empty() {
+                    continue;
+                }
                 let k = per.entry(r.owner_uid).or_default();
                 if *k >= PENDING_PER_OWNER {
                     continue;
@@ -1276,7 +1310,7 @@ impl LandBook for Lands {
             match have {
                 Some(p) => out.push(p),
                 None => {
-                    if let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, now) {
+                    if let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, false, now) {
                         if let Some(q) = lock(&self.state).requests.get(&rid) {
                             out.push(Self::action(q));
                         }
@@ -1396,7 +1430,26 @@ pub fn review_json(r: &Review) -> Value {
         "flags": flags,
         "entries": serde_json::to_value(&r.entries).unwrap_or(Value::Null),
         "base_head": r.base_head,
+        "git_config": git_config_paths(r),
     })
+}
+
+/// R-T6e: the reviewed entries' git-config paths, escaped.
+fn git_config_paths(r: &Review) -> Vec<String> {
+    r.entries
+        .iter()
+        .filter(|h| review::git_config(&h.path))
+        .map(|h| review::escape(&h.path))
+        .collect()
+}
+
+/// At most 10 of `v`, then how many more.
+fn list_some(v: &[String]) -> String {
+    let mut s = v.iter().take(10).cloned().collect::<Vec<_>>().join(", ");
+    if v.len() > 10 {
+        s.push_str(&format!(" and {} more", v.len() - 10));
+    }
+    s
 }
 
 /// `{diff, review}`: `box.diff`'s answer over a review.
@@ -1431,7 +1484,8 @@ fn open_delta(paths: &BoxPaths, n: u32) -> Result<std::os::fd::OwnedFd, BoxError
 
 /// One land or push op, its arguments checked.
 enum LandOp {
-    Begin(BoxId, Option<BTreeSet<String>>),
+    /// The box, `files`, and `allow_git_config` (R-T6e).
+    Begin(BoxId, Option<BTreeSet<String>>, bool),
     Land(u64, saiife_touch::Assertion),
     Reject(u64),
     /// `None`: list the approved, unapplied lands (no descriptor).
@@ -1531,7 +1585,12 @@ impl LandOp {
                     }
                     Some(_) => return Err(invalid("files must be a list of paths")),
                 };
-                LandOp::Begin(arg_box(a)?, only)
+                let allow = match a.get("allow_git_config") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err(invalid("allow_git_config must be true or false")),
+                };
+                LandOp::Begin(arg_box(a)?, only, allow)
             }
             m::OP_BOX_LAND => LandOp::Land(arg_rid(a)?, arg_assertion(a)?),
             m::OP_BOX_LAND_REJECT => LandOp::Reject(arg_rid(a)?),
@@ -1673,7 +1732,7 @@ pub async fn handle(
     // The box: named, or the request's (owner-bound: another uid's request
     // is a missing one).
     let target = match &op {
-        LandOp::Begin(b, _)
+        LandOp::Begin(b, ..)
         | LandOp::Fetch(b, _)
         | LandOp::Applied(b, ..)
         | LandOp::PushBegin(b, ..) => Ok(b.clone()),
@@ -1767,12 +1826,12 @@ fn run(ctx: &Ctx, lands: &Lands, uid: u32, op: LandOp) -> Out {
     let now = lands.now();
     let creds = || ctx.touch.credentials_of(uid);
     match op {
-        LandOp::Begin(b, only) => {
+        LandOp::Begin(b, only, allow) => {
             let creds = creds();
             if creds.is_empty() {
                 return Out::Touch(no_device(&format!("landing box {}", b.as_str())));
             }
-            let (rid, rec, land) = match lands.begin(&b, uid, only, now) {
+            let (rid, rec, land) = match lands.begin(&b, uid, only, allow, now) {
                 Ok(x) => x,
                 Err(e) => return e.into(),
             };

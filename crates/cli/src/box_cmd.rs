@@ -84,6 +84,10 @@ pub enum BoxAction {
         /// Land only these paths (comma-separated, or repeat the flag).
         #[arg(long, value_delimiter = ',')]
         files: Vec<String>,
+        /// Land changes to git config (.gitattributes, .gitmodules,
+        /// .lfsconfig, ...) too, once you have reviewed them.
+        #[arg(long)]
+        allow_git_config: bool,
     },
     /// Write the commits of a box's approved lands (approved in the Workspace).
     Apply { id: String },

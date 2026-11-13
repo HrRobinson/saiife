@@ -9,11 +9,17 @@
 //! -z --index-info`, written with `write-tree` and checked against what the
 //! delta says it must be; then `commit-tree -p <parent> -F -`. Every git call
 //! runs with hooks and fsmonitor off and git's NTFS/HFS path checks on
-//! (`box_repo::git_cmd`). Only the worktree's checkout and fast-forward use
-//! the user's own config, as any checkout of their repo does.
+//! (`box_repo::git_cmd`).
 //!
-//! Exit codes: 0 done, 1 a local step failed (git push, a land the dirty
-//! worktree kept off the branch), 2 refused (by the daemon, by a check here,
+//! Only refs move (R-T6d): saiife never checks out or merges box content,
+//! so no filter, attribute or hook of the user's config runs on it. After
+//! a land it prints the command that checks the branch out, for the user
+//! to run once they have reviewed it. A land that changes git config
+//! (`.gitattributes`, `.gitmodules`, `.lfsconfig`, …) needs
+//! `--allow-git-config` (R-T6e).
+//!
+//! Exit codes: 0 done, 1 a local step failed (git push, a land kept off a
+//! branch that is checked out), 2 refused (by the daemon, by a check here,
 //! or by the key), 5 the daemon, the key or this build's key support cannot
 //! be reached (as `saiife approvals`).
 
@@ -39,7 +45,7 @@ use saiife_wire::source::BoxId;
 use serde_json::{json, Map, Value};
 
 use crate::box_cmd::BoxAction;
-use crate::box_repo::{self, display_name, one_oid, trim_nl, FALLBACK_IDENT};
+use crate::box_repo::{self, display_name, one_oid, FALLBACK_IDENT};
 use crate::broker::{self, Target};
 use crate::text::sanitize;
 
@@ -53,9 +59,10 @@ const DETAIL_MAX: usize = 512;
 /// The longest worktree dir name taken from the repo's name.
 const NAME_MAX: usize = 64;
 
-/// What [`apply`] did. `moved_branch` is false when the worktree had
-/// changes: the commit exists (kept by `refs/saiife/box-<id>/land-<n>`), the
-/// branch was not moved.
+/// What [`apply`] did. `moved_branch` is false when the branch is checked
+/// out in `worktree`: the commit exists (kept by
+/// `refs/saiife/box-<id>/land-<n>`), the branch was not moved. Otherwise
+/// `worktree` is where saiife suggests checking the branch out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     pub commit: String,
@@ -100,7 +107,11 @@ pub fn run(config: Option<&Path>, action: BoxAction) -> ExitCode {
 fn go(t: &Target, action: BoxAction) -> Result<(), Stop> {
     match action {
         BoxAction::Diff { id, json, stat } => diff(t, &box_id(&id)?, json, stat),
-        BoxAction::Land { id, files } => land(t, &box_id(&id)?, files),
+        BoxAction::Land {
+            id,
+            files,
+            allow_git_config,
+        } => land(t, &box_id(&id)?, files, allow_git_config),
         BoxAction::Apply { id } => {
             let id = box_id(&id)?;
             let tools = tools();
@@ -270,6 +281,21 @@ pub(crate) fn review_lines(diff: &Value, review: Option<&Value>, stat: bool) -> 
             sanitize(s(f, "why"))
         ));
     }
+    let git: Vec<String> = review
+        .and_then(|r| r.get("git_config"))
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(Value::as_str)
+        .map(sanitize)
+        .collect();
+    if !git.is_empty() {
+        out.push(format!(
+            "this land changes git config ({}); it lands only from the CLI: saiife box land {} --allow-git-config",
+            git.join(", "),
+            sanitize(s(diff, "id"))
+        ));
+    }
     if let Some(tr) = diff.get("tests").filter(|t| t.is_object()) {
         out.push(format!(
             "tests: {} passed, {} failed, {} skipped{}",
@@ -341,11 +367,11 @@ fn diff(t: &Target, id: &BoxId, as_json: bool, stat: bool) -> Result<(), Stop> {
 enum Waiting {
     /// This many lands applied.
     Done(usize),
-    /// A land is kept off the branch (a dirty worktree): the message.
+    /// A land is kept off the branch (it is checked out): the message.
     Kept(String),
 }
 
-fn land(t: &Target, id: &BoxId, files: Vec<String>) -> Result<(), Stop> {
+fn land(t: &Target, id: &BoxId, files: Vec<String>, allow_git_config: bool) -> Result<(), Stop> {
     let i = id.as_str();
     // Errata R-4: no key, no challenge spent; the Workspace can approve.
     let key = crate::touch_cmd::pick().map_err(|m| {
@@ -368,6 +394,9 @@ fn land(t: &Target, id: &BoxId, files: Vec<String>) -> Result<(), Stop> {
     let mut a = args([("box", json!(i))]);
     if !files.is_empty() {
         a.insert("files".into(), json!(files));
+    }
+    if allow_git_config {
+        a.insert("allow_git_config".into(), json!(true));
     }
     let b = call(&mut connect(t)?, t, "box.land.begin", a)?;
     let d = b.get("diff").cloned().unwrap_or(Value::Null);
@@ -405,7 +434,7 @@ fn land(t: &Target, id: &BoxId, files: Vec<String>) -> Result<(), Stop> {
 }
 
 /// Applies every approved land of `id` still waiting for its commit, in
-/// order (`box.land.fetch`). Stops at one the worktree keeps off the branch.
+/// order (`box.land.fetch`). Stops at one kept off a checked-out branch.
 fn apply_waiting(t: &Target, tools: &Tools, id: &BoxId) -> Result<Waiting, Stop> {
     let i = id.as_str();
     let mut c = connect(t)?;
@@ -471,17 +500,27 @@ fn apply_one(
     let wt = r.worktree.display().to_string();
     if !r.moved_branch {
         return Ok(Some(format!(
-            "land {n} of box {i} is commit {c}, but the worktree {wt} has changes, so saiife/box-{i} was not moved\n\
+            "land {n} of box {i} is commit {c}, but saiife/box-{i} is checked out at {wt}, so it was not moved\n\
              to finish: git -C {wt} merge --ff-only {c}\n\
              then run: saiife box apply {i}",
             c = r.commit
         )));
     }
-    outln!(
-        "{verb} {i} #{n}: {} on saiife/box-{i} (worktree {})",
-        r.commit,
-        sanitize(&wt)
-    );
+    outln!("{verb} {i} #{n}: {} on saiife/box-{i}", r.commit);
+    // R-T6d: checking it out is the user's step, after their review.
+    if std::fs::symlink_metadata(&r.worktree).is_ok() {
+        outln!(
+            "the worktree {} is not updated; to update it: git -C {} merge --ff-only saiife/box-{i}",
+            sanitize(&wt),
+            sanitize(&wt)
+        );
+    } else {
+        outln!(
+            "to check it out: git -C {} worktree add --detach {} saiife/box-{i}",
+            sanitize(repo),
+            sanitize(&wt)
+        );
+    }
     let recorded = connect(t).and_then(|mut c| {
         call(
             &mut c,
@@ -511,31 +550,24 @@ fn push(t: &Target, id: &BoxId, remote: &str) -> Result<(), Stop> {
     saiife_daemon::box_land::check_remote(remote).map_err(|e| Stop::Refused(e.to_string()))?;
     let key = crate::touch_cmd::pick().map_err(Stop::Unavailable)?;
     let tools = tools();
-    // The box's repo name (from `box.list`) names its worktree.
-    let l = call(
-        &mut connect(t)?,
-        t,
-        "box.list",
-        args([("all", json!(false))]),
-    )?;
-    let repo = l
-        .get("boxes")
-        .and_then(Value::as_array)
-        .and_then(|bs| bs.iter().find(|b| s(b, "id") == i))
-        .map(|b| s(b, "repo").to_string())
-        .ok_or_else(|| Stop::Refused(format!("not_found: no box {i}")))?;
-    let wt = worktree_dir(&repo, id).map_err(Stop::Failed)?;
-    if std::fs::symlink_metadata(&wt).is_err() {
+    // The repo here (the current directory) must be the box's: it has the
+    // box's base ref. No checkout is needed: the branch tip is pushed.
+    let here = std::env::current_dir()
+        .map_err(|e| Stop::Failed(format!("cannot read the current directory: {e}")))?;
+    let base = format!("refs/saiife/box-{i}/base");
+    if rev(&tools, &here, &base).map_err(Stop::Failed)?.is_none() {
         return Err(Stop::Refused(format!(
-            "box {i} has no worktree at {}: saiife box apply {i} first",
-            wt.display()
+            "{} is not the repo box {i} started from (it has no {base}); run saiife box push there",
+            here.display()
         )));
     }
     let branch = branch_ref(id);
-    let commit = rev(&tools, &wt, &branch)
+    let commit = rev(&tools, &here, &branch)
         .map_err(Stop::Failed)?
         .ok_or_else(|| {
-            Stop::Refused(format!("saiife/box-{i} does not exist in {}", wt.display()))
+            Stop::Refused(format!(
+                "saiife/box-{i} does not exist yet: saiife box apply {i} first"
+            ))
         })?;
     let b = call(
         &mut connect(t)?,
@@ -564,7 +596,7 @@ fn push(t: &Target, id: &BoxId, remote: &str) -> Result<(), Stop> {
     let refspec = format!("{commit}:refs/heads/saiife/box-{i}");
     let out = box_repo::git_run_env(
         &tools,
-        &wt,
+        &here,
         None,
         &[
             OsStr::new("push"),
@@ -1112,7 +1144,6 @@ fn base_of(tools: &Tools, repo: &Path, info: &LandInfo) -> Result<String, String
 /// later only; a path with a newline is not one of saiife's worktrees).
 struct Worktree {
     path: PathBuf,
-    head: Option<String>,
     branch: Option<String>,
 }
 
@@ -1135,13 +1166,10 @@ fn worktrees(tools: &Tools, repo: &Path) -> Result<Vec<Worktree>, String> {
             list.extend(cur.take());
             cur = Some(Worktree {
                 path: PathBuf::from(OsStr::from_bytes(p)),
-                head: None,
                 branch: None,
             });
         } else if let Some(w) = cur.as_mut() {
-            if let Some(h) = f.strip_prefix(b"HEAD ") {
-                w.head = Some(String::from_utf8_lossy(h).into_owned());
-            } else if let Some(b) = f.strip_prefix(b"branch ") {
+            if let Some(b) = f.strip_prefix(b"branch ") {
                 w.branch = Some(String::from_utf8_lossy(b).into_owned());
             }
         }
@@ -1150,15 +1178,10 @@ fn worktrees(tools: &Tools, repo: &Path) -> Result<Vec<Worktree>, String> {
     Ok(list)
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
-    }
-}
-
 /// Writes land `info` (its `delta.bin`) as a commit on `saiife/box-<id>`
-/// of `repo` (the box's `repo_dir`), and moves the box's worktree to it.
+/// of `repo` (the box's `repo_dir`). Only refs move: nothing of the box is
+/// checked out or merged, so no checkout filter, attribute or hook of the
+/// user's config ever runs on box content (R-T6d).
 ///
 /// - The base ref must name the land's base commit (recreated when
 ///   missing, refused when git gc removed the commit).
@@ -1166,10 +1189,12 @@ fn same_path(a: &Path, b: &Path) -> bool {
 ///   commit of this box older than `n`; any other tip is a branch moved by
 ///   hand and is refused. A tip that already is land `n` (same diff hash)
 ///   is the land, applied before: nothing is written.
-/// - No worktree: `update-ref <branch> <new> <old-or-empty>` (compare and
-///   swap), then `worktree add`. A worktree: `merge --ff-only` there; with
-///   changes in it the commit is kept (`refs/saiife/box-<id>/land-<n>`)
-///   and the branch is not moved (`moved_branch: false`).
+/// - The branch moves with `update-ref <branch> <new> <old-or-empty>`
+///   (compare and swap). A branch checked out in some worktree is not
+///   moved under it: the commit is kept (`refs/saiife/box-<id>/land-<n>`),
+///   `moved_branch` is false and `worktree` names that checkout.
+/// - Otherwise `worktree` is where saiife suggests checking it out:
+///   `$XDG_DATA_HOME/saiife/worktrees/<repo>-<id>`.
 pub fn apply(tools: &Tools, repo: &Path, info: &LandInfo, delta: File) -> Result<Applied, String> {
     let i = info.id.as_str();
     let n = info.n;
@@ -1184,27 +1209,9 @@ pub fn apply(tools: &Tools, repo: &Path, info: &LandInfo, delta: File) -> Result
         .map_err(|e| format!("{} is not a git repo: {e}", repo.display()))?;
     let base = base_of(tools, repo, info)?;
     let wt = worktree_dir(&display_name(repo), &info.id)?;
-    let list = worktrees(tools, repo)?;
-    let checked_out = list
-        .iter()
-        .find(|w| w.branch.as_deref() == Some(branch.as_str()));
-    let ours = checked_out.filter(|w| same_path(&w.path, &wt));
-    if let Some(w) = checked_out.filter(|_| ours.is_none()) {
-        return Err(format!(
-            "saiife/box-{i} is checked out at {}, not in the box's worktree {}; switch that checkout to another branch, then run: saiife box apply {i}",
-            w.path.display(),
-            wt.display()
-        ));
-    }
-    let wt_exists = std::fs::symlink_metadata(&wt).is_ok();
-    if wt_exists && ours.is_none() {
-        return Err(format!(
-            "{} is not the worktree of saiife/box-{i}; move it away, then run: saiife box apply {i}",
-            wt.display()
-        ));
-    }
 
     let tip = rev(tools, repo, &branch)?;
+    let mut new = None;
     let parent = match &tip {
         None => base.clone(),
         Some(t) if *t == base => t.clone(),
@@ -1242,20 +1249,9 @@ pub fn apply(tools: &Tools, repo: &Path, info: &LandInfo, delta: File) -> Result
                         "saiife/box-{i} already has a land {n} with another diff hash ({sha}); this land cannot be applied"
                     ));
                 }
-                // Applied before (the record of it was lost): the worktree
-                // only needs to show it.
-                return place(
-                    tools,
-                    repo,
-                    info,
-                    &branch,
-                    tip.as_deref(),
-                    t,
-                    &wt,
-                    ours.and_then(|w| w.head.clone()),
-                );
-            }
-            if m > n {
+                // Applied before (the record of it was lost).
+                new = Some(t.clone());
+            } else if m > n {
                 return Err(format!(
                     "saiife/box-{i} already has land {m}, which is newer than land {n}"
                 ));
@@ -1265,139 +1261,58 @@ pub fn apply(tools: &Tools, repo: &Path, info: &LandInfo, delta: File) -> Result
     };
 
     let keep = format!("refs/saiife/box-{i}/land-{n}");
-    // A land kept by a dirty worktree before is written once.
-    let kept = match rev(tools, repo, &keep)? {
-        Some(k) => {
-            let raw = cat_commit(tools, repo, &k)?;
-            let same = parents(&raw) == [parent.clone()]
-                && trailers(&raw) == Some((i.to_string(), n, info.diff_sha256.clone()));
-            same.then_some(k)
+    let new = match new {
+        Some(c) => c,
+        None => {
+            // A land kept off a checked-out branch before is written once.
+            let kept = match rev(tools, repo, &keep)? {
+                Some(k) => {
+                    let raw = cat_commit(tools, repo, &k)?;
+                    let same = parents(&raw) == [parent.clone()]
+                        && trailers(&raw) == Some((i.to_string(), n, info.diff_sha256.clone()));
+                    same.then_some(k)
+                }
+                None => None,
+            };
+            match kept {
+                Some(k) => k,
+                None => build_commit(tools, repo, info, delta, &parent)?,
+            }
         }
-        None => None,
     };
-    let new = match kept {
-        Some(k) => k,
-        None => build_commit(tools, repo, info, delta, &parent)?,
-    };
-    place(
+    if tip.as_deref() == Some(new.as_str()) {
+        return Ok(Applied {
+            commit: new,
+            worktree: wt,
+            moved_branch: true,
+        });
+    }
+    // Moving a checked-out branch would leave that checkout's files behind
+    // its HEAD; its owner fast-forwards it instead.
+    if let Some(w) = worktrees(tools, repo)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch.as_str()))
+    {
+        git_ok(tools, repo, None, &["update-ref", &keep, &new], None)?;
+        return Ok(Applied {
+            commit: new,
+            worktree: w.path,
+            moved_branch: false,
+        });
+    }
+    git_ok(
         tools,
         repo,
-        info,
-        &branch,
-        tip.as_deref(),
-        &new,
-        &wt,
-        ours.and_then(|w| w.head.clone()),
+        None,
+        &["update-ref", &branch, &new, tip.as_deref().unwrap_or("")],
+        None,
     )
-}
-
-/// Moves the branch and the worktree to `new` (see [`apply`]).
-#[allow(clippy::too_many_arguments)]
-fn place(
-    tools: &Tools,
-    repo: &Path,
-    info: &LandInfo,
-    branch: &str,
-    tip: Option<&str>,
-    new: &str,
-    wt: &Path,
-    wt_head: Option<String>,
-) -> Result<Applied, String> {
-    let i = info.id.as_str();
-    let done = |moved: bool| Applied {
-        commit: new.to_string(),
-        worktree: wt.to_path_buf(),
-        moved_branch: moved,
-    };
-    if let Some(head) = wt_head {
-        if head == new {
-            return Ok(done(true));
-        }
-        if Some(head.as_str()) != tip {
-            return Err(format!(
-                "the worktree {} is at {head}, not at the tip of saiife/box-{i}; run: saiife box apply {i}",
-                wt.display()
-            ));
-        }
-        let status = git_ok(
-            tools,
-            wt,
-            None,
-            &["status", "--porcelain", "-z", "--untracked-files=no"],
-            None,
-        )?;
-        let merged = status.is_empty()
-            && box_repo::git_run_env(
-                tools,
-                wt,
-                None,
-                &[
-                    OsStr::new("merge"),
-                    OsStr::new("--ff-only"),
-                    OsStr::new("-q"),
-                    OsStr::new(new),
-                ],
-                None,
-                &[],
-            )?
-            .status
-            .success();
-        if !merged {
-            let keep = format!("refs/saiife/box-{i}/land-{}", info.n);
-            git_ok(tools, repo, None, &["update-ref", &keep, new], None)?;
-            return Ok(done(false));
-        }
-        if rev(tools, repo, branch)?.as_deref() != Some(new) {
-            return Err(format!(
-                "git merge in {} did not move saiife/box-{i} to {new}",
-                wt.display()
-            ));
-        }
-    } else {
-        if tip != Some(new) {
-            git_ok(
-                tools,
-                repo,
-                None,
-                &["update-ref", branch, new, tip.unwrap_or("")],
-                None,
-            )
-            .map_err(|e| format!("saiife/box-{i} moved while the land was written: {e}"))?;
-        }
-        if let Some(p) = wt.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(p)
-                .map_err(|e| format!("{}: {e}", p.display()))?;
-        }
-        // A worktree removed by hand leaves its registration behind.
-        git_ok(tools, repo, None, &["worktree", "prune"], None)?;
-        let short = format!("saiife/box-{i}");
-        let o = box_repo::git_run_env(
-            tools,
-            repo,
-            None,
-            &[
-                OsStr::new("worktree"),
-                OsStr::new("add"),
-                OsStr::new("-q"),
-                OsStr::new("--"),
-                wt.as_os_str(),
-                OsStr::new(&short),
-            ],
-            None,
-            &[],
-        )?;
-        if !o.status.success() {
-            return Err(format!(
-                "the land is on saiife/box-{i} as {new}, but git worktree add {} failed: {}",
-                wt.display(),
-                String::from_utf8_lossy(&trim_nl(o.stderr)).trim()
-            ));
-        }
-    }
-    Ok(done(true))
+    .map_err(|e| format!("saiife/box-{i} moved while the land was written: {e}"))?;
+    Ok(Applied {
+        commit: new,
+        worktree: wt,
+        moved_branch: true,
+    })
 }
 
 #[cfg(test)]

@@ -83,6 +83,7 @@ const PART: &str = ".part";
 const OLD_PART: &str = ".old";
 
 /// One flagged path (L6). `why` is one of "protected path",
+/// "protected path (git config)" ([`git_config`], R-T6e),
 /// "rule <pack>: <reason>", "becomes executable", "new symlink", "binary",
 /// "differs only in case or accents from <other>".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,9 +701,12 @@ pub fn render(
 ///   `.gitlab-ci.yml`, `.pre-commit-config.yaml`, `.cursorrules`;
 /// - at any depth (agents and direnv read nested ones): `CLAUDE.md`,
 ///   `AGENTS.md`, `GEMINI.md`, `.envrc`;
-/// - any component starting with `.git` (`.gitattributes`, `.gitmodules`,
-///   `.gitconfig`, `.github/…`) except a final `.gitignore`.
+/// - every [`git_config`] path (`.gitattributes`, `.gitmodules`,
+///   `.gitconfig`, `.github/…`, `.lfsconfig`).
 pub fn protected(path: &str) -> bool {
+    if git_config(path) {
+        return true;
+    }
     let comps: Vec<String> = path.split('/').map(normalize_component).collect();
     let last = comps.len() - 1;
     let first = comps[0].as_str();
@@ -745,10 +749,21 @@ pub fn protected(path: &str) -> bool {
     ) {
         return true;
     }
-    comps
-        .iter()
-        .enumerate()
-        .any(|(i, c)| c.starts_with(".git") && !(i == last && c == ".gitignore"))
+    false
+}
+
+/// R-T6e: a path git or its filters may read as configuration of the
+/// user's repo once it is checked out: a component whose
+/// [`normalize_component`] key is `.lfsconfig`, or starts with `.git`
+/// (`.gitattributes`, `.gitmodules`, `.gitconfig`, `.github`, …), except a
+/// final `.gitignore`. A land touching one needs the CLI's
+/// `--allow-git-config`; the Workspace does not offer it.
+pub fn git_config(path: &str) -> bool {
+    let comps: Vec<String> = path.split('/').map(normalize_component).collect();
+    let last = comps.len() - 1;
+    comps.iter().enumerate().any(|(i, c)| {
+        c == ".lfsconfig" || (c.starts_with(".git") && !(i == last && c == ".gitignore"))
+    })
 }
 
 /// A path in the spelling case collisions and symlink prefixes are
@@ -783,7 +798,9 @@ fn flags(
     };
     for h in selected(v, only) {
         let p = h.path.as_str();
-        if protected(p) {
+        if git_config(p) {
+            flag(p, "protected path (git config)".into());
+        } else if protected(p) {
             flag(p, "protected path".into());
         }
         if h.op == Op::Delete {
