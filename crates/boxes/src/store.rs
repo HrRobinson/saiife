@@ -54,8 +54,12 @@ pub struct BoxRecord {
 }
 
 /// Single-writer by contract: the Manager's one Mutex serialises every Store
-/// call (spawn's `claim_id` plus first `save`, and gc, all run under it, so gc
-/// never sees a claimed-but-unsaved dir).
+/// call (spawn's `claim_id` plus first `save`, and gc, all run under it). A
+/// spawn with a repo disk lets the lock go between the two, to move the disk
+/// in; the manager marks that id as being placed and gc leaves it alone.
+/// A failed spawn's dir is removed the same way, through a clone, outside
+/// the lock and with the id still marked.
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
 }
@@ -243,6 +247,10 @@ impl Store {
             let entry = entry.map_err(|e| io_err(&self.root, e))?;
             let ft = entry.file_type().map_err(|e| io_err(&entry.path(), e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            // The daemon's staging of passed repo disks (plan 37), not a box.
+            if name == crate::place::INCOMING {
+                continue;
+            }
             if ft.is_dir() || ft.is_symlink() {
                 out.push((name, ft.is_symlink()));
             }

@@ -168,11 +168,11 @@ pub fn check_spec(spec: &LaunchSpec, paths: &BoxPaths, allowed: &Allowed) -> Res
     // CH opens these by path, following links: a VMM-planted symlink or hard
     // link would hand the next VMM another file (S4 sweep).
     let mut files = vec![
-        ("root.qcow2", paths.root_disk()),
+        (crate::paths::ROOT_DISK, paths.root_disk()),
         ("serial.log", paths.serial()),
     ];
     if spec.repo {
-        files.push(("repo.img", paths.repo_disk()));
+        files.push((crate::paths::REPO_DISK, paths.repo_disk()));
     }
     for (name, p) in files {
         check_plain(name, &p)?;

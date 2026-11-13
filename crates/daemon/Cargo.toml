@@ -22,6 +22,7 @@ fake-boxes = ["saiife-wire/fake"]
 saiife-audit = { path = "../audit" }
 # The box manager behind the `box.*` ops (plan 34, Task 8).
 saiife-boxes = { path = "../boxes" }
+saiife-boxproto = { path = "../boxproto" }
 saiife-ipc = { path = "../ipc" }
 saiife-policy = { path = "../policy" }
 # Touch classes, action records and refusals (plan 26, Task 6).
@@ -77,7 +78,6 @@ rustix = { version = "1", features = ["fs", "process", "net", "system"] }
 # The per-box gateway (plan 38, Task 6): VmHooks, BoxPaths and the vsock
 # listeners (tokio-free; unix-only on plan 35's branch), and the fixed ports.
 saiife-boxhost = { path = "../boxhost" }
-saiife-boxproto = { path = "../boxproto" }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]

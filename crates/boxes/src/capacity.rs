@@ -10,6 +10,8 @@ pub const RESERVE_THREADS: u32 = 2;
 pub const VCPU_OVERCOMMIT: u32 = 2;
 /// Free disk required beyond a box's own disk.
 pub const DISK_HEADROOM_GIB: u64 = 30;
+/// Free space on the boxes filesystem below which running boxes are paused.
+pub const DISK_FLOOR_GIB: u64 = 10;
 /// Per-box VMM overhead: the spike measured a 4 GiB guest plus 256 MiB per
 /// box, so 5 boxes in 24 GiB.
 pub const VMM_OVERHEAD_MIB: u64 = 256;
@@ -52,6 +54,11 @@ impl Refusal {
             }
         }
     }
+}
+
+/// True when the boxes filesystem has less than [`DISK_FLOOR_GIB`] free.
+pub fn below_floor(h: &HostFacts) -> bool {
+    h.disk_free_mib < DISK_FLOOR_GIB.saturating_mul(1024)
 }
 
 /// One box's memory charge: its guest memory plus the VMM overhead.
@@ -130,6 +137,16 @@ mod tests {
             disk_free_mib: 500 * 1024,
             cpu_pct: None,
         }
+    }
+
+    #[test]
+    fn below_floor_rule() {
+        let at = |mib| HostFacts {
+            disk_free_mib: mib,
+            ..owner()
+        };
+        assert!(!below_floor(&at(10 * 1024)));
+        assert!(below_floor(&at(10 * 1024 - 1)));
     }
 
     #[test]

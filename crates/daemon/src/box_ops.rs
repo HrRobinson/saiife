@@ -56,8 +56,17 @@ pub const FAKE_TERMINAL_ENV: &str = "SAIIFE_BOX_FAKE_TERMINAL";
 /// The most bytes of [`FAKE_TERMINAL_ENV`] parsed.
 #[cfg(feature = "fake-vmm")]
 const FAKE_TERMINAL_MAX: usize = 64 * 1024;
+/// Why the tick paused a box when the boxes filesystem ran low.
+pub const DISK_LOW_WHY: &str = "paused: the host disk is almost full";
 /// The stderr line of a daemon whose boxes run on the fake VM.
 pub const FAKE_NOTICE: &str = "saiifed: boxes use a fake VM (test build)";
+/// What a `box.spawn` was passed (plan 37): the repo disk and its base
+/// manifest. Descriptors pass on unix only.
+#[cfg(unix)]
+type Passed = Vec<std::os::fd::OwnedFd>;
+#[cfg(not(unix))]
+type Passed = Vec<()>;
+
 /// The longest template name and `repo_dir` taken.
 const MAX_TEMPLATE_BYTES: usize = 64;
 const MAX_REPO_DIR_BYTES: usize = 4096;
@@ -82,7 +91,36 @@ pub const OPS: &[&str] = &[
 
 /// `<state_dir>/boxes`.
 pub fn dir_in(state_dir: &Path) -> PathBuf {
-    state_dir.join("boxes")
+    #[cfg(unix)]
+    {
+        saiife_boxhost::layout::boxes_in(state_dir)
+    }
+    // No boxes off Unix (no box host crate there); the same path.
+    #[cfg(not(unix))]
+    {
+        state_dir.join("boxes")
+    }
+}
+
+/// Where spawn moves a box's repo disk and base manifest: the box's
+/// [`saiife_boxhost::paths::BoxPaths`]. `None` off Unix, where a box takes
+/// no repo disk.
+pub fn disk_place() -> Option<saiife_boxes::manager::DiskPlacer> {
+    #[cfg(unix)]
+    {
+        use saiife_boxes::manager::DiskPlace;
+        Some(Arc::new(|root: &Path, id: &BoxId| {
+            let p = saiife_boxhost::paths::BoxPaths::of(root, id);
+            DiskPlace {
+                repo_image: p.repo_disk(),
+                base_manifest: p.base_manifest(),
+            }
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Where box templates come from (B11). Locked: `<dir of config_path>/templates.d`,
@@ -284,6 +322,7 @@ fn build_fake(
             None => host_facts(&root, &prev),
         }),
         clock: Arc::new(unix_now),
+        disk_place: disk_place(),
     })
     .map_err(|e| e.to_string())?;
     let mut warnings = opened.warnings;
@@ -395,7 +434,7 @@ pub async fn guest_event(
     })
     .await?;
     if let Some(c) = &c {
-        write_tick_records(ctx, vec![(c.clone(), template)]).await;
+        write_tick_records(ctx, "tick", None, vec![(c.clone(), template)]).await;
     }
     Ok(c)
 }
@@ -410,33 +449,68 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
     };
     let admit = !locked_all(ctx);
     let done = tokio::task::spawn_blocking(move || {
-        let changes = mgr.tick_with(admit);
-        changes
+        // The floor first: the free-space read and the pauses hold no lock
+        // while the host is probed; a box newly Running is paused (and
+        // recorded) once, a box already Paused is not touched again.
+        let low = floor_pauses(&mgr);
+        let changes = mgr
+            .tick_with(admit)
             .into_iter()
             .map(|c| {
                 let template = mgr.get(&c.id).ok().map(|r| r.template);
                 (c, template)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (low, changes)
     })
     .await;
-    let changes = match done {
+    let (low, changes) = match done {
         Ok(c) => c,
         Err(e) => {
             eprintln!("saiifed: boxes: the tick did not finish: {e}");
             return 0;
         }
     };
-    let n = changes.len();
-    write_tick_records(ctx, changes).await;
+    let n = low.len() + changes.len();
+    write_tick_records(ctx, "disk_low", Some(DISK_LOW_WHY), low).await;
+    write_tick_records(ctx, "tick", None, changes).await;
     n
+}
+
+/// Below the disk floor: pause every `Running` box with [`DISK_LOW_WHY`].
+fn floor_pauses(mgr: &Manager) -> Vec<(Change, Option<String>)> {
+    if !capacity::below_floor(&mgr.host_facts()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for r in mgr.list() {
+        if r.state != BoxState::Running {
+            continue;
+        }
+        match mgr.pause_for(&r.id, DISK_LOW_WHY) {
+            Ok(c) => out.push((c, Some(r.template))),
+            Err(e) => eprintln!(
+                "saiifed: boxes: cannot pause {} on low disk: {e}",
+                r.id.as_str()
+            ),
+        }
+    }
+    out
 }
 
 /// The daemon's own `box` records (`action`/`via` "tick", `reason` = why),
 /// one per change, each with the box's template when it is still known.
-async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
+async fn write_tick_records(
+    ctx: &Ctx,
+    action: &str,
+    reason: Option<&str>,
+    changes: Vec<(Change, Option<String>)>,
+) {
     for (c, template) in changes {
-        let rec = tick_record(ctx, &c, template.as_deref());
+        let mut rec = tick_record(ctx, action, &c, template.as_deref());
+        if let Some(r) = reason {
+            rec.reason = Some(r.to_string());
+        }
         if let Err(e) = ctx.writer.append(rec).await {
             eprintln!("saiifed: warning: cannot write a box tick record: {e}");
         }
@@ -444,10 +518,10 @@ async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
 }
 
 /// One daemon-made change as its `box` record.
-fn tick_record(ctx: &Ctx, c: &Change, template: Option<&str>) -> Record {
+fn tick_record(ctx: &Ctx, action: &str, c: &Change, template: Option<&str>) -> Record {
     let mut rec = box_rec(
         ctx,
-        "tick",
+        action,
         Some(&c.id),
         template,
         Some(c.from),
@@ -470,7 +544,7 @@ pub fn change_records(ctx: &Ctx, changes: &[Change]) -> Vec<Record> {
                 .as_ref()
                 .and_then(|m| m.get(&c.id).ok())
                 .map(|r| r.template);
-            tick_record(ctx, c, template.as_deref())
+            tick_record(ctx, "tick", c, template.as_deref())
         })
         .collect()
 }
@@ -573,7 +647,9 @@ enum Op {
 }
 
 impl Op {
-    fn parse(op: &str, a: &Map<String, Value>, uid: u32) -> Result<Op, BoxError> {
+    /// `disk`: a repo disk was passed, whose manifest names the repo, so
+    /// `box.spawn` may leave `repo` out.
+    fn parse(op: &str, a: &Map<String, Value>, uid: u32, disk: bool) -> Result<Op, BoxError> {
         Ok(match op {
             OP_BOX_SPAWN => {
                 let task = match a.get("task") {
@@ -599,9 +675,13 @@ impl Op {
                     Some(Value::String(s)) if s == "now" => Start::Now,
                     Some(_) => return Err(invalid("start is \"now\" or \"queue\"")),
                 };
+                let repo = match a.get("repo") {
+                    None | Some(Value::Null) if disk => String::new(),
+                    _ => arg_text(a, "repo", MAX_REPO_BYTES)?,
+                };
                 Op::Spawn(SpawnArgs {
                     template: arg_text(a, "template", MAX_TEMPLATE_BYTES)?,
-                    repo: arg_text(a, "repo", MAX_REPO_BYTES)?,
+                    repo,
                     repo_dir,
                     task,
                     start,
@@ -701,6 +781,20 @@ fn obj<T: Serialize>(t: &T) -> Map<String, Value> {
     }
 }
 
+/// Allocated MiB (rounded up) of a box's disks; lstat only, no lock held.
+#[cfg(unix)]
+fn disk_mib(root: &Path, id: &BoxId) -> u64 {
+    saiife_boxhost::disk::usage(&saiife_boxhost::paths::BoxPaths::of(root, id))
+        .total()
+        .div_ceil(1 << 20)
+}
+
+#[cfg(not(unix))]
+fn disk_mib(root: &Path, id: &BoxId) -> u64 {
+    let _ = (root, id);
+    0
+}
+
 /// `{box: BoxInfo}`: box `r` as `scope` sees it (queue positions among
 /// that owner's boxes; `None`: the whole queue).
 fn info_of(mgr: &Arc<Manager>, r: &BoxRecord, scope: Option<u32>) -> Map<String, Value> {
@@ -738,9 +832,19 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let Some(mgr) = ctx.box_manager.clone() else {
         return err(id, ErrorCode::Unavailable, UNAVAILABLE);
     };
+    // The descriptors a `box.fds` passed are this op's: `box.spawn` takes
+    // them, any other box op closes them now. Every refusal below closes
+    // them too.
+    #[cfg(unix)]
+    let mut passed: Passed = conn.take_fds();
+    #[cfg(not(unix))]
+    let mut passed: Passed = Vec::new();
+    if req.op != OP_BOX_SPAWN {
+        passed.clear();
+    }
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
-    let op = match Op::parse(&req.op, &req.args, peer.uid) {
+    let op = match Op::parse(&req.op, &req.args, peer.uid, !passed.is_empty()) {
         Ok(op) => op,
         Err(e) => return refusal(id, &e),
     };
@@ -808,7 +912,7 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         None => None,
     };
 
-    let done = run(ctx, &mgr, &caller, op, before).await;
+    let done = run(ctx, &mgr, &caller, op, before, passed).await;
     let (answer, rec) = match done {
         Ok(x) => x,
         Err(e) => return refusal(id, &e),
@@ -831,14 +935,59 @@ type Done = (Map<String, Value>, Option<Record>);
 /// A manager call that changes one box.
 type Step = Box<dyn FnOnce(&Manager) -> Result<Change, BoxError> + Send>;
 
+/// The repo disk a `box.spawn` was passed, taken in (`crate::box_repo`)
+/// and named in `args`, with the repo's name from its manifest. `None`
+/// when nothing was passed. A refused disk is `Invalid` (`bad_request`);
+/// a disk the daemon failed to take in (I/O) is `Unavailable`.
+#[cfg(unix)]
+fn take_disk(
+    root: &Path,
+    passed: Passed,
+    args: &mut SpawnArgs,
+) -> Result<Option<PathBuf>, BoxError> {
+    if passed.is_empty() {
+        return Ok(None);
+    }
+    use crate::box_repo::IntakeError;
+    let (image, manifest, parsed) = crate::box_repo::intake(root, passed).map_err(|e| match e {
+        IntakeError::Refused(m) => BoxError::Invalid(m),
+        IntakeError::Failed(m) => BoxError::Unavailable(m),
+    })?;
+    args.repo = parsed.repo;
+    args.repo_image = Some(image.clone());
+    args.base_manifest = Some(manifest);
+    Ok(Some(image))
+}
+
+#[cfg(not(unix))]
+fn take_disk(
+    root: &Path,
+    passed: Passed,
+    args: &mut SpawnArgs,
+) -> Result<Option<PathBuf>, BoxError> {
+    let _ = (root, passed, args);
+    Ok(None)
+}
+
+/// What [`take_disk`] left in `.incoming`, once the spawn is over.
+fn discard_disk(root: &Path, image: Option<&Path>) {
+    #[cfg(unix)]
+    if let Some(i) = image {
+        crate::box_repo::discard(root, i);
+    }
+    #[cfg(not(unix))]
+    let _ = (root, image);
+}
+
 /// One op, past its argument, lockdown and owner checks. `before` is the
-/// target box as the owner check read it.
+/// target box as the owner check read it; `passed`, a spawn's repo disk.
 async fn run(
     ctx: &Ctx,
     mgr: &Arc<Manager>,
     caller: &Arc<Caller>,
     op: Op,
     before: Option<BoxRecord>,
+    passed: Passed,
 ) -> Result<Done, BoxError> {
     let m = Arc::clone(mgr);
     let c = Arc::clone(caller);
@@ -871,9 +1020,15 @@ async fn run(
         }
     };
     match op {
-        Op::Spawn(args) => {
+        Op::Spawn(mut args) => {
             let (r, answer, others) = blocking(move || {
-                let (r, changes) = m.spawn_changes(&args)?;
+                // The copy runs here, off the runtime and outside every
+                // lock; the manager moves it into the box dir.
+                let root = m.root().to_path_buf();
+                let staged = take_disk(&root, passed, &mut args)?;
+                let spawned = m.spawn_changes(&args);
+                discard_disk(&root, staged.as_deref());
+                let (r, changes) = spawned?;
                 let answer = info_of(&m, &r, Some(r.owner_uid));
                 // Earlier queue heads this spawn's admission pass moved
                 // (possibly other owners' boxes): the tick never sees them.
@@ -890,7 +1045,7 @@ async fn run(
                 Ok((r, answer, others))
             })
             .await?;
-            write_tick_records(ctx, others).await;
+            write_tick_records(ctx, "tick", None, others).await;
             let mut rec = box_rec(
                 ctx,
                 "spawn",
@@ -909,6 +1064,9 @@ async fn run(
             let scope = (!(all && caller.privileged)).then_some(uid);
             blocking(move || {
                 let boxes = ManagerSource::new(Arc::clone(&m), scope).list();
+                // Usage is read from the box dirs after every manager lock
+                // is released (the lists above are snapshots).
+                let root = m.root().to_path_buf();
                 let (host, committed) = m.capacity();
                 let (total, free) = capacity::slots(&host, &committed);
                 let mut a = Map::new();
@@ -924,9 +1082,13 @@ async fn run(
                     .into_iter()
                     .map(|b| {
                         let err = errors.get(&b.id).cloned();
+                        let disk = disk_mib(&root, &b.id);
                         let mut v = serde_json::to_value(b).unwrap_or_default();
-                        if let (Some(e), Value::Object(o)) = (err, &mut v) {
-                            o.insert("error".into(), e.into());
+                        if let Value::Object(o) = &mut v {
+                            if let Some(e) = err {
+                                o.insert("error".into(), e.into());
+                            }
+                            o.insert("disk_mib".into(), disk.into());
                         }
                         v
                     })

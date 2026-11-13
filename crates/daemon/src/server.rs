@@ -4,6 +4,8 @@
 use crate::hooks::{ConnId, HookTable};
 use crate::ops::{self, Ctx, Notice};
 use saiife_ipc::frame::{body_len, decode, encode_max, FrameError, MAX_ANSWER_FRAME};
+#[cfg(unix)]
+use saiife_ipc::msg::OP_BOX_FDS;
 use saiife_ipc::msg::{err, ErrorCode, Request, OP_HELLO, PROTO};
 use saiife_ipc::peer::PeerCred;
 use serde_json::{Map, Value};
@@ -145,14 +147,36 @@ pub async fn connection(s: NamedPipeServer, ctx: Arc<Ctx>) {
     serve_peer(s, peer, ctx, Listener::Control).await
 }
 
+/// A connection's stream: a unix socket, or a pipe instance on Windows.
+#[cfg(unix)]
+type Stream = UnixStream;
+#[cfg(windows)]
+type Stream = NamedPipeServer;
+
+/// The descriptors that follow a `box.fds` frame (plan 37): exactly one
+/// byte is read, so the next frame stays in the stream. `Err` leaves the
+/// stream out of step: the connection must close. `Ok(None)`: the hook
+/// table closed the connection meanwhile (its overrun), which ends it now.
+#[cfg(unix)]
+async fn recv_box_fds(
+    s: &Stream,
+    conn: &ops::Conn,
+) -> std::io::Result<Option<Vec<std::os::fd::OwnedFd>>> {
+    use saiife_ipc::fdpass::{recv_fds, MAX_FDS};
+    let byte = s.async_io(tokio::io::Interest::READABLE, || recv_fds(s, MAX_FDS));
+    tokio::select! {
+        biased;
+        _ = conn.close.notified() => Ok(None),
+        r = timeout(FRAME_TIMEOUT, byte) => match r {
+            Ok(r) => r.map(Some),
+            Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+        },
+    }
+}
+
 /// Serves one identified peer. The caps are taken before any frame is read: a connection
 /// over its uid's cap is closed at once, so it cannot hold a pipe instance or a descriptor.
-async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(
-    mut s: S,
-    peer: PeerCred,
-    ctx: Arc<Ctx>,
-    listener: Listener,
-) {
+async fn serve_peer(mut s: Stream, peer: PeerCred, ctx: Arc<Ctx>, listener: Listener) {
     let accepted = tokio::time::Instant::now();
     // A gateway MCP child (decision 12), or in locked mode any process of
     // the daemon's own uid: closed before a byte is read or answered.
@@ -221,6 +245,10 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(
         let req = match Request::from_map(frame) {
             Ok(r) => r,
             Err(code) => {
+                // Not dispatched: descriptors a `box.fds` left are for this
+                // frame, so they go with it.
+                #[cfg(unix)]
+                drop(conn.take_fds());
                 let msg = "a request needs a u64 id and a string op";
                 if !write(&mut s, &err(id_hint, code, msg)).await || !greeted {
                     return;
@@ -245,12 +273,38 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(
             }
             continue;
         }
+        // `box.fds` (plan 37): its byte follows the frame at once and is read
+        // now, whatever the answer, so the stream stays in step. A byte that
+        // cannot be read (EOF, the frame timeout, another byte, too many
+        // descriptors) closes the stash and, once answered, the connection.
+        #[cfg(unix)]
+        let passed = if listener == Listener::Control && req.op == OP_BOX_FDS {
+            match recv_box_fds(&s, &conn).await {
+                Ok(Some(fds)) => Some(fds),
+                Ok(None) => return,
+                Err(e) => {
+                    drop(conn.take_fds());
+                    let msg = format!("box.fds: the descriptors did not come: {e}");
+                    write(&mut s, &err(req.id, ErrorCode::BadRequest, &msg)).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let answer = match ctx.limits.try_begin(peer.uid, Instant::now()) {
             Ok(_in_flight) => match listener {
+                #[cfg(unix)]
+                Listener::Control if passed.is_some() => {
+                    ops::box_fds(&conn, &req, passed.unwrap_or_default())
+                }
                 Listener::Control => ops::dispatch_conn(&ctx, &conn, req).await,
                 Listener::Link => crate::workspace_ops::dispatch_link(&ctx, &conn, req).await,
             },
             Err(code) => {
+                // A refused request takes no descriptors: the stash goes too.
+                #[cfg(unix)]
+                drop(conn.take_fds());
                 ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Requests);
                 err(req.id, code, "too many requests from this uid")
             }
@@ -282,6 +336,240 @@ mod tests {
         assert!(read.is_ok(), "the connection was not closed");
         let _ = task.await;
         got
+    }
+
+    /// A greeted connection to `ctx` (as its own uid) and its task.
+    async fn greeted(ctx: Arc<Ctx>) -> (UnixStream, tokio::task::JoinHandle<()>) {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(theirs, ctx));
+        let hello = json!({"id": 1, "op": OP_HELLO, "proto": PROTO});
+        assert_eq!(ask(&mut ours, hello, &[]).await["ok"], true);
+        (ours, task)
+    }
+
+    /// Sends `req`, then (when `fds` is not empty, or `req` is `box.fds`)
+    /// the fd byte with `fds`, and reads one answer.
+    async fn ask(s: &mut UnixStream, req: Value, fds: &[std::os::fd::BorrowedFd<'_>]) -> Value {
+        s.write_all(&encode_max(&req, MAX_ANSWER_FRAME).unwrap())
+            .await
+            .unwrap();
+        if req["op"] == OP_BOX_FDS {
+            saiife_ipc::fdpass::send_fds(&*s, fds).unwrap();
+        }
+        answer(s).await.expect("an answer")
+    }
+
+    /// The next answer frame, `None` at EOF.
+    async fn answer(s: &mut UnixStream) -> Option<Value> {
+        let mut h = [0u8; 4];
+        let read = timeout(Duration::from_secs(5), s.read_exact(&mut h)).await;
+        read.expect("answered in time").ok()?;
+        let mut body = vec![0u8; saiife_ipc::frame::body_len_max(h, MAX_ANSWER_FRAME).unwrap()];
+        s.read_exact(&mut body).await.unwrap();
+        Some(serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A descriptor to pass, and the far end that tells whether every copy
+    /// of it is closed. Only this pair's own state is checked, so tests
+    /// opening descriptors in parallel cannot change the answer.
+    fn witness() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (pass, far) = std::os::unix::net::UnixStream::pair().unwrap();
+        far.set_nonblocking(true).unwrap();
+        (pass, far)
+    }
+
+    /// Whether every copy of the witness's passed end is closed (EOF).
+    fn closed(far: &std::os::unix::net::UnixStream) -> bool {
+        use std::io::Read;
+        match (&*far).read(&mut [0u8; 1]) {
+            Ok(0) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn fds_req(id: u64, n: Value) -> Value {
+        json!({"id": id, "op": OP_BOX_FDS, "n": n})
+    }
+
+    #[tokio::test]
+    async fn fds_reach_the_next_op() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(ctx).await;
+        std::fs::write(t.path().join("a"), "alpha").unwrap();
+        std::fs::write(t.path().join("b"), "beta").unwrap();
+        let a = std::fs::File::open(t.path().join("a")).unwrap();
+        let b = std::fs::File::open(t.path().join("b")).unwrap();
+        let r = ask(&mut ours, fds_req(2, 2.into()), &[a.as_fd(), b.as_fd()]).await;
+        assert_eq!(r, json!({"id": 2, "ok": true}));
+        let r = ask(&mut ours, json!({"id": 3, "op": ops::TEST_FDS_OP}), &[]).await;
+        assert_eq!(r["texts"], json!(["alpha", "beta"]), "{r}");
+        // Taken: the next one finds none.
+        let r = ask(&mut ours, json!({"id": 4, "op": ops::TEST_FDS_OP}), &[]).await;
+        assert_eq!(r["texts"], json!([]), "{r}");
+        // Any other op closes what is kept.
+        let (pass, far) = witness();
+        let r = ask(&mut ours, fds_req(5, 1.into()), &[pass.as_fd()]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        drop(pass);
+        assert!(!closed(&far));
+        let r = ask(&mut ours, json!({"id": 6, "op": "status"}), &[]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(closed(&far));
+        let r = ask(&mut ours, json!({"id": 7, "op": ops::TEST_FDS_OP}), &[]).await;
+        assert_eq!(r["texts"], json!([]), "{r}");
+        drop(ours);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stash_is_dropped_with_the_connection() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(ctx).await;
+        let (pass, far) = witness();
+        let r = ask(&mut ours, fds_req(2, 1.into()), &[pass.as_fd()]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        drop(pass);
+        assert!(!closed(&far), "the daemon keeps it");
+        drop(ours);
+        task.await.unwrap();
+        assert!(closed(&far), "closed with the connection");
+    }
+
+    #[tokio::test]
+    async fn second_box_fds_is_bad_request() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(ctx).await;
+        let (p1, f1) = witness();
+        let (p2, f2) = witness();
+        let r = ask(&mut ours, fds_req(2, 1.into()), &[p1.as_fd()]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        let r = ask(&mut ours, fds_req(3, 1.into()), &[p2.as_fd()]).await;
+        assert_eq!(r["error"], "bad_request", "{r}");
+        drop((p1, p2));
+        assert!(closed(&f1) && closed(&f2), "both sets are closed");
+        // Still in step: the connection answers on.
+        let r = ask(&mut ours, json!({"id": 4, "op": ops::TEST_FDS_OP}), &[]).await;
+        assert_eq!(r["texts"], json!([]), "{r}");
+        drop(ours);
+        task.await.unwrap();
+    }
+
+    /// A count that is not 1 to MAX_FDS, or not what came, is refused with
+    /// every descriptor closed, and the connection answers on.
+    #[tokio::test]
+    async fn bad_box_fds_counts_are_bad_request() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(ctx).await;
+        let (pass, far) = witness();
+        let one = [pass.as_fd()];
+        let cases: [(Value, &[std::os::fd::BorrowedFd<'_>]); 6] = [
+            (0.into(), &[]),
+            (1.into(), &[]),
+            (0.into(), &one),
+            (2.into(), &one),
+            (Value::Null, &one),
+            ("1".into(), &one),
+        ];
+        for (i, (n, fds)) in cases.into_iter().enumerate() {
+            let r = ask(&mut ours, fds_req(10 + i as u64, n.clone()), fds).await;
+            assert_eq!(r["error"], "bad_request", "n {n}: {r}");
+        }
+        drop(pass);
+        assert!(closed(&far));
+        let r = ask(&mut ours, json!({"id": 30, "op": "status"}), &[]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        drop(ours);
+        task.await.unwrap();
+    }
+
+    /// More than MAX_FDS, or no fd byte after the frame: refused, every
+    /// descriptor closed, and the connection closed (out of step).
+    #[tokio::test]
+    async fn unreadable_box_fds_closes_the_connection() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(Arc::clone(&ctx)).await;
+        let pairs: Vec<_> = (0..5).map(|_| witness()).collect();
+        let fds: Vec<_> = pairs.iter().map(|(p, _)| p.as_fd()).collect();
+        let r = ask(&mut ours, fds_req(2, 5.into()), &fds).await;
+        assert_eq!(r["error"], "bad_request", "{r}");
+        assert_eq!(answer(&mut ours).await, None, "closed");
+        task.await.unwrap();
+        drop(fds);
+        for (p, far) in pairs {
+            drop(p);
+            assert!(closed(&far));
+        }
+        // A request where the byte should be.
+        let (mut ours, task) = greeted(ctx).await;
+        let mut two = encode_max(&fds_req(2, 1.into()), MAX_ANSWER_FRAME).unwrap();
+        two.extend(encode_max(&json!({"id": 3, "op": "status"}), MAX_ANSWER_FRAME).unwrap());
+        ours.write_all(&two).await.unwrap();
+        let r = answer(&mut ours).await.unwrap();
+        assert_eq!(r["error"], "bad_request", "{r}");
+        assert_eq!(answer(&mut ours).await, None, "closed");
+        task.await.unwrap();
+    }
+
+    /// R8 (M1): a frame that is no request is not dispatched, and the
+    /// descriptors a `box.fds` left go with it: none reach a later op.
+    #[tokio::test]
+    async fn malformed_request_drops_the_stash() {
+        use std::os::fd::AsFd;
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let (mut ours, task) = greeted(ctx).await;
+        let (pass, far) = witness();
+        let r = ask(&mut ours, fds_req(2, 1.into()), &[pass.as_fd()]).await;
+        assert_eq!(r["ok"], true, "{r}");
+        drop(pass);
+        assert!(!closed(&far));
+        let r = ask(&mut ours, json!({"id": 3, "op": 5}), &[]).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(closed(&far), "the stash went with the malformed frame");
+        let r = ask(&mut ours, json!({"id": 4, "op": ops::TEST_FDS_OP}), &[]).await;
+        assert_eq!(r["texts"], json!([]), "{r}");
+        drop(ours);
+        task.await.unwrap();
+    }
+
+    /// R8 (M2): the hook table closing the connection (its overrun) while
+    /// the daemon waits for a `box.fds` byte ends the wait at once, not at
+    /// the frame timeout.
+    #[tokio::test]
+    async fn overrun_during_box_fds_closes_at_once() {
+        let (_ours, theirs) = UnixStream::pair().unwrap();
+        let peer = saiife_ipc::peer::peer_cred(&theirs).unwrap();
+        let conn = ops::Conn::new(peer, None);
+        let close = Arc::clone(&conn.close);
+        let start = Instant::now();
+        let wait = async { recv_box_fds(&theirs, &conn).await };
+        let fire = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            close.notify_one();
+        };
+        let (got, ()) = tokio::join!(wait, fire);
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        assert!(start.elapsed() < FRAME_TIMEOUT / 2, "{:?}", start.elapsed());
     }
 
     #[tokio::test]

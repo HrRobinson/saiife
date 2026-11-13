@@ -15,6 +15,8 @@ pub mod audit_query;
 #[cfg(unix)]
 pub mod box_gateway;
 pub mod box_ops;
+#[cfg(unix)]
+pub mod box_repo;
 pub mod cloud_ops;
 pub mod cosign;
 pub mod disk;

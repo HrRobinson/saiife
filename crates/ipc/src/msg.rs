@@ -276,6 +276,16 @@ pub const OP_BOX_DONE: &str = "box.done";
 /// local): `{}` -> `{removed: [id]}`. Root or an admin removes every one;
 /// anyone else only their own discarded boxes.
 pub const OP_BOX_GC: &str = "box.gc";
+/// Control socket only, machine local (plan 37): `{n}` -> `{}`. The frame is
+/// followed at once by one byte, `fdpass::FD_BYTE`, carrying `n` (1 to
+/// `fdpass::MAX_FDS`) descriptors, which the connection keeps for its next
+/// request. Only an op in [`FD_OPS`] takes them; any other op closes them.
+/// A second `box.fds` while descriptors are kept is `bad_request`.
+pub const OP_BOX_FDS: &str = "box.fds";
+/// The ops that take the descriptors of the `box.fds` just before them.
+/// `box.image.import` (plan 36) is named here before its `OP_` const exists,
+/// so that adding the const and its level is that plan's change.
+pub const FD_OPS: &[&str] = &[OP_BOX_SPAWN, "box.image.import"];
 /// The only ops link.sock answers; every other name is `unknown_op`.
 pub const LINK_OPS: &[&str] = &[
     OP_HELLO,

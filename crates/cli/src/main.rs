@@ -34,6 +34,9 @@ mod audit_locked;
 mod box_attach;
 mod box_cmd;
 mod box_image_cmd;
+// The repo disk of `box spawn` (plan 37).
+#[cfg(unix)]
+mod box_repo;
 mod box_vmm_cmd;
 mod box_vmm_helper;
 #[cfg(any(unix, windows))]

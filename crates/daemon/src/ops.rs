@@ -1163,6 +1163,11 @@ pub struct Conn {
     pub id: crate::hooks::ConnId,
     /// Fired when the hook table closes this connection (a hook overrun).
     pub close: Arc<tokio::sync::Notify>,
+    /// The descriptors the last `box.fds` passed (plan 37), kept for the
+    /// next request; closed by any request not in `FD_OPS`, and with the
+    /// connection.
+    #[cfg(unix)]
+    pub fds: Arc<Mutex<Vec<std::os::fd::OwnedFd>>>,
 }
 
 impl Conn {
@@ -1173,8 +1178,81 @@ impl Conn {
             steps: Arc::default(),
             id: crate::server::next_conn_id(),
             close: Arc::default(),
+            #[cfg(unix)]
+            fds: Arc::default(),
         }
     }
+
+    /// The descriptors the last `box.fds` passed, the stash emptied. Dropping
+    /// them closes them, outside the stash's lock.
+    #[cfg(unix)]
+    pub fn take_fds(&self) -> Vec<std::os::fd::OwnedFd> {
+        std::mem::take(&mut *lock(&self.fds))
+    }
+}
+
+/// Whether `op` takes the descriptors of the `box.fds` before it.
+#[cfg(unix)]
+fn takes_fds(op: &str) -> bool {
+    if saiife_ipc::msg::FD_OPS.contains(&op) {
+        return true;
+    }
+    #[cfg(test)]
+    if op == TEST_FDS_OP {
+        return true;
+    }
+    false
+}
+
+/// `box.fds {n}` once its descriptors `got` are in (the connection reads
+/// them, `crate::server`): kept for the next request when `n` is 1 to
+/// `MAX_FDS` and names exactly what came, and nothing is kept yet.
+/// Otherwise `bad_request`, with every descriptor closed, kept or new.
+#[cfg(unix)]
+pub fn box_fds(conn: &Conn, req: &Request, got: Vec<std::os::fd::OwnedFd>) -> Value {
+    use saiife_ipc::fdpass::MAX_FDS;
+    let held = conn.take_fds();
+    if !held.is_empty() {
+        return err(
+            req.id,
+            ErrorCode::BadRequest,
+            "box.fds was sent twice: both sets of descriptors are closed",
+        );
+    }
+    let n = req.args.get("n").and_then(Value::as_u64);
+    let fits = matches!(n, Some(n) if (1..=MAX_FDS as u64).contains(&n) && n == got.len() as u64);
+    if !fits {
+        let msg = format!(
+            "box.fds needs n, 1 to {MAX_FDS}, naming the descriptors passed ({} came)",
+            got.len()
+        );
+        return err(req.id, ErrorCode::BadRequest, &msg);
+    }
+    *lock(&conn.fds) = got;
+    ok(req.id, Map::new())
+}
+
+/// A test-only op that takes the stash and answers what each descriptor
+/// reads from its start (`fds_reach_the_next_op`).
+#[cfg(all(test, unix))]
+pub(crate) const TEST_FDS_OP: &str = "test.fds";
+
+#[cfg(all(test, unix))]
+fn test_fds(conn: &Conn, id: u64) -> Value {
+    use std::os::unix::fs::FileExt;
+    let texts: Vec<Value> = conn
+        .take_fds()
+        .into_iter()
+        .map(|fd| {
+            let f = std::fs::File::from(fd);
+            let mut buf = vec![0u8; 256];
+            let n = f.read_at(&mut buf, 0).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned().into()
+        })
+        .collect();
+    let mut m = Map::new();
+    m.insert("texts".into(), texts.into());
+    ok(id, m)
 }
 
 /// The last answers of a connection's `grant.consume` and
@@ -1204,7 +1282,22 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 /// Every op but `hello`.
 pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let peer = &conn.peer;
+    // Passed descriptors are for the very next request, and only for one
+    // that takes them: any other closes them.
+    #[cfg(unix)]
+    if !takes_fds(&req.op) {
+        drop(conn.take_fds());
+    }
     match req.op.as_str() {
+        #[cfg(all(test, unix))]
+        TEST_FDS_OP => test_fds(conn, req.id),
+        // The connection reads `box.fds` itself (`crate::server`), on the
+        // control socket of a unix daemon only.
+        saiife_ipc::msg::OP_BOX_FDS => err(
+            req.id,
+            ErrorCode::BadRequest,
+            "box.fds is taken by a unix control connection only",
+        ),
         OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
         // Machine local only: the touch admin ops (enrol, remove, list,
@@ -1242,11 +1335,16 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             crate::workspace_ops::handle(ctx, conn, req).await
         }
         op if crate::box_ops::OPS.contains(&op) => crate::box_ops::handle(ctx, conn, req).await,
-        other => err(
-            req.id,
-            ErrorCode::UnknownOp,
-            &format!("unknown op {other:?}"),
-        ),
+        other => {
+            // An fd op this daemon does not serve: what it was passed goes.
+            #[cfg(unix)]
+            drop(conn.take_fds());
+            err(
+                req.id,
+                ErrorCode::UnknownOp,
+                &format!("unknown op {other:?}"),
+            )
+        }
     }
 }
 

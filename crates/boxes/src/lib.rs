@@ -6,6 +6,7 @@ pub mod capacity;
 pub mod error;
 pub mod guest;
 pub mod manager;
+pub mod place;
 pub mod source;
 pub mod state;
 pub mod store;
