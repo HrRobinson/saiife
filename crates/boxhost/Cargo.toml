@@ -27,6 +27,8 @@ serde_json = "1"
 toml = "0.8"
 # Headless terminal for the box PTY (spec §9.4); pinned.
 vt100 = "=0.15.2"
+# Line diffs for the host-rendered land review (plan 39 Task 3); pinned, no deps.
+similar = "=2.7.0"
 
 [features]
 # Builds the saiife-fake-ch test binary.

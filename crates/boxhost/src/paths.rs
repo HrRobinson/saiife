@@ -75,8 +75,42 @@ impl BoxPaths {
     pub fn term_cast(&self) -> PathBuf {
         self.file("term.cast")
     }
+    /// Daemon-trusted state: the land records (plan 39), one dir per export.
     pub fn lands_dir(&self) -> PathBuf {
         self.file("lands")
+    }
+    /// `lands/<n>/` (0700): one export's review and land records.
+    pub fn land_dir(&self, n: u32) -> PathBuf {
+        self.lands_dir().join(n.to_string())
+    }
+    /// `lands/<n>/blobs/`: content by SHA-256 (new content, and the old
+    /// content of a modify the review renders as text).
+    pub fn land_blobs(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("blobs")
+    }
+    /// `lands/<n>/blobs/<sha256>`.
+    pub fn land_blob(&self, n: u32, sha256: &str) -> PathBuf {
+        self.land_blobs(n).join(sha256)
+    }
+    /// `lands/<n>/delta.bin`: the selected entries' new content, for the CLI.
+    pub fn land_delta(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("delta.bin")
+    }
+    /// `lands/<n>/review.json`.
+    pub fn land_review(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("review.json")
+    }
+    /// `lands/<n>/request.json`.
+    pub fn land_request(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("request.json")
+    }
+    /// `lands/<n>/approved.json`.
+    pub fn land_approved(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("approved.json")
+    }
+    /// `lands/<n>/applied.json`.
+    pub fn land_applied(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("applied.json")
     }
     pub fn placeholder(&self) -> PathBuf {
         self.file("placeholder")
@@ -105,5 +139,21 @@ mod tests {
         assert_eq!(p.root_disk(), p.dir.join(ROOT_DISK));
         assert_eq!(p.repo_disk(), p.dir.join(REPO_DISK));
         assert_eq!(p.base_manifest(), p.dir.join(BASE_MANIFEST));
+    }
+
+    #[test]
+    fn land_files_are_under_lands() {
+        let p = BoxPaths::new(PathBuf::from("/b/x"));
+        assert_eq!(p.land_dir(3), PathBuf::from("/b/x/lands/3"));
+        assert_eq!(p.land_blob(3, "ab"), PathBuf::from("/b/x/lands/3/blobs/ab"));
+        for f in [
+            p.land_delta(3),
+            p.land_review(3),
+            p.land_request(3),
+            p.land_approved(3),
+            p.land_applied(3),
+        ] {
+            assert_eq!(f.parent(), Some(p.land_dir(3).as_path()));
+        }
     }
 }
