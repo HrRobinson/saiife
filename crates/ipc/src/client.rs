@@ -573,6 +573,44 @@ impl Client {
         self.call(op, args, deadline)
     }
 
+    /// As [`Client::call`] for an op whose `ok` answer is followed by the fd
+    /// byte (`crate::msg::FD_ANSWER_OPS`): the descriptors that came with
+    /// it, at most `max`. A refusal has no byte after it and is returned as
+    /// the error, the connection still usable. A byte that does not come in
+    /// time, or is not the fd byte, leaves the connection unusable.
+    #[cfg(unix)]
+    pub fn call_recv_fds(
+        &mut self,
+        op: &str,
+        args: Map<String, Value>,
+        max: usize,
+        deadline: Instant,
+    ) -> Result<(Map<String, Value>, Vec<std::os::fd::OwnedFd>), ClientError> {
+        let ans = self.call(op, args, deadline)?;
+        let r = (|| {
+            // One arm outside tests: the pipe transport is a test double here.
+            #[allow(clippy::infallible_destructuring_match)]
+            let s = match &self.stream {
+                Transport::Unix(s) => s,
+                #[cfg(test)]
+                Transport::Pipe(_) => {
+                    return Err(ClientError::Protocol("not a unix socket".into()))
+                }
+            };
+            let left = remaining(deadline).ok_or(ClientError::Timeout)?;
+            s.set_read_timeout(Some(left))
+                .map_err(|e| ClientError::Frame(FrameError::Io(e)))?;
+            crate::fdpass::recv_fds(s, max).map_err(|e| ClientError::from(FrameError::Io(e)))
+        })();
+        match r {
+            Ok(fds) => Ok((ans, fds)),
+            Err(e) => {
+                self.poison(&e);
+                Err(e)
+            }
+        }
+    }
+
     /// Not on this platform: descriptors pass over a unix socket only.
     #[cfg(windows)]
     pub fn call_with_fds(
@@ -1393,6 +1431,61 @@ mod tests {
         assert!(!c.is_poisoned());
         drop(c);
         assert_eq!(h.join().unwrap(), ["box.fds", "box.spawn"]);
+    }
+
+    /// `call_recv_fds`: the fd byte after an `ok` answer is read with its
+    /// descriptor; a refusal has none and leaves the connection usable.
+    #[test]
+    fn call_recv_fds_reads_the_fd_after_the_answer() {
+        let d = dir_0755();
+        let f = d.path().join("delta");
+        std::fs::write(&f, "delta bytes").unwrap();
+        let l = UnixListener::bind(d.path().join(SOCKET_NAME)).unwrap();
+        let fp = f.clone();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let h = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":h["id"],"ok":true,"proto":1})).unwrap();
+            // A refusal: no byte.
+            let m = read_frame(&mut s).unwrap();
+            write_frame(
+                &mut s,
+                &json!({"id":m["id"],"ok":false,"error":"bad_request","message":"no"}),
+            )
+            .unwrap();
+            // An answer and its descriptor.
+            let m = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":m["id"],"ok":true,"land":{"n":1}})).unwrap();
+            let file = std::fs::File::open(&fp).unwrap();
+            use std::os::fd::AsFd;
+            crate::fdpass::send_fds(&s, &[file.as_fd()]).unwrap();
+            // An answer and no byte: the client times out.
+            let m = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":m["id"],"ok":true})).unwrap();
+            let _ = read_frame(&mut s);
+        });
+        let mut c = Client::connect(d.path(), me(), dl(2000)).unwrap();
+        let r = c.call_recv_fds("box.land", Map::new(), 1, dl(2000));
+        assert!(
+            matches!(&r, Err(ClientError::Refused { code, .. }) if code == "bad_request"),
+            "{r:?}"
+        );
+        assert!(!c.is_poisoned());
+        let (a, fds) = c
+            .call_recv_fds("box.land", Map::new(), 1, dl(2000))
+            .unwrap();
+        assert_eq!(a["land"]["n"], 1);
+        assert_eq!(fds.len(), 1);
+        let mut text = String::new();
+        std::fs::File::from(fds.into_iter().next().unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "delta bytes");
+        let r = c.call_recv_fds("box.land", Map::new(), 1, dl(300));
+        assert!(r.is_err(), "{r:?}");
+        assert!(c.is_poisoned());
+        drop(c);
+        h.join().unwrap();
     }
 
     #[test]

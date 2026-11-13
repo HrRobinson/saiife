@@ -5,6 +5,10 @@
 //! base tree and a work tree and serves exports of the difference (made
 //! with `write_delta`). Touches use plan 26's `SoftAuthenticator`. No VM
 //! is ever started.
+//!
+//! Task 5: the control-socket ops (`box.diff`, `box.land.*`, `box.push.*`,
+//! `box.discard --force`) through `ops::dispatch_conn`, and once over the
+//! real socket with `Client`.
 #![cfg(all(unix, feature = "fake-vmm"))]
 
 use saiife_audit::{ChainWriter, WriterOptions};
@@ -26,19 +30,25 @@ use saiife_boxproto::frame::{read_msg, write_msg};
 use saiife_boxproto::manifest::{BaseManifest, Entry, EntryKind};
 use saiife_boxproto::msg::{AgentSpec, Event, HostReply, Reply, Request, Setup};
 use saiife_boxproto::{ports, PROTO};
+use saiife_broker::pipeline::{LockScope, Lockdown};
 use saiife_daemon::box_land::{self, Lands};
 use saiife_daemon::box_ops;
-use saiife_daemon::ops::{Ctx, CtxInit, Mode, PolicyState};
+use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, Mode, PolicyState};
 use saiife_daemon::touch::IssueKey;
 use saiife_daemon::writer::{self, WriterConfig};
+use saiife_ipc::msg::Request as IpcRequest;
+use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, Fsync};
 use saiife_touch::soft::SoftAuthenticator;
-use saiife_touch::{challenge, TouchClass, TouchError, TouchEvidence, LOCAL_RP_ID as RP};
+use saiife_touch::{
+    challenge, ActionRecord, TouchClass, TouchError, TouchEvidence, LOCAL_RP_ID as RP,
+};
 use saiife_wire::conformance::{check, Fixture};
 use saiife_wire::source::{BoxSource, Decision, PendingAction, Start};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,6 +58,8 @@ use std::time::{Duration, Instant};
 
 const ALICE: u32 = 2000;
 const BOB: u32 = 2001;
+/// A user with no touch device.
+const CAROL: u32 = 2002;
 const T0: u64 = 1_800_000_000;
 const T: Duration = Duration::from_secs(10);
 
@@ -348,7 +360,8 @@ fn world(slots: u64) -> World {
             "root:x:0:0::/root:/bin/sh\n\
          saiife:x:999:999::/var/lib/saiife:/bin/sh\n\
          alice:x:2000:2000::/home/alice:/bin/sh\n\
-         bob:x:2001:2001::/home/bob:/bin/sh\n",
+         bob:x:2001:2001::/home/bob:/bin/sh\n\
+         carol:x:2002:2002::/home/carol:/bin/sh\n",
             "admins:x:3000:\n",
         ));
     let clock = Arc::new(AtomicU64::new(T0));
@@ -381,7 +394,7 @@ fn world(slots: u64) -> World {
         ..base
     }));
     let mut keys = BTreeMap::new();
-    for uid in [ALICE, BOB] {
+    for uid in BTreeSet::from([ALICE, BOB, me()]) {
         let s = SoftAuthenticator::new_es256();
         ctx.touch.add(s.credential(RP, uid, "k")).unwrap();
         keys.insert(uid, s);
@@ -1125,4 +1138,769 @@ fn hostile_export_audits_diff_rejected() {
     // The next honest export is reviewed again, under a fresh number.
     let r = w.lands.refresh(&i).unwrap();
     assert_eq!(r.n, 4);
+}
+
+// ---- Task 5: the control-socket ops ----
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
+fn peer(uid: u32) -> PeerCred {
+    PeerCred {
+        uid,
+        gid: uid,
+        pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
+    }
+}
+
+fn unhex32(s: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+    }
+    out
+}
+
+fn read_fd(fd: OwnedFd) -> Vec<u8> {
+    let mut b = Vec::new();
+    std::fs::File::from(fd).read_to_end(&mut b).unwrap();
+    b
+}
+
+fn rule(a: &Value) -> &str {
+    a["rule"].as_str().unwrap_or("")
+}
+
+impl World {
+    /// One op on the control socket's dispatch as `uid`: the answer and
+    /// the descriptors it hands to the connection.
+    fn op(&self, uid: u32, op: &str, args: Value) -> (Value, Vec<OwnedFd>) {
+        let conn = Conn::new(peer(uid), None);
+        let req = IpcRequest {
+            id: 7,
+            op: op.into(),
+            args: args.as_object().cloned().unwrap_or_default(),
+        };
+        let a = rt().block_on(dispatch_conn(&self.ctx, &conn, req));
+        (a, conn.take_out_fds())
+    }
+
+    fn call(&self, uid: u32, op: &str, args: Value) -> Value {
+        let (a, fds) = self.op(uid, op, args);
+        assert!(fds.is_empty(), "{op} passed descriptors: {a}");
+        a
+    }
+
+    fn ok(&self, uid: u32, op: &str, args: Value) -> Value {
+        let a = self.call(uid, op, args);
+        assert_eq!(a["ok"], true, "{op}: {a}");
+        a
+    }
+
+    /// `uid`'s touch over the challenge of a begin answer.
+    fn assert_for(&self, uid: u32, begun: &Value) -> Value {
+        let ch = unhex32(begun["touch"]["challenge"].as_str().unwrap());
+        serde_json::to_value(self.keys[&uid].assert_ctap(RP, &ch)).unwrap()
+    }
+
+    /// begin → touch → `box.land`: the answer and its delta fd.
+    fn cli_land(&self, uid: u32, i: &BoxId) -> (Value, Vec<u8>) {
+        let b = self.ok(uid, "box.land.begin", json!({"box": i.as_str()}));
+        let asr = self.assert_for(uid, &b);
+        let (a, fds) = self.op(
+            uid,
+            "box.land",
+            json!({"request_id": b["request_id"], "assertion": asr}),
+        );
+        assert_eq!(a["ok"], true, "{a}");
+        assert_eq!(fds.len(), 1);
+        (a, read_fd(fds.into_iter().next().unwrap()))
+    }
+
+    fn allowed(&self, action: &str) -> Vec<Value> {
+        let mut v = self.actions(action);
+        v.retain(|r| r["decision"] != "deny");
+        v
+    }
+
+    fn denied(&self, action: &str) -> Vec<Value> {
+        let mut v = self.actions(action);
+        v.retain(|r| r["decision"] == "deny");
+        v
+    }
+
+    fn lockdown(&self) {
+        self.ctx
+            .lockdown
+            .set(Some(Lockdown {
+                scope: LockScope::All,
+                reason: "incident".into(),
+                by_uid: 0,
+                since: "t".into(),
+            }))
+            .unwrap();
+    }
+}
+
+#[test]
+fn cli_land_roundtrip() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    // box.diff: the cached review, its entries and flags.
+    let d = w.ok(ALICE, "box.diff", json!({"box": s}));
+    let full = w.lands.latest(&i).unwrap();
+    assert_eq!(d["diff"]["diff_sha256"], full.summary.diff_sha256.as_str());
+    assert_eq!(d["diff"]["id"], s);
+    assert_eq!(d["review"]["n"], full.n);
+    assert_eq!(d["review"]["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(d["review"]["base_head"], "a".repeat(40));
+    assert!(d["review"]["flags"].is_array());
+    let before = w.exports(&i);
+    w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    assert_eq!(w.exports(&i), before + 1, "refresh exports again");
+
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": s}));
+    let rid: u64 = b["request_id"].as_str().unwrap().parse().unwrap();
+    let (req, rec) = w.lands.request(rid).unwrap();
+    assert_eq!(b["touch"]["rp_id"], RP);
+    assert_eq!(b["touch"]["uv"], true);
+    assert_eq!(
+        unhex32(b["touch"]["challenge"].as_str().unwrap()),
+        challenge(&rec)
+    );
+    assert_eq!(b["touch"]["summary"], rec.summary.as_str());
+    assert_eq!(b["expires_at"], rec.expires_at);
+    assert_eq!(b["review"]["n"], req.n);
+    assert_eq!(b["diff"]["diff_sha256"], req.diff_sha256.as_str());
+    assert_eq!(b["id"], 7, "no box id at the top: {b}");
+
+    let asr = w.assert_for(ALICE, &b);
+    let (a, fds) = w.op(
+        ALICE,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["land"]["id"], s);
+    assert_eq!(a["land"]["n"], req.n);
+    assert_eq!(a["land"]["diff_sha256"], req.diff_sha256.as_str());
+    assert_eq!(a["land"]["target_ref"], format!("saiife/box-{s}"));
+    assert_eq!(fds.len(), 1);
+    let got = read_fd(fds.into_iter().next().unwrap());
+    let on_disk = std::fs::read(w.paths(&i).land_delta(req.n)).unwrap();
+    assert!(!got.is_empty());
+    assert_eq!(got, on_disk);
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!((r.state, r.lands), (BoxState::Landed, 1));
+    let l = w.actions("land");
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0]["via"], "cli");
+    assert_eq!(l[0]["uid"], ALICE);
+    assert!(l[0]["touch"].is_object(), "{}", l[0]);
+}
+
+#[test]
+fn later_writes_need_a_new_touch() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": s}));
+    let asr = w.assert_for(ALICE, &b);
+    // The box writes more after the touch was asked for.
+    w.with_repo(&i, |g| {
+        g.work.insert("late.txt".into(), C(b"late\n".to_vec()));
+    });
+    let a = w.call(
+        ALICE,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(a["ok"], false);
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(rule(&a), "touch_mismatch", "{a}");
+    assert_eq!(w.state(&i), BoxState::Done);
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 0);
+    assert!(w.allowed("land").is_empty());
+    let refused = w.denied("land");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["rule"], "touch_mismatch");
+    // The review was refreshed: the next begin covers the late write.
+    assert!(files_of(&w, &i).contains(&"late.txt".to_string()));
+    let (a, _) = w.cli_land(ALICE, &i);
+    assert_eq!(a["land"]["id"], s);
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 1);
+}
+
+#[test]
+fn subset_hash_is_bound() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let full = w.lands.latest(&i).unwrap();
+    let b = w.ok(
+        ALICE,
+        "box.land.begin",
+        json!({"box": i.as_str(), "files": ["NEW.md"]}),
+    );
+    let rid: u64 = b["request_id"].as_str().unwrap().parse().unwrap();
+    let (req, rec) = w.lands.request(rid).unwrap();
+    assert_eq!(b["diff"]["files"].as_array().unwrap().len(), 1);
+    assert_ne!(req.diff_sha256, full.summary.diff_sha256);
+    assert_eq!(rec.fields["diff_sha256"], req.diff_sha256);
+    // A touch over the record of the whole diff (both changes) never
+    // verifies for the subset's request.
+    let mut whole: ActionRecord = rec.clone();
+    whole
+        .fields
+        .insert("diff_sha256".into(), full.summary.diff_sha256.clone());
+    let asr = w.keys[&ALICE].assert_ctap(RP, &challenge(&whole));
+    let a = w.call(
+        ALICE,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert!(
+        ["touch_mismatch", "touch_failed"].contains(&rule(&a)),
+        "{a}"
+    );
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 0);
+    assert!(!w.paths(&i).land_approved(req.n).exists());
+}
+
+#[test]
+fn request_is_single_use() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": i.as_str()}));
+    let asr = w.assert_for(ALICE, &b);
+    let args = json!({"request_id": b["request_id"], "assertion": asr});
+    let (a, fds) = w.op(ALICE, "box.land", args.clone());
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(fds.len(), 1);
+    let a = w.call(ALICE, "box.land", args);
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(rule(&a), "touch_failed", "{a}");
+    let a = w.call(
+        ALICE,
+        "box.land.reject",
+        json!({"request_id": b["request_id"]}),
+    );
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 1);
+    assert_eq!(w.allowed("land").len(), 1);
+    assert_eq!(w.denied("land").len(), 1);
+}
+
+#[test]
+fn other_uid_is_refused() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    // Bob cannot see Alice's box (B8).
+    for (op, args) in [
+        ("box.land.begin", json!({"box": s})),
+        ("box.diff", json!({"box": s})),
+        ("box.land.fetch", json!({"box": s, "n": 1})),
+        (
+            "box.land.applied",
+            json!({"box": s, "n": 1, "commit": "c".repeat(40)}),
+        ),
+        (
+            "box.push.begin",
+            json!({"box": s, "remote": "origin", "commit": "c".repeat(40)}),
+        ),
+    ] {
+        let a = w.call(BOB, op, args);
+        assert_eq!(a["ok"], false, "{op}: {a}");
+        assert_eq!(rule(&a), "not_found", "{op}: {a}");
+    }
+    // Nor use Alice's request, even with a touch of his own.
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": s}));
+    let ch = unhex32(b["touch"]["challenge"].as_str().unwrap());
+    let bob = serde_json::to_value(w.keys[&BOB].assert_ctap(RP, &ch)).unwrap();
+    let a = w.call(
+        BOB,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": bob}),
+    );
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let a = w.call(
+        BOB,
+        "box.land.reject",
+        json!({"request_id": b["request_id"]}),
+    );
+    assert_eq!(a["ok"], false, "{a}");
+    // Alice's request is untouched by Bob's tries.
+    let asr = w.assert_for(ALICE, &b);
+    let (a, fds) = w.op(
+        ALICE,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(fds.len(), 1);
+}
+
+#[test]
+fn expired_request_is_refused() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": i.as_str()}));
+    let asr = w.assert_for(ALICE, &b);
+    w.clock
+        .fetch_add(saiife_touch::CHALLENGE_TTL_SECS + 1, Ordering::SeqCst);
+    let a = w.call(
+        ALICE,
+        "box.land",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(rule(&a), "touch_failed", "{a}");
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 0);
+}
+
+#[test]
+fn no_credential_names_enrol() {
+    let w = world(2);
+    let i = w.done(CAROL, &changed());
+    let a = w.call(CAROL, "box.land.begin", json!({"box": i.as_str()}));
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(rule(&a), "touch_unavailable", "{a}");
+    let m = a["message"].as_str().unwrap();
+    assert!(m.contains("enrol a key: saiife touch enrol"), "{m}");
+    let r = w.actions("land.begin");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0]["decision"], "deny");
+    assert_eq!(r[0]["rule"], "touch_unavailable");
+}
+
+#[test]
+fn fetch_for_web_approved_land() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    let p = w.pending_of(&i);
+    let ev = w.evidence(ALICE, &p);
+    w.src(Some(ALICE))
+        .complete(p.request_id, Decision::Approve, Some(ev))
+        .unwrap();
+    let n = w.lands.approved_unapplied(&i)[0].n;
+    let (a, fds) = w.op(ALICE, "box.land.fetch", json!({"box": s, "n": n}));
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["land"]["id"], s);
+    assert_eq!(a["land"]["n"], n);
+    assert_eq!(fds.len(), 1);
+    assert_eq!(
+        read_fd(fds.into_iter().next().unwrap()),
+        std::fs::read(w.paths(&i).land_delta(n)).unwrap()
+    );
+    let a = w.call(ALICE, "box.land.fetch", json!({"box": s, "n": n + 5}));
+    assert_eq!(a["error"], "bad_request", "{a}");
+    w.ok(
+        ALICE,
+        "box.land.applied",
+        json!({"box": s, "n": n, "commit": "c".repeat(40)}),
+    );
+    let a = w.call(ALICE, "box.land.fetch", json!({"box": s, "n": n}));
+    assert_eq!(a["error"], "bad_request", "applied: {a}");
+}
+
+#[test]
+fn applied_is_recorded_once() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    let (a, _) = w.cli_land(ALICE, &i);
+    let n = a["land"]["n"].as_u64().unwrap();
+    let a = w.call(
+        ALICE,
+        "box.land.applied",
+        json!({"box": s, "n": n, "commit": "not a commit"}),
+    );
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let c = "c".repeat(40);
+    w.ok(
+        ALICE,
+        "box.land.applied",
+        json!({"box": s, "n": n, "commit": c}),
+    );
+    let a = w.call(
+        ALICE,
+        "box.land.applied",
+        json!({"box": s, "n": n, "commit": c}),
+    );
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("already applied"),
+        "{a}"
+    );
+    let r = w.actions("land_applied");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["commit"], c.as_str());
+    // Applied: discard needs no force.
+    w.ok(ALICE, "box.discard", json!({"box": s}));
+}
+
+#[test]
+fn push_needs_touch_and_records() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    let c = "d".repeat(40);
+    // Nothing landed yet: nothing to push.
+    let a = w.call(
+        ALICE,
+        "box.push.begin",
+        json!({"box": s, "remote": "origin", "commit": c}),
+    );
+    assert_eq!(a["error"], "bad_request", "{a}");
+    w.cli_land(ALICE, &i);
+    for bad in ["-oops", "", "two words", "a\u{1b}b"] {
+        let a = w.call(
+            ALICE,
+            "box.push.begin",
+            json!({"box": s, "remote": bad, "commit": c}),
+        );
+        assert_eq!(a["error"], "bad_request", "{bad:?}: {a}");
+    }
+    let b = w.ok(
+        ALICE,
+        "box.push.begin",
+        json!({"box": s, "remote": "origin", "commit": c}),
+    );
+    let rid: u64 = b["request_id"].as_str().unwrap().parse().unwrap();
+    let (req, rec) = w.lands.push_request(rid).unwrap();
+    assert_eq!(rec.class, TouchClass::PushProtected);
+    assert_eq!(rec.fields["remote"], "origin");
+    assert_eq!(rec.fields["commit"], c);
+    assert_eq!(rec.fields["repo"], "demo");
+    assert_eq!(rec.fields["target_ref"], format!("saiife/box-{s}"));
+    assert!(rec.summary.contains(&c), "{}", rec.summary);
+    assert_eq!(req.owner, ALICE);
+    assert_eq!(b["touch"]["uv"], false);
+    // Done before a touch: refused.
+    let a = w.call(
+        ALICE,
+        "box.push.done",
+        json!({"request_id": b["request_id"], "ok": true, "detail": ""}),
+    );
+    assert_eq!(a["error"], "bad_request", "{a}");
+    // A touch for something else: refused, and the challenge is spent.
+    let mut other = rec.clone();
+    other.fields.insert("remote".into(), "evil".into());
+    let wrong = w.keys[&ALICE].assert_ctap(RP, &challenge(&other));
+    let a = w.call(
+        ALICE,
+        "box.push",
+        json!({"request_id": b["request_id"], "assertion": wrong}),
+    );
+    assert_eq!(a["error"], "forbidden", "{a}");
+    let asr = w.assert_for(ALICE, &b);
+    let a = w.call(
+        ALICE,
+        "box.push",
+        json!({"request_id": b["request_id"], "assertion": asr}),
+    );
+    assert_eq!(rule(&a), "touch_failed", "spent: {a}");
+    // A new request, its touch, the push and its record.
+    let b = w.ok(
+        ALICE,
+        "box.push.begin",
+        json!({"box": s, "remote": "origin", "commit": c}),
+    );
+    let asr = w.assert_for(ALICE, &b);
+    let args = json!({"request_id": b["request_id"], "assertion": asr});
+    w.ok(ALICE, "box.push", args.clone());
+    assert_eq!(rule(&w.call(ALICE, "box.push", args)), "touch_failed");
+    // Not Bob's to finish.
+    let a = w.call(
+        BOB,
+        "box.push.done",
+        json!({"request_id": b["request_id"], "ok": true}),
+    );
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let long = format!("rejected\u{1b}[31m {}", "x".repeat(2000));
+    w.ok(
+        ALICE,
+        "box.push.done",
+        json!({"request_id": b["request_id"], "ok": false, "detail": long}),
+    );
+    let a = w.call(
+        ALICE,
+        "box.push.done",
+        json!({"request_id": b["request_id"], "ok": true, "detail": ""}),
+    );
+    assert_eq!(a["error"], "bad_request", "once: {a}");
+    let p = w.allowed("push");
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0]["box"], s);
+    assert_eq!(p[0]["remote"], "origin");
+    assert_eq!(p[0]["commit"], c.as_str());
+    assert_eq!(p[0]["ok"], false);
+    assert_eq!(p[0]["uid"], ALICE);
+    assert!(p[0]["touch"].is_object(), "{}", p[0]);
+    let d = p[0]["detail"].as_str().unwrap();
+    assert!(!d.contains('\u{1b}'), "{d:?}");
+    assert!(d.chars().count() <= 512, "{}", d.len());
+    // Every refused touch is recorded.
+    let r = w.denied("push");
+    assert_eq!(r.len(), 3, "{r:?}");
+    assert!(r.iter().all(|x| x["box"] == s), "{r:?}");
+}
+
+#[test]
+fn lockdown_refuses_land_and_push() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    let (a, _) = w.cli_land(ALICE, &i);
+    let n = a["land"]["n"].as_u64().unwrap();
+    // A second review, begun before the lockdown.
+    w.mgr.revise(&i, "more").unwrap();
+    w.with_repo(&i, |g| {
+        g.work.insert("docs.md".into(), C(b"docs\n".to_vec()));
+    });
+    w.mgr.done(&i).unwrap();
+    w.lands.refresh(&i).unwrap();
+    let b = w.ok(ALICE, "box.land.begin", json!({"box": s}));
+    let asr = w.assert_for(ALICE, &b);
+    let c = "e".repeat(40);
+    let pb = w.ok(
+        ALICE,
+        "box.push.begin",
+        json!({"box": s, "remote": "origin", "commit": c}),
+    );
+    let pasr = w.assert_for(ALICE, &pb);
+    w.lockdown();
+    let before = w.records().len();
+    for (op, args) in [
+        ("box.land.begin", json!({"box": s})),
+        (
+            "box.land",
+            json!({"request_id": b["request_id"], "assertion": asr}),
+        ),
+        ("box.land.fetch", json!({"box": s, "n": n})),
+        (
+            "box.push.begin",
+            json!({"box": s, "remote": "origin", "commit": c}),
+        ),
+        (
+            "box.push",
+            json!({"request_id": pb["request_id"], "assertion": pasr}),
+        ),
+    ] {
+        let a = w.call(ALICE, op, args);
+        assert_eq!(a["ok"], false, "{op}: {a}");
+        assert_eq!(a["error"], "lockdown", "{op}: {a}");
+        assert_eq!(rule(&a), "lockdown", "{op}: {a}");
+    }
+    let recs = w.records();
+    let denies: Vec<&Value> = recs[before..]
+        .iter()
+        .filter(|r| r["decision"] == "deny")
+        .collect();
+    assert_eq!(denies.len(), 5, "{denies:?}");
+    assert!(denies.iter().all(|r| r["rule"] == "lockdown"));
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 1);
+    // What only records or takes away stays allowed.
+    w.ok(ALICE, "box.diff", json!({"box": s}));
+    w.ok(
+        ALICE,
+        "box.land.applied",
+        json!({"box": s, "n": n, "commit": c}),
+    );
+    w.ok(
+        ALICE,
+        "box.land.reject",
+        json!({"request_id": b["request_id"]}),
+    );
+}
+
+/// C1: a land record that cannot be read counts as an unapplied land, so
+/// `box.discard` refuses without `force`.
+#[test]
+fn unreadable_land_record_blocks_discard() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let s = i.as_str();
+    let (a, _) = w.cli_land(ALICE, &i);
+    let n = a["land"]["n"].as_u64().unwrap() as u32;
+    let a = w.call(ALICE, "box.discard", json!({"box": s}));
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().ends_with(&format!(
+            "box {s} has an approved land that is not applied: saiife box apply {s}, or discard --force"
+        )),
+        "{a}"
+    );
+    w.ok(
+        ALICE,
+        "box.land.applied",
+        json!({"box": s, "n": n, "commit": "c".repeat(40)}),
+    );
+    assert_eq!(w.lands.unapplied(&i), 0);
+    // approved.json replaced by a directory: unreadable, so unapplied.
+    let ap = w.paths(&i).land_approved(n);
+    std::fs::remove_file(&ap).unwrap();
+    std::fs::create_dir(&ap).unwrap();
+    assert_eq!(w.lands.unapplied(&i), 1);
+    let a = w.call(ALICE, "box.discard", json!({"box": s}));
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(w.state(&i), BoxState::Landed);
+    let a = w.ok(ALICE, "box.discard", json!({"box": s, "force": true}));
+    assert_eq!(a["box"]["id"], s);
+    let d = w.actions("discard");
+    assert_eq!(d.last().unwrap()["force"], true);
+}
+
+/// C3: a partial land that is not taken puts the whole export's files back,
+/// so a later whole land of the same export builds the right base.
+#[test]
+fn failed_partial_land_restores_the_whole_export() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let full = w.lands.latest(&i).unwrap();
+    let n = full.n;
+    let paths = w.paths(&i);
+    let review_before = std::fs::read(paths.land_review(n)).unwrap();
+    let delta_before = std::fs::read(paths.land_delta(n)).unwrap();
+    let only = Some(BTreeSet::from(["NEW.md".to_string()]));
+    let (rid, rec, _) = w.lands.begin(&i, ALICE, only, w.now()).unwrap();
+    let p = PendingAction {
+        request_id: rid,
+        class: TouchClass::Land,
+        box_id: Some(i.clone()),
+        summary: rec.summary.clone(),
+        record: rec.clone(),
+        created_at: w.now(),
+        expires_at: rec.expires_at,
+    };
+    let ev = w.evidence(ALICE, &p);
+    w.ctx.touch.take(&IssueKey::Land(rid), ALICE).unwrap();
+    // The approval cannot be recorded: the land is not taken.
+    std::fs::create_dir(paths.land_approved(n)).unwrap();
+    assert!(matches!(
+        w.lands.approve(rid, &ev, "cli"),
+        Err(BoxError::WrongState { .. })
+    ));
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 0);
+    let r: saiife_boxhost::review::Review =
+        serde_json::from_slice(&std::fs::read(paths.land_review(n)).unwrap()).unwrap();
+    assert_eq!(r, full, "review.json is the whole export again");
+    assert_eq!(
+        serde_json::from_slice::<saiife_boxhost::review::Review>(&review_before).unwrap(),
+        r
+    );
+    assert_eq!(std::fs::read(paths.land_delta(n)).unwrap(), delta_before);
+    // A whole land of the same export then takes every change.
+    std::fs::remove_dir(paths.land_approved(n)).unwrap();
+    let (rid, rec, _) = w.lands.begin(&i, ALICE, None, w.now()).unwrap();
+    let p = PendingAction {
+        request_id: rid,
+        record: rec.clone(),
+        summary: rec.summary.clone(),
+        expires_at: rec.expires_at,
+        ..p
+    };
+    let ev = w.evidence(ALICE, &p);
+    w.ctx.touch.take(&IssueKey::Land(rid), ALICE).unwrap();
+    let restored = w.lands.approve(rid, &ev, "cli").unwrap();
+    assert_eq!(restored.n, n);
+    assert_eq!(w.with_repo(&i, |g| g.base.clone()), changed());
+    // The next review is empty: the base the daemon rebuilds has it all.
+    w.mgr.revise(&i, "again").unwrap();
+    w.mgr.done(&i).unwrap();
+    let next = w.lands.refresh(&i).unwrap();
+    assert!(next.summary.files.is_empty(), "{:?}", next.summary.files);
+}
+
+/// Over the real control socket with the ipc crate's `Client`: per-box
+/// ops take `{box}`, and `box.land`'s answer nests the box id under `land`
+/// and is followed by the delta's descriptor.
+#[test]
+fn per_box_ops_take_box_not_id() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(2);
+    let i = w.done(me(), &changed());
+    assert_eq!(i.as_str(), "b1");
+    let run = w._tmp.path().join("run");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = run.join(saiife_ipc::msg::SOCKET_NAME);
+    let ctx = Arc::clone(&w.ctx);
+    let listener = {
+        let _g = rt().enter();
+        tokio::net::UnixListener::bind(&sock).unwrap()
+    };
+    let server = rt().spawn(async move {
+        loop {
+            let Ok((s, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(saiife_daemon::server::connection(s, Arc::clone(&ctx)));
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut c = saiife_ipc::client::Client::connect(&run, me(), deadline).unwrap();
+    let args = |v: Value| v.as_object().cloned().unwrap();
+    let d = c
+        .call("box.diff", args(json!({"box": "b1"})), deadline)
+        .unwrap();
+    assert_eq!(d["diff"]["id"], "b1");
+    assert!(d["id"].is_u64(), "the answer's id is the request's: {d:?}");
+    let r = c.call("box.diff", args(json!({"id": "b1"})), deadline);
+    assert!(r.is_err(), "{r:?}");
+    let b = c
+        .call("box.land.begin", args(json!({"box": "b1"})), deadline)
+        .unwrap();
+    let asr = w.assert_for(me(), &Value::Object(b.clone()));
+    let (a, fds) = c
+        .call_recv_fds(
+            "box.land",
+            args(json!({"request_id": b["request_id"], "assertion": asr})),
+            1,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(a["land"]["id"], "b1");
+    assert!(a["id"].is_u64());
+    let n = a["land"]["n"].as_u64().unwrap() as u32;
+    assert_eq!(fds.len(), 1);
+    assert_eq!(
+        read_fd(fds.into_iter().next().unwrap()),
+        std::fs::read(w.paths(&i).land_delta(n)).unwrap()
+    );
+    // The connection stays in step after the descriptor.
+    let (f, fds) = c
+        .call_recv_fds(
+            "box.land.fetch",
+            args(json!({"box": "b1", "n": n})),
+            1,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(f["land"]["id"], "b1");
+    assert_eq!(fds.len(), 1);
+    c.call(
+        "box.land.applied",
+        args(json!({"box": "b1", "n": n, "commit": "c".repeat(40)})),
+        deadline,
+    )
+    .unwrap();
+    drop(c);
+    server.abort();
 }

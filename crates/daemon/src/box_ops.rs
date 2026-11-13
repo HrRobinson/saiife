@@ -87,6 +87,27 @@ pub const OPS: &[&str] = &[
     OP_BOX_GC,
     OP_BOX_DIFF,
     OP_BOX_TERM_READ,
+    // Land and push (plan 39): `crate::box_land::handle`.
+    saiife_ipc::msg::OP_BOX_LAND_BEGIN,
+    saiife_ipc::msg::OP_BOX_LAND,
+    saiife_ipc::msg::OP_BOX_LAND_REJECT,
+    saiife_ipc::msg::OP_BOX_LAND_FETCH,
+    saiife_ipc::msg::OP_BOX_LAND_APPLIED,
+    saiife_ipc::msg::OP_BOX_PUSH_BEGIN,
+    saiife_ipc::msg::OP_BOX_PUSH,
+    saiife_ipc::msg::OP_BOX_PUSH_DONE,
+];
+
+/// The ops of [`OPS`] the land book serves (plan 39).
+const LAND_OPS: &[&str] = &[
+    saiife_ipc::msg::OP_BOX_LAND_BEGIN,
+    saiife_ipc::msg::OP_BOX_LAND,
+    saiife_ipc::msg::OP_BOX_LAND_REJECT,
+    saiife_ipc::msg::OP_BOX_LAND_FETCH,
+    saiife_ipc::msg::OP_BOX_LAND_APPLIED,
+    saiife_ipc::msg::OP_BOX_PUSH_BEGIN,
+    saiife_ipc::msg::OP_BOX_PUSH,
+    saiife_ipc::msg::OP_BOX_PUSH_DONE,
 ];
 
 /// `<state_dir>/boxes`.
@@ -584,7 +605,7 @@ fn box_rec(
 
 /// The answer to a refused op: `bad_request` with `rule` for not found,
 /// wrong state and invalid; `busy`; `unavailable`.
-fn refusal(id: u64, e: &BoxError) -> Value {
+pub(crate) fn refusal(id: u64, e: &BoxError) -> Value {
     let code = match e {
         BoxError::NotFound | BoxError::WrongState { .. } | BoxError::Invalid(_) => {
             ErrorCode::BadRequest
@@ -634,18 +655,22 @@ fn arg_bool(args: &Map<String, Value>, name: &str) -> Result<bool, BoxError> {
 /// One op with its arguments checked.
 enum Op {
     Spawn(SpawnArgs),
-    List { all: bool },
+    List {
+        all: bool,
+    },
     Templates,
     Pause(BoxId),
     Stop(BoxId, bool),
-    Discard(BoxId),
+    /// `force`: even with an approved land not applied.
+    Discard(BoxId, bool),
     Done(BoxId),
     Resume(BoxId),
     Revise(BoxId, String),
     Steer(BoxId, String),
     Reorder(Vec<BoxId>),
     Gc,
-    Diff(BoxId),
+    /// `refresh`: export again rather than answer the cached review.
+    Diff(BoxId, bool),
     TermRead(BoxId, Option<u64>),
 }
 
@@ -699,7 +724,7 @@ impl Op {
             OP_BOX_TEMPLATES => Op::Templates,
             OP_BOX_PAUSE => Op::Pause(arg_id(a)?),
             OP_BOX_STOP => Op::Stop(arg_id(a)?, arg_bool(a, "keep")?),
-            OP_BOX_DISCARD => Op::Discard(arg_id(a)?),
+            OP_BOX_DISCARD => Op::Discard(arg_id(a)?, arg_bool(a, "force")?),
             OP_BOX_DONE => Op::Done(arg_id(a)?),
             OP_BOX_RESUME => Op::Resume(arg_id(a)?),
             OP_BOX_REVISE => Op::Revise(arg_id(a)?, arg_text(a, "comment", MAX_STEER_BYTES)?),
@@ -718,7 +743,7 @@ impl Op {
                 Op::Reorder(ids)
             }
             OP_BOX_GC => Op::Gc,
-            OP_BOX_DIFF => Op::Diff(arg_id(a)?),
+            OP_BOX_DIFF => Op::Diff(arg_id(a)?, arg_bool(a, "refresh")?),
             OP_BOX_TERM_READ => {
                 let after = match a.get("after") {
                     None | Some(Value::Null) => None,
@@ -746,12 +771,12 @@ impl Op {
         match self {
             Op::Pause(i)
             | Op::Stop(i, _)
-            | Op::Discard(i)
+            | Op::Discard(i, _)
             | Op::Done(i)
             | Op::Resume(i)
             | Op::Revise(i, _)
             | Op::Steer(i, _)
-            | Op::Diff(i)
+            | Op::Diff(i, _)
             | Op::TermRead(i, _) => Some(i),
             _ => None,
         }
@@ -759,7 +784,7 @@ impl Op {
 }
 
 /// A manager call off the runtime thread.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
 ) -> Result<T, BoxError> {
     tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
@@ -920,6 +945,13 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let mut passed: Passed = Vec::new();
     if req.op != OP_BOX_SPAWN {
         passed.clear();
+    }
+    // Land and push (plan 39): the land book's own ops.
+    if LAND_OPS.contains(&req.op.as_str()) {
+        #[cfg(unix)]
+        return crate::box_land::handle(ctx, conn, req).await;
+        #[cfg(not(unix))]
+        return err(id, ErrorCode::Unavailable, UNAVAILABLE);
     }
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
@@ -1217,9 +1249,31 @@ async fn run(
         }
         Op::Resume(i) => change("resume", Box::new(move |m| m.resume(&i))).await,
         Op::Revise(i, text) => change("revise", Box::new(move |m| m.revise(&i, &text))).await,
-        Op::Discard(i) => {
-            let (_, rec) = change("discard", Box::new(move |m| m.discard(&i))).await?;
+        Op::Discard(i, force) => {
+            // An approved land not applied yet keeps the box (L4), unless
+            // forced; a land record that cannot be read counts as one.
+            let book = lands.clone();
+            let (_, rec) = change(
+                "discard",
+                Box::new(move |m| {
+                    if !force {
+                        if let Some(b) = &book {
+                            if b.unapplied(&i) > 0 {
+                                return Err(saiife_boxes::source::unapplied_refusal(&i));
+                            }
+                        }
+                    }
+                    m.discard(&i)
+                }),
+            )
+            .await?;
             let b = before.ok_or(BoxError::NotFound)?;
+            let mut rec = rec;
+            if force {
+                if let Some(r) = rec.as_mut() {
+                    r.extra.insert("force".into(), true.into());
+                }
+            }
             Ok((under("box", &json!({"id": b.id.as_str()})), rec))
         }
         Op::Steer(i, msg) => {
@@ -1300,7 +1354,21 @@ async fn run(
             }
             Ok((a, Some(rec)))
         }
-        Op::Diff(i) => {
+        Op::Diff(i, refresh) => {
+            // With the land book: the review too (plan 39), the cached one
+            // unless `refresh`.
+            #[cfg(unix)]
+            if let Some(l) = ctx.box_lands.get().cloned() {
+                return blocking(move || {
+                    let r = match (refresh, l.latest(&i)) {
+                        (false, Some(r)) => r,
+                        _ => l.refresh(&i)?,
+                    };
+                    Ok((crate::box_land::diff_answer(&r), None))
+                })
+                .await;
+            }
+            let _ = refresh;
             blocking(move || {
                 let d = source(&m, None, &lands).diff(&i)?;
                 Ok((under("diff", &d), None))

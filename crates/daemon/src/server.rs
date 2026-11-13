@@ -312,6 +312,35 @@ async fn serve_peer(mut s: Stream, peer: PeerCred, ctx: Arc<Ctx>, listener: List
         if !write(&mut s, &answer).await {
             return;
         }
+        // An answer that carries descriptors (plan 39: `box.land`,
+        // `box.land.fetch`): its fd byte follows at once. Only an `ok`
+        // answer has any; one that cannot be sent closes the connection.
+        #[cfg(unix)]
+        {
+            let out = conn.take_out_fds();
+            if !out.is_empty() {
+                if answer.get("ok") != Some(&Value::Bool(true)) {
+                    continue;
+                }
+                if send_answer_fds(&s, &out).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The fd byte with `fds`, in time.
+#[cfg(unix)]
+async fn send_answer_fds(s: &Stream, fds: &[std::os::fd::OwnedFd]) -> std::io::Result<()> {
+    use std::os::fd::AsFd;
+    let b: Vec<std::os::fd::BorrowedFd<'_>> = fds.iter().map(|f| f.as_fd()).collect();
+    let send = s.async_io(tokio::io::Interest::WRITABLE, || {
+        saiife_ipc::fdpass::send_fds(s, &b)
+    });
+    match timeout(WRITE_TIMEOUT, send).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
     }
 }
 

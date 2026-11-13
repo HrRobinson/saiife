@@ -105,6 +105,14 @@ const IPC_OPS: &[&str] = &[
     // fd passing (plan 37): control socket only.
     "box.fds",
     "box.gc",
+    // Land and push sub-ops (plan 39): machine local; `box.land` and
+    // `box.push` themselves are in REMOTE.
+    "box.land.applied",
+    "box.land.begin",
+    "box.land.fetch",
+    "box.land.reject",
+    "box.push.begin",
+    "box.push.done",
     "cloud.lease",
     "grant.consume",
     "hello",
@@ -226,6 +234,24 @@ mod tests {
             assert_eq!(level_for(a), Some(Level::MachineOnly), "{a}");
             assert!(!REMOTE.iter().any(|(n, _)| *n == a), "{a} is remote");
         }
+    }
+
+    #[test]
+    fn land_sub_ops_are_machine_only() {
+        for a in [
+            "box.land.begin",
+            "box.land.reject",
+            "box.land.fetch",
+            "box.land.applied",
+            "box.push.begin",
+            "box.push.done",
+        ] {
+            assert_eq!(level_for(a), Some(Level::MachineOnly), "{a}");
+            assert!(!REMOTE.iter().any(|(n, _)| *n == a), "{a} is remote");
+        }
+        assert_eq!(level_for("box.diff"), Some(Level::Signed));
+        assert_eq!(level_for("box.land"), Some(Level::Touch));
+        assert_eq!(level_for("box.push"), Some(Level::Touch));
     }
 
     #[test]

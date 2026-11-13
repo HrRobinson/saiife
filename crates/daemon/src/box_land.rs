@@ -120,6 +120,31 @@ pub struct LandRequest {
     pub expires_at: u64,
 }
 
+/// A push request (L7): the touch binds `{repo, target_ref, remote,
+/// commit}` (ruling R-T5a: the commit is bound as a field, not only named
+/// in the summary). In memory only; single use, bound to its owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRequest {
+    pub request_id: u64,
+    pub id: BoxId,
+    pub owner: u32,
+    pub remote: String,
+    pub commit: String,
+    pub target_ref: String,
+    pub repo: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Clone)]
+struct Push {
+    req: PushRequest,
+    record: ActionRecord,
+    /// The verified touch, once `box.push` took it.
+    verified: Option<TouchEvidence>,
+    done: bool,
+}
+
 /// `lands/<n>/approved.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Approved {
@@ -176,6 +201,7 @@ struct State {
     rejected: BTreeMap<BoxId, String>,
     /// The last export number asked for, per box.
     last_export: BTreeMap<BoxId, u32>,
+    pushes: BTreeMap<u64, Push>,
 }
 
 /// The box's current base (R-P3).
@@ -435,9 +461,23 @@ impl Lands {
                 requests: BTreeMap::new(),
                 rejected: BTreeMap::new(),
                 last_export: BTreeMap::new(),
+                pushes: BTreeMap::new(),
             }),
             boxes: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// The book's clock (unix seconds): what every op of the book counts
+    /// expiry against.
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    fn next_rid(&self) -> u64 {
+        let mut st = lock(&self.state);
+        let r = st.next_rid;
+        st.next_rid = r.wrapping_add(1).max(1);
+        r
     }
 
     fn ctx(&self) -> Result<Arc<Ctx>, BoxError> {
@@ -681,12 +721,7 @@ impl Lands {
         };
         let summary = summary(id, &land);
         let fields = fields(id, &cached.base, &land);
-        let rid = {
-            let mut st = lock(&self.state);
-            let r = st.next_rid;
-            st.next_rid = r.wrapping_add(1).max(1);
-            r
-        };
+        let rid = self.next_rid();
         let issued = ctx
             .touch
             .issue(
@@ -766,7 +801,7 @@ impl Lands {
         };
         let id = q.req.id.clone();
         let bl = self.box_lock(&id);
-        let _held = lock(&bl);
+        let held = lock(&bl);
         let rec = self.mgr.get(&id)?;
         let wrong = || BoxError::WrongState { state: rec.state };
         if !self.is_current(rid) || !matches!(rec.state, BoxState::Done | BoxState::Landed) {
@@ -775,10 +810,30 @@ impl Lands {
         let cached = self.cached(&id).ok_or_else(wrong)?;
         let paths = self.paths(&id);
         let n = q.req.n;
-        if let Some(o) = &q.req.only {
-            review::write_land_files(&paths, &cached.base, &q.review, Some(o))
-                .map_err(unavailable)?;
-        }
+        // A partial land rewrites `lands/<n>/` to the subset (delta.bin is
+        // exactly what lands). Until the land is taken, any failure puts
+        // the whole export back, so a later whole land of the same `n`
+        // never sees a subset `review.json` under its full review (the
+        // R-P3 base is rebuilt from these files).
+        let whole = match &q.req.only {
+            None => None,
+            Some(o) => {
+                let whole: Review = read_json(&paths.land_review(n), "land review", REVIEW_MAX)
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable(format!("land {n} has no review")))?;
+                if let Err(e) = review::write_land_files(&paths, &cached.base, &q.review, Some(o)) {
+                    self.restore_whole(&id, &paths, &cached.base, &whole);
+                    return Err(unavailable(e));
+                }
+                Some(whole)
+            }
+        };
+        let undo = |why: BoxError| {
+            if let Some(w) = &whole {
+                self.restore_whole(&id, &paths, &cached.base, w);
+            }
+            why
+        };
         let approved = Approved {
             request_id: rid,
             id: id.clone(),
@@ -793,11 +848,16 @@ impl Lands {
             task: rec.task.clone(),
             repo_dir: rec.repo_dir.clone(),
         };
-        let body = serde_json::to_vec_pretty(&approved).map_err(|e| unavailable(e.to_string()))?;
+        let body =
+            serde_json::to_vec_pretty(&approved).map_err(|e| undo(unavailable(e.to_string())))?;
         match write_new(&paths.land_approved(n), &body) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(wrong()),
-            Err(e) => return Err(unavailable(format!("cannot record the approval: {e}"))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(undo(wrong())),
+            Err(e) => {
+                return Err(undo(unavailable(format!(
+                    "cannot record the approval: {e}"
+                ))))
+            }
         }
         if let Err(e) = self.mgr.land(&id) {
             // A failed save still moved the record in memory: keep the
@@ -808,7 +868,7 @@ impl Lands {
                 .is_ok_and(|r| r.lands == rec.lands.saturating_add(1));
             if !moved {
                 let _ = fs::remove_file(paths.land_approved(n));
-                return Err(e);
+                return Err(undo(e));
             }
         }
         {
@@ -822,6 +882,9 @@ impl Lands {
                 id.as_str()
             );
         }
+        // The box's files are done with: the audit write (an fsync) holds
+        // no box lock.
+        drop(held);
         let mut r = self.record(&ctx, "land", &id, Some(q.req.owner));
         let x = &mut r.extra;
         x.insert("land".into(), n.into());
@@ -840,6 +903,22 @@ impl Lands {
             task: rec.task,
             repo_dir: rec.repo_dir,
         })
+    }
+
+    /// Put export `whole.n`'s whole files back after a partial land that
+    /// was not taken. When that fails too, the cached review is dropped:
+    /// no request over it can be approved, and the next export gets a new
+    /// number (a `lands/<n>` without `approved.json` is never read as a
+    /// land).
+    fn restore_whole(&self, id: &BoxId, paths: &BoxPaths, base: &BaseManifest, whole: &Review) {
+        if let Err(e) = review::write_land_files(paths, base, whole, None) {
+            eprintln!(
+                "saiifed: boxes: box {}: cannot restore export {} after a land that was not taken: {e}",
+                id.as_str(),
+                whole.n
+            );
+            lock(&self.state).reviews.remove(id);
+        }
     }
 
     /// Reject request `rid` (`via`: "cli" or "web"): a `land_rejected`
@@ -913,18 +992,39 @@ impl Lands {
 
     /// The box's approved lands without `applied.json`, in land order.
     pub fn approved_unapplied(&self, id: &BoxId) -> Vec<LandInfo> {
+        self.scan_unapplied(id).0
+    }
+
+    /// [`Lands::approved_unapplied`], and how many land records could not
+    /// be read (each counts as unapplied: fail closed).
+    fn scan_unapplied(&self, id: &BoxId) -> (Vec<LandInfo>, u32) {
         let paths = self.paths(id);
-        let Ok(ns) = land_numbers(&paths) else {
-            return Vec::new();
+        let ns = match land_numbers(&paths) {
+            Ok(ns) => ns,
+            Err(_) => return (Vec::new(), 1),
         };
         let mut out = Vec::new();
+        let mut unreadable = 0u32;
         for n in ns {
-            let Ok(Some(a)) =
-                read_json::<Approved>(&paths.land_approved(n), "approved land", RECORD_MAX)
-            else {
-                continue;
-            };
-            if exists(&paths.land_applied(n)).unwrap_or(true) || a.n != n {
+            let a =
+                match read_json::<Approved>(&paths.land_approved(n), "approved land", RECORD_MAX) {
+                    Ok(Some(a)) => a,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        unreadable = unreadable.saturating_add(1);
+                        continue;
+                    }
+                };
+            match exists(&paths.land_applied(n)) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => {
+                    unreadable = unreadable.saturating_add(1);
+                    continue;
+                }
+            }
+            if a.n != n {
+                unreadable = unreadable.saturating_add(1);
                 continue;
             }
             out.push(LandInfo {
@@ -937,7 +1037,158 @@ impl Lands {
                 repo_dir: a.repo_dir,
             });
         }
-        out
+        (out, unreadable)
+    }
+
+    /// A push request (L7) for box `id` by `owner`: `commit` (the tip of
+    /// `saiife/box-<id>` the CLI will push) to `remote`. Issues
+    /// `IssueKey::Push(request_id)`, class `PushProtected`. The box must
+    /// have landed at least once.
+    pub fn push_begin(
+        &self,
+        id: &BoxId,
+        owner: u32,
+        remote: &str,
+        commit: &str,
+        now: u64,
+    ) -> Result<(u64, ActionRecord), BoxError> {
+        let ctx = self.ctx()?;
+        let rec = self.mgr.get(id)?;
+        check_remote(remote)?;
+        if !is_oid(commit) {
+            return Err(BoxError::Invalid("commit must be a git commit id".into()));
+        }
+        if rec.lands == 0 {
+            return Err(BoxError::Invalid(format!(
+                "box {} has not landed anything to push",
+                id.as_str()
+            )));
+        }
+        let target = target_ref(id);
+        let mut summary = format!(
+            "push {}: {commit} to {} as {target}",
+            id.as_str(),
+            review::escape(remote)
+        );
+        if summary.chars().count() > MAX_SUMMARY {
+            summary = summary.chars().take(MAX_SUMMARY - 1).collect();
+            summary.push('\u{2026}');
+        }
+        let fields = BTreeMap::from([
+            ("repo".to_string(), rec.repo.clone()),
+            ("target_ref".to_string(), target.clone()),
+            ("remote".to_string(), remote.to_string()),
+            ("commit".to_string(), commit.to_string()),
+        ]);
+        let rid = self.next_rid();
+        let issued = ctx
+            .touch
+            .issue(
+                IssueKey::Push(rid),
+                owner,
+                TouchClass::PushProtected,
+                summary.clone(),
+                fields.clone(),
+                now,
+            )
+            .map_err(unavailable)?;
+        let record = ActionRecord {
+            instance_id: ctx.touch.instance_id(),
+            request_id: rid,
+            class: TouchClass::PushProtected,
+            summary,
+            fields,
+            nonce: issued.nonce,
+            expires_at: issued.expires_at,
+        };
+        let req = PushRequest {
+            request_id: rid,
+            id: id.clone(),
+            owner,
+            remote: remote.to_string(),
+            commit: commit.to_string(),
+            target_ref: target,
+            repo: rec.repo,
+            created_at: now,
+            expires_at: issued.expires_at,
+        };
+        let mut st = lock(&self.state);
+        // Finished pushes, and ones never touched in time, are gone.
+        st.pushes
+            .retain(|_, p| !p.done && (p.verified.is_some() || p.record.expires_at >= now));
+        st.pushes.insert(
+            rid,
+            Push {
+                req,
+                record: record.clone(),
+                verified: None,
+                done: false,
+            },
+        );
+        Ok((rid, record))
+    }
+
+    /// Push request `rid` and its touch record.
+    pub fn push_request(&self, rid: u64) -> Option<(PushRequest, ActionRecord)> {
+        lock(&self.state)
+            .pushes
+            .get(&rid)
+            .map(|p| (p.req.clone(), p.record.clone()))
+    }
+
+    /// `box.push` verified the touch of push request `rid`: the CLI may
+    /// push now. Once per request.
+    pub fn push_verified(&self, rid: u64, ev: TouchEvidence) -> Result<(), BoxError> {
+        let mut st = lock(&self.state);
+        let p = st.pushes.get_mut(&rid).ok_or(BoxError::NotFound)?;
+        if p.verified.is_some() || p.done {
+            return Err(BoxError::Invalid(format!(
+                "push request {rid} is already used"
+            )));
+        }
+        p.verified = Some(ev);
+        Ok(())
+    }
+
+    /// The CLI's push of request `rid` is over (`ok`, git's `detail`): a
+    /// `push` record with the touch, once. `detail` is escaped and cut at
+    /// [`MAX_SUMMARY`] chars.
+    pub fn push_done(&self, rid: u64, ok: bool, detail: &str) -> Result<(), BoxError> {
+        let ctx = self.ctx()?;
+        let (req, ev) = {
+            let mut st = lock(&self.state);
+            let p = st.pushes.get_mut(&rid).ok_or(BoxError::NotFound)?;
+            if p.done {
+                return Err(BoxError::Invalid(format!(
+                    "push request {rid} is already recorded"
+                )));
+            }
+            let Some(ev) = p.verified.clone() else {
+                return Err(BoxError::Invalid(format!(
+                    "push request {rid} has no verified touch: saiife box push again"
+                )));
+            };
+            p.done = true;
+            (p.req.clone(), ev)
+        };
+        let mut d = review::escape(detail);
+        if d.chars().count() > MAX_SUMMARY {
+            d = d.chars().take(MAX_SUMMARY - 1).collect();
+            d.push('\u{2026}');
+        }
+        let mut r = self.record(&ctx, "push", &req.id, Some(req.owner));
+        if !ok {
+            r.reason = Some(d.clone());
+        }
+        let x = &mut r.extra;
+        x.insert("remote".into(), req.remote.clone().into());
+        x.insert("commit".into(), req.commit.clone().into());
+        x.insert("ok".into(), ok.into());
+        x.insert("detail".into(), d.into());
+        x.insert("request".into(), rid.to_string().into());
+        x.insert("target_ref".into(), req.target_ref.clone().into());
+        self.write(&ctx, crate::approvals::record_with_touch(r, &ev));
+        Ok(())
     }
 
     /// The pending action of a live request.
@@ -1074,8 +1325,13 @@ impl LandBook for Lands {
         }
     }
 
+    /// Approved lands not applied, plus every land record that cannot be
+    /// read (fail closed: a discard waits for them too).
     fn unapplied(&self, id: &BoxId) -> u32 {
-        u32::try_from(self.approved_unapplied(id).len()).unwrap_or(u32::MAX)
+        let (l, unreadable) = self.scan_unapplied(id);
+        u32::try_from(l.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(unreadable)
     }
 
     fn box_of(&self, request_id: u64) -> Option<BoxId> {
@@ -1086,6 +1342,25 @@ impl LandBook for Lands {
     }
 }
 
+/// A push remote as the CLI passes it to `git push`: 1 to 1024 bytes, no
+/// control or whitespace char, and no leading `-` (never an option).
+pub fn check_remote(remote: &str) -> Result<(), BoxError> {
+    let bad = |why: &str| Err(BoxError::Invalid(format!("remote {why}")));
+    if remote.is_empty() || remote.len() > 1024 {
+        return bad("must be 1 to 1024 bytes");
+    }
+    if remote.starts_with('-') {
+        return bad("must not start with -");
+    }
+    if remote
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || saiife_wire::text::is_unsafe_char(c))
+    {
+        return bad("has a space or a control character");
+    }
+    Ok(())
+}
+
 /// The `{land: LandInfo}` answer (R20).
 pub fn land_answer(l: &LandInfo) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
@@ -1094,4 +1369,532 @@ pub fn land_answer(l: &LandInfo) -> serde_json::Map<String, Value> {
         serde_json::to_value(l).unwrap_or(Value::Null),
     );
     m
+}
+
+// ---- the control-socket ops (plan 39 Task 5) ----
+
+/// The answer of a land or push op when the daemon has no land book.
+pub const NO_LANDS: &str =
+    "box lands are not available in this daemon: it has no channel to the boxes' guests";
+/// The most paths a partial land names.
+const MAX_ONLY: usize = 20_000;
+/// The longest path a partial land names.
+const MAX_ONLY_PATH: usize = 4096;
+
+/// `{n, flags, entries, base_head}` of a review, every flag escaped
+/// (`escape` leaves escaped text as it is).
+pub fn review_json(r: &Review) -> Value {
+    let flags: Vec<Value> = r
+        .flags
+        .iter()
+        .map(
+            |f| serde_json::json!({"path": review::escape(&f.path), "why": review::escape(&f.why)}),
+        )
+        .collect();
+    serde_json::json!({
+        "n": r.n,
+        "flags": flags,
+        "entries": serde_json::to_value(&r.entries).unwrap_or(Value::Null),
+        "base_head": r.base_head,
+    })
+}
+
+/// `{diff, review}`: `box.diff`'s answer over a review.
+pub fn diff_answer(r: &Review) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "diff".into(),
+        serde_json::to_value(&r.summary).unwrap_or(Value::Null),
+    );
+    m.insert("review".into(), review_json(r));
+    m
+}
+
+/// Land `n`'s `delta.bin`, opened to pass (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`,
+/// a regular file).
+fn open_delta(paths: &BoxPaths, n: u32) -> Result<std::os::fd::OwnedFd, BoxError> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow())
+        .open(paths.land_delta(n))
+        .map_err(|e| unavailable(format!("cannot open the delta of land {n}: {e}")))?;
+    let m = f
+        .metadata()
+        .map_err(|e| unavailable(format!("cannot open the delta of land {n}: {e}")))?;
+    if !m.is_file() {
+        return Err(unavailable(format!(
+            "the delta of land {n} is not a regular file"
+        )));
+    }
+    Ok(f.into())
+}
+
+/// One land or push op, its arguments checked.
+enum LandOp {
+    Begin(BoxId, Option<BTreeSet<String>>),
+    Land(u64, saiife_touch::Assertion),
+    Reject(u64),
+    Fetch(BoxId, u32),
+    Applied(BoxId, u32, String),
+    PushBegin(BoxId, String, String),
+    Push(u64, saiife_touch::Assertion),
+    PushDone(u64, bool, String),
+}
+
+/// The ops [`handle`] serves.
+pub const OPS: &[&str] = &[
+    saiife_ipc::msg::OP_BOX_LAND_BEGIN,
+    saiife_ipc::msg::OP_BOX_LAND,
+    saiife_ipc::msg::OP_BOX_LAND_REJECT,
+    saiife_ipc::msg::OP_BOX_LAND_FETCH,
+    saiife_ipc::msg::OP_BOX_LAND_APPLIED,
+    saiife_ipc::msg::OP_BOX_PUSH_BEGIN,
+    saiife_ipc::msg::OP_BOX_PUSH,
+    saiife_ipc::msg::OP_BOX_PUSH_DONE,
+];
+
+type Args = serde_json::Map<String, Value>;
+
+fn invalid(m: impl Into<String>) -> BoxError {
+    BoxError::Invalid(m.into())
+}
+
+fn arg_box(a: &Args) -> Result<BoxId, BoxError> {
+    match a.get("box") {
+        Some(Value::String(s)) => BoxId::parse(s),
+        _ => Err(invalid("box must be a box id")),
+    }
+}
+
+/// A request id: its decimal string (as answered), or a number.
+fn arg_rid(a: &Args) -> Result<u64, BoxError> {
+    let bad = || invalid("request_id must be a request id");
+    match a.get("request_id") {
+        Some(Value::String(s))
+            if !s.is_empty()
+                && s.len() <= 20
+                && s.bytes().all(|b| b.is_ascii_digit())
+                && (s == "0" || !s.starts_with('0')) =>
+        {
+            s.parse().map_err(|_| bad())
+        }
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(bad),
+        _ => Err(bad()),
+    }
+}
+
+fn arg_n(a: &Args) -> Result<u32, BoxError> {
+    a.get("n")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| invalid("n must be a land number"))
+}
+
+fn arg_str(a: &Args, name: &str) -> Result<String, BoxError> {
+    match a.get(name) {
+        Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err(invalid(format!("{name} must be a string"))),
+    }
+}
+
+fn arg_assertion(a: &Args) -> Result<saiife_touch::Assertion, BoxError> {
+    match a.get("assertion") {
+        None | Some(Value::Null) => Err(invalid("assertion is required")),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| invalid(format!("assertion is not an assertion: {e}"))),
+    }
+}
+
+impl LandOp {
+    fn parse(op: &str, a: &Args) -> Result<LandOp, BoxError> {
+        use saiife_ipc::msg as m;
+        Ok(match op {
+            m::OP_BOX_LAND_BEGIN => {
+                let only = match a.get("files") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(v)) => {
+                        if v.len() > MAX_ONLY {
+                            return Err(invalid(format!("files names at most {MAX_ONLY} paths")));
+                        }
+                        let mut set = BTreeSet::new();
+                        for x in v {
+                            match x {
+                                Value::String(s) if !s.is_empty() && s.len() <= MAX_ONLY_PATH => {
+                                    set.insert(s.clone());
+                                }
+                                _ => return Err(invalid("files must be a list of paths")),
+                            }
+                        }
+                        Some(set)
+                    }
+                    Some(_) => return Err(invalid("files must be a list of paths")),
+                };
+                LandOp::Begin(arg_box(a)?, only)
+            }
+            m::OP_BOX_LAND => LandOp::Land(arg_rid(a)?, arg_assertion(a)?),
+            m::OP_BOX_LAND_REJECT => LandOp::Reject(arg_rid(a)?),
+            m::OP_BOX_LAND_FETCH => LandOp::Fetch(arg_box(a)?, arg_n(a)?),
+            m::OP_BOX_LAND_APPLIED => {
+                LandOp::Applied(arg_box(a)?, arg_n(a)?, arg_str(a, "commit")?)
+            }
+            m::OP_BOX_PUSH_BEGIN => {
+                LandOp::PushBegin(arg_box(a)?, arg_str(a, "remote")?, arg_str(a, "commit")?)
+            }
+            m::OP_BOX_PUSH => LandOp::Push(arg_rid(a)?, arg_assertion(a)?),
+            m::OP_BOX_PUSH_DONE => {
+                let ok = a
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| invalid("ok must be true or false"))?;
+                let detail = match a.get("detail") {
+                    None | Some(Value::Null) => String::new(),
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => return Err(invalid("detail must be a string")),
+                };
+                LandOp::PushDone(arg_rid(a)?, ok, detail)
+            }
+            _ => return Err(invalid("not a land op")),
+        })
+    }
+
+    /// The ops that bring box content toward the user's repo or a remote:
+    /// refused under lockdown `all`.
+    fn grants_power(&self) -> bool {
+        matches!(
+            self,
+            LandOp::Begin(..)
+                | LandOp::Land(..)
+                | LandOp::Fetch(..)
+                | LandOp::PushBegin(..)
+                | LandOp::Push(..)
+        )
+    }
+
+    /// The record action of a refusal.
+    fn action(&self) -> &'static str {
+        match self {
+            LandOp::Begin(..) => "land.begin",
+            LandOp::Land(..) => "land",
+            LandOp::Reject(..) => "land.reject",
+            LandOp::Fetch(..) => "land.fetch",
+            LandOp::Applied(..) => "land.applied",
+            LandOp::PushBegin(..) => "push.begin",
+            LandOp::Push(..) => "push",
+            LandOp::PushDone(..) => "push.done",
+        }
+    }
+}
+
+/// What a land or push op ends with.
+enum Out {
+    Answer(serde_json::Map<String, Value>),
+    /// The answer, and the descriptor that follows it.
+    WithFd(serde_json::Map<String, Value>, std::os::fd::OwnedFd),
+    Box(BoxError),
+    /// A touch that did not verify (plan 26's mapping).
+    Touch(crate::approvers::Refusal),
+}
+
+impl From<BoxError> for Out {
+    fn from(e: BoxError) -> Self {
+        Out::Box(e)
+    }
+}
+
+/// A box record of `action` (a land or push op) by `peer`.
+fn peer_record(
+    ctx: &Ctx,
+    action: &str,
+    id: &BoxId,
+    peer: &saiife_ipc::peer::PeerCred,
+    user: Option<String>,
+) -> Record {
+    let mut r = ctx.record("box", &format!("{action} {}", id.as_str()));
+    r.session = Some(format!("box-{}", id.as_str()));
+    r.uid = Some(peer.uid);
+    r.sid = peer.sid.clone();
+    r.user = user;
+    r.extra.insert("action".into(), action.into());
+    r.extra.insert("box".into(), id.as_str().into());
+    r.extra.insert("via".into(), "cli".into());
+    r
+}
+
+/// A touch request for `rec` to `uid`'s devices (plan 26's shape).
+fn touch_request(rec: &ActionRecord, creds: Vec<saiife_touch::Credential>) -> Value {
+    let c = saiife_touch::challenge(rec);
+    let tr = saiife_touch::TouchRequest {
+        rp_id: saiife_touch::LOCAL_RP_ID.into(),
+        challenge: c,
+        allow: creds.into_iter().map(|c| c.id).collect(),
+        uv: rec.class.needs_uv(),
+        summary: rec.summary.clone(),
+        short_code: saiife_touch::short_code(&c),
+    };
+    serde_json::to_value(&tr).unwrap_or(Value::Null)
+}
+
+/// The refusal when `uid` has no touch device.
+fn no_device(what: &str) -> crate::approvers::Refusal {
+    crate::approvers::Refusal::TouchUnavailable(format!(
+        "{what} needs a touch and no touch device is enrolled for you; enrol a key: saiife touch enrol"
+    ))
+}
+
+/// Every op in [`OPS`]: owner checked as plan 34 B8 (a box the peer may
+/// not see, and a request of another uid, are missing ones); lockdown
+/// `all` refuses the ops that bring box content out.
+pub async fn handle(
+    ctx: &Arc<Ctx>,
+    conn: &crate::ops::Conn,
+    req: saiife_ipc::msg::Request,
+) -> Value {
+    use crate::box_ops::{blocking, refusal};
+    use saiife_ipc::msg::{err_with, ok, ErrorCode};
+    let id = req.id;
+    let Some(mgr) = ctx.box_manager.clone() else {
+        return refusal(id, &unavailable(crate::box_ops::UNAVAILABLE));
+    };
+    let Some(lands) = ctx.box_lands.get().cloned() else {
+        return refusal(id, &unavailable(NO_LANDS));
+    };
+    let op = match LandOp::parse(&req.op, &req.args) {
+        Ok(op) => op,
+        Err(e) => return refusal(id, &e),
+    };
+    let peer = conn.peer.clone();
+    let uid = peer.uid;
+    // The box: named, or the request's (owner-bound: another uid's request
+    // is a missing one).
+    let target = match &op {
+        LandOp::Begin(b, _)
+        | LandOp::Fetch(b, _)
+        | LandOp::Applied(b, ..)
+        | LandOp::PushBegin(b, ..) => Ok(b.clone()),
+        LandOp::Land(r, _) | LandOp::Reject(r) => match lands.request(*r) {
+            Some((q, _)) if q.owner == uid => Ok(q.id),
+            _ => Err(invalid(format!("no land request {r}"))),
+        },
+        LandOp::Push(r, _) | LandOp::PushDone(r, ..) => match lands.push_request(*r) {
+            Some((q, _)) if q.owner == uid => Ok(q.id),
+            _ => Err(invalid(format!("no push request {r}"))),
+        },
+    };
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => return refusal(id, &e),
+    };
+    let user = ctx.peer_name(&peer).await;
+
+    if op.grants_power() {
+        if let Some(l) = ctx
+            .lockdown
+            .get()
+            .filter(|l| l.scope == saiife_broker::pipeline::LockScope::All)
+        {
+            let why = crate::lockdown::message(&l);
+            let mut rec = peer_record(ctx, op.action(), &target, &peer, user.clone());
+            rec.decision = saiife_audit::DecisionKind::Deny;
+            rec.rule = Some("lockdown".into());
+            rec.reason = Some(why.clone());
+            if let Err(e) = ctx.writer.append(rec).await {
+                eprintln!("saiifed: warning: cannot write a box record: {e}");
+            }
+            let mut m = serde_json::Map::new();
+            m.insert("rule".into(), "lockdown".into());
+            return err_with(id, ErrorCode::Lockdown, &why, m);
+        }
+    }
+
+    // B8: the box must be one the peer may see.
+    let privileged = (peer.sid.is_none() && uid == 0) || ctx.peer_is_admin(&peer).await;
+    let (m, t) = (Arc::clone(&mgr), target.clone());
+    let seen = blocking(move || {
+        let r = m.get(&t)?;
+        if privileged || r.owner_uid == uid {
+            Ok(())
+        } else {
+            Err(BoxError::NotFound)
+        }
+    })
+    .await;
+    if let Err(e) = seen {
+        return refusal(id, &e);
+    }
+
+    let what = op.action();
+    let c = Arc::clone(ctx);
+    let out = tokio::task::spawn_blocking(move || run(&c, &lands, uid, op))
+        .await
+        .unwrap_or_else(|e| Out::Box(unavailable(format!("the land book did not finish: {e}"))));
+    match out {
+        Out::Answer(a) => ok(id, a),
+        Out::WithFd(a, fd) => {
+            conn.give_fds(vec![fd]);
+            ok(id, a)
+        }
+        Out::Box(e) => refusal(id, &e),
+        Out::Touch(why) => {
+            let rule = why.rule();
+            let mut rec = peer_record(ctx, what, &target, &peer, user);
+            rec.decision = saiife_audit::DecisionKind::Deny;
+            rec.rule = Some(rule.into());
+            rec.reason = Some(why.to_string());
+            if let Err(e) = ctx.writer.append(rec).await {
+                eprintln!("saiifed: warning: cannot write a box record: {e}");
+            }
+            let mut m = serde_json::Map::new();
+            m.insert("rule".into(), rule.into());
+            err_with(
+                id,
+                ErrorCode::Forbidden,
+                &format!("refused ({rule}): {why}"),
+                m,
+            )
+        }
+    }
+}
+
+/// One checked op, off the runtime (the book and the touch state block).
+fn run(ctx: &Ctx, lands: &Lands, uid: u32, op: LandOp) -> Out {
+    use crate::approvers::Refusal;
+    let now = lands.now();
+    let creds = || ctx.touch.credentials_of(uid);
+    match op {
+        LandOp::Begin(b, only) => {
+            let creds = creds();
+            if creds.is_empty() {
+                return Out::Touch(no_device(&format!("landing box {}", b.as_str())));
+            }
+            let (rid, rec, land) = match lands.begin(&b, uid, only, now) {
+                Ok(x) => x,
+                Err(e) => return e.into(),
+            };
+            let mut a = serde_json::Map::new();
+            a.insert("request_id".into(), rid.to_string().into());
+            a.insert("touch".into(), touch_request(&rec, creds));
+            a.insert("expires_at".into(), rec.expires_at.into());
+            a.insert("review".into(), review_json(&land));
+            a.insert(
+                "diff".into(),
+                serde_json::to_value(&land.summary).unwrap_or(Value::Null),
+            );
+            Out::Answer(a)
+        }
+        LandOp::Land(rid, asr) => {
+            let Some((req, rec)) = lands.request(rid) else {
+                return invalid(format!("no land request {rid}")).into();
+            };
+            // The record is the daemon's own, never the client's.
+            let built = |i: &crate::touch::Issued| ActionRecord {
+                nonce: i.nonce,
+                expires_at: i.expires_at,
+                ..rec.clone()
+            };
+            let ev = match ctx.touch.consume(
+                &IssueKey::Land(rid),
+                uid,
+                built,
+                &asr,
+                saiife_touch::LOCAL_RP_ID,
+                now,
+            ) {
+                Ok((ev, _)) => ev,
+                Err(e) => return Out::Touch(Refusal::from(e)),
+            };
+            // What the box holds now must still be what was touched for.
+            if let Err(e) = lands.refresh(&req.id) {
+                return e.into();
+            }
+            if !lands.is_current(rid) {
+                return Out::Touch(Refusal::TouchMismatch(format!(
+                    "box {} changed after the land began: saiife box land {} again",
+                    req.id.as_str(),
+                    req.id.as_str()
+                )));
+            }
+            let info = match lands.approve(rid, &ev, "cli") {
+                Ok(i) => i,
+                Err(e) => return e.into(),
+            };
+            match open_delta(&lands.paths(&info.id), info.n) {
+                Ok(fd) => Out::WithFd(land_answer(&info), fd),
+                Err(e) => unavailable(format!(
+                    "land {} of box {} is approved, but {e}; saiife box apply {} takes it",
+                    info.n,
+                    info.id.as_str(),
+                    info.id.as_str()
+                ))
+                .into(),
+            }
+        }
+        LandOp::Reject(rid) => {
+            if let Err(e) = lands.reject(rid, "cli") {
+                return e.into();
+            }
+            let _ = ctx.touch.take(&IssueKey::Land(rid), uid);
+            Out::Answer(serde_json::Map::new())
+        }
+        LandOp::Fetch(b, n) => {
+            let Some(info) = lands.approved_unapplied(&b).into_iter().find(|l| l.n == n) else {
+                return invalid(format!(
+                    "land {n} of box {} is not an approved land waiting to be applied",
+                    b.as_str()
+                ))
+                .into();
+            };
+            match open_delta(&lands.paths(&b), n) {
+                Ok(fd) => Out::WithFd(land_answer(&info), fd),
+                Err(e) => e.into(),
+            }
+        }
+        LandOp::Applied(b, n, commit) => match lands.applied(&b, n, &commit) {
+            Ok(()) => Out::Answer(serde_json::Map::new()),
+            Err(e) => e.into(),
+        },
+        LandOp::PushBegin(b, remote, commit) => {
+            let creds = creds();
+            if creds.is_empty() {
+                return Out::Touch(no_device(&format!("pushing box {}", b.as_str())));
+            }
+            let (rid, rec) = match lands.push_begin(&b, uid, &remote, &commit, now) {
+                Ok(x) => x,
+                Err(e) => return e.into(),
+            };
+            let mut a = serde_json::Map::new();
+            a.insert("request_id".into(), rid.to_string().into());
+            a.insert("touch".into(), touch_request(&rec, creds));
+            a.insert("expires_at".into(), rec.expires_at.into());
+            Out::Answer(a)
+        }
+        LandOp::Push(rid, asr) => {
+            let Some((_, rec)) = lands.push_request(rid) else {
+                return invalid(format!("no push request {rid}")).into();
+            };
+            let built = |i: &crate::touch::Issued| ActionRecord {
+                nonce: i.nonce,
+                expires_at: i.expires_at,
+                ..rec.clone()
+            };
+            match ctx.touch.consume(
+                &IssueKey::Push(rid),
+                uid,
+                built,
+                &asr,
+                saiife_touch::LOCAL_RP_ID,
+                now,
+            ) {
+                Ok((ev, _)) => match lands.push_verified(rid, ev) {
+                    Ok(()) => Out::Answer(serde_json::Map::new()),
+                    Err(e) => e.into(),
+                },
+                Err(e) => Out::Touch(Refusal::from(e)),
+            }
+        }
+        LandOp::PushDone(rid, ok, detail) => match lands.push_done(rid, ok, &detail) {
+            Ok(()) => Out::Answer(serde_json::Map::new()),
+            Err(e) => e.into(),
+        },
+    }
 }
