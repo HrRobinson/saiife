@@ -954,7 +954,9 @@ fn boxes_with(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Ve
 
 #[cfg(target_os = "linux")]
 fn boxes_checks(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Check> {
-    use crate::boxes_install::{BOXES_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR};
+    use crate::boxes_install::{
+        BOXES_DIR, BOX_STATE_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR,
+    };
     use saiife_boxhost::layout::Layout as BoxLayout;
     use saiife_boxhost::preflight;
     use saiife_boxhost::tools::Tools;
@@ -1022,17 +1024,47 @@ fn boxes_checks(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> 
         &ctx.layout.at("/dev/kvm"),
         crate::sandbox::landlock_abi(),
     );
+    // I-B: locked, `/var/lib/saiife-box` is root:saiife-box 0750. A user
+    // outside the group cannot see the box dirs or the image store: one
+    // Info line, and only the world-readable checks.
+    let as_root = ctx.as_root || rustix::process::geteuid().is_root();
+    let hidden = locked
+        && !as_root
+        && matches!(
+            fs::read_dir(ctx.layout.at(BOX_STATE_DIR)),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+        );
+    let found: Vec<_> = if hidden {
+        found
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.name,
+                    "vmm" | "firmware" | "qemu-img" | "mke2fs" | "landlock"
+                )
+            })
+            .collect()
+    } else {
+        found
+    };
     let failed = if locked { Status::Fail } else { Status::Info };
-    found
-        .into_iter()
-        .map(|c| {
+    let head = hidden.then(|| {
+        Check::new(
+            "boxes.access",
+            Status::Info,
+            TITLE,
+            "not checked as you (run \"sudo saiife doctor\")",
+        )
+    });
+    head.into_iter()
+        .chain(found.into_iter().map(|c| {
             Check::new(
                 format!("boxes.{}", c.name),
                 if c.ok { Status::Pass } else { failed },
                 format!("{TITLE}: {}", c.name),
                 sanitize(&c.detail),
             )
-        })
+        }))
         .collect()
 }
 
@@ -1953,6 +1985,72 @@ mod tests {
         );
         assert_eq!(status(&r, "boxes.mke2fs"), Status::Fail, "{}", r.to_text());
         assert_eq!(r.exit_code(), 2);
+    }
+
+    /// I-B: locked, as a user outside saiife-box, `/var/lib/saiife-box`
+    /// (0750) cannot be read: one Info line instead of false FAILs, and only
+    /// the world-readable checks (pins, tools, Landlock).
+    #[test]
+    fn locked_boxes_unreadable_as_a_user_are_not_checked() {
+        use crate::boxes_install::{
+            BOXES_DIR, BOX_STATE_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR,
+        };
+        if rustix::process::geteuid().is_root() {
+            return; // root reads a 0000 dir: nothing to test
+        }
+        let setup = |as_root: bool| {
+            let t = T::new(as_root);
+            fs::create_dir_all(t.at("/etc/systemd/system")).unwrap();
+            fs::write(t.at(BOX_UNIT_PATH), "[Unit]\n").unwrap();
+            for d in [BOXES_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR] {
+                fs::create_dir_all(t.at(d)).unwrap();
+            }
+            fs::set_permissions(t.at(BOX_STATE_DIR), fs::Permissions::from_mode(0o000)).unwrap();
+            t
+        };
+        let t = setup(false);
+        let r = t.doctor();
+        fs::set_permissions(t.at(BOX_STATE_DIR), fs::Permissions::from_mode(0o750)).unwrap();
+        let a = get(&r, "boxes.access");
+        assert_eq!(a.status, Status::Info, "{}", r.to_text());
+        assert_eq!(a.title, "boxes");
+        assert_eq!(a.detail, "not checked as you (run \"sudo saiife doctor\")");
+        for gone in ["boxes.installed", "boxes.image"] {
+            assert!(r.checks.iter().all(|c| c.id != gone), "{}", r.to_text());
+        }
+        for kept in [
+            "boxes.vmm",
+            "boxes.firmware",
+            "boxes.qemu-img",
+            "boxes.mke2fs",
+            "boxes.landlock",
+        ] {
+            get(&r, kept);
+        }
+        // root (or a readable root dir) gets every check
+        let t = setup(true);
+        let r = t.doctor();
+        fs::set_permissions(t.at(BOX_STATE_DIR), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            r.checks.iter().all(|c| c.id != "boxes.access"),
+            "{}",
+            r.to_text()
+        );
+        get(&r, "boxes.installed");
+        let t = setup(false);
+        fs::set_permissions(t.at(BOX_STATE_DIR), fs::Permissions::from_mode(0o750)).unwrap();
+        let r = t.doctor();
+        assert!(
+            r.checks.iter().all(|c| c.id != "boxes.access"),
+            "{}",
+            r.to_text()
+        );
+        assert_eq!(
+            status(&r, "boxes.installed"),
+            Status::Pass,
+            "{}",
+            r.to_text()
+        );
     }
 
     #[test]
