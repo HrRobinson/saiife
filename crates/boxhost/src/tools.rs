@@ -240,13 +240,29 @@ mod tests {
         t
     }
 
+    /// `t.run`, again while the just-written script is busy (ETXTBSY: a
+    /// child another test thread forked meanwhile still holds the write
+    /// fd until its exec).
+    #[cfg(unix)]
+    fn run(t: &Tools, tool: Tool, limit: Duration) -> Result<std::process::Output, ToolError> {
+        for _ in 0..50 {
+            match t.run(tool, &[], limit) {
+                Err(ToolError::Io(e)) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                r => return r,
+            }
+        }
+        t.run(tool, &[], limit)
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_times_out_and_kills_own_child() {
         let d = tempfile::tempdir().unwrap();
         let t = script(d.path(), "exec sleep 30");
         let start = std::time::Instant::now();
-        let r = t.run(Tool::Git, &[], Duration::from_secs(1));
+        let r = run(&t, Tool::Git, Duration::from_secs(1));
         assert!(
             matches!(
                 r,
@@ -265,7 +281,7 @@ mod tests {
     fn run_reports_stderr() {
         let d = tempfile::tempdir().unwrap();
         let t = script(d.path(), "echo boom >&2; exit 3");
-        match t.run(Tool::Git, &[], Duration::from_secs(5)) {
+        match run(&t, Tool::Git, Duration::from_secs(5)) {
             Err(ToolError::Failed {
                 status: Some(3),
                 stderr,
@@ -274,7 +290,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let t = script(d.path(), "echo hi");
-        let out = t.run(Tool::Git, &[], Duration::from_secs(5)).unwrap();
+        let out = run(&t, Tool::Git, Duration::from_secs(5)).unwrap();
         assert_eq!(out.stdout, b"hi\n");
     }
 
