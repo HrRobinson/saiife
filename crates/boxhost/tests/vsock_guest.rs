@@ -432,7 +432,89 @@ fn event_flood_is_bounded() {
     let ev: Vec<GuestEvent> = ev.into_iter().map(|(_, e)| e).collect();
     assert_eq!(ev.first(), Some(&GuestEvent::Ready));
     assert!(ev.contains(&GuestEvent::Exited));
-    assert_eq!(ev.last(), Some(&GuestEvent::Activity));
+    // The last Activity was held back by the rate limit (I1) and comes once
+    // its 5 s window opens.
+    assert_eq!(
+        events_until(&g, 1, Duration::from_secs(7)),
+        vec![GuestEvent::Activity]
+    );
+    g.after_off(&b1());
+}
+
+/// I1: 1000 Activity and TurnFinished frames back to back cost the daemon
+/// one of each, then the newest held back once its window opens: never
+/// more than one Activity per 5 s and one TurnFinished per 1 s.
+#[test]
+fn chatter_is_rate_limited_per_run() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    let t0 = Instant::now();
+    let mut buf = Vec::new();
+    for i in 0..1000 {
+        let e = if i % 2 == 0 {
+            Event::Activity
+        } else {
+            Event::TurnFinished
+        };
+        write_msg(&mut buf, &e).unwrap();
+    }
+    s.write_all(&buf).unwrap();
+    // Within the first second: the first of each, nothing more.
+    let mut first = Vec::new();
+    while t0.elapsed() < Duration::from_millis(800) {
+        first.extend(
+            g.recv_events(Duration::from_millis(50))
+                .into_iter()
+                .map(|(_, e)| e),
+        );
+    }
+    assert_eq!(
+        first,
+        vec![GuestEvent::Activity, GuestEvent::TurnFinished],
+        "the flood's first window"
+    );
+    // The newest held back (a TurnFinished) once its 1 s window opens.
+    assert_eq!(
+        events_until(&g, 1, Duration::from_secs(3)),
+        vec![GuestEvent::TurnFinished]
+    );
+    assert!(g.recv_events(Duration::from_millis(1500)).is_empty());
+    // A reconnecting guest does not reset the limit: the run keeps it.
+    drop(s);
+    let mut s2 = w.hello(true);
+    write_msg(&mut s2, &Event::Activity).unwrap();
+    if t0.elapsed() < Duration::from_millis(4500) {
+        assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    }
+    assert_eq!(
+        events_until(&g, 1, Duration::from_secs(7)),
+        vec![GuestEvent::Activity]
+    );
+    assert!(t0.elapsed() >= Duration::from_secs(5), "{:?}", t0.elapsed());
+    g.after_off(&b1());
+}
+
+/// m2: what a stopped run left queued never reaches the box's next run.
+#[test]
+fn a_stopped_runs_events_do_not_reach_the_next_run() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Exited { code: Some(0) }).unwrap();
+    // The run took the Exited (its terminal says ended); both events are
+    // still queued, nobody received them.
+    wait_for("exited", T, || {
+        g.terminal(&b1(), None).is_ok_and(|b| b.ended)
+    });
+    drop(s);
+    g.after_off(&b1());
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
     g.after_off(&b1());
 }
 
@@ -820,8 +902,8 @@ fn failed_setup_allows_retry() {
     assert!(matches!(r, Some(HostReply::Refuse { .. })), "{r:?}");
     let e = g.last_error(&b1()).unwrap();
     assert!(e.contains("chown of /work failed"), "{e}");
-    // A retry is welcomed and set up again.
-    let mut s2 = w.hello(false);
+    // A retry is welcomed and set up again (after the 1 s setup floor).
+    let mut s2 = hello_after_floor(&w);
     wait_for("second setup", T, || w.requests().len() == 2);
     assert!(matches!(w.requests()[1], Request::Setup(_)));
     write_msg(&mut s2, &Event::Started).unwrap();
@@ -916,21 +998,115 @@ fn restarted_init_in_run_is_set_up_again() {
     );
     // The old init process dies: its session ends.
     drop(s);
-    let end = Instant::now() + T;
-    let mut s2 = loop {
-        let (s2, r) = try_hello(&w, false);
-        if r == Some(HostReply::Welcome {
-            proto: PROTO.into(),
-        }) {
-            break s2;
-        }
-        assert!(Instant::now() < end, "never welcomed again: {r:?}");
-        thread::sleep(Duration::from_millis(50));
-    };
+    let mut s2 = hello_after_floor(&w);
     wait_for("second setup", T, || w.requests().len() == 2);
     assert!(matches!(w.requests()[1], Request::Setup(_)));
     write_msg(&mut s2, &Event::Started).unwrap();
     write_msg(&mut s2, &Event::Activity).unwrap();
     assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Activity]);
     g.after_off(&b1());
+}
+
+/// A set_up:false hello retried until welcomed (the setup floor and the end
+/// of the earlier session pass), as a restarting guest init does.
+fn hello_after_floor(w: &World) -> UnixStream {
+    let end = Instant::now() + T;
+    loop {
+        let (s, r) = try_hello(w, false);
+        if r == Some(HostReply::Welcome {
+            proto: PROTO.into(),
+        }) {
+            return s;
+        }
+        assert!(Instant::now() < end, "never welcomed again: {r:?}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// T8-R22: setups of one run are at least 1 s apart; a fresh init that
+/// would be set up sooner is refused ("setup too soon") and its retry a
+/// second later is set up.
+#[test]
+fn setups_are_a_second_apart() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let t0 = Instant::now();
+    let s = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    drop(s);
+    // The session ends at once; the next set_up:false hello comes too soon.
+    let mut too_soon = 0;
+    let s2 = loop {
+        let (s2, r) = try_hello(&w, false);
+        match r {
+            Some(HostReply::Welcome { .. }) => break s2,
+            Some(HostReply::Refuse { why }) if why == "setup too soon" => too_soon += 1,
+            Some(HostReply::Refuse { why }) if why == "already set up" => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(t0.elapsed() < T, "never welcomed again");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(too_soon > 0, "no hello was refused as too soon");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1000),
+        "{:?}",
+        t0.elapsed()
+    );
+    wait_for("second setup", T, || w.requests().len() == 2);
+    // A flood of fresh inits within the floor makes no setups.
+    drop(s2);
+    let t1 = Instant::now();
+    while t1.elapsed() < Duration::from_millis(700) {
+        let _ = try_hello(&w, false);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let setups = w
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::Setup(_)))
+        .count();
+    assert_eq!(setups, 2, "setup sent {setups} times");
+    g.after_off(&b1());
+}
+
+/// m3: a box's next run goes on numbering its terminal frames after the
+/// earlier run's, so a reader's `after` stays monotonic.
+#[test]
+fn terminal_seq_goes_on_across_runs() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"first run".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("first run"));
+    g.after_off(&b1());
+    let last = g.terminal(&b1(), None).unwrap().next;
+    assert!(last >= 1);
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert!(g.terminal(&b1(), Some(last)).unwrap().frames.is_empty());
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"second run".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("second run"));
+    let b = g.terminal(&b1(), Some(last)).unwrap();
+    assert!(
+        matches!(b.frames.first(), Some(TermFrame::Snapshot { seq, .. }) if *seq == last + 1),
+        "{b:?}"
+    );
+    g.after_off(&b1());
+}
+
+/// m5: the guest channel unlinks only its own listeners; the gateway's
+/// (egress, model) are left for the gateway's own after_off.
+#[test]
+fn after_off_leaves_the_gateways_sockets() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let eg = saiife_boxhost::vsock::listen(&w.paths, ports::EGRESS, false).unwrap();
+    let md = saiife_boxhost::vsock::listen(&w.paths, ports::MODEL, false).unwrap();
+    g.after_off(&b1());
+    assert!(!w.paths.vsock_port(ports::EVENTS).exists());
+    assert!(!w.paths.vsock_port(ports::PTY).exists());
+    assert!(w.paths.vsock_port(ports::EGRESS).exists());
+    assert!(w.paths.vsock_port(ports::MODEL).exists());
+    drop((eg, md));
 }

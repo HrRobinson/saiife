@@ -92,6 +92,13 @@ fn truncate_at_boundary(s: &mut String, max: usize) {
 
 impl Screen {
     pub fn new(rows: u16, cols: u16) -> Screen {
+        Self::new_after(rows, cols, 0)
+    }
+
+    /// A fresh screen whose first frame has seq `seq + 1`: a box's next run
+    /// goes on from its earlier run's last seq, so readers' `after` stays
+    /// monotonic (and an `after` from the earlier run gets the new screen).
+    pub fn new_after(rows: u16, cols: u16, seq: u64) -> Screen {
         let (rows, cols) = clamp_dims(rows, cols);
         Screen {
             // Scrollback 0: nothing outside the visible screen is kept.
@@ -100,7 +107,7 @@ impl Screen {
             ring_bytes: 0,
             snapshots: 0,
             bytes_since_snapshot: 0,
-            seq: 0,
+            seq,
             rows,
             cols,
             last_rows: Vec::new(),
@@ -109,6 +116,11 @@ impl Screen {
             deltas_since_snapshot: 0,
             dirty: false,
         }
+    }
+
+    /// The seq of the newest frame (0: none yet).
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// Parses all bytes; cuts a frame only if at least 200 ms passed since the
@@ -531,6 +543,28 @@ mod tests {
         }
         assert_eq!(b.next, 1);
         assert!(!b.ended);
+    }
+
+    /// m3: a later run's screen goes on from the earlier run's seq; a
+    /// reader at the old seq gets the new screen's snapshot.
+    #[test]
+    fn new_after_goes_on_from_the_earlier_seq() {
+        let mut old = Screen::new(5, 20);
+        old.feed(b"one", 1000);
+        old.feed(b"\r\ntwo", 1300);
+        let last = old.seq();
+        assert_eq!(last, 2);
+        let mut s = Screen::new_after(5, 20, last);
+        assert_eq!(s.seq(), last);
+        assert!(s.batch(Some(last), false).frames.is_empty());
+        s.feed(b"again", 10);
+        let b = s.batch(Some(last), false);
+        assert_eq!(b.frames.len(), 1);
+        assert!(
+            matches!(&b.frames[0], TermFrame::Snapshot { seq, .. } if *seq == last + 1),
+            "{b:?}"
+        );
+        assert_eq!(b.next, last + 1);
     }
 
     #[test]

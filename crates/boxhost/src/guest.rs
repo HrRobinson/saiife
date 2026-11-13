@@ -59,9 +59,20 @@ const MAX_CONNS: usize = 8;
 /// Pause after each accepted connection, refused or served: a reconnecting
 /// guest cannot spin the acceptor.
 const ACCEPT_THROTTLE: Duration = Duration::from_millis(20);
+/// Host-side floors on the guest's chatter, per run (G2; final review I1):
+/// an Activity at most this often, a TurnFinished at most this often. A
+/// flooding guest costs the daemon at most one record write per window; the
+/// newest event held back goes out once its window opens.
+const ACTIVITY_EVERY_MS: u64 = 5_000;
+const TURN_EVERY_MS: u64 = 1_000;
+/// Setups of one run are at least this far apart (ruling R22: a restarting
+/// init comes back after systemd's RestartSec=1, so nothing honest waits).
+const SETUP_FLOOR_MS: u64 = 1_000;
 const SETUP_NONE: u8 = 0;
 const SETUP_IN_FLIGHT: u8 = 1;
 const SETUP_DONE: u8 = 2;
+/// The host listeners this hook binds (the gateway binds the others).
+const OUR_PORTS: [u32; 2] = [ports::EVENTS, ports::PTY];
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
@@ -117,6 +128,59 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
+/// The per-run rate limit on Activity and TurnFinished.
+#[derive(Default)]
+struct Chatter {
+    activity_at: Option<u64>,
+    turn_at: Option<u64>,
+    /// The newest event held back, sent once its window opens.
+    owed: Option<GuestEvent>,
+}
+
+impl Chatter {
+    fn open(&self, ev: GuestEvent, now: u64) -> bool {
+        let (at, every) = match ev {
+            GuestEvent::Activity => (self.activity_at, ACTIVITY_EVERY_MS),
+            GuestEvent::TurnFinished => (self.turn_at, TURN_EVERY_MS),
+            GuestEvent::Ready | GuestEvent::Exited => return true,
+        };
+        at.is_none_or(|t| now.saturating_sub(t) >= every)
+    }
+
+    fn mark(&mut self, ev: GuestEvent, now: u64) {
+        match ev {
+            GuestEvent::Activity => self.activity_at = Some(now),
+            GuestEvent::TurnFinished => self.turn_at = Some(now),
+            GuestEvent::Ready | GuestEvent::Exited => {}
+        }
+    }
+
+    /// An event from the guest: `Some` to queue now, or `None` when its
+    /// window is shut (it is held as the newest, replacing an older one; the
+    /// newest event alone decides the idle clocks).
+    fn offer(&mut self, ev: GuestEvent, now: u64) -> Option<GuestEvent> {
+        if self.open(ev, now) {
+            self.mark(ev, now);
+            self.owed = None;
+            Some(ev)
+        } else {
+            self.owed = Some(ev);
+            None
+        }
+    }
+
+    /// The held event, once its window opened.
+    fn due(&mut self, now: u64) -> Option<GuestEvent> {
+        let ev = self.owed?;
+        if !self.open(ev, now) {
+            return None;
+        }
+        self.owed = None;
+        self.mark(ev, now);
+        Some(ev)
+    }
+}
+
 /// The screen plus the 200 ms timer state and a dead flag (a panicking
 /// emulator is contained, not fatal).
 struct Term {
@@ -128,9 +192,11 @@ struct Term {
 }
 
 impl Term {
-    fn new() -> Term {
+    /// A fresh screen whose frames go on after `seq` (the box's earlier
+    /// run), so a reader's `after` stays monotonic across runs.
+    fn new(seq: u64) -> Term {
         Term {
-            screen: Screen::new(ROWS, COLS),
+            screen: Screen::new_after(ROWS, COLS, seq),
             dead: false,
             last_cut: None,
             pending: false,
@@ -191,6 +257,9 @@ impl Term {
 /// One box run: from before_boot to after_off.
 struct Run {
     id: BoxId,
+    /// Unique per run of this VsockGuest: queued events carry it, and
+    /// recv_events drops those of a run that is no longer the box's.
+    gen: u64,
     paths: BoxPaths,
     start: Instant,
     /// after_off ran.
@@ -212,8 +281,13 @@ struct Run {
     pty_gen: AtomicU64,
     /// Connection handler threads alive (events and PTY), capped at MAX_CONNS.
     conns: AtomicUsize,
-    /// The cap was logged this run (once per run).
-    cap_logged: AtomicBool,
+    /// Log lines by reason this run: the first is logged, the rest counted
+    /// and summed up when the run stops.
+    logged: Mutex<BTreeMap<&'static str, u64>>,
+    /// The rate limit on Activity and TurnFinished.
+    chatter: Mutex<Chatter>,
+    /// When the last setup of this run was claimed (ms since `start`).
+    last_setup: Mutex<Option<u64>>,
     /// Clones of the current connections, kept to shut them down.
     events_conn: Mutex<Option<(u64, UnixStream)>>,
     /// Events connections still in their hello, by generation.
@@ -239,15 +313,37 @@ impl Run {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
-    fn set_error_if_empty(&self, msg: &str) {
-        log(&self.id, msg);
+    /// Logs `msg` the first time `why` happens this run; later ones are
+    /// only counted (a guest reconnecting in a loop cannot flood the log).
+    fn log_once(&self, why: &'static str, msg: &str) {
+        let first = {
+            let mut m = lock(&self.logged);
+            let n = m.entry(why).or_insert(0);
+            *n += 1;
+            *n == 1
+        };
+        if first {
+            log(&self.id, msg);
+        }
+    }
+    /// At the run's end: one line per reason that happened more than once.
+    fn log_counts(&self) {
+        let counts = std::mem::take(&mut *lock(&self.logged));
+        for (why, n) in counts {
+            if n > 1 {
+                log(&self.id, &format!("{why}: {} more this run", n - 1));
+            }
+        }
+    }
+    fn set_error_if_empty(&self, why: &'static str, msg: &str) {
+        self.log_once(why, msg);
         let mut e = lock(&self.last_error);
         if e.is_none() {
             *e = Some(sanitize(msg));
         }
     }
-    fn set_error(&self, msg: &str) {
-        log(&self.id, msg);
+    fn set_error(&self, why: &'static str, msg: &str) {
+        self.log_once(why, msg);
         *lock(&self.last_error) = Some(sanitize(msg));
     }
 
@@ -358,7 +454,9 @@ pub struct VsockGuest {
     vmm_uid: u32,
     cast_path: CastPath,
     runs: Mutex<BTreeMap<BoxId, Arc<Run>>>,
-    queue: Mutex<VecDeque<(BoxId, GuestEvent)>>,
+    /// Events for the daemon, each with its run's `gen`.
+    queue: Mutex<VecDeque<(BoxId, u64, GuestEvent)>>,
+    next_run: AtomicU64,
     queue_cv: Condvar,
     live: Arc<AtomicUsize>,
 }
@@ -389,19 +487,30 @@ impl VsockGuest {
             vmm_uid,
             runs: Mutex::new(BTreeMap::new()),
             queue: Mutex::new(VecDeque::new()),
+            next_run: AtomicU64::new(0),
             queue_cv: Condvar::new(),
             live: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    /// Waits up to `timeout` for events, then returns all queued ones.
+    /// Waits up to `timeout` for events, then returns all queued ones of
+    /// each box's current run (an event of a run that ended and was
+    /// replaced by a new boot is dropped: it must not move the new run).
     pub fn recv_events(&self, timeout: Duration) -> Vec<(BoxId, GuestEvent)> {
-        let q = lock(&self.queue);
-        let (mut q, _) = self
-            .queue_cv
-            .wait_timeout_while(q, timeout, |q| q.is_empty())
-            .unwrap_or_else(|e| e.into_inner());
-        q.drain(..).collect()
+        let drained: Vec<(BoxId, u64, GuestEvent)> = {
+            let q = lock(&self.queue);
+            let (mut q, _) = self
+                .queue_cv
+                .wait_timeout_while(q, timeout, |q| q.is_empty())
+                .unwrap_or_else(|e| e.into_inner());
+            q.drain(..).collect()
+        };
+        let runs = lock(&self.runs);
+        drained
+            .into_iter()
+            .filter(|(id, gen, _)| runs.get(id).is_some_and(|r| r.gen == *gen))
+            .map(|(id, _, ev)| (id, ev))
+            .collect()
     }
 
     /// The last refused hello or failed setup of the box's current run.
@@ -563,12 +672,14 @@ impl VsockGuest {
         }
     }
 
-    /// Queues an event; bounded and coalesced so a flooding guest cannot
-    /// grow memory: per box at most one pending Activity, TurnFinished and
-    /// Exited (the newest Activity/TurnFinished moves to the back).
-    fn push(&self, id: &BoxId, ev: GuestEvent) {
+    /// Queues an event of `run`; bounded and coalesced so a flooding guest
+    /// cannot grow memory: per box at most one pending Activity,
+    /// TurnFinished and Exited (the newest Activity/TurnFinished moves to
+    /// the back).
+    fn push(&self, run: &Run, ev: GuestEvent) {
+        let id = &run.id;
         let mut q = lock(&self.queue);
-        let same = |(b, e): &(BoxId, GuestEvent)| b == id && *e == ev;
+        let same = |(b, _, e): &(BoxId, u64, GuestEvent)| b == id && *e == ev;
         match ev {
             GuestEvent::Activity | GuestEvent::TurnFinished => {
                 if let Some(i) = q.iter().position(same) {
@@ -585,7 +696,7 @@ impl VsockGuest {
         if q.len() >= QUEUE_CAP {
             let chatter =
                 |e: &GuestEvent| matches!(e, GuestEvent::Activity | GuestEvent::TurnFinished);
-            if let Some(i) = q.iter().position(|(_, e)| chatter(e)) {
+            if let Some(i) = q.iter().position(|(_, _, e)| chatter(e)) {
                 q.remove(i);
             } else if chatter(&ev) {
                 return;
@@ -593,7 +704,7 @@ impl VsockGuest {
                 q.pop_front();
             }
         }
-        q.push_back((id.clone(), ev));
+        q.push_back((id.clone(), run.gen, ev));
         drop(q);
         self.queue_cv.notify_all();
     }
@@ -619,6 +730,8 @@ impl VsockGuest {
         if run.stop.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Whatever the run still holds back dies with it.
+        lock(&run.chatter).owed = None;
         let deadline = Instant::now() + JOIN_WAIT;
         let mut pending: Vec<JoinHandle<()>> = Vec::new();
         loop {
@@ -650,7 +763,9 @@ impl VsockGuest {
         if let Some(mut rec) = lock(&run.recorder).take() {
             rec.flush();
         }
-        vsock::unlink_all(&run.paths);
+        // Only our own listeners: the gateway's are its own business.
+        vsock::unlink_ports(&run.paths, &OUR_PORTS);
+        run.log_counts();
     }
 
     // ---- the events channel ----
@@ -680,7 +795,7 @@ impl VsockGuest {
                     }) {
                         let hello = lock(&run.hellos).remove(&gen);
                         drop(hello);
-                        log(&run.id, &format!("events thread: {e}"));
+                        run.log_once("events thread failed", &format!("events thread: {e}"));
                     }
                     // A reconnecting guest cannot make threads faster than this.
                     std::thread::sleep(ACCEPT_THROTTLE);
@@ -688,7 +803,7 @@ impl VsockGuest {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    log(&run.id, &format!("events accept: {e}"));
+                    run.log_once("events accept failed", &format!("events accept: {e}"));
                     std::thread::sleep(POLL);
                 }
             }
@@ -699,12 +814,10 @@ impl VsockGuest {
     fn conn_slot(run: &Arc<Run>) -> Option<ConnSlot> {
         if run.conns.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
             run.conns.fetch_sub(1, Ordering::SeqCst);
-            if !run.cap_logged.swap(true, Ordering::SeqCst) {
-                log(
-                    &run.id,
-                    "too many guest connections; closing new ones (logged once per run)",
-                );
-            }
+            run.log_once(
+                "too many guest connections",
+                "too many guest connections; closing new ones",
+            );
             return None;
         }
         Some(ConnSlot(run.clone()))
@@ -751,7 +864,10 @@ impl VsockGuest {
                     let _ = write_msg(&mut &*s, &HostReply::Refuse { why: why.clone() });
                     // Never over an earlier error of this run (a failed
                     // setup is what the daemon must see).
-                    run.set_error_if_empty(&format!("refused the guest hello: {why}"));
+                    run.set_error_if_empty(
+                        "refused a guest hello",
+                        &format!("refused the guest hello: {why}"),
+                    );
                 }
                 return;
             }
@@ -765,6 +881,9 @@ impl VsockGuest {
         // hello is a fresh guest init (ruling R22: the agent died with the
         // earlier init process) and is set up again, but only once no
         // welcomed events session is live; while one is, it is refused.
+        // Setups of a run are at least SETUP_FLOOR_MS apart: a hello that
+        // would be set up sooner is refused (the guest init exits and
+        // systemd brings it back a second later).
         if !set_up {
             let claimed = run
                 .setup
@@ -786,13 +905,24 @@ impl VsockGuest {
                         Err(state)
                     }
                 });
-            if let Err(state) = claimed {
-                let why = if state == SETUP_DONE {
-                    "already set up"
-                } else {
-                    "setup already in progress"
-                };
-                log(&run.id, &format!("refused a guest hello: {why}"));
+            let refused = match claimed {
+                Err(SETUP_DONE) => Some("already set up"),
+                Err(_) => Some("setup already in progress"),
+                Ok(before) => {
+                    let now = run.now_ms();
+                    let mut last = lock(&run.last_setup);
+                    if last.is_some_and(|t| now.saturating_sub(t) < SETUP_FLOOR_MS) {
+                        // ours alone while in flight: put it back as it was
+                        run.setup.store(before, Ordering::SeqCst);
+                        Some("setup too soon")
+                    } else {
+                        *last = Some(now);
+                        None
+                    }
+                }
+            };
+            if let Some(why) = refused {
+                run.log_once(why, &format!("refused a guest hello: {why}"));
                 let _ = write_msg(&mut &*s, &HostReply::Refuse { why: why.into() });
                 return;
             }
@@ -815,7 +945,7 @@ impl VsockGuest {
             proto: PROTO.into(),
         };
         if let Err(e) = write_msg(&mut &*s, &welcome) {
-            log(&run.id, &format!("welcome not sent: {e}"));
+            run.log_once("welcome not sent", &format!("welcome not sent: {e}"));
             unclaim();
             return;
         }
@@ -832,7 +962,7 @@ impl VsockGuest {
                 Err(e) => {
                     unclaim();
                     if Self::current(run, gen) {
-                        run.set_error(&e);
+                        run.set_error("setup failed", &e);
                     }
                     return;
                 }
@@ -847,7 +977,7 @@ impl VsockGuest {
                 Ok(None) => return,
                 Err(e) => {
                     if Self::current(run, gen) {
-                        log(&run.id, &format!("events link closed: {e}"));
+                        run.log_once("events link closed", &format!("events link closed: {e}"));
                     }
                     return;
                 }
@@ -857,7 +987,10 @@ impl VsockGuest {
             }
             let out = match ev {
                 Event::Hello { .. } => {
-                    log(&run.id, "a second hello on the events link; closing it");
+                    run.log_once(
+                        "a second hello",
+                        "a second hello on the events link; closing it",
+                    );
                     return;
                 }
                 Event::Started => {
@@ -873,8 +1006,12 @@ impl VsockGuest {
                     GuestEvent::Exited
                 }
             };
+            // I1: Activity and TurnFinished are rate limited per run.
+            let Some(out) = lock(&run.chatter).offer(out, run.now_ms()) else {
+                continue;
+            };
             let Some(g) = me.upgrade() else { return };
-            g.push(&run.id, out);
+            g.push(run, out);
         }
     }
 
@@ -928,20 +1065,28 @@ impl VsockGuest {
                         let _slot = slot;
                         VsockGuest::pty_conn(run2, gen, s)
                     }) {
-                        log(&run.id, &format!("pty thread: {e}"));
+                        run.log_once("pty thread failed", &format!("pty thread: {e}"));
                     }
                     std::thread::sleep(ACCEPT_THROTTLE);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    log(&run.id, &format!("pty accept: {e}"));
+                    run.log_once("pty accept failed", &format!("pty accept: {e}"));
                     std::thread::sleep(POLL);
                 }
             }
             // The 200 ms frame timer and the periodic recording flush.
             let now = run.now_ms();
             lock(&run.term).tick(now, false);
+            // A held Activity/TurnFinished whose window opened (I1).
+            let owed = lock(&run.chatter).due(now);
+            if let Some(ev) = owed {
+                match me.upgrade() {
+                    Some(g) if !run.stopped() => g.push(&run, ev),
+                    _ => {}
+                }
+            }
             if last_rec_flush.elapsed() >= RECORDER_FLUSH {
                 last_rec_flush = Instant::now();
                 if let Some(rec) = lock(&run.recorder).as_mut() {
@@ -967,13 +1112,19 @@ impl VsockGuest {
                     }
                 }
                 Ok(Some(Frame::Json(_))) => {
-                    log(&run.id, "a json frame on the terminal stream; closing it");
+                    run.log_once(
+                        "a json frame on the terminal stream",
+                        "a json frame on the terminal stream; closing it",
+                    );
                     break;
                 }
                 Ok(None) => break,
                 Err(e) => {
                     if !run.stopped() {
-                        log(&run.id, &format!("terminal stream closed: {e}"));
+                        run.log_once(
+                            "terminal stream closed",
+                            &format!("terminal stream closed: {e}"),
+                        );
                     }
                     break;
                 }
@@ -986,11 +1137,16 @@ impl VsockGuest {
 impl VmHooks for VsockGuest {
     fn before_boot(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String> {
         let old = lock(&self.runs).get(id).cloned();
-        if let Some(old) = old {
-            self.stop_run(&old);
-        }
+        // m3: the new screen's frames go on after the earlier run's.
+        let seq = old.as_ref().map_or(0, |old| {
+            self.stop_run(old);
+            lock(&old.term).screen.seq()
+        });
+        // m2: whatever the earlier run left queued is not this run's.
+        lock(&self.queue).retain(|(b, _, _)| b != id);
         let run = Arc::new(Run {
             id: id.clone(),
+            gen: self.next_run.fetch_add(1, Ordering::SeqCst) + 1,
             paths: paths.clone(),
             start: Instant::now(),
             stop: AtomicBool::new(false),
@@ -1003,19 +1159,21 @@ impl VmHooks for VsockGuest {
             next_events_gen: AtomicU64::new(0),
             pty_gen: AtomicU64::new(0),
             conns: AtomicUsize::new(0),
-            cap_logged: AtomicBool::new(false),
+            logged: Mutex::new(BTreeMap::new()),
+            chatter: Mutex::new(Chatter::default()),
+            last_setup: Mutex::new(None),
             events_conn: Mutex::new(None),
             hellos: Mutex::new(BTreeMap::new()),
             pty_conn: Mutex::new(None),
             controls: Mutex::new(BTreeMap::new()),
             next_control: AtomicU64::new(0),
-            term: Mutex::new(Term::new()),
+            term: Mutex::new(Term::new(seq)),
             recorder: Mutex::new(None),
             threads: Mutex::new(Vec::new()),
             last_error: Mutex::new(None),
         });
         let fail = |what: &str, e: io::Error| {
-            vsock::unlink_all(paths);
+            vsock::unlink_ports(paths, &OUR_PORTS);
             format!("{what}: {e}")
         };
         let bind = |port: u32| -> io::Result<UnixListener> {

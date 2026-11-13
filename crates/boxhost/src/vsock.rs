@@ -295,8 +295,14 @@ pub fn listen(paths: &BoxPaths, port: u32, group_rw: bool) -> io::Result<UnixLis
 /// Remove the host-bound sockets of every guest-initiated port. Only
 /// sockets are unlinked; `vsock.sock` itself belongs to the VMM.
 pub fn unlink_all(paths: &BoxPaths) {
+    unlink_ports(paths, &ports::ALL_HOST_PORTS);
+}
+
+/// Remove the host-bound sockets of `ports` only (each owner of listeners
+/// unlinks its own). Only sockets are unlinked, never followed.
+pub fn unlink_ports(paths: &BoxPaths, ports: &[u32]) {
     use rustix::fs::{unlinkat, AtFlags};
-    for port in ports::ALL_HOST_PORTS {
+    for &port in ports {
         let path = paths.vsock_port(port);
         let Ok((dir, name)) = open_parent(&path) else {
             continue;
@@ -627,5 +633,20 @@ mod tests {
             .is_socket());
         // Idempotent with everything absent.
         unlink_all(&p);
+    }
+
+    #[test]
+    fn unlink_ports_removes_only_the_named_ones() {
+        let (_t, p) = setup();
+        let all = ports::ALL_HOST_PORTS.map(|port| listen(&p, port, false).unwrap());
+        unlink_ports(&p, &[ports::EVENTS, ports::PTY]);
+        assert!(!p.vsock_port(ports::EVENTS).exists());
+        assert!(!p.vsock_port(ports::PTY).exists());
+        assert!(p.vsock_port(ports::EGRESS).exists());
+        assert!(p.vsock_port(ports::MODEL).exists());
+        unlink_ports(&p, &[ports::EGRESS, ports::MODEL]);
+        assert!(!p.vsock_port(ports::EGRESS).exists());
+        assert!(!p.vsock_port(ports::MODEL).exists());
+        drop(all);
     }
 }
