@@ -693,3 +693,51 @@ fn dir_swapped_for_symlink_is_not_followed() {
     let e = w.validate(&buf).unwrap_err();
     assert_eq!(e.path.as_deref(), Some("d"), "{e}");
 }
+
+#[test]
+fn advance_some_paths_refuses_file_dir_conflict() {
+    let w = World::new();
+    w.put("dir", b"a file in the base\n");
+    w.put("a/x", b"a file below a\n");
+    init_base(&w.env).unwrap();
+    // The export turns the file `dir` into a directory and the directory
+    // `a` into a file.
+    w.rm("dir");
+    w.put("dir/x", b"x\n");
+    std::fs::remove_dir_all(w.work("a")).unwrap();
+    w.put("a", b"now a file\n");
+    let (v, _) = w.export(1);
+    assert_eq!(v.entries.len(), 4);
+    let base = w.rev("refs/base");
+    let only = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    // A new path below a base file that is kept.
+    let e = advance(&w.env, 1, Some(&only(&["dir/x"]))).unwrap_err();
+    assert!(e.contains("both a file and a directory"), "{e}");
+    // A new file over a base directory whose files are kept.
+    let e = advance(&w.env, 1, Some(&only(&["a"]))).unwrap_err();
+    assert!(e.contains("both a file and a directory"), "{e}");
+    assert_eq!(w.rev("refs/base"), base, "a refusal changes nothing");
+    // With the deletes selected too, both go through.
+    advance(&w.env, 1, Some(&only(&["dir", "dir/x", "a/x", "a"]))).unwrap();
+    let ls = String::from_utf8(w.git(&["ls-tree", "-r", "--name-only", "refs/base"])).unwrap();
+    assert_eq!(ls, "a\ndir/x\n");
+}
+
+#[test]
+fn advance_some_paths_refuses_a_path_not_in_the_export() {
+    let w = World::new();
+    w.put("a", b"a\n");
+    w.put("same", b"unchanged\n");
+    init_base(&w.env).unwrap();
+    w.put("a", b"a2\n");
+    let (v, _) = w.export(1);
+    assert_eq!(paths(&v), [("a", Op::Modify)]);
+    let base = w.rev("refs/base");
+    for p in ["nope", "same"] {
+        let e = advance(&w.env, 1, Some(&[p.to_string()])).unwrap_err();
+        assert!(e.contains("is not a change of export 1"), "{e}");
+    }
+    // One bad path refuses the whole list.
+    assert!(advance(&w.env, 1, Some(&["a".to_string(), "nope".to_string()])).is_err());
+    assert_eq!(w.rev("refs/base"), base);
+}

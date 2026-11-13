@@ -1025,9 +1025,31 @@ pub fn export_within(
     cat.close()
 }
 
+/// A tree's files: path -> "<mode> <oid>".
+fn tree_entries(git: &Git, commit: &str) -> Result<BTreeMap<Vec<u8>, String>, String> {
+    let ls = git.run(&["ls-tree", "-r", "-z", "--full-tree", commit])?;
+    let mut out = BTreeMap::new();
+    for rec in ls.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        // "<mode> SP <type> SP <oid> TAB <path>"
+        let tab = rec
+            .iter()
+            .position(|&b| b == b'\t')
+            .ok_or("git ls-tree: a record without a path")?;
+        let meta = String::from_utf8_lossy(&rec[..tab]).into_owned();
+        let mut f = meta.split(' ');
+        let (Some(mode), Some(_), Some(oid)) = (f.next(), f.next(), f.next()) else {
+            return Err(format!("git ls-tree: bad record {meta:?}"));
+        };
+        out.insert(rec[tab + 1..].to_vec(), format!("{mode} {oid}"));
+    }
+    Ok(out)
+}
+
 /// Moves `refs/base` to `refs/exports/<n>` (`paths` `None`), or to the base
 /// with only `paths` taken from the export (a listed path the export lacks
-/// is removed from the base).
+/// is removed from the base). Refused, with nothing changed, when a listed
+/// path is not a change of the export or the result would make a path both
+/// a file and a directory.
 pub fn advance(env: &GuestEnv, n: u32, paths: Option<&[String]>) -> Result<(), String> {
     let git = Git::new(env, "advance");
     let base = git.commit(BASE_REF, "the box's base")?;
@@ -1040,21 +1062,38 @@ pub fn advance(env: &GuestEnv, n: u32, paths: Option<&[String]>) -> Result<(), S
     for p in paths {
         check_path(p)?;
     }
-    // The export's tree, path -> "<mode> <oid>".
-    let ls = git.run(&["ls-tree", "-r", "-z", "--full-tree", &exp])?;
-    let mut have = BTreeMap::new();
-    for rec in ls.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-        // "<mode> SP <type> SP <oid> TAB <path>"
-        let tab = rec
-            .iter()
-            .position(|&b| b == b'\t')
-            .ok_or("git ls-tree: a record without a path")?;
-        let meta = String::from_utf8_lossy(&rec[..tab]).into_owned();
-        let mut f = meta.split(' ');
-        let (Some(mode), Some(_), Some(oid)) = (f.next(), f.next(), f.next()) else {
-            return Err(format!("git ls-tree: bad record {meta:?}"));
-        };
-        have.insert(rec[tab + 1..].to_vec(), format!("{mode} {oid}"));
+    let have = tree_entries(&git, &exp)?;
+    let was = tree_entries(&git, &base)?;
+    // Every listed path must be a change of this export.
+    for p in paths {
+        let k = p.as_bytes();
+        if have.get(k) == was.get(k) {
+            return Err(format!("{} is not a change of export {n}", esc(k)));
+        }
+    }
+    // The resulting tree must still be a tree: no path both a file and a
+    // directory of another (`update-index --index-info` would silently
+    // replace one with the other). Base and export are each valid, so a
+    // conflict always involves a listed path; checking the whole result
+    // covers both directions.
+    let listed: std::collections::BTreeSet<&[u8]> = paths.iter().map(|p| p.as_bytes()).collect();
+    let mut result: std::collections::BTreeSet<&[u8]> = was
+        .keys()
+        .map(Vec::as_slice)
+        .filter(|k| !listed.contains(k))
+        .collect();
+    result.extend(listed.iter().copied().filter(|k| have.contains_key(*k)));
+    for p in &result {
+        for (i, _) in p.iter().enumerate().filter(|(_, &b)| b == b'/') {
+            let up = &p[..i];
+            if result.contains(up) {
+                return Err(format!(
+                    "taking only the listed paths would make {} both a file and a directory (of {})",
+                    esc(up),
+                    esc(p)
+                ));
+            }
+        }
     }
     let mut remove = Vec::new();
     let mut add = Vec::new();
