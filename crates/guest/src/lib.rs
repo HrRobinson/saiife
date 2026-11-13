@@ -8,3 +8,36 @@ pub mod events;
 pub mod export;
 pub mod pty;
 pub mod setup;
+
+pub use env::{GuestEnv, GuestTools, Timing};
+pub use saiife_boxproto::msg::Event;
+
+/// The service main (`saiife __guest init`). Returns only on a fatal error;
+/// systemd restarts it.
+///
+/// Ruling R22 (supersedes R10): a fresh init process (a cold boot, or systemd
+/// restarting the service) always hellos `set_up: false` and is set up again,
+/// spawning a new agent; the setup marker only skips the first-time `chown -R
+/// /work` and base commit. A re-hello within one process (the events link
+/// dropped and came back, as after a snapshot restore) says `set_up: true`
+/// once that process has spawned its agent, and reports nothing extra.
+pub fn run_init(env: &GuestEnv) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return control::run(env);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = env;
+        Err("saiife-guest runs only inside the Linux box VM".into())
+    }
+}
+
+/// `saiife __guest event turn-finished`: one event to local.sock.
+pub fn send_local_event(env: &GuestEnv, ev: &Event) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return control::send_local(env, ev);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (env, ev);
+        Err("saiife-guest runs only inside the Linux box VM".into())
+    }
+}

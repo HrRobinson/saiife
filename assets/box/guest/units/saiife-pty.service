@@ -1,0 +1,12 @@
+[Unit]
+Description=saiife guest channel: terminal to the host (vsock 5003)
+
+[Service]
+ExecStart=/usr/bin/socat UNIX-LISTEN:/run/saiife-guest/pty.sock,fork,mode=0600 VSOCK-CONNECT:2:5003
+RuntimeDirectory=saiife-guest
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

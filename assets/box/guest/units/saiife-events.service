@@ -1,0 +1,12 @@
+[Unit]
+Description=saiife guest channel: events to the host (vsock 5000)
+
+[Service]
+ExecStart=/usr/bin/socat UNIX-LISTEN:/run/saiife-guest/events.sock,fork,mode=0600 VSOCK-CONNECT:2:5000
+RuntimeDirectory=saiife-guest
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

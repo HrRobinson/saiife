@@ -1656,3 +1656,229 @@ fn tick_retries_a_failed_discard_destroy() {
     );
     assert_eq!(count(&w, &a, VmOp::Destroy), 2);
 }
+
+#[test]
+fn note_error_appends() {
+    let w = world(1);
+    let b = w.spawn("t").id;
+    w.mgr.note_error(&b, "guest: setup failed").unwrap();
+    assert_eq!(
+        w.mgr.get(&b).unwrap().error.as_deref(),
+        Some("guest: setup failed")
+    );
+    w.mgr.note_error(&b, "more").unwrap();
+    assert_eq!(
+        w.mgr.get(&b).unwrap().error.as_deref(),
+        Some("guest: setup failed; more")
+    );
+    assert!(matches!(
+        w.mgr.note_error(&id("b99"), "x"),
+        Err(BoxError::NotFound)
+    ));
+}
+
+#[test]
+fn stop_if_starting_only_stops_a_starting_box() {
+    let w = world(2);
+    let b = w.spawn("t").id;
+    let c = w
+        .mgr
+        .stop_if_starting(&b, "agent gone", "why")
+        .unwrap()
+        .unwrap();
+    assert_eq!(c, change(&b, BoxState::Starting, BoxState::Done, "why"));
+    let r = w.mgr.get(&b).unwrap();
+    assert!(!r.vm_on);
+    assert!(r.vm.is_some(), "the VM is kept");
+    assert_eq!(r.error.as_deref(), Some("agent gone"));
+    assert_eq!(count(&w, &b, VmOp::Stop), 1);
+    assert_eq!(count(&w, &b, VmOp::Destroy), 0);
+    let run = running(&w, "u");
+    assert_eq!(w.mgr.stop_if_starting(&run, "x", "why").unwrap(), None);
+    assert_eq!(state(&w, &run), BoxState::Running);
+}
+
+#[test]
+fn ready_clears_keep() {
+    let w = world(1);
+    let i = running(&w, "a");
+    w.mgr.stop(&i, true).unwrap();
+    assert!(w.mgr.get(&i).unwrap().keep);
+    w.mgr.revise(&i, "again").unwrap();
+    w.mgr.tick();
+    assert_eq!(state(&w, &i), BoxState::Starting);
+    w.mgr.guest_event(&i, GuestEvent::Ready).unwrap();
+    assert!(!w.mgr.get(&i).unwrap().keep);
+}
+
+/// A guest whose prompts take `delay` (the guest controls a real send's
+/// timing): records each prompt once it is through.
+struct SlowGuest {
+    delay: std::time::Duration,
+    prompts: Mutex<Vec<(BoxId, String)>>,
+    started: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowGuest {
+    fn new(delay_ms: u64) -> Arc<SlowGuest> {
+        Arc::new(SlowGuest {
+            delay: std::time::Duration::from_millis(delay_ms),
+            prompts: Mutex::new(Vec::new()),
+            started: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn prompts(&self) -> Vec<(BoxId, String)> {
+        self.prompts.lock().unwrap().clone()
+    }
+    fn started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Waits until `n` prompts have started.
+    fn wait_started(&self, n: usize) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.started() < n {
+            assert!(std::time::Instant::now() < end, "no prompt started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl saiife_boxes::guest::GuestLink for SlowGuest {
+    fn prompt(&self, id: &BoxId, text: &str) -> Result<(), saiife_boxes::guest::GuestError> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((id.clone(), text.to_string()));
+        Ok(())
+    }
+    fn terminal(
+        &self,
+        _id: &BoxId,
+        _after: Option<u64>,
+    ) -> Result<saiife_wire::source::TermBatch, saiife_boxes::guest::GuestError> {
+        Err(saiife_boxes::guest::GuestError::NotConnected)
+    }
+    fn diff(
+        &self,
+        _id: &BoxId,
+    ) -> Result<saiife_wire::source::DiffSummary, saiife_boxes::guest::GuestError> {
+        Err(saiife_boxes::guest::GuestError::NotConnected)
+    }
+}
+
+/// `w`'s store under a new manager whose guest is `g`.
+fn slow_manager(w: &World, g: &Arc<SlowGuest>) -> Arc<Manager> {
+    let guest: Arc<dyn saiife_boxes::guest::GuestLink> = g.clone();
+    Arc::new(Manager::open(w.init(guest)).unwrap().manager)
+}
+
+fn quick<T>(what: &str, f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let v = f();
+    let took = t0.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(200),
+        "{what} took {took:?}"
+    );
+    v
+}
+
+/// I2: a prompt the guest holds for 2 s does not hold the manager: reads of
+/// another box, the list and a tick answer at once, and the tick does not
+/// send the prompt that is already out a second time.
+#[test]
+fn a_slow_prompt_does_not_block_the_manager() {
+    let w = world(2);
+    let a = w.spawn("task a").id;
+    let b = w.spawn("task b").id;
+    let g = SlowGuest::new(2000);
+    let mgr = slow_manager(&w, &g);
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.guest_event(&a2, GuestEvent::Ready).unwrap());
+    g.wait_started(1);
+    let r = quick("get", || mgr.get(&b).unwrap());
+    assert_eq!(r.state, BoxState::Starting);
+    assert_eq!(quick("list", || mgr.list()).len(), 2);
+    // The box runs, its prompt is out: it is still pending, and a tick
+    // (which sends held prompts) leaves it to the send in flight.
+    let ra = quick("get a", || mgr.get(&a).unwrap());
+    assert_eq!(ra.state, BoxState::Running);
+    assert_eq!(ra.pending_prompt.as_deref(), Some("task a"));
+    quick("tick", || mgr.tick());
+    assert_eq!(
+        t.join().unwrap(),
+        Some(change(&a, BoxState::Starting, BoxState::Running, "ready"))
+    );
+    assert_eq!(g.prompts(), vec![(a.clone(), "task a".to_string())]);
+    assert_eq!(g.started(), 1, "the prompt was sent twice");
+    let ra = mgr.get(&a).unwrap();
+    assert_eq!(ra.pending_prompt, None);
+    assert_eq!(ra.error, None);
+    let saved = Store::open(w.root.clone())
+        .unwrap()
+        .load(&a)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.pending_prompt, None);
+    // say: checked under the lock, sent with it released.
+    let m3 = mgr.clone();
+    let a3 = a.clone();
+    let t = std::thread::spawn(move || m3.say(&a3, "steer"));
+    g.wait_started(2);
+    quick("get during say", || mgr.get(&b).unwrap());
+    t.join().unwrap().unwrap();
+}
+
+/// I2: a box stopped and requeued (with a newer prompt) while its earlier
+/// prompt was out keeps the newer prompt: the late outcome changes nothing.
+#[test]
+fn a_late_prompt_outcome_never_touches_a_box_that_moved_on() {
+    let w = world(1);
+    let a = w.spawn("first").id;
+    let g = SlowGuest::new(1000);
+    let mgr = slow_manager(&w, &g);
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.guest_event(&a2, GuestEvent::Ready).unwrap());
+    g.wait_started(1);
+    mgr.stop(&a, false).unwrap();
+    mgr.revise(&a, "second").unwrap();
+    t.join().unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert_eq!(r.pending_prompt.as_deref(), Some("second"));
+    assert_eq!(r.error, None);
+}
+
+/// I2: a revise whose box was stopped while the comment was out is not
+/// revived (the box stays Done, VM off).
+#[test]
+fn revise_does_not_revive_a_box_stopped_meanwhile() {
+    let w = world(1);
+    let a = running(&w, "a");
+    w.mgr.done(&a).unwrap();
+    let g = SlowGuest::new(1000);
+    let mgr = slow_manager(&w, &g);
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.revise(&a2, "more"));
+    g.wait_started(1);
+    // A second revise while the first comment is out is refused.
+    assert!(matches!(
+        quick("second revise", || mgr.revise(&a, "again")),
+        Err(BoxError::Unavailable(_))
+    ));
+    mgr.stop(&a, false).unwrap();
+    assert_eq!(
+        t.join().unwrap(),
+        Err(BoxError::WrongState {
+            state: BoxState::Done
+        })
+    );
+    let r = mgr.get(&a).unwrap();
+    assert_eq!(r.state, BoxState::Done);
+    assert!(!r.vm_on);
+}

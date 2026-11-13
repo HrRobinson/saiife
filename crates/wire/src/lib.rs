@@ -13,6 +13,7 @@ pub mod pair;
 pub mod seal;
 pub mod sig;
 pub mod source;
+pub mod text;
 pub mod verify;
 
 mod error;

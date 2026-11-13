@@ -15,10 +15,17 @@ use std::fs;
 use std::process::{Command, Output, Stdio};
 
 fn daemon_with(slots: Option<u32>) -> TestDaemon {
+    daemon_with_env(slots, Vec::new())
+}
+
+/// [`daemon_with`] plus `extra` daemon environment; the project is a git
+/// repo (spawn snapshots it into a repo disk, plan 37).
+fn daemon_with_env(slots: Option<u32>, extra: Vec<(String, String)>) -> TestDaemon {
     let mut env = vec![("SAIIFE_BOX_FAKE_VMM".to_string(), "1".to_string())];
     if let Some(n) = slots {
         env.push(("SAIIFE_BOX_FAKE_SLOTS".to_string(), n.to_string()));
     }
+    env.extend(extra);
     let d = TestDaemon::start(Opts {
         env,
         ..Opts::default()
@@ -482,4 +489,53 @@ fn spawn_cleans_staging_on_error() {
     assert!(staging_left(&d).is_empty());
     // The daemon has nothing of these.
     assert!(ls_json(&d)["boxes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn attach_prints_sanitized_lines() {
+    let frames = serde_json::json!([{"snapshot": {"seq": 1, "rows": 40, "cols": 120,
+        "lines": ["hello", "evil\u{1b}[31m\u{202e}rtl\u{85}\u{2028}x"], "cursor": [0, 0]}}]);
+    let d = daemon_with_term(&frames.to_string());
+    assert_eq!(code(&bx(&d, &["spawn"])), 0);
+    let o = bx(&d, &["attach", "b1"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let t = out(&o);
+    assert!(t.starts_with("box b1 ("), "{t}");
+    assert!(
+        t.contains("): read-only, q quits; type into it with saiife box say b1 \"…\""),
+        "{t}"
+    );
+    assert!(t.contains("hello\n"), "{t}");
+    assert!(
+        t.contains("evil\\x1b[31m\\u{202E}rtl\\x85\\u{2028}x"),
+        "{t}"
+    );
+    for bad in ['\u{1b}', '\u{202e}', '\u{85}', '\u{2028}'] {
+        assert!(!t.contains(bad), "{t:?}");
+    }
+}
+
+#[test]
+fn attach_without_tty_prints_once() {
+    let frames = serde_json::json!([
+        {"snapshot": {"seq": 1, "rows": 40, "cols": 120, "lines": ["one"], "cursor": [0, 0]}},
+        {"delta": {"seq": 2, "lines": [[1, "two"]], "cursor": [0, 0]}}]);
+    let d = daemon_with_term(&frames.to_string());
+    assert_eq!(code(&bx(&d, &["spawn"])), 0);
+    let o = bx(&d, &["attach", "b1"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let t = out(&o);
+    assert!(t.contains("one\ntwo\n"), "{t}");
+    assert!(
+        !t.contains("\u{1b}"),
+        "no clear sequence without a tty: {t:?}"
+    );
+    assert_eq!(code(&bx(&d, &["attach", "b9"])), 2);
+}
+
+fn daemon_with_term(term: &str) -> TestDaemon {
+    daemon_with_env(
+        Some(1),
+        vec![("SAIIFE_BOX_FAKE_TERMINAL".to_string(), term.to_string())],
+    )
 }

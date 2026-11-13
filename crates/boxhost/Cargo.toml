@@ -14,15 +14,21 @@ path = "src/lib.rs"
 saiife-boxproto = { path = "../boxproto" }
 # The Vmm trait ChVmm implements (boxes never depends on boxhost).
 saiife-boxes = { path = "../boxes" }
+# The hook matcher and timeout (tokio-free) and the user pack id rule.
+saiife-agents = { path = "../agents" }
+saiife-policy = { path = "../policy" }
 # BoxId (tokio-free).
 saiife-wire = { path = "../wire" }
 serde = { version = "1", features = ["derive"] }
 # O_NOFOLLOW / O_NONBLOCK constants, *at calls and a non-blocking API
-# socket connect; no unsafe. (`net` is already enabled by saiife-ipc.)
-rustix = { version = "1", features = ["fs", "process", "net"] }
+# socket connect, and poll for the vsock/terminal readers; no unsafe.
+# (`net` is already enabled by saiife-ipc.)
+rustix = { version = "1", features = ["fs", "process", "net", "event"] }
 ring = "=0.17.14"
 serde_json = "1"
 toml = "0.8"
+# Headless terminal for the box PTY (spec §9.4); pinned.
+vt100 = "=0.15.2"
 
 [features]
 # Builds the saiife-fake-ch test binary.

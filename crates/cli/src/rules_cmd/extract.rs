@@ -175,15 +175,9 @@ fn is_program_word(w: &str) -> bool {
 
 /// A character that must never reach a terminal or a rule: C0 controls
 /// (tab excepted), DEL, C1 controls, bidi controls and the other Unicode
-/// format characters (category Cf).
+/// format and default-ignorable characters (`saiife_wire::text`).
 pub(crate) fn is_unsafe_char(c: char) -> bool {
-    let u = c as u32;
-    (c.is_control() && c != '\t')
-        || matches!(u,
-            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2
-            | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
-            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD
-            | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+    saiife_wire::text::is_unsafe_char(c)
 }
 
 pub(crate) fn has_unsafe_char(s: &str) -> bool {

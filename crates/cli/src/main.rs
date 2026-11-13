@@ -30,6 +30,8 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+#[cfg(unix)]
+mod box_attach;
 mod box_cmd;
 mod box_image_cmd;
 // The repo disk of `box spawn` (plan 37).
@@ -277,6 +279,12 @@ enum Cmd {
         #[arg(long)]
         locked: bool,
     },
+    /// The box guest init and its helpers (inside the box VM only).
+    #[command(name = "__guest", hide = true)]
+    Guest {
+        #[command(subcommand)]
+        cmd: GuestCmd,
+    },
     /// Test seam (debug builds): a scripted MCP stdio server.
     #[cfg(debug_assertions)]
     #[command(name = "__fake-mcp-server", hide = true)]
@@ -463,6 +471,14 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum GuestCmd {
+    /// The guest service (saiife-guest.service): hello, setup, the agent.
+    Init,
+    /// Report an event to the guest init; the Stop hook sends `turn-finished`.
+    Event { name: String },
+}
+
+#[derive(Subcommand)]
 enum AuditAction {
     /// Check that the audit log has not been edited, reordered or cut.
     Verify {
@@ -487,6 +503,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
     match cmd {
         Cmd::McpSpawn => Some(NO_GATEWAY),
         Cmd::BoxVmm { .. } => Some("saiife: __box-vmm: boxes need Linux or macOS"),
+        Cmd::Guest { .. } => Some("saiife: __guest: runs inside a box VM"),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
         // No wildcard: a new subcommand must be put on one side or the other here, or this
@@ -584,6 +601,9 @@ fn main() -> ExitCode {
     }
     if let Cmd::BoxVmm { dir, locked } = cli.command {
         return box_vmm_helper::run(dir, locked);
+    }
+    if let Cmd::Guest { cmd } = cli.command {
+        return guest_cmd(cmd);
     }
     if let Cmd::McpSpawn = cli.command {
         #[cfg(target_os = "linux")]
@@ -836,6 +856,7 @@ fn main() -> ExitCode {
         | Cmd::Eval { .. }
         | Cmd::McpSpawn
         | Cmd::BoxVmm { .. }
+        | Cmd::Guest { .. }
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
         | Cmd::Secret { .. }
@@ -901,6 +922,30 @@ fn main() -> ExitCode {
             },
             &packs,
         ),
+    }
+}
+
+/// `saiife __guest`: the box guest init, or one event to it.
+fn guest_cmd(cmd: GuestCmd) -> ExitCode {
+    let env = saiife_guest::GuestEnv::system();
+    let r = match cmd {
+        GuestCmd::Init => saiife_guest::run_init(&env),
+        GuestCmd::Event { name } => match name.as_str() {
+            "turn-finished" => {
+                saiife_guest::send_local_event(&env, &saiife_guest::Event::TurnFinished)
+            }
+            other => {
+                eprintln!("saiife: __guest event: unknown event {other:?} (known: turn-finished)");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("saiife: __guest: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
