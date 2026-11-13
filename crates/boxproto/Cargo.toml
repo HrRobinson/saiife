@@ -16,6 +16,9 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# The shared sanitizer predicate (plan 39 R-P8): delta paths and symlink
+# targets with control, bidi or invisible chars are refused.
+saiife-wire = { path = "../wire" }
 
 [lints]
 workspace = true

@@ -1,0 +1,811 @@
+//! Plan 39 Task 1: the delta validator treats the guest as hostile.
+
+use saiife_boxproto::delta::{
+    apply_manifest, write_delta, BlobSink, DeltaError, DeltaItem, EntryHead, Limits, Op, Reader,
+    Valid, BASE_MISMATCH, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEAD_BYTES, MAX_TOTAL_BYTES,
+};
+use saiife_boxproto::frame::{read_frame, Frame};
+use saiife_boxproto::manifest::{BaseManifest, Entry, EntryKind};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Cursor};
+
+fn sha(b: &[u8]) -> String {
+    Sha256::digest(b)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The fixture's ten paths: (path, kind, mode, content).
+const FIXTURE: &[(&str, EntryKind, u32, &[u8])] = &[
+    ("README.md", EntryKind::File, 0o644, b"hello\n"),
+    ("docs/a", EntryKind::File, 0o644, b"doc a\n"),
+    ("docs/b", EntryKind::File, 0o644, b"doc b\n"),
+    ("ln", EntryKind::Symlink, 0, b"docs"),
+    ("run.sh", EntryKind::File, 0o755, b"#!/bin/sh\n"),
+    ("src/lib.rs", EntryKind::File, 0o644, b"pub fn f() {}\n"),
+    ("src/main.rs", EntryKind::File, 0o644, b"fn main() {}\n"),
+    ("src/util/mod.rs", EntryKind::File, 0o644, b"// util\n"),
+    ("tests/t.rs", EntryKind::File, 0o644, b"#[test] fn t() {}\n"),
+    ("z.txt", EntryKind::File, 0o644, b"zzz\n"),
+];
+
+fn base() -> BaseManifest {
+    let mut entries = BTreeMap::new();
+    for (p, kind, mode, content) in FIXTURE {
+        entries.insert(
+            p.to_string(),
+            Entry {
+                kind: kind.clone(),
+                mode: *mode,
+                size: content.len() as u64,
+                sha256: sha(content),
+            },
+        );
+    }
+    let bytes = entries.values().map(|e| e.size).sum();
+    let m = BaseManifest {
+        version: 1,
+        repo: "demo".into(),
+        base_commit: Some("c".repeat(40)),
+        snapshot_commit: "d".repeat(40),
+        files: entries.len() as u64,
+        bytes,
+        entries,
+    };
+    // The fixture itself is a valid manifest.
+    BaseManifest::parse(&serde_json::to_string(&m).unwrap()).unwrap()
+}
+
+fn old_of(p: &str) -> &'static [u8] {
+    FIXTURE.iter().find(|f| f.0 == p).unwrap().3
+}
+
+#[derive(Default)]
+struct Sink {
+    blobs: BTreeMap<String, Vec<u8>>,
+    cur: Option<Vec<u8>>,
+}
+
+impl BlobSink for Sink {
+    fn begin(&mut self) -> io::Result<()> {
+        assert!(self.cur.is_none(), "begin while a blob is open");
+        self.cur = Some(Vec::new());
+        Ok(())
+    }
+    fn write(&mut self, b: &[u8]) -> io::Result<()> {
+        self.cur
+            .as_mut()
+            .expect("write before begin")
+            .extend_from_slice(b);
+        Ok(())
+    }
+    fn finish(&mut self, sha256: &str) -> io::Result<()> {
+        let b = self.cur.take().expect("finish before begin");
+        assert_eq!(sha(&b), sha256, "finish called with an unverified hash");
+        self.blobs.insert(sha256.to_string(), b);
+        Ok(())
+    }
+}
+
+type Item = (EntryHead, Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn head(p: &str, op: Op, kind: EntryKind, mode: u32, content: &[u8]) -> EntryHead {
+    EntryHead {
+        path: p.into(),
+        op,
+        kind,
+        mode,
+        size: content.len() as u64,
+        sha256: sha(content),
+        old_kind: None,
+        old_size: None,
+        old_sha256: None,
+    }
+}
+
+fn add(p: &str, content: &[u8]) -> Item {
+    (
+        head(p, Op::Add, EntryKind::File, 0o644, content),
+        None,
+        Some(content.to_vec()),
+    )
+}
+
+fn add_link(p: &str, target: &str) -> Item {
+    (
+        head(p, Op::Add, EntryKind::Symlink, 0, target.as_bytes()),
+        None,
+        Some(target.as_bytes().to_vec()),
+    )
+}
+
+fn with_old(mut h: EntryHead, p: &str) -> EntryHead {
+    let e = &base().entries[p];
+    h.old_kind = Some(e.kind.clone());
+    h.old_size = Some(e.size);
+    h.old_sha256 = Some(e.sha256.clone());
+    h
+}
+
+fn modify(p: &str, content: &[u8]) -> Item {
+    let h = with_old(head(p, Op::Modify, EntryKind::File, 0o644, content), p);
+    (h, Some(old_of(p).to_vec()), Some(content.to_vec()))
+}
+
+fn delete(p: &str) -> Item {
+    let kind = base().entries[p].kind.clone();
+    let mut h = with_old(head(p, Op::Delete, kind, 0, b""), p);
+    h.sha256 = String::new();
+    (h, None, None)
+}
+
+fn encode(items: &[Item]) -> Vec<u8> {
+    let refs: Vec<DeltaItem> = items
+        .iter()
+        .map(|(h, o, n)| (h.clone(), o.as_deref(), n.as_deref()))
+        .collect();
+    let mut buf = Vec::new();
+    write_delta(&mut buf, 7, &refs).unwrap();
+    buf
+}
+
+fn frames(buf: &[u8]) -> Vec<Frame> {
+    let mut r = Cursor::new(buf);
+    let mut out = Vec::new();
+    while let Some(f) = read_frame(&mut r).unwrap() {
+        out.push(f);
+    }
+    out
+}
+
+/// Feeds frames to a reader (with the fixture base, or `paths_only`) and
+/// finishes it.
+fn feed(
+    with_base: bool,
+    limits: Limits,
+    fs: Vec<Frame>,
+    sink: &mut Sink,
+) -> Result<Valid, DeltaError> {
+    let b = base();
+    let mut r = if with_base {
+        Reader::new(&b, limits, sink)
+    } else {
+        Reader::paths_only(limits, sink)
+    };
+    for f in fs {
+        r.push(f)?;
+    }
+    r.finish()
+}
+
+fn run(items: &[Item]) -> Result<Valid, DeltaError> {
+    feed(
+        true,
+        Limits::default(),
+        frames(&encode(items)),
+        &mut Sink::default(),
+    )
+}
+
+fn refused(items: &[Item]) -> DeltaError {
+    run(items).expect_err("the delta was accepted")
+}
+
+fn assert_refused(items: &[Item], path: &str, needle: &str) {
+    let e = refused(items);
+    assert_eq!(e.path.as_deref(), Some(path), "{e}");
+    assert!(e.reason.contains(needle), "{e:?} lacks {needle:?}");
+}
+
+#[test]
+fn default_limits_are_the_plan_caps() {
+    let l = Limits::default();
+    assert_eq!(l.entries, 20_000);
+    assert_eq!(l.file_bytes, 64 << 20);
+    assert_eq!(l.total_bytes, 512 << 20);
+    assert_eq!(
+        (MAX_ENTRIES, MAX_FILE_BYTES, MAX_TOTAL_BYTES),
+        (20_000, 64 << 20, 512 << 20)
+    );
+    assert_eq!(MAX_DEPTH, 64);
+}
+
+#[test]
+fn traversal_is_refused() {
+    for p in ["../x", "a/../b", "docs/..", "./a"] {
+        assert_refused(&[add(p, b"x")], p, ". or ..");
+    }
+}
+
+#[test]
+fn absolute_is_refused() {
+    assert_refused(&[add("/etc/passwd", b"x")], "/etc/passwd", "absolute");
+}
+
+#[test]
+fn dot_git_any_case_any_depth() {
+    for p in [
+        ".git/config",
+        ".GIT/HEAD",
+        "x/.GiT/hooks/pre-commit",
+        "a/b/.Git",
+        "src/.git",
+    ] {
+        assert_refused(&[add(p, b"x")], p, ".git");
+    }
+    // A delete or modify of a .git path is refused the same way (never flagged).
+    let mut d = delete("z.txt");
+    d.0.path = ".git/index".into();
+    assert_refused(&[d], ".git/index", ".git");
+    // A look-alike is fine.
+    run(&[add(".gitignore", b"x"), add("a.git/b", b"y")]).unwrap();
+}
+
+#[test]
+fn symlink_escape_is_refused() {
+    for (p, t, needle) in [
+        ("esc", "../out", "leaves the repo"),
+        ("docs/e", "../../x", "leaves the repo"),
+        ("abs", "/etc", "absolute"),
+        ("back", "docs/../..", ".. after a name"),
+        ("updown", "docs/../README.md", ".. after a name"),
+        ("gitlink", ".git/config", ".git"),
+        ("gitlink2", "docs/.GIT", ".git"),
+        ("bs", "..\\x", "backslash"),
+    ] {
+        assert_refused(&[add_link(p, t)], p, needle);
+    }
+    // An empty target and a NUL.
+    assert_refused(&[add_link("empty", "")], "empty", "empty");
+    assert_refused(&[add_link("nul", "a\0b")], "nul", "NUL");
+}
+
+#[test]
+fn symlink_inside_is_ok() {
+    let v = run(&[add_link("ln2", "docs/a")]).unwrap();
+    assert_eq!(v.entries.len(), 1);
+    run(&[add_link("docs/up", "../README.md")]).unwrap();
+    run(&[add_link("src/util/up", "../../docs/./a")]).unwrap();
+    run(&[add_link("root", ".")]).unwrap();
+}
+
+#[test]
+fn write_through_symlink_in_delta() {
+    let e = refused(&[add_link("l2", "docs"), add("l2/x", b"x")]);
+    assert_eq!(e.path.as_deref(), Some("l2/x"));
+    assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+}
+
+#[test]
+fn write_through_symlink_in_base() {
+    assert_refused(&[add("ln/x", b"x")], "ln/x", "symlink in the base");
+    // Even when the link is deleted in the same delta.
+    let e = refused(&[delete("ln"), add("ln/x", b"x")]);
+    assert!(e.reason.contains("symlink"), "{e:?}");
+}
+
+#[test]
+fn file_dir_conflict() {
+    // A base file becomes a directory.
+    assert_refused(
+        &[add("z.txt/inner", b"x")],
+        "z.txt/inner",
+        "both a file and a directory",
+    );
+    // A base directory becomes a file.
+    assert_refused(&[add("src", b"x")], "src", "both a file and a directory");
+    // Within the delta.
+    let e = refused(&[add("q", b"x"), add("q/r", b"y")]);
+    assert!(e.reason.contains("both a file and a directory"), "{e:?}");
+    // Deleting everything under a directory frees the name.
+    run(&[
+        delete("docs/a"),
+        delete("docs/b"),
+        add("docs", b"now a file"),
+    ])
+    .map(|_| ())
+    .expect_err("docs/ sorts after docs, so docs is first: entries unsorted");
+    let v = run(&[
+        add("docs", b"now a file"),
+        delete("docs/a"),
+        delete("docs/b"),
+    ])
+    .unwrap();
+    assert_eq!(v.entries.len(), 3);
+    // Deleting a file frees the name for a directory.
+    run(&[delete("z.txt"), add("z.txt/inner", b"x")])
+        .map(|_| ())
+        .unwrap();
+}
+
+#[test]
+fn duplicate_path() {
+    assert_refused(&[add("new", b"a"), add("new", b"b")], "new", "duplicate");
+}
+
+#[test]
+fn unsorted_entries() {
+    assert_refused(&[add("b", b"a"), add("a", b"b")], "a", "not sorted");
+    // Byte order, not char order: "Z" (0x5a) sorts before "a".
+    run(&[add("Z", b"1"), add("a", b"2")]).unwrap();
+}
+
+#[test]
+fn old_hash_must_match_manifest() {
+    // The declared old hash differs from the manifest.
+    let mut m = modify("README.md", b"new\n");
+    m.0.old_sha256 = Some(sha(b"something else"));
+    assert_refused(&[m], "README.md", BASE_MISMATCH);
+    // Declared old size or kind differs.
+    let mut m = modify("README.md", b"new\n");
+    m.0.old_size = Some(1);
+    assert_refused(&[m], "README.md", BASE_MISMATCH);
+    let mut m = modify("README.md", b"new\n");
+    m.0.old_kind = Some(EntryKind::Symlink);
+    assert_refused(&[m], "README.md", BASE_MISMATCH);
+    // Declared right, but the old bytes sent are not the base's.
+    let mut m = modify("README.md", b"new\n");
+    m.1 = Some(b"HELLO\n".to_vec());
+    assert_refused(&[m], "README.md", BASE_MISMATCH);
+    // A delete with a stale old hash.
+    let mut d = delete("z.txt");
+    d.0.old_sha256 = Some(sha(b"stale"));
+    assert_refused(&[d], "z.txt", BASE_MISMATCH);
+    // A modify missing its old fields.
+    let mut m = modify("README.md", b"new\n");
+    m.0.old_sha256 = None;
+    assert_refused(&[m], "README.md", BASE_MISMATCH);
+}
+
+#[test]
+fn add_of_existing_is_refused() {
+    assert_refused(&[add("README.md", b"x")], "README.md", "already has");
+    let mut a = add("new", b"x");
+    a.0.old_size = Some(0);
+    assert_refused(&[a], "new", "an add carries");
+}
+
+#[test]
+fn delete_of_missing_is_refused() {
+    let mut d = delete("z.txt");
+    d.0.path = "zz.txt".into();
+    assert_refused(&[d], "zz.txt", "does not have");
+    let mut m = modify("z.txt", b"x");
+    m.0.path = "zz.txt".into();
+    assert_refused(&[m], "zz.txt", "does not have");
+    // A delete must describe nothing new.
+    let mut d = delete("z.txt");
+    d.0.size = 4;
+    assert_refused(&[d], "z.txt", "a delete must have");
+}
+
+#[test]
+fn file_too_large() {
+    let mut sink = Sink::default();
+    let limits = Limits {
+        file_bytes: 8,
+        ..Limits::default()
+    };
+    let e = feed(
+        true,
+        limits,
+        frames(&encode(&[add("big", b"123456789")])),
+        &mut sink,
+    )
+    .unwrap_err();
+    assert_eq!(e.path.as_deref(), Some("big"));
+    assert!(e.reason.contains("MAX_FILE_BYTES"), "{e:?}");
+    assert!(
+        sink.cur.is_none() && sink.blobs.is_empty(),
+        "bytes were read"
+    );
+
+    // Refused from the header alone: no byte frame needed.
+    let mut sink = Sink::default();
+    let mut h = head("huge", Op::Add, EntryKind::File, 0o644, b"");
+    h.size = MAX_FILE_BYTES + 1;
+    let b = base();
+    let mut r = Reader::new(&b, Limits::default(), &mut sink);
+    r.push(Frame::Json(json!({"t": "delta", "n": 1, "entries": 1})))
+        .unwrap();
+    let mut v = serde_json::to_value(&h).unwrap();
+    v["t"] = "entry".into();
+    let e = r.push(Frame::Json(v)).unwrap_err();
+    assert!(e.reason.contains("MAX_FILE_BYTES"), "{e:?}");
+    // The old side is capped too.
+    let mut m = modify("README.md", b"x");
+    m.0.old_size = Some(MAX_FILE_BYTES + 1);
+    m.1 = None;
+    assert_refused(&[m], "README.md", "MAX_FILE_BYTES");
+    // A symlink target over LINK_MAX.
+    let long = "a".repeat(4096);
+    assert_refused(&[add_link("l", &long)], "l", "symlink target of 4096 bytes");
+}
+
+#[test]
+fn too_many_entries() {
+    let mut sink = Sink::default();
+    let b = base();
+    let mut r = Reader::new(&b, Limits::default(), &mut sink);
+    let e = r
+        .push(Frame::Json(
+            json!({"t": "delta", "n": 1, "entries": MAX_ENTRIES + 1}),
+        ))
+        .unwrap_err();
+    assert!(e.reason.contains("MAX_ENTRIES"), "{e:?}");
+
+    let limits = Limits {
+        entries: 2,
+        ..Limits::default()
+    };
+    let items = [add("a", b"1"), add("b", b"2"), add("c", b"3")];
+    let e = feed(true, limits, frames(&encode(&items)), &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("MAX_ENTRIES"), "{e:?}");
+
+    // More entries than the header declared.
+    let mut fs = frames(&encode(&[add("a", b"1"), add("b", b"2")]));
+    fs[0] = Frame::Json(json!({"t": "delta", "n": 1, "entries": 1}));
+    let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("more entries"), "{e:?}");
+}
+
+#[test]
+fn total_too_large() {
+    let limits = Limits {
+        total_bytes: 10,
+        ..Limits::default()
+    };
+    let items = [add("a", b"123456"), add("b", b"123456")];
+    let mut sink = Sink::default();
+    let e = feed(true, limits, frames(&encode(&items)), &mut sink).unwrap_err();
+    assert_eq!(e.path.as_deref(), Some("b"));
+    assert!(e.reason.contains("MAX_TOTAL_BYTES"), "{e:?}");
+    // "b"'s bytes were never read.
+    assert_eq!(sink.blobs.len(), 1);
+}
+
+#[test]
+fn truncated_stream() {
+    let fs = frames(&encode(&[add("a", b"1"), add("b", b"2")]));
+    // Without the end frame.
+    let e = feed(
+        true,
+        Limits::default(),
+        fs[..fs.len() - 1].to_vec(),
+        &mut Sink::default(),
+    )
+    .unwrap_err();
+    assert!(e.reason.contains("truncated"), "{e:?}");
+    // In the middle of content.
+    let fs = frames(&encode(&[add("a", b"hello")]));
+    let mut cut = fs[..1].to_vec();
+    cut.push(fs[1].clone());
+    cut.push(Frame::Bytes(b"he".to_vec()));
+    let e = feed(true, Limits::default(), cut, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("truncated"), "{e:?}");
+    assert_eq!(e.path.as_deref(), Some("a"));
+    // Nothing at all.
+    let e = feed(true, Limits::default(), vec![], &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("truncated"), "{e:?}");
+}
+
+#[test]
+fn size_mismatch() {
+    // Too many bytes.
+    let mut a = add("a", b"12345");
+    a.2 = Some(b"123456".to_vec());
+    assert_refused(&[a], "a", "more content bytes");
+    // Too few, then the next entry.
+    let mut a = add("a", b"12345");
+    a.2 = Some(b"1234".to_vec());
+    assert_refused(&[a, add("b", b"x")], "a", "fewer content bytes");
+    // Too few, then the end.
+    let mut a = add("a", b"12345");
+    a.2 = Some(b"1234".to_vec());
+    assert_refused(&[a], "a", "fewer content bytes");
+    // Bytes for a delete.
+    let mut d = delete("z.txt");
+    d.2 = Some(b"x".to_vec());
+    assert_refused(&[d], "z.txt", "more content bytes");
+    // Bytes before any entry.
+    let mut fs = frames(&encode(&[]));
+    fs.insert(1, Frame::Bytes(vec![1]));
+    let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("more content bytes"), "{e:?}");
+}
+
+#[test]
+fn sha_mismatch() {
+    let mut a = add("a", b"12345");
+    a.2 = Some(b"12346".to_vec());
+    let mut sink = Sink::default();
+    let e = feed(true, Limits::default(), frames(&encode(&[a])), &mut sink).unwrap_err();
+    assert_eq!(e.path.as_deref(), Some("a"));
+    assert!(e.reason.contains("sha256"), "{e:?}");
+    assert!(sink.blobs.is_empty(), "an unverified blob was finished");
+    // A sha256 that is not hex.
+    let mut a = add("a", b"1");
+    a.0.sha256 = "Z".repeat(64);
+    assert_refused(&[a], "a", "64 lowercase hex");
+}
+
+#[test]
+fn bad_mode() {
+    for (kind, mode, needle) in [
+        (EntryKind::File, 0o600, "not 0o644 or 0o755"),
+        (EntryKind::File, 0o777, "not 0o644 or 0o755"),
+        (EntryKind::File, 0, "not 0o644 or 0o755"),
+        (EntryKind::Symlink, 0o644, "symlink mode"),
+        (EntryKind::File, 0o104755, "setuid"),
+        (EntryKind::File, 0o4755, "setuid"),
+        (EntryKind::File, 0o2755, "setgid"),
+        (EntryKind::File, 0o1755, "sticky"),
+        (EntryKind::File, 0o20644, "file-type bits"),
+        (EntryKind::File, 0o10644, "file-type bits"),
+        (EntryKind::File, 0o100644, "file-type bits"),
+    ] {
+        let content: &[u8] = b"docs";
+        let item = (
+            head("m", Op::Add, kind, mode, content),
+            None,
+            Some(content.to_vec()),
+        );
+        assert_refused(&[item], "m", needle);
+    }
+    // A delete's mode is 0.
+    let mut d = delete("run.sh");
+    d.0.mode = 0o755;
+    assert_refused(&[d], "run.sh", "a delete must have");
+}
+
+#[test]
+fn unknown_kind_is_refused() {
+    for kind in ["device", "fifo", "dir", "socket"] {
+        let mut v = serde_json::to_value(add("dev", b"x").0).unwrap();
+        v["kind"] = kind.into();
+        v["t"] = "entry".into();
+        let fs = vec![
+            Frame::Json(json!({"t": "delta", "n": 1, "entries": 1})),
+            Frame::Json(v),
+        ];
+        let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+        assert!(e.reason.contains("bad entry header"), "{e:?}");
+        assert!(e.reason.contains(kind), "{e:?}");
+    }
+}
+
+#[test]
+fn unknown_field_is_refused() {
+    let mut v = serde_json::to_value(add("a", b"x").0).unwrap();
+    v["t"] = "entry".into();
+    v["exec"] = true.into();
+    let fs = vec![
+        Frame::Json(json!({"t": "delta", "n": 1, "entries": 1})),
+        Frame::Json(v),
+    ];
+    let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("exec"), "{e:?}");
+    // In the delta header and the end frame too.
+    let fs = vec![Frame::Json(
+        json!({"t": "delta", "n": 1, "entries": 0, "x": 1}),
+    )];
+    assert!(feed(true, Limits::default(), fs, &mut Sink::default()).is_err());
+    let fs = vec![
+        Frame::Json(json!({"t": "delta", "n": 1, "entries": 0})),
+        Frame::Json(json!({"t": "end", "entries": 0, "x": 1})),
+    ];
+    assert!(feed(true, Limits::default(), fs, &mut Sink::default()).is_err());
+    // An unknown tag.
+    let fs = vec![
+        Frame::Json(json!({"t": "delta", "n": 1, "entries": 0})),
+        Frame::Json(json!({"t": "chmod"})),
+    ];
+    assert!(feed(true, Limits::default(), fs, &mut Sink::default()).is_err());
+}
+
+#[test]
+fn oversized_head_is_refused() {
+    let mut v = serde_json::to_value(add("a", b"x").0).unwrap();
+    v["t"] = "entry".into();
+    v["path"] = "p".repeat(MAX_HEAD_BYTES).into();
+    let fs = vec![
+        Frame::Json(json!({"t": "delta", "n": 1, "entries": 1})),
+        Frame::Json(v),
+    ];
+    let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("larger than"), "{e:?}");
+}
+
+#[test]
+fn unsafe_chars_in_path_are_refused() {
+    for p in [
+        "a\u{202e}txt.exe",
+        "a\nb",
+        "zero\u{200b}width",
+        "esc\u{1b}[31m",
+    ] {
+        assert_refused(&[add(p, b"x")], p, "unsafe character");
+    }
+    // In a symlink target too.
+    assert_refused(&[add_link("l", "docs/\u{202e}a")], "l", "unsafe character");
+    assert_refused(&[add_link("l", "docs\na")], "l", "unsafe character");
+}
+
+#[test]
+fn depth_over_64_is_refused() {
+    let ok = vec!["d"; MAX_DEPTH].join("/");
+    run(&[add(&ok, b"x")]).unwrap();
+    let deep = vec!["d"; MAX_DEPTH + 1].join("/");
+    assert_refused(&[add(&deep, b"x")], &deep, "MAX_DEPTH");
+}
+
+#[test]
+fn end_count_mismatch() {
+    let mut fs = frames(&encode(&[add("a", b"1"), add("b", b"2")]));
+    let last = fs.len() - 1;
+    fs[last] = Frame::Json(json!({"t": "end", "entries": 3}));
+    let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("entry count mismatch"), "{e:?}");
+    // The header promised more than was sent.
+    let mut fs = frames(&encode(&[add("a", b"1")]));
+    fs[0] = Frame::Json(json!({"t": "delta", "n": 1, "entries": 2}));
+    let last = fs.len() - 1;
+    fs[last] = Frame::Json(json!({"t": "end", "entries": 2}));
+    let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+    assert!(e.reason.contains("entry count mismatch"), "{e:?}");
+}
+
+#[test]
+fn frames_after_end_and_errors_stick() {
+    let mut sink = Sink::default();
+    let b = base();
+    let mut r = Reader::new(&b, Limits::default(), &mut sink);
+    let fs = frames(&encode(&[add("a", b"1")]));
+    let n = fs.len();
+    for (i, f) in fs.into_iter().enumerate() {
+        assert_eq!(r.push(f).unwrap(), i == n - 1);
+    }
+    let e = r.push(Frame::Bytes(vec![1])).unwrap_err();
+    assert!(e.reason.contains("after the end"), "{e:?}");
+    // Once failed, always failed.
+    let e2 = r
+        .push(Frame::Json(json!({"t": "end", "entries": 1})))
+        .unwrap_err();
+    assert_eq!(e, e2);
+    assert_eq!(r.finish().unwrap_err(), e);
+}
+
+#[test]
+fn good_delta_roundtrip() {
+    let big = vec![7u8; (1 << 20) + 10]; // two Bytes frames
+    let items = [
+        add("README.md.bak", b"hello\n"),
+        modify("README.md", b"hello, world\n"),
+        add("big.bin", &big),
+        add_link("docs/link", "a"),
+        add("empty", b""),
+        delete("ln"),
+        modify("run.sh", b"#!/bin/sh\necho hi\n"),
+        delete("z.txt"),
+    ];
+    let mut sorted = items.to_vec();
+    sorted.sort_by(|a, b| a.0.path.as_bytes().cmp(b.0.path.as_bytes()));
+    let mut sink = Sink::default();
+    let v = feed(true, Limits::default(), frames(&encode(&sorted)), &mut sink).unwrap();
+    assert_eq!(v.n, 7);
+    assert_eq!(
+        v.entries,
+        sorted.iter().map(|i| i.0.clone()).collect::<Vec<_>>()
+    );
+    // Every new content is in the sink under its hash; old content is not.
+    for (h, _, new) in &sorted {
+        if let Some(n) = new {
+            assert_eq!(sink.blobs.get(&h.sha256), Some(n), "{}", h.path);
+        }
+    }
+    assert!(!sink.blobs.contains_key(&sha(b"#!/bin/sh\n")));
+    assert!(!sink.blobs.contains_key(&sha(b"zzz\n")));
+    assert!(sink.cur.is_none());
+}
+
+#[test]
+fn paths_only_checks_without_manifest() {
+    // A modify whose old side matches nothing is accepted (old_* ignored)...
+    let mut m = modify("README.md", b"new\n");
+    m.0.old_sha256 = Some(sha(b"other"));
+    m.1 = Some(b"not the base".to_vec());
+    m.0.old_size = Some(12);
+    let mut sink = Sink::default();
+    let v = feed(
+        false,
+        Limits::default(),
+        frames(&encode(&[m.clone()])),
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(v.entries.len(), 1);
+    assert!(sink.blobs.contains_key(&sha(b"new\n")));
+    // ...but the old bytes are still counted.
+    let mut short = m.clone();
+    short.1 = Some(b"not".to_vec());
+    let e = feed(
+        false,
+        Limits::default(),
+        frames(&encode(&[short])),
+        &mut Sink::default(),
+    )
+    .unwrap_err();
+    assert!(e.reason.contains("fewer content bytes"), "{e:?}");
+    // An add over a path the (absent) base has is fine; path, symlink, mode
+    // and hash rules still apply.
+    let ok = [add("README.md", b"x")];
+    feed(
+        false,
+        Limits::default(),
+        frames(&encode(&ok)),
+        &mut Sink::default(),
+    )
+    .unwrap();
+    for bad in [
+        vec![add(".git/config", b"x")],
+        vec![add_link("l", "../x")],
+        vec![add_link("l", "docs"), add("l/x", b"x")],
+        vec![add("q", b"x"), add("q/r", b"y")],
+        vec![(
+            head("m", Op::Add, EntryKind::File, 0o4755, b"x"),
+            None,
+            Some(b"x".to_vec()),
+        )],
+        vec![{
+            let mut a = add("a", b"12345");
+            a.2 = Some(b"12346".to_vec());
+            a
+        }],
+    ] {
+        let r = feed(
+            false,
+            Limits::default(),
+            frames(&encode(&bad)),
+            &mut Sink::default(),
+        );
+        assert!(r.is_err(), "{:?} passed", bad[0].0.path);
+    }
+}
+
+#[test]
+fn apply_manifest_full_and_partial() {
+    let b = base();
+    let items = [
+        modify("README.md", b"hello, world\n"),
+        add("new.txt", b"new\n"),
+        delete("z.txt"),
+    ];
+    let v = run(&items).unwrap();
+
+    let full = apply_manifest(&b, &v, None);
+    assert_eq!(full.entries["README.md"].sha256, sha(b"hello, world\n"));
+    assert_eq!(full.entries["new.txt"].size, 4);
+    assert!(!full.entries.contains_key("z.txt"));
+    assert_eq!(full.files, 10);
+    assert_eq!(
+        full.bytes,
+        full.entries.values().map(|e| e.size).sum::<u64>()
+    );
+    assert_eq!(full.snapshot_commit, b.snapshot_commit);
+    // The result is still a valid manifest.
+    BaseManifest::parse(&serde_json::to_string(&full).unwrap()).unwrap();
+
+    let only: BTreeSet<String> = ["new.txt".to_string()].into();
+    let part = apply_manifest(&b, &v, Some(&only));
+    assert_eq!(part.entries["README.md"], b.entries["README.md"]);
+    assert!(part.entries.contains_key("z.txt"));
+    assert!(part.entries.contains_key("new.txt"));
+    assert_eq!(part.files, 11);
+    BaseManifest::parse(&serde_json::to_string(&part).unwrap()).unwrap();
+
+    let none = apply_manifest(&b, &v, Some(&BTreeSet::new()));
+    assert_eq!(none, b);
+}

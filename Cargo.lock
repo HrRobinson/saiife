@@ -1731,6 +1731,7 @@ dependencies = [
 name = "saiife-boxproto"
 version = "0.2.0"
 dependencies = [
+ "saiife-wire",
  "serde",
  "serde_json",
  "sha2",
