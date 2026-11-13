@@ -753,7 +753,7 @@ fn flags_protected_and_hits() {
     assert_eq!(
         got,
         vec![
-            (".github/workflows/ci.yml", "protected path (git config)"),
+            (".github/workflows/ci.yml", "protected path"),
             ("CLAUDE.md", "protected path"),
             ("sub/.gitattributes", "protected path (git config)"),
             ("src/x.rs", "rule mypack: no writes to src"),
@@ -1252,8 +1252,10 @@ fn git_config_paths() {
         ".LfsConfig",
         ".G\u{130}TATTRIBUTES",
         ".gitattributes.",
-        ".github/workflows/ci.yml",
-        ".gitignore/x",
+        ".gitattributes/x",
+        "a/.gitconfig",
+        ".github",
+        "a/.gitkeep",
     ] {
         assert!(git_config(p), "{p}");
         assert!(protected(p), "{p}");
@@ -1266,5 +1268,15 @@ fn git_config_paths() {
         "x.git",
     ] {
         assert!(!git_config(p), "{p}");
+    }
+    // R-T6f: a `.git*` directory is not git config, only protected.
+    for p in [
+        ".github/workflows/ci.yml",
+        ".github/CODEOWNERS",
+        ".gitignore/x",
+        ".gitlab/ci.yml",
+    ] {
+        assert!(!git_config(p), "{p}");
+        assert!(protected(p), "{p}");
     }
 }

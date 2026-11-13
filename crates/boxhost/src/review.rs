@@ -701,8 +701,9 @@ pub fn render(
 ///   `.gitlab-ci.yml`, `.pre-commit-config.yaml`, `.cursorrules`;
 /// - at any depth (agents and direnv read nested ones): `CLAUDE.md`,
 ///   `AGENTS.md`, `GEMINI.md`, `.envrc`;
-/// - every [`git_config`] path (`.gitattributes`, `.gitmodules`,
-///   `.gitconfig`, `.github/…`, `.lfsconfig`).
+/// - any component starting with `.git` (`.gitattributes`, `.gitmodules`,
+///   `.gitconfig`, `.github/…`) except a final `.gitignore`;
+/// - every [`git_config`] path (`.lfsconfig` too).
 pub fn protected(path: &str) -> bool {
     if git_config(path) {
         return true;
@@ -749,20 +750,26 @@ pub fn protected(path: &str) -> bool {
     ) {
         return true;
     }
-    false
+    comps
+        .iter()
+        .enumerate()
+        .any(|(i, c)| c.starts_with(".git") && !(i == last && c == ".gitignore"))
 }
 
-/// R-T6e: a path git or its filters may read as configuration of the
-/// user's repo once it is checked out: a component whose
-/// [`normalize_component`] key is `.lfsconfig`, or starts with `.git`
-/// (`.gitattributes`, `.gitmodules`, `.gitconfig`, `.github`, …), except a
-/// final `.gitignore`. A land touching one needs the CLI's
-/// `--allow-git-config`; the Workspace does not offer it.
+/// R-T6e, R-T6f: a path git or its filters may read as configuration of
+/// the user's repo once it is checked out: any component whose
+/// [`normalize_component`] key is `.gitattributes`, `.lfsconfig` or
+/// `.gitmodules`, or a final component whose key starts with `.git`
+/// (`.gitconfig`, …) other than `.gitignore`. A directory such as
+/// `.github/` does not match. A land touching one needs the CLI's
+/// `--allow-git-config`; the Workspace does not offer it. The one helper:
+/// the daemon and the CLI call this.
 pub fn git_config(path: &str) -> bool {
     let comps: Vec<String> = path.split('/').map(normalize_component).collect();
     let last = comps.len() - 1;
     comps.iter().enumerate().any(|(i, c)| {
-        c == ".lfsconfig" || (c.starts_with(".git") && !(i == last && c == ".gitignore"))
+        matches!(c.as_str(), ".gitattributes" | ".lfsconfig" | ".gitmodules")
+            || (i == last && c.starts_with(".git") && c != ".gitignore")
     })
 }
 

@@ -2001,3 +2001,39 @@ fn pending_skips_git_config() {
         "{f:?}"
     );
 }
+
+/// R-T6f: a workflow under `.github/` is protected, not git config: it
+/// needs no flag and the Workspace gets its record.
+#[test]
+fn github_workflow_is_protected_not_git_config() {
+    let w = world(3);
+    let i = w.done(ALICE, &with_git_config(".github/workflows/ci.yml"));
+    let p = w.lands.pending();
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].box_id.as_ref(), Some(&i));
+    let r = w.lands.latest(&i).unwrap();
+    assert!(
+        r.flags
+            .iter()
+            .any(|x| x.path == ".github/workflows/ci.yml" && x.why == "protected path"),
+        "{:?}",
+        r.flags
+    );
+    assert!(!p[0].record.fields.contains_key("git_config"));
+    let d = w.ok(ALICE, "box.diff", json!({"box": i.as_str()}));
+    assert_eq!(d["review"]["git_config"], json!([]), "{d}");
+    // And sub/.gitattributes, .gitconfig still are.
+    let j = w.done(ALICE, &with_git_config("sub/.gitattributes"));
+    let a = w.call(ALICE, "box.land.begin", json!({"box": j.as_str()}));
+    assert_eq!(a["error"], "bad_request", "{a}");
+    let k = w.done(ALICE, &with_git_config(".gitconfig"));
+    let a = w.call(ALICE, "box.land.begin", json!({"box": k.as_str()}));
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert!(
+        a["message"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-git-config"),
+        "{a}"
+    );
+}
