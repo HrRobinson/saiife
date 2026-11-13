@@ -58,6 +58,7 @@ fn fast() -> Timing {
         activity_every: Duration::from_secs(1),
         control_deadline: Duration::from_secs(5),
         local_deadline: Duration::from_secs(2),
+        ..Timing::default()
     }
 }
 

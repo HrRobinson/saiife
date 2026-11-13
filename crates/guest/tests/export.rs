@@ -34,6 +34,17 @@ impl World {
         let root = dir.path().join("g");
         std::fs::create_dir_all(root.join("work")).unwrap();
         std::fs::create_dir_all(root.join("var/lib/saiife-guest")).unwrap();
+        // The agent is this test's own user: the untracked listing runs as it.
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let (uid, gid) = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        std::fs::write(
+            root.join("etc/passwd"),
+            format!("root:x:0:0::/root:/bin/sh\nagent:x:{uid}:{gid}::/home/agent:/bin/sh\n"),
+        )
+        .unwrap();
         let none = PathBuf::from("/nonexistent");
         let env = GuestEnv {
             root,
@@ -740,4 +751,106 @@ fn advance_some_paths_refuses_a_path_not_in_the_export() {
     // One bad path refuses the whole list.
     assert!(advance(&w.env, 1, Some(&["a".to_string(), "nope".to_string()])).is_err());
     assert_eq!(w.rev("refs/base"), base);
+}
+
+/// I-2: an agent-made FIFO named `.gitignore` blocks git's open of it; the
+/// export's deadline kills that git, the export fails saying so, and the
+/// next export (FIFO gone) works.
+#[test]
+fn fifo_gitignore_does_not_wedge_export() {
+    let mut w = World::new();
+    w.env.timing.export_deadline = std::time::Duration::from_secs(2);
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    w.put("sub/f", b"new\n");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        w.work("sub/.gitignore"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+    let t = std::time::Instant::now();
+    let mut buf = Vec::new();
+    let e = export(&w.env, 1, &mut buf).unwrap_err();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(e.contains("took longer than 2 s"), "{e}");
+    assert!(buf.is_empty());
+    std::fs::remove_file(w.work("sub/.gitignore")).unwrap();
+    let (v, _) = w.export(2);
+    assert_eq!(paths(&v), [("sub/f", Op::Add)]);
+}
+
+/// I-2: a `.gitignore` hard-linked to a file outside `/work` is refused,
+/// naming it; and one the agent cannot read is not read for it (the
+/// listing runs with the agent's rights), so its patterns, which would hide
+/// the ignore file itself, do not apply and the export still refuses it.
+#[test]
+fn hardlinked_gitignore_is_refused() {
+    if rustix::process::getuid().is_root() {
+        // Root reads a 0o000 file anyway; the test needs an unprivileged agent.
+        return;
+    }
+    let w = World::new();
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    let d = w._dir.path().join("outside");
+    std::fs::create_dir_all(&d).unwrap();
+    let rules = d.join("rules");
+    std::fs::write(&rules, b"hidden.txt\n").unwrap();
+    std::fs::hard_link(&rules, w.work(".gitignore")).unwrap();
+    w.put("hidden.txt", b"listed only when the rules were not read\n");
+    let mut buf = Vec::new();
+    let e = export(&w.env, 1, &mut buf).unwrap_err();
+    assert!(
+        e.contains("\".gitignore\"") && e.contains("hard link"),
+        "{e}"
+    );
+    assert!(buf.is_empty());
+    // A root-only file: its rules would hide `.gitignore` itself; unread,
+    // they do not, and the export refuses the file it cannot read.
+    std::fs::write(&rules, b"/.gitignore\nhidden.txt\n").unwrap();
+    std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let e = export(&w.env, 2, &mut buf).unwrap_err();
+    assert!(e.starts_with("\".gitignore\""), "{e}");
+    assert!(buf.is_empty());
+    // Gone, the export lists what the unreadable rules would have hidden.
+    std::fs::remove_file(w.work(".gitignore")).unwrap();
+    let (v, _) = w.export(3);
+    assert_eq!(paths(&v), [("hidden.txt", Op::Add)]);
+}
+
+/// I-2: the untracked listing switches to the agent's uid; an unprivileged
+/// test cannot switch to another one, so the export fails at that git.
+#[test]
+fn untracked_listing_runs_as_the_agent() {
+    if rustix::process::getuid().is_root() {
+        return;
+    }
+    let w = World::new();
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    let uid = rustix::process::getuid().as_raw() + 1;
+    let gid = rustix::process::getgid().as_raw();
+    std::fs::write(
+        w.env.path("/etc/passwd"),
+        format!("agent:x:{uid}:{gid}::/home/agent:/bin/sh\n"),
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    let e = export(&w.env, 1, &mut buf).unwrap_err();
+    assert!(e.starts_with("git ls-files"), "{e}");
+    // The listing repository is world-readable and holds only the exclude.
+    let list = w.env.path(saiife_guest::export::LIST_GIT);
+    let mode = std::fs::metadata(&list).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+    assert_eq!(
+        std::fs::read_to_string(list.join("info/exclude")).unwrap(),
+        ".git\n"
+    );
 }

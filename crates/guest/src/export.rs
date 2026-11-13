@@ -12,10 +12,17 @@
 //! fsmonitor, and `info/attributes` unsetting every content-changing
 //! attribute (it beats any `/work/.gitattributes`).
 //!
-//! Git (run as root) never reads `/work` content (R-T2d): it only lists
-//! paths, the ones the base tracks (`ls-files -c` of the base) and the
-//! untracked ones (`ls-files -o`, honoring `/work/.gitignore`; a file the
-//! base already tracks stays tracked). Each path is then read by this
+//! Git run as root never reads `/work` content (R-T2d): it only lists the
+//! paths the base tracks (`ls-files -c` of the base). The untracked ones
+//! (`ls-files -o`, honoring every `/work/**/.gitignore`; a file the base
+//! already tracks stays tracked) are listed by a git run as the agent's
+//! uid and gid, against [`LIST_GIT`] (root-owned, readable, holding only
+//! the `.git` exclude) and an empty index: it reads the ignore files with
+//! the agent's rights, so a hard link to a root-only file is not read, and
+//! its output is only a list of names, each checked below like any other.
+//! Every git child is killed at the call's deadline (`Timing`, well under
+//! the host's own), so a FIFO named `.gitignore` cannot wedge the guest's
+//! control loop. Each path is then read by this
 //! module with `openat2` beneath a dirfd of `/work`, no symlink or magic
 //! link resolved: a symlink is recorded as its target (`readlinkat`), a
 //! file must be regular with a single link (a hard link could name a
@@ -52,10 +59,18 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The guest's base repository.
 pub const BASE_GIT: &str = "/var/lib/saiife-guest/base.git";
+/// The repository the agent-uid listing of untracked paths runs against
+/// (I-2): root-owned, world-readable, no objects, no index, the `.git`
+/// exclude only. Outside `/var/lib/saiife-guest` so the agent needs no way
+/// into the base's parent.
+pub const LIST_GIT: &str = "/var/lib/saiife-guest-list.git";
 /// The last landed tree.
 pub const BASE_REF: &str = "refs/base";
 /// R-T2a: unsets every attribute that would change bytes on the way in.
@@ -90,16 +105,116 @@ const FLAGS: &[&str] = &[
     "advice.addEmbeddedRepo=false",
 ];
 
-/// One git invocation context: the base dir, `/work`, and this call's index.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A git child killed at its call's deadline by a watchdog thread (I-2): a
+/// git blocked on something in `/work` (a FIFO) cannot wedge the guest.
+struct Timed {
+    child: Arc<Mutex<Child>>,
+    stop: Option<mpsc::Sender<()>>,
+    fired: Arc<AtomicBool>,
+}
+
+impl Timed {
+    fn new(child: Child, deadline: Instant, name: &str) -> Result<Timed, String> {
+        let child = Arc::new(Mutex::new(child));
+        let fired = Arc::new(AtomicBool::new(false));
+        let (stop, rx) = mpsc::channel::<()>();
+        let (c, f) = (child.clone(), fired.clone());
+        let spawned = std::thread::Builder::new()
+            .name("guest-git-deadline".into())
+            .spawn(move || {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(left) {
+                    f.store(true, Ordering::SeqCst);
+                    // Our own child; a reaped one is not signalled again.
+                    let _ = lock(&c).kill();
+                }
+            });
+        if let Err(e) = spawned {
+            let mut c = lock(&child);
+            let _ = c.kill();
+            let _ = c.wait();
+            return Err(format!("git {name}: {e}"));
+        }
+        Ok(Timed {
+            child,
+            stop: Some(stop),
+            fired,
+        })
+    }
+
+    /// Waits for the child (killed at the deadline at the latest).
+    fn wait(&self) -> io::Result<ExitStatus> {
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if let Some(st) = lock(&self.child).try_wait()? {
+                return Ok(st);
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(20));
+        }
+    }
+
+    fn kill(&self) {
+        let _ = lock(&self.child).kill();
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        // Ends the watchdog (its receiver sees the sender gone).
+        drop(self.stop.take());
+    }
+}
+
+/// The error of a git child that broke: a deadline kill says so.
+fn broke(name: &str, fired: bool, within: Duration, e: impl std::fmt::Display) -> String {
+    if fired {
+        format!(
+            "git {name} took longer than {} s and was stopped; nothing was exported",
+            within.as_secs()
+        )
+    } else {
+        format!("git {name}: {e}")
+    }
+}
+
+/// Reads a child's pipe to the end on its own thread.
+fn drain<R: Read + Send + 'static>(
+    r: Option<R>,
+) -> Result<std::thread::JoinHandle<Vec<u8>>, String> {
+    std::thread::Builder::new()
+        .name("guest-git-pipe".into())
+        .spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut v);
+            }
+            v
+        })
+        .map_err(|e| format!("git: {e}"))
+}
+
+/// One git invocation context: the base dir, `/work`, this call's index,
+/// and the deadline every git child of the call is killed at.
 struct Git<'a> {
     env: &'a GuestEnv,
     dir: PathBuf,
     work: PathBuf,
     index: PathBuf,
+    within: Duration,
+    deadline: Instant,
 }
 
 impl<'a> Git<'a> {
-    fn new(env: &'a GuestEnv, call: &str) -> Git<'a> {
+    fn new(env: &'a GuestEnv, call: &str, within: Duration) -> Git<'a> {
         let dir = env.path(BASE_GIT);
         let index = dir.join(format!("index-{call}"));
         Git {
@@ -107,7 +222,14 @@ impl<'a> Git<'a> {
             dir,
             work: env.path(WORK),
             index,
+            within,
+            deadline: Instant::now() + within,
         }
+    }
+
+    /// Wraps a spawned child of this call in its deadline.
+    fn timed(&self, child: Child, name: &str) -> Result<Timed, String> {
+        Timed::new(child, self.deadline, name)
     }
 
     fn cmd<S: AsRef<OsStr>>(&self, args: &[S]) -> Command {
@@ -147,8 +269,13 @@ impl<'a> Git<'a> {
             .first()
             .map(|a| a.as_ref().to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut child = self
-            .cmd(args)
+        self.run_cmd(&name, self.cmd(args), input)
+    }
+
+    /// Runs `c` to completion within the call's deadline, feeding `input`
+    /// on stdin; returns stdout.
+    fn run_cmd(&self, name: &str, mut c: Command, input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let mut child = c
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -158,28 +285,116 @@ impl<'a> Git<'a> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("git {name}: {e}"))?;
-        let feeder = match (input, child.stdin.take()) {
+        let (stdin, stdout, stderr) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let child = self.timed(child, name)?;
+        let feeder = match (input, stdin) {
             (Some(b), Some(mut w)) => {
                 let b = b.to_vec();
-                Some(std::thread::spawn(move || w.write_all(&b)))
+                match std::thread::Builder::new()
+                    .name("guest-git-stdin".into())
+                    .spawn(move || w.write_all(&b))
+                {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        child.kill();
+                        let _ = child.wait();
+                        return Err(format!("git {name}: {e}"));
+                    }
+                }
             }
             _ => None,
         };
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("git {name}: {e}"))?;
+        let pipes = drain(stdout).and_then(|o| drain(stderr).map(|e| (o, e)));
+        let (out, err) = match pipes {
+            Ok(p) => p,
+            Err(e) => {
+                child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        let status = child.wait();
+        let out = out.join().unwrap_or_default();
+        let err = err.join().unwrap_or_default();
         if let Some(f) = feeder {
             let _ = f.join();
         }
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
+        if child.fired() {
+            return Err(broke(name, true, self.within, ""));
+        }
+        let status = status.map_err(|e| format!("git {name}: {e}"))?;
+        if !status.success() {
+            let err = String::from_utf8_lossy(&err);
             return Err(format!(
-                "git {name} failed ({}): {}",
-                out.status,
+                "git {name} failed ({status}): {}",
                 err.lines().next().unwrap_or("")
             ));
         }
-        Ok(out.stdout)
+        Ok(out)
+    }
+
+    /// The untracked paths of `/work` (`ls-files -o`, honoring every
+    /// `.gitignore`), listed by a git run as the agent (I-2): root never
+    /// opens an ignore file the agent planted. An empty index, so the
+    /// tracked paths come back too (the caller keeps them tracked).
+    #[cfg(target_os = "linux")]
+    fn list_as_agent(&self) -> Result<Vec<u8>, String> {
+        use std::os::unix::process::CommandExt;
+        let ids = crate::setup::agent_ids(self.env)?;
+        let list = self.list_repo()?;
+        let mut c = self.cmd(&["ls-files", "-o", "-z", "--exclude-standard"]);
+        c.env("GIT_DIR", &list)
+            .env("GIT_INDEX_FILE", list.join("index-none"))
+            .env("HOME", &list)
+            .uid(ids.uid)
+            .gid(ids.gid);
+        self.run_cmd("ls-files", c, None)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn list_as_agent(&self) -> Result<Vec<u8>, String> {
+        Err("the export runs only inside the Linux box VM".into())
+    }
+
+    /// [`LIST_GIT`], made on first use: an empty bare repository, every
+    /// directory 0755 and file 0644, `info/exclude` (written last, the mark
+    /// of a whole one) holding [`BASE_EXCLUDE`].
+    #[cfg(target_os = "linux")]
+    fn list_repo(&self) -> Result<PathBuf, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.env.path(LIST_GIT);
+        let exclude = dir.join("info/exclude");
+        if std::fs::symlink_metadata(&exclude).is_ok_and(|m| m.is_file()) {
+            return Ok(dir);
+        }
+        let fail = |e: io::Error| format!("{LIST_GIT}: {e}");
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            std::fs::remove_dir_all(&dir).map_err(fail)?;
+        }
+        std::fs::create_dir_all(&dir).map_err(fail)?;
+        let mut c = self.cmd(&["init", "-q", "--bare", "--template="]);
+        c.env("GIT_DIR", &dir).env("HOME", &dir);
+        self.run_cmd("init", c, None)?;
+        std::fs::create_dir_all(dir.join("info")).map_err(fail)?;
+        fn open_up(p: &std::path::Path) -> io::Result<()> {
+            let m = std::fs::symlink_metadata(p)?;
+            if m.is_dir() {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755))?;
+                for e in std::fs::read_dir(p)? {
+                    open_up(&e?.path())?;
+                }
+            } else if m.is_file() {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644))?;
+            }
+            Ok(())
+        }
+        open_up(&dir).map_err(fail)?;
+        let tmp = dir.join("info/exclude.new");
+        std::fs::write(&tmp, BASE_EXCLUDE).map_err(fail)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).map_err(fail)?;
+        std::fs::rename(&tmp, &exclude).map_err(fail)?;
+        Ok(dir)
     }
 
     fn run<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Vec<u8>, String> {
@@ -229,7 +444,7 @@ impl<'a> Git<'a> {
 /// repository holding every file `/work` has (even ignored ones: the host
 /// wrote exactly the snapshot there).
 pub fn init_base(env: &GuestEnv) -> Result<(), String> {
-    let git = Git::new(env, "base");
+    let git = Git::new(env, "base", env.timing.git_deadline);
     if std::fs::symlink_metadata(&git.dir).is_ok() {
         // A setup that died before its marker: start over.
         std::fs::remove_dir_all(&git.dir).map_err(|e| format!("{BASE_GIT}: {e}"))?;
@@ -261,8 +476,10 @@ fn is_git_alias(c: &[u8]) -> bool {
 }
 
 /// Snapshots `/work` and returns the tree id (R-T2d). Git only lists
-/// paths: the paths `start` tracks and the untracked ones (`ls-files -o`,
-/// honoring `.gitignore` unless `force`); a nested repository's untracked
+/// paths: the paths `start` tracks and the untracked ones (`ls-files -o`;
+/// unless `force`, honoring `.gitignore` and run as the agent, I-2; with
+/// `force`, the first setup before the agent ever ran, reading no ignore
+/// file at all); a nested repository's untracked
 /// files and `.git`-alias paths are skipped (R-T2b). Every content byte is
 /// read by [`work::Work`] (openat2 beneath `/work`, no symlink followed)
 /// and fed to `git fast-import` on a pipe; the tree is built with
@@ -277,11 +494,12 @@ fn snapshot(git: &Git, start: Option<&str>, force: bool) -> Result<String, Strin
             }
             None => Vec::new(),
         };
-        let mut others = vec!["ls-files", "-o", "-z"];
-        if !force {
-            others.push("--exclude-standard");
-        }
-        Ok::<_, String>((tracked, git.run(&others)?))
+        let others = if force {
+            git.run(&["ls-files", "-o", "-z"])?
+        } else {
+            git.list_as_agent()?
+        };
+        Ok::<_, String>((tracked, others))
     })();
     git.drop_index();
     let (tracked, untracked) = listed?;
@@ -361,6 +579,8 @@ fn esc(p: &[u8]) -> String {
 }
 
 /// What one `/work` path holds, opened without following any symlink.
+/// (Only the Linux reader builds one; elsewhere the export is refused.)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum Item {
     /// A symlink's target bytes.
     Link(Vec<u8>),
@@ -384,10 +604,11 @@ impl Item {
 /// One `git fast-import` that stores the blobs it is fed on its stdin
 /// (it reads nothing else of `/work`); its marks give the object ids.
 struct Blobs {
-    child: Child,
+    child: Timed,
     stdin: Option<std::io::BufWriter<ChildStdin>>,
     marks: PathBuf,
     next: u64,
+    within: Duration,
 }
 
 impl Blobs {
@@ -416,16 +637,18 @@ impl Blobs {
             .map_err(|e| format!("git fast-import: {e}"))?;
         let stdin = child.stdin.take().map(std::io::BufWriter::new);
         Ok(Blobs {
-            child,
+            child: git.timed(child, "fast-import")?,
             stdin,
             marks,
             next: 0,
+            within: git.within,
         })
     }
 
     /// Feeds one blob; returns its mark and git mode.
     fn add(&mut self, p: &[u8], item: Item) -> Result<(u64, &'static str), String> {
-        let broke = |e: io::Error| format!("git fast-import: {e}");
+        let (fired, within) = (self.child.fired.clone(), self.within);
+        let broke = |e: io::Error| broke("fast-import", fired.load(Ordering::SeqCst), within, e);
         self.next += 1;
         let mark = self.next;
         let w = self.stdin.as_mut().ok_or("git fast-import: closed")?;
@@ -437,8 +660,13 @@ impl Blobs {
                 "120000"
             }
             Item::File { file, exec, .. } => {
-                let copied =
-                    io::copy(&mut (&file).take(size), w).map_err(|e| format!("{}: {e}", esc(p)))?;
+                let copied = io::copy(&mut (&file).take(size), w).map_err(|e| {
+                    if self.child.fired() {
+                        broke(e)
+                    } else {
+                        format!("{}: {e}", esc(p))
+                    }
+                })?;
                 if copied != size {
                     return Err(format!(
                         "{} changed while it was read; export again",
@@ -458,12 +686,16 @@ impl Blobs {
 
     /// Ends the import; mark -> object id.
     fn finish(mut self) -> Result<BTreeMap<u64, String>, String> {
-        let broke = |e: io::Error| format!("git fast-import: {e}");
+        let (fired, within) = (self.child.fired.clone(), self.within);
+        let broke = |e: io::Error| broke("fast-import", fired.load(Ordering::SeqCst), within, e);
         if let Some(mut w) = self.stdin.take() {
             w.write_all(b"done\n").map_err(broke)?;
             w.flush().map_err(broke)?;
         }
         let st = self.child.wait().map_err(broke)?;
+        if self.child.fired() {
+            return Err(broke(io::Error::other("killed")));
+        }
         if !st.success() {
             return Err(format!("git fast-import failed ({st})"));
         }
@@ -486,7 +718,7 @@ impl Drop for Blobs {
     fn drop(&mut self) {
         if self.stdin.take().is_some() {
             // Not finished (an error mid-way): our own child.
-            let _ = self.child.kill();
+            self.child.kill();
         }
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.marks);
@@ -754,9 +986,10 @@ fn parse_raw(raw: &[u8]) -> Result<Vec<Change>, String> {
 
 /// One `git cat-file --batch` for the whole export.
 struct CatFile {
-    child: Child,
+    child: Timed,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    within: Duration,
 }
 
 impl CatFile {
@@ -770,28 +1003,37 @@ impl CatFile {
             .map_err(|e| format!("git cat-file: {e}"))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().map(BufReader::new);
+        let child = git.timed(child, "cat-file")?;
         match stdout {
             Some(stdout) => Ok(CatFile {
                 child,
                 stdin,
                 stdout,
+                within: git.within,
             }),
             None => Err("git cat-file: no stdout".into()),
         }
     }
 
+    /// The error of a broken pipe to or from the child.
+    fn broke(&self, e: io::Error) -> String {
+        broke("cat-file", self.child.fired(), self.within, e)
+    }
+
     /// Asks for a blob; returns its size (refused above `max` before any
     /// content is read).
     fn open(&mut self, oid: &str, path: &str, max: u64) -> Result<u64, String> {
-        let err = |e: io::Error| format!("git cat-file: {e}");
         let w = self.stdin.as_mut().ok_or("git cat-file: closed")?;
-        w.write_all(format!("{oid}\n").as_bytes()).map_err(err)?;
-        w.flush().map_err(err)?;
+        let sent = w
+            .write_all(format!("{oid}\n").as_bytes())
+            .and_then(|()| w.flush());
+        sent.map_err(|e| self.broke(e))?;
         let mut line = Vec::new();
-        (&mut self.stdout)
-            .take(256)
-            .read_until(b'\n', &mut line)
-            .map_err(err)?;
+        let got = (&mut self.stdout).take(256).read_until(b'\n', &mut line);
+        got.map_err(|e| self.broke(e))?;
+        if line.is_empty() && self.child.fired() {
+            return Err(self.broke(io::ErrorKind::UnexpectedEof.into()));
+        }
         let line = String::from_utf8_lossy(&line);
         let f: Vec<&str> = line.trim_end().split(' ').collect();
         let [got, "blob", size] = f[..] else {
@@ -818,19 +1060,20 @@ impl CatFile {
         size: u64,
         each: &mut dyn FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<String, String> {
-        let err = |e: io::Error| format!("git cat-file: {e}");
         let mut h = Sha256::new();
         let mut left = size;
         let mut buf = vec![0u8; MAX_FRAME.min(size.max(1) as usize)];
         while left > 0 {
             let want = (left.min(buf.len() as u64)) as usize;
-            self.stdout.read_exact(&mut buf[..want]).map_err(err)?;
+            let got = self.stdout.read_exact(&mut buf[..want]);
+            got.map_err(|e| self.broke(e))?;
             h.update(&buf[..want]);
             each(&buf[..want])?;
             left -= want as u64;
         }
         let mut nl = [0u8; 1];
-        self.stdout.read_exact(&mut nl).map_err(err)?;
+        let got = self.stdout.read_exact(&mut nl);
+        got.map_err(|e| self.broke(e))?;
         if nl[0] != b'\n' {
             return Err("git cat-file: bad blob terminator".into());
         }
@@ -846,10 +1089,10 @@ impl CatFile {
 
     fn close(mut self) -> Result<(), String> {
         drop(self.stdin.take());
-        let st = self
-            .child
-            .wait()
-            .map_err(|e| format!("git cat-file: {e}"))?;
+        let st = self.child.wait().map_err(|e| self.broke(e))?;
+        if self.child.fired() {
+            return Err(self.broke(io::Error::other("killed")));
+        }
         if !st.success() {
             return Err(format!("git cat-file failed ({st})"));
         }
@@ -861,7 +1104,7 @@ impl Drop for CatFile {
     fn drop(&mut self) {
         if self.stdin.take().is_some() {
             // Not closed cleanly (an error mid-way): our own child.
-            let _ = self.child.kill();
+            self.child.kill();
         }
         let _ = self.child.wait();
     }
@@ -885,7 +1128,7 @@ pub fn export_within(
     limits: Limits,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let git = Git::new(env, "export");
+    let git = Git::new(env, "export", env.timing.export_deadline);
     let base = git.commit(BASE_REF, "the box's base")?;
     let tree = snapshot(&git, Some(&base), false)?;
     let to = export_ref(n);
@@ -1046,7 +1289,7 @@ fn tree_entries(git: &Git, commit: &str) -> Result<BTreeMap<Vec<u8>, String>, St
 /// path is not a change of the export or the result would make a path both
 /// a file and a directory.
 pub fn advance(env: &GuestEnv, n: u32, paths: Option<&[String]>) -> Result<(), String> {
-    let git = Git::new(env, "advance");
+    let git = Git::new(env, "advance", env.timing.git_deadline);
     let base = git.commit(BASE_REF, "the box's base")?;
     let exp = git.commit(&export_ref(n), &format!("export {n}"))?;
     let Some(paths) = paths else {
