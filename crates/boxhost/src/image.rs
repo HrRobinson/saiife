@@ -31,6 +31,10 @@ pub struct ClaudePin {
     pub sha256: String,
 }
 
+/// What a box without a default image is told (R43). Plan 36 Task 5 drops
+/// the part after the semicolon once `image import --default` is built.
+pub const DEFAULT_IMAGE_HINT: &str = "make one with \"saiife box image build\"; making it the default (\"saiife box image import --default <path>\") is not in this build yet";
+
 pub const DEFAULT_RECIPE: &str = include_str!("../../../assets/box/recipe.toml");
 
 #[derive(Deserialize)]

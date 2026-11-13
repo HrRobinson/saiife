@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::image::Store;
+use crate::image::{Store, DEFAULT_IMAGE_HINT};
 use crate::layout::Layout;
 use crate::pins;
 use crate::tools::{Tool, Tools};
@@ -23,8 +23,6 @@ pub struct Check {
 pub const FETCH_HINT: &str = "run \"saiife box vmm fetch\"";
 /// What a locked host runs to get everything boxes need.
 pub const INSTALL_HINT: &str = "run \"sudo saiife system install --boxes\"";
-/// What makes an image the default.
-pub const IMAGE_HINT: &str = "run \"saiife box image import --default <path>\"";
 
 fn pass(name: &'static str, detail: impl Into<String>) -> Check {
     Check {
@@ -165,7 +163,7 @@ fn default_image(layout: &Layout) -> Check {
         return fail(
             "image",
             format!(
-                "no box images yet ({} is missing): {IMAGE_HINT}",
+                "no box images yet ({} is missing): {DEFAULT_IMAGE_HINT}",
                 layout.images.display()
             ),
         );
@@ -175,10 +173,16 @@ fn default_image(layout: &Layout) -> Check {
         Err(e) => return fail("image", e),
     };
     match store.default_id() {
-        None => fail("image", format!("no default box image: {IMAGE_HINT}")),
+        None => fail(
+            "image",
+            format!("no default box image: {DEFAULT_IMAGE_HINT}"),
+        ),
         Some(id) => match store.get(&id) {
             Ok(_) => pass("image", format!("default image {id}")),
-            Err(e) => fail("image", format!("the default image: {e}; {IMAGE_HINT}")),
+            Err(e) => fail(
+                "image",
+                format!("the default image: {e}; {DEFAULT_IMAGE_HINT}"),
+            ),
         },
     }
 }
@@ -324,7 +328,11 @@ mod tests {
         assert!(by(&c, "qemu-img").ok && by(&c, "mke2fs").ok, "{c:?}");
         assert!(by(&c, "landlock").ok);
         let i = by(&c, "image");
-        assert!(!i.ok && i.detail.contains("--default"), "{i:?}");
+        assert_eq!(
+            i.detail,
+            format!("no default box image: {}", crate::image::DEFAULT_IMAGE_HINT)
+        );
+        assert!(!i.ok, "{i:?}");
         std::fs::remove_file(w.tools.path(Tool::Mke2fs)).unwrap();
         let c = checks(&w.layout, &w.tools, &w.kvm, 0);
         assert!(by(&c, "mke2fs").detail.contains("e2fsprogs"), "{c:?}");
