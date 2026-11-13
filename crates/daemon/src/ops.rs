@@ -396,6 +396,11 @@ pub struct Ctx {
     pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
     /// The template files skipped at start, for `box.templates`.
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
+    /// The land book (plan 39), set once the context is shared
+    /// (`box_ops::attach_lands`): it needs the box's guest channel, which
+    /// only a daemon with real boxes has. Empty: lands are unavailable.
+    #[cfg(unix)]
+    pub box_lands: std::sync::OnceLock<Arc<crate::box_land::Lands>>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -744,6 +749,8 @@ impl Ctx {
             cosign: Mutex::default(),
             box_manager: i.box_manager,
             box_template_warnings: i.box_template_warnings,
+            #[cfg(unix)]
+            box_lands: std::sync::OnceLock::new(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,

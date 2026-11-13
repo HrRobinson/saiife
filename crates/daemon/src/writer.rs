@@ -89,6 +89,23 @@ impl WriterHandle {
         .await
     }
 
+    /// [`WriterHandle::append`] from a blocking thread (`spawn_blocking`,
+    /// the box land book behind the Workspace's `BoxSource`): waits for the
+    /// writer's answer without a runtime. Never call it on a runtime worker.
+    pub fn append_blocking(&self, rec: Record) -> Result<u64, String> {
+        let (reply, rx) = oneshot::channel();
+        match self.tx.try_send(Job::Append {
+            rec: Box::new(rec),
+            reply,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err("the audit writer queue is full".into()),
+            Err(TrySendError::Disconnected(_)) => return Err("the audit writer has stopped".into()),
+        }
+        rx.blocking_recv()
+            .unwrap_or_else(|_| Err("the audit writer has stopped".into()))
+    }
+
     pub async fn checkpoint(&self) -> Result<Option<u64>, String> {
         self.send(|reply| Job::Checkpoint { reply }).await
     }

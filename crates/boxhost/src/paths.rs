@@ -112,6 +112,20 @@ impl BoxPaths {
     pub fn land_applied(&self, n: u32) -> PathBuf {
         self.land_dir(n).join("applied.json")
     }
+    /// `lands/<n>/advanced.json`: the guest's base took this land (an
+    /// approved land without it is advanced again before the next export).
+    pub fn land_advanced(&self, n: u32) -> PathBuf {
+        self.land_dir(n).join("advanced.json")
+    }
+    /// The export number of a `lands/` entry name (`None`: not one).
+    pub fn land_number(name: &std::ffi::OsStr) -> Option<u32> {
+        let s = name.to_str()?;
+        if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: u32 = s.parse().ok()?;
+        (n.to_string() == s).then_some(n)
+    }
     pub fn placeholder(&self) -> PathBuf {
         self.file("placeholder")
     }
@@ -152,8 +166,15 @@ mod tests {
             p.land_request(3),
             p.land_approved(3),
             p.land_applied(3),
+            p.land_advanced(3),
         ] {
             assert_eq!(f.parent(), Some(p.land_dir(3).as_path()));
+        }
+        let n = |s: &str| BoxPaths::land_number(std::ffi::OsStr::new(s));
+        assert_eq!(n("3"), Some(3));
+        assert_eq!(n("4294967295"), Some(u32::MAX));
+        for bad in ["", "03", "-1", "1a", "4294967296", ".3"] {
+            assert_eq!(n(bad), None, "{bad}");
         }
     }
 }

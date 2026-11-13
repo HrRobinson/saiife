@@ -14,6 +14,9 @@ pub mod audit_query;
 // The per-box gateway: allow-listed CONNECT egress and the model port (plan 38).
 #[cfg(unix)]
 pub mod box_gateway;
+// The land book: reviews, land touch records, approvals (plan 39).
+#[cfg(unix)]
+pub mod box_land;
 pub mod box_ops;
 #[cfg(unix)]
 pub mod box_repo;
