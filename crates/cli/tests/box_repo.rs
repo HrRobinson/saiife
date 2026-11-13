@@ -92,7 +92,8 @@ fn exec(p: &Path, body: &str) {
 }
 
 /// A fake mke2fs: records its argv (one per line) next to itself and
-/// writes a marker to the image path (argv 8); `fail` exits 1 instead.
+/// writes a marker to the image path (the next-to-last argument); `fail`
+/// exits 1 instead.
 fn world_with(fail: bool) -> W {
     env();
     let d = tempfile::tempdir().unwrap();
@@ -105,7 +106,8 @@ fn world_with(fail: bool) -> W {
         "#!/bin/sh\necho 'mke2fs: no space' >&2\nexit 1\n".to_string()
     } else {
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'fake-ext4' > \"$8\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n\
+             for a; do img=$last; last=$a; done\nprintf 'fake-ext4' > \"$img\"\n",
             bin.join("argv").display()
         )
     };
@@ -416,14 +418,101 @@ fn mke2fs_argv_is_pinned() {
     assert_eq!(img, s.staging.parent().unwrap().join("repo.img"));
     assert_eq!(std::fs::read(&img).unwrap(), b"fake-ext4");
     let argv = std::fs::read_to_string(w.bin.join("argv")).unwrap();
+    // R20: `-N` (files + symlinks + dirs + 4096) before `-d`; one file
+    // and no dir here.
     let want = format!(
-        "-q\n-t\next4\n-L\nrepo\n-d\n{}\n{}\n257M\n",
+        "-q\n-t\next4\n-L\nrepo\n-N\n4097\n-d\n{}\n{}\n257M\n",
         s.staging.display(),
         img.display()
     );
     assert_eq!(argv, want);
     s.remove();
     assert!(w.left().is_empty());
+
+    // Two files, a symlink and two dirs (a/, a/b/): 4096 + 5.
+    let w = world();
+    w.write("a/b/c.txt", b"c\n");
+    w.write("x.txt", b"x\n");
+    symlink("x.txt", w.repo.join("ln")).unwrap();
+    let s = snapshot(&w.tools, &w.repo, &w.cache).unwrap();
+    make_repo_image(&w.tools, &s).unwrap();
+    let argv = std::fs::read_to_string(w.bin.join("argv")).unwrap();
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(&argv[5..8], &["-N", "4101", "-d"], "{argv:?}");
+    s.remove();
+}
+
+/// R21: a spawn the user interrupted leaves its staging dir; the next
+/// snapshot removes `box-spawn` entries over an hour old, never following a
+/// link, and keeps younger ones.
+#[test]
+fn interrupted_staging_is_swept() {
+    use std::time::{Duration, SystemTime};
+    let w = world();
+    w.write("README", b"hi\n");
+    let spawn = w.cache.join("box-spawn");
+    let back = SystemTime::now() - Duration::from_secs(2 * 3600);
+    // utimensat with AT_SYMLINK_NOFOLLOW: a link's own times, not its
+    // target's.
+    let age = |p: &Path| {
+        let at = rustix::fs::Timespec {
+            tv_sec: back
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as _,
+            tv_nsec: 0,
+        };
+        let t = rustix::fs::Timestamps {
+            last_access: at,
+            last_modification: at,
+        };
+        rustix::fs::utimensat(
+            rustix::fs::CWD,
+            p,
+            &t,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+    };
+    // Outside the cache: a dir and a file the old entries link to.
+    let far = w.repo.parent().unwrap().join("far");
+    std::fs::create_dir_all(far.join("d")).unwrap();
+    std::fs::write(far.join("d/keep"), b"keep").unwrap();
+    std::fs::write(far.join("f"), b"f").unwrap();
+    // An old staging dir, as an interrupted spawn leaves it, with a link
+    // out of it.
+    let old = spawn.join("0000000000000000");
+    std::fs::create_dir_all(old.join("tree/src")).unwrap();
+    std::fs::write(old.join("tree/src/main.rs"), b"m").unwrap();
+    std::fs::write(old.join("repo.img"), b"img").unwrap();
+    symlink(far.join("d"), old.join("tree/out")).unwrap();
+    // Old links in box-spawn itself, to a dir and to a file outside.
+    symlink(far.join("d"), spawn.join("1111111111111111")).unwrap();
+    symlink(far.join("f"), spawn.join("stray-link")).unwrap();
+    std::fs::write(spawn.join("stray"), b"s").unwrap();
+    // A young one (another spawn running now).
+    let young = spawn.join("2222222222222222");
+    std::fs::create_dir_all(young.join("tree")).unwrap();
+    for p in [
+        old.as_path(),
+        &spawn.join("1111111111111111"),
+        &spawn.join("stray-link"),
+        &spawn.join("stray"),
+    ] {
+        age(p);
+    }
+    let s = snapshot(&w.tools, &w.repo, &w.cache).unwrap();
+    let name = |p: &Path| p.file_name().unwrap().to_owned();
+    let mut left: Vec<OsString> = w.left().iter().map(|p| name(p)).collect();
+    left.sort();
+    let mut want = vec![name(&young), name(s.dir())];
+    want.sort();
+    assert_eq!(left, want);
+    // Nothing a link named was touched.
+    assert_eq!(std::fs::read(far.join("d/keep")).unwrap(), b"keep");
+    assert_eq!(std::fs::read(far.join("f")).unwrap(), b"f");
+    assert!(young.join("tree").is_dir());
+    s.remove();
 }
 
 #[test]

@@ -14,7 +14,9 @@
 //!
 //! Staging layout (ruling R2): `<cache>/box-spawn/<16 hex>/` (0700) holds
 //! `tree/` (the snapshot), `repo.img` and the snapshot commit's temporary
-//! `index`. Removing the staging means removing that whole dir.
+//! `index`. Removing the staging means removing that whole dir. A spawn
+//! that is killed before it removes its staging leaves the dir; the next
+//! snapshot sweeps entries over an hour old (ruling R21).
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, CWD};
 use rustix::io::Errno;
@@ -92,6 +94,69 @@ impl Drop for Cleanup {
         if let Some(p) = self.0.take() {
             remove_tree(&p);
         }
+    }
+}
+
+/// Ruling R21: a `box-spawn` entry older than this is what an interrupted
+/// spawn (killed, Ctrl-C, a closed terminal) left: its guard never ran.
+const STAGING_MAX_AGE_SECS: u64 = 3600;
+/// How deep the staging sweep goes: a staged path is at most
+/// `manifest::PATH_MAX` bytes, so at most half as many components.
+const SWEEP_DEPTH: u32 = (manifest::PATH_MAX / 2) as u32 + 4;
+
+/// The entry names of `dir`, `.` and `..` left out.
+fn names(dir: &OwnedFd) -> rustix::io::Result<Vec<OsString>> {
+    let mut out = Vec::new();
+    for e in rustix::fs::Dir::read_from(dir)? {
+        let e = e?;
+        let n = e.file_name().to_bytes();
+        if n != b"." && n != b".." {
+            out.push(OsStr::from_bytes(n).to_os_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Remove `name` in `at`: a directory with what it holds, relative to its
+/// own fd and never through a symlink; anything else (a symlink too) is
+/// unlinked. Best effort: goes on past what it cannot remove.
+fn remove_at(at: &OwnedFd, name: &OsStr, depth: u32) -> rustix::io::Result<()> {
+    let st = rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
+        return rustix::fs::unlinkat(at, name, AtFlags::empty());
+    }
+    if depth == 0 {
+        return Err(Errno::LOOP);
+    }
+    let d = rustix::fs::openat(at, name, dir_flags(), Mode::empty())?;
+    for n in names(&d)? {
+        let _ = remove_at(&d, &n, depth - 1);
+    }
+    drop(d);
+    rustix::fs::unlinkat(at, name, AtFlags::REMOVEDIR)
+}
+
+/// R21: remove every entry of `spawn` (`<cache>/box-spawn`) whose own
+/// mtime (lstat) is [`STAGING_MAX_AGE_SECS`] or more before `now` (Unix
+/// seconds). `spawn` is opened `O_DIRECTORY|O_NOFOLLOW` and every entry is
+/// handled relative to it, never following a link. Errors are ignored.
+fn sweep_staging(spawn: &Path, now: u64) {
+    let Ok(d) = rustix::fs::openat(CWD, spawn, dir_flags(), Mode::empty()) else {
+        return;
+    };
+    let Ok(list) = names(&d) else {
+        return;
+    };
+    for n in list {
+        let Ok(st) = rustix::fs::statat(&d, &n, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        #[allow(clippy::unnecessary_cast)]
+        let mtime = u64::try_from(st.st_mtime as i64).unwrap_or(0);
+        if now.saturating_sub(mtime) < STAGING_MAX_AGE_SECS {
+            continue;
+        }
+        let _ = remove_at(&d, &n, SWEEP_DEPTH);
     }
 }
 
@@ -598,7 +663,14 @@ fn display_name(top: &Path) -> String {
 /// devices and paths under a symlinked parent with a warning; a non-UTF-8
 /// path, a path `check_path` refuses, and a repo over the D5 caps (checked
 /// before each copy) are refused. Every failure leaves no staging dir.
+///
+/// First, staging dirs an interrupted spawn left over an hour ago go
+/// (ruling R21, [`sweep_staging`]).
 pub fn snapshot(tools: &Tools, repo: &Path, cache: &Path) -> Result<Snapshot, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    sweep_staging(&cache.join("box-spawn"), now);
     let canon = repo
         .canonicalize()
         .map_err(|e| format!("cannot open the repo {}: {e}", repo.display()))?;
@@ -764,19 +836,36 @@ fn describe(e: &ToolError) -> String {
     }
 }
 
-/// Build `<staging>/../repo.img` with `mke2fs -q -t ext4 -L repo -d
-/// <staging> <img> <mib>M` (D4). On failure the whole staging dir is
-/// removed.
+/// Ruling R20: the inodes the repo disk is made with, one per file,
+/// symlink and directory below the staging root, plus 4096 spare (the
+/// root, lost+found and ext4's reserved inodes among them). D4's size alone,
+/// with mke2fs's default bytes-per-inode, cannot hold a repo of many tiny
+/// files.
+pub fn repo_image_inodes(m: &BaseManifest, dirs: u64) -> u64 {
+    (m.entries.len() as u64)
+        .saturating_add(dirs)
+        .saturating_add(4096)
+}
+
+/// Build `<staging>/../repo.img` with `mke2fs -q -t ext4 -L repo -N
+/// <inodes> -d <staging> <img> <mib>M` (D4). `-N` ([`repo_image_inodes`])
+/// is ruling R20, a deviation from the plan's fixed argv (owner checked):
+/// without it a repo of many small files runs out of inodes. On failure
+/// the whole staging dir is removed.
 pub fn make_repo_image(tools: &Tools, s: &Snapshot) -> Result<PathBuf, String> {
     let img = s.dir().join(saiife_boxhost::paths::REPO_DISK);
-    let mib = repo_image_mib(&s.manifest, staging_dirs(&s.manifest));
+    let dirs = staging_dirs(&s.manifest);
+    let mib = repo_image_mib(&s.manifest, dirs);
     let size = format!("{mib}M");
-    let args: [&OsStr; 9] = [
+    let inodes = repo_image_inodes(&s.manifest, dirs).to_string();
+    let args: [&OsStr; 11] = [
         OsStr::new("-q"),
         OsStr::new("-t"),
         OsStr::new("ext4"),
         OsStr::new("-L"),
         OsStr::new("repo"),
+        OsStr::new("-N"),
+        OsStr::new(&inodes),
         OsStr::new("-d"),
         s.staging.as_os_str(),
         img.as_os_str(),
