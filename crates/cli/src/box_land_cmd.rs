@@ -52,6 +52,9 @@ use crate::text::sanitize;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// `box.land.begin` and `box.diff` may wait for the guest's export (120 s).
 const CALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// `box.land` may advance a land not taken yet (60 s), export again
+/// (120 s) and advance the approved one (60 s) before it answers (M-1).
+const LAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// The task line of a land commit, in characters.
 const TASK_LINE: usize = 72;
 /// `box.push.done`'s detail, in characters.
@@ -164,9 +167,15 @@ fn call(c: &mut Client, t: &Target, op: &str, a: Args) -> Result<Args, Stop> {
 }
 
 /// A call whose answer carries one descriptor (`box.land`, `box.land.fetch`).
-fn call_fd(c: &mut Client, t: &Target, op: &str, a: Args) -> Result<(Args, File), Stop> {
+fn call_fd(
+    c: &mut Client,
+    t: &Target,
+    op: &str,
+    a: Args,
+    within: Duration,
+) -> Result<(Args, File), Stop> {
     let (a, mut fds) = c
-        .call_recv_fds(op, a, 1, Instant::now() + CALL_TIMEOUT)
+        .call_recv_fds(op, a, 1, Instant::now() + within)
         .map_err(|e| refused(t, e))?;
     match (fds.pop(), fds.is_empty()) {
         (Some(fd), true) => Ok((a, File::from(fd))),
@@ -409,27 +418,40 @@ fn land(t: &Target, id: &BoxId, files: Vec<String>, allow_git_config: bool) -> R
         sanitize(&r.short_code)
     );
     let asr = assertion_json(key.as_ref(), &r)?;
-    // A touch may take 120 s: a new connection for the land (D6).
-    let mut c = connect(t)?;
-    let (a, delta) = call_fd(
-        &mut c,
-        t,
-        "box.land",
-        args([("request_id", json!(rid)), ("assertion", asr)]),
-    )
-    .map_err(|e| match e {
-        // R-T5e: a Workspace approval of this land spends the CLI's
-        // challenge; the land itself is then waiting for its commit.
-        Stop::Refused(m) => Stop::Refused(format!(
-            "{m}\nif this land was approved in the Workspace meanwhile, run: saiife box apply {i}"
-        )),
-        other => other,
-    })?;
-    drop(c);
-    let info = land_of(&a, id)?;
+    // A touch may take 120 s: a new connection for the land (D6). From
+    // here on the land may be approved whatever the answer: every failure
+    // names `saiife box apply` (M-1).
+    let landed = (|| {
+        let mut c = connect(t)?;
+        let (a, delta) = call_fd(
+            &mut c,
+            t,
+            "box.land",
+            args([("request_id", json!(rid)), ("assertion", asr)]),
+            LAND_TIMEOUT,
+        )?;
+        drop(c);
+        Ok((land_of(&a, id)?, delta))
+    })();
+    let (info, delta) = landed.map_err(|e| after_touch(i, e))?;
     match apply_one(t, &tools, &info, delta, "landed")? {
         None => Ok(()),
         Some(kept) => Err(Stop::Failed(kept)),
+    }
+}
+
+/// A `box.land` failure after the touch: the land may be approved (in the
+/// Workspace meanwhile, R-T5e, or by this call before its answer was
+/// lost), so the message names `saiife box apply`.
+fn after_touch(i: &str, e: Stop) -> Stop {
+    match e {
+        Stop::Refused(m) => Stop::Refused(format!(
+            "{m}\nif this land was approved in the Workspace meanwhile, run: saiife box apply {i}"
+        )),
+        Stop::Unavailable(m) => Stop::Unavailable(format!(
+            "{m}\nthe land may have been approved before the answer was lost; run: saiife box apply {i}"
+        )),
+        other => other,
     }
 }
 
@@ -464,6 +486,7 @@ fn apply_waiting(t: &Target, tools: &Tools, id: &BoxId) -> Result<Waiting, Stop>
             t,
             "box.land.fetch",
             args([("box", json!(i)), ("n", json!(n))]),
+            CALL_TIMEOUT,
         )?;
         let info = land_of(&a, id)?;
         if info.n != n {
@@ -1328,6 +1351,27 @@ mod tests {
             diff_sha256: "b".repeat(64),
             task: task.into(),
             repo_dir: Some("/r".into()),
+        }
+    }
+
+    /// M-1: `box.land` waits past the daemon's worst case, and every
+    /// failure after the touch names `saiife box apply`.
+    #[test]
+    fn land_failures_after_the_touch_name_apply() {
+        assert!(
+            LAND_TIMEOUT
+                > saiife_boxhost::review::EXPORT_TIMEOUT
+                    + 2 * saiife_daemon::box_land::ADVANCE_TIMEOUT
+        );
+        let hint = "run: saiife box apply b1";
+        for e in [
+            Stop::Unavailable("the saiife daemon did not answer in time".into()),
+            Stop::Refused("refused (touch_mismatch)".into()),
+        ] {
+            match after_touch("b1", e) {
+                Stop::Unavailable(m) | Stop::Refused(m) => assert!(m.contains(hint), "{m}"),
+                _ => panic!("another kind"),
+            }
         }
     }
 
