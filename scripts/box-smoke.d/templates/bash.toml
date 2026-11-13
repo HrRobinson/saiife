@@ -1,0 +1,29 @@
+# The plan 38 guest smoke's template (scripts/box-smoke.d/30-guest.sh): the
+# agent is a plain bash, so `saiife box say` types shell commands. Owner-run
+# only; install it into the daemon's templates.d and restart the daemon.
+name = "bash"
+description = "A bash shell (plan 38 guest smoke)"
+
+[agent]
+kind = "claude-code"
+command = ["bash"]
+login = "api-key"
+credential = "anthropic"
+
+[image]
+base = "default"
+
+[egress]
+# registry.npmjs.org: the allowed check (200). localtest.me resolves to
+# 127.0.0.1: allow-listed so the gateway's address rule refuses it (403).
+# Docker Hub's three hosts: the docker pull check.
+allow = [
+  "registry.npmjs.org",
+  "localtest.me",
+  "registry-1.docker.io",
+  "auth.docker.io",
+  "production.cloudflare.docker.com",
+]
+
+[idle]
+stop_after_mins = 30

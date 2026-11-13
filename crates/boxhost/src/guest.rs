@@ -201,6 +201,8 @@ struct Run {
     welcomed: AtomicBool,
     /// Ready was queued this run (G3: once per run).
     ready_sent: AtomicBool,
+    /// A `set_up: true` hello was welcomed this run (a restored guest, R14).
+    restored: AtomicBool,
     /// SETUP_NONE, SETUP_IN_FLIGHT or SETUP_DONE: one setup at a time, once.
     setup: AtomicU8,
     /// Generation of the welcomed events session (0: none yet).
@@ -420,6 +422,17 @@ impl VsockGuest {
             }
             _ => false,
         }
+    }
+
+    /// Ruling R14: the box's current run welcomed a `set_up: true` hello (a
+    /// guest restored from a snapshot, which never says Ready) and the agent
+    /// has not exited. Advisory: the guest's word, like `Started`.
+    pub fn restored(&self, id: &BoxId) -> bool {
+        self.run(id).is_some_and(|run| {
+            !run.stopped()
+                && run.restored.load(Ordering::SeqCst)
+                && !run.exited.load(Ordering::SeqCst)
+        })
     }
 
     /// Threads of all runs still alive (tests).
@@ -789,6 +802,9 @@ impl VsockGuest {
             return;
         }
         run.welcomed.store(true, Ordering::SeqCst);
+        if set_up {
+            run.restored.store(true, Ordering::SeqCst);
+        }
         if !set_up {
             let Some(g) = me.upgrade() else {
                 unclaim();
@@ -964,6 +980,7 @@ impl VmHooks for VsockGuest {
             exited: AtomicBool::new(false),
             welcomed: AtomicBool::new(false),
             ready_sent: AtomicBool::new(false),
+            restored: AtomicBool::new(false),
             setup: AtomicU8::new(SETUP_NONE),
             events_gen: AtomicU64::new(0),
             next_events_gen: AtomicU64::new(0),
@@ -1049,6 +1066,18 @@ impl GuestLink for VsockGuest {
         Err(GuestError::Unavailable(
             "the diff is read through the land book".into(),
         ))
+    }
+
+    fn last_error(&self, id: &BoxId) -> Option<String> {
+        VsockGuest::last_error(self, id)
+    }
+
+    fn restored(&self, id: &BoxId) -> bool {
+        VsockGuest::restored(self, id)
+    }
+
+    fn forget(&self, id: &BoxId) {
+        let _ = VsockGuest::forget(self, id);
     }
 }
 

@@ -15,6 +15,10 @@ pub mod audit_query;
 #[cfg(unix)]
 pub mod box_gateway;
 pub mod box_ops;
+// The guest channel's setup, the late gateway hook and the recording's
+// place for real boxes (plan 38, Task 8).
+#[cfg(unix)]
+pub mod box_setup;
 /// The system bus calls behind the locked-mode `UnitLauncher` (plan 35).
 #[cfg(target_os = "linux")]
 pub mod box_unit;

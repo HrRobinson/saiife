@@ -24,6 +24,25 @@ pub trait GuestLink: Send + Sync {
     fn prompt(&self, id: &BoxId, text: &str) -> Result<(), GuestError>;
     fn terminal(&self, id: &BoxId, after: Option<u64>) -> Result<TermBatch, GuestError>;
     fn diff(&self, id: &BoxId) -> Result<DiffSummary, GuestError>;
+
+    /// The last refused hello or failed setup of the box's current run
+    /// (guest-derived text: the caller sanitizes and caps it before keeping
+    /// it). The daemon copies it into a box's error at the boot timeout.
+    fn last_error(&self, _id: &BoxId) -> Option<String> {
+        None
+    }
+
+    /// The box's guest came back already set up (a restored snapshot: its
+    /// hello said `set_up: true` on this run) and its agent has not exited.
+    /// Advisory, like `Ready`: the daemon only acts on it for a box that
+    /// booted from a kept snapshot.
+    fn restored(&self, _id: &BoxId) -> bool {
+        false
+    }
+
+    /// Drop what is kept for a box that is gone (its last screen, its last
+    /// error). Nothing for a box whose run is still on.
+    fn forget(&self, _id: &BoxId) {}
 }
 
 /// The guest channel before its plan lands: every call is unavailable.

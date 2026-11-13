@@ -744,6 +744,20 @@ impl Manager {
         Ok(out)
     }
 
+    /// Add `note` to the box's `error` (`"<error>; <note>"`, or `note` alone).
+    /// The caller cleans and caps guest-derived text first.
+    pub fn note_error(&self, id: &BoxId, note: &str) -> Result<(), BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        r.error = Some(match r.error.take().filter(|e| !e.is_empty()) {
+            Some(e) => format!("{e}; {note}"),
+            None => note.to_string(),
+        });
+        r.updated_at = now;
+        g.put(r)
+    }
+
     /// Send and clear `r`'s pending prompt; a failure goes to `error`.
     fn send_pending(&self, r: &mut BoxRecord) {
         if let Some(p) = r.pending_prompt.take() {

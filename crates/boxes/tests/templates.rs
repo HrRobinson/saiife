@@ -287,3 +287,20 @@ fn non_regular_entries_are_skipped_before_opening() {
     assert_eq!(ws.len(), 1);
     assert!(ws[0].reason.contains("not a regular file"), "{ws:?}");
 }
+
+/// The plan 38 guest smoke's template is a valid template (bash as the
+/// agent, the smoke's egress hosts).
+#[test]
+fn guest_smoke_template_parses() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/box-smoke.d/templates/bash.toml"
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    let t = parse("bash", &text).unwrap();
+    assert_eq!(t.command, vec!["bash".to_string()]);
+    let hosts: Vec<&str> = t.egress.iter().map(|e| e.host.as_str()).collect();
+    assert!(hosts.contains(&"registry.npmjs.org"), "{hosts:?}");
+    assert!(hosts.contains(&"localtest.me"), "{hosts:?}");
+    assert!(t.egress.iter().all(|e| e.port == 443));
+}

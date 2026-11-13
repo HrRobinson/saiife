@@ -18,10 +18,17 @@
 //! box and sends no prompt a `Ready` held (R30). Every change is a `box` record
 //! with `extra = {action, box, template, from, to, via}` and `session =
 //! "box-<id>"`.
+//!
+//! Real boxes (plan 38) have the guest channel as the manager's guest: its
+//! events reach the manager through [`start_event_forwarder`] (`via:
+//! "guest"`), a box restored from its kept snapshot runs without a `Ready`
+//! once the channel says it is back (`via: "restore"`, R14), and a box the
+//! boot timeout ends keeps its guest's last error (R2).
 
 use crate::ops::{Conn, Ctx, Mode};
 use saiife_audit::{DecisionKind, Record};
 use saiife_boxes::capacity::{self, HostFacts};
+use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::{Change, Manager, SpawnArgs, MAX_REPO_BYTES};
 use saiife_boxes::source::{info, ManagerSource};
 use saiife_boxes::store::BoxRecord;
@@ -224,7 +231,14 @@ pub struct Built {
     pub audit: Arc<AuditLink>,
     /// The manager runs on the fake VM (a `fake-vmm` test build).
     pub fake: bool,
+    /// Real boxes only: what is wired once the daemon context exists (the
+    /// box gateway's hook, the guest event forwarder). Call it with the
+    /// context and the daemon's runtime before any box can boot.
+    pub on_ctx: Option<OnCtx>,
 }
+
+/// See [`Built::on_ctx`].
+pub type OnCtx = Box<dyn FnOnce(&Arc<Ctx>, &tokio::runtime::Handle) + Send>;
 
 /// The box manager, or why boxes are unavailable (`Ok(Err(why))`): (1) a
 /// `fake-vmm` build with `SAIIFE_BOX_FAKE_VMM=1` runs on the fake VM;
@@ -257,8 +271,13 @@ pub fn build_with(
 }
 
 /// The preflight, then `ChVmm` (personal: a child of the daemon; locked:
-/// the `saiife-box@` unit) with no guest channel yet (plan 38). Only in a
-/// build with the `boxes` feature (R38).
+/// the `saiife-box@` unit) with the guest channel ([`VsockGuest`], plan 38)
+/// as the manager's guest and, as VMM hooks, the audit hook, the box
+/// gateway (filled late by [`Built::on_ctx`]: it needs the daemon context;
+/// until then every boot fails) and the guest channel. Only in a build with
+/// the `boxes` feature (R38).
+///
+/// [`VsockGuest`]: saiife_boxhost::guest::VsockGuest
 #[cfg(all(target_os = "linux", feature = "boxes"))]
 fn build_real(
     state_dir: &Path,
@@ -266,8 +285,11 @@ fn build_real(
     config_path: &Path,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Result<Built, String>, String> {
+    use crate::box_setup::{cast_path, packs_dir, LateHooks, TemplateSetup};
     use saiife_boxes::store::Store;
+    use saiife_boxhost::guest::VsockGuest;
     use saiife_boxhost::preflight;
+    use saiife_boxhost::vmm::VmHooks;
 
     let layout = match crate::box_vmm::layout_for(state_dir, mode, env) {
         Ok(l) => l,
@@ -283,13 +305,29 @@ fn build_real(
     if let Err(why) = preflight::ready(&checks) {
         return Ok(Err(why));
     }
-    let audit = Arc::new(AuditLink::default());
-    let hooks: Vec<Arc<dyn saiife_boxhost::vmm::VmHooks>> = vec![Arc::new(
-        crate::box_vmm::AuditHooks::new(Arc::clone(&audit)),
-    )];
+    let vmm_uid = match crate::box_vmm::vmm_uid(&layout, mode) {
+        Ok(u) => u,
+        Err(why) => return Ok(Err(why)),
+    };
     // records in the daemon's own state dir, runtime dirs in the layout
-    // (R37): nothing the VMM can write is ever read as a record
+    // (R37): nothing the VMM can write is ever read as a record, and the
+    // terminal recording goes beside the record (R15)
     let records = dir_in(state_dir);
+    let cast_store = Store::open(records.clone()).map_err(|e| e.to_string())?;
+    let setups = TemplateSetup::new(packs_dir(config_path));
+    let guest = VsockGuest::with_cast_path(
+        setups.clone(),
+        *mode == Mode::Locked,
+        vmm_uid,
+        cast_path(cast_store),
+    );
+    let audit = Arc::new(AuditLink::default());
+    let gateway = LateHooks::new();
+    let hooks: Vec<Arc<dyn VmHooks>> = vec![
+        Arc::new(crate::box_vmm::AuditHooks::new(Arc::clone(&audit))),
+        gateway.clone(),
+        guest.clone(),
+    ];
     let vmm = match crate::box_vmm::real_vmm_with(&layout, &records, mode, hooks, env) {
         Ok(v) => v,
         Err(why) => return Ok(Err(why)),
@@ -298,15 +336,28 @@ fn build_real(
     // the disks are in the runtime dirs
     let root = layout.boxes.clone();
     let prev = Mutex::new(None);
-    open_manager(
+    let mut built = open_manager(
         store,
         vmm,
-        Arc::new(saiife_boxes::guest::NoGuest),
+        guest.clone(),
         Arc::new(move || host_facts(&root, &prev)),
         (mode, config_path, env),
         (audit, false),
-    )
-    .map(Ok)
+    )?;
+    setups.attach(&built.manager);
+    built.on_ctx = Some(Box::new(move |ctx, rt| {
+        use crate::box_gateway::{GatewayConfig, GatewayHooks, SystemResolve};
+        let hooks = GatewayHooks::new(
+            Arc::clone(ctx),
+            rt.clone(),
+            Arc::new(SystemResolve::new()),
+            GatewayConfig::default(),
+        );
+        gateway.fill(hooks);
+        let _in_rt = rt.enter();
+        start_event_forwarder(Arc::clone(ctx), guest);
+    }));
+    Ok(Ok(built))
 }
 
 /// Without real boxes: plan 34's answer; on Linux it says the build has
@@ -368,6 +419,7 @@ fn open_manager(
         changes: opened.changes,
         audit,
         fake,
+        on_ctx: None,
     })
 }
 
@@ -525,8 +577,134 @@ async fn fake_ready(ctx: &Ctx) {
     .await
     .unwrap_or_default();
     for id in starting {
-        let _ = guest_event(ctx, id, saiife_boxes::guest::GuestEvent::Ready).await;
+        let _ = guest_event(ctx, id, GuestEvent::Ready).await;
     }
+}
+
+/// Where the forwarder reads guest events from: the guest channel
+/// (`saiife_boxhost::guest::VsockGuest`) of real boxes, a stub in tests.
+pub trait GuestEvents: Send + Sync + 'static {
+    /// Waits up to `timeout` for events, then returns all queued ones.
+    fn recv_events(&self, timeout: Duration) -> Vec<(BoxId, GuestEvent)>;
+}
+
+/// The forwarder's wait for events per round.
+pub const FORWARD_WAIT: Duration = Duration::from_secs(1);
+/// What a box's error says when its agent exited before it was ready.
+pub const EXITED_WHILE_STARTING: &str = "the agent exited before it was ready";
+/// Guest-derived text kept in a box's error, in bytes.
+pub const MAX_GUEST_NOTE: usize = 512;
+
+/// Real boxes: forward the guest channel's events to the manager, each
+/// through [`guest_event`]'s rules (lockdown holds a `Ready`'s prompt, R30),
+/// one `box` record (`via: "guest"`) per change. The wait runs on the
+/// blocking pool; the task holds the context weakly and ends with it (or
+/// with the runtime). Never beside the fake VM's `fake_ready`: the fake
+/// path has no guest channel. No manager, no task.
+pub fn start_event_forwarder(ctx: Arc<Ctx>, guest: Arc<dyn GuestEvents>) {
+    if ctx.box_manager.is_none() {
+        return;
+    }
+    let weak = Arc::downgrade(&ctx);
+    drop(ctx);
+    tokio::spawn(async move {
+        loop {
+            let g = Arc::clone(&guest);
+            let Ok(events) = tokio::task::spawn_blocking(move || g.recv_events(FORWARD_WAIT)).await
+            else {
+                break;
+            };
+            let Some(ctx) = weak.upgrade() else { break };
+            for (id, ev) in events {
+                forward(&ctx, id, ev).await;
+            }
+        }
+    });
+}
+
+/// One guest event. A stale one (the box moved on or is gone) is dropped.
+/// An `Exited` while the box is still starting (a guest init that came up
+/// set up but without its agent: R10) stops the box instead of leaving it
+/// to the boot timeout, which would destroy its VM.
+async fn forward(ctx: &Ctx, id: BoxId, ev: GuestEvent) {
+    match guest_event_via(ctx, id.clone(), ev, "guest").await {
+        Ok(_) => {}
+        Err(BoxError::WrongState {
+            state: BoxState::Starting,
+        }) if ev == GuestEvent::Exited => exited_while_starting(ctx, id).await,
+        Err(BoxError::WrongState { .. } | BoxError::NotFound) => {}
+        Err(e) => eprintln!(
+            "saiifed: boxes: {}: a guest event was not taken: {e}",
+            id.as_str()
+        ),
+    }
+}
+
+/// A starting box whose agent exited: stopped (Done, its disks kept), with
+/// [`EXITED_WHILE_STARTING`] in its error and a `box` record (`via: "guest"`).
+async fn exited_while_starting(ctx: &Ctx, id: BoxId) {
+    let Some(mgr) = ctx.box_manager.clone() else {
+        return;
+    };
+    let done = blocking(move || {
+        if mgr.get(&id)?.state != BoxState::Starting {
+            return Ok(None);
+        }
+        let mut c = mgr.stop(&id, false)?;
+        c.why = "agent exited while starting";
+        mgr.note_error(&id, EXITED_WHILE_STARTING)?;
+        let template = mgr.get(&id).ok().map(|r| r.template);
+        Ok(Some((c, template)))
+    })
+    .await;
+    match done {
+        Ok(Some(c)) => write_tick_records(ctx, vec![c], "guest").await,
+        Ok(None) => {}
+        Err(e) => eprintln!("saiifed: boxes: a box whose agent exited was not stopped: {e}"),
+    }
+}
+
+/// Guest-derived text for a box's error: `guest: <text>`, cleaned and cut
+/// to [`MAX_GUEST_NOTE`] bytes.
+fn guest_note(text: &str) -> String {
+    let mut t = saiife_audit::text::sanitize(text);
+    if t.len() > MAX_GUEST_NOTE {
+        let mut n = MAX_GUEST_NOTE;
+        while !t.is_char_boundary(n) {
+            n -= 1;
+        }
+        t.truncate(n);
+    }
+    format!("guest: {t}")
+}
+
+/// R14: a box booted from its kept snapshot gets no `Ready` (its guest was
+/// set up before and says hello `set_up: true`). Once the guest channel
+/// says it is back with its agent alive, such a starting box runs, through
+/// [`guest_event`] (`via: "restore"`): its held prompt goes out unless
+/// lockdown holds it. Returns how many boxes moved.
+async fn promote_restored(ctx: &Ctx) -> usize {
+    let Some(mgr) = ctx.box_manager.clone() else {
+        return 0;
+    };
+    let ids = tokio::task::spawn_blocking(move || {
+        let g = mgr.guest();
+        mgr.list()
+            .into_iter()
+            .filter(|r| r.state == BoxState::Starting && r.vm_on && r.keep)
+            .map(|r| r.id)
+            .filter(|id| g.restored(id))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let mut n = 0;
+    for id in ids {
+        if let Ok(Some(_)) = guest_event_via(ctx, id, GuestEvent::Ready, "restore").await {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// What a box op answers without a manager: the failed preflight's detail,
@@ -546,10 +724,17 @@ fn locked_all(ctx: &Ctx) -> bool {
 /// it is a state change. Under lockdown `all` a `Ready` keeps the box's
 /// pending prompt unsent; the first tick after lockdown lifts sends it
 /// (R30). Every guest event the daemon takes comes through here.
-pub async fn guest_event(
+pub async fn guest_event(ctx: &Ctx, id: BoxId, ev: GuestEvent) -> Result<Option<Change>, BoxError> {
+    guest_event_via(ctx, id, ev, "tick").await
+}
+
+/// [`guest_event`] with the record's `via` (`"guest"` from the guest
+/// channel, `"restore"` for a restored box).
+pub async fn guest_event_via(
     ctx: &Ctx,
     id: BoxId,
-    ev: saiife_boxes::guest::GuestEvent,
+    ev: GuestEvent,
+    via: &'static str,
 ) -> Result<Option<Change>, BoxError> {
     let Some(mgr) = ctx.box_manager.clone() else {
         return Err(BoxError::Unavailable(unavailable(ctx).into()));
@@ -562,7 +747,7 @@ pub async fn guest_event(
     })
     .await?;
     if let Some(c) = &c {
-        write_tick_records(ctx, vec![(c.clone(), template)]).await;
+        write_tick_records(ctx, vec![(c.clone(), template)], via).await;
     }
     Ok(c)
 }
@@ -578,6 +763,16 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
     let admit = !locked_all(ctx);
     let done = tokio::task::spawn_blocking(move || {
         let changes = mgr.tick_with(admit);
+        // R2: a box the boot timeout ended keeps why its guest failed
+        // (a refused hello, a failed setup), cleaned and capped.
+        let guest = mgr.guest();
+        for c in changes.iter().filter(|c| c.why == "boot timed out") {
+            if let Some(e) = guest.last_error(&c.id) {
+                if let Err(e) = mgr.note_error(&c.id, &guest_note(&e)) {
+                    eprintln!("saiifed: boxes: {}: {e}", c.id.as_str());
+                }
+            }
+        }
         changes
             .into_iter()
             .map(|c| {
@@ -595,15 +790,16 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
         }
     };
     let n = changes.len();
-    write_tick_records(ctx, changes).await;
-    n
+    write_tick_records(ctx, changes, "tick").await;
+    n + promote_restored(ctx).await
 }
 
-/// The daemon's own `box` records (`action`/`via` "tick", `reason` = why),
-/// one per change, each with the box's template when it is still known.
-async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
+/// The daemon's own `box` records (`action` "tick", `via` = who moved the
+/// box: `"tick"`, `"guest"`, `"restore"`; `reason` = why), one per change,
+/// each with the box's template when it is still known.
+async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>, via: &str) {
     for (c, template) in changes {
-        let rec = tick_record(ctx, &c, template.as_deref());
+        let rec = tick_record(ctx, &c, template.as_deref(), via);
         if let Err(e) = ctx.writer.append(rec).await {
             eprintln!("saiifed: warning: cannot write a box tick record: {e}");
         }
@@ -611,7 +807,7 @@ async fn write_tick_records(ctx: &Ctx, changes: Vec<(Change, Option<String>)>) {
 }
 
 /// One daemon-made change as its `box` record.
-fn tick_record(ctx: &Ctx, c: &Change, template: Option<&str>) -> Record {
+fn tick_record(ctx: &Ctx, c: &Change, template: Option<&str>, via: &str) -> Record {
     let mut rec = box_rec(
         ctx,
         "tick",
@@ -619,7 +815,7 @@ fn tick_record(ctx: &Ctx, c: &Change, template: Option<&str>) -> Record {
         template,
         Some(c.from),
         Some(c.to),
-        "tick",
+        via,
     );
     rec.reason = Some(c.why.to_string());
     rec
@@ -637,7 +833,7 @@ pub fn change_records(ctx: &Ctx, changes: &[Change]) -> Vec<Record> {
                 .as_ref()
                 .and_then(|m| m.get(&c.id).ok())
                 .map(|r| r.template);
-            tick_record(ctx, c, template.as_deref())
+            tick_record(ctx, c, template.as_deref(), "tick")
         })
         .collect()
 }
@@ -1057,7 +1253,7 @@ async fn run(
                 Ok((r, answer, others))
             })
             .await?;
-            write_tick_records(ctx, others).await;
+            write_tick_records(ctx, others, "tick").await;
             let mut rec = box_rec(
                 ctx,
                 "spawn",
@@ -1129,7 +1325,14 @@ async fn run(
         Op::Resume(i) => change("resume", Box::new(move |m| m.resume(&i))).await,
         Op::Revise(i, text) => change("revise", Box::new(move |m| m.revise(&i, &text))).await,
         Op::Discard(i) => {
+            let gone = i.clone();
             let (_, rec) = change("discard", Box::new(move |m| m.discard(&i))).await?;
+            // its run is stopped: the guest channel drops its last screen
+            blocking(move || {
+                m.guest().forget(&gone);
+                Ok(())
+            })
+            .await?;
             let b = before.ok_or(BoxError::NotFound)?;
             Ok((under("box", &json!({"id": b.id.as_str()})), rec))
         }
@@ -1175,8 +1378,15 @@ async fn run(
             // gc goes on past a box it cannot remove (R31): the answer and
             // the record list every id removed, plus the first error.
             let (removed, error) = blocking(move || {
+                let forget = |removed: &[BoxId]| {
+                    let g = m.guest();
+                    for i in removed {
+                        g.forget(i);
+                    }
+                };
                 if c.privileged {
                     let g = m.gc();
+                    forget(&g.removed);
                     return Ok((g.removed, g.error));
                 }
                 // Only the caller's own discarded boxes; orphan dirs have no
@@ -1197,6 +1407,7 @@ async fn run(
                         removed.push(i);
                     }
                 }
+                forget(&removed);
                 Ok((removed, error))
             })
             .await?;

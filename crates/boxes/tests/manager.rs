@@ -1372,3 +1372,23 @@ fn tick_retries_a_failed_discard_destroy() {
     );
     assert_eq!(count(&w, &a, VmOp::Destroy), 2);
 }
+
+#[test]
+fn note_error_appends() {
+    let w = world(1);
+    let b = w.spawn("t").id;
+    w.mgr.note_error(&b, "guest: setup failed").unwrap();
+    assert_eq!(
+        w.mgr.get(&b).unwrap().error.as_deref(),
+        Some("guest: setup failed")
+    );
+    w.mgr.note_error(&b, "more").unwrap();
+    assert_eq!(
+        w.mgr.get(&b).unwrap().error.as_deref(),
+        Some("guest: setup failed; more")
+    );
+    assert!(matches!(
+        w.mgr.note_error(&id("b99"), "x"),
+        Err(BoxError::NotFound)
+    ));
+}

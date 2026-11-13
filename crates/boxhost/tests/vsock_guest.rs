@@ -828,3 +828,51 @@ fn failed_setup_allows_retry() {
     assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
     g.after_off(&b1());
 }
+
+/// Ruling R14 (plan 38, Task 8): a set_up:true hello on a fresh run never
+/// yields Ready, but the daemon can ask whether the guest came back set up
+/// with its agent alive (a restored snapshot); an Exited ends that.
+#[test]
+fn restored_is_a_set_up_hello_without_exit() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    assert!(!GuestLink::restored(&*g, &b1()), "no hello yet");
+    let mut s = w.hello(true);
+    wait_for("restored", T, || GuestLink::restored(&*g, &b1()));
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Exited { code: None }).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Exited]);
+    assert!(!GuestLink::restored(&*g, &b1()), "the agent exited");
+    g.after_off(&b1());
+    assert!(!GuestLink::restored(&*g, &b1()), "the run is off");
+}
+
+#[test]
+fn a_fresh_setup_is_not_restored() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    assert!(!GuestLink::restored(&*g, &b1()));
+    g.after_off(&b1());
+}
+
+/// The trait's last_error and forget reach the VsockGuest's own.
+#[test]
+fn guest_link_last_error_and_forget() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Err("no such template".into()));
+    let _s = w.hello(false);
+    wait_for("setup error", T, || {
+        GuestLink::last_error(&*g, &b1()).is_some()
+    });
+    assert!(GuestLink::last_error(&*g, &b1())
+        .unwrap()
+        .contains("no such template"));
+    GuestLink::forget(&*g, &b1());
+    assert!(g.last_error(&b1()).is_some(), "kept while the run is on");
+    g.after_off(&b1());
+    GuestLink::forget(&*g, &b1());
+    assert_eq!(GuestLink::last_error(&*g, &b1()), None);
+}
