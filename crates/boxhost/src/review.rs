@@ -689,9 +689,10 @@ pub fn render(
     (full, files)
 }
 
-/// L6: the built-in protected paths. Each component is compared in its
-/// [`normalize_component`] spelling (R-T3i: letter case, trailing dots and
-/// spaces, combining marks and Unicode look-alike letters folded, as a
+/// L6: the built-in protected paths. Each component is compared by
+/// [`normalize_component`], the one comparison key shared with the delta
+/// validator's symlink checks and `.git` alias check (R-T3i, R-T3l:
+/// decomposition, full case fold, combining marks dropped, as a
 /// case-insensitive or normalising checkout would resolve them).
 /// - rooted: `.claude/**`, `.saiife/**`, `.vscode/**`, `.devcontainer/**`,
 ///   `.husky/**`, `.cursor/**`, `.gemini/**`, `.codex/**`, `.gitlab/**`,
@@ -751,7 +752,7 @@ pub fn protected(path: &str) -> bool {
 }
 
 /// A path in the spelling case collisions and symlink prefixes are
-/// compared in (R-T3i).
+/// compared in: [`fold_path`], the shared key (R-T3i, R-T3l).
 fn fold(p: &str) -> String {
     fold_path(p)
 }

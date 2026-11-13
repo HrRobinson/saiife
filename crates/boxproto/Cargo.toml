@@ -19,6 +19,9 @@ sha2 = "0.10"
 # The shared sanitizer predicate (plan 39 R-P8): delta paths and symlink
 # targets with control, bidi or invisible chars are refused.
 saiife-wire = { path = "../wire" }
+# R-T3l: path components must be NFC, and the one comparison key folds
+# canonical decompositions.
+unicode-normalization = "=0.1.25"
 
 [lints]
 workspace = true

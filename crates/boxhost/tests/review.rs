@@ -676,6 +676,12 @@ fn flags_protected_and_hits() {
         ".\u{17F}aiife/x",
         ".gem\u{131}n\u{130}/settings.json",
         ".G\u{131}tattributes",
+        // R-T3l: the shared key (decomposition, full case fold).
+        ".G\u{130}THUB/workflows/ci.yml",
+        "CL\u{C1}UDE.md",
+        "sub/AG\u{C9}NTS.MD",
+        ".\u{17F}AIIFE/x",
+        ".gi\u{301}tmodules",
         // R-T3j.
         ".vscode/tasks.json",
         ".devcontainer/devcontainer.json",
@@ -772,6 +778,25 @@ fn case_collision_is_flagged() {
         vec![Flag {
             path: "readme.md".into(),
             why: "differs only in case or accents from README.md".into()
+        }]
+    );
+}
+
+#[test]
+fn full_case_fold_collision_is_flagged() {
+    // R-T3l: the collision flag folds with the shared key: `STRASSE.md`
+    // and `stra\u{DF}e.md` are one name on a case-insensitive host.
+    let w = World::new();
+    let t0 = with(&base_tree(), &[("STRASSE.md", Some(C::f(b"a\n")))]);
+    let b0 = manifest(&t0);
+    let t1 = with(&t0, &[("stra\u{DF}e.md", Some(C::f(b"b\n")))]);
+    let v = w.land(&b0, 1, &t0, &t1);
+    let r = review(&b1(), &b0, &v, &w.blobs(1), None, &no_hits);
+    assert_eq!(
+        r.flags,
+        vec![Flag {
+            path: "stra\u{DF}e.md".into(),
+            why: "differs only in case or accents from STRASSE.md".into()
         }]
     );
 }
@@ -1156,6 +1181,24 @@ fn subset_through_folded_symlink_is_refused() {
     };
     let e = check_subset(&b0, &v, Some(&set(&[p]))).unwrap_err();
     assert!(e.contains("through a symlink"), "{e}");
+    // R-T3l: full case fold and a base link committed decomposed.
+    let t0 = with(
+        &base_tree(),
+        &[
+            ("strasse", Some(C::l("src"))),
+            ("\u{3C3}\u{3C3}", Some(C::l("src"))),
+            ("Cafe\u{301}", Some(C::l("src"))),
+        ],
+    );
+    let b0 = manifest(&t0);
+    for p in ["STRA\u{1E9E}E/x", "\u{3C3}\u{3C2}/x", "CAF\u{C9}/x"] {
+        let v = Valid {
+            n: 1,
+            entries: vec![add_head(p, &C::f(b"x\n"))],
+        };
+        let e = check_subset(&b0, &v, Some(&set(&[p]))).unwrap_err();
+        assert!(e.contains("through a symlink"), "{p}: {e}");
+    }
 }
 
 #[test]

@@ -1,8 +1,9 @@
 //! Plan 39 Task 1: the delta validator treats the guest as hostile.
 
 use saiife_boxproto::delta::{
-    apply_manifest, write_delta, BlobSink, DeltaError, DeltaItem, EntryHead, Limits, Op, Reader,
-    Valid, BASE_MISMATCH, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEAD_BYTES, MAX_TOTAL_BYTES,
+    apply_manifest, fold_path, is_git_alias, normalize_component, write_delta, BlobSink,
+    DeltaError, DeltaItem, EntryHead, Limits, Op, Reader, Valid, BASE_MISMATCH, MAX_DEPTH,
+    MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEAD_BYTES, MAX_TOTAL_BYTES,
 };
 use saiife_boxproto::frame::{read_frame, Frame};
 use saiife_boxproto::manifest::{BaseManifest, Entry, EntryKind};
@@ -984,9 +985,10 @@ fn write_through_symlink_case_folded() {
     let e = refused(&[add_link("docs2", "docs"), add("doc\u{17F}2/x", b"x")]);
     assert_eq!(e.path.as_deref(), Some("doc\u{17F}2/x"));
     assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+    // R-T3l: a Kelvin-sign link name is not NFC, so it is refused itself.
     let e = refused(&[add("link/x", b"x"), add_link("lin\u{212A}", "docs")]);
-    assert_eq!(e.path.as_deref(), Some("link/x"));
-    assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+    assert_eq!(e.path.as_deref(), Some("lin\u{212A}"));
+    assert!(e.reason.contains("not in Unicode NFC form"), "{e:?}");
 }
 
 #[test]
@@ -1012,22 +1014,167 @@ fn write_through_symlink_unicode_fold_in_base() {
         "l\u{0301}inks/x",
         "l\u{0301}n/x",
     ] {
-        let mut sink = Sink::default();
-        let mut r = Reader::new(&b, Limits::default(), &mut sink);
-        let mut res = Ok(false);
-        for f in frames(&encode(&[add(p, b"x")])) {
-            res = r.push(f);
-            if res.is_err() {
-                break;
-            }
-        }
-        let e = match res {
-            Err(e) => e,
-            Ok(_) => r.finish().expect_err(p),
-        };
+        let e = refused_on(&b, &[add(p, b"x")]);
         assert_eq!(e.path.as_deref(), Some(p), "{e:?}");
-        assert!(e.reason.contains("symlink in the base"), "{p}: {e:?}");
+        // R-T3l: the Kelvin sign and decomposed spellings are not NFC, so
+        // they are refused before the symlink check sees them.
+        assert!(
+            e.reason.contains("symlink in the base") || e.reason.contains("not in Unicode NFC"),
+            "{p}: {e:?}"
+        );
     }
+}
+
+/// Runs `items` against base `b` through `finish`, expecting a refusal.
+fn refused_on(b: &BaseManifest, items: &[Item]) -> DeltaError {
+    let mut sink = Sink::default();
+    let mut r = Reader::new(b, Limits::default(), &mut sink);
+    for f in frames(&encode(items)) {
+        if let Err(e) = r.push(f) {
+            return e;
+        }
+    }
+    r.finish().expect_err("refused")
+}
+
+fn with_links(names: &[&str]) -> BaseManifest {
+    let mut b = base();
+    for name in names {
+        b.entries.insert(
+            name.to_string(),
+            Entry {
+                kind: EntryKind::Symlink,
+                mode: 0,
+                size: 4,
+                sha256: sha(b"docs"),
+            },
+        );
+    }
+    b
+}
+
+#[test]
+fn non_nfc_components_are_refused() {
+    // R-T3l: a component that is not already NFC, in a path or a symlink
+    // target's named component.
+    for p in [
+        "Do\u{301}cs/x",
+        "re\u{301}sume\u{301}.md",
+        "sub/\u{212A}elvin",
+        "\u{212B}ngstrom",
+        "\u{30D5}\u{309A}.txt",
+    ] {
+        assert_refused(&[add(p, b"x")], p, "not in Unicode NFC form");
+    }
+    for t in ["Do\u{301}cs", "sub/\u{212A}it"] {
+        let e = refused(&[add_link("l2", t)]);
+        assert_eq!(e.path.as_deref(), Some("l2"), "{t}");
+        assert!(e.reason.contains("symlink target"), "{t}: {e:?}");
+        assert!(e.reason.contains("not in Unicode NFC form"), "{t}: {e:?}");
+    }
+    // The guest text in the reason is escaped like every other.
+    let e = refused(&[add("Do\u{301}cs", b"x")]);
+    assert!(!e.reason.contains('\u{301}'), "{e:?}");
+}
+
+#[test]
+fn nfc_i18n_names_are_accepted() {
+    let mut items = vec![
+        add("na\u{EF}ve/\u{FC}ber.txt", b"1"),
+        add("r\u{E9}sum\u{E9}.md", b"2"),
+        add(
+            "\u{65E5}\u{672C}\u{8A9E}/\u{30D5}\u{30A1}\u{30A4}\u{30EB}.txt",
+            b"3",
+        ),
+        add("\u{3A3}\u{3C3}\u{3C2}.txt", b"4"),
+        add("stra\u{DF}e.md", b"5"),
+        add_link("l\u{E9}", "r\u{E9}sum\u{E9}.md"),
+    ];
+    items.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    let v = run(&items).unwrap();
+    assert_eq!(v.entries.len(), 6);
+}
+
+#[test]
+fn write_through_symlink_full_case_fold() {
+    // R-T3l: base symlinks `Docs`, `kit`, `strasse`, `\u{3C3}\u{3C3}` and a
+    // decomposed (macOS-committed, unchecked) `Cafe\u{301}`. Every spelling
+    // a case-insensitive, normalising host resolves to one of them is
+    // refused: as non-NFC, or as going through the symlink.
+    let b = with_links(&["Docs", "kit", "strasse", "\u{3C3}\u{3C3}", "Cafe\u{301}"]);
+    for (p, why) in [
+        ("docs/x", "symlink in the base"),
+        ("DOCS/x", "symlink in the base"),
+        ("dOcS/deep/x", "symlink in the base"),
+        ("Do\u{301}cs/x", "not in Unicode NFC form"),
+        ("\u{212A}it/x", "not in Unicode NFC form"),
+        ("KIT/x", "symlink in the base"),
+        ("stra\u{DF}e/x", "symlink in the base"),
+        ("STRA\u{1E9E}E/x", "symlink in the base"),
+        ("\u{3C3}\u{3C2}/x", "symlink in the base"),
+        ("\u{3A3}\u{3A3}/x", "symlink in the base"),
+        ("Caf\u{E9}/x", "symlink in the base"),
+        ("CAF\u{C9}/x", "symlink in the base"),
+    ] {
+        let e = refused_on(&b, &[add(p, b"x")]);
+        assert_eq!(e.path.as_deref(), Some(p), "{e:?}");
+        assert!(e.reason.contains(why), "{p}: {e:?}");
+    }
+    // The same through symlinks the delta adds.
+    for (link, p) in [
+        ("strasse2", "stra\u{DF}e2/x"),
+        ("\u{3C3}\u{3C3}2", "\u{3C3}\u{3C2}2/x"),
+        ("Docs2", "docs2/x"),
+    ] {
+        let mut items = vec![add_link(link, "docs"), add(p, b"x")];
+        items.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+        let e = refused(&items);
+        assert_eq!(e.path.as_deref(), Some(p), "{e:?}");
+        assert!(e.reason.contains("symlink in the delta"), "{p}: {e:?}");
+    }
+}
+
+#[test]
+fn one_comparison_key() {
+    // R-T3l: fold_path and is_git_alias both go through normalize_component.
+    for (a, b) in [
+        ("STRA\u{1E9E}E", "strasse"),
+        ("stra\u{DF}e", "strasse"),
+        ("\u{3C3}\u{3C2}", "\u{3C3}\u{3C3}"),
+        ("\u{212A}it", "kit"),
+        ("\u{17F}rc", "src"),
+        ("\u{130}NDEX", "index"),
+        ("\u{131}ndex", "index"),
+        ("\u{212B}ngstr\u{F6}m", "angstrom"),
+        ("Caf\u{E9}", "cafe"),
+        ("Cafe\u{301}", "cafe"),
+        ("\u{1E9B}", "s"),
+    ] {
+        assert_eq!(normalize_component(a), normalize_component(b), "{a}");
+        assert_eq!(normalize_component(a), b, "{a}");
+    }
+    assert_eq!(
+        fold_path("Docs/STRA\u{1E9E}E/\u{3A3}\u{3C2}.md"),
+        "docs/strasse/\u{3C3}\u{3C3}.md"
+    );
+    for c in [
+        ".G\u{130}T",
+        ".g\u{131}t",
+        ".GI\u{301}T",
+        ".G\u{CD}T",
+        "G\u{CD}T~1",
+    ] {
+        assert!(is_git_alias(c), "{c}");
+    }
+    assert!(!is_git_alias(".gist"));
+    // `.G\u{130}T` is NFC, so it reaches the alias check and is refused
+    // there.
+    assert_refused(
+        &[add(".G\u{130}T/config", b"x")],
+        ".G\u{130}T/config",
+        ".git",
+    );
+    assert_refused(&[add(".G\u{CD}T", b"x")], ".G\u{CD}T", ".git");
 }
 
 #[test]

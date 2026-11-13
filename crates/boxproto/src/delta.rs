@@ -27,14 +27,15 @@
 //! none ends in a dot or a space, none contains any of `<>:"|?*` (so no
 //! NTFS stream such as `a::$DATA`), and none is shaped like an 8.3 short
 //! name (the part before the first `.` is 1 to 6 chars, `~`, then digits,
-//! as in `CLAUDE~1.MD`). The same rules apply to every named component of a
+//! as in `CLAUDE~1.MD`), and every component is already in Unicode NFC
+//! form (R-T3l). The same rules apply to every named component of a
 //! symlink target. Case-only collisions are not refused here (Task 3 flags
 //! them).
 //!
 //! No path may go through a symlink, in the base or in the delta, compared
-//! in their [`fold_path`] spelling (R-T1e, R-T3i: case, trailing dots and
-//! spaces, combining marks and look-alike letters folded). So a directory and a symlink never swap
-//! in one delta, either way: deleting the symlink `ln` and adding `ln/x` is
+//! in their [`fold_path`] spelling (R-T1e, R-T3i, R-T3l: canonical
+//! decomposition, full case fold, combining marks dropped). So a directory
+//! and a symlink never swap in one delta, either way: deleting the symlink `ln` and adding `ln/x` is
 //! refused, and so is adding the symlink `docs` while deleting `docs/a`.
 //!
 //! Every reason is free of unsafe chars: guest text in it (paths, targets,
@@ -56,6 +57,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::ops::Bound;
+use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 /// L2: the most entries one delta may carry.
 pub const MAX_ENTRIES: usize = 20_000;
@@ -306,26 +308,39 @@ fn is_combining(c: char) -> bool {
         0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
 }
 
-/// R-T3i: the one spelling of a path component that case-insensitive,
-/// normalising hosts (NTFS, HFS+, APFS) may treat as the same name:
-/// trailing dots and spaces stripped, combining marks dropped, the Kelvin
-/// sign, long s, dotted and dotless i and the Angstrom sign mapped to
-/// their letters, then Unicode lowercase. Shared by the `.git` alias check
-/// here, the guest's export and the host's protected-path list.
+/// R-T3i, R-T3l: the one comparison key of a path component, the spelling
+/// case-insensitive, normalising hosts (NTFS, HFS+, APFS) may treat as the
+/// same name. Every comparison of names goes through it: [`fold_path`] (the
+/// symlink write-through checks), [`is_git_alias`] (here and in the guest's
+/// export) and the host's protected-path list and case-collision flag.
+///
+/// In order:
+/// 1. trailing dots and spaces stripped (refused anyway, R-T3h);
+/// 2. canonical decomposition (NFD), so a precomposed and a decomposed
+///    spelling meet (delta paths are NFC, but base paths are not checked
+///    and may be NFD, as a macOS checkout commits them);
+/// 3. full case fold: Unicode lowercase, then `ß` → `ss` (`ẞ` lowercases to
+///    `ß`), `ς` → `σ`, the Kelvin sign → `k`, long s → `s`, dotted and
+///    dotless i → `i`, the Angstrom sign → `å`;
+/// 4. decomposed again, then the combining marks dropped (over-folding
+///    only refuses or flags more);
+/// 5. trailing dots and spaces stripped again, in case a mark hid one.
 pub fn normalize_component(c: &str) -> String {
-    let mut out = String::with_capacity(c.len());
-    for ch in c.trim_end_matches(['.', ' ']).chars() {
-        if is_combining(ch) {
-            continue;
-        }
-        match ch {
-            '\u{212A}' => out.push('k'),
-            '\u{017F}' => out.push('s'),
-            '\u{0130}' | '\u{0131}' => out.push('i'),
-            '\u{212B}' => out.push('\u{E5}'),
-            c => out.extend(c.to_lowercase()),
+    let mut cased = String::with_capacity(c.len());
+    for ch in c.trim_end_matches(['.', ' ']).nfd() {
+        for l in ch.to_lowercase() {
+            match l {
+                '\u{DF}' => cased.push_str("ss"),
+                '\u{3C2}' => cased.push('\u{3C3}'),
+                '\u{212A}' => cased.push('k'),
+                '\u{017F}' => cased.push('s'),
+                '\u{0130}' | '\u{0131}' => cased.push('i'),
+                '\u{212B}' => cased.push('\u{E5}'),
+                l => cased.push(l),
+            }
         }
     }
+    let mut out: String = cased.nfd().filter(|&ch| !is_combining(ch)).collect();
     // A mark after a trailing dot hid the dot from the first trim.
     let t = out.trim_end_matches(['.', ' ']).len();
     out.truncate(t);
@@ -366,8 +381,13 @@ fn is_short_name(c: &str) -> bool {
         && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// R-T3h: a component no host may read as a different name.
+/// R-T3h, R-T3l: a component no host may read as a different name; it
+/// must also already be NFC, so precomposed and decomposed spellings of one
+/// name never both reach a checkout.
 fn check_spelling(c: &str) -> Result<(), String> {
+    if !is_nfc(c) {
+        return Err(format!("component {c:?} is not in Unicode NFC form"));
+    }
     if c.ends_with(['.', ' ']) {
         return Err(format!("component {c:?} ends with a dot or a space"));
     }
