@@ -93,6 +93,10 @@ pub enum BoxAction {
     },
 }
 
+/// The table and JSON output of the box commands, for `box image` too.
+#[cfg(unix)]
+pub(crate) use imp::{ascii_json, disk, render};
+
 #[cfg(not(unix))]
 pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
     let _ = (config, action);
@@ -357,6 +361,7 @@ mod imp {
             return match crate::box_image_cmd::run(config, action) {
                 Ok(()) => Ok(()),
                 Err(crate::box_image_cmd::Fail::Failed(m)) => Err(Stop::Failed(m)),
+                Err(crate::box_image_cmd::Fail::Refused(m)) => Err(Stop::Refused(m)),
                 Err(crate::box_image_cmd::Fail::Unavailable(m)) => Err(Stop::Unavailable(m)),
             };
         }
@@ -498,7 +503,7 @@ mod imp {
     }
 
     /// Allocated MiB as `412M`, or `3.1G` from 1 GiB.
-    pub(super) fn disk(mib: u64) -> String {
+    pub(crate) fn disk(mib: u64) -> String {
         if mib < 1024 {
             format!("{mib}M")
         } else {
@@ -525,7 +530,7 @@ mod imp {
 
     /// A table as lines: columns padded to the widest cell, the last one
     /// not padded. A row's trailer, if any, is a line under it.
-    pub(super) fn render(head: &[&str], rows: &[(Vec<String>, Option<String>)]) -> Vec<String> {
+    pub(crate) fn render(head: &[&str], rows: &[(Vec<String>, Option<String>)]) -> Vec<String> {
         let mut w: Vec<usize> = head.iter().map(|h| h.chars().count()).collect();
         for (r, _) in rows {
             for (i, c) in r.iter().enumerate() {
@@ -601,7 +606,7 @@ mod imp {
     /// `v` as JSON with every non-ASCII character of a string written as
     /// `\uXXXX` (a surrogate pair above the BMP): same data, and a bidi or
     /// format character from the daemon never reaches the terminal raw.
-    pub(super) fn ascii_json(v: &Value) -> String {
+    pub(crate) fn ascii_json(v: &Value) -> String {
         use serde::Serialize;
         struct Ascii;
         impl serde_json::ser::Formatter for Ascii {

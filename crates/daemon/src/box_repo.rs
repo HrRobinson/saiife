@@ -43,7 +43,10 @@ fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-fn open_dir(at: impl rustix::fd::AsFd, name: impl rustix::path::Arg) -> io::Result<OwnedFd> {
+pub(crate) fn open_dir(
+    at: impl rustix::fd::AsFd,
+    name: impl rustix::path::Arg,
+) -> io::Result<OwnedFd> {
     Ok(openat(at, name, dir_flags(), Mode::empty())?)
 }
 
@@ -58,7 +61,7 @@ fn open_parent(p: &Path) -> io::Result<(OwnedFd, &OsStr)> {
 /// The incoming dir of `boxes_root` ([`incoming_in`]), opened; with
 /// `make`, made 0700 if missing. It must be a real directory (not a
 /// symlink) owned by this process's uid.
-fn incoming_dir(boxes_root: &Path, make: bool) -> Result<OwnedFd, String> {
+pub(crate) fn incoming_dir(boxes_root: &Path, make: bool) -> Result<OwnedFd, String> {
     let inc = incoming_in(boxes_root);
     let shown = inc.display();
     let (up, name) = open_parent(&inc).map_err(|e| format!("cannot open {shown}: {e}"))?;
@@ -133,7 +136,7 @@ pub fn read_base_manifest(paths: &BoxPaths) -> Result<BaseManifest, String> {
     BaseManifest::parse(&text)
 }
 
-fn random_hex() -> Result<String, String> {
+pub(crate) fn random_hex() -> Result<String, String> {
     let mut b = [0u8; 8];
     getrandom::fill(&mut b).map_err(|e| format!("no randomness for the incoming dir: {e}"))?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
@@ -141,7 +144,7 @@ fn random_hex() -> Result<String, String> {
 
 /// The passed descriptor as a regular file of at most `max` bytes; its
 /// length.
-fn regular(f: &File, what: &str, max: u64) -> Result<u64, String> {
+pub(crate) fn regular(f: &File, what: &str, max: u64) -> Result<u64, String> {
     let st = rustix::fs::fstat(f).map_err(|e| format!("the {what}: {e}"))?;
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
         return Err(format!("the {what} is not a regular file"));
@@ -158,7 +161,13 @@ fn regular(f: &File, what: &str, max: u64) -> Result<u64, String> {
 /// A new file `name` in `dir` with `mode`, never through a symlink, and
 /// `src` copied into it (at most `len` bytes, the length checked); the
 /// copy, open for reading.
-fn copy_in(dir: &OwnedFd, name: &str, mode: u32, src: &File, len: u64) -> Result<File, String> {
+pub(crate) fn copy_in(
+    dir: &OwnedFd,
+    name: &str,
+    mode: u32,
+    src: &File,
+    len: u64,
+) -> Result<File, String> {
     let flags = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = openat(dir, name, flags, Mode::from_raw_mode(mode))
         .map_err(|e| format!("cannot make {name}: {e}"))?;
@@ -174,11 +183,15 @@ fn copy_in(dir: &OwnedFd, name: &str, mode: u32, src: &File, len: u64) -> Result
     Ok(dst)
 }
 
-/// Remove `<.incoming>/<sub>` and the files [`intake`] makes in it.
-fn remove_sub(inc: &OwnedFd, sub: &str) {
+/// The files [`intake`] makes in its incoming dir.
+const INTAKE_FILES: &[&str] = &[REPO_DISK, BASE_MANIFEST];
+
+/// Remove `<.incoming>/<sub>` and the files `names` in it (an intake's
+/// own: [`INTAKE_FILES`] here, the image import's in `crate::box_images`).
+pub(crate) fn remove_sub(inc: &OwnedFd, sub: &str, names: &[&str]) {
     if let Ok(d) = open_dir(inc, sub) {
-        for n in [REPO_DISK, BASE_MANIFEST] {
-            let _ = rustix::fs::unlinkat(&d, n, AtFlags::empty());
+        for n in names {
+            let _ = rustix::fs::unlinkat(&d, *n, AtFlags::empty());
         }
     }
     let _ = rustix::fs::unlinkat(inc, sub, AtFlags::REMOVEDIR);
@@ -230,7 +243,7 @@ pub fn intake(
     match made {
         Ok(m) => Ok((dir.join(REPO_DISK), dir.join(BASE_MANIFEST), m)),
         Err(e) => {
-            remove_sub(&inc, sub);
+            remove_sub(&inc, sub, INTAKE_FILES);
             Err(e)
         }
     }
@@ -249,7 +262,7 @@ pub fn discard(boxes_root: &Path, image: &Path) {
         return;
     };
     if let Ok(inc) = incoming_dir(boxes_root, false) {
-        remove_sub(&inc, sub);
+        remove_sub(&inc, sub, INTAKE_FILES);
     }
 }
 

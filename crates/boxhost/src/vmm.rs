@@ -551,6 +551,21 @@ impl ChVmm {
     }
 }
 
+/// The longest handle data [`image_of_data`] parses.
+const MAX_HANDLE_DATA: usize = 4096;
+
+/// `data["image"]` of a handle's data, when the data is short JSON and the
+/// image a valid id.
+fn image_of_data(data: &str) -> Option<String> {
+    if data.len() > MAX_HANDLE_DATA {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let id = v.get("image")?.as_str()?;
+    crate::image::parse_image_id(id).ok()?;
+    Some(id.to_string())
+}
+
 impl Vmm for ChVmm {
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
         let inner = &self.inner;
@@ -717,6 +732,13 @@ impl Vmm for ChVmm {
             return VmStatus::Running;
         }
         self.inner.status_of(&h.id, &self.inner.paths(&h.id))
+    }
+
+    /// The `image` this driver put in the handle's data at `create`: read
+    /// from at most [`MAX_HANDLE_DATA`] bytes of JSON and only when it is a
+    /// valid `base-<64 hex>` id.
+    fn image_id(&self, h: &VmHandle) -> Option<String> {
+        image_of_data(&h.data)
     }
 
     /// Stops the VM if needed, waits for its reaper (at most

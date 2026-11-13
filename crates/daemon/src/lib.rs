@@ -11,6 +11,7 @@ pub mod approval_ops;
 pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
+pub mod box_images;
 pub mod box_ops;
 #[cfg(unix)]
 pub mod box_repo;

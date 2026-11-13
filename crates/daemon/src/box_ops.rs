@@ -79,6 +79,11 @@ pub const OPS: &[&str] = &[
     OP_BOX_GC,
     OP_BOX_DIFF,
     OP_BOX_TERM_READ,
+    // The base images (plan 36): `crate::box_images`.
+    saiife_ipc::msg::OP_BOX_IMAGE_LS,
+    saiife_ipc::msg::OP_BOX_IMAGE_IMPORT,
+    saiife_ipc::msg::OP_BOX_IMAGE_DEFAULT,
+    saiife_ipc::msg::OP_BOX_IMAGE_RM,
 ];
 
 /// `<state_dir>/boxes`.
@@ -511,6 +516,10 @@ fn tick_record(ctx: &Ctx, action: &str, c: &Change, template: Option<&str>) -> R
         "tick",
     );
     rec.reason = Some(c.why.to_string());
+    // A queue head admitted here: the base image its VM was created from.
+    if let Some(i) = &c.image {
+        rec.extra.insert("image".into(), i.as_str().into());
+    }
     rec
 }
 
@@ -536,7 +545,7 @@ fn state_value(s: BoxState) -> Value {
 }
 
 /// A `box` record of `action`. The caller sets the peer.
-fn box_rec(
+pub(crate) fn box_rec(
     ctx: &Ctx,
     action: &str,
     id: Option<&BoxId>,
@@ -814,15 +823,25 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let Some(mgr) = ctx.box_manager.clone() else {
         return err(id, ErrorCode::Unavailable, UNAVAILABLE);
     };
-    // The descriptors a `box.fds` passed are this op's: `box.spawn` takes
-    // them, any other box op closes them now. Every refusal below closes
-    // them too.
+    // The descriptors a `box.fds` passed are this op's: an op in
+    // `msg::FD_OPS` (`box.spawn`, `box.image.import`) takes them, any other
+    // box op closes them now. Every refusal below closes them too.
     #[cfg(unix)]
     let mut passed: Passed = conn.take_fds();
     #[cfg(not(unix))]
     let mut passed: Passed = Vec::new();
-    if req.op != OP_BOX_SPAWN {
+    if !saiife_ipc::msg::FD_OPS.contains(&req.op.as_str()) {
         passed.clear();
+    }
+    // The base images (plan 36), behind the same manager gate.
+    if crate::box_images::OPS.contains(&req.op.as_str()) {
+        #[cfg(unix)]
+        return crate::box_images::handle(ctx, &mgr, &conn.peer, req, passed).await;
+        #[cfg(not(unix))]
+        {
+            drop(passed);
+            return err(id, ErrorCode::Unavailable, UNAVAILABLE);
+        }
     }
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
@@ -1035,6 +1054,11 @@ async fn run(
             );
             if r.state == BoxState::Discarded {
                 rec.reason = r.error.clone();
+            }
+            // Admitted at its own spawn: the base image its VM was created
+            // from (plan 36).
+            if let Some(i) = &r.image {
+                rec.extra.insert("image".into(), i.as_str().into());
             }
             Ok((answer, Some(rec)))
         }

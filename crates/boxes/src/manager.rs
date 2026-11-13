@@ -111,7 +111,8 @@ pub struct Change {
     pub from: BoxState,
     pub to: BoxState,
     pub why: &'static str,
-    /// The base image id (plan 36); always `None` until then.
+    /// The base image id (plan 36): the admission change of a box whose
+    /// VM was created names it; every other change has `None`.
     pub image: Option<String>,
 }
 
@@ -541,6 +542,7 @@ impl Manager {
             if g.save_new(r.clone()).is_err() {
                 break;
             }
+            let admitted = out.len();
             out.push(change(&r, from, "admitted"));
             let spec = VmSpec {
                 id: r.id.clone(),
@@ -552,6 +554,10 @@ impl Manager {
             };
             let booted = self.vmm.create(&spec).and_then(|h| {
                 r.vm = Some(h.clone());
+                // The driver names the base image; the handle's data stays
+                // opaque here (plan 36).
+                r.image = self.vmm.image_id(&h);
+                out[admitted].image = r.image.clone();
                 // Best effort, like every save after a VMM call.
                 let _ = g.put(r.clone());
                 self.vmm.boot(&h)

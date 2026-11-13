@@ -1013,6 +1013,10 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         Some(b) => (Some(b.manager), b.template_warnings, b.changes),
         None => (None, Vec::new(), Vec::new()),
     };
+    // The base image store (plan 36), only beside a box manager.
+    let box_images = box_manager
+        .as_ref()
+        .map(|_| crate::box_images::paths_for(&state_dir, &mode));
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
@@ -1129,6 +1133,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         boxes,
         box_manager,
         box_template_warnings,
+        box_images,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();

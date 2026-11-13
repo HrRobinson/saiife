@@ -48,7 +48,8 @@ pub struct BoxRecord {
     pub turn_finished_at: Option<u64>,
     pub pending_prompt: Option<String>,
     pub error: Option<String>,
-    /// Resolved base image id (plan 36); always `None` until then.
+    /// The base image id (plan 36), set at admission from the VMM
+    /// (`Vmm::image_id`); `None` before, or when the driver cannot say.
     #[serde(default)]
     pub image: Option<String>,
 }

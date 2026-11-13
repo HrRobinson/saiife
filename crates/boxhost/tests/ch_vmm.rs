@@ -340,6 +340,26 @@ fn create_writes_spec_and_overlay() {
         data,
         serde_json::json!({"launcher": "child", "image": format!("base-{HEX}")})
     );
+    // The manager learns the image through the driver (plan 36).
+    assert_eq!(v.image_id(&h), Some(format!("base-{HEX}")));
+    for data in [
+        String::new(),
+        "not json".to_string(),
+        r#"{"image": "../etc"}"#.to_string(),
+        r#"{"image": 7}"#.to_string(),
+        format!(
+            r#"{{"image": "base-{HEX}", "pad": "{}"}}"#,
+            "x".repeat(5000)
+        ),
+    ] {
+        let other = VmHandle { data, ..h.clone() };
+        assert_eq!(
+            v.image_id(&other),
+            None,
+            "{}",
+            &other.data[..other.data.len().min(40)]
+        );
+    }
     let p = w.paths("b1");
     assert_eq!(std::fs::read_to_string(p.root_disk()).unwrap(), "qcow\n");
     let qargv = std::fs::read_to_string(w.root.join("t/qemu-argv")).unwrap();

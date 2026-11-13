@@ -2,6 +2,12 @@
 //! Runs as the user: verifies every input against its pin, drives passt and
 //! Cloud Hypervisor as its own children, and leaves `<out>/base-<sha>.raw`
 //! with its manifest. Linux only. Exit 1 when the build fails.
+//!
+//! `saiife box image import|ls|default|rm` (plan 36, Task 5): the daemon's
+//! image store through its `box.image.*` ops. Import opens the image (and
+//! its manifest and kernel beside it) read-only and `O_NOFOLLOW`, and hands
+//! the image to the daemon as descriptors. Exit codes as `saiife box`: 0
+//! ok, 2 refused, 5 the daemon cannot be reached or has no boxes.
 
 use std::path::PathBuf;
 
@@ -24,12 +30,41 @@ pub enum ImageAction {
         #[arg(long)]
         direct_kernel: bool,
     },
+    /// Put a built image into the daemon's store (`<path>` is the
+    /// `base-<sha256>.raw`; its `.json` manifest and any `.vmlinuz` are
+    /// read from beside it).
+    Import {
+        path: PathBuf,
+        /// Also make it the default image.
+        #[arg(long)]
+        default: bool,
+    },
+    /// List the images in the store.
+    Ls {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an image in the store the default.
+    Default {
+        /// The image id (`base-<sha256>`).
+        #[arg(value_name = "ID")]
+        image: String,
+    },
+    /// Remove an image no box uses and that is not the default.
+    Rm {
+        /// The image id (`base-<sha256>`).
+        #[arg(value_name = "ID")]
+        image: String,
+    },
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum Fail {
-    /// The build failed or was refused: exit 1.
+    /// The build failed: exit 1.
     Failed(String),
+    /// The daemon or a local check refused: exit 2.
+    Refused(String),
     /// Not on this OS: exit 5.
     Unavailable(String),
 }
@@ -38,13 +73,246 @@ pub enum Fail {
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn run(_config: Option<&std::path::Path>, _action: ImageAction) -> Result<(), Fail> {
     Err(Fail::Unavailable(
-        "saiife box image build runs on Linux only".to_string(),
+        "saiife box image runs on Linux only".to_string(),
     ))
 }
 
 #[cfg(target_os = "linux")]
 pub fn run(config: Option<&std::path::Path>, action: ImageAction) -> Result<(), Fail> {
-    imp::run(config, action)
+    match action {
+        ImageAction::Build { .. } => imp::run(config, action),
+        other => store::run(config, other),
+    }
+}
+
+/// `import`, `ls`, `default` and `rm`: the daemon's store.
+#[cfg(target_os = "linux")]
+mod store {
+    use super::{Fail, ImageAction};
+    use crate::box_cmd::{ascii_json, disk, render};
+    use crate::broker::{self, Target};
+    use crate::text::sanitize;
+    use saiife_boxhost::image::{Manifest, ManifestBoot};
+    use saiife_ipc::client::ClientError;
+    use saiife_ipc::msg::{
+        OP_BOX_IMAGE_DEFAULT, OP_BOX_IMAGE_IMPORT, OP_BOX_IMAGE_LS, OP_BOX_IMAGE_RM,
+    };
+    use serde_json::{json, Map, Value};
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// An import copies and hashes the whole image.
+    const CALL_TIMEOUT: Duration = Duration::from_secs(900);
+    /// The largest manifest read.
+    const MANIFEST_MAX_BYTES: u64 = 1 << 20;
+
+    type Args = Map<String, Value>;
+
+    /// One call on a fresh connection, passing `fds` when there are any.
+    fn call(t: &Target, op: &str, a: Args, fds: &[BorrowedFd<'_>]) -> Result<Args, Fail> {
+        let down = |e: &ClientError| Fail::Unavailable(broker::unreachable(t, e));
+        let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
+        let deadline = Instant::now() + CALL_TIMEOUT;
+        let r = if fds.is_empty() {
+            c.call(op, a, deadline)
+        } else {
+            c.call_with_fds(op, a, fds, deadline)
+        };
+        r.map_err(|e| match e {
+            ClientError::Refused { code, message } if code == "unavailable" => {
+                Fail::Unavailable(message)
+            }
+            ClientError::Refused { message, .. } => Fail::Refused(message),
+            other => down(&other),
+        })
+    }
+
+    /// `p` read-only: never through a symlink (`O_NOFOLLOW`), never
+    /// blocking on a FIFO, and a regular file.
+    fn open_plain(p: &Path) -> Result<File, Fail> {
+        let shown = sanitize(&p.display().to_string());
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(p)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::ELOOP) => {
+                    Fail::Refused(format!("{shown} is a symlink; give the file itself"))
+                }
+                _ => Fail::Refused(format!("cannot open {shown}: {e}")),
+            })?;
+        let m = f
+            .metadata()
+            .map_err(|e| Fail::Refused(format!("{shown}: {e}")))?;
+        if !m.file_type().is_file() {
+            return Err(Fail::Refused(format!("{shown} is not a regular file")));
+        }
+        Ok(f)
+    }
+
+    /// `<path>` minus `.raw`, plus `ext`.
+    fn beside(path: &Path, ext: &str) -> Result<PathBuf, Fail> {
+        if path.extension().and_then(|e| e.to_str()) != Some("raw") {
+            return Err(Fail::Refused(format!(
+                "{} is not a .raw image (saiife box image build makes base-<sha256>.raw)",
+                sanitize(&path.display().to_string())
+            )));
+        }
+        Ok(path.with_extension(ext))
+    }
+
+    pub(super) fn run(config: Option<&Path>, action: ImageAction) -> Result<(), Fail> {
+        match action {
+            ImageAction::Import { path, default } => import(config, &path, default),
+            ImageAction::Ls { json } => {
+                let t = broker::resolve_here(config).map_err(Fail::Unavailable)?;
+                let a = call(&t, OP_BOX_IMAGE_LS, Args::new(), &[])?;
+                let images = a.get("images").cloned().unwrap_or(json!([]));
+                let warnings = a.get("warnings").cloned().unwrap_or(json!([]));
+                if json {
+                    outln!(
+                        "{}",
+                        ascii_json(&json!({"images": images, "warnings": warnings}))
+                    );
+                    return Ok(());
+                }
+                for l in table(images.as_array().map_or(&[], Vec::as_slice)) {
+                    outln!("{l}");
+                }
+                for w in warnings.as_array().into_iter().flatten() {
+                    eprintln!("saiife: warning: {}", sanitize(w.as_str().unwrap_or("")));
+                }
+                Ok(())
+            }
+            ImageAction::Default { image } => {
+                let t = broker::resolve_here(config).map_err(Fail::Unavailable)?;
+                // `image`, never `id`: the frame's own `id` is the request's.
+                let a: Args = [("image".to_string(), json!(image))].into_iter().collect();
+                call(&t, OP_BOX_IMAGE_DEFAULT, a, &[])?;
+                outln!("default image {}", sanitize(&image));
+                Ok(())
+            }
+            ImageAction::Rm { image } => {
+                let t = broker::resolve_here(config).map_err(Fail::Unavailable)?;
+                let a: Args = [("image".to_string(), json!(image))].into_iter().collect();
+                call(&t, OP_BOX_IMAGE_RM, a, &[])?;
+                outln!("removed {}", sanitize(&image));
+                Ok(())
+            }
+            ImageAction::Build { .. } => Err(Fail::Failed("not a store command".into())),
+        }
+    }
+
+    /// Opens `<path>` (the raw image), `<path minus .raw>.json` (its
+    /// manifest) and, when the manifest boots a kernel, the `.vmlinuz`
+    /// beside it, all `O_NOFOLLOW`, then hands the image to the daemon.
+    fn import(config: Option<&Path>, path: &Path, default: bool) -> Result<(), Fail> {
+        let json_path = beside(path, "json")?;
+        let raw = open_plain(path)?;
+        let mut text = String::new();
+        open_plain(&json_path)?
+            .take(MANIFEST_MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| Fail::Refused(format!("the manifest: {e}")))?;
+        if text.len() as u64 > MANIFEST_MAX_BYTES {
+            return Err(Fail::Refused("the manifest is too large".into()));
+        }
+        let m = Manifest::parse(&text).map_err(Fail::Refused)?;
+        let kernel = match m.boot {
+            ManifestBoot::Kernel { .. } => Some(open_plain(&beside(path, "vmlinuz")?)?),
+            ManifestBoot::Firmware => None,
+        };
+        let manifest: Value =
+            serde_json::from_str(&text).map_err(|e| Fail::Refused(format!("the manifest: {e}")))?;
+        let t = broker::resolve_here(config).map_err(Fail::Unavailable)?;
+        let mut a = Args::new();
+        a.insert("manifest".into(), manifest);
+        a.insert("default".into(), json!(default));
+        let mut fds = vec![raw.as_fd()];
+        if let Some(k) = &kernel {
+            fds.push(k.as_fd());
+        }
+        let answer = call(&t, OP_BOX_IMAGE_IMPORT, a, &fds)?;
+        let image = answer.get("image").and_then(Value::as_str).unwrap_or("");
+        outln!("imported {}", sanitize(image));
+        if default {
+            outln!("default image {}", sanitize(image));
+        }
+        Ok(())
+    }
+
+    /// `ID  DEFAULT  UBUNTU  CLAUDE  SIZE  IN USE`.
+    fn table(images: &[Value]) -> Vec<String> {
+        let head = ["ID", "DEFAULT", "UBUNTU", "CLAUDE", "SIZE", "IN USE"];
+        let text = |v: &Value| sanitize(v.as_str().unwrap_or("-"));
+        let rows: Vec<(Vec<String>, Option<String>)> = images
+            .iter()
+            .map(|i| {
+                let in_use: Vec<String> = i
+                    .get("in_use")
+                    .and_then(Value::as_array)
+                    .map(|v| v.iter().map(text).collect())
+                    .unwrap_or_default();
+                let cells = vec![
+                    text(&i["id"]),
+                    if i["default"] == true { "yes" } else { "-" }.to_string(),
+                    text(&i["ubuntu"]["release"]),
+                    text(&i["claude"]["version"]),
+                    i["actual_bytes"]
+                        .as_u64()
+                        .map_or_else(|| "-".to_string(), |b| disk(b.div_ceil(1 << 20))),
+                    if in_use.is_empty() {
+                        "-".to_string()
+                    } else {
+                        in_use.join(",")
+                    },
+                ];
+                (cells, None)
+            })
+            .collect();
+        render(&head, &rows)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn table_columns() {
+            let rows = table(&[json!({
+                "id": "base-abc",
+                "default": true,
+                "ubuntu": {"release": "release-1"},
+                "claude": {"version": "9.9.9"},
+                "actual_bytes": 3u64 << 30,
+                "in_use": ["b1", "b2"],
+            })]);
+            assert!(rows[0].starts_with("ID"), "{rows:?}");
+            for h in ["DEFAULT", "UBUNTU", "CLAUDE", "SIZE", "IN USE"] {
+                assert!(rows[0].contains(h), "{rows:?}");
+            }
+            for c in ["base-abc", "yes", "release-1", "9.9.9", "b1,b2"] {
+                assert!(rows[1].contains(c), "{rows:?}");
+            }
+        }
+
+        #[test]
+        fn import_needs_a_raw_path() {
+            assert!(matches!(
+                beside(Path::new("/x/base.img"), "json"),
+                Err(Fail::Refused(_))
+            ));
+            assert_eq!(
+                beside(Path::new("/x/base-1.raw"), "json").ok(),
+                Some(PathBuf::from("/x/base-1.json"))
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -148,7 +416,10 @@ mod imp {
             out,
             saiife_bin,
             direct_kernel,
-        } = action;
+        } = action
+        else {
+            return Err(Fail::Failed("not a build".into()));
+        };
         let failed = Fail::Failed;
         let home = abs_env("HOME");
         let cache_home = abs_env("XDG_CACHE_HOME")

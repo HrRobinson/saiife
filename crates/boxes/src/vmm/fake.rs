@@ -38,6 +38,10 @@ struct State {
     repo_disk: HashMap<BoxId, bool>,
     fail: Vec<(VmOp, String)>,
     calls: Vec<VmCall>,
+    /// What `image_id` answers for every handle.
+    image: Option<String>,
+    /// The `data` of every handle `create` makes.
+    data: String,
 }
 
 #[derive(Default)]
@@ -68,6 +72,17 @@ impl FakeVmm {
     /// create yet).
     pub fn saw_repo_disk(&self, id: &BoxId) -> Option<bool> {
         self.lock().repo_disk.get(id).copied()
+    }
+
+    /// What `image_id` answers from now on (`None`: no image, like a
+    /// driver that cannot say).
+    pub fn set_image(&self, image: Option<&str>) {
+        self.lock().image = image.map(str::to_string);
+    }
+
+    /// The opaque `data` of the handles `create` makes from now on.
+    pub fn set_handle_data(&self, data: &str) {
+        self.lock().data = data.to_string();
     }
 
     pub fn calls(&self) -> Vec<VmCall> {
@@ -114,7 +129,7 @@ impl Vmm for FakeVmm {
         Ok(VmHandle {
             id: spec.id.clone(),
             driver: "fake".into(),
-            data: String::new(),
+            data: s.data.clone(),
         })
     }
 
@@ -179,6 +194,10 @@ impl Vmm for FakeVmm {
         let mut s = self.enter(VmOp::Destroy, &h.id)?;
         s.status.insert(h.id.clone(), VmStatus::Gone);
         Ok(())
+    }
+
+    fn image_id(&self, _h: &VmHandle) -> Option<String> {
+        self.lock().image.clone()
     }
 }
 
@@ -271,6 +290,19 @@ mod tests {
             }),
             VmStatus::Running
         );
+    }
+
+    #[test]
+    fn image_id_is_settable() {
+        let d = tempfile::tempdir().unwrap();
+        let v = FakeVmm::new();
+        let h = v.create(&spec("b1", d.path())).unwrap();
+        assert_eq!(v.image_id(&h), None);
+        let img = format!("base-{}", "a".repeat(64));
+        v.set_image(Some(&img));
+        v.set_handle_data("not json {");
+        assert_eq!(v.image_id(&h).as_deref(), Some(img.as_str()));
+        assert_eq!(v.create(&spec("b2", d.path())).unwrap().data, "not json {");
     }
 
     #[test]

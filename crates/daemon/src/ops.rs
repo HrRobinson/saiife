@@ -396,6 +396,9 @@ pub struct Ctx {
     pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
     /// The template files skipped at start, for `box.templates`.
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
+    /// The box image store's dirs (plan 36); `None`: the `box.image.*`
+    /// ops are unavailable.
+    pub box_images: Option<crate::box_images::ImagePaths>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -452,6 +455,8 @@ pub struct CtxInit {
     pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
     /// See [`Ctx::box_template_warnings`].
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
+    /// See [`Ctx::box_images`]. `minimal` leaves it `None`.
+    pub box_images: Option<crate::box_images::ImagePaths>,
 }
 
 impl CtxInit {
@@ -510,6 +515,7 @@ impl CtxInit {
             boxes: Arc::new(saiife_wire::source::NoBoxes),
             box_manager: None,
             box_template_warnings: Vec::new(),
+            box_images: None,
         }
     }
 }
@@ -744,6 +750,7 @@ impl Ctx {
             cosign: Mutex::default(),
             box_manager: i.box_manager,
             box_template_warnings: i.box_template_warnings,
+            box_images: i.box_images,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
