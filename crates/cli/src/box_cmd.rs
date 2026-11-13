@@ -133,6 +133,16 @@ mod imp {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     /// A spawn waits for the VM to boot.
     const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+    /// The most a spawn with a repo disk waits ([`spawn_timeout`]).
+    const SPAWN_TIMEOUT_MAX: Duration = Duration::from_secs(1800);
+
+    /// A `box.spawn` that passes a repo disk also waits for the daemon to
+    /// copy it in: [`CALL_TIMEOUT`] plus 1 s per whole 64 MiB of the
+    /// image's allocated size, at most [`SPAWN_TIMEOUT_MAX`].
+    fn spawn_timeout(allocated: u64) -> Duration {
+        let extra = Duration::from_secs(allocated / (64 << 20));
+        CALL_TIMEOUT.saturating_add(extra).min(SPAWN_TIMEOUT_MAX)
+    }
     /// The longest task in `ls`, in characters.
     const TASK_COLS: usize = 40;
     const NEED_YES: &str = "discarding a box needs a yes. Run it in a terminal, or add --yes.";
@@ -153,20 +163,21 @@ mod imp {
     /// One call on a fresh connection. `unavailable` (no boxes in this
     /// version) is exit 5 like an unreachable daemon; every other refusal is 2.
     fn call(t: &Target, op: &str, a: Args) -> Result<Args, Stop> {
-        call_passing(t, op, a, &[])
+        call_passing(t, op, a, &[], CALL_TIMEOUT)
     }
 
     /// [`call`], with `fds` passed to the daemon for this op (none: a
-    /// plain call).
+    /// plain call) and an answer awaited for at most `timeout`.
     fn call_passing(
         t: &Target,
         op: &str,
         a: Args,
         fds: &[std::os::fd::BorrowedFd<'_>],
+        timeout: Duration,
     ) -> Result<Args, Stop> {
         let down = |e: &ClientError| Stop::Unavailable(broker::unreachable(t, e));
         let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
-        let deadline = Instant::now() + CALL_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let r = if fds.is_empty() {
             c.call(op, a, deadline)
         } else {
@@ -184,7 +195,7 @@ mod imp {
     /// `saiife box spawn` (plan 37): the repo disk is built here, as the
     /// user, and handed to the daemon as descriptors.
     mod spawn {
-        use super::{args, call_passing, sanitize, Args, Stop};
+        use super::{args, call_passing, sanitize, spawn_timeout, Args, Stop};
         use crate::box_repo::{self, Snapshot};
         use crate::broker::Target;
         use saiife_boxhost::layout::Layout;
@@ -291,6 +302,14 @@ mod imp {
             let image = std::fs::File::open(&img)
                 .map_err(|e| Stop::Failed(format!("{}: {e}", img.display())))?;
             let manifest = manifest_file(snap)?;
+            let allocated = {
+                use std::os::unix::fs::MetadataExt;
+                image
+                    .metadata()
+                    .map_err(|e| Stop::Failed(format!("{}: {e}", img.display())))?
+                    .blocks()
+                    .saturating_mul(512)
+            };
             let mut a = args([
                 ("template", json!(template)),
                 ("repo", json!(snap.manifest.repo)),
@@ -300,7 +319,13 @@ mod imp {
             if let Some(task) = task {
                 a.insert("task".into(), json!(task));
             }
-            let answer = call_passing(t, "box.spawn", a, &[image.as_fd(), manifest.as_fd()])?;
+            let answer = call_passing(
+                t,
+                "box.spawn",
+                a,
+                &[image.as_fd(), manifest.as_fd()],
+                spawn_timeout(allocated),
+            )?;
             drop((image, manifest));
             clock.step("spawn");
             let id = answer
@@ -676,6 +701,23 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn spawn_timeout_scales_with_the_image() {
+            const MIB: u64 = 1 << 20;
+            assert_eq!(spawn_timeout(0), Duration::from_secs(120));
+            assert_eq!(spawn_timeout(64 * MIB - 1), Duration::from_secs(120));
+            assert_eq!(spawn_timeout(64 * MIB), Duration::from_secs(121));
+            // An 8 GiB repo's 16.25 GiB image: 120 + 260 s.
+            assert_eq!(
+                spawn_timeout(16 * 1024 * MIB + 256 * MIB),
+                Duration::from_secs(380)
+            );
+            // Capped.
+            assert_eq!(spawn_timeout(1680 * 64 * MIB), Duration::from_secs(1800));
+            assert_eq!(spawn_timeout(1681 * 64 * MIB), Duration::from_secs(1800));
+            assert_eq!(spawn_timeout(u64::MAX), Duration::from_secs(1800));
+        }
 
         #[test]
         fn disk_units() {
