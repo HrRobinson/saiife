@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use saiife_boxes::guest::GuestError;
 use saiife_boxproto::delta::{
-    apply_manifest, BlobSink, DeltaError, EntryHead, Limits, Op, Reader, Valid,
+    apply_manifest, normalize_component, BlobSink, DeltaError, EntryHead, Limits, Op, Reader, Valid,
 };
 use saiife_boxproto::frame::{write_frame, Frame, MAX_FRAME};
 use saiife_boxproto::manifest::{BaseManifest, EntryKind};
@@ -688,30 +688,73 @@ pub fn render(
     (full, files)
 }
 
-/// L6: the built-in protected paths, compared with ASCII case folded
-/// (a case-insensitive checkout resolves `claude.md` to `CLAUDE.md`):
-/// `.claude/**`, `.saiife/**`, `.github/workflows/**`, `.mcp.json`,
-/// `.gitlab-ci.yml`; `CLAUDE.md`, `AGENTS.md` and `.envrc` at any depth
-/// (agents and direnv read nested ones); and any component starting with
-/// `.git` (`.gitattributes`, `.gitmodules`, `.github/…`) except a final
-/// `.gitignore`.
+/// L6: the built-in protected paths. Each component is compared in its
+/// [`normalize_component`] spelling (R-T3i: letter case, trailing dots and
+/// spaces, combining marks and Unicode look-alike letters folded, as a
+/// case-insensitive or normalising checkout would resolve them).
+/// - rooted: `.claude/**`, `.saiife/**`, `.vscode/**`, `.devcontainer/**`,
+///   `.husky/**`, `.cursor/**`, `.gemini/**`, `.codex/**`, `.gitlab/**`,
+///   `.circleci/**`, `.github/workflows/**`, `.mcp.json`,
+///   `.gitlab-ci.yml`, `.pre-commit-config.yaml`, `.cursorrules`;
+/// - at any depth (agents and direnv read nested ones): `CLAUDE.md`,
+///   `AGENTS.md`, `GEMINI.md`, `.envrc`;
+/// - any component starting with `.git` (`.gitattributes`, `.gitmodules`,
+///   `.gitconfig`, `.github/…`) except a final `.gitignore`.
 pub fn protected(path: &str) -> bool {
-    let l = path.to_ascii_lowercase();
-    let comps: Vec<&str> = l.split('/').collect();
+    let comps: Vec<String> = path.split('/').map(normalize_component).collect();
     let last = comps.len() - 1;
-    if matches!(comps[0], ".claude" | ".saiife") {
+    let first = comps[0].as_str();
+    if last > 0
+        && matches!(
+            first,
+            ".claude"
+                | ".saiife"
+                | ".vscode"
+                | ".devcontainer"
+                | ".husky"
+                | ".cursor"
+                | ".gemini"
+                | ".codex"
+                | ".gitlab"
+                | ".circleci"
+        )
+    {
         return true;
     }
-    if matches!(l.as_str(), ".mcp.json" | ".gitlab-ci.yml") || l.starts_with(".github/workflows/") {
+    if last == 0
+        && matches!(
+            first,
+            ".claude"
+                | ".saiife"
+                | ".mcp.json"
+                | ".gitlab-ci.yml"
+                | ".pre-commit-config.yaml"
+                | ".cursorrules"
+        )
+    {
         return true;
     }
-    if matches!(comps[last], "claude.md" | "agents.md" | ".envrc") {
+    if last >= 2 && first == ".github" && comps[1] == "workflows" {
+        return true;
+    }
+    if matches!(
+        comps[last].as_str(),
+        "claude.md" | "agents.md" | "gemini.md" | ".envrc"
+    ) {
         return true;
     }
     comps
         .iter()
         .enumerate()
-        .any(|(i, c)| c.starts_with(".git") && !(i == last && *c == ".gitignore"))
+        .any(|(i, c)| c.starts_with(".git") && !(i == last && c == ".gitignore"))
+}
+
+/// A path in the spelling case collisions are compared in.
+fn fold(p: &str) -> String {
+    p.split('/')
+        .map(normalize_component)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn flags(
@@ -724,7 +767,7 @@ fn flags(
     let result = apply_manifest(base, v, only);
     let mut folded: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for k in result.entries.keys() {
-        folded.entry(k.to_ascii_lowercase()).or_default().push(k);
+        folded.entry(fold(k)).or_default().push(k);
     }
     let binary: BTreeSet<&str> = files
         .iter()
@@ -757,7 +800,7 @@ fn flags(
         if binary.contains(p) {
             flag(p, "binary".into());
         }
-        let same = folded.get(&p.to_ascii_lowercase());
+        let same = folded.get(&fold(p));
         if let Some(other) = same.and_then(|s| s.iter().find(|o| **o != p)) {
             flag(p, format!("differs only in case from {}", escape(other)));
         }
@@ -872,7 +915,8 @@ pub fn check_subset(
             .entries
             .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
             .map(|(k, _)| k.as_str())
-            .find(|k| k.starts_with(prefix.as_str()));
+            .take_while(|k| k.starts_with(prefix.as_str()))
+            .next();
         if let Some(k) = under {
             return conflict(p, k, "would be a file and a directory");
         }

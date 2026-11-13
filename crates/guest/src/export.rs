@@ -253,16 +253,11 @@ pub fn init_base(env: &GuestEnv) -> Result<(), String> {
     git.commit_to(&tree, None, "saiife base", BASE_REF)
 }
 
-/// R-T1e mirrored: a component a Windows host could resolve to `.git`.
+/// R-T1e, R-T3i: a component a Windows or macOS host could resolve to
+/// `.git`, by the host validator's own rule (a non-UTF-8 name is no alias;
+/// the host refuses it anyway).
 fn is_git_alias(c: &[u8]) -> bool {
-    let mut t = c;
-    while let [rest @ .., b'.' | b' '] = t {
-        t = rest;
-    }
-    if t.eq_ignore_ascii_case(b".git") {
-        return true;
-    }
-    t.len() > 4 && t[..4].eq_ignore_ascii_case(b"git~") && t[4..].iter().all(u8::is_ascii_digit)
+    std::str::from_utf8(c).is_ok_and(saiife_boxproto::delta::is_git_alias)
 }
 
 /// Snapshots `/work` and returns the tree id (R-T2d). Git only lists

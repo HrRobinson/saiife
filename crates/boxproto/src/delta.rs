@@ -22,9 +22,14 @@
 //!
 //! Path rules beyond [`check_path`]: at most [`MAX_DEPTH`] components, no
 //! unsafe char (control, bidi, invisible), and no `.git` alias: a component
-//! that is `.git` after trimming trailing dots and spaces, or the 8.3 name
-//! `git~<digits>`, in any letter case (R-T1e). Case-only collisions are not
-//! refused here (Task 3 flags them); `:` is allowed.
+//! whose [`normalize_component`] is `.git` or `git~<digits>` (R-T1e, R-T3i).
+//! No component a Windows or macOS host would read as another name (R-T3h):
+//! none ends in a dot or a space, none contains any of `<>:"|?*` (so no
+//! NTFS stream such as `a::$DATA`), and none is shaped like an 8.3 short
+//! name (the part before the first `.` is 1 to 6 chars, `~`, then digits,
+//! as in `CLAUDE~1.MD`). The same rules apply to every named component of a
+//! symlink target. Case-only collisions are not refused here (Task 3 flags
+//! them).
 //!
 //! No path may go through a symlink, in the base or in the delta, compared
 //! with ASCII case folded (R-T1e). So a directory and a symlink never swap
@@ -294,16 +299,77 @@ fn has_unsafe(s: &str) -> Option<char> {
     s.chars().find(|&c| saiife_wire::text::is_unsafe_char(c))
 }
 
-/// R-T1e: a component a Windows (NTFS) host could resolve to `.git`:
-/// `.git` after trimming trailing dots and spaces, or the 8.3 short name
-/// `git~<digits>`, in any letter case.
-fn is_git_alias(c: &str) -> bool {
-    let t = c.trim_end_matches(['.', ' ']);
-    if t.eq_ignore_ascii_case(".git") {
+/// R-T3i: combining marks a normalising file system may drop.
+fn is_combining(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
+}
+
+/// R-T3i: the one spelling of a path component that case-insensitive,
+/// normalising hosts (NTFS, HFS+, APFS) may treat as the same name:
+/// trailing dots and spaces stripped, combining marks dropped, the Kelvin
+/// sign, long s, dotted and dotless i and the Angstrom sign mapped to
+/// their letters, then Unicode lowercase. Shared by the `.git` alias check
+/// here, the guest's export and the host's protected-path list.
+pub fn normalize_component(c: &str) -> String {
+    let mut out = String::with_capacity(c.len());
+    for ch in c.trim_end_matches(['.', ' ']).chars() {
+        if is_combining(ch) {
+            continue;
+        }
+        match ch {
+            '\u{212A}' => out.push('k'),
+            '\u{017F}' => out.push('s'),
+            '\u{0130}' | '\u{0131}' => out.push('i'),
+            '\u{212B}' => out.push('\u{E5}'),
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    // A mark after a trailing dot hid the dot from the first trim.
+    let t = out.trim_end_matches(['.', ' ']).len();
+    out.truncate(t);
+    out
+}
+
+/// R-T1e, R-T3i: a component a Windows or macOS host could resolve to
+/// `.git`: [`normalize_component`] gives `.git` or the 8.3 short name
+/// `git~<digits>`.
+pub fn is_git_alias(c: &str) -> bool {
+    let n = normalize_component(c);
+    if n == ".git" {
         return true;
     }
-    let b = t.as_bytes();
-    b.len() > 4 && b[..4].eq_ignore_ascii_case(b"git~") && b[4..].iter().all(u8::is_ascii_digit)
+    n.strip_prefix("git~")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// R-T3h: an 8.3 short name: the part before the first `.` (or the whole
+/// name) is 1 to 6 chars, `~`, then one or more digits.
+fn is_short_name(c: &str) -> bool {
+    let stem = c.split('.').next().unwrap_or(c);
+    let Some((head, digits)) = stem.rsplit_once('~') else {
+        return false;
+    };
+    (1..=6).contains(&head.chars().count())
+        && !head.contains('~')
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// R-T3h: a component no host may read as a different name.
+fn check_spelling(c: &str) -> Result<(), String> {
+    if c.ends_with(['.', ' ']) {
+        return Err(format!("component {c:?} ends with a dot or a space"));
+    }
+    if let Some(x) = c.chars().find(|x| "<>:\"|?*".contains(*x)) {
+        return Err(format!(
+            "component {c:?} contains {x:?}, which Windows does not allow in a name"
+        ));
+    }
+    if is_short_name(c) {
+        return Err(format!("component {c:?} is shaped like an 8.3 short name"));
+    }
+    Ok(())
 }
 
 /// Path rules beyond [`check_path`]: depth, unsafe chars, `.git` aliases.
@@ -311,6 +377,9 @@ fn check_delta_path(p: &str) -> Result<(), String> {
     check_path(p).map_err(|e| clean(&e))?;
     if p.split('/').any(is_git_alias) {
         return Err("has a .git component (or an NTFS alias of one)".into());
+    }
+    for c in p.split('/') {
+        check_spelling(c)?;
     }
     if p.split('/').count() > MAX_DEPTH {
         return Err(format!("deeper than MAX_DEPTH ({MAX_DEPTH} components)"));
@@ -397,7 +466,12 @@ fn check_link(path: &str, target: &[u8]) -> Result<(), DeltaError> {
             c if is_git_alias(c) => {
                 return refuse(format!("{t:?} has a .git component"));
             }
-            _ => named = true,
+            c => {
+                if let Err(e) = check_spelling(c) {
+                    return refuse(format!("{t:?}: {e}"));
+                }
+                named = true;
+            }
         }
     }
     Ok(())

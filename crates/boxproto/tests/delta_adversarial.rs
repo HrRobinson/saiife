@@ -919,13 +919,55 @@ fn git_ntfs_aliases_are_refused() {
     ] {
         assert_refused(&[add(p, b"x")], p, ".git");
     }
-    // Look-alikes stay fine; case-only collisions and ':' are not refused here.
+    // Unicode spellings a normalising host folds to `.git` (R-T3i).
+    for p in [".g\u{131}t", ".G\u{130}T/x", ".gi\u{301}t", "a/.git\u{301}"] {
+        assert_refused(&[add(p, b"x")], p, ".git");
+    }
+    // Look-alikes stay fine; case-only collisions are not refused here.
     run(&[
         add("Readme.md", b"x"),
-        add("a:b", b"y"),
         add("git~", b"z"),
         add("git~1a", b"w"),
-        add("x.git.", b"v"),
+        add("x.git", b"v"),
+    ])
+    .unwrap();
+}
+
+#[test]
+fn host_respellings_are_refused() {
+    // R-T3h: names Windows or macOS would read as another name.
+    for (p, why) in [
+        ("CLAUDE.md.", "ends with a dot or a space"),
+        ("claude.md ", "ends with a dot or a space"),
+        ("sub/notes.", "ends with a dot or a space"),
+        ("x.git.", "ends with a dot or a space"),
+        ("CLAUDE~1.MD", "8.3 short name"),
+        ("progra~12/x", "8.3 short name"),
+        ("a~1", "8.3 short name"),
+        (".claude::$DATA", "Windows does not allow"),
+        ("a:b", "Windows does not allow"),
+        ("a<b", "Windows does not allow"),
+        ("x?", "Windows does not allow"),
+        ("d/e*f", "Windows does not allow"),
+        ("q\"", "Windows does not allow"),
+        ("p|q", "Windows does not allow"),
+        ("g>h", "Windows does not allow"),
+    ] {
+        assert_refused(&[add(p, b"x")], p, why);
+    }
+    // The same in a symlink target's named components.
+    for t in ["docs.", "CLAUDE~1.MD", "a:b", "../x?"] {
+        let e = refused(&[add_link("l2", t)]);
+        assert_eq!(e.path.as_deref(), Some("l2"), "{t}");
+        assert!(e.reason.contains("symlink target"), "{t}: {e:?}");
+    }
+    // Ordinary names, a leading `..` in a target, and `~` names not 8.3.
+    run(&[
+        add("a~b.txt", b"1"),
+        add("backup~", b"2"),
+        add("sub/claude-notes.md", b"3"),
+        add_link("sub/up", "../README.md"),
+        add("toolong~1.txt", b"4"),
     ])
     .unwrap();
 }

@@ -666,6 +666,29 @@ fn flags_protected_and_hits() {
         "a/.envrc",
         "a/.gitattributes",
         "a/.gitkeep",
+        ".gitconfig",
+        // R-T3i: spellings a normalising, case-insensitive host folds.
+        "Cla\u{301}ude.md",
+        ".ClAuDe/settings.json",
+        "CLAUDE.md.",
+        ".claude ./x",
+        ".hus\u{212A}y/pre-commit",
+        ".\u{17F}aiife/x",
+        ".gem\u{131}n\u{130}/settings.json",
+        ".G\u{131}tattributes",
+        // R-T3j.
+        ".vscode/tasks.json",
+        ".devcontainer/devcontainer.json",
+        ".husky/pre-commit",
+        ".pre-commit-config.yaml",
+        ".cursor/rules/x.mdc",
+        ".cursorrules",
+        ".gemini/settings.json",
+        "GEMINI.md",
+        "pkg/gemini.md",
+        ".codex/config.toml",
+        ".gitlab/ci.yml",
+        ".circleci/config.yml",
     ] {
         assert!(protected(p), "{p}");
     }
@@ -674,7 +697,10 @@ fn flags_protected_and_hits() {
         "a/.gitignore",
         "src/main.rs",
         "docs/claude.txt",
+        "docs/claude-notes.md",
+        "README.md",
         "x/.mcp.json",
+        "src/.vscode.rs",
     ] {
         assert!(!protected(p), "{p}");
     }
