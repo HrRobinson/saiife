@@ -308,6 +308,19 @@ impl Manager {
         (self.clock)()
     }
 
+    /// Remove the dir of `id`, claimed by a spawn that failed before its
+    /// record was saved. The dir may hold a repo disk of many GiB, so the
+    /// removal runs outside the lock: `id` is kept in `placing` meanwhile
+    /// (gc leaves it alone; the id counter never hands it out again), and
+    /// cleared once the lock is taken back.
+    fn release(&self, mut g: MutexGuard<'_, Inner>, id: &BoxId) {
+        g.placing.insert(id.clone());
+        let store = g.store.clone();
+        drop(g);
+        let _ = store.remove(id);
+        self.lock().placing.remove(id);
+    }
+
     /// The box store's root.
     pub fn root(&self) -> &Path {
         &self.root
@@ -464,18 +477,23 @@ impl Manager {
                 )),
             };
             g = self.lock();
-            g.placing.remove(&id);
-            if let Err(e) = moved {
-                let _ = g.store.remove(&id);
-                return Err(BoxError::Unavailable(format!(
+            let refused = match moved {
+                Err(e) => Some(BoxError::Unavailable(format!(
                     "cannot move the repo disk into the box: {e}"
-                )));
+                ))),
+                // Another spawn may have taken the room meanwhile.
+                Ok(()) if a.start == Start::Now && Self::now_busy(&g, &host, &size) => {
+                    Some(BoxError::Busy)
+                }
+                Ok(()) => None,
+            };
+            if let Some(e) = refused {
+                // Still in `placing`: the dir (and the disk moved into it)
+                // goes outside the lock.
+                self.release(g, &id);
+                return Err(e);
             }
-            // Another spawn may have taken the room meanwhile.
-            if a.start == Start::Now && Self::now_busy(&g, &host, &size) {
-                let _ = g.store.remove(&id);
-                return Err(BoxError::Busy);
-            }
+            g.placing.remove(&id);
         }
         let seq = g.take_seq();
         let r = BoxRecord {
@@ -504,7 +522,7 @@ impl Manager {
             image: None,
         };
         if let Err(e) = g.save_new(r) {
-            let _ = g.store.remove(&id);
+            self.release(g, &id);
             return Err(e);
         }
         let changes = self.admission(&mut g, &host, now);

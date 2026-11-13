@@ -57,6 +57,9 @@ pub struct BoxRecord {
 /// call (spawn's `claim_id` plus first `save`, and gc, all run under it). A
 /// spawn with a repo disk lets the lock go between the two, to move the disk
 /// in; the manager marks that id as being placed and gc leaves it alone.
+/// A failed spawn's dir is removed the same way, through a clone, outside
+/// the lock and with the id still marked.
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
 }

@@ -337,6 +337,83 @@ fn spawn_places_the_disk_where_the_placer_says() {
     assert_eq!(w.spawn("a").id, id("b3"));
 }
 
+/// A placer that, once, runs `during` on the manager while the spawn has
+/// the lock let go (the id claimed, the disk not yet moved in), then names
+/// the usual places.
+fn placer_running(
+    w: &mut World,
+    during: impl Fn(&Manager, &BoxId) + Send + Sync + 'static,
+) -> Arc<Mutex<Option<std::sync::Weak<Manager>>>> {
+    let slot: Arc<Mutex<Option<std::sync::Weak<Manager>>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&slot);
+    let once = std::sync::atomic::AtomicBool::new(false);
+    let usual = common::placer();
+    with_placer(
+        w,
+        Some(Arc::new(move |root: &Path, i: &BoxId| {
+            let m = s
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(m) = m {
+                if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    during(&m, i);
+                }
+            }
+            usual(root, i)
+        })),
+    );
+    *slot.lock().unwrap() = Some(Arc::downgrade(&w.mgr));
+    slot
+}
+
+#[test]
+fn gc_skips_an_id_being_placed() {
+    let mut w = world(1);
+    let seen: Arc<Mutex<Option<(GcReport, bool)>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&seen);
+    let root = w.root.clone();
+    placer_running(&mut w, move |m, i| {
+        // The claimed dir has no record yet: an orphan, but for `placing`.
+        let rep = m.gc();
+        *s.lock().unwrap() = Some((rep, root.join(i.as_str()).is_dir()));
+    });
+    let (img, man) = incoming(&w, "00112233aabbccdd");
+    let r = w.mgr.spawn(&with_disk(&w, &img, &man)).unwrap();
+    let (rep, kept) = seen.lock().unwrap().take().expect("gc ran mid-spawn");
+    assert_eq!(rep, GcReport::default(), "{rep:?}");
+    assert!(kept, "the dir being placed stays");
+    assert_eq!(r.id, id("b1"));
+    assert_eq!(r.state, BoxState::Starting);
+    assert!(w.root.join("b1/repo.img").is_file());
+    w.assert_saved(&r.id);
+}
+
+#[test]
+fn now_busy_after_the_renames_leaves_no_dir() {
+    let mut w = world(1);
+    let other = w.args("claude-code", "other", Start::Now);
+    placer_running(&mut w, move |m, _| {
+        // Another spawn takes the one slot while the disk moves in.
+        let r = m.spawn(&other).unwrap();
+        assert_eq!(r.state, BoxState::Starting);
+    });
+    let (img, man) = incoming(&w, "00112233aabbccdd");
+    let mut a = with_disk(&w, &img, &man);
+    a.start = Start::Now;
+    assert_eq!(w.mgr.spawn(&a), Err(BoxError::Busy));
+    // The racing spawn got b2; b1's dir and the disk moved into it are gone.
+    let ids: Vec<BoxId> = w.mgr.list().iter().map(|r| r.id.clone()).collect();
+    assert_eq!(ids, vec![id("b2")]);
+    assert!(!w.root.join("b1").exists(), "no stray dir");
+    assert!(!w.root.join(".incoming/00112233aabbccdd").exists());
+    assert_eq!(w.vmm.saw_repo_disk(&id("b2")), Some(false));
+    // Nothing for gc either, and the id is not reused.
+    assert_eq!(w.mgr.gc(), GcReport::default());
+    assert_eq!(w.spawn("q").id, id("b3"));
+}
+
 #[test]
 fn incoming_is_swept_by_gc() {
     use std::os::unix::fs::symlink;
