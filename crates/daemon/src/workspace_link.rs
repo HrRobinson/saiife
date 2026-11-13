@@ -561,7 +561,7 @@ async fn source_for(
     v: &Verified,
     action: &str,
 ) -> Result<Arc<dyn BoxSource>, Fail> {
-    let Some(m) = ctx.box_manager.clone() else {
+    let Some(m) = ctx.box_manager.clone().filter(|_| !ctx.workspace_demo) else {
         return Ok(Arc::clone(&ctx.boxes));
     };
     if !action.starts_with("box.") {
@@ -584,14 +584,24 @@ async fn source_for(
         a::BOX_INBOX,
     ];
     if admin && !reads.contains(&action) {
-        // An admin changes only their own boxes.
-        if let Some(Ok(id)) = v
+        // An admin changes only their own boxes: every box the frame names
+        // (`id`, or reorder's `ids`).
+        let named = v
             .frame
             .args
             .get("id")
-            .and_then(Value::as_str)
-            .map(BoxId::parse)
-        {
+            .into_iter()
+            .chain(
+                v.frame
+                    .args
+                    .get("ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter_map(Value::as_str)
+            .filter_map(|s| BoxId::parse(s).ok());
+        for id in named {
             if m.get(&id).is_ok_and(|r| r.owner_uid != owner) {
                 return Err(Fail::Policy(Refused::new(
                     ErrorCode::Forbidden,

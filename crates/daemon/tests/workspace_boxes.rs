@@ -120,6 +120,12 @@ async fn world(slots: u64) -> World {
 
 /// [`world`] with the device owner an admin or not.
 async fn world_as(slots: u64, admin: bool) -> World {
+    world_with(slots, admin, false).await
+}
+
+/// [`world_as`], with the fake demo as `Ctx.boxes` when `demo` (a manager
+/// is there all the same).
+async fn world_with(slots: u64, admin: bool, demo: bool) -> World {
     let tmp = scratch();
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
@@ -162,14 +168,22 @@ async fn world_as(slots: u64, admin: bool) -> World {
     );
     let (ws, warning) = Workspace::open(dir_in(&state));
     assert!(warning.is_none(), "{warning:?}");
-    let cell: box_ops::CtxCell = Arc::default();
-    let boxes = box_ops::pick_workspace_boxes(
-        Arc::new(saiife_wire::source::NoBoxes),
-        Some(&mgr),
-        None,
-        Arc::clone(&cell),
-        None,
-    );
+    let fake: Option<Arc<dyn saiife_wire::source::BoxSource>> = {
+        #[cfg(feature = "fake-boxes")]
+        {
+            demo.then(|| {
+                Arc::new(saiife_wire::fake::FakeBoxSource::demo(now_secs()))
+                    as Arc<dyn saiife_wire::source::BoxSource>
+            })
+        }
+        #[cfg(not(feature = "fake-boxes"))]
+        {
+            assert!(!demo);
+            None
+        }
+    };
+    let (boxes, workspace_demo) =
+        box_ops::pick_workspace_boxes(Arc::new(saiife_wire::source::NoBoxes), fake);
     let ctx = Arc::new(Ctx::new(CtxInit {
         mode: Mode::Locked,
         own_uid: OWN,
@@ -178,6 +192,7 @@ async fn world_as(slots: u64, admin: bool) -> World {
         socket_dir: run.clone(),
         workspace: Arc::new(ws),
         boxes,
+        workspace_demo,
         box_manager: Some(Arc::clone(&mgr)),
         policy: PolicyState {
             admin_groups: vec!["admins".into()],
@@ -185,7 +200,6 @@ async fn world_as(slots: u64, admin: bool) -> World {
         },
         ..CtxInit::minimal(handle, cfg, dirs, &state)
     }));
-    cell.set(Arc::downgrade(&ctx)).unwrap();
     let listener = UnixListener::bind(run.join(LINK_SOCKET_NAME)).unwrap();
     tokio::spawn(saiife_daemon::server::serve_link(
         listener,
@@ -422,13 +436,12 @@ async fn admission_of_other_boxes_is_audited() {
     assert_eq!(box_ops::tick_once(&w.ctx).await, 1);
     let tick = box_records(&w, &b, "tick", 1).await;
     assert_eq!(tick.len(), 1, "{tick:?}");
-    // A frame spawn whose admission pass admits a queue head: B is the head
-    // again once its box is gone and C takes the slot's place.
+    // C queues behind the running B, E behind C.
     let c = send(&w, &mut link, &d, "box.spawn", spawn_args("c")).await;
     let c = c["result"]["id"].as_str().unwrap().to_string();
     let e = send(&w, &mut link, &d, "box.spawn", spawn_args("e")).await;
     let e = e["result"]["id"].as_str().unwrap().to_string();
-    // B stops (slot frees), then a spawn frame admits C, the head.
+    // B stops (slot frees); the next spawn frame's pass admits C, the head.
     let s = send(&w, &mut link, &d, "box.stop", json!({"id": b})).await;
     assert_eq!(s["ok"], true, "{s}");
     let f = send(&w, &mut link, &d, "box.spawn", spawn_args("f")).await;
@@ -447,21 +460,18 @@ async fn admission_of_other_boxes_is_audited() {
     assert!(box_records(&w, &e, "workspace", 0).await.is_empty());
 }
 
-/// The demo wins over a manager when asked (test builds).
+/// The demo wins over a manager when asked (test builds): a frame reads it.
 #[cfg(feature = "fake-boxes")]
 #[tokio::test]
 async fn fake_boxes_env_still_wins() {
-    use saiife_wire::source::BoxSource;
-    let w = world(1).await;
-    let demo: Arc<dyn BoxSource> = Arc::new(saiife_wire::fake::FakeBoxSource::demo(now_secs()));
-    let picked = box_ops::pick_workspace_boxes(
-        Arc::new(saiife_wire::source::NoBoxes),
-        Some(&w.mgr),
-        None,
-        Arc::default(),
-        Some(demo),
-    );
-    assert_eq!(picked.overview().boxes.len(), 4);
+    let w = world_with(1, true, true).await;
+    assert!(w.ctx.box_manager.is_some());
+    let mut link = Link::open(&w).await;
+    let d = pair_device(&w, &mut link).await;
+    let o = send(&w, &mut link, &d, "box.overview", json!({})).await;
+    assert_eq!(o["ok"], true, "{o}");
+    assert_eq!(o["result"]["boxes"].as_array().unwrap().len(), 4, "{o}");
+    assert!(w.mgr.list().is_empty());
 }
 
 /// Another user's box, running, made straight on the manager.
@@ -519,6 +529,10 @@ async fn a_user_cannot_reach_another_users_box() {
         assert_eq!(a["ok"], false, "{action}: {a}");
         assert_eq!(a["rule"], "not_found", "{action}: {a}");
     }
+    // A reorder naming theirs is refused too (no leak: same as a missing id).
+    let q = send(&w, &mut link, &d, "box.reorder", json!({"ids": [theirs]})).await;
+    assert_eq!(q["ok"], false, "{q}");
+    assert_ne!(q["error"], "forbidden", "{q}");
     // Untouched, and the failed changes are audited.
     let r = w.mgr.get(&BoxId::parse(&theirs).unwrap()).unwrap();
     assert_ne!(r.state, saiife_boxes::BoxState::Done);
@@ -543,18 +557,25 @@ async fn an_admin_sees_but_cannot_change_another_users_box() {
         .collect();
     assert!(ids.contains(&theirs), "{o}");
     let df = send(&w, &mut link, &d, "box.diff", json!({"id": theirs})).await;
-    assert_ne!(df["rule"], "not_found", "{df}");
+    // Past the owner scope (a non-admin gets not_found): the guest has no
+    // diff for this box.
+    assert_eq!(df["ok"], false, "{df}");
+    assert_eq!(df["rule"], "unavailable", "{df}");
+    assert_eq!(df["message"], "no diff for this box", "{df}");
     let s = send(&w, &mut link, &d, "box.stop", json!({"id": theirs})).await;
     assert_eq!(s["ok"], false, "{s}");
     assert_eq!(s["error"], "forbidden", "{s}");
     assert_eq!(s["rule"], "not_owner", "{s}");
+    let q = send(&w, &mut link, &d, "box.reorder", json!({"ids": [theirs]})).await;
+    assert_eq!(q["error"], "forbidden", "{q}");
+    assert_eq!(q["rule"], "not_owner", "{q}");
     let r = w.mgr.get(&BoxId::parse(&theirs).unwrap()).unwrap();
     assert_ne!(r.state, saiife_boxes::BoxState::Done);
     let denied = records(&w, "workspace")
         .into_iter()
-        .filter(|r| field(r, "action") == "box.stop" && r["decision"] == "deny")
+        .filter(|r| r["decision"] == "deny" && field(r, "rule") == "not_owner")
         .count();
-    assert_eq!(denied, 1);
+    assert_eq!(denied, 2);
 }
 
 fn lock_all(w: &World) {

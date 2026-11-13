@@ -1095,18 +1095,12 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     #[cfg(not(feature = "fake-boxes"))]
     let fake_demo: Option<Arc<dyn saiife_wire::BoxSource>> = None;
     let boxes_fallback: Arc<dyn saiife_wire::BoxSource> = Arc::new(saiife_wire::source::NoBoxes);
-    // The Workspace over the real box manager when there is one (plan 31):
-    // locked mode sees every box and spawns only through a frame (which
-    // knows the device owner); personal mode is the daemon user's. The
-    // sink's context is set once it exists. The fake demo wins when asked.
-    let workspace_ctx: crate::box_ops::CtxCell = Arc::default();
-    let boxes = crate::box_ops::pick_workspace_boxes(
-        boxes_fallback,
-        box_manager.as_ref(),
-        (mode != Mode::Locked).then_some(euid),
-        Arc::clone(&workspace_ctx),
-        fake_demo,
-    );
+    // `Ctx.boxes` is the fake demo when asked (test builds), else `NoBoxes`:
+    // with a manager, every Workspace frame builds its own source from the
+    // device owner (`workspace_link::source_for`, over
+    // `box_ops::workspace_source`), so nothing here is an unscoped manager
+    // view that later code could reach by mistake.
+    let (boxes, workspace_demo) = crate::box_ops::pick_workspace_boxes(boxes_fallback, fake_demo);
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
     // The MCP gateway (plan 17): children never get read access to the
@@ -1173,6 +1167,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         // Workspace (plan 29)
         workspace: Arc::new(workspace),
         boxes,
+        workspace_demo,
         box_manager,
         box_unavailable,
         box_template_warnings,
@@ -1180,7 +1175,6 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         box_disk_root,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
-    let _ = workspace_ctx.set(Arc::downgrade(&ctx));
     if let Some(a) = &box_audit {
         a.attach(&ctx);
     }

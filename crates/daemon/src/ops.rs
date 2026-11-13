@@ -406,6 +406,9 @@ pub struct Ctx {
     /// Where the boxes' disks are (`box_ops::Built::disk_root`); `None`:
     /// the manager's store root.
     pub box_disk_root: Option<PathBuf>,
+    /// The Workspace serves the fake demo boxes (`fake-boxes` test builds),
+    /// not the manager: frames then read `boxes` as it is.
+    pub workspace_demo: bool,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -468,6 +471,9 @@ pub struct CtxInit {
     pub box_images: Option<crate::box_images::ImagePaths>,
     /// See [`Ctx::box_disk_root`]. `minimal` leaves it `None`.
     pub box_disk_root: Option<PathBuf>,
+    /// The Workspace serves the fake demo boxes (`fake-boxes` test builds),
+    /// not the manager: frames then read `boxes` as it is.
+    pub workspace_demo: bool,
 }
 
 impl CtxInit {
@@ -529,6 +535,7 @@ impl CtxInit {
             box_template_warnings: Vec::new(),
             box_images: None,
             box_disk_root: None,
+            workspace_demo: false,
         }
     }
 }
@@ -766,6 +773,7 @@ impl Ctx {
             box_template_warnings: i.box_template_warnings,
             box_images: i.box_images,
             box_disk_root: i.box_disk_root,
+            workspace_demo: i.workspace_demo,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,

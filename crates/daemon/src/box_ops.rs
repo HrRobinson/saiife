@@ -971,14 +971,6 @@ impl Op {
         })
     }
 
-    /// The ops that give a box power, refused under lockdown `all`.
-    fn grants_power(&self) -> bool {
-        matches!(
-            self,
-            Op::Spawn(_) | Op::Resume(_) | Op::Revise(..) | Op::Steer(..)
-        )
-    }
-
     /// The box a per-box op is about.
     fn target(&self) -> Option<&BoxId> {
         match self {
@@ -1114,7 +1106,7 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     };
 
     // Lockdown `all` refuses what gives a box power; the record says so.
-    if op.grants_power() {
+    {
         if let Some(why) = power_refusal(ctx, &action) {
             let template = match &op {
                 Op::Spawn(a) => Some(a.template.as_str()),
@@ -1527,22 +1519,18 @@ pub fn workspace_source(mgr: Arc<Manager>, owner: Option<u32>, cell: CtxCell) ->
     ManagerSource::new(mgr, owner).with_changes(workspace_sink(cell))
 }
 
-/// The Workspace's box source: the demo (`fake_demo`, test builds) wins,
-/// else the real manager when there is one (locked mode `owner = None`,
-/// personal the daemon's uid), else `fallback`.
+/// What `Ctx.boxes` holds, and whether it is the fake demo. Frames never
+/// read it when there is a manager and no demo: they build their source per
+/// frame from the device owner (`workspace_source`, the one construction
+/// site), so with a manager and no demo `Ctx.boxes` is `fallback`
+/// (`NoBoxes`), never an unscoped manager view.
 pub fn pick_workspace_boxes(
     fallback: Arc<dyn BoxSource>,
-    manager: Option<&Arc<Manager>>,
-    owner: Option<u32>,
-    cell: CtxCell,
     fake_demo: Option<Arc<dyn BoxSource>>,
-) -> Arc<dyn BoxSource> {
-    if let Some(d) = fake_demo {
-        return d;
-    }
-    match manager {
-        Some(m) => Arc::new(workspace_source(Arc::clone(m), owner, cell)),
-        None => fallback,
+) -> (Arc<dyn BoxSource>, bool) {
+    match fake_demo {
+        Some(d) => (d, true),
+        None => (fallback, false),
     }
 }
 
