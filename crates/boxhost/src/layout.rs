@@ -10,6 +10,13 @@ pub fn boxes_in(state_dir: &Path) -> PathBuf {
     state_dir.join("boxes")
 }
 
+/// The personal image store under a state dir: `<state_dir>/images`, the
+/// VMM-readable half of the image store (raw disks and kernels). The
+/// daemon keeps the image manifests apart, in its own records dir.
+pub fn images_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("images")
+}
+
 /// Daemon-trusted state: where the daemon stages a repo disk and its base
 /// manifest a CLI passed (plan 37), under the box store root. The daemon
 /// reads the manifest there, so it is the daemon's own 0700 dir, opened
@@ -45,7 +52,7 @@ impl Layout {
     pub fn personal(state_dir: &Path, data_home: &Path) -> Layout {
         Layout {
             boxes: boxes_in(state_dir),
-            images: state_dir.join("images"),
+            images: images_in(state_dir),
             vmm: data_home.join("saiife").join("vmm"),
             vault: state_dir.join("box-vault"),
             locked: false,
@@ -92,6 +99,7 @@ mod tests {
         let id = saiife_wire::source::BoxId::parse("b7").unwrap();
         let l = Layout::personal(Path::new("/s/state"), Path::new("/s/data"));
         assert_eq!(boxes_in(Path::new("/s/state")), l.boxes);
+        assert_eq!(images_in(Path::new("/s/state")), l.images);
         assert_eq!(l.incoming(), PathBuf::from("/s/state/boxes/.incoming"));
         assert_eq!(incoming_in(&l.boxes), l.incoming());
         assert_eq!(l.box_paths(&id).dir, PathBuf::from("/s/state/boxes/b7"));

@@ -1,19 +1,34 @@
-//! The base image store: `<dir>/base-<sha256>.raw` (0440), `.json`, an
-//! optional `.vmlinuz`, and `<dir>/default` (one line: the id). The JSON
-//! file is written last, so an entry without one is not in the store.
-//! The store is also the Cloud Hypervisor driver's `ImageResolver`.
+//! The base image store, in two dirs (plan 35's final layout, R37):
+//!
+//! - the records dir, daemon-only (0700): the manifests `<id>.json` and
+//!   `default` (one line: the id). The trusted manifest is only ever read
+//!   from here.
+//! - the images dir, readable by the VMM: `<id>.raw` (0440) and an optional
+//!   `<id>.vmlinuz` (0440). Nothing is read back from it but the raw disk
+//!   and the kernel themselves, for hashing.
+//!
+//! The manifest is written last, so an entry without one is not in the
+//! store. The store is also the Cloud Hypervisor driver's `ImageResolver`.
 
 use super::{parse_image_id, Manifest, ManifestBoot};
 use crate::launch::Boot;
 use crate::vmm::{ImageResolver, ResolvedImage};
+use rustix::fs::{FileType, Mode, OFlags};
 use saiife_boxes::template::ImageRef;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+/// The largest manifest the store reads.
+const MANIFEST_MAX_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct Store {
-    dir: PathBuf,
+    /// Daemon-only: `<id>.json` and `default`.
+    records: PathBuf,
+    /// VMM-readable: `<id>.raw` and `<id>.vmlinuz`.
+    images: PathBuf,
     /// The firmware a firmware-booting image boots with
     /// (`<vmm>/CLOUDHV.fd`); see `with_firmware`.
     fw: Option<PathBuf>,
@@ -28,15 +43,61 @@ fn regular_file(p: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
 fn set_mode(p: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(p, fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
-fn set_mode(_p: &Path, _mode: u32) -> io::Result<()> {
-    Ok(())
+/// `p` opened read-only, never through a symlink and never blocking on a
+/// FIFO; it must be a regular file.
+fn open_plain(p: &Path) -> Result<File, String> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd =
+        rustix::fs::open(p, flags, Mode::empty()).map_err(|e| format!("{}: {e}", p.display()))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| format!("{}: {e}", p.display()))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(format!("{} is not a regular file", p.display()));
+    }
+    Ok(File::from(fd))
+}
+
+/// The SHA-256 of what `f` holds, read from its start.
+fn sha256_of(f: &File, what: &str) -> Result<String, String> {
+    use std::os::unix::fs::FileExt;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    loop {
+        let n = match f.read_at(&mut buf, at) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(x) if x.kind() == io::ErrorKind::Interrupted => continue,
+            Err(x) => return Err(format!("cannot read {what}: {x}")),
+        };
+        ctx.update(&buf[..n]);
+        at += n as u64;
+    }
+    let mut hex = String::with_capacity(64);
+    for b in ctx.finish().as_ref() {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+}
+
+/// A manifest file of the records dir: opened with [`open_plain`], at
+/// most [`MANIFEST_MAX_BYTES`].
+fn read_manifest_text(p: &Path) -> Result<String, io::Error> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let f = File::from(rustix::fs::open(p, flags, Mode::empty())?);
+    if !f.metadata()?.file_type().is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let mut text = String::new();
+    f.take(MANIFEST_MAX_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MANIFEST_MAX_BYTES {
+        return Err(io::Error::other("the manifest is too large"));
+    }
+    Ok(text)
 }
 
 /// Removes the listed paths on drop unless disarmed.
@@ -50,36 +111,6 @@ impl Drop for Cleanup {
     }
 }
 
-/// Copies `src` into a new file at `dest` and returns the SHA-256 of what
-/// was copied. A plain `std::io::copy`-style loop for now; plan 37's
-/// `disk::copy_sparse` replaces it so holes stay holes.
-fn copy_hashing(src: &mut File, dest: &Path) -> Result<String, String> {
-    let e = |x: io::Error| format!("{}: {x}", dest.display());
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-        .map_err(e)?;
-    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = match src.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(x) if x.kind() == io::ErrorKind::Interrupted => continue,
-            Err(x) => return Err(format!("read the source image: {x}")),
-        };
-        ctx.update(&buf[..n]);
-        out.write_all(&buf[..n]).map_err(e)?;
-    }
-    out.sync_all().map_err(e)?;
-    let mut hex = String::with_capacity(64);
-    for b in ctx.finish().as_ref() {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    Ok(hex)
-}
-
 /// Writes `text` to `<dir>/.<name>.tmp`, then renames it to `<dir>/<name>`.
 fn write_atomic(dir: &Path, name: &str, text: &str, mode: u32) -> Result<(), String> {
     let tmp = dir.join(format!(".{name}.tmp"));
@@ -90,6 +121,7 @@ fn write_atomic(dir: &Path, name: &str, text: &str, mode: u32) -> Result<(), Str
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
         .open(&tmp)
         .map_err(e)?;
     f.write_all(text.as_bytes()).map_err(e)?;
@@ -100,18 +132,44 @@ fn write_atomic(dir: &Path, name: &str, text: &str, mode: u32) -> Result<(), Str
     Ok(())
 }
 
+/// `dir`, created 0700 when missing.
+fn make_dir(dir: &Path) -> Result<(), String> {
+    if !dir.is_dir() {
+        let mut b = fs::DirBuilder::new();
+        b.recursive(true);
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// The manifest, re-parsed (so every check of `Manifest::parse` holds),
+/// and whether the kernel given matches what it boots.
+fn checked(manifest: &Manifest, has_kernel: bool) -> Result<Manifest, String> {
+    let m = Manifest::parse(&manifest.to_json())?;
+    let boots_kernel = matches!(m.boot, ManifestBoot::Kernel { .. });
+    match (has_kernel, boots_kernel) {
+        (true, false) => Err(format!(
+            "{} boots from firmware but a kernel was given",
+            m.id
+        )),
+        (false, true) => Err(format!("{} boots a kernel but none was given", m.id)),
+        _ => Ok(m),
+    }
+}
+
 impl Store {
-    /// The store at `dir`, created 0700 when missing.
-    pub fn open(dir: PathBuf) -> Result<Store, String> {
-        if !dir.is_dir() {
-            let mut b = fs::DirBuilder::new();
-            b.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-            b.create(&dir)
-                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
-        Ok(Store { dir, fw: None })
+    /// The store with its manifests in `records` and its disks in
+    /// `images`; each dir is created 0700 when missing.
+    pub fn open(records: PathBuf, images: PathBuf) -> Result<Store, String> {
+        make_dir(&records)?;
+        make_dir(&images)?;
+        Ok(Store {
+            records,
+            images,
+            fw: None,
+        })
     }
 
     /// The firmware firmware-booting images resolve to: the caller passes
@@ -123,23 +181,33 @@ impl Store {
         }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// The daemon-only dir of the manifests and `default`.
+    pub fn records_dir(&self) -> &Path {
+        &self.records
+    }
+
+    /// The VMM-readable dir of the raw disks and kernels.
+    pub fn images_dir(&self) -> &Path {
+        &self.images
+    }
+
+    fn manifest_path(&self, id: &str) -> PathBuf {
+        self.records.join(format!("{id}.json"))
     }
 
     fn path(&self, id: &str, ext: &str) -> PathBuf {
-        self.dir.join(format!("{id}.{ext}"))
+        self.images.join(format!("{id}.{ext}"))
     }
 
-    /// Every `<id>.json` in the store, sorted by id, each with its
+    /// Every `<id>.json` in the records dir, sorted by id, each with its
     /// warnings (file name not the manifest's id, `.raw` missing). The
     /// second list warns about manifests that cannot be read at all.
     pub fn list(&self) -> (Vec<(Manifest, Vec<String>)>, Vec<String>) {
         let mut entries = Vec::new();
         let mut bad = Vec::new();
-        let rd = match fs::read_dir(&self.dir) {
+        let rd = match fs::read_dir(&self.records) {
             Ok(rd) => rd,
-            Err(e) => return (entries, vec![format!("{}: {e}", self.dir.display())]),
+            Err(e) => return (entries, vec![format!("{}: {e}", self.records.display())]),
         };
         let mut files: Vec<String> = rd
             .filter_map(|e| e.ok())
@@ -149,8 +217,8 @@ impl Store {
         files.sort();
         for name in files {
             let stem = &name[..name.len() - ".json".len()];
-            let p = self.dir.join(&name);
-            let m = fs::read_to_string(&p)
+            let p = self.records.join(&name);
+            let m = read_manifest_text(&p)
                 .map_err(|e| e.to_string())
                 .and_then(|t| Manifest::parse(&t));
             let m = match m {
@@ -181,8 +249,8 @@ impl Store {
     /// The manifest of an image that is in the store (its `.raw` present).
     pub fn get(&self, id: &str) -> Result<Manifest, String> {
         parse_image_id(id)?;
-        let p = self.path(id, "json");
-        let text = fs::read_to_string(&p).map_err(|e| match e.kind() {
+        let p = self.manifest_path(id);
+        let text = read_manifest_text(&p).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => format!("no image {id} in the store"),
             _ => format!("{}: {e}", p.display()),
         })?;
@@ -196,9 +264,9 @@ impl Store {
         Ok(m)
     }
 
-    /// The id in `<dir>/default`, when it is a valid image id.
+    /// The id in `<records>/default`, when it is a valid image id.
     pub fn default_id(&self) -> Option<String> {
-        let text = fs::read_to_string(self.dir.join("default")).ok()?;
+        let text = read_manifest_text(&self.records.join("default")).ok()?;
         let id = text.trim();
         parse_image_id(id).ok()?;
         Some(id.to_string())
@@ -207,73 +275,106 @@ impl Store {
     /// Makes `id`, which must be in the store, the default.
     pub fn set_default(&self, id: &str) -> Result<(), String> {
         self.get(id)?;
-        write_atomic(&self.dir, "default", &format!("{id}\n"), 0o600)
+        write_atomic(&self.records, "default", &format!("{id}\n"), 0o600)
     }
 
-    /// Copies an image into the store: the raw disk into `.<id>.raw.tmp`
-    /// (hashed as it is copied and checked against `manifest.sha256`, then
-    /// 0440 and renamed), the kernel when the manifest boots one (hashed
-    /// the same way and checked against `boot.sha256`), and the manifest
-    /// last. On failure nothing new is left in the store.
-    pub fn insert(
+    /// Takes an image whose files are already in the images dir's
+    /// filesystem (the daemon's own copies, e.g. in `<images>/.incoming/`)
+    /// into the store: the manifest must parse and match the kernel given;
+    /// each file is opened without following a link, must be a regular
+    /// file, and is hashed against the manifest (`sha256`, and the kernel
+    /// against `boot.sha256`); then made 0440 and renamed to `<id>.raw`
+    /// and `<id>.vmlinuz`, and the manifest is written to the records dir
+    /// last. On failure nothing new is in the store; the files given stay
+    /// where they are for the caller to remove.
+    pub fn adopt(
         &self,
-        raw_src: &mut File,
+        raw: &Path,
+        kernel: Option<&Path>,
         manifest: &Manifest,
-        kernel: Option<&mut File>,
     ) -> Result<(), String> {
-        let m = Manifest::parse(&manifest.to_json())?;
+        let m = checked(manifest, kernel.is_some())?;
         let id = m.id.as_str();
-        let boots_kernel = matches!(m.boot, ManifestBoot::Kernel { .. });
-        match (&kernel, boots_kernel) {
-            (Some(_), false) => {
-                return Err(format!("{id} boots from firmware but a kernel was given"))
-            }
-            (None, true) => return Err(format!("{id} boots a kernel but none was given")),
-            _ => {}
-        }
-        let (raw, json, vmlinuz) = (
+        let (dest_raw, dest_k, json) = (
             self.path(id, "raw"),
-            self.path(id, "json"),
             self.path(id, "vmlinuz"),
+            self.manifest_path(id),
         );
-        if raw.exists() || json.exists() || vmlinuz.exists() {
+        let there = |p: &Path| fs::symlink_metadata(p).is_ok();
+        if there(&dest_raw) || there(&dest_k) || there(&json) {
             return Err(format!("{id} is already in the store"));
         }
-        let raw_tmp = self.dir.join(format!(".{id}.raw.tmp"));
-        let k_tmp = self.dir.join(format!(".{id}.vmlinuz.tmp"));
-        let _ = fs::remove_file(&raw_tmp);
-        let _ = fs::remove_file(&k_tmp);
-        let mut guard = Cleanup(vec![raw_tmp.clone(), k_tmp.clone()]);
-        let got = copy_hashing(raw_src, &raw_tmp)?;
+        let ro = Mode::from_raw_mode(0o440);
+        let f = open_plain(raw)?;
+        let got = sha256_of(&f, "the image")?;
         if got != m.sha256 {
             return Err(format!(
                 "the image's sha256 is {got}, the manifest says {}",
                 m.sha256
             ));
         }
-        let e = |p: &Path, x: io::Error| format!("{}: {x}", p.display());
-        set_mode(&raw_tmp, 0o440).map_err(|x| e(&raw_tmp, x))?;
+        rustix::fs::fchmod(&f, ro).map_err(|e| format!("{}: {e}", raw.display()))?;
         if let (Some(k), ManifestBoot::Kernel { sha256: want, .. }) = (kernel, &m.boot) {
-            let got = copy_hashing(k, &k_tmp)?;
+            let f = open_plain(k)?;
+            let got = sha256_of(&f, "the kernel")?;
             if got != *want {
                 return Err(format!(
                     "the kernel's sha256 is {got}, the manifest says {want}"
                 ));
             }
-            set_mode(&k_tmp, 0o440).map_err(|x| e(&k_tmp, x))?;
+            rustix::fs::fchmod(&f, ro).map_err(|e| format!("{}: {e}", k.display()))?;
         }
-        guard.0.push(raw.clone());
-        fs::rename(&raw_tmp, &raw).map_err(|x| e(&raw, x))?;
-        if boots_kernel {
-            guard.0.push(vmlinuz.clone());
-            fs::rename(&k_tmp, &vmlinuz).map_err(|x| e(&vmlinuz, x))?;
+        let e = |p: &Path, x: io::Error| format!("{}: {x}", p.display());
+        let mut guard = Cleanup(Vec::new());
+        fs::rename(raw, &dest_raw).map_err(|x| e(&dest_raw, x))?;
+        guard.0.push(dest_raw.clone());
+        if let Some(k) = kernel {
+            fs::rename(k, &dest_k).map_err(|x| e(&dest_k, x))?;
+            guard.0.push(dest_k.clone());
         }
-        write_atomic(&self.dir, &format!("{id}.json"), &m.to_json(), 0o440)?;
+        write_atomic(&self.records, &format!("{id}.json"), &m.to_json(), 0o440)?;
         guard.0.clear();
         Ok(())
     }
 
-    /// Removes an image that is not the default.
+    /// Copies an image into the store: the raw disk (and the kernel when
+    /// the manifest boots one) into `<images>/.<id>.raw.tmp` (holes kept),
+    /// then [`Store::adopt`]. On failure nothing new is left in the store.
+    pub fn insert(
+        &self,
+        raw_src: &File,
+        manifest: &Manifest,
+        kernel: Option<&File>,
+    ) -> Result<(), String> {
+        let m = checked(manifest, kernel.is_some())?;
+        let id = m.id.as_str();
+        let raw_tmp = self.images.join(format!(".{id}.raw.tmp"));
+        let k_tmp = self.images.join(format!(".{id}.vmlinuz.tmp"));
+        let _ = fs::remove_file(&raw_tmp);
+        let _ = fs::remove_file(&k_tmp);
+        let _guard = Cleanup(vec![raw_tmp.clone(), k_tmp.clone()]);
+        let copy = |src: &File, dest: &Path| -> Result<(), String> {
+            let e = |x: io::Error| format!("{}: {x}", dest.display());
+            let out = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(dest)
+                .map_err(e)?;
+            crate::disk::copy_sparse(src, &out).map_err(e)?;
+            out.sync_all().map_err(e)
+        };
+        copy(raw_src, &raw_tmp)?;
+        if let Some(k) = kernel {
+            copy(k, &k_tmp)?;
+        }
+        self.adopt(&raw_tmp, kernel.map(|_| k_tmp.as_path()), &m)
+    }
+
+    /// Removes an image that is not the default: its manifest first (so
+    /// the entry is gone at once), then its disk and kernel.
     pub fn remove(&self, id: &str) -> Result<(), String> {
         parse_image_id(id)?;
         if self.default_id().as_deref() == Some(id) {
@@ -281,12 +382,11 @@ impl Store {
                 "{id} is the default image; make another image the default first"
             ));
         }
-        let json = self.path(id, "json");
+        let json = self.manifest_path(id);
         if !json.exists() && !self.path(id, "raw").exists() {
             return Err(format!("no image {id} in the store"));
         }
-        for ext in ["json", "raw", "vmlinuz"] {
-            let p = self.path(id, ext);
+        for p in [json, self.path(id, "raw"), self.path(id, "vmlinuz")] {
             match fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(x) if x.kind() == io::ErrorKind::NotFound => {}
@@ -328,8 +428,7 @@ impl ImageResolver for Store {
             } => {
                 let kernel = self.path(&id, "vmlinuz");
                 regular_file(&kernel)?;
-                let got = crate::pins::sha256_file(&kernel)
-                    .map_err(|e| format!("{}: {e}", kernel.display()))?;
+                let got = sha256_of(&open_plain(&kernel)?, "the kernel")?;
                 if got != *want {
                     return Err(format!(
                         "{id}: the kernel's sha256 is {got}, the manifest says {want}"
@@ -373,7 +472,7 @@ mod tests {
     fn world() -> W {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().to_path_buf();
-        let store = Store::open(root.join("images")).unwrap();
+        let store = Store::open(root.join("records"), root.join("images")).unwrap();
         W { _d: d, root, store }
     }
 
@@ -387,10 +486,23 @@ mod tests {
 
     fn add(w: &W, name: &str, content: &str) -> Manifest {
         let (p, m) = src(w, name, content);
-        w.store
-            .insert(&mut File::open(&p).unwrap(), &m, None)
-            .unwrap();
+        w.store.insert(&File::open(&p).unwrap(), &m, None).unwrap();
         m
+    }
+
+    /// Every name in both of the store's dirs, `r/` or `i/` before it.
+    fn store_names(w: &W) -> Vec<String> {
+        let mut v: Vec<String> = names(w.store.records_dir())
+            .into_iter()
+            .map(|n| format!("r/{n}"))
+            .chain(
+                names(w.store.images_dir())
+                    .into_iter()
+                    .map(|n| format!("i/{n}")),
+            )
+            .collect();
+        v.sort();
+        v
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -403,11 +515,95 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_the_dir_0700() {
+    fn open_creates_both_dirs_0700() {
         let w = world();
-        let m = fs::metadata(w.store.dir()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(m, 0o700);
-        assert!(Store::open(w.store.dir().to_path_buf()).is_ok());
+        for d in [w.store.records_dir(), w.store.images_dir()] {
+            let m = fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(m, 0o700, "{}", d.display());
+        }
+        assert_ne!(w.store.records_dir(), w.store.images_dir());
+        assert!(Store::open(
+            w.store.records_dir().to_path_buf(),
+            w.store.images_dir().to_path_buf()
+        )
+        .is_ok());
+    }
+
+    /// The manifest and `default` are in the records dir only; the disk
+    /// and the kernel in the images dir only.
+    #[test]
+    fn store_split_records_from_images() {
+        let w = world();
+        let m = add_kernel(&w, "kernel");
+        w.store.set_default(&m.id).unwrap();
+        assert_eq!(
+            store_names(&w),
+            vec![
+                format!("i/{}.raw", m.id),
+                format!("i/{}.vmlinuz", m.id),
+                format!("r/{}.json", m.id),
+                "r/default".to_string(),
+            ]
+        );
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(w.store.images_dir().join(format!("{}.vmlinuz", m.id))),
+            0o440
+        );
+        assert_eq!(
+            mode(w.store.records_dir().join(format!("{}.json", m.id))),
+            0o440
+        );
+        // A manifest planted in the images dir is not read.
+        let other = manifest_for(&"7".repeat(64));
+        fs::write(
+            w.store.images_dir().join(format!("{}.json", other.id)),
+            other.to_json(),
+        )
+        .unwrap();
+        let ids: Vec<String> = w.store.list().0.into_iter().map(|(m, _)| m.id).collect();
+        assert_eq!(ids, vec![m.id.clone()]);
+        assert!(w.store.get(&other.id).is_err());
+        // A symlinked manifest in the records dir is not followed.
+        let link = w.store.records_dir().join(format!("{}.json", other.id));
+        std::os::unix::fs::symlink(
+            w.store.images_dir().join(format!("{}.json", other.id)),
+            &link,
+        )
+        .unwrap();
+        assert!(w.store.get(&other.id).is_err());
+    }
+
+    /// `adopt` takes files already beside the store, hashes them, and
+    /// renames them in; a symlink or a wrong hash leaves the store empty.
+    #[test]
+    fn adopt_checks_and_renames() {
+        let w = world();
+        let inc = w.store.images_dir().join(".incoming");
+        fs::create_dir(&inc).unwrap();
+        let raw = inc.join("base.raw");
+        fs::write(&raw, "image-a\n").unwrap();
+        let m = manifest_for(&sha256_file(&raw).unwrap());
+        // A symlink to the right content is refused.
+        let link = inc.join("link.raw");
+        std::os::unix::fs::symlink(&raw, &link).unwrap();
+        let e = w.store.adopt(&link, None, &m).unwrap_err();
+        assert!(e.contains("link.raw"), "{e}");
+        // A wrong digest is refused.
+        let mut bad = manifest_for(&"0".repeat(64));
+        bad.boot = ManifestBoot::Firmware;
+        let e = w.store.adopt(&raw, None, &bad).unwrap_err();
+        assert!(e.contains("sha256"), "{e}");
+        assert_eq!(store_names(&w), vec!["i/.incoming".to_string()]);
+        w.store.adopt(&raw, None, &m).unwrap();
+        assert!(!raw.exists());
+        assert_eq!(w.store.get(&m.id).unwrap(), m);
+        let mode = fs::metadata(w.store.images_dir().join(format!("{}.raw", m.id)))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o440);
     }
 
     #[test]
@@ -419,30 +615,26 @@ mod tests {
         m.id = image_id(&m.sha256);
         let e = w
             .store
-            .insert(&mut File::open(&p).unwrap(), &m, None)
+            .insert(&File::open(&p).unwrap(), &m, None)
             .unwrap_err();
         assert!(e.contains("sha256") && e.contains(&real), "{e}");
-        assert!(
-            names(w.store.dir()).is_empty(),
-            "{:?}",
-            names(w.store.dir())
-        );
+        assert!(store_names(&w).is_empty(), "{:?}", store_names(&w));
 
         let m = add(&w, "b.raw", "image-b\n");
-        let raw = w.store.dir().join(format!("{}.raw", m.id));
+        let raw = w.store.images_dir().join(format!("{}.raw", m.id));
         assert_eq!(fs::read_to_string(&raw).unwrap(), "image-b\n");
         let mode = fs::metadata(&raw).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o440);
         assert_eq!(w.store.get(&m.id).unwrap(), m);
         assert_eq!(
-            names(w.store.dir()),
-            vec![format!("{}.json", m.id), format!("{}.raw", m.id)]
+            store_names(&w),
+            vec![format!("i/{}.raw", m.id), format!("r/{}.json", m.id)]
         );
         // The same id again is refused.
         let p = w.root.join("b.raw");
         let e = w
             .store
-            .insert(&mut File::open(&p).unwrap(), &m, None)
+            .insert(&File::open(&p).unwrap(), &m, None)
             .unwrap_err();
         assert!(e.contains("already"), "{e}");
     }
@@ -456,11 +648,7 @@ mod tests {
         // Firmware boot with a kernel file, and kernel boot without one, are refused.
         let e = w
             .store
-            .insert(
-                &mut File::open(&p).unwrap(),
-                &m,
-                Some(&mut File::open(&k).unwrap()),
-            )
+            .insert(&File::open(&p).unwrap(), &m, Some(&File::open(&k).unwrap()))
             .unwrap_err();
         assert!(e.contains("kernel"), "{e}");
         m.boot = ManifestBoot::Kernel {
@@ -470,35 +658,27 @@ mod tests {
         };
         let e = w
             .store
-            .insert(&mut File::open(&p).unwrap(), &m, None)
+            .insert(&File::open(&p).unwrap(), &m, None)
             .unwrap_err();
         assert!(e.contains("kernel"), "{e}");
-        assert!(names(w.store.dir()).is_empty());
+        assert!(store_names(&w).is_empty());
         // A kernel whose hash is not the manifest's is refused, and nothing is left.
         let other = w.root.join("vmlinuz-other");
         fs::write(&other, "another kernel").unwrap();
         let e = w
             .store
             .insert(
-                &mut File::open(&p).unwrap(),
+                &File::open(&p).unwrap(),
                 &m,
-                Some(&mut File::open(&other).unwrap()),
+                Some(&File::open(&other).unwrap()),
             )
             .unwrap_err();
         assert!(e.contains("kernel's sha256"), "{e}");
-        assert!(
-            names(w.store.dir()).is_empty(),
-            "{:?}",
-            names(w.store.dir())
-        );
+        assert!(store_names(&w).is_empty(), "{:?}", store_names(&w));
         w.store
-            .insert(
-                &mut File::open(&p).unwrap(),
-                &m,
-                Some(&mut File::open(&k).unwrap()),
-            )
+            .insert(&File::open(&p).unwrap(), &m, Some(&File::open(&k).unwrap()))
             .unwrap();
-        let kp = w.store.dir().join(format!("{}.vmlinuz", m.id));
+        let kp = w.store.images_dir().join(format!("{}.vmlinuz", m.id));
         assert_eq!(fs::read_to_string(kp).unwrap(), "kernel");
     }
 
@@ -514,7 +694,7 @@ mod tests {
         w.store.set_default(&a.id).unwrap();
         assert_eq!(w.store.default_id().as_deref(), Some(a.id.as_str()));
         assert_eq!(
-            fs::read_to_string(w.store.dir().join("default")).unwrap(),
+            fs::read_to_string(w.store.records_dir().join("default")).unwrap(),
             format!("{}\n", a.id)
         );
         assert_eq!(w.store.get(&b.id).unwrap(), b);
@@ -525,7 +705,7 @@ mod tests {
         assert!(w.store.get(&b.id).is_err());
         assert!(w.store.remove(&b.id).is_err());
         w.store.set_default(&a.id).unwrap();
-        assert_eq!(names(w.store.dir()).len(), 3);
+        assert_eq!(store_names(&w).len(), 3);
         // The resolver takes the same default and the same pinned ids.
         let store = w.store.clone().with_firmware(w.root.join("vmm/CLOUDHV.fd"));
         let got = store.resolve(&ImageRef::Default).unwrap();
@@ -533,7 +713,7 @@ mod tests {
             got,
             ResolvedImage {
                 id: a.id.clone(),
-                raw: w.store.dir().join(format!("{}.raw", a.id)),
+                raw: w.store.images_dir().join(format!("{}.raw", a.id)),
                 sha256: a.sha256.clone(),
                 virtual_gib: a.virtual_gib,
                 boot: Boot::Firmware {
@@ -549,7 +729,7 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("bad image id"), "{e}");
         // A garbage default file reads as no default.
-        fs::write(w.store.dir().join("default"), "../etc\n").unwrap();
+        fs::write(w.store.records_dir().join("default"), "../etc\n").unwrap();
         assert_eq!(w.store.default_id(), None);
         let e = store.resolve(&ImageRef::Default).unwrap_err();
         assert_eq!(
@@ -586,7 +766,7 @@ mod tests {
         let w = world();
         let a = add(&w, "a.raw", "image-a\n");
         let store = w.store.clone().with_firmware(w.root.join("fw"));
-        let raw = w.store.dir().join(format!("{}.raw", a.id));
+        let raw = w.store.images_dir().join(format!("{}.raw", a.id));
         let real = w.root.join("elsewhere.raw");
         fs::rename(&raw, &real).unwrap();
         std::os::unix::fs::symlink(&real, &raw).unwrap();
@@ -607,11 +787,7 @@ mod tests {
             cmdline: "console=ttyS0 root=/dev/vda1".into(),
         };
         w.store
-            .insert(
-                &mut File::open(&p).unwrap(),
-                &m,
-                Some(&mut File::open(&k).unwrap()),
-            )
+            .insert(&File::open(&p).unwrap(), &m, Some(&File::open(&k).unwrap()))
             .unwrap();
         m
     }
@@ -626,11 +802,11 @@ mod tests {
             got,
             ResolvedImage {
                 id: m.id.clone(),
-                raw: w.store.dir().join(format!("{}.raw", m.id)),
+                raw: w.store.images_dir().join(format!("{}.raw", m.id)),
                 sha256: m.sha256.clone(),
                 virtual_gib: m.virtual_gib,
                 boot: Boot::Kernel {
-                    kernel: w.store.dir().join(format!("{}.vmlinuz", m.id)),
+                    kernel: w.store.images_dir().join(format!("{}.vmlinuz", m.id)),
                     cmdline: "console=ttyS0 root=/dev/vda1".into(),
                 },
             }
@@ -641,7 +817,7 @@ mod tests {
     fn resolver_refuses_a_changed_or_symlinked_kernel() {
         let w = world();
         let m = add_kernel(&w, "kernel");
-        let kp = w.store.dir().join(format!("{}.vmlinuz", m.id));
+        let kp = w.store.images_dir().join(format!("{}.vmlinuz", m.id));
         // A kernel whose content no longer matches the manifest.
         set_mode(&kp, 0o640).unwrap();
         fs::write(&kp, "tampered").unwrap();
@@ -671,9 +847,9 @@ mod tests {
         let a = add(&w, "a.raw", "image-a\n");
         let b = add(&w, "b.raw", "image-b\n");
         let c = add(&w, "c.raw", "image-c\n");
-        let dir = w.store.dir();
+        let dir = w.store.records_dir();
         // b loses its raw file; c's json is filed under another id.
-        fs::remove_file(dir.join(format!("{}.raw", b.id))).unwrap();
+        fs::remove_file(w.store.images_dir().join(format!("{}.raw", b.id))).unwrap();
         let other = image_id(&"e".repeat(64));
         fs::rename(
             dir.join(format!("{}.json", c.id)),
