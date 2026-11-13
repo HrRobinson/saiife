@@ -52,8 +52,10 @@ const LOG_TAIL_LINES: usize = 20;
 const LOG_LINE_MAX: usize = 300;
 /// At most this many entries of a box dir are looked at.
 const MAX_DIR_ENTRIES: usize = 256;
-/// `destroy` waits this long for a boot in progress.
-const BOOT_WAIT: Duration = Duration::from_secs(15);
+/// `destroy` waits at most this long, for a boot in progress and for the
+/// stop ladder together (R41: the trait's "about a second"). A VMM still
+/// stopping fails the call with every file kept; the caller retries.
+const DESTROY_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedImage {
@@ -701,6 +703,12 @@ impl ChVmm {
         ) {
             return Ok(());
         }
+        self.restart_ladder(h, paths)
+    }
+
+    /// A stale run (none, or a reaper that ended without confirming the
+    /// exit) gets a new reaper that runs the ladder at once.
+    fn restart_ladder(&self, h: &VmHandle, paths: BoxPaths) -> Result<(), VmmError> {
         let mut g = self.runs();
         let stale = match g.get(&h.id) {
             None => true,
@@ -713,6 +721,27 @@ impl ChVmm {
             g.insert(h.id.clone(), Slot::Run(e));
         }
         Ok(())
+    }
+
+    /// `destroy`'s stop of a VMM the launcher says is alive, without
+    /// asking its API (a hung API would cost the call's timeout): a live
+    /// reaper is told to stop, a stale run gets a new ladder.
+    fn request_stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        {
+            let mut g = self.runs();
+            match g.get_mut(&h.id) {
+                Some(Slot::Starting { stop }) => {
+                    *stop = true;
+                    return Ok(());
+                }
+                Some(Slot::Run(e)) if !e.run.done() => {
+                    let _ = e.stop_tx.send(());
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        self.restart_ladder(h, self.inner.paths(&h.id))
     }
 }
 
@@ -902,54 +931,66 @@ impl Vmm for ChVmm {
         self.inner.status_of(&h.id, &self.inner.paths(&h.id))
     }
 
-    /// Stops the VM if needed, waits for its reaper (at most
-    /// `power_s + shutdown_s + force_s + 5` s) and forgets the run; then
-    /// removes the runtime dir and the vault entries (R37). Fails, keeping
-    /// the run and every file, when the exit was not confirmed: nothing is
-    /// removed under a live VMM.
+    /// Bounded to about a second (`DESTROY_WAIT`, R41): asks for the stop
+    /// when the VMM is alive (its reaper runs the ladder), waits briefly for
+    /// the reaper and, only once the launcher says the VMM is gone, forgets
+    /// the run and removes the runtime dir and the vault entries (R37). A
+    /// VMM still booting or stopping fails it with `Failed` and keeps the
+    /// run and every file (runtime dir, vault, pid record): nothing is
+    /// removed under a live VMM. The manager's tick retries it.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
-        let until = Instant::now() + BOOT_WAIT;
+        let until = Instant::now() + DESTROY_WAIT;
         while matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             if Instant::now() >= until {
                 return Err(VmmError::Failed("the VM is still booting".into()));
             }
             std::thread::sleep(POLL);
         }
-        if !matches!(self.status(h), VmStatus::Off | VmStatus::Gone) {
-            self.stop(h)?;
+        // an earlier run that is gone by now gets its after_off first
+        self.settle(&h.id);
+        if !self.inner.gone(&h.id) {
+            self.request_stop(h)?;
+        }
+        loop {
+            let run = match self.runs().get(&h.id) {
+                Some(Slot::Run(e)) => Arc::clone(&e.run),
+                Some(Slot::Starting { .. }) => {
+                    return Err(VmmError::Failed("the VM is booting".into()));
+                }
+                None => break,
+            };
+            if run.done() {
+                // gone by now: confirmed here, with its after_off
+                self.inner.settle(&run);
+                break;
+            }
+            if Instant::now() >= until {
+                return Err(VmmError::Failed("the VMM is still stopping".into()));
+            }
+            std::thread::sleep(POLL);
         }
         let e = {
             let mut g = self.runs();
             match g.remove(&h.id) {
-                Some(Slot::Run(e)) => e,
+                Some(Slot::Run(e)) if e.run.off() => e,
                 Some(other) => {
+                    let done = matches!(&other, Slot::Run(e) if e.run.done());
                     g.insert(h.id.clone(), other);
-                    return Err(VmmError::Failed("the VM is booting".into()));
+                    return Err(VmmError::Failed(if done {
+                        "the VMM did not stop; it may still be running".into()
+                    } else {
+                        "the VMM is still stopping".into()
+                    }));
                 }
                 // no run: only the launcher's word lets the state go
-                None if self.inner.gone(&h.id) => return self.inner.remove_runtime(&h.id),
-                None => return Err(VmmError::Failed("the VMM has not stopped yet".into())),
+                None if self.inner.gone(&h.id) => {
+                    drop(g);
+                    return self.inner.remove_runtime(&h.id);
+                }
+                None => return Err(VmmError::Failed("the VMM is still stopping".into())),
             }
         };
-        let s = self.inner.stop;
-        let until = Instant::now() + Duration::from_secs(s.power_s + s.shutdown_s + s.force_s + 5);
-        while !e.run.done() {
-            if Instant::now() >= until {
-                log(&h.id, "the VMM has not stopped yet");
-                self.runs().entry(h.id.clone()).or_insert(Slot::Run(e));
-                return Err(VmmError::Failed("the VMM has not stopped yet".into()));
-            }
-            std::thread::sleep(POLL);
-        }
-        // gone by now: confirmed here, with its after_off
-        self.inner.settle(&e.run);
-        if !e.run.off() {
-            self.runs().entry(h.id.clone()).or_insert(Slot::Run(e));
-            return Err(VmmError::Failed(
-                "the VMM did not stop; it may still be running".into(),
-            ));
-        }
-        let _ = e.reaper.join();
+        let _ = e.reaper.join(); // done: returns at once
         self.inner.remove_runtime(&h.id)
     }
 }

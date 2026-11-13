@@ -159,6 +159,21 @@ impl World {
         hooks: Vec<Arc<dyn VmHooks>>,
         vmm_uid: u32,
     ) -> Arc<ChVmm> {
+        let stop = StopTimes {
+            power_s: 1,
+            shutdown_s: 1,
+            force_s: 2,
+        };
+        self.vmm_times(launcher, hooks, vmm_uid, stop)
+    }
+
+    fn vmm_times<L: Launcher + 'static>(
+        &self,
+        launcher: Arc<L>,
+        hooks: Vec<Arc<dyn VmHooks>>,
+        vmm_uid: u32,
+        stop: StopTimes,
+    ) -> Arc<ChVmm> {
         Arc::new(ChVmm::new(ChVmmInit {
             vmm_uid,
             records: self.records.clone(),
@@ -168,11 +183,7 @@ impl World {
             launcher,
             hooks,
             landlock: true,
-            stop: StopTimes {
-                power_s: 1,
-                shutdown_s: 1,
-                force_s: 2,
-            },
+            stop,
         }))
     }
 
@@ -321,8 +332,9 @@ impl World {
 impl Drop for World {
     fn drop(&mut self) {
         let all = std::mem::take(&mut *self.vmms.lock().unwrap());
+        // destroy is bounded (R41): retry it while a stop ladder runs
         for (v, h) in &all {
-            let _ = v.destroy(h);
+            let _ = destroy_eventually(v, h);
         }
         // Safety net: destroy must have left no child running.
         let mut leaks = 0;
@@ -350,6 +362,19 @@ fn wait_for(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     f()
+}
+
+/// `destroy` until it succeeds, as the manager's tick retries it (R41);
+/// the last error after `LONG`.
+fn destroy_eventually(v: &ChVmm, h: &VmHandle) -> Result<(), VmmError> {
+    let t = Instant::now();
+    loop {
+        match v.destroy(h) {
+            Ok(()) => return Ok(()),
+            Err(e) if t.elapsed() >= LONG => return Err(e),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 fn failed(r: Result<impl std::fmt::Debug, VmmError>) -> String {
@@ -1555,7 +1580,9 @@ fn unit_force_stop_waits_for_the_queued_job() {
     let (v, h) = queued_vmm(&w, Duration::from_secs(1));
     v.boot(&h).unwrap();
     v.stop(&h).unwrap();
-    v.destroy(&h).unwrap();
+    // the ladder takes power_s + shutdown_s + the queued job: destroy is
+    // bounded (R41), so it is retried as the manager's tick does
+    destroy_eventually(&v, &h).unwrap();
     assert_eq!(offs(&w), 1, "{:?}", w.events());
 }
 
@@ -1583,4 +1610,75 @@ fn a_late_exit_still_gets_after_off_once() {
     v.stop(&h).unwrap();
     v.destroy(&h).unwrap();
     assert_eq!(offs(&w), 1, "{:?}", w.events());
+}
+
+/// R41: destroy is bounded to about a second. A VMM that ignores the power
+/// button is still stopping: destroy fails at once and keeps everything
+/// (runtime dir, pid record); once the ladder ends, a retried destroy
+/// succeeds and the runtime dir goes.
+#[test]
+fn destroy_is_bounded_and_a_retry_finishes_it() {
+    let w = World::new();
+    let l = w.launcher(&[("FAKE_CH_IGNORE_POWER", "1")]);
+    let stop = StopTimes {
+        power_s: 3,
+        shutdown_s: 2,
+        force_s: 2,
+    };
+    let v = w.vmm_times(
+        Arc::clone(&l),
+        vec![w.hook("h", false)],
+        rustix::process::geteuid().as_raw(),
+        stop,
+    );
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    let t = Instant::now();
+    let m = failed(v.destroy(&h));
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(m.contains("still stopping"), "{m}");
+    assert!(w.paths("b1").vm_json().exists(), "the runtime dir is kept");
+    assert!(w.pid_record("b1").exists(), "the pid record is kept");
+    assert_eq!(l.exited(&h.id), Some(false), "the VMM still runs");
+    assert_eq!(offs(&w), 0, "{:?}", w.events());
+    // a second call is bounded too and still keeps everything
+    let t = Instant::now();
+    assert!(v.destroy(&h).is_err());
+    assert!(t.elapsed() < Duration::from_millis(1500));
+    assert!(w.paths("b1").vm_json().exists());
+    // the ladder ends (vmm.shutdown after power_s): the next destroy succeeds
+    assert!(wait_for(LONG, || l.exit_status(&h.id).is_some()));
+    v.destroy(&h).unwrap();
+    assert!(!w.paths("b1").dir.exists(), "the runtime dir is gone");
+    assert!(!w.pid_record("b1").exists());
+    assert_eq!(offs(&w), 1, "{:?}", w.events());
+    assert_eq!(v.status(&h), VmStatus::Gone);
+}
+
+/// R41: a destroy during a boot does not wait out the boot either.
+#[test]
+fn destroy_during_a_slow_boot_is_bounded() {
+    let w = World::new();
+    let l = w.launcher(&[]);
+    let v = w.vmm_with(l, vec![w.slow_hook("h", false, Duration::from_secs(3))]);
+    let h = w.create(&v, "b1");
+    std::thread::scope(|s| {
+        let a = s.spawn(|| v.boot(&h));
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        let m = failed(v.destroy(&h));
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(m.contains("booting"), "{m}");
+        a.join().unwrap().unwrap();
+    });
+    destroy_eventually(&v, &h).unwrap();
+    assert!(!w.paths("b1").dir.exists());
 }

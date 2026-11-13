@@ -47,6 +47,9 @@ pub trait Vmm: Send + Sync {
     /// The VM must be paused.
     fn snapshot(&self, h: &VmHandle, dest: &Path) -> Result<(), VmmError>;
     fn status(&self, h: &VmHandle) -> VmStatus;
-    /// Frees VMM resources; the store removes the dir.
+    /// Frees VMM resources; the store removes the dir. Bounded like every
+    /// other call: a VM still booting or stopping is not waited out, the
+    /// call fails and keeps its state, and the manager's tick retries it
+    /// (R41).
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError>;
 }
