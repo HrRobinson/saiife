@@ -288,11 +288,68 @@ fn hello_then_welcome() {
         T
     ));
     assert_eq!(mode(saiife_boxproto::ports::GUEST_LOCAL_SOCK), 0o666);
-    // Export and Advance wait for plan 39.
+    // Before the setup there is no base: Export answers one Err frame,
+    // Advance an Err reply.
     assert_eq!(
         request(&h.env, &Request::Export { n: 1 }),
         Reply::Err {
-            why: "not in this version".into()
+            why: "the box's base does not exist".into()
+        }
+    );
+    assert_eq!(
+        request(&h.env, &Request::Advance { n: 1, paths: None }),
+        Reply::Err {
+            why: "the box's base does not exist".into()
+        }
+    );
+}
+
+/// Every frame of one streamed reply, until the guest closes.
+fn stream(env: &GuestEnv, req: &Request) -> Vec<Frame> {
+    let mut s = UnixStream::connect(env.path(GUEST_CONTROL_SOCK)).unwrap();
+    s.set_read_timeout(Some(T)).unwrap();
+    write_msg(&mut s, req).unwrap();
+    let mut out = Vec::new();
+    while let Some(f) = read_frame(&mut s).unwrap() {
+        out.push(f);
+    }
+    out
+}
+
+#[test]
+fn export_streams_then_advance_replies() {
+    let h = host();
+    std::fs::write(h.env.path("/work/a"), "a\n").unwrap();
+    let (_ev, _pty) = running(&h, &["/bin/sh", "-c", "sleep 5"]);
+    std::fs::write(h.env.path("/work/b"), "b\n").unwrap();
+    let frames = stream(&h.env, &Request::Export { n: 1 });
+    let tag = |f: &Frame| match f {
+        Frame::Json(v) => v["t"].as_str().unwrap_or("").to_string(),
+        Frame::Bytes(_) => "bytes".into(),
+    };
+    let tags: Vec<String> = frames.iter().map(tag).collect();
+    assert_eq!(tags, ["delta", "entry", "bytes", "end"]);
+    match &frames[1] {
+        Frame::Json(v) => assert_eq!(
+            (v["path"].as_str(), v["op"].as_str()),
+            (Some("b"), Some("add"))
+        ),
+        f => panic!("{f:?}"),
+    }
+    assert_eq!(frames[2], Frame::Bytes(b"b\n".to_vec()));
+    assert_eq!(
+        request(&h.env, &Request::Advance { n: 1, paths: None }),
+        Reply::Ok
+    );
+    let tags: Vec<String> = stream(&h.env, &Request::Export { n: 2 })
+        .iter()
+        .map(tag)
+        .collect();
+    assert_eq!(tags, ["delta", "end"]);
+    assert_eq!(
+        request(&h.env, &Request::Advance { n: 7, paths: None }),
+        Reply::Err {
+            why: "export 7 does not exist".into()
         }
     );
 }
