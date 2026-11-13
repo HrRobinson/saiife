@@ -48,14 +48,16 @@ pub struct BoxRecord {
     pub turn_finished_at: Option<u64>,
     pub pending_prompt: Option<String>,
     pub error: Option<String>,
-    /// Resolved base image id (plan 36); always `None` until then.
+    /// The base image id (plan 36), set at admission from the VMM
+    /// (`Vmm::image_id`); `None` before, or when the driver cannot say.
     #[serde(default)]
     pub image: Option<String>,
 }
 
 /// Single-writer by contract: the Manager's one Mutex serialises every Store
-/// call (spawn's `claim_id` plus first `save`, and gc, all run under it, so gc
-/// never sees a claimed-but-unsaved dir).
+/// call (spawn's `claim_id` plus first `save`, and gc, all run under it). A
+/// spawn with a repo disk lets the lock go between the two, to move the disk
+/// in; the manager marks that id as being placed and gc leaves it alone.
 pub struct Store {
     root: PathBuf,
 }
@@ -243,6 +245,10 @@ impl Store {
             let entry = entry.map_err(|e| io_err(&self.root, e))?;
             let ft = entry.file_type().map_err(|e| io_err(&entry.path(), e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            // The daemon's staging of passed repo disks (plan 37), not a box.
+            if name == crate::place::INCOMING {
+                continue;
+            }
             if ft.is_dir() || ft.is_symlink() {
                 out.push((name, ft.is_symlink()));
             }

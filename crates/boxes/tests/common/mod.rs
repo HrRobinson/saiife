@@ -8,7 +8,7 @@ use std::sync::Arc;
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::fake::FakeGuest;
 use saiife_boxes::guest::GuestLink;
-use saiife_boxes::manager::{Change, Manager, ManagerInit, SpawnArgs};
+use saiife_boxes::manager::{Change, DiskPlace, DiskPlacer, Manager, ManagerInit, SpawnArgs};
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::{self, BoxTemplate, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
@@ -88,7 +88,20 @@ fn make_init(
         templates: templates.to_vec(),
         host: Arc::new(move || host),
         clock: Arc::new(move || clock.load(Ordering::SeqCst)),
+        disk_place: Some(placer()),
     }
+}
+
+/// The daemon's names (`saiife_boxhost::paths::BoxPaths`), which this
+/// crate cannot use: `repo.img` and `base.json` in the box dir.
+pub fn placer() -> DiskPlacer {
+    Arc::new(|root: &Path, id: &BoxId| {
+        let dir = root.join(id.as_str());
+        DiskPlace {
+            repo_image: dir.join("repo.img"),
+            base_manifest: dir.join("base.json"),
+        }
+    })
 }
 
 /// A sized copy of the built-in template under another name.

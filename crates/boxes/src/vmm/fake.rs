@@ -8,6 +8,12 @@ use saiife_wire::source::BoxId;
 
 use super::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 
+/// The repo disk the fake looks for in the box dir. Test support only: the
+/// real name is `saiife_boxhost::paths::REPO_DISK`, which this crate cannot
+/// use; the daemon's repo-disk spawn test (`saw_repo_disk` after a placement
+/// through `BoxPaths`) fails if the two drift apart.
+const REPO_DISK_NAME: &str = "repo.img";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmOp {
     Create,
@@ -28,8 +34,14 @@ pub struct VmCall {
 #[derive(Default)]
 struct State {
     status: HashMap<BoxId, VmStatus>,
+    /// Whether `<dir>/repo.img` was there when `create` ran.
+    repo_disk: HashMap<BoxId, bool>,
     fail: Vec<(VmOp, String)>,
     calls: Vec<VmCall>,
+    /// What `image_id` answers for every handle.
+    image: Option<String>,
+    /// The `data` of every handle `create` makes.
+    data: String,
 }
 
 #[derive(Default)]
@@ -54,6 +66,23 @@ impl FakeVmm {
     /// Force a status, e.g. `Gone` to simulate a crash.
     pub fn set_status(&self, id: &BoxId, s: VmStatus) {
         self.lock().status.insert(id.clone(), s);
+    }
+
+    /// Whether the box's repo disk was in its dir at `create` (`None`: no
+    /// create yet).
+    pub fn saw_repo_disk(&self, id: &BoxId) -> Option<bool> {
+        self.lock().repo_disk.get(id).copied()
+    }
+
+    /// What `image_id` answers from now on (`None`: no image, like a
+    /// driver that cannot say).
+    pub fn set_image(&self, image: Option<&str>) {
+        self.lock().image = image.map(str::to_string);
+    }
+
+    /// The opaque `data` of the handles `create` makes from now on.
+    pub fn set_handle_data(&self, data: &str) {
+        self.lock().data = data.to_string();
     }
 
     pub fn calls(&self) -> Vec<VmCall> {
@@ -93,12 +122,14 @@ impl FakeVmm {
 
 impl Vmm for FakeVmm {
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
+        let disk = spec.dir.join(REPO_DISK_NAME).is_file();
         let mut s = self.enter(VmOp::Create, &spec.id)?;
+        s.repo_disk.insert(spec.id.clone(), disk);
         s.status.insert(spec.id.clone(), VmStatus::Created);
         Ok(VmHandle {
             id: spec.id.clone(),
             driver: "fake".into(),
-            data: String::new(),
+            data: s.data.clone(),
         })
     }
 
@@ -163,6 +194,10 @@ impl Vmm for FakeVmm {
         let mut s = self.enter(VmOp::Destroy, &h.id)?;
         s.status.insert(h.id.clone(), VmStatus::Gone);
         Ok(())
+    }
+
+    fn image_id(&self, _h: &VmHandle) -> Option<String> {
+        self.lock().image.clone()
     }
 }
 
@@ -255,6 +290,19 @@ mod tests {
             }),
             VmStatus::Running
         );
+    }
+
+    #[test]
+    fn image_id_is_settable() {
+        let d = tempfile::tempdir().unwrap();
+        let v = FakeVmm::new();
+        let h = v.create(&spec("b1", d.path())).unwrap();
+        assert_eq!(v.image_id(&h), None);
+        let img = format!("base-{}", "a".repeat(64));
+        v.set_image(Some(&img));
+        v.set_handle_data("not json {");
+        assert_eq!(v.image_id(&h).as_deref(), Some(img.as_str()));
+        assert_eq!(v.create(&spec("b2", d.path())).unwrap().data, "not json {");
     }
 
     #[test]

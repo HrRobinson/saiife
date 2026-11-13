@@ -1,0 +1,13 @@
+[ubuntu]
+release = "release-20261017"
+sha256 = "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94"
+[packages]
+apt = ["docker.io", "socat", "git", "ca-certificates", "curl", "build-essential", "pkg-config", "python3", "python3-venv", "cloud-guest-utils"]
+[images]
+pull = []
+[claude]
+version = "UNPINNED"
+url = "UNPINNED"
+sha256 = "UNPINNED"
+[boot]
+direct_kernel = false

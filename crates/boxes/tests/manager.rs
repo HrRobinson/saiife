@@ -2,12 +2,15 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use common::{id, template_sized, world, world_with, World};
 use saiife_boxes::capacity::{self, Committed};
 use saiife_boxes::guest::GuestEvent;
-use saiife_boxes::manager::{Change, GcReport, Manager, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS};
+use saiife_boxes::manager::{
+    Change, DiskPlace, DiskPlacer, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS,
+};
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::Size;
 use saiife_boxes::vmm::fake::{FakeVmm, VmOp};
@@ -178,17 +181,200 @@ fn task_with_escape_is_invalid() {
     assert!(w.guest.prompts().is_empty());
 }
 
+/// `<root>/.incoming/<sub>/` with a repo disk and a base manifest in it,
+/// as the daemon's intake leaves them.
+fn incoming(w: &World, sub: &str) -> (PathBuf, PathBuf) {
+    let d = w.root.join(".incoming").join(sub);
+    std::fs::create_dir_all(&d).unwrap();
+    let (img, man) = (d.join("repo.img"), d.join("base.json"));
+    std::fs::write(&img, b"disk").unwrap();
+    std::fs::write(&man, b"{}").unwrap();
+    (img, man)
+}
+
+fn with_disk(w: &World, img: &Path, man: &Path) -> SpawnArgs {
+    let mut a = w.args("claude-code", "x", Start::Queue);
+    a.repo_image = Some(img.to_path_buf());
+    a.base_manifest = Some(man.to_path_buf());
+    a
+}
+
 #[test]
-fn repo_disks_are_refused_before_an_id() {
+fn spawn_places_repo_disk_before_admission() {
     let w = world(1);
-    let want = Err(BoxError::Invalid("repo disks are not supported yet".into()));
+    let (img, man) = incoming(&w, "00112233aabbccdd");
+    let r = w.mgr.spawn(&with_disk(&w, &img, &man)).unwrap();
+    assert_eq!(r.state, BoxState::Starting);
+    // The VMM's create already saw the disk in the box dir.
+    assert_eq!(w.vmm.saw_repo_disk(&r.id), Some(true));
+    let dir = w.root.join(r.id.as_str());
+    assert_eq!(std::fs::read(dir.join("repo.img")).unwrap(), b"disk");
+    assert_eq!(std::fs::read(dir.join("base.json")).unwrap(), b"{}");
+    assert!(!img.exists() && !man.exists());
+    assert!(!w.root.join(".incoming/00112233aabbccdd").exists());
+    w.assert_saved(&r.id);
+    // `.incoming` is no box: no warning on a restart, no orphan for gc.
+    let mut w = w;
+    assert!(w.reopen().is_empty());
+    assert_eq!(w.mgr.gc(), GcReport::default());
+    // A queued box gets its disk at spawn too, long before its admission.
+    let (img, man) = incoming(&w, "1111111111111111");
+    let q = w.mgr.spawn(&with_disk(&w, &img, &man)).unwrap();
+    assert_eq!(q.state, BoxState::Queued);
+    assert!(w.root.join(q.id.as_str()).join("repo.img").is_file());
+    assert_eq!(w.vmm.saw_repo_disk(&q.id), None);
+}
+
+#[test]
+fn spawn_without_repo_is_unchanged() {
+    let w = world(1);
+    let r = w.spawn("a");
+    assert_eq!(r.id, id("b1"));
+    assert_eq!(r.state, BoxState::Starting);
+    assert_eq!(w.vmm.saw_repo_disk(&r.id), Some(false));
+    assert!(!w.root.join("b1/repo.img").exists());
+    assert!(!w.root.join("b1/base.json").exists());
+    assert!(!w.root.join(".incoming").exists());
+}
+
+#[test]
+fn repo_image_without_manifest_is_invalid() {
+    let w = world(1);
+    let (img, man) = incoming(&w, "00112233aabbccdd");
     let mut a = w.args("claude-code", "x", Start::Queue);
-    a.repo_image = Some("/srv/repo.img".into());
-    assert_eq!(w.mgr.spawn(&a), want);
+    a.repo_image = Some(img.clone());
+    assert!(matches!(w.mgr.spawn(&a), Err(BoxError::Invalid(_))));
     let mut a = w.args("claude-code", "x", Start::Queue);
-    a.base_manifest = Some("/srv/base.json".into());
-    assert_eq!(w.mgr.spawn(&a), want);
+    a.base_manifest = Some(man.clone());
+    assert!(matches!(w.mgr.spawn(&a), Err(BoxError::Invalid(_))));
+    // Outside .incoming, in two dirs, or one file twice: invalid too.
+    let elsewhere = w.dir.path().join("repo.img");
+    std::fs::write(&elsewhere, b"x").unwrap();
+    let (img2, _) = incoming(&w, "ffffffffffffffff");
+    let deep = w.root.join(".incoming/a/b/repo.img");
+    for (i, m) in [
+        (&elsewhere, &man),
+        (&img2, &man),
+        (&img, &img),
+        (&deep, &man),
+    ] {
+        let e = w.mgr.spawn(&with_disk(&w, i, m));
+        assert!(matches!(e, Err(BoxError::Invalid(_))), "{i:?} {m:?}: {e:?}");
+    }
+    // No id was claimed: the counter is unchanged.
+    assert!(!w.root.join("b1").exists());
+    assert!(!w.root.join("next-id").exists());
     assert_eq!(w.spawn("a").id, id("b1"));
+    assert!(img.exists() && man.exists(), "left for the caller");
+}
+
+#[test]
+fn rename_failure_releases_the_id() {
+    let w = world(1);
+    // In .incoming, but not there: the move fails after the id is claimed.
+    let d = w.root.join(".incoming/00112233aabbccdd");
+    let e = w
+        .mgr
+        .spawn(&with_disk(&w, &d.join("repo.img"), &d.join("base.json")));
+    assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
+    assert!(!w.root.join("b1").exists(), "the id's dir is released");
+    assert!(w.mgr.list().is_empty());
+    assert!(w.vmm.calls().is_empty());
+    // A manifest that is not a regular file: refused the same way, and the
+    // disk moved in first goes with the dir.
+    let (img, man) = incoming(&w, "1111111111111111");
+    std::fs::remove_file(&man).unwrap();
+    std::fs::create_dir(&man).unwrap();
+    let e = w.mgr.spawn(&with_disk(&w, &img, &man));
+    assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
+    assert!(!w.root.join("b2").exists());
+    // Ids are never reused.
+    assert_eq!(w.spawn("a").id, id("b3"));
+}
+
+/// `w`'s manager reopened with `place` as its disk placer.
+fn with_placer(w: &mut World, place: Option<DiskPlacer>) {
+    let guest: Arc<dyn saiife_boxes::guest::GuestLink> = w.guest.clone();
+    let mut init = w.init(guest);
+    init.disk_place = place;
+    w.mgr = Arc::new(Manager::open(init).unwrap().manager);
+}
+
+#[test]
+fn spawn_places_the_disk_where_the_placer_says() {
+    let mut w = world(1);
+    with_placer(
+        &mut w,
+        Some(Arc::new(|root: &Path, i: &BoxId| DiskPlace {
+            repo_image: root.join(i.as_str()).join("disk.img"),
+            base_manifest: root.join(i.as_str()).join("m.json"),
+        })),
+    );
+    let (img, man) = incoming(&w, "00112233aabbccdd");
+    let r = w.mgr.spawn(&with_disk(&w, &img, &man)).unwrap();
+    let dir = w.root.join(r.id.as_str());
+    assert_eq!(std::fs::read(dir.join("disk.img")).unwrap(), b"disk");
+    assert_eq!(std::fs::read(dir.join("m.json")).unwrap(), b"{}");
+    assert!(!dir.join("repo.img").exists() && !dir.join("base.json").exists());
+    // A place outside the box dir: refused once the id is claimed, which
+    // is then released; the disk stays for the caller to discard.
+    with_placer(
+        &mut w,
+        Some(Arc::new(|root: &Path, i: &BoxId| DiskPlace {
+            repo_image: root.join(i.as_str()).join("repo.img"),
+            base_manifest: root.join("elsewhere").join("base.json"),
+        })),
+    );
+    let (img, man) = incoming(&w, "1111111111111111");
+    let e = w.mgr.spawn(&with_disk(&w, &img, &man));
+    assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
+    assert!(!w.root.join("b2").exists());
+    assert!(img.exists() && man.exists());
+    // No placer: a repo disk is refused before any id is claimed.
+    with_placer(&mut w, None);
+    let e = w.mgr.spawn(&with_disk(&w, &img, &man));
+    assert!(matches!(e, Err(BoxError::Unavailable(_))), "{e:?}");
+    assert_eq!(w.spawn("a").id, id("b3"));
+}
+
+#[test]
+fn incoming_is_swept_by_gc() {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let w = world(1);
+    let now = SystemTime::now();
+    w.clock.store(
+        now.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let (old_img, _) = incoming(&w, "0000000000000000");
+    let (new_img, _) = incoming(&w, "1111111111111111");
+    // A file outside, linked from the old dir: never followed.
+    let outside = w.dir.path().join("keep");
+    std::fs::write(&outside, b"keep").unwrap();
+    let old = old_img.parent().unwrap().to_path_buf();
+    symlink(&outside, old.join("link")).unwrap();
+    std::fs::create_dir(old.join("nested")).unwrap();
+    std::fs::write(old.join("nested/f"), b"f").unwrap();
+    let back = now - Duration::from_secs(2 * 3600);
+    std::fs::File::open(&old)
+        .unwrap()
+        .set_modified(back)
+        .unwrap();
+    let stray = w.root.join(".incoming/stray");
+    std::fs::write(&stray, b"s").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stray)
+        .unwrap()
+        .set_modified(back)
+        .unwrap();
+    let rep = w.mgr.gc();
+    assert_eq!(rep, GcReport::default());
+    assert!(!old.exists());
+    assert!(!stray.exists());
+    assert!(new_img.exists(), "under an hour old: kept");
+    assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
 }
 
 #[test]
@@ -580,6 +766,27 @@ fn pause_resume_roundtrip() {
     );
     assert_eq!(w.vmm.status(&handle(&i)), VmStatus::Running);
     w.assert_saved(&i);
+}
+
+#[test]
+fn pause_for_sets_error() {
+    let w = world(1);
+    let i = running(&w, "a");
+    let c = w
+        .mgr
+        .pause_for(&i, "paused: the host disk is almost full")
+        .unwrap();
+    assert_eq!(c, change(&i, BoxState::Running, BoxState::Paused, "pause"));
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!(r.state, BoxState::Paused);
+    assert_eq!(
+        r.error.as_deref(),
+        Some("paused: the host disk is almost full")
+    );
+    assert_eq!(w.vmm.status(&handle(&i)), VmStatus::Paused);
+    w.assert_saved(&i);
+    w.mgr.resume(&i).unwrap();
+    assert_eq!(w.mgr.get(&i).unwrap().error, None);
 }
 
 #[test]

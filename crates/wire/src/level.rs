@@ -102,7 +102,14 @@ const IPC_OPS: &[&str] = &[
     "audit.query",
     "audit.rotate_key",
     "box.done",
+    // fd passing (plan 37): control socket only.
+    "box.fds",
     "box.gc",
+    // Box base images (plan 36): control socket only.
+    "box.image.default",
+    "box.image.import",
+    "box.image.ls",
+    "box.image.rm",
     "cloud.lease",
     "grant.consume",
     "hello",
@@ -224,6 +231,25 @@ mod tests {
             assert_eq!(level_for(a), Some(Level::MachineOnly), "{a}");
             assert!(!REMOTE.iter().any(|(n, _)| *n == a), "{a} is remote");
         }
+    }
+
+    #[test]
+    fn box_image_ops_are_machine_only() {
+        for a in [
+            "box.image.ls",
+            "box.image.import",
+            "box.image.default",
+            "box.image.rm",
+        ] {
+            assert_eq!(level_for(a), Some(Level::MachineOnly), "{a}");
+            assert!(!REMOTE.iter().any(|(n, _)| *n == a), "{a} is remote");
+        }
+    }
+
+    #[test]
+    fn box_fds_is_machine_only() {
+        assert_eq!(level_for("box.fds"), Some(Level::MachineOnly));
+        assert!(!REMOTE.iter().any(|(n, _)| *n == "box.fds"));
     }
 
     #[test]

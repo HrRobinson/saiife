@@ -49,4 +49,11 @@ pub trait Vmm: Send + Sync {
     fn status(&self, h: &VmHandle) -> VmStatus;
     /// Frees VMM resources; the store removes the dir.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError>;
+    /// The base image id (`base-<sha256>`) the VM of `h` was created
+    /// from, as the driver itself recorded it; `None` when it cannot say.
+    /// The manager learns the image here and never reads `h.data` (plan 36).
+    fn image_id(&self, h: &VmHandle) -> Option<String> {
+        let _ = h;
+        None
+    }
 }

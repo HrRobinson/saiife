@@ -276,6 +276,28 @@ pub const OP_BOX_DONE: &str = "box.done";
 /// local): `{}` -> `{removed: [id]}`. Root or an admin removes every one;
 /// anyone else only their own discarded boxes.
 pub const OP_BOX_GC: &str = "box.gc";
+/// Control socket only, machine local (plan 37): `{n}` -> `{}`. The frame is
+/// followed at once by one byte, `fdpass::FD_BYTE`, carrying `n` (1 to
+/// `fdpass::MAX_FDS`) descriptors, which the connection keeps for its next
+/// request. Only an op in [`FD_OPS`] takes them; any other op closes them.
+/// A second `box.fds` while descriptors are kept is `bad_request`.
+pub const OP_BOX_FDS: &str = "box.fds";
+/// The box base images (plan 36; control socket, machine local). None of
+/// them takes or answers an `id` key: the frame's own `id` is the request's.
+/// `{}` -> `{images: [Manifest + {default: bool, in_use: [box id]}],
+/// warnings: [string]}`. Any local peer.
+pub const OP_BOX_IMAGE_LS: &str = "box.image.ls";
+/// `{manifest, default?}`, after a `box.fds` of `[raw, kernel?]` ->
+/// `{image}`. Root or an `[admin]` member (locked); the daemon's own user
+/// (personal).
+pub const OP_BOX_IMAGE_IMPORT: &str = "box.image.import";
+/// `{image}` -> `{}`: makes an image in the store the default.
+pub const OP_BOX_IMAGE_DEFAULT: &str = "box.image.default";
+/// `{image}` -> `{}`: removes an image no box names and that is not the
+/// default.
+pub const OP_BOX_IMAGE_RM: &str = "box.image.rm";
+/// The ops that take the descriptors of the `box.fds` just before them.
+pub const FD_OPS: &[&str] = &[OP_BOX_SPAWN, OP_BOX_IMAGE_IMPORT];
 /// The only ops link.sock answers; every other name is `unknown_op`.
 pub const LINK_OPS: &[&str] = &[
     OP_HELLO,

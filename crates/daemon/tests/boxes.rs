@@ -43,8 +43,12 @@ fn scratch() -> tempfile::TempDir {
 
 /// A host that holds exactly two default boxes.
 fn two_boxes() -> HostFacts {
+    two_boxes_host(2)
+}
+
+fn two_boxes_host(n: u64) -> HostFacts {
     HostFacts {
-        mem_total_mib: 8192 + 2 * capacity::charge_mib(&Size::default()),
+        mem_total_mib: 8192 + n * capacity::charge_mib(&Size::default()),
         mem_avail_mib: 4096,
         threads: 12,
         disk_free_mib: 1024 * 1024,
@@ -123,6 +127,7 @@ fn world_with(s: Setup) -> World {
                 templates: template::builtin(),
                 host: Arc::new(move || host),
                 clock: Arc::new(move || c.load(Ordering::SeqCst)),
+                disk_place: box_ops::disk_place(),
             })
             .unwrap();
             assert!(o.warnings.is_empty(), "{:?}", o.warnings);
@@ -561,6 +566,89 @@ async fn tick_records_changes() {
 }
 
 #[tokio::test]
+async fn disk_floor_pauses_running_boxes() {
+    // A manager whose free disk the test moves (spawn needs the headroom).
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let free = Arc::new(AtomicU64::new(1024 * 1024));
+    let f = Arc::clone(&free);
+    let o = Manager::open(ManagerInit {
+        store: Store::open(box_ops::dir_in(&state)).unwrap(),
+        vmm: Arc::new(FakeVmm::new()),
+        guest: Arc::new(FakeGuest::new()),
+        templates: template::builtin(),
+        host: Arc::new(move || HostFacts {
+            disk_free_mib: f.load(Ordering::SeqCst),
+            ..two_boxes_host(3)
+        }),
+        clock: Arc::new(|| T0),
+        disk_place: None,
+    })
+    .unwrap();
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(Arc::new(o.manager)),
+    });
+    let a = w.running(ALICE, "one").await;
+    let b = w.running(ALICE, "two").await;
+    let c = w.running(ALICE, "three").await;
+    let before = w.records().len();
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0, "plenty of disk");
+    free.store(9 * 1024, Ordering::SeqCst);
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 3);
+    for i in [&a, &b, &c] {
+        let r = w.mgr().get(&id(i)).unwrap();
+        assert_eq!(r.state.to_string_lossy(), "paused");
+        assert_eq!(
+            r.error.as_deref(),
+            Some("paused: the host disk is almost full")
+        );
+    }
+    let recs = w.records();
+    let new = &recs[before..];
+    assert_eq!(new.len(), 3, "{new:?}");
+    for (r, i) in new.iter().zip([&a, &b, &c]) {
+        assert_eq!(r["action"], "disk_low");
+        assert_eq!(r["via"], "tick");
+        assert_eq!(r["box"], i.as_str());
+        assert_eq!(r["from"], "running");
+        assert_eq!(r["to"], "paused");
+        assert_eq!(r["reason"], "paused: the host disk is almost full");
+    }
+    // Still low: the paused boxes are not recorded again.
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
+    assert_eq!(w.records().len(), before + 3);
+    // One resumed by hand while still low is paused again, with its record.
+    w.mgr().resume(&id(&c)).unwrap();
+    assert_eq!(w.mgr().get(&id(&c)).unwrap().error, None);
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 1);
+    assert_eq!(w.records().len(), before + 4);
+    // Back above the floor: nothing more.
+    free.store(20 * 1024, Ordering::SeqCst);
+    w.mgr().resume(&id(&c)).unwrap();
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 0);
+    assert_eq!(
+        w.mgr().get(&id(&c)).unwrap().state.to_string_lossy(),
+        "running"
+    );
+}
+
+#[tokio::test]
+async fn list_reports_disk_per_entry() {
+    let w = world();
+    let b = w.running(ALICE, "one").await;
+    let dir = w.mgr().root().join(&b);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("root.qcow2"), vec![7u8; 3 << 20]).unwrap();
+    let l = w.ok(ALICE, "box.list", json!({})).await;
+    assert!(l.get("disk").is_none(), "{l}");
+    let e = &l["boxes"][0];
+    let mib = e["disk_mib"].as_u64().expect("disk_mib present");
+    assert!((3..=4).contains(&mib), "{l}");
+}
+
+#[tokio::test]
 async fn spawn_records_the_heads_it_admits() {
     let w = world();
     let b1 = w.running(ALICE, "one").await;
@@ -902,4 +990,206 @@ async fn gc_goes_on_past_a_box_it_cannot_remove() {
     assert_eq!(g["removed"], json!(["b4"]), "{g}");
     assert!(g["error"].is_string(), "{g}");
     assert!(w.mgr().get(&id("b1")).is_ok(), "the stuck box stays");
+}
+
+// ---------------------------------------------------------------- plan 37
+
+/// A sparse file of `len` bytes with the ext4 magic at 1080.
+fn ext4_image(p: &Path, len: u64) -> std::fs::File {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(p)
+        .unwrap();
+    f.set_len(len).unwrap();
+    f.write_all_at(&[0x53, 0xEF], 1080).unwrap();
+    f.write_all_at(b"repo data", 1 << 20).unwrap();
+    f
+}
+
+fn manifest_file(p: &Path, repo: &str) -> std::fs::File {
+    let text = format!(
+        "{{\"version\":1,\"repo\":\"{repo}\",\"base_commit\":null,\
+         \"snapshot_commit\":\"{}\",\"files\":0,\"bytes\":0,\"entries\":{{}}}}",
+        "b".repeat(40)
+    );
+    std::fs::write(p, text).unwrap();
+    std::fs::File::open(p).unwrap()
+}
+
+/// What `.incoming` holds.
+fn incoming_entries(w: &World) -> Vec<PathBuf> {
+    match std::fs::read_dir(w.mgr().root().join(".incoming")) {
+        Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A `box.spawn` whose connection was passed `fds`.
+async fn spawn_passing(w: &World, fds: Vec<std::os::fd::OwnedFd>) -> Value {
+    let conn = saiife_daemon::ops::Conn::new(peer(ALICE), None);
+    *conn.fds.lock().unwrap() = fds;
+    let req = Request {
+        id: 7,
+        op: "box.spawn".into(),
+        args: json!({"template": "claude-code", "repo": "shop", "start": "queue"})
+            .as_object()
+            .cloned()
+            .unwrap(),
+    };
+    let a = saiife_daemon::ops::dispatch_conn(&w.ctx, &conn, req).await;
+    assert!(conn.take_fds().is_empty(), "the stash was taken");
+    a
+}
+
+#[tokio::test]
+async fn repo_fd_must_be_an_ext4_file() {
+    use std::os::fd::OwnedFd;
+    let w = world();
+    let t = scratch();
+    let plain = t.path().join("plain.img");
+    std::fs::write(&plain, vec![0u8; 8192]).unwrap();
+    let cases: Vec<(Vec<OwnedFd>, &str)> = vec![
+        (
+            vec![
+                std::fs::File::open(&plain).unwrap().into(),
+                manifest_file(&t.path().join("m1"), "shop").into(),
+            ],
+            "not an ext4 image",
+        ),
+        (
+            vec![
+                std::fs::File::open(t.path()).unwrap().into(),
+                manifest_file(&t.path().join("m2"), "shop").into(),
+            ],
+            "not a regular file",
+        ),
+        (
+            vec![ext4_image(&t.path().join("i3"), 4 << 20).into()],
+            "two descriptors",
+        ),
+    ];
+    for (fds, want) in cases {
+        let a = spawn_passing(&w, fds).await;
+        assert_eq!(a["ok"], false, "{a}");
+        assert_eq!(a["error"], "bad_request", "{a}");
+        assert!(a["message"].as_str().unwrap().contains(want), "{a}");
+    }
+    // Nothing claimed, nothing left, nothing recorded.
+    assert!(w.mgr().list().is_empty());
+    assert!(!w.mgr().root().join("b1").exists());
+    assert!(incoming_entries(&w).is_empty());
+    assert!(w.records().is_empty());
+    // A refused spawn (unknown template) after a good intake: the copies go.
+    let conn = saiife_daemon::ops::Conn::new(peer(ALICE), None);
+    *conn.fds.lock().unwrap() = vec![
+        ext4_image(&t.path().join("i4"), 4 << 20).into(),
+        manifest_file(&t.path().join("m4"), "shop").into(),
+    ];
+    let req = Request {
+        id: 8,
+        op: "box.spawn".into(),
+        args: json!({"template": "nope", "start": "queue"})
+            .as_object()
+            .cloned()
+            .unwrap(),
+    };
+    let a = saiife_daemon::ops::dispatch_conn(&w.ctx, &conn, req).await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert!(incoming_entries(&w).is_empty());
+}
+
+/// The whole path over a real control connection: hello, `box.fds` with the
+/// disk and manifest, `box.spawn`. The box dir holds both before the VM's
+/// create, the repo's name comes from the manifest and `.incoming` is empty
+/// again; the next spawn on the connection, with no descriptors, has no
+/// disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_with_fds_roundtrip() {
+    use saiife_ipc::frame::{body_len_max, encode_max, MAX_ANSWER_FRAME};
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    let w = world();
+    let t = scratch();
+    let img = ext4_image(&t.path().join("repo.img"), 64 << 20);
+    let man = manifest_file(&t.path().join("base.json"), "demo");
+    let (ours, theirs) = tokio::net::UnixStream::pair().unwrap();
+    let server = tokio::spawn(saiife_daemon::server::connection(
+        theirs,
+        Arc::clone(&w.ctx),
+    ));
+    let mut s = ours.into_std().unwrap();
+    s.set_nonblocking(false).unwrap();
+    let answers = tokio::task::spawn_blocking(move || {
+        let mut ask = |req: Value, fds: Option<[std::os::fd::BorrowedFd<'_>; 2]>| -> Value {
+            s.write_all(&encode_max(&req, MAX_ANSWER_FRAME).unwrap())
+                .unwrap();
+            if let Some(f) = fds {
+                saiife_ipc::fdpass::send_fds(&s, &f).unwrap();
+            }
+            let mut h = [0u8; 4];
+            s.read_exact(&mut h).unwrap();
+            let mut body = vec![0u8; body_len_max(h, MAX_ANSWER_FRAME).unwrap()];
+            s.read_exact(&mut body).unwrap();
+            serde_json::from_slice(&body).unwrap()
+        };
+        let hello = ask(
+            json!({"id": 1, "op": saiife_ipc::msg::OP_HELLO, "proto": saiife_ipc::msg::PROTO}),
+            None,
+        );
+        assert_eq!(hello["ok"], true, "{hello}");
+        let fds = ask(
+            json!({"id": 2, "op": saiife_ipc::msg::OP_BOX_FDS, "n": 2}),
+            Some([img.as_fd(), man.as_fd()]),
+        );
+        assert_eq!(fds["ok"], true, "{fds}");
+        drop((img, man));
+        let one = ask(
+            json!({"id": 3, "op": "box.spawn", "template": "claude-code", "task": "t"}),
+            None,
+        );
+        let two = ask(
+            json!({"id": 4, "op": "box.spawn", "template": "claude-code", "repo": "shop"}),
+            None,
+        );
+        (one, two)
+    })
+    .await
+    .unwrap();
+    let (one, two) = answers;
+    assert_eq!(one["ok"], true, "{one}");
+    assert_eq!(one["box"]["id"], "b1", "{one}");
+    assert_eq!(one["box"]["state"], "starting", "{one}");
+    assert_eq!(one["box"]["repo"], "demo", "{one}");
+    assert_eq!(w.vmm.saw_repo_disk(&id("b1")), Some(true));
+    let dir = w.mgr().root().join("b1");
+    let disk = std::fs::read(dir.join("repo.img")).unwrap();
+    assert_eq!(disk.len(), 64 << 20);
+    assert_eq!(&disk[1080..1082], &[0x53, 0xEF]);
+    assert_eq!(&disk[1 << 20..(1 << 20) + 9], b"repo data");
+    let base = std::fs::read_to_string(dir.join("base.json")).unwrap();
+    assert!(base.contains("\"demo\""), "{base}");
+    assert!(incoming_entries(&w).is_empty());
+    assert_eq!(two["ok"], true, "{two}");
+    assert_eq!(two["box"]["id"], "b2", "{two}");
+    assert!(!w.mgr().root().join("b2/repo.img").exists());
+    server.abort();
+}
+
+/// Plan 37 Task 4b: the store root the daemon hands to intake, gc and
+/// `disk::usage` is the personal Layout's, and the disk placer is BoxPaths'.
+#[test]
+fn the_box_root_and_disk_places_are_the_layouts() {
+    use saiife_boxhost::layout::Layout;
+    use saiife_boxhost::paths::BoxPaths;
+    let state = Path::new("/s/state");
+    let root = box_ops::dir_in(state);
+    assert_eq!(root, Layout::personal(state, Path::new("/s/data")).boxes);
+    let place = box_ops::disk_place().expect("a placer on unix");
+    let got = place(&root, &id("b4"));
+    let want = BoxPaths::of(&root, &id("b4"));
+    assert_eq!(got.repo_image, want.repo_disk());
+    assert_eq!(got.base_manifest, want.base_manifest());
 }

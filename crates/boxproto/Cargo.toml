@@ -1,0 +1,21 @@
+[package]
+name = "saiife-boxproto"
+description = "saiife box guest protocol: frames, messages, ports, deltas and manifests shared by host and guest."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_boxproto"
+path = "src/lib.rs"
+
+[dependencies]
+# The base manifest (plan 37): JSON, and its SHA-256 (pure Rust, so the guest
+# builds everywhere).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[lints]
+workspace = true

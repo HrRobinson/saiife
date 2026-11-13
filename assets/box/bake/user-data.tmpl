@@ -1,0 +1,17 @@
+#cloud-config
+# Rendered by saiife_boxhost::bake::render_user_data; the placeholder is the
+# base64 of saiife-bake.sh.
+package_update: false
+users: []
+write_files:
+  - path: /usr/local/sbin/saiife-bake.sh
+    owner: root:root
+    permissions: '0755'
+    encoding: b64
+    content: @SAIIFE_BAKE_B64@
+runcmd:
+  - [bash, /usr/local/sbin/saiife-bake.sh]
+power_state:
+  mode: poweroff
+  message: saiife bake finished
+  timeout: 60

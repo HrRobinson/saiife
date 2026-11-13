@@ -19,8 +19,9 @@
 //! A Discarded record whose `vm` is still `Some` means the VMM resource may
 //! still exist (its destroy failed); gc retries the destroy before removing
 //! the record.
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use saiife_wire::source::{
@@ -43,6 +44,11 @@ pub const DONE_IDLE_SECS: u64 = 30;
 pub const DEFAULT_IDLE_STOP_MINS: u32 = 120;
 /// Longest repo name accepted at spawn.
 pub const MAX_REPO_BYTES: usize = 256;
+const PAIR: &str = "a repo disk and its base manifest come together, or neither";
+const NOT_INCOMING: &str =
+    "the repo disk and its base manifest must be in one dir of the box store's .incoming";
+const NO_PLACER: &str = "this box manager takes no repo disk";
+const NOT_IN_BOX: &str = "the repo disk's place is not in the box dir";
 
 const RECORD_VERSION: u32 = 1;
 const LOST: &str = "the VM was gone after a daemon restart";
@@ -56,6 +62,19 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// A live sample of the host.
 pub type HostProbe = Arc<dyn Fn() -> HostFacts + Send + Sync>;
 
+/// Where spawn moves a box's repo disk and its base manifest (plan 37).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskPlace {
+    pub repo_image: PathBuf,
+    pub base_manifest: PathBuf,
+}
+
+/// `(store root, box id)` to the [`DiskPlace`] of that box. The manager
+/// never names these files itself: the daemon's placer comes from its
+/// layout helpers (`saiife_boxhost::paths::BoxPaths`). Both places must be
+/// in the box dir (`<root>/<id>`), where the move is directory-relative.
+pub type DiskPlacer = Arc<dyn Fn(&Path, &BoxId) -> DiskPlace + Send + Sync>;
+
 pub struct ManagerInit {
     pub store: Store,
     pub vmm: Arc<dyn Vmm>,
@@ -63,6 +82,9 @@ pub struct ManagerInit {
     pub templates: Vec<BoxTemplate>,
     pub host: HostProbe,
     pub clock: Clock,
+    /// Where a spawn's repo disk goes; `None`: a spawn with one is
+    /// `Unavailable`.
+    pub disk_place: Option<DiskPlacer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,9 +95,11 @@ pub struct SpawnArgs {
     pub task: String,
     pub start: Start,
     pub owner_uid: u32,
-    /// A repo disk image (plan 37); refused until then.
+    /// A repo disk image (plan 37) in `<store root>/.incoming/<dir>/`;
+    /// spawn moves it to its [`DiskPlace`] before admission.
     pub repo_image: Option<PathBuf>,
-    /// The base manifest of a repo disk (plan 37); refused until then.
+    /// The base manifest of that disk, in the same dir; it goes to its
+    /// [`DiskPlace`] too. Both or neither.
     pub base_manifest: Option<PathBuf>,
 }
 
@@ -87,7 +111,8 @@ pub struct Change {
     pub from: BoxState,
     pub to: BoxState,
     pub why: &'static str,
-    /// The base image id (plan 36); always `None` until then.
+    /// The base image id (plan 36): the admission change of a box whose
+    /// VM was created names it; every other change has `None`.
     pub image: Option<String>,
 }
 
@@ -112,6 +137,10 @@ struct Inner {
     store: Store,
     records: BTreeMap<BoxId, BoxRecord>,
     next_seq: u64,
+    /// Ids claimed by a spawn that is moving its repo disk in, outside the
+    /// lock: their dirs have no record yet, and gc must not take them for
+    /// orphans.
+    placing: BTreeSet<BoxId>,
 }
 
 impl Inner {
@@ -164,11 +193,14 @@ impl Inner {
 
 pub struct Manager {
     inner: Mutex<Inner>,
+    /// The store root, for the work done outside the lock.
+    root: PathBuf,
     vmm: Arc<dyn Vmm>,
     guest: Arc<dyn GuestLink>,
     templates: Vec<BoxTemplate>,
     host: HostProbe,
     clock: Clock,
+    disk_place: Option<DiskPlacer>,
 }
 
 fn change(r: &BoxRecord, from: BoxState, why: &'static str) -> Change {
@@ -212,10 +244,12 @@ impl Manager {
     pub fn open(init: ManagerInit) -> Result<Opened, BoxesError> {
         let (loaded, mut warns) = init.store.list()?;
         let now = (init.clock)();
+        let root = init.store.root().to_path_buf();
         let mut inner = Inner {
             store: init.store,
             records: BTreeMap::new(),
             next_seq: 1,
+            placing: BTreeSet::new(),
         };
         let mut max_seq = 0;
         let mut changes = Vec::new();
@@ -252,11 +286,13 @@ impl Manager {
         }
         let mgr = Manager {
             inner: Mutex::new(inner),
+            root,
             vmm: init.vmm,
             guest: init.guest,
             templates: init.templates,
             host: init.host,
             clock: init.clock,
+            disk_place: init.disk_place,
         };
         Ok(Opened {
             manager: mgr,
@@ -271,6 +307,51 @@ impl Manager {
 
     fn now(&self) -> u64 {
         (self.clock)()
+    }
+
+    /// The box store's root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `(dir, image name, manifest name)` of a repo disk spawn takes: both
+    /// files in one dir right under `<root>/.incoming`.
+    fn incoming<'a>(
+        &self,
+        image: &'a Path,
+        manifest: &'a Path,
+    ) -> Result<(&'a OsStr, &'a OsStr, &'a OsStr), BoxError> {
+        let bad = || BoxError::Invalid(NOT_INCOMING.into());
+        let inc = self.root.join(crate::place::INCOMING);
+        let split = |p: &'a Path| -> Option<(&'a OsStr, &'a OsStr)> {
+            let name = p.file_name()?;
+            let dir = p.parent()?;
+            (dir.parent()? == inc).then_some((dir.file_name()?, name))
+        };
+        let (d1, image) = split(image).ok_or_else(bad)?;
+        let (d2, manifest) = split(manifest).ok_or_else(bad)?;
+        if d1 != d2 || image == manifest {
+            return Err(bad());
+        }
+        Ok((d1, image, manifest))
+    }
+
+    /// The names of `to` in the box dir `dir`: both right in it, and two.
+    fn names_in<'a>(dir: &Path, to: &'a DiskPlace) -> Option<(&'a OsStr, &'a OsStr)> {
+        let name = |p: &'a Path| {
+            if p.parent()? == dir {
+                p.file_name()
+            } else {
+                None
+            }
+        };
+        let (i, m) = (name(&to.repo_image)?, name(&to.base_manifest)?);
+        (i != m).then_some((i, m))
+    }
+
+    /// Whether a `Start::Now` spawn must be refused.
+    fn now_busy(g: &Inner, host: &HostFacts, size: &crate::template::Size) -> bool {
+        !g.queue().is_empty() || capacity::admit(host, &g.committed(), size).is_err()
     }
 
     fn template(&self, name: &str) -> Option<&BoxTemplate> {
@@ -336,9 +417,19 @@ impl Manager {
     /// admission and any earlier queue heads it admitted (or discarded on a
     /// boot failure), which may belong to other owners. The audit log needs
     /// those, since the tick never sees them.
+    ///
+    /// With a repo disk the id is claimed under the lock, the lock let go
+    /// while the disk and manifest are renamed into the box dir (gc leaves
+    /// that id alone meanwhile), and taken again to save the record and
+    /// admit. A rename error releases the id's dir and is `Unavailable`.
     pub fn spawn_changes(&self, a: &SpawnArgs) -> Result<(BoxRecord, Vec<Change>), BoxError> {
-        if a.repo_image.is_some() || a.base_manifest.is_some() {
-            return Err(BoxError::Invalid("repo disks are not supported yet".into()));
+        let disk = match (&a.repo_image, &a.base_manifest) {
+            (None, None) => None,
+            (Some(i), Some(m)) => Some(self.incoming(i, m)?),
+            _ => return Err(BoxError::Invalid(PAIR.into())),
+        };
+        if disk.is_some() && self.disk_place.is_none() {
+            return Err(BoxError::Unavailable(NO_PLACER.into()));
         }
         if !a.task.is_empty() {
             check_text(&a.task, MAX_TASK_BYTES)?;
@@ -352,12 +443,41 @@ impl Manager {
         capacity::fits_ever(&host, &size).map_err(|r| BoxError::Invalid(r.message()))?;
         let now = self.now();
         let mut g = self.lock();
-        if a.start == Start::Now
-            && (!g.queue().is_empty() || capacity::admit(&host, &g.committed(), &size).is_err())
-        {
+        if a.start == Start::Now && Self::now_busy(&g, &host, &size) {
             return Err(BoxError::Busy);
         }
         let id = g.store.claim_id()?;
+        if let (Some((sub, image, manifest)), Some(placer)) = (disk, &self.disk_place) {
+            g.placing.insert(id.clone());
+            let dir = g.store.box_dir(&id);
+            drop(g);
+            let to = placer(&self.root, &id);
+            let moved = match Self::names_in(&dir, &to) {
+                Some((ti, tm)) => crate::place::place(
+                    &self.root,
+                    id.as_str(),
+                    sub,
+                    &[(image, ti), (manifest, tm)],
+                ),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    NOT_IN_BOX,
+                )),
+            };
+            g = self.lock();
+            g.placing.remove(&id);
+            if let Err(e) = moved {
+                let _ = g.store.remove(&id);
+                return Err(BoxError::Unavailable(format!(
+                    "cannot move the repo disk into the box: {e}"
+                )));
+            }
+            // Another spawn may have taken the room meanwhile.
+            if a.start == Start::Now && Self::now_busy(&g, &host, &size) {
+                let _ = g.store.remove(&id);
+                return Err(BoxError::Busy);
+            }
+        }
         let seq = g.take_seq();
         let r = BoxRecord {
             version: RECORD_VERSION,
@@ -422,6 +542,7 @@ impl Manager {
             if g.save_new(r.clone()).is_err() {
                 break;
             }
+            let admitted = out.len();
             out.push(change(&r, from, "admitted"));
             let spec = VmSpec {
                 id: r.id.clone(),
@@ -433,6 +554,10 @@ impl Manager {
             };
             let booted = self.vmm.create(&spec).and_then(|h| {
                 r.vm = Some(h.clone());
+                // The driver names the base image; the handle's data stays
+                // opaque here (plan 36).
+                r.image = self.vmm.image_id(&h);
+                out[admitted].image = r.image.clone();
                 // Best effort, like every save after a VMM call.
                 let _ = g.put(r.clone());
                 self.vmm.boot(&h)
@@ -488,11 +613,21 @@ impl Manager {
     }
 
     pub fn pause(&self, id: &BoxId) -> Result<Change, BoxError> {
-        self.vm_step(id, Event::Pause, "pause", |v, h| v.pause(h))
+        self.vm_step(id, Event::Pause, "pause", None, |v, h| v.pause(h))
+    }
+
+    /// `pause`, with the record's `error` set to `why` in the same save.
+    pub fn pause_for(&self, id: &BoxId, why: &str) -> Result<Change, BoxError> {
+        self.vm_step(id, Event::Pause, "pause", Some(why), |v, h| v.pause(h))
+    }
+
+    /// The host as probed now, without the manager lock.
+    pub fn host_facts(&self) -> HostFacts {
+        (self.host)()
     }
 
     pub fn resume(&self, id: &BoxId) -> Result<Change, BoxError> {
-        self.vm_step(id, Event::Resume, "resume", |v, h| v.resume(h))
+        self.vm_step(id, Event::Resume, "resume", None, |v, h| v.resume(h))
     }
 
     /// The transition first (so a wrong state costs no VMM call), then the
@@ -502,6 +637,7 @@ impl Manager {
         id: &BoxId,
         ev: Event,
         why: &'static str,
+        error: Option<&str>,
         call: impl Fn(&dyn Vmm, &crate::vmm::VmHandle) -> Result<(), VmmError>,
     ) -> Result<Change, BoxError> {
         let now = self.now();
@@ -515,8 +651,16 @@ impl Manager {
                 .ok_or_else(|| BoxError::Unavailable("the box has no VM".into()))?;
         call(self.vmm.as_ref(), &h).map_err(|e| BoxError::Unavailable(vmm_msg(e)))?;
         r.state = to;
-        if ev == Event::Resume {
-            r.last_activity = now;
+        match ev {
+            Event::Resume => {
+                r.last_activity = now;
+                r.error = None;
+            }
+            _ => {
+                if let Some(e) = error {
+                    r.error = Some(e.to_string());
+                }
+            }
         }
         r.updated_at = now;
         g.put(r.clone())?;
@@ -832,13 +976,21 @@ impl Manager {
     /// that fails again the record stays, with the error updated. A store
     /// error does not stop the pass: the report has every id removed and
     /// the first error.
+    ///
+    /// First, outside the lock, every `<root>/.incoming` entry older than
+    /// [`crate::place::INCOMING_MAX_AGE_SECS`] goes: what a daemon that died
+    /// mid-spawn left there.
     pub fn gc(&self) -> GcReport {
         let now = self.now();
-        let mut g = self.lock();
         let mut rep = GcReport::default();
         let fail = |rep: &mut GcReport, e: String| {
             rep.error.get_or_insert(e);
         };
+        for e in crate::place::sweep_incoming(&self.root, now, crate::place::INCOMING_MAX_AGE_SECS)
+        {
+            fail(&mut rep, e);
+        }
+        let mut g = self.lock();
         let gone: Vec<BoxId> = g
             .records
             .values()
@@ -871,7 +1023,7 @@ impl Manager {
         match g.store.orphans() {
             Ok(orphans) => {
                 for id in orphans {
-                    if g.records.contains_key(&id) {
+                    if g.records.contains_key(&id) || g.placing.contains(&id) {
                         continue;
                     }
                     match g.store.remove(&id) {

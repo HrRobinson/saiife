@@ -1614,11 +1614,14 @@ dependencies = [
  "predicates",
  "qrcode",
  "rcgen",
+ "ring",
  "rpassword",
  "rustix",
  "rustls",
  "saiife-agents",
  "saiife-audit",
+ "saiife-boxhost",
+ "saiife-boxproto",
  "saiife-broker",
  "saiife-daemon",
  "saiife-dev",
@@ -1683,6 +1686,7 @@ dependencies = [
 name = "saiife-boxes"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "saiife-touch",
  "saiife-wire",
  "serde",
@@ -1690,6 +1694,30 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "saiife-boxhost"
+version = "0.2.0"
+dependencies = [
+ "ring",
+ "rustix",
+ "saiife-boxes",
+ "saiife-boxproto",
+ "saiife-wire",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "saiife-boxproto"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1746,6 +1774,8 @@ dependencies = [
  "rustls",
  "saiife-audit",
  "saiife-boxes",
+ "saiife-boxhost",
+ "saiife-boxproto",
  "saiife-broker",
  "saiife-darwin",
  "saiife-guard",
@@ -1811,6 +1841,13 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+]
+
+[[package]]
+name = "saiife-guest"
+version = "0.2.0"
+dependencies = [
+ "saiife-boxproto",
 ]
 
 [[package]]

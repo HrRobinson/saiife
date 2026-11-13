@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+#[cfg(unix)]
+pub mod fdpass;
 pub mod frame;
 pub mod hookkey;
 pub mod msg;
