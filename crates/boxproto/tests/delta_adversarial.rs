@@ -254,9 +254,25 @@ fn symlink_escape_is_refused() {
         ("updown", "docs/../README.md", ".. after a name"),
         ("gitlink", ".git/config", ".git"),
         ("gitlink2", "docs/.GIT", ".git"),
+        ("gitlink3", "docs/.git./x", ".git"),
+        ("gitlink4", "GIT~1/config", ".git"),
         ("bs", "..\\x", "backslash"),
     ] {
-        assert_refused(&[add_link(p, t)], p, needle);
+        let mut sink = Sink::default();
+        let e = feed(
+            true,
+            Limits::default(),
+            frames(&encode(&[add_link(p, t)])),
+            &mut sink,
+        )
+        .unwrap_err();
+        assert_eq!(e.path.as_deref(), Some(p), "{e}");
+        assert!(e.reason.contains(needle), "{e:?} lacks {needle:?}");
+        // The hash passed but the target did not: nothing was finished.
+        assert!(
+            sink.blobs.is_empty(),
+            "{p}: a refused link reached the sink"
+        );
     }
     // An empty target and a NUL.
     assert_refused(&[add_link("empty", "")], "empty", "empty");
@@ -301,13 +317,13 @@ fn file_dir_conflict() {
     let e = refused(&[add("q", b"x"), add("q/r", b"y")]);
     assert!(e.reason.contains("both a file and a directory"), "{e:?}");
     // Deleting everything under a directory frees the name.
-    run(&[
+    // ("docs" sorts before "docs/a", so this order is unsorted.)
+    let e = refused(&[
         delete("docs/a"),
         delete("docs/b"),
         add("docs", b"now a file"),
-    ])
-    .map(|_| ())
-    .expect_err("docs/ sorts after docs, so docs is first: entries unsorted");
+    ]);
+    assert!(e.reason.contains("not sorted"), "{e:?}");
     let v = run(&[
         add("docs", b"now a file"),
         delete("docs/a"),
@@ -808,4 +824,132 @@ fn apply_manifest_full_and_partial() {
 
     let none = apply_manifest(&b, &v, Some(&BTreeSet::new()));
     assert_eq!(none, b);
+}
+
+/// No reason or Display may carry an unsafe char, whatever the guest sent.
+fn assert_clean(e: &DeltaError) {
+    let unsafe_in = |s: &str| s.chars().any(saiife_wire::text::is_unsafe_char);
+    assert!(
+        !unsafe_in(&e.reason),
+        "unsafe char in reason {:?}",
+        e.reason
+    );
+    assert!(
+        !unsafe_in(&e.to_string()),
+        "unsafe char in Display {:?}",
+        e.to_string()
+    );
+}
+
+#[test]
+fn guest_text_in_reasons_is_escaped() {
+    let evil = ["\u{1b}[31mred", "a\u{202e}b", "x\ny"];
+    for name in evil {
+        // An unknown field: serde echoes its name.
+        let mut v = serde_json::to_value(add("a", b"x").0).unwrap();
+        v["t"] = "entry".into();
+        v[name] = 1.into();
+        let fs = vec![
+            Frame::Json(json!({"t": "delta", "n": 1, "entries": 1})),
+            Frame::Json(v),
+        ];
+        let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+        assert!(e.reason.contains("bad entry header"), "{e:?}");
+        assert_clean(&e);
+        // An unknown variant.
+        let mut v = serde_json::to_value(add("a", b"x").0).unwrap();
+        v["t"] = "entry".into();
+        v["kind"] = name.into();
+        let fs = vec![
+            Frame::Json(json!({"t": "delta", "n": 1, "entries": 1})),
+            Frame::Json(v),
+        ];
+        let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+        assert_clean(&e);
+        // The delta header, the end frame and the tag.
+        let mut h = json!({"t": "delta", "n": 1, "entries": 0});
+        h[name] = 1.into();
+        let e = feed(
+            true,
+            Limits::default(),
+            vec![Frame::Json(h)],
+            &mut Sink::default(),
+        )
+        .unwrap_err();
+        assert_clean(&e);
+        let mut end = json!({"t": "end", "entries": 0});
+        end[name] = 1.into();
+        let fs = vec![
+            Frame::Json(json!({"t": "delta", "n": 1, "entries": 0})),
+            Frame::Json(end),
+        ];
+        let e = feed(true, Limits::default(), fs, &mut Sink::default()).unwrap_err();
+        assert_clean(&e);
+        let e = feed(
+            true,
+            Limits::default(),
+            vec![Frame::Json(json!({"t": name}))],
+            &mut Sink::default(),
+        )
+        .unwrap_err();
+        assert_clean(&e);
+        // A path and a symlink target.
+        let e = refused(&[add(&format!("p{name}"), b"x")]);
+        assert_clean(&e);
+        let e = refused(&[add_link("l", &format!("../{name}"))]);
+        assert_clean(&e);
+    }
+    // An unsorted pair whose earlier path is echoed.
+    let e = refused(&[add("b\u{202e}", b"x"), add("a", b"y")]);
+    assert_clean(&e);
+}
+
+#[test]
+fn git_ntfs_aliases_are_refused() {
+    for p in [
+        ".git.",
+        ".GIT ",
+        ".git. .",
+        "x/.Git./y",
+        ".git../hooks/x",
+        "GIT~1/config",
+        "git~12",
+        "a/Git~1/b",
+        "GIT~1. ",
+    ] {
+        assert_refused(&[add(p, b"x")], p, ".git");
+    }
+    // Look-alikes stay fine; case-only collisions and ':' are not refused here.
+    run(&[
+        add("Readme.md", b"x"),
+        add("a:b", b"y"),
+        add("git~", b"z"),
+        add("git~1a", b"w"),
+        add("x.git.", b"v"),
+    ])
+    .unwrap();
+}
+
+#[test]
+fn write_through_symlink_case_folded() {
+    for p in ["LN/x", "Ln/x", "lN/deep/x"] {
+        assert_refused(&[add(p, b"x")], p, "symlink in the base");
+    }
+    let e = refused(&[add("L2/x", b"x"), add_link("l2", "docs")]);
+    assert_eq!(e.path.as_deref(), Some("L2/x"));
+    assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+}
+
+#[test]
+fn old_total_too_large() {
+    let limits = Limits {
+        total_bytes: 10,
+        ..Limits::default()
+    };
+    // README.md (6) + run.sh (10) of old content: 16 > 10; new content 2.
+    let items = [modify("README.md", b"a"), modify("run.sh", b"b")];
+    let e = feed(true, limits, frames(&encode(&items)), &mut Sink::default()).unwrap_err();
+    assert_eq!(e.path.as_deref(), Some("run.sh"));
+    assert!(e.reason.contains("old content"), "{e:?}");
+    assert!(e.reason.contains("MAX_TOTAL_BYTES"), "{e:?}");
 }

@@ -15,9 +15,26 @@
 //! - add: `old_*` are null.
 //! - modify: `old_kind`, `old_size`, `old_sha256` describe the base entry;
 //!   `kind`, `mode`, `size`, `sha256` the new one (the kind may change).
-//! - delete: the one rule is `mode` 0, `size` 0 and `sha256` `""` (nothing
-//!   new is described); `kind` equals `old_kind`, and `old_*` describe the
-//!   base entry being removed. No bytes follow.
+//! - delete: the one rule (controller ruling R-T1a) is `mode` 0, `size` 0
+//!   and `sha256` `""` (nothing new is described); `kind` equals
+//!   `old_kind`, and `old_*` describe the base entry being removed. No
+//!   bytes follow.
+//!
+//! Path rules beyond [`check_path`]: at most [`MAX_DEPTH`] components, no
+//! unsafe char (control, bidi, invisible), and no `.git` alias: a component
+//! that is `.git` after trimming trailing dots and spaces, or the 8.3 name
+//! `git~<digits>`, in any letter case (R-T1e). Case-only collisions are not
+//! refused here (Task 3 flags them); `:` is allowed.
+//!
+//! No path may go through a symlink, in the base or in the delta, compared
+//! with ASCII case folded (R-T1e). So a directory and a symlink never swap
+//! in one delta, either way: deleting the symlink `ln` and adding `ln/x` is
+//! refused, and so is adding the symlink `docs` while deleting `docs/a`.
+//!
+//! Every reason is free of unsafe chars: guest text in it (paths, targets,
+//! serde's echo of unknown field or variant names) is escaped as `\u{..}`.
+//! [`DeltaError::path`] is the raw guest path; render it escaped (the
+//! `Display` impl does).
 //!
 //! The [`Reader`] is fed one frame at a time. Everything a header declares
 //! (entry count, sizes, running totals, path length and depth, modes) is
@@ -120,18 +137,39 @@ impl std::fmt::Display for DeltaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.path {
             // Debug quoting: the path came from the guest.
-            Some(p) => write!(f, "delta refused: {p:?}: {}", self.reason),
-            None => write!(f, "delta refused: {}", self.reason),
+            Some(p) => write!(f, "delta refused: {}: {}", esc(p), clean(&self.reason)),
+            None => write!(f, "delta refused: {}", clean(&self.reason)),
         }
     }
 }
 
 impl std::error::Error for DeltaError {}
 
+/// Replaces every unsafe char (control, bidi, invisible) with `\u{..}`.
+fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if saiife_wire::text::is_unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Guest text for a reason: Debug-quoted, then cleaned.
+fn esc(s: &str) -> String {
+    clean(&format!("{s:?}"))
+}
+
+/// Every refusal goes through here, so no reason carries an unsafe char
+/// whatever guest text was formatted into it (serde echoes unknown field
+/// and variant names raw).
 fn bad(path: Option<&str>, reason: impl Into<String>) -> DeltaError {
     DeltaError {
         path: path.map(str::to_string),
-        reason: reason.into(),
+        reason: clean(&reason.into()),
     }
 }
 
@@ -256,9 +294,24 @@ fn has_unsafe(s: &str) -> Option<char> {
     s.chars().find(|&c| saiife_wire::text::is_unsafe_char(c))
 }
 
-/// Path rules beyond [`check_path`]: depth and unsafe chars.
+/// R-T1e: a component a Windows (NTFS) host could resolve to `.git`:
+/// `.git` after trimming trailing dots and spaces, or the 8.3 short name
+/// `git~<digits>`, in any letter case.
+fn is_git_alias(c: &str) -> bool {
+    let t = c.trim_end_matches(['.', ' ']);
+    if t.eq_ignore_ascii_case(".git") {
+        return true;
+    }
+    let b = t.as_bytes();
+    b.len() > 4 && b[..4].eq_ignore_ascii_case(b"git~") && b[4..].iter().all(u8::is_ascii_digit)
+}
+
+/// Path rules beyond [`check_path`]: depth, unsafe chars, `.git` aliases.
 fn check_delta_path(p: &str) -> Result<(), String> {
-    check_path(p)?;
+    check_path(p).map_err(|e| clean(&e))?;
+    if p.split('/').any(is_git_alias) {
+        return Err("has a .git component (or an NTFS alias of one)".into());
+    }
     if p.split('/').count() > MAX_DEPTH {
         return Err(format!("deeper than MAX_DEPTH ({MAX_DEPTH} components)"));
     }
@@ -294,9 +347,12 @@ fn check_mode_bits(mode: u32) -> Result<(), String> {
 }
 
 /// A symlink target: UTF-8, non-empty, relative, at most [`LINK_MAX`]
-/// bytes, no NUL, `\` or unsafe char, no `.git` component, and `..` only as
-/// a leading run (so, with every link's directory a real directory, the
-/// lexical resolution is the physical one), not climbing above the repo.
+/// bytes, no NUL, `\` or unsafe char, no `.git` component (or alias), and
+/// `..` only as a leading run, not climbing above the repo. With every
+/// link's directory a real directory, this keeps the link inside the repo
+/// lexically and through any chain of links the delta creates; a base
+/// symlink's target is not checked (the manifest holds only its hash), so a
+/// delta link resolving through an escaping base link escapes with it.
 fn check_link(path: &str, target: &[u8]) -> Result<(), DeltaError> {
     let refuse = |why: String| Err(bad(Some(path), format!("symlink target {why}")));
     let Ok(t) = std::str::from_utf8(target) else {
@@ -338,7 +394,7 @@ fn check_link(path: &str, target: &[u8]) -> Result<(), DeltaError> {
                 }
                 depth -= 1;
             }
-            c if c.eq_ignore_ascii_case(".git") => {
+            c if is_git_alias(c) => {
                 return refuse(format!("{t:?} has a .git component"));
             }
             _ => named = true,
@@ -685,19 +741,32 @@ impl<'a> Reader<'a> {
             None => base.is_some_and(|b| b.contains_key(k)),
         };
 
-        // No writing through a symlink, in the base or in the delta.
+        // No writing through a symlink, in the base or in the delta, with
+        // ASCII case folded (R-T1e: `LN/x` on a case-insensitive host goes
+        // through `ln`).
+        let fold = |p: &str| p.to_ascii_lowercase();
+        let base_links: BTreeSet<String> = base
+            .into_iter()
+            .flatten()
+            .filter(|(_, e)| e.kind == EntryKind::Symlink)
+            .map(|(k, _)| fold(k))
+            .collect();
+        let delta_links: BTreeSet<String> = self
+            .entries
+            .iter()
+            .filter(|h| h.kind == EntryKind::Symlink)
+            .map(|h| fold(&h.path))
+            .collect();
         for h in &self.entries {
-            for a in ancestors(&h.path) {
-                if base
-                    .and_then(|b| b.get(a))
-                    .is_some_and(|e| e.kind == EntryKind::Symlink)
-                {
+            let folded = fold(&h.path);
+            for a in ancestors(&folded) {
+                if base_links.contains(a) {
                     return Err(bad(
                         Some(&h.path),
                         format!("goes through {a:?}, a symlink in the base"),
                     ));
                 }
-                if delta.get(a).is_some_and(|d| d.kind == EntryKind::Symlink) {
+                if delta_links.contains(a) {
                     return Err(bad(
                         Some(&h.path),
                         format!("goes through {a:?}, a symlink in the delta"),
