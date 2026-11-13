@@ -570,3 +570,126 @@ fn no_hook_runs() {
         std::fs::read_to_string(&marker)
     );
 }
+
+// R-T2d: root reads /work without following anything the agent planted.
+
+const SECRET: &[u8] = b"p39-root-only-secret-bytes";
+
+fn has_secret(buf: &[u8]) -> bool {
+    buf.windows(SECRET.len()).any(|w| w == SECRET)
+}
+
+impl World {
+    /// A directory outside /work holding the secret as `a.txt`.
+    fn outside(&self) -> PathBuf {
+        let d = self._dir.path().join("outside");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.txt"), SECRET).unwrap();
+        d
+    }
+
+    /// The raw export and the entry headers in it.
+    fn export_raw(&self, n: u32) -> (Vec<u8>, Vec<serde_json::Value>) {
+        let mut buf = Vec::new();
+        export(&self.env, n, &mut buf).unwrap();
+        let mut heads = Vec::new();
+        let mut src = &buf[..];
+        while let Some(f) = read_frame(&mut src).unwrap() {
+            if let saiife_boxproto::frame::Frame::Json(v) = f {
+                if v["t"] == "entry" {
+                    heads.push(v);
+                }
+            }
+        }
+        (buf, heads)
+    }
+
+    /// The host validator's verdict on a raw export against the base.
+    fn validate(&self, buf: &[u8]) -> Result<Valid, saiife_boxproto::delta::DeltaError> {
+        let m = self.manifest();
+        let mut sink = Blobs::default();
+        let mut r = Reader::new(&m, Limits::default(), &mut sink);
+        let mut src = buf;
+        while let Some(f) = read_frame(&mut src).unwrap() {
+            r.push(f)?;
+        }
+        r.finish()
+    }
+}
+
+fn head_of<'a>(heads: &'a [serde_json::Value], p: &str) -> &'a serde_json::Value {
+    heads.iter().find(|h| h["path"] == p).unwrap()
+}
+
+#[test]
+fn symlink_to_outside_file_is_not_followed() {
+    let w = World::new();
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    let target = w.outside().join("a.txt");
+    w.link("leak", target.to_str().unwrap());
+    let (buf, heads) = w.export_raw(1);
+    assert!(!has_secret(&buf), "the secret was read");
+    let h = head_of(&heads, "leak");
+    assert_eq!(
+        (h["op"].as_str(), h["kind"].as_str()),
+        (Some("add"), Some("symlink"))
+    );
+    assert_eq!(h["size"], target.as_os_str().len() as u64);
+    // The host refuses the escaping link.
+    let e = w.validate(&buf).unwrap_err();
+    assert_eq!(e.path.as_deref(), Some("leak"), "{e}");
+}
+
+#[test]
+fn hard_link_to_outside_file_is_refused() {
+    let w = World::new();
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    let target = w.outside().join("a.txt");
+    std::fs::hard_link(&target, w.work("hl")).unwrap();
+    let mut buf = Vec::new();
+    let e = export(&w.env, 1, &mut buf).unwrap_err();
+    assert!(e.contains("\"hl\"") && e.contains("hard link"), "{e}");
+    assert!(buf.is_empty() && !has_secret(&buf));
+    // A tracked file hard-linked later is refused the same way.
+    std::fs::remove_file(w.work("hl")).unwrap();
+    std::fs::hard_link(w.work("keep"), w._dir.path().join("keep-twin")).unwrap();
+    let e = export(&w.env, 2, &mut buf).unwrap_err();
+    assert!(e.contains("\"keep\""), "{e}");
+    // Escaped in the message: no raw control char reaches the host.
+    std::fs::remove_file(w._dir.path().join("keep-twin")).unwrap();
+    std::fs::hard_link(&target, w.work("x\u{1b}[2J\u{202e}")).unwrap();
+    let e = export(&w.env, 3, &mut buf).unwrap_err();
+    assert!(!e.contains('\u{1b}') && !e.contains('\u{202e}'), "{e:?}");
+    assert!(e.contains("\\u{202e}"), "{e:?}");
+}
+
+#[test]
+fn dir_swapped_for_symlink_is_not_followed() {
+    let w = World::new();
+    w.put("d/a.txt", b"mine\n");
+    init_base(&w.env).unwrap();
+    let out = w.outside();
+    std::fs::remove_dir_all(w.work("d")).unwrap();
+    std::os::unix::fs::symlink(&out, w.work("d")).unwrap();
+    let (buf, heads) = w.export_raw(1);
+    assert!(!has_secret(&buf), "a file below the swapped dir was read");
+    let got: Vec<(&str, &str, &str)> = heads
+        .iter()
+        .map(|h| {
+            (
+                h["path"].as_str().unwrap(),
+                h["op"].as_str().unwrap(),
+                h["kind"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [("d", "add", "symlink"), ("d/a.txt", "delete", "file")]
+    );
+    // The host refuses the absolute link.
+    let e = w.validate(&buf).unwrap_err();
+    assert_eq!(e.path.as_deref(), Some("d"), "{e}");
+}

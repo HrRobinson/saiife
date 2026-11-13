@@ -16,6 +16,8 @@ saiife-boxproto = { path = "../boxproto" }
 # SHA-256, as boxproto builds them (both already in the tree).
 serde_json = "1"
 sha2 = "0.10"
+# Escaping guest paths in export errors (the shared unsafe-char predicate).
+saiife-wire = { path = "../wire" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The agent's PTY, its window size, dirfd-relative setup writes, and a

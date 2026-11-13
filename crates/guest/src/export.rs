@@ -10,21 +10,32 @@
 //! Nothing in `/work` steers this git (R-T2a): every call runs with a
 //! cleared environment, no system or global config, hooks off, no
 //! fsmonitor, and `info/attributes` unsetting every content-changing
-//! attribute (it beats any `/work/.gitattributes`), so the snapshot stores
-//! the raw bytes. `/work/.gitignore` is honored for untracked files; a file
-//! the base already tracks stays tracked.
+//! attribute (it beats any `/work/.gitattributes`).
+//!
+//! Git (run as root) never reads `/work` content (R-T2d): it only lists
+//! paths, the ones the base tracks (`ls-files -c` of the base) and the
+//! untracked ones (`ls-files -o`, honoring `/work/.gitignore`; a file the
+//! base already tracks stays tracked). Each path is then read by this
+//! module with `openat2` beneath a dirfd of `/work`, no symlink or magic
+//! link resolved: a symlink is recorded as its target (`readlinkat`), a
+//! file must be regular with a single link (a hard link could name a
+//! root-only file outside `/work`; the export fails naming the path), its
+//! mode is 0o644 or 0o755 from the owner exec bit, and its size is bounded
+//! before a byte is read. The bytes go on a pipe to `git fast-import`,
+//! raw; the tree is built with `update-index --index-info`. A path gone
+//! mid-walk, or below a directory that became a symlink, counts as
+//! deleted (the symlink is its own entry); a final component that turns
+//! into a symlink between the stat and the open fails the export.
 //!
 //! Nested repositories (R-T2b): a directory of `/work` holding a `.git`
-//! (directory or file, valid or not) is taken for another repository; git would record it as a gitlink (mode 160000),
-//! which the delta cannot carry. Its untracked files are skipped entirely
-//! (none is exported, whether git lists the directory as one entry or file
-//! by file), and a gitlink is dropped from every snapshot. Files
-//! the base already tracks stay tracked like any other, so an agent's `git
-//! init` over existing files does not make them vanish from the export.
-//! A `.git` file or directory itself never is
-//! (`info/exclude`), and neither is any path with a component a Windows host
-//! could resolve to `.git` (`.GIT`, `.git.`, `git~1`, ...): those are
-//! dropped from the snapshot so they never reach the base either.
+//! (directory or file, valid or not) is taken for another repository. Its
+//! untracked files are skipped entirely (none is exported, whether git
+//! lists the directory as one entry or file by file); no gitlink is ever
+//! recorded. Files the base already tracks stay tracked like any other, so
+//! an agent's `git init` over existing files does not make them vanish
+//! from the export. A `.git` file or directory itself never is exported
+//! (`info/exclude`), and neither is any path with a component a Windows
+//! host could resolve to `.git` (`.GIT`, `.git.`, `git~1`, ...).
 //!
 //! The export bounds itself (R-T2c): it stops with an error, before writing
 //! a frame, when the delta would pass `delta::Limits` (entries, a file's
@@ -35,7 +46,7 @@
 use crate::env::{GuestEnv, WORK};
 use saiife_boxproto::delta::{EntryHead, Limits, Op};
 use saiife_boxproto::frame::{write_frame, Frame, MAX_FRAME};
-use saiife_boxproto::manifest::{check_path, EntryKind, LINK_MAX};
+use saiife_boxproto::manifest::{check_path, EntryKind, LINK_MAX, REPO_MAX_BYTES};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -254,65 +265,387 @@ fn is_git_alias(c: &[u8]) -> bool {
     t.len() > 4 && t[..4].eq_ignore_ascii_case(b"git~") && t[4..].iter().all(u8::is_ascii_digit)
 }
 
-/// Snapshots `/work` into this call's index (starting from `start`, so
-/// what that tree tracks stays tracked) and returns the tree id. Gitlinks
-/// (nested repositories) and `.git`-alias paths are dropped (R-T2b).
+/// Snapshots `/work` and returns the tree id (R-T2d). Git only lists
+/// paths: the paths `start` tracks and the untracked ones (`ls-files -o`,
+/// honoring `.gitignore` unless `force`); a nested repository's untracked
+/// files and `.git`-alias paths are skipped (R-T2b). Every content byte is
+/// read by [`work::Work`] (openat2 beneath `/work`, no symlink followed)
+/// and fed to `git fast-import` on a pipe; the tree is built with
+/// `update-index --index-info`. A path gone mid-walk counts as deleted.
 fn snapshot(git: &Git, start: Option<&str>, force: bool) -> Result<String, String> {
     git.drop_index();
-    let r = (|| {
-        if let Some(s) = start {
-            git.run(&["read-tree", s])?;
-        }
-        // Not `git add -A`: it refuses a nested repository without a
-        // commit. Tracked paths are refreshed (`add -u`), then the untracked
-        // files `ls-files` lists are added; it lists a nested repository as
-        // `dir/`, which is skipped (R-T2b).
-        if start.is_some() {
-            git.run(&["add", "-u"])?;
-        }
+    let listed = (|| {
+        let tracked = match start {
+            Some(s) => {
+                git.run(&["read-tree", s])?;
+                git.run(&["ls-files", "-c", "-z"])?
+            }
+            None => Vec::new(),
+        };
         let mut others = vec!["ls-files", "-o", "-z"];
         if !force {
             others.push("--exclude-standard");
         }
-        let listed = git.run(&others)?;
-        let mut add = Vec::new();
-        let mut nested = NestedRepos::new(&git.work);
-        for p in listed.split(|&b| b == 0) {
-            if !p.is_empty() && !p.ends_with(b"/") && !nested.inside(p) {
-                add.extend_from_slice(p);
-                add.push(0);
-            }
+        Ok::<_, String>((tracked, git.run(&others)?))
+    })();
+    git.drop_index();
+    let (tracked, untracked) = listed?;
+
+    // path -> the most bytes it may hold (R-T2c): a tracked file is bounded
+    // by the repo cap (an unchanged large base file must not fail every
+    // export; the delta caps apply to what changed), a new file by the
+    // delta's per-file cap, as its export would be refused past it anyway.
+    let mut paths: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    let plain = |p: &[u8]| !p.is_empty() && !p.split(|&b| b == b'/').any(is_git_alias);
+    for p in tracked.split(|&b| b == 0).filter(|p| plain(p)) {
+        paths.insert(p.to_vec(), REPO_MAX_BYTES);
+    }
+    let new_max = if force {
+        REPO_MAX_BYTES
+    } else {
+        Limits::default().file_bytes
+    };
+    let mut nested = NestedRepos::new(&git.work);
+    for p in untracked.split(|&b| b == 0) {
+        if plain(p) && !p.ends_with(b"/") && !nested.inside(p) {
+            paths.entry(p.to_vec()).or_insert(new_max);
         }
-        if !add.is_empty() {
-            git.run_in(&["update-index", "-z", "--add", "--stdin"], Some(&add))?;
+    }
+
+    let work = work::Work::open(&git.work)?;
+    let mut blobs = Blobs::spawn(git)?;
+    let mut total = 0u64;
+    let mut found = Vec::new();
+    for (p, max) in &paths {
+        let Some(item) = work.read(p, *max)? else {
+            continue;
+        };
+        total = total.saturating_add(item.size());
+        if total > REPO_MAX_BYTES {
+            return Err(format!(
+                "/work holds more than {REPO_MAX_BYTES} bytes; nothing was exported"
+            ));
         }
-        let ls = git.run(&["ls-files", "-s", "-z"])?;
-        let mut drop = Vec::new();
-        for rec in ls.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-            // "<mode> <oid> <stage>\t<path>"
-            let tab = rec
-                .iter()
-                .position(|&b| b == b'\t')
-                .ok_or("git ls-files: a record without a path")?;
-            let (meta, path) = (&rec[..tab], &rec[tab + 1..]);
-            let mode = meta.split(|&b| b == b' ').next().unwrap_or_default();
-            let keep = matches!(mode, b"100644" | b"100755" | b"120000")
-                && !path.split(|&b| b == b'/').any(is_git_alias);
-            if !keep {
-                drop.extend_from_slice(path);
-                drop.push(0);
-            }
-        }
-        if !drop.is_empty() {
-            git.run_in(
-                &["update-index", "-z", "--force-remove", "--stdin"],
-                Some(&drop),
-            )?;
+        let mark = blobs.add(p, item)?;
+        found.push((p, mark));
+    }
+    let oids = blobs.finish()?;
+    let mut info = Vec::new();
+    for (p, (mark, mode)) in found {
+        let oid = oids
+            .get(&mark)
+            .ok_or_else(|| format!("git fast-import lost the blob of {}", esc(p)))?;
+        info.extend_from_slice(format!("{mode} {oid}\t").as_bytes());
+        info.extend_from_slice(p);
+        info.push(0);
+    }
+    git.drop_index();
+    let r = (|| {
+        if !info.is_empty() {
+            git.run_in(&["update-index", "-z", "--index-info"], Some(&info))?;
         }
         git.oid(&["write-tree"])
     })();
     git.drop_index();
     r
+}
+
+/// A guest path for an error message: lossy UTF-8, quoted, every control,
+/// bidi or invisible char escaped.
+fn esc(p: &[u8]) -> String {
+    let q = format!("{:?}", String::from_utf8_lossy(p));
+    let mut out = String::with_capacity(q.len());
+    for c in q.chars() {
+        if saiife_wire::text::is_unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// What one `/work` path holds, opened without following any symlink.
+pub(crate) enum Item {
+    /// A symlink's target bytes.
+    Link(Vec<u8>),
+    /// A regular file (single link), its size at open, and its exec bit.
+    File {
+        file: std::fs::File,
+        size: u64,
+        exec: bool,
+    },
+}
+
+impl Item {
+    fn size(&self) -> u64 {
+        match self {
+            Item::Link(t) => t.len() as u64,
+            Item::File { size, .. } => *size,
+        }
+    }
+}
+
+/// One `git fast-import` that stores the blobs it is fed on its stdin
+/// (it reads nothing else of `/work`); its marks give the object ids.
+struct Blobs {
+    child: Child,
+    stdin: Option<std::io::BufWriter<ChildStdin>>,
+    marks: PathBuf,
+    next: u64,
+}
+
+impl Blobs {
+    fn spawn(git: &Git) -> Result<Blobs, String> {
+        let marks = git.dir.join(format!(
+            "marks-{}",
+            git.index
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&marks);
+        let mut arg = std::ffi::OsString::from("--export-marks=");
+        arg.push(&marks);
+        let mut child = git
+            .cmd(&[
+                OsStr::new("fast-import"),
+                OsStr::new("--quiet"),
+                OsStr::new("--done"),
+                &arg,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("git fast-import: {e}"))?;
+        let stdin = child.stdin.take().map(std::io::BufWriter::new);
+        Ok(Blobs {
+            child,
+            stdin,
+            marks,
+            next: 0,
+        })
+    }
+
+    /// Feeds one blob; returns its mark and git mode.
+    fn add(&mut self, p: &[u8], item: Item) -> Result<(u64, &'static str), String> {
+        let broke = |e: io::Error| format!("git fast-import: {e}");
+        self.next += 1;
+        let mark = self.next;
+        let w = self.stdin.as_mut().ok_or("git fast-import: closed")?;
+        let size = item.size();
+        write!(w, "blob\nmark :{mark}\ndata {size}\n").map_err(broke)?;
+        let mode = match item {
+            Item::Link(t) => {
+                w.write_all(&t).map_err(broke)?;
+                "120000"
+            }
+            Item::File { file, exec, .. } => {
+                let copied =
+                    io::copy(&mut (&file).take(size), w).map_err(|e| format!("{}: {e}", esc(p)))?;
+                if copied != size {
+                    return Err(format!(
+                        "{} changed while it was read; export again",
+                        esc(p)
+                    ));
+                }
+                if exec {
+                    "100755"
+                } else {
+                    "100644"
+                }
+            }
+        };
+        w.write_all(b"\n").map_err(broke)?;
+        Ok((mark, mode))
+    }
+
+    /// Ends the import; mark -> object id.
+    fn finish(mut self) -> Result<BTreeMap<u64, String>, String> {
+        let broke = |e: io::Error| format!("git fast-import: {e}");
+        if let Some(mut w) = self.stdin.take() {
+            w.write_all(b"done\n").map_err(broke)?;
+            w.flush().map_err(broke)?;
+        }
+        let st = self.child.wait().map_err(broke)?;
+        if !st.success() {
+            return Err(format!("git fast-import failed ({st})"));
+        }
+        let text = std::fs::read_to_string(&self.marks).unwrap_or_default();
+        let _ = std::fs::remove_file(&self.marks);
+        let mut out = BTreeMap::new();
+        for line in text.lines() {
+            let mut f = line.split(' ');
+            if let (Some(m), Some(oid)) = (f.next(), f.next()) {
+                if let Ok(m) = m.trim_start_matches(':').parse::<u64>() {
+                    out.insert(m, oid.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for Blobs {
+    fn drop(&mut self) {
+        if self.stdin.take().is_some() {
+            // Not finished (an error mid-way): our own child.
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.marks);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod work {
+    //! Reading `/work` as root without following anything the agent
+    //! planted (R-T2d): every open is an `openat2` beneath a dirfd of
+    //! `/work` with no symlink or magic link resolved.
+    use super::{esc, Item};
+    use rustix::fs::{
+        fstat, open, openat2, readlinkat, statat, AtFlags, FileType, Mode, OFlags, ResolveFlags,
+    };
+    use rustix::io::Errno;
+    use saiife_boxproto::manifest::LINK_MAX;
+    use std::ffi::OsStr;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+        .union(ResolveFlags::NO_SYMLINKS)
+        .union(ResolveFlags::NO_MAGICLINKS);
+
+    pub(super) struct Work {
+        dir: OwnedFd,
+    }
+
+    fn gone(e: Errno) -> bool {
+        e == Errno::NOENT || e == Errno::NOTDIR
+    }
+
+    impl Work {
+        pub(super) fn open(work: &Path) -> Result<Work, String> {
+            let dir = open(
+                work,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| format!("/work: {e}"))?;
+            Ok(Work { dir })
+        }
+
+        /// What `p` holds now: `None` when it is gone, a directory, below a
+        /// symlinked directory (not a path of this tree; the symlink is its
+        /// own entry), or not a file or symlink. A file must be a single
+        /// link and at most `max` bytes.
+        pub(super) fn read(&self, p: &[u8], max: u64) -> Result<Option<Item>, String> {
+            let fail = |why: String| Err(format!("{}: {why}", esc(p)));
+            let (parent, name) = match p.iter().rposition(|&b| b == b'/') {
+                Some(i) => (Some(&p[..i]), &p[i + 1..]),
+                None => (None, p),
+            };
+            let name = OsStr::from_bytes(name);
+            let held;
+            let dir = match parent {
+                None => &self.dir,
+                Some(d) => {
+                    let opened = openat2(
+                        &self.dir,
+                        OsStr::from_bytes(d),
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                        RESOLVE,
+                    );
+                    match opened {
+                        Ok(fd) => {
+                            held = fd;
+                            &held
+                        }
+                        Err(e) if gone(e) => return Ok(None),
+                        // A directory replaced by a symlink: nothing below
+                        // it is read; `ls-files` lists the link itself.
+                        Err(Errno::LOOP) => return Ok(None),
+                        Err(e) => return fail(format!("cannot open its directory: {e}")),
+                    }
+                }
+            };
+            let st = match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => st,
+                Err(e) if gone(e) => return Ok(None),
+                Err(e) => return fail(format!("{e}")),
+            };
+            match FileType::from_raw_mode(st.st_mode) {
+                FileType::Symlink => {
+                    let t = match readlinkat(dir, name, Vec::new()) {
+                        Ok(t) => t.into_bytes(),
+                        Err(e) if gone(e) => return Ok(None),
+                        Err(e) => return fail(format!("readlink: {e}")),
+                    };
+                    if t.len() as u64 > LINK_MAX || t.len() as u64 > max {
+                        return fail(format!("symlink target is longer than {LINK_MAX} bytes"));
+                    }
+                    Ok(Some(Item::Link(t)))
+                }
+                FileType::RegularFile => {
+                    let fd = match openat2(
+                        dir,
+                        name,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                        RESOLVE,
+                    ) {
+                        Ok(fd) => fd,
+                        Err(e) if gone(e) => return Ok(None),
+                        Err(e) => return fail(format!("cannot open it beneath /work: {e}")),
+                    };
+                    let st = fstat(&fd).map_err(|e| format!("{}: {e}", esc(p)))?;
+                    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                        return fail("is not a regular file".into());
+                    }
+                    if st.st_nlink != 1 {
+                        return fail(format!(
+                            "has {} hard links; a file with more than one is not exported",
+                            st.st_nlink
+                        ));
+                    }
+                    let size = st.st_size as u64;
+                    if size > max {
+                        return fail(format!("is {size} bytes, over the export's limit of {max}"));
+                    }
+                    Ok(Some(Item::File {
+                        file: std::fs::File::from(fd),
+                        size,
+                        exec: st.st_mode & 0o100 != 0,
+                    }))
+                }
+                // Directories (their files are listed on their own), FIFOs,
+                // sockets and devices are not entries.
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod work {
+    use super::Item;
+    use std::path::Path;
+
+    pub(super) struct Work;
+
+    impl Work {
+        pub(super) fn open(_work: &Path) -> Result<Work, String> {
+            Err("the export runs only inside the Linux box VM".into())
+        }
+
+        pub(super) fn read(&self, p: &[u8], max: u64) -> Result<Option<Item>, String> {
+            let _ = (p, max);
+            Err("the export runs only inside the Linux box VM".into())
+        }
+    }
 }
 
 /// Which directories of `/work` hold a `.git` (another repository),

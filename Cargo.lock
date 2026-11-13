@@ -1854,6 +1854,7 @@ version = "0.2.0"
 dependencies = [
  "rustix",
  "saiife-boxproto",
+ "saiife-wire",
  "serde_json",
  "sha2",
  "tempfile",
