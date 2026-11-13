@@ -31,9 +31,10 @@ pub struct ClaudePin {
     pub sha256: String,
 }
 
-/// What a box without a default image is told (R43). Plan 36 Task 5 drops
-/// the part after the semicolon once `image import --default` is built.
-pub const DEFAULT_IMAGE_HINT: &str = "make one with \"saiife box image build\"; making it the default (\"saiife box image import --default <path>\") is not in this build yet";
+/// What a box without a default image is told (R43): build one, then
+/// import it as the default (plan 36 Task 5).
+pub const DEFAULT_IMAGE_HINT: &str =
+    "make one with \"saiife box image build\", then \"saiife box image import --default <path>\"";
 
 pub const DEFAULT_RECIPE: &str = include_str!("../../../assets/box/recipe.toml");
 
@@ -299,6 +300,15 @@ impl Manifest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Image import exists (plan 36 Task 5): the hint names it as a step,
+    /// never as missing from the build.
+    #[test]
+    fn default_image_hint_names_the_import() {
+        assert!(!DEFAULT_IMAGE_HINT.contains("not in this build"));
+        assert!(DEFAULT_IMAGE_HINT.contains("saiife box image build"));
+        assert!(DEFAULT_IMAGE_HINT.contains("saiife box image import --default <path>"));
+    }
 
     fn hex(c: char) -> String {
         c.to_string().repeat(64)

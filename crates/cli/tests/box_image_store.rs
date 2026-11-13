@@ -228,3 +228,17 @@ fn import_default_error_exits_2_after_the_import() {
     assert_eq!(v["images"][0]["id"], id.as_str(), "{v}");
     assert_eq!(v["images"][0]["default"], false, "{v}");
 }
+
+/// The hint a box without a default image gets (R43) names a command this
+/// build has: `image import` with `--default`.
+#[test]
+fn default_image_hint_command_exists() {
+    let hint = saiife_boxhost::image::DEFAULT_IMAGE_HINT;
+    assert!(hint.contains("saiife box image import --default"), "{hint}");
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["box", "image", "import", "--help"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("--default"), "{}", out(&o));
+}
