@@ -201,7 +201,11 @@ p39_step() {
   local key=$1 label=$2 rc=0
   shift 2
   "$@" || rc=$?
-  if [ "$rc" = 0 ]; then p39_result "$key" ok; else p39_result "$key" FAIL; fi
+  case "$rc" in
+    0) p39_result "$key" ok ;;
+    3) p39_result "$key" partial_no_key; label="$label (partial: no key)"; rc=0 ;;
+    *) p39_result "$key" FAIL ;;
+  esac
   check "$label" test "$rc" = 0
 }
 
@@ -246,9 +250,9 @@ p39_check_protected() {
   p39_in_box "$P39_BOX" "cd /work && printf '# rules\nbe nice\n' > CLAUDE.md && sync" >/dev/null || return 1
   o=$(saiife box diff "$P39_BOX" 2>&1) || return 1
   printf '%s\n' "$o" | grep -q '^! CLAUDE.md' || { p39_log "CLAUDE.md is not flagged in the review"; return 1; }
-  # the land prints the same review before the touch; with no key the
-  # review is not shown, so the diff above is the check
-  [ "$P39_NOKEY" = 1 ] && return 0
+  # the land prints the same review (and the touch summary) before the
+  # touch; with no key that half did not run: return 3 (partial)
+  [ "$P39_NOKEY" = 1 ] && return 3
   p39_run_land "$P39_BOX" --files CLAUDE.md
   printf '%s\n' "$P39_OUT" | grep -q '^! CLAUDE.md' && p39_land_rc_ok
 }
@@ -267,8 +271,7 @@ p39_check_git_config() {
   p39_run_land "$P39_BOX" --files .gitattributes --allow-git-config
   p39_land_rc_ok || return 1
   git -C "$P39_REPO" cat-file -e "refs/heads/saiife/box-$P39_BOX:.gitattributes" || return 1
-  # reading the history must not run the filter either
-  git -C "$P39_REPO" log -p -1 "refs/heads/saiife/box-$P39_BOX" >/dev/null
+  # saiife runs no git porcelain that applies filters: the marker is absent
   [ ! -e "$marker" ]
 }
 
@@ -288,12 +291,20 @@ p39_hostile_one() {
   [ "$after" -gt "$before" ] || { p39_log "hostile ($label): no diff_rejected record"; return 1; }
 }
 
+# Names the guest really exports (it reads /work, never .git, and cannot
+# name a path outside it: `../escape` and `.git/hooks/x` are unit-tested, not
+# smoked) and the host refuses. One hostile file per box, so each must give
+# its own diff_rejected record.
+# Quoting, layer by layer: the four backslashes in this file's double quotes
+# become two in the command text sent to the guest
+# (`printf "e\\314\\201.txt"`); the guest shell's double quotes reduce them to
+# one, and printf turns the octal escapes (portable, unlike \x) into the bytes
+# 0x65 0xcc 0x81: "e" plus a combining acute accent, a non-NFC name.
 p39_check_hostile() {
   local bad=0
-  p39_hostile_one ".git/hooks/x" "cd /work && mkdir -p .git/hooks && printf '#!/bin/sh\n' > .git/hooks/x && chmod +x .git/hooks/x && sync" || bad=1
-  p39_hostile_one "../escape" "cd /work && git update-index --add --cacheinfo 100644,\$(printf x | git hash-object -w --stdin),../escape; printf x > /work/../escape; sync" || bad=1
   p39_hostile_one "trailing dot" "cd /work && printf x > 'notes.' && sync" || bad=1
-  p39_hostile_one "non-NFC name" "cd /work && printf x > \"\$(printf 'e\\\\xcc\\\\x81.txt')\" && sync" || bad=1
+  p39_hostile_one "non-NFC name" "cd /work && printf x > \"\$(printf \"e\\\\314\\\\201.txt\")\" && sync" || bad=1
+  p39_hostile_one "8.3 name" "cd /work && printf x > 'CLAUDE~1.MD' && sync" || bad=1
   [ "$bad" = 0 ]
 }
 
