@@ -116,6 +116,29 @@ fn is_plain_file(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
 }
 
+/// The helper's fail-closed limits on a spec it reads from the
+/// VMM-writable runtime dir, whatever wrote it: a locked VMM always runs
+/// under Landlock, and no VMM gets more vCPUs or memory than any template
+/// may ask for (`saiife_boxes::template::MAX_VCPUS`, `MAX_MEM_MIB`). The
+/// daemon never reads the spec back (it rebuilds it every boot); this is
+/// the second line.
+pub fn check_limits(spec: &LaunchSpec, locked: bool) -> Result<(), String> {
+    use saiife_boxes::template::{MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB};
+    if locked && !spec.landlock {
+        return Err("landlock: a locked box VMM always runs under Landlock".into());
+    }
+    if !(1..=MAX_VCPUS).contains(&spec.vcpus) {
+        return Err(format!("vcpus: {} is not 1..={MAX_VCPUS}", spec.vcpus));
+    }
+    if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&spec.mem_mib) {
+        return Err(format!(
+            "mem_mib: {} is not {MIN_MEM_MIB}..={MAX_MEM_MIB}",
+            spec.mem_mib
+        ));
+    }
+    Ok(())
+}
+
 pub fn check_spec(spec: &LaunchSpec, paths: &BoxPaths, allowed: &Allowed) -> Result<(), String> {
     if spec.version != 1 {
         return Err(format!("version: {} is not 1", spec.version));
@@ -934,6 +957,32 @@ mod tests {
             },
             landlock: true,
             restore: None,
+        }
+    }
+
+    /// The helper's fail-closed limits (a tampered spec, even if the
+    /// daemon's rebuild regressed): Landlock on when locked, sizes within
+    /// the template ceilings.
+    #[test]
+    fn limits_refuse_landlock_off_locked_and_oversize() {
+        let e = env();
+        let ok = spec(&e, "b1");
+        assert_eq!(check_limits(&ok, true), Ok(()));
+        let off = LaunchSpec {
+            landlock: false,
+            ..ok.clone()
+        };
+        assert!(check_limits(&off, true).unwrap_err().contains("landlock"));
+        assert_eq!(check_limits(&off, false), Ok(()));
+        for (vcpus, mem_mib) in [(33, 4096), (0, 4096), (2, 262_145), (2, 511)] {
+            let big = LaunchSpec {
+                vcpus,
+                mem_mib,
+                ..ok.clone()
+            };
+            for locked in [true, false] {
+                assert!(check_limits(&big, locked).is_err(), "{vcpus} {mem_mib}");
+            }
         }
     }
 

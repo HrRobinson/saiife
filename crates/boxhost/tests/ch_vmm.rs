@@ -396,7 +396,7 @@ fn create_writes_spec_and_overlay() {
     let data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
     assert_eq!(
         data,
-        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096})
+        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096, "vcpus": 2})
     );
     // The manager learns the image through the driver (plan 36).
     assert_eq!(v.image_id(&h), Some(format!("base-{HEX}")));
@@ -1777,4 +1777,64 @@ fn a_spawn_with_a_repo_disk_on_the_real_path_manager_boots() {
     assert_eq!(std::fs::read(p.repo_disk()).unwrap(), b"repo");
     assert!(!p.dir.join(BASE_MANIFEST).exists());
     assert!(read_spec(&p).unwrap().repo, "the VMM is told to open it");
+}
+
+/// The fake CH's argv of box `id`'s last start.
+fn ch_argv(w: &World, id: &str) -> Vec<String> {
+    std::fs::read_to_string(w.paths(id).dir.join("fake-ch.argv"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// vm.json is in the runtime dir, which the VMM user can write (R37): a
+/// VMM that edits it between runs (Landlock off, four times the memory,
+/// more vCPUs, its own kernel) gets none of it. Boot builds the spec from
+/// the daemon's own state (the handle in the box record, the image store,
+/// the driver's Landlock setting) and writes it fresh.
+#[test]
+fn a_tampered_vm_json_is_never_trusted_at_boot() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let p = w.paths("b1");
+    let mut s: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(p.vm_json()).unwrap()).unwrap();
+    s["landlock"] = false.into();
+    s["mem_mib"] = (4096u64 * 4).into();
+    s["vcpus"] = 32.into();
+    s["boot"] = serde_json::json!({"kernel": {
+        "kernel": w.root.join("i/base").display().to_string(),
+        "cmdline": "init=/bin/sh"}});
+    std::fs::write(p.vm_json(), s.to_string()).unwrap();
+    v.boot(&h).unwrap();
+    let a = ch_argv(&w, "b1");
+    assert!(a.iter().any(|x| x == "--landlock"), "{a:?}");
+    assert!(a.iter().any(|x| x == "size=4096M"), "{a:?}");
+    assert!(a.iter().any(|x| x == "boot=2"), "{a:?}");
+    assert!(a.iter().any(|x| x == "--firmware"), "{a:?}");
+    assert!(
+        !a.iter().any(|x| x == "--kernel" || x.contains("init=")),
+        "{a:?}"
+    );
+    // and the file now says what was booted
+    let s = read_spec(&p).unwrap();
+    assert!(s.landlock && s.mem_mib == 4096 && s.vcpus == 2);
+}
+
+/// A handle without the sizes boot needs (one made before they were kept
+/// in the record) is refused rather than read from vm.json.
+#[test]
+fn a_handle_without_its_sizes_does_not_boot() {
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let old = VmHandle {
+        data: serde_json::json!({"launcher": "child", "image": format!("base-{HEX}")}).to_string(),
+        ..h.clone()
+    };
+    let e = failed(v.boot(&old));
+    assert!(e.contains("record"), "{e}");
+    assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
 }

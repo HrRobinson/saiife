@@ -33,7 +33,7 @@ use saiife_wire::source::BoxId;
 
 use crate::ch::{Action, Api, ApiError, VmState};
 use crate::disk::make_overlay;
-use crate::launch::{self, read_spec, write_spec, Boot, LaunchSpec, Launcher, MAX_SOCK_PATH};
+use crate::launch::{self, write_spec, Boot, LaunchSpec, Launcher, MAX_SOCK_PATH};
 use crate::layout::Layout;
 use crate::paths::BoxPaths;
 use crate::pins::CH_VERSION;
@@ -528,6 +528,49 @@ impl ChVmmInit {
     /// The snapshot to restore this boot from, if any (the VMM of the box is
     /// confirmed gone). Not trusted: discarded with its marker, noted to
     /// the hooks, and the box cold-boots.
+    /// The spec of a boot, from daemon-held state only: the image and sizes
+    /// in the handle's data (the box record's), the image as the store
+    /// resolves it now (base, firmware or kernel and cmdline), the driver's
+    /// Landlock setting, and the repo disk create handed to the runtime dir.
+    /// `restore` is the caller's (from the vault marker).
+    fn launch_spec(&self, h: &VmHandle, paths: &BoxPaths) -> Result<LaunchSpec, String> {
+        let stale = || {
+            "the box's VM record has no image or sizes (made by an older saiife):              discard the box and spawn it again"
+                .to_string()
+        };
+        let image = image_of_data(&h.data).ok_or_else(stale)?;
+        let v: serde_json::Value = serde_json::from_str(&h.data).map_err(|_| stale())?;
+        let mem_mib = v.get("mem_mib").and_then(serde_json::Value::as_u64);
+        let vcpus = v
+            .get("vcpus")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        let (Some(mem_mib), Some(vcpus)) = (mem_mib, vcpus) else {
+            return Err(stale());
+        };
+        let resolved = self.images.resolve(&ImageRef::Pinned(image.clone()))?;
+        if resolved.id != image {
+            return Err(format!(
+                "the image store resolved {image} to {}",
+                resolved.id
+            ));
+        }
+        let spec = LaunchSpec {
+            version: 1,
+            id: h.id.clone(),
+            vcpus,
+            mem_mib,
+            base: resolved.raw,
+            // not followed: a symlink here is refused below (check_plain)
+            repo: std::fs::symlink_metadata(paths.repo_disk()).is_ok(),
+            boot: resolved.boot,
+            landlock: self.landlock,
+            restore: None,
+        };
+        launch::check_limits(&spec, self.layout.locked)?;
+        Ok(spec)
+    }
+
     fn decide_restore(&self, id: &BoxId, paths: &BoxPaths, spec: &LaunchSpec) -> Option<PathBuf> {
         let vault = &self.layout.vault;
         let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
@@ -610,7 +653,10 @@ impl ChVmm {
                 crate::vault::pid_path(&inner.layout.vault, id).display()
             )));
         }
-        let mut spec = read_spec(paths).map_err(VmmError::Failed)?;
+        // Never read back from vm.json: it is in the runtime dir, which the
+        // VMM user can write (R37). The spec is rebuilt from the daemon's
+        // own state and written fresh every boot.
+        let mut spec = inner.launch_spec(h, paths).map_err(VmmError::Failed)?;
         // CH opens these by path and follows links (S4 sweep): serial.log is
         // replaced when it is not a plain file (unlink removes a link, not its
         // target); the disks hold the box's data, so they are refused.
@@ -828,12 +874,15 @@ impl Vmm for ChVmm {
             return Err(VmmError::Failed(e));
         }
         handover.commit().map_err(VmmError::Failed)?;
-        // mem_mib bounds the snapshot copy (`snapshot::seal`); the
-        // VMM-writable vm.json is not asked for it.
+        // The handle (kept in the daemon-only box record) holds what boot
+        // rebuilds the spec from: the image, the admitted sizes. mem_mib also
+        // bounds the snapshot copy (`snapshot::seal`). The VMM-writable
+        // vm.json is never asked for any of it.
         let data = serde_json::json!({
             "launcher": inner.launcher.kind(),
             "image": image.id,
             "mem_mib": spec.size.mem_mib,
+            "vcpus": spec.size.vcpus,
         });
         Ok(VmHandle {
             id: spec.id.clone(),

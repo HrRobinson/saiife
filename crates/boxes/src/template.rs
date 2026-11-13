@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use saiife_touch::TouchClass;
 use serde::{Deserialize, Serialize};
 
+/// The most vCPUs a template may give a box (also the VMM helper's hard
+/// ceiling).
+pub const MAX_VCPUS: u32 = 32;
+/// The least memory a template may give a box, in MiB.
+pub const MIN_MEM_MIB: u64 = 512;
+/// The most memory a template may give a box, in MiB (also the VMM
+/// helper's hard ceiling).
+pub const MAX_MEM_MIB: u64 = 262_144;
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude-code.toml");
 /// Largest template file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -307,10 +315,10 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
         return Err(format!("bad image base {:?}", raw.image.base));
     };
     let s = raw.size;
-    if !(1..=32).contains(&s.vcpus) {
+    if !(1..=MAX_VCPUS).contains(&s.vcpus) {
         return Err("vcpus must be 1..=32".into());
     }
-    if !(512..=262_144).contains(&s.mem_mib) || s.mem_max_mib < s.mem_mib {
+    if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&s.mem_mib) || s.mem_max_mib < s.mem_mib {
         return Err("memory: need 512 <= mem_mib <= 262144 and mem_max_mib >= mem_mib".into());
     }
     if !(10..=1024).contains(&s.disk_gib) {
