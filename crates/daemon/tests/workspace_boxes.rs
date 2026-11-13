@@ -23,13 +23,13 @@ use saiife_ipc::msg::{
     OP_WORKSPACE_PAIR_CONFIRM, OP_WORKSPACE_PAIR_FINISH, PROTO,
 };
 use saiife_ipc::peer::PeerCred;
-use saiife_policy::{Directory, Fsync};
+use saiife_policy::{Directory, Fsync, GroupEntry, UserEntry};
 use saiife_wire::frame::{Frame, SignedFrame};
 use saiife_wire::sig::TestDevice;
 use saiife_wire::{b64, pair};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +60,50 @@ fn host(n: u64) -> HostFacts {
     }
 }
 
+/// `saiife` (the daemon), `me` (this process's uid), and the `admins` group
+/// with `me` in it while the flag is set.
+struct Dir(Arc<AtomicBool>);
+
+impl Directory for Dir {
+    fn user(&self, name: &str) -> Option<UserEntry> {
+        match name {
+            "saiife" => Some(UserEntry { uid: OWN, gid: OWN }),
+            // Pairing is done as root; the frames come from this process's
+            // uid, so the device owner "root" resolves to it.
+            "me" | "root" => Some(UserEntry {
+                uid: me(),
+                gid: me(),
+            }),
+            _ => None,
+        }
+    }
+    fn name_of(&self, uid: u32) -> Option<String> {
+        match uid {
+            OWN => Some("saiife".into()),
+            0 => Some("root".into()),
+            u if u == me() => Some("me".into()),
+            _ => None,
+        }
+    }
+    fn group(&self, name: &str) -> Option<GroupEntry> {
+        (name == "admins").then(|| GroupEntry {
+            gid: 3000,
+            members: if self.0.load(Ordering::SeqCst) {
+                vec!["me".into()]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+    fn groups_of(&self, user: &str) -> Vec<String> {
+        if user == "me" && self.0.load(Ordering::SeqCst) {
+            vec!["admins".into()]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 struct World {
     ctx: Arc<Ctx>,
     mgr: Arc<Manager>,
@@ -71,6 +115,11 @@ struct World {
 /// A locked daemon: uid `OWN`, the device owner `me` (this process's uid, in
 /// `[admin] groups`), one box slot, the Workspace over the manager.
 async fn world(slots: u64) -> World {
+    world_as(slots, true).await
+}
+
+/// [`world`] with the device owner an admin or not.
+async fn world_as(slots: u64, admin: bool) -> World {
     let tmp = scratch();
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
@@ -93,14 +142,7 @@ async fn world(slots: u64) -> World {
         fsync: Fsync::Always,
     };
     let (handle, _join) = writer::spawn(cw, cfg, None).unwrap();
-    let u = me();
-    let dirs: Arc<dyn Directory + Send + Sync> =
-        Arc::new(saiife_policy::FixedDirectory::from_text(
-            &format!(
-                "saiife:x:{OWN}:{OWN}::/var/lib/saiife:/bin/sh\nme:x:{u}:{u}::/home/me:/bin/sh\n"
-            ),
-            "admins:x:3000:me\n",
-        ));
+    let dirs: Arc<dyn Directory + Send + Sync> = Arc::new(Dir(Arc::new(AtomicBool::new(admin))));
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let guest: Arc<dyn GuestLink> = Arc::new(FakeGuest::new());
     let h = host(slots);
@@ -160,8 +202,8 @@ async fn world(slots: u64) -> World {
 
 fn peer() -> PeerCred {
     PeerCred {
-        uid: me(),
-        gid: me(),
+        uid: 0,
+        gid: 0,
         pid: std::process::id(),
         sid: None,
         group_sids: Vec::new(),
@@ -316,7 +358,11 @@ async fn box_records(w: &World, id: &str, via: &str, want: usize) -> Vec<Value> 
 }
 
 async fn paired(slots: u64) -> (World, Link, TestDevice) {
-    let w = world(slots).await;
+    paired_as(slots, true).await
+}
+
+async fn paired_as(slots: u64, admin: bool) -> (World, Link, TestDevice) {
+    let w = world_as(slots, admin).await;
     let mut link = Link::open(&w).await;
     let d = pair_device(&w, &mut link).await;
     (w, link, d)
@@ -416,4 +462,146 @@ async fn fake_boxes_env_still_wins() {
         Some(demo),
     );
     assert_eq!(picked.overview().boxes.len(), 4);
+}
+
+/// Another user's box, running, made straight on the manager.
+fn others_box(w: &World) -> String {
+    let rec = w
+        .mgr
+        .spawn(&saiife_boxes::manager::SpawnArgs {
+            template: "claude-code".into(),
+            repo: "shop".into(),
+            repo_dir: None,
+            task: "theirs".into(),
+            start: saiife_wire::source::Start::Queue,
+            owner_uid: me().wrapping_add(7),
+            repo_image: None,
+            base_manifest: None,
+        })
+        .unwrap();
+    rec.id.as_str().to_string()
+}
+
+fn rules(w: &World, kind: &str) -> Vec<String> {
+    records(w, kind)
+        .iter()
+        .filter_map(|r| field(r, "rule").as_str().map(String::from))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_user_cannot_reach_another_users_box() {
+    let (w, mut link, d) = paired_as(3, false).await;
+    let theirs = others_box(&w);
+    let mine = send(&w, &mut link, &d, "box.spawn", spawn_args("mine")).await;
+    assert_eq!(mine["ok"], true, "{mine}");
+    let o = send(&w, &mut link, &d, "box.overview", json!({})).await;
+    let ids: Vec<_> = o["result"]["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![mine["result"]["id"].as_str().unwrap().to_string()]
+    );
+    let l = send(&w, &mut link, &d, "box.list", json!({})).await;
+    assert_eq!(l["result"].as_array().unwrap().len(), 1, "{l}");
+    for (action, args) in [
+        ("box.diff", json!({"id": theirs})),
+        ("box.term.read", json!({"id": theirs})),
+        ("box.stop", json!({"id": theirs})),
+        ("box.pause", json!({"id": theirs})),
+        ("box.discard", json!({"id": theirs})),
+    ] {
+        let a = send(&w, &mut link, &d, action, args).await;
+        assert_eq!(a["ok"], false, "{action}: {a}");
+        assert_eq!(a["rule"], "not_found", "{action}: {a}");
+    }
+    // Untouched, and the failed changes are audited.
+    let r = w.mgr.get(&BoxId::parse(&theirs).unwrap()).unwrap();
+    assert_ne!(r.state, saiife_boxes::BoxState::Done);
+    let stops: Vec<_> = records(&w, "workspace")
+        .into_iter()
+        .filter(|r| field(r, "action") == "box.stop" && field(r, "box") == theirs.as_str())
+        .collect();
+    assert_eq!(stops.len(), 1, "{stops:?}");
+    assert_eq!(stops[0]["decision"], "deny", "{:?}", stops[0]);
+}
+
+#[tokio::test]
+async fn an_admin_sees_but_cannot_change_another_users_box() {
+    let (w, mut link, d) = paired_as(3, true).await;
+    let theirs = others_box(&w);
+    let o = send(&w, &mut link, &d, "box.overview", json!({})).await;
+    let ids: Vec<_> = o["result"]["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&theirs), "{o}");
+    let df = send(&w, &mut link, &d, "box.diff", json!({"id": theirs})).await;
+    assert_ne!(df["rule"], "not_found", "{df}");
+    let s = send(&w, &mut link, &d, "box.stop", json!({"id": theirs})).await;
+    assert_eq!(s["ok"], false, "{s}");
+    assert_eq!(s["error"], "forbidden", "{s}");
+    assert_eq!(s["rule"], "not_owner", "{s}");
+    let r = w.mgr.get(&BoxId::parse(&theirs).unwrap()).unwrap();
+    assert_ne!(r.state, saiife_boxes::BoxState::Done);
+    let denied = records(&w, "workspace")
+        .into_iter()
+        .filter(|r| field(r, "action") == "box.stop" && r["decision"] == "deny")
+        .count();
+    assert_eq!(denied, 1);
+}
+
+fn lock_all(w: &World) {
+    w.ctx
+        .lockdown
+        .set(Some(saiife_broker::pipeline::Lockdown {
+            scope: saiife_broker::pipeline::LockScope::All,
+            reason: "incident".into(),
+            by_uid: 0,
+            since: "t".into(),
+        }))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn lockdown_all_refuses_a_frame_spawn_but_not_stop_or_list() {
+    let (w, mut link, d) = paired(2).await;
+    let a = send(&w, &mut link, &d, "box.spawn", spawn_args("a")).await;
+    let a = a["result"]["id"].as_str().unwrap().to_string();
+    lock_all(&w);
+    let s = send(&w, &mut link, &d, "box.spawn", spawn_args("b")).await;
+    assert_eq!(s["ok"], false, "{s}");
+    assert_eq!(s["rule"], "lockdown", "{s}");
+    assert_eq!(w.mgr.list().len(), 1, "nothing was spawned");
+    assert!(rules(&w, "workspace").contains(&"lockdown".to_string()));
+    for action in ["box.steer", "box.revise", "box.resume"] {
+        let r = send(&w, &mut link, &d, action, json!({"id": a, "msg": "x"})).await;
+        assert_eq!(r["rule"], "lockdown", "{action}: {r}");
+    }
+    let l = send(&w, &mut link, &d, "box.list", json!({})).await;
+    assert_eq!(l["ok"], true, "{l}");
+    let st = send(&w, &mut link, &d, "box.stop", json!({"id": a})).await;
+    assert_eq!(st["ok"], true, "{st}");
+}
+
+#[tokio::test]
+async fn the_shared_gate_holds_all_six_power_actions() {
+    let w = world(1).await;
+    for a in ["spawn", "resume", "steer", "revise", "land", "push"] {
+        assert!(box_ops::power_refusal(&w.ctx, a).is_none(), "{a}");
+    }
+    lock_all(&w);
+    for a in ["spawn", "resume", "steer", "revise", "land", "push"] {
+        assert!(box_ops::power_refusal(&w.ctx, a).is_some(), "{a}");
+        assert!(box_ops::power_refusal(&w.ctx, &format!("box.{a}")).is_some());
+    }
+    for a in ["stop", "pause", "discard", "list", "overview", "diff"] {
+        assert!(box_ops::power_refusal(&w.ctx, a).is_none(), "{a}");
+    }
 }

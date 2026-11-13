@@ -540,10 +540,10 @@ fn to_value<T: serde::Serialize>(t: &T) -> Result<Value, Fail> {
 
 /// A box source call, off the runtime thread.
 async fn blocking<T: Send + 'static>(
-    ctx: &Arc<Ctx>,
+    boxes: &Arc<dyn BoxSource>,
     f: impl FnOnce(&dyn BoxSource) -> Result<T, BoxError> + Send + 'static,
 ) -> Result<T, Fail> {
-    let boxes = Arc::clone(&ctx.boxes);
+    let boxes = Arc::clone(boxes);
     match tokio::task::spawn_blocking(move || f(boxes.as_ref())).await {
         Ok(Ok(t)) => Ok(t),
         Ok(Err(e)) => Err(source_error(&e)),
@@ -551,9 +551,73 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
+/// The box source a frame's action runs on, built from the verified device
+/// owner (never the shared `ctx.boxes`, when there is a manager): the owner
+/// sees and changes their own boxes, another user's box is `not_found`. An
+/// admin or root owner also SEES every box (reads only); changing another
+/// user's box is `forbidden` (plan 34 R18). Audited by `run` like any refusal.
+async fn source_for(
+    ctx: &Arc<Ctx>,
+    v: &Verified,
+    action: &str,
+) -> Result<Arc<dyn BoxSource>, Fail> {
+    let Some(m) = ctx.box_manager.clone() else {
+        return Ok(Arc::clone(&ctx.boxes));
+    };
+    if !action.starts_with("box.") {
+        return Ok(Arc::clone(&ctx.boxes));
+    }
+    let Some(owner) = uid_of(ctx, &v.owner_user).await else {
+        return Err(Fail::Policy(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_owner",
+            "the device owner is not a user of this machine",
+        )));
+    };
+    let admin = owner == 0 || ctx.is_admin(owner).await;
+    let reads = [
+        a::BOX_OVERVIEW,
+        a::BOX_LIST,
+        a::BOX_TEMPLATES,
+        a::BOX_DIFF,
+        a::BOX_TERM_READ,
+        a::BOX_INBOX,
+    ];
+    if admin && !reads.contains(&action) {
+        // An admin changes only their own boxes.
+        if let Some(Ok(id)) = v
+            .frame
+            .args
+            .get("id")
+            .and_then(Value::as_str)
+            .map(BoxId::parse)
+        {
+            if m.get(&id).is_ok_and(|r| r.owner_uid != owner) {
+                return Err(Fail::Policy(Refused::new(
+                    ErrorCode::Forbidden,
+                    "not_owner",
+                    "that box belongs to another user",
+                )));
+            }
+        }
+    }
+    let scope = (!(admin && reads.contains(&action))).then_some(owner);
+    let cell: crate::box_ops::CtxCell = Arc::default();
+    let _ = cell.set(Arc::downgrade(ctx));
+    Ok(Arc::new(crate::box_ops::workspace_source(m, scope, cell)))
+}
+
 async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, Fail> {
     let action = v.frame.action.as_str();
     let args = &v.frame.args;
+    // One lockdown gate for box power, shared with the control socket.
+    if let Some(why) = crate::box_ops::power_refusal(ctx, action) {
+        return Err(Fail::Policy(Refused::new(
+            ErrorCode::Lockdown,
+            "lockdown",
+            why,
+        )));
+    }
     match v.level {
         // Plan 31 verifies touch proofs; until then none is acted on.
         Level::Touch => return Err(touch_required(action)),
@@ -573,6 +637,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
             format!("{action} is not available in this version"),
         )));
     }
+    let src = source_for(ctx, v, action).await?;
     match action {
         a::WORKSPACE_WHOAMI => {
             only(args, &[])?;
@@ -585,20 +650,20 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
         }
         a::BOX_OVERVIEW => {
             only(args, &[])?;
-            to_value(&blocking(ctx, |b| Ok(b.overview())).await?)
+            to_value(&blocking(&src, |b| Ok(b.overview())).await?)
         }
         a::BOX_LIST => {
             only(args, &[])?;
-            to_value(&blocking(ctx, |b| Ok(b.list())).await?)
+            to_value(&blocking(&src, |b| Ok(b.list())).await?)
         }
         a::BOX_TEMPLATES => {
             only(args, &[])?;
-            to_value(&blocking(ctx, |b| Ok(b.templates())).await?)
+            to_value(&blocking(&src, |b| Ok(b.templates())).await?)
         }
         a::BOX_DIFF => {
             only(args, &["id"])?;
             let id = id_arg(args)?;
-            to_value(&blocking(ctx, move |b| b.diff(&id)).await?)
+            to_value(&blocking(&src, move |b| b.diff(&id)).await?)
         }
         a::BOX_TERM_READ => {
             only(args, &["id", "after"])?;
@@ -607,11 +672,11 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
                 None | Some(Value::Null) => None,
                 Some(x) => Some(x.as_u64().ok_or_else(|| invalid("after is a u64"))?),
             };
-            to_value(&blocking(ctx, move |b| b.terminal(&id, after)).await?)
+            to_value(&blocking(&src, move |b| b.terminal(&id, after)).await?)
         }
         a::BOX_INBOX => {
             only(args, &[])?;
-            let items: Vec<_> = blocking(ctx, |b| Ok(b.pending_actions()))
+            let items: Vec<_> = blocking(&src, |b| Ok(b.pending_actions()))
                 .await?
                 .iter()
                 .map(|p| p.view())
@@ -622,7 +687,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
             only(args, &["id"])?;
             let id = id_arg(args)?;
             let name = action.to_string();
-            blocking(ctx, move |b| match name.as_str() {
+            blocking(&src, move |b| match name.as_str() {
                 a::BOX_STOP => b.stop(&id),
                 a::BOX_PAUSE => b.pause(&id),
                 _ => b.discard(&id),
@@ -647,7 +712,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
                         .ok_or_else(|| invalid("ids is a list of box ids"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            blocking(ctx, move |b| b.reorder(&ids)).await?;
+            blocking(&src, move |b| b.reorder(&ids)).await?;
             Ok(json!({}))
         }
         a::BOX_SPAWN => {
@@ -660,7 +725,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
                 Some("queue") => Start::Queue,
                 _ => return Err(invalid("start is \"now\" or \"queue\"")),
             };
-            let templates = blocking(ctx, |b| Ok(b.templates())).await?;
+            let templates = blocking(&src, |b| Ok(b.templates())).await?;
             let Some(t) = templates.iter().find(|t| t.name == template) else {
                 return Err(invalid(format!("no template {template:?}")));
             };
@@ -674,28 +739,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
                 task,
                 start,
             };
-            let id = match ctx.box_manager.clone() {
-                // The frame knows the device owner: a source scoped to them
-                // spawns (the shared one cannot in locked mode) and audits.
-                Some(m) => {
-                    let Some(owner) = uid_of(ctx, &v.owner_user).await else {
-                        return Err(Fail::Policy(Refused::new(
-                            ErrorCode::Forbidden,
-                            "unknown_owner",
-                            "the device owner is not a user of this machine",
-                        )));
-                    };
-                    let cell: crate::box_ops::CtxCell = Arc::default();
-                    let _ = cell.set(Arc::downgrade(ctx));
-                    let src = crate::box_ops::workspace_source(m, Some(owner), cell);
-                    match tokio::task::spawn_blocking(move || src.spawn(&req)).await {
-                        Ok(Ok(id)) => id,
-                        Ok(Err(e)) => return Err(source_error(&e)),
-                        Err(e) => return Err(internal(e)),
-                    }
-                }
-                None => blocking(ctx, move |b| b.spawn(&req)).await?,
-            };
+            let id = blocking(&src, move |b| b.spawn(&req)).await?;
             Ok(json!({ "id": id }))
         }
         a::LOCKDOWN_ON => {

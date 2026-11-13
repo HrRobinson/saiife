@@ -611,6 +611,25 @@ fn locked_all(ctx: &Ctx) -> bool {
         .is_some_and(|l| l.scope == LockScope::All)
 }
 
+/// The box actions that give a box power (bare names, without `box.`):
+/// refused under lockdown `all`. Stop, pause, discard and reads are not
+/// here: stopping is a safety action.
+pub const POWER_ACTIONS: &[&str] = &["spawn", "resume", "steer", "revise", "land", "push"];
+
+/// The one lockdown gate for box power, shared by the control socket and the
+/// Workspace's frames: under lockdown `all`, a power action (`spawn`,
+/// `box.spawn`, ...) is refused, with the lockdown's message.
+pub fn power_refusal(ctx: &Ctx, action: &str) -> Option<String> {
+    let name = action.strip_prefix("box.").unwrap_or(action);
+    if !POWER_ACTIONS.contains(&name) {
+        return None;
+    }
+    ctx.lockdown
+        .get()
+        .filter(|l| l.scope == LockScope::All)
+        .map(|l| crate::lockdown::message(&l))
+}
+
 /// One event from a box's guest, and its `box` record (`via: "tick"`) when
 /// it is a state change. Under lockdown `all` a `Ready` keeps the box's
 /// pending prompt unsent; the first tick after lockdown lifts sends it
@@ -1096,7 +1115,7 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
 
     // Lockdown `all` refuses what gives a box power; the record says so.
     if op.grants_power() {
-        if let Some(l) = ctx.lockdown.get().filter(|l| l.scope == LockScope::All) {
+        if let Some(why) = power_refusal(ctx, &action) {
             let template = match &op {
                 Op::Spawn(a) => Some(a.template.as_str()),
                 _ => None,
@@ -1110,7 +1129,6 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                 None,
                 "cli",
             ));
-            let why = crate::lockdown::message(&l);
             rec.decision = DecisionKind::Deny;
             rec.rule = Some("lockdown".into());
             rec.reason = Some(why.clone());
