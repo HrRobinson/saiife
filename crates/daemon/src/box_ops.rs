@@ -256,6 +256,40 @@ pub struct Built {
     pub audit: Arc<AuditLink>,
     /// The manager runs on the fake VM (a `fake-vmm` test build).
     pub fake: bool,
+    /// Where the boxes' disks are, for `box.list`'s `disk_mib`: the
+    /// driver's runtime root (`Layout.boxes`, R37) on the real path, the
+    /// record root on the fake VM.
+    pub disk_root: PathBuf,
+}
+
+/// The box image store's dirs (plan 36) when this build and mode have
+/// boxes, whether or not the box manager came up: an import is how a host
+/// without a default image gets one. Records: `box_images::paths_for`
+/// (the daemon's own); images: the box layout's (`box_vmm::layout_for`,
+/// which honours the debug-only `SAIIFE_TEST_BOX_ROOT`), so the preflight,
+/// the driver and the image ops agree. `None` without boxes.
+pub fn image_paths(
+    state_dir: &Path,
+    mode: &Mode,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<crate::box_images::ImagePaths> {
+    #[cfg(feature = "fake-vmm")]
+    if env(FAKE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return Some(crate::box_images::paths_for(state_dir, mode));
+    }
+    #[cfg(all(target_os = "linux", feature = "boxes"))]
+    {
+        let layout = crate::box_vmm::layout_for(state_dir, mode, env).ok()?;
+        Some(crate::box_images::ImagePaths {
+            records: crate::box_images::paths_for(state_dir, mode).records,
+            images: layout.images,
+        })
+    }
+    #[cfg(not(all(target_os = "linux", feature = "boxes")))]
+    {
+        let _ = (state_dir, mode, env);
+        None
+    }
 }
 
 /// The box manager, or why boxes are unavailable (`Ok(Err(why))`): (1) a
@@ -335,13 +369,14 @@ fn build_real(
     // the disks are in the runtime dirs
     let root = layout.boxes.clone();
     let prev = Mutex::new(None);
+    let disk_root = root.clone();
     open_manager(
         store,
         vmm,
         Arc::new(saiife_boxes::guest::NoGuest),
         Arc::new(move || host_facts(&root, &prev)),
         (mode, config_path, env),
-        (audit, false),
+        (audit, false, disk_root),
     )
     .map(Ok)
 }
@@ -377,7 +412,7 @@ fn open_manager(
     guest: Arc<dyn saiife_boxes::guest::GuestLink>,
     host: saiife_boxes::manager::HostProbe,
     (mode, config_path, env): (&Mode, &Path, EnvFn<'_>),
-    (audit, fake): (Arc<AuditLink>, bool),
+    (audit, fake, disk_root): (Arc<AuditLink>, bool, PathBuf),
 ) -> Result<Built, String> {
     use saiife_boxes::manager::ManagerInit;
 
@@ -406,6 +441,7 @@ fn open_manager(
         changes: opened.changes,
         audit,
         fake,
+        disk_root,
     })
 }
 
@@ -424,6 +460,7 @@ fn build_fake(
 
     let root = dir_in(state_dir);
     let store = Store::open(root.clone()).map_err(|e| e.to_string())?;
+    let disk_root = root.clone();
     let prev = Mutex::new(None);
     let pinned = env(FAKE_SLOTS_ENV)
         .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
@@ -437,7 +474,7 @@ fn build_fake(
             None => host_facts(&root, &prev),
         }),
         (mode, config_path, env),
-        (Arc::new(AuditLink::default()), true),
+        (Arc::new(AuditLink::default()), true, disk_root),
     )
 }
 
@@ -989,9 +1026,6 @@ impl Caller {
 /// Every op in [`OPS`].
 pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
-    let Some(mgr) = ctx.box_manager.clone() else {
-        return err(id, ErrorCode::Unavailable, unavailable(ctx));
-    };
     // The descriptors a `box.fds` passed are this op's: an op in
     // `msg::FD_OPS` (`box.spawn`, `box.image.import`) takes them, any other
     // box op closes them now. Every refusal below closes them too.
@@ -1002,16 +1036,25 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if !saiife_ipc::msg::FD_OPS.contains(&req.op.as_str()) {
         passed.clear();
     }
-    // The base images (plan 36), behind the same manager gate.
+    // The base images (plan 36) need the image store, not the manager: a
+    // host whose preflight failed for want of a default image imports one
+    // here (`ctx.box_images` is set whenever this build and mode have boxes).
     if crate::box_images::OPS.contains(&req.op.as_str()) {
+        if ctx.box_images.is_none() {
+            return err(id, ErrorCode::Unavailable, unavailable(ctx));
+        }
         #[cfg(unix)]
-        return crate::box_images::handle(ctx, &mgr, &conn.peer, req, passed).await;
+        return crate::box_images::handle(ctx, ctx.box_manager.as_ref(), &conn.peer, req, passed)
+            .await;
         #[cfg(not(unix))]
         {
             drop(passed);
             return err(id, ErrorCode::Unavailable, UNAVAILABLE);
         }
     }
+    let Some(mgr) = ctx.box_manager.clone() else {
+        return err(id, ErrorCode::Unavailable, unavailable(ctx));
+    };
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
     let op = match Op::parse(&req.op, &req.args, peer.uid, !passed.is_empty()) {
@@ -1237,11 +1280,13 @@ async fn run(
         }
         Op::List { all } => {
             let scope = (!(all && caller.privileged)).then_some(uid);
+            let disk_root = ctx.box_disk_root.clone();
             blocking(move || {
                 let boxes = ManagerSource::new(Arc::clone(&m), scope).list();
                 // Usage is read from the box dirs after every manager lock
-                // is released (the lists above are snapshots).
-                let root = m.root().to_path_buf();
+                // is released (the lists above are snapshots); the disks are
+                // in the driver's runtime dirs (R37).
+                let root = disk_root.unwrap_or_else(|| m.root().to_path_buf());
                 let (host, committed) = m.capacity();
                 let (total, free) = capacity::slots(&host, &committed);
                 let mut a = Map::new();

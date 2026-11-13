@@ -782,10 +782,6 @@ impl Vmm for ChVmm {
             )));
         }
         inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
-        // spawn placed the repo disk in the record dir; the VMM opens it
-        // from the runtime dir (R37, R40); base.json stays in the record
-        crate::repo_handover::take_repo_disk(&spec.dir, &paths.dir, inner.layout.locked, false)
-            .map_err(VmmError::Failed)?;
         let image = inner
             .images
             .resolve(&spec.image)
@@ -807,6 +803,13 @@ impl Vmm for ChVmm {
         if inner.layout.locked {
             group_writable(&root).map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
         }
+        // Spawn placed the repo disk in the record dir; the VMM opens it
+        // from the runtime dir (R37, R40); base.json stays in the record.
+        // The last step that can fail before the spec: a failed create
+        // gives the disk back to the record, which a discard removes.
+        let handover =
+            crate::repo_handover::take_repo_disk(&spec.dir, &paths.dir, inner.layout.locked)
+                .map_err(VmmError::Failed)?;
         // `restore` is decided at boot, from the marker (S1).
         let ls = LaunchSpec {
             version: 1,
@@ -820,7 +823,11 @@ impl Vmm for ChVmm {
             landlock: inner.landlock,
             restore: None,
         };
-        write_spec(&ls, &paths).map_err(VmmError::Failed)?;
+        if let Err(e) = write_spec(&ls, &paths) {
+            handover.undo();
+            return Err(VmmError::Failed(e));
+        }
+        handover.commit().map_err(VmmError::Failed)?;
         // mem_mib bounds the snapshot copy (`snapshot::seal`); the
         // VMM-writable vm.json is not asked for it.
         let data = serde_json::json!({

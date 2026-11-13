@@ -1031,19 +1031,21 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     };
     // The recovery's state changes are `box` records, written with the
     // start records below (R29).
-    let (box_manager, box_template_warnings, box_recovered, box_audit) = match boxes {
+    let (box_manager, box_template_warnings, box_recovered, box_audit, box_disk_root) = match boxes
+    {
         Some(b) => (
             Some(b.manager),
             b.template_warnings,
             b.changes,
             Some(b.audit),
+            Some(b.disk_root),
         ),
-        None => (None, Vec::new(), Vec::new(), None),
+        None => (None, Vec::new(), Vec::new(), None, None),
     };
-    // The base image store (plan 36), only beside a box manager.
-    let box_images = box_manager
-        .as_ref()
-        .map(|_| crate::box_images::paths_for(&state_dir, &mode));
+    // The base image store (plan 36) whenever this build and mode have
+    // boxes, with or without a manager: a failed preflight for want of a
+    // default image is mended by an import.
+    let box_images = crate::box_ops::image_paths(&state_dir, &mode, &|k| std::env::var_os(k));
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
@@ -1162,6 +1164,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         box_unavailable,
         box_template_warnings,
         box_images,
+        box_disk_root,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     if let Some(a) = &box_audit {

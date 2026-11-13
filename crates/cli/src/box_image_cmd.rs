@@ -250,6 +250,9 @@ mod store {
         if default {
             outln!("default image {}", sanitize(image));
         }
+        if let Some(note) = answer.get("note").and_then(Value::as_str) {
+            outln!("note: {}", sanitize(note));
+        }
         Ok(())
     }
 

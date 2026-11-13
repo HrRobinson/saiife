@@ -446,12 +446,17 @@ fn create_refuses_small_disk() {
     let (v, _l) = w.vmm(&[]);
     let mut spec = w.spec("b1");
     spec.size.disk_gib = 2;
+    // a repo disk spawn placed in the record stays there (R40): a failed
+    // create never leaves it in the VMM-readable runtime dir
+    std::fs::write(spec.dir.join("repo.img"), b"repo").unwrap();
     assert_eq!(
         failed(v.create(&spec)),
         "the box disk (2 GiB) is smaller than the base image (4 GiB)"
     );
     assert!(!w.paths("b1").root_disk().exists());
     assert!(!w.paths("b1").vm_json().exists());
+    assert!(!w.paths("b1").repo_disk().exists());
+    assert_eq!(std::fs::read(spec.dir.join("repo.img")).unwrap(), b"repo");
 }
 
 #[test]

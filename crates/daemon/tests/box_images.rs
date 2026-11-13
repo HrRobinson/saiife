@@ -38,6 +38,8 @@ const ALICE: u32 = 2000;
 const CAROL: u32 = 2002;
 const ROOT: u32 = 0;
 
+const UNAVAILABLE_WHY: &str = "boxes are unavailable: no default box image";
+
 fn scratch() -> tempfile::TempDir {
     let base = std::env::var_os("SAIIFE_TEST_TMP")
         .map(PathBuf::from)
@@ -112,6 +114,12 @@ fn host(n: u64) -> HostFacts {
 /// in the temp dir. Locked: the daemon is uid 999, `carol` is an admin.
 /// Personal: the daemon is this process's uid.
 fn world(mode: Mode) -> World {
+    world_with(mode, true)
+}
+
+/// `manager: false`: a daemon whose box preflight failed (no manager), as
+/// one without a default image yet starts.
+fn world_with(mode: Mode, manager: bool) -> World {
     let tmp = scratch();
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
@@ -174,7 +182,8 @@ fn world(mode: Mode) -> World {
             admin_groups: vec!["admins".into()],
             ..PolicyState::invalid(0)
         },
-        box_manager: Some(Arc::clone(&mgr)),
+        box_manager: manager.then(|| Arc::clone(&mgr)),
+        box_unavailable: (!manager).then(|| UNAVAILABLE_WHY.to_string()),
         box_images: Some(paths.clone()),
         ..base
     }));
@@ -1057,4 +1066,43 @@ async fn import_default_error_is_ok_with_the_image() {
     let a = w.ok(me(), "box.image.ls", json!({})).await;
     assert_eq!(a["images"][0]["id"], s.manifest.id.as_str());
     assert_eq!(a["images"][0]["default"], false);
+}
+
+/// Plan 35's preflight wants a default image, and plan 36's import makes
+/// one: with no manager (the preflight failed) the image ops still serve
+/// the store. ls names no box, rm is refused (box records it cannot see
+/// may name the image), import says a restart uses it; other box ops stay
+/// unavailable with the preflight's why.
+#[tokio::test]
+async fn image_ops_work_without_a_manager() {
+    let w = world_with(Mode::Personal, false);
+    let a = w.ok(me(), "box.image.ls", json!({})).await;
+    assert_eq!(a["images"], json!([]));
+    let s = w.src("a", "image-a\n");
+    let a = w.import(me(), &s, true).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("default_error").is_none(), "{a}");
+    assert!(a["note"].as_str().unwrap().contains("restart"), "{a}");
+    assert_eq!(
+        std::fs::read_to_string(w.paths.records.join("default")).unwrap(),
+        format!("{}\n", s.manifest.id)
+    );
+    let a = w.ok(me(), "box.image.ls", json!({})).await;
+    assert_eq!(a["images"][0]["default"], true, "{a}");
+    assert_eq!(a["images"][0]["in_use"], json!([]), "{a}");
+    let a = w
+        .call(me(), "box.image.rm", json!({"image": s.manifest.id}))
+        .await;
+    assert_eq!(a["error"], "unavailable", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains(UNAVAILABLE_WHY),
+        "{a}"
+    );
+    let a = w.call(me(), "box.list", json!({})).await;
+    assert_eq!(a["error"], "unavailable", "{a}");
+    assert_eq!(a["message"], UNAVAILABLE_WHY, "{a}");
+    // with a manager an import carries no note
+    let w = world(Mode::Personal);
+    let a = w.import(me(), &w.src("b", "image-b\n"), false).await;
+    assert!(a.get("note").is_none(), "{a}");
 }

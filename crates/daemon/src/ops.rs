@@ -400,8 +400,12 @@ pub struct Ctx {
     /// The template files skipped at start, for `box.templates`.
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     /// The box image store's dirs (plan 36); `None`: the `box.image.*`
-    /// ops are unavailable.
+    /// ops are unavailable. Set whenever this build and mode have boxes,
+    /// with or without a manager (`box_ops::image_paths`).
     pub box_images: Option<crate::box_images::ImagePaths>,
+    /// Where the boxes' disks are (`box_ops::Built::disk_root`); `None`:
+    /// the manager's store root.
+    pub box_disk_root: Option<PathBuf>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -462,6 +466,8 @@ pub struct CtxInit {
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     /// See [`Ctx::box_images`]. `minimal` leaves it `None`.
     pub box_images: Option<crate::box_images::ImagePaths>,
+    /// See [`Ctx::box_disk_root`]. `minimal` leaves it `None`.
+    pub box_disk_root: Option<PathBuf>,
 }
 
 impl CtxInit {
@@ -522,6 +528,7 @@ impl CtxInit {
             box_unavailable: None,
             box_template_warnings: Vec::new(),
             box_images: None,
+            box_disk_root: None,
         }
     }
 }
@@ -758,6 +765,7 @@ impl Ctx {
             box_unavailable: i.box_unavailable,
             box_template_warnings: i.box_template_warnings,
             box_images: i.box_images,
+            box_disk_root: i.box_disk_root,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,

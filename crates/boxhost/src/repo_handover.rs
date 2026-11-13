@@ -42,14 +42,90 @@ fn dir_fd(p: &Path) -> Result<OwnedFd, String> {
     .map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// A repo disk handed to the runtime dir by [`take_repo_disk`], until the
+/// caller's create succeeds ([`Handover::commit`]) or fails
+/// ([`Handover::undo`]). Dropped without either, it is committed.
+#[derive(Debug)]
+pub struct Handover {
+    moved: Moved,
+    /// The record and runtime dir fds, when something moved.
+    dirs: Option<(OwnedFd, OwnedFd)>,
+}
+
+impl Handover {
+    pub fn moved(&self) -> Moved {
+        self.moved
+    }
+
+    /// The create succeeded: a copied disk leaves the record now.
+    pub fn commit(mut self) -> Result<(), String> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        match (self.moved, self.dirs.take()) {
+            (Moved::Copied, Some((rec, _))) => {
+                rustix::fs::unlinkat(&rec, REPO_DISK, rustix::fs::AtFlags::empty()).map_err(|e| {
+                    format!("the repo disk was copied but not removed from the record: {e}")
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The create failed: the record has the disk again and the runtime
+    /// dir none (a failed spawn's box is discarded with its record, so its
+    /// disk never stays in a VMM-readable dir). Best effort.
+    pub fn undo(mut self) {
+        match (self.moved, self.dirs.take()) {
+            (Moved::Renamed, Some((rec, rt))) => {
+                let back = rustix::fs::renameat_with(
+                    &rt,
+                    REPO_DISK,
+                    &rec,
+                    REPO_DISK,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                );
+                if back.is_err() {
+                    let _ = rustix::fs::unlinkat(&rt, REPO_DISK, rustix::fs::AtFlags::empty());
+                }
+            }
+            (Moved::Copied, Some((_, rt))) => {
+                let _ = rustix::fs::unlinkat(&rt, REPO_DISK, rustix::fs::AtFlags::empty());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for Handover {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 /// Moves `<record_dir>/repo.img` to `<runtime_dir>/repo.img` (see the
-/// module doc). `force_copy` takes the `EXDEV` path (tests).
+/// module doc). A copy (`EXDEV`) keeps the record's file until
+/// [`Handover::commit`].
 pub fn take_repo_disk(
     record_dir: &Path,
     runtime_dir: &Path,
     locked: bool,
+) -> Result<Handover, String> {
+    take(record_dir, runtime_dir, locked, false)
+}
+
+/// [`take_repo_disk`]; `force_copy` takes the `EXDEV` path (tests).
+pub(crate) fn take(
+    record_dir: &Path,
+    runtime_dir: &Path,
+    locked: bool,
     force_copy: bool,
-) -> Result<Moved, String> {
+) -> Result<Handover, String> {
+    let nothing = || Handover {
+        moved: Moved::Nothing,
+        dirs: None,
+    };
     let rec = dir_fd(record_dir)?;
     let src = match rustix::fs::openat(
         &rec,
@@ -58,7 +134,7 @@ pub fn take_repo_disk(
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(Moved::Nothing),
+        Err(Errno::NOENT) => return Ok(nothing()),
         Err(e) => return Err(format!("the repo disk in the box record: {e}")),
     };
     let st = rustix::fs::fstat(&src).map_err(|e| format!("the repo disk: {e}"))?;
@@ -74,6 +150,12 @@ pub fn take_repo_disk(
     let rt = dir_fd(runtime_dir)?;
     let gid = if locked {
         let d = rustix::fs::fstat(&rt).map_err(|e| format!("{}: {e}", runtime_dir.display()))?;
+        if d.st_uid != me {
+            return Err(format!(
+                "the box runtime dir {} is not the daemon's",
+                runtime_dir.display()
+            ));
+        }
         Some(rustix::fs::Gid::from_raw(d.st_gid))
     } else {
         None
@@ -87,9 +169,19 @@ pub fn take_repo_disk(
         Ok(())
     };
     if !force_copy {
-        make_shared(&src)?;
         match rustix::fs::renameat(&rec, REPO_DISK, &rt, REPO_DISK) {
-            Ok(()) => return Ok(Moved::Renamed),
+            Ok(()) => {
+                let h = Handover {
+                    moved: Moved::Renamed,
+                    dirs: Some((rec, rt)),
+                };
+                // through the open fd: the moved inode, never a name
+                if let Err(e) = make_shared(&src) {
+                    h.undo();
+                    return Err(e);
+                }
+                return Ok(h);
+            }
             Err(Errno::XDEV) => {}
             Err(e) => return Err(format!("cannot move the repo disk into the box: {e}")),
         }
@@ -119,9 +211,10 @@ pub fn take_repo_disk(
         let _ = rustix::fs::unlinkat(&rt, PART, rustix::fs::AtFlags::empty());
         return Err(e);
     }
-    rustix::fs::unlinkat(&rec, REPO_DISK, rustix::fs::AtFlags::empty())
-        .map_err(|e| format!("the repo disk was copied but not removed from the record: {e}"))?;
-    Ok(Moved::Copied)
+    Ok(Handover {
+        moved: Moved::Copied,
+        dirs: Some((rec, rt)),
+    })
 }
 
 #[cfg(test)]
@@ -129,6 +222,38 @@ mod tests {
     use super::*;
     use crate::paths::BASE_MANIFEST;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+
+    /// How it moved, committed.
+    fn moved(h: Result<Handover, String>) -> Moved {
+        let h = h.unwrap();
+        let m = h.moved();
+        h.commit().unwrap();
+        m
+    }
+
+    #[test]
+    fn undo_gives_the_disk_back_to_the_record() {
+        for copy in [false, true] {
+            let (_t, rec, rt) = dirs();
+            plant(&rec);
+            let h = take(&rec, &rt, false, copy).unwrap();
+            assert!(rt.join(REPO_DISK).exists(), "copy={copy}");
+            h.undo();
+            assert!(!rt.join(REPO_DISK).exists(), "copy={copy}");
+            let d = std::fs::read(rec.join(REPO_DISK)).unwrap();
+            assert_eq!(&d[1 << 20..(1 << 20) + 9], b"repo data", "copy={copy}");
+        }
+    }
+
+    #[test]
+    fn a_copy_keeps_the_record_until_commit() {
+        let (_t, rec, rt) = dirs();
+        plant(&rec);
+        let h = take(&rec, &rt, false, true).unwrap();
+        assert!(rec.join(REPO_DISK).exists());
+        h.commit().unwrap();
+        check_moved(&rec, &rt);
+    }
 
     fn dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let t = tempfile::tempdir().unwrap();
@@ -160,10 +285,10 @@ mod tests {
     fn renames_the_disk_and_keeps_the_manifest() {
         let (_t, rec, rt) = dirs();
         plant(&rec);
-        assert_eq!(take_repo_disk(&rec, &rt, false, false), Ok(Moved::Renamed));
+        assert_eq!(moved(take(&rec, &rt, false, false)), Moved::Renamed);
         check_moved(&rec, &rt);
         // a second create finds nothing to move and keeps the runtime disk
-        assert_eq!(take_repo_disk(&rec, &rt, false, false), Ok(Moved::Nothing));
+        assert_eq!(moved(take(&rec, &rt, false, false)), Moved::Nothing);
         assert!(rt.join(REPO_DISK).exists());
     }
 
@@ -172,7 +297,7 @@ mod tests {
         let (_t, rec, rt) = dirs();
         plant(&rec);
         std::fs::write(rt.join(PART), "stale").unwrap();
-        assert_eq!(take_repo_disk(&rec, &rt, false, true), Ok(Moved::Copied));
+        assert_eq!(moved(take(&rec, &rt, false, true)), Moved::Copied);
         check_moved(&rec, &rt);
         let m = std::fs::metadata(rt.join(REPO_DISK)).unwrap();
         assert!(
@@ -189,7 +314,7 @@ mod tests {
             plant(&rec);
             std::fs::set_permissions(rec.join(REPO_DISK), PermissionsExt::from_mode(0o600))
                 .unwrap();
-            take_repo_disk(&rec, &rt, true, copy).unwrap();
+            moved(take(&rec, &rt, true, copy));
             let m = std::fs::metadata(rt.join(REPO_DISK)).unwrap();
             assert_eq!(m.mode() & 0o777, 0o660, "copy={copy}");
             assert_eq!(
@@ -208,16 +333,16 @@ mod tests {
         let far = t.path().join("far.img");
         std::fs::write(&far, "x").unwrap();
         std::os::unix::fs::symlink(&far, rec.join(REPO_DISK)).unwrap();
-        assert!(take_repo_disk(&rec, &rt, false, false).is_err());
+        assert!(take(&rec, &rt, false, false).is_err());
         std::fs::remove_file(rec.join(REPO_DISK)).unwrap();
         // a second link
         std::fs::hard_link(&far, rec.join(REPO_DISK)).unwrap();
-        let e = take_repo_disk(&rec, &rt, false, false).unwrap_err();
+        let e = take(&rec, &rt, false, false).unwrap_err();
         assert!(e.contains("not a plain file"), "{e}");
         std::fs::remove_file(rec.join(REPO_DISK)).unwrap();
         // a dir
         std::fs::create_dir(rec.join(REPO_DISK)).unwrap();
-        assert!(take_repo_disk(&rec, &rt, false, false).is_err());
+        assert!(take(&rec, &rt, false, false).is_err());
         assert!(!rt.join(REPO_DISK).exists());
         assert!(far.exists());
     }
@@ -228,7 +353,7 @@ mod tests {
         plant(&rec);
         let link = t.path().join("rt-link");
         std::os::unix::fs::symlink(&rt, &link).unwrap();
-        assert!(take_repo_disk(&rec, &link, false, false).is_err());
+        assert!(take(&rec, &link, false, false).is_err());
         assert!(rec.join(REPO_DISK).exists(), "nothing moved");
     }
 }

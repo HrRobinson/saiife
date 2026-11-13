@@ -1352,6 +1352,8 @@ async fn fake_env_still_wins() {
         .unwrap();
     assert_eq!(b.vm.as_ref().map(|h| h.driver.as_str()), Some("fake"));
     assert!(state.join("boxes").join(b.id.as_str()).is_dir());
+    // the fake VM keeps its disks in the record dirs: box.list reads them there
+    assert_eq!(built.disk_root, state.join("boxes"));
 }
 
 /// R37: the box records stay in the daemon's own state dir in both modes;
@@ -1501,4 +1503,34 @@ fn kvm_seam_replaces_the_device_in_tests() {
     assert_eq!(kvm_path(&seam), Path::new("/s/kvm"));
     let rel = |k: &str| (k == "SAIIFE_TEST_KVM").then(|| OsString::from("kvm"));
     assert_eq!(kvm_path(&rel), Path::new("/dev/kvm"));
+}
+
+/// The image store's dirs exist without a manager (an import mends a
+/// preflight that wants a default image), and their images half is the
+/// box layout's: the debug-only test root re-roots it as it re-roots the
+/// driver's, so the image ops never touch the host's install.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn image_paths_follow_the_box_layout() {
+    use saiife_daemon::box_vmm::layout_for;
+    let tmp = scratch();
+    let root = tmp.path().join("box-root");
+    let seam = |k: &str| -> Option<OsString> {
+        (k == "SAIIFE_TEST_BOX_ROOT").then(|| root.clone().into_os_string())
+    };
+    let state = Path::new("/var/lib/saiife");
+    let p = box_ops::image_paths(state, &Mode::Locked, &seam).expect("boxes in this build");
+    assert_eq!(p.images, root.join("var/lib/saiife-box/images"));
+    assert_eq!(p.records, Path::new("/var/lib/saiife/images"));
+    let env = personal_env(tmp.path(), false);
+    let s = tmp.path().join("state");
+    let p = box_ops::image_paths(&s, &Mode::Personal, &env).unwrap();
+    assert_eq!(
+        p.images,
+        layout_for(&s, &Mode::Personal, &env).unwrap().images
+    );
+    assert_eq!(p.records, s.join("image-records"));
+    // no data dir: no layout, no image store
+    let none = |_: &str| -> Option<OsString> { None };
+    assert!(box_ops::image_paths(&s, &Mode::Personal, &none).is_none());
 }

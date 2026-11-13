@@ -139,6 +139,9 @@ mod imp {
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
 
+    /// An import's `note` when the daemon has no box manager.
+    const RESTART_NOTE: &str =
+        "boxes were unavailable when the daemon started: restart it to use this image";
     /// The copies' names in their incoming dir.
     const RAW_NAME: &str = "base.raw";
     const KERNEL_NAME: &str = "base.vmlinuz";
@@ -215,10 +218,14 @@ mod imp {
     }
 
     /// Every op in [`super::OPS`]. `passed`: the descriptors of the
-    /// `box.fds` before an import (closed for any other op).
+    /// `box.fds` before an import (closed for any other op). `mgr` is
+    /// `None` when boxes are unavailable (a failed preflight, such as no
+    /// default image yet): `ls` then names no box as a user, `rm` is
+    /// refused (box records it cannot see may name the image), and an
+    /// import says the daemon must restart to use it.
     pub(crate) async fn handle(
         ctx: &Ctx,
-        mgr: &Arc<Manager>,
+        mgr: Option<&Arc<Manager>>,
         peer: &PeerCred,
         req: Request,
         passed: Vec<OwnedFd>,
@@ -284,9 +291,25 @@ mod imp {
         }
         let done = match req.op.as_str() {
             OP_BOX_IMAGE_LS => ls(mgr, &paths, peer.uid, admin).await,
-            OP_BOX_IMAGE_IMPORT => import(ctx, &paths, &req.args, passed, &with_peer).await,
+            OP_BOX_IMAGE_IMPORT => import(ctx, &paths, &req.args, passed, &with_peer)
+                .await
+                .map(|mut a| {
+                    if mgr.is_none() {
+                        a.insert("note".into(), RESTART_NOTE.into());
+                    }
+                    a
+                }),
             OP_BOX_IMAGE_DEFAULT => set_default(ctx, &paths, &req.args, &with_peer).await,
-            OP_BOX_IMAGE_RM => rm(ctx, mgr, &paths, &req.args, &with_peer).await,
+            OP_BOX_IMAGE_RM => match mgr {
+                Some(mgr) => rm(ctx, mgr, &paths, &req.args, &with_peer).await,
+                None => Err((
+                    ErrorCode::Unavailable,
+                    format!(
+                        "box images cannot be removed while boxes are unavailable ({})",
+                        ctx.box_unavailable.as_deref().unwrap_or(NO_STORE)
+                    ),
+                )),
+            },
             _ => Err(bad("not a box image op")),
         };
         match done {
@@ -309,17 +332,17 @@ mod imp {
     /// names the boxes whose record names the image, among those the
     /// caller may see (an admin: all of them).
     async fn ls(
-        mgr: &Arc<Manager>,
+        mgr: Option<&Arc<Manager>>,
         paths: &ImagePaths,
         uid: u32,
         admin: bool,
     ) -> Result<Map<String, Value>, Refusal> {
-        let (m, p) = (Arc::clone(mgr), paths.clone());
+        let (m, p) = (mgr.map(Arc::clone), paths.clone());
         blocking(move || {
             let store = open(&p)?;
             let (entries, mut warnings) = store.list();
             let default = store.default_id();
-            let boxes = m.list();
+            let boxes = m.map(|m| m.list()).unwrap_or_default();
             let images: Vec<Value> = entries
                 .into_iter()
                 .map(|(man, warn)| {
