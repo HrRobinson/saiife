@@ -610,11 +610,29 @@ pub fn start_event_forwarder(ctx: Arc<Ctx>, guest: Arc<dyn GuestEvents>) {
     tokio::spawn(async move {
         loop {
             let g = Arc::clone(&guest);
-            let Ok(events) = tokio::task::spawn_blocking(move || g.recv_events(FORWARD_WAIT)).await
-            else {
+            let events =
+                match tokio::task::spawn_blocking(move || g.recv_events(FORWARD_WAIT)).await {
+                    Ok(events) => events,
+                    // the runtime is shutting down
+                    Err(e) if e.is_cancelled() => {
+                        eprintln!(
+                        "saiifed: boxes: the guest event forwarder ended: the daemon is stopping"
+                    );
+                        break;
+                    }
+                    // a panic in the wait: one line, a pause, and on (a dead
+                    // forwarder would leave every box starting until the boot
+                    // timeout destroys it)
+                    Err(e) => {
+                        eprintln!("saiifed: boxes: the guest event wait failed ({e}); going on");
+                        tokio::time::sleep(FORWARD_WAIT).await;
+                        Vec::new()
+                    }
+                };
+            let Some(ctx) = weak.upgrade() else {
+                eprintln!("saiifed: boxes: the guest event forwarder ended: the daemon is gone");
                 break;
             };
-            let Some(ctx) = weak.upgrade() else { break };
             for (id, ev) in events {
                 forward(&ctx, id, ev).await;
             }
@@ -623,9 +641,10 @@ pub fn start_event_forwarder(ctx: Arc<Ctx>, guest: Arc<dyn GuestEvents>) {
 }
 
 /// One guest event. A stale one (the box moved on or is gone) is dropped.
-/// An `Exited` while the box is still starting (a guest init that came up
-/// set up but without its agent: R10) stops the box instead of leaving it
-/// to the boot timeout, which would destroy its VM.
+/// An `Exited` while the box is still starting (its agent died before it was
+/// ready) stops the box instead of leaving it to the boot timeout, which
+/// would destroy its VM. Since ruling R22 a fresh guest init is set up again,
+/// so this is a safety net, not the cold-boot path.
 async fn forward(ctx: &Ctx, id: BoxId, ev: GuestEvent) {
     match guest_event_via(ctx, id.clone(), ev, "guest").await {
         Ok(_) => {}
@@ -647,12 +666,12 @@ async fn exited_while_starting(ctx: &Ctx, id: BoxId) {
         return;
     };
     let done = blocking(move || {
-        if mgr.get(&id)?.state != BoxState::Starting {
+        // one manager step: no promotion or requeue can come in between
+        let Some(c) =
+            mgr.stop_if_starting(&id, EXITED_WHILE_STARTING, "agent exited while starting")?
+        else {
             return Ok(None);
-        }
-        let mut c = mgr.stop(&id, false)?;
-        c.why = "agent exited while starting";
-        mgr.note_error(&id, EXITED_WHILE_STARTING)?;
+        };
         let template = mgr.get(&id).ok().map(|r| r.template);
         Ok(Some((c, template)))
     })
@@ -766,7 +785,8 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
         // R2: a box the boot timeout ended keeps why its guest failed
         // (a refused hello, a failed setup), cleaned and capped.
         let guest = mgr.guest();
-        for c in changes.iter().filter(|c| c.why == "boot timed out") {
+        let timed_out = saiife_boxes::manager::WHY_BOOT_TIMED_OUT;
+        for c in changes.iter().filter(|c| c.why == timed_out) {
             if let Some(e) = guest.last_error(&c.id) {
                 if let Err(e) = mgr.note_error(&c.id, &guest_note(&e)) {
                     eprintln!("saiifed: boxes: {}: {e}", c.id.as_str());

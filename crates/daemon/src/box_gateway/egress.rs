@@ -433,9 +433,15 @@ async fn prepare(
         return Err(r);
     }
     let unknown = || Refusal::new(403, "this box is not known", "unknown_box").to(&host, port);
-    let Some(mgr) = gw.ctx.box_manager.clone() else {
+    let Some(ctx) = gw.ctx() else {
+        return Err(
+            Refusal::new(503, "saiife is stopping: egress is refused", "stopping").to(&host, port),
+        );
+    };
+    let Some(mgr) = ctx.box_manager.clone() else {
         return Err(unknown());
     };
+    drop(ctx);
     // The template's rules are read once per connection.
     let id = run.id.clone();
     let found = tokio::task::spawn_blocking(move || {
@@ -748,7 +754,11 @@ pub(crate) async fn serve_run(mut stream: UnixStream, run: Arc<BoxRun>, gw: Arc<
     drop(upstream);
     drop(slot);
     let ms = ms_since(t0);
-    let mut rec = gw.ctx.record("egress", &format!("{host}:{port}"));
+    let Some(ctx) = gw.ctx() else {
+        eprintln!("saiifed: boxes: an egress record was not written: saiife is stopping");
+        return;
+    };
+    let mut rec = ctx.record("egress", &format!("{host}:{port}"));
     rec.session = Some(session);
     let x = &mut rec.extra;
     x.insert("box".into(), run.id.as_str().into());
@@ -759,7 +769,7 @@ pub(crate) async fn serve_run(mut stream: UnixStream, run: Arc<BoxRun>, gw: Arc<
     x.insert("bytes_down".into(), down.into());
     x.insert("ms".into(), ms.into());
     x.insert("outcome".into(), outcome.into());
-    if let Err(e) = gw.ctx.writer.append(rec).await {
+    if let Err(e) = ctx.writer.append(rec).await {
         eprintln!("saiifed: warning: cannot write an egress record: {e}");
     }
 }

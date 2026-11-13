@@ -1278,25 +1278,9 @@ async fn ready_under_lockdown_keeps_the_prompt() {
     );
 }
 
-/// The forwarder holds the context weakly: it ends when the daemon does.
-#[tokio::test]
-async fn forwarder_ends_with_the_context() {
-    let w = world();
-    let ev = Arc::new(StubEvents::default());
-    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
-    wait_until("polling", || ev.calls.load(Ordering::SeqCst) >= 2).await;
-    let World { ctx, mgr, .. } = w;
-    drop(mgr);
-    drop(ctx);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let n = ev.calls.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(ev.calls.load(Ordering::SeqCst), n, "still polling");
-}
-
-/// R10: a guest init that comes up set up but without its agent says
-/// Exited while the box is starting: the box stops (Done, disks kept)
-/// instead of waiting for the boot timeout, which would destroy it.
+/// The safety net (R22 made a fresh init set up again): an agent that exits
+/// while its box is starting stops the box (Done, disks kept) instead of
+/// waiting for the boot timeout, which would destroy it.
 #[tokio::test]
 async fn exited_while_starting_stops_the_box() {
     let w = world();
@@ -1483,4 +1467,158 @@ fn personal_vmm_uid_is_the_daemon_euid() {
     );
     let e = vmm_uid(&l, &Mode::Locked).unwrap_err();
     assert!(e.contains("system bus"), "{e}");
+}
+
+/// The stub's wait panics once, then serves events: the forwarder goes on.
+#[derive(Default)]
+struct PanicOnce {
+    inner: StubEvents,
+    panicked: std::sync::atomic::AtomicBool,
+}
+
+impl box_ops::GuestEvents for PanicOnce {
+    fn recv_events(&self, timeout: Duration) -> Vec<(BoxId, GuestEvent)> {
+        if !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("p38 test: the guest wait panicked");
+        }
+        self.inner.recv_events(timeout)
+    }
+}
+
+#[tokio::test]
+async fn forwarder_survives_a_panicking_wait() {
+    let w = world();
+    let a = w.spawn(ALICE, "t").await;
+    let b = starting(&w, &a);
+    let ev = Arc::new(PanicOnce::default());
+    ev.inner.push(&b, GuestEvent::Ready);
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    wait_until("running", || state_of(&w, &b) == "running").await;
+    assert!(ev.panicked.load(Ordering::SeqCst));
+}
+
+/// A VMM that holds its hooks, as `ChVmm` does: the daemon context holds
+/// the manager, which holds this, which holds the gateway hook.
+struct HookedVmm {
+    inner: FakeVmm,
+    _hooks: Vec<Arc<dyn saiife_boxhost::vmm::VmHooks>>,
+}
+
+impl saiife_boxes::vmm::Vmm for HookedVmm {
+    fn create(
+        &self,
+        spec: &saiife_boxes::vmm::VmSpec,
+    ) -> Result<saiife_boxes::vmm::VmHandle, saiife_boxes::vmm::VmmError> {
+        self.inner.create(spec)
+    }
+    fn boot(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.boot(h)
+    }
+    fn pause(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.pause(h)
+    }
+    fn resume(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.resume(h)
+    }
+    fn stop(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.stop(h)
+    }
+    fn snapshot(
+        &self,
+        h: &saiife_boxes::vmm::VmHandle,
+        dest: &Path,
+    ) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.snapshot(h, dest)
+    }
+    fn status(&self, h: &saiife_boxes::vmm::VmHandle) -> saiife_boxes::vmm::VmStatus {
+        self.inner.status(h)
+    }
+    fn destroy(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.destroy(h)
+    }
+}
+
+/// The real hook chain (context -> manager -> VMM -> late hook -> gateway)
+/// is no cycle: once the daemon drops its context, the context is freed
+/// (its vault key zeroized) and the forwarder ends.
+#[tokio::test]
+async fn the_context_is_freed_with_the_gateway_wired() {
+    use saiife_daemon::box_gateway::{GatewayConfig, GatewayHooks, SystemResolve};
+    use saiife_daemon::box_setup::LateHooks;
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let late = LateHooks::new();
+    let vmm = Arc::new(HookedVmm {
+        inner: FakeVmm::new(),
+        _hooks: vec![late.clone()],
+    });
+    let guest: Arc<dyn GuestLink> = Arc::new(FakeGuest::new());
+    let host = two_boxes();
+    let mgr = Arc::new(
+        Manager::open(ManagerInit {
+            store: Store::open(box_ops::dir_in(&state)).unwrap(),
+            vmm,
+            guest,
+            templates: template::builtin(),
+            host: Arc::new(move || host),
+            clock: Arc::new(|| T0),
+        })
+        .unwrap()
+        .manager,
+    );
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(mgr),
+        unavailable: None,
+    });
+    let gw = GatewayHooks::new(
+        Arc::clone(&w.ctx),
+        tokio::runtime::Handle::current(),
+        Arc::new(SystemResolve::new()),
+        GatewayConfig::default(),
+    );
+    assert!(late.fill(gw));
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    wait_until("polling", || ev.calls.load(Ordering::SeqCst) >= 2).await;
+    let weak = Arc::downgrade(&w.ctx);
+    let World { ctx, mgr, .. } = w;
+    drop(mgr);
+    drop(ctx);
+    // the forwarder may hold it for one round
+    wait_until("the context freed", || weak.upgrade().is_none()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let n = ev.calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ev.calls.load(Ordering::SeqCst), n, "still polling");
+}
+
+/// R22: a cold boot is set up like a first boot. A Done box with its VM
+/// off (no snapshot kept) is revised, boots again, and its guest's
+/// set_up:false -> Setup -> Started arrives as a Ready: it runs again and
+/// gets the comment.
+#[tokio::test]
+async fn revise_after_a_cold_stop_runs_again() {
+    let w = world();
+    let b = id(&w.running(ALICE, "one").await);
+    w.ok(ALICE, "box.stop", json!({"box": b.as_str()})).await;
+    assert!(!w.mgr().get(&b).unwrap().vm_on);
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "again"}),
+    )
+    .await;
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(state_of(&w, &b), "starting");
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    ev.push(&b, GuestEvent::Ready);
+    wait_until("running", || state_of(&w, &b) == "running").await;
+    assert!(w
+        .guest
+        .prompts()
+        .contains(&(b.clone(), "again".to_string())));
+    assert!(!w.mgr().get(&b).unwrap().keep);
 }

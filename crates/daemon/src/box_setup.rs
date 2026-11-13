@@ -20,7 +20,7 @@ use saiife_boxes::BoxId;
 use saiife_boxhost::guest::{claude_settings, pack_files, CastPath, SetupSource, VsockGuest};
 use saiife_boxhost::paths::BoxPaths;
 use saiife_boxhost::vmm::VmHooks;
-use saiife_boxproto::msg::{AgentSpec, Setup, SetupFile};
+use saiife_boxproto::msg::{AgentSpec, Setup, SetupFile, MAX_FILES, MAX_FILE_TEXT};
 use saiife_policy::userpacks::{read_user_packs, MAX_USER_PACK_BYTES, USER_PACKS_DIR};
 
 use crate::box_ops::GuestEvents;
@@ -30,9 +30,6 @@ pub const SETTINGS_PATH: &str = "/home/agent/.claude/settings.json";
 /// The agent's terminal (G4).
 pub const ROWS: u16 = 40;
 pub const COLS: u16 = 120;
-/// `Setup::check`'s limits: files per setup and bytes per file.
-pub const MAX_FILES: usize = 64;
-pub const MAX_FILE_TEXT: usize = 256 * 1024;
 /// What a boot answers before the gateway hook is filled.
 pub const GATEWAY_NOT_READY: &str = "the box gateway is not ready";
 /// What a setup answers before the manager is attached.

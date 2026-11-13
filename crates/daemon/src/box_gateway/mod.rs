@@ -32,7 +32,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::runtime::Handle;
@@ -377,7 +377,10 @@ impl Denied {
 
 /// What every connection task shares.
 pub struct GatewayShared {
-    pub(crate) ctx: Arc<Ctx>,
+    /// Weak: the context holds the manager, which holds the VMM, which holds
+    /// this gateway as a hook; a strong reference would be a cycle that
+    /// keeps the context (and its vault key) alive forever.
+    ctx: Weak<Ctx>,
     pub(crate) resolve: Arc<dyn Resolve>,
     pub(crate) limits: Limits,
     allow_loopback: bool,
@@ -394,9 +397,15 @@ impl GatewayShared {
         lock(&self.runs).get(id).cloned()
     }
 
-    /// Any lockdown blocks connectors, and so egress (G8).
+    /// The daemon context, while the daemon runs.
+    pub(crate) fn ctx(&self) -> Option<Arc<Ctx>> {
+        self.ctx.upgrade()
+    }
+
+    /// Any lockdown blocks connectors, and so egress (G8). A daemon that is
+    /// going away blocks it too.
     pub(crate) fn locked(&self) -> bool {
-        self.ctx.lockdown.get().is_some()
+        self.ctx().is_none_or(|c| c.lockdown.get().is_some())
     }
 
     /// The address rule (G7), with the debug-only loopback exception. Only
@@ -418,7 +427,8 @@ pub(crate) async fn deny(gw: &GatewayShared, id: &BoxId, r: egress::Refusal) {
         (Some(h), Some(p)) => format!("{h}:{p}"),
         _ => "-".to_string(),
     };
-    let mut rec = gw.ctx.record("egress_denied", &input);
+    let Some(ctx) = gw.ctx() else { return };
+    let mut rec = ctx.record("egress_denied", &input);
     rec.decision = DecisionKind::Deny;
     rec.reason = Some(r.reason.to_string());
     rec.session = Some(format!("box-{}", id.as_str()));
@@ -435,7 +445,7 @@ pub(crate) async fn deny(gw: &GatewayShared, id: &BoxId, r: egress::Refusal) {
     if suppressed > 0 {
         x.insert("suppressed".into(), suppressed.into());
     }
-    if let Err(e) = gw.ctx.writer.append(rec).await {
+    if let Err(e) = ctx.writer.append(rec).await {
         eprintln!("saiifed: warning: cannot write an egress_denied record: {e}");
     }
 }
@@ -506,7 +516,7 @@ impl GatewayHooks {
         let lookups = Arc::new(Semaphore::new(cfg.limits.lookups));
         Arc::new(GatewayHooks {
             shared: Arc::new(GatewayShared {
-                ctx,
+                ctx: Arc::downgrade(&ctx),
                 resolve,
                 limits: cfg.limits,
                 allow_loopback,
