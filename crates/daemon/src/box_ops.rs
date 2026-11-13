@@ -48,9 +48,14 @@ pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
 /// With [`FAKE_ENV`] (a `fake-vmm` build only): `<n>` pins the host to
 /// exactly `n` default boxes, so a test never depends on the machine's RAM.
 pub const FAKE_SLOTS_ENV: &str = "SAIIFE_BOX_FAKE_SLOTS";
-/// With [`FAKE_ENV`]: a JSON array of terminal frames the fake guest serves
-/// for box `b1` (the CLI tests cannot reach the daemon's `FakeGuest`).
+/// With [`FAKE_ENV`] (a `fake-vmm` build only): a JSON array of terminal
+/// frames (at most 64 KiB) the fake guest serves for box `b1` (the CLI tests
+/// cannot reach the daemon's `FakeGuest`).
+#[cfg(feature = "fake-vmm")]
 pub const FAKE_TERMINAL_ENV: &str = "SAIIFE_BOX_FAKE_TERMINAL";
+/// The most bytes of [`FAKE_TERMINAL_ENV`] parsed.
+#[cfg(feature = "fake-vmm")]
+const FAKE_TERMINAL_MAX: usize = 64 * 1024;
 /// The stderr line of a daemon whose boxes run on the fake VM.
 pub const FAKE_NOTICE: &str = "saiifed: boxes use a fake VM (test build)";
 /// The longest template name and `repo_dir` taken.
@@ -262,6 +267,7 @@ fn build_fake(
     let guest = Arc::new(FakeGuest::new());
     if let Some(frames) = env(FAKE_TERMINAL_ENV)
         .and_then(|v| v.to_str().map(str::to_string))
+        .filter(|s| s.len() <= FAKE_TERMINAL_MAX)
         .and_then(|s| serde_json::from_str(&s).ok())
     {
         if let Ok(b1) = saiife_wire::source::BoxId::parse("b1") {

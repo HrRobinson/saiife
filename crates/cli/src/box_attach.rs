@@ -223,7 +223,8 @@ impl Keys for StdinKeys {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
         use std::os::fd::AsFd;
         let stdin = std::io::stdin();
-        let mut fds = [PollFd::new(&stdin.as_fd(), PollFlags::IN)];
+        let fd = stdin.as_fd();
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
         let t = Timespec {
             tv_sec: d.as_secs() as _,
             tv_nsec: d.subsec_nanos() as _,

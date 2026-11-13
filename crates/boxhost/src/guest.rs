@@ -1080,17 +1080,21 @@ pub fn claude_settings() -> String {
 }
 
 /// The setup files for user packs: `(id, toml text)` to
-/// `/home/agent/.config/saiife/packs/<id>.toml`, mode 0644. A pair whose id
-/// is not a valid user pack id is left out (an id is a file name, so it
-/// must never carry a path).
-pub fn pack_files(packs: &[(String, String)]) -> Vec<SetupFile> {
+/// `/home/agent/.config/saiife/packs/<id>.toml`, mode 0644. An id that is
+/// not a valid user pack id is an error naming it (an id is a file name, so
+/// it must never carry a path); nothing is dropped silently.
+pub fn pack_files(packs: &[(String, String)]) -> Result<Vec<SetupFile>, String> {
     packs
         .iter()
-        .filter(|(id, _)| saiife_policy::userpacks::valid_user_pack_id(id))
-        .map(|(id, text)| SetupFile {
-            path: format!("/home/agent/.config/saiife/packs/{id}.toml"),
-            mode: 0o644,
-            text: text.clone(),
+        .map(|(id, text)| {
+            if !saiife_policy::userpacks::valid_user_pack_id(id) {
+                return Err(format!("{id:?} is not a valid user pack id"));
+            }
+            Ok(SetupFile {
+                path: format!("/home/agent/.config/saiife/packs/{id}.toml"),
+                mode: 0o644,
+                text: text.clone(),
+            })
         })
         .collect()
 }
@@ -1133,14 +1137,14 @@ mod settings_tests {
 
     #[test]
     fn pack_files_paths_and_bad_ids() {
-        let packs = vec![
-            ("user.mine".to_string(), "a = 1".to_string()),
-            ("user.../../etc/x".to_string(), "bad".to_string()),
-            ("builtin.x".to_string(), "bad".to_string()),
-            ("user.-lead".to_string(), "bad".to_string()),
-            ("user.".to_string(), "bad".to_string()),
-        ];
-        let f = pack_files(&packs);
+        let good = vec![("user.mine".to_string(), "a = 1".to_string())];
+        for bad in ["user.../../etc/x", "builtin.x", "user.-lead", "user."] {
+            let mut packs = good.clone();
+            packs.push((bad.to_string(), "bad".to_string()));
+            let e = pack_files(&packs).unwrap_err();
+            assert!(e.contains(bad), "{e}");
+        }
+        let f = pack_files(&good).unwrap();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].path, "/home/agent/.config/saiife/packs/user.mine.toml");
         assert_eq!(f[0].mode, 0o644);
