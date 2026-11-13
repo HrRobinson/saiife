@@ -35,6 +35,10 @@ pub struct SystemConfig {
     pub doctor: DoctorCfg,
     #[serde(default)]
     pub gateway: GatewayCfg,
+    /// `[workspace]` (plan 31): the origins a browser may touch from. Left
+    /// out of the serialised form (and so the policy hash) while default.
+    #[serde(default, skip_serializing_if = "WorkspaceCfg::is_default")]
+    pub workspace: WorkspaceCfg,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceCfg>,
     /// `[mcp.<name>]`: gateway servers (plan 17). Locked mode only.
@@ -429,6 +433,80 @@ fn valid_name(name: &str) -> bool {
 /// The load warning when `[guard] ask` routes calls to approval but
 /// `[approval] approvers` is empty.
 pub const NO_APPROVERS_WARNING: &str = "[approval] approvers is empty: nobody can approve requests";
+
+/// `[workspace]`: the web origins a Workspace touch may come from (plan 31).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCfg {
+    #[serde(default = "default_origins")]
+    pub origins: Vec<String>,
+}
+
+/// The default origin: the plan 29 UI port on localhost.
+pub fn default_origins() -> Vec<String> {
+    vec!["http://localhost:47810".to_string()]
+}
+
+impl Default for WorkspaceCfg {
+    fn default() -> Self {
+        WorkspaceCfg {
+            origins: default_origins(),
+        }
+    }
+}
+
+impl WorkspaceCfg {
+    pub fn is_default(&self) -> bool {
+        *self == WorkspaceCfg::default()
+    }
+
+    /// Each origin is `http://localhost:<1..=65535>` or `https://<host>[:port]`
+    /// with a lowercase DNS host; no path, query, userinfo or trailing slash.
+    pub fn validate(&self) -> Result<(), String> {
+        for o in &self.origins {
+            if !valid_origin(o) {
+                return Err(format!(
+                    "[workspace] origins: {o:?} is not http://localhost:<port> or https://<lowercase host>[:port]"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_port(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('0')
+        && p.len() <= 5
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+}
+
+fn valid_dns_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+fn valid_origin(o: &str) -> bool {
+    if let Some(port) = o.strip_prefix("http://localhost:") {
+        return valid_port(port);
+    }
+    let Some(rest) = o.strip_prefix("https://") else {
+        return false;
+    };
+    match rest.split_once(':') {
+        Some((host, port)) => valid_dns_host(host) && valid_port(port),
+        None => valid_dns_host(rest),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

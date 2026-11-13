@@ -686,6 +686,56 @@ fn non_loopback_tcp_is_config_error_at_load() {
 }
 
 #[test]
+fn workspace_origins_default_and_parse() {
+    let (_d, cfg) = etc("version = 2\nlocked = true\n", &[]);
+    let p = load_system(&cfg).unwrap();
+    assert_eq!(p.config.workspace.origins, ["http://localhost:47810"]);
+    let ok = |o: &str| {
+        let (_d, cfg) = etc(
+            &format!("version = 2\nlocked = true\n[workspace]\norigins = [{o}]\n"),
+            &[],
+        );
+        load_system(&cfg)
+    };
+    let p = ok(
+        "\"http://localhost:9000\", \"https://app.saiife.com\", \"https://app.saiife.com:8443\"",
+    )
+    .unwrap();
+    assert_eq!(p.config.workspace.origins.len(), 3);
+    for bad in [
+        "\"http://evil.test\"",
+        "\"http://localhost:9000/\"",
+        "\"http://localhost\"",
+        "\"http://localhost:0\"",
+        "\"http://localhost:65536\"",
+        "\"javascript:x\"",
+        "\"https://App.saiife.com\"",
+        "\"https://app.saiife.com/x\"",
+        "\"https://app.saiife.com?q=1\"",
+        "\"https://app.saiife.com:\"",
+        "\"https://\"",
+        "\"https://a b.test\"",
+        "\"https://-a.test\"",
+        "\"https://a..test\"",
+        "\"https://a.test:0\"",
+        "\"https://user@a.test\"",
+        "\"\"",
+    ] {
+        let e = ok(bad).unwrap_err().to_string();
+        assert!(e.contains("[workspace] origins"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn workspace_unknown_key_is_refused() {
+    let (_d, cfg) = etc(
+        "version = 2\nlocked = true\n[workspace]\norigin = [\"http://localhost:1\"]\n",
+        &[],
+    );
+    assert!(load_system(&cfg).is_err());
+}
+
+#[test]
 fn approvers_are_validated() {
     let (_d, cfg) = etc(
         "version = 2\n[approval]\napprovers = [\"alice\", \"group:ops\"]\n",

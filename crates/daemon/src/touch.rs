@@ -25,7 +25,7 @@ const ID_FILE: &str = "instance_id";
 const CREDS_FILE: &str = "credentials.json";
 /// Live challenges in all, and per uid.
 const MAX_LIVE: usize = 32;
-const MAX_PER_UID: usize = 4;
+const MAX_PER_UID: usize = 8;
 
 /// Unix seconds now, from the daemon's clock (so a faked clock applies).
 pub fn unix_now() -> u64 {
@@ -35,13 +35,19 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// What a challenge was issued for. The uid in the last three is the peer's.
+/// What a challenge was issued for. The uid in `Enrol`, `Remove` and `Test` is the
+/// peer's; a `Web` key is per device.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IssueKey {
     Approve(u64),
     Enrol(u32),
     Remove(u32),
     Test(u32),
+    /// A Workspace touch: the device's id and its request id.
+    Web {
+        device: String,
+        request_id: u64,
+    },
 }
 
 /// One live challenge.
@@ -363,24 +369,24 @@ mod tests {
     fn issue_caps() {
         let d = dir();
         let (t, _) = TouchState::open(d.path());
-        for i in 0..4 {
+        for i in 0..8 {
             issue(&t, IssueKey::Approve(i), 1000, NOW).unwrap();
         }
-        assert!(issue(&t, IssueKey::Approve(4), 1000, NOW).is_err());
+        assert!(issue(&t, IssueKey::Approve(8), 1000, NOW).is_err());
         // The same key replaces.
         issue(&t, IssueKey::Approve(0), 1000, NOW).unwrap();
         // Expired ones drop.
         issue(&t, IssueKey::Approve(5), 1000, NOW + 301).unwrap();
-        // 32 in all over 9 uids.
+        // 32 in all over 4 uids at 8 each; a fifth uid is refused.
         let (t, _) = TouchState::open(d.path());
         let mut n = 0u64;
-        for uid in 0..8u32 {
-            for _ in 0..4 {
+        for uid in 0..4u32 {
+            for _ in 0..8 {
                 issue(&t, IssueKey::Approve(n), uid, NOW).unwrap();
                 n += 1;
             }
         }
-        let e = issue(&t, IssueKey::Approve(n), 8, NOW).unwrap_err();
+        let e = issue(&t, IssueKey::Approve(n), 4, NOW).unwrap_err();
         assert_eq!(e, "too many touches in progress");
     }
 
@@ -497,7 +503,7 @@ mod tests {
         let k = IssueKey::Approve(1);
         let first = issue(&t, k.clone(), 1000, NOW).unwrap();
         // Another uid at its own cap asks for the same key: refused.
-        for i in 10..14 {
+        for i in 10..18 {
             issue(&t, IssueKey::Approve(i), 2000, NOW).unwrap();
         }
         let e = issue(&t, k.clone(), 2000, NOW).unwrap_err();
@@ -506,20 +512,64 @@ mod tests {
         let asr = s.assert_ctap(RP, &challenge(&record(&t)(&first)));
         assert!(t.consume(&k, 1000, record(&t), &asr, RP, NOW).is_ok());
         // A uid at its cap may still replace its own entry (it is excluded).
-        for i in 20..24 {
+        for i in 20..28 {
             issue(&t, IssueKey::Approve(i), 3000, NOW).unwrap();
         }
         issue(&t, IssueKey::Approve(20), 3000, NOW).unwrap();
         // The global cap counts without the replaced entry too: 32 live.
         let (t, _) = TouchState::open(d.path());
         let mut n = 0u64;
-        for uid in 0..8u32 {
-            for _ in 0..4 {
+        for uid in 0..4u32 {
+            for _ in 0..8 {
                 issue(&t, IssueKey::Approve(n), uid, NOW).unwrap();
                 n += 1;
             }
         }
         issue(&t, IssueKey::Approve(0), 0, NOW).unwrap();
+    }
+
+    #[test]
+    fn per_uid_cap_is_eight() {
+        let d = dir();
+        let (t, _) = TouchState::open(d.path());
+        for i in 0..8 {
+            issue(&t, IssueKey::Approve(i), 1000, NOW).unwrap();
+        }
+        let e = issue(&t, IssueKey::Approve(8), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress");
+        issue(&t, IssueKey::Approve(9), 1001, NOW).unwrap();
+    }
+
+    fn web(device: &str, request_id: u64) -> IssueKey {
+        IssueKey::Web {
+            device: device.into(),
+            request_id,
+        }
+    }
+
+    #[test]
+    fn web_key_is_distinct_per_device() {
+        let d = dir();
+        let (t, _) = TouchState::open(d.path());
+        let a = issue(&t, web("dev-a", 7), 1000, NOW).unwrap();
+        let b = issue(&t, web("dev-b", 7), 1000, NOW).unwrap();
+        assert_ne!(a.nonce, b.nonce);
+        // Each is spent on its own: taking one leaves the other.
+        t.take(&web("dev-a", 7), 1000).unwrap();
+        t.take(&web("dev-b", 7), 1000).unwrap();
+    }
+
+    #[test]
+    fn web_entries_share_the_caps() {
+        let d = dir();
+        let (t, _) = TouchState::open(d.path());
+        for i in 0..8 {
+            issue(&t, web("dev-a", i), 1000, NOW).unwrap();
+        }
+        let e = issue(&t, web("dev-a", 8), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress");
+        // An Approve entry of the same uid counts too.
+        assert!(issue(&t, IssueKey::Approve(1), 1000, NOW).is_err());
     }
 
     /// `take` spends the entry whatever the outcome: missing is

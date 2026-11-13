@@ -67,6 +67,7 @@ pub mod workspace;
 // Workspace (plan 29): link.sock and frame execution.
 pub mod workspace_link;
 pub mod workspace_ops;
+pub mod workspace_touch;
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};

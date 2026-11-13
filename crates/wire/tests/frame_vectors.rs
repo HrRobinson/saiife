@@ -36,6 +36,19 @@ fn frozen_pair_vector() {
     assert_eq!(short_code(&m, &d, &secret), s(&v, "short_code"));
 }
 
+/// The passkey create challenge (plan 31), pinned in the pair vector file as
+/// an extra key: the existing keys are untouched.
+#[test]
+fn passkey_challenge_vector() {
+    use saiife_wire::pair::{passkey_challenge, PASSKEY_CHALLENGE_DOMAIN, PASSKEY_DOMAIN};
+    let v: serde_json::Value = serde_json::from_str(include_str!("vectors/pair-v1.json")).unwrap();
+    let d = b64::dec_n::<65>(&s(&v, "device_pub_b64u")).unwrap();
+    let c = passkey_challenge(&s(&v, "pair_id"), &d);
+    assert_eq!(b64::hex(&c), s(&v, "passkey_challenge_hex"));
+    assert_eq!(PASSKEY_CHALLENGE_DOMAIN, b"saiife-pair-passkey-v1\n");
+    assert_eq!(PASSKEY_DOMAIN, b"saiife-pair-passkey-v1 sig\n");
+}
+
 /// The frozen machine-hello vector (plan 29): the bytes the machine key
 /// signs for a seal handshake (both bindings) and for the hub hello. The
 /// stored signatures were made once by a throwaway key; ECDSA signatures are

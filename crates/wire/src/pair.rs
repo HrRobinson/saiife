@@ -13,6 +13,10 @@ pub const OFFER_TTL_SECS: u64 = 300;
 pub const MAX_OPEN_OFFERS: usize = 4;
 pub const PAIR_PROOF_DOMAIN: &[u8] = b"saiife-pair-v1\n";
 pub const SHORT_CODE_DOMAIN: &[u8] = b"saiife-pair-code-v1\n";
+/// The domain of the device key's signature over a passkey attestation (plan 31).
+pub const PASSKEY_DOMAIN: &[u8] = b"saiife-pair-passkey-v1 sig\n";
+/// The domain of the passkey create challenge.
+pub const PASSKEY_CHALLENGE_DOMAIN: &[u8] = b"saiife-pair-passkey-v1\n";
 const MAX_LABEL_CHARS: usize = 40;
 
 #[derive(Clone)]
@@ -86,6 +90,42 @@ pub struct PairRequest {
     pub device_pub: String,
     pub label: String,
     pub proof: String,
+}
+
+/// A passkey created during pairing, with the device key's signature over it
+/// (all fields base64url). The machine verifies and stores it only when the
+/// owner confirms the pairing.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAttestation {
+    pub credential_id: String,
+    pub authenticator_data: String,
+    pub client_data_json: String,
+    pub device_sig: String,
+}
+
+/// The passkey create challenge: SHA-256(domain || pair_id ASCII || device_pub).
+pub fn passkey_challenge(pair_id: &str, device_pub: &[u8; 65]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PASSKEY_CHALLENGE_DOMAIN);
+    h.update(pair_id.as_bytes());
+    h.update(device_pub);
+    h.finalize().into()
+}
+
+/// What the device key signs (under [`PASSKEY_DOMAIN`]): pair_id ASCII ||
+/// credential id || SHA-256(authenticator data) || SHA-256(clientDataJSON),
+/// the last three decoded.
+pub fn passkey_sig_msg(pair_id: &str, p: &PasskeyAttestation) -> Result<Vec<u8>, WireError> {
+    let cred = b64::dec(&p.credential_id)?;
+    let ad = b64::dec(&p.authenticator_data)?;
+    let cdj = b64::dec(&p.client_data_json)?;
+    let mut m = Vec::with_capacity(pair_id.len() + cred.len() + 64);
+    m.extend_from_slice(pair_id.as_bytes());
+    m.extend_from_slice(&cred);
+    m.extend_from_slice(&Sha256::digest(&ad));
+    m.extend_from_slice(&Sha256::digest(&cdj));
+    Ok(m)
 }
 
 fn hmac_key(secret: &[u8; 32]) -> ring::hmac::Key {
@@ -292,6 +332,53 @@ pub enum PairStatus {
 
 #[cfg(test)]
 mod tests {
+
+    fn att() -> PasskeyAttestation {
+        PasskeyAttestation {
+            credential_id: b64::enc(b"cred"),
+            authenticator_data: b64::enc(b"authdata"),
+            client_data_json: b64::enc(b"{\"a\":1}"),
+            device_sig: b64::enc(&[0u8; 64]),
+        }
+    }
+
+    #[test]
+    fn passkey_sig_msg_layout() {
+        let m = passkey_sig_msg("AQIDBAUGBwg", &att()).unwrap();
+        let mut want = Vec::new();
+        want.extend_from_slice(b"AQIDBAUGBwg");
+        want.extend_from_slice(b"cred");
+        want.extend_from_slice(&Sha256::digest(b"authdata"));
+        want.extend_from_slice(&Sha256::digest(b"{\"a\":1}"));
+        assert_eq!(m, want);
+        // The domain is not part of the message (the signer adds it).
+        assert!(!m.starts_with(PASSKEY_DOMAIN));
+        let mut bad = att();
+        bad.credential_id = "a=".into();
+        assert!(matches!(
+            passkey_sig_msg("x", &bad),
+            Err(WireError::Malformed(_))
+        ));
+        let mut bad = att();
+        bad.client_data_json = "***".into();
+        assert!(passkey_sig_msg("x", &bad).is_err());
+    }
+
+    #[test]
+    fn passkey_attestation_rejects_unknown_fields() {
+        let j = serde_json::json!({
+            "credential_id": "a", "authenticator_data": "b",
+            "client_data_json": "c", "device_sig": "d", "extra": 1
+        });
+        assert!(serde_json::from_value::<PasskeyAttestation>(j).is_err());
+    }
+
+    #[test]
+    fn pair_request_without_passkey_still_parses() {
+        let j = r#"{"pair_id":"AQIDBAUGBwg","device_pub":"x","label":"l","proof":"p"}"#;
+        let r: PairRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(r.pair_id, "AQIDBAUGBwg");
+    }
     use super::*;
     use crate::sig::TestDevice;
     use ring::rand::SystemRandom;

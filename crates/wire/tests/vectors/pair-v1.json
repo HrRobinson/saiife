@@ -5,5 +5,6 @@
   "machine_pub_b64u": "BC5wByRqK3P6zEqRuCP-VTWaYfpB0vl2minnz8UKeXyqV677DNqhOoYNBpoikzMxMo2p7x6CIHzcZfak8X4y6G4",
   "device_pub_b64u": "BLncm-1ADBPVFMnvSubsgyudJKHblz2xMT4X1aZFtZyIJNGq28vLMVDph003QBzaoRamUQMd1nyYQG2wuAMlZ7I",
   "proof_b64u": "Suzmt1kJf72RkR6B1kCFekaydUAybXuF7WTwi9OV-F8",
-  "short_code": "157 318"
+  "short_code": "157 318",
+  "passkey_challenge_hex": "55665efc5c27f7b1a327adf00cb83a4a48567c55e7ea4b2efa314bd156cf9e7e"
 }

@@ -20,6 +20,8 @@ pub enum TouchClass {
     Enrol,
     Remove,
     Test,
+    /// A Workspace steer window (plan 31).
+    Steer,
 }
 
 impl TouchClass {
@@ -33,6 +35,7 @@ impl TouchClass {
             Self::Enrol => "touch_enrol",
             Self::Remove => "touch_remove",
             Self::Test => "touch_test",
+            Self::Steer => "steer",
         }
     }
 
@@ -46,6 +49,7 @@ impl TouchClass {
             "touch_enrol" => Self::Enrol,
             "touch_remove" => Self::Remove,
             "touch_test" => Self::Test,
+            "steer" => Self::Steer,
             _ => return None,
         })
     }
@@ -268,6 +272,30 @@ mod tests {
         for (c, w) in ALL.iter().zip(want) {
             assert_eq!(c.needs_uv(), w, "{}", c.name());
         }
+    }
+
+    #[test]
+    fn steer_class_roundtrip() {
+        let c = TouchClass::Steer;
+        assert_eq!(c.name(), "steer");
+        assert_eq!(TouchClass::from_name("steer"), Some(c));
+        assert_eq!(serde_json::to_string(&c).unwrap(), "\"steer\"");
+        assert_eq!(serde_json::from_str::<TouchClass>("\"steer\"").unwrap(), c);
+        assert!(c.needs_uv());
+    }
+
+    #[test]
+    fn stronger_with_steer() {
+        use TouchClass::*;
+        assert_eq!(
+            TouchClass::stronger(Some(EgressExternal), Some(Steer)),
+            Some(Steer)
+        );
+        assert_eq!(
+            TouchClass::stronger(Some(Steer), Some(PushProtected)),
+            Some(Steer)
+        );
+        assert_eq!(TouchClass::stronger(None, Some(Steer)), Some(Steer));
     }
 
     #[test]

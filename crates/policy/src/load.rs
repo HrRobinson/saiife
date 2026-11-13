@@ -237,6 +237,9 @@ pub fn load_system_with(
     cfg.gateway
         .tcp_addr()
         .map_err(|why| invalid(config_file, why))?;
+    cfg.workspace
+        .validate()
+        .map_err(|why| invalid(config_file, why))?;
     cfg.notify
         .validate()
         .map_err(|why| invalid(config_file, why))?;
