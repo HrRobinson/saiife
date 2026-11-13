@@ -337,7 +337,7 @@ fn setup_writes_files_and_env() {
     let h = host();
     let _init = start(&h.env);
     let mut ev = welcomed(&h);
-    let mut s = setup(&["/bin/sh", "-c", "env; sleep 3"]);
+    let mut s = setup(&["/bin/sh", "-c", "env; echo END-OF-ENV; sleep 3"]);
     s.files = vec![
         SetupFile {
             path: "/home/agent/.claude/settings.json".into(),
@@ -377,7 +377,8 @@ fn setup_writes_files_and_env() {
     assert!(h.env.path("/var/lib/saiife-guest/setup-done").exists());
     // The agent got exactly the fixed env plus the setup's; nothing inherited.
     let mut pty = accept(&h.pty, T);
-    let out = pty_until(&mut pty, "NO_PROXY=", T);
+    // `env` prints in no fixed order: read up to the line after it
+    let out = pty_until(&mut pty, "END-OF-ENV", T);
     for want in [
         "HOME=/home/agent",
         "USER=agent",
