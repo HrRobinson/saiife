@@ -1702,3 +1702,74 @@ fn destroy_during_a_slow_boot_is_bounded() {
     destroy_eventually(&v, &h).unwrap();
     assert!(!w.paths("b1").dir.exists());
 }
+
+/// The real-path manager (plan 35 R40, plan 37): the store at the record
+/// root, `ChVmm` on the fake CH and the daemon's placer
+/// (`layout::record_disk_place`). A spawn with a repo disk is admitted and
+/// booted, never `Unavailable`; the disk ends in the runtime dir, where the
+/// VMM is told to open it, and the base manifest stays in the record.
+#[test]
+fn a_spawn_with_a_repo_disk_on_the_real_path_manager_boots() {
+    use saiife_boxes::capacity::HostFacts;
+    use saiife_boxes::manager::{Manager, ManagerInit, SpawnArgs};
+    use saiife_boxes::store::Store;
+    use saiife_boxhost::paths::{BASE_MANIFEST, REPO_DISK};
+    use saiife_wire::source::{BoxState, Start};
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let inc = w.records.join(".incoming").join("0123456789abcdef");
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::set_permissions(
+        w.records.join(".incoming"),
+        PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(inc.join(REPO_DISK), b"repo").unwrap();
+    std::fs::write(inc.join(BASE_MANIFEST), b"{}").unwrap();
+    let m = Manager::open(ManagerInit {
+        store: Store::open(w.records.clone()).unwrap(),
+        vmm: Arc::clone(&v) as Arc<dyn Vmm>,
+        guest: Arc::new(saiife_boxes::guest::NoGuest),
+        templates: saiife_boxes::template::builtin(),
+        host: Arc::new(|| HostFacts {
+            mem_total_mib: 64 << 10,
+            mem_avail_mib: 64 << 10,
+            threads: 32,
+            disk_free_mib: 1 << 20,
+            cpu_pct: None,
+        }),
+        clock: Arc::new(|| 1_700_000_000),
+        disk_place: Some(Arc::new(|root: &Path, id: &BoxId| {
+            saiife_boxhost::layout::record_disk_place(root, id)
+        })),
+    })
+    .unwrap()
+    .manager;
+    let r = m
+        .spawn(&SpawnArgs {
+            template: "claude-code".into(),
+            repo: "shop".into(),
+            repo_dir: None,
+            task: "t".into(),
+            start: Start::Now,
+            owner_uid: 1000,
+            repo_image: Some(inc.join(REPO_DISK)),
+            base_manifest: Some(inc.join(BASE_MANIFEST)),
+        })
+        .expect("a spawn with a repo disk is admitted");
+    if let Some(h) = &r.vm {
+        w.track(&v, h);
+    }
+    assert_eq!(r.state, BoxState::Starting, "{r:?}");
+    let id = r.id.as_str();
+    let rec = w.records.join(id);
+    assert!(
+        rec.join(BASE_MANIFEST).exists(),
+        "base.json stays in the record"
+    );
+    assert!(!rec.join(REPO_DISK).exists(), "the disk left the record");
+    let p = w.paths(id);
+    assert_eq!(std::fs::read(p.repo_disk()).unwrap(), b"repo");
+    assert!(!p.dir.join(BASE_MANIFEST).exists());
+    assert!(read_spec(&p).unwrap().repo, "the VMM is told to open it");
+}

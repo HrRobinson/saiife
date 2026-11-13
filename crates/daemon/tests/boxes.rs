@@ -1233,20 +1233,26 @@ async fn spawn_with_fds_roundtrip() {
 
 /// Plan 37 Task 4b, with plan 35's R37: the store root the daemon hands to
 /// intake, gc and `disk::usage` is the record root (`layout::boxes_in`),
-/// never the VMM's runtime root, and the disk placer is BoxPaths' under it.
+/// never the VMM's runtime root, and the placer puts both files in the
+/// box's record dir.
 #[test]
 fn the_box_root_and_disk_places_are_the_layouts() {
     use saiife_boxhost::layout::{boxes_in, Layout};
-    use saiife_boxhost::paths::BoxPaths;
+    use saiife_boxhost::paths::{BASE_MANIFEST, REPO_DISK};
     let state = Path::new("/s/state");
     let root = box_ops::dir_in(state);
     assert_eq!(root, boxes_in(state));
     assert_ne!(root, Layout::personal(state, Path::new("/s/data")).boxes);
     let place = box_ops::disk_place().expect("a placer on unix");
     let got = place(&root, &id("b4"));
-    let want = BoxPaths::of(&root, &id("b4"));
-    assert_eq!(got.repo_image, want.repo_disk());
-    assert_eq!(got.base_manifest, want.base_manifest());
+    // both in the record dir (R40); the driver moves the disk at create
+    let rec = root.join("b4");
+    assert_eq!(got.repo_image, rec.join(REPO_DISK));
+    assert_eq!(got.base_manifest, rec.join(BASE_MANIFEST));
+    assert_eq!(
+        got,
+        saiife_boxhost::layout::record_disk_place(&root, &id("b4"))
+    );
 }
 
 /// The env of a personal daemon whose data and home are under `tmp`.

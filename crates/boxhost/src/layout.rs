@@ -1,6 +1,6 @@
 //! Where boxes, images and the VMM live on disk (V5, V6).
 
-use crate::paths::BoxPaths;
+use crate::paths::{BoxPaths, BASE_MANIFEST, REPO_DISK};
 use saiife_wire::source::BoxId;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,17 @@ pub fn image_records_in(state_dir: &Path, locked: bool) -> PathBuf {
 /// `O_NOFOLLOW` with an owner check; gc sweeps it.
 pub fn incoming_in(boxes_root: &Path) -> PathBuf {
     boxes_root.join(saiife_boxes::place::INCOMING)
+}
+
+/// Where spawn places a box's repo disk and base manifest (plan 37): its
+/// record dir `<records_root>/<id>` (R37, R40). `ChVmm::create` hands the
+/// disk on to the runtime dir by fd; the manifest never leaves the record.
+pub fn record_disk_place(records_root: &Path, id: &BoxId) -> saiife_boxes::manager::DiskPlace {
+    let dir = records_root.join(id.as_str());
+    saiife_boxes::manager::DiskPlace {
+        repo_image: dir.join(REPO_DISK),
+        base_manifest: dir.join(BASE_MANIFEST),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +168,15 @@ mod tests {
             PathBuf::from("/s/state/boxes/.incoming")
         );
         assert_eq!(l.box_paths(&id).dir, PathBuf::from("/s/state/box-run/b7"));
+        let place = record_disk_place(&boxes_in(state), &id);
+        assert_eq!(
+            place.repo_image,
+            PathBuf::from("/s/state/boxes/b7/repo.img")
+        );
+        assert_eq!(
+            place.base_manifest,
+            PathBuf::from("/s/state/boxes/b7/base.json")
+        );
         let l = Layout::locked();
         assert_eq!(
             l.box_paths(&id).dir,

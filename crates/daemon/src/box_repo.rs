@@ -19,7 +19,7 @@
 //! `O_DIRECTORY|O_NOFOLLOW`), and fstat'd for type, owner and size.
 
 use saiife_boxhost::layout::incoming_in;
-use saiife_boxhost::paths::{BoxPaths, BASE_MANIFEST, REPO_DISK};
+use saiife_boxhost::paths::{BASE_MANIFEST, REPO_DISK};
 use saiife_boxproto::manifest::{BaseManifest, REPO_MAX_BYTES};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -147,10 +147,15 @@ pub fn read_trusted(path: &Path, what: &str, max: u64) -> Result<Vec<u8>, String
     read_fd(&File::from(fd), what, max)
 }
 
-/// A box's base manifest ([`BoxPaths::base_manifest`], daemon-trusted),
-/// read with [`read_trusted`] and parsed.
-pub fn read_base_manifest(paths: &BoxPaths) -> Result<BaseManifest, String> {
-    let text = read_trusted(&paths.base_manifest(), "base manifest", MANIFEST_MAX_BYTES)?;
+/// A box's base manifest ([`BASE_MANIFEST`] in its record dir
+/// `record_dir`, daemon-trusted, R37), read with [`read_trusted`] and
+/// parsed.
+pub fn read_base_manifest(record_dir: &Path) -> Result<BaseManifest, String> {
+    let text = read_trusted(
+        &record_dir.join(BASE_MANIFEST),
+        "base manifest",
+        MANIFEST_MAX_BYTES,
+    )?;
     let text = String::from_utf8(text).map_err(|_| "the base manifest is not UTF-8")?;
     BaseManifest::parse(&text)
 }
@@ -499,11 +504,12 @@ mod tests {
         assert!(intake(&root, fds("c")).is_ok());
     }
 
-    fn box_with_manifest(t: &Path) -> saiife_boxhost::paths::BoxPaths {
-        let paths = saiife_boxhost::paths::BoxPaths::new(t.join("b1"));
-        std::fs::create_dir(&paths.dir).unwrap();
-        std::fs::write(paths.base_manifest(), manifest_text()).unwrap();
-        paths
+    /// A record dir `<t>/b1` with a good base manifest.
+    fn box_with_manifest(t: &Path) -> std::path::PathBuf {
+        let dir = t.join("b1");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(BASE_MANIFEST), manifest_text()).unwrap();
+        dir
     }
 
     #[test]
@@ -514,16 +520,16 @@ mod tests {
         // The manifest swapped for a link to a good one: refused.
         let far = t.path().join("far.json");
         std::fs::write(&far, manifest_text()).unwrap();
-        std::fs::remove_file(paths.base_manifest()).unwrap();
-        std::os::unix::fs::symlink(&far, paths.base_manifest()).unwrap();
+        std::fs::remove_file(paths.join(BASE_MANIFEST)).unwrap();
+        std::os::unix::fs::symlink(&far, paths.join(BASE_MANIFEST)).unwrap();
         let e = read_base_manifest(&paths).unwrap_err();
         assert!(e.contains("base manifest"), "{e}");
         // The box dir swapped for a link to a dir with a good one: refused.
         let x = t.path().join("x");
         std::fs::create_dir(&x).unwrap();
         let other = box_with_manifest(&x);
-        let linked = saiife_boxhost::paths::BoxPaths::new(t.path().join("b2"));
-        std::os::unix::fs::symlink(&other.dir, &linked.dir).unwrap();
+        let linked = t.path().join("b2");
+        std::os::unix::fs::symlink(&other, &linked).unwrap();
         assert!(read_base_manifest(&linked).is_err());
     }
 
@@ -532,10 +538,10 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let paths = box_with_manifest(t.path());
         // A FIFO: refused, and the open does not block.
-        std::fs::remove_file(paths.base_manifest()).unwrap();
+        std::fs::remove_file(paths.join(BASE_MANIFEST)).unwrap();
         rustix::fs::mknodat(
             CWD,
-            paths.base_manifest(),
+            paths.join(BASE_MANIFEST),
             FileType::Fifo,
             Mode::from_raw_mode(0o600),
             0,
@@ -544,18 +550,18 @@ mod tests {
         let e = read_base_manifest(&paths).unwrap_err();
         assert!(e.contains("not a regular file"), "{e}");
         // A directory.
-        std::fs::remove_file(paths.base_manifest()).unwrap();
-        std::fs::create_dir(paths.base_manifest()).unwrap();
+        std::fs::remove_file(paths.join(BASE_MANIFEST)).unwrap();
+        std::fs::create_dir(paths.join(BASE_MANIFEST)).unwrap();
         let e = read_base_manifest(&paths).unwrap_err();
         assert!(e.contains("not a regular file"), "{e}");
         // Over the cap (sparse).
-        std::fs::remove_dir(paths.base_manifest()).unwrap();
-        let f = File::create(paths.base_manifest()).unwrap();
+        std::fs::remove_dir(paths.join(BASE_MANIFEST)).unwrap();
+        let f = File::create(paths.join(BASE_MANIFEST)).unwrap();
         f.set_len(MANIFEST_MAX_BYTES + 1).unwrap();
         let e = read_base_manifest(&paths).unwrap_err();
         assert!(e.contains("more than"), "{e}");
         // Missing.
-        std::fs::remove_file(paths.base_manifest()).unwrap();
+        std::fs::remove_file(paths.join(BASE_MANIFEST)).unwrap();
         assert!(read_base_manifest(&paths).is_err());
     }
 }

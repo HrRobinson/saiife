@@ -10,9 +10,12 @@ use std::path::{Path, PathBuf};
 /// VMM-shared runtime: the box's qcow2 root disk (overlay on the base).
 pub const ROOT_DISK: &str = "root.qcow2";
 /// VMM-shared runtime: the box's ext4 repo disk (plan 37), `/work` in the
-/// guest.
+/// guest. Spawn places it in the record dir; `ChVmm::create` moves it here
+/// (`repo_handover`).
 pub const REPO_DISK: &str = "repo.img";
-/// Daemon-trusted state: the base manifest of the repo disk (plan 37).
+/// Daemon-trusted state: the base manifest of the repo disk (plan 37). It
+/// lives in the box's record dir only (`layout::record_disk_place`), never
+/// in a runtime dir, so [`BoxPaths`] has no helper for it.
 pub const BASE_MANIFEST: &str = "base.json";
 
 #[derive(Debug, Clone)]
@@ -59,11 +62,6 @@ impl BoxPaths {
     pub fn repo_disk(&self) -> PathBuf {
         self.file(REPO_DISK)
     }
-    /// Daemon-trusted state ([`BASE_MANIFEST`]): read only through
-    /// `O_NOFOLLOW` with an owner check (the daemon's `box_repo`).
-    pub fn base_manifest(&self) -> PathBuf {
-        self.file(BASE_MANIFEST)
-    }
     pub fn snapshot_dir(&self) -> PathBuf {
         self.file("snapshot")
     }
@@ -90,6 +88,5 @@ mod tests {
         assert_eq!(p.dir, PathBuf::from("/b/b3"));
         assert_eq!(p.root_disk(), p.dir.join(ROOT_DISK));
         assert_eq!(p.repo_disk(), p.dir.join(REPO_DISK));
-        assert_eq!(p.base_manifest(), p.dir.join(BASE_MANIFEST));
     }
 }

@@ -105,19 +105,16 @@ pub fn dir_in(state_dir: &Path) -> PathBuf {
     }
 }
 
-/// Where spawn moves a box's repo disk and base manifest: the box's
-/// [`saiife_boxhost::paths::BoxPaths`]. `None` off Unix, where a box takes
-/// no repo disk.
+/// Where spawn moves a box's repo disk and base manifest: the box's record
+/// dir under the store root ([`saiife_boxhost::layout::record_disk_place`],
+/// R37/R40). The real driver hands the disk on to its runtime dir at
+/// create; the manifest stays. `None` off Unix, where a box takes no repo
+/// disk.
 pub fn disk_place() -> Option<saiife_boxes::manager::DiskPlacer> {
     #[cfg(unix)]
     {
-        use saiife_boxes::manager::DiskPlace;
         Some(Arc::new(|root: &Path, id: &BoxId| {
-            let p = saiife_boxhost::paths::BoxPaths::of(root, id);
-            DiskPlace {
-                repo_image: p.repo_disk(),
-                base_manifest: p.base_manifest(),
-            }
+            saiife_boxhost::layout::record_disk_place(root, id)
         }))
     }
     #[cfg(not(unix))]

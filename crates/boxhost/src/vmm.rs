@@ -761,9 +761,10 @@ fn image_of_data(data: &str) -> Option<String> {
 }
 
 impl Vmm for ChVmm {
-    /// `spec.dir` is the box's record dir (the store's, R37), only
-    /// checked; everything the VMM touches goes to the runtime dir
-    /// `<layout.boxes>/<id>`, made here.
+    /// `spec.dir` is the box's record dir (the store's, R37): checked, and
+    /// a repo disk spawn placed there is moved to the runtime dir
+    /// (`repo_handover`); everything the VMM touches goes to the runtime
+    /// dir `<layout.boxes>/<id>`, made here.
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
         let inner = &self.inner;
         let want = inner.records.join(spec.id.as_str());
@@ -781,6 +782,10 @@ impl Vmm for ChVmm {
             )));
         }
         inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
+        // spawn placed the repo disk in the record dir; the VMM opens it
+        // from the runtime dir (R37, R40); base.json stays in the record
+        crate::repo_handover::take_repo_disk(&spec.dir, &paths.dir, inner.layout.locked, false)
+            .map_err(VmmError::Failed)?;
         let image = inner
             .images
             .resolve(&spec.image)
