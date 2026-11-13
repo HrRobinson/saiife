@@ -11,7 +11,7 @@ use saiife_boxes::guest::{GuestEvent, GuestLink};
 use saiife_boxes::manager::{Manager, ManagerInit};
 use saiife_boxes::store::Store;
 use saiife_boxes::template::{self, Size};
-use saiife_boxes::vmm::fake::FakeVmm;
+use saiife_boxes::vmm::fake::{FakeVmm, VmOp};
 use saiife_boxes::BoxId;
 use saiife_boxhost::image::ubuntu::UBUNTU_CLOUD_FPR;
 use saiife_boxhost::image::{
@@ -773,12 +773,23 @@ async fn rm_refuses_an_image_in_use() {
         .await;
     assert!(!w.mgr.get(&id("b1")).unwrap().vm_on);
     refused(&w.call(ROOT, "box.image.rm", rm.clone()).await);
+    // Discarding a stopped box removes its record at once: it no longer
+    // names the image.
     w.ok(ALICE, "box.discard", json!({"box": "b1"})).await;
-    if w.mgr.get(&id("b1")).is_ok() {
-        refused(&w.call(ROOT, "box.image.rm", rm.clone()).await);
-        w.ok(ROOT, "box.gc", json!({})).await;
-    }
     assert!(w.mgr.get(&id("b1")).is_err());
+    // A box whose boot failed stays as a Discarded record until gc, and
+    // it still names the image.
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let b = w.spawn(ALICE).await;
+    assert_eq!(b["id"], "b2");
+    let r = w.mgr.get(&id("b2")).unwrap();
+    assert_eq!(r.state, saiife_boxes::BoxState::Discarded);
+    assert_eq!(r.image.as_deref(), Some(i.as_str()));
+    let a = w.call(ROOT, "box.image.rm", rm.clone()).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(a["message"].as_str().unwrap().contains("b2"), "{a}");
+    w.ok(ROOT, "box.gc", json!({})).await;
+    assert!(w.mgr.get(&id("b2")).is_err());
     w.ok(ROOT, "box.image.rm", rm).await;
     assert!(w.store_names().is_empty(), "{:?}", w.store_names());
     let _ = &w.guest;
@@ -903,4 +914,147 @@ fn image_store_paths_follow_the_layout() {
     let l = paths_for(Path::new("/var/lib/saiife"), &Mode::Locked);
     assert_eq!(l.records, PathBuf::from("/var/lib/saiife/images"));
     assert_eq!(l.images, Layout::locked().images);
+}
+
+/// rm and default of the same image, racing: the store lock orders them,
+/// so the default never names a missing image. The test holds the lock
+/// while both start, shows neither finishes under it, then lets them go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn rm_racing_default_never_leaves_a_missing_default() {
+    let w = Arc::new(world(Mode::Personal));
+    let a = w.src("a", "image-a\n");
+    let b = w.src("b", "image-b\n");
+    w.imported(me(), &a, false).await;
+    w.imported(me(), &b, true).await;
+    let ia = a.manifest.id.clone();
+    let held = saiife_daemon::box_images::store_lock();
+    let (w1, w2) = (Arc::clone(&w), Arc::clone(&w));
+    let (i1, i2) = (ia.clone(), ia.clone());
+    let rm = tokio::spawn(async move { w1.call(me(), "box.image.rm", json!({"image": i1})).await });
+    let def = tokio::spawn(async move {
+        w2.call(me(), "box.image.default", json!({"image": i2}))
+            .await
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !rm.is_finished() && !def.is_finished(),
+        "both wait for the lock"
+    );
+    drop(held);
+    let (rm, def) = (rm.await.unwrap(), def.await.unwrap());
+    // Exactly one wins, and the store stays consistent either way.
+    assert_ne!(rm["ok"], def["ok"], "rm {rm} default {def}");
+    let default = std::fs::read_to_string(w.paths.records.join("default")).unwrap();
+    let default = default.trim();
+    assert!(
+        w.paths.records.join(format!("{default}.json")).is_file()
+            && w.paths.images.join(format!("{default}.raw")).is_file(),
+        "the default {default} is missing; rm {rm} default {def}"
+    );
+    if rm["ok"] == true {
+        assert_eq!(default, b.manifest.id, "{def}");
+    } else {
+        assert_eq!(default, ia, "{rm}");
+        assert!(rm["message"].as_str().unwrap().contains("default"), "{rm}");
+    }
+}
+
+/// A subdir of `<images>/.incoming` left by a daemon that died
+/// mid-import is swept by the next import; a link there is not followed.
+#[tokio::test]
+async fn import_sweeps_stale_incoming() {
+    let w = world(Mode::Personal);
+    let inc = w.paths.images.join(".incoming");
+    let stale = inc.join("00112233aabbccdd");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("base.raw"), "half an image").unwrap();
+    let outside = w.tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("base.raw"), "keep me").unwrap();
+    std::os::unix::fs::symlink(&outside, inc.join("0011223344556677")).unwrap();
+    let s = w.src("a", "image-a\n");
+    w.imported(me(), &s, false).await;
+    assert!(!stale.exists(), "the stale import dir is swept");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("base.raw")).unwrap(),
+        "keep me"
+    );
+    let left: Vec<String> = std::fs::read_dir(&inc)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["0011223344556677"], "only the link is left");
+}
+
+/// Lockdown `all` refuses import, default and rm with a deny record; ls
+/// stays open.
+#[tokio::test]
+async fn lockdown_refuses_image_changes() {
+    use saiife_broker::pipeline::{LockScope, Lockdown};
+    let w = world(Mode::Locked);
+    let s = w.src("a", "image-a\n");
+    w.imported(ROOT, &s, false).await;
+    w.ctx
+        .lockdown
+        .set(Some(Lockdown {
+            scope: LockScope::All,
+            reason: "incident".into(),
+            by_uid: 0,
+            since: "t".into(),
+        }))
+        .unwrap();
+    let before = w.image_records().len();
+    let b = w.src("b", "image-b\n");
+    let a = w.import(ROOT, &b, true).await;
+    assert_eq!(a["error"], "lockdown", "{a}");
+    assert_eq!(a["rule"], "lockdown", "{a}");
+    let img = json!({"image": s.manifest.id});
+    for op in ["box.image.default", "box.image.rm"] {
+        let a = w.call(ROOT, op, img.clone()).await;
+        assert_eq!(a["error"], "lockdown", "{op}: {a}");
+    }
+    let a = w.ok(ROOT, "box.image.ls", json!({})).await;
+    assert_eq!(a["images"].as_array().unwrap().len(), 1, "{a}");
+    let i = &s.manifest.id;
+    assert_eq!(
+        w.store_names(),
+        vec![format!("i/{i}.raw"), format!("r/{i}.json")]
+    );
+    let recs = w.image_records();
+    let new = &recs[before..];
+    let actions: Vec<&str> = new.iter().map(|r| r["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["image_import", "image_default", "image_remove"]);
+    for r in new {
+        assert_eq!(r["decision"], "deny", "{r}");
+        assert_eq!(r["rule"], "lockdown", "{r}");
+    }
+    assert_eq!(new[0]["image"], b.manifest.id.as_str());
+    assert_eq!(new[1]["image"], i.as_str());
+}
+
+/// The import is in the store and recorded even when `--default` then
+/// fails: the answer is ok and says why the default did not change.
+#[tokio::test]
+async fn import_default_error_is_ok_with_the_image() {
+    let w = world(Mode::Personal);
+    // `default` is a dir here, so it cannot be replaced.
+    std::fs::create_dir_all(w.paths.records.join("default")).unwrap();
+    std::fs::write(w.paths.records.join("default/x"), "x").unwrap();
+    let s = w.src("a", "image-a\n");
+    let a = w.import(me(), &s, true).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["image"], s.manifest.id.as_str(), "{a}");
+    assert!(
+        a["default_error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{a}"
+    );
+    let actions: Vec<String> = w
+        .image_records()
+        .iter()
+        .map(|r| r["action"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(actions, ["image_import"]);
+    let a = w.ok(me(), "box.image.ls", json!({})).await;
+    assert_eq!(a["images"][0]["id"], s.manifest.id.as_str());
+    assert_eq!(a["images"][0]["default"], false);
 }

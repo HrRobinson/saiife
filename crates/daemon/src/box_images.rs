@@ -95,15 +95,30 @@ fn locked_images() -> PathBuf {
 #[cfg(unix)]
 pub(crate) use imp::handle;
 
+/// One lock for every change to the image store (intake, `default`, `rm`):
+/// held inside each blocking closure that changes it, so a check and the
+/// change it guards (rm's default and in-use checks and its deletion, an
+/// import's id check and renames) are one step to every other change. A
+/// subdir of `<images>/.incoming` that exists while it is held is stale.
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`STORE_LOCK`] (a poisoned lock is still the lock). Public for
+/// the tests, which hold it to order racing changes.
+#[doc(hidden)]
+pub fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(unix)]
 mod imp {
-    use super::{ImagePaths, KERNEL_MAX_BYTES, NO_STORE, RAW_MAX_BYTES};
+    use super::{store_lock, ImagePaths, KERNEL_MAX_BYTES, NO_STORE, RAW_MAX_BYTES};
     use crate::box_repo::{copy_in, incoming_dir, open_dir, random_hex, regular, remove_sub};
     use crate::ops::{Ctx, Mode};
-    use saiife_audit::Record;
+    use saiife_audit::{DecisionKind, Record};
     use saiife_boxes::manager::Manager;
     use saiife_boxhost::image::{parse_image_id, Manifest, ManifestBoot, Store};
     use saiife_boxhost::layout::incoming_in;
+    use saiife_broker::pipeline::LockScope;
     use saiife_ipc::msg::{
         err, ok, ErrorCode, Request, OP_BOX_IMAGE_DEFAULT, OP_BOX_IMAGE_IMPORT, OP_BOX_IMAGE_LS,
         OP_BOX_IMAGE_RM,
@@ -217,6 +232,46 @@ mod imp {
             r.user = user.clone();
             r
         };
+        // Lockdown `all` refuses every change to the store, as it refuses
+        // the box ops that give power; `ls` stays open. The record says so.
+        if req.op != OP_BOX_IMAGE_LS {
+            if let Some(l) = ctx.lockdown.get().filter(|l| l.scope == LockScope::All) {
+                let action = match req.op.as_str() {
+                    OP_BOX_IMAGE_IMPORT => "image_import",
+                    OP_BOX_IMAGE_DEFAULT => "image_default",
+                    _ => "image_remove",
+                };
+                let named = match req.op.as_str() {
+                    OP_BOX_IMAGE_IMPORT => req
+                        .args
+                        .get("manifest")
+                        .and_then(|m| m.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|i| parse_image_id(i).is_ok())
+                        .map(str::to_string),
+                    _ => arg_image(&req.args).ok(),
+                };
+                let mut rec = with_peer(image_rec(
+                    ctx,
+                    action,
+                    named.as_deref().unwrap_or("-"),
+                    None,
+                ));
+                if named.is_none() {
+                    rec.extra.insert("image".into(), Value::Null);
+                }
+                let why = crate::lockdown::message(&l);
+                rec.decision = DecisionKind::Deny;
+                rec.rule = Some("lockdown".into());
+                rec.reason = Some(why.clone());
+                if let Err(e) = ctx.writer.append(rec).await {
+                    eprintln!("saiifed: warning: cannot write a box image record: {e}");
+                }
+                let mut m = Map::new();
+                m.insert("rule".into(), "lockdown".into());
+                return saiife_ipc::msg::err_with(id, ErrorCode::Lockdown, &why, m);
+            }
+        }
         let done = match req.op.as_str() {
             OP_BOX_IMAGE_LS => ls(mgr, &paths, peer.uid, admin).await,
             OP_BOX_IMAGE_IMPORT => import(ctx, &paths, &req.args, passed, &with_peer).await,
@@ -309,6 +364,7 @@ mod imp {
         let (p, m) = (paths.clone(), manifest.clone());
         blocking(move || {
             let store = open(&p)?;
+            let _held = store_lock();
             intake(&store, passed, &m).map_err(bad)
         })
         .await?;
@@ -319,22 +375,56 @@ mod imp {
             "box.image.import",
         )
         .await?;
+        let mut out = Map::new();
+        out.insert("image".into(), image.clone().into());
         if make_default {
             let (p, i) = (paths.clone(), image.clone());
-            blocking(move || open(&p)?.set_default(&i).map_err(bad)).await?;
-            append(
-                ctx,
-                with_peer(image_rec(ctx, "image_default", &image, Some(&manifest))),
-                "box.image.import --default",
-            )
-            .await?;
+            let set = blocking(move || {
+                let store = open(&p)?;
+                let _held = store_lock();
+                store.set_default(&i).map_err(bad)
+            })
+            .await;
+            match set {
+                // The image is in the store and recorded: the answer is ok
+                // and says the default did not change.
+                Err((_, why)) => {
+                    out.insert("default_error".into(), why.into());
+                }
+                Ok(()) => {
+                    append(
+                        ctx,
+                        with_peer(image_rec(ctx, "image_default", &image, Some(&manifest))),
+                        "box.image.import --default",
+                    )
+                    .await?;
+                }
+            }
         }
-        let mut out = Map::new();
-        out.insert("image".into(), image.into());
         Ok(out)
     }
 
+    /// Remove every subdir of `<images>/.incoming` (each with the files an
+    /// intake makes in it), relative to its dir descriptor and never
+    /// through a link. Called with [`store_lock`] held, so each is a stale
+    /// leftover of a daemon that died mid-import.
+    fn sweep_incoming(inc: &OwnedFd) {
+        let Ok(dir) = rustix::fs::Dir::read_from(inc) else {
+            return;
+        };
+        let names: Vec<String> = dir
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type() == rustix::fs::FileType::Directory)
+            .filter_map(|e| e.file_name().to_str().ok().map(str::to_string))
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        for n in names {
+            remove_sub(inc, &n, &[RAW_NAME, KERNEL_NAME]);
+        }
+    }
+
     /// The passed `[raw, kernel?]` into the store (see the module docs).
+    /// The caller holds [`store_lock`].
     fn intake(store: &Store, fds: Vec<OwnedFd>, m: &Manifest) -> Result<(), String> {
         let kernel = matches!(m.boot, ManifestBoot::Kernel { .. });
         let want = if kernel { 2 } else { 1 };
@@ -362,6 +452,7 @@ mod imp {
         };
         let images = store.images_dir();
         let inc = incoming_dir(images, true)?;
+        sweep_incoming(&inc);
         let sub = random_hex()?;
         let dir = incoming_in(images).join(&sub);
         rustix::fs::mkdirat(&inc, sub.as_str(), rustix::fs::Mode::from_raw_mode(0o700))
@@ -390,6 +481,7 @@ mod imp {
         let (p, i) = (paths.clone(), image.clone());
         let m = blocking(move || {
             let store = open(&p)?;
+            let _held = store_lock();
             store.set_default(&i).map_err(bad)?;
             store.get(&i).map_err(bad)
         })
@@ -416,6 +508,9 @@ mod imp {
         let image = arg_image(a)?;
         let (m, p, i) = (Arc::clone(mgr), paths.clone(), image.clone());
         let man = blocking(move || {
+            let store = open(&p)?;
+            // One hold covers the in-use and default checks and the removal.
+            let _held = store_lock();
             let users: Vec<String> = m
                 .list()
                 .into_iter()
@@ -428,7 +523,6 @@ mod imp {
                     users.join(", ")
                 )));
             }
-            let store = open(&p)?;
             let man = store.get(&i).ok();
             store.remove(&i).map_err(bad)?;
             Ok(man)

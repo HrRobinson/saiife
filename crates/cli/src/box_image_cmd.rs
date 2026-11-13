@@ -240,6 +240,13 @@ mod store {
         let answer = call(&t, OP_BOX_IMAGE_IMPORT, a, &fds)?;
         let image = answer.get("image").and_then(Value::as_str).unwrap_or("");
         outln!("imported {}", sanitize(image));
+        // Imported, but not made the default: exit 2 with why.
+        if let Some(why) = answer.get("default_error").and_then(Value::as_str) {
+            return Err(Fail::Refused(format!(
+                "{} is imported but not the default: {why}",
+                sanitize(image)
+            )));
+        }
         if default {
             outln!("default image {}", sanitize(image));
         }

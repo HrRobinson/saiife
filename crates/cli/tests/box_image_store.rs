@@ -206,3 +206,25 @@ fn default_and_rm_take_image_not_id() {
         ]
     );
 }
+
+/// `import --default` whose default step fails: the image is in the store,
+/// the CLI prints it and why it is not the default, and exits 2.
+#[test]
+fn import_default_error_exits_2_after_the_import() {
+    let b = broker();
+    let records = b.state_dir().join("image-records");
+    fs::create_dir_all(records.join("default")).unwrap();
+    fs::write(records.join("default/x"), "x").unwrap();
+    let (raw, id) = built(&b, "out", "image-a\n");
+    let o = image(&b, &["import", "--default", raw.to_str().unwrap()]);
+    assert_eq!(code(&o), 2, "{}{}", out(&o), err(&o));
+    assert_eq!(out(&o), format!("imported {id}\n"));
+    assert!(
+        err(&o).contains(&id) && err(&o).contains("not the default"),
+        "{}",
+        err(&o)
+    );
+    let v = ls_json(&b);
+    assert_eq!(v["images"][0]["id"], id.as_str(), "{v}");
+    assert_eq!(v["images"][0]["default"], false, "{v}");
+}

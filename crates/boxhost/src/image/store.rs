@@ -337,9 +337,14 @@ impl Store {
         Ok(())
     }
 
+    /// For tests and the CLI-free path only: the daemon takes images in
+    /// with [`Store::adopt`] of its own copies.
+    ///
     /// Copies an image into the store: the raw disk (and the kernel when
-    /// the manifest boots one) into `<images>/.<id>.raw.tmp` (holes kept),
-    /// then [`Store::adopt`]. On failure nothing new is left in the store.
+    /// the manifest boots one) into randomly named temp files in the
+    /// images dir (holes kept), then [`Store::adopt`]. On failure nothing
+    /// new is left in the store.
+    #[doc(hidden)]
     pub fn insert(
         &self,
         raw_src: &File,
@@ -347,11 +352,12 @@ impl Store {
         kernel: Option<&File>,
     ) -> Result<(), String> {
         let m = checked(manifest, kernel.is_some())?;
-        let id = m.id.as_str();
-        let raw_tmp = self.images.join(format!(".{id}.raw.tmp"));
-        let k_tmp = self.images.join(format!(".{id}.vmlinuz.tmp"));
-        let _ = fs::remove_file(&raw_tmp);
-        let _ = fs::remove_file(&k_tmp);
+        let mut rnd = [0u8; 8];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut rnd)
+            .map_err(|_| "no randomness for a temp name".to_string())?;
+        let tag: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+        let raw_tmp = self.images.join(format!(".insert-{tag}.raw.tmp"));
+        let k_tmp = self.images.join(format!(".insert-{tag}.vmlinuz.tmp"));
         let _guard = Cleanup(vec![raw_tmp.clone(), k_tmp.clone()]);
         let copy = |src: &File, dest: &Path| -> Result<(), String> {
             let e = |x: io::Error| format!("{}: {x}", dest.display());
