@@ -469,9 +469,9 @@ mod imp {
             .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
         let r = (|| {
             let d = open_dir(&inc, sub.as_str()).map_err(|e| format!("{}: {e}", dir.display()))?;
-            copy_in(&d, RAW_NAME, 0o600, &raw, raw_len)?;
+            copy_in(&d, RAW_NAME, 0o600, &raw, raw_len).map_err(|e| e.to_string())?;
             if let (Some(f), Some(len)) = (&k, k_len) {
-                copy_in(&d, KERNEL_NAME, 0o600, f, len)?;
+                copy_in(&d, KERNEL_NAME, 0o600, f, len).map_err(|e| e.to_string())?;
             }
             let kp = dir.join(KERNEL_NAME);
             store.adopt(&dir.join(RAW_NAME), k.as_ref().map(|_| kp.as_path()), m)

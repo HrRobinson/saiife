@@ -30,8 +30,10 @@ fn daemon_with(slots: Option<u32>) -> TestDaemon {
     fs::create_dir_all(d.path().join("bin")).unwrap();
     exec(
         &d.path().join("bin/mke2fs"),
-        "#!/bin/sh\nhead -c 1080 /dev/zero > \"$8\" && printf '\\123\\357' >> \"$8\" \
-         && head -c 4096 /dev/zero >> \"$8\"\n",
+        // The image is the next-to-last argument.
+        "#!/bin/sh\nfor a; do img=$last; last=$a; done\n\
+         head -c 1080 /dev/zero > \"$img\" && printf '\\123\\357' >> \"$img\" \
+         && head -c 4096 /dev/zero >> \"$img\"\n",
     );
     exec(
         &d.path().join("bin/mke2fs-fails"),
