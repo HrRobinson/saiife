@@ -295,7 +295,11 @@ async fn post(req: Request<Incoming>, daemon: &Daemon, port: u16, opts: Opts, ki
             answer(r.map(|m| json!({"ok": true, "result": m.get("result").cloned()})))
         }
         Post::Pair => {
-            if !keys_ok(&obj, &["pair_id", "device_pub", "label", "proof"], &[]) {
+            if !keys_ok(
+                &obj,
+                &["pair_id", "device_pub", "label", "proof"],
+                &["passkey"],
+            ) {
                 return json_error(StatusCode::BAD_REQUEST, "bad_request");
             }
             let r = daemon.call(OP_WORKSPACE_PAIR_FINISH, obj).await;

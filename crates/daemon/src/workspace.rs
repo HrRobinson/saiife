@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ring::rand::SystemRandom;
+use saiife_touch::Credential;
 use saiife_wire::device::{Device, DeviceList, DeviceState};
 use saiife_wire::frame::{SignedFrame, FRAME_VERSION};
 use saiife_wire::pair::{Offers, PairOffer, PairRequest, PairStatus};
@@ -72,6 +73,9 @@ struct Inner {
     dirty: bool,
     /// Who began each open offer: `pair_id -> (owner_user, expires_at)`.
     owners: std::collections::HashMap<String, (String, u64)>,
+    /// A verified passkey held with its offer until the owner decides
+    /// (`pair_id -> credential`); never stored before an accept.
+    passkeys: std::collections::HashMap<String, Credential>,
 }
 
 pub struct Workspace {
@@ -147,6 +151,7 @@ impl Workspace {
                 verifier,
                 dirty: false,
                 owners: Default::default(),
+                passkeys: Default::default(),
             }),
             dir,
             locked,
@@ -228,6 +233,10 @@ impl Workspace {
             .offers
             .open(&self.machine, owner_user, label, &self.rng, now)?;
         g.owners.retain(|_, (_, exp)| now < *exp);
+        let Inner {
+            owners, passkeys, ..
+        } = &mut *g;
+        passkeys.retain(|k, _| owners.contains_key(k));
         g.owners.insert(
             offer.pair_id.clone(),
             (owner_user.to_string(), offer.expires_at),
@@ -248,6 +257,18 @@ impl Workspace {
     /// until [`Workspace::confirm_pair`] accepts it; the short code is shown
     /// on both screens.
     pub fn finish_pair(&self, req: &PairRequest, now: u64) -> Result<(Device, String), WireError> {
+        self.finish_pair_with(req, None, now)
+    }
+
+    /// As [`Workspace::finish_pair`], plus a verified passkey held with the
+    /// offer until [`Workspace::confirm_pair_with`]. A refused request (bad
+    /// proof, expired offer) holds nothing.
+    pub fn finish_pair_with(
+        &self,
+        req: &PairRequest,
+        passkey: Option<Credential>,
+        now: u64,
+    ) -> Result<(Device, String), WireError> {
         self.unlocked()?;
         let mut g = self.inner();
         let Inner {
@@ -267,7 +288,12 @@ impl Workspace {
         }
         let device = offers.request(req, devices, now)?;
         match offers.status(&req.pair_id, now) {
-            PairStatus::Requested { short_code, .. } => Ok((device, short_code)),
+            PairStatus::Requested { short_code, .. } => {
+                if let Some(c) = passkey {
+                    g.passkeys.insert(req.pair_id.clone(), c);
+                }
+                Ok((device, short_code))
+            }
             _ => Err(WireError::PairExpired),
         }
     }
@@ -286,19 +312,43 @@ impl Workspace {
         accept: bool,
         now: u64,
     ) -> io::Result<Option<Device>> {
+        self.confirm_pair_with(pair_id, accept, now, &|_| Ok(()))
+    }
+
+    /// [`Workspace::confirm_pair`] with the passkey held for the offer. On an
+    /// accept `add` stores it first; the device then lists its id in
+    /// `touch_credentials`. When `add` fails the device is paired without a
+    /// passkey. When the device save fails the list is unchanged and the
+    /// error is returned: the caller removes a credential `add` stored. A
+    /// reject (or a lapsed offer) drops the held passkey and stores nothing.
+    pub fn confirm_pair_with(
+        &self,
+        pair_id: &str,
+        accept: bool,
+        now: u64,
+        add: &dyn Fn(&Credential) -> Result<(), String>,
+    ) -> io::Result<Option<Device>> {
         let mut g = self.inner();
         if !matches!(g.offers.status(pair_id, now), PairStatus::Requested { .. }) {
+            g.passkeys.remove(pair_id);
             return Ok(None);
         }
         if !accept {
             let _ = g.offers.take(pair_id, now);
+            g.passkeys.remove(pair_id);
             return Ok(None);
         }
         self.unlocked().map_err(io::Error::other)?;
+        let held = g.passkeys.remove(pair_id);
         let Some(mut device) = g.offers.take(pair_id, now) else {
             return Ok(None);
         };
         device.state = DeviceState::Active;
+        if let Some(c) = held {
+            if add(&c).is_ok() {
+                device.touch_credentials = vec![b64::enc(&c.id)];
+            }
+        }
         let mut next = g.devices.clone();
         next.upsert(device.clone());
         // A failed save leaves the list as it was; the offer is spent, so
@@ -519,6 +569,7 @@ mod tests {
             device_pub: b64::enc(&pubkey),
             label: label.into(),
             proof: b64::enc(&proof(&o.secret, &o.pair_id, &pubkey)),
+            passkey: None,
         }
     }
 

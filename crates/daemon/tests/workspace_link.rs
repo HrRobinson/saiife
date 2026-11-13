@@ -1012,6 +1012,7 @@ async fn non_approver_needs_a_device_for_a_hub_hello() {
         device_pub: b64::enc(&pubkey),
         label: "phone".into(),
         proof: b64::enc(&pair::proof(&offer.secret, &offer.pair_id, &pubkey)),
+        passkey: None,
     };
     ws.finish_pair(&req, now).unwrap();
     assert!(ws

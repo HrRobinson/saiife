@@ -20,7 +20,7 @@ use saiife_ipc::peer::comm;
 use saiife_wire::pair::{self, PairStatus};
 use saiife_wire::WireError;
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The polkit `--detail` of confirming a pairing (as `lockdown::OFF_DETAIL`).
 pub const PAIR_DETAIL: &str = "workspace pair";
@@ -362,7 +362,40 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     }
     // The prompt can take minutes: an offer that expired meanwhile is gone.
     let now = ctx.workspace.now();
-    let device = match ctx.workspace.confirm_pair(&pair_id, accept, now) {
+    // The held passkey is stored first (in a blocking task: it writes the
+    // touch files); a device save that fails takes it out again.
+    let added: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let not_saved: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let confirmed = {
+        let (ctx, pair_id, added, not_saved) = (
+            Arc::clone(ctx),
+            pair_id.clone(),
+            Arc::clone(&added),
+            Arc::clone(&not_saved),
+        );
+        tokio::task::spawn_blocking(move || {
+            ctx.workspace
+                .confirm_pair_with(&pair_id, accept, now, &|c| match ctx.touch.add(c.clone()) {
+                    Ok(()) => {
+                        *added.lock().unwrap_or_else(|e| e.into_inner()) = Some(c.id.clone());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        *not_saved.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
+                        Err(e)
+                    }
+                })
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+    };
+    if confirmed.is_err() {
+        let stored = added.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(cid) = stored {
+            let _ = ctx.touch.remove(&cid);
+        }
+    }
+    let device = match confirmed {
         Ok(d) => d,
         Err(e) => {
             let rule = if ctx.workspace.locked() {
@@ -399,12 +432,26 @@ async fn confirm(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         rec.extra.insert("short_code".into(), short_code.into());
     }
     let state = if accept { "active" } else { "rejected" };
+    // `extra.passkey` is the stored credential's id, or null.
+    let passkey = device
+        .as_ref()
+        .and_then(|d| d.touch_credentials.first().cloned());
+    let reason = not_saved.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if accept {
+        rec.extra.insert("passkey".into(), json!(passkey));
+    }
     if let Err(e) = ctx.writer.append(rec).await {
         return unrecorded(id, &format!("the device is {state}"), &e);
     }
     let mut m = Map::new();
     m.insert("device_id".into(), device_id.into());
     m.insert("state".into(), state.into());
+    if let Some(p) = passkey {
+        m.insert("passkey".into(), p.into());
+    } else if let Some(why) = reason {
+        m.insert("passkey".into(), "not_saved".into());
+        m.insert("passkey_reason".into(), why.into());
+    }
     ok(id, m)
 }
 
@@ -631,6 +678,7 @@ mod tests {
             device_pub: b64::enc(&pubkey),
             label: label.into(),
             proof: b64::enc(&proof(&secret, &pair_id, &pubkey)),
+            passkey: None,
         }
     }
 
@@ -1130,5 +1178,241 @@ mod tests {
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(r["state"], "revoked");
         assert!(f.reauth.calls.lock().unwrap().is_empty());
+    }
+
+    // ---- passkey enrolment (plan 31) ----
+
+    const ORIGIN: &str = "http://localhost:47810";
+
+    struct Pk {
+        args: Value,
+        id: Vec<u8>,
+    }
+
+    /// The browser side: a create-side authData with AT from the soft
+    /// authenticator, a clientDataJSON, and the device key's signature.
+    /// `tweak` edits (challenge, origin, type, authData) before signing.
+    fn passkey_req(
+        begin: &Value,
+        d: &TestDevice,
+        signer: &TestDevice,
+        tweak: &dyn Fn(&mut String, &mut String, &mut Vec<u8>),
+    ) -> Pk {
+        use saiife_touch::{EnrolRequest, Touch};
+        let (pair_id, secret, _, _) =
+            pair::parse_fragment(begin["fragment"].as_str().unwrap()).unwrap();
+        let pubkey = d.public_raw();
+        let auth = saiife_touch::soft::SoftAuthenticator::new_es256();
+        let mut ad = auth
+            .enrol(&EnrolRequest {
+                rp_id: "localhost".into(),
+                rp_name: "saiife".into(),
+                user_id: vec![1],
+                user_name: "phone".into(),
+                challenge: [0; 32],
+                exclude: vec![],
+            })
+            .unwrap();
+        let mut challenge = b64::enc(&pair::passkey_challenge(&pair_id, &pubkey));
+        let mut origin = ORIGIN.to_string();
+        tweak(&mut challenge, &mut origin, &mut ad);
+        let cdj = format!(
+            "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{origin}\",\"crossOrigin\":false}}"
+        );
+        let mut att = pair::PasskeyAttestation {
+            credential_id: b64::enc(&auth.credential_id()),
+            authenticator_data: b64::enc(&ad),
+            client_data_json: b64::enc(cdj.as_bytes()),
+            device_sig: String::new(),
+        };
+        let msg = pair::passkey_sig_msg(&pair_id, &att).unwrap();
+        att.device_sig = b64::enc(&signer.sign_domain(pair::PASSKEY_DOMAIN, &msg));
+        let args = json!({
+            "pair_id": pair_id,
+            "device_pub": b64::enc(&pubkey),
+            "label": "phone",
+            "proof": b64::enc(&proof(&secret, &pair_id, &pubkey)),
+            "passkey": att,
+        });
+        Pk {
+            args,
+            id: auth.credential_id(),
+        }
+    }
+
+    async fn link_finish(f: &Fx, args: Value) -> Value {
+        crate::workspace_link::dispatch_link(
+            &f.ctx,
+            &conn(ALICE),
+            req(saiife_ipc::msg::OP_WORKSPACE_PAIR_FINISH, args),
+        )
+        .await
+    }
+
+    async fn begin(f: &Fx) -> Value {
+        let b = call(f, ADMIN, OP_WORKSPACE_PAIR_BEGIN, json!({})).await;
+        assert_eq!(b["ok"], true, "{b}");
+        b
+    }
+
+    async fn confirm_accept(f: &Fx, b: &Value) -> Value {
+        call(
+            f,
+            ADMIN,
+            OP_WORKSPACE_PAIR_CONFIRM,
+            json!({"pair_id": b["pair_id"], "accept": true}),
+        )
+        .await
+    }
+
+    /// The refused request leaves the offer open and nothing stored.
+    async fn refused_whole(f: &Fx, b: &Value, pk: Pk) {
+        let r = link_finish(f, pk.args).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(r["rule"], "passkey_refused", "{r}");
+        let s = call(
+            f,
+            ADMIN,
+            OP_WORKSPACE_PAIR_STATUS,
+            json!({"pair_id": b["pair_id"]}),
+        )
+        .await;
+        assert_eq!(s["state"], "waiting", "{s}");
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pair_with_passkey_enrols_credential() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        let r = link_finish(&f, pk.args.clone()).await;
+        assert_eq!(r["ok"], true, "{r}");
+        // Held, not stored, until the machine confirms.
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+        let c = confirm_accept(&f, &b).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["passkey"], b64::enc(&pk.id), "{c}");
+        let creds = f.ctx.touch.credentials_of(0);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].kind, "webauthn");
+        assert_eq!(creds[0].rp_id, "localhost");
+        assert_eq!(creds[0].origins, vec![ORIGIN.to_string()]);
+        assert_eq!(creds[0].id, pk.id);
+        let devs = f.ctx.workspace.devices();
+        assert_eq!(devs[0].touch_credentials, vec![b64::enc(&pk.id)]);
+        assert!(audit_text(&f).contains(&b64::enc(&pk.id)));
+    }
+
+    #[tokio::test]
+    async fn passkey_with_wrong_challenge_is_refused() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|c, _, _| *c = b64::enc(&[7u8; 32]));
+        refused_whole(&f, &b, pk).await;
+    }
+
+    #[tokio::test]
+    async fn passkey_signed_by_another_key_is_refused() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let other = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &other, &|_, _, _| {});
+        refused_whole(&f, &b, pk).await;
+    }
+
+    #[tokio::test]
+    async fn passkey_without_uv_is_refused() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        // Flags byte: UP | AT, no UV.
+        let pk = passkey_req(&b, &d, &d, &|_, _, ad| ad[32] = 0x41);
+        refused_whole(&f, &b, pk).await;
+    }
+
+    #[tokio::test]
+    async fn passkey_for_other_origin_is_refused() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|_, o, _| *o = "http://localhost:9".into());
+        refused_whole(&f, &b, pk).await;
+    }
+
+    #[tokio::test]
+    async fn pair_without_passkey_is_signed_only() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        finish(&f, &b, &d);
+        let c = confirm_accept(&f, &b).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert!(c.get("passkey").is_none(), "{c}");
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+        assert!(f.ctx.workspace.devices()[0].touch_credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reject_stores_no_credential() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        assert_eq!(link_finish(&f, pk.args).await["ok"], true);
+        let c = call(
+            &f,
+            ADMIN,
+            OP_WORKSPACE_PAIR_CONFIRM,
+            json!({"pair_id": b["pair_id"], "accept": false}),
+        )
+        .await;
+        assert_eq!(c["state"], "rejected", "{c}");
+        assert!(f.ctx.touch.credentials_of(0).is_empty());
+        assert!(f.ctx.touch.all().is_empty());
+        assert!(f.ctx.workspace.devices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrong_proof_with_passkey_does_not_burn_the_offer() {
+        let f = fx("deny", ReauthResult::Authorized);
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let mut pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        let good = pk.args["proof"].clone();
+        pk.args["proof"] = json!(b64::enc(&[0u8; 32]));
+        let r = link_finish(&f, pk.args.clone()).await;
+        assert_eq!(r["ok"], false, "{r}");
+        pk.args["proof"] = good;
+        let r = link_finish(&f, pk.args).await;
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(f.ctx.touch.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn passkey_store_full_pairs_without_passkey() {
+        let f = fx("deny", ReauthResult::Authorized);
+        for i in 0..16u8 {
+            let mut c =
+                saiife_touch::soft::SoftAuthenticator::new_es256().credential("localhost", 0, "x");
+            c.id = vec![i + 1; 16];
+            f.ctx.touch.add(c).unwrap();
+        }
+        let b = begin(&f).await;
+        let d = TestDevice::generate();
+        let pk = passkey_req(&b, &d, &d, &|_, _, _| {});
+        assert_eq!(link_finish(&f, pk.args).await["ok"], true);
+        let c = confirm_accept(&f, &b).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["state"], "active");
+        assert_eq!(c["passkey"], "not_saved", "{c}");
+        assert!(c["passkey_reason"].as_str().is_some(), "{c}");
+        assert_eq!(f.ctx.touch.credentials_of(0).len(), 16);
+        let devs = f.ctx.workspace.devices();
+        assert_eq!(devs[0].state, saiife_wire::device::DeviceState::Active);
+        assert!(devs[0].touch_credentials.is_empty());
     }
 }

@@ -851,7 +851,7 @@ async fn handle(daemon: &Daemon, s: &Sealed, plain: &[u8]) -> Result<Value, Clos
                 plain,
                 "pair",
                 &["pair_id", "device_pub", "label", "proof"],
-                &[],
+                &["passkey"],
             )?;
             if s.pair_id.as_deref() != Some(get_str(&m, "pair_id")?) {
                 return Err(());

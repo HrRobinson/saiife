@@ -7,6 +7,9 @@ import { ACTIONS, outcome } from "./actions.js";
 
 export const PAIR_PROOF_DOMAIN = "saiife-pair-v1\n";
 export const SHORT_CODE_DOMAIN = "saiife-pair-code-v1\n";
+export const PASSKEY_CHALLENGE_DOMAIN = "saiife-pair-passkey-v1\n";
+export const PASSKEY_DOMAIN = "saiife-pair-passkey-v1 sig\n";
+export const NO_TOUCHES = "Touches are not available on this browser: approvals stay on the machine";
 export const MAX_LABEL_CHARS = 40;
 export const DEFAULT_LABEL = "Browser on this machine";
 export const CODES_DIFFER = "Codes differ: do not confirm on the machine";
@@ -104,6 +107,67 @@ export async function shortCode(machinePub, devicePub, secret) {
   return `${three(Math.floor(n / 1000))} ${three(n % 1000)}`;
 }
 
+async function sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+
+// The create challenge: SHA-256(PASSKEY_CHALLENGE_DOMAIN ‖ pairId ASCII ‖ devicePub).
+export async function passkeyChallenge(pairId, devicePub) {
+  return sha256(concat(enc.encode(PASSKEY_CHALLENGE_DOMAIN), enc.encode(pairId), devicePub));
+}
+
+// The options of navigator.credentials.create (plan 31 "Fixed values").
+export function createOptions({ challenge, hostname, deviceId, label }) {
+  return {
+    publicKey: {
+      challenge,
+      rp: { id: hostname, name: "saiife" },
+      user: { id: enc.encode(deviceId), name: label, displayName: label },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -7 },
+        { type: "public-key", alg: -8 },
+      ],
+      authenticatorSelection: { userVerification: "required", residentKey: "preferred" },
+      attestation: "none",
+      timeout: 120000,
+    },
+  };
+}
+
+// Makes a passkey for this pairing and has the device key sign it:
+// ECDSA P-256 over PASSKEY_DOMAIN ‖ pairId ‖ credentialId ‖ SHA-256(authData)
+// ‖ SHA-256(clientDataJSON). -> {credential_id, authenticator_data,
+// client_data_json, device_sig} (base64url) | null when this browser cannot
+// or the person declines (the pairing then goes on without touches).
+export async function makePasskey({ credentials, hasPublicKey, hostname, pairId, publicRaw, deviceId, label, key }) {
+  if (!hasPublicKey || !credentials || typeof credentials.create !== "function") return null;
+  try {
+    const challenge = await passkeyChallenge(pairId, publicRaw);
+    const cred = await credentials.create(createOptions({ challenge, hostname, deviceId, label }));
+    const r = cred && cred.response;
+    if (!r || typeof r.getAuthenticatorData !== "function") return null;
+    const credId = new Uint8Array(cred.rawId);
+    const authData = new Uint8Array(r.getAuthenticatorData());
+    const cdj = new Uint8Array(r.clientDataJSON);
+    const msg = concat(
+      enc.encode(PASSKEY_DOMAIN),
+      enc.encode(pairId),
+      credId,
+      await sha256(authData),
+      await sha256(cdj),
+    );
+    const sig = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, msg));
+    return {
+      credential_id: b64u(credId),
+      authenticator_data: b64u(authData),
+      client_data_json: b64u(cdj),
+      device_sig: b64u(sig),
+    };
+  } catch {
+    return null;
+  }
+}
+
 // null when the daemon would take the label, else the sentence why not.
 export function checkLabel(label) {
   if (typeof label !== "string") return "A label is 1 to 40 characters";
@@ -118,8 +182,17 @@ export function checkLabel(label) {
 // saved here (ruling R-T3c): the new device is returned in memory, and
 // `waitAndSave` saves it only once the owner confirmed on the machine.
 // `store` is accepted for the brief's signature and never written.
-// -> {deviceId, shortCode, device} | {error, rule?}
-export async function pair({ hash, location, history, fetch, store, label }) {
+// -> {deviceId, shortCode, device, passkey} | {error, rule?}
+export async function pair({
+  hash,
+  location,
+  history,
+  fetch,
+  store,
+  label,
+  credentials = globalThis.navigator && globalThis.navigator.credentials,
+  hasPublicKey = typeof globalThis.PublicKeyCredential !== "undefined",
+}) {
   const offer = await parseFragment(hash);
   // The secret leaves the address bar (and this history entry) first.
   history.replaceState(null, "", location.pathname);
@@ -147,16 +220,34 @@ export async function pair({ hash, location, history, fetch, store, label }) {
     return { error: SENTENCES.crypto };
   }
 
-  const a = await client.request("/api/pair", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      pair_id: offer.pairId,
-      device_pub: b64u(publicRaw),
-      label,
-      proof: b64u(tag),
-    }),
+  let passkey = await makePasskey({
+    credentials,
+    hasPublicKey,
+    hostname: location.hostname,
+    pairId: offer.pairId,
+    publicRaw,
+    deviceId,
+    label,
+    key: keys.privateKey,
   });
+  const post = (pk) =>
+    client.request("/api/pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pair_id: offer.pairId,
+        device_pub: b64u(publicRaw),
+        label,
+        proof: b64u(tag),
+        ...(pk ? { passkey: pk } : {}),
+      }),
+    });
+  let a = await post(passkey);
+  // The machine refused the passkey but not the pairing: go on without it.
+  if (!a.ok && passkey && (a.rule ?? a.error) === "passkey_refused") {
+    passkey = null;
+    a = await post(null);
+  }
   if (!a.ok) return { error: a.message, rule: a.rule ?? a.error };
   const r = a.result;
   if (!r || typeof r.device_id !== "string" || typeof r.short_code !== "string") {
@@ -166,7 +257,7 @@ export async function pair({ hash, location, history, fetch, store, label }) {
   if (r.short_code !== code) return { error: CODES_DIFFER };
   if (r.device_id !== deviceId) return { error: SENTENCES.answer };
   const device = { key: keys.privateKey, publicRaw, deviceId, machineId: offer.machineId };
-  return { deviceId, shortCode: code, device };
+  return { deviceId, shortCode: code, device, passkey: passkey !== null };
 }
 
 // Polls workspace.whoami every POLL_MS until the owner confirms. While the

@@ -242,7 +242,45 @@ fn hello(ctx: &Arc<Ctx>, req: Request) -> Value {
     ok(req.id, m)
 }
 
-/// `workspace.pair.finish {pair_id, device_pub, label, proof}` ->
+/// The checked credential of a pairing request's passkey (plan 31).
+async fn passkey_for(
+    ctx: &Arc<Ctx>,
+    pr: &PairRequest,
+    p: &saiife_wire::pair::PasskeyAttestation,
+    now: u64,
+) -> Result<saiife_touch::Credential, Refused> {
+    let device_pub = saiife_wire::b64::dec_n::<65>(&pr.device_pub)
+        .map_err(|e| Refused::new(ErrorCode::BadRequest, e.rule(), e.to_string()))?;
+    let owner = ctx.workspace.offer_owner(&pr.pair_id, now).ok_or_else(|| {
+        Refused::new(
+            ErrorCode::Forbidden,
+            "pair_expired",
+            "this pairing has expired",
+        )
+    })?;
+    let uid = uid_of(ctx, &owner).await.ok_or_else(|| {
+        Refused::new(
+            ErrorCode::Unavailable,
+            "owner_unknown",
+            "cannot resolve the user who began this pairing",
+        )
+    })?;
+    saiife_touch::check_label(&pr.label)
+        .map_err(|m| Refused::new(ErrorCode::BadRequest, "bad_request", m))?;
+    let origins = crate::workspace_touch::origins(ctx);
+    crate::workspace_touch::passkey_credential(
+        p,
+        &pr.pair_id,
+        &device_pub,
+        &origins,
+        uid,
+        &pr.label,
+        &crate::ops::now_ts(),
+    )
+    .map_err(|m| Refused::new(ErrorCode::BadRequest, "passkey_refused", m))
+}
+
+/// `workspace.pair.finish {pair_id, device_pub, label, proof, passkey?}` ->
 /// `{device_id, short_code}`. No peer check: the offer's proof is the
 /// authority. Records `pair_request`; a refused request is not recorded
 /// (it proves nothing about who sent it).
@@ -261,7 +299,17 @@ async fn pair_finish(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
     };
     let now = ctx.workspace.now();
-    let (device, short_code) = match ctx.workspace.finish_pair(&pr, now) {
+    // A passkey is checked in full before anything is held; one that fails
+    // refuses the whole request (nothing is held, the offer stays open).
+    let has_passkey = pr.passkey.is_some();
+    let passkey = match &pr.passkey {
+        None => None,
+        Some(p) => match passkey_for(ctx, &pr, p, now).await {
+            Ok(c) => Some(c),
+            Err(r) => return r.answer(id),
+        },
+    };
+    let (device, short_code) = match ctx.workspace.finish_pair_with(&pr, passkey, now) {
         Ok(x) => x,
         Err(e) => {
             let code = match &e {
@@ -278,6 +326,9 @@ async fn pair_finish(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     rec.extra
         .insert("label".into(), device.label.clone().into());
     rec.extra.insert("pair_id".into(), pr.pair_id.into());
+    if has_passkey {
+        rec.extra.insert("passkey".into(), true.into());
+    }
     if let Err(e) = append(ctx, rec).await {
         return err(
             id,

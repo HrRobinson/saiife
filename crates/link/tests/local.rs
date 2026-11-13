@@ -316,6 +316,37 @@ async fn hello_and_pair_refusals() {
     assert!(a["message"].is_string(), "{a}");
 }
 
+/// `passkey` is the one optional pairing key; the daemon (not this server)
+/// judges it, so a junk passkey comes back as the daemon's own refusal.
+#[tokio::test]
+async fn pair_post_accepts_passkey_key() {
+    let (_w, s) = up().await;
+    let (st, _, body) = s
+        .post(
+            "/api/pair",
+            &json!({"pair_id": "nope", "device_pub": "AAAA", "label": "x", "proof": "AAAA",
+                    "passkey": {"credential_id": "AA"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let a = json_of(&body);
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(a["error"].is_string() && a["message"].is_string(), "{a}");
+}
+
+#[tokio::test]
+async fn pair_post_refuses_other_extra_keys() {
+    let (_w, s) = up().await;
+    for v in [
+        json!({"pair_id": "a", "device_pub": "A", "label": "x", "proof": "A", "extra": "b"}),
+        json!({"pair_id": "a", "device_pub": "A", "label": "x", "proof": "A",
+               "passkey": {}, "via": "hub"}),
+    ] {
+        let (st, _, _) = s.post("/api/pair", &v).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+}
+
 #[tokio::test]
 async fn daemon_down_is_503() {
     let tmp = scratch();

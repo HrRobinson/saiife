@@ -90,6 +90,10 @@ pub struct PairRequest {
     pub device_pub: String,
     pub label: String,
     pub proof: String,
+    /// A passkey made with this pairing (plan 31); held with the offer until
+    /// the owner confirms.
+    #[serde(default)]
+    pub passkey: Option<PasskeyAttestation>,
 }
 
 /// A passkey created during pairing, with the device key's signature over it
@@ -411,6 +415,7 @@ mod tests {
             device_pub: b64::enc(&d.public_raw()),
             label: label.into(),
             proof: b64::enc(&proof(&o.secret, &o.pair_id, &d.public_raw())),
+            passkey: None,
         }
     }
 
@@ -619,6 +624,7 @@ mod tests {
                 device_pub: b64::enc(&p),
                 label: "x".into(),
                 proof: b64::enc(&proof(&o.secret, &o.pair_id, &p)),
+                passkey: None,
             };
             assert!(matches!(
                 f.offers.request(&r, &known, 101),
@@ -630,6 +636,7 @@ mod tests {
             device_pub: b64::enc(&[4u8; 10]),
             label: "x".into(),
             proof: b64::enc(&[0u8; 32]),
+            passkey: None,
         };
         assert!(matches!(
             f.offers.request(&r, &known, 101),

@@ -6,7 +6,7 @@ import { h } from "../dom.js";
 import { visible } from "../format.js";
 import * as keystore from "../keystore.js";
 import { takeNotice, UNPAIRED, PAIR_AGAIN } from "../unpaired.js";
-import { pair, parseFragment, waitAndSave, checkLabel, DEFAULT_LABEL, MAX_LABEL_CHARS, WAIT_MS, FRAGMENT_INVALID } from "../pairing.js";
+import { NO_TOUCHES, pair, parseFragment, waitAndSave, checkLabel, DEFAULT_LABEL, MAX_LABEL_CHARS, WAIT_MS, FRAGMENT_INVALID } from "../pairing.js";
 
 const HOW = "On the machine, run saiife workspace pair --local and open the link it prints.";
 
@@ -41,7 +41,7 @@ function form(root, fragment) {
       status.replaceChildren(visible(r.error));
       return;
     }
-    waiting(root, r.shortCode, r.device);
+    waiting(root, r.shortCode, r.device, r.passkey);
   };
   show(
     root,
@@ -60,13 +60,14 @@ function form(root, fragment) {
 // The new device stays in memory until the owner confirms; only then is it
 // saved (replacing any older pairing). Leaving, a refusal or the deadline
 // drop it and leave the keystore as it was.
-function waiting(root, code, device) {
+function waiting(root, code, device, passkey) {
   const status = h("p", { class: "muted", role: "status", "aria-live": "polite" }, "Waiting for the machine…");
   show(
     root,
     h("h1", {}, "Confirm on the machine"),
     h("p", { class: "code", "aria-label": `Short code ${code}` }, visible(code)),
     h("p", {}, "Check that your machine shows the same code, then confirm there."),
+    ...(passkey ? [] : [h("p", { class: "muted" }, NO_TOUCHES)]),
     status,
   );
   const stop = waitAndSave({
