@@ -691,7 +691,7 @@ pub fn render(
 
 /// L6: the built-in protected paths. Each component is compared by
 /// [`normalize_component`], the one comparison key shared with the delta
-/// validator's symlink checks and `.git` alias check (R-T3i, R-T3l:
+/// validator's symlink checks and `.git` alias check (R-T3i, R-T3l, R-T3n:
 /// decomposition, full case fold, combining marks dropped, as a
 /// case-insensitive or normalising checkout would resolve them).
 /// - rooted: `.claude/**`, `.saiife/**`, `.vscode/**`, `.devcontainer/**`,

@@ -1190,3 +1190,134 @@ fn old_total_too_large() {
     assert!(e.reason.contains("old content"), "{e:?}");
     assert!(e.reason.contains("MAX_TOTAL_BYTES"), "{e:?}");
 }
+
+#[test]
+fn write_through_symlink_round_trip_fold() {
+    // R-T3n: spellings a lowercase alone left apart. Each base link's name
+    // and its NFC variant key alike, so a write under the variant is refused.
+    let pairs = [
+        ("\u{3BC}", "\u{B5}"),          // μ / micro sign
+        ("\u{3B2}", "\u{3D0}"),         // β / ϐ
+        ("\u{3B8}", "\u{3D1}"),         // θ / ϑ
+        ("\u{3C6}", "\u{3D5}"),         // φ / ϕ
+        ("\u{3C0}", "\u{3D6}"),         // π / ϖ
+        ("\u{3BA}", "\u{3F0}"),         // κ / ϰ
+        ("\u{3C1}", "\u{3F1}"),         // ρ / ϱ
+        ("\u{3B5}", "\u{3F5}"),         // ε / ϵ
+        ("files", "\u{FB01}les"),       // fi ligature
+        ("\u{3B1}\u{3B9}", "\u{1FB3}"), // αι / ᾳ (iota subscript)
+    ];
+    for (link, alias) in pairs {
+        assert_eq!(
+            normalize_component(link),
+            normalize_component(alias),
+            "{link} {alias}"
+        );
+        let b = with_links(&[link]);
+        let p = format!("{alias}/x");
+        let e = refused_on(&b, &[add(&p, b"x")]);
+        assert_eq!(e.path.as_deref(), Some(p.as_str()), "{e:?}");
+        assert!(e.reason.contains("symlink in the base"), "{p}: {e:?}");
+        // And the other way round: a link under the variant, a write under
+        // the plain name.
+        let b = with_links(&[alias]);
+        let p = format!("{link}/x");
+        let e = refused_on(&b, &[add(&p, b"x")]);
+        assert!(e.reason.contains("symlink in the base"), "{p}: {e:?}");
+    }
+    // U+0345 folds to ι, it is not dropped as a mark.
+    assert_eq!(normalize_component("\u{3B1}\u{345}"), "\u{3B1}\u{3B9}");
+    // ß and ς still fold explicitly.
+    assert_eq!(normalize_component("Stra\u{DF}e"), "strasse");
+    assert_eq!(normalize_component("\u{3C3}\u{3C2}"), "\u{3C3}\u{3C3}");
+}
+
+#[test]
+fn nfc_i18n_names_still_accepted_after_round_trip() {
+    let mut items = vec![
+        add("\u{3BC}-\u{B5}.txt", b"1"),
+        add("\u{FB01}le.txt", b"2"),
+        add("\u{1FB3}.md", b"3"),
+        add("\u{41F}\u{440}\u{438}\u{432}\u{435}\u{442}.txt", b"4"),
+        add("\u{D55C}\u{AD6D}\u{C5B4}.txt", b"5"),
+        add("\u{5D0}\u{5D1}.txt", b"6"),
+    ];
+    items.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    let v = run(&items).unwrap();
+    assert_eq!(v.entries.len(), 6);
+}
+
+/// The fixture base plus a file under the decomposed `Cafe\u{301}.txt`,
+/// with content `old`.
+fn with_nfd_file(old: &[u8]) -> BaseManifest {
+    let mut b = base();
+    b.entries.insert(
+        "Cafe\u{301}.txt".into(),
+        Entry {
+            kind: EntryKind::File,
+            mode: 0o644,
+            size: old.len() as u64,
+            sha256: sha(old),
+        },
+    );
+    b
+}
+
+fn run_on(b: &BaseManifest, items: &[Item]) -> Result<Valid, DeltaError> {
+    let mut sink = Sink::default();
+    let mut r = Reader::new(b, Limits::default(), &mut sink);
+    for f in frames(&encode(items)) {
+        r.push(f)?;
+    }
+    r.finish()
+}
+
+#[test]
+fn nfd_base_path_can_be_modified_and_deleted() {
+    // R-T3p: the NFC gate applies to added paths only. A modify or delete
+    // names the base's own (here NFD) spelling and is accepted.
+    let p = "Cafe\u{301}.txt";
+    let old = b"old\n";
+    let b = with_nfd_file(old);
+    let e = &b.entries[p];
+    let mut h = head(p, Op::Modify, EntryKind::File, 0o644, b"new\n");
+    h.old_kind = Some(e.kind.clone());
+    h.old_size = Some(e.size);
+    h.old_sha256 = Some(e.sha256.clone());
+    let v = run_on(&b, &[(h, Some(old.to_vec()), Some(b"new\n".to_vec()))]).unwrap();
+    assert_eq!(v.entries.len(), 1);
+
+    let mut h = head(p, Op::Delete, EntryKind::File, 0, b"");
+    h.sha256 = String::new();
+    h.old_kind = Some(e.kind.clone());
+    h.old_size = Some(e.size);
+    h.old_sha256 = Some(e.sha256.clone());
+    let v = run_on(&b, &[(h, None, None)]).unwrap();
+    assert_eq!(v.entries.len(), 1);
+
+    // The CLI's paths_only re-check agrees.
+    let mut h = head(p, Op::Delete, EntryKind::File, 0, b"");
+    h.sha256 = String::new();
+    feed(
+        false,
+        Limits::default(),
+        frames(&encode(&[(h, None, None)])),
+        &mut Sink::default(),
+    )
+    .unwrap();
+
+    // Adding a new NFD path is still refused, also beside the NFD file.
+    for q in ["Cafe\u{301}2.txt", "Do\u{301}cs/x"] {
+        let e = refused_on(&b, &[add(q, b"x")]);
+        assert_eq!(e.path.as_deref(), Some(q), "{e:?}");
+        assert!(e.reason.contains("not in Unicode NFC form"), "{q}: {e:?}");
+    }
+    // A modify of an NFD path the base does not have is still refused.
+    let q = "Do\u{301}cs.txt";
+    let mut h = head(q, Op::Modify, EntryKind::File, 0o644, b"new\n");
+    h.old_kind = Some(EntryKind::File);
+    h.old_size = Some(4);
+    h.old_sha256 = Some(sha(old));
+    let e = refused_on(&b, &[(h, Some(old.to_vec()), Some(b"new\n".to_vec()))]);
+    assert!(e.reason.contains("does not have"), "{e:?}");
+}

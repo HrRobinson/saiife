@@ -682,6 +682,9 @@ fn flags_protected_and_hits() {
         "sub/AG\u{C9}NTS.MD",
         ".\u{17F}AIIFE/x",
         ".gi\u{301}tmodules",
+        // R-T3n: the round-trip fold (ligatures).
+        ".pre-commit-con\u{FB01}g.yaml",
+        ".github/work\u{FB02}ows/ci.yml",
         // R-T3j.
         ".vscode/tasks.json",
         ".devcontainer/devcontainer.json",
@@ -1181,17 +1184,28 @@ fn subset_through_folded_symlink_is_refused() {
     };
     let e = check_subset(&b0, &v, Some(&set(&[p]))).unwrap_err();
     assert!(e.contains("through a symlink"), "{e}");
-    // R-T3l: full case fold and a base link committed decomposed.
+    // R-T3l: full case fold and a base link committed decomposed;
+    // R-T3n: spellings only the round-trip fold joins.
     let t0 = with(
         &base_tree(),
         &[
             ("strasse", Some(C::l("src"))),
             ("\u{3C3}\u{3C3}", Some(C::l("src"))),
             ("Cafe\u{301}", Some(C::l("src"))),
+            ("files", Some(C::l("src"))),
+            ("\u{3BC}", Some(C::l("src"))),
+            ("\u{3B1}\u{3B9}", Some(C::l("src"))),
         ],
     );
     let b0 = manifest(&t0);
-    for p in ["STRA\u{1E9E}E/x", "\u{3C3}\u{3C2}/x", "CAF\u{C9}/x"] {
+    for p in [
+        "STRA\u{1E9E}E/x",
+        "\u{3C3}\u{3C2}/x",
+        "CAF\u{C9}/x",
+        "\u{FB01}les/x",
+        "\u{B5}/x",
+        "\u{1FB3}/x",
+    ] {
         let v = Valid {
             n: 1,
             entries: vec![add_head(p, &C::f(b"x\n"))],

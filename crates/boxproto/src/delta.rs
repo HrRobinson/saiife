@@ -319,28 +319,33 @@ fn is_combining(c: char) -> bool {
 /// 2. canonical decomposition (NFD), so a precomposed and a decomposed
 ///    spelling meet (delta paths are NFC, but base paths are not checked
 ///    and may be NFD, as a macOS checkout commits them);
-/// 3. full case fold: Unicode lowercase, then `ß` → `ss` (`ẞ` lowercases to
-///    `ß`), `ς` → `σ`, the Kelvin sign → `k`, long s → `s`, dotted and
-///    dotless i → `i`, the Angstrom sign → `å`;
-/// 4. decomposed again, then the combining marks dropped (over-folding
-///    only refuses or flags more);
+/// 3. full case fold, per char: Rust's full (multi-char) `to_lowercase`,
+///    each result char `to_uppercase`, each result `to_lowercase` again
+///    (R-T3n: the round trip folds what a lowercase alone leaves apart,
+///    such as `µ`/`μ`, `ϐ`/`β`, the `ﬁ` ligature and U+0345 to `ι`), then
+///    `ß` → `ss` and `ς` → `σ`;
+/// 4. the combining marks dropped (over-folding only refuses or flags
+///    more);
 /// 5. trailing dots and spaces stripped again, in case a mark hid one.
+///
+/// `tests/fold_exhaustive.rs` pins that every char keys like its full
+/// uppercase and its full lowercase.
 pub fn normalize_component(c: &str) -> String {
-    let mut cased = String::with_capacity(c.len());
+    let mut out = String::with_capacity(c.len());
     for ch in c.trim_end_matches(['.', ' ']).nfd() {
         for l in ch.to_lowercase() {
-            match l {
-                '\u{DF}' => cased.push_str("ss"),
-                '\u{3C2}' => cased.push('\u{3C3}'),
-                '\u{212A}' => cased.push('k'),
-                '\u{017F}' => cased.push('s'),
-                '\u{0130}' | '\u{0131}' => cased.push('i'),
-                '\u{212B}' => cased.push('\u{E5}'),
-                l => cased.push(l),
+            for u in l.to_uppercase() {
+                for f in u.to_lowercase() {
+                    match f {
+                        '\u{DF}' => out.push_str("ss"),
+                        '\u{3C2}' => out.push('\u{3C3}'),
+                        f if is_combining(f) => {}
+                        f => out.push(f),
+                    }
+                }
             }
         }
     }
-    let mut out: String = cased.nfd().filter(|&ch| !is_combining(ch)).collect();
     // A mark after a trailing dot hid the dot from the first trim.
     let t = out.trim_end_matches(['.', ' ']).len();
     out.truncate(t);
@@ -381,13 +386,17 @@ fn is_short_name(c: &str) -> bool {
         && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// R-T3h, R-T3l: a component no host may read as a different name; it
-/// must also already be NFC, so precomposed and decomposed spellings of one
-/// name never both reach a checkout.
-fn check_spelling(c: &str) -> Result<(), String> {
+/// R-T3l: a new name must already be NFC, so precomposed and decomposed
+/// spellings of one name never both reach a checkout.
+fn check_nfc(c: &str) -> Result<(), String> {
     if !is_nfc(c) {
         return Err(format!("component {c:?} is not in Unicode NFC form"));
     }
+    Ok(())
+}
+
+/// R-T3h: a component no host may read as a different name.
+fn check_spelling(c: &str) -> Result<(), String> {
     if c.ends_with(['.', ' ']) {
         return Err(format!("component {c:?} ends with a dot or a space"));
     }
@@ -403,12 +412,18 @@ fn check_spelling(c: &str) -> Result<(), String> {
 }
 
 /// Path rules beyond [`check_path`]: depth, unsafe chars, `.git` aliases.
-fn check_delta_path(p: &str) -> Result<(), String> {
+/// The NFC gate applies only to an added path (R-T3p): a modify or delete
+/// names a path the base manifest has, in the base's own spelling (a macOS
+/// checkout commits NFD names), and the comparison keys still apply to it.
+fn check_delta_path(p: &str, added: bool) -> Result<(), String> {
     check_path(p).map_err(|e| clean(&e))?;
     if p.split('/').any(is_git_alias) {
         return Err("has a .git component (or an NTFS alias of one)".into());
     }
     for c in p.split('/') {
+        if added {
+            check_nfc(c)?;
+        }
         check_spelling(c)?;
     }
     if p.split('/').count() > MAX_DEPTH {
@@ -497,7 +512,8 @@ fn check_link(path: &str, target: &[u8]) -> Result<(), DeltaError> {
                 return refuse(format!("{t:?} has a .git component"));
             }
             c => {
-                if let Err(e) = check_spelling(c) {
+                // Every link checked here is added or changed (R-T3p).
+                if let Err(e) = check_nfc(c).and_then(|()| check_spelling(c)) {
                     return refuse(format!("{t:?}: {e}"));
                 }
                 named = true;
@@ -633,7 +649,7 @@ impl<'a> Reader<'a> {
         let p = h.path.as_str();
         let refuse = |why: String| Err(bad(Some(p), why));
 
-        check_delta_path(p).map_err(|e| bad(Some(p), e))?;
+        check_delta_path(p, h.op == Op::Add).map_err(|e| bad(Some(p), e))?;
         if let Some(prev) = self.entries.last() {
             if prev.path == h.path {
                 return refuse("duplicate path".into());
