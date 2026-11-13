@@ -740,7 +740,7 @@ fn poweroff_replies_then_calls_systemctl() {
 /// disk and its marker) asks for the setup again; the second setup skips
 /// the first-time chown of /work and spawns the agent.
 #[test]
-fn rehello_reports_set_up() {
+fn fresh_init_with_marker_asks_for_setup() {
     let h = host_with(fast(), true);
     let _init = start(&h.env);
     let (mut s, ev) = hello(&h);
@@ -903,6 +903,9 @@ fn units_are_as_fixed() {
                 lines(name, "After"),
                 vec!["local-fs.target saiife-events.service saiife-control.service"]
             );
+            // R22: restarts (a refused hello, the init-restart race) never
+            // hit systemd's start limit and leave the unit failed.
+            assert_eq!(lines(name, "StartLimitIntervalSec"), vec!["0"]);
             assert!(lines(name, "RuntimeDirectory").is_empty());
         } else {
             assert_eq!(
