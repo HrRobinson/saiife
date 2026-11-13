@@ -78,6 +78,8 @@ mod imp {
                 pins::verify(fw, pins::FW_SHA256)?;
             }
         }
+        // The Landlock rule's snapshot dir, made as the VMM user.
+        launch::ensure_snapshot_dir(&paths)?;
         let log = launch::open_ch_log(&paths.ch_log())?;
         let log2 = log.try_clone().map_err(|e| format!("ch.log: {e}"))?;
         let mut cmd = Command::new(&ch);

@@ -199,35 +199,68 @@ impl Read for Deadline<'_> {
     }
 }
 
-/// Connect, giving up after `CONNECT_TIMEOUT`. `UnixStream::connect` blocks
-/// when the listener backlog is full, so it runs on a helper thread that is
-/// left to finish on its own after a timeout.
+/// A close-on-exec, non-blocking unix stream socket.
+#[cfg(not(target_os = "macos"))]
+fn nonblocking_stream() -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )
+}
+
+/// macOS has no `SOCK_NONBLOCK` / `SOCK_CLOEXEC`: set right after `socket`.
+#[cfg(target_os = "macos")]
+fn nonblocking_stream() -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+    let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::ioctl_fionbio(&fd, true)?;
+    Ok(fd)
+}
+
+/// Connect, giving up after `CONNECT_TIMEOUT`, on the calling thread. A
+/// blocking `connect` waits as long as the listener's backlog is full, so
+/// the socket is non-blocking: a unix connect either completes at once or
+/// fails with EAGAIN (backlog full), which is retried until the deadline
+/// and is then a `Timeout`. The stream is made blocking again for the
+/// request (its reads and writes carry their own timeouts).
 /// `api.sock` lives in a directory the VMM can write: only a socket is
 /// connected to, never a symlink (which could lead to another box's VMM).
 /// The check and the connect are not atomic; the VMM of this box could swap
 /// the path in between, but only while it runs, and then it already holds
 /// its own API.
 fn connect(sock: &Path) -> Result<UnixStream, ApiError> {
+    use rustix::io::Errno;
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(sock) {
         Ok(m) if m.file_type().is_socket() => {}
         _ => return Err(ApiError::NoSocket),
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let p = sock.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = tx.send(UnixStream::connect(p));
-    });
-    match rx.recv_timeout(CONNECT_TIMEOUT) {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(match e.kind() {
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                ApiError::NoSocket
+    let bad = |e: Errno| ApiError::Bad(std::io::Error::from(e).to_string());
+    let addr = rustix::net::SocketAddrUnix::new(sock).map_err(bad)?;
+    let fd = nonblocking_stream().map_err(bad)?;
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        match rustix::net::connect(&fd, &addr) {
+            Ok(()) => break,
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN | Errno::INPROGRESS) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ApiError::Timeout);
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
             }
-            _ => io_err(&e),
-        }),
-        Err(_) => Err(ApiError::Timeout),
+            Err(Errno::NOENT | Errno::CONNREFUSED) => return Err(ApiError::NoSocket),
+            Err(e) => return Err(bad(e)),
+        }
     }
+    let s = UnixStream::from(fd);
+    s.set_nonblocking(false).map_err(|e| io_err(&e))?;
+    Ok(s)
 }
 
 impl Api {
@@ -540,6 +573,59 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, b"x").unwrap();
         assert_eq!(Api::new(link).ping(), Err(ApiError::NoSocket));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A VMM that never accepts, with its backlog full: connect gives up
+    /// within about a second, on this thread (no helper thread is left
+    /// blocked in connect).
+    #[test]
+    fn full_backlog_times_out_without_a_thread() {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+        use std::os::unix::net::UnixStream as Std;
+        let (d, s) = tmp_sock("full");
+        // std listens with a large backlog: a backlog of 1, never accepted
+        let l = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        rustix::net::bind(&l, &SocketAddrUnix::new(&s).unwrap()).unwrap();
+        rustix::net::listen(&l, 1).unwrap();
+        // fill the queue: connects succeed until the backlog is full
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            let fd = rustix::net::socket_with(
+                rustix::net::AddressFamily::UNIX,
+                rustix::net::SocketType::STREAM,
+                rustix::net::SocketFlags::NONBLOCK | rustix::net::SocketFlags::CLOEXEC,
+                None,
+            )
+            .unwrap();
+            let addr = rustix::net::SocketAddrUnix::new(&s).unwrap();
+            match rustix::net::connect(&fd, &addr) {
+                Ok(()) => held.push(Std::from(fd)),
+                Err(_) => break,
+            }
+        }
+        assert!(held.len() < 64, "the backlog never filled");
+        // A thread inherits its creator's name: count the tasks named as
+        // this test's thread (other tests' threads have other names).
+        let me = std::fs::read_to_string("/proc/thread-self/comm").unwrap();
+        let threads = || {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .flatten()
+                .filter(|t| std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c == me))
+                .count()
+        };
+        let mut worst = Duration::ZERO;
+        let before = threads();
+        for _ in 0..3 {
+            let t = Instant::now();
+            assert_eq!(Api::new(s.clone()).ping(), Err(ApiError::Timeout));
+            worst = worst.max(t.elapsed());
+        }
+        assert!(worst < Duration::from_millis(1600), "{worst:?}");
+        assert_eq!(threads(), before, "a connect thread was left behind");
+        drop(l);
+        drop(held);
         let _ = std::fs::remove_dir_all(d);
     }
 

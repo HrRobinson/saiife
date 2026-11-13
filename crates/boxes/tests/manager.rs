@@ -1316,3 +1316,59 @@ fn gc_goes_on_past_a_box_it_cannot_remove() {
     assert!(!w.root.join(next.as_str()).exists());
     assert!(!w.root.join(orphan.as_str()).exists());
 }
+
+/// R41: a destroy that fails (a VMM still stopping) keeps `vm`; the next
+/// tick retries it and clears `vm` (and the destroy failure in `error`)
+/// once it succeeds. A finished retry is not tried again.
+#[test]
+fn tick_retries_a_failed_destroy_until_it_succeeds() {
+    let w = world(1);
+    let r = w.spawn("a");
+    w.vmm.fail_next(VmOp::Destroy, "the VMM is still stopping");
+    w.advance(BOOT_TIMEOUT_SECS);
+    assert_eq!(w.mgr.tick().len(), 1);
+    let g = w.mgr.get(&r.id).unwrap();
+    assert_eq!(g.state, BoxState::Discarded);
+    assert!(g.vm.is_some(), "a failed destroy keeps the handle");
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 1);
+    // the next tick retries it, fails again, keeps the handle
+    w.vmm.fail_next(VmOp::Destroy, "the VMM is still stopping");
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
+    assert!(w.mgr.get(&r.id).unwrap().vm.is_some());
+    // then it succeeds: vm cleared, the destroy failure dropped, saved
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 3);
+    let g = w.mgr.get(&r.id).unwrap();
+    assert_eq!(g.vm, None);
+    assert_eq!(g.state, BoxState::Discarded);
+    assert_eq!(g.error.as_deref(), Some("boot timed out"));
+    w.assert_saved(&r.id);
+    // nothing left to retry
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 3);
+}
+
+/// R41: a discard whose destroy failed is retried by the tick too.
+#[test]
+fn tick_retries_a_failed_discard_destroy() {
+    let w = world(1);
+    let a = running(&w, "a");
+    w.mgr.done(&a).unwrap();
+    w.vmm.fail_next(VmOp::Destroy, "busy");
+    w.mgr.discard(&a).unwrap();
+    assert!(w.mgr.get(&a).unwrap().vm.is_some());
+    assert!(w.mgr.tick().is_empty());
+    let g = w.mgr.get(&a).unwrap();
+    assert_eq!(g.vm, None);
+    assert_eq!(g.error, None);
+    w.assert_saved(&a);
+    assert_eq!(
+        w.mgr.gc(),
+        GcReport {
+            removed: vec![a.clone()],
+            error: None,
+        }
+    );
+    assert_eq!(count(&w, &a, VmOp::Destroy), 2);
+}

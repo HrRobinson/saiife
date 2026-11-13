@@ -1,4 +1,8 @@
-//! The files in one box directory.
+//! The files in one box's runtime directory (`<layout.boxes>/<id>`, shared
+//! with the VMM; R37). Only VMM-side files live here: the spec, sockets,
+//! logs, disks and `snapshot/`. Daemon-trusted files (`base.json`,
+//! `term.cast`, `lands/`, `placeholder`, review and land state; plans 37-39)
+//! belong in the box's record dir, which the box store owns.
 
 use std::path::PathBuf;
 
@@ -39,20 +43,8 @@ impl BoxPaths {
     pub fn repo_disk(&self) -> PathBuf {
         self.file("repo.img")
     }
-    pub fn base_manifest(&self) -> PathBuf {
-        self.file("base.json")
-    }
     pub fn snapshot_dir(&self) -> PathBuf {
         self.file("snapshot")
-    }
-    pub fn term_cast(&self) -> PathBuf {
-        self.file("term.cast")
-    }
-    pub fn lands_dir(&self) -> PathBuf {
-        self.file("lands")
-    }
-    pub fn placeholder(&self) -> PathBuf {
-        self.file("placeholder")
     }
     /// The longest socket path in the box dir (for sun_path length checks).
     pub fn longest_socket(&self) -> PathBuf {

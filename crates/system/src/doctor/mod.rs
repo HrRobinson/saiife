@@ -40,6 +40,9 @@ pub struct DoctorOptions {
     /// This CLI build can use a FIDO2 key (`cfg!(feature = "fido-hid")` in
     /// the CLI). Read by the `touch-key` check only.
     pub touch_supported: bool,
+    /// This CLI build runs real boxes (`cfg!(feature = "boxes")` in the CLI,
+    /// plan 35 R38). Read by the boxes section only.
+    pub boxes_enabled: bool,
 }
 
 /// What every check reads.
@@ -127,6 +130,8 @@ fn unix_checks(ctx: &Ctx) -> Vec<Check> {
     checks.extend(host::checks(ctx));
     #[cfg(target_os = "linux")]
     checks.extend(touch::checks(ctx));
+    #[cfg(target_os = "linux")]
+    checks.extend(host::boxes(ctx));
     checks
 }
 

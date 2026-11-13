@@ -1697,6 +1697,7 @@ dependencies = [
 name = "saiife-boxes"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "saiife-touch",
  "saiife-wire",
  "serde",
@@ -1807,6 +1808,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "zbus",
  "zeroize",
 ]
 
@@ -1946,6 +1948,7 @@ dependencies = [
  "rustix",
  "saiife-agents",
  "saiife-audit",
+ "saiife-boxhost",
  "saiife-ipc",
  "saiife-policy",
  "saiife-win",

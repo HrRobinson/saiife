@@ -271,3 +271,127 @@ fn hostile_counter_is_refused() {
     fs::create_dir(s.root().join(format!("b{}", u64::MAX))).ok();
     assert!(s.claim_id().is_err());
 }
+
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// Personal mode: the root and every box dir are the user's alone.
+#[cfg(unix)]
+#[test]
+fn personal_store_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("boxes");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let s = Store::open(root.clone()).unwrap();
+    assert_eq!(mode_of(&root), 0o700);
+    let b = s.claim_id().unwrap();
+    assert_eq!(mode_of(&s.box_dir(&b)), 0o700);
+}
+
+/// S6/R37: a box's record files are read without following links, and only
+/// when they are plain files of this uid with one link: anything else makes
+/// the box corrupt (a warning), never trusted, never removed.
+#[cfg(unix)]
+#[test]
+fn symlinked_or_hard_linked_records_are_corrupt_and_kept() {
+    let t = tempfile::tempdir().unwrap();
+    let s = open(&t);
+    let outside = t.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let target = outside.join("box.json");
+    let b1 = s.claim_id().unwrap();
+    s.save(&rec(&b1)).unwrap();
+    fs::write(&target, serde_json::to_string(&rec(&b1)).unwrap()).unwrap();
+    let file = s.box_dir(&b1).join("box.json");
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+    assert!(s.load(&b1).is_err());
+    let b2 = s.claim_id().unwrap();
+    s.save(&rec(&b2)).unwrap();
+    let file2 = s.box_dir(&b2).join("box.json");
+    fs::hard_link(&file2, outside.join("other")).unwrap();
+    assert!(s.load(&b2).is_err());
+    let (all, warns) = s.list().unwrap();
+    assert!(all.is_empty(), "{all:?}");
+    assert_eq!(warns.len(), 2, "{warns:?}");
+    assert!(s.orphans().unwrap().is_empty());
+    // a symlinked marker: not labelled, so never removed
+    let b3 = s.claim_id().unwrap();
+    let m = s.box_dir(&b3).join(".saiife-box");
+    fs::write(outside.join("marker"), marker(b3.as_str())).unwrap();
+    fs::remove_file(&m).unwrap();
+    std::os::unix::fs::symlink(outside.join("marker"), &m).unwrap();
+    assert!(s.remove(&b3).is_err());
+    assert!(s.box_dir(&b3).exists());
+    assert!(target.exists() && outside.join("other").exists());
+}
+
+/// A symlinked counter is refused, its target untouched.
+#[cfg(unix)]
+#[test]
+fn symlinked_counter_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let s = open(&t);
+    let target = t.path().join("elsewhere");
+    fs::write(&target, "5").unwrap();
+    std::os::unix::fs::symlink(&target, s.root().join("next-id")).unwrap();
+    assert!(s.claim_id().is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "5");
+}
+
+/// The store root must be a real directory of this uid; a group-writable
+/// one of ours is made 0700.
+#[cfg(unix)]
+#[test]
+fn store_root_is_checked() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(Store::open(link).is_err(), "a symlinked root");
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).unwrap();
+    Store::open(real.clone()).unwrap();
+    assert_eq!(mode_of(&real), 0o700);
+    // a file is not a root
+    let f = t.path().join("file");
+    fs::write(&f, "").unwrap();
+    assert!(Store::open(f).is_err());
+}
+
+/// R37: a VMM-group write into the runtime dirs (a hostile `box.json`,
+/// marker or counter, a planted box dir) is not in the store: it changes
+/// nothing listed, nothing claimed and nothing removed.
+#[cfg(unix)]
+#[test]
+fn runtime_files_are_not_records() {
+    let t = tempfile::tempdir().unwrap();
+    let s = open(&t);
+    let b1 = s.claim_id().unwrap();
+    s.save(&rec(&b1)).unwrap();
+    let run = t.path().join("box-run");
+    fs::create_dir_all(run.join("b1")).unwrap();
+    fs::create_dir_all(run.join("b9")).unwrap();
+    let mut evil = rec(&b1);
+    evil.owner_uid = 0;
+    evil.state = BoxState::Done;
+    fs::write(
+        run.join("b1/box.json"),
+        serde_json::to_string(&evil).unwrap(),
+    )
+    .unwrap();
+    fs::write(run.join("b1/.saiife-box"), marker("b1")).unwrap();
+    fs::write(run.join("b9/.saiife-box"), marker("b9")).unwrap();
+    fs::write(run.join("next-id"), "1").unwrap();
+    let (all, warns) = s.list().unwrap();
+    assert_eq!(all, vec![rec(&b1)], "{warns:?}");
+    assert!(s.orphans().unwrap().is_empty());
+    assert_eq!(s.claim_id().unwrap(), id("b2"));
+    assert!(run.join("b9").exists() && run.join("b1/box.json").exists());
+}

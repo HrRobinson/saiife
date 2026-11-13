@@ -27,6 +27,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - run: cargo clippy -p saiife --features fido-hid --all-targets -- -D warnings
+      # The real box driver's wiring and the fake VM (plan 35, M-1): the
+      # workspace clippy above never turns these features on. CI only,
+      # never a release workflow.
+      - name: clippy with boxes and the fake VM
+        if: runner.os == 'Linux'
+        run: cargo clippy -p saiife-daemon -p saiife --features saiife-daemon/boxes,saiife-daemon/fake-vmm,saiife/boxes,saiife/fake-vmm --all-targets -- -D warnings
       # The HID key's pure parts (classify, one_of, credential_of); no key is opened.
       - name: fido-hid unit tests
         if: runner.os == 'Linux'
@@ -50,12 +56,21 @@ jobs:
       # The box manager behind its fake VM (plan 34): nothing in the workspace
       # turns on saiife-boxes/fake or saiife-daemon/fake-vmm, so the step above
       # never builds these tests. Test builds only; release never sets them.
+      # saiife-boxhost/fake builds the saiife-fake-ch stand-in for Cloud
+      # Hypervisor (plan 35); its ch_api and ch_vmm suites need it, and the
+      # snapshot tests make a FIFO (mknodat), so Linux only. `boxes` turns on
+      # the real Cloud Hypervisor driver's wiring (plan 35, R38; its tests
+      # never start a VMM): CI only, never a release workflow until plan 41.
       - name: box manager and box.* ops (fake VM)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
           cargo test -p saiife-boxes --features fake --no-fail-fast
+          cargo test -p saiife-boxhost --features fake --no-fail-fast
           cargo test -p saiife-daemon --features fake-vmm --test boxes
           cargo test -p saiife --features fake-vmm --test box_cmd
+          cargo test -p saiife-daemon --features fake-vmm,boxes --test boxes
+          cargo test -p saiife-daemon --features boxes --lib box_ops
+          cargo test -p saiife --features fake-vmm,boxes --test box_cmd
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}

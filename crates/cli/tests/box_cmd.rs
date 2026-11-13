@@ -281,15 +281,32 @@ fn reorder_queue() {
 
 #[test]
 fn unavailable_without_fake_env_is_exit_5() {
+    // M1 / I-C: every TestDaemon re-roots the locked box layout under its
+    // own dir (`<daemon>/box-root`, debug-only seam), so a `boxes` build's
+    // preflight never reads the host's install.
     let d = TestDaemon::start(Opts::default());
+    let root = d.path().join("box-root");
     fs::create_dir_all(d.path().join("project")).unwrap();
     let o = bx(&d, &["ls"]);
     assert_eq!(code(&o), 5, "{}", err(&o));
-    assert!(
-        err(&o).contains("boxes are not available in this version"),
-        "{}",
-        err(&o)
-    );
+    // Without the fake flag: a `boxes` build runs the real driver's
+    // preflight (plan 35), which on a host without `system install --boxes`
+    // names the install; any other build says boxes are not enabled (R38).
+    if cfg!(feature = "boxes") {
+        assert!(err(&o).contains("install --boxes"), "{}", err(&o));
+        assert!(
+            err(&o).contains(&root.display().to_string()),
+            "the test root: {}",
+            err(&o)
+        );
+    } else {
+        assert!(
+            err(&o).contains("boxes are not available in this version"),
+            "{}",
+            err(&o)
+        );
+        assert!(err(&o).contains("not enabled in this build"), "{}", err(&o));
+    }
 }
 
 #[test]

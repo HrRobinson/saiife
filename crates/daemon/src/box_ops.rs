@@ -1,9 +1,12 @@
 //! The `box.*` ops on the control socket (plan 34, Task 8) over the box
 //! manager of `saiife-boxes`, and its 5 s tick.
 //!
-//! A release daemon has no boxes: [`build`] gives a manager only in a build
-//! with the `fake-vmm` feature and `SAIIFE_BOX_FAKE_VMM=1` (a fake VM, for
-//! tests). Without one every op answers `unavailable`.
+//! [`build`] gives the manager: on the fake VM in a `fake-vmm` build with
+//! `SAIIFE_BOX_FAKE_VMM=1` (tests), else on Linux in a `boxes` build the
+//! Cloud Hypervisor driver once the box preflight passed (plan 35; `boxes`
+//! is off by default and in every release until plan 41, R38). Without a manager every
+//! op answers `unavailable`, with the failed check's detail when there is
+//! one.
 //!
 //! Each op checks its arguments (`BoxId::parse`, `check_text`) before the
 //! manager is called, and every manager call runs in `spawn_blocking` (the
@@ -43,6 +46,8 @@ use std::time::Duration;
 pub const TICK_SECS: u64 = 5;
 /// The answer of every box op when there is no manager.
 pub const UNAVAILABLE: &str = "boxes are not available in this version";
+/// Why a Linux build without the `boxes` feature has no boxes (R38).
+pub const NOT_ENABLED: &str = "boxes are not enabled in this build";
 /// Set to `1` (in a `fake-vmm` build) to run boxes on the fake VM.
 pub const FAKE_ENV: &str = "SAIIFE_BOX_FAKE_VMM";
 /// With [`FAKE_ENV`] (a `fake-vmm` build only): `<n>` pins the host to
@@ -80,7 +85,8 @@ pub const OPS: &[&str] = &[
     OP_BOX_TERM_READ,
 ];
 
-/// `<state_dir>/boxes`.
+/// `<state_dir>/boxes`: the box records, the daemon's own in both modes
+/// (R37). The VMM's runtime dirs are `saiife_boxhost::layout::Layout.boxes`.
 pub fn dir_in(state_dir: &Path) -> PathBuf {
     state_dir.join("boxes")
 }
@@ -206,20 +212,33 @@ fn cpu_pct(a: (u64, u64), b: (u64, u64)) -> Option<u8> {
 }
 
 /// What [`build`] made: the manager, the start warnings (store, recovery,
-/// templates) for stderr, the template warnings `box.templates` shows and
-/// the recovery's state changes, which the daemon records with its start
-/// records ([`change_records`], R29).
+/// templates) for stderr, the template warnings `box.templates` shows, the
+/// recovery's state changes, which the daemon records with its start
+/// records ([`change_records`], R29), and the link the driver's audit hook
+/// writes through once the context exists ([`AuditLink::attach`]).
 pub struct Built {
     pub manager: Arc<Manager>,
     pub warnings: Vec<String>,
     pub template_warnings: Vec<TemplateWarning>,
     pub changes: Vec<Change>,
+    pub audit: Arc<AuditLink>,
+    /// The manager runs on the fake VM (a `fake-vmm` test build).
+    pub fake: bool,
 }
 
-/// The box manager, or `None`: only a `fake-vmm` build with
-/// `SAIIFE_BOX_FAKE_VMM=1` has one (a fake VM; no release build has boxes).
-/// `Err` when the box state cannot be opened.
-pub fn build(state_dir: &Path, mode: &Mode, config_path: &Path) -> Result<Option<Built>, String> {
+/// The box manager, or why boxes are unavailable (`Ok(Err(why))`): (1) a
+/// `fake-vmm` build with `SAIIFE_BOX_FAKE_VMM=1` runs on the fake VM;
+/// (2) otherwise, on Linux, the real driver once the preflight
+/// (`saiife_boxhost::preflight`) passed, whose first failure is the why;
+/// (3) elsewhere [`UNAVAILABLE`]. `Err` when the box state cannot be opened.
+///
+/// Locked mode talks to the system bus, which needs the daemon's runtime
+/// driven by another thread: call this on a `spawn_blocking` thread.
+pub fn build(
+    state_dir: &Path,
+    mode: &Mode,
+    config_path: &Path,
+) -> Result<Result<Built, String>, String> {
     build_with(state_dir, mode, config_path, &|k| std::env::var_os(k))
 }
 
@@ -229,60 +248,110 @@ pub fn build_with(
     mode: &Mode,
     config_path: &Path,
     env: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<Option<Built>, String> {
+) -> Result<Result<Built, String>, String> {
     #[cfg(feature = "fake-vmm")]
-    {
-        if env(FAKE_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
-            return Ok(None);
-        }
-        build_fake(state_dir, mode, config_path, env).map(Some)
+    if env(FAKE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return build_fake(state_dir, mode, config_path, env).map(Ok);
     }
-    #[cfg(not(feature = "fake-vmm"))]
-    {
-        let _ = (state_dir, mode, config_path, env);
-        Ok(None)
-    }
+    build_real(state_dir, mode, config_path, env)
 }
 
-#[cfg(feature = "fake-vmm")]
-fn build_fake(
+/// The preflight, then `ChVmm` (personal: a child of the daemon; locked:
+/// the `saiife-box@` unit) with no guest channel yet (plan 38). Only in a
+/// build with the `boxes` feature (R38).
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+fn build_real(
     state_dir: &Path,
     mode: &Mode,
     config_path: &Path,
     env: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<Built, String> {
-    use saiife_boxes::guest::fake::FakeGuest;
-    use saiife_boxes::manager::ManagerInit;
+) -> Result<Result<Built, String>, String> {
     use saiife_boxes::store::Store;
-    use saiife_boxes::vmm::fake::FakeVmm;
+    use saiife_boxhost::preflight;
 
-    let root = dir_in(state_dir);
-    let store = Store::open(root.clone()).map_err(|e| e.to_string())?;
+    let layout = match crate::box_vmm::layout_for(state_dir, mode, env) {
+        Ok(l) => l,
+        Err(why) => return Ok(Err(why)),
+    };
+    let tools = saiife_boxhost::tools::Tools::system(&layout.vmm).with_env(env);
+    let checks = preflight::checks(
+        &layout,
+        &tools,
+        &crate::box_vmm::kvm_path(env),
+        saiife_system::sandbox::landlock_abi(),
+    );
+    if let Err(why) = preflight::ready(&checks) {
+        return Ok(Err(why));
+    }
+    let audit = Arc::new(AuditLink::default());
+    let hooks: Vec<Arc<dyn saiife_boxhost::vmm::VmHooks>> = vec![Arc::new(
+        crate::box_vmm::AuditHooks::new(Arc::clone(&audit)),
+    )];
+    // records in the daemon's own state dir, runtime dirs in the layout
+    // (R37): nothing the VMM can write is ever read as a record
+    let records = dir_in(state_dir);
+    let vmm = match crate::box_vmm::real_vmm_with(&layout, &records, mode, hooks, env) {
+        Ok(v) => v,
+        Err(why) => return Ok(Err(why)),
+    };
+    let store = Store::open(records).map_err(|e| e.to_string())?;
+    // the disks are in the runtime dirs
+    let root = layout.boxes.clone();
+    let prev = Mutex::new(None);
+    open_manager(
+        store,
+        vmm,
+        Arc::new(saiife_boxes::guest::NoGuest),
+        Arc::new(move || host_facts(&root, &prev)),
+        (mode, config_path, env),
+        (audit, false),
+    )
+    .map(Ok)
+}
+
+/// Without real boxes: plan 34's answer; on Linux it says the build has
+/// them off (R38: `boxes` is off until plan 41 ships).
+#[cfg(not(all(target_os = "linux", feature = "boxes")))]
+fn build_real(
+    state_dir: &Path,
+    mode: &Mode,
+    config_path: &Path,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Result<Built, String>, String> {
+    let _ = (state_dir, mode, config_path, env);
+    if cfg!(target_os = "linux") {
+        Ok(Err(format!("{UNAVAILABLE} ({NOT_ENABLED})")))
+    } else {
+        Ok(Err(UNAVAILABLE.into()))
+    }
+}
+
+/// The environment as a function.
+type EnvFn<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// The manager over `store` and `vmm`, with the mode's templates.
+#[cfg_attr(
+    not(any(all(target_os = "linux", feature = "boxes"), feature = "fake-vmm")),
+    allow(dead_code)
+)]
+fn open_manager(
+    store: saiife_boxes::store::Store,
+    vmm: Arc<dyn saiife_boxes::vmm::Vmm>,
+    guest: Arc<dyn saiife_boxes::guest::GuestLink>,
+    host: saiife_boxes::manager::HostProbe,
+    (mode, config_path, env): (&Mode, &Path, EnvFn<'_>),
+    (audit, fake): (Arc<AuditLink>, bool),
+) -> Result<Built, String> {
+    use saiife_boxes::manager::ManagerInit;
+
     let (tdir, trust) = templates_dir(mode, config_path, env);
     let (templates, template_warnings) = saiife_boxes::template::load_dir(&tdir, trust);
-    let prev = Mutex::new(None);
-    let pinned = env(FAKE_SLOTS_ENV)
-        .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
-        .map(fake_host);
-    let guest = Arc::new(FakeGuest::new());
-    if let Some(frames) = env(FAKE_TERMINAL_ENV)
-        .and_then(|v| v.to_str().map(str::to_string))
-        .filter(|s| s.len() <= FAKE_TERMINAL_MAX)
-        .and_then(|s| serde_json::from_str(&s).ok())
-    {
-        if let Ok(b1) = saiife_wire::source::BoxId::parse("b1") {
-            guest.set_terminal(&b1, frames);
-        }
-    }
     let opened = Manager::open(ManagerInit {
         store,
-        vmm: Arc::new(FakeVmm::new()),
+        vmm,
         guest,
         templates,
-        host: Arc::new(move || match &pinned {
-            Some(h) => *h,
-            None => host_facts(&root, &prev),
-        }),
+        host,
         clock: Arc::new(unix_now),
     })
     .map_err(|e| e.to_string())?;
@@ -297,7 +366,94 @@ fn build_fake(
         warnings,
         template_warnings,
         changes: opened.changes,
+        audit,
+        fake,
     })
+}
+
+/// Plan 34's fake VM and guest. The fake VM has no VMM user, so its boxes
+/// stay under `<state>/boxes` in both modes (as before plan 35).
+#[cfg(feature = "fake-vmm")]
+fn build_fake(
+    state_dir: &Path,
+    mode: &Mode,
+    config_path: &Path,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Built, String> {
+    use saiife_boxes::guest::fake::FakeGuest;
+    use saiife_boxes::store::Store;
+    use saiife_boxes::vmm::fake::FakeVmm;
+
+    let root = dir_in(state_dir);
+    let store = Store::open(root.clone()).map_err(|e| e.to_string())?;
+    let prev = Mutex::new(None);
+    let pinned = env(FAKE_SLOTS_ENV)
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
+        .map(fake_host);
+    let guest = Arc::new(FakeGuest::new());
+    if let Some(frames) = env(FAKE_TERMINAL_ENV)
+        .and_then(|v| v.to_str().map(str::to_string))
+        .filter(|s| s.len() <= FAKE_TERMINAL_MAX)
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        if let Ok(b1) = saiife_wire::source::BoxId::parse("b1") {
+            guest.set_terminal(&b1, frames);
+        }
+    }
+    open_manager(
+        store,
+        Arc::new(FakeVmm::new()),
+        guest,
+        Arc::new(move || match &pinned {
+            Some(h) => *h,
+            None => host_facts(&root, &prev),
+        }),
+        (mode, config_path, env),
+        (Arc::new(AuditLink::default()), true),
+    )
+}
+
+/// Where the driver's audit hook writes (R36): the daemon context, attached
+/// once it exists. Never takes the box manager's lock and never asks the
+/// manager anything (it runs inside the manager's VMM calls): the record is
+/// made from the box id alone and written by a runtime task.
+///
+/// Before [`AuditLink::attach`] there is no context: a `restore_refused`
+/// during `Manager::open`'s recovery (which runs inside [`build`], before
+/// the daemon context exists) is only a stderr line, never an audit record
+/// (M-3). `Manager::open` boots nothing, so a refusal at a restoring boot
+/// comes after the attach and is recorded.
+#[derive(Default)]
+pub struct AuditLink {
+    ctx: Mutex<std::sync::Weak<Ctx>>,
+}
+
+impl AuditLink {
+    pub fn attach(&self, ctx: &Arc<Ctx>) {
+        *self.ctx.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(ctx);
+    }
+
+    /// A `box` record `restore_refused` (`via: "vmm"`, `reason` = why,
+    /// sanitized). Called from a runtime's blocking thread (every manager
+    /// call is); without a context or a runtime it is a stderr line.
+    pub fn restore_refused(&self, id: &BoxId, why: &str) {
+        let why = saiife_audit::text::sanitize(why);
+        let ctx = self.ctx.lock().unwrap_or_else(|p| p.into_inner()).upgrade();
+        let (Some(ctx), Ok(rt)) = (ctx, tokio::runtime::Handle::try_current()) else {
+            eprintln!(
+                "saiifed: boxes: {}: snapshot not restored: {why}",
+                id.as_str()
+            );
+            return;
+        };
+        let mut rec = box_rec(&ctx, "restore_refused", Some(id), None, None, None, "vmm");
+        rec.reason = Some(why);
+        rt.spawn(async move {
+            if let Err(e) = ctx.writer.append(rec).await {
+                eprintln!("saiifed: warning: cannot write a box record: {e}");
+            }
+        });
+    }
 }
 
 /// A host that holds exactly `n` default boxes (`SAIIFE_BOX_FAKE_SLOTS`).
@@ -316,7 +472,10 @@ pub fn fake_host(n: u64) -> HostFacts {
     }
 }
 
-#[cfg(feature = "fake-vmm")]
+#[cfg_attr(
+    not(any(all(target_os = "linux", feature = "boxes"), feature = "fake-vmm")),
+    allow(dead_code)
+)]
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -357,6 +516,8 @@ async fn fake_ready(ctx: &Ctx) {
     let starting = tokio::task::spawn_blocking(move || {
         mgr.list()
             .into_iter()
+            // a fake-vmm build that runs the real driver has no fake guest
+            .filter(|r| r.vm.as_ref().is_some_and(|h| h.driver == "fake"))
             .filter(|r| r.state == BoxState::Starting)
             .map(|r| r.id)
             .collect::<Vec<_>>()
@@ -366,6 +527,12 @@ async fn fake_ready(ctx: &Ctx) {
     for id in starting {
         let _ = guest_event(ctx, id, saiife_boxes::guest::GuestEvent::Ready).await;
     }
+}
+
+/// What a box op answers without a manager: the failed preflight's detail,
+/// else [`UNAVAILABLE`].
+fn unavailable(ctx: &Ctx) -> &str {
+    ctx.box_unavailable.as_deref().unwrap_or(UNAVAILABLE)
 }
 
 /// Lockdown `all`: the scheduler gives no box power (R30).
@@ -385,7 +552,7 @@ pub async fn guest_event(
     ev: saiife_boxes::guest::GuestEvent,
 ) -> Result<Option<Change>, BoxError> {
     let Some(mgr) = ctx.box_manager.clone() else {
-        return Err(BoxError::Unavailable(UNAVAILABLE.into()));
+        return Err(BoxError::Unavailable(unavailable(ctx).into()));
     };
     let prompt = !locked_all(ctx);
     let (c, template) = blocking(move || {
@@ -736,7 +903,7 @@ impl Caller {
 pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
     let Some(mgr) = ctx.box_manager.clone() else {
-        return err(id, ErrorCode::Unavailable, UNAVAILABLE);
+        return err(id, ErrorCode::Unavailable, unavailable(ctx));
     };
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
@@ -1064,6 +1231,40 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every build (with or without `fake-vmm`): no fake flag and no VMM in
+    /// the personal layout is a reason, not a manager, and nothing is made.
+    #[test]
+    fn no_vmm_is_a_reason_naming_the_fetch() {
+        let tmp = tempfile::tempdir_in(
+            std::env::var_os("SAIIFE_TEST_TMP")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        )
+        .unwrap();
+        let state = tmp.path().join("state");
+        let data = tmp.path().join("data");
+        let env = |k: &str| -> Option<OsString> {
+            match k {
+                "XDG_DATA_HOME" => Some(data.clone().into_os_string()),
+                "HOME" => Some(tmp.path().join("home").into_os_string()),
+                "SAIIFE_TEST_KVM" => Some(tmp.path().join("kvm").into_os_string()),
+                _ => None,
+            }
+        };
+        let why = build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+            .unwrap()
+            .err()
+            .expect("unavailable");
+        if cfg!(all(target_os = "linux", feature = "boxes")) {
+            assert!(why.contains("saiife box vmm fetch"), "{why}");
+        } else if cfg!(target_os = "linux") {
+            assert!(why.contains(NOT_ENABLED), "{why}");
+        } else {
+            assert_eq!(why, UNAVAILABLE);
+        }
+        assert!(!state.exists() && !data.exists());
+    }
 
     #[test]
     fn meminfo_fields() {

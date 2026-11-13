@@ -60,6 +60,7 @@ pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode 
             user,
             home,
             touch_supported: cfg!(feature = "fido-hid"),
+            boxes_enabled: cfg!(feature = "boxes"),
         },
     );
     if json {

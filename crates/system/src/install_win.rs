@@ -1945,6 +1945,8 @@ mod windows_tests {
                 approvers: Vec::new(),
                 non_interactive: true,
                 allow_test_build: false,
+                boxes: false,
+                vmm_dir: None,
             }
         }
 

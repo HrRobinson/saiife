@@ -12,6 +12,8 @@
 #[cfg(unix)]
 use crate::authright;
 #[cfg(unix)]
+use crate::boxes_install;
+#[cfg(unix)]
 use crate::default_config::default_config;
 #[cfg(unix)]
 use crate::fsops;
@@ -28,7 +30,7 @@ use crate::polkit::polkit_present;
 #[cfg(unix)]
 use crate::supported::{check_supported, Support};
 #[cfg(unix)]
-use crate::unit::{unit_text, vault_key_mode};
+use crate::unit::{unit_text_for, vault_key_mode};
 use saiife_agents::Agent;
 #[cfg(unix)]
 use saiife_agents::{claude, codex, gemini, AgentError, Change};
@@ -57,6 +59,12 @@ pub struct InstallOptions {
     /// (the CI jobs `locked-linux`, `locked-macos` and `macos-pkg` only; never
     /// for production).
     pub allow_test_build: bool,
+    /// Also install boxes (`--boxes`, plan 35): the `saiife-box` user, the box
+    /// dirs, the VMM, the `saiife-box@` unit and its polkit rule. Linux only.
+    pub boxes: bool,
+    /// With `boxes`: copy the VMM from this dir (verified against the pins)
+    /// instead of downloading it.
+    pub vmm_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -381,12 +389,23 @@ fn open_install_lock(
     }
 }
 
+/// `--boxes` is for Linux: refused before anything changes.
+fn boxes_platform(layout: &Layout, opts: &InstallOptions) -> Result<(), InstallError> {
+    if opts.boxes && layout.platform() != Platform::Linux {
+        return Err(InstallError::Unsupported(
+            "boxes (--boxes) are for Linux only".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn install(
     layout: &Layout,
     host: &dyn Host,
     opts: &InstallOptions,
     binary: &Path,
 ) -> Result<InstallReport, InstallError> {
+    boxes_platform(layout, opts)?;
     if layout.platform() == Platform::Windows {
         let began = std::cell::Cell::new(false);
         let lock = lock_install(layout, host)?;
@@ -411,6 +430,7 @@ pub fn install_locked(
     binary: &Path,
     began: &std::cell::Cell<bool>,
 ) -> Result<InstallReport, InstallError> {
+    boxes_platform(layout, opts)?;
     if layout.platform() == Platform::Windows {
         return install_win::install(layout, host, opts, binary, began);
     }
@@ -536,6 +556,15 @@ fn install_unlocked(
         step: "binary".into(),
         detail: format!("{}: {e}", binary.display()),
     })?;
+    // `--boxes`: its read-only refusals too, before the first change.
+    if opts.boxes {
+        boxes_install::preflight(
+            layout,
+            host,
+            opts.vmm_dir.as_deref(),
+            &boxes_install::vmm_pins(),
+        )?;
+    }
     let strict = layout.is_system() && !opts.allow_test_build;
     let warnings: Vec<String> = if mac {
         check_macho(binary, &binary_bytes, strict)?
@@ -635,6 +664,11 @@ fn install_unlocked(
     } else {
         // 5b. The polkit action, when polkit is there.
         run.polkit()?;
+        // 5c. Boxes (plan 35): before the unit, which names their group.
+        // Once installed, a reinstall keeps the unit's box lines.
+        if opts.boxes {
+            run.boxes(opts.vmm_dir.as_deref())?;
+        }
         // 6. The vault key.
         run.vault_key(key_mode)?;
         // 7. The unit.
@@ -1724,12 +1758,61 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// The `--boxes` steps ([`boxes_install`]); whatever they created is
+    /// recorded even when one fails.
+    fn boxes(&mut self, vmm_dir: Option<&Path>) -> Result<(), InstallError> {
+        let mut c = boxes_install::Created::default();
+        let res = boxes_install::install_boxes_with(
+            self.layout,
+            self.host,
+            self.layout.daemon_user(),
+            vmm_dir,
+            &boxes_install::vmm_pins(),
+            &mut c,
+        );
+        for u in c.users {
+            if !self.rec.users.contains(&u) {
+                self.rec.users.push(u);
+            }
+        }
+        for g in c.groups {
+            if !self.rec.groups.contains(&g) {
+                self.rec.groups.push(g);
+            }
+        }
+        for (user, group) in c.memberships {
+            let m = Membership { user, group };
+            if !self.rec.memberships.contains(&m) {
+                self.rec.memberships.push(m);
+            }
+        }
+        for f in c.files {
+            match self.rec.files.iter_mut().find(|x| x.path == f.path) {
+                Some(x) => {
+                    x.sha256 = f.sha256;
+                    x.kind = f.kind;
+                }
+                None => self.rec.files.push(InstalledFile {
+                    path: f.path,
+                    sha256: f.sha256,
+                    kind: f.kind,
+                    created: f.created,
+                }),
+            }
+        }
+        self.report.changed.extend(c.changed);
+        self.save()?;
+        res
+    }
+
     fn unit(&mut self, key_mode: VaultKeyMode, systemd: u32) -> Result<bool, InstallError> {
         // The unit follows the key on disk, not only the systemd version: a
         // plain key from before a systemd upgrade keeps `LoadCredential=`.
+        // With boxes installed (now or before) it names their group and dir.
+        let boxes = boxes_install::recorded(&self.rec);
         let text = match key_mode {
-            VaultKeyMode::File | VaultKeyMode::DaemonFile => unit_text(systemd.min(249)),
-            VaultKeyMode::Credential => unit_text(systemd.max(250)),
+            VaultKeyMode::File | VaultKeyMode::DaemonFile => unit_text_for(systemd.min(249), boxes),
+            VaultKeyMode::Credential => unit_text_for(systemd.max(250), boxes),
         };
         let unit_dir = Path::new(UNIT)
             .parent()
@@ -2608,6 +2691,8 @@ pub(crate) mod tests {
             approvers: Vec::new(),
             non_interactive: true,
             allow_test_build: false,
+            boxes: false,
+            vmm_dir: None,
         }
     }
 
@@ -4064,6 +4149,8 @@ pub(crate) mod macos_tests {
             approvers: Vec::new(),
             non_interactive: true,
             allow_test_build: false,
+            boxes: false,
+            vmm_dir: None,
         }
     }
 
