@@ -38,11 +38,18 @@ pub fn incoming_in(boxes_root: &Path) -> PathBuf {
     boxes_root.join(saiife_boxes::place::INCOMING)
 }
 
+/// Box `id`'s record dir, `<records_root>/<id>` (the box store's,
+/// daemon-only, R37): its base manifest, its terminal recording
+/// (`paths::TERM_CAST`, R15) and, until create, its repo disk.
+pub fn record_dir(records_root: &Path, id: &BoxId) -> PathBuf {
+    records_root.join(id.as_str())
+}
+
 /// Where spawn places a box's repo disk and base manifest (plan 37): its
-/// record dir `<records_root>/<id>` (R37, R40). `ChVmm::create` hands the
-/// disk on to the runtime dir by fd; the manifest never leaves the record.
+/// [`record_dir`] (R37, R40). `ChVmm::create` hands the disk on to the
+/// runtime dir by fd; the manifest never leaves the record.
 pub fn record_disk_place(records_root: &Path, id: &BoxId) -> saiife_boxes::manager::DiskPlace {
-    let dir = records_root.join(id.as_str());
+    let dir = record_dir(records_root, id);
     saiife_boxes::manager::DiskPlace {
         repo_image: dir.join(REPO_DISK),
         base_manifest: dir.join(BASE_MANIFEST),

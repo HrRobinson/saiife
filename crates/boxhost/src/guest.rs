@@ -467,7 +467,8 @@ impl VsockGuest {
     /// The recording goes to `term.cast` in each box's runtime dir (tests;
     /// the daemon uses [`VsockGuest::with_cast_path`]).
     pub fn new(setups: Arc<dyn SetupSource>, group_rw: bool, vmm_uid: u32) -> Arc<VsockGuest> {
-        let cast_path: CastPath = Arc::new(|_id: &BoxId, p: &BoxPaths| p.dir.join("term.cast"));
+        let cast_path: CastPath =
+            Arc::new(|_id: &BoxId, p: &BoxPaths| p.dir.join(crate::paths::TERM_CAST));
         Self::with_cast_path(setups, group_rw, vmm_uid, cast_path)
     }
 

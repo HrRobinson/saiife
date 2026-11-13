@@ -159,10 +159,13 @@ pub fn build_setup(
 }
 
 /// Where box `id`'s terminal recording goes (R15, R37): `term.cast` in its
-/// record dir in the daemon's own state ([`Store::box_dir`]), never in the
+/// record dir in the daemon's own state (`layout::record_dir` of the
+/// store's root, where spawn also places the base manifest), never in the
 /// VMM-writable runtime dir the guest channel is handed.
 pub fn cast_path(store: Store) -> CastPath {
-    Arc::new(move |id: &BoxId, _runtime: &BoxPaths| store.box_dir(id).join("term.cast"))
+    Arc::new(move |id: &BoxId, _runtime: &BoxPaths| {
+        saiife_boxhost::layout::record_dir(store.root(), id).join(saiife_boxhost::paths::TERM_CAST)
+    })
 }
 
 /// A hook filled after the VMM exists: the gateway needs the daemon
@@ -338,6 +341,14 @@ mod tests {
         assert_eq!(p, want);
         assert_eq!(p, records.join("b1").join("term.cast"));
         assert!(!p.starts_with(&runtime));
+        // the same record dir the spawn placer uses (R40)
+        let place = saiife_boxhost::layout::record_disk_place(&records, &b1());
+        assert_eq!(p.parent(), place.base_manifest.parent());
+        assert_eq!(
+            p,
+            saiife_boxhost::layout::record_dir(&records, &b1())
+                .join(saiife_boxhost::paths::TERM_CAST)
+        );
     }
 
     #[derive(Default)]
