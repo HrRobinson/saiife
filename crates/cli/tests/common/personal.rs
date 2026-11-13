@@ -130,6 +130,9 @@ impl TestBroker {
             )
             .env("SAIIFE_DATA_DIR", self.path().join("hookdata"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("hookaudit"))
+            // M-2 (debug-only seam): a `boxes` build's personal preflight
+            // probes this path, never the host's /dev/kvm
+            .env("SAIIFE_TEST_KVM", self.path().join("kvm"))
             .env_remove("NOTIFY_SOCKET")
             .env_remove("SAIIFE_TEST_CA_OWNER")
             .env_remove("STATE_DIRECTORY")

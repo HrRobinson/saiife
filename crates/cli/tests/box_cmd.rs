@@ -281,19 +281,11 @@ fn reorder_queue() {
 
 #[test]
 fn unavailable_without_fake_env_is_exit_5() {
-    // M1: a `boxes` build's preflight reads the test's own locked root,
-    // never the host's install (debug-only seam).
-    let base = std::env::var_os("SAIIFE_TEST_TMP")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let root = tempfile::tempdir_in(base).unwrap();
-    let d = TestDaemon::start(Opts {
-        env: vec![(
-            "SAIIFE_TEST_BOX_ROOT".into(),
-            root.path().display().to_string(),
-        )],
-        ..Opts::default()
-    });
+    // M1 / I-C: every TestDaemon re-roots the locked box layout under its
+    // own dir (`<daemon>/box-root`, debug-only seam), so a `boxes` build's
+    // preflight never reads the host's install.
+    let d = TestDaemon::start(Opts::default());
+    let root = d.path().join("box-root");
     fs::create_dir_all(d.path().join("project")).unwrap();
     let o = bx(&d, &["ls"]);
     assert_eq!(code(&o), 5, "{}", err(&o));
@@ -303,7 +295,7 @@ fn unavailable_without_fake_env_is_exit_5() {
     if cfg!(feature = "boxes") {
         assert!(err(&o).contains("install --boxes"), "{}", err(&o));
         assert!(
-            err(&o).contains(&root.path().display().to_string()),
+            err(&o).contains(&root.display().to_string()),
             "the test root: {}",
             err(&o)
         );

@@ -936,6 +936,8 @@ fn personal_env(tmp: &Path, fake: bool) -> impl Fn(&str) -> Option<OsString> {
             "XDG_DATA_HOME" => Some(tmp.join("data").into_os_string()),
             "XDG_CONFIG_HOME" => Some(tmp.join("config").into_os_string()),
             "HOME" => Some(tmp.join("home").into_os_string()),
+            // M-2: the personal preflight never probes the host's /dev/kvm
+            "SAIIFE_TEST_KVM" => Some(tmp.join("kvm").into_os_string()),
             _ => None,
         }
     }
@@ -1121,4 +1123,45 @@ fn locked_test_layout_never_reaches_the_bus() {
         .err()
         .expect("refused");
     assert!(e.contains("system bus"), "{e}");
+}
+
+/// M-4: a test box root that resolves to `/`, or into the real locked
+/// roots, or is not absolute, is an error (never the real layout, never
+/// the system bus); unset is the real layout.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn test_box_root_refuses_the_real_root() {
+    use saiife_daemon::box_vmm::layout_for;
+    for bad in [
+        "/",
+        "/.",
+        "//",
+        "/tmp/..",
+        "/var/lib/saiife-box",
+        "/var/lib/saiife-box/boxes",
+        "/opt/saiife",
+        "relative/root",
+        "",
+    ] {
+        let seam = |k: &str| (k == "SAIIFE_TEST_BOX_ROOT").then(|| OsString::from(bad));
+        let e = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &seam).expect_err(bad);
+        assert!(e.contains("SAIIFE_TEST_BOX_ROOT"), "{bad}: {e}");
+    }
+    let none = |_: &str| -> Option<OsString> { None };
+    let l = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &none).unwrap();
+    assert_eq!(l, saiife_boxhost::layout::Layout::locked());
+}
+
+/// M-2: the device the personal preflight probes: `/dev/kvm`, or the
+/// debug-only `SAIIFE_TEST_KVM` file (absolute only).
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn kvm_seam_replaces_the_device_in_tests() {
+    use saiife_daemon::box_vmm::kvm_path;
+    let none = |_: &str| -> Option<OsString> { None };
+    assert_eq!(kvm_path(&none), Path::new("/dev/kvm"));
+    let seam = |k: &str| (k == "SAIIFE_TEST_KVM").then(|| OsString::from("/s/kvm"));
+    assert_eq!(kvm_path(&seam), Path::new("/s/kvm"));
+    let rel = |k: &str| (k == "SAIIFE_TEST_KVM").then(|| OsString::from("kvm"));
+    assert_eq!(kvm_path(&rel), Path::new("/dev/kvm"));
 }

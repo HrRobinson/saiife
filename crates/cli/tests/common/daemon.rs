@@ -233,6 +233,12 @@ impl TestDaemon {
             // Many test daemons run at once: each binds its co-signer on
             // a free port, not the fixed 127.0.0.1:7433.
             .env("SAIIFE_TEST_COSIGN_ADDR", "127.0.0.1:0")
+            // I-C / M-2 (debug-only seams): a `boxes` build's locked box
+            // layout is re-rooted here and the KVM device is a path here,
+            // so no test daemon reads the host's install or `/dev/kvm`, nor
+            // reaches the system bus.
+            .env("SAIIFE_TEST_BOX_ROOT", self.path().join("box-root"))
+            .env("SAIIFE_TEST_KVM", self.path().join("kvm"))
             .env_remove("NOTIFY_SOCKET")
             .env_remove("STATE_DIRECTORY")
             .env_remove("CREDENTIALS_DIRECTORY")

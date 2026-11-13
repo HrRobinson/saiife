@@ -269,7 +269,7 @@ fn build_real(
     let checks = preflight::checks(
         &layout,
         &tools,
-        Path::new(crate::box_vmm::KVM),
+        &crate::box_vmm::kvm_path(env),
         saiife_system::sandbox::landlock_abi(),
     );
     if let Err(why) = preflight::ready(&checks) {
@@ -399,6 +399,12 @@ fn build_fake(
 /// once it exists. Never takes the box manager's lock and never asks the
 /// manager anything (it runs inside the manager's VMM calls): the record is
 /// made from the box id alone and written by a runtime task.
+///
+/// Before [`AuditLink::attach`] there is no context: a `restore_refused`
+/// during `Manager::open`'s recovery (which runs inside [`build`], before
+/// the daemon context exists) is only a stderr line, never an audit record
+/// (M-3). `Manager::open` boots nothing, so a refusal at a restoring boot
+/// comes after the attach and is recorded.
 #[derive(Default)]
 pub struct AuditLink {
     ctx: Mutex<std::sync::Weak<Ctx>>,
@@ -1224,6 +1230,7 @@ mod tests {
             match k {
                 "XDG_DATA_HOME" => Some(data.clone().into_os_string()),
                 "HOME" => Some(tmp.path().join("home").into_os_string()),
+                "SAIIFE_TEST_KVM" => Some(tmp.path().join("kvm").into_os_string()),
                 _ => None,
             }
         };

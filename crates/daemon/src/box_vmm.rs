@@ -33,6 +33,68 @@ pub const BOX_USER: &str = "saiife-box";
 pub const TEST_BOX_ROOT_ENV: &str = "SAIIFE_TEST_BOX_ROOT";
 /// The device a personal VMM opens.
 pub const KVM: &str = "/dev/kvm";
+/// Debug builds only (the V9 rule, as [`TEST_BOX_ROOT_ENV`]): an absolute
+/// file the personal preflight probes instead of [`KVM`], so tests never
+/// touch the host's `/dev/kvm` (M-2). Release builds ignore it.
+pub const TEST_KVM_ENV: &str = "SAIIFE_TEST_KVM";
+
+/// The device the personal preflight probes: [`KVM`], or in a debug build
+/// the absolute path in [`TEST_KVM_ENV`].
+pub fn kvm_path(env: &dyn Fn(&str) -> Option<OsString>) -> std::path::PathBuf {
+    env(TEST_KVM_ENV)
+        .map(std::path::PathBuf::from)
+        .filter(|p| cfg!(debug_assertions) && p.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(KVM))
+}
+
+/// The debug-only test root for the locked layout (M1): `None` when unset
+/// (or in a release build). Set, it must be absolute and must not resolve
+/// to `/` or into the real locked roots: such a value is an error, never
+/// the real layout, so a test never reaches the host's install or the
+/// system bus (M-4).
+fn test_box_root(
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use std::path::{Component, PathBuf};
+    if !cfg!(debug_assertions) {
+        return Ok(None);
+    }
+    let Some(raw) = env(TEST_BOX_ROOT_ENV) else {
+        return Ok(None);
+    };
+    let raw = PathBuf::from(raw);
+    let bad = || {
+        Err(format!(
+            "{TEST_BOX_ROOT_ENV}={} is not a test root (absolute, not / or the real box dirs)",
+            raw.display()
+        ))
+    };
+    if !raw.is_absolute() {
+        return bad();
+    }
+    // `..` and `.` resolved by hand (the dir may not exist yet); an existing
+    // one through its links too
+    let mut lexical = PathBuf::from("/");
+    for c in raw.components() {
+        match c {
+            Component::Normal(n) => lexical.push(n),
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    let resolved = std::fs::canonicalize(&lexical).unwrap_or(lexical);
+    let real = Layout::locked();
+    let real_roots = [Path::new("/var/lib/saiife-box"), Path::new("/opt/saiife")];
+    if resolved == Path::new("/")
+        || real_roots.iter().any(|r| resolved.starts_with(r))
+        || Layout::locked_under(&resolved) == real
+    {
+        return bad();
+    }
+    Ok(Some(resolved))
+}
 
 /// The box layout of this daemon: [`Layout::locked`], or the personal one
 /// under `state_dir` and the XDG data home (as `saiife box vmm fetch` and
@@ -44,15 +106,10 @@ pub fn layout_for(
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Layout, String> {
     match mode {
-        Mode::Locked => Ok(
-            match env(TEST_BOX_ROOT_ENV)
-                .map(std::path::PathBuf::from)
-                .filter(|p| cfg!(debug_assertions) && p.is_absolute())
-            {
-                Some(root) => Layout::locked_under(&root),
-                None => Layout::locked(),
-            },
-        ),
+        Mode::Locked => Ok(match test_box_root(env)? {
+            Some(root) => Layout::locked_under(&root),
+            None => Layout::locked(),
+        }),
         Mode::Personal => {
             let abs = |k: &str| {
                 env(k)
