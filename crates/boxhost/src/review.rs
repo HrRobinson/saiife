@@ -51,7 +51,8 @@ use std::time::{Duration, Instant};
 
 use saiife_boxes::guest::GuestError;
 use saiife_boxproto::delta::{
-    apply_manifest, normalize_component, BlobSink, DeltaError, EntryHead, Limits, Op, Reader, Valid,
+    apply_manifest, fold_path, normalize_component, BlobSink, DeltaError, EntryHead, Limits, Op,
+    Reader, Valid,
 };
 use saiife_boxproto::frame::{write_frame, Frame, MAX_FRAME};
 use saiife_boxproto::manifest::{BaseManifest, EntryKind};
@@ -83,7 +84,7 @@ const OLD_PART: &str = ".old";
 
 /// One flagged path (L6). `why` is one of "protected path",
 /// "rule <pack>: <reason>", "becomes executable", "new symlink", "binary",
-/// "differs only in case from <other>".
+/// "differs only in case or accents from <other>".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flag {
     pub path: String,
@@ -749,12 +750,10 @@ pub fn protected(path: &str) -> bool {
         .any(|(i, c)| c.starts_with(".git") && !(i == last && c == ".gitignore"))
 }
 
-/// A path in the spelling case collisions are compared in.
+/// A path in the spelling case collisions and symlink prefixes are
+/// compared in (R-T3i).
 fn fold(p: &str) -> String {
-    p.split('/')
-        .map(normalize_component)
-        .collect::<Vec<_>>()
-        .join("/")
+    fold_path(p)
 }
 
 fn flags(
@@ -802,7 +801,10 @@ fn flags(
         }
         let same = folded.get(&fold(p));
         if let Some(other) = same.and_then(|s| s.iter().find(|o| **o != p)) {
-            flag(p, format!("differs only in case from {}", escape(other)));
+            flag(
+                p,
+                format!("differs only in case or accents from {}", escape(other)),
+            );
         }
     }
     let paths: Vec<&str> = selected(v, only).map(|h| h.path.as_str()).collect();
@@ -885,7 +887,7 @@ pub fn check_subset(
         .entries
         .iter()
         .filter(|(_, e)| e.kind == EntryKind::Symlink)
-        .map(|(k, _)| k.to_ascii_lowercase())
+        .map(|(k, _)| fold(k))
         .collect();
     // The path of the pair whose change was left out.
     let missing = |a: &str, b: &str| -> String {
@@ -906,7 +908,7 @@ pub fn check_subset(
             if result.entries.contains_key(a) {
                 return conflict(p, a, "would be a file and a directory");
             }
-            if links.contains(&a.to_ascii_lowercase()) {
+            if links.contains(&fold(a)) {
                 return conflict(p, a, "would put a path through a symlink");
             }
         }

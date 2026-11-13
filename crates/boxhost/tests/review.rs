@@ -771,7 +771,7 @@ fn case_collision_is_flagged() {
         r.flags,
         vec![Flag {
             path: "readme.md".into(),
-            why: "differs only in case from README.md".into()
+            why: "differs only in case or accents from README.md".into()
         }]
     );
 }
@@ -1141,6 +1141,21 @@ fn land_files_reread_with_paths_only() {
         rd.push(f).unwrap();
     }
     assert_eq!(rd.finish().unwrap().entries.len(), 1);
+}
+
+#[test]
+fn subset_through_folded_symlink_is_refused() {
+    // check_subset folds like the validator (R-T3i): a hand-made delta
+    // writing under a Unicode spelling of the base symlink `links`.
+    let t0 = with(&base_tree(), &[("links", Some(C::l("src")))]);
+    let b0 = manifest(&t0);
+    let p = "lin\u{212A}s/x";
+    let v = Valid {
+        n: 1,
+        entries: vec![add_head(p, &C::f(b"x\n"))],
+    };
+    let e = check_subset(&b0, &v, Some(&set(&[p]))).unwrap_err();
+    assert!(e.contains("through a symlink"), "{e}");
 }
 
 #[test]

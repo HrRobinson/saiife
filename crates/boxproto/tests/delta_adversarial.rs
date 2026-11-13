@@ -980,6 +980,54 @@ fn write_through_symlink_case_folded() {
     let e = refused(&[add("L2/x", b"x"), add_link("l2", "docs")]);
     assert_eq!(e.path.as_deref(), Some("L2/x"));
     assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+    // R-T3i: Unicode look-alikes fold too, through a delta symlink.
+    let e = refused(&[add_link("docs2", "docs"), add("doc\u{17F}2/x", b"x")]);
+    assert_eq!(e.path.as_deref(), Some("doc\u{17F}2/x"));
+    assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+    let e = refused(&[add("link/x", b"x"), add_link("lin\u{212A}", "docs")]);
+    assert_eq!(e.path.as_deref(), Some("link/x"));
+    assert!(e.reason.contains("symlink in the delta"), "{e:?}");
+}
+
+#[test]
+fn write_through_symlink_unicode_fold_in_base() {
+    // R-T3i: base symlinks `docs2` and `links`; Unicode spellings of them
+    // resolve to the links on a case-insensitive, normalising host.
+    let mut b = base();
+    for name in ["docs2", "links"] {
+        b.entries.insert(
+            name.into(),
+            Entry {
+                kind: EntryKind::Symlink,
+                mode: 0,
+                size: 4,
+                sha256: sha(b"docs"),
+            },
+        );
+    }
+    for p in [
+        "doc\u{17F}2/x",
+        "lin\u{212A}s/x",
+        "LIN\u{212A}\u{17F}/deep/x",
+        "l\u{0301}inks/x",
+        "l\u{0301}n/x",
+    ] {
+        let mut sink = Sink::default();
+        let mut r = Reader::new(&b, Limits::default(), &mut sink);
+        let mut res = Ok(false);
+        for f in frames(&encode(&[add(p, b"x")])) {
+            res = r.push(f);
+            if res.is_err() {
+                break;
+            }
+        }
+        let e = match res {
+            Err(e) => e,
+            Ok(_) => r.finish().expect_err(p),
+        };
+        assert_eq!(e.path.as_deref(), Some(p), "{e:?}");
+        assert!(e.reason.contains("symlink in the base"), "{p}: {e:?}");
+    }
 }
 
 #[test]

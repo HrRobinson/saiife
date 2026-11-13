@@ -32,7 +32,8 @@
 //! them).
 //!
 //! No path may go through a symlink, in the base or in the delta, compared
-//! with ASCII case folded (R-T1e). So a directory and a symlink never swap
+//! in their [`fold_path`] spelling (R-T1e, R-T3i: case, trailing dots and
+//! spaces, combining marks and look-alike letters folded). So a directory and a symlink never swap
 //! in one delta, either way: deleting the symlink `ln` and adding `ln/x` is
 //! refused, and so is adding the symlink `docs` while deleting `docs/a`.
 //!
@@ -329,6 +330,15 @@ pub fn normalize_component(c: &str) -> String {
     let t = out.trim_end_matches(['.', ' ']).len();
     out.truncate(t);
     out
+}
+
+/// R-T3i: a path in the spelling a case-insensitive, normalising host
+/// resolves it to: [`normalize_component`] of each component, rejoined.
+pub fn fold_path(p: &str) -> String {
+    p.split('/')
+        .map(normalize_component)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// R-T1e, R-T3i: a component a Windows or macOS host could resolve to
@@ -815,10 +825,10 @@ impl<'a> Reader<'a> {
             None => base.is_some_and(|b| b.contains_key(k)),
         };
 
-        // No writing through a symlink, in the base or in the delta, with
-        // ASCII case folded (R-T1e: `LN/x` on a case-insensitive host goes
-        // through `ln`).
-        let fold = |p: &str| p.to_ascii_lowercase();
+        // No writing through a symlink, in the base or in the delta, folded
+        // as a case-insensitive, normalising host would (R-T1e, R-T3i:
+        // `LN/x` or `doc\u{17F}/x` goes through `ln` or `docs` there).
+        let fold = fold_path;
         let base_links: BTreeSet<String> = base
             .into_iter()
             .flatten()
