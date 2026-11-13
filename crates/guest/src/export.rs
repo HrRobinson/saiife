@@ -109,12 +109,60 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// A git child killed at its call's deadline by a watchdog thread (I-2): a
-/// git blocked on something in `/work` (a FIFO) cannot wedge the guest.
+/// The most bytes one git call may print on stdout (a listing of every
+/// path of a large tree fits); past it the call is refused.
+const OUT_MAX: usize = 64 << 20;
+/// The stderr kept of one git call (only its first line is shown); the
+/// rest is read and dropped.
+const ERR_KEEP: usize = 64 << 10;
+
+/// Puts every git child in its own process group, so a deadline kill
+/// reaches what it forked too (best effort: a child of the agent's uid can
+/// leave the group; nothing here ever waits on such a one).
+fn own_group(c: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = c;
+}
+
+/// SIGKILL to the process group `pid` leads (our own child's), then to the
+/// child itself; the child must not be reaped yet (its pid, the group id,
+/// cannot be reused while it is a zombie).
+fn kill_tree(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    if let Ok(None) = child.try_wait() {
+        if let Some(p) = rustix::process::Pid::from_raw(child.id() as i32) {
+            let _ = rustix::process::kill_process_group(p, rustix::process::Signal::KILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Reaps a killed child, waiting at most a second (a child stuck in the
+/// kernel is left; nothing blocks on it).
+fn reap(child: &mut Child) {
+    let end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < end {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A long-lived git child (cat-file, fast-import) killed, with its process
+/// group, at its call's deadline by a watchdog thread (I-2): its pipes then
+/// close, so no read or write on them blocks past the deadline.
 struct Timed {
     child: Arc<Mutex<Child>>,
     stop: Option<mpsc::Sender<()>>,
     fired: Arc<AtomicBool>,
+    /// Killed by us (an error mid-way): the wait is bounded too.
+    killed: AtomicBool,
 }
 
 impl Timed {
@@ -129,29 +177,37 @@ impl Timed {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(left) {
                     f.store(true, Ordering::SeqCst);
-                    // Our own child; a reaped one is not signalled again.
-                    let _ = lock(&c).kill();
+                    kill_tree(&mut lock(&c));
                 }
             });
         if let Err(e) = spawned {
             let mut c = lock(&child);
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_tree(&mut c);
+            reap(&mut c);
             return Err(format!("git {name}: {e}"));
         }
         Ok(Timed {
             child,
             stop: Some(stop),
             fired,
+            killed: AtomicBool::new(false),
         })
     }
 
-    /// Waits for the child (killed at the deadline at the latest).
+    /// Waits for the child; past the deadline (the watchdog killed it) at
+    /// most a second more.
     fn wait(&self) -> io::Result<ExitStatus> {
         let mut pause = Duration::from_millis(1);
+        let mut late = None;
         loop {
             if let Some(st) = lock(&self.child).try_wait()? {
                 return Ok(st);
+            }
+            if self.fired() || self.killed.load(Ordering::SeqCst) {
+                let end = *late.get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+                if Instant::now() >= end {
+                    return Err(io::Error::other("killed"));
+                }
             }
             std::thread::sleep(pause);
             pause = (pause * 2).min(Duration::from_millis(20));
@@ -159,7 +215,8 @@ impl Timed {
     }
 
     fn kill(&self) {
-        let _ = lock(&self.child).kill();
+        self.killed.store(true, Ordering::SeqCst);
+        kill_tree(&mut lock(&self.child));
     }
 
     fn fired(&self) -> bool {
@@ -186,20 +243,130 @@ fn broke(name: &str, fired: bool, within: Duration, e: impl std::fmt::Display) -
     }
 }
 
-/// Reads a child's pipe to the end on its own thread.
-fn drain<R: Read + Send + 'static>(
-    r: Option<R>,
-) -> Result<std::thread::JoinHandle<Vec<u8>>, String> {
-    std::thread::Builder::new()
-        .name("guest-git-pipe".into())
-        .spawn(move || {
-            let mut v = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r.read_to_end(&mut v);
+/// Why [`pump`] stopped early.
+enum Pumped {
+    Late,
+    Flood,
+    Io(io::Error),
+}
+
+/// Sets a pipe end nonblocking.
+fn nonblocking(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::io::ioctl_fionbio(fd, true).map_err(io::Error::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        Err(io::Error::other(
+            "the export runs only inside the Linux box VM",
+        ))
+    }
+}
+
+/// Reads what `r` has now into `buf` (at most `cap` bytes kept; past it
+/// `flood` says whether that refuses or drops). `Ok(false)` at end of file.
+fn take_now(
+    r: &mut impl Read,
+    buf: &mut Vec<u8>,
+    cap: usize,
+    flood: bool,
+    moved: &mut bool,
+) -> Result<bool, Pumped> {
+    let mut chunk = [0u8; 64 << 10];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => return Ok(false),
+            Ok(k) => {
+                *moved = true;
+                if buf.len() + k > cap {
+                    if flood {
+                        return Err(Pumped::Flood);
+                    }
+                    let room = cap - buf.len();
+                    buf.extend_from_slice(&chunk[..room]);
+                } else {
+                    buf.extend_from_slice(&chunk[..k]);
+                }
             }
-            v
-        })
-        .map_err(|e| format!("git: {e}"))
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Pumped::Io(e)),
+        }
+    }
+}
+
+/// Feeds `input` and reads stdout and stderr, all nonblocking in this
+/// thread, until the child has exited and both pipes are at end of file,
+/// or until `deadline` (a child that left something holding a pipe ends
+/// there too). Nothing here ever blocks on the child.
+fn pump(
+    child: &mut Child,
+    input: Option<&[u8]>,
+    deadline: Instant,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Pumped> {
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    if let Some(w) = &stdin {
+        nonblocking(w).map_err(Pumped::Io)?;
+    }
+    if let Some(r) = &stdout {
+        nonblocking(r).map_err(Pumped::Io)?;
+    }
+    if let Some(r) = &stderr {
+        nonblocking(r).map_err(Pumped::Io)?;
+    }
+    let input = input.unwrap_or_default();
+    let (mut fed, mut out, mut err, mut status) = (0usize, Vec::new(), Vec::new(), None);
+    let mut pause = Duration::from_millis(1);
+    loop {
+        let mut moved = false;
+        if let Some(w) = stdin.as_mut() {
+            match w.write(&input[fed..]) {
+                Ok(k) => {
+                    fed += k;
+                    moved |= k > 0;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                // A child that stopped reading: its exit says the rest.
+                Err(_) => fed = input.len(),
+            }
+            if fed >= input.len() {
+                stdin = None;
+            }
+        }
+        if let Some(r) = stdout.as_mut() {
+            if !take_now(r, &mut out, OUT_MAX, true, &mut moved)? {
+                stdout = None;
+            }
+        }
+        if let Some(r) = stderr.as_mut() {
+            if !take_now(r, &mut err, ERR_KEEP, false, &mut moved)? {
+                stderr = None;
+            }
+        }
+        if status.is_none() {
+            status = child.try_wait().map_err(Pumped::Io)?;
+        }
+        if let (Some(st), None, None) = (status, &stdout, &stderr) {
+            return Ok((st, out, err));
+        }
+        if Instant::now() >= deadline {
+            return Err(Pumped::Late);
+        }
+        if moved {
+            pause = Duration::from_millis(1);
+        } else {
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(10));
+        }
+    }
 }
 
 /// One git invocation context: the base dir, `/work`, this call's index,
@@ -252,6 +419,7 @@ impl<'a> Git<'a> {
             .env("GIT_COMMITTER_NAME", "saiife")
             .env("GIT_COMMITTER_EMAIL", "saiife@box.invalid")
             .current_dir(&self.work);
+        own_group(&mut c);
         if args.first().is_some_and(|a| a.as_ref() == "init") {
             // `init` makes the repository: no work tree, no index yet.
             c.env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE");
@@ -273,7 +441,9 @@ impl<'a> Git<'a> {
     }
 
     /// Runs `c` to completion within the call's deadline, feeding `input`
-    /// on stdin; returns stdout.
+    /// on stdin; returns stdout (at most [`OUT_MAX`] bytes). Past the
+    /// deadline the child's process group is killed and the call fails at
+    /// once: nothing waits on a pipe something else may still hold.
     fn run_cmd(&self, name: &str, mut c: Command, input: Option<&[u8]>) -> Result<Vec<u8>, String> {
         let mut child = c
             .stdin(if input.is_some() {
@@ -285,45 +455,21 @@ impl<'a> Git<'a> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("git {name}: {e}"))?;
-        let (stdin, stdout, stderr) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        let child = self.timed(child, name)?;
-        let feeder = match (input, stdin) {
-            (Some(b), Some(mut w)) => {
-                let b = b.to_vec();
-                match std::thread::Builder::new()
-                    .name("guest-git-stdin".into())
-                    .spawn(move || w.write_all(&b))
-                {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        child.kill();
-                        let _ = child.wait();
-                        return Err(format!("git {name}: {e}"));
-                    }
-                }
-            }
-            _ => None,
-        };
-        let pipes = drain(stdout).and_then(|o| drain(stderr).map(|e| (o, e)));
-        let (out, err) = match pipes {
-            Ok(p) => p,
-            Err(e) => {
-                child.kill();
-                let _ = child.wait();
-                return Err(e);
+        let (status, out, err) = match pump(&mut child, input, self.deadline) {
+            Ok(done) => done,
+            Err(why) => {
+                // The parent's pipe ends are closed already (dropped).
+                kill_tree(&mut child);
+                reap(&mut child);
+                return Err(match why {
+                    Pumped::Late => broke(name, true, self.within, ""),
+                    Pumped::Flood => format!(
+                        "git {name} printed more than {OUT_MAX} bytes and was stopped; nothing was exported"
+                    ),
+                    Pumped::Io(e) => format!("git {name}: {e}"),
+                });
             }
         };
-        let status = child.wait();
-        let out = out.join().unwrap_or_default();
-        let err = err.join().unwrap_or_default();
-        if let Some(f) = feeder {
-            let _ = f.join();
-        }
-        if child.fired() {
-            return Err(broke(name, true, self.within, ""));
-        }
-        let status = status.map_err(|e| format!("git {name}: {e}"))?;
         if !status.success() {
             let err = String::from_utf8_lossy(&err);
             return Err(format!(

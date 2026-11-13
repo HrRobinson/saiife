@@ -854,3 +854,63 @@ fn untracked_listing_runs_as_the_agent() {
         ".git\n"
     );
 }
+
+impl World {
+    /// Points the guest at a git that runs `listing` (shell) when called
+    /// for the untracked listing, then the real git.
+    fn fake_git(&mut self, listing: &str) {
+        let real = real_git();
+        let p = self._dir.path().join("fake-git");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --exclude-standard ]; then\n    {listing}\n    break\n  fi\ndone\nexec {} \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.env.tools.git = p;
+    }
+}
+
+/// Addendum 1: a git of the agent's uid that leaves a grandchild (in its
+/// own session, out of reach of the group kill) holding stdout open does
+/// not hold the export past its deadline, and the next call is served.
+#[test]
+fn grandchild_holding_stdout_does_not_wedge_export() {
+    let mut w = World::new();
+    w.env.timing.export_deadline = std::time::Duration::from_secs(2);
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    w.put("new.txt", b"n\n");
+    w.fake_git("setsid sleep 6 &");
+    let t = std::time::Instant::now();
+    let mut buf = Vec::new();
+    let e = export(&w.env, 1, &mut buf).unwrap_err();
+    let took = t.elapsed();
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+    assert!(e.contains("git ls-files took longer than 2 s"), "{e}");
+    assert!(buf.is_empty());
+    // The next request is served at once.
+    w.env.tools.git = real_git();
+    let (v, _) = w.export(2);
+    assert_eq!(paths(&v), [("new.txt", Op::Add)]);
+}
+
+/// Addendum 1: a git flooding its stdout is stopped at the cap and the
+/// export refused, well before the deadline.
+#[test]
+fn flooding_git_output_is_capped_and_refused() {
+    let mut w = World::new();
+    w.put("keep", b"k\n");
+    init_base(&w.env).unwrap();
+    w.fake_git("exec cat /dev/zero");
+    let mut buf = Vec::new();
+    let e = export(&w.env, 1, &mut buf).unwrap_err();
+    assert!(
+        e.contains("git ls-files printed more than 67108864 bytes"),
+        "{e}"
+    );
+    assert!(buf.is_empty());
+}
