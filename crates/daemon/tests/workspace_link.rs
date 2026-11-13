@@ -1616,13 +1616,28 @@ async fn begin_for_approval_binds_the_stored_request() {
     );
     assert_eq!(tr.challenge, saiife_touch::challenge(&rec));
     assert_eq!(tr.summary, rec.summary);
-    // A request with no touch class, an unknown one and extra args.
+    // Each refusal has its own rule.
     let plain = make_request(&w, None);
-    for args in [
-        json!({"id": plain.id}),
-        json!({"id": 999}),
-        json!({"id": r.id, "class": "land"}),
-        json!({"id": "1"}),
+    let decided = make_request(&w, Some("deploy"));
+    w.ctx
+        .approvals
+        .as_ref()
+        .unwrap()
+        .transition(
+            decided.id,
+            &[saiife_daemon::approvals::State::Pending],
+            saiife_daemon::approvals::State::Rejected,
+            Some(me()),
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    for (args, rule) in [
+        (json!({"id": plain.id}), "invalid"),
+        (json!({"id": decided.id}), "invalid"),
+        (json!({"id": 999}), "not_found"),
+        (json!({"id": r.id, "class": "land"}), "invalid"),
+        (json!({"id": r.id.to_string()}), "invalid"),
     ] {
         let a = send(
             &w,
@@ -1633,20 +1648,48 @@ async fn begin_for_approval_binds_the_stored_request() {
         )
         .await;
         assert_eq!(a["ok"], false, "{args}: {a}");
-        assert!(
-            a["rule"] == "invalid" || a["rule"] == "not_found",
-            "{args}: {a}"
-        );
+        assert_eq!(a["rule"], rule, "{args}: {a}");
     }
+    // The not-pending one says so.
     let a = send(
         &w,
         &mut link,
         &d,
         "workspace.touch.begin",
-        begin_args("approval.approve", json!({"id": plain.id})),
+        begin_args("approval.approve", json!({"id": decided.id})),
     )
     .await;
-    assert_eq!(a["rule"], "invalid", "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("not pending"),
+        "{a}"
+    );
+}
+
+/// The daemon's own uid is not the device owner's: the owner is a requester
+/// but no approver, so a begin for their own pending request is refused.
+#[tokio::test]
+async fn begin_for_approval_needs_an_approver() {
+    // Paired (with a passkey) in a personal broker, then the same state
+    // dir served by a locked daemon of another uid with no approvers.
+    let (w0, link0, d, _) = paired_with_passkey().await;
+    drop(link0);
+    let state = w0.state.clone();
+    let (ws, warning) = Workspace::open(dir_in(&state));
+    assert!(warning.is_none(), "{warning:?}");
+    let w = build_as(scratch(), state, ws, DaemonMode::Locked, me() + 1).await;
+    let mut link = Link::open(&w).await;
+    let r = make_request(&w, Some("deploy"));
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": r.id})),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "not_approver", "{a}");
+    assert_eq!(w.ctx.touch.credentials_of(me()).len(), 1);
 }
 
 #[tokio::test]
@@ -1752,4 +1795,8 @@ async fn begin_is_recorded() {
     assert_eq!(last["decision"], "allow", "{last}");
     assert_eq!(field(last, "touch_begin")["request_id"], "1", "{last}");
     assert_eq!(field(last, "touch_begin")["class"], "steer", "{last}");
+    assert_eq!(field(last, "touch_begin")["action"], "box.resume", "{last}");
+    assert_eq!(field(last, "touch_begin")["box"], "b-run", "{last}");
+    // The audit detail is not part of the answer.
+    assert!(a["result"].get("touch_begin").is_none(), "{a}");
 }

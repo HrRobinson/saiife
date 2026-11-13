@@ -626,3 +626,29 @@ async fn the_shared_gate_holds_all_six_power_actions() {
         assert!(box_ops::power_refusal(&w.ctx, a).is_none(), "{a}");
     }
 }
+
+/// A begin for another user's box (plan 31 R-T1a): the owner scope answers
+/// as for the action itself.
+#[tokio::test]
+async fn begin_for_another_users_box_is_scoped_like_the_action() {
+    for (admin, error, rule) in [
+        (false, "bad_request", "not_found"),
+        (true, "forbidden", "not_owner"),
+    ] {
+        let (w, mut link, d) = paired_as(3, admin).await;
+        let theirs = others_box(&w);
+        for action in ["box.steer", "box.revise", "box.resume"] {
+            let a = send(
+                &w,
+                &mut link,
+                &d,
+                "workspace.touch.begin",
+                json!({"action": action, "args": {"id": theirs}}),
+            )
+            .await;
+            assert_eq!(a["ok"], false, "admin {admin} {action}: {a}");
+            assert_eq!(a["error"], error, "admin {admin} {action}: {a}");
+            assert_eq!(a["rule"], rule, "admin {admin} {action}: {a}");
+        }
+    }
+}

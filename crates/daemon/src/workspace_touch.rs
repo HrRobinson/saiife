@@ -278,7 +278,7 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
     };
     // The box source scoped to the device owner, as the action itself would
     // use it (a bound box must be one the owner may touch).
-    let src = crate::workspace_link::source_for(ctx, v, &action)
+    let src = crate::workspace_link::source_for(ctx, v, &action, &inner)
         .await
         .map_err(refused)?;
     let (class, summary, fields) = bind(ctx, owner_uid, &src, &action, &inner).await?;
@@ -288,7 +288,7 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
     let creds: Vec<Credential> =
         tokio::task::spawn_blocking(move || c.touch.credentials_of(owner_uid))
             .await
-            .unwrap_or_default()
+            .map_err(|e| Refused::new(ErrorCode::Internal, "internal", e.to_string()))?
             .into_iter()
             .filter(|c| c.kind == "webauthn" && held.contains(&saiife_wire::b64::enc(&c.id)))
             .collect();
@@ -338,7 +338,7 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
         })
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()));
+    .map_err(|e| Refused::new(ErrorCode::Internal, "internal", e.to_string()))?;
     let rec = issued.map_err(|e| Refused::new(ErrorCode::Busy, "busy", e))?;
     let ch = challenge(&rec);
     let tr = TouchRequest {
@@ -362,6 +362,17 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
     m.insert("request_id".into(), request_id.to_string().into());
     m.insert("expires_at".into(), rec.expires_at.into());
     m.insert("class".into(), class.name().into());
+    // What the audit record of this begin carries: the inner action and box
+    // as the daemon bound them.
+    let mut tb = json!({
+        "request_id": request_id.to_string(),
+        "class": class.name(),
+        "action": action,
+    });
+    if let Some(b) = rec.fields.get("box") {
+        tb["box"] = json!(b);
+    }
+    m.insert("touch_begin".into(), tb);
     Ok(json!(m))
 }
 

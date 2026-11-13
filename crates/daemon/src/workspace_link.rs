@@ -503,7 +503,12 @@ async fn run(
 ) -> Result<Value, Refused> {
     let action = v.frame.action.as_str();
     let mut level = v.level;
-    let out = act(ctx, v, &mut level).await;
+    let mut out = act(ctx, v, &mut level).await;
+    // The begin's audit detail is not part of its answer.
+    let begun = match (&mut out, action) {
+        (Ok(Value::Object(m)), a::WORKSPACE_TOUCH_BEGIN) => m.remove("touch_begin"),
+        _ => None,
+    };
     let changing = CHANGES.contains(&action);
     let (record, refused) = match &out {
         Ok(_) => (changing, None),
@@ -517,11 +522,8 @@ async fn run(
                 rec.extra.insert("box".into(), b.into());
             }
         }
-        if let (Ok(res), a::WORKSPACE_TOUCH_BEGIN) = (&out, action) {
-            rec.extra.insert(
-                "touch_begin".into(),
-                json!({ "request_id": res["request_id"], "class": res["class"] }),
-            );
+        if let Some(tb) = begun {
+            rec.extra.insert("touch_begin".into(), tb);
         }
         if let Some(r) = refused {
             deny(&mut rec, r);
@@ -617,11 +619,14 @@ pub(crate) async fn blocking<T: Send + 'static>(
 /// owner (never the shared `ctx.boxes`, when there is a manager): the owner
 /// sees and changes their own boxes, another user's box is `not_found`. An
 /// admin or root owner also SEES every box (reads only); changing another
-/// user's box is `forbidden` (plan 34 R18). Audited by `run` like any refusal.
+/// user's box is `forbidden` (plan 34 R18). `args` are the action's own
+/// args (the frame's, or a begin frame's inner ones): the boxes they name
+/// are checked. Audited by `run` like any refusal.
 pub(crate) async fn source_for(
     ctx: &Arc<Ctx>,
     v: &Verified,
     action: &str,
+    args: &Map<String, Value>,
 ) -> Result<Arc<dyn BoxSource>, Fail> {
     let Some(m) = ctx.box_manager.clone().filter(|_| !ctx.workspace_demo) else {
         return Ok(Arc::clone(&ctx.boxes));
@@ -648,15 +653,11 @@ pub(crate) async fn source_for(
     if admin && !reads.contains(&action) {
         // An admin changes only their own boxes: every box the frame names
         // (`id`, or reorder's `ids`).
-        let named = v
-            .frame
-            .args
+        let named = args
             .get("id")
             .into_iter()
             .chain(
-                v.frame
-                    .args
-                    .get("ids")
+                args.get("ids")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten(),
@@ -709,7 +710,7 @@ async fn act(ctx: &Arc<Ctx>, v: &Verified, level: &mut Level) -> Result<Value, F
             format!("{action} is not available in this version"),
         )));
     }
-    let src = source_for(ctx, v, action).await?;
+    let src = source_for(ctx, v, action, args).await?;
     match action {
         a::WORKSPACE_WHOAMI => {
             only(args, &[])?;
