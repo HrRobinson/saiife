@@ -201,6 +201,8 @@ async fn world(o: Opts) -> W {
         templates: vec![t],
         host: Arc::new(move || host),
         clock: Arc::new(|| T0),
+        // No repo disks here: the gateway tests spawn without one.
+        disk_place: None,
     })
     .unwrap()
     .manager;

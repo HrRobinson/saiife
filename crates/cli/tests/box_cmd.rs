@@ -15,7 +15,13 @@ use std::fs;
 use std::process::{Command, Output, Stdio};
 
 fn daemon_with(slots: Option<u32>) -> TestDaemon {
+    daemon_with_env(slots, Vec::new())
+}
+
+/// [`daemon_with`] plus `extra` daemon environment.
+fn daemon_with_env(slots: Option<u32>, extra: Vec<(String, String)>) -> TestDaemon {
     let mut env = vec![("SAIIFE_BOX_FAKE_VMM".to_string(), "1".to_string())];
+    env.extend(extra);
     if let Some(n) = slots {
         env.push(("SAIIFE_BOX_FAKE_SLOTS".to_string(), n.to_string()));
     }
@@ -439,17 +445,12 @@ fn attach_without_tty_prints_once() {
     assert_eq!(code(&bx(&d, &["attach", "b9"])), 2);
 }
 
+/// One slot, the git project world, and `term` as box `b1`'s fake terminal.
 fn daemon_with_term(term: &str) -> TestDaemon {
-    let d = TestDaemon::start(Opts {
-        env: vec![
-            ("SAIIFE_BOX_FAKE_VMM".to_string(), "1".to_string()),
-            ("SAIIFE_BOX_FAKE_SLOTS".to_string(), "1".to_string()),
-            ("SAIIFE_BOX_FAKE_TERMINAL".to_string(), term.to_string()),
-        ],
-        ..Opts::default()
-    });
-    fs::create_dir_all(d.path().join("project")).unwrap();
-    d
+    daemon_with_env(
+        Some(1),
+        vec![("SAIIFE_BOX_FAKE_TERMINAL".to_string(), term.to_string())],
+    )
 }
 
 /// What is left under the CLI's staging root.
