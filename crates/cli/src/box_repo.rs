@@ -836,36 +836,27 @@ fn describe(e: &ToolError) -> String {
     }
 }
 
-/// Ruling R20: the inodes the repo disk is made with, one per file,
-/// symlink and directory below the staging root, plus 4096 spare (the
-/// root, lost+found and ext4's reserved inodes among them). D4's size alone,
-/// with mke2fs's default bytes-per-inode, cannot hold a repo of many tiny
-/// files.
-pub fn repo_image_inodes(m: &BaseManifest, dirs: u64) -> u64 {
-    (m.entries.len() as u64)
-        .saturating_add(dirs)
-        .saturating_add(4096)
-}
-
-/// Build `<staging>/../repo.img` with `mke2fs -q -t ext4 -L repo -N
-/// <inodes> -d <staging> <img> <mib>M` (D4). `-N` ([`repo_image_inodes`])
-/// is ruling R20, a deviation from the plan's fixed argv (owner checked):
-/// without it a repo of many small files runs out of inodes. On failure
-/// the whole staging dir is removed.
+/// Build `<staging>/../repo.img` with `mke2fs -q -t ext4 -L repo -i 4096
+/// -d <staging> <img> <mib>M` (D4). `-i 4096` (one inode per 4 KiB of
+/// image) is ruling R24, a deviation from the plan's fixed argv (owner
+/// checked), replacing R20's `-N`: D4 counts every entry as at least 4096
+/// bytes and sizes the image at least twice that, so a 4 KiB ratio always
+/// holds the repo with room for at least as many new files, where `-N`
+/// would be a fixed ceiling leaving the agent about 4096 free inodes in
+/// /work. On failure the whole staging dir is removed.
 pub fn make_repo_image(tools: &Tools, s: &Snapshot) -> Result<PathBuf, String> {
     let img = s.dir().join(saiife_boxhost::paths::REPO_DISK);
     let dirs = staging_dirs(&s.manifest);
     let mib = repo_image_mib(&s.manifest, dirs);
     let size = format!("{mib}M");
-    let inodes = repo_image_inodes(&s.manifest, dirs).to_string();
     let args: [&OsStr; 11] = [
         OsStr::new("-q"),
         OsStr::new("-t"),
         OsStr::new("ext4"),
         OsStr::new("-L"),
         OsStr::new("repo"),
-        OsStr::new("-N"),
-        OsStr::new(&inodes),
+        OsStr::new("-i"),
+        OsStr::new("4096"),
         OsStr::new("-d"),
         s.staging.as_os_str(),
         img.as_os_str(),

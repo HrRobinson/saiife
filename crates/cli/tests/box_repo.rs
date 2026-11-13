@@ -418,28 +418,15 @@ fn mke2fs_argv_is_pinned() {
     assert_eq!(img, s.staging.parent().unwrap().join("repo.img"));
     assert_eq!(std::fs::read(&img).unwrap(), b"fake-ext4");
     let argv = std::fs::read_to_string(w.bin.join("argv")).unwrap();
-    // R20: `-N` (files + symlinks + dirs + 4096) before `-d`; one file
-    // and no dir here.
+    // R24: `-i 4096` (one inode per 4 KiB of image) before `-d`.
     let want = format!(
-        "-q\n-t\next4\n-L\nrepo\n-N\n4097\n-d\n{}\n{}\n257M\n",
+        "-q\n-t\next4\n-L\nrepo\n-i\n4096\n-d\n{}\n{}\n257M\n",
         s.staging.display(),
         img.display()
     );
     assert_eq!(argv, want);
     s.remove();
     assert!(w.left().is_empty());
-
-    // Two files, a symlink and two dirs (a/, a/b/): 4096 + 5.
-    let w = world();
-    w.write("a/b/c.txt", b"c\n");
-    w.write("x.txt", b"x\n");
-    symlink("x.txt", w.repo.join("ln")).unwrap();
-    let s = snapshot(&w.tools, &w.repo, &w.cache).unwrap();
-    make_repo_image(&w.tools, &s).unwrap();
-    let argv = std::fs::read_to_string(w.bin.join("argv")).unwrap();
-    let argv: Vec<&str> = argv.lines().collect();
-    assert_eq!(&argv[5..8], &["-N", "4101", "-d"], "{argv:?}");
-    s.remove();
 }
 
 /// R21: a spawn the user interrupted leaves its staging dir; the next
