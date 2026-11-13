@@ -89,8 +89,9 @@ fn uninstall_unix(
         },
         None => return Ok(Vec::new()),
     };
+    let boxes = crate::boxes_install::recorded(&rec);
     if opts.purge {
-        purge_preflight(layout, host)?;
+        purge_preflight(layout, host, boxes)?;
     }
     let mut out = Vec::new();
     let at = |p: &Path| -> Result<PathBuf, InstallError> {
@@ -179,6 +180,12 @@ fn uninstall_unix(
         });
     }
 
+    // 3c. Boxes (plan 35): stop the box units, then the template unit, the
+    // polkit rule and the VMM. The data stays without --purge.
+    if boxes {
+        out.extend(crate::boxes_install::uninstall_boxes(layout, host)?);
+    }
+
     // 4. The unit, daemon-reload, the binary.
     for kind in [FileKind::Unit, FileKind::Polkit, FileKind::Binary] {
         for f in rec.files.iter().rev().filter(|f| f.kind == kind) {
@@ -259,7 +266,7 @@ fn uninstall_unix(
     // systemd made these for the daemon (StateDirectory, LogsDirectory);
     // on macOS install did, with the socket dir.
     // Removed fd-relative from the root (checked again here).
-    for abs in purge_trees(layout) {
+    for abs in purge_trees(layout, boxes) {
         let shown = layout.logical(abs);
         if let Some(t) = purge_target(layout, host, abs)? {
             fsops::remove_tree_at(&t.parent, &t.name, &t.stat)
@@ -343,8 +350,8 @@ fn uninstall_unix(
 /// Before `--purge` deletes the state and audit trees: each is checked as
 /// [`purge_target`] checks it, before anything is removed.
 #[cfg(unix)]
-fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
-    for abs in purge_trees(layout) {
+fn purge_preflight(layout: &Layout, host: &dyn Host, boxes: bool) -> Result<(), InstallError> {
+    for abs in purge_trees(layout, boxes) {
         purge_target(layout, host, abs)?;
     }
     Ok(())
@@ -353,11 +360,16 @@ fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError>
 /// The daemon's trees `--purge` removes: the state and audit dirs, and on
 /// macOS the socket dir install made.
 #[cfg(unix)]
-fn purge_trees(layout: &Layout) -> Vec<&'static str> {
-    match layout.platform() {
+fn purge_trees(layout: &Layout, boxes: bool) -> Vec<&'static str> {
+    let mut trees = match layout.platform() {
         Platform::Linux | Platform::Windows => vec![STATE_DIR, AUDIT_DIR],
         Platform::Macos => vec![STATE_DIR, AUDIT_DIR, RUN_DIR],
+    };
+    // The box images, boxes and vault are the user's data: only --purge.
+    if boxes {
+        trees.extend(crate::boxes_install::PURGE_TREES);
     }
+    trees
 }
 
 /// A tree `--purge` removes: its parent, open, and its `stat`.

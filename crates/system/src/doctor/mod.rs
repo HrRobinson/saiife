@@ -40,6 +40,9 @@ pub struct DoctorOptions {
     /// How this CLI build reaches a FIDO2 key. Read by the `touch-key` and
     /// `touch-helper` checks only.
     pub touch: TouchSupport,
+    /// This CLI build runs real boxes (`cfg!(feature = "boxes")` in the CLI,
+    /// plan 35 R38). Read by the boxes section only.
+    pub boxes_enabled: bool,
 }
 
 /// How a build reaches a FIDO2 key (plan 41 Task 4).
@@ -151,6 +154,8 @@ fn unix_checks(ctx: &Ctx) -> Vec<Check> {
     checks.extend(host::checks(ctx));
     #[cfg(target_os = "linux")]
     checks.extend(touch::checks(ctx));
+    #[cfg(target_os = "linux")]
+    checks.extend(host::boxes(ctx));
     checks
 }
 

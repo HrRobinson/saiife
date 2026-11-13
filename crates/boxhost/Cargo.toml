@@ -17,8 +17,9 @@ saiife-boxes = { path = "../boxes" }
 # BoxId (tokio-free).
 saiife-wire = { path = "../wire" }
 serde = { version = "1", features = ["derive"] }
-# O_NOFOLLOW / O_NONBLOCK constants only; no unsafe.
-rustix = { version = "1", features = ["fs", "process"] }
+# O_NOFOLLOW / O_NONBLOCK constants, *at calls and a non-blocking API
+# socket connect; no unsafe. (`net` is already enabled by saiife-ipc.)
+rustix = { version = "1", features = ["fs", "process", "net"] }
 ring = "=0.17.14"
 serde_json = "1"
 toml = "0.8"

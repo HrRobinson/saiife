@@ -1,5 +1,12 @@
 //! The box store (spec §7.3): one labelled directory per box under the state
 //! root, `box.json` written atomically, ids from a persisted counter.
+//!
+//! These record dirs are the daemon's alone (0700, in its own state dir, in
+//! both modes; plan 35 R37): the VMM's runtime files live elsewhere. Every
+//! record file (`box.json`, the marker, the counter) is read relative to its
+//! directory's fd, without following links, and only when it is a plain file
+//! of this uid with one link (S6): anything else makes the box corrupt (a
+//! `list` warning), never trusted and never removed.
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +21,8 @@ const MARKER: &str = ".saiife-box";
 const RECORD: &str = "box.json";
 const COUNTER: &str = "next-id";
 const VERSION: u32 = 1;
+/// The largest record file read.
+const MAX_RECORD_BYTES: u64 = 1 << 20;
 
 /// Opaque to the manager; only the VMM driver reads `data`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,12 +121,90 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), BoxesError> {
     })
 }
 
+/// `name` in `dir`, read without following links (S6): `dir` must be a real
+/// directory and `name` a plain file, both owned by this uid, the file with
+/// one link and at most [`MAX_RECORD_BYTES`]. `Ok(None)` when the file is
+/// missing.
+#[cfg(unix)]
+fn read_trusted(dir: &Path, name: &str) -> Result<Option<String>, BoxesError> {
+    use rustix::fs::{FileType, Mode, OFlags, CWD};
+    use std::io::Read;
+    let me = rustix::process::geteuid().as_raw();
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let dfd = rustix::fs::openat(CWD, dir, flags | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| state_err(dir, format!("not a real directory: {e}")))?;
+    let st = rustix::fs::fstat(&dfd).map_err(|e| io_err(dir, e.into()))?;
+    if st.st_uid != me {
+        return Err(state_err(
+            dir,
+            format!("owned by uid {}, not {me}", st.st_uid),
+        ));
+    }
+    let file = dir.join(name);
+    let fd = match rustix::fs::openat(&dfd, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP) => return Err(state_err(&file, "is a symlink")),
+        Err(e) => return Err(io_err(&file, e.into())),
+    };
+    let st = rustix::fs::fstat(&fd).map_err(|e| io_err(&file, e.into()))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(state_err(&file, "not a plain file"));
+    }
+    if st.st_uid != me {
+        return Err(state_err(
+            &file,
+            format!("owned by uid {}, not {me}", st.st_uid),
+        ));
+    }
+    if st.st_nlink != 1 {
+        return Err(state_err(&file, "has more than one link"));
+    }
+    let mut text = String::new();
+    std::fs::File::from(fd)
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| io_err(&file, e))?;
+    if text.len() as u64 > MAX_RECORD_BYTES {
+        return Err(state_err(&file, "too large"));
+    }
+    Ok(Some(text))
+}
+
+#[cfg(not(unix))]
+fn read_trusted(dir: &Path, name: &str) -> Result<Option<String>, BoxesError> {
+    let file = dir.join(name);
+    match fs::symlink_metadata(&file) {
+        Ok(m) if m.file_type().is_file() && m.len() <= MAX_RECORD_BYTES => {}
+        Ok(m) if m.file_type().is_file() => return Err(state_err(&file, "too large")),
+        Ok(_) => return Err(state_err(&file, "not a plain file")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err(&file, e)),
+    }
+    fs::read_to_string(&file)
+        .map(Some)
+        .map_err(|e| io_err(&file, e))
+}
+
 impl Store {
+    /// The store at `root`, created when missing. The root must be a real
+    /// directory of this uid; it is made 0700.
     pub fn open(root: PathBuf) -> Result<Store, BoxesError> {
         fs::create_dir_all(&root).map_err(|e| io_err(&root, e))?;
+        let md = fs::symlink_metadata(&root).map_err(|e| io_err(&root, e))?;
+        if !md.file_type().is_dir() {
+            return Err(state_err(&root, "not a real directory"));
+        }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let me = rustix::process::geteuid().as_raw();
+            if md.uid() != me {
+                return Err(state_err(
+                    &root,
+                    format!("owned by uid {}, not {me}", md.uid()),
+                ));
+            }
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .map_err(|e| io_err(&root, e))?;
         }
@@ -135,13 +222,12 @@ impl Store {
     /// Next unused id from the persisted counter; never reuses a number.
     pub fn claim_id(&self) -> Result<BoxId, BoxesError> {
         let counter = self.root.join(COUNTER);
-        let mut n: u64 = match fs::read_to_string(&counter) {
-            Ok(t) => t
+        let mut n: u64 = match read_trusted(&self.root, COUNTER)? {
+            Some(t) => t
                 .trim()
                 .parse()
                 .map_err(|_| state_err(&counter, "counter is not a number"))?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 1,
-            Err(e) => return Err(io_err(&counter, e)),
+            None => 1,
         };
         n = n.max(1);
         loop {
@@ -188,13 +274,10 @@ impl Store {
             return Err(state_err(&dir, "not a real directory"));
         }
         let marker = dir.join(MARKER);
-        match fs::read_to_string(&marker) {
-            Ok(t) if t == marker_text(id.as_str()) => Ok(()),
-            Ok(_) => Err(state_err(&marker, "marker names another box")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(state_err(&marker, "marker missing"))
-            }
-            Err(e) => Err(io_err(&marker, e)),
+        match read_trusted(&dir, MARKER)? {
+            Some(t) if t == marker_text(id.as_str()) => Ok(()),
+            Some(_) => Err(state_err(&marker, "marker names another box")),
+            None => Err(state_err(&marker, "marker missing")),
         }
     }
 
@@ -214,10 +297,8 @@ impl Store {
         }
         self.check_labelled(id)?;
         let file = dir.join(RECORD);
-        let text = match fs::read_to_string(&file) {
-            Ok(t) => t,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_err(&file, e)),
+        let Some(text) = read_trusted(&dir, RECORD)? else {
+            return Ok(None);
         };
         let r: BoxRecord =
             serde_json::from_str(&text).map_err(|e| state_err(&file, e.to_string()))?;

@@ -392,8 +392,11 @@ pub struct Ctx {
     /// folding (plan 20).
     pub cosign: Mutex<crate::cosign::CosignState>,
     /// The box manager behind the `box.*` ops (plan 34); `None`: boxes are
-    /// unavailable (every release build).
+    /// unavailable, and [`Ctx::box_unavailable`] says why when it can.
     pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
+    /// Why there is no box manager when the box preflight failed (plan 35):
+    /// what every `box.*` op answers instead of the fixed `unavailable`.
+    pub box_unavailable: Option<String>,
     /// The template files skipped at start, for `box.templates`.
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     /// The box image store's dirs (plan 36); `None`: the `box.image.*`
@@ -453,6 +456,8 @@ pub struct CtxInit {
     pub boxes: Arc<dyn saiife_wire::BoxSource>,
     /// See [`Ctx::box_manager`]. `minimal` leaves it `None`.
     pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
+    /// See [`Ctx::box_unavailable`]. `minimal` leaves it `None`.
+    pub box_unavailable: Option<String>,
     /// See [`Ctx::box_template_warnings`].
     pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     /// See [`Ctx::box_images`]. `minimal` leaves it `None`.
@@ -514,6 +519,7 @@ impl CtxInit {
             workspace: Arc::new(crate::workspace::Workspace::memory()),
             boxes: Arc::new(saiife_wire::source::NoBoxes),
             box_manager: None,
+            box_unavailable: None,
             box_template_warnings: Vec::new(),
             box_images: None,
         }
@@ -749,6 +755,7 @@ impl Ctx {
             hooks,
             cosign: Mutex::default(),
             box_manager: i.box_manager,
+            box_unavailable: i.box_unavailable,
             box_template_warnings: i.box_template_warnings,
             box_images: i.box_images,
             names: Mutex::new(HashMap::new()),

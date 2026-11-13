@@ -1,4 +1,4 @@
-#![cfg(feature = "fake")]
+#![cfg(all(unix, feature = "fake"))]
 use saiife_boxhost::ch::{Action, Api, ApiError, VmState};
 use std::path::PathBuf;
 use std::process::{Child, Command};

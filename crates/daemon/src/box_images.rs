@@ -61,14 +61,19 @@ pub struct ImagePaths {
 pub fn paths_for(state_dir: &Path, mode: &Mode) -> ImagePaths {
     match mode {
         Mode::Personal => ImagePaths {
-            records: state_dir.join("image-records"),
+            records: image_records(state_dir, false),
             images: personal_images(state_dir),
         },
         Mode::Locked => ImagePaths {
-            records: state_dir.join("images"),
+            records: image_records(state_dir, true),
             images: locked_images(),
         },
     }
+}
+
+#[cfg(unix)]
+fn image_records(state_dir: &Path, locked: bool) -> PathBuf {
+    saiife_boxhost::layout::image_records_in(state_dir, locked)
 }
 
 #[cfg(unix)]
@@ -82,6 +87,11 @@ fn locked_images() -> PathBuf {
 }
 
 // No boxes off Unix (no box host crate there); the same paths.
+#[cfg(not(unix))]
+fn image_records(state_dir: &Path, locked: bool) -> PathBuf {
+    state_dir.join(if locked { "images" } else { "image-records" })
+}
+
 #[cfg(not(unix))]
 fn personal_images(state_dir: &Path) -> PathBuf {
     state_dir.join("images")

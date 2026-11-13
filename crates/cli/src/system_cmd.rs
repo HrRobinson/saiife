@@ -52,6 +52,15 @@ pub enum SystemAction {
         /// On Windows the doctor's text also goes to the install log.
         #[arg(long, requires = "fleet")]
         package: bool,
+        /// Also set up boxes (Linux): the saiife-box user, /var/lib/saiife-box,
+        /// the pinned Cloud Hypervisor in /opt/saiife/vmm, the saiife-box@ unit
+        /// and a polkit rule that lets the daemon start and stop only those units.
+        #[arg(long)]
+        boxes: bool,
+        /// With --boxes: copy cloud-hypervisor and CLOUDHV.fd from this directory
+        /// (checked against the pinned digests) instead of downloading them.
+        #[arg(long, requires = "boxes", value_name = "DIR")]
+        vmm_dir: Option<PathBuf>,
         /// Install below this directory with a fake host (tests only).
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -143,6 +152,7 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
         } else {
             saiife_system::doctor::TouchSupport::None
         },
+        boxes_enabled: cfg!(feature = "boxes"),
     };
     let (text, failed) = doctor::after_install(layout, host, &dir, &opts);
     outln!();
@@ -173,6 +183,8 @@ pub fn run(action: SystemAction) -> ExitCode {
             non_interactive,
             fleet,
             package,
+            boxes,
+            vmm_dir,
             root,
             #[cfg(debug_assertions)]
             allow_test_build,
@@ -202,6 +214,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                 match fleet_options(&layout, host.as_ref()) {
                     Ok(o) => InstallOptions {
                         allow_test_build,
+                        boxes,
+                        vmm_dir,
                         ..o
                     },
                     Err(e) => return report_untouched(e),
@@ -213,6 +227,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                     approvers,
                     non_interactive,
                     allow_test_build,
+                    boxes,
+                    vmm_dir,
                 }
             };
             let began = std::cell::Cell::new(false);

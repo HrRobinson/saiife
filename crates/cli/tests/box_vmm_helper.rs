@@ -31,7 +31,7 @@ fn fx() -> Fx {
     let root = std::fs::canonicalize(t.path()).unwrap();
     let state = root.join("s/saiife/broker");
     let data = root.join("d/saiife/vmm");
-    for d in [state.join("boxes/b1"), state.join("images"), data.clone()] {
+    for d in [state.join("box-run/b1"), state.join("images"), data.clone()] {
         std::fs::create_dir_all(&d).unwrap();
     }
     let base_img = state.join("images/base.qcow2");
@@ -46,7 +46,7 @@ fn fx() -> Fx {
     )
     .unwrap();
     std::fs::set_permissions(&ch, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let paths = BoxPaths::new(state.join("boxes/b1"));
+    let paths = BoxPaths::new(state.join("box-run/b1"));
     let spec = LaunchSpec {
         version: 1,
         id: BoxId::parse("b1").unwrap(),
@@ -112,6 +112,7 @@ fn helper_execs_the_tool_with_argv() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn helper_refuses_unpinned_binary() {
     let f = fx();
     let o = run(&f, false);
@@ -227,4 +228,27 @@ fn helper_restores_only_from_the_vault() {
         got.contains(&format!("source_url=file://{}", snap.display())),
         "{got}"
     );
+}
+
+/// The Landlock rule names `<dir>/snapshot`: the helper makes it (0770, as
+/// the VMM user) before the exec, and refuses a symlink there.
+#[test]
+#[cfg(debug_assertions)]
+fn helper_makes_the_snapshot_dir_and_refuses_a_symlink() {
+    use std::os::unix::fs::MetadataExt;
+    let f = fx();
+    let o = run(&f, true);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let m = std::fs::symlink_metadata(f.paths.snapshot_dir()).unwrap();
+    assert!(m.file_type().is_dir());
+    assert_eq!(m.mode() & 0o7777, 0o770);
+    std::fs::remove_dir(f.paths.snapshot_dir()).unwrap();
+    std::fs::remove_file(&f.out).unwrap();
+    let target = f.root.join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, f.paths.snapshot_dir()).unwrap();
+    let o = run(&f, true);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).contains("snapshot"), "{}", stderr(&o));
+    assert!(!f.out.exists());
 }

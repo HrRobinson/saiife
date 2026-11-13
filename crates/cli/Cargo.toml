@@ -66,6 +66,9 @@ fake-fido = ["saiife-fido/fake"]
 # release workflows never enable it. The daemon runs inside this binary
 # (`saiife daemon`), so the feature reaches the daemon the tests start.
 fake-vmm = ["saiife-daemon/fake-vmm"]
+# Real boxes in the daemon this binary runs (plan 35, R38): off by default;
+# the release workflows never set it.
+boxes = ["saiife-daemon/boxes"]
 
 [target.'cfg(unix)'.dependencies]
 saiife-boxhost = { path = "../boxhost" }

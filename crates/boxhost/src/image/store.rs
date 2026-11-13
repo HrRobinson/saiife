@@ -410,9 +410,9 @@ impl ImageResolver for Store {
     /// was hashed on insert and is large).
     fn resolve(&self, r: &ImageRef) -> Result<ResolvedImage, String> {
         let id = match r {
-            ImageRef::Default => self.default_id().ok_or_else(|| {
-                "no default box image: saiife box image import --default <path>".to_string()
-            })?,
+            ImageRef::Default => self
+                .default_id()
+                .ok_or_else(|| format!("no default box image: {}", super::DEFAULT_IMAGE_HINT))?,
             ImageRef::Pinned(id) => {
                 parse_image_id(id)?;
                 id.clone()
@@ -740,7 +740,7 @@ mod tests {
         let e = store.resolve(&ImageRef::Default).unwrap_err();
         assert_eq!(
             e,
-            "no default box image: saiife box image import --default <path>"
+            format!("no default box image: {}", crate::image::DEFAULT_IMAGE_HINT)
         );
     }
 
@@ -752,7 +752,7 @@ mod tests {
         let e = store.resolve(&ImageRef::Default).unwrap_err();
         assert_eq!(
             e,
-            "no default box image: saiife box image import --default <path>"
+            format!("no default box image: {}", crate::image::DEFAULT_IMAGE_HINT)
         );
     }
 

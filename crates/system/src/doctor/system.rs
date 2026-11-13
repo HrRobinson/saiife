@@ -2910,7 +2910,15 @@ mod tests {
     fn not_installed_is_info_only() {
         let t = T::empty();
         let r = t.doctor();
-        let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
+        // The personal boxes section (plan 35) is info only, never a failure.
+        let (boxes, rest): (Vec<&super::super::Check>, Vec<&super::super::Check>) =
+            r.checks.iter().partition(|c| c.id.starts_with("boxes."));
+        assert!(
+            boxes.iter().all(|c| c.status != Status::Fail),
+            "{}",
+            r.to_text()
+        );
+        let ids: Vec<&str> = rest.iter().map(|c| c.id.as_str()).collect();
         let mut want = vec!["system.supported", "install.record", "touch-key"];
         if cfg!(target_os = "linux") {
             want.push("touch-helper");

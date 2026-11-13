@@ -1,13 +1,8 @@
-//! The files in one box directory.
-//!
-//! Every path of a box goes through [`BoxPaths`] (and the store-wide ones
-//! through [`crate::layout`]); nothing else joins these names. Each disk
-//! file is classed as VMM-shared runtime (the VMM opens or writes it, so
-//! the daemon must never trust what it finds there) or daemon-trusted
-//! state (the daemon reads it and acts on it: opened `O_NOFOLLOW`, fstat'd
-//! for type, owner and size). Today both live in the box dir; plan 35's
-//! locked layout may point the daemon-trusted helpers at a daemon-only
-//! tree, which moves only these helpers.
+//! The files in one box's runtime directory (`<layout.boxes>/<id>`, shared
+//! with the VMM; R37). Only VMM-side files live here: the spec, sockets,
+//! logs, disks and `snapshot/`. Daemon-trusted files (`base.json`,
+//! `term.cast`, `lands/`, `placeholder`, review and land state; plans 37-39)
+//! belong in the box's record dir, which the box store owns.
 
 use saiife_wire::source::BoxId;
 use std::path::{Path, PathBuf};
@@ -71,15 +66,6 @@ impl BoxPaths {
     }
     pub fn snapshot_dir(&self) -> PathBuf {
         self.file("snapshot")
-    }
-    pub fn term_cast(&self) -> PathBuf {
-        self.file("term.cast")
-    }
-    pub fn lands_dir(&self) -> PathBuf {
-        self.file("lands")
-    }
-    pub fn placeholder(&self) -> PathBuf {
-        self.file("placeholder")
     }
     /// The longest socket path in the box dir (for sun_path length checks).
     pub fn longest_socket(&self) -> PathBuf {

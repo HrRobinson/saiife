@@ -99,6 +99,19 @@ pub(crate) use imp::{ascii_json, disk, render};
 
 #[cfg(not(unix))]
 pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
+    if let BoxAction::Vmm { action } = action {
+        return match crate::box_vmm_cmd::run(config.as_deref(), action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(crate::box_vmm_cmd::Fail::Refused(m)) => {
+                eprintln!("saiife: {}", crate::text::sanitize(&m));
+                ExitCode::from(2)
+            }
+            Err(crate::box_vmm_cmd::Fail::Unavailable(m)) => {
+                eprintln!("saiife: {}", crate::text::sanitize(&m));
+                ExitCode::from(5)
+            }
+        };
+    }
     let _ = (config, action);
     eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)

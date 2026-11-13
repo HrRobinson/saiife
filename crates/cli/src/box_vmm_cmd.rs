@@ -17,6 +17,7 @@ pub enum VmmAction {
     Status,
 }
 
+// Refused is never built on non-unix, where run only answers Unavailable.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum Fail {
     Refused(String),
@@ -51,7 +52,7 @@ mod imp {
     const LOCKED_HINT: &str =
         "boxes are installed system-wide; run \"sudo saiife system install --boxes\"";
 
-    /// The three things pinned: file name, version, URL, sha256, mode.
+    /// The two things pinned, each with file name, version, URL, sha256, mode.
     const FILES: [(&str, &str, &str, &str, u32); 2] = [
         (
             "cloud-hypervisor",
@@ -116,7 +117,7 @@ mod imp {
         outln!("vmm dir {}", sanitize(&dir.display().to_string()));
         for (name, version, _, sha, _) in FILES {
             let p = dir.join(name);
-            let state = if !p.exists() {
+            let state = if std::fs::symlink_metadata(&p).is_err() {
                 "missing".to_string()
             } else {
                 match pins::verify(&p, sha) {

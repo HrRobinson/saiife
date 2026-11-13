@@ -52,8 +52,10 @@ const LOG_TAIL_LINES: usize = 20;
 const LOG_LINE_MAX: usize = 300;
 /// At most this many entries of a box dir are looked at.
 const MAX_DIR_ENTRIES: usize = 256;
-/// `destroy` waits this long for a boot in progress.
-const BOOT_WAIT: Duration = Duration::from_secs(15);
+/// `destroy` waits at most this long, for a boot in progress and for the
+/// stop ladder together (R41: the trait's "about a second"). A VMM still
+/// stopping fails the call with every file kept; the caller retries.
+const DESTROY_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedImage {
@@ -79,11 +81,14 @@ pub trait VmHooks: Send + Sync {
 }
 
 /// The stop ladder: wait `power_s` after the power button, then
-/// `shutdown_s` after `vmm.shutdown`, then force-stop.
+/// `shutdown_s` after `vmm.shutdown`, then force-stop and wait up to
+/// `force_s` for the launcher to see the exit (a unit's StopUnit returns
+/// once the job is queued; systemd's own TimeoutStopSec is 30 s).
 #[derive(Debug, Clone, Copy)]
 pub struct StopTimes {
     pub power_s: u64,
     pub shutdown_s: u64,
+    pub force_s: u64,
 }
 
 impl Default for StopTimes {
@@ -91,12 +96,19 @@ impl Default for StopTimes {
         StopTimes {
             power_s: 60,
             shutdown_s: 30,
+            force_s: 35,
         }
     }
 }
 
+/// How often the force-stop wait asks the launcher.
+const FORCE_POLL: Duration = Duration::from_millis(250);
+
 pub struct ChVmmInit {
     pub layout: Layout,
+    /// The daemon's record dirs (the box store's root, R37): `VmSpec.dir`
+    /// must be `<records>/<id>`. Nothing VMM-side is ever written there.
+    pub records: PathBuf,
     pub tools: Tools,
     pub images: Arc<dyn ImageResolver>,
     pub launcher: Arc<dyn Launcher>,
@@ -239,12 +251,43 @@ fn remove_sockets(paths: &BoxPaths) {
     }
 }
 
+/// `mem_mib` from the handle `create` made (daemon-stored, unlike vm.json).
+fn handle_mem_mib(h: &VmHandle) -> Result<u64, VmmError> {
+    serde_json::from_str::<serde_json::Value>(&h.data)
+        .ok()
+        .and_then(|v| v.get("mem_mib")?.as_u64())
+        .ok_or_else(|| VmmError::Failed("the box handle has no mem_mib; recreate the box".into()))
+}
+
+/// Locked mode: the overlay the daemon just made is read and written by
+/// the VMM user through the group (0660, I5). Set through an fd opened
+/// without following links; only a regular file with one link is touched.
+fn group_writable(p: &Path) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags, CWD};
+    let fd = rustix::fs::openat(
+        CWD,
+        p,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{}: {e}", p.display()))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| e.to_string())?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile
+        || st.st_nlink != 1
+    {
+        return Err(format!("{} is not a plain file", p.display()));
+    }
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o660)).map_err(|e| e.to_string())
+}
+
+/// The API's state of a VMM the launcher says is alive. Never Off: only the
+/// launcher's word ends a VMM (R19), so a live VMM that says Shutdown (after
+/// `vm.shutdown`, or lying) is Running until it exits.
 fn map_state(s: VmState) -> VmStatus {
     match s {
         VmState::Created => VmStatus::Created,
-        VmState::Running => VmStatus::Running,
+        VmState::Running | VmState::Shutdown => VmStatus::Running,
         VmState::Paused => VmStatus::Paused,
-        VmState::Shutdown => VmStatus::Off,
     }
 }
 
@@ -260,15 +303,125 @@ impl ChVmmInit {
     }
 
     fn wait_exit(&self, run: &Run, until: Instant) -> bool {
+        self.wait_exit_every(run, until, POLL)
+    }
+
+    fn wait_exit_every(&self, run: &Run, until: Instant, step: Duration) -> bool {
         loop {
             if self.gone(&run.id) {
                 return true;
             }
-            if Instant::now() >= until {
+            let now = Instant::now();
+            if now >= until {
                 return false;
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(step.min(until - now));
         }
+    }
+
+    /// A run whose reaper ended without seeing the exit: once the launcher
+    /// says the VMM is gone, confirm it and run `after_off`, exactly once
+    /// (the reaper is done, and the flag is taken by compare-exchange).
+    fn settle(&self, run: &Run) {
+        if !run.done() || run.off() || !self.gone(&run.id) {
+            return;
+        }
+        if run
+            .confirmed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            log(&run.id, "the VMM has stopped after all");
+            self.after_off(&run.id);
+            remove_sockets(&run.paths);
+        }
+    }
+
+    /// The runtime dir of a box (R37): made when missing (personal 0700,
+    /// locked 2770 so the VMM user's group gets in; setgid keeps the group);
+    /// an existing one must be a real dir of this uid. Its root is made
+    /// 0700 in personal mode; locked, `system install --boxes` made it.
+    fn runtime_dir(&self, paths: &BoxPaths) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let dir = &paths.dir;
+        let me = rustix::process::geteuid().as_raw();
+        if !self.layout.locked {
+            self.private_root()?;
+        }
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if !m.file_type().is_dir() => {
+                return Err(format!(
+                    "the box runtime dir {} is not a directory (or is a symlink)",
+                    dir.display()
+                ));
+            }
+            Ok(m) if m.uid() != me => {
+                return Err(format!(
+                    "the box runtime dir {} is owned by uid {}, not {me}",
+                    dir.display(),
+                    m.uid()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(dir)
+                    .map_err(|e| format!("box runtime dir {}: {e}", dir.display()))?;
+            }
+            Err(e) => return Err(format!("box runtime dir {}: {e}", dir.display())),
+        }
+        if self.layout.locked {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770))
+                .map_err(|e| format!("box runtime dir {}: {e}", dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Personal mode: the runtime root (`<state>/box-run`) is made 0700 when
+    /// missing, an existing one of this uid made 0700, a symlinked, non-dir
+    /// or foreign one refused (M2).
+    fn private_root(&self) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let root = &self.layout.boxes;
+        let me = rustix::process::geteuid().as_raw();
+        if std::fs::symlink_metadata(root).is_err() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(root)
+                .map_err(|e| format!("box runtime root {}: {e}", root.display()))?;
+        }
+        let m = std::fs::symlink_metadata(root)
+            .map_err(|e| format!("box runtime root {}: {e}", root.display()))?;
+        if !m.file_type().is_dir() {
+            return Err(format!(
+                "the box runtime root {} is not a directory (or is a symlink)",
+                root.display()
+            ));
+        }
+        if m.uid() != me {
+            return Err(format!(
+                "the box runtime root {} is owned by uid {}, not {me}",
+                root.display(),
+                m.uid()
+            ));
+        }
+        if m.mode() & 0o7777 != 0o700 {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("box runtime root {}: {e}", root.display()))?;
+        }
+        Ok(())
+    }
+
+    /// After a confirmed exit: the runtime dir (by fd, never following a
+    /// link) and the box's vault entries. A failure keeps the rest.
+    fn remove_runtime(&self, id: &BoxId) -> Result<(), VmmError> {
+        snapshot::remove_runtime_dir(&self.paths(id))
+            .map_err(|e| VmmError::Failed(format!("the box runtime dir is kept: {e}")))?;
+        snapshot::discard(&self.layout.vault, id).map_err(VmmError::Failed)?;
+        crate::vault::remove_pid(&self.layout.vault, id);
+        Ok(())
     }
 
     fn after_off(&self, id: &BoxId) {
@@ -322,6 +475,9 @@ impl ChVmmInit {
         if let Err(e) = self.launcher.force_stop(&run.id) {
             log(&run.id, &format!("force stop: {e}"));
         }
+        // A unit's stop job may still be running: wait for it, bounded.
+        let until = Instant::now() + Duration::from_secs(self.stop.force_s);
+        self.wait_exit_every(run, until, FORCE_POLL);
     }
 
     /// The reaper: watch for the exit (or a stop request), run the ladder,
@@ -352,6 +508,7 @@ impl ChVmmInit {
             remove_sockets(&run.paths);
             run.confirmed.store(true, Ordering::SeqCst);
         } else {
+            // `ChVmm::settle` confirms it later (status, stop, boot, destroy).
             log(&run.id, "the VMM did not stop; it may still be running");
         }
         run.done.store(true, Ordering::SeqCst);
@@ -408,6 +565,16 @@ impl ChVmm {
 
     fn runs(&self) -> std::sync::MutexGuard<'_, BTreeMap<BoxId, Slot>> {
         self.runs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `ChVmmInit::settle` for the box's done, unconfirmed run, if any
+    /// (the hooks run outside the map lock).
+    fn settle(&self, id: &BoxId) {
+        let run = match self.runs().get(id) {
+            Some(Slot::Run(e)) if e.run.done() && !e.run.off() => Arc::clone(&e.run),
+            _ => return,
+        };
+        self.inner.settle(&run);
     }
 
     fn spawn_reaper(&self, id: &BoxId, paths: BoxPaths, stopping: bool) -> Result<Entry, VmmError> {
@@ -536,6 +703,12 @@ impl ChVmm {
         ) {
             return Ok(());
         }
+        self.restart_ladder(h, paths)
+    }
+
+    /// A stale run (none, or a reaper that ended without confirming the
+    /// exit) gets a new reaper that runs the ladder at once.
+    fn restart_ladder(&self, h: &VmHandle, paths: BoxPaths) -> Result<(), VmmError> {
         let mut g = self.runs();
         let stale = match g.get(&h.id) {
             None => true,
@@ -548,6 +721,27 @@ impl ChVmm {
             g.insert(h.id.clone(), Slot::Run(e));
         }
         Ok(())
+    }
+
+    /// `destroy`'s stop of a VMM the launcher says is alive, without
+    /// asking its API (a hung API would cost the call's timeout): a live
+    /// reaper is told to stop, a stale run gets a new ladder.
+    fn request_stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        {
+            let mut g = self.runs();
+            match g.get_mut(&h.id) {
+                Some(Slot::Starting { stop }) => {
+                    *stop = true;
+                    return Ok(());
+                }
+                Some(Slot::Run(e)) if !e.run.done() => {
+                    let _ = e.stop_tx.send(());
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        self.restart_ladder(h, self.inner.paths(&h.id))
     }
 }
 
@@ -567,22 +761,26 @@ fn image_of_data(data: &str) -> Option<String> {
 }
 
 impl Vmm for ChVmm {
+    /// `spec.dir` is the box's record dir (the store's, R37), only
+    /// checked; everything the VMM touches goes to the runtime dir
+    /// `<layout.boxes>/<id>`, made here.
     fn create(&self, spec: &VmSpec) -> Result<VmHandle, VmmError> {
         let inner = &self.inner;
-        let want = inner.layout.box_paths(&spec.id).dir;
+        let want = inner.records.join(spec.id.as_str());
         if spec.dir != want {
             return Err(VmmError::Failed(format!(
-                "the box dir must be {}",
+                "the box record dir must be {}",
                 want.display()
             )));
         }
-        let paths = BoxPaths::new(spec.dir.clone());
+        let paths = inner.paths(&spec.id);
         let n = paths.longest_socket().as_os_str().as_bytes().len();
         if n > MAX_SOCK_PATH {
             return Err(VmmError::Failed(format!(
                 "the box dir is too long: a socket path would be {n} bytes, over {MAX_SOCK_PATH}"
             )));
         }
+        inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
         let image = inner
             .images
             .resolve(&spec.image)
@@ -599,6 +797,11 @@ impl Vmm for ChVmm {
             make_overlay(&inner.tools, &image.raw, &root, spec.size.disk_gib)
                 .map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
         }
+        // Also for a kept overlay: an earlier create whose fchmod failed is
+        // retried (R35). A link or a hard-linked file is refused.
+        if inner.layout.locked {
+            group_writable(&root).map_err(|e| VmmError::Failed(format!("root disk: {e}")))?;
+        }
         // `restore` is decided at boot, from the marker (S1).
         let ls = LaunchSpec {
             version: 1,
@@ -613,9 +816,12 @@ impl Vmm for ChVmm {
             restore: None,
         };
         write_spec(&ls, &paths).map_err(VmmError::Failed)?;
+        // mem_mib bounds the snapshot copy (`snapshot::seal`); the
+        // VMM-writable vm.json is not asked for it.
         let data = serde_json::json!({
             "launcher": inner.launcher.kind(),
             "image": image.id,
+            "mem_mib": spec.size.mem_mib,
         });
         Ok(VmHandle {
             id: spec.id.clone(),
@@ -628,6 +834,8 @@ impl Vmm for ChVmm {
     /// for its API socket and returns; the guest's readiness arrives later.
     fn boot(&self, h: &VmHandle) -> Result<(), VmmError> {
         let paths = self.inner.paths(&h.id);
+        // an earlier run that is gone by now gets its after_off first
+        self.settle(&h.id);
         let old = {
             let mut g = self.runs();
             match g.get(&h.id) {
@@ -679,6 +887,7 @@ impl Vmm for ChVmm {
     /// Asks for the stop and returns; the reaper sends the power button and
     /// escalates (`StopTimes`). During a boot, the stop follows the start.
     fn stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.settle(&h.id);
         {
             let mut g = self.runs();
             match g.get_mut(&h.id) {
@@ -705,10 +914,13 @@ impl Vmm for ChVmm {
     fn snapshot(&self, h: &VmHandle, dest: &Path) -> Result<(), VmmError> {
         let inner = &self.inner;
         let paths = inner.paths(&h.id);
-        if dest != paths.snapshot_dir() {
+        // the manager's dest (the record dir's) is checked, never written:
+        // the VMM writes into the runtime `snapshot/` (R37)
+        let want = inner.records.join(h.id.as_str()).join("snapshot");
+        if dest != want {
             return Err(VmmError::Failed(format!(
                 "a snapshot goes to {} only",
-                paths.snapshot_dir().display()
+                want.display()
             )));
         }
         let api = Api::new(paths.api_sock());
@@ -717,20 +929,20 @@ impl Vmm for ChVmm {
             Ok(_) => return Err(VmmError::Failed("pause first".into())),
             Err(e) => return Err(failed_api(e)),
         }
+        let mem_mib = handle_mem_mib(h)?;
         snapshot::discard(&inner.layout.vault, &h.id).map_err(VmmError::Failed)?;
-        match std::fs::remove_dir_all(dest) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(VmmError::Failed(format!("remove the old snapshot: {e}"))),
-        }
-        api.snapshot(dest).map_err(failed_api)?;
-        snapshot::seal(&inner.layout.vault, &h.id, &paths, inner.vmm_uid).map_err(VmmError::Failed)
+        // emptied by fd, never removed: Landlock's rule is bound to the dir
+        snapshot::clear_dir(&paths).map_err(VmmError::Failed)?;
+        api.snapshot(&paths.snapshot_dir()).map_err(failed_api)?;
+        snapshot::seal(&inner.layout.vault, &h.id, &paths, inner.vmm_uid, mem_mib)
+            .map_err(VmmError::Failed)
     }
 
     fn status(&self, h: &VmHandle) -> VmStatus {
         if matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             return VmStatus::Running;
         }
+        self.settle(&h.id);
         self.inner.status_of(&h.id, &self.inner.paths(&h.id))
     }
 
@@ -741,54 +953,66 @@ impl Vmm for ChVmm {
         image_of_data(&h.data)
     }
 
-    /// Stops the VM if needed, waits for its reaper (at most
-    /// `power_s + shutdown_s + 5` s) and forgets the run. Never deletes
-    /// files. Fails, keeping the run, when the exit was not confirmed: the
-    /// store must not remove the dir under a live VMM.
+    /// Bounded to about a second (`DESTROY_WAIT`, R41): asks for the stop
+    /// when the VMM is alive (its reaper runs the ladder), waits briefly for
+    /// the reaper and, only once the launcher says the VMM is gone, forgets
+    /// the run and removes the runtime dir and the vault entries (R37). A
+    /// VMM still booting or stopping fails it with `Failed` and keeps the
+    /// run and every file (runtime dir, vault, pid record): nothing is
+    /// removed under a live VMM. The manager's tick retries it.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
-        let until = Instant::now() + BOOT_WAIT;
+        let until = Instant::now() + DESTROY_WAIT;
         while matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             if Instant::now() >= until {
                 return Err(VmmError::Failed("the VM is still booting".into()));
             }
             std::thread::sleep(POLL);
         }
-        if !matches!(self.status(h), VmStatus::Off | VmStatus::Gone) {
-            self.stop(h)?;
+        // an earlier run that is gone by now gets its after_off first
+        self.settle(&h.id);
+        if !self.inner.gone(&h.id) {
+            self.request_stop(h)?;
+        }
+        loop {
+            let run = match self.runs().get(&h.id) {
+                Some(Slot::Run(e)) => Arc::clone(&e.run),
+                Some(Slot::Starting { .. }) => {
+                    return Err(VmmError::Failed("the VM is booting".into()));
+                }
+                None => break,
+            };
+            if run.done() {
+                // gone by now: confirmed here, with its after_off
+                self.inner.settle(&run);
+                break;
+            }
+            if Instant::now() >= until {
+                return Err(VmmError::Failed("the VMM is still stopping".into()));
+            }
+            std::thread::sleep(POLL);
         }
         let e = {
             let mut g = self.runs();
             match g.remove(&h.id) {
-                Some(Slot::Run(e)) => e,
+                Some(Slot::Run(e)) if e.run.off() => e,
                 Some(other) => {
+                    let done = matches!(&other, Slot::Run(e) if e.run.done());
                     g.insert(h.id.clone(), other);
-                    return Err(VmmError::Failed("the VM is booting".into()));
+                    return Err(VmmError::Failed(if done {
+                        "the VMM did not stop; it may still be running".into()
+                    } else {
+                        "the VMM is still stopping".into()
+                    }));
                 }
-                None => return Ok(()),
+                // no run: only the launcher's word lets the state go
+                None if self.inner.gone(&h.id) => {
+                    drop(g);
+                    return self.inner.remove_runtime(&h.id);
+                }
+                None => return Err(VmmError::Failed("the VMM is still stopping".into())),
             }
         };
-        let s = self.inner.stop;
-        let until = Instant::now() + Duration::from_secs(s.power_s + s.shutdown_s + 5);
-        while !e.run.done() {
-            if Instant::now() >= until {
-                log(&h.id, "the VMM has not stopped yet");
-                self.runs().entry(h.id.clone()).or_insert(Slot::Run(e));
-                return Err(VmmError::Failed("the VMM has not stopped yet".into()));
-            }
-            std::thread::sleep(POLL);
-        }
-        if !e.run.off()
-            && !matches!(
-                self.inner.status_of(&h.id, &e.run.paths),
-                VmStatus::Off | VmStatus::Gone
-            )
-        {
-            self.runs().entry(h.id.clone()).or_insert(Slot::Run(e));
-            return Err(VmmError::Failed(
-                "the VMM did not stop; it may still be running".into(),
-            ));
-        }
-        let _ = e.reaper.join();
-        Ok(())
+        let _ = e.reaper.join(); // done: returns at once
+        self.inner.remove_runtime(&h.id)
     }
 }

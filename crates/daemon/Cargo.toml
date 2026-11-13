@@ -14,6 +14,11 @@ path = "src/lib.rs"
 # A fake VM behind the box manager (plan 34, Task 8): test builds only. The
 # release workflows never enable it, so a release daemon has no boxes.
 fake-vmm = ["saiife-boxes/fake"]
+# Real boxes (plan 35, ruling R38): the Cloud Hypervisor driver behind the
+# box preflight. Off by default until plan 41 ships: the Linux CI step runs
+# the box tests with it, the release workflows never set it, so a release
+# daemon answers every box op "boxes are not enabled in this build".
+boxes = []
 # Test builds only (never in release CI): `SAIIFE_WORKSPACE_FAKE_BOXES=1`
 # serves the wire crate's demo boxes so the Workspace UI can be tried (plan 29).
 fake-boxes = ["saiife-wire/fake"]
@@ -75,7 +80,13 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process", "net", "system"] }
+# The UnitLauncher and UnitBus the locked-mode box unit bus implements (plan 35).
 saiife-boxhost = { path = "../boxhost" }
+
+# The system bus, for the saiife-box@ units (plan 35, Task 6); as in saiife-keychain
+# (no blocking-api: each call runs on a thread that blocks on the runtime).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]

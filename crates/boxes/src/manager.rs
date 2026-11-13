@@ -17,8 +17,10 @@
 //! (which return only changes) are best effort and retry on the next save.
 //!
 //! A Discarded record whose `vm` is still `Some` means the VMM resource may
-//! still exist (its destroy failed); gc retries the destroy before removing
-//! the record.
+//! still exist (its destroy failed, for instance a VMM still stopping: a
+//! driver's destroy is bounded and does not wait out its stop ladder, R41).
+//! Every tick retries the destroy and clears `vm` once it succeeds; gc also
+//! retries it before removing the record.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -900,7 +902,8 @@ impl Manager {
         self.tick_with(true)
     }
 
-    /// Boot timeouts, finished turns and idle stops, which only take power
+    /// Destroy retries for Discarded records that still hold a VM (R41),
+    /// boot timeouts, finished turns and idle stops, which only take power
     /// away; then, with `admit`, the prompts a `Ready` under lockdown held
     /// (for Running boxes) and the admission pass. The daemon passes
     /// `admit = false` under lockdown `all` (R30): the queue and held
@@ -913,6 +916,18 @@ impl Manager {
         let ids: Vec<BoxId> = g.records.keys().cloned().collect();
         for id in ids {
             let mut r = g.records[&id].clone();
+            if r.state == BoxState::Discarded {
+                // R41: retry a destroy that failed (the VMM was still stopping)
+                if let Some(h) = r.vm.clone() {
+                    if self.vmm.destroy(&h).is_ok() {
+                        r.vm = None;
+                        r.error = r.error.take().and_then(without_destroy_failure);
+                        r.updated_at = now;
+                        let _ = g.put(r);
+                    }
+                }
+                continue;
+            }
             let mut changed = false;
             let started = r.started_at.unwrap_or(r.updated_at);
             if r.state == BoxState::Starting && now.saturating_sub(started) >= BOOT_TIMEOUT_SECS {
@@ -1035,6 +1050,20 @@ impl Manager {
             Err(e) => fail(&mut rep, e.to_string()),
         }
         rep
+    }
+}
+
+/// A record's error once its VM's destroy finally succeeded: the destroy
+/// failure is dropped, whatever came before it is kept.
+fn without_destroy_failure(e: String) -> Option<String> {
+    if e.starts_with("discard: the VM could not be destroyed")
+        || e.starts_with("gc: the VM could not be destroyed")
+    {
+        return None;
+    }
+    match e.find("; destroy failed:") {
+        Some(i) => Some(e[..i].to_string()),
+        None => Some(e),
     }
 }
 

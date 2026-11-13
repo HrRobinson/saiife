@@ -70,6 +70,8 @@ struct Setup {
     manager: bool,
     template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
     built: Option<Arc<Manager>>,
+    /// Why boxes are unavailable (a failed preflight), with no manager.
+    unavailable: Option<String>,
 }
 
 fn world() -> World {
@@ -77,6 +79,7 @@ fn world() -> World {
         manager: true,
         template_warnings: Vec::new(),
         built: None,
+        unavailable: None,
     })
 }
 
@@ -145,6 +148,7 @@ fn world_with(s: Setup) -> World {
             ..PolicyState::invalid(0)
         },
         box_manager: mgr.clone(),
+        box_unavailable: s.unavailable,
         box_template_warnings: s.template_warnings,
         ..base
     }));
@@ -282,6 +286,7 @@ async fn unavailable_without_manager() {
         manager: false,
         template_warnings: Vec::new(),
         built: None,
+        unavailable: None,
     });
     for (op, args) in EVERY_OP {
         let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
@@ -589,6 +594,7 @@ async fn disk_floor_pauses_running_boxes() {
         manager: true,
         template_warnings: Vec::new(),
         built: Some(Arc::new(o.manager)),
+        unavailable: None,
     });
     let a = w.running(ALICE, "one").await;
     let b = w.running(ALICE, "two").await;
@@ -739,6 +745,7 @@ async fn templates_lists_warnings() {
         manager: true,
         template_warnings: built.template_warnings.clone(),
         built: Some(built.manager),
+        unavailable: None,
     });
     let a = w.ok(ALICE, "box.templates", json!({})).await;
     let names: Vec<&str> = a["templates"]
@@ -783,11 +790,26 @@ async fn build_needs_the_fake_flag() {
     let tmp = scratch();
     let state = tmp.path().join("state");
     let off = |_: &str| -> Option<OsString> { None };
-    assert!(
-        box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &off)
-            .unwrap()
-            .is_none()
-    );
+    // Without it the real driver's preflight runs: on the test's own locked
+    // root (M1: never the host's /var/lib/saiife-box or /opt/saiife), which
+    // has no install (read-only: nothing is created).
+    let root = tmp.path().join("box-root");
+    let seam = |k: &str| -> Option<OsString> {
+        (k == "SAIIFE_TEST_BOX_ROOT").then(|| root.clone().into_os_string())
+    };
+    let why = box_ops::build_with(&state, &Mode::Locked, &state.join("config.toml"), &seam)
+        .unwrap()
+        .err()
+        .expect("no boxes without the fake flag or an install");
+    if cfg!(all(target_os = "linux", feature = "boxes")) {
+        assert!(why.contains("install --boxes"), "{why}");
+        assert!(
+            why.contains(&root.display().to_string()),
+            "the test root: {why}"
+        );
+        assert!(!root.exists());
+    }
+    assert!(!state.join("boxes").exists());
     let (dir, trust) =
         box_ops::templates_dir(&Mode::Locked, Path::new("/etc/saiife/config.toml"), &off);
     assert_eq!(dir, Path::new("/etc/saiife/templates.d"));
@@ -882,6 +904,7 @@ async fn restart_changes_are_recorded() {
         manager: true,
         template_warnings: Vec::new(),
         built: Some(second.manager),
+        unavailable: None,
     });
     for rec in box_ops::change_records(&w.ctx, &second.changes) {
         w.ctx.writer.append(rec).await.unwrap();
@@ -1178,18 +1201,268 @@ async fn spawn_with_fds_roundtrip() {
     server.abort();
 }
 
-/// Plan 37 Task 4b: the store root the daemon hands to intake, gc and
-/// `disk::usage` is the personal Layout's, and the disk placer is BoxPaths'.
+/// Plan 37 Task 4b, with plan 35's R37: the store root the daemon hands to
+/// intake, gc and `disk::usage` is the record root (`layout::boxes_in`),
+/// never the VMM's runtime root, and the disk placer is BoxPaths' under it.
 #[test]
 fn the_box_root_and_disk_places_are_the_layouts() {
-    use saiife_boxhost::layout::Layout;
+    use saiife_boxhost::layout::{boxes_in, Layout};
     use saiife_boxhost::paths::BoxPaths;
     let state = Path::new("/s/state");
     let root = box_ops::dir_in(state);
-    assert_eq!(root, Layout::personal(state, Path::new("/s/data")).boxes);
+    assert_eq!(root, boxes_in(state));
+    assert_ne!(root, Layout::personal(state, Path::new("/s/data")).boxes);
     let place = box_ops::disk_place().expect("a placer on unix");
     let got = place(&root, &id("b4"));
     let want = BoxPaths::of(&root, &id("b4"));
     assert_eq!(got.repo_image, want.repo_disk());
     assert_eq!(got.base_manifest, want.base_manifest());
+}
+
+/// The env of a personal daemon whose data and home are under `tmp`.
+fn personal_env(tmp: &Path, fake: bool) -> impl Fn(&str) -> Option<OsString> {
+    let tmp = tmp.to_path_buf();
+    move |k: &str| -> Option<OsString> {
+        match k {
+            "SAIIFE_BOX_FAKE_VMM" if fake => Some("1".into()),
+            "SAIIFE_BOX_FAKE_SLOTS" if fake => Some("1".into()),
+            "XDG_DATA_HOME" => Some(tmp.join("data").into_os_string()),
+            "XDG_CONFIG_HOME" => Some(tmp.join("config").into_os_string()),
+            "HOME" => Some(tmp.join("home").into_os_string()),
+            // M-2: the personal preflight never probes the host's /dev/kvm
+            "SAIIFE_TEST_KVM" => Some(tmp.join("kvm").into_os_string()),
+            _ => None,
+        }
+    }
+}
+
+/// R38: a build without the `boxes` feature never runs the real driver: no
+/// fake flag is plan 34's answer, saying boxes are not enabled.
+#[cfg(not(feature = "boxes"))]
+#[tokio::test]
+async fn without_the_boxes_feature_boxes_are_not_enabled() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = personal_env(tmp.path(), false);
+    let why = box_ops::build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+        .unwrap()
+        .err()
+        .expect("no boxes");
+    assert!(why.starts_with(box_ops::UNAVAILABLE), "{why}");
+    assert!(why.contains("boxes are not enabled in this build"), "{why}");
+    let w = world_with(Setup {
+        manager: false,
+        template_warnings: Vec::new(),
+        built: None,
+        unavailable: Some(why.clone()),
+    });
+    let a = w.call(ALICE, "box.list", json!({})).await;
+    assert_eq!(a["error"], "unavailable", "{a}");
+    assert_eq!(a["message"], why.as_str(), "{a}");
+}
+
+/// No VMM in the personal layout and no fake flag: the preflight fails
+/// before anything is made or spawned, and every op answers its detail.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[tokio::test]
+async fn unavailable_message_names_the_failed_check() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = personal_env(tmp.path(), false);
+    let why = box_ops::build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+        .unwrap()
+        .err()
+        .expect("no VMM: boxes are unavailable");
+    assert!(why.contains("saiife box vmm fetch"), "{why}");
+    assert!(!state.join("boxes").exists(), "nothing is created");
+    assert!(!tmp.path().join("data").exists(), "nothing is created");
+    let w = world_with(Setup {
+        manager: false,
+        template_warnings: Vec::new(),
+        built: None,
+        unavailable: Some(why.clone()),
+    });
+    for (op, args) in EVERY_OP {
+        let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
+        assert_eq!(a["ok"], false, "{op}: {a}");
+        assert_eq!(a["error"], "unavailable", "{op}: {a}");
+        assert_eq!(a["message"], why.as_str(), "{op}: {a}");
+    }
+    assert!(w.records().is_empty());
+}
+
+/// The fake flag wins over the preflight: plan 34's fake manager, with no
+/// VMM anywhere.
+#[tokio::test]
+async fn fake_env_still_wins() {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let env = personal_env(tmp.path(), true);
+    let built = box_ops::build_with(&state, &Mode::Personal, &state.join("config.toml"), &env)
+        .unwrap()
+        .expect("the fake VM is on");
+    let b = built
+        .manager
+        .spawn(&saiife_boxes::manager::SpawnArgs {
+            template: "claude-code".into(),
+            repo: "shop".into(),
+            repo_dir: None,
+            task: "one".into(),
+            start: saiife_wire::source::Start::Queue,
+            owner_uid: ALICE,
+            repo_image: None,
+            base_manifest: None,
+        })
+        .unwrap();
+    assert_eq!(b.vm.as_ref().map(|h| h.driver.as_str()), Some("fake"));
+    assert!(state.join("boxes").join(b.id.as_str()).is_dir());
+}
+
+/// R37: the box records stay in the daemon's own state dir in both modes;
+/// only the VMM's runtime dirs differ (`/var/lib/saiife-box/boxes` locked,
+/// `<state>/box-run` personal).
+#[test]
+fn records_stay_in_the_state_dir() {
+    assert_eq!(
+        box_ops::dir_in(Path::new("/var/lib/saiife")),
+        Path::new("/var/lib/saiife/boxes")
+    );
+    assert_eq!(
+        box_ops::dir_in(Path::new("/s/state")),
+        Path::new("/s/state/boxes")
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn runtime_dirs_are_apart_from_the_records() {
+    use saiife_daemon::box_vmm::layout_for;
+    let none = |_: &str| -> Option<OsString> { None };
+    let locked = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &none).unwrap();
+    assert_eq!(locked.boxes, Path::new("/var/lib/saiife-box/boxes"));
+    let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
+    let personal = layout_for(Path::new("/s/state"), &Mode::Personal, &home).unwrap();
+    assert_eq!(personal.boxes, Path::new("/s/state/box-run"));
+    assert_ne!(personal.boxes, box_ops::dir_in(Path::new("/s/state")));
+}
+
+/// R36: a snapshot the driver did not trust is a `box` record of the
+/// daemon, made from the box id alone (the hook runs under the manager's
+/// lock, inside its VMM call), with the reason sanitized.
+#[tokio::test]
+async fn restore_refused_is_audited() {
+    // (the hook type exists in `boxes` builds on Linux; the link everywhere)
+    let w = world();
+    let link = Arc::new(box_ops::AuditLink::default());
+    // Before the context is attached: a stderr line, no record, no panic.
+    let l = Arc::clone(&link);
+    tokio::task::spawn_blocking(move || l.restore_refused(&id("b1"), "early"))
+        .await
+        .unwrap();
+    link.attach(&w.ctx);
+    #[cfg(all(target_os = "linux", feature = "boxes"))]
+    let hook: Arc<dyn saiife_boxhost::vmm::VmHooks> =
+        Arc::new(saiife_daemon::box_vmm::AuditHooks::new(Arc::clone(&link)));
+    tokio::task::spawn_blocking(move || {
+        #[cfg(all(target_os = "linux", feature = "boxes"))]
+        hook.restore_refused(&id("b1"), "digest \u{1b}[31mmismatch");
+        #[cfg(not(all(target_os = "linux", feature = "boxes")))]
+        link.restore_refused(&id("b1"), "digest \u{1b}[31mmismatch");
+    })
+    .await
+    .unwrap();
+    let mut recs = Vec::new();
+    for _ in 0..100 {
+        recs = w.records();
+        if !recs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r["action"], "restore_refused", "{r}");
+    assert_eq!(r["box"], "b1");
+    assert_eq!(r["session"], "box-b1");
+    assert_eq!(r["via"], "vmm");
+    assert_eq!(r["uid"], 999, "the daemon's own record");
+    let why = r["reason"].as_str().unwrap();
+    assert!(why.contains("digest") && why.contains("mismatch"), "{r}");
+    assert!(!why.contains('\u{1b}'), "{r}");
+}
+
+/// M1: the debug-only locked layout seam re-roots every locked path, and a
+/// locked layout that is not the real one never reaches the system bus.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn locked_test_layout_never_reaches_the_bus() {
+    use saiife_daemon::box_vmm::{layout_for, real_vmm_with};
+    let tmp = scratch();
+    let root = tmp.path().join("box-root");
+    let seam = |k: &str| -> Option<OsString> {
+        (k == "SAIIFE_TEST_BOX_ROOT").then(|| root.clone().into_os_string())
+    };
+    let l = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &seam).unwrap();
+    assert!(l.locked);
+    for p in [&l.boxes, &l.images, &l.vmm, &l.vault] {
+        assert!(p.starts_with(&root), "{}", p.display());
+    }
+    assert_eq!(l.boxes, root.join("var/lib/saiife-box/boxes"));
+    for p in [&l.images, &l.vmm, &l.vault] {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let records = tmp.path().join("records");
+    let image_records = tmp.path().join("image-records");
+    let e = real_vmm_with(
+        &l,
+        &records,
+        &image_records,
+        &Mode::Locked,
+        Vec::new(),
+        &seam,
+    )
+    .err()
+    .expect("refused");
+    assert!(e.contains("system bus"), "{e}");
+}
+
+/// M-4: a test box root that resolves to `/`, or into the real locked
+/// roots, or is not absolute, is an error (never the real layout, never
+/// the system bus); unset is the real layout.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn test_box_root_refuses_the_real_root() {
+    use saiife_daemon::box_vmm::layout_for;
+    for bad in [
+        "/",
+        "/.",
+        "//",
+        "/tmp/..",
+        "/var/lib/saiife-box",
+        "/var/lib/saiife-box/boxes",
+        "/opt/saiife",
+        "relative/root",
+        "",
+    ] {
+        let seam = |k: &str| (k == "SAIIFE_TEST_BOX_ROOT").then(|| OsString::from(bad));
+        let e = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &seam).expect_err(bad);
+        assert!(e.contains("SAIIFE_TEST_BOX_ROOT"), "{bad}: {e}");
+    }
+    let none = |_: &str| -> Option<OsString> { None };
+    let l = layout_for(Path::new("/var/lib/saiife"), &Mode::Locked, &none).unwrap();
+    assert_eq!(l, saiife_boxhost::layout::Layout::locked());
+}
+
+/// M-2: the device the personal preflight probes: `/dev/kvm`, or the
+/// debug-only `SAIIFE_TEST_KVM` file (absolute only).
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn kvm_seam_replaces_the_device_in_tests() {
+    use saiife_daemon::box_vmm::kvm_path;
+    let none = |_: &str| -> Option<OsString> { None };
+    assert_eq!(kvm_path(&none), Path::new("/dev/kvm"));
+    let seam = |k: &str| (k == "SAIIFE_TEST_KVM").then(|| OsString::from("/s/kvm"));
+    assert_eq!(kvm_path(&seam), Path::new("/s/kvm"));
+    let rel = |k: &str| (k == "SAIIFE_TEST_KVM").then(|| OsString::from("kvm"));
+    assert_eq!(kvm_path(&rel), Path::new("/dev/kvm"));
 }

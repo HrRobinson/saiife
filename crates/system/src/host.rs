@@ -1706,7 +1706,9 @@ const STATE_FILE: &str = ".fakehost.json";
 
 /// The names install creates. In a [`FakeHost`] they exist only once
 /// created; every other name resolves to the test user.
-const CREATED_NAMES: [&str; 6] = [
+const CREATED_NAMES: [&str; 7] = [
+    // `system install --boxes` (plan 35): the VMM user and its group.
+    "saiife-box",
     DAEMON_USER,
     DAEMON_GROUP,
     AUDIT_GROUP,
@@ -1757,6 +1759,9 @@ pub struct FakeState {
     pub run: BTreeMap<String, CmdOutput>,
     /// Paths whose `chown` fails (tests of a step failing part-way).
     pub fail_chown: Vec<PathBuf>,
+    /// Groups that do not exist even though the fake resolves unknown names
+    /// (a host without a `kvm` group).
+    pub missing_groups: Vec<String>,
     /// Gids whose `users_with_primary_gid` fails (a directory that could
     /// not be asked, as dscl failing on macOS).
     pub fail_primary_gid: Vec<u32>,
@@ -1873,6 +1878,7 @@ impl Default for FakeState {
             groups: BTreeMap::new(),
             members: BTreeMap::new(),
             chowns: Vec::new(),
+            missing_groups: Vec::new(),
             calls: Vec::new(),
             systemd: 255,
             macos: (15, 0),
@@ -1969,6 +1975,9 @@ impl FakeState {
     fn group_id(&self, name: &str) -> Option<u32> {
         if let Some(g) = self.groups.get(name) {
             return Some(*g);
+        }
+        if self.missing_groups.iter().any(|g| g == name) {
+            return None;
         }
         if CREATED_NAMES.contains(&name) {
             return None;
