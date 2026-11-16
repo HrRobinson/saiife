@@ -56,7 +56,10 @@ export function templateLabel(t) {
 }
 
 export function credentialLabel(t) {
-  return t && t.credential === "in_box" ? "credential inside box (weaker)" : "key stays on this computer";
+  const c = t && t.credential;
+  if (!c || c === "gateway") return "key stays on this computer";
+  if (c === "in_box") return "credential inside box (weaker)";
+  return "credential mode unknown";
 }
 
 export function noticeText(t) {

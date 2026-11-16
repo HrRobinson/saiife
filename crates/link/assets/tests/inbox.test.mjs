@@ -66,13 +66,14 @@ test("credentialLabel follows the credential mode", () => {
   assert.equal(credentialLabel({ credential: "gateway" }), "key stays on this computer");
   assert.equal(credentialLabel({}), "key stays on this computer");
   assert.equal(credentialLabel({ credential: "in_box" }), "credential inside box (weaker)");
+  assert.equal(credentialLabel({ credential: "weird" }), "credential mode unknown");
 });
 
 test("templateLabel and credentialLabel take untrusted names through visible()", () => {
   const s = templateLabel({ name: "a‮b", beta: true });
   assert.ok(!s.includes("‮"), s);
   assert.ok(s.includes("U+202E"), s);
-  assert.equal(credentialLabel({ credential: "a‮b" }), "key stays on this computer");
+  assert.equal(credentialLabel({ credential: "a‮b" }), "credential mode unknown");
 });
 
 test("noticeText shows the notice through visible()", () => {

@@ -262,7 +262,7 @@ mod imp {
     /// `saiife box spawn` (plan 37): the repo disk is built here, as the
     /// user, and handed to the daemon as descriptors.
     mod spawn {
-        use super::{args, call, call_passing, sanitize, spawn_timeout, Args, Stop};
+        use super::{args, call_passing, sanitize, spawn_timeout, Args, Stop};
         use crate::box_repo::{self, Snapshot};
         use crate::broker::Target;
         use saiife_boxhost::layout::Layout;
@@ -271,7 +271,7 @@ mod imp {
         use serde_json::{json, Value};
         use std::os::fd::AsFd;
         use std::path::{Path, PathBuf};
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         /// `--timings`: each step's milliseconds on stderr.
         struct Clock {
@@ -344,12 +344,10 @@ mod imp {
             now: bool,
             timings: bool,
         ) -> Result<Args, Stop> {
-            let mut clock = Clock {
-                on: timings,
-                last: Instant::now(),
-            };
-            // Best effort: a daemon that cannot list templates just skips the notice.
-            if let Ok(a) = call(t, "box.templates", Args::new()) {
+            // Best effort, bounded to 2 s, and before the clock starts: a daemon that cannot list templates just skips the notice.
+            if let Ok(a) =
+                call_passing(t, "box.templates", Args::new(), &[], Duration::from_secs(2))
+            {
                 let list: &[Value] = a
                     .get("templates")
                     .and_then(Value::as_array)
@@ -358,6 +356,10 @@ mod imp {
                     eprintln!("saiife: {n}");
                 }
             }
+            let mut clock = Clock {
+                on: timings,
+                last: Instant::now(),
+            };
             let abs = std::fs::canonicalize(repo).map_err(|e| {
                 Stop::Refused(format!("cannot read the repo {}: {e}", repo.display()))
             })?;
