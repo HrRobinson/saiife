@@ -208,7 +208,7 @@ p36_check_audit() {
   sha=$(p36_manifest_get "$P36_MANIFEST" .sha256) || return 1
   compgen -G "$dir/*.jsonl" >/dev/null || return 1
   jq -en --arg s "$sha" \
-    '[inputs | select(.kind == "box" and .extra.action == "image_import" and .extra.sha256 == $s)] | length > 0' \
+    '[inputs | select(.kind == "box" and .action == "image_import" and .sha256 == $s)] | length > 0' \
     "$dir"/*.jsonl >/dev/null
 }
 

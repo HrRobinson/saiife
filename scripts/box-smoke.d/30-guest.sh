@@ -205,9 +205,9 @@ p38_egress_audit() {
   done < <(p38_audit_dirs)
   [ "${#files[@]}" -gt 0 ] || { p38_log "no readable audit files in: $(p38_audit_dirs | tr '\n' ' ')"; return 1; }
   jq -en --arg b "$P38_BOX" \
-    '[inputs | select(.kind == "egress" and .extra.box == $b
-       and (.extra.bytes_up | type) == "number"
-       and (.extra.bytes_down | type) == "number")] | length > 0' \
+    '[inputs | select(.kind == "egress" and .box == $b
+       and (.bytes_up | type) == "number"
+       and (.bytes_down | type) == "number")] | length > 0' \
     "${files[@]}" >/dev/null
 }
 

@@ -102,10 +102,15 @@ p40_template() {
 }
 
 # p40_keyfile_ok FILE: a readable one-line key file (no blank line: an empty
-# grep pattern would match everything). Prints nothing from the file.
+# grep pattern would match everything; no carriage return (CRLF) and no
+# trailing blank: grep -F -f would then search for "key\r" or "key " and
+# never match, so the key-on-disk checks would pass falsely). Prints nothing
+# from the file.
 p40_keyfile_ok() {
   [ -n "$1" ] && [ -f "$1" ] && [ -r "$1" ] && [ -s "$1" ] || return 1
   ! grep -q '^$' "$1" || return 1
+  ! grep -q $'\r' "$1" || return 1
+  ! grep -q '[[:blank:]]$' "$1" || return 1
   [ "$(grep -c . "$1")" = 1 ]
 }
 
@@ -177,7 +182,8 @@ p40_no_prompt_by_eye() {
 }
 
 # model records of this box: status 200 and credential "gateway", and no
-# record of this box with another credential mode
+# record of this box with another credential mode (the audit Record
+# flattens its extra map, so box, status and credential are top-level keys)
 p40_model_records() {
   local dir f files=()
   while IFS= read -r dir; do
@@ -192,9 +198,10 @@ p40_model_records() {
   done < <(p40_audit_dirs)
   [ "${#files[@]}" -gt 0 ] || { p40_log "no readable audit files in: $(p40_audit_dirs | tr '\n' ' ')"; return 1; }
   jq -en --arg b "$P40_BOX" \
-    '[inputs | select(.kind == "model" and .extra.box == $b)] as $m
-     | ([$m[] | select(.extra.status == 200 and .extra.credential == "gateway")] | length > 0)
-       and ([$m[] | select(.extra.credential != "gateway")] | length == 0)' \
+    '[inputs | select(.kind == "model" and .box == $b)] as $m
+     | ($m | length > 0)
+       and ([$m[] | select(.status == 200 and .credential == "gateway")] | length > 0)
+       and ([$m[] | select(.credential != "gateway")] | length == 0)' \
     "${files[@]}" >/dev/null
 }
 
@@ -272,7 +279,7 @@ p40_leg() {
   local kind=$1 tpl=$2 t0
   P40_KEYFILE=$3
   p40_log "== claude, login kind $kind (template $tpl)"
-  if ! check "[$kind] key file readable, one line, no blank line" p40_keyfile_ok "$P40_KEYFILE"; then
+  if ! check "[$kind] key file readable, one line, no blank line, no CR (CRLF), no trailing blank" p40_keyfile_ok "$P40_KEYFILE"; then
     p40_leg_fail "$kind"
     return 0
   fi
