@@ -23,6 +23,10 @@ pub enum GuestError {
 pub trait GuestLink: Send + Sync {
     fn prompt(&self, id: &BoxId, text: &str) -> Result<(), GuestError>;
     fn terminal(&self, id: &BoxId, after: Option<u64>) -> Result<TermBatch, GuestError>;
+    /// The box's diff without a land book. A [`crate::source::ManagerSource`]
+    /// given one ([`crate::source::ManagerSource::with_lands`], plan 39)
+    /// never calls this: the daemon's book exports, validates and renders
+    /// the diff itself.
     fn diff(&self, id: &BoxId) -> Result<DiffSummary, GuestError>;
 
     /// The last refused hello or failed setup of the box's current run

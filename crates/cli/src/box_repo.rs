@@ -48,7 +48,7 @@ const TOP: usize = 5;
 
 /// Git's own location variables a caller's environment may carry (from a
 /// hook, say); every git call here runs against `-C <repo>` alone.
-const GIT_SCRUB: [&str; 8] = [
+pub(crate) const GIT_SCRUB: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -195,13 +195,19 @@ fn human(n: u64) -> String {
 
 // ---------------------------------------------------------------- git
 
-fn git_cmd(tools: &Tools, repo: &Path, index: Option<&Path>) -> Command {
+pub(crate) fn git_cmd(tools: &Tools, repo: &Path, index: Option<&Path>) -> Command {
     let mut c = Command::new(tools.path(Tool::Git));
     c.arg("-C").arg(repo).args([
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
         "core.fsmonitor=false",
+        // Plan 39 ruling R-T1e: git's own checks of `.git` aliases in index
+        // paths, as a Windows or macOS host would read them.
+        "-c",
+        "core.protectNTFS=true",
+        "-c",
+        "core.protectHFS=true",
     ]);
     for v in GIT_SCRUB {
         c.env_remove(v);
@@ -226,7 +232,7 @@ fn git_run(
 }
 
 /// [`git_run`] with `env` set for this one call.
-fn git_run_env(
+pub(crate) fn git_run_env(
     tools: &Tools,
     repo: &Path,
     index: Option<&Path>,
@@ -271,7 +277,7 @@ fn git_ok(
 }
 
 /// [`git_ok`] with `env` set for this one call.
-fn git_ok_env(
+pub(crate) fn git_ok_env(
     tools: &Tools,
     repo: &Path,
     index: Option<&Path>,
@@ -292,14 +298,14 @@ fn git_ok_env(
     Ok(out.stdout)
 }
 
-fn trim_nl(mut b: Vec<u8>) -> Vec<u8> {
+pub(crate) fn trim_nl(mut b: Vec<u8>) -> Vec<u8> {
     while b.last().is_some_and(|c| *c == b'\n' || *c == b'\r') {
         b.pop();
     }
     b
 }
 
-fn one_oid(b: Vec<u8>, what: &str) -> Result<String, String> {
+pub(crate) fn one_oid(b: Vec<u8>, what: &str) -> Result<String, String> {
     let s = String::from_utf8(trim_nl(b)).map_err(|_| format!("git {what}: not an id"))?;
     if manifest::is_oid(&s) {
         Ok(s)
@@ -628,7 +634,7 @@ impl Walk {
     }
 }
 
-fn random_hex() -> Result<String, String> {
+pub(crate) fn random_hex() -> Result<String, String> {
     use ring::rand::SecureRandom;
     let mut b = [0u8; 8];
     ring::rand::SystemRandom::new()
@@ -637,7 +643,7 @@ fn random_hex() -> Result<String, String> {
     Ok(hex(&b))
 }
 
-fn display_name(top: &Path) -> String {
+pub(crate) fn display_name(top: &Path) -> String {
     let raw = top
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1014,7 +1020,7 @@ fn commit_in(
 }
 
 /// The snapshot commit's identity when the user has none (R13).
-const FALLBACK_IDENT: [(&str, &str); 4] = [
+pub(crate) const FALLBACK_IDENT: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "saiife"),
     ("GIT_AUTHOR_EMAIL", "saiife@localhost"),
     ("GIT_COMMITTER_NAME", "saiife"),

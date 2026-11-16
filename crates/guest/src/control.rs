@@ -221,6 +221,17 @@ impl Init {
             read_msg::<Request>(&mut r)
         };
         let (reply, after) = match req {
+            // The export's reply is the delta itself, frame after frame on
+            // this connection, then the close (the host's `request_stream`).
+            // A failure is one `Reply::Err` frame instead (before any delta
+            // frame, unless the stream itself broke).
+            Ok(Some(Request::Export { n })) => {
+                let mut w = &s;
+                if let Err(why) = crate::export::export(&self.env, n, &mut w) {
+                    let _ = write_msg(&mut &s, &Reply::Err { why });
+                }
+                return;
+            }
             Ok(Some(req)) => self.handle(req),
             Ok(None) => return,
             Err(FrameError::BadJson(e)) => (
@@ -280,7 +291,14 @@ impl Init {
                 }
             }
             Request::Poweroff => (Reply::Ok, After::Poweroff),
-            Request::Export { .. } | Request::Advance { .. } => err("not in this version".into()),
+            Request::Advance { n, paths } => {
+                match crate::export::advance(&self.env, n, paths.as_deref()) {
+                    Ok(()) => (Reply::Ok, After::Nothing),
+                    Err(e) => err(e),
+                }
+            }
+            // Answered as a stream in `serve_control`.
+            Request::Export { .. } => err("export is a stream".into()),
         }
     }
 

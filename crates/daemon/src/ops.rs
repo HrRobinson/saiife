@@ -406,6 +406,11 @@ pub struct Ctx {
     /// Where the boxes' disks are (`box_ops::Built::disk_root`); `None`:
     /// the manager's store root.
     pub box_disk_root: Option<PathBuf>,
+    /// The land book (plan 39), set once the context is shared
+    /// (`box_ops::attach_lands`): it needs the box's guest channel, which
+    /// only a daemon with real boxes has. Empty: lands are unavailable.
+    #[cfg(unix)]
+    pub box_lands: std::sync::OnceLock<Arc<crate::box_land::Lands>>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
@@ -766,6 +771,8 @@ impl Ctx {
             box_template_warnings: i.box_template_warnings,
             box_images: i.box_images,
             box_disk_root: i.box_disk_root,
+            #[cfg(unix)]
+            box_lands: std::sync::OnceLock::new(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
@@ -1190,6 +1197,11 @@ pub struct Conn {
     /// connection.
     #[cfg(unix)]
     pub fds: Arc<Mutex<Vec<std::os::fd::OwnedFd>>>,
+    /// The descriptors an op's `ok` answer carries (plan 39: `box.land`,
+    /// `box.land.fetch`): the connection sends them in one fd byte right
+    /// after that answer. Emptied before every request.
+    #[cfg(unix)]
+    pub out_fds: Arc<Mutex<Vec<std::os::fd::OwnedFd>>>,
 }
 
 impl Conn {
@@ -1202,6 +1214,8 @@ impl Conn {
             close: Arc::default(),
             #[cfg(unix)]
             fds: Arc::default(),
+            #[cfg(unix)]
+            out_fds: Arc::default(),
         }
     }
 
@@ -1210,6 +1224,18 @@ impl Conn {
     #[cfg(unix)]
     pub fn take_fds(&self) -> Vec<std::os::fd::OwnedFd> {
         std::mem::take(&mut *lock(&self.fds))
+    }
+
+    /// Hand `fds` to the connection, to go right after this op's answer.
+    #[cfg(unix)]
+    pub fn give_fds(&self, fds: Vec<std::os::fd::OwnedFd>) {
+        *lock(&self.out_fds) = fds;
+    }
+
+    /// What the last op handed over to go after its answer, emptied.
+    #[cfg(unix)]
+    pub fn take_out_fds(&self) -> Vec<std::os::fd::OwnedFd> {
+        std::mem::take(&mut *lock(&self.out_fds))
     }
 }
 
@@ -1307,6 +1333,8 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if !takes_fds(&req.op) {
         drop(conn.take_fds());
     }
+    #[cfg(unix)]
+    drop(conn.take_out_fds());
     match req.op.as_str() {
         #[cfg(all(test, unix))]
         TEST_FDS_OP => test_fds(conn, req.id),

@@ -23,9 +23,10 @@ use saiife_touch::{
 const DIR: &str = "touch";
 const ID_FILE: &str = "instance_id";
 const CREDS_FILE: &str = "credentials.json";
-/// Live challenges in all, and per uid.
+/// Live challenges in all, and per uid. Per uid 8 (plan 39 errata R-2):
+/// up to 4 land requests of the Workspace leave room for other touches.
 const MAX_LIVE: usize = 32;
-const MAX_PER_UID: usize = 4;
+const MAX_PER_UID: usize = 8;
 
 /// Unix seconds now, from the daemon's clock (so a faked clock applies).
 pub fn unix_now() -> u64 {
@@ -35,13 +36,17 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// What a challenge was issued for. The uid in the last three is the peer's.
+/// What a challenge was issued for. The uid in `Enrol`, `Remove` and
+/// `Test` is the peer's. `Land` and `Push` carry a box land or push
+/// request id (plan 39, owner-approved contract addition).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IssueKey {
     Approve(u64),
     Enrol(u32),
     Remove(u32),
     Test(u32),
+    Land(u64),
+    Push(u64),
 }
 
 /// One live challenge.
@@ -363,14 +368,18 @@ mod tests {
     fn issue_caps() {
         let d = dir();
         let (t, _) = TouchState::open(d.path());
-        for i in 0..4 {
+        for i in 0..8 {
             issue(&t, IssueKey::Approve(i), 1000, NOW).unwrap();
         }
-        assert!(issue(&t, IssueKey::Approve(4), 1000, NOW).is_err());
+        assert!(issue(&t, IssueKey::Approve(8), 1000, NOW).is_err());
+        // Land and push keys count against the same per-uid cap.
+        let e = issue(&t, IssueKey::Land(1), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress");
+        assert!(issue(&t, IssueKey::Push(1), 1000, NOW).is_err());
         // The same key replaces.
         issue(&t, IssueKey::Approve(0), 1000, NOW).unwrap();
         // Expired ones drop.
-        issue(&t, IssueKey::Approve(5), 1000, NOW + 301).unwrap();
+        issue(&t, IssueKey::Approve(9), 1000, NOW + 301).unwrap();
         // 32 in all over 9 uids.
         let (t, _) = TouchState::open(d.path());
         let mut n = 0u64;
@@ -497,7 +506,7 @@ mod tests {
         let k = IssueKey::Approve(1);
         let first = issue(&t, k.clone(), 1000, NOW).unwrap();
         // Another uid at its own cap asks for the same key: refused.
-        for i in 10..14 {
+        for i in 10..18 {
             issue(&t, IssueKey::Approve(i), 2000, NOW).unwrap();
         }
         let e = issue(&t, k.clone(), 2000, NOW).unwrap_err();
@@ -506,7 +515,7 @@ mod tests {
         let asr = s.assert_ctap(RP, &challenge(&record(&t)(&first)));
         assert!(t.consume(&k, 1000, record(&t), &asr, RP, NOW).is_ok());
         // A uid at its cap may still replace its own entry (it is excluded).
-        for i in 20..24 {
+        for i in 20..28 {
             issue(&t, IssueKey::Approve(i), 3000, NOW).unwrap();
         }
         issue(&t, IssueKey::Approve(20), 3000, NOW).unwrap();

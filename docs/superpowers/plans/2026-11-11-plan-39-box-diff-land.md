@@ -14,6 +14,10 @@
 > 9. Plan 27's CLI touch client is `touch_cmd::pick() -> Result<Box<dyn Touch>, String>`, `run_touch`, `exit_for` (`crates/cli/src/touch_cmd.rs:358`, `:386`, `:406`). **Owner ruling 2026-11-12 (resolves the conflict):** `fido-hid` is off in Linux release builds (plan 27 D1/R-A, `release.yml:97` enables it for `apple-darwin` only), and boxes are Linux-only. Plan 41 (`2026-11-12-plan-41-linux-fido-helper.md`) builds the packaged FIDO helper that gives a static Linux `saiife` key support. Until plan 41 lands, and afterwards on a Linux install without the helper (tarball, `install.sh`), `saiife box land` refuses with plan 27's D1 line plus a pointer to the Workspace (Face ID) and `saiife box apply` (Task 6, fixed text below). Tests use the soft authenticator and are unaffected. Boxes do not ship in a release before plan 41 is done (plan 35 header).
 > 10. Global Constraints: branch `v3-p39`; builds with `CARGO_PROFILE_DEV_DEBUG=0`.
 
+> **Hand-off to plan 31 (and plan 35), from the final review of this plan, 2026-11-13:**
+> 1. Production `ctx.boxes` is built before `Ctx` exists (today `NoBoxes`, `start.rs`), while the land book is attached afterwards (`box_ops::attach_lands` sets `ctx.box_lands`, a `OnceLock`). Whoever replaces `ctx.boxes` with a real `ManagerSource` must look the book up at call time (`box_ops::source()` or `ctx.box_lands.get()` on each call), not once at build time. Otherwise the Workspace's `discard` bypasses the L4 guard (and its box lock, `LandBook::discard_with`), and `pending` and `complete` stay empty.
+> 2. Plan 31's Workspace `complete` (its Task 5) must verify the WebAuthn touch only against a `PendingAction.record` that `pending()` listed, never against a record of a request it did not get from `pending()`. `Lands::complete(Approve, ..)` itself refuses any request that changes git config (`git_config` set): "land {id} changes git config; land it from the CLI: saiife box land {id} --allow-git-config".
+
 > **Depends on:** plan 34 merged (`Manager`, `ManagerSource`, plan 28's kit); **plan 26** merged (`saiife_touch::{ActionRecord, TouchClass::{Land, PushProtected}, TouchEvidence}`, daemon `TouchState::{issue, consume}`, `approvals::record_with_touch`); **plan 27** (the CLI's touch client, for Task 6); **plan 32 Task 3** (`userpack::diff_hits`, `Profile::Box`); plan 37 Tasks 2–4 (`fdpass`, `BaseManifest`, `check_path`, the base ref); plan 38 Tasks 1, 3, 4 (`Request::{Export, Advance}`, the guest crate, `VsockGuest::request_stream`). Plan 31's Workspace land (its Task 5, `complete` after a WebAuthn touch) builds on Task 4; Workspace push is not built (plan 31 keeps `box.push` in `LATER`).
 > **Soft dependency (owner ruling 2026-11-12):** plan 41 (`2026-11-12-plan-41-linux-fido-helper.md`, the packaged Linux FIDO helper). This plan builds and tests without it; without it a Linux release `saiife box land` refuses and points to the Workspace plus `saiife box apply` (Task 6). The CLI land path with a real key on a Linux release needs plan 41.
 
@@ -67,7 +71,7 @@ Plan 35's Global Constraints apply (including `CARGO_PROFILE_DEV_DEBUG=0`), with
 | unified header | `diff --saiife a/<p> b/<p>`; `new file mode 100644`, `deleted file mode 100755`, `old mode …`/`new mode …`; `--- a/<p>` or `--- /dev/null`; `+++ b/<p>` or `+++ /dev/null`; hunks with 3 context lines; `\ No newline at end of file` |
 | binary line | `Binary file b/<p>: <size> bytes, sha256 <hex>` (deleted: `Binary file a/<p> deleted`) |
 | symlink | rendered as a one-line text file whose content is the target, with mode `120000` in the header |
-| land dir | `<box>/lands/<n>/` (0700): `blobs/<sha256>`, `delta.bin` (canonical, new content only, for the CLI), `review.json`, `request.json`, `approved.json`, `applied.json` |
+| land dir | `<record dir>/lands/<n>/` (0700; the box's record dir, `RecordPaths::of(<store root>, id)`, never the VMM runtime dir, R37): `blobs/<sha256>`, `delta.bin` (canonical, new content only, for the CLI), `review.json`, `request.json`, `approved.json`, `applied.json` |
 | `target_ref` | `saiife/box-<id>` |
 | land commit message | `saiife box <id>: land <n>\n\n<first line of the task, ≤ 72 chars>\n\nSaiife-Box: <id>\nSaiife-Land: <n>\nSaiife-Diff-Sha256: <sha>\n` |
 | worktree | `$XDG_DATA_HOME/saiife/worktrees/<repo>-<id>` |
@@ -153,10 +157,10 @@ Every git call: `GIT_DIR=<root>/var/lib/saiife-guest/base.git GIT_WORK_TREE=<roo
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct Flag { pub path: String, pub why: String }   // L6 texts: "protected path", "rule <pack>: <reason>", "becomes executable", "new symlink", "binary", "differs only in case from <other>"
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] pub struct Review { pub n: u32, pub summary: saiife_wire::DiffSummary, pub flags: Vec<Flag>, pub entries: Vec<EntryHead>, pub base_head: Option<String> }
 pub type Hits<'a> = &'a dyn Fn(&[&str]) -> Vec<Flag>;   // the daemon passes plan 32's diff_hits mapped to Flag
-pub fn receive(guest: &VsockGuest, id: &BoxId, paths: &BoxPaths, base: &BaseManifest, n: u32) -> Result<Valid, DeltaError>;   // request_stream(Export{n}) into lands/<n>/blobs; on error removes lands/<n>
+pub fn receive(guest: &VsockGuest, id: &BoxId, paths: &RecordPaths, base: &BaseManifest, n: u32) -> Result<Valid, DeltaError>;   // request_stream(Export{n}) into lands/<n>/blobs; on error removes lands/<n>
 pub fn render(base: &BaseManifest, v: &Valid, blobs: &Path, only: Option<&BTreeSet<String>>) -> (String /* full unified */, Vec<FileChange>);
 pub fn review(id: &BoxId, base: &BaseManifest, v: &Valid, blobs: &Path, only: Option<&BTreeSet<String>>, hits: Hits) -> Review;   // diff_sha256 = sha256(full); unified cut at a line end ≤ MAX_DIFF_BYTES
-pub fn write_land_files(paths: &BoxPaths, r: &Review, only: Option<&BTreeSet<String>>) -> Result<(), String>;   // delta.bin (new content of the selected entries) + review.json, 0600
+pub fn write_land_files(paths: &RecordPaths, r: &Review, only: Option<&BTreeSet<String>>) -> Result<(), String>;   // delta.bin (new content of the selected entries) + review.json, 0600
 pub fn protected(path: &str) -> bool;   // L6 built-in list
 ```
 Old content of a `modify` comes from the delta's old side, already proven equal to the manifest hash, so the renderer never trusts the guest for it. `render` output is deterministic (entries in path order; `similar` `TextDiff::from_lines(..).unified_diff().context_radius(3)`), pinned by golden files.

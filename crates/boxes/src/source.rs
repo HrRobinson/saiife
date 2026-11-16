@@ -5,6 +5,12 @@
 //! `owner_uid` is `u`; another user's id behaves exactly like a missing one
 //! (`NotFound`). With `owner = None` (locked mode) it sees every box, but
 //! cannot spawn.
+//!
+//! Lands (plan 39): with a [`LandBook`] ([`ManagerSource::with_lands`]),
+//! `diff`, `pending_actions` and `complete` go to the book, and `discard`
+//! refuses a box with an approved land that is not applied yet (L4). An
+//! owner-scoped source shows only the records of that owner's boxes, and
+//! a request of another owner's box is `NotFound`.
 
 use std::sync::Arc;
 
@@ -21,6 +27,55 @@ use crate::store::BoxRecord;
 pub struct ManagerSource {
     mgr: Arc<Manager>,
     owner: Option<u32>,
+    lands: Option<Arc<dyn LandBook>>,
+}
+
+/// The daemon's land book (plan 39 Task 4): reviews, land requests and
+/// their decisions. Every method may block on the guest or the disk.
+pub trait LandBook: Send + Sync {
+    /// The box's latest review (`NotFound` for an unknown box).
+    fn diff(&self, id: &BoxId) -> Result<DiffSummary, BoxError>;
+    /// The land requests the Workspace may decide, all owners' (L8: at
+    /// most four per owner); the source filters them by owner.
+    fn pending(&self) -> Vec<PendingAction>;
+    /// Decide request `request_id` (plan 28's `complete` contract).
+    fn complete(
+        &self,
+        request_id: u64,
+        d: Decision,
+        ev: Option<TouchEvidence>,
+    ) -> Result<(), BoxError>;
+    /// Approved lands of the box not applied yet (L4).
+    fn unapplied(&self, id: &BoxId) -> u32;
+    /// Runs `discard` unless the box has an unapplied land (`force` skips
+    /// that check). A book that approves lands overrides it to hold its
+    /// per-box lock across the check and the discard, so an approval
+    /// cannot slip in between (L4).
+    fn discard_with(
+        &self,
+        id: &BoxId,
+        force: bool,
+        discard: &mut dyn FnMut() -> Result<(), BoxError>,
+    ) -> Result<(), BoxError> {
+        if !force && self.unapplied(id) > 0 {
+            return Err(unapplied_refusal(id));
+        }
+        discard()
+    }
+    /// The box a request is for, `None` for an unknown request: lets an
+    /// owner-scoped source refuse another owner's request as `NotFound`.
+    fn box_of(&self, request_id: u64) -> Option<BoxId> {
+        let _ = request_id;
+        None
+    }
+}
+
+/// [`ManagerSource::discard`]'s refusal while `unapplied(id) > 0` (L4).
+pub fn unapplied_refusal(id: &BoxId) -> BoxError {
+    let i = id.as_str();
+    BoxError::Invalid(format!(
+        "box {i} has an approved land that is not applied: saiife box apply {i}, or discard --force"
+    ))
 }
 
 /// The wire view of a record. `queue_pos` is the caller's choice (see
@@ -52,7 +107,23 @@ fn is_over(s: BoxState) -> bool {
 
 impl ManagerSource {
     pub fn new(mgr: Arc<Manager>, owner: Option<u32>) -> ManagerSource {
-        ManagerSource { mgr, owner }
+        ManagerSource {
+            mgr,
+            owner,
+            lands: None,
+        }
+    }
+
+    /// This source with a land book (plan 39): `diff`, `pending_actions`
+    /// and `complete` go to it, and `discard` refuses unapplied lands.
+    pub fn with_lands(mut self, lands: Arc<dyn LandBook>) -> ManagerSource {
+        self.lands = Some(lands);
+        self
+    }
+
+    /// Whether this source sees box `id` (a missing box is not seen).
+    fn sees_id(&self, id: &BoxId) -> bool {
+        self.mgr.get(id).is_ok_and(|r| self.sees(&r))
     }
 
     fn sees(&self, r: &BoxRecord) -> bool {
@@ -134,7 +205,10 @@ impl BoxSource for ManagerSource {
 
     fn diff(&self, id: &BoxId) -> Result<DiffSummary, BoxError> {
         self.visible(id)?;
-        self.mgr.guest().diff(id).map_err(BoxError::from)
+        match &self.lands {
+            Some(l) => l.diff(id),
+            None => self.mgr.guest().diff(id).map_err(BoxError::from),
+        }
     }
 
     fn stop(&self, id: &BoxId) -> Result<(), BoxError> {
@@ -154,7 +228,10 @@ impl BoxSource for ManagerSource {
 
     fn discard(&self, id: &BoxId) -> Result<(), BoxError> {
         self.visible(id)?;
-        self.mgr.discard(id).map(|_| ())
+        match &self.lands {
+            Some(l) => l.discard_with(id, false, &mut || self.mgr.discard(id).map(|_| ())),
+            None => self.mgr.discard(id).map(|_| ()),
+        }
     }
 
     /// With an owner filter `queue` must list exactly that user's queued
@@ -207,18 +284,34 @@ impl BoxSource for ManagerSource {
         self.mgr.revise(id, comment).map(|_| ())
     }
 
-    /// Land is a later plan: nothing is ever pending.
+    /// Without a land book nothing is ever pending.
     fn pending_actions(&self) -> Vec<PendingAction> {
-        Vec::new()
+        let Some(l) = &self.lands else {
+            return Vec::new();
+        };
+        l.pending()
+            .into_iter()
+            .filter(|p| self.owner.is_none() || p.box_id.as_ref().is_some_and(|b| self.sees_id(b)))
+            .collect()
     }
 
     fn complete(
         &self,
-        _request_id: u64,
-        _decision: Decision,
-        _evidence: Option<TouchEvidence>,
+        request_id: u64,
+        decision: Decision,
+        evidence: Option<TouchEvidence>,
     ) -> Result<(), BoxError> {
-        Err(BoxError::NotFound)
+        let Some(l) = &self.lands else {
+            return Err(BoxError::NotFound);
+        };
+        if self.owner.is_some() {
+            if let Some(b) = l.box_of(request_id) {
+                if !self.sees_id(&b) {
+                    return Err(BoxError::NotFound);
+                }
+            }
+        }
+        l.complete(request_id, decision, evidence)
     }
 
     fn templates(&self) -> Vec<Template> {

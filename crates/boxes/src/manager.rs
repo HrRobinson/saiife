@@ -848,6 +848,22 @@ impl Manager {
         Ok(change(&r, from, "done"))
     }
 
+    /// A land was approved (plan 39): Done or Landed → Landed and
+    /// `lands += 1`, through `Event::Land`. The land book writes its
+    /// records before and advances the guest after; the manager only keeps
+    /// the count and the state.
+    pub fn land(&self, id: &BoxId) -> Result<Change, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        r.state = transition(from, Event::Land)?;
+        r.lands = r.lands.saturating_add(1);
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(change(&r, from, "land"))
+    }
+
     /// Steer a Running or Paused box (R3). The state is checked under the
     /// lock; the message is sent with it released.
     pub fn say(&self, id: &BoxId, msg: &str) -> Result<(), BoxError> {

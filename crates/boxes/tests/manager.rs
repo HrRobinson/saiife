@@ -991,6 +991,38 @@ fn done_needs_running() {
     w.assert_saved(&i.id);
 }
 
+/// Plan 39: `land` is Done/Landed → Landed with `lands += 1`, saved.
+#[test]
+fn land_moves_done_to_landed() {
+    let mut w = world(1);
+    let i = running(&w, "a");
+    assert_eq!(
+        w.mgr.land(&i),
+        Err(BoxError::WrongState {
+            state: BoxState::Running
+        })
+    );
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 0);
+    w.mgr.done(&i).unwrap();
+    assert_eq!(
+        w.mgr.land(&i).unwrap(),
+        change(&i, BoxState::Done, BoxState::Landed, "land")
+    );
+    assert_eq!(w.mgr.get(&i).unwrap().lands, 1);
+    w.assert_saved(&i);
+    // A second land of what is left (a partial land): Landed again.
+    assert_eq!(
+        w.mgr.land(&i).unwrap(),
+        change(&i, BoxState::Landed, BoxState::Landed, "land")
+    );
+    assert!(w.reopen().is_empty());
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!((r.state, r.lands), (BoxState::Landed, 2));
+    // The VM is untouched: a land never stops it.
+    assert!(r.vm_on);
+    assert_eq!(w.mgr.land(&id("zz")), Err(BoxError::NotFound));
+}
+
 #[test]
 fn revise_running_box_is_wrong_state() {
     let w = world(1);

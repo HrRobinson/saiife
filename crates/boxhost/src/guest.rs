@@ -52,6 +52,9 @@ const FLUSH_MS: u64 = 200;
 const RECORDER_FLUSH: Duration = Duration::from_secs(1);
 /// after_off waits this long for the box's threads, then detaches them.
 const JOIN_WAIT: Duration = Duration::from_secs(2);
+/// The error of [`VsockGuest::request_stream_until`] once its overall
+/// deadline has passed.
+pub const STREAM_DEADLINE: &str = "the guest stream passed its overall deadline";
 /// Guest-derived error text kept or logged, in bytes.
 const MAX_TEXT: usize = 512;
 /// Connection handler threads per run (events and PTY together); above it a
@@ -585,13 +588,50 @@ impl VsockGuest {
         timeout: Duration,
         on_frame: &mut dyn FnMut(Frame) -> Result<bool, String>,
     ) -> Result<(), GuestError> {
+        self.stream(id, req, timeout, None, on_frame)
+    }
+
+    /// [`Self::request_stream`] with an overall deadline as well (plan 38
+    /// R13, plan 39 R-P4): the first frame may take until `total` (the
+    /// guest answers an export only after its full snapshot), each later
+    /// frame must arrive within `per_frame`, and no frame is read after
+    /// `total`. Past `total` the error is [`STREAM_DEADLINE`].
+    pub fn request_stream_until(
+        &self,
+        id: &BoxId,
+        req: &Request,
+        per_frame: Duration,
+        total: Instant,
+        on_frame: &mut dyn FnMut(Frame) -> Result<bool, String>,
+    ) -> Result<(), GuestError> {
+        self.stream(id, req, per_frame, Some(total), on_frame)
+    }
+
+    fn stream(
+        &self,
+        id: &BoxId,
+        req: &Request,
+        per_frame: Duration,
+        total: Option<Instant>,
+        on_frame: &mut dyn FnMut(Frame) -> Result<bool, String>,
+    ) -> Result<(), GuestError> {
         let run = self.live_run(id)?;
-        let (s, _guard) = self.open_control(&run, req, timeout, None)?;
+        let left = |now: Instant| total.map(|t| t.saturating_duration_since(now));
+        let connect = left(Instant::now()).map_or(per_frame, |l| l.min(per_frame));
+        if connect.is_zero() {
+            return Err(GuestError::Unavailable(STREAM_DEADLINE.into()));
+        }
+        let (s, _guard) = self.open_control(&run, req, connect, None)?;
+        let mut first = true;
         loop {
-            let mut r = DeadlineReader {
-                s: &s,
-                deadline: Instant::now() + timeout,
+            let now = Instant::now();
+            let deadline = match total {
+                Some(t) if first => t,
+                Some(t) => t.min(now + per_frame),
+                None => now + per_frame,
             };
+            first = false;
+            let mut r = DeadlineReader { s: &s, deadline };
             match read_frame(&mut r) {
                 Ok(Some(f)) => match on_frame(f) {
                     Ok(true) => {}
@@ -599,6 +639,9 @@ impl VsockGuest {
                     Err(m) => return Err(GuestError::Unavailable(m)),
                 },
                 Ok(None) => return Ok(()),
+                Err(_) if total.is_some_and(|t| Instant::now() >= t) => {
+                    return Err(GuestError::Unavailable(STREAM_DEADLINE.into()))
+                }
                 Err(e) => return Err(unavailable("the guest stream failed", e)),
             }
         }
