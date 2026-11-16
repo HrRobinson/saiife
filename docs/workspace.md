@@ -103,8 +103,11 @@ The page shows a 6-digit short code before the passkey dialog opens. The
 same code is in the inbox, and in the optional `box_waiting` notification,
 so you can check that the prompt is the one you meant to answer. That
 notification carries the box and the code and no link. It is sent once per
-land request, when the daemon first offers that request in the inbox. See
-[notifications](notifications.md). If this browser has no passkey, the page
+finished run of a box, when the daemon first offers that run's result in the
+inbox. A land request expires after 5 minutes and the inbox offers it again
+under a new request id (and a new code); that sends no second notification.
+When the box is revised and finishes again, the new result sends one more.
+See [notifications](notifications.md). If this browser has no passkey, the page
 says "Needs a touch on a paired passkey" and shows the machine command
 instead.
 

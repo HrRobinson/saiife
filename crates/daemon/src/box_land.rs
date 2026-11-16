@@ -205,9 +205,11 @@ struct State {
     /// The last export number asked for, per box.
     last_export: BTreeMap<BoxId, u32>,
     pushes: BTreeMap<u64, Push>,
-    /// The request ids `box_waiting` was sent for (kept as long as their
-    /// request).
-    notified: BTreeSet<u64>,
+    /// Per `Done` box, the whole-review hash `box_waiting` was sent for:
+    /// once per finished run, however often its request id is issued
+    /// again. Dropped when the book sees the box out of `Done` (revised,
+    /// landed, discarded or gone), so the next finished run sends again.
+    notified: BTreeMap<BoxId, String>,
 }
 
 /// The box's current base (R-P3).
@@ -471,7 +473,7 @@ impl Lands {
                 rejected: BTreeMap::new(),
                 last_export: BTreeMap::new(),
                 pushes: BTreeMap::new(),
-                notified: BTreeSet::new(),
+                notified: BTreeMap::new(),
             }),
             boxes: Mutex::new(BTreeMap::new()),
         })
@@ -1319,17 +1321,15 @@ impl LandBook for Lands {
         done.sort_by(|a, b| {
             (a.owner_uid, a.updated_at, &a.id).cmp(&(b.owner_uid, b.updated_at, &b.id))
         });
-        let mut want: Vec<(BoxRecord, Option<PendingAction>)> = Vec::new();
+        let mut want: Vec<(BoxRecord, String, Option<PendingAction>)> = Vec::new();
         {
             let mut st = lock(&self.state);
             let live: BTreeSet<BoxId> = self.mgr.list().into_iter().map(|r| r.id).collect();
             st.reviews.retain(|k, _| live.contains(k));
             st.rejected.retain(|k, _| live.contains(k));
             st.requests.retain(|_, q| live.contains(&q.req.id));
-            let State {
-                requests, notified, ..
-            } = &mut *st;
-            notified.retain(|rid| requests.contains_key(rid));
+            let done_ids: BTreeSet<&BoxId> = done.iter().map(|r| &r.id).collect();
+            st.notified.retain(|k, _| done_ids.contains(k));
             let mut per: BTreeMap<u32, usize> = BTreeMap::new();
             for r in done {
                 let Some(c) = st.reviews.get(&r.id) else {
@@ -1365,34 +1365,34 @@ impl LandBook for Lands {
                     })
                     .max_by_key(|q| q.req.request_id)
                     .map(Self::action);
-                want.push((r, have));
+                want.push((r, sha, have));
             }
         }
         let mut out = Vec::new();
-        for (r, have) in want {
-            match have {
-                Some(p) => out.push(p),
+        for (r, sha, have) in want {
+            let pa = match have {
+                Some(p) => p,
                 None => {
-                    if let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, false, now) {
-                        let mut st = lock(&self.state);
-                        let Some(q) = st.requests.get(&rid) else {
-                            continue;
-                        };
-                        let pa = Self::action(q);
-                        // `box_waiting`: once per request id, here where the
-                        // id is first issued, so a later list (the
-                        // Workspace's own inbox poll) never sends it again.
-                        let first = st.notified.insert(rid);
-                        drop(st);
-                        if first {
-                            if let Ok(ctx) = self.ctx() {
-                                crate::workspace_touch::notify_pending(&ctx, &pa);
-                            }
-                        }
-                        out.push(pa);
-                    }
+                    let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, false, now) else {
+                        continue;
+                    };
+                    let st = lock(&self.state);
+                    let Some(q) = st.requests.get(&rid) else {
+                        continue;
+                    };
+                    Self::action(q)
+                }
+            };
+            // `box_waiting`: once per finished run (box and review), not per
+            // request id: a request issued again past its expiry, or a later
+            // list (the Workspace's own inbox poll), never sends it again.
+            let first = lock(&self.state).notified.insert(r.id.clone(), sha.clone()) != Some(sha);
+            if first {
+                if let Ok(ctx) = self.ctx() {
+                    crate::workspace_touch::notify_pending(&ctx, &pa);
                 }
             }
+            out.push(pa);
         }
         out
     }
