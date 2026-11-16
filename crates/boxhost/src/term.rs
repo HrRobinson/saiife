@@ -947,6 +947,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn cast_replaces_a_fifo_without_blocking() {
         use rustix::fs::{mknodat, FileType, Mode, CWD};
         let d = tmp();

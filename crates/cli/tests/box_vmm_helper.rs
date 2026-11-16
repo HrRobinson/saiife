@@ -135,7 +135,7 @@ fn helper_refuses_a_tampered_spec_before_exec() {
 }
 
 /// Runs the helper with a bound: a stuck open would hang it forever.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_os = "linux"))]
 fn run_bounded(f: &Fx) -> Option<std::process::ExitStatus> {
     let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
     c.args(["__box-vmm"])
@@ -166,7 +166,7 @@ fn run_bounded(f: &Fx) -> Option<std::process::ExitStatus> {
 }
 
 #[test]
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_os = "linux"))]
 fn helper_replaces_a_fifo_log() {
     let f = fx();
     rustix::fs::mknodat(

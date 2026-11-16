@@ -1097,6 +1097,7 @@ mod tests {
     /// `vm.json`, or a planted `vm.json.tmp`, never stops the daemon's
     /// write, and a link's target is never written.
     #[test]
+    #[cfg(target_os = "linux")]
     fn write_spec_replaces_whatever_the_vmm_left() {
         use std::os::unix::fs::FileTypeExt;
         let e = env();

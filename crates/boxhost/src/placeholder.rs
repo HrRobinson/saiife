@@ -191,7 +191,9 @@ pub fn placeholder_matches(expected: &str, got: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::paths::PLACEHOLDER;
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::PermissionsExt;
 
     fn rp(d: &tempfile::TempDir) -> RecordPaths {
         RecordPaths::new(d.path().to_path_buf())
@@ -268,6 +270,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_fifo_never_blocks() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join(PLACEHOLDER);

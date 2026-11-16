@@ -580,6 +580,7 @@ mod tests {
     /// within about a second, on this thread (no helper thread is left
     /// blocked in connect).
     #[test]
+    #[cfg(target_os = "linux")]
     fn full_backlog_times_out_without_a_thread() {
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
         use std::os::unix::net::UnixStream as Std;
