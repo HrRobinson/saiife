@@ -958,7 +958,7 @@ async fn write_tick_records(
     changes: Vec<(Change, Option<String>)>,
     via: &str,
 ) {
-    write_records(ctx, action, reason, "tick", changes).await;
+    write_records(ctx, action, reason, via, changes).await;
 }
 
 /// The `box` records of changes made on a caller's behalf (`via` names it,
