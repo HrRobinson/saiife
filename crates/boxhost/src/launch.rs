@@ -327,27 +327,51 @@ pub fn argv(spec: &LaunchSpec, paths: &BoxPaths) -> Vec<OsString> {
     v
 }
 
-/// `vm.json.tmp` (0640) renamed over `vm.json`.
+/// A fresh temporary file (0640, `O_EXCL`, random name: nothing in the
+/// VMM-writable runtime dir can be planted at it) renamed over `vm.json`.
+/// A `vm.json` that is not a regular file is removed first (a directory
+/// would make the rename fail; unlink removes a link, not its target).
 pub fn write_spec(spec: &LaunchSpec, paths: &BoxPaths) -> Result<(), String> {
+    use ring::rand::SecureRandom;
+    use std::io::Write;
     let body = serde_json::to_vec(spec).map_err(|e| e.to_string())?;
-    let tmp = paths.dir.join("vm.json.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let write = || -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
+    let target = paths.vm_json();
+    if let Ok(m) = std::fs::symlink_metadata(&target) {
+        if m.is_dir() {
+            std::fs::remove_dir(&target)
+                .map_err(|e| format!("vm.json: a directory that cannot be removed: {e}"))?;
+        } else if !m.file_type().is_file() {
+            std::fs::remove_file(&target).map_err(|e| format!("vm.json: {e}"))?;
+        }
+    }
+    let rng = ring::rand::SystemRandom::new();
+    for _ in 0..8 {
+        let mut b = [0u8; 8];
+        rng.fill(&mut b)
+            .map_err(|_| "vm.json: no randomness for a temporary name".to_string())?;
+        let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let tmp = paths.dir.join(format!(".vm.json.{name}.tmp"));
+        let mut f = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o640)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&tmp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, paths.vm_json())
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("vm.json: {e}")
-    })
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("vm.json: {e}")),
+        };
+        let r = f
+            .write_all(&body)
+            .and_then(|()| f.sync_all())
+            .and_then(|()| std::fs::rename(&tmp, &target));
+        return r.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("vm.json: {e}")
+        });
+    }
+    Err("vm.json: no free temporary name".into())
 }
 
 /// Reads `vm.json`: a regular file (not a symlink, no FIFO), at most 16 KiB.
@@ -394,8 +418,40 @@ pub fn read_spec_owned(paths: &BoxPaths, not_uid: Option<u32>) -> Result<LaunchS
     serde_json::from_slice(&buf).map_err(|e| format!("vm.json: {e}"))
 }
 
+/// What the VMM process of a box may use on the host, beyond the guest
+/// RAM: Cloud Hypervisor's own heap, threads, queues and caches.
+pub const VMM_OVERHEAD_MIB: u64 = 256;
+
+/// The host's caps on a box's VMM process (locked: the unit's cgroup),
+/// from the spec the daemon built: the guest RAM plus
+/// [`VMM_OVERHEAD_MIB`], and one CPU per vCPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmLimits {
+    /// `MemoryMax=`, in bytes.
+    pub memory_max: u64,
+    /// `CPUQuota=` as systemd's `CPUQuotaPerSecUSec`: CPU time per second.
+    pub cpu_usec_per_sec: u64,
+}
+
+impl VmmLimits {
+    pub fn of(spec: &LaunchSpec) -> VmmLimits {
+        VmmLimits {
+            memory_max: spec.mem_mib.saturating_add(VMM_OVERHEAD_MIB) << 20,
+            cpu_usec_per_sec: u64::from(spec.vcpus) * 1_000_000,
+        }
+    }
+}
+
 /// Starts and stops the VMM process of a box.
 pub trait Launcher: Send + Sync {
+    /// Caps what the next start of the box's VMM may use; called right
+    /// before every `start`, which does not happen when it fails. Locked:
+    /// the unit's `MemoryMax=` and `CPUQuota=`. Personal mode has no cap
+    /// (the default): the VMM is a child of the daemon in the user's own
+    /// session, and only the guest's size in the spec bounds it.
+    fn limit(&self, _id: &BoxId, _limits: &VmmLimits) -> Result<(), String> {
+        Ok(())
+    }
     /// Returns once the process is started.
     fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String>;
     /// The only liveness source (S3, ruling R19); never the VMM's API.
@@ -521,6 +577,11 @@ enum Slot {
 /// (unlinking a pid record in the daemon-owned vault is the one file call).
 /// Each child gets a `<vault>/<id>.pid` record so a restarted daemon can
 /// tell whether it still runs.
+///
+/// No host cap (personal-mode gap): the child shares the daemon's cgroup,
+/// so `Launcher::limit` is a no-op here; a compromised VMM can use more
+/// memory and CPU than the box was admitted with, up to the user's own
+/// limits. Locked mode caps the unit ([`UnitLauncher`]).
 pub struct ChildLauncher {
     program: PathBuf,
     mode: Mode,
@@ -769,6 +830,9 @@ impl Launcher for ChildLauncher {
 /// the daemon's implementation runs each call on a short-lived thread.
 pub trait UnitBus: Send + Sync {
     fn start(&self, unit: &str) -> Result<(), String>;
+    /// Sets the unit's `MemoryMax=` and `CPUQuota=` for its next run
+    /// (runtime properties, gone at reboot; set before every start).
+    fn set_limits(&self, unit: &str, limits: &VmmLimits) -> Result<(), String>;
     fn stop(&self, unit: &str) -> Result<(), String>;
     /// `Ok(false)` only when the unit is known to have no process: `inactive`
     /// or `failed`, or not loaded at all (systemd drops inactive units).
@@ -804,6 +868,13 @@ impl UnitLauncher {
 }
 
 impl Launcher for UnitLauncher {
+    /// Fails closed: a unit whose caps could not be set is not started.
+    fn limit(&self, id: &BoxId, limits: &VmmLimits) -> Result<(), String> {
+        self.bus
+            .set_limits(&unit_name(id)?, limits)
+            .map_err(|e| format!("cannot cap the box's VMM unit: {e}"))
+    }
+
     fn start(&self, id: &BoxId, _paths: &BoxPaths) -> Result<(), String> {
         self.bus.start(&unit_name(id)?)
     }
@@ -834,6 +905,8 @@ pub struct FakeUnitBus {
     pub calls: Mutex<Vec<String>>,
     /// What `active` answers.
     pub active: Mutex<Result<bool, String>>,
+    /// What `set_limits` answers.
+    pub limits: Mutex<Result<(), String>>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -842,6 +915,7 @@ impl FakeUnitBus {
         FakeUnitBus {
             calls: Mutex::new(Vec::new()),
             active: Mutex::new(Ok(false)),
+            limits: Mutex::new(Ok(())),
         }
     }
 
@@ -865,6 +939,14 @@ impl UnitBus for FakeUnitBus {
     fn start(&self, unit: &str) -> Result<(), String> {
         self.record("start", unit);
         Ok(())
+    }
+    fn set_limits(&self, unit: &str, limits: &VmmLimits) -> Result<(), String> {
+        let l = format!("{unit} {} {}", limits.memory_max, limits.cpu_usec_per_sec);
+        self.record("limit", &l);
+        self.limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     fn stop(&self, unit: &str) -> Result<(), String> {
         self.record("stop", unit);
@@ -900,6 +982,87 @@ mod tests {
         }
         // Not even a box id: never reaches a unit name.
         assert!(BoxId::parse("b1/../x").is_err());
+    }
+
+    /// The runtime dir is VMM-writable: a directory, FIFO or symlink at
+    /// `vm.json`, or a planted `vm.json.tmp`, never stops the daemon's
+    /// write, and a link's target is never written.
+    #[test]
+    fn write_spec_replaces_whatever_the_vmm_left() {
+        use std::os::unix::fs::FileTypeExt;
+        let e = env();
+        let s = spec(&e, "b1");
+        let paths = BoxPaths::new(e.root.join("boxes/b1"));
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let victim = e.root.join("elsewhere/victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, paths.dir.join("vm.json.tmp")).unwrap();
+        for plant in ["dir", "fifo", "link"] {
+            let p = paths.vm_json();
+            let _ = std::fs::remove_file(&p);
+            match plant {
+                "dir" => std::fs::create_dir(&p).unwrap(),
+                "fifo" => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &p,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap(),
+                _ => std::os::unix::fs::symlink(&victim, &p).unwrap(),
+            }
+            write_spec(&s, &paths).unwrap();
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert!(
+                m.file_type().is_file() && !m.file_type().is_fifo(),
+                "{plant}"
+            );
+            assert_eq!(read_spec(&paths).unwrap(), s, "{plant}");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        // only vm.json and the planted link: no temporary file is left
+        let mut names: Vec<String> = std::fs::read_dir(&paths.dir)
+            .unwrap()
+            .map(|d| d.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["vm.json", "vm.json.tmp"]);
+    }
+
+    /// Locked: the unit is capped at the spec's RAM plus the VMM's
+    /// overhead and one CPU per vCPU; a bus error fails closed.
+    #[test]
+    fn unit_launcher_caps_the_unit_from_the_spec() {
+        let e = env();
+        let bus = std::sync::Arc::new(FakeUnitBus::new());
+        let l = UnitLauncher::new(bus.clone());
+        let id = BoxId::parse("b7").unwrap();
+        let s = LaunchSpec {
+            vcpus: 3,
+            mem_mib: 2048,
+            ..spec(&e, "b7")
+        };
+        let lim = VmmLimits::of(&s);
+        assert_eq!(lim.memory_max, (2048 + VMM_OVERHEAD_MIB) << 20);
+        assert_eq!(lim.cpu_usec_per_sec, 3_000_000);
+        l.limit(&id, &lim).unwrap();
+        assert_eq!(
+            bus.calls.lock().unwrap().clone(),
+            [format!(
+                "limit saiife-box@b7.service {} 3000000",
+                (2048 + VMM_OVERHEAD_MIB) << 20
+            )]
+        );
+        *bus.limits.lock().unwrap() = Err("denied".into());
+        let err = l.limit(&id, &lim).unwrap_err();
+        assert!(err.contains("cap") && err.contains("denied"), "{err}");
+        // a bad id never reaches the bus
+        assert!(l.limit(&BoxId::parse("x1").unwrap(), &lim).is_err());
+        assert_eq!(bus.calls.lock().unwrap().len(), 2);
+        // personal: no cap, nothing refused
+        let c = ChildLauncher::helper(PathBuf::from("/x"), e.root.join("vault"));
+        assert_eq!(c.limit(&id, &lim), Ok(()));
     }
 
     #[test]

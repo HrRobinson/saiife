@@ -696,7 +696,13 @@ impl ChVmm {
             inner.unwind(id, paths, false);
             return Err(VmmError::Failed(e));
         }
-        if let Err(e) = inner.launcher.start(id, paths) {
+        // locked: the unit is capped at what the box was admitted with
+        // before every start; no cap, no start
+        let started = inner
+            .launcher
+            .limit(id, &launch::VmmLimits::of(&spec))
+            .and_then(|()| inner.launcher.start(id, paths));
+        if let Err(e) = started {
             inner.unwind(id, paths, false);
             return Err(VmmError::Failed(e));
         }
@@ -874,8 +880,10 @@ impl Vmm for ChVmm {
             vcpus: spec.size.vcpus,
             mem_mib: spec.size.mem_mib,
             base: image.raw.clone(),
-            // not followed: a symlink here is refused at boot (check_plain)
-            repo: std::fs::symlink_metadata(paths.repo_disk()).is_ok(),
+            // what this create handed over, not what the VMM-writable
+            // runtime dir holds: a repo.img found there is not the box's
+            // (boot then refuses it)
+            repo: handover.moved() != crate::repo_handover::Moved::Nothing,
             boot: image.boot.clone(),
             landlock: inner.landlock,
             restore: None,

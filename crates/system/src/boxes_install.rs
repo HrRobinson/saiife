@@ -77,12 +77,14 @@ Restart=no
 ";
 
 /// The polkit rule: the daemon user may start and stop `saiife-box@b<N>`
-/// units, nothing else. It names the Linux daemon user
+/// units and set their runtime properties (the daemon sets each box's
+/// `MemoryMax=` and `CPUQuota=` before every start, from the size the box
+/// was admitted with), nothing else. It names the Linux daemon user
 /// ([`crate::layout::DAEMON_USER`]); `install_boxes` refuses any other.
 pub const POLKIT_RULE: &str = r#"polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "saiife") {
     var unit = action.lookup("unit"), verb = action.lookup("verb");
-    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
+    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop" || verb == "set-property")) {
       return polkit.Result.YES;
     }
   }
@@ -675,7 +677,8 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
     #[test]
     fn polkit_rule_is_narrow() {
         assert!(POLKIT_RULE.contains(r"/^saiife-box@b[0-9]{1,9}\.service$/.test(unit)"));
-        assert!(POLKIT_RULE.contains(r#"(verb == "start" || verb == "stop")"#));
+        assert!(POLKIT_RULE
+            .contains(r#"(verb == "start" || verb == "stop" || verb == "set-property")"#));
         assert!(POLKIT_RULE.contains(r#"subject.user == "saiife""#));
         assert!(POLKIT_RULE.contains(r#"action.id == "org.freedesktop.systemd1.manage-units""#));
         assert_eq!(POLKIT_RULE.matches("return polkit.Result").count(), 1);

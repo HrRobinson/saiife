@@ -270,6 +270,15 @@ impl World {
         self.resign(id);
     }
 
+    /// Rewrites the vault copy's state.json (raw bytes) and re-signs it.
+    fn forge_state(&self, id: &str, edit: impl FnOnce(&mut serde_json::Value) -> Vec<u8>) {
+        let p = self.snap(id).join("state.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let body = edit(&mut v);
+        std::fs::write(&p, body).unwrap();
+        self.resign(id);
+    }
+
     fn booted_cold(&self, id: &str) -> bool {
         let argv = std::fs::read_to_string(self.paths(id).dir.join("fake-ch.argv")).unwrap();
         !argv.contains("\"--restore\"")
@@ -430,14 +439,22 @@ fn create_writes_spec_and_overlay() {
     assert_eq!(s.boot, w.image.boot);
     assert!(s.landlock);
     assert!(!s.repo && s.restore.is_none());
-    // repo.img is picked up on the next create; a snapshot is not trusted
-    // by create (boot decides, from the marker)
+    // a repo.img in the (VMM-writable) runtime dir is not the box's: only
+    // one create hands over from the record dir counts; a snapshot is not
+    // trusted by create (boot decides, from the marker)
     std::fs::write(p.repo_disk(), b"r").unwrap();
     std::fs::create_dir(p.snapshot_dir()).unwrap();
     std::fs::write(p.snapshot_dir().join("config.json"), b"{}").unwrap();
-    v.create(&w.spec("b1")).unwrap();
+    let h2 = v.create(&w.spec("b1")).unwrap();
     let s = read_spec(&p).unwrap();
-    assert!(s.repo && s.restore.is_none());
+    assert!(!s.repo && s.restore.is_none());
+    assert!(h2.data.contains("\"repo\":false"), "{}", h2.data);
+    std::fs::remove_file(p.repo_disk()).unwrap();
+    let spec = w.spec("b1");
+    std::fs::write(spec.dir.join("repo.img"), b"r").unwrap();
+    let h3 = v.create(&spec).unwrap();
+    assert!(read_spec(&p).unwrap().repo);
+    assert!(h3.data.contains("\"repo\":true"), "{}", h3.data);
 }
 
 #[test]
@@ -1555,6 +1572,13 @@ impl saiife_boxhost::launch::UnitBus for QueuedStopBus {
         *self.active.lock().unwrap() = true;
         Ok(())
     }
+    fn set_limits(
+        &self,
+        unit: &str,
+        limits: &saiife_boxhost::launch::VmmLimits,
+    ) -> Result<(), String> {
+        self.fake.set_limits(unit, limits)
+    }
     fn stop(&self, unit: &str) -> Result<(), String> {
         self.fake.stop(unit)?;
         let (active, child, id, delay) = (
@@ -1885,4 +1909,101 @@ fn boot_refuses_a_repo_disk_the_box_was_not_created_with() {
     let e = failed(v.boot(&h));
     assert!(e.contains("repo"), "{e}");
     assert!(!w.paths("b1").dir.join("fake-ch.argv").exists());
+}
+
+/// state.json is the VMM's own too: on restore Cloud Hypervisor rebuilds
+/// the vCPUs and the guest RAM from it. More vCPU states, more RAM, a
+/// hotplug slot in use or a state that cannot be read (all re-signed, as
+/// a VMM that forged them before the seal would have them) are refused
+/// with an audit hook call; the box boots cold.
+#[test]
+fn restore_refuses_a_state_the_box_was_not_admitted_with() {
+    type Edit = fn(&mut serde_json::Value) -> Vec<u8>;
+    fn mem(v: &mut serde_json::Value, f: fn(&mut serde_json::Value)) -> Vec<u8> {
+        let p = "/snapshots/memory-manager/snapshot_data/state";
+        let mut m: serde_json::Value =
+            serde_json::from_str(v.pointer(p).unwrap().as_str().unwrap()).unwrap();
+        f(&mut m);
+        *v.pointer_mut(p).unwrap() = m.to_string().into();
+        serde_json::to_vec(v).unwrap()
+    }
+    let edits: &[(&str, Edit)] = &[
+        ("vcpus", |v| {
+            v["snapshots"]["cpu-manager"]["snapshots"]["9"] = serde_json::json!({});
+            serde_json::to_vec(v).unwrap()
+        }),
+        ("ram", |v| {
+            mem(v, |m| {
+                m["boot_ram"] = (1u64 << 36).into();
+                m["current_ram"] = (1u64 << 36).into();
+                m["guest_ram_mappings"][0]["size"] = (1u64 << 36).into();
+            })
+        }),
+        ("hotplug", |v| {
+            mem(v, |m| m["hotplug_slots"][0]["active"] = true.into())
+        }),
+        ("unparseable", |_| b"{\"snapshots\": [".to_vec()),
+        ("empty", |_| b"{}".to_vec()),
+    ];
+    for (what, edit) in edits {
+        let w = World::new();
+        let (v, _l) = w.vmm(&[]);
+        let h = w.snapshotted(&v, "b1");
+        w.forge_state("b1", edit);
+        v.boot(&h).unwrap();
+        assert!(w.booted_cold("b1"), "{what}");
+        assert!(
+            w.events().contains(&"h.refused".to_string()),
+            "{what}: {:?}",
+            w.events()
+        );
+        assert!(!w.marker("b1").exists() && !w.snap("b1").exists(), "{what}");
+    }
+}
+
+/// Locked: every boot caps the box's unit at the RAM and vCPUs the box
+/// was admitted with (the daemon's handle, not vm.json) before it starts
+/// it; a unit whose caps cannot be set is never started.
+#[test]
+fn unit_boot_caps_the_unit_before_starting_it() {
+    use saiife_boxhost::launch::VMM_OVERHEAD_MIB;
+    let w = World::new();
+    let child = w.launcher(&[]);
+    let bus = Arc::new(QueuedStopBus {
+        fake: FakeUnitBus::new(),
+        child,
+        paths: w.paths("b1"),
+        id: BoxId::parse("b1").unwrap(),
+        delay: Duration::from_millis(10),
+        active: Arc::new(Mutex::new(false)),
+    });
+    let v = w.vmm_with(
+        Arc::new(UnitLauncher::new(bus.clone())),
+        vec![w.hook("h", false)],
+    );
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    let calls = bus.fake.calls.lock().unwrap().clone();
+    let limit = format!(
+        "limit saiife-box@b1.service {} 2000000",
+        (4096 + VMM_OVERHEAD_MIB) << 20
+    );
+    let at = |c: &str| calls.iter().position(|x| x == c);
+    assert!(
+        at(&limit).unwrap() < at("start saiife-box@b1.service").unwrap(),
+        "{calls:?}"
+    );
+
+    let w = World::new();
+    let bus = Arc::new(FakeUnitBus::new());
+    *bus.limits.lock().unwrap() = Err("access denied".into());
+    let v = w.vmm_with(
+        Arc::new(UnitLauncher::new(bus.clone())),
+        vec![w.hook("h", false)],
+    );
+    let h = w.create(&v, "b1");
+    let e = failed(v.boot(&h));
+    assert!(e.contains("cap") && e.contains("access denied"), "{e}");
+    let calls = bus.calls.lock().unwrap().clone();
+    assert!(!calls.iter().any(|c| c.starts_with("start")), "{calls:?}");
 }
