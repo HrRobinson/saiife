@@ -112,7 +112,7 @@ struct Up {
     conns: Arc<AtomicUsize>,
     /// `/forever`'s body could no longer be sent (the connection is gone).
     closed: Arc<AtomicBool>,
-    /// When `/v1/messages/sse` sent its third event.
+    /// When the `sse` behaviour sent its third event.
     third_at: Arc<Mutex<Option<Instant>>>,
     /// Every host name the forwarder asked the resolver for.
     asked: Arc<Mutex<Vec<String>>>,
@@ -132,6 +132,11 @@ fn sse_event(i: usize) -> Bytes {
     Bytes::from(format!("event: ping\ndata: {{\"n\":{i}}}\n\n"))
 }
 
+/// The request body that picks the fake upstream's `kind` behaviour.
+fn fake(kind: &str) -> String {
+    format!(r#"{{"saiife_fake":"{kind}"}}"#)
+}
+
 async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBody>, Infallible> {
     let (parts, body) = req.into_parts();
     let body = body
@@ -139,7 +144,8 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
         .await
         .map(|c| c.to_bytes())
         .unwrap_or_default();
-    let stream_asked = String::from_utf8_lossy(&body).contains(r#""stream":true"#);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let stream_asked = text.contains(r#""stream":true"#);
     up.seen.lock().unwrap().push(Seen {
         method: parts.method.to_string(),
         uri: parts.uri.to_string(),
@@ -163,17 +169,24 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             .unwrap()
     };
     let path = parts.uri.path().to_string();
+    // The test behaviours are picked by the request body on
+    // `POST /v1/messages` ([`fake`]; plan 42 R12: only exact paths pass).
     // Codex's streamed Responses call and Gemini's streamed call answer
-    // with the same three events as `/v1/messages/sse`.
+    // with the same three events as `sse`.
     let streamed = (path == "/v1/responses" && stream_asked)
         || path == "/v1beta/models/m:streamGenerateContent";
-    let path = if streamed {
-        "/v1/messages/sse"
+    let kind = if streamed {
+        "sse"
+    } else if path == "/v1/messages" {
+        ["sse", "forever", "stall", "nohead"]
+            .into_iter()
+            .find(|k| text == fake(k))
+            .unwrap_or("")
     } else {
-        path.as_str()
+        ""
     };
-    Ok(match path {
-        "/v1/messages/sse" => {
+    Ok(match kind {
+        "sse" => {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let third = Arc::clone(&up.third_at);
             tokio::spawn(async move {
@@ -191,7 +204,7 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
-        "/v1/messages/forever" => {
+        "forever" => {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let closed = Arc::clone(&up.closed);
             tokio::spawn(async move {
@@ -205,7 +218,7 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
-        "/v1/messages/stall" => {
+        "stall" => {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let _ = tx.send(sse_event(0)).await;
@@ -215,7 +228,7 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
-        "/v1/messages/nohead" => {
+        "nohead" => {
             // No answer at all, far longer than the test's idle limit.
             tokio::time::sleep(Duration::from_secs(30)).await;
             full(200, "{}")
@@ -1103,7 +1116,11 @@ async fn body_cap_is_413() {
 async fn sse_events_arrive_incrementally() {
     let w = world(Opts::default()).await;
     let (mut tx, _task) = client(&w.a).await;
-    let req = post("/v1/messages/sse", &[("x-api-key", &w.a.placeholder)], "{}");
+    let req = post(
+        "/v1/messages",
+        &[("x-api-key", &w.a.placeholder)],
+        &fake("sse"),
+    );
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
         .unwrap()
@@ -1146,9 +1163,9 @@ async fn client_disconnect_closes_upstream() {
     let w = world(Opts::default()).await;
     let (mut tx, task) = client(&w.a).await;
     let req = post(
-        "/v1/messages/forever",
+        "/v1/messages",
         &[("x-api-key", &w.a.placeholder)],
-        "{}",
+        &fake("forever"),
     );
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
@@ -1187,9 +1204,9 @@ async fn idle_upstream_times_out() {
     .await;
     let (mut tx, _task) = client(&w.a).await;
     let req = post(
-        "/v1/messages/stall",
+        "/v1/messages",
         &[("x-api-key", &w.a.placeholder)],
-        "{}",
+        &fake("stall"),
     );
     let t0 = Instant::now();
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
@@ -1427,9 +1444,9 @@ async fn lockdown_cuts_streams() {
     let w = world(Opts::default()).await;
     let (mut tx, _task) = client(&w.a).await;
     let req = post(
-        "/v1/messages/forever",
+        "/v1/messages",
         &[("x-api-key", &w.a.placeholder)],
-        "{}",
+        &fake("forever"),
     );
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
@@ -1526,7 +1543,7 @@ async fn failure_answers_never_echo_credentials() {
     w.rotate(REAL_KEY);
     let (code, h, b) = ask(
         &w.a,
-        post("/v1/messages/nohead", &[("x-api-key", &pa)], "{}"),
+        post("/v1/messages", &[("x-api-key", &pa)], &fake("nohead")),
     )
     .await;
     assert_eq!(code, 504, "{b}");
@@ -1697,35 +1714,183 @@ async fn route_comes_from_the_template() {
     assert_eq!(w.up.seen()[0].headers["host"], "api.openai.com");
 }
 
+/// A request from box `b` of `agent`: `method` and `target`, its own
+/// credential header, an empty body for GET.
+fn reqm(agent: AgentKind, b: &Bx, method: &str, target: &str) -> Request<Full<Bytes>> {
+    let (k, v) = auth(agent, &b.placeholder);
+    let body = if method == "POST" { "{}" } else { "" };
+    Request::builder()
+        .method(method)
+        .uri(target)
+        .header(k, v)
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Review Focus 1 and SEC4 (ruling R12): every (method, path, query) off
+/// the route's exact list is a 403 with a `model_denied` record per
+/// distinct (method, path), and the upstream sees nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paths_outside_the_route_are_403() {
-    let cases: [(AgentKind, &[&str]); 3] = [
+    let id129 = format!("/v1/models/{}", "a".repeat(129));
+    let cases: [(AgentKind, Vec<(&str, &str)>); 3] = [
         (
             AgentKind::ClaudeCode,
-            &["/v1/responses?x=1", "/api/hello", "/v1/files"],
+            vec![
+                ("POST", "/v1/responses?x=1"),
+                ("GET", "/api/hello"),
+                ("POST", "/v1/files"),
+                ("POST", "/v1/messages/batches"),
+                ("POST", "/v1/messages/batches/x"),
+                ("GET", "/v1/messages/batches"),
+                ("GET", "/v1/messages"),
+                ("POST", "/v1/models"),
+                ("POST", "/v1/messages?x=1"),
+                ("POST", "/v1/messages?beta=true&beta=true"),
+                ("GET", "/v1/models?after_id=x"),
+                ("GET", &id129),
+                ("GET", "/v1/models/a$b"),
+            ],
         ),
-        (AgentKind::Codex, &["/v1/messages?x=1", "/v1/files"]),
+        (
+            AgentKind::Codex,
+            vec![
+                ("POST", "/v1/messages?x=1"),
+                ("POST", "/v1/files"),
+                ("GET", "/v1/responses/abc"),
+                ("POST", "/v1/responses/compact"),
+                ("POST", "/v1/responses?stream=true"),
+                ("GET", "/v1/responses"),
+                ("POST", "/v1/chat/completions"),
+            ],
+        ),
         (
             AgentKind::Gemini,
-            &["/upload/v1beta/files?uploadType=resumable", "/v1/responses"],
+            vec![
+                ("POST", "/upload/v1beta/files?uploadType=resumable"),
+                ("POST", "/v1/responses"),
+                ("GET", "/v1beta/models"),
+                ("POST", "/v1beta/models/m:streamGenerateContent?alt=json"),
+                ("POST", "/v1beta/models/m:streamGenerateContent"),
+                ("POST", "/v1beta/models/m:generateContent?alt=sse"),
+                ("POST", "/v1beta/models/a$b:generateContent"),
+            ],
         ),
     ];
-    for (agent, paths) in cases {
+    for (agent, reqs) in cases {
         let w = world(Opts::agent(agent)).await;
-        for p in paths {
-            let (code, h, body) = ask(&w.a, req_as(agent, &w.a, p, &[])).await;
-            assert_eq!(code, 403, "{agent:?} {p}: {body}");
+        let mut want: Vec<(String, String)> = Vec::new();
+        for (m, target) in &reqs {
+            let (code, h, body) = ask(&w.a, reqm(agent, &w.a, m, target)).await;
+            assert_eq!(code, 403, "{agent:?} {m} {target}: {body}");
             assert_eq!(body.trim(), NOT_FORWARDED);
-            assert!(!format!("{h:?}{body}").contains(p.split('?').next().unwrap()));
+            let path = target.split('?').next().unwrap();
+            assert!(!format!("{h:?}{body}").contains(path));
+            let k = (m.to_string(), path.to_string());
+            if !want.contains(&k) {
+                want.push(k);
+            }
         }
         assert!(w.up.seen().is_empty(), "{agent:?}");
         assert!(w.up.asked().is_empty(), "{agent:?}");
-        let recs = w.wait_records("model_denied", 1).await;
-        assert_eq!(recs[0]["reason"], "path_not_allowed", "{agent:?}");
-        assert_eq!(recs[0]["path"], paths[0].split('?').next().unwrap());
-        assert!(!w.audit_text().contains("x=1"));
-        assert!(!w.audit_text().contains("uploadType"));
+        let recs = w.wait_records("model_denied", want.len()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let recs_now = w.records("model_denied");
+        assert_eq!(recs_now.len(), want.len(), "{agent:?}: {recs:?}");
+        let mut got: Vec<(String, String)> = recs_now
+            .iter()
+            .map(|r| {
+                assert_eq!(r["reason"], "path_not_allowed", "{agent:?}");
+                assert_eq!(r["box"], w.a.id.as_str());
+                (
+                    r["method"].as_str().unwrap().to_string(),
+                    r["path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "{agent:?}");
+        let audit = w.audit_text();
+        for q in [
+            "x=1",
+            "uploadType",
+            "alt=json",
+            "after_id",
+            "stream=true",
+            "beta=true",
+        ] {
+            assert!(
+                !audit.contains(q),
+                "{agent:?}: the audit holds the query {q}"
+            );
+        }
         assert!(w.records("model").is_empty());
+    }
+    // Methods other than GET and POST stop earlier (405).
+    for (agent, m, target) in [
+        (AgentKind::Codex, "DELETE", "/v1/responses/abc"),
+        (AgentKind::ClaudeCode, "HEAD", "/api/hello"),
+    ] {
+        let w = world(Opts::agent(agent)).await;
+        let (code, _, _) = ask(&w.a, reqm(agent, &w.a, m, target)).await;
+        assert_eq!(code, 405, "{m} {target}");
+        assert!(w.up.seen().is_empty());
+    }
+}
+
+/// R12: each allowed (method, path, query) of each route reaches its
+/// upstream unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_allow_list_passes() {
+    let cases: [(AgentKind, &[(&str, &str)]); 3] = [
+        (
+            AgentKind::ClaudeCode,
+            &[
+                ("POST", "/v1/messages"),
+                ("POST", "/v1/messages?beta=true"),
+                ("POST", "/v1/messages/count_tokens"),
+                ("POST", "/v1/messages/count_tokens?beta=true"),
+                ("GET", "/v1/models"),
+                ("GET", "/v1/models?beta=true"),
+                ("GET", "/v1/models?beta=true&limit=1000"),
+                ("GET", "/v1/models/claude-opus-4-1"),
+                ("GET", "/v1/models/claude-opus-4-1?beta=true"),
+            ],
+        ),
+        (
+            AgentKind::Codex,
+            &[
+                ("POST", "/v1/responses"),
+                ("GET", "/v1/models"),
+                ("GET", "/v1/models?client_version=0.169.0"),
+                ("GET", "/v1/models/gpt-5.1-codex"),
+            ],
+        ),
+        (
+            AgentKind::Gemini,
+            &[
+                ("POST", "/v1beta/models/m:streamGenerateContent?alt=sse"),
+                ("POST", "/v1beta/models/gemini-2.5-pro:generateContent"),
+                ("POST", "/v1beta/models/gemini-2.5-pro:countTokens"),
+            ],
+        ),
+    ];
+    for (agent, reqs) in cases {
+        let w = world(Opts::agent(agent)).await;
+        for (m, target) in reqs {
+            let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, target)).await;
+            assert_eq!(code, 200, "{agent:?} {m} {target}: {body}");
+        }
+        let seen = w.up.seen();
+        assert_eq!(seen.len(), reqs.len(), "{agent:?}");
+        for (s, (m, target)) in seen.iter().zip(reqs.iter()) {
+            assert_eq!(s.method, *m);
+            assert_eq!(s.uri, *target);
+            assert_eq!(s.headers["host"], host_of(agent));
+        }
+        assert!(w.up.asked().iter().all(|h| h == host_of(agent)));
+        assert!(w.records("model_denied").is_empty(), "{agent:?}");
     }
 }
 
@@ -1808,10 +1973,14 @@ async fn lookalike_prefix_is_403() {
         assert!(w.up.seen().is_empty());
         let recs = w.wait_records("model_denied", 1).await;
         assert_eq!(recs[0]["reason"], "path_not_allowed");
+        assert_eq!(recs[0]["method"], "POST");
         assert_eq!(recs[0]["path"], p);
     }
 }
 
+/// The placeholder in the target. R12 leaves one place it can pass the
+/// allow-list, a model ID segment, and there it is a 401; anywhere else
+/// (a query value, percent-encoded) the exact list refuses it first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placeholder_in_target_is_401() {
     for agent in ALL_AGENTS {
@@ -1819,22 +1988,42 @@ async fn placeholder_in_target_is_401() {
         let ph = w.a.placeholder.clone();
         // Percent-encoding its first character does not hide it.
         let enc = format!("%{:02X}{}", ph.as_bytes()[0], &ph[1..]);
+        let (m, in_id) = match agent {
+            AgentKind::Gemini => ("POST", format!("/v1beta/models/{ph}:generateContent")),
+            _ => ("GET", format!("/v1/models/{ph}")),
+        };
+        let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, &in_id)).await;
+        assert_eq!(code, 401, "{agent:?} {in_id}: {body}");
+        assert_eq!(body.trim(), NOT_VALID);
         let base = ok_path(agent);
         for target in [
             format!("{base}/{ph}"),
-            format!("{base}?q={ph}"),
+            format!("{base}?beta={ph}"),
             format!("{base}?alt=sse&q=x{ph}y"),
             format!("{base}/{enc}"),
             format!("{base}?q={enc}"),
+            format!("/v1/models?client_version={ph}"),
+            match agent {
+                AgentKind::Gemini => format!("/v1beta/models/{enc}:generateContent"),
+                _ => format!("/v1/models/{enc}"),
+            },
         ] {
-            let (code, _, body) = ask(&w.a, req_as(agent, &w.a, &target, &[])).await;
-            assert_eq!(code, 401, "{agent:?} {target}: {body}");
-            assert_eq!(body.trim(), NOT_VALID);
+            let m = if target.starts_with("/v1/models") {
+                "GET"
+            } else {
+                "POST"
+            };
+            let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, &target)).await;
+            assert!(
+                code == 401 || code == 403,
+                "{agent:?} {target}: {code} {body}"
+            );
         }
         assert!(w.up.seen().is_empty(), "{agent:?}");
         let recs = w.wait_records("model_denied", 1).await;
         assert_eq!(recs[0]["reason"], "bad_credential");
         assert!(!w.audit_text().contains(&ph));
+        assert!(!w.audit_text().contains(&ph[1..]));
     }
 }
 
@@ -1851,11 +2040,12 @@ async fn query_key_is_400() {
     assert!(w.up.seen().is_empty());
     let recs = w.wait_records("model_denied", 1).await;
     assert_eq!(recs[0]["reason"], "query_key");
-    // Lookalike names pass.
+    // Lookalike names are not `key`, but R12's exact list refuses them.
     let target = format!("{base}?alt=sse&keys=1&Key=2");
     let (code, _, body) = ask(&w.a, req_as(AgentKind::Gemini, &w.a, &target, &[])).await;
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(w.up.seen()[0].uri, target);
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(body.trim(), NOT_FORWARDED);
+    assert!(w.up.seen().is_empty());
 }
 
 /// Review Focus 2: another provider's credential and billing headers never
@@ -1969,8 +2159,13 @@ async fn records_name_the_provider() {
         (AgentKind::Gemini, "google"),
     ] {
         let w = world(Opts::agent(agent)).await;
-        let path = ok_path(agent);
-        let (code, _, body) = ask(&w.a, req_as(agent, &w.a, &format!("{path}?alt=x"), &[])).await;
+        let (path, query) = match agent {
+            AgentKind::ClaudeCode => ("/v1/messages", "?beta=true"),
+            AgentKind::Codex => ("/v1/responses", ""),
+            AgentKind::Gemini => ("/v1beta/models/m:streamGenerateContent", "?alt=sse"),
+        };
+        let target = format!("{path}{query}");
+        let (code, _, body) = ask(&w.a, req_as(agent, &w.a, &target, &[])).await;
         assert_eq!(code, 200, "{body}");
         let recs = w.wait_records("model", 1).await;
         let r = &recs[0];
@@ -1981,7 +2176,8 @@ async fn records_name_the_provider() {
         assert_eq!(r["box"], w.a.id.as_str());
         assert_eq!(r["outcome"], "done");
         let audit = w.audit_text();
-        assert!(!audit.contains("alt=x"));
+        assert!(!audit.contains("beta=true"));
+        assert!(!audit.contains("alt=sse"));
         assert!(!audit.contains(real_key(agent)));
         assert!(!audit.contains(&w.a.placeholder));
     }

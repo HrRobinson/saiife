@@ -8,8 +8,8 @@
 //!
 //! The guest is untrusted. A request passes only when it is `GET` or
 //! `POST`, has an origin-form target, asks for no upgrade, has a plain path
-//! on its route's allow-list (plan 42 D4; on Google, no `key` query
-//! parameter), and carries this box's own placeholder (checked in constant
+//! (plan 42 D4; on Google, no `key` query parameter), is one of its
+//! route's exact (method, path, query) shapes (ruling R12), and carries this box's own placeholder (checked in constant
 //! time) in exactly its credential's header: `x-api-key` for an Anthropic
 //! API key, `authorization: Bearer` for an Anthropic subscription or an
 //! OpenAI key, `x-goog-api-key` for a Google key. The placeholder anywhere
@@ -93,6 +93,11 @@ const RECORD_PATH_MAX: usize = 256;
 /// The denied-record key's host for the model port: never a DNS name, so
 /// it cannot share a key with an egress refusal.
 const DENIED_KEY: &str = ":model";
+/// The denied-record keys of one box's refused (method, path) pairs start
+/// with this; at most [`MAX_PATH_KEYS`] of them live per window (R12), then
+/// the refusals share [`DENIED_KEY`].
+const PATH_KEY_PREFIX: &str = ":model ";
+const MAX_PATH_KEYS: usize = 64;
 
 /// C5's limits. Tests shorten them; the upstream is fixed in every build.
 #[derive(Debug, Clone)]
@@ -387,12 +392,12 @@ fn plain(code: StatusCode, msg: &str) -> Response<ResBody> {
 // ---------------------------------------------------------------- refusals
 
 /// A refused request: its answer, its `model_denied` reason and, for
-/// `path_not_allowed`, the recorded path.
+/// `path_not_allowed`, the recorded method and path.
 struct Deny {
     code: StatusCode,
     msg: String,
     reason: &'static str,
-    path: Option<String>,
+    request: Option<(String, String)>,
 }
 
 impl Deny {
@@ -401,16 +406,41 @@ impl Deny {
             code,
             msg: msg.into(),
             reason,
-            path: None,
+            request: None,
         }
     }
 }
 
-/// Write the `model_denied` record of `reason` (with `path` when given)
-/// unless its key wrote one in the last 60 s.
-async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str, path: Option<String>) {
-    let key = (id.clone(), Some(DENIED_KEY.to_string()), reason);
-    let Some(suppressed) = lock(&gw.denied).admit(key, (gw.clock)()) else {
+/// Write the `model_denied` record of `reason` (with the method and path
+/// when given) unless its key wrote one in the last 60 s. A refused
+/// (method, path) pair is its own key, so each distinct one is recorded,
+/// up to [`MAX_PATH_KEYS`] per box per window (R12).
+async fn model_deny(
+    gw: Arc<GatewayShared>,
+    id: BoxId,
+    reason: &'static str,
+    request: Option<(String, String)>,
+) {
+    let now = (gw.clock)();
+    let suppressed = {
+        let mut denied = lock(&gw.denied);
+        let host = match &request {
+            Some((m, p)) => {
+                let k = format!("{PATH_KEY_PREFIX}{m} {p}");
+                let known = denied
+                    .0
+                    .contains_key(&(id.clone(), Some(k.clone()), reason));
+                if known || denied.live_with_prefix(&id, PATH_KEY_PREFIX, now) < MAX_PATH_KEYS {
+                    k
+                } else {
+                    DENIED_KEY.to_string()
+                }
+            }
+            None => DENIED_KEY.to_string(),
+        };
+        denied.admit((id.clone(), Some(host), reason), now)
+    };
+    let Some(suppressed) = suppressed else {
         return;
     };
     let Some(ctx) = gw.ctx() else { return };
@@ -420,7 +450,8 @@ async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str, pat
     rec.session = Some(format!("box-{}", id.as_str()));
     let x = &mut rec.extra;
     x.insert("box".into(), id.as_str().into());
-    if let Some(p) = path {
+    if let Some((m, p)) = request {
+        x.insert("method".into(), m.into());
         x.insert("path".into(), p.into());
     }
     if suppressed > 0 {
@@ -946,13 +977,16 @@ async fn forward(st: &Arc<ConnState>, req: Request<Incoming>) -> Result<Response
     if !routes::path_plain(path) {
         return Err(Deny::new(StatusCode::BAD_REQUEST, NOT_PLAIN, "path"));
     }
-    if !routes::path_allowed(route, path) {
-        let mut d = Deny::new(StatusCode::FORBIDDEN, NOT_FORWARDED, "path_not_allowed");
-        d.path = Some(denied_path(path, info.placeholder.as_deref()));
-        return Err(d);
-    }
     if route.provider == Provider::Google && parts.uri.query().is_some_and(routes::query_has_key) {
         return Err(Deny::new(StatusCode::BAD_REQUEST, QUERY_KEY, "query_key"));
+    }
+    if !routes::allowed(route, &parts.method, path, parts.uri.query()) {
+        let mut d = Deny::new(StatusCode::FORBIDDEN, NOT_FORWARDED, "path_not_allowed");
+        d.request = Some((
+            parts.method.to_string(),
+            denied_path(path, info.placeholder.as_deref()),
+        ));
+        return Err(d);
     }
     let Some(expected) = info.placeholder.as_deref() else {
         return Err(not_valid("no_placeholder"));
@@ -1083,7 +1117,7 @@ pub(crate) async fn serve_run(mut stream: UnixStream, run: Arc<BoxRun>, gw: Arc<
                         Arc::clone(&st.gw),
                         st.run.id.clone(),
                         d.reason,
-                        d.path,
+                        d.request,
                     ));
                     plain(d.code, &d.msg)
                 }
