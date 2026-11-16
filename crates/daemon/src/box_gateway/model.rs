@@ -884,12 +884,20 @@ fn pump(st: &ConnState, body: Incoming, c: Arc<Counters>, rec: RecInfo, status: 
             let stop_w = stopped(&mut stop);
             tokio::pin!(idle_w, lock_w, stop_w);
             loop {
+                // Biased, the body first: once hyper has sent the whole
+                // content-length body to the box it drops the receiver,
+                // and a finished response must be recorded as `done`, not
+                // `client_closed` (plan 42 R13). A receiver dropped before
+                // the body ended is still `client_closed`.
                 let frame = tokio::select! {
+                    biased;
                     f = body.frame() => f,
                     () = &mut idle_w => break "idle",
                     () = &mut lock_w => break "lockdown",
                     () = &mut stop_w => break "stopped",
-                    () = tx.closed() => break "client_closed",
+                    () = tx.closed() => {
+                        break if body.is_end_stream() { "done" } else { "client_closed" };
+                    }
                 };
                 let data = match frame {
                     None => break "done",

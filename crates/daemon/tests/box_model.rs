@@ -2014,10 +2014,9 @@ async fn placeholder_in_target_is_401() {
                 "POST"
             };
             let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, &target)).await;
-            assert!(
-                code == 401 || code == 403,
-                "{agent:?} {target}: {code} {body}"
-            );
+            // Off the exact list: 403 before the credential check.
+            assert_eq!(code, 403, "{agent:?} {target}: {body}");
+            assert_eq!(body.trim(), NOT_FORWARDED);
         }
         assert!(w.up.seen().is_empty(), "{agent:?}");
         let recs = w.wait_records("model_denied", 1).await;
