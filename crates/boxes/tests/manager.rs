@@ -9,7 +9,8 @@ use common::{id, template_sized, world, world_with, World};
 use saiife_boxes::capacity::{self, Committed};
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::{
-    Change, DiskPlace, DiskPlacer, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS,
+    Change, DiskPlace, DiskPlacer, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS,
+    DESTROY_RETRY_FIRST_SECS, DESTROY_RETRY_MAX_SECS, DONE_IDLE_SECS,
 };
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::{Login, Size};
@@ -65,6 +66,8 @@ fn running(w: &World, task: &str) -> BoxId {
 fn constants_are_the_fixed_values() {
     assert_eq!(BOOT_TIMEOUT_SECS, 90);
     assert_eq!(DONE_IDLE_SECS, 30);
+    assert_eq!(DESTROY_RETRY_FIRST_SECS, 5);
+    assert_eq!(DESTROY_RETRY_MAX_SECS, 300);
 }
 
 #[test]
@@ -1691,7 +1694,11 @@ fn tick_retries_a_failed_destroy_until_it_succeeds() {
     assert!(w.mgr.tick().is_empty());
     assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
     assert!(w.mgr.get(&r.id).unwrap().vm.is_some());
+    // R44: not again before its backoff elapses
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
     // then it succeeds: vm cleared, the destroy failure dropped, saved
+    w.advance(DESTROY_RETRY_FIRST_SECS);
     assert!(w.mgr.tick().is_empty());
     assert_eq!(count(&w, &r.id, VmOp::Destroy), 3);
     let g = w.mgr.get(&r.id).unwrap();
@@ -1726,6 +1733,139 @@ fn tick_retries_a_failed_discard_destroy() {
         }
     );
     assert_eq!(count(&w, &a, VmOp::Destroy), 2);
+}
+
+/// A done box whose discard's destroy fails for good (its VMM never
+/// confirms its exit): Discarded, still holding its VM.
+fn wedged(w: &World, task: &str) -> BoxId {
+    let b = running(w, task);
+    w.mgr.done(&b).unwrap();
+    w.vmm.wedge(&b, true);
+    w.mgr.discard(&b).unwrap();
+    let g = w.mgr.get(&b).unwrap();
+    assert_eq!(g.state, BoxState::Discarded);
+    assert!(g.vm.is_some());
+    assert_eq!(count(w, &b, VmOp::Destroy), 1);
+    b
+}
+
+/// R44: the tick retries a wedged record's destroy at once, then waits
+/// `DESTROY_RETRY_FIRST_SECS`, doubling after each failure up to
+/// `DESTROY_RETRY_MAX_SECS`; a tick before the wait is over skips it. It
+/// stays Discarded with its VM throughout (fail closed).
+#[test]
+fn tick_backs_off_a_destroy_that_keeps_failing() {
+    let w = world(1);
+    let a = wedged(&w, "a");
+    assert_eq!(w.mgr.destroy_retry_at(&a), None);
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(
+        count(&w, &a, VmOp::Destroy),
+        2,
+        "the first tick retries at once"
+    );
+    let mut n = 2;
+    for wait in [5, 10, 20, 40, 80, 160, 300, 300, 300] {
+        assert_eq!(w.mgr.destroy_retry_at(&a), Some(w.now() + wait));
+        w.advance(wait - 1);
+        assert!(w.mgr.tick().is_empty());
+        assert_eq!(count(&w, &a, VmOp::Destroy), n, "skipped before {wait} s");
+        w.advance(1);
+        assert!(w.mgr.tick().is_empty());
+        n += 1;
+        assert_eq!(count(&w, &a, VmOp::Destroy), n, "retried after {wait} s");
+        let g = w.mgr.get(&a).unwrap();
+        assert_eq!(g.state, BoxState::Discarded);
+        assert!(g.vm.is_some(), "never treated as gone unconfirmed");
+    }
+}
+
+/// R44: one record's backoff holds back nothing else in the tick: a
+/// failed destroy of another record is retried on the next tick, and a
+/// boot timeout due while the wedged record waits is handled.
+#[test]
+fn a_backed_off_record_leaves_the_others_alone() {
+    let w = world(3);
+    let a = wedged(&w, "a");
+    let c = w.spawn("c").id;
+    let t0 = w.now();
+    // a fails at t0, +5, +15, +35, +75: next try at +155
+    for at in [0, 5, 15, 35, 75] {
+        w.clock.store(t0 + at, std::sync::atomic::Ordering::SeqCst);
+        assert!(w.mgr.tick().is_empty());
+    }
+    assert_eq!(count(&w, &a, VmOp::Destroy), 6);
+    let b = running(&w, "b");
+    w.mgr.done(&b).unwrap();
+    w.vmm.fail_next(VmOp::Destroy, "busy");
+    w.mgr.discard(&b).unwrap();
+    assert!(w.mgr.get(&b).unwrap().vm.is_some());
+    w.clock
+        .store(t0 + BOOT_TIMEOUT_SECS, std::sync::atomic::Ordering::SeqCst);
+    let out = w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 6, "a still waits");
+    assert_eq!(count(&w, &b, VmOp::Destroy), 2, "b is retried at once");
+    assert_eq!(w.mgr.get(&b).unwrap().vm, None);
+    assert_eq!(w.mgr.destroy_retry_at(&b), None);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].id, c);
+    assert_eq!(out[0].why, "boot timed out");
+}
+
+/// R44: once the exit is confirmed the backoff is gone: by the tick's own
+/// retry, or by gc's (which a backoff never holds back).
+#[test]
+fn a_confirmed_exit_ends_the_backoff() {
+    let w = world(2);
+    let a = wedged(&w, "a");
+    for _ in 0..4 {
+        w.mgr.tick();
+        w.advance(DESTROY_RETRY_MAX_SECS);
+    }
+    assert!(w.mgr.destroy_retry_at(&a).is_some());
+    w.vmm.wedge(&a, false);
+    w.mgr.tick();
+    let g = w.mgr.get(&a).unwrap();
+    assert_eq!(g.vm, None);
+    assert_eq!(g.error, None);
+    assert_eq!(w.mgr.destroy_retry_at(&a), None);
+    let n = count(&w, &a, VmOp::Destroy);
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), n, "nothing left to retry");
+
+    // gc confirms a backed-off record's exit and removes it
+    let b = wedged(&w, "b");
+    w.mgr.tick();
+    w.mgr.tick();
+    assert_eq!(count(&w, &b, VmOp::Destroy), 2, "the second tick waits");
+    w.vmm.wedge(&b, false);
+    let rep = w.mgr.gc();
+    assert!(rep.removed.contains(&b), "{rep:?}");
+    assert_eq!(w.mgr.destroy_retry_at(&b), None);
+    w.mgr.tick();
+    assert_eq!(count(&w, &b, VmOp::Destroy), 3);
+}
+
+/// R44: the backoff is in memory only: after a restart the tick retries a
+/// wedged record at once. A clock set back further than the cap does not
+/// stall the retries either.
+#[test]
+fn a_restart_or_a_clock_set_back_retries_at_once() {
+    let mut w = world(1);
+    let a = wedged(&w, "a");
+    w.mgr.tick();
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 2);
+    w.reopen();
+    assert_eq!(w.mgr.destroy_retry_at(&a), None);
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 3, "retried at once");
+    // a clock set back an hour: the 5 s wait is not stretched to an hour
+    w.clock
+        .store(w.now() - 3600, std::sync::atomic::Ordering::SeqCst);
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 4);
+    assert_eq!(w.mgr.destroy_retry_at(&a), Some(w.now() + 10));
 }
 
 #[test]

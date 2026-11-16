@@ -22,8 +22,12 @@
 //! A Discarded record whose `vm` is still `Some` means the VMM resource may
 //! still exist (its destroy failed, for instance a VMM still stopping: a
 //! driver's destroy is bounded and does not wait out its stop ladder, R41).
-//! Every tick retries the destroy and clears `vm` once it succeeds; gc also
-//! retries it before removing the record.
+//! The tick retries the destroy and clears `vm` once it succeeds; gc also
+//! retries it before removing the record. Each tick retry that fails backs
+//! that record off (R44): the next try waits [`DESTROY_RETRY_FIRST_SECS`],
+//! doubling to at most [`DESTROY_RETRY_MAX_SECS`], so a VMM that never
+//! confirms its exit does not cost every tick a second of the lock. The
+//! backoff is in memory only and never treats the VM as gone.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -49,6 +53,11 @@ pub const BOOT_TIMEOUT_SECS: u64 = 90;
 pub const WHY_BOOT_TIMED_OUT: &str = "boot timed out";
 /// A finished turn with no activity for this long → `Done`.
 pub const DONE_IDLE_SECS: u64 = 30;
+/// R44: the tick's first wait before retrying a destroy that failed
+/// again (one daemon tick); it doubles after each failure.
+pub const DESTROY_RETRY_FIRST_SECS: u64 = 5;
+/// R44: the cap on that wait.
+pub const DESTROY_RETRY_MAX_SECS: u64 = 300;
 /// Idle stop for a box whose template was deleted.
 pub const DEFAULT_IDLE_STOP_MINS: u32 = 120;
 /// Longest repo name accepted at spawn.
@@ -157,6 +166,39 @@ struct Inner {
     /// discard drops the entry, so a late outcome changes nothing.
     prompting: BTreeMap<BoxId, u64>,
     next_token: u64,
+    /// R44: the tick's destroy backoff of each Discarded record that still
+    /// holds a VM and whose retry failed. In memory only: after a restart
+    /// the first tick retries at once.
+    retries: BTreeMap<BoxId, Backoff>,
+}
+
+/// A destroy the tick retried and that failed again (R44).
+struct Backoff {
+    /// Tick retries that failed in a row.
+    fails: u32,
+    /// The tick skips the record before this.
+    next_at: u64,
+}
+
+impl Backoff {
+    /// Whether the tick retries now. A clock set back past the longest
+    /// wait counts as due, so it never stretches a wait.
+    fn due(&self, now: u64) -> bool {
+        now >= self.next_at || self.next_at - now > DESTROY_RETRY_MAX_SECS
+    }
+
+    /// One more failure at `now`: the wait is `DESTROY_RETRY_FIRST_SECS`
+    /// doubled for each earlier failure, at most `DESTROY_RETRY_MAX_SECS`.
+    fn failed(prev: Option<&Backoff>, now: u64) -> Backoff {
+        let fails = prev.map_or(0, |b| b.fails).saturating_add(1);
+        let wait = DESTROY_RETRY_FIRST_SECS
+            .saturating_mul(1 << (fails - 1).min(32))
+            .min(DESTROY_RETRY_MAX_SECS);
+        Backoff {
+            fails,
+            next_at: now.saturating_add(wait),
+        }
+    }
 }
 
 /// A prompt taken out under the lock, to send once it is released.
@@ -309,6 +351,7 @@ impl Manager {
             placing: BTreeSet::new(),
             prompting: BTreeMap::new(),
             next_token: 0,
+            retries: BTreeMap::new(),
         };
         let mut max_seq = 0;
         let mut changes = Vec::new();
@@ -1100,14 +1143,22 @@ impl Manager {
         }
     }
 
+    /// When the tick next retries the destroy of `id`, a Discarded record
+    /// whose VMM has not confirmed its exit (R44). `None`: no backoff (no
+    /// retry failed yet, or the exit is confirmed); the next tick retries
+    /// it if it still holds a VM.
+    pub fn destroy_retry_at(&self, id: &BoxId) -> Option<u64> {
+        self.lock().retries.get(id).map(|b| b.next_at)
+    }
+
     /// `tick_with(true)`.
     pub fn tick(&self) -> Vec<Change> {
         self.tick_with(true)
     }
 
-    /// Destroy retries for Discarded records that still hold a VM (R41),
-    /// boot timeouts, finished turns and idle stops, which only take power
-    /// away; then, with `admit`, the prompts a `Ready` under lockdown held
+    /// Destroy retries for Discarded records that still hold a VM (R41;
+    /// each record backed off after a failed retry, R44), boot timeouts,
+    /// finished turns and idle stops, which only take power away; then, with `admit`, the prompts a `Ready` under lockdown held
     /// (for Running boxes) and the admission pass. The daemon passes
     /// `admit = false` under lockdown `all` (R30): the queue and held
     /// prompts wait until it lifts.
@@ -1118,17 +1169,36 @@ impl Manager {
         let mut out = Vec::new();
         // Held prompts are sent after the pass, with the lock released.
         let mut sends = Vec::new();
+        // R44: a backoff ends once its record no longer awaits a destroy
+        // (confirmed elsewhere, by gc for instance, or removed).
+        let Inner {
+            records, retries, ..
+        } = &mut *g;
+        retries.retain(|id, _| {
+            records
+                .get(id)
+                .is_some_and(|r| r.state == BoxState::Discarded && r.vm.is_some())
+        });
         let ids: Vec<BoxId> = g.records.keys().cloned().collect();
         for id in ids {
             let mut r = g.records[&id].clone();
             if r.state == BoxState::Discarded {
-                // R41: retry a destroy that failed (the VMM was still stopping)
+                // R41: retry a destroy that failed (the VMM was still
+                // stopping); R44: with a per-record backoff, since each try
+                // can hold the lock about a second.
                 if let Some(h) = r.vm.clone() {
+                    if g.retries.get(&id).is_some_and(|b| !b.due(now)) {
+                        continue;
+                    }
                     if self.vmm.destroy(&h).is_ok() {
+                        g.retries.remove(&id);
                         r.vm = None;
                         r.error = r.error.take().and_then(without_destroy_failure);
                         r.updated_at = now;
                         let _ = g.put(r);
+                    } else {
+                        let b = Backoff::failed(g.retries.get(&id), now);
+                        g.retries.insert(id, b);
                     }
                 }
                 continue;
@@ -1237,6 +1307,7 @@ impl Manager {
                 r.vm = None;
                 g.records.insert(id.clone(), r);
             }
+            g.retries.remove(&id);
             match g.store.remove(&id) {
                 Ok(()) => {
                     g.records.remove(&id);
