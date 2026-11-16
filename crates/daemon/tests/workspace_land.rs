@@ -3,12 +3,16 @@
 //! the land book attached after the context exists (`box_ops::attach_lands`,
 //! as `start.rs` does), `serve_link` on a Unix socket, and Workspace devices
 //! of two users paired with soft passkeys. A box of alice's is `Done` with
-//! its review made by a fake guest over plan 38's vsock multiplexer (as in
-//! `box_land.rs`). The browser reads the land request from `box.inbox`, the
-//! diff hash from `box.diff`, and lands with a WebAuthn touch over the
-//! challenge it was shown. No VM is ever started.
+//! its review made by a fake guest over plan 38's vsock multiplexer
+//! (`common/land_guest.rs`, shared with `box_land.rs`). The browser reads
+//! the land request from `box.inbox`, the diff hash from `box.diff`, and
+//! lands with a WebAuthn touch over the challenge it was shown. No VM is
+//! ever started.
 #![cfg(all(unix, feature = "fake-vmm"))]
 
+mod common;
+
+use common::land_guest::{self, *};
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::fake::FakeGuest;
@@ -19,14 +23,10 @@ use saiife_boxes::store::Store;
 use saiife_boxes::template::{self, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
 use saiife_boxes::{BoxError, BoxId, BoxState};
-use saiife_boxhost::guest::{SetupSource, VsockGuest};
+use saiife_boxhost::guest::VsockGuest;
 use saiife_boxhost::paths::{BoxPaths, RecordPaths, BASE_MANIFEST};
 use saiife_boxhost::vmm::VmHooks;
-use saiife_boxproto::delta::{write_delta, DeltaItem, EntryHead, Op};
-use saiife_boxproto::frame::{read_msg, write_msg};
-use saiife_boxproto::manifest::{BaseManifest, Entry, EntryKind};
-use saiife_boxproto::msg::{AgentSpec, Event, HostReply, Reply, Request, Setup};
-use saiife_boxproto::{ports, PROTO};
+use saiife_boxproto::msg::Request;
 use saiife_daemon::box_land::Lands;
 use saiife_daemon::box_ops;
 use saiife_daemon::ops::{self, Conn, Ctx, CtxInit, Mode, PolicyState};
@@ -48,21 +48,17 @@ use saiife_wire::sig::TestDevice;
 use saiife_wire::source::{Decision, PendingAction};
 use saiife_wire::{b64, pair};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 const ALICE: u32 = 2000;
 const BOB: u32 = 2001;
 const ORIGIN: &str = "http://localhost:47810";
-const T: Duration = Duration::from_secs(10);
 
 fn scratch() -> tempfile::TempDir {
     let base = std::env::var_os("SAIIFE_TEST_TMP")
@@ -77,210 +73,6 @@ fn scratch() -> tempfile::TempDir {
 
 fn me() -> u32 {
     rustix::process::geteuid().as_raw()
-}
-
-fn sha(b: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, b)
-        .as_ref()
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect()
-}
-
-// ---- a tree model: manifests and exports (as in box_land.rs) ----
-
-type Tree = BTreeMap<String, Vec<u8>>;
-
-fn tree(items: &[(&str, &str)]) -> Tree {
-    items
-        .iter()
-        .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
-        .collect()
-}
-
-fn base_tree() -> Tree {
-    tree(&[
-        ("README.md", "# Demo\n\nline 1\nline 2\n"),
-        ("old.txt", "bye\n"),
-        ("src/main.rs", "fn main() {}\n"),
-    ])
-}
-
-fn changed() -> Tree {
-    let mut t = base_tree();
-    t.insert("src/main.rs".into(), b"fn main() { run(); }\n".to_vec());
-    t.insert("NEW.md".into(), b"new\n".to_vec());
-    t.remove("old.txt");
-    t
-}
-
-fn manifest(t: &Tree) -> BaseManifest {
-    let entries: BTreeMap<String, Entry> = t
-        .iter()
-        .map(|(p, c)| {
-            (
-                p.clone(),
-                Entry {
-                    kind: EntryKind::File,
-                    mode: 0o644,
-                    size: c.len() as u64,
-                    sha256: sha(c),
-                },
-            )
-        })
-        .collect();
-    BaseManifest {
-        version: 1,
-        repo: "demo".into(),
-        base_commit: Some("a".repeat(40)),
-        snapshot_commit: "b".repeat(40),
-        files: entries.len() as u64,
-        bytes: entries.values().map(|e| e.size).sum(),
-        entries,
-    }
-}
-
-fn head(p: &str, op: Op, old: Option<&[u8]>, new: Option<&[u8]>) -> EntryHead {
-    let (size, sha256, mode) = match new {
-        Some(n) => (n.len() as u64, sha(n), 0o644),
-        None => (0, String::new(), 0),
-    };
-    EntryHead {
-        path: p.into(),
-        op,
-        kind: EntryKind::File,
-        mode,
-        size,
-        sha256,
-        old_kind: old.map(|_| EntryKind::File),
-        old_size: old.map(|o| o.len() as u64),
-        old_sha256: old.map(sha),
-    }
-}
-
-type Item = (EntryHead, Option<Vec<u8>>, Option<Vec<u8>>);
-
-/// Export `n` of `old → new`, as the guest sends it.
-fn export(n: u32, old: &Tree, new: &Tree) -> Vec<u8> {
-    let keys: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
-    let mut items: Vec<Item> = Vec::new();
-    for k in keys {
-        match (old.get(k), new.get(k)) {
-            (None, Some(c)) => items.push((head(k, Op::Add, None, Some(c)), None, Some(c.clone()))),
-            (Some(o), None) => items.push((head(k, Op::Delete, Some(o), None), None, None)),
-            (Some(o), Some(c)) if o != c => items.push((
-                head(k, Op::Modify, Some(o), Some(c)),
-                Some(o.clone()),
-                Some(c.clone()),
-            )),
-            _ => {}
-        }
-    }
-    let refs: Vec<DeltaItem<'_>> = items
-        .iter()
-        .map(|(h, o, n)| (h.clone(), o.as_deref(), n.as_deref()))
-        .collect();
-    let mut out = Vec::new();
-    write_delta(&mut out, n, &refs).unwrap();
-    out
-}
-
-// ---- the fake guest: plan 38's multiplexer over the box's vsock ----
-
-struct Setups;
-impl SetupSource for Setups {
-    fn setup_for(&self, _id: &BoxId) -> Result<Setup, String> {
-        Ok(Setup {
-            agent: AgentSpec {
-                command: vec!["claude".into()],
-                user: "agent".into(),
-                cwd: "/work".into(),
-            },
-            env: vec![],
-            files: vec![],
-            rows: 40,
-            cols: 120,
-        })
-    }
-}
-
-#[derive(Default)]
-struct GuestRepo {
-    base: Tree,
-    work: Tree,
-    exports: BTreeMap<u32, Tree>,
-}
-
-fn serve(repo: &Mutex<GuestRepo>, r: Request, s: &mut StdStream) {
-    match r {
-        Request::Export { n } => {
-            let mut g = repo.lock().unwrap();
-            let work = g.work.clone();
-            g.exports.insert(n, work.clone());
-            let b = export(n, &g.base, &work);
-            drop(g);
-            let _ = s.write_all(&b);
-        }
-        Request::Advance { n, paths } => {
-            let mut g = repo.lock().unwrap();
-            let Some(e) = g.exports.get(&n).cloned() else {
-                let _ = write_msg(
-                    s,
-                    &Reply::Err {
-                        why: "no such export".into(),
-                    },
-                );
-                return;
-            };
-            match paths {
-                None => g.base = e,
-                Some(ps) => {
-                    for p in ps {
-                        match e.get(&p) {
-                            Some(c) => g.base.insert(p, c.clone()),
-                            None => g.base.remove(&p),
-                        };
-                    }
-                }
-            }
-            let _ = write_msg(s, &Reply::Ok);
-        }
-        _ => {
-            let _ = write_msg(s, &Reply::Ok);
-        }
-    }
-}
-
-/// One multiplexer connection: `CONNECT 1024\n` → `OK 1\n`, then one request.
-fn mux_conn(mut s: StdStream, reqs: Arc<Mutex<Vec<Request>>>, repo: Arc<Mutex<GuestRepo>>) {
-    let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    while line.len() < 32 {
-        if s.read(&mut b).unwrap_or(0) == 0 {
-            return;
-        }
-        line.push(b[0]);
-        if b[0] == b'\n' {
-            break;
-        }
-    }
-    if line != b"CONNECT 1024\n" {
-        return;
-    }
-    s.write_all(b"OK 1\n").unwrap();
-    let req: Request = match read_msg(&mut s) {
-        Ok(Some(r)) => r,
-        _ => return,
-    };
-    reqs.lock().unwrap().push(req.clone());
-    serve(&repo, req, &mut s);
-}
-
-struct Served {
-    repo: Arc<Mutex<GuestRepo>>,
-    requests: Arc<Mutex<Vec<Request>>>,
-    stop: Arc<AtomicBool>,
-    _events: StdStream,
 }
 
 // ---- the world ----
@@ -473,64 +265,8 @@ impl World {
     fn connect(&self, i: &BoxId, base: &Tree, work: &Tree) {
         let p = BoxPaths::of(&self.runtime, i);
         std::fs::create_dir_all(&p.dir).unwrap();
-        let repo = Arc::new(Mutex::new(GuestRepo {
-            base: base.clone(),
-            work: work.clone(),
-            ..GuestRepo::default()
-        }));
-        let requests: Arc<Mutex<Vec<Request>>> = Arc::default();
-        let stop = Arc::new(AtomicBool::new(false));
-        let l = StdListener::bind(p.vsock()).unwrap();
-        l.set_nonblocking(true).unwrap();
-        let (reqs, st, rp) = (requests.clone(), stop.clone(), repo.clone());
-        thread::spawn(move || {
-            while !st.load(Ordering::SeqCst) {
-                let s = match l.accept() {
-                    Ok((s, _)) => s,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                };
-                s.set_nonblocking(false).unwrap();
-                let (reqs, rp) = (reqs.clone(), rp.clone());
-                thread::spawn(move || mux_conn(s, reqs, rp));
-            }
-        });
-        self.guest.before_boot(i, &p).unwrap();
-        let mut ev = StdStream::connect(p.vsock_port(ports::EVENTS)).unwrap();
-        ev.set_read_timeout(Some(T)).unwrap();
-        write_msg(
-            &mut ev,
-            &Event::Hello {
-                proto: PROTO.into(),
-                guest: "0.1".into(),
-                uptime_ms: 5,
-                set_up: false,
-            },
-        )
-        .unwrap();
-        let r: HostReply = read_msg(&mut ev).unwrap().unwrap();
-        assert_eq!(
-            r,
-            HostReply::Welcome {
-                proto: PROTO.into()
-            }
-        );
-        let end = Instant::now() + T;
-        while requests.lock().unwrap().is_empty() {
-            assert!(Instant::now() < end, "no setup request");
-            thread::sleep(Duration::from_millis(20));
-        }
-        self.served.lock().unwrap().insert(
-            i.clone(),
-            Served {
-                repo,
-                requests,
-                stop,
-                _events: ev,
-            },
-        );
+        let s = land_guest::connect(&self.guest, &p, i, base, work);
+        self.served.lock().unwrap().insert(i.clone(), s);
     }
 
     /// The book's pending land for box `i` (the daemon's own view).
@@ -1126,7 +862,7 @@ async fn proofless_and_wrong_hash_lands_are_refused() {
     // The agent's work changed and the review was made again: the old
     // request (and its hash) is stale.
     let mut more = changed();
-    more.insert("MORE.md".into(), b"more\n".to_vec());
+    more.insert("MORE.md".into(), C(b"more\n".to_vec()));
     w.with_repo(&i, |g| g.work = more.clone());
     tokio::task::block_in_place(|| w.lands.refresh(&i)).unwrap();
     let fresh = w.pending_of(&i);
@@ -1177,7 +913,8 @@ async fn proofless_and_wrong_hash_lands_are_refused() {
 }
 
 /// R-LW2: Workspace push is not built; `box.push` stays refused from the
-/// browser, with or without a touch, after the box has landed.
+/// browser, with or without a touch, after the box has landed. A refused
+/// push spends nothing: a land's proof sent with a push still lands after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_from_the_browser_stays_refused() {
     let Two {
@@ -1185,16 +922,33 @@ async fn push_from_the_browser_stays_refused() {
     } = two().await;
     let i = w.done(ALICE, &changed());
     let seen = browse_land(&w, &mut link, &alice, &i).await;
+    let land_proof = proof(&alice, &seen.rid, &seen.challenge);
+    // Before the land: the land's own proof on a push frame.
+    let p = send_touch(
+        &w,
+        &mut link,
+        &alice,
+        "box.push",
+        json!({"id": i.as_str()}),
+        land_proof.clone(),
+    )
+    .await;
+    assert_eq!(p["error"], "unavailable", "{p}");
+    assert_eq!(p["rule"], "unavailable", "{p}");
+    // Nothing was spent: the request is still pending, and the very same
+    // proof lands it.
+    assert_eq!(w.pending_of(&i).request_id.to_string(), seen.rid);
     let a = send_touch(
         &w,
         &mut link,
         &alice,
         "box.land",
         land_args(&i, &seen.diff_sha256),
-        proof(&alice, &seen.rid, &seen.challenge),
+        land_proof,
     )
     .await;
     assert_eq!(a["ok"], true, "{a}");
+    // After the land, with and without a touch.
     let p = send(&w, &mut link, &alice, "box.push", json!({"id": i.as_str()})).await;
     assert_eq!(p["error"], "unavailable", "{p}");
     assert_eq!(p["rule"], "unavailable", "{p}");

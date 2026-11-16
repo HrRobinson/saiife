@@ -3,7 +3,8 @@
 //! multi-land. A box manager on `FakeVmm` and `FakeGuest` (prompts), and a
 //! `VsockGuest` over plan 38's test multiplexer whose fake guest keeps a
 //! base tree and a work tree and serves exports of the difference (made
-//! with `write_delta`). Touches use plan 26's `SoftAuthenticator`. No VM
+//! with `write_delta`; `common/land_guest.rs`, shared with
+//! `workspace_land.rs`). Touches use plan 26's `SoftAuthenticator`. No VM
 //! is ever started.
 //!
 //! Task 5: the control-socket ops (`box.diff`, `box.land.*`, `box.push.*`,
@@ -11,6 +12,9 @@
 //! real socket with `Client`.
 #![cfg(all(unix, feature = "fake-vmm"))]
 
+mod common;
+
+use common::land_guest::{self, *};
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::fake::FakeGuest;
@@ -21,14 +25,10 @@ use saiife_boxes::store::Store;
 use saiife_boxes::template::{self, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
 use saiife_boxes::{BoxError, BoxId, BoxState};
-use saiife_boxhost::guest::{SetupSource, VsockGuest};
+use saiife_boxhost::guest::VsockGuest;
 use saiife_boxhost::paths::{BoxPaths, RecordPaths, BASE_MANIFEST};
 use saiife_boxhost::vmm::VmHooks;
-use saiife_boxproto::delta::{write_delta, DeltaItem, EntryHead, Op};
-use saiife_boxproto::frame::{read_msg, write_msg};
-use saiife_boxproto::manifest::{BaseManifest, Entry, EntryKind};
-use saiife_boxproto::msg::{AgentSpec, Event, HostReply, Reply, Request, Setup};
-use saiife_boxproto::{ports, PROTO};
+use saiife_boxproto::msg::Request;
 use saiife_broker::pipeline::{LockScope, Lockdown};
 use saiife_daemon::box_land::{self, Lands};
 use saiife_daemon::box_ops;
@@ -46,13 +46,11 @@ use saiife_wire::conformance::{check, Fixture};
 use saiife_wire::source::{BoxSource, Decision, PendingAction, Start};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const ALICE: u32 = 2000;
@@ -75,228 +73,6 @@ fn scratch() -> tempfile::TempDir {
 
 fn me() -> u32 {
     rustix::process::geteuid().as_raw()
-}
-
-fn sha(b: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, b)
-        .as_ref()
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect()
-}
-
-// ---- a tree model: manifests and exports ----
-
-#[derive(Clone, Debug, PartialEq)]
-struct C(Vec<u8>);
-
-type Tree = BTreeMap<String, C>;
-
-fn tree(items: &[(&str, &str)]) -> Tree {
-    items
-        .iter()
-        .map(|(p, c)| (p.to_string(), C(c.as_bytes().to_vec())))
-        .collect()
-}
-
-fn base_tree() -> Tree {
-    tree(&[
-        ("README.md", "# Demo\n\nline 1\nline 2\n"),
-        ("old.txt", "bye\n"),
-        ("src/main.rs", "fn main() {}\n"),
-    ])
-}
-
-fn manifest(t: &Tree) -> BaseManifest {
-    let entries: BTreeMap<String, Entry> = t
-        .iter()
-        .map(|(p, c)| {
-            (
-                p.clone(),
-                Entry {
-                    kind: EntryKind::File,
-                    mode: 0o644,
-                    size: c.0.len() as u64,
-                    sha256: sha(&c.0),
-                },
-            )
-        })
-        .collect();
-    BaseManifest {
-        version: 1,
-        repo: "demo".into(),
-        base_commit: Some("a".repeat(40)),
-        snapshot_commit: "b".repeat(40),
-        files: entries.len() as u64,
-        bytes: entries.values().map(|e| e.size).sum(),
-        entries,
-    }
-}
-
-fn head(p: &str, op: Op, old: Option<&C>, new: Option<&C>) -> EntryHead {
-    let (size, sha256, mode) = match new {
-        Some(n) => (n.0.len() as u64, sha(&n.0), 0o644),
-        None => (0, String::new(), 0),
-    };
-    EntryHead {
-        path: p.into(),
-        op,
-        kind: EntryKind::File,
-        mode,
-        size,
-        sha256,
-        old_kind: old.map(|_| EntryKind::File),
-        old_size: old.map(|o| o.0.len() as u64),
-        old_sha256: old.map(|o| sha(&o.0)),
-    }
-}
-
-/// An entry head with its old and new content.
-type Item = (EntryHead, Option<Vec<u8>>, Option<Vec<u8>>);
-
-/// Export `n` of `old → new`, as the guest sends it.
-fn export(n: u32, old: &Tree, new: &Tree) -> Vec<u8> {
-    let keys: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
-    let mut items: Vec<Item> = Vec::new();
-    for k in keys {
-        match (old.get(k), new.get(k)) {
-            (None, Some(c)) => {
-                items.push((head(k, Op::Add, None, Some(c)), None, Some(c.0.clone())))
-            }
-            (Some(o), None) => items.push((head(k, Op::Delete, Some(o), None), None, None)),
-            (Some(o), Some(c)) if o != c => items.push((
-                head(k, Op::Modify, Some(o), Some(c)),
-                Some(o.0.clone()),
-                Some(c.0.clone()),
-            )),
-            _ => {}
-        }
-    }
-    let refs: Vec<DeltaItem<'_>> = items
-        .iter()
-        .map(|(h, o, n)| (h.clone(), o.as_deref(), n.as_deref()))
-        .collect();
-    let mut out = Vec::new();
-    write_delta(&mut out, n, &refs).unwrap();
-    out
-}
-
-// ---- the fake guest: plan 38's multiplexer over the box's vsock ----
-
-struct Setups;
-impl SetupSource for Setups {
-    fn setup_for(&self, _id: &BoxId) -> Result<Setup, String> {
-        Ok(Setup {
-            agent: AgentSpec {
-                command: vec!["claude".into()],
-                user: "agent".into(),
-                cwd: "/work".into(),
-            },
-            env: vec![],
-            files: vec![],
-            rows: 40,
-            cols: 120,
-        })
-    }
-}
-
-/// The guest's git: the base tree, `/work`, and the exports it made.
-#[derive(Default)]
-struct GuestRepo {
-    base: Tree,
-    work: Tree,
-    exports: BTreeMap<u32, Tree>,
-    /// Served (once) instead of the next export.
-    hostile: Option<Answer>,
-}
-
-#[derive(Clone)]
-enum Answer {
-    Bytes(Vec<u8>),
-    Err(String),
-}
-
-struct Served {
-    repo: Arc<Mutex<GuestRepo>>,
-    requests: Arc<Mutex<Vec<Request>>>,
-    stop: Arc<AtomicBool>,
-    _events: UnixStream,
-}
-
-fn serve(repo: &Mutex<GuestRepo>, r: Request, s: &mut UnixStream) {
-    match r {
-        Request::Export { n } => {
-            let mut g = repo.lock().unwrap();
-            if let Some(a) = g.hostile.take() {
-                match a {
-                    Answer::Bytes(b) => {
-                        let _ = s.write_all(&b);
-                    }
-                    Answer::Err(why) => {
-                        let _ = write_msg(s, &Reply::Err { why });
-                    }
-                }
-                return;
-            }
-            let work = g.work.clone();
-            g.exports.insert(n, work.clone());
-            let b = export(n, &g.base, &work);
-            drop(g);
-            let _ = s.write_all(&b);
-        }
-        Request::Advance { n, paths } => {
-            let mut g = repo.lock().unwrap();
-            let Some(e) = g.exports.get(&n).cloned() else {
-                let _ = write_msg(
-                    s,
-                    &Reply::Err {
-                        why: "no such export".into(),
-                    },
-                );
-                return;
-            };
-            match paths {
-                None => g.base = e,
-                Some(ps) => {
-                    for p in ps {
-                        match e.get(&p) {
-                            Some(c) => g.base.insert(p, c.clone()),
-                            None => g.base.remove(&p),
-                        };
-                    }
-                }
-            }
-            let _ = write_msg(s, &Reply::Ok);
-        }
-        _ => {
-            let _ = write_msg(s, &Reply::Ok);
-        }
-    }
-}
-
-/// One multiplexer connection: `CONNECT 1024\n` → `OK 1\n`, then one request.
-fn mux_conn(mut s: UnixStream, reqs: Arc<Mutex<Vec<Request>>>, repo: Arc<Mutex<GuestRepo>>) {
-    let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    while line.len() < 32 {
-        if s.read(&mut b).unwrap_or(0) == 0 {
-            return;
-        }
-        line.push(b[0]);
-        if b[0] == b'\n' {
-            break;
-        }
-    }
-    if line != b"CONNECT 1024\n" {
-        return;
-    }
-    s.write_all(b"OK 1\n").unwrap();
-    let req: Request = match read_msg(&mut s) {
-        Ok(Some(r)) => r,
-        _ => return,
-    };
-    reqs.lock().unwrap().push(req.clone());
-    serve(&repo, req, &mut s);
 }
 
 // ---- the world ----
@@ -493,64 +269,8 @@ impl World {
 
     fn connect(&self, i: &BoxId, base: &Tree, work: &Tree) {
         let p = self.rt(i);
-        let repo = Arc::new(Mutex::new(GuestRepo {
-            base: base.clone(),
-            work: work.clone(),
-            ..GuestRepo::default()
-        }));
-        let requests: Arc<Mutex<Vec<Request>>> = Arc::default();
-        let stop = Arc::new(AtomicBool::new(false));
-        let l = UnixListener::bind(p.vsock()).unwrap();
-        l.set_nonblocking(true).unwrap();
-        let (reqs, st, rp) = (requests.clone(), stop.clone(), repo.clone());
-        thread::spawn(move || {
-            while !st.load(Ordering::SeqCst) {
-                let s = match l.accept() {
-                    Ok((s, _)) => s,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                };
-                s.set_nonblocking(false).unwrap();
-                let (reqs, rp) = (reqs.clone(), rp.clone());
-                thread::spawn(move || mux_conn(s, reqs, rp));
-            }
-        });
-        self.guest.before_boot(i, &p).unwrap();
-        let mut ev = UnixStream::connect(p.vsock_port(ports::EVENTS)).unwrap();
-        ev.set_read_timeout(Some(T)).unwrap();
-        write_msg(
-            &mut ev,
-            &Event::Hello {
-                proto: PROTO.into(),
-                guest: "0.1".into(),
-                uptime_ms: 5,
-                set_up: false,
-            },
-        )
-        .unwrap();
-        let r: HostReply = read_msg(&mut ev).unwrap().unwrap();
-        assert_eq!(
-            r,
-            HostReply::Welcome {
-                proto: PROTO.into()
-            }
-        );
-        let end = Instant::now() + T;
-        while requests.lock().unwrap().is_empty() {
-            assert!(Instant::now() < end, "no setup request");
-            thread::sleep(Duration::from_millis(20));
-        }
-        self.served.lock().unwrap().insert(
-            i.clone(),
-            Served {
-                repo,
-                requests,
-                stop,
-                _events: ev,
-            },
-        );
+        let s = land_guest::connect(&self.guest, &p, i, base, work);
+        self.served.lock().unwrap().insert(i.clone(), s);
     }
 
     fn with_repo<T>(&self, i: &BoxId, f: impl FnOnce(&mut GuestRepo) -> T) -> T {
@@ -626,14 +346,6 @@ impl World {
             .filter(|r| r["action"] == action)
             .collect()
     }
-}
-
-fn changed() -> Tree {
-    let mut t = base_tree();
-    t.insert("src/main.rs".into(), C(b"fn main() { run(); }\n".to_vec()));
-    t.insert("NEW.md".into(), C(b"new\n".to_vec()));
-    t.remove("old.txt");
-    t
 }
 
 fn files_of(w: &World, i: &BoxId) -> Vec<String> {

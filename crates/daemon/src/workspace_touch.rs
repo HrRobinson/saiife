@@ -548,7 +548,9 @@ pub async fn verify_frame(
             .await
             .map_err(internal)?;
             // A box the owner's source does not see (another user's) is
-            // `not_found`, as for every other box action of the frame.
+            // `not_found`, as for every other box action of the frame. The
+            // `pa.box_id` check below still matters: a request id of another
+            // of the owner's own boxes is `touch_mismatch`.
             if !seen {
                 return Err(refused(not_found("box")));
             }
