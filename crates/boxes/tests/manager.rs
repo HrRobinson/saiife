@@ -1221,7 +1221,14 @@ fn list_order_matches_plan_28() {
 fn templates_are_the_init_templates() {
     let w = world(1);
     let names: Vec<String> = w.mgr.templates().into_iter().map(|t| t.name).collect();
-    assert_eq!(names, vec!["claude-code".to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            "claude-code".to_string(),
+            "codex".to_string(),
+            "gemini".to_string()
+        ]
+    );
 }
 
 #[test]
