@@ -965,6 +965,13 @@ pub(crate) fn owner_may_decide(
             false => Err(Refusal::NotApprover),
         };
     }
+    // A request with a SID against an owner whose SID cannot be resolved:
+    // the owner's standing is unknown, and a name alone is never enough (it
+    // is what the CLI's decision avoids), so they are no approver of it
+    // (`not_approver`), whatever `same_user` says.
+    if r.sid.is_some() && owner.sid.is_none() {
+        return Err(Refusal::NotApprover);
+    }
     let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
         return Err(Refusal::NotApprover);
     };
@@ -990,13 +997,11 @@ pub(crate) fn owner_may_decide(
 pub(crate) async fn request_to_approve(
     ctx: &Arc<Ctx>,
     owner_uid: u32,
+    owner_user: &str,
     rid: u64,
 ) -> Result<Result<ApprovalRequest, Refusal>, ApprovalLookup> {
-    let Some(user) = ctx.directory.name_of(owner_uid) else {
-        return Ok(Err(Refusal::NotApprover));
-    };
-    let peer = owner_peer(ctx, owner_uid, &user);
-    let r = match visible_to_owner(ctx, &peer, &user, rid).await {
+    let peer = owner_peer(ctx, owner_uid, owner_user);
+    let r = match visible_to_owner(ctx, &peer, owner_user, rid).await {
         Err(()) => return Err(ApprovalLookup::Unavailable),
         Ok(None) => return Err(ApprovalLookup::Unknown),
         Ok(Some(r)) => r,
@@ -1004,7 +1009,7 @@ pub(crate) async fn request_to_approve(
     if r.state != State::Pending {
         return Err(ApprovalLookup::NotPending);
     }
-    Ok(owner_may_decide(ctx, &peer, &user, &r).map(|()| r))
+    Ok(owner_may_decide(ctx, &peer, owner_user, &r).map(|()| r))
 }
 
 /// Why [`request_to_approve`] has no request to approve.
@@ -3733,31 +3738,27 @@ pub(crate) mod touch_tests {
     }
 
     /// The request has a SID and the owner's cannot be resolved: the owner
-    /// counts as the requester (so `deny` refuses), and is no requester for
-    /// a withdrawal.
+    /// is no approver of it (`not_approver`, recorded), under `deny` and
+    /// `reauth` alike, for approving and for rejecting; it is no requester
+    /// either, so it cannot withdraw it.
     #[tokio::test]
     async fn remote_unresolved_owner_sid_fails_closed() {
-        let w = remote("deny");
-        let rid = made_by(&w, 4444, Some(SID_ANN));
-        assert_eq!(
-            rule(remote_decide(&w, "ghost", 4444, rid, true).await),
-            "same_user"
-        );
-        // Not a withdrawal either: it is a rejection that needs an approver
-        // who is not the requester.
-        assert_eq!(
-            rule(remote_decide(&w, "ghost", 4444, rid, false).await),
-            "same_user"
-        );
-        let r = w.ctx.approvals.as_ref().unwrap().get(rid).unwrap();
-        assert_eq!(r.state, State::Pending);
-        // The same under `reauth` is a touch matter, not a refusal here.
-        let w = remote("reauth");
-        let rid = made_by(&w, 4444, Some(SID_ANN));
-        assert_eq!(
-            rule(remote_decide(&w, "ghost", 4444, rid, true).await),
-            "touch_required"
-        );
+        for same_user in ["deny", "reauth"] {
+            let w = remote(same_user);
+            let rid = made_by(&w, 4444, Some(SID_ANN));
+            for approve in [true, false] {
+                let e = remote_decide(&w, "ghost", 4444, rid, approve).await;
+                assert_eq!(rule(e), "not_approver", "{same_user} approve={approve}");
+            }
+            let r = w.ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+            assert_eq!(r.state, State::Pending, "{same_user}");
+            let rec = records(w.d.path())
+                .into_iter()
+                .find(|r| r["kind"] == "approval" && r["action"] == "refused")
+                .unwrap();
+            assert_eq!(rec["rule"], "not_approver", "{same_user}");
+            assert!(list_remote(&w.ctx, 4444, "ghost").await.unwrap().is_empty());
+        }
     }
 
     /// Another SID: an approver decides (the touch is still required to approve).

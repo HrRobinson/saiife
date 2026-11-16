@@ -125,11 +125,12 @@ fn not_found(what: &str) -> Fail {
 pub async fn bind(
     ctx: &Arc<Ctx>,
     owner_uid: u32,
+    owner_user: &str,
     src: &Arc<dyn BoxSource>,
     action: &str,
     args: &Map<String, Value>,
 ) -> Result<(TouchClass, String, BTreeMap<String, String>), Refused> {
-    bind_inner(ctx, owner_uid, src, action, args)
+    bind_inner(ctx, owner_uid, owner_user, src, action, args)
         .await
         .map_err(refused)
 }
@@ -137,6 +138,7 @@ pub async fn bind(
 async fn bind_inner(
     ctx: &Arc<Ctx>,
     owner_uid: u32,
+    owner_user: &str,
     src: &Arc<dyn BoxSource>,
     action: &str,
     args: &Map<String, Value>,
@@ -203,7 +205,7 @@ async fn bind_inner(
                 .get("id")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid("id is a request number"))?;
-            let r = pending_request(ctx, owner_uid, rid).await?;
+            let r = pending_request(ctx, owner_uid, owner_user, rid).await?;
             let class = crate::approval_ops::effective_class(ctx, &r)
                 .ok_or_else(|| invalid(format!("request #{rid} needs no touch")))?;
             let rec = crate::approvals::action_record(&r, class, [0; 16], [0; 32], 0);
@@ -222,10 +224,11 @@ async fn bind_inner(
 async fn pending_request(
     ctx: &Arc<Ctx>,
     owner_uid: u32,
+    owner_user: &str,
     rid: u64,
 ) -> Result<crate::approvals::Request, Fail> {
     use crate::approval_ops::ApprovalLookup;
-    match crate::approval_ops::request_to_approve(ctx, owner_uid, rid).await {
+    match crate::approval_ops::request_to_approve(ctx, owner_uid, owner_user, rid).await {
         Err(ApprovalLookup::Unavailable) => Err(Fail::Policy(Refused::new(
             ErrorCode::Unavailable,
             "unavailable",
@@ -272,7 +275,8 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
     let src = crate::workspace_link::source_for(ctx, v, &action, &inner)
         .await
         .map_err(refused)?;
-    let (class, summary, fields) = bind(ctx, owner_uid, &src, &action, &inner).await?;
+    let (class, summary, fields) =
+        bind(ctx, owner_uid, &v.owner_user, &src, &action, &inner).await?;
     // The device's passkeys that the touch store still holds, for one RP id.
     let held = device.touch_credentials;
     let c = Arc::clone(ctx);
@@ -501,8 +505,15 @@ pub async fn verify_frame(
             .await
             .map_err(internal)?
             .map_err(tk)?;
-            let (class, summary, fields) =
-                bind(ctx, owner_uid, src, action, &bound_args(action, args)).await?;
+            let (class, summary, fields) = bind(
+                ctx,
+                owner_uid,
+                &v.owner_user,
+                src,
+                action,
+                &bound_args(action, args),
+            )
+            .await?;
             if record.fields != fields || record.class != class || record.summary != summary {
                 return Err(mismatch(
                     "the touch was for a different action than this frame's",
@@ -568,7 +579,9 @@ pub async fn verify_frame(
             let id = args.get("id").and_then(Value::as_u64).ok_or_else(|| {
                 Refused::new(ErrorCode::BadRequest, "invalid", "id is a request number")
             })?;
-            let r = pending_request(ctx, owner_uid, id).await.map_err(refused)?;
+            let r = pending_request(ctx, owner_uid, &v.owner_user, id)
+                .await
+                .map_err(refused)?;
             let class = crate::approval_ops::effective_class(ctx, &r).ok_or_else(|| {
                 Refused::new(
                     ErrorCode::BadRequest,
