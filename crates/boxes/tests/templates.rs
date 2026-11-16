@@ -350,7 +350,7 @@ fn codex_builtin_is_pinned() {
     let t = &builtin()[1];
     assert_eq!(t.agent, AgentKind::Codex);
     assert_eq!(t.agent.provider(), Provider::OpenAi);
-    assert_eq!(t.command, vec!["codex", "--dangerously-bypass-hook-trust"]);
+    assert_eq!(t.command, vec!["codex"]);
     assert_eq!(t.login, Login::ApiKey);
     assert_eq!(t.credential, "openai");
     assert!(t.egress.is_empty() && t.secrets.is_empty());
@@ -428,4 +428,17 @@ fn old_wire_template_parses() {
     assert!(!t.beta);
     assert_eq!(t.credential, "");
     assert_eq!(t.notice, "");
+}
+
+#[test]
+fn codex_builtin_has_no_hook_trust_bypass() {
+    for t in builtin() {
+        assert!(
+            !t.command
+                .iter()
+                .any(|c| c == "--dangerously-bypass-hook-trust"),
+            "{}",
+            t.name
+        );
+    }
 }

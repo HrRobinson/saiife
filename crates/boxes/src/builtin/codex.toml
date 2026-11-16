@@ -3,7 +3,9 @@ description = "OpenAI Codex CLI in its TUI (beta)"
 
 [agent]
 kind = "codex"
-command = ["codex", "--dangerously-bypass-hook-trust"]
+# Hooks are managed via /etc/codex/requirements.toml in the image (plan 42 R7),
+# so there is no hook-trust bypass.
+command = ["codex"]
 login = "api-key"
 credential = "openai"
 
