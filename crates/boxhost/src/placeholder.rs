@@ -376,7 +376,9 @@ mod tests {
                 if read == made {
                     assert!(r.unwrap().is_some());
                 } else {
-                    assert!(r.is_err(), "{made:?} read as {read:?}");
+                    let e = r.unwrap_err();
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                    assert_eq!(e.to_string(), OTHER_AGENT, "{made:?} read as {read:?}");
                 }
             }
         }

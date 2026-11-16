@@ -1369,6 +1369,177 @@ pub fn claude_json_seed(placeholder: &str) -> String {
     serde_json::to_string_pretty(&v).unwrap_or_default()
 }
 
+/// Variables no box setup ever sets (plan 42 D5): each would move a client
+/// off the gateway's placeholder path (another Google login or backend,
+/// another OpenAI base URL).
+pub const NEVER_SET: [&str; 5] = [
+    "GOOGLE_GENAI_USE_GCA",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_API_KEY",
+    "GOOGLE_CLOUD_ACCESS_TOKEN",
+    "OPENAI_BASE_URL",
+];
+
+/// Where the image holds Codex's managed requirements (plan 42 R7): root
+/// owned, 0644, baked in, so the agent in the box cannot change them.
+pub const CODEX_REQUIREMENTS_PATH: &str = "/etc/codex/requirements.toml";
+
+fn pairs(v: &[(&str, String)]) -> Vec<(String, String)> {
+    v.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+}
+
+fn table<const N: usize>(kv: [(&str, toml::Value); N]) -> toml::Value {
+    toml::Value::Table(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+/// The model environment of Codex in the box (plan 42 D5, R7): the box's
+/// placeholder as the OpenAI key (the forwarder swaps it) and a fixed
+/// `CODEX_HOME`, so another `HOME` cannot move Codex off saiife's config.
+pub fn codex_env(placeholder: &str) -> Vec<(String, String)> {
+    pairs(&[
+        ("OPENAI_API_KEY", placeholder.to_string()),
+        ("CODEX_HOME", "/home/agent/.codex".into()),
+    ])
+}
+
+/// `/home/agent/.codex/config.toml` (plan 42 D5, R7): a model provider
+/// pointing at the gateway (HTTP Responses API, no websockets), no update
+/// check or analytics, and `/work` untrusted, so no repo `.codex/` config,
+/// hooks or MCP servers load. The VM is the boundary, so no sandbox and no
+/// approval prompts. saiife's hooks are not here: they are managed, in
+/// [`codex_requirements`]. It holds no placeholder.
+pub fn codex_config() -> String {
+    let off = || table([("enabled", false.into())]);
+    let v = table([
+        ("model_provider", "saiife".into()),
+        ("sandbox_mode", "danger-full-access".into()),
+        ("approval_policy", "never".into()),
+        ("check_for_update_on_startup", false.into()),
+        (
+            "model_providers",
+            table([(
+                "saiife",
+                table([
+                    ("name", "OpenAI through saiife".into()),
+                    (
+                        "base_url",
+                        format!("http://127.0.0.1:{}/v1", ports::MODEL_TCP).into(),
+                    ),
+                    ("env_key", "OPENAI_API_KEY".into()),
+                    ("wire_api", "responses".into()),
+                    ("supports_websockets", false.into()),
+                ]),
+            )]),
+        ),
+        ("analytics", off()),
+        ("feedback", off()),
+        (
+            "projects",
+            table([("/work", table([("trust_level", "untrusted".into())]))]),
+        ),
+    ]);
+    toml::to_string(&v).unwrap_or_default()
+}
+
+/// `/etc/codex/requirements.toml` (plan 42 R7), baked into the image root
+/// owned: only managed hooks run, and they are saiife's PreToolUse check
+/// (advisory; the box is the boundary) and the Stop hook that tells the host
+/// a turn finished. Managed hooks need no trust and cannot be turned off.
+pub fn codex_requirements() -> String {
+    use saiife_agents::codex::{MATCHER, TIMEOUT_SECS};
+    let one = |v: toml::Value| toml::Value::Array(vec![v]);
+    let v = table([
+        ("allow_managed_hooks_only", true.into()),
+        ("features", table([("hooks", true.into())])),
+        (
+            "hooks",
+            table([
+                (
+                    "PreToolUse",
+                    one(table([
+                        ("matcher", MATCHER.into()),
+                        (
+                            "hooks",
+                            one(table([
+                                ("type", "command".into()),
+                                (
+                                    "command",
+                                    "/usr/local/bin/saiife check --hook-exit --agent codex --profile box"
+                                        .into(),
+                                ),
+                                ("timeout", TIMEOUT_SECS.into()),
+                            ])),
+                        ),
+                    ])),
+                ),
+                (
+                    "Stop",
+                    one(table([(
+                        "hooks",
+                        one(table([
+                            ("type", "command".into()),
+                            (
+                                "command",
+                                "/usr/local/bin/saiife __guest event turn-finished".into(),
+                            ),
+                        ])),
+                    )])),
+                ),
+            ]),
+        ),
+    ]);
+    toml::to_string(&v).unwrap_or_default()
+}
+
+/// The model environment of Gemini CLI in the box (plan 42 D5): the box's
+/// placeholder as the Gemini key and the gateway's model URL (which puts
+/// the CLI in its `gateway` auth mode), telemetry off.
+pub fn gemini_env(placeholder: &str) -> Vec<(String, String)> {
+    pairs(&[
+        ("GEMINI_API_KEY", placeholder.to_string()),
+        (
+            "GOOGLE_GEMINI_BASE_URL",
+            format!("http://127.0.0.1:{}", ports::MODEL_TCP),
+        ),
+        ("GEMINI_TELEMETRY_ENABLED", "false".into()),
+    ])
+}
+
+/// `/home/agent/.gemini/settings.json` (plan 42 D5): the gateway auth type,
+/// no folder trust screen, no usage statistics, updates or telemetry, and
+/// saiife's hooks: the BeforeTool check (advisory; the box is the boundary)
+/// and the AfterAgent turn-finished signal.
+pub fn gemini_settings() -> String {
+    use saiife_agents::gemini::{MATCHER, TIMEOUT_MS};
+    let v = serde_json::json!({
+        "security": {
+            "auth": {"selectedType": "gateway"},
+            "folderTrust": {"enabled": false},
+        },
+        "privacy": {"usageStatisticsEnabled": false},
+        "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
+        "telemetry": {"enabled": false},
+        "hooks": {
+            "BeforeTool": [{
+                "matcher": MATCHER,
+                "hooks": [{
+                    "type": "command",
+                    "command": "/usr/local/bin/saiife check --hook-exit --agent gemini --profile box",
+                    "timeout": TIMEOUT_MS,
+                }]
+            }],
+            "AfterAgent": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/usr/local/bin/saiife __guest event turn-finished",
+                    "timeout": TIMEOUT_MS,
+                }]
+            }]
+        }
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
 /// The setup files for user packs: `(id, toml text)` to
 /// `/home/agent/.config/saiife/packs/<id>.toml`, mode 0644. An id that is
 /// not a valid user pack id is an error naming it (an id is a file name, so
@@ -1497,5 +1668,193 @@ mod settings_tests {
             cols: 120,
         };
         assert_eq!(s.check(), Ok(()));
+    }
+
+    fn kv(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn codex_env_is_pinned() {
+        assert_eq!(
+            codex_env("PH"),
+            kv(&[
+                ("OPENAI_API_KEY", "PH"),
+                ("CODEX_HOME", "/home/agent/.codex")
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_config_is_pinned() {
+        let text = codex_config();
+        let v: toml::Table = toml::from_str(&text).unwrap();
+        let want: toml::Table = toml::from_str(
+            r#"
+model_provider = "saiife"
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+check_for_update_on_startup = false
+
+[model_providers.saiife]
+name = "OpenAI through saiife"
+base_url = "http://127.0.0.1:3129/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false
+
+[projects."/work"]
+trust_level = "untrusted"
+"#,
+        )
+        .unwrap();
+        assert_eq!(v, want);
+        // R7: saiife's hooks are managed (requirements.toml), never here.
+        assert!(!v.contains_key("hooks"));
+        assert!(!text.contains("hooks"), "{text}");
+        assert_eq!(
+            v["projects"]["/work"]["trust_level"].as_str(),
+            Some("untrusted")
+        );
+        assert_eq!(v["approval_policy"].as_str(), Some("never"));
+    }
+
+    #[test]
+    fn codex_requirements_are_pinned() {
+        assert_eq!(CODEX_REQUIREMENTS_PATH, "/etc/codex/requirements.toml");
+        let v: toml::Table = toml::from_str(&codex_requirements()).unwrap();
+        let mut keys: Vec<&str> = v.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["allow_managed_hooks_only", "features", "hooks"]);
+        assert_eq!(v["allow_managed_hooks_only"].as_bool(), Some(true));
+        assert_eq!(
+            v["features"].as_table().unwrap(),
+            &toml::from_str::<toml::Table>("hooks = true").unwrap()
+        );
+        let hooks = v["hooks"].as_table().unwrap();
+        let mut events: Vec<&str> = hooks.keys().map(String::as_str).collect();
+        events.sort_unstable();
+        assert_eq!(events, ["PreToolUse", "Stop"]);
+        let pre = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1, "one PreToolUse group");
+        let pre = pre[0].as_table().unwrap();
+        assert_eq!(pre.len(), 2, "{pre:?}");
+        assert_eq!(pre["matcher"].as_str(), Some(saiife_agents::codex::MATCHER));
+        assert_eq!(pre["matcher"].as_str(), Some("^(Bash|apply_patch)$"));
+        let h = pre["hooks"].as_array().unwrap();
+        assert_eq!(h.len(), 1, "one PreToolUse handler");
+        let h = h[0].as_table().unwrap();
+        assert_eq!(h.len(), 3, "{h:?}");
+        assert_eq!(h["type"].as_str(), Some("command"));
+        assert_eq!(
+            h["command"].as_str(),
+            Some("/usr/local/bin/saiife check --hook-exit --agent codex --profile box")
+        );
+        assert_eq!(
+            h["timeout"].as_integer(),
+            Some(saiife_agents::codex::TIMEOUT_SECS)
+        );
+        let stop = hooks["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "one Stop group");
+        let stop = stop[0].as_table().unwrap();
+        assert_eq!(stop.len(), 1, "{stop:?}");
+        let h = stop["hooks"].as_array().unwrap();
+        assert_eq!(h.len(), 1, "one Stop handler");
+        let h = h[0].as_table().unwrap();
+        assert_eq!(h.len(), 2, "{h:?}");
+        assert_eq!(h["type"].as_str(), Some("command"));
+        assert_eq!(
+            h["command"].as_str(),
+            Some("/usr/local/bin/saiife __guest event turn-finished")
+        );
+    }
+
+    #[test]
+    fn gemini_env_is_pinned() {
+        assert_eq!(
+            gemini_env("PH"),
+            kv(&[
+                ("GEMINI_API_KEY", "PH"),
+                ("GOOGLE_GEMINI_BASE_URL", "http://127.0.0.1:3129"),
+                ("GEMINI_TELEMETRY_ENABLED", "false"),
+            ])
+        );
+    }
+
+    #[test]
+    fn gemini_settings_are_pinned() {
+        let v: serde_json::Value = serde_json::from_str(&gemini_settings()).unwrap();
+        let hook = |command: &str| serde_json::json!({"type": "command", "command": command, "timeout": 10_000});
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "security": {
+                    "auth": {"selectedType": "gateway"},
+                    "folderTrust": {"enabled": false},
+                },
+                "privacy": {"usageStatisticsEnabled": false},
+                "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
+                "telemetry": {"enabled": false},
+                "hooks": {
+                    "BeforeTool": [{
+                        "matcher": saiife_agents::gemini::MATCHER,
+                        "hooks": [hook("/usr/local/bin/saiife check --hook-exit --agent gemini --profile box")],
+                    }],
+                    "AfterAgent": [{
+                        "hooks": [hook("/usr/local/bin/saiife __guest event turn-finished")],
+                    }],
+                },
+            })
+        );
+        assert_eq!(saiife_agents::gemini::TIMEOUT_MS, 10_000);
+    }
+
+    #[test]
+    fn never_set_vars_absent() {
+        assert_eq!(
+            NEVER_SET,
+            [
+                "GOOGLE_GENAI_USE_GCA",
+                "GOOGLE_GENAI_USE_VERTEXAI",
+                "GOOGLE_API_KEY",
+                "GOOGLE_CLOUD_ACCESS_TOKEN",
+                "OPENAI_BASE_URL",
+            ]
+        );
+        let envs = [
+            ("claude-api", claude_env(Login::ApiKey, "PH")),
+            ("claude-sub", claude_env(Login::Subscription, "PH")),
+            ("codex", codex_env("PH")),
+            ("gemini", gemini_env("PH")),
+        ];
+        for (agent, env) in &envs {
+            for (k, _) in env {
+                assert!(!NEVER_SET.contains(&k.as_str()), "{agent} sets {k}");
+                if !agent.starts_with("claude") {
+                    assert!(!k.starts_with("ANTHROPIC_"), "{agent} sets {k}");
+                }
+            }
+        }
+    }
+
+    /// R7: no trust bypass and no user-level hooks for Codex.
+    #[test]
+    fn codex_has_no_hook_bypass() {
+        let config = codex_config();
+        assert!(!config.contains("--dangerously-bypass-hook-trust"));
+        let v: toml::Table = toml::from_str(&config).unwrap();
+        assert!(!v.contains_key("hooks"));
+        for (k, val) in codex_env("PH") {
+            assert!(!val.contains("--dangerously-bypass-hook-trust"), "{k}");
+            assert!(!val.contains("hooks"), "{k}");
+        }
     }
 }
