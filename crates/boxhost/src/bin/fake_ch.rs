@@ -229,6 +229,49 @@ mod imp {
         Some((method, path, String::from_utf8_lossy(&body).into_owned()))
     }
 
+    /// A CH v54-shaped `state.json` for the vCPUs and memory of `config`
+    /// (the VM's `VmConfig`): one vCPU state per vCPU and one RAM mapping
+    /// of the whole memory, its state JSON-encoded as CH writes it.
+    fn vm_state(config: &str) -> serde_json::Value {
+        use serde_json::{json, Value};
+        let c: Value = serde_json::from_str(config).unwrap_or(Value::Null);
+        let vcpus = c
+            .pointer("/cpus/boot_vcpus")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let mem = c
+            .pointer("/memory/size")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let slot =
+            json!({"base": 0, "length": 0, "active": false, "inserting": false, "removing": false});
+        let mm = json!({
+            "memory_ranges": {"data": [{"gpa": 0, "length": mem}]},
+            "guest_ram_mappings": [{"slot": 0, "gpa": 0, "size": mem, "zone_id": "mem0",
+                                    "virtio_mem": false, "file_offset": 0}],
+            "start_of_device_area": 1u64 << 40,
+            "boot_ram": mem, "current_ram": mem, "arch_mem_regions": [],
+            "hotplug_slots": vec![slot; 8],
+            "next_memory_slot": 1, "selected_slot": 0, "next_hotplug_slot": 0
+        });
+        let cpus: serde_json::Map<String, Value> = (0..vcpus)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    json!({"snapshots": {}, "snapshot_data": {"state": "{}"}}),
+                )
+            })
+            .collect();
+        json!({
+            "snapshots": {
+                "cpu-manager": {"snapshots": cpus, "snapshot_data": null},
+                "memory-manager": {"snapshots": {}, "snapshot_data": {"state": mm.to_string()}},
+                "device-manager": {"snapshots": {}, "snapshot_data": null}
+            },
+            "snapshot_data": {"state": "{}"}
+        })
+    }
+
     /// The snapshot files; FAKE_CH_SNAP_EVIL plays a hostile VMM:
     /// `dirlink:<dir>` (the snapshot dir is a symlink to `<dir>`),
     /// `link:<file>` / `hardlink:<file>` (memory-ranges links to `<file>`),
@@ -254,7 +297,7 @@ mod imp {
             }
         };
         let _ = std::fs::write(dir.join("config.json"), config.as_bytes());
-        let _ = std::fs::write(dir.join("state.json"), b"{\"fake_state\":true}\n");
+        let _ = std::fs::write(dir.join("state.json"), vm_state(config).to_string());
         let mem = dir.join("memory-ranges");
         if let Some(t) = evil.strip_prefix("link:") {
             let _ = std::os::unix::fs::symlink(t, &mem);

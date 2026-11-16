@@ -46,9 +46,9 @@ p38_now_ms() { date +%s%3N; }
 # 05-image's p36_audit_dir ($SAIIFE_AUDIT_DIR when absolute, else
 # <data base>/saiife/audit), the personal daemon's own dir
 # (<data base>/saiife/broker/audit, crates/system/src/personal.rs) and, when
-# the daemon is locked (10-vmm's test: the saiife-box@ unit is installed),
+# the daemon is locked (10-vmm's test: the saiife-box-m@ unit is installed),
 # the locked audit dir (/var/log/saiife/audit, crates/system/src/default_config.rs).
-P38_LOCKED_UNIT=/etc/systemd/system/saiife-box@.service
+P38_LOCKED_UNIT=/etc/systemd/system/saiife-box-m@.service
 P38_LOCKED_AUDIT=/var/log/saiife/audit
 
 p38_audit_dirs() {

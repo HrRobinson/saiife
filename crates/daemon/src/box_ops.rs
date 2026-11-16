@@ -349,7 +349,7 @@ pub fn build_with(
 }
 
 /// The preflight, then `ChVmm` (personal: a child of the daemon; locked:
-/// the `saiife-box@` unit) with the guest channel ([`VsockGuest`], plan 38)
+/// the `saiife-box-<tier>@` unit) with the guest channel ([`VsockGuest`], plan 38)
 /// as the manager's guest and, as VMM hooks, the audit hook, the box
 /// gateway (filled late by [`Built::on_ctx`]: it needs the daemon context;
 /// until then every boot fails) and the guest channel. Only in a build with

@@ -53,7 +53,7 @@ pub enum SystemAction {
         #[arg(long, requires = "fleet")]
         package: bool,
         /// Also set up boxes (Linux): the saiife-box user, /var/lib/saiife-box,
-        /// the pinned Cloud Hypervisor in /opt/saiife/vmm, the saiife-box@ unit
+        /// the pinned Cloud Hypervisor in /opt/saiife/vmm, the saiife-box-<tier>@ units
         /// and a polkit rule that lets the daemon start and stop only those units.
         #[arg(long)]
         boxes: bool,

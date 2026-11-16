@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
+use saiife_boxes::template::{tier_named, Tier, TIERS};
 use saiife_wire::source::BoxId;
 use serde::{Deserialize, Serialize};
 
@@ -185,10 +186,10 @@ pub fn check_spec(spec: &LaunchSpec, paths: &BoxPaths, allowed: &Allowed) -> Res
         }
     }
     if !VCPUS.contains(&spec.vcpus) {
-        return Err(format!("vcpus: {} is outside 1..=32", spec.vcpus));
+        return Err(format!("vcpus: {} is outside {VCPUS:?}", spec.vcpus));
     }
     if !MEM_MIB.contains(&spec.mem_mib) {
-        return Err(format!("mem_mib: {} is outside 512..=262144", spec.mem_mib));
+        return Err(format!("mem_mib: {} is outside {MEM_MIB:?}", spec.mem_mib));
     }
     // CH opens these by path, following links: a VMM-planted symlink or hard
     // link would hand the next VMM another file (S4 sweep).
@@ -327,27 +328,52 @@ pub fn argv(spec: &LaunchSpec, paths: &BoxPaths) -> Vec<OsString> {
     v
 }
 
-/// `vm.json.tmp` (0640) renamed over `vm.json`.
+/// A fresh temporary file (0640, `O_EXCL`, random name: nothing in the
+/// VMM-writable runtime dir can be planted at it) renamed over `vm.json`.
+/// A `vm.json` that is not a regular file is removed first (a directory
+/// would make the rename fail; unlink removes a link, not its target).
 pub fn write_spec(spec: &LaunchSpec, paths: &BoxPaths) -> Result<(), String> {
+    use ring::rand::SecureRandom;
+    use std::io::Write;
     let body = serde_json::to_vec(spec).map_err(|e| e.to_string())?;
-    let tmp = paths.dir.join("vm.json.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let write = || -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
+    let target = paths.vm_json();
+    if let Ok(m) = std::fs::symlink_metadata(&target) {
+        if m.is_dir() {
+            // remove_dir_all removes links inside, never their targets
+            std::fs::remove_dir_all(&target)
+                .map_err(|e| format!("vm.json: a directory that cannot be removed: {e}"))?;
+        } else if !m.file_type().is_file() {
+            std::fs::remove_file(&target).map_err(|e| format!("vm.json: {e}"))?;
+        }
+    }
+    let rng = ring::rand::SystemRandom::new();
+    for _ in 0..8 {
+        let mut b = [0u8; 8];
+        rng.fill(&mut b)
+            .map_err(|_| "vm.json: no randomness for a temporary name".to_string())?;
+        let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let tmp = paths.dir.join(format!(".vm.json.{name}.tmp"));
+        let mut f = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o640)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&tmp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, paths.vm_json())
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("vm.json: {e}")
-    })
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("vm.json: {e}")),
+        };
+        let r = f
+            .write_all(&body)
+            .and_then(|()| f.sync_all())
+            .and_then(|()| std::fs::rename(&tmp, &target));
+        return r.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("vm.json: {e}")
+        });
+    }
+    Err("vm.json: no free temporary name".into())
 }
 
 /// Reads `vm.json`: a regular file (not a symlink, no FIFO), at most 16 KiB.
@@ -394,8 +420,30 @@ pub fn read_spec_owned(paths: &BoxPaths, not_uid: Option<u32>) -> Result<LaunchS
     serde_json::from_slice(&buf).map_err(|e| format!("vm.json: {e}"))
 }
 
+/// What the VMM process of a box may use on the host, beyond the guest
+/// RAM: Cloud Hypervisor's own heap, threads, queues and caches.
+pub const VMM_OVERHEAD_MIB: u64 = 256;
+
+/// A tier unit's fixed `MemoryMax=`, in MiB: the tier's guest memory plus
+/// [`VMM_OVERHEAD_MIB`]. The daemon may not set unit properties, so a box
+/// is capped at its tier, not its exact size; that is held by the spec the
+/// daemon rebuilds and the snapshot checks.
+pub fn unit_memory_max_mib(t: &Tier) -> u64 {
+    t.mem_mib + VMM_OVERHEAD_MIB
+}
+
+/// A tier unit's fixed `CPUQuota=`, in percent: one CPU per vCPU.
+pub fn unit_cpu_quota_pct(t: &Tier) -> u32 {
+    t.vcpus * 100
+}
+
 /// Starts and stops the VMM process of a box.
 pub trait Launcher: Send + Sync {
+    /// Tells the launcher the box's size tier, from the daemon's record
+    /// (the handle), before any other call for that box. Locked: the tier
+    /// names the unit; None leaves the box without one, and every call for
+    /// it then fails closed. Personal mode ignores it.
+    fn bind(&self, _id: &BoxId, _tier: Option<&str>) {}
     /// Returns once the process is started.
     fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String>;
     /// The only liveness source (S3, ruling R19); never the VMM's API.
@@ -521,6 +569,11 @@ enum Slot {
 /// (unlinking a pid record in the daemon-owned vault is the one file call).
 /// Each child gets a `<vault>/<id>.pid` record so a restarted daemon can
 /// tell whether it still runs.
+///
+/// No host cap (personal-mode gap): the child shares the daemon's cgroup,
+/// so a compromised VMM can use more memory and CPU than the box was
+/// admitted with, up to the user's own limits. Locked mode's unit has a
+/// fixed ceiling ([`UNIT_MEMORY_MAX_MIB`], [`UNIT_CPU_QUOTA_PCT`]).
 pub struct ChildLauncher {
     program: PathBuf,
     mode: Mode,
@@ -778,40 +831,115 @@ pub trait UnitBus: Send + Sync {
     fn active(&self, unit: &str) -> Result<bool, String>;
 }
 
-/// `saiife-box@<id>.service`; the id must be `b` and 1 to 9 digits (the
-/// polkit rule allows exactly that shape, so nothing else is ever asked).
-pub fn unit_name(id: &BoxId) -> Result<String, String> {
+/// `saiife-box-<tier>@<id>.service`; the tier must be one of
+/// [`TIERS`] and the id `b` and 1 to 9 digits (the polkit rule allows
+/// exactly that shape, so nothing else is ever asked).
+pub fn unit_name(id: &BoxId, tier: &str) -> Result<String, String> {
     let s = id.as_str();
     let b = s.as_bytes();
     let ok = (2..=10).contains(&b.len()) && b[0] == b'b' && b[1..].iter().all(u8::is_ascii_digit);
-    if ok {
-        Ok(format!("saiife-box@{s}.service"))
-    } else {
-        Err(format!("box id {s:?} cannot name a unit (b<digits>)"))
+    if !ok {
+        return Err(format!("box id {s:?} cannot name a unit (b<digits>)"));
     }
+    if tier_named(tier).is_none() {
+        return Err(format!("{tier:?} is not a box size tier"));
+    }
+    Ok(format!("saiife-box-{tier}@{s}.service"))
 }
 
-/// Locked mode: the VMM runs as the systemd unit `saiife-box@<id>.service`
-/// under the `saiife-box` user, started and stopped over the system bus.
+/// The untiered unit of earlier builds, `saiife-box@<id>.service` (asked
+/// about only, read only: the polkit rule no longer lets anyone start it).
+fn legacy_unit_name(id: &BoxId) -> Result<String, String> {
+    unit_name(id, "m").map(|_| format!("saiife-box@{}.service", id.as_str()))
+}
+
+/// Locked mode: the VMM runs as the systemd unit
+/// `saiife-box-<tier>@<id>.service` (the box's size tier, from its record,
+/// see [`Launcher::bind`]) under the `saiife-box` user, started and
+/// stopped over the system bus.
 pub struct UnitLauncher {
     bus: std::sync::Arc<dyn UnitBus>,
+    tiers: Mutex<BTreeMap<BoxId, String>>,
 }
 
 impl UnitLauncher {
     pub fn new(bus: std::sync::Arc<dyn UnitBus>) -> UnitLauncher {
-        UnitLauncher { bus }
+        UnitLauncher {
+            bus,
+            tiers: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The box's unit; Err when no tier was bound (a record made before
+    /// tiers, or a bad one).
+    fn unit(&self, id: &BoxId) -> Result<String, String> {
+        let tier = self
+            .tiers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "box {} has no size tier in its record (made by an older saiife): \
+                     discard the box and spawn it again",
+                    id.as_str()
+                )
+            })?;
+        unit_name(id, &tier)
     }
 }
 
+/// StartUnit's answer when the unit file is not there.
+fn not_installed(e: &str) -> bool {
+    e.contains("org.freedesktop.systemd1.NoSuchUnit")
+}
+
 impl Launcher for UnitLauncher {
-    fn start(&self, id: &BoxId, _paths: &BoxPaths) -> Result<(), String> {
-        self.bus.start(&unit_name(id)?)
+    fn bind(&self, id: &BoxId, tier: Option<&str>) {
+        let mut g = self.tiers.lock().unwrap_or_else(|e| e.into_inner());
+        match tier.filter(|t| tier_named(t).is_some()) {
+            Some(t) => g.insert(id.clone(), t.to_string()),
+            None => g.remove(id),
+        };
     }
 
-    /// Fails closed: a bus error is "cannot tell", never "gone".
+    /// Fails closed: no tier, or the tier's unit not installed, is a
+    /// refusal with the install hint.
+    fn start(&self, id: &BoxId, _paths: &BoxPaths) -> Result<(), String> {
+        let unit = self.unit(id)?;
+        self.bus.start(&unit).map_err(|e| {
+            if not_installed(&e) {
+                let tmpl = unit.split('@').next().unwrap_or(&unit);
+                format!(
+                    "the {tmpl}@.service unit is not installed: {}",
+                    crate::preflight::INSTALL_HINT
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Fails closed: a bus error is "cannot tell", never "gone". With no
+    /// tier bound (an older record) every unit the box could run in, each
+    /// tier's and the untiered `saiife-box@<id>`, is asked (read only, no
+    /// polkit): gone only when all of them are, so such a box can still be
+    /// discarded once nothing of it runs.
     fn exited(&self, id: &BoxId) -> Option<bool> {
-        let Ok(unit) = unit_name(id) else {
-            return Some(false);
+        let Ok(unit) = self.unit(id) else {
+            let units = TIERS
+                .iter()
+                .map(|t| unit_name(id, t.name))
+                .chain([legacy_unit_name(id)])
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(units) = units else {
+                return Some(false);
+            };
+            let all_gone = units
+                .iter()
+                .all(|u| matches!(self.bus.active(u), Ok(false)));
+            return Some(all_gone);
         };
         match self.bus.active(&unit) {
             Ok(true) | Err(_) => Some(false),
@@ -820,7 +948,7 @@ impl Launcher for UnitLauncher {
     }
 
     fn force_stop(&self, id: &BoxId) -> Result<(), String> {
-        self.bus.stop(&unit_name(id)?)
+        self.bus.stop(&self.unit(id)?)
     }
 
     fn kind(&self) -> &'static str {
@@ -834,6 +962,8 @@ pub struct FakeUnitBus {
     pub calls: Mutex<Vec<String>>,
     /// What `active` answers.
     pub active: Mutex<Result<bool, String>>,
+    /// What `start` answers.
+    pub start: Mutex<Result<(), String>>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -842,6 +972,7 @@ impl FakeUnitBus {
         FakeUnitBus {
             calls: Mutex::new(Vec::new()),
             active: Mutex::new(Ok(false)),
+            start: Mutex::new(Ok(())),
         }
     }
 
@@ -864,7 +995,7 @@ impl Default for FakeUnitBus {
 impl UnitBus for FakeUnitBus {
     fn start(&self, unit: &str) -> Result<(), String> {
         self.record("start", unit);
-        Ok(())
+        self.start.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     fn stop(&self, unit: &str) -> Result<(), String> {
         self.record("stop", unit);
@@ -888,18 +1019,128 @@ mod tests {
     fn unit_name_rules() {
         let id = |s: &str| BoxId::parse(s).unwrap();
         assert_eq!(
-            unit_name(&id("b3")).unwrap(),
-            "saiife-box@b3.service".to_string()
+            unit_name(&id("b3"), "m").unwrap(),
+            "saiife-box-m@b3.service".to_string()
         );
         assert_eq!(
-            unit_name(&id("b123456789")).unwrap(),
-            "saiife-box@b123456789.service"
+            unit_name(&id("b123456789"), "xxl").unwrap(),
+            "saiife-box-xxl@b123456789.service"
         );
         for bad in ["b", "x1", "b1234567890", "b1-2", "b1x", "1b"] {
-            assert!(unit_name(&id(bad)).is_err(), "{bad}");
+            assert!(unit_name(&id(bad), "m").is_err(), "{bad}");
+        }
+        for bad in ["", "xxxl", "M", "m@x", "../m"] {
+            assert!(unit_name(&id("b1"), bad).is_err(), "{bad:?}");
         }
         // Not even a box id: never reaches a unit name.
         assert!(BoxId::parse("b1/../x").is_err());
+    }
+
+    /// The launcher starts the unit of the tier bound from the record; no
+    /// tier, a bad one or an uninstalled unit is refused (fail closed).
+    #[test]
+    fn unit_launcher_uses_the_bound_tier() {
+        let bus = std::sync::Arc::new(FakeUnitBus::new());
+        let l = UnitLauncher::new(bus.clone());
+        let id = BoxId::parse("b7").unwrap();
+        let paths = BoxPaths::new(PathBuf::from("/x/boxes/b7"));
+        let e = l.start(&id, &paths).unwrap_err();
+        assert!(e.contains("tier") && e.contains("spawn it again"), "{e}");
+        assert!(l.force_stop(&id).is_err());
+        // no tier: gone only when every unit the box could be in is
+        assert_eq!(l.exited(&id), Some(true));
+        let asked = bus.calls.lock().unwrap().clone();
+        assert_eq!(asked.len(), TIERS.len() + 1, "{asked:?}");
+        assert!(asked.contains(&"active saiife-box@b7.service".to_string()));
+        *bus.active.lock().unwrap() = Ok(true);
+        assert_eq!(l.exited(&id), Some(false));
+        *bus.active.lock().unwrap() = Err("no bus".into());
+        assert_eq!(l.exited(&id), Some(false));
+        *bus.active.lock().unwrap() = Ok(false);
+        bus.calls.lock().unwrap().clear();
+        l.bind(&id, Some("bogus"));
+        assert!(l.start(&id, &paths).is_err());
+        assert!(bus.calls.lock().unwrap().is_empty());
+        l.bind(&id, Some("l"));
+        l.start(&id, &paths).unwrap();
+        assert_eq!(
+            bus.calls.lock().unwrap().clone(),
+            ["start saiife-box-l@b7.service"]
+        );
+        *bus.start.lock().unwrap() = Err(
+            "org.freedesktop.systemd1.NoSuchUnit: Unit saiife-box-l@b7.service not found.".into(),
+        );
+        let e = l.start(&id, &paths).unwrap_err();
+        assert!(
+            e.contains("saiife-box-l@.service unit is not installed")
+                && e.contains("system install --boxes"),
+            "{e}"
+        );
+        *bus.start.lock().unwrap() = Err("Access denied: unit not found in the cache".into());
+        assert_eq!(
+            l.start(&id, &paths).unwrap_err(),
+            "Access denied: unit not found in the cache"
+        );
+        l.bind(&id, None);
+        assert!(l.start(&id, &paths).is_err());
+        assert_eq!(bus.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn tier_caps_are_the_tier_plus_overhead() {
+        let m = tier_named("m").unwrap();
+        assert_eq!(unit_memory_max_mib(m), 4096 + VMM_OVERHEAD_MIB);
+        assert_eq!(unit_cpu_quota_pct(m), 200);
+    }
+
+    /// The runtime dir is VMM-writable: a directory, FIFO or symlink at
+    /// `vm.json`, or a planted `vm.json.tmp`, never stops the daemon's
+    /// write, and a link's target is never written.
+    #[test]
+    fn write_spec_replaces_whatever_the_vmm_left() {
+        use std::os::unix::fs::FileTypeExt;
+        let e = env();
+        let s = spec(&e, "b1");
+        let paths = BoxPaths::new(e.root.join("boxes/b1"));
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let victim = e.root.join("elsewhere/victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, paths.dir.join("vm.json.tmp")).unwrap();
+        for plant in ["dir", "fifo", "link"] {
+            let p = paths.vm_json();
+            let _ = std::fs::remove_file(&p);
+            match plant {
+                "dir" => {
+                    std::fs::create_dir(&p).unwrap();
+                    std::fs::write(p.join("x"), b"x").unwrap();
+                    std::os::unix::fs::symlink(&victim, p.join("l")).unwrap();
+                }
+                "fifo" => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &p,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap(),
+                _ => std::os::unix::fs::symlink(&victim, &p).unwrap(),
+            }
+            write_spec(&s, &paths).unwrap();
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert!(
+                m.file_type().is_file() && !m.file_type().is_fifo(),
+                "{plant}"
+            );
+            assert_eq!(read_spec(&paths).unwrap(), s, "{plant}");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        // only vm.json and the planted link: no temporary file is left
+        let mut names: Vec<String> = std::fs::read_dir(&paths.dir)
+            .unwrap()
+            .map(|d| d.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["vm.json", "vm.json.tmp"]);
     }
 
     #[test]
@@ -908,6 +1149,7 @@ mod tests {
         let l = UnitLauncher::new(bus.clone());
         let id = BoxId::parse("b7").unwrap();
         let paths = BoxPaths::new(PathBuf::from("/x/boxes/b7"));
+        l.bind(&id, Some("m"));
         assert_eq!(l.kind(), "unit");
         l.start(&id, &paths).unwrap();
         l.force_stop(&id).unwrap();
@@ -920,15 +1162,16 @@ mod tests {
         assert_eq!(
             bus.calls.lock().unwrap().clone(),
             [
-                "start saiife-box@b7.service",
-                "stop saiife-box@b7.service",
-                "active saiife-box@b7.service",
-                "active saiife-box@b7.service",
-                "active saiife-box@b7.service",
+                "start saiife-box-m@b7.service",
+                "stop saiife-box-m@b7.service",
+                "active saiife-box-m@b7.service",
+                "active saiife-box-m@b7.service",
+                "active saiife-box-m@b7.service",
             ]
         );
         // A bad id never reaches the bus.
         let bad = BoxId::parse("x1").unwrap();
+        l.bind(&bad, Some("m"));
         assert!(l.start(&bad, &paths).is_err());
         assert!(l.force_stop(&bad).is_err());
         assert_eq!(l.exited(&bad), Some(false));

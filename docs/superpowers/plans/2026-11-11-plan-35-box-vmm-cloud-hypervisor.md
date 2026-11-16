@@ -41,6 +41,8 @@
 >     - `layout::boxes_in` names only the record root, and `Layout::personal.boxes` stays `<state>/box-run`;
 >     - the locked roots `/var/lib/saiife/boxes` (records, the daemon's StateDirectory, 0700) and `/var/lib/saiife-box/boxes` (runtime, 3770) are distinct by design.
 >     - The hint for a missing default image is `saiife_boxhost::image::DEFAULT_IMAGE_HINT` (R43), used by `Store::resolve` and the preflight; plan 36 Task 5 removes the part after the semicolon ("making it the default ... is not in this build yet") and adds `--help` CLI tests. `box_image_cmd.rs`'s own `next:` line (parsed by `05-image.sh`) is separate and unchanged.
+> 11. Restore checks `state.json` too (integration, 2026-11-16): `snapshot::check_state` runs in `verify` on the hashed bytes. One vCPU state per vCPU (`snapshots.cpu-manager.snapshots` keyed `"0"`..), the memory manager's JSON-encoded state with `boot_ram` = `current_ram` = the sum of `guest_ram_mappings` sizes = `mem_mib` MiB, no virtio-mem mapping, every hotplug slot unused, the saved `memory_ranges.data` at most the RAM, and the `memory-ranges` file at most the RAM plus `SLACK_MIB`. The snapshot `platform` section may hold CH's defaults only (one PCI segment; no `tdx`, `sev_snp`, iommufd, IOMMU segments, OEM strings or SMBIOS fields). Anything else, or a state that cannot be parsed, boots cold with `restore_refused`. Owner smoke: confirm the ids `cpu-manager` and `memory-manager` and the field names on a real CH v54 snapshot (from source, not captured); if they differ every restore boots cold (fail closed).
+> 12. Honest limit: per-box caps are size-tier caps; a box can exceed its exact size only up to its tier (integration 2026-11-16, coordinator ruling). `saiife_boxes::template::TIERS` is the one source: s (1 vCPU, 2 GiB), m (2, 4 GiB), l (4, 8 GiB), xl (8, 16 GiB), xxl (16, 32 GiB); template validation refuses sizes above xxl (`MAX_VCPUS` 16, `MAX_MEM_MIB` 32768, derived from it). The root installer writes one template unit per tier, `/etc/systemd/system/saiife-box-<tier>@.service` (`boxes_install::box_unit`), with `MemoryMax=` tier memory + `launch::VMM_OVERHEAD_MIB` (256 MiB), `MemorySwapMax=0`, `CPUQuota=` tier vCPUs x 100%, `TasksMax=512`, `LimitNOFILE=4096` and the unit hardening. `ChVmm::create` records the smallest tier holding the box's vCPUs and memory (round up in both) as `tier` in the handle data (daemon-only record); every `Vmm` call binds it into `UnitLauncher` (`Launcher::bind`), which starts, stops and asks about `saiife-box-<tier>@<id>.service`. Fail closed: a record without a tier is refused at boot ("discard the box and spawn it again") and reads as "cannot tell" for liveness; StartUnit's NoSuchUnit (tier unit not installed) is refused with the install hint. The polkit rule allows start/stop on `^saiife-box-(s|m|l|xl|xxl)@b[0-9]{1,9}\.service$` only, never `set-property` (polkit cannot restrict which properties; it could loosen `DeviceAllow=` or the paths). Uninstall stops and removes the tier units and the old `saiife-box@.service`. Exact per-box sizes stay layer 1: the spec the daemon rebuilds every boot (`check_limits`) and the snapshot's `config.json`/`state.json` bounds (item 11). Owner smoke: the overhead and `TasksMax` are enough for CH (the box smoke checks tier m's caps). **Personal-mode gap:** `ChildLauncher` sets no cap at all; the VMM shares the daemon's cgroup, so a compromised VMM is bounded only by the user's own limits.
 
 > **Build order (owner ruling 2026-11-12):** boxes (plans 35–40) do not ship in a release before plan 41 (`2026-11-12-plan-41-linux-fido-helper.md`, the Linux FIDO helper) is done: without it a Linux release `saiife box land` cannot touch a key. They may be built and merged into `v3-dev` before then; the release that first enables them must contain plan 41.
 
@@ -50,7 +52,7 @@
 
 **Goal:** Replace `FakeVmm` with a real driver:
 - `ChVmm: saiife_boxes::Vmm` runs one unprivileged Cloud Hypervisor v54.0 process per box, driven over its REST API on a Unix socket, with Landlock on;
-- the VMM is started through a small helper, `saiife __box-vmm <dir>`, that checks the launch spec and the binary's pinned digest, then execs Cloud Hypervisor; personal mode runs it as a child of the daemon, locked mode as a systemd template unit `saiife-box@<id>.service` under the `saiife-box` user;
+- the VMM is started through a small helper, `saiife __box-vmm <dir>`, that checks the launch spec and the binary's pinned digest, then execs Cloud Hypervisor; personal mode runs it as a child of the daemon, locked mode as a systemd template unit `saiife-box@<id>.service` (as built: one per size tier, `saiife-box-<tier>@<id>.service`, item 12) under the `saiife-box` user;
 - every call is bounded by a timeout, and stop is the spike's ladder: power button, then `vmm.shutdown`, then the launcher's last resort;
 - `saiife box vmm fetch` downloads the pinned VMM and firmware; `saiife doctor` reports box readiness.
 
@@ -58,7 +60,7 @@
 - **New crates (Task 1), all tokio-free:** `saiife-boxhost` (`crates/boxhost`, unix-only: everything the host does to a VM), `saiife-boxproto` (`crates/boxproto`, portable: the `saiife-guest/1` protocol and the delta format), `saiife-guest` (`crates/guest`, Linux-only: the in-box init). Task 1 declares every module plans 35–40 fill, so those plans add none.
 - **The API client is a small synchronous HTTP/1.1 client over `std::os::unix::net::UnixStream`**, not hyper: `Vmm` is a sync trait, the API is eight fixed calls with tiny JSON bodies, and a tokio-free crate keeps the CI tokio gate. (Spec §7.1 says "with `hyper`"; this is a deviation, flagged.)
 - **The daemon never builds a Cloud Hypervisor command line.** It writes `<box>/vm.json` (a `LaunchSpec`); the helper validates it against the dirs it derives itself (never from the file), checks the binary's SHA-256 against the pin, builds argv with `launch::argv` (a port of `scripts/spike/vm.sh` `ch_boot`) and execs.
-- **Locked mode replaces §5.1's `Delegate=yes` with a template unit.** Each VMM is `saiife-box@<id>.service` (`User=saiife-box`, `DeviceAllow=/dev/kvm rw`, its own cgroup from systemd). The daemon starts and stops it with systemd's D-Bus `StartUnit`/`StopUnit`, allowed by a polkit rule that matches only that unit pattern and only the `saiife` user. Root is needed once, at `saiife system install --boxes`.
+- **Locked mode replaces §5.1's `Delegate=yes` with a template unit.** Each VMM is `saiife-box@<id>.service` (as built: `saiife-box-<tier>@<id>.service`, item 12; `User=saiife-box`, `DeviceAllow=/dev/kvm rw`, its own cgroup from systemd). The daemon starts and stops it with systemd's D-Bus `StartUnit`/`StopUnit`, allowed by a polkit rule that matches only that unit pattern and only the `saiife` user. Root is needed once, at `saiife system install --boxes`.
 - **Host-side listeners are bound before boot** by `VmHooks` (vsock listeners from plan 38, gateway listeners from plans 38 and 40), so the guest never connects to a socket that is not there yet.
 
 **Tech Stack:** Rust. `serde`, `serde_json`, `ring` (SHA-256), `rustix` (already in `Cargo.lock`); the daemon adds `zbus = "=5.19.0"` (already in `Cargo.lock` via `saiife-keychain`). No new crates.
@@ -113,7 +115,7 @@ Owner hard rules (`.superpowers/sdd/hard-rules.md`) bind every task. The ones th
 | `StopTimes` default | `power_s = 60`, `shutdown_s = 30` | V2, spike `ch_stop` |
 | `BOOT_TIMEOUT_SECS` | `90` | V4 |
 | `MAX_SOCK_PATH` | `100` bytes | V7 |
-| unit | `saiife-box@<id>.service`, id `b[0-9]{1,9}` | plan 34 B5 |
+| unit | `saiife-box-<tier>@<id>.service` (item 12), id `b[0-9]{1,9}` | plan 34 B5 |
 | polkit rule file | `/etc/polkit-1/rules.d/50-saiife-box.rules` | |
 | locked roots | `/var/lib/saiife-box/{boxes,images}`, `/opt/saiife/vmm` | V5, V6 |
 
@@ -123,7 +125,7 @@ Owner hard rules (`.superpowers/sdd/hard-rules.md`) bind every task. The ones th
 2. **A swapped VMM binary** (one byte changed in `cloud-hypervisor`). Expected: `box vmm fetch` refuses it and the helper refuses to launch it, in release builds always (Task 2: `fetch_refuses_wrong_digest`; Task 4: `helper_refuses_unpinned_binary`).
 3. **A guest that ignores the power button, or a VMM that hangs.** Expected: `stop` returns at once; the VMM is gone after `power_s + shutdown_s` plus the last resort; `status` is `Off`; nothing leaks (Task 5: `stop_ladder_escalates`, `stop_returns_within_a_second`, `hung_api_times_out`).
 4. **Daemon restart while VMs run** (personal mode: the child handles are lost). Expected: `status` answers from the API socket (`Running`/`Paused`), a dead socket is `Gone`, and a later `stop` still works through the API (Task 5: `status_after_restart_uses_the_api`, `stop_after_restart_without_child`).
-5. **A polkit rule that grants more than intended** (another unit, another verb, another user). Expected: the rule text allows only `start`/`stop` of `saiife-box@b<digits>.service` for user `saiife` (Task 6: `polkit_rule_is_narrow`).
+5. **A polkit rule that grants more than intended** (another unit, another verb, another user). Expected: the rule text allows only `start`/`stop` of `saiife-box-<tier>@b<digits>.service` (tiers s, m, l, xl, xxl; item 12) for user `saiife` (Task 6: `polkit_rule_is_narrow`).
 
 ---
 
@@ -328,7 +330,7 @@ Behaviour (one test each):
 ```rust
 // boxhost launch.rs
 pub trait UnitBus: Send + Sync { fn start(&self, unit: &str) -> Result<(), String>; fn stop(&self, unit: &str) -> Result<(), String>; fn active(&self, unit: &str) -> Result<bool, String>; }
-pub fn unit_name(id: &BoxId) -> Result<String, String>;   // "saiife-box@<id>.service"; id must match b[0-9]{1,9}
+pub fn unit_name(id: &BoxId, tier: &str) -> Result<String, String>;   // "saiife-box-<tier>@<id>.service" (as built, item 12); id must match b[0-9]{1,9}
 pub struct UnitLauncher { /* Arc<dyn UnitBus> */ }
 impl UnitLauncher { pub fn new(bus: Arc<dyn UnitBus>) -> UnitLauncher; }
 impl Launcher for UnitLauncher { /* start -> bus.start; exited -> Some(!active); force_stop -> bus.stop; kind "unit" */ }
@@ -347,7 +349,7 @@ pub struct SystemdBus { /* zbus::Connection (system bus), tokio Handle */ }
 impl SystemdBus { pub async fn connect() -> Result<SystemdBus, String>; }
 impl saiife_boxhost::launch::UnitBus for SystemdBus { /* Handle::block_on of Manager.StartUnit(unit, "fail"), StopUnit(unit, "replace"), GetUnit + Unit.ActiveState == "active"|"activating" */ }
 ```
-`BOX_UNIT` (`/etc/systemd/system/saiife-box@.service`):
+`box_unit(m)` (`/etc/systemd/system/saiife-box-m@.service`; one per size tier, item 12):
 ```ini
 [Unit]
 Description=saiife box %i (Cloud Hypervisor)
@@ -367,6 +369,11 @@ ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/lib/saiife-box/boxes/%i
 ReadOnlyPaths=/var/lib/saiife-box/images /opt/saiife/vmm
+MemoryMax=4352M
+MemorySwapMax=0
+CPUQuota=200%
+TasksMax=512
+LimitNOFILE=4096
 TimeoutStopSec=30
 KillMode=control-group
 Restart=no
@@ -376,7 +383,7 @@ Restart=no
 polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "saiife") {
     var unit = action.lookup("unit"), verb = action.lookup("verb");
-    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
+    if (/^saiife-box-(s|m|l|xl|xxl)@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
       return polkit.Result.YES;
     }
   }

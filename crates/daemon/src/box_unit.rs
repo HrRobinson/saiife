@@ -1,4 +1,4 @@
-//! Locked mode: start, stop and ask about the `saiife-box@<id>.service`
+//! Locked mode: start, stop and ask about the `saiife-box-<tier>@<id>.service`
 //! units over the system bus (plan 35, Task 6). The polkit rule the install
 //! writes lets the daemon user do exactly `start` and `stop` on those units.
 //!
