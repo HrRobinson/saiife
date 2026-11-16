@@ -72,6 +72,8 @@ struct Setup {
     built: Option<Arc<Manager>>,
     /// Why boxes are unavailable (a failed preflight), with no manager.
     unavailable: Option<String>,
+    /// A ready (empty) vault in the daemon context, as a real daemon has.
+    ready_vault: bool,
 }
 
 fn world() -> World {
@@ -80,6 +82,7 @@ fn world() -> World {
         template_warnings: Vec::new(),
         built: None,
         unavailable: None,
+        ready_vault: false,
     })
 }
 
@@ -137,7 +140,17 @@ fn world_with(s: Setup) -> World {
             Some(Arc::new(o.manager))
         }
     };
-    let base = CtxInit::minimal(handle, cfg, dirs, &state);
+    let mut base = CtxInit::minimal(handle, cfg, dirs, &state);
+    if s.ready_vault {
+        let key_file = tmp.path().join("vault-key");
+        std::fs::write(&key_file, [7u8; 32]).unwrap();
+        std::fs::set_permissions(
+            &key_file,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        base.vault = saiife_daemon::vault::open(&key_file, &state.join("vault").join("vault.bin"));
+    }
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
         own_user: "saiife".into(),
@@ -287,6 +300,7 @@ async fn unavailable_without_manager() {
         template_warnings: Vec::new(),
         built: None,
         unavailable: None,
+        ready_vault: false,
     });
     for (op, args) in EVERY_OP {
         let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
@@ -595,6 +609,7 @@ async fn disk_floor_pauses_running_boxes() {
         template_warnings: Vec::new(),
         built: Some(Arc::new(o.manager)),
         unavailable: None,
+        ready_vault: false,
     });
     let a = w.running(ALICE, "one").await;
     let b = w.running(ALICE, "two").await;
@@ -746,6 +761,7 @@ async fn templates_lists_warnings() {
         template_warnings: built.template_warnings.clone(),
         built: Some(built.manager),
         unavailable: None,
+        ready_vault: false,
     });
     let a = w.ok(ALICE, "box.templates", json!({})).await;
     let names: Vec<&str> = a["templates"]
@@ -905,6 +921,7 @@ async fn restart_changes_are_recorded() {
         template_warnings: Vec::new(),
         built: Some(second.manager),
         unavailable: None,
+        ready_vault: false,
     });
     for rec in box_ops::change_records(&w.ctx, &second.changes) {
         w.ctx.writer.append(rec).await.unwrap();
@@ -1291,6 +1308,7 @@ async fn without_the_boxes_feature_boxes_are_not_enabled() {
         template_warnings: Vec::new(),
         built: None,
         unavailable: Some(why.clone()),
+        ready_vault: false,
     });
     let a = w.call(ALICE, "box.list", json!({})).await;
     assert_eq!(a["error"], "unavailable", "{a}");
@@ -1317,6 +1335,7 @@ async fn unavailable_message_names_the_failed_check() {
         template_warnings: Vec::new(),
         built: None,
         unavailable: Some(why.clone()),
+        ready_vault: false,
     });
     for (op, args) in EVERY_OP {
         let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
@@ -1901,21 +1920,43 @@ async fn resetup_keeps_env_and_placeholder() {
     assert_ne!(setups.setup_for(&c).unwrap().env, s1.env);
 }
 
-/// Plan 40 R3: the setup never holds a vault value: nothing here reads the
-/// vault, so a secret stored under the template's credential name is absent
-/// from the serialized setup.
+/// Plan 40 R3: the setup never holds a vault value: a secret stored under
+/// the template's credential name for the model service is absent from the
+/// serialized setup (only the placeholder travels).
 #[tokio::test]
 async fn setup_has_no_secret() {
     use saiife_boxhost::guest::SetupSource;
     use saiife_daemon::box_setup::TemplateSetup;
-    let w = world();
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: None,
+        unavailable: None,
+        ready_vault: true,
+    });
     let tmp = scratch();
     let a = w.spawn(ALICE, "t").await;
     let b = id(a["box"]["id"].as_str().unwrap());
     let setups = TemplateSetup::new(tmp.path().join("packs"));
     setups.attach(w.mgr.as_ref().unwrap());
-    let json = serde_json::to_string(&setups.setup_for(&b).unwrap()).unwrap();
     let secret = concat!("sk-", "ant-", "api03-", "REALSECRET0123456789");
+    let entry = saiife_daemon::vault::Entry {
+        name: "anthropic".into(),
+        kind: saiife_daemon::vault::Kind::Token,
+        fields: [(
+            "token".to_string(),
+            zeroize::Zeroizing::new(secret.to_string()),
+        )]
+        .into(),
+        allowed_services: vec!["box-model".into()],
+        created_by: 0,
+        created: "2026-11-16T00:00:00Z".into(),
+        last_used: None,
+        rotate_after: None,
+    };
+    w.ctx.vault.writer().put(entry).unwrap();
+    let json = serde_json::to_string(&setups.setup_for(&b).unwrap()).unwrap();
+    assert!(json.contains("ANTHROPIC_API_KEY"), "the setup is real");
     assert!(!json.contains(secret));
     assert!(!json.contains("REALSECRET"));
 }
@@ -2038,6 +2079,7 @@ async fn the_context_is_freed_with_the_gateway_wired() {
         template_warnings: Vec::new(),
         built: Some(mgr),
         unavailable: None,
+        ready_vault: false,
     });
     let gw = GatewayHooks::new(
         Arc::clone(&w.ctx),

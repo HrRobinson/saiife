@@ -137,9 +137,9 @@ fn user_packs(id: &BoxId, dir: &Path) -> Vec<(String, String)> {
 
 /// The setup of box `id`: `command`, the model env and `.claude.json` seed
 /// when given (they count against the env and file limits; only packs are
-/// skippable), the Claude Code settings, then each pack that fits (invalid id, a text over [`MAX_FILE_TEXT`], past
-/// [`MAX_FILES`] files or past [`MAX_USER_PACK_BYTES`] of packs: skipped,
-/// one line each). `Setup::check` runs last; its error is the answer.
+/// skippable), the Claude Code settings, then each pack that fits (invalid
+/// id, a text over [`MAX_FILE_TEXT`], past [`MAX_FILES`] files or past
+/// [`MAX_USER_PACK_BYTES`] of packs: skipped, one line each). `Setup::check` runs last; its error is the answer.
 pub fn build_setup(
     id: &BoxId,
     command: &[String],
