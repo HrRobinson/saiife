@@ -597,7 +597,7 @@ async fn review_screen_is_served() {
     }
     // Approve answers the box's pending land with this browser's passkey.
     assert!(view.contains("pendingLand(client, id)"));
-    assert!(view.contains("touch(client, { action, args, ...p, mount })"));
+    assert!(view.contains("touch(client, { action, args, ...p, mount, ...opts })"));
     let (st, _, _) = s.get("/js/diff.js").await;
     assert_eq!(st, StatusCode::OK);
 }

@@ -91,7 +91,7 @@ test("term render is inert", () => {
   const screen = apply(null, snap(1, [
     "\u001b]52;c;cm0gLXJmIH4=\u0007",
     "\u001b]8;;https://x\u0007Approve\u001b]8;;\u0007",
-    "evil‮gnp.exe",
+    "evil\u202egnp.exe",
     "[ Approve ] <button>Approve</button> <a href=x>y</a>",
     "two\nlines",
   ])).screen;
@@ -167,4 +167,50 @@ test("term ended stops polling", async () => {
   assert.equal(cancelled, 1);
   assert.equal(updates.at(-1).ended, true);
   assert.equal(ENDED, "The terminal has ended");
+});
+
+test("term stops on a refusal a retry cannot change", async () => {
+  for (const [answer, stops] of [
+    [{ ok: false, error: "bad_request", rule: "not_found", message: "no such box" }, true],
+    [{ ok: false, error: "forbidden", rule: "forbidden", message: "not yours" }, true],
+    [{ ok: false, error: "forbidden", rule: "unknown_device", message: "unpaired" }, true],
+    [{ ok: false, error: "bad_answer", rule: null, message: "junk" }, true],
+    [{ ok: false, error: "busy", rule: "busy", message: "busy" }, false],
+    [{ ok: false, error: "unreachable", rule: null, message: "down" }, false],
+  ]) {
+    let calls = 0;
+    let cancelled = 0;
+    const updates = [];
+    const client = { async send() { calls++; return answer; } };
+    let t = 0;
+    const p = poller({ client, id: "b-x", schedule: () => 3, cancel: () => cancelled++, now: () => t, onUpdate: (u) => updates.push(u) });
+    p.start();
+    await p.idle();
+    for (let i = 0; i < 3; i++) {
+      t += POLL_MS;
+      await p.tick();
+    }
+    assert.equal(calls, stops ? 1 : 4, JSON.stringify(answer));
+    assert.equal(cancelled, stops ? 1 : 0);
+    assert.equal(updates[0].failed, stops);
+    assert.equal(updates[0].error, answer);
+    p.stop();
+  }
+});
+
+test("term cuts long lines by code point", () => {
+  const s = "\u{1F600}".repeat(1500);
+  const screen = apply(null, snap(1, [s])).screen;
+  const [kept] = screen.lines;
+  // No half surrogate pair is kept or shown.
+  assert.equal(Array.from(kept).length, 1001);
+  assert.ok(Array.from(kept).every((c) => c === "\u{1F600}"));
+  const [shown] = texts(render(screen, h));
+  const cs = Array.from(shown);
+  assert.equal(cs.length, 1001);
+  assert.equal(cs.at(-1), "…");
+  assert.ok(cs.slice(0, 1000).every((c) => c === "\u{1F600}"));
+  assert.ok(!shown.includes("⟨U+D83D⟩") && !shown.includes("⟨U+DE00⟩"));
+  // A short line is kept as it came.
+  assert.deepEqual(apply(null, snap(1, ["a\u{1F600}b"])).screen.lines, ["a\u{1F600}b"]);
 });

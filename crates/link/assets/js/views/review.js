@@ -47,7 +47,8 @@ function digest(sha) {
   return b;
 }
 
-export function view(client, id) {
+// `credentials` is navigator.credentials unless a test hands in a fake.
+export function view(client, id, { credentials } = {}) {
   const head = h("div", {}, h("p", { role: "status", "aria-live": "polite" }, "Loading the diff…"));
   const body = h("div", {});
   const out = h("div", { role: "status", "aria-live": "polite" });
@@ -88,20 +89,24 @@ export function view(client, id) {
     buttons();
     out.replaceChildren(h("p", { class: "muted" }, "Working…"));
     let a;
+    const mount = (n) => {
+      if (!left) out.replaceChildren(n);
+    };
+    const opts = credentials ? { credentials } : {};
     try {
-      a = await client.send(action, args);
-      if (!left && outcome(a) === "needs_touch") {
-        // Land answers the box's pending land (its own touch request);
-        // Revise asks the daemon for one. Either way the code shows first.
-        const mount = (n) => {
-          if (!left) out.replaceChildren(n);
-        };
-        if (action === ACTIONS.land) {
-          const p = await pendingLand(client, id);
-          if (p) a = await touch(client, { action, args, ...p, mount });
-        } else {
-          a = await touch(client, { action, args, mount });
-        }
+      if (action === ACTIONS.land) {
+        // A land always needs a touch (no steer window covers it): answer
+        // the box's pending land straight away, with no proof-less frame
+        // first. None pending, or no passkey here: the machine prompt.
+        const p = await pendingLand(client, id);
+        if (left) return;
+        a = p
+          ? await touch(client, { action, args, ...p, mount, ...opts })
+          : { ok: false, error: "forbidden", rule: "touch_required", message: "" };
+      } else {
+        a = await client.send(action, args);
+        // Revise asks the daemon for a touch when no steer window is open.
+        if (!left && outcome(a) === "needs_touch") a = await touch(client, { action, args, mount, ...opts });
       }
     } finally {
       inFlight = false;

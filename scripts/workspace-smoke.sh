@@ -108,14 +108,17 @@ else
   bad "audit verify exits 0"
 fi
 
-# 3. the same land again is refused. The page cannot resend an assertion
-# (a replayed one is refused by the daemon: workspace_link
-# assertion_reuse_is_refused); here the land is simply gone.
+# 3. the same land again does not land twice. The page cannot resend an
+# assertion (a replayed one is refused by the daemon: workspace_link
+# assertion_reuse_is_refused); with no pending land left it sends no land
+# frame at all. Exactly one allowed box.land in the audit, before and after.
+LANDS_BEFORE=$(audit_records | jq -s '[.[] | select(.kind == "workspace" and .action == "box.land" and .decision == "allow")] | length')
 wait_enter "step 3: in the page, press Approve with touch on the same box again. It must not land again: the page shows the machine command."
-if audit_records | jq -e -s '[.[] | select(.kind == "workspace" and .action == "box.land" and .decision == "deny")] | length > 0' >/dev/null; then
-  ok "audit: the replayed land is refused"
+LANDS_AFTER=$(audit_records | jq -s '[.[] | select(.kind == "workspace" and .action == "box.land" and .decision == "allow")] | length')
+if [ "$LANDS_BEFORE" = 1 ] && [ "$LANDS_AFTER" = 1 ]; then
+  ok "audit: the box landed once only"
 else
-  bad "audit: the replayed land is refused (in $AUDIT_DIR)"
+  bad "audit: the box landed once only (allowed box.land records: $LANDS_BEFORE before step 3, $LANDS_AFTER after; in $AUDIT_DIR)"
 fi
 
 # 4. one touch, two steers inside 10 minutes.

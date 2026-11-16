@@ -3,9 +3,11 @@
 // screen of plain lines, shown as text in one <pre>. Nothing in a line can
 // act: no markup, no links, no buttons; escapes are shown, never run (§9.4).
 import { visible } from "./format.js";
+import { outcome } from "./actions.js";
 
 export const POLL_MS = 1000; // at most one read per second
 export const ENDED = "The terminal has ended";
+export const UNREADABLE = "The terminal cannot be read here";
 // What one pane shows at most, whatever a frame claims (10 000 lines/s
 // cost the page nothing beyond this).
 export const MAX_ROWS = 500;
@@ -13,8 +15,12 @@ export const MAX_COLS = 1000;
 
 const SEQ = (x) => Number.isSafeInteger(x) && x >= 0;
 
+// A line as kept: cut by code point (never inside a surrogate pair), one
+// more than shown so `shown` can mark the cut.
 function line(x) {
-  return typeof x === "string" ? x.slice(0, MAX_COLS * 2) : "";
+  if (typeof x !== "string") return "";
+  const cs = Array.from(x);
+  return cs.length > MAX_COLS + 1 ? cs.slice(0, MAX_COLS + 1).join("") : x;
 }
 
 // -> {screen, gap}. A snapshot replaces the screen; a delta patches lines
@@ -64,7 +70,8 @@ export function render(screen, h) {
 // gap ask with no `after` (a fresh snapshot), the others with `after` = the
 // last seq. One read at a time and at most one per POLL_MS whatever ticks
 // arrive; `ended` stops it. `schedule(fn, ms)`/`cancel` are setInterval /
-// clearInterval; `onUpdate({screen, ended, error})` after every read.
+// clearInterval; `onUpdate({screen, ended, failed, error})` after every
+// read. A refusal that a retry cannot change (`failed`) stops it too.
 export function poller({ client, id, schedule = setInterval, cancel = clearInterval, now = Date.now, onUpdate = () => {}, isVisible = () => true }) {
   let screen = null;
   let fresh = true; // the next read asks for a snapshot
@@ -72,6 +79,7 @@ export function poller({ client, id, schedule = setInterval, cancel = clearInter
   let busy = null;
   let stopped = true;
   let ended = false;
+  let failed = false;
   let timer = null;
 
   function halt() {
@@ -84,7 +92,14 @@ export function poller({ client, id, schedule = setInterval, cancel = clearInter
     const a = await client.send("box.term.read", args);
     if (stopped) return;
     if (!a || !a.ok) {
-      onUpdate({ screen, ended, error: a });
+      // Busy or briefly unreachable: try again next second. Anything else
+      // (not found, forbidden, unpaired, a bad answer) will not change on
+      // a retry: stop reading.
+      if (outcome(a) !== "retry") {
+        failed = true;
+        halt();
+      }
+      onUpdate({ screen, ended, failed, error: a });
       return;
     }
     const r = a.result && typeof a.result === "object" ? a.result : {};
@@ -101,11 +116,11 @@ export function poller({ client, id, schedule = setInterval, cancel = clearInter
       ended = true;
       halt();
     }
-    onUpdate({ screen, ended, error: null });
+    onUpdate({ screen, ended, failed, error: null });
   }
 
   function tick() {
-    if (stopped || ended || busy || !isVisible()) return busy ?? Promise.resolve();
+    if (stopped || ended || failed || busy || !isVisible()) return busy ?? Promise.resolve();
     const t = now();
     if (t - last < POLL_MS) return Promise.resolve();
     last = t;

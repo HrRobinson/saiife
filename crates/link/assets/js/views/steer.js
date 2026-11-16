@@ -9,7 +9,7 @@ import { counter } from "../overviewlogic.js";
 import { show } from "../touchprompt.js";
 import { leaveIfUnpaired } from "../unpaired.js";
 import { touch } from "../touch.js";
-import { poller, render as renderTerm, ENDED } from "../term.js";
+import { poller, render as renderTerm, ENDED, UNREADABLE } from "../term.js";
 
 // The pane: one <pre> of text, no controls. Polled while the page is
 // visible, at most once per second; stops when the box's terminal ended
@@ -21,10 +21,11 @@ function terminal(client, id) {
     client,
     id,
     isVisible: () => document.visibilityState === "visible",
-    onUpdate: async ({ screen, ended, error }) => {
+    onUpdate: async ({ screen, ended, failed, error }) => {
       if (error) {
         if (await leaveIfUnpaired(error)) return p.stop();
-        note.replaceChildren(visible(error.message || "Could not read the terminal."));
+        // Stopped for good: a plain sentence. Busy: say so and keep trying.
+        note.replaceChildren(failed ? `${UNREADABLE}. ${visible(error.message || "")}`.trim() : "The terminal is busy; trying again.");
         return;
       }
       pre.replaceChildren(renderTerm(screen, h));
