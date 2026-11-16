@@ -160,7 +160,7 @@ pub type Hits<'a> = &'a dyn Fn(&[&str]) -> Vec<Flag>;   // the daemon passes pla
 pub fn receive(guest: &VsockGuest, id: &BoxId, paths: &RecordPaths, base: &BaseManifest, n: u32) -> Result<Valid, DeltaError>;   // request_stream(Export{n}) into lands/<n>/blobs; on error removes lands/<n>
 pub fn render(base: &BaseManifest, v: &Valid, blobs: &Path, only: Option<&BTreeSet<String>>) -> (String /* full unified */, Vec<FileChange>);
 pub fn review(id: &BoxId, base: &BaseManifest, v: &Valid, blobs: &Path, only: Option<&BTreeSet<String>>, hits: Hits) -> Review;   // diff_sha256 = sha256(full); unified cut at a line end ≤ MAX_DIFF_BYTES
-pub fn write_land_files(paths: &BoxPaths, r: &Review, only: Option<&BTreeSet<String>>) -> Result<(), String>;   // delta.bin (new content of the selected entries) + review.json, 0600
+pub fn write_land_files(paths: &RecordPaths, r: &Review, only: Option<&BTreeSet<String>>) -> Result<(), String>;   // delta.bin (new content of the selected entries) + review.json, 0600
 pub fn protected(path: &str) -> bool;   // L6 built-in list
 ```
 Old content of a `modify` comes from the delta's old side, already proven equal to the manifest hash, so the renderer never trusts the guest for it. `render` output is deterministic (entries in path order; `similar` `TextDiff::from_lines(..).unified_diff().context_radius(3)`), pinned by golden files.
