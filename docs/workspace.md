@@ -95,7 +95,12 @@ A touch is a WebAuthn assertion from a passkey enrolled for this device. It
 binds the exact action the page showed: the daemon makes the challenge from
 the action record (what, which box, expiry), and an assertion for one action
 or one box is refused for another (`touch_mismatch`). A challenge works once
-and is valid for 5 minutes. The prompt times out after 120 seconds. A
+and is valid for 5 minutes. A browser can hold at most 4 challenges that are
+not yet used or expired, and a user at most 8 across all their browsers and
+the machine's own touches (lands, pushes, approvals). One more is refused
+with `busy`. The record's reason says which limit it hit: "too many touches
+in progress on this device" for the browser's 4, "too many touches in
+progress" for the user's 8. The prompt times out after 120 seconds. A
 timeout, an error or the wrong passkey all deny: the page says "Not approved"
 and sends nothing. There is never a password fallback.
 
