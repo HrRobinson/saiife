@@ -18,9 +18,9 @@
 #     subscription through a local proxy, spec 7.9 and 13). Only if it
 #     allows it, flip SUBSCRIPTION_LOGIN_CLEARED in crates/boxes in a LOCAL
 #     build (its own commit if you keep it), then
-#       SAIIFE_BOX_SMOKE_SUB_KEY_FILE=<file with the `claude setup-token` token>
-#         saiife secret add anthropic-sub --kind token --service box-model \
-#           --from-file "$SAIIFE_BOX_SMOKE_SUB_KEY_FILE"
+#       export SAIIFE_BOX_SMOKE_SUB_KEY_FILE=<file with the `claude setup-token` token>
+#       saiife secret add anthropic-sub --kind token --service box-model \
+#         --from-file "$SAIIFE_BOX_SMOKE_SUB_KEY_FILE"
 #       install scripts/box-smoke.d/templates/claude-subscription.toml into
 #       templates.d (as 30-guest does for bash.toml) and restart the daemon;
 #   - for the no_placeholder_401 check, the bash template of 30-guest
@@ -217,15 +217,16 @@ p40_placeholder_ok() {
 # NULs become newlines so a sparse disk is never one huge line.
 p40_disk_clean() {
   local out n sts
-  out=$({ p40_as cat "$1" | tr '\0' '\n' | grep -c -a -F -f "$P40_KEYFILE"; printf ' %s' "${PIPESTATUS[*]}"; } 2>/dev/null) || true
-  n=${out%% *}
-  sts=${out#* }
+  out=$({ p40_as cat "$1" | tr '\0' '\n' | grep -c -a -F -f "$P40_KEYFILE"; printf 'S %s' "${PIPESTATUS[*]}"; } 2>/dev/null) || true
+  n=$(printf '%s' "$out" | head -n 1 | tr -d '[:space:]')
+  sts=${out##*S }
   p40_log "key matches in $(basename "$1"): ${n:-?}"
-  [ "$n" = 0 ] || return 1
+  # grep exit 2 (error) or an unreadable disk is a FAIL, never a pass
   case "$sts" in
-    "0 0 0" | "0 0 1") return 0 ;;
+    "0 0 0" | "0 0 1") ;;
     *) p40_log "could not read $1 (locked mode needs sudo -n)"; return 1 ;;
   esac
+  [ "$n" = 0 ]
 }
 
 # after `box stop`: neither disk of the box holds the key
@@ -258,26 +259,36 @@ p40_curl_401() {
   return 1
 }
 
+# p40_leg_fail KIND: every result key of the leg is FAIL (it could not run)
+p40_leg_fail() {
+  local k
+  for k in claude_turn_ok claude_no_prompt model_records placeholder_accepted key_not_on_disk; do
+    p40_result "${k}_$1" FAIL
+  done
+}
+
 # the whole leg for one login kind: p40_leg KIND TEMPLATE KEYFILE
 p40_leg() {
   local kind=$1 tpl=$2 t0
   P40_KEYFILE=$3
   p40_log "== claude, login kind $kind (template $tpl)"
   if ! check "[$kind] key file readable, one line, no blank line" p40_keyfile_ok "$P40_KEYFILE"; then
+    p40_leg_fail "$kind"
     return 0
   fi
   if ! check "[$kind] template $tpl is loaded" p40_template "$tpl"; then
+    p40_leg_fail "$kind"
     return 0
   fi
   t0=$(p40_now_ms)
   if ! check "[$kind] box spawn --template $tpl --task (secret must be in the vault with --service box-model)" p40_spawn "$tpl" "$P40_TASK"; then
-    p40_result "placeholder_accepted_$kind" 0
+    p40_leg_fail "$kind"
     return 0
   fi
   if check "[$kind] box reaches running within ${P40_RUN_LIMIT_S} s" p40_wait_state running "$P40_RUN_LIMIT_S"; then
     p40_result "ready_ms_$kind" "$(($(p40_now_ms) - t0))"
   else
-    p40_result "claude_turn_ok_$kind" 0
+    p40_leg_fail "$kind"
     p40_end_box
     return 0
   fi
