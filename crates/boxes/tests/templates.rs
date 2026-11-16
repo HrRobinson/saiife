@@ -362,7 +362,7 @@ fn gemini_builtin_is_pinned() {
     let t = &builtin()[2];
     assert_eq!(t.agent, AgentKind::Gemini);
     assert_eq!(t.agent.provider(), Provider::Google);
-    assert_eq!(t.command, vec!["gemini"]);
+    assert_eq!(t.command, vec!["gemini", "--include-directories", "/work"]);
     assert_eq!(t.login, Login::ApiKey);
     assert_eq!(t.credential, "gemini");
     assert!(t.egress.is_empty() && t.secrets.is_empty());

@@ -140,10 +140,19 @@ pub const CODEX_CONFIG_PATH: &str = "/home/agent/.codex/config.toml";
 /// Where the in-box Gemini CLI settings go (plan 42 D5).
 pub const GEMINI_SETTINGS_PATH: &str = "/home/agent/.gemini/settings.json";
 
-/// What an agent kind adds to a box's setup: its model env and its files.
+/// The agent's working directory in most boxes: the repo.
+pub const WORK_CWD: &str = "/work";
+/// Gemini CLI's working directory (plan 42 R9a): its home, so no settings,
+/// `.env` or project agents of the repo load; the repo is an include
+/// directory of the built-in command.
+pub const GEMINI_CWD: &str = "/home/agent";
+
+/// What an agent kind adds to a box's setup: its model env, its files and
+/// the directory it runs in.
 pub struct AgentSetup {
     pub env: Vec<(String, String)>,
     pub files: Vec<SetupFile>,
+    pub cwd: String,
 }
 
 /// A 0600 file saiife's setup rewrites on every setup (the agent's own
@@ -176,10 +185,16 @@ fn claude_setup(model: Option<ModelSetup>) -> AgentSetup {
             keep_existing: true,
         });
     }
-    AgentSetup { env, files }
+    AgentSetup {
+        env,
+        files,
+        cwd: WORK_CWD.into(),
+    }
 }
 
-/// The env and files of `agent` with the box's `placeholder` (plan 42 D5).
+/// The env, files and cwd of `agent` with the box's `placeholder` (plan 42
+/// D5, R9: Gemini's own settings are in a root-owned system file in the
+/// image, `gemini_system_settings`, and it runs in [`GEMINI_CWD`]).
 /// `cred` picks Claude Code's login variable; Codex and Gemini have one
 /// login each. Codex's hooks are not here: they are managed, baked into the
 /// image (R7, `codex_requirements`). No agent gets another agent's files.
@@ -198,10 +213,12 @@ pub fn agent_setup(agent: AgentKind, cred: ModelCred, placeholder: &str) -> Agen
         AgentKind::Codex => AgentSetup {
             env: codex_env(placeholder),
             files: vec![authoritative(CODEX_CONFIG_PATH, codex_config())],
+            cwd: WORK_CWD.into(),
         },
         AgentKind::Gemini => AgentSetup {
             env: gemini_env(placeholder),
             files: vec![authoritative(GEMINI_SETTINGS_PATH, gemini_settings())],
+            cwd: GEMINI_CWD.into(),
         },
     }
 }
@@ -248,7 +265,11 @@ pub fn build_agent_setup(
     agent: AgentSetup,
     packs: &[(String, String)],
 ) -> Result<Setup, String> {
-    let AgentSetup { env, mut files } = agent;
+    let AgentSetup {
+        env,
+        mut files,
+        cwd,
+    } = agent;
     let mut pack_bytes = 0usize;
     for (pid, text) in packs {
         let skip = |why: &str| log(id, &format!("user pack {pid:?} skipped: {why}"));
@@ -276,7 +297,7 @@ pub fn build_agent_setup(
         agent: AgentSpec {
             command: command.to_vec(),
             user: "agent".into(),
-            cwd: "/work".into(),
+            cwd,
         },
         env,
         files,
@@ -578,6 +599,7 @@ mod tests {
             ]
         );
         assert_eq!(s.files[0].text, codex_config());
+        assert_eq!(s.agent.cwd, "/work");
         assert!(!paths.contains(&SETTINGS_PATH));
         assert!(!paths.contains(&CLAUDE_JSON_PATH));
         assert_eq!(CODEX_CONFIG_PATH, "/home/agent/.codex/config.toml");
@@ -585,7 +607,9 @@ mod tests {
 
     #[test]
     fn gemini_box_has_no_claude_files() {
-        let cmd = vec!["gemini".to_string()];
+        let cmd: Vec<String> = ["gemini", "--include-directories", "/work"]
+            .map(String::from)
+            .to_vec();
         let a = agent_setup(AgentKind::Gemini, ModelCred::GoogleApiKey, "PH");
         let s = build_agent_setup(&b1(), &cmd, a, &one_pack()).unwrap();
         assert_eq!(s.agent.command, cmd);
@@ -599,6 +623,7 @@ mod tests {
             ]
         );
         assert_eq!(s.files[0].text, gemini_settings());
+        assert_eq!(s.agent.cwd, "/home/agent");
         assert!(!paths.contains(&SETTINGS_PATH));
         assert!(!paths.contains(&CLAUDE_JSON_PATH));
         assert_eq!(GEMINI_SETTINGS_PATH, "/home/agent/.gemini/settings.json");
@@ -814,6 +839,28 @@ mod tests {
                 let other = spawn(&m, template);
                 assert_ne!(env_of(&s.setup_for(&other).unwrap(), var).unwrap(), ph);
             }
+        }
+
+        /// R9a: a gemini box runs in its home with the repo as an include
+        /// directory; codex and claude-code run in the repo.
+        #[test]
+        fn agent_cwd_per_agent() {
+            let t = scratch();
+            let m = manager(
+                &t.path().join("state"),
+                vec![
+                    tmpl("cc", AgentKind::ClaudeCode),
+                    tmpl("cx", AgentKind::Codex),
+                    tmpl("gm", AgentKind::Gemini),
+                ],
+            );
+            let s = setups(&t, &m);
+            let of = |template: &str| s.setup_for(&spawn(&m, template)).unwrap().agent;
+            let gm = of("gm");
+            assert_eq!(gm.cwd, "/home/agent");
+            assert_eq!(gm.command, ["gemini", "--include-directories", "/work"]);
+            assert_eq!(of("cx").cwd, "/work");
+            assert_eq!(of("cc").cwd, "/work");
         }
 
         /// A box spawned as codex whose template now names gemini sets up

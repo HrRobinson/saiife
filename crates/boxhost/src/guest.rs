@@ -1405,15 +1405,16 @@ pub fn codex_env(placeholder: &str) -> Vec<(String, String)> {
 /// `/home/agent/.codex/config.toml` (plan 42 D5, R7): a model provider
 /// pointing at the gateway (HTTP Responses API, no websockets), no update
 /// check or analytics, and `/work` untrusted, so no repo `.codex/` config,
-/// hooks or MCP servers load. The VM is the boundary, so no sandbox and no
-/// approval prompts. saiife's hooks are not here: they are managed, in
+/// hooks or MCP servers load. The VM is the boundary, so no sandbox; the
+/// agent asks in its TUI when it wants to (`on-request`, R9e, as Claude Code
+/// does). saiife's hooks are not here: they are managed, in
 /// [`codex_requirements`]. It holds no placeholder.
 pub fn codex_config() -> String {
     let off = || table([("enabled", false.into())]);
     let v = table([
         ("model_provider", "saiife".into()),
         ("sandbox_mode", "danger-full-access".into()),
-        ("approval_policy", "never".into()),
+        ("approval_policy", "on-request".into()),
         ("check_for_update_on_startup", false.into()),
         (
             "model_providers",
@@ -1491,9 +1492,10 @@ pub fn codex_requirements() -> String {
     toml::to_string(&v).unwrap_or_default()
 }
 
-/// The model environment of Gemini CLI in the box (plan 42 D5): the box's
-/// placeholder as the Gemini key and the gateway's model URL (which puts
-/// the CLI in its `gateway` auth mode), telemetry off.
+/// The model environment of Gemini CLI in the box (plan 42 D5, R9): the
+/// box's placeholder as the Gemini key and the gateway's model URL (which
+/// puts the CLI in its `gateway` auth mode), telemetry off, and a fixed
+/// `GEMINI_CLI_HOME`, so a `.env` the CLI reaches cannot move its home.
 pub fn gemini_env(placeholder: &str) -> Vec<(String, String)> {
     pairs(&[
         ("GEMINI_API_KEY", placeholder.to_string()),
@@ -1502,27 +1504,45 @@ pub fn gemini_env(placeholder: &str) -> Vec<(String, String)> {
             format!("http://127.0.0.1:{}", ports::MODEL_TCP),
         ),
         ("GEMINI_TELEMETRY_ENABLED", "false".into()),
+        ("GEMINI_CLI_HOME", "/home/agent".into()),
     ])
 }
 
-/// `/home/agent/.gemini/settings.json` (plan 42 D5): the gateway auth type,
-/// no folder trust screen, no usage statistics, updates or telemetry, and
-/// saiife's hooks: the BeforeTool check (advisory; the box is the boundary)
-/// and the AfterAgent turn-finished signal.
+/// `/home/agent/.gemini/settings.json` (plan 42 R9c): only the gateway auth
+/// type. Everything else, saiife's hooks included, is in the root-owned
+/// system file ([`gemini_system_settings`]); hooks here too would be
+/// registered twice.
 pub fn gemini_settings() -> String {
+    let v = serde_json::json!({"security": {"auth": {"selectedType": "gateway"}}});
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
+/// Where the image holds Gemini CLI's system settings (plan 42 R9b): root
+/// owned, 0644 in a 0755 dir, baked in, so the agent in the box cannot
+/// change them; they win over every user and workspace setting.
+pub const GEMINI_SYSTEM_SETTINGS_PATH: &str = "/etc/gemini-cli/settings.json";
+
+/// `/etc/gemini-cli/settings.json` (plan 42 R9b): the gateway auth type
+/// enforced, no folder trust, no extensions or MCP servers, no local `.env`,
+/// no sandbox (the VM is the boundary), no statistics, updates or
+/// telemetry, and saiife's hooks: the BeforeTool check (advisory; the box
+/// is the boundary), run in order, and the AfterAgent turn-finished signal.
+pub fn gemini_system_settings() -> String {
     use saiife_agents::gemini::{MATCHER, TIMEOUT_MS};
     let v = serde_json::json!({
         "security": {
-            "auth": {"selectedType": "gateway"},
+            "auth": {"selectedType": "gateway", "enforcedType": "gateway"},
             "folderTrust": {"enabled": false},
+            "blockGitExtensions": true,
+            "allowedExtensions": ["^saiife-no-extensions$"],
         },
-        "privacy": {"usageStatisticsEnabled": false},
-        "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
-        "telemetry": {"enabled": false},
+        "hooksConfig": {"enabled": true, "notifications": false},
         "hooks": {
             "BeforeTool": [{
                 "matcher": MATCHER,
+                "sequential": true,
                 "hooks": [{
+                    "name": "saiife-guard",
                     "type": "command",
                     "command": "/usr/local/bin/saiife check --hook-exit --agent gemini --profile box",
                     "timeout": TIMEOUT_MS,
@@ -1530,12 +1550,20 @@ pub fn gemini_settings() -> String {
             }],
             "AfterAgent": [{
                 "hooks": [{
+                    "name": "saiife-turn-finished",
                     "type": "command",
                     "command": "/usr/local/bin/saiife __guest event turn-finished",
                     "timeout": TIMEOUT_MS,
                 }]
             }]
-        }
+        },
+        "mcp": {"allowed": ["saiife-no-mcp"]},
+        "tools": {"sandbox": false},
+        "advanced": {"ignoreLocalEnv": true},
+        "privacy": {"usageStatisticsEnabled": false},
+        "telemetry": {"enabled": false},
+        "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
+        "ui": {"showHomeDirectoryWarning": false},
     });
     serde_json::to_string_pretty(&v).unwrap_or_default()
 }
@@ -1695,7 +1723,7 @@ mod settings_tests {
             r#"
 model_provider = "saiife"
 sandbox_mode = "danger-full-access"
-approval_policy = "never"
+approval_policy = "on-request"
 check_for_update_on_startup = false
 
 [model_providers.saiife]
@@ -1724,7 +1752,7 @@ trust_level = "untrusted"
             v["projects"]["/work"]["trust_level"].as_str(),
             Some("untrusted")
         );
-        assert_eq!(v["approval_policy"].as_str(), Some("never"));
+        assert_eq!(v["approval_policy"].as_str(), Some("on-request"));
     }
 
     #[test]
@@ -1785,6 +1813,7 @@ trust_level = "untrusted"
                 ("GEMINI_API_KEY", "PH"),
                 ("GOOGLE_GEMINI_BASE_URL", "http://127.0.0.1:3129"),
                 ("GEMINI_TELEMETRY_ENABLED", "false"),
+                ("GEMINI_CLI_HOME", "/home/agent"),
             ])
         );
     }
@@ -1792,28 +1821,64 @@ trust_level = "untrusted"
     #[test]
     fn gemini_settings_are_pinned() {
         let v: serde_json::Value = serde_json::from_str(&gemini_settings()).unwrap();
-        let hook = |command: &str| serde_json::json!({"type": "command", "command": command, "timeout": 10_000});
+        assert_eq!(
+            v,
+            serde_json::json!({"security": {"auth": {"selectedType": "gateway"}}})
+        );
+        for k in ["hooks", "hooksConfig", "mcpServers"] {
+            assert!(v.get(k).is_none(), "{k}");
+        }
+        assert!(v["security"].get("folderTrust").is_none());
+    }
+
+    #[test]
+    fn gemini_system_settings_are_pinned() {
+        assert_eq!(GEMINI_SYSTEM_SETTINGS_PATH, "/etc/gemini-cli/settings.json");
+        let v: serde_json::Value = serde_json::from_str(&gemini_system_settings()).unwrap();
+        assert!(v.get("admin").is_none());
+        let hook = |name: &str, command: &str| serde_json::json!({"name": name, "type": "command", "command": command, "timeout": 10_000});
         assert_eq!(
             v,
             serde_json::json!({
                 "security": {
-                    "auth": {"selectedType": "gateway"},
+                    "auth": {"selectedType": "gateway", "enforcedType": "gateway"},
                     "folderTrust": {"enabled": false},
+                    "blockGitExtensions": true,
+                    "allowedExtensions": ["^saiife-no-extensions$"],
                 },
-                "privacy": {"usageStatisticsEnabled": false},
-                "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
-                "telemetry": {"enabled": false},
+                "hooksConfig": {"enabled": true, "notifications": false},
                 "hooks": {
                     "BeforeTool": [{
                         "matcher": saiife_agents::gemini::MATCHER,
-                        "hooks": [hook("/usr/local/bin/saiife check --hook-exit --agent gemini --profile box")],
+                        "sequential": true,
+                        "hooks": [hook(
+                            "saiife-guard",
+                            "/usr/local/bin/saiife check --hook-exit --agent gemini --profile box"
+                        )],
                     }],
                     "AfterAgent": [{
-                        "hooks": [hook("/usr/local/bin/saiife __guest event turn-finished")],
+                        "hooks": [hook(
+                            "saiife-turn-finished",
+                            "/usr/local/bin/saiife __guest event turn-finished"
+                        )],
                     }],
                 },
+                "mcp": {"allowed": ["saiife-no-mcp"]},
+                "tools": {"sandbox": false},
+                "advanced": {"ignoreLocalEnv": true},
+                "privacy": {"usageStatisticsEnabled": false},
+                "telemetry": {"enabled": false},
+                "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
+                "ui": {"showHomeDirectoryWarning": false},
             })
         );
+        let before = v["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(before.len(), 1, "one BeforeTool group");
+        assert_eq!(before[0]["sequential"], true);
+        assert_eq!(before[0]["hooks"].as_array().unwrap().len(), 1);
+        let after = v["hooks"]["AfterAgent"].as_array().unwrap();
+        assert_eq!(after.len(), 1, "one AfterAgent group");
+        assert_eq!(after[0]["hooks"].as_array().unwrap().len(), 1);
         assert_eq!(saiife_agents::gemini::TIMEOUT_MS, 10_000);
     }
 

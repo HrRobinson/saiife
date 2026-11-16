@@ -3,7 +3,9 @@ description = "Google Gemini CLI in its TUI (beta)"
 
 [agent]
 kind = "gemini"
-command = ["gemini"]
+# Plan 42 R9: Gemini runs in /home/agent (no /work settings, .env or project
+# agents load) and reaches the repo as an include directory.
+command = ["gemini", "--include-directories", "/work"]
 login = "api-key"
 credential = "gemini"
 
