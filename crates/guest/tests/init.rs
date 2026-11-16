@@ -17,6 +17,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const T: Duration = Duration::from_secs(10);
+/// Ceiling of the PTY condition waits: the agent has to start and print under
+/// whatever load the host has. It is reached only when the wait has failed,
+/// never a margin a passing run depends on.
+const PTY_CEIL: Duration = Duration::from_secs(60);
 
 /// The fake tools, written once before any test spawns anything (a script
 /// still open for writing while another thread forks would be ETXTBSY).
@@ -442,7 +446,7 @@ fn setup_writes_files_and_env() {
     // The agent got exactly the fixed env plus the setup's; nothing inherited.
     let mut pty = accept(&h.pty, T);
     // `env` prints in no fixed order: read up to the line after it
-    let out = pty_until(&mut pty, "END-OF-ENV", T);
+    let out = pty_until(&mut pty, "END-OF-ENV", PTY_CEIL);
     for want in [
         "HOME=/home/agent",
         "USER=agent",

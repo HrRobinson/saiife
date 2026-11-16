@@ -334,26 +334,16 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// The one logging script behind every fake tool, written once per
-    /// process: a script written per test is exec'd while other test threads
-    /// fork, and a child that inherits its still-open write fd makes the exec
-    /// fail with ETXTBSY. Each test links it under the tool's name; it logs to
-    /// `calls.log` next to the link it was started through.
+    /// The one logging script behind every fake tool, a checked-in fixture
+    /// (mode 755): nothing is written at run time, so no write fd can leak
+    /// into a forking test thread and make the exec fail with ETXTBSY. Each
+    /// test links it under the tool's name; it logs to `calls.log` next to
+    /// the link it was started through.
     fn fake_script() -> &'static Path {
-        static SCRIPT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        SCRIPT.get_or_init(|| {
-            let d = tempfile::Builder::new()
-                .prefix("bake-fake")
-                .tempdir()
-                .unwrap()
-                .keep();
-            let p = d.join("tool");
-            // one line per call: tool name, then each argument
-            let body = "#!/bin/sh\nl=\"${0%/*}/calls.log\"\nprintf '%s' \"${0##*/}\" >>\"$l\"\nfor a in \"$@\"; do printf ' %s' \"$a\" >>\"$l\"; done\nprintf '\\n' >>\"$l\"\n";
-            fs::write(&p, body).unwrap();
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
-            p
-        })
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake-tool"
+        ))
     }
 
     fn fake(dir: &Path, name: &str) -> PathBuf {

@@ -1682,7 +1682,7 @@ fn destroy_is_bounded_and_a_retry_finishes_it() {
     );
     let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
-    // each destroy runs on its own thread: a hang is a failure after CEIL,
+    // each destroy runs on its own thread: a hang is a failure after that ceiling,
     // not a stuck test
     let bounded = |what: &str| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1690,7 +1690,7 @@ fn destroy_is_bounded_and_a_retry_finishes_it() {
         std::thread::spawn(move || {
             let _ = tx.send(v.destroy(&h));
         });
-        rx.recv_timeout(Duration::from_secs(40))
+        rx.recv_timeout(Duration::from_secs(stop.power_s / 3))
             .unwrap_or_else(|_| panic!("{what}: destroy waited out the ladder"))
     };
     let m = failed(bounded("first"));
