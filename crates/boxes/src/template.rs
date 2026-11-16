@@ -79,7 +79,17 @@ pub const SUBSCRIPTION_LOGIN_CLEARED: bool = false;
 /// in the setup of a box whose template was edited to subscription later,
 /// and (403) on the model forwarder.
 pub const SUBSCRIPTION_GATED: &str = "subscription login is waiting for the owner's terms check (spec §7.9); use login = \"api-key\"";
+/// The Gemini billing notice (plan 42 R2/OD2), shown wherever a Gemini
+/// template is listed or spawned. The one place the text lives.
+pub const GEMINI_KEY_NOTICE: &str = "Gemini: use a billing-enabled API key for private code; on the free tier Google may use prompts and responses to improve its products";
+/// Plan 42 D2: the load error for `login = "subscription"` on codex and
+/// gemini (the `{}` is the agent kind).
+fn subscription_unavailable(kind: &str) -> String {
+    format!("login = \"subscription\" is not available for {kind}: only \"api-key\" (the gateway cannot hold its OAuth login yet; plan 42 D2)")
+}
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude-code.toml");
+const BUILTIN_CODEX: &str = include_str!("builtin/codex.toml");
+const BUILTIN_GEMINI: &str = include_str!("builtin/gemini.toml");
 /// Largest template file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// The longest `[idle] stop_after_mins`: a week.
@@ -107,6 +117,73 @@ impl Default for Size {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     ClaudeCode,
+    Codex,
+    Gemini,
+}
+
+impl AgentKind {
+    /// The `kind` value in a template file and on the wire.
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "claude-code",
+            AgentKind::Codex => "codex",
+            AgentKind::Gemini => "gemini",
+        }
+    }
+
+    /// Plan 42 D8: the beta label comes only from here.
+    pub fn beta(self) -> bool {
+        matches!(self, AgentKind::Codex | AgentKind::Gemini)
+    }
+
+    /// The model provider this agent talks to (the forwarder's route).
+    pub fn provider(self) -> Provider {
+        match self {
+            AgentKind::ClaudeCode => Provider::Anthropic,
+            AgentKind::Codex => Provider::OpenAi,
+            AgentKind::Gemini => Provider::Google,
+        }
+    }
+
+    /// A one-line notice to show with the template (plan 42 R2); Gemini only.
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            AgentKind::Gemini => Some(GEMINI_KEY_NOTICE),
+            _ => None,
+        }
+    }
+
+    fn from_name(s: &str) -> Option<AgentKind> {
+        [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Gemini]
+            .into_iter()
+            .find(|k| k.name() == s)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Anthropic,
+    OpenAi,
+    Google,
+}
+
+impl Provider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAi => "openai",
+            Provider::Google => "google",
+        }
+    }
+}
+
+/// Which model credential a box holds the placeholder of (plan 42 D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCred {
+    AnthropicApiKey,
+    AnthropicSubscription,
+    OpenAiApiKey,
+    GoogleApiKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +235,19 @@ impl BoxTemplate {
         }
     }
 
+    /// The model credential kind of this template: its agent's provider and
+    /// its login.
+    pub fn model_cred(&self) -> ModelCred {
+        match (self.agent, self.login) {
+            (AgentKind::ClaudeCode, Login::ApiKey) => ModelCred::AnthropicApiKey,
+            (AgentKind::ClaudeCode, Login::Subscription) => ModelCred::AnthropicSubscription,
+            // Parse refuses a subscription login for the others; a template
+            // built by hand gets the api-key kind, never an OAuth one.
+            (AgentKind::Codex, _) => ModelCred::OpenAiApiKey,
+            (AgentKind::Gemini, _) => ModelCred::GoogleApiKey,
+        }
+    }
+
     pub fn wire(&self) -> saiife_wire::source::Template {
         saiife_wire::source::Template {
             name: self.name.clone(),
@@ -170,6 +260,10 @@ impl BoxTemplate {
             }
             .into(),
             credential_in_box: self.credential_in_box,
+            agent: self.agent.name().into(),
+            beta: self.agent.beta(),
+            credential: self.credential_mode().into(),
+            notice: self.agent.notice().unwrap_or_default().into(),
         }
     }
 }
@@ -366,14 +460,16 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
     if raw.description.len() > 200 || raw.description.chars().any(char::is_control) {
         return Err("bad description".into());
     }
-    if raw.agent.kind != "claude-code" {
-        return Err(format!("unknown agent kind {:?}", raw.agent.kind));
-    }
+    let agent = AgentKind::from_name(&raw.agent.kind)
+        .ok_or_else(|| format!("unknown agent kind {:?}", raw.agent.kind))?;
     let login = match raw.agent.login.as_str() {
         "api-key" => Login::ApiKey,
         "subscription" => Login::Subscription,
         other => return Err(format!("unknown login {other:?}")),
     };
+    if agent != AgentKind::ClaudeCode && login == Login::Subscription {
+        return Err(subscription_unavailable(agent.name()));
+    }
     if raw.agent.command.is_empty()
         || raw
             .agent
@@ -440,7 +536,7 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
     Ok(BoxTemplate {
         name: raw.name,
         description: raw.description,
-        agent: AgentKind::ClaudeCode,
+        agent,
         command: raw.agent.command,
         login,
         credential: raw.agent.credential,
@@ -461,7 +557,11 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
 }
 
 pub fn builtin() -> Vec<BoxTemplate> {
-    vec![parse("claude-code", BUILTIN_CLAUDE_CODE).expect("built-in claude-code template is valid")]
+    vec![
+        parse("claude-code", BUILTIN_CLAUDE_CODE).expect("built-in claude-code template is valid"),
+        parse("codex", BUILTIN_CODEX).expect("built-in codex template is valid"),
+        parse("gemini", BUILTIN_GEMINI).expect("built-in gemini template is valid"),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

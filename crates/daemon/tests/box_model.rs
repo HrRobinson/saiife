@@ -22,7 +22,7 @@ use saiife_boxes::guest::fake::FakeGuest;
 use saiife_boxes::guest::GuestLink;
 use saiife_boxes::manager::{Manager, ManagerInit, SpawnArgs};
 use saiife_boxes::store::Store;
-use saiife_boxes::template::{self, BoxTemplate, Login, Size};
+use saiife_boxes::template::{self, BoxTemplate, Login, ModelCred, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
 use saiife_boxes::BoxId;
 use saiife_boxhost::paths::BoxPaths;
@@ -435,9 +435,9 @@ async fn world(o: Opts) -> W {
         .unwrap()
     };
     let (pa, pb, ps) = (
-        ph(&ra.id, Login::ApiKey),
-        ph(&rb.id, Login::ApiKey),
-        ph(&rs.id, Login::Subscription),
+        ph(&ra.id, ModelCred::AnthropicApiKey),
+        ph(&rb.id, ModelCred::AnthropicApiKey),
+        ph(&rs.id, ModelCred::AnthropicSubscription),
     );
 
     let key_file = tmp.path().join("vault-key");

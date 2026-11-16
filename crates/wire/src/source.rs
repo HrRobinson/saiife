@@ -232,6 +232,18 @@ pub struct Template {
     /// refuses it).
     #[serde(default)]
     pub credential_in_box: bool,
+    /// `claude-code`, `codex` or `gemini` (plan 42 D8); empty from an old daemon.
+    #[serde(default)]
+    pub agent: String,
+    /// The agent is a beta template; the label comes only from this.
+    #[serde(default)]
+    pub beta: bool,
+    /// `gateway` or `in_box`: how the model credential reaches the box.
+    #[serde(default)]
+    pub credential: String,
+    /// A notice to show with the template (Gemini key billing); empty if none.
+    #[serde(default)]
+    pub notice: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

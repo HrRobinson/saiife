@@ -344,6 +344,10 @@ mod tests {
             has_egress: e,
             login: "api-key".into(),
             credential_in_box: false,
+            agent: String::new(),
+            beta: false,
+            credential: String::new(),
+            notice: String::new(),
         };
         assert_eq!(spawn_level(&t(false, false)), Level::Signed);
         assert_eq!(spawn_level(&t(true, false)), Level::Touch);

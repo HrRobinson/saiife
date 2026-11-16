@@ -4,7 +4,8 @@ use std::fs;
 use std::path::Path;
 
 use saiife_boxes::template::{
-    builtin, load_dir, parse, AgentKind, EgressRule, ImageRef, Login, Size, Trust,
+    builtin, load_dir, parse, AgentKind, EgressRule, ImageRef, Login, ModelCred, Provider, Size,
+    Trust, GEMINI_KEY_NOTICE,
 };
 use saiife_touch::TouchClass;
 
@@ -45,7 +46,7 @@ fn with(extra: &str) -> String {
 #[test]
 fn builtin_claude_code() {
     let b = builtin();
-    assert_eq!(b.len(), 1);
+    assert_eq!(b.len(), 3);
     let t = &b[0];
     assert_eq!(t.name, "claude-code");
     assert_eq!(t.agent, AgentKind::ClaudeCode);
@@ -248,7 +249,7 @@ fn bad_files_are_skipped_others_load() {
     fs::write(d.path().join("notes.txt"), "hi").unwrap();
     let (ts, ws) = load_dir(d.path(), Trust::OwnedBy(own_uid(d.path())));
     let names: Vec<_> = ts.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["claude-code", "good"]);
+    assert_eq!(names, ["claude-code", "codex", "gemini", "good"]);
     assert_eq!(ws.len(), 2);
     assert!(ws.iter().any(|w| w.file.ends_with("bad1.toml")));
     assert!(ws.iter().any(|w| w.file.ends_with("bad2.toml")));
@@ -264,8 +265,9 @@ fn file_replaces_builtin() {
     fs::write(d.path().join("claude-code.toml"), text).unwrap();
     let (ts, ws) = load_dir(d.path(), Trust::OwnedBy(own_uid(d.path())));
     assert!(ws.is_empty(), "{ws:?}");
-    assert_eq!(ts.len(), 1);
-    assert_eq!(ts[0].description, "mine");
+    assert_eq!(ts.len(), 3);
+    let cc = ts.iter().find(|t| t.name == "claude-code").unwrap();
+    assert_eq!(cc.description, "mine");
 }
 
 #[test]
@@ -333,4 +335,97 @@ fn guest_smoke_template_parses() {
     assert!(hosts.contains(&"registry.npmjs.org"), "{hosts:?}");
     assert!(hosts.contains(&"localtest.me"), "{hosts:?}");
     assert!(t.egress.iter().all(|e| e.port == 443));
+}
+
+#[test]
+fn builtins_are_three() {
+    let b = builtin();
+    let names: Vec<_> = b.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["claude-code", "codex", "gemini"]);
+    assert!(!b[0].agent.beta() && b[1].agent.beta() && b[2].agent.beta());
+}
+
+#[test]
+fn codex_builtin_is_pinned() {
+    let t = &builtin()[1];
+    assert_eq!(t.agent, AgentKind::Codex);
+    assert_eq!(t.agent.provider(), Provider::OpenAi);
+    assert_eq!(t.command, vec!["codex", "--dangerously-bypass-hook-trust"]);
+    assert_eq!(t.login, Login::ApiKey);
+    assert_eq!(t.credential, "openai");
+    assert!(t.egress.is_empty() && t.secrets.is_empty());
+    assert_eq!(t.model_cred(), ModelCred::OpenAiApiKey);
+}
+
+#[test]
+fn gemini_builtin_is_pinned() {
+    let t = &builtin()[2];
+    assert_eq!(t.agent, AgentKind::Gemini);
+    assert_eq!(t.agent.provider(), Provider::Google);
+    assert_eq!(t.command, vec!["gemini"]);
+    assert_eq!(t.login, Login::ApiKey);
+    assert_eq!(t.credential, "gemini");
+    assert!(t.egress.is_empty() && t.secrets.is_empty());
+    assert_eq!(t.model_cred(), ModelCred::GoogleApiKey);
+}
+
+#[test]
+fn claude_model_cred_follows_login() {
+    assert_eq!(builtin()[0].model_cred(), ModelCred::AnthropicApiKey);
+    assert_eq!(
+        parse("rust", FULL).unwrap().model_cred(),
+        ModelCred::AnthropicSubscription
+    );
+}
+
+#[test]
+fn subscription_refused_for_codex_and_gemini() {
+    for kind in ["codex", "gemini"] {
+        let text = MIN
+            .replace("claude-code", kind)
+            .replace("api-key", "subscription");
+        assert_eq!(
+            parse("m", &text).unwrap_err(),
+            format!("login = \"subscription\" is not available for {kind}: only \"api-key\" (the gateway cannot hold its OAuth login yet; plan 42 D2)")
+        );
+    }
+}
+
+#[test]
+fn unknown_kind_still_refused() {
+    let text = MIN.replace("claude-code", "cursor");
+    assert!(parse("m", &text)
+        .unwrap_err()
+        .contains("unknown agent kind"));
+}
+
+#[test]
+fn wire_carries_agent_beta_credential() {
+    let w = builtin()[1].wire();
+    assert_eq!(w.agent, "codex");
+    assert!(w.beta);
+    assert_eq!(w.credential, "gateway");
+    assert_eq!(w.notice, "");
+    let c = builtin()[0].wire();
+    assert_eq!((c.agent.as_str(), c.beta), ("claude-code", false));
+}
+
+#[test]
+fn notice_is_gemini_only() {
+    assert_eq!(AgentKind::ClaudeCode.notice(), None);
+    assert_eq!(AgentKind::Codex.notice(), None);
+    assert_eq!(AgentKind::Gemini.notice(), Some(GEMINI_KEY_NOTICE));
+    assert_eq!(builtin()[2].wire().notice, GEMINI_KEY_NOTICE);
+}
+
+#[test]
+fn old_wire_template_parses() {
+    let t: saiife_wire::source::Template = serde_json::from_str(
+        r#"{"name":"n","description":"d","has_secrets":false,"has_egress":false}"#,
+    )
+    .unwrap();
+    assert_eq!(t.agent, "");
+    assert!(!t.beta);
+    assert_eq!(t.credential, "");
+    assert_eq!(t.notice, "");
 }

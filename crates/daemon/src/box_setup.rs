@@ -110,12 +110,19 @@ impl SetupSource for TemplateSetup {
         // read back, so a re-setup carries the same env and approval.
         let model = match t.agent {
             AgentKind::ClaudeCode => {
-                let p = read_or_make_placeholder(&record, t.login)
+                let p = read_or_make_placeholder(&record, t.model_cred())
                     .map_err(|e| format!("the box's model placeholder: {e}"))?;
                 Some(ModelSetup {
                     env: claude_env(t.login, &p),
                     seed: claude_json_seed(&p),
                 })
+            }
+            // Plan 42 task 2 adds their setup.
+            AgentKind::Codex | AgentKind::Gemini => {
+                return Err(format!(
+                    "the {} agent's box setup is not available yet",
+                    t.agent.name()
+                ))
             }
         };
         build_setup(id, &t.command, model, &user_packs(id, &self.packs))

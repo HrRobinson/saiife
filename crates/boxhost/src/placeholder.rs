@@ -18,38 +18,51 @@ use std::io::{self, Read, Write};
 
 use ring::rand::{SecureRandom, SystemRandom};
 use rustix::fs::{Mode, OFlags, CWD};
-use saiife_boxes::template::Login;
+use saiife_boxes::template::ModelCred;
 
 use crate::paths::RecordPaths;
 
 const API_KEY_PREFIX: &str = concat!("sk-", "ant-", "api03-", "saiife");
 const SUBSCRIPTION_PREFIX: &str = concat!("sk-", "ant-", "oat01-", "saiife");
+const OPENAI_PREFIX: &str = "saiife-openai-";
+const GOOGLE_PREFIX: &str = "saiife-google-";
+const ALL: [ModelCred; 4] = [
+    ModelCred::AnthropicApiKey,
+    ModelCred::AnthropicSubscription,
+    ModelCred::OpenAiApiKey,
+    ModelCred::GoogleApiKey,
+];
+/// The error text when the file belongs to another agent or login (plan 42 D3).
+pub const OTHER_AGENT: &str =
+    "the box placeholder is for another agent or login: discard the box and spawn it again";
 const HEX_LEN: usize = 64;
 /// More than the longest placeholder plus a newline; anything larger is not ours.
 const MAX_FILE_BYTES: u64 = 256;
 
-fn prefix(login: Login) -> &'static str {
-    match login {
-        Login::ApiKey => API_KEY_PREFIX,
-        Login::Subscription => SUBSCRIPTION_PREFIX,
+fn prefix(cred: ModelCred) -> &'static str {
+    match cred {
+        ModelCred::AnthropicApiKey => API_KEY_PREFIX,
+        ModelCred::AnthropicSubscription => SUBSCRIPTION_PREFIX,
+        ModelCred::OpenAiApiKey => OPENAI_PREFIX,
+        ModelCred::GoogleApiKey => GOOGLE_PREFIX,
     }
 }
 
-/// A new random placeholder for `login`.
-pub fn placeholder(login: Login) -> io::Result<String> {
+/// A new random placeholder for `cred`.
+pub fn placeholder(cred: ModelCred) -> io::Result<String> {
     let mut raw = [0u8; HEX_LEN / 2];
     SystemRandom::new()
         .fill(&mut raw)
         .map_err(|_| io::Error::other("the system random source failed"))?;
-    let mut s = String::from(prefix(login));
+    let mut s = String::from(prefix(cred));
     for b in raw {
         s.push_str(&format!("{b:02x}"));
     }
     Ok(s)
 }
 
-fn shaped(login: Login, s: &str) -> bool {
-    s.strip_prefix(prefix(login)).is_some_and(|h| {
+fn shaped(cred: ModelCred, s: &str) -> bool {
+    s.strip_prefix(prefix(cred)).is_some_and(|h| {
         h.len() == HEX_LEN && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     })
 }
@@ -68,19 +81,22 @@ enum Found {
     /// A regular file of ours whose content is not a placeholder (a crashed
     /// or failed create; it was never sent to a guest).
     BadContent,
+    /// Has the shape of a different [`ModelCred`]: never accepted, never remade.
+    Other,
 }
 
 /// Read the placeholder back; `None` when the file does not exist. Never
 /// creates or removes anything.
-pub fn read_placeholder(record: &RecordPaths, login: Login) -> io::Result<Option<String>> {
-    match read_inner(record, login)? {
+pub fn read_placeholder(record: &RecordPaths, cred: ModelCred) -> io::Result<Option<String>> {
+    match read_inner(record, cred)? {
         Found::Missing => Ok(None),
         Found::Good(p) => Ok(Some(p)),
         Found::BadContent => Err(bad("does not have the placeholder shape for this login")),
+        Found::Other => Err(io::Error::new(io::ErrorKind::InvalidData, OTHER_AGENT)),
     }
 }
 
-fn read_inner(record: &RecordPaths, login: Login) -> io::Result<Found> {
+fn read_inner(record: &RecordPaths, cred: ModelCred) -> io::Result<Found> {
     let fd = match rustix::fs::openat(
         CWD,
         record.placeholder(),
@@ -109,7 +125,10 @@ fn read_inner(record: &RecordPaths, login: Login) -> io::Result<Found> {
         return Ok(Found::BadContent);
     };
     let text = text.strip_suffix('\n').unwrap_or(text);
-    if !shaped(login, text) {
+    if !shaped(cred, text) {
+        if ALL.iter().any(|c| *c != cred && shaped(*c, text)) {
+            return Ok(Found::Other);
+        }
         return Ok(Found::BadContent);
     }
     Ok(Found::Good(text.to_string()))
@@ -130,11 +149,11 @@ fn read_inner(record: &RecordPaths, login: Login) -> io::Result<Found> {
 /// keeps one setup in flight per box: a run claims its setup with a
 /// compare-and-swap before calling, and a new boot of the box first stops
 /// the earlier run and joins its threads.
-pub fn read_or_make_placeholder(record: &RecordPaths, login: Login) -> io::Result<String> {
+pub fn read_or_make_placeholder(record: &RecordPaths, cred: ModelCred) -> io::Result<String> {
     let path = record.placeholder();
     let mut replaced = false;
     for _ in 0..3 {
-        match read_inner(record, login)? {
+        match read_inner(record, cred)? {
             Found::Good(p) => return Ok(p),
             Found::BadContent if !replaced => {
                 replaced = true;
@@ -146,6 +165,7 @@ pub fn read_or_make_placeholder(record: &RecordPaths, login: Login) -> io::Resul
                 continue;
             }
             Found::BadContent => break,
+            Found::Other => return Err(io::Error::new(io::ErrorKind::InvalidData, OTHER_AGENT)),
             Found::Missing => {}
         }
         let made = rustix::fs::openat(
@@ -156,7 +176,7 @@ pub fn read_or_make_placeholder(record: &RecordPaths, login: Login) -> io::Resul
         );
         match made {
             Ok(fd) => {
-                let p = placeholder(login)?;
+                let p = placeholder(cred)?;
                 let mut f = std::fs::File::from(fd);
                 let wrote = f
                     .write_all(p.as_bytes())
@@ -199,34 +219,37 @@ mod tests {
 
     #[test]
     fn placeholder_shape() {
-        for login in [Login::ApiKey, Login::Subscription] {
-            let a = placeholder(login).unwrap();
-            let b = placeholder(login).unwrap();
+        for cred in [ModelCred::AnthropicApiKey, ModelCred::AnthropicSubscription] {
+            let a = placeholder(cred).unwrap();
+            let b = placeholder(cred).unwrap();
             assert_ne!(a, b);
-            assert!(shaped(login, &a));
-            assert_eq!(a.len(), prefix(login).len() + 64);
+            assert!(shaped(cred, &a));
+            assert_eq!(a.len(), prefix(cred).len() + 64);
         }
-        assert!(placeholder(Login::ApiKey)
+        assert!(placeholder(ModelCred::AnthropicApiKey)
             .unwrap()
             .starts_with(concat!("sk-", "ant-", "api03-")));
-        assert!(placeholder(Login::Subscription)
+        assert!(placeholder(ModelCred::AnthropicSubscription)
             .unwrap()
             .starts_with(concat!("sk-", "ant-", "oat01-")));
         assert!(!shaped(
-            Login::ApiKey,
-            &placeholder(Login::Subscription).unwrap()
+            ModelCred::AnthropicApiKey,
+            &placeholder(ModelCred::AnthropicSubscription).unwrap()
         ));
     }
 
     #[test]
     fn placeholder_file_is_created_once() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(read_placeholder(&rp(&d), Login::ApiKey).unwrap(), None);
-        let a = read_or_make_placeholder(&rp(&d), Login::ApiKey).unwrap();
-        let b = read_or_make_placeholder(&rp(&d), Login::ApiKey).unwrap();
+        assert_eq!(
+            read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).unwrap(),
+            None
+        );
+        let a = read_or_make_placeholder(&rp(&d), ModelCred::AnthropicApiKey).unwrap();
+        let b = read_or_make_placeholder(&rp(&d), ModelCred::AnthropicApiKey).unwrap();
         assert_eq!(a, b);
         assert_eq!(
-            read_placeholder(&rp(&d), Login::ApiKey).unwrap(),
+            read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).unwrap(),
             Some(a.clone())
         );
         let m = std::fs::metadata(d.path().join(PLACEHOLDER)).unwrap();
@@ -234,14 +257,14 @@ mod tests {
         // Another box (dir) gets another one.
         let d2 = tempfile::tempdir().unwrap();
         assert_ne!(
-            read_or_make_placeholder(&rp(&d2), Login::ApiKey).unwrap(),
+            read_or_make_placeholder(&rp(&d2), ModelCred::AnthropicApiKey).unwrap(),
             a
         );
     }
 
     #[test]
     fn placeholder_matches_rules() {
-        let e = placeholder(Login::ApiKey).unwrap();
+        let e = placeholder(ModelCred::AnthropicApiKey).unwrap();
         assert!(placeholder_matches(&e, e.as_bytes()));
         let mut off = e.clone().into_bytes();
         *off.last_mut().unwrap() ^= 1;
@@ -259,10 +282,13 @@ mod tests {
         let f = d.path().join(PLACEHOLDER);
         for junk in [&b""[..], b"half-written", b"\xff\xfe"] {
             std::fs::write(&f, junk).unwrap();
-            assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
-            let p = read_or_make_placeholder(&rp(&d), Login::ApiKey).unwrap();
-            assert!(shaped(Login::ApiKey, &p));
-            assert_eq!(read_placeholder(&rp(&d), Login::ApiKey).unwrap(), Some(p));
+            assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
+            let p = read_or_make_placeholder(&rp(&d), ModelCred::AnthropicApiKey).unwrap();
+            assert!(shaped(ModelCred::AnthropicApiKey, &p));
+            assert_eq!(
+                read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).unwrap(),
+                Some(p)
+            );
             std::fs::remove_file(&f).unwrap();
         }
     }
@@ -279,8 +305,8 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
-        assert!(read_or_make_placeholder(&rp(&d), Login::ApiKey).is_err());
+        assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
+        assert!(read_or_make_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
         // Still a FIFO: never unlinked.
         assert!(std::fs::symlink_metadata(&f).unwrap().file_type().is_fifo());
     }
@@ -290,20 +316,80 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join(PLACEHOLDER);
         // A symlink is not followed.
-        std::fs::write(d.path().join("x"), placeholder(Login::ApiKey).unwrap()).unwrap();
+        std::fs::write(
+            d.path().join("x"),
+            placeholder(ModelCred::AnthropicApiKey).unwrap(),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(d.path().join("x"), &f).unwrap();
-        assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
-        assert!(read_or_make_placeholder(&rp(&d), Login::ApiKey).is_err());
+        assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
+        assert!(read_or_make_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
         std::fs::remove_file(&f).unwrap();
         // Wrong shape, wrong login, too big, a directory.
         std::fs::write(&f, "not a placeholder\n").unwrap();
-        assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
-        std::fs::write(&f, placeholder(Login::Subscription).unwrap()).unwrap();
-        assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
+        assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
+        std::fs::write(&f, placeholder(ModelCred::AnthropicSubscription).unwrap()).unwrap();
+        assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
         std::fs::write(&f, "a".repeat(10_000)).unwrap();
-        assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
+        assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
         std::fs::remove_file(&f).unwrap();
         std::fs::create_dir(&f).unwrap();
-        assert!(read_placeholder(&rp(&d), Login::ApiKey).is_err());
+        assert!(read_placeholder(&rp(&d), ModelCred::AnthropicApiKey).is_err());
+    }
+
+    #[test]
+    fn placeholder_shape_per_cred() {
+        for (cred, pre) in [
+            (ModelCred::AnthropicApiKey, concat!("sk-", "ant-", "api03-")),
+            (
+                ModelCred::AnthropicSubscription,
+                concat!("sk-", "ant-", "oat01-"),
+            ),
+            (ModelCred::OpenAiApiKey, "saiife-openai-"),
+            (ModelCred::GoogleApiKey, "saiife-google-"),
+        ] {
+            let a = placeholder(cred).unwrap();
+            let b = placeholder(cred).unwrap();
+            assert_ne!(a, b);
+            assert!(a.starts_with(pre));
+            let rest = a.strip_prefix(prefix(cred)).expect("prefix");
+            assert!(shaped(cred, &a));
+            assert_eq!(rest.len(), 64);
+            assert_eq!(a.len(), prefix(cred).len() + 64);
+            assert!(a[prefix(cred).len()..]
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
+        }
+    }
+
+    #[test]
+    fn placeholder_of_another_cred_is_refused() {
+        for made in ALL {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::write(
+                d.path().join(PLACEHOLDER),
+                format!("{}\n", placeholder(made).unwrap()),
+            )
+            .unwrap();
+            for read in ALL {
+                let r = read_placeholder(&rp(&d), read);
+                if read == made {
+                    assert!(r.unwrap().is_some());
+                } else {
+                    assert!(r.is_err(), "{made:?} read as {read:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn other_cred_placeholder_is_not_remade() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(PLACEHOLDER);
+        let p = placeholder(ModelCred::OpenAiApiKey).unwrap();
+        std::fs::write(&f, format!("{p}\n")).unwrap();
+        let e = read_or_make_placeholder(&rp(&d), ModelCred::GoogleApiKey).unwrap_err();
+        assert_eq!(e.to_string(), OTHER_AGENT);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("{p}\n"));
     }
 }

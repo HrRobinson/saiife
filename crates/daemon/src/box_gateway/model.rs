@@ -439,7 +439,7 @@ async fn box_info(gw: &GatewayShared, id: &BoxId) -> Result<BoxInfo, Deny> {
         let t = mgr.templates().into_iter().find(|t| t.name == r.template)?;
         let record = saiife_boxhost::paths::RecordPaths::of(mgr.root(), &id);
         // A bad or unreadable file is as good as none: nothing passes.
-        let placeholder = saiife_boxhost::placeholder::read_placeholder(&record, t.login)
+        let placeholder = saiife_boxhost::placeholder::read_placeholder(&record, t.model_cred())
             .ok()
             .flatten();
         Some(BoxInfo {

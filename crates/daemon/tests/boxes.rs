@@ -773,7 +773,7 @@ async fn templates_lists_warnings() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["claude-code"], "{a}");
+    assert_eq!(names, ["claude-code", "codex", "gemini"], "{a}");
     let warns = a["warnings"].as_array().unwrap();
     assert_eq!(warns.len(), 1, "{a}");
     assert!(
