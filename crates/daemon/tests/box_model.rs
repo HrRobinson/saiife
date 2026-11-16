@@ -1237,6 +1237,35 @@ async fn rotated_key_applies_next_request() {
     assert_eq!(w.up.conns.load(Ordering::SeqCst), 1);
 }
 
+/// Every model audit line parses back as a `saiife_audit::Record` and
+/// carries each key once (`session` and `reason` are top-level record
+/// fields; the flattened extras must not repeat them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_records_carry_each_key_once() {
+    let w = world(Opts::default()).await;
+    assert_eq!(ask(&w.a, api_req(&w.a)).await.0, 200);
+    w.wait_records("model", 1).await;
+    // A refused request writes a `model_denied` record (reason is top-level).
+    let req = post("/v1/messages", &[], &messages_body());
+    assert_eq!(ask(&w.a, req).await.0, 401);
+    w.wait_records("model_denied", 1).await;
+    let read = saiife_audit::store::read_all(&w.audit);
+    assert_eq!(read.skipped_lines, 0, "an audit line did not parse");
+    for kind in ["model", "model_denied"] {
+        let lines: Vec<String> = std::fs::read_dir(&w.audit)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap_or_default())
+            .flat_map(|t| t.lines().map(String::from).collect::<Vec<_>>())
+            .filter(|l| l.contains(&format!("\"kind\":\"{kind}\"")))
+            .collect();
+        assert!(!lines.is_empty(), "no {kind} line");
+        for l in lines {
+            assert_eq!(l.matches("\"session\":").count(), 1, "{l}");
+            assert_eq!(l.matches("\"reason\":").count(), 1, "{l}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn records_per_request() {
     let w = world(Opts::default()).await;

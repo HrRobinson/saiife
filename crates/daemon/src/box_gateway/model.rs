@@ -393,7 +393,6 @@ async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str) {
     rec.session = Some(format!("box-{}", id.as_str()));
     let x = &mut rec.extra;
     x.insert("box".into(), id.as_str().into());
-    x.insert("reason".into(), reason.into());
     if suppressed > 0 {
         x.insert("suppressed".into(), suppressed.into());
     }
@@ -754,7 +753,6 @@ async fn model_record(gw: &GatewayShared, r: &RecInfo, status: u16, c: &Counters
     rec.session = Some(r.session.clone());
     let x = &mut rec.extra;
     x.insert("box".into(), r.id.as_str().into());
-    x.insert("session".into(), r.session.clone().into());
     x.insert("method".into(), r.method.clone().into());
     x.insert("path".into(), r.path.clone().into());
     x.insert("status".into(), status.into());
