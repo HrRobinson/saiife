@@ -405,7 +405,7 @@ fn create_writes_spec_and_overlay() {
     let data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
     assert_eq!(
         data,
-        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096, "vcpus": 2, "repo": false})
+        serde_json::json!({"launcher": "child", "image": format!("base-{HEX}"), "mem_mib": 4096, "vcpus": 2, "repo": false, "tier": "m"})
     );
     // The manager learns the image through the driver (plan 36).
     assert_eq!(v.image_id(&h), Some(format!("base-{HEX}")));
@@ -1952,4 +1952,65 @@ fn restore_refuses_a_state_the_box_was_not_admitted_with() {
         );
         assert!(!w.marker("b1").exists() && !w.snap("b1").exists(), "{what}");
     }
+}
+
+/// Locked: create records the smallest size tier that holds the box, and
+/// boot starts that tier's unit (`saiife-box-<tier>@<id>`), whose fixed
+/// caps the installer wrote. A record without a tier is refused, not
+/// started under a guessed unit.
+#[test]
+fn unit_boot_starts_the_recorded_tier_unit() {
+    let w = World::new();
+    let bus = Arc::new(QueuedStopBus {
+        fake: FakeUnitBus::new(),
+        child: w.launcher(&[]),
+        paths: w.paths("b1"),
+        id: BoxId::parse("b1").unwrap(),
+        delay: Duration::from_millis(10),
+        active: Arc::new(Mutex::new(false)),
+    });
+    let v = w.vmm_with(
+        Arc::new(UnitLauncher::new(bus.clone())),
+        vec![w.hook("h", false)],
+    );
+    let mut spec = w.spec("b1");
+    spec.size.vcpus = 3; // 3 vCPUs, 4 GiB: tier l (4 vCPUs, 8 GiB)
+    let h = v.create(&spec).unwrap();
+    w.track(&v, &h);
+    let data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
+    assert_eq!(data["tier"], "l");
+    v.boot(&h).unwrap();
+    let calls = bus.fake.calls.lock().unwrap().clone();
+    assert!(
+        calls.iter().any(|c| c == "start saiife-box-l@b1.service"),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains("saiife-box@")),
+        "{calls:?}"
+    );
+
+    // a handle without a tier (an older record): refused, nothing started
+    let w = World::new();
+    let (v0, _l) = w.vmm(&[]);
+    let h = w.create(&v0, "b1");
+    let mut data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
+    data.as_object_mut().unwrap().remove("tier");
+    let old = VmHandle {
+        data: data.to_string(),
+        ..h
+    };
+    let bus = Arc::new(FakeUnitBus::new());
+    let v = w.vmm_with(Arc::new(UnitLauncher::new(bus.clone())), vec![]);
+    let m = failed(v.boot(&old));
+    assert!(
+        m.contains("no size tier") && m.contains("spawn it again"),
+        "{m}"
+    );
+    assert!(!bus
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("start")));
 }

@@ -42,7 +42,7 @@
 >     - the locked roots `/var/lib/saiife/boxes` (records, the daemon's StateDirectory, 0700) and `/var/lib/saiife-box/boxes` (runtime, 3770) are distinct by design.
 >     - The hint for a missing default image is `saiife_boxhost::image::DEFAULT_IMAGE_HINT` (R43), used by `Store::resolve` and the preflight; plan 36 Task 5 removes the part after the semicolon ("making it the default ... is not in this build yet") and adds `--help` CLI tests. `box_image_cmd.rs`'s own `next:` line (parsed by `05-image.sh`) is separate and unchanged.
 > 11. Restore checks `state.json` too (integration, 2026-11-16): `snapshot::check_state` runs in `verify` on the hashed bytes. One vCPU state per vCPU (`snapshots.cpu-manager.snapshots` keyed `"0"`..), the memory manager's JSON-encoded state with `boot_ram` = `current_ram` = the sum of `guest_ram_mappings` sizes = `mem_mib` MiB, no virtio-mem mapping, every hotplug slot unused, the saved `memory_ranges.data` at most the RAM, and the `memory-ranges` file at most the RAM plus `SLACK_MIB`. The snapshot `platform` section may hold CH's defaults only (one PCI segment; no `tdx`, `sev_snp`, iommufd, IOMMU segments, OEM strings or SMBIOS fields). Anything else, or a state that cannot be parsed, boots cold with `restore_refused`. Owner smoke: confirm the ids `cpu-manager` and `memory-manager` and the field names on a real CH v54 snapshot (from source, not captured); if they differ every restore boots cold (fail closed).
-> 12. Honest limit: the outside-CH cap is the template maximum, not the box's size. The locked unit file (written by the root installer) has fixed `MemoryMax=262400M` (`template::MAX_MEM_MIB` + `launch::VMM_OVERHEAD_MIB` 256 MiB = `launch::UNIT_MEMORY_MAX_MIB`), `MemorySwapMax=0` (or `MemoryMax=` only moves pages to swap), `CPUQuota=3200%` (`MAX_VCPUS` x 100%), `TasksMax=512` and `LimitNOFILE=4096`. On a typical host the memory ceiling does not bind (no host has 256 GiB to spare): one compromised locked VMM can still use up host RAM; a host-relative `MemoryMax=` written by the installer is a follow-up. The daemon is never given `set-property` (polkit cannot restrict which properties, so it could loosen `DeviceAllow=` or the paths): the rule stays start/stop only. Per-box exactness is layer 1: the spec the daemon rebuilds every boot (`check_limits`) and the snapshot's `config.json`/`state.json` bounds (item 11). Owner smoke: the overhead and `TasksMax` are enough for CH. **Personal-mode gap:** `ChildLauncher` sets no cap at all; the VMM shares the daemon's cgroup, so a compromised VMM is bounded only by the user's own limits.
+> 12. Honest limit: per-box caps are size-tier caps; a box can exceed its exact size only up to its tier (integration 2026-11-16, coordinator ruling). `saiife_boxes::template::TIERS` is the one source: s (1 vCPU, 2 GiB), m (2, 4 GiB), l (4, 8 GiB), xl (8, 16 GiB), xxl (16, 32 GiB); template validation refuses sizes above xxl (`MAX_VCPUS` 16, `MAX_MEM_MIB` 32768, derived from it). The root installer writes one template unit per tier, `/etc/systemd/system/saiife-box-<tier>@.service` (`boxes_install::box_unit`), with `MemoryMax=` tier memory + `launch::VMM_OVERHEAD_MIB` (256 MiB), `MemorySwapMax=0`, `CPUQuota=` tier vCPUs x 100%, `TasksMax=512`, `LimitNOFILE=4096` and the unit hardening. `ChVmm::create` records the smallest tier holding the box's vCPUs and memory (round up in both) as `tier` in the handle data (daemon-only record); every `Vmm` call binds it into `UnitLauncher` (`Launcher::bind`), which starts, stops and asks about `saiife-box-<tier>@<id>.service`. Fail closed: a record without a tier is refused at boot ("discard the box and spawn it again") and reads as "cannot tell" for liveness; StartUnit's NoSuchUnit (tier unit not installed) is refused with the install hint. The polkit rule allows start/stop on `^saiife-box-(s|m|l|xl|xxl)@b[0-9]{1,9}\.service$` only, never `set-property` (polkit cannot restrict which properties; it could loosen `DeviceAllow=` or the paths). Uninstall stops and removes the tier units and the old `saiife-box@.service`. Exact per-box sizes stay layer 1: the spec the daemon rebuilds every boot (`check_limits`) and the snapshot's `config.json`/`state.json` bounds (item 11). Owner smoke: the overhead and `TasksMax` are enough for CH (the box smoke checks tier m's caps). **Personal-mode gap:** `ChildLauncher` sets no cap at all; the VMM shares the daemon's cgroup, so a compromised VMM is bounded only by the user's own limits.
 
 > **Build order (owner ruling 2026-11-12):** boxes (plans 35–40) do not ship in a release before plan 41 (`2026-11-12-plan-41-linux-fido-helper.md`, the Linux FIDO helper) is done: without it a Linux release `saiife box land` cannot touch a key. They may be built and merged into `v3-dev` before then; the release that first enables them must contain plan 41.
 
@@ -349,7 +349,7 @@ pub struct SystemdBus { /* zbus::Connection (system bus), tokio Handle */ }
 impl SystemdBus { pub async fn connect() -> Result<SystemdBus, String>; }
 impl saiife_boxhost::launch::UnitBus for SystemdBus { /* Handle::block_on of Manager.StartUnit(unit, "fail"), StopUnit(unit, "replace"), GetUnit + Unit.ActiveState == "active"|"activating" */ }
 ```
-`BOX_UNIT` (`/etc/systemd/system/saiife-box@.service`):
+`box_unit(m)` (`/etc/systemd/system/saiife-box-m@.service`; one per size tier, item 12):
 ```ini
 [Unit]
 Description=saiife box %i (Cloud Hypervisor)
@@ -369,9 +369,9 @@ ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/lib/saiife-box/boxes/%i
 ReadOnlyPaths=/var/lib/saiife-box/images /opt/saiife/vmm
-MemoryMax=262400M
+MemoryMax=4352M
 MemorySwapMax=0
-CPUQuota=3200%
+CPUQuota=200%
 TasksMax=512
 LimitNOFILE=4096
 TimeoutStopSec=30
@@ -383,7 +383,7 @@ Restart=no
 polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "saiife") {
     var unit = action.lookup("unit"), verb = action.lookup("verb");
-    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
+    if (/^saiife-box-(s|m|l|xl|xxl)@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
       return polkit.Result.YES;
     }
   }

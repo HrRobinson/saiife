@@ -390,6 +390,6 @@ fn boxes_with_a_vmm_that_is_not_the_pinned_one_is_refused() {
     assert!(!root.path().join("var/lib/saiife-box").exists());
     assert!(!root
         .path()
-        .join("etc/systemd/system/saiife-box@.service")
+        .join("etc/systemd/system/saiife-box-m@.service")
         .exists());
 }

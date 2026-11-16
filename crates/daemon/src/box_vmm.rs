@@ -1,6 +1,6 @@
 //! The real box driver (plan 35, Task 7): `ChVmm` over the pinned Cloud
 //! Hypervisor, as a child of the daemon (`saiife __box-vmm`, personal mode)
-//! or as the `saiife-box@<id>.service` unit (locked mode), always with
+//! or as the `saiife-box-<tier>@<id>.service` unit (locked mode), always with
 //! Landlock on. [`crate::box_ops::build`] calls [`real_vmm`] only after the
 //! preflight passed.
 //!

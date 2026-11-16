@@ -610,6 +610,15 @@ impl ChVmmInit {
 }
 
 impl ChVmm {
+    /// Tells the launcher the box's tier from the daemon's record (the
+    /// handle) before it is asked anything about the box; locked, the tier
+    /// names the unit, and a handle without one fails closed.
+    fn bind(&self, h: &VmHandle) {
+        self.inner
+            .launcher
+            .bind(&h.id, tier_of_data(&h.data).as_deref());
+    }
+
     pub fn new(init: ChVmmInit) -> ChVmm {
         ChVmm {
             inner: Arc::new(init),
@@ -805,6 +814,17 @@ impl ChVmm {
 /// The longest handle data [`image_of_data`] parses.
 const MAX_HANDLE_DATA: usize = 4096;
 
+/// `data["tier"]` of a handle's data (the box's size tier, recorded at
+/// create), when the data is short JSON and the tier one of `TIERS`.
+fn tier_of_data(data: &str) -> Option<String> {
+    if data.len() > MAX_HANDLE_DATA {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let t = v.get("tier")?.as_str()?;
+    saiife_boxes::template::tier_named(t).map(|t| t.name.to_string())
+}
+
 /// `data["image"]` of a handle's data, when the data is short JSON and the
 /// image a valid id.
 fn image_of_data(data: &str) -> Option<String> {
@@ -864,6 +884,15 @@ impl Vmm for ChVmm {
         // from the runtime dir (R37, R40); base.json stays in the record.
         // The last step that can fail before the spec: a failed create
         // gives the disk back to the record, which a discard removes.
+        // locked: the unit of the smallest tier that holds the box (its
+        // MemoryMax= and CPUQuota= are the tier's, written by the installer)
+        let tier = saiife_boxes::template::tier_for(spec.size.vcpus, spec.size.mem_mib)
+            .ok_or_else(|| {
+                VmmError::Failed(format!(
+                    "no size tier holds {} vCPUs and {} MiB",
+                    spec.size.vcpus, spec.size.mem_mib
+                ))
+            })?;
         let handover =
             crate::repo_handover::take_repo_disk(&spec.dir, &paths.dir, inner.layout.locked)
                 .map_err(VmmError::Failed)?;
@@ -897,17 +926,28 @@ impl Vmm for ChVmm {
             "mem_mib": spec.size.mem_mib,
             "vcpus": spec.size.vcpus,
             "repo": ls.repo,
+            "tier": tier.name,
         });
-        Ok(VmHandle {
+        let h = VmHandle {
             id: spec.id.clone(),
             driver: format!("ch-{CH_VERSION}"),
             data: data.to_string(),
-        })
+        };
+        self.bind(&h);
+        Ok(h)
     }
 
     /// Runs the hooks, starts the VMM (restoring a trusted snapshot), waits
     /// for its API socket and returns; the guest's readiness arrives later.
     fn boot(&self, h: &VmHandle) -> Result<(), VmmError> {
+        if tier_of_data(&h.data).is_none() {
+            return Err(VmmError::Failed(
+                "the box's VM record has no size tier (made by an older saiife): \
+                 discard the box and spawn it again"
+                    .into(),
+            ));
+        }
+        self.bind(h);
         let paths = self.inner.paths(&h.id);
         // an earlier run that is gone by now gets its after_off first
         self.settle(&h.id);
@@ -962,6 +1002,7 @@ impl Vmm for ChVmm {
     /// Asks for the stop and returns; the reaper sends the power button and
     /// escalates (`StopTimes`). During a boot, the stop follows the start.
     fn stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.bind(h);
         self.settle(&h.id);
         {
             let mut g = self.runs();
@@ -1014,6 +1055,7 @@ impl Vmm for ChVmm {
     }
 
     fn status(&self, h: &VmHandle) -> VmStatus {
+        self.bind(h);
         if matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             return VmStatus::Running;
         }
@@ -1036,6 +1078,7 @@ impl Vmm for ChVmm {
     /// run and every file (runtime dir, vault, pid record): nothing is
     /// removed under a live VMM. The manager's tick retries it.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.bind(h);
         let until = Instant::now() + DESTROY_WAIT;
         while matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             if Instant::now() >= until {

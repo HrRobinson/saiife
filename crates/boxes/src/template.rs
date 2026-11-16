@@ -6,14 +6,70 @@ use std::path::{Path, PathBuf};
 use saiife_touch::TouchClass;
 use serde::{Deserialize, Serialize};
 
-/// The most vCPUs a template may give a box (also the VMM helper's hard
-/// ceiling).
-pub const MAX_VCPUS: u32 = 32;
+/// A locked box's size tier: its VMM runs in the systemd unit
+/// `saiife-box-<name>@<id>.service`, whose fixed `MemoryMax=` and
+/// `CPUQuota=` (written by the root installer) are the tier's memory plus
+/// the VMM's overhead and one CPU per vCPU. A box gets the smallest tier
+/// that holds its vCPUs and memory, so it can exceed its exact size only
+/// up to its tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tier {
+    pub name: &'static str,
+    pub vcpus: u32,
+    pub mem_mib: u64,
+}
+
+/// The tiers, smallest first; the one source of the unit files, the polkit
+/// rule and the template size bounds.
+pub const TIERS: &[Tier] = &[
+    Tier {
+        name: "s",
+        vcpus: 1,
+        mem_mib: 2048,
+    },
+    Tier {
+        name: "m",
+        vcpus: 2,
+        mem_mib: 4096,
+    },
+    Tier {
+        name: "l",
+        vcpus: 4,
+        mem_mib: 8192,
+    },
+    Tier {
+        name: "xl",
+        vcpus: 8,
+        mem_mib: 16_384,
+    },
+    Tier {
+        name: "xxl",
+        vcpus: 16,
+        mem_mib: 32_768,
+    },
+];
+
+/// The smallest tier with at least `vcpus` and `mem_mib`; None above the
+/// largest.
+pub fn tier_for(vcpus: u32, mem_mib: u64) -> Option<&'static Tier> {
+    TIERS
+        .iter()
+        .find(|t| t.vcpus >= vcpus && t.mem_mib >= mem_mib)
+}
+
+/// The tier named `name`.
+pub fn tier_named(name: &str) -> Option<&'static Tier> {
+    TIERS.iter().find(|t| t.name == name)
+}
+
+/// The most vCPUs a template may give a box: the largest tier's (also the
+/// VMM helper's hard ceiling).
+pub const MAX_VCPUS: u32 = TIERS[TIERS.len() - 1].vcpus;
 /// The least memory a template may give a box, in MiB.
 pub const MIN_MEM_MIB: u64 = 512;
-/// The most memory a template may give a box, in MiB (also the VMM
-/// helper's hard ceiling).
-pub const MAX_MEM_MIB: u64 = 262_144;
+/// The most memory a template may give a box, in MiB: the largest tier's
+/// (also the VMM helper's hard ceiling).
+pub const MAX_MEM_MIB: u64 = TIERS[TIERS.len() - 1].mem_mib;
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude-code.toml");
 /// Largest template file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -316,10 +372,15 @@ pub fn parse(name_from_stem: &str, text: &str) -> Result<BoxTemplate, String> {
     };
     let s = raw.size;
     if !(1..=MAX_VCPUS).contains(&s.vcpus) {
-        return Err("vcpus must be 1..=32".into());
+        return Err(format!(
+            "vcpus must be 1..={MAX_VCPUS} (the largest size tier)"
+        ));
     }
     if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&s.mem_mib) || s.mem_max_mib < s.mem_mib {
-        return Err("memory: need 512 <= mem_mib <= 262144 and mem_max_mib >= mem_mib".into());
+        return Err(format!(
+            "memory: need {MIN_MEM_MIB} <= mem_mib <= {MAX_MEM_MIB} (the largest size tier) \
+             and mem_max_mib >= mem_mib"
+        ));
     }
     if !(10..=1024).contains(&s.disk_gib) {
         return Err("disk_gib must be 10..=1024".into());

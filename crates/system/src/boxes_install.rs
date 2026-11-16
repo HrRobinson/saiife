@@ -1,7 +1,7 @@
 //! `saiife system install --boxes` (plan 35, Task 6): the `saiife-box` user
-//! and group, the box state dirs, the pinned VMM, the `saiife-box@` template
-//! unit and the narrow polkit rule that lets the daemon start and stop
-//! exactly those units. Everything acts through [`Host`] on paths from the
+//! and group, the box state dirs, the pinned VMM, one `saiife-box-<tier>@`
+//! template unit per size tier and the narrow polkit rule that lets the
+//! daemon start and stop exactly those units. Everything acts through [`Host`] on paths from the
 //! [`Layout`], so tests run on a fake root; nothing here runs `systemctl`
 //! except through [`Host::systemctl`].
 
@@ -10,6 +10,7 @@ use crate::host::Host;
 use crate::install::{refused, step, InstallError};
 use crate::layout::{Layout, Platform, OPT_DIR};
 use crate::polkit::POLKIT_RULES_DIRS;
+use saiife_boxes::template::{Tier, TIERS};
 use saiife_policy::installed::{FileKind, Installed};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,13 @@ pub const VAULT_DIR: &str = "/var/lib/saiife-box/vault";
 pub const VMM_DIR: &str = "/opt/saiife/vmm";
 pub const VMM_CH: &str = "/opt/saiife/vmm/cloud-hypervisor";
 pub const VMM_FW: &str = "/opt/saiife/vmm/CLOUDHV.fd";
-pub const BOX_UNIT_PATH: &str = "/etc/systemd/system/saiife-box@.service";
+/// The single template unit of earlier builds; uninstall removes it.
+pub const LEGACY_BOX_UNIT_PATH: &str = "/etc/systemd/system/saiife-box@.service";
+
+/// The template unit of a size tier: `/etc/systemd/system/saiife-box-<tier>@.service`.
+pub fn box_unit_path(t: &Tier) -> String {
+    format!("/etc/systemd/system/saiife-box-{}@.service", t.name)
+}
 pub const POLKIT_RULE_NAME: &str = "50-saiife-box.rules";
 
 /// `/var/lib/saiife-box`: root:saiife-box. The VMM user cannot rename
@@ -37,7 +44,10 @@ pub const MODE_BOXES: u32 = 0o3770;
 /// `images/` and `vault/`: saiife:saiife-box; the VMM reads, never writes.
 pub const MODE_RO: u32 = 0o2750;
 
-/// The template unit (`/etc/systemd/system/saiife-box@.service`).
+/// The template unit of size tier `t`
+/// (`/etc/systemd/system/saiife-box-<tier>@.service`), generated from
+/// `saiife_boxes::template::TIERS`, the source the daemon's tier choice
+/// and the template size bounds use too.
 ///
 /// Every box's VMM runs as the one `saiife-box` user, so file modes cannot
 /// keep one VMM out of another box's disks, serial log, API socket or
@@ -50,15 +60,18 @@ pub const MODE_RO: u32 = 0o2750;
 /// keeps the rest of the tree read-only; `/opt/saiife/vmm` is named
 /// read-only for clarity.
 ///
-/// Outside Cloud Hypervisor the unit is capped at a fixed ceiling, the
-/// largest template (`MemoryMax=` = `launch::UNIT_MEMORY_MAX_MIB`,
-/// `CPUQuota=` = `launch::UNIT_CPU_QUOTA_PCT`), no swap (`MemorySwapMax=0`,
-/// or `MemoryMax=` only moves pages to swap), plus `TasksMax=` and
-/// `LimitNOFILE=`: not the box's own size, which the daemon's rebuilt spec
-/// and the snapshot checks hold. The daemon cannot set unit properties.
-pub const BOX_UNIT: &str = "\
+/// Outside Cloud Hypervisor the unit is capped at its tier: `MemoryMax=`
+/// the tier's memory plus `launch::VMM_OVERHEAD_MIB`, no swap
+/// (`MemorySwapMax=0`, or `MemoryMax=` only moves pages to swap),
+/// `CPUQuota=` one CPU per tier vCPU, plus `TasksMax=` and `LimitNOFILE=`.
+/// A box can exceed its exact size only up to its tier; the exact size is
+/// held by the daemon's rebuilt spec and the snapshot checks. The daemon
+/// cannot set unit properties.
+pub fn box_unit(t: &Tier) -> String {
+    format!(
+        "\
 [Unit]
-Description=saiife box %i (Cloud Hypervisor)
+Description=saiife box %i, size tier {name} (Cloud Hypervisor)
 [Service]
 Type=exec
 User=saiife-box
@@ -78,25 +91,31 @@ BindPaths=/var/lib/saiife-box/boxes/%i
 BindReadOnlyPaths=/var/lib/saiife-box/images
 BindReadOnlyPaths=-/var/lib/saiife-box/vault/%i.snap
 ReadOnlyPaths=/opt/saiife/vmm
-MemoryMax=262400M
+MemoryMax={mem}M
 MemorySwapMax=0
-CPUQuota=3200%
+CPUQuota={cpu}%
 TasksMax=512
 LimitNOFILE=4096
 TimeoutStopSec=30
 KillMode=control-group
 Restart=no
-";
+",
+        name = t.name,
+        mem = saiife_boxhost::launch::unit_memory_max_mib(t),
+        cpu = saiife_boxhost::launch::unit_cpu_quota_pct(t),
+    )
+}
 
-/// The polkit rule: the daemon user may start and stop `saiife-box@b<N>`
-/// units, nothing else. Never `set-property`: polkit cannot limit which
+/// The polkit rule: the daemon user may start and stop
+/// `saiife-box-<tier>@b<N>` units (the tiers of
+/// `saiife_boxes::template::TIERS`, pinned by a test), nothing else. Never `set-property`: polkit cannot limit which
 /// properties, and a runtime `DeviceAllow=` or path change would loosen
 /// the sandbox below. It names the Linux daemon user
 /// ([`crate::layout::DAEMON_USER`]); `install_boxes` refuses any other.
 pub const POLKIT_RULE: &str = r#"polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "saiife") {
     var unit = action.lookup("unit"), verb = action.lookup("verb");
-    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
+    if (/^saiife-box-(s|m|l|xl|xxl)@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
       return polkit.Result.YES;
     }
   }
@@ -165,9 +184,11 @@ pub(crate) struct Created {
 
 /// True when `rec` says `--boxes` was installed.
 pub(crate) fn recorded(rec: &Installed) -> bool {
-    rec.files
-        .iter()
-        .any(|f| f.kind == FileKind::Unit && f.path == Path::new(BOX_UNIT_PATH))
+    rec.files.iter().any(|f| {
+        f.kind == FileKind::Unit
+            && (f.path == Path::new(LEGACY_BOX_UNIT_PATH)
+                || TIERS.iter().any(|t| f.path == Path::new(&box_unit_path(t))))
+    })
 }
 
 /// The polkit rule's logical path (the first rules dir).
@@ -407,8 +428,8 @@ pub(crate) fn install_boxes_with(
         }
     }
 
-    // 5. The unit and the polkit rule, recorded for uninstall.
-    let unit_dir = Path::new(BOX_UNIT_PATH)
+    // 5. The tier units and the polkit rule, recorded for uninstall.
+    let unit_dir = Path::new(LEGACY_BOX_UNIT_PATH)
         .parent()
         .and_then(Path::to_str)
         .unwrap_or("/");
@@ -421,43 +442,31 @@ pub(crate) fn install_boxes_with(
         false,
         created,
     )?;
-    let unit_path = layout.at(BOX_UNIT_PATH);
-    let unit_new = fsops::lstat(&unit_path)
-        .map_err(|e| refused(&unit_path, e.to_string()))?
-        .is_none();
-    let rule_logical = polkit_rule_path();
-    let rule_path = layout.at(&rule_logical);
-    let rule_new = fsops::lstat(&rule_path)
-        .map_err(|e| refused(&rule_path, e.to_string()))?
-        .is_none();
-    for (logical, path, text, kind, is_new, name) in [
-        (
-            BOX_UNIT_PATH,
-            &unit_path,
-            BOX_UNIT,
-            FileKind::Unit,
-            unit_new,
-            "unit",
-        ),
-        (
-            rule_logical.as_str(),
-            &rule_path,
-            POLKIT_RULE,
-            FileKind::Polkit,
-            rule_new,
-            "polkit",
-        ),
-    ] {
+    let mut files: Vec<(String, String, FileKind, &str)> = TIERS
+        .iter()
+        .map(|t| (box_unit_path(t), box_unit(t), FileKind::Unit, "unit"))
+        .collect();
+    files.push((
+        polkit_rule_path(),
+        POLKIT_RULE.to_string(),
+        FileKind::Polkit,
+        "polkit",
+    ));
+    for (logical, text, kind, name) in &files {
+        let path = layout.at(logical);
+        let is_new = fsops::lstat(&path)
+            .map_err(|e| refused(&path, e.to_string()))?
+            .is_none();
         // Listed before it is written, so a failure leaves it on the list.
         created.files.push(BoxFile {
             path: PathBuf::from(logical),
-            kind,
+            kind: *kind,
             sha256: None,
             created: is_new,
         });
         put(
             host,
-            path,
+            &path,
             text.as_bytes(),
             0o644,
             (root_uid, root_gid),
@@ -558,24 +567,29 @@ fn ensure_dir(
 /// [`PURGE_TREES`]).
 pub fn uninstall_boxes(layout: &Layout, host: &dyn Host) -> Result<Vec<String>, InstallError> {
     let mut out = Vec::new();
-    match host.systemctl(&["stop", "saiife-box@*.service"]) {
-        Ok(o) if o.status == 0 => {}
-        Ok(o) => out.push(format!(
-            "warning: systemctl stop saiife-box@*.service exited {}: {}",
-            o.status,
-            o.stderr.trim()
-        )),
-        Err(e) => out.push(format!("warning: systemctl stop saiife-box@*.service: {e}")),
+    for glob in ["saiife-box-*@*.service", "saiife-box@*.service"] {
+        match host.systemctl(&["stop", glob]) {
+            Ok(o) if o.status == 0 => {}
+            Ok(o) => out.push(format!(
+                "warning: systemctl stop {glob} exited {}: {}",
+                o.status,
+                o.stderr.trim()
+            )),
+            Err(e) => out.push(format!("warning: systemctl stop {glob}: {e}")),
+        }
     }
-    for logical in [
-        BOX_UNIT_PATH.to_string(),
+    let units = TIERS
+        .iter()
+        .map(box_unit_path)
+        .chain([LEGACY_BOX_UNIT_PATH.to_string()]);
+    for logical in units.chain([
         polkit_rule_path(),
         VMM_CH.to_string(),
         VMM_FW.to_string(),
         format!("{VMM_CH}.part"),
         format!("{VMM_FW}.part"),
         VMM_DIR.to_string(),
-    ] {
+    ]) {
         let p = layout.at(&logical);
         if fsops::remove_if_listed(&p).map_err(step("files"))? {
             out.push(format!("removed {logical}"));
@@ -653,26 +667,42 @@ mod tests {
             .collect()
     }
 
-    /// The unit's fixed caps are the largest template plus the VMM's
-    /// overhead (a ceiling: the daemon cannot set per-box properties).
+    /// One unit per tier, capped at the tier: its memory plus the VMM's
+    /// overhead, no swap, one CPU per vCPU (the daemon cannot set per-box
+    /// properties).
     #[test]
-    fn box_unit_caps_are_the_template_ceiling() {
-        use saiife_boxhost::launch::{UNIT_CPU_QUOTA_PCT, UNIT_MEMORY_MAX_MIB, VMM_OVERHEAD_MIB};
-        assert_eq!(UNIT_MEMORY_MAX_MIB, 262_144 + VMM_OVERHEAD_MIB);
-        assert_eq!(UNIT_CPU_QUOTA_PCT, 32 * 100);
-        let line = |l: String| assert!(BOX_UNIT.lines().any(|x| x == l), "{l}");
-        line(format!("MemoryMax={UNIT_MEMORY_MAX_MIB}M"));
-        line(format!("CPUQuota={UNIT_CPU_QUOTA_PCT}%"));
-        // without it memory.max pushes anonymous pages to (zram) swap
-        line("MemorySwapMax=0".into());
-        line("TasksMax=512".into());
-        line("LimitNOFILE=4096".into());
-        assert_eq!(BOX_UNIT.matches("MemoryMax=").count(), 1);
+    fn box_units_are_capped_at_their_tier() {
+        use saiife_boxhost::launch::VMM_OVERHEAD_MIB;
+        assert_eq!(
+            TIERS.iter().map(|t| t.name).collect::<Vec<_>>(),
+            ["s", "m", "l", "xl", "xxl"]
+        );
+        for t in TIERS {
+            let u = box_unit(t);
+            let line = |l: String| assert!(u.lines().any(|x| x == l), "{}: {l}", t.name);
+            line(format!("MemoryMax={}M", t.mem_mib + VMM_OVERHEAD_MIB));
+            line(format!("CPUQuota={}%", t.vcpus * 100));
+            // without it memory.max pushes anonymous pages to (zram) swap
+            line("MemorySwapMax=0".into());
+            line("TasksMax=512".into());
+            line("LimitNOFILE=4096".into());
+            assert_eq!(u.matches("MemoryMax=").count(), 1);
+            assert_eq!(
+                box_unit_path(t),
+                format!("/etc/systemd/system/saiife-box-{}@.service", t.name)
+            );
+        }
+        let m = box_unit(saiife_boxes::template::tier_named("m").unwrap());
+        assert!(
+            m.contains("MemoryMax=4352M\nMemorySwapMax=0\nCPUQuota=200%\n"),
+            "{m}"
+        );
     }
 
     #[test]
     fn box_unit_text_is_pinned() {
-        let want = "[Unit]\nDescription=saiife box %i (Cloud Hypervisor)\n[Service]\nType=exec\n\
+        let want = "[Unit]\nDescription=saiife box %i, size tier xl (Cloud Hypervisor)\n\
+[Service]\nType=exec\n\
 User=saiife-box\nGroup=saiife-box\nSupplementaryGroups=kvm\n\
 ExecStart=/opt/saiife/bin/saiife __box-vmm /var/lib/saiife-box/boxes/%i --locked\n\
 UMask=0007\nNoNewPrivileges=yes\nDevicePolicy=closed\nDeviceAllow=/dev/kvm rw\n\
@@ -682,9 +712,12 @@ BindPaths=/var/lib/saiife-box/boxes/%i\n\
 BindReadOnlyPaths=/var/lib/saiife-box/images\n\
 BindReadOnlyPaths=-/var/lib/saiife-box/vault/%i.snap\n\
 ReadOnlyPaths=/opt/saiife/vmm\n\
-MemoryMax=262400M\nMemorySwapMax=0\nCPUQuota=3200%\nTasksMax=512\nLimitNOFILE=4096\n\
+MemoryMax=16640M\nMemorySwapMax=0\nCPUQuota=800%\nTasksMax=512\nLimitNOFILE=4096\n\
 TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
-        assert_eq!(BOX_UNIT, want);
+        assert_eq!(
+            box_unit(saiife_boxes::template::tier_named("xl").unwrap()),
+            want
+        );
     }
 
     /// The polkit rule names the Linux daemon user; any other user would
@@ -697,7 +730,7 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             .unwrap_err();
         assert!(e.to_string().contains("saiife"), "{e}");
         assert!(c.users.is_empty() && c.groups.is_empty());
-        assert!(!w.layout.at(BOX_UNIT_PATH).exists());
+        assert!(!w.layout.at(&box_unit_path(&TIERS[0])).exists());
         assert!(POLKIT_RULE.contains(&format!(
             "subject.user == \"{}\"",
             crate::layout::DAEMON_USER
@@ -706,7 +739,31 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
 
     #[test]
     fn polkit_rule_is_narrow() {
-        assert!(POLKIT_RULE.contains(r"/^saiife-box@b[0-9]{1,9}\.service$/.test(unit)"));
+        let names: Vec<&str> = TIERS.iter().map(|t| t.name).collect();
+        let re = format!(r"^saiife-box-({})@b[0-9]{{1,9}}\.service$", names.join("|"));
+        assert!(POLKIT_RULE.contains(&format!("/{re}/.test(unit)")), "{re}");
+        // the JS regex, read as a Rust regex (the same syntax here)
+        let re = regex::Regex::new(&re).unwrap();
+        for t in TIERS {
+            assert!(re.is_match(&format!("saiife-box-{}@b1.service", t.name)));
+            assert!(re.is_match(&format!("saiife-box-{}@b123456789.service", t.name)));
+        }
+        for bad in [
+            "saiife-box@b1.service",
+            "saiife-box-xxxl@b1.service",
+            "saiife-box-@b1.service",
+            "saiife-boxx-m@b1.service",
+            "other-box-m@b1.service",
+            "xsaiife-box-m@b1.service",
+            "saiife-box-m@b.service",
+            "saiife-box-m@b1234567890.service",
+            "saiife-box-m@x1.service",
+            "saiife-box-m@b1.service.d",
+            "saiife-box-m@b1.socket",
+            "saiife-box-m@b1-2.service",
+        ] {
+            assert!(!re.is_match(bad), "{bad}");
+        }
         assert!(POLKIT_RULE.contains(r#"(verb == "start" || verb == "stop")) {"#));
         assert_eq!(POLKIT_RULE.matches("verb ==").count(), 2);
         assert!(!POLKIT_RULE.contains("set-property"));
@@ -781,11 +838,12 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         assert_eq!(std::fs::read(at(VMM_CH)).unwrap(), b"fake ch");
         assert_eq!(mode(&at(VMM_CH)), 0o755);
         assert_eq!(mode(&at(VMM_FW)), 0o644);
-        assert_eq!(
-            std::fs::read_to_string(at(BOX_UNIT_PATH)).unwrap(),
-            BOX_UNIT
-        );
-        assert_eq!(mode(&at(BOX_UNIT_PATH)), 0o644);
+        for t in TIERS {
+            let p = box_unit_path(t);
+            assert_eq!(std::fs::read_to_string(at(&p)).unwrap(), box_unit(t));
+            assert_eq!(mode(&at(&p)), 0o644);
+        }
+        assert!(!at(LEGACY_BOX_UNIT_PATH).exists());
         let rule = at(&polkit_rule_path());
         assert_eq!(
             polkit_rule_path(),
@@ -803,7 +861,9 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             .iter()
             .any(|l| l == "systemctl daemon-reload"));
         let kinds: Vec<FileKind> = c.files.iter().map(|f| f.kind).collect();
-        assert_eq!(kinds, [FileKind::Unit, FileKind::Polkit]);
+        let mut want = vec![FileKind::Unit; TIERS.len()];
+        want.push(FileKind::Polkit);
+        assert_eq!(kinds, want);
         assert!(c.files.iter().all(|f| f.sha256.is_some() && f.created));
         // A second run changes nothing.
         let mut again = Created::default();
@@ -873,14 +933,18 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         let w = world();
         run(&w, &mut Created::default()).unwrap();
         let out = uninstall_boxes(&w.layout, &w.host).unwrap();
-        for p in [BOX_UNIT_PATH, VMM_CH, VMM_FW, VMM_DIR] {
+        let units: Vec<String> = TIERS.iter().map(box_unit_path).collect();
+        for p in units
+            .iter()
+            .map(String::as_str)
+            .chain([VMM_CH, VMM_FW, VMM_DIR])
+        {
             assert!(!w.layout.at(p).exists(), "{p}");
         }
         assert!(!w.layout.at(&polkit_rule_path()).exists());
-        assert!(
-            out.iter().any(|l| l == &format!("removed {BOX_UNIT_PATH}")),
-            "{out:?}"
-        );
+        for u in &units {
+            assert!(out.iter().any(|l| l == &format!("removed {u}")), "{out:?}");
+        }
         // The data stays without --purge.
         assert!(w.layout.at(BOXES_DIR).is_dir());
         assert!(w
@@ -888,7 +952,7 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             .state()
             .calls
             .iter()
-            .any(|l| l == "systemctl stop saiife-box@*.service"));
+            .any(|l| l == "systemctl stop saiife-box-*@*.service"));
         // Idempotent.
         uninstall_boxes(&w.layout, &w.host).unwrap();
     }
@@ -930,7 +994,7 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             e.install();
             assert_eq!(std::fs::read_to_string(e.at(UNIT)).unwrap(), unit_text(255));
             assert!(!e.at(BOX_STATE_DIR).exists());
-            assert!(!e.at(BOX_UNIT_PATH).exists());
+            assert!(!e.at(&box_unit_path(&TIERS[0])).exists());
             assert!(e.host.user(BOX_USER).is_none());
             assert!(e.host.group_id(BOX_GROUP).is_none());
             let rec = e.installed();
@@ -1003,7 +1067,8 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             );
             // A plain uninstall takes the unit, rule and VMM, keeps the data.
             let out = uninstall(&e.layout, &e.host, &UninstallOptions { purge: false }).unwrap();
-            assert!(!e.at(BOX_UNIT_PATH).exists() && !e.at(&polkit_rule_path()).exists());
+            assert!(TIERS.iter().all(|t| !e.at(&box_unit_path(t)).exists()));
+            assert!(!e.at(&polkit_rule_path()).exists());
             assert!(!e.at(VMM_DIR).exists(), "{out:?}");
             assert!(e.at(BOXES_DIR).is_dir() && e.at(VAULT_DIR).is_dir());
             assert!(e.host.user(BOX_USER).is_some());
