@@ -615,9 +615,14 @@ pub enum Event {
     Lockdown,
     /// An OAuth2 refresh failed (plan 14, decision 8).
     RefreshFailed,
+    /// A box waits for a touch in the Workspace inbox (plan 31). Carries the
+    /// box id and a short code; never a link.
+    BoxWaiting,
 }
 
 impl Event {
+    /// The events sent when `[notify] on` is absent. `BoxWaiting` is not in
+    /// it: adding it would change the policy hash of every existing config.
     pub const ALL: [Event; 7] = [
         Event::ApprovalCreated,
         Event::LimitReached,
@@ -637,6 +642,7 @@ impl Event {
             Event::ForwardFailing => "forward_failing",
             Event::Lockdown => "lockdown",
             Event::RefreshFailed => "refresh_failed",
+            Event::BoxWaiting => "box_waiting",
         }
     }
 }
@@ -1064,6 +1070,17 @@ mod tests {
             let b = format!("[audit.forward.\"{n}\"]\ntype = \"file\"\npath = \"/x\"\n");
             assert!(fwd_valid(&b).is_ok(), "{n}");
         }
+    }
+
+    #[test]
+    fn box_waiting_event_parses() {
+        let c: SystemConfig =
+            toml::from_str("version = 2\n[notify]\non = [\"box_waiting\"]\n").unwrap();
+        assert_eq!(c.notify.on, vec![Event::BoxWaiting]);
+        assert_eq!(Event::BoxWaiting.as_str(), "box_waiting");
+        // Opt in: the default list is unchanged, so the policy hash of an
+        // existing config is too.
+        assert!(!Event::ALL.contains(&Event::BoxWaiting));
     }
 
     #[test]

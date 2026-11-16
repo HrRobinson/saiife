@@ -164,6 +164,7 @@ impl Ctx {
             host: hostname(),
             summary: clean(summary),
             reason: None,
+            box_id: None,
         });
     }
 

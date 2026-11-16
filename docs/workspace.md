@@ -66,7 +66,7 @@ page forgets its key and shows the pair screen:
 | Review | Read the diff and the test result of a finished box. Reject it (discards the box). |
 | Spawn | Start a box from a template. |
 | Inbox | See what waits for you. The page asks again every 5 s while the tab is visible. |
-| Steer | Pause or stop a box. Both work. Sending a message and Resume need a touch, so they are refused for now. |
+| Steer | Pause or stop a box. Sending a message, Revise and Resume need a touch (one touch covers a 10-minute window, see [The steer window](#the-steer-window)). |
 | Pair | Pair this browser. |
 
 The diff shows the first 2000 lines. A file cut by that limit says how many of
@@ -82,14 +82,84 @@ that gives power needs a touch on a paired passkey.
 | Level | Actions |
 |---|---|
 | Signed browser key | `box.overview`, `box.list`, `box.diff`, `box.inbox`, `box.templates`, `box.term.read`, `approval.list`; `box.pause`, `box.stop`, `box.reorder`, `box.discard`, `approval.reject`; `lockdown.on`; `box.spawn` with a template that has no secrets and no egress |
-| Needs a touch | `box.land`, `box.push`, `box.pr`, `box.resume`, `box.revise`, `box.steer`, `approval.approve`; `box.spawn` with a template that has secrets or egress |
+| Needs a touch | `box.land`, `box.steer`, `box.revise`, `box.resume`, `approval.approve`; `box.spawn` with a template that has secrets or egress |
+| Not from the browser | `box.push`, `box.pr` (see [Why push stays on the machine](#why-push-stays-on-the-machine)) |
 | Machine only | policy, config, vault, connectors, egress; enrolling or removing devices (including pairing and revoking); `lockdown.off`; raising caps; uninstall; anything about the audit |
 
-**The touch is not built yet.** Passkey support comes with plan 31. Until
-then the daemon refuses every action in the touch row with `touch_required`,
-even with a proof. The page says "Needs a touch on a paired passkey" and shows
-the machine command. The button never shows success. Do these on the machine.
-The machine-side box commands arrive with the box manager.
+A touch is a WebAuthn assertion from a passkey enrolled for this device. It
+binds the exact action the page showed: the daemon makes the challenge from
+the action record (what, which box, expiry), and an assertion for one action
+or one box is refused for another (`touch_mismatch`). A challenge works once
+and is valid for 5 minutes. The prompt times out after 120 seconds. A timeout,
+an error or the wrong passkey all deny. There is never a password fallback.
+
+The page also shows a 6-digit code. The same code is in the inbox and in the
+`box_waiting` notification, so you can check that the prompt is the one you
+meant to answer. See [notifications](notifications.md). That notification
+carries the box and the code and no link.
+
+- **Land.** The touch is for one pending land of one box. Landing is a
+  pending action the daemon made; the browser answers it.
+- **Spawn.** A template with secrets asks for the secret-sensitive touch; one
+  with external egress asks for the egress touch. A template with neither
+  needs no touch.
+- **Approvals.** `approval.approve` needs a touch. `approval.reject` and
+  `approval.list` need only the signed browser key. `[approval] same_user`
+  still applies: with `"deny"` (the default) the requester cannot approve
+  their own request, from the page either. With `"reauth"` the touch replaces
+  the polkit password prompt, because it already proves presence and user
+  verification. See [approvals](approvals.md).
+
+## Passkeys
+
+A passkey is made only while you pair, and only after you have accepted the
+pairing on the machine. The page asks the browser for a new passkey
+(Face ID, a fingerprint or a PIN), and the browser's own device key signs the
+passkey into the pairing request, so a relay on the way cannot swap in its
+own. A pairing without a passkey works for the signed actions, but nothing in
+the touch row will work for that browser.
+
+User verification is required for every touch: Face ID, a fingerprint or the
+key's PIN. A passkey or key that does not verify the user is refused
+(`touch_failed`). The page says "needs Face ID, fingerprint or PIN".
+
+A passkey belongs to one origin. A touch made for another origin (a different
+host or port) is refused.
+
+## `[workspace] origins`
+
+```toml
+[workspace]
+origins = ["http://localhost:47810"]
+```
+
+The list is in the machine's config, like all config. A touch is accepted
+only when the page's origin is in the list. The WebAuthn RP id is the host of
+the origin (`localhost` for the default), taken from this list and never from
+the browser. The default is the page `saiife workspace serve` shows on port
+47810. If you use `serve --port N`, add `http://localhost:N`. To use a phone
+over Tailscale, add the https origin the phone opens, for example
+`https://box.tail1234.ts.net`. Each entry is `http://localhost:<port>` or
+`https://<host>[:port]`; nothing else is accepted. A passkey made at one
+origin works only there.
+
+## The steer window
+
+Steer, Revise and Resume send text to a running box. The touch does not bind
+the text; it opens a window. One touch opens a window of 600 seconds (10
+minutes) for that browser and that box. Inside the window, further steers,
+revises and resumes of the same box need no touch. The window is per browser
+and per box: another browser, or another box, asks for its own touch. It
+closes at once when you revoke the browser, and it ends after 600 seconds. A
+frame covered by a window is recorded with `window: true`.
+
+## Why push stays on the machine
+
+`box.push` and `box.pr` send a box's work to a remote. They are not offered
+to the browser at all, because a compromised page or hub must not be able to
+send code out. Pushing is a command on the machine, bound to a touch there
+(a later release). The browser can land a box into the local repository
+(`box.land`) and nothing more.
 
 Machine-only actions are not offered in the page at all. A frame that asks for
 one is refused.
@@ -98,7 +168,11 @@ one is refused.
 
 Every change from the page is recorded by the daemon: reorder, stop, pause,
 discard, spawn, lockdown on and so on. Each record has the device id and
-`via: "local"`.
+`via: "local"`. A frame that needed a touch also carries a `touch` object: the
+credential, `uv`, the challenge and the signature, with `via: "web"`, so
+`saiife audit verify` and an auditor can check it. A frame covered by a
+steer window has `window: true` instead. A refused frame is recorded with
+the rule that refused it.
 Successful reads (overview, diff, inbox) are not recorded. A read the daemon
 refuses is recorded.
 

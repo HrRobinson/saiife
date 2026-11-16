@@ -622,6 +622,25 @@ pub async fn verify_frame(
 }
 
 /// Whether `pa` is a land (its class and its record's class both).
+/// Tells the owner that a box waits in the Workspace inbox: the box id and
+/// the short code to match, nothing else. No URL and no request id (§9.6):
+/// nothing in a notification approves anything. Called by whoever creates
+/// pending actions (plan 39's `Lands::refresh`).
+pub fn notify_pending(ctx: &Ctx, pa: &PendingAction) {
+    let code = pa.view().short_code;
+    ctx.notifier.send(crate::notifier::NotifyEvent {
+        event: saiife_policy::Event::BoxWaiting,
+        id: None,
+        service: None,
+        operation: None,
+        uid: None,
+        host: crate::signals::hostname(),
+        summary: format!("A box is waiting for your approval in the Workspace inbox (code {code})"),
+        reason: None,
+        box_id: pa.box_id.as_ref().map(|b| b.as_str().to_string()),
+    });
+}
+
 fn is_land(pa: &PendingAction) -> bool {
     pa.class == TouchClass::Land && pa.record.class == TouchClass::Land
 }
@@ -828,6 +847,43 @@ mod tests {
         w.close_device("d1");
         assert!(!w.window_open("d1", &a, 1001) && !w.window_open("d1", &b, 1001));
         assert!(w.window_open("d2", &a, 1001));
+    }
+
+    #[test]
+    fn notification_has_no_approve_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(dir.path(), crate::ops::Mode::Locked, 7);
+        let request_id = 424_242_424_242u64;
+        let pa = PendingAction {
+            request_id,
+            class: TouchClass::Land,
+            box_id: Some(BoxId::parse("b-run").unwrap()),
+            summary: "land b-run".into(),
+            record: ActionRecord {
+                instance_id: [0; 16],
+                request_id,
+                class: TouchClass::Land,
+                summary: "land b-run".into(),
+                fields: BTreeMap::new(),
+                nonce: [3; 32],
+                expires_at: 99,
+            },
+            created_at: 0,
+            expires_at: 99,
+        };
+        let code = pa.view().short_code;
+        notify_pending(&ctx, &pa);
+        let q = ctx.notifier.queued_events();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].event, saiife_policy::Event::BoxWaiting);
+        assert_eq!(q[0].box_id.as_deref(), Some("b-run"));
+        let text = q[0].payload().to_string();
+        assert!(text.contains(&code), "{text}");
+        assert!(text.contains("Workspace inbox"), "{text}");
+        assert!(!text.contains("http"), "{text}");
+        assert!(!text.contains("request_id"), "{text}");
+        assert!(!text.contains(&request_id.to_string()), "{text}");
+        assert!(q[0].id.is_none());
     }
 
     fn list() -> Vec<String> {
