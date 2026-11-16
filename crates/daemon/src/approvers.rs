@@ -165,6 +165,54 @@ impl<'a> From<(u32, Option<&'a str>)> for Requester<'a> {
     }
 }
 
+/// How an approver stands to a request, once they are known to be the
+/// peer's own account and listed: the requester or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Other,
+    SameUser,
+}
+
+/// The identity checks of [`may_decide`], without any re-authentication, so
+/// the CLI's decision and the Workspace's (a UV touch stands in for the
+/// re-authentication there) cannot differ: the looked-up name is the peer's
+/// own account, the peer is listed, and whether the peer is the requester.
+/// A requester with a SID against a peer with none (its SID could not be
+/// resolved) counts as the same user: unknown is never "someone else".
+pub fn approver_standing<'r>(
+    cfg: &ApprovalCfg,
+    dir: &dyn Directory,
+    approver_user: &str,
+    requester: impl Into<Requester<'r>>,
+    peer: &PeerCred,
+) -> Result<Standing, Refusal> {
+    let requester = requester.into();
+    let approver_uid = peer.uid;
+    // The name was looked up from this peer. On Windows that is by SID, and an elevated
+    // admin's uid label is 0 whatever its name's label is, so the SIDs are compared.
+    let same_account = match peer.sid.as_deref() {
+        Some(sid) => dir.sid_of(approver_user).as_deref() == Some(sid),
+        None => dir.user(approver_user).map(|u| u.uid) == Some(approver_uid),
+    };
+    if !same_account {
+        return Err(Refusal::ReauthError(MISMATCH.to_string()));
+    }
+    if !peer_is_listed(cfg, dir, approver_user, peer) {
+        return Err(Refusal::NotApprover);
+    }
+    let same = crate::ops::same_principal(
+        approver_uid,
+        peer.sid.as_deref(),
+        requester.uid,
+        requester.sid,
+    ) || (requester.sid.is_some() && peer.sid.is_none());
+    Ok(if same {
+        Standing::SameUser
+    } else {
+        Standing::Other
+    })
+}
+
 /// May the CLI connected as `peer` decide a request made by
 /// `requester_uid`? The approver's uid is `peer.uid`. Every error refuses
 /// (fail closed).
@@ -205,24 +253,7 @@ pub fn may_decide<'r>(
 ) -> Result<(), Refusal> {
     let requester = requester.into();
     let approver_uid = peer.uid;
-    // The name was looked up from this peer. On Windows that is by SID, and an elevated
-    // admin's uid label is 0 whatever its name's label is, so the SIDs are compared.
-    let same_account = match peer.sid.as_deref() {
-        Some(sid) => dir.sid_of(approver_user).as_deref() == Some(sid),
-        None => dir.user(approver_user).map(|u| u.uid) == Some(approver_uid),
-    };
-    if !same_account {
-        return Err(Refusal::ReauthError(MISMATCH.to_string()));
-    }
-    if !peer_is_listed(cfg, dir, approver_user, peer) {
-        return Err(Refusal::NotApprover);
-    }
-    if !crate::ops::same_principal(
-        approver_uid,
-        peer.sid.as_deref(),
-        requester.uid,
-        requester.sid,
-    ) {
+    if approver_standing(cfg, dir, approver_user, requester, peer)? == Standing::Other {
         return Ok(());
     }
     match cfg.same_user {

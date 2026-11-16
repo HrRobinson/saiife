@@ -2524,7 +2524,7 @@ async fn touched_frame(
     args: Value,
 ) -> Value {
     let bound = match action {
-        "box.steer" | "box.revise" | "box.resume" => json!({"id": args["id"]}),
+        "box.steer" | "box.revise" | "box.resume" | "approval.approve" => json!({"id": args["id"]}),
         _ => args.clone(),
     };
     let (rid, ch) = begin_touch(w, link, d, action, bound).await;
@@ -2721,7 +2721,7 @@ async fn resume_and_revise_use_the_window() {
     )
     .await;
     assert_eq!(a["ok"], true, "{a}");
-    // b-done runs again; its window now covers a second revise and a pause.
+    // b-done runs again; the touch's window now covers a steer.
     let a = send(
         &w,
         &mut link,
@@ -2759,7 +2759,9 @@ async fn resume_and_revise_use_the_window() {
         sign_for(&soft, rid, &ch),
     )
     .await;
-    assert_ne!(a["rule"], "touch_failed", "{a}");
+    // The touch was kept: it verifies and runs, and b-run (Running) is no
+    // box to revise.
+    assert_eq!(a["rule"], "wrong_state", "{a}");
 }
 
 #[tokio::test]
@@ -3008,11 +3010,13 @@ async fn approval_approve_needs_touch_and_approver() {
         &d,
         &soft,
         "approval.approve",
-        json!({"id": r.id}),
+        json!({"id": r.id, "note": "ok by me"}),
     )
     .await;
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(a["result"]["state"], "approved", "{a}");
+    let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
+    assert_eq!(s.note.as_deref(), Some("ok by me"));
 
     // The device owner is no approver: forbidden, nothing decided.
     // (Their own request, so they may see it, but not decide it.)
@@ -3037,26 +3041,46 @@ async fn approval_approve_needs_touch_and_approver() {
 async fn requester_cannot_approve_own_request() {
     let (w, mut link, d, soft) = paired_locked(APPROVER_POLICY).await;
     let r = request_of(&w, me(), ME);
-    let (rid, ch) = begin_touch(&w, &mut link, &d, "approval.approve", json!({"id": r.id})).await;
+    // Refused before any touch is issued (so none is spent), and recorded.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": r.id})),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "same_user", "{a}");
+    assert!(w
+        .ctx
+        .touch
+        .take(
+            &saiife_daemon::touch::IssueKey::Web {
+                device: d.device_id(),
+                request_id: 1,
+            },
+            me()
+        )
+        .is_err());
     let a = send_touch(
         &w,
         &mut link,
         &d,
         "approval.approve",
         json!({"id": r.id}),
-        sign_for(&soft, rid, &ch),
+        sign_for(&soft, 1, &[0; 32]),
     )
     .await;
-    assert_eq!(a["error"], "forbidden", "{a}");
     assert_eq!(a["rule"], "same_user", "{a}");
     let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
     assert_eq!(s.state, saiife_daemon::approvals::State::Pending);
-    let rs = approval_records(&w);
-    assert!(
-        rs.iter()
-            .any(|v| field(v, "action") == "refused" && v["rule"] == "same_user"),
-        "{rs:?}"
-    );
+    let rs = records(&w);
+    assert_eq!(rs.last().unwrap()["rule"], "same_user", "{rs:?}");
+    assert_eq!(rs.last().unwrap()["decision"], "deny");
+    // The requester's own pending request is not listed for them either.
+    let a = send(&w, &mut link, &d, "approval.list", json!({})).await;
+    assert_eq!(a["result"], json!({"items": []}), "{a}");
     // [approval] same_user = "reauth": the web touch is the re-authentication.
     let (w, mut link, d, soft) = paired_locked(
         "version = 2\nlocked = true\n[approval]\napprovers = [\"me\"]\nsame_user = \"reauth\"\n",

@@ -581,7 +581,7 @@ fn touch_required(action: &str) -> Fail {
     Fail::Policy(Refused::new(
         ErrorCode::Forbidden,
         "touch_required",
-        format!("{action} needs a touch on a security key, which this version cannot check yet"),
+        format!("{action} needs a touch: confirm it with your passkey"),
     ))
 }
 
@@ -710,12 +710,16 @@ async fn touched(
     let Some(proof) = proof else {
         return Err(touch_required(action));
     };
-    let Some(owner_uid) = uid_of(ctx, &v.owner_user).await else {
-        return Err(Fail::Policy(Refused::new(
-            ErrorCode::Forbidden,
-            "unknown_owner",
-            "the device owner is not a user of this machine",
-        )));
+    let owner_uid = owner_uid_of(ctx, v).await?;
+    // An approval's note is checked before its touch is verified (spent).
+    let note = match (action, v.frame.args.get("note")) {
+        (a::APPROVAL_APPROVE, Some(Value::String(n))) => {
+            crate::approvals::check_note(n).map_err(|e| invalid(e.to_string()))?;
+            Some(n.clone())
+        }
+        (a::APPROVAL_APPROVE, Some(Value::Null) | None) => None,
+        (a::APPROVAL_APPROVE, Some(_)) => return Err(invalid("note is a string")),
+        _ => None,
     };
     let src = source_for(ctx, v, action, &v.frame.args).await?;
     let proven = crate::workspace_touch::verify_frame(ctx, v, owner_uid, &src, proof)
@@ -741,7 +745,7 @@ async fn touched(
                 &v.owner_user,
                 rid,
                 true,
-                None,
+                note,
                 Some(ev),
                 &device,
             )
@@ -805,13 +809,7 @@ async fn steer(
         Some(k) => Some(text_arg(args, k, MAX_STEER_BYTES)?.to_string()),
         None => None,
     };
-    let Some(owner_uid) = uid_of(ctx, &v.owner_user).await else {
-        return Err(Fail::Policy(Refused::new(
-            ErrorCode::Forbidden,
-            "unknown_owner",
-            "the device owner is not a user of this machine",
-        )));
-    };
+    let owner_uid = owner_uid_of(ctx, v).await?;
     let src = source_for(ctx, v, action, args).await?;
     match proof {
         Some(p) => {
@@ -1005,7 +1003,9 @@ async fn act(
         a::APPROVAL_LIST => {
             only(args, &[])?;
             let owner_uid = owner_uid_of(ctx, v).await?;
-            let items = crate::approval_ops::list_remote(ctx, owner_uid, &v.owner_user).await;
+            let items = crate::approval_ops::list_remote(ctx, owner_uid, &v.owner_user)
+                .await
+                .map_err(Fail::Policy)?;
             Ok(json!({ "items": items }))
         }
         a::APPROVAL_REJECT => {

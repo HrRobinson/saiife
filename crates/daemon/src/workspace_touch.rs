@@ -216,42 +216,30 @@ async fn bind_inner(
     }
 }
 
-/// Pending approval request `rid`, when the device owner may decide it.
+/// Pending approval request `rid`, when the device owner may decide it: the
+/// shared identity checks (`approval_ops::owner_may_decide`, the CLI's
+/// own) run before any touch is issued or spent.
 async fn pending_request(
     ctx: &Arc<Ctx>,
     owner_uid: u32,
     rid: u64,
 ) -> Result<crate::approvals::Request, Fail> {
-    use crate::approval_ops as ops;
-    let peer = saiife_ipc::peer::PeerCred {
-        uid: owner_uid,
-        gid: owner_uid,
-        pid: 0,
-        sid: None,
-        group_sids: Vec::new(),
-    };
-    let r = match ops::visible(ctx, &peer, rid).await {
-        Err(()) => {
-            return Err(Fail::Policy(Refused::new(
-                ErrorCode::Unavailable,
-                "unavailable",
-                "approvals are not available on this machine",
-            )))
-        }
-        Ok(None) => return Err(not_found("approval request")),
-        Ok(Some(r)) => r,
-    };
-    if r.state != crate::approvals::State::Pending {
-        return Err(invalid(format!("request #{rid} is not pending")));
-    }
-    if !ops::is_approver(ctx, &peer).await {
-        return Err(Fail::Policy(Refused::new(
+    use crate::approval_ops::ApprovalLookup;
+    match crate::approval_ops::request_to_approve(ctx, owner_uid, rid).await {
+        Err(ApprovalLookup::Unavailable) => Err(Fail::Policy(Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            "approvals are not available on this machine",
+        ))),
+        Err(ApprovalLookup::Unknown) => Err(not_found("approval request")),
+        Err(ApprovalLookup::NotPending) => Err(invalid(format!("request #{rid} is not pending"))),
+        Ok(Err(why)) => Err(Fail::Policy(Refused::new(
             ErrorCode::Forbidden,
-            "not_approver",
-            format!("only an approver can touch for request #{rid}"),
-        )));
+            why.rule(),
+            format!("request #{rid} cannot be approved by this user: {why}"),
+        ))),
+        Ok(Ok(r)) => Ok(r),
     }
-    Ok(r)
 }
 
 /// `workspace.touch.begin {action, args}`: issues a challenge bound to the
