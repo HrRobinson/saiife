@@ -3,6 +3,9 @@
 # It needs a phone (Face ID or a fingerprint) or a security key with a PIN, and it
 # asks you to touch it. The Workspace page in the browser asks for the touch.
 #
+# Steps 2 to 4 need the browser touch prompt (touch.js), which is a later step of
+# plan 31. Until it is built they report bad; steps 1 and 5 can still be run.
+#
 # Needs:
 #   - a running daemon: the personal broker (`saiife daemon --user`) or a locked
 #     daemon. For the "fake land" it must run with the demo boxes:
@@ -10,9 +13,10 @@
 #   - `saiife workspace serve` in another terminal (127.0.0.1, port 47810, or
 #     SAIIFE_SMOKE_PORT);
 #   - the browser: on this machine, `http://localhost:<port>` (the default origin).
-#     A phone on the same Tailscale network opens the link through the machine's
-#     tailnet address; add that origin to `[workspace] origins` in the system
-#     config first (an https origin, as a phone needs a secure context);
+#     `serve` listens on 127.0.0.1 only. A phone needs an https origin: put your own
+#     https proxy in front (for example `tailscale serve`), add that origin to
+#     `[workspace] origins` in the system config, and build the pairing link by
+#     hand with that host (`pair --local` prints a localhost link).
 #   - the binary: SAIIFE=${SAIIFE:-target/debug/saiife}; jq.
 #
 # Audit: the script reads the month files (*.jsonl) with jq, as touch-smoke.sh does.
@@ -21,7 +25,7 @@
 #
 #   bash scripts/workspace-smoke.sh
 #
-# Expect 8 "ok:" lines and exit 0. The browser steps are done by you, by hand;
+# Expect 9 "ok:" lines and exit 0. The browser steps are done by you, by hand;
 # the script waits for Enter and then checks the audit log.
 set -euo pipefail
 
@@ -73,9 +77,10 @@ wait_enter() {
 
 # 1. pair, with the passkey made at pairing.
 echo "step 1: pairing. Open the link below in the browser (the phone, or this machine)."
-echo "  Use the label 'smoke-ws' when the page asks for a name. Check that the code on"
-echo "  the page matches the terminal, accept here, and make the passkey with Face ID,"
-echo "  a fingerprint or the key's PIN when the page asks."
+echo "  Use the label 'smoke-ws' when the page asks for a name. The page asks for the"
+echo "  passkey first (Face ID, a fingerprint or the key's PIN). Check that the code on"
+echo "  the page matches the terminal, then accept here; the machine stores the passkey"
+echo "  only when you accept."
 "$SAIIFE" workspace pair --local --port "$PORT" --label smoke-ws || true
 DEVICE=$("$SAIIFE" workspace devices 2>/dev/null | grep -oE 'd-[A-Za-z0-9_-]+' | tail -n 1 || true)
 if [ -n "$DEVICE" ]; then
@@ -91,7 +96,7 @@ fi
 
 # 2. approve the fake land with a touch.
 wait_enter "step 2: in the page, open the finished demo box, press Land, and approve with your touch."
-if audit_records | jq -e -s 'any(.[]; .kind == "workspace" and .action == "box.land" and .touch.via == "web" and .touch.uv == true and (.touch.preimage | length > 0))' >/dev/null; then
+if audit_records | jq -e -s 'any(.[]; .kind == "workspace" and .action == "box.land" and .decision == "allow" and .touch.via == "web" and .touch.uv == true and (.touch.preimage | length > 0))' >/dev/null; then
   ok "audit: box.land carries a touch object (via web, uv true)"
 else
   bad "audit: box.land carries a touch object (via web, uv true) (in $AUDIT_DIR)"
@@ -103,7 +108,7 @@ else
 fi
 
 # 3. the same request again is refused.
-wait_enter "step 3: in the page, send the same Land again (reload the old prompt, or use 'Retry' if shown). It must be refused."
+wait_enter "step 3: in the page, answer the same Land prompt a second time (the same assertion). It must be refused."
 if audit_records | jq -e -s '[.[] | select(.kind == "workspace" and .action == "box.land" and .decision == "deny")] | length > 0' >/dev/null; then
   ok "audit: the replayed land is refused"
 else
@@ -124,11 +129,17 @@ fi
 echo "step 5: revoking the browser on the machine"
 if [ -n "$DEVICE" ] && "$SAIIFE" workspace revoke "$DEVICE"; then
   ok "revoked $DEVICE"
-  wait_enter "In the page, wait for the next refresh. It must show 'This browser is no longer paired.'"
-  if audit_records | jq -e -s --arg d "$DEVICE" 'any(.[]; .kind == "workspace" and .device == $d and .decision == "deny")' >/dev/null; then
-    ok "audit: a frame from the revoked browser is refused"
+  wait_enter "In the page, wait for the next refresh. It must show 'This browser is no longer paired.' (a frame from a revoked device is refused and not audited)."
+  if audit_records | jq -e -s --arg d "$DEVICE" 'any(.[]; .kind == "workspace" and .action == "revoked" and .device == $d)' >/dev/null; then
+    ok "audit: the revoke is recorded"
   else
-    bad "audit: a frame from the revoked browser is refused (in $AUDIT_DIR)"
+    bad "audit: the revoke is recorded (in $AUDIT_DIR)"
+  fi
+  # touch_removed is written only when the device held a passkey.
+  if audit_records | jq -e -s --arg d "$DEVICE" 'any(.[]; .kind == "workspace" and .action == "touch_removed" and .device == $d)' >/dev/null; then
+    ok "audit: the passkey was removed with the revoke (touch_removed)"
+  else
+    bad "audit: the passkey was removed with the revoke (touch_removed) (in $AUDIT_DIR)"
   fi
 else
   bad "revoke $DEVICE"

@@ -90,13 +90,16 @@ A touch is a WebAuthn assertion from a passkey enrolled for this device. It
 binds the exact action the page showed: the daemon makes the challenge from
 the action record (what, which box, expiry), and an assertion for one action
 or one box is refused for another (`touch_mismatch`). A challenge works once
-and is valid for 5 minutes. The prompt times out after 120 seconds. A timeout,
-an error or the wrong passkey all deny. There is never a password fallback.
+and is valid for 5 minutes. A timeout, an error or the wrong passkey all deny. There is never a password fallback.
 
-The page also shows a 6-digit code. The same code is in the inbox and in the
-`box_waiting` notification, so you can check that the prompt is the one you
-meant to answer. See [notifications](notifications.md). That notification
-carries the box and the code and no link.
+**The browser touch prompt is not built yet.** The daemon side is: it checks
+touches, opens steer windows and records them. Until the page can ask for a
+touch, it still says "Needs a touch on a paired passkey" and shows the machine
+command.
+
+A pending action has a 6-digit code. The optional `box_waiting` notification
+carries that code and the box, so you can match it in the inbox. It has no
+link. See [notifications](notifications.md).
 
 - **Land.** The touch is for one pending land of one box. Landing is a
   pending action the daemon made; the browser answers it.
@@ -112,16 +115,15 @@ carries the box and the code and no link.
 
 ## Passkeys
 
-A passkey is made only while you pair, and only after you have accepted the
-pairing on the machine. The page asks the browser for a new passkey
-(Face ID, a fingerprint or a PIN), and the browser's own device key signs the
-passkey into the pairing request, so a relay on the way cannot swap in its
-own. A pairing without a passkey works for the signed actions, but nothing in
+A passkey is made only while you pair. The browser asks for the new passkey
+first (Face ID, a fingerprint or a PIN), and the browser's own device key signs
+it into the pairing request, so a relay on the way cannot swap in its own. The
+machine stores the passkey only when you accept the pairing there. A pairing without a passkey works for the signed actions, but nothing in
 the touch row will work for that browser.
 
 User verification is required for every touch: Face ID, a fingerprint or the
 key's PIN. A passkey or key that does not verify the user is refused
-(`touch_failed`). The page says "needs Face ID, fingerprint or PIN".
+(`touch_failed`).
 
 A passkey belongs to one origin. A touch made for another origin (a different
 host or port) is refused.
@@ -157,8 +159,7 @@ frame covered by a window is recorded with `window: true`.
 
 `box.push` and `box.pr` send a box's work to a remote. They are not offered
 to the browser at all, because a compromised page or hub must not be able to
-send code out. Pushing is a command on the machine, bound to a touch there
-(a later release). The browser can land a box into the local repository
+send code out. Pushing is done on the machine, with the CLI. The browser can land a box into the local repository
 (`box.land`) and nothing more.
 
 Machine-only actions are not offered in the page at all. A frame that asks for
@@ -171,8 +172,9 @@ discard, spawn, lockdown on and so on. Each record has the device id and
 `via: "local"`. A frame that needed a touch also carries a `touch` object: the
 credential, `uv`, the challenge and the signature, with `via: "web"`, so
 `saiife audit verify` and an auditor can check it. A frame covered by a
-steer window has `window: true` instead. A refused frame is recorded with
-the rule that refused it.
+steer window has `window: true` instead. A frame refused after its
+signature checked out is recorded with the rule that refused it. A frame from
+an unknown or revoked device, or one with a bad signature, is not recorded.
 Successful reads (overview, diff, inbox) are not recorded. A read the daemon
 refuses is recorded.
 

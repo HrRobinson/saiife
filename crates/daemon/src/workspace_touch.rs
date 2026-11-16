@@ -621,7 +621,6 @@ pub async fn verify_frame(
     }
 }
 
-/// Whether `pa` is a land (its class and its record's class both).
 /// Tells the owner that a box waits in the Workspace inbox: the box id and
 /// the short code to match, nothing else. No URL and no request id (§9.6):
 /// nothing in a notification approves anything. Called by whoever creates
@@ -641,6 +640,7 @@ pub fn notify_pending(ctx: &Ctx, pa: &PendingAction) {
     });
 }
 
+/// Whether `pa` is a land (its class and its record's class both).
 fn is_land(pa: &PendingAction) -> bool {
     pa.class == TouchClass::Land && pa.record.class == TouchClass::Land
 }
@@ -884,6 +884,51 @@ mod tests {
         assert!(!text.contains("request_id"), "{text}");
         assert!(!text.contains(&request_id.to_string()), "{text}");
         assert!(q[0].id.is_none());
+    }
+
+    #[test]
+    fn hostile_looking_input_cannot_make_a_link() {
+        // What can vary is the box id and the request id. A box id that
+        // looks like a URL is not a box id at all.
+        for bad in [
+            "http://evil.test/x",
+            "b-1/../x",
+            "b:1",
+            "B-1",
+            "b 1",
+            "b-1?a=1",
+        ] {
+            assert!(BoxId::parse(bad).is_err(), "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(dir.path(), crate::ops::Mode::Locked, 7);
+        let request_id = 5_551_234_567u64;
+        let pa = PendingAction {
+            request_id,
+            class: TouchClass::Land,
+            box_id: Some(BoxId::parse("http-evil-test").unwrap()),
+            summary: "see https://evil.test/approve?id=5551234567".into(),
+            record: ActionRecord {
+                instance_id: [0; 16],
+                request_id,
+                class: TouchClass::Land,
+                summary: "see https://evil.test/approve?id=5551234567".into(),
+                fields: BTreeMap::new(),
+                nonce: [9; 32],
+                expires_at: 99,
+            },
+            created_at: 0,
+            expires_at: 99,
+        };
+        notify_pending(&ctx, &pa);
+        let ev = ctx.notifier.queued_events().remove(0);
+        let text = ev.payload().to_string();
+        // Neither the pending action's own summary nor its request id leaks.
+        for needle in ["://", "evil.test", "approve?", "request_id", "5551234567"] {
+            assert!(!text.contains(needle), "{needle} in {text}");
+        }
+        assert_eq!(ev.box_id.as_deref(), Some("http-evil-test"));
+        assert!(ev.id.is_none());
     }
 
     fn list() -> Vec<String> {
