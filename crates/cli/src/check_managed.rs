@@ -272,7 +272,7 @@ mod imp {
         }
     }
 
-    /// After `OVERALL_TIMEOUT`, kill the worker if one runs, say why on
+    /// After `overall_timeout()`, kill the worker if one runs, say why on
     /// stderr and exit 2, wherever the main thread is stuck. `false`: the
     /// thread could not be started (`RLIMIT_NPROC`, `pids.max`).
     pub fn start_watchdog() -> bool {
@@ -858,7 +858,7 @@ mod imp {
 
     /// `req` judged in this process, on its own thread, with the environment a worker
     /// would get (never the agent's): the answer, or why there is none, within
-    /// `WORKER_TIMEOUT` of the start. A panic there is caught; a judgment still running
+    /// `worker_timeout()` of the start. A panic there is caught; a judgment still running
     /// then is left behind, and ends with the process.
     fn judge_here(req: EvalRequest) -> (String, Result<EvalAnswer, String>) {
         use crate::hook_timing::time;
@@ -900,7 +900,9 @@ mod imp {
         let answer = match time("judge.wait", || rx.recv_timeout(left)) {
             Ok(Ok(a)) => Ok(a),
             Ok(Err(())) => Err("it panicked".into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err("no answer within 3 s".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("no answer within {} s", worker_timeout().as_secs()))
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err("it is gone".into()),
         };
         (payload, answer)
@@ -1308,7 +1310,7 @@ mod imp {
             }
         }
 
-        /// The answer, or why there is none, within `WORKER_TIMEOUT` of the
+        /// The answer, or why there is none, within `worker_timeout()` of the
         /// request. A worker still running then is killed.
         fn finish(mut self) -> (String, Result<EvalAnswer, String>) {
             let deadline = self.started + worker_timeout();
@@ -1320,7 +1322,7 @@ mod imp {
         }
 
         fn answer(&mut self, deadline: Instant) -> Result<EvalAnswer, String> {
-            let timeout = || "no answer within 3 s".to_string();
+            let timeout = || format!("no answer within {} s", worker_timeout().as_secs());
             let left = deadline.saturating_duration_since(Instant::now());
             let out = match self.out.recv_timeout(left) {
                 Ok(out) => out,
@@ -1772,7 +1774,7 @@ mod imp {
     }
 
     /// [`connect_locked`], then `hook.begin {agent, event}` (plan 20), all
-    /// within `CONNECT_TIMEOUT`. From the begin on, the daemon records a
+    /// within `connect_timeout()`. From the begin on, the daemon records a
     /// connection that ends without an `audit.append`. A refusal of the
     /// begin (a daemon that does not know the op) changes nothing else; a
     /// begin that breaks the connection is a daemon that cannot be reached.
@@ -1879,7 +1881,7 @@ mod imp {
     }
 
     /// `audit.append`, acknowledged with a `seq` by `deadline` (at most
-    /// `ACK_TIMEOUT` from the first send). A bound `key` goes beside the
+    /// `ack_timeout()` from the first send). A bound `key` goes beside the
     /// record as `tool_use_id` and `input_sha256`: the daemon settles that
     /// key with them and writes neither.
     fn append(

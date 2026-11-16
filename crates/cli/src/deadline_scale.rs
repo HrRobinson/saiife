@@ -6,6 +6,11 @@
 //! them by `SAIIFE_TEST_DEADLINE_SCALE` (a whole number, 1 to 100) when it is set: a test
 //! that is about what the hook decides, not how fast, makes the deadlines generous so a
 //! loaded machine cannot fail it. Unset, or in a release build, a deadline is its value.
+//!
+//! A test-build-only lever, like `SAIIFE_EVAL_FAULT`: the `ci-locked` profile also has debug
+//! assertions and is installed as a locked system build in CI, where an environment the agent
+//! controls could scale the watchdog past the agents' 10 s hook timeout. Never for production
+//! (a release build ignores it).
 
 use std::time::Duration;
 
