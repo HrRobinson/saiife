@@ -479,9 +479,9 @@ async fn frame(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
 /// tests. The caller has run `Workspace::check` and checked the peer; this
 /// refuses a Touch action without a verified `touch` proof (`touch_required`,
 /// also `box.spawn` with a template that reaches secrets or the network) and
-/// every name in [`LATER`], and records as the module says. Records written through `execute` carry no peer (no `uid`, `user`
-/// or `peer` field): it has no connection; `workspace.frame` on `link.sock`
-/// records its peer.
+/// every name in [`LATER`], and records as the module says. Records written
+/// through `execute` carry no peer (no `uid`, `user` or `peer` field): it
+/// has no connection; `workspace.frame` on `link.sock` records its peer.
 pub async fn execute(
     ctx: &Arc<Ctx>,
     v: &Verified,
@@ -698,8 +698,10 @@ pub(crate) async fn source_for(
 
 /// A Touch action: without a proof `touch_required`; with one, the proof
 /// is verified (`workspace_touch::verify_frame`) and only then is anything
-/// done. `box.land` completes its pending action with the evidence; the
-/// other touch-bound actions are not available until the next step.
+/// done. `box.land` completes its pending action with the evidence,
+/// `box.spawn` spawns the box the touch bound and `approval.approve`
+/// decides the request (`approval_ops::decide_remote`); any other action
+/// is `unavailable`. The steer actions go through [`steer`].
 async fn touched(
     ctx: &Arc<Ctx>,
     v: &Verified,
@@ -777,7 +779,10 @@ fn device_of(ctx: &Arc<Ctx>, v: &Verified) -> Result<saiife_wire::device::Device
 /// ([`WebTouches::open_window`](crate::workspace_touch::WebTouches)) and the
 /// action runs; without a proof, an open window on exactly this box lets it
 /// run (recorded `window: true`); else `touch_required`. The text is checked
-/// before a proof is verified, so a bad text does not spend the touch.
+/// before a proof is verified, so a bad text does not spend the touch. The
+/// window opens on the verified touch, before the action runs: it stays
+/// open even when the action then fails (a `WrongState`, say), since the
+/// touch proved presence for that box all the same.
 async fn steer(
     ctx: &Arc<Ctx>,
     v: &Verified,

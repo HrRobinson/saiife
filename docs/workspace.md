@@ -4,8 +4,8 @@ The Workspace is a web page that shows your boxes and lets you steer them from
 a browser. Today it runs on your own machine, at `http://localhost:47810`. When
 the hub ships, the same page will also be served from app.saiife.com.
 
-Boxes themselves arrive in a later release. Until then the page has nothing to
-show, except on the demo build (see
+Boxes run on Linux only and are not in a release yet. Where the daemon runs no
+boxes, the page has nothing to show, except on the demo build (see
 [Try it before boxes ship](#try-it-before-boxes-ship)).
 
 ## Start it
@@ -102,7 +102,8 @@ and sends nothing. There is never a password fallback.
 The page shows a 6-digit short code before the passkey dialog opens. The
 same code is in the inbox, and in the optional `box_waiting` notification,
 so you can check that the prompt is the one you meant to answer. That
-notification carries the box and the code and no link. See
+notification carries the box and the code and no link. It is sent once per
+land request, when the daemon first offers that request in the inbox. See
 [notifications](notifications.md). If this browser has no passkey, the page
 says "Needs a touch on a paired passkey" and shows the machine command
 instead.
@@ -159,20 +160,24 @@ origin works only there.
 
 ## The steer window
 
-Steer, Revise and Resume send text to a running box. The touch does not bind
-the text; it opens a window. One touch opens a window of 600 seconds (10
+Steer sends a message to a running box, Revise sends a comment to a finished
+one, and Resume carries on a paused one (it sends no text). The touch does not
+bind the text; it opens a window. One touch opens a window of 600 seconds (10
 minutes) for that browser and that box. Inside the window, further steers,
 revises and resumes of the same box need no touch. The window is per browser
 and per box: another browser, or another box, asks for its own touch. It
 closes at once when you revoke the browser, and it ends after 600 seconds. A
-frame covered by a window is recorded with `window: true`.
+frame covered by a window is recorded with `window: true`. The window opens
+once the touch is verified, even if the action itself then fails.
 
 ## Why push stays on the machine
 
 `box.push` and `box.pr` send a box's work to a remote. They are not offered
 to the browser at all, because a compromised page or hub must not be able to
-send code out. Pushing is done on the machine, with the CLI. The browser can land a box into the local repository
-(`box.land`) and nothing more.
+send code out. Pushing is done on the machine, with the CLI.
+
+The browser can land a box into the local repository (`box.land`) and nothing
+more.
 
 Machine-only actions are not offered in the page at all. A frame that asks for
 one is refused.
