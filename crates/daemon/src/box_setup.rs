@@ -23,8 +23,8 @@ use saiife_boxes::template::{
 };
 use saiife_boxes::BoxId;
 use saiife_boxhost::guest::{
-    claude_env, claude_json_seed, claude_settings, codex_config, codex_env, gemini_env,
-    gemini_settings, pack_files, CastPath, SetupSource, VsockGuest,
+    claude_env, claude_json_seed, claude_settings, codex_config, codex_env, gemini_env, pack_files,
+    CastPath, SetupSource, VsockGuest, GEMINI_HOME,
 };
 use saiife_boxhost::paths::{BoxPaths, RecordPaths};
 use saiife_boxhost::placeholder::read_or_make_placeholder;
@@ -137,15 +137,13 @@ impl SetupSource for TemplateSetup {
 
 /// Where the in-box Codex config goes (plan 42 D5).
 pub const CODEX_CONFIG_PATH: &str = "/home/agent/.codex/config.toml";
-/// Where the in-box Gemini CLI settings go (plan 42 D5).
-pub const GEMINI_SETTINGS_PATH: &str = "/home/agent/.gemini/settings.json";
 
 /// The agent's working directory in most boxes: the repo.
 pub const WORK_CWD: &str = "/work";
-/// Gemini CLI's working directory (plan 42 R9a): its home, so no settings,
-/// `.env` or project agents of the repo load; the repo is an include
-/// directory of the built-in command.
-pub const GEMINI_CWD: &str = "/home/agent";
+/// Gemini CLI's working directory (plan 42 R9a, R11): its baked root-owned
+/// home, so no settings, `.env` or project agents of the repo load; the repo
+/// is an include directory of the built-in command.
+pub const GEMINI_CWD: &str = GEMINI_HOME;
 
 /// What an agent kind adds to a box's setup: its model env, its files and
 /// the directory it runs in.
@@ -193,17 +191,31 @@ fn claude_setup(model: Option<ModelSetup>) -> AgentSetup {
 }
 
 /// The env, files and cwd of `agent` with the box's `placeholder` (plan 42
-/// D5, R9: Gemini's own settings are in a root-owned system file in the
-/// image, `gemini_system_settings`, and it runs in [`GEMINI_CWD`]).
+/// D5, R9, R11: Gemini's settings, system and user, are baked into the
+/// image root owned (`gemini_system_settings`, `gemini_user_settings`), so
+/// a gemini box gets no setup file, and it runs in [`GEMINI_CWD`]).
 /// `cred` picks Claude Code's login variable; Codex and Gemini have one
 /// login each. Codex's hooks are not here: they are managed, baked into the
 /// image (R7, `codex_requirements`). No agent gets another agent's files.
 pub fn agent_setup(agent: AgentKind, cred: ModelCred, placeholder: &str) -> AgentSetup {
     match agent {
         AgentKind::ClaudeCode => {
+            // A Claude Code template's `model_cred()` is always an
+            // Anthropic one, and `setup_for` refuses a box whose placeholder
+            // is another agent's before any setup is built, so the other
+            // creds never reach here; should one, it gets the api-key
+            // variable, never an OAuth one.
+            debug_assert!(
+                matches!(
+                    cred,
+                    ModelCred::AnthropicApiKey | ModelCred::AnthropicSubscription
+                ),
+                "claude-code with {cred:?}"
+            );
             let login = match cred {
+                ModelCred::AnthropicApiKey => Login::ApiKey,
                 ModelCred::AnthropicSubscription => Login::Subscription,
-                _ => Login::ApiKey,
+                ModelCred::OpenAiApiKey | ModelCred::GoogleApiKey => Login::ApiKey,
             };
             claude_setup(Some(ModelSetup {
                 env: claude_env(login, placeholder),
@@ -217,7 +229,7 @@ pub fn agent_setup(agent: AgentKind, cred: ModelCred, placeholder: &str) -> Agen
         },
         AgentKind::Gemini => AgentSetup {
             env: gemini_env(placeholder),
-            files: vec![authoritative(GEMINI_SETTINGS_PATH, gemini_settings())],
+            files: Vec::new(),
             cwd: GEMINI_CWD.into(),
         },
     }
@@ -615,28 +627,37 @@ mod tests {
         assert_eq!(s.agent.command, cmd);
         assert_eq!(s.env, gemini_env("PH"));
         let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        // R11: Gemini's settings are baked into the image; only packs travel.
         assert_eq!(
             paths,
-            vec![
-                GEMINI_SETTINGS_PATH,
-                "/home/agent/.config/saiife/packs/user.one.toml"
-            ]
+            vec!["/home/agent/.config/saiife/packs/user.one.toml"]
         );
-        assert_eq!(s.files[0].text, gemini_settings());
-        assert_eq!(s.agent.cwd, "/home/agent");
-        assert!(!paths.contains(&SETTINGS_PATH));
-        assert!(!paths.contains(&CLAUDE_JSON_PATH));
-        assert_eq!(GEMINI_SETTINGS_PATH, "/home/agent/.gemini/settings.json");
+        assert_eq!(s.agent.cwd, "/opt/saiife-gemini-home");
+        assert_eq!(GEMINI_CWD, GEMINI_HOME);
+    }
+
+    /// R11: a gemini box's setup has no files at all (without packs).
+    #[test]
+    fn gemini_setup_has_no_files() {
+        let a = agent_setup(AgentKind::Gemini, ModelCred::GoogleApiKey, "PH");
+        assert!(a.files.is_empty());
+        let s = build_agent_setup(&b1(), &["gemini".to_string()], a, &[]).unwrap();
+        assert!(s.files.is_empty(), "{:?}", s.files);
     }
 
     #[test]
     fn agent_files_are_0600_and_authoritative() {
+        use saiife_boxhost::placeholder::placeholder;
         for (agent, cred, _) in other_agents() {
-            let a = agent_setup(agent, cred, "PH");
-            assert_eq!(a.files.len(), 1, "{agent:?}");
+            let ph = placeholder(cred).unwrap();
+            let a = agent_setup(agent, cred, &ph);
+            let want = usize::from(agent == AgentKind::Codex);
+            assert_eq!(a.files.len(), want, "{agent:?}");
+            assert!(a.env.iter().any(|(_, v)| *v == ph), "{agent:?}");
             for f in &a.files {
                 assert_eq!((f.mode, f.keep_existing), (0o600, false), "{}", f.path);
-                assert!(!f.text.contains("PH"), "no placeholder in {}", f.path);
+                assert!(!f.text.contains(&ph), "no placeholder in {}", f.path);
+                assert!(!f.text.contains(&ph[ph.len() - 20..]), "{}", f.path);
             }
         }
     }
@@ -804,7 +825,12 @@ mod tests {
             let (c, g) = (spawn(&m, "cx"), spawn(&m, "gm"));
             let s = setups(&t, &m);
             for (b, var) in [(c, "OPENAI_API_KEY"), (g, "GEMINI_API_KEY")] {
-                let json = serde_json::to_string(&s.setup_for(&b).unwrap()).unwrap();
+                let setup = s.setup_for(&b).unwrap();
+                let ph = env_of(&setup, var).unwrap();
+                for f in &setup.files {
+                    assert!(!f.text.contains(&ph), "placeholder in {}", f.path);
+                }
+                let json = serde_json::to_string(&setup).unwrap();
                 assert!(json.contains(var), "the setup is real");
                 assert!(!json.contains(secret));
                 assert!(!json.contains("REALSECRET"));
@@ -841,7 +867,7 @@ mod tests {
             }
         }
 
-        /// R9a: a gemini box runs in its home with the repo as an include
+        /// R9a, R11: a gemini box runs in its baked home with the repo as an include
         /// directory; codex and claude-code run in the repo.
         #[test]
         fn agent_cwd_per_agent() {
@@ -856,8 +882,10 @@ mod tests {
             );
             let s = setups(&t, &m);
             let of = |template: &str| s.setup_for(&spawn(&m, template)).unwrap().agent;
-            let gm = of("gm");
-            assert_eq!(gm.cwd, "/home/agent");
+            let gm_setup = s.setup_for(&spawn(&m, "gm")).unwrap();
+            assert!(gm_setup.files.is_empty(), "{:?}", gm_setup.files);
+            let gm = gm_setup.agent;
+            assert_eq!(gm.cwd, "/opt/saiife-gemini-home");
             assert_eq!(gm.command, ["gemini", "--include-directories", "/work"]);
             assert_eq!(of("cx").cwd, "/work");
             assert_eq!(of("cc").cwd, "/work");

@@ -179,9 +179,9 @@ pub const MAX_FILES: usize = 64;
 /// The most bytes of one setup file's text.
 pub const MAX_FILE_TEXT: usize = 256 * 1024;
 const FILE_ROOTS: [&str; 2] = ["/home/agent/", "/etc/saiife-guest/"];
-/// Where the agent may run: the repo, or (Gemini CLI, plan 42 R9) the
-/// agent's home with the repo as an include directory.
-pub const AGENT_CWDS: [&str; 2] = ["/work", "/home/agent"];
+/// Where the agent may run: the repo, or (Gemini CLI, plan 42 R9/R11) its
+/// baked root-owned home with the repo as an include directory.
+pub const AGENT_CWDS: [&str; 2] = ["/work", "/opt/saiife-gemini-home"];
 
 fn env_name_ok(n: &str) -> bool {
     let b = n.as_bytes();
@@ -217,7 +217,7 @@ impl Setup {
             return Err("agent user must be agent".into());
         }
         if !AGENT_CWDS.contains(&self.agent.cwd.as_str()) {
-            return Err("agent cwd must be /work or /home/agent".into());
+            return Err("agent cwd must be /work or /opt/saiife-gemini-home".into());
         }
         if self.env.len() > MAX_ENV {
             return Err(format!("more than {MAX_ENV} environment variables"));
@@ -431,8 +431,12 @@ mod tests {
         for cwd in [
             "/",
             "/home",
+            "/home/agent",
             "/home/agent/",
             "/home/agent/x",
+            "/opt",
+            "/opt/saiife-gemini-home/",
+            "/opt/saiife-gemini-home/x",
             "/work/",
             "/work/x",
             "/etc",
@@ -440,7 +444,7 @@ mod tests {
             bad(&|s| s.agent.cwd = cwd.into());
         }
         let mut home = setup();
-        home.agent.cwd = "/home/agent".into();
+        home.agent.cwd = "/opt/saiife-gemini-home".into();
         assert_eq!(home.check(), Ok(()));
         for n in ["a", "1A", "A-B", "", &"A".repeat(65)] {
             bad(&|s| s.env = vec![(n.into(), "v".into())]);

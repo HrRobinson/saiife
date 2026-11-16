@@ -1439,7 +1439,7 @@ pub fn codex_config() -> String {
             table([("/work", table([("trust_level", "untrusted".into())]))]),
         ),
     ]);
-    toml::to_string(&v).unwrap_or_default()
+    toml::to_string(&v).expect("static config serializes")
 }
 
 /// `/etc/codex/requirements.toml` (plan 42 R7), baked into the image root
@@ -1489,13 +1489,23 @@ pub fn codex_requirements() -> String {
             ]),
         ),
     ]);
-    toml::to_string(&v).unwrap_or_default()
+    toml::to_string(&v).expect("static config serializes")
 }
 
-/// The model environment of Gemini CLI in the box (plan 42 D5, R9): the
-/// box's placeholder as the Gemini key and the gateway's model URL (which
-/// puts the CLI in its `gateway` auth mode), telemetry off, and a fixed
-/// `GEMINI_CLI_HOME`, so a `.env` the CLI reaches cannot move its home.
+/// Gemini CLI's home in the box (plan 42 R11): baked into the image root
+/// owned (its `.gemini` is sticky and group-writable for the agent, its
+/// `settings.json`, `.env` and `extensions/` root-owned), so the agent cannot
+/// edit the user settings layer. It is also the agent's cwd.
+pub const GEMINI_HOME: &str = "/opt/saiife-gemini-home";
+/// Gemini CLI's user settings file, baked into the image (plan 42 R11) with
+/// [`gemini_user_settings`]; never a setup file.
+pub const GEMINI_USER_SETTINGS_PATH: &str = "/opt/saiife-gemini-home/.gemini/settings.json";
+
+/// The model environment of Gemini CLI in the box (plan 42 D5, R9, R11):
+/// the box's placeholder as the Gemini key and the gateway's model URL
+/// (which puts the CLI in its `gateway` auth mode), telemetry off, and
+/// `GEMINI_CLI_HOME` fixed to [`GEMINI_HOME`], so a `.env` the CLI reaches
+/// cannot move its home.
 pub fn gemini_env(placeholder: &str) -> Vec<(String, String)> {
     pairs(&[
         ("GEMINI_API_KEY", placeholder.to_string()),
@@ -1504,17 +1514,17 @@ pub fn gemini_env(placeholder: &str) -> Vec<(String, String)> {
             format!("http://127.0.0.1:{}", ports::MODEL_TCP),
         ),
         ("GEMINI_TELEMETRY_ENABLED", "false".into()),
-        ("GEMINI_CLI_HOME", "/home/agent".into()),
+        ("GEMINI_CLI_HOME", GEMINI_HOME.into()),
     ])
 }
 
-/// `/home/agent/.gemini/settings.json` (plan 42 R9c): only the gateway auth
+/// [`GEMINI_USER_SETTINGS_PATH`] (plan 42 R9c, R11): only the gateway auth
 /// type. Everything else, saiife's hooks included, is in the root-owned
 /// system file ([`gemini_system_settings`]); hooks here too would be
-/// registered twice.
-pub fn gemini_settings() -> String {
+/// registered twice. Baked into the image root owned, never sent at setup.
+pub fn gemini_user_settings() -> String {
     let v = serde_json::json!({"security": {"auth": {"selectedType": "gateway"}}});
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+    serde_json::to_string_pretty(&v).expect("static config serializes")
 }
 
 /// Where the image holds Gemini CLI's system settings (plan 42 R9b): root
@@ -1565,7 +1575,7 @@ pub fn gemini_system_settings() -> String {
         "general": {"enableAutoUpdate": false, "enableAutoUpdateNotification": false},
         "ui": {"showHomeDirectoryWarning": false},
     });
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+    serde_json::to_string_pretty(&v).expect("static config serializes")
 }
 
 /// The setup files for user packs: `(id, toml text)` to
@@ -1813,14 +1823,20 @@ trust_level = "untrusted"
                 ("GEMINI_API_KEY", "PH"),
                 ("GOOGLE_GEMINI_BASE_URL", "http://127.0.0.1:3129"),
                 ("GEMINI_TELEMETRY_ENABLED", "false"),
-                ("GEMINI_CLI_HOME", "/home/agent"),
+                ("GEMINI_CLI_HOME", "/opt/saiife-gemini-home"),
             ])
         );
     }
 
     #[test]
-    fn gemini_settings_are_pinned() {
-        let v: serde_json::Value = serde_json::from_str(&gemini_settings()).unwrap();
+    fn gemini_user_settings_are_pinned() {
+        assert_eq!(GEMINI_HOME, "/opt/saiife-gemini-home");
+        assert_eq!(
+            GEMINI_USER_SETTINGS_PATH,
+            format!("{GEMINI_HOME}/.gemini/settings.json")
+        );
+        assert!(saiife_boxproto::msg::AGENT_CWDS.contains(&GEMINI_HOME));
+        let v: serde_json::Value = serde_json::from_str(&gemini_user_settings()).unwrap();
         assert_eq!(
             v,
             serde_json::json!({"security": {"auth": {"selectedType": "gateway"}}})
