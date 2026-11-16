@@ -37,17 +37,16 @@ fn prefix(login: Login) -> &'static str {
 }
 
 /// A new random placeholder for `login`.
-pub fn placeholder(login: Login) -> String {
+pub fn placeholder(login: Login) -> io::Result<String> {
     let mut raw = [0u8; HEX_LEN / 2];
-    // A failing system RNG is not recoverable.
     SystemRandom::new()
         .fill(&mut raw)
-        .expect("the system random source failed");
+        .map_err(|_| io::Error::other("the system random source failed"))?;
     let mut s = String::from(prefix(login));
     for b in raw {
         s.push_str(&format!("{b:02x}"));
     }
-    s
+    Ok(s)
 }
 
 fn shaped(login: Login, s: &str) -> bool {
@@ -63,8 +62,26 @@ fn bad(why: &str) -> io::Error {
     )
 }
 
-/// Read the placeholder back; `None` when the file does not exist.
+/// What [`read_inner`] found.
+enum Found {
+    Missing,
+    Good(String),
+    /// A regular file of ours whose content is not a placeholder (a crashed
+    /// or failed create; it was never sent to a guest).
+    BadContent,
+}
+
+/// Read the placeholder back; `None` when the file does not exist. Never
+/// creates or removes anything.
 pub fn read_placeholder(record_dir: &Path, login: Login) -> io::Result<Option<String>> {
+    match read_inner(record_dir, login)? {
+        Found::Missing => Ok(None),
+        Found::Good(p) => Ok(Some(p)),
+        Found::BadContent => Err(bad("does not have the placeholder shape for this login")),
+    }
+}
+
+fn read_inner(record_dir: &Path, login: Login) -> io::Result<Found> {
     let fd = match rustix::fs::openat(
         CWD,
         record_dir.join(PLACEHOLDER),
@@ -72,7 +89,7 @@ pub fn read_placeholder(record_dir: &Path, login: Login) -> io::Result<Option<St
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::NOENT) => return Ok(Found::Missing),
         Err(e) => return Err(e.into()),
     };
     let st = rustix::fs::fstat(&fd)?;
@@ -83,40 +100,64 @@ pub fn read_placeholder(record_dir: &Path, login: Login) -> io::Result<Option<St
         return Err(bad("is not a plain file of the daemon"));
     }
     if u64::try_from(st.st_size).map_or(true, |n| n > MAX_FILE_BYTES) {
-        return Err(bad("is too big"));
+        return Ok(Found::BadContent);
     }
     let mut buf = Vec::new();
     std::fs::File::from(fd)
         .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut buf)?;
-    let text = std::str::from_utf8(&buf).map_err(|_| bad("is not text"))?;
+    let Ok(text) = std::str::from_utf8(&buf) else {
+        return Ok(Found::BadContent);
+    };
     let text = text.strip_suffix('\n').unwrap_or(text);
     if !shaped(login, text) {
-        return Err(bad("does not have the placeholder shape for this login"));
+        return Ok(Found::BadContent);
     }
-    Ok(Some(text.to_string()))
+    Ok(Found::Good(text.to_string()))
 }
 
 /// The box's placeholder: created once (0600, `O_EXCL`), then read back.
-/// Losing the create race reads the winner's file.
+/// Losing the create race reads the winner's file. A file of ours with bad
+/// content (a create that crashed or failed part way) is removed and made
+/// afresh once; it was never sent to a guest. Only the setup source calls
+/// this; the forwarder uses [`read_placeholder`].
 pub fn read_or_make_placeholder(record_dir: &Path, login: Login) -> io::Result<String> {
-    for _ in 0..2 {
-        if let Some(p) = read_placeholder(record_dir, login)? {
-            return Ok(p);
+    let path = record_dir.join(PLACEHOLDER);
+    let mut replaced = false;
+    for _ in 0..3 {
+        match read_inner(record_dir, login)? {
+            Found::Good(p) => return Ok(p),
+            Found::BadContent if !replaced => {
+                replaced = true;
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+            Found::BadContent => break,
+            Found::Missing => {}
         }
         let made = rustix::fs::openat(
             CWD,
-            record_dir.join(PLACEHOLDER),
+            &path,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         );
         match made {
             Ok(fd) => {
-                let p = placeholder(login);
+                let p = placeholder(login)?;
                 let mut f = std::fs::File::from(fd);
-                f.write_all(p.as_bytes())?;
-                f.write_all(b"\n")?;
-                f.sync_all()?;
+                let wrote = f
+                    .write_all(p.as_bytes())
+                    .and_then(|()| f.write_all(b"\n"))
+                    .and_then(|()| f.sync_all());
+                if let Err(e) = wrote {
+                    // Never leave a partial file behind.
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
                 return Ok(p);
             }
             // The winner's file is there now: read it.
@@ -140,20 +181,27 @@ pub fn placeholder_matches(expected: &str, got: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     #[test]
     fn placeholder_shape() {
         for login in [Login::ApiKey, Login::Subscription] {
-            let a = placeholder(login);
-            let b = placeholder(login);
+            let a = placeholder(login).unwrap();
+            let b = placeholder(login).unwrap();
             assert_ne!(a, b);
             assert!(shaped(login, &a));
             assert_eq!(a.len(), prefix(login).len() + 64);
         }
-        assert!(placeholder(Login::ApiKey).starts_with(concat!("sk-", "ant-", "api03-")));
-        assert!(placeholder(Login::Subscription).starts_with(concat!("sk-", "ant-", "oat01-")));
-        assert!(!shaped(Login::ApiKey, &placeholder(Login::Subscription)));
+        assert!(placeholder(Login::ApiKey)
+            .unwrap()
+            .starts_with(concat!("sk-", "ant-", "api03-")));
+        assert!(placeholder(Login::Subscription)
+            .unwrap()
+            .starts_with(concat!("sk-", "ant-", "oat01-")));
+        assert!(!shaped(
+            Login::ApiKey,
+            &placeholder(Login::Subscription).unwrap()
+        ));
     }
 
     #[test]
@@ -179,7 +227,7 @@ mod tests {
 
     #[test]
     fn placeholder_matches_rules() {
-        let e = placeholder(Login::ApiKey);
+        let e = placeholder(Login::ApiKey).unwrap();
         assert!(placeholder_matches(&e, e.as_bytes()));
         let mut off = e.clone().into_bytes();
         *off.last_mut().unwrap() ^= 1;
@@ -192,11 +240,43 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_regular_file_is_replaced_by_make_only() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(PLACEHOLDER);
+        for junk in [&b""[..], b"half-written", b"\xff\xfe"] {
+            std::fs::write(&f, junk).unwrap();
+            assert!(read_placeholder(d.path(), Login::ApiKey).is_err());
+            let p = read_or_make_placeholder(d.path(), Login::ApiKey).unwrap();
+            assert!(shaped(Login::ApiKey, &p));
+            assert_eq!(read_placeholder(d.path(), Login::ApiKey).unwrap(), Some(p));
+            std::fs::remove_file(&f).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_fifo_never_blocks() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(PLACEHOLDER);
+        rustix::fs::mknodat(
+            CWD,
+            &f,
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        assert!(read_placeholder(d.path(), Login::ApiKey).is_err());
+        assert!(read_or_make_placeholder(d.path(), Login::ApiKey).is_err());
+        // Still a FIFO: never unlinked.
+        assert!(std::fs::symlink_metadata(&f).unwrap().file_type().is_fifo());
+    }
+
+    #[test]
     fn hostile_files_are_refused() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join(PLACEHOLDER);
         // A symlink is not followed.
-        std::fs::write(d.path().join("x"), placeholder(Login::ApiKey)).unwrap();
+        std::fs::write(d.path().join("x"), placeholder(Login::ApiKey).unwrap()).unwrap();
         std::os::unix::fs::symlink(d.path().join("x"), &f).unwrap();
         assert!(read_placeholder(d.path(), Login::ApiKey).is_err());
         assert!(read_or_make_placeholder(d.path(), Login::ApiKey).is_err());
@@ -204,7 +284,7 @@ mod tests {
         // Wrong shape, wrong login, too big, a directory.
         std::fs::write(&f, "not a placeholder\n").unwrap();
         assert!(read_placeholder(d.path(), Login::ApiKey).is_err());
-        std::fs::write(&f, placeholder(Login::Subscription)).unwrap();
+        std::fs::write(&f, placeholder(Login::Subscription).unwrap()).unwrap();
         assert!(read_placeholder(d.path(), Login::ApiKey).is_err());
         std::fs::write(&f, "a".repeat(10_000)).unwrap();
         assert!(read_placeholder(d.path(), Login::ApiKey).is_err());
