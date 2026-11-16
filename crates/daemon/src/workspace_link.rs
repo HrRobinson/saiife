@@ -913,11 +913,26 @@ async fn act(
     match action {
         a::WORKSPACE_WHOAMI => {
             only(args, &[])?;
-            let label = ctx.workspace.device(&v.device_id).map(|d| d.label);
+            let device = ctx.workspace.device(&v.device_id);
+            let label = device.as_ref().map(|d| d.label.clone());
+            // The passkeys a touch from this browser may use, as the daemon
+            // holds them (none when the owner is unknown: fail closed).
+            let passkeys: Vec<String> = match (device, uid_of(ctx, &v.owner_user).await) {
+                (Some(d), Some(uid)) => {
+                    crate::workspace_touch::device_passkeys(ctx, uid, d.touch_credentials)
+                        .await
+                        .map_err(Fail::Policy)?
+                        .iter()
+                        .map(|c| saiife_wire::b64::enc(&c.id))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
             Ok(json!({
                 "device_id": v.device_id,
                 "label": label,
                 "owner_user": v.owner_user,
+                "passkeys": passkeys,
             }))
         }
         a::BOX_OVERVIEW => {

@@ -478,7 +478,7 @@ async fn reads_are_not_recorded() {
     let who = send(&w, &mut link, &d, "workspace.whoami", json!({})).await;
     assert_eq!(
         who["result"],
-        json!({"device_id": d.device_id(), "label": "phone", "owner_user": ME})
+        json!({"device_id": d.device_id(), "label": "phone", "owner_user": ME, "passkeys": []})
     );
     let inbox = send(&w, &mut link, &d, "box.inbox", json!({})).await;
     let items = inbox["result"]["items"].as_array().unwrap();
@@ -1394,6 +1394,20 @@ async fn paired_with_passkey() -> (World, Link, TestDevice, Vec<u8>) {
     let mut link = Link::open(&w).await;
     let (d, cid) = pair_with_passkey(&w, &mut link).await;
     (w, link, d, cid)
+}
+
+/// The page learns from the daemon, not from its own claim, whether this
+/// browser has a passkey: `whoami` lists the ids the device and the owner's
+/// touch store both hold (what `begin` would allow); none without one.
+#[tokio::test]
+async fn whoami_lists_the_passkeys_the_daemon_holds() {
+    let (w, mut link, d, cid) = paired_with_passkey().await;
+    let who = send(&w, &mut link, &d, "workspace.whoami", json!({})).await;
+    assert_eq!(who["result"]["passkeys"], json!([b64::enc(&cid)]), "{who}");
+    // Removed from the touch store: no longer listed (fail closed).
+    w.ctx.touch.remove(&cid).unwrap();
+    let who = send(&w, &mut link, &d, "workspace.whoami", json!({})).await;
+    assert_eq!(who["result"]["passkeys"], json!([]), "{who}");
 }
 
 fn begin_args(action: &str, args: Value) -> Value {

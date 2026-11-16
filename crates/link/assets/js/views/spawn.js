@@ -6,6 +6,7 @@ import { Client } from "../wire.js";
 import { taskCounter, checkRepo, checkTask, needsTouchBadge, spawnArgs } from "../inboxlogic.js";
 import { show } from "../touchprompt.js";
 import { leaveIfUnpaired } from "../unpaired.js";
+import { touch } from "../touch.js";
 
 export function view(client) {
   const select = h("select", { id: "spawn-template", name: "template" });
@@ -59,18 +60,24 @@ export function view(client) {
     let a;
     try {
       a = await client.send(ACTIONS.spawn, args);
+      // A template with secrets or egress: this browser's passkey, with the
+      // daemon's summary (shown through visible(): a repo may carry bidi).
+      if (outcome(a) === "needs_touch") {
+        a = await touch(client, { action: ACTIONS.spawn, args, mount: (n) => out.replaceChildren(n) });
+      }
     } finally {
       inFlight = false;
       buttons(templates.length > 0);
     }
     if (await leaveIfUnpaired(a)) return;
+    if (a.error === "not_approved") return; // the prompt says "Not approved"
     const o = outcome(a);
     if (o === "done") {
       location.hash = "#/overview";
       return;
     }
-    if (o === "needs_touch") {
-      return out.replaceChildren(show(a, { action: ACTIONS.spawn, id: "", summary: `Start a box from ${args.template} for ${args.repo}` }));
+    if (o === "needs_touch" || a.rule === "touch_unavailable") {
+      return out.replaceChildren(show(a, { action: ACTIONS.spawn, id: "", summary: `Start a box from ${visible(args.template)} for ${visible(args.repo)}` }));
     }
     out.replaceChildren(h("p", { class: "error", role: "alert" }, visible(a.message || "That did not work.")));
   }

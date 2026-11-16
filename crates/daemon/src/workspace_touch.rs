@@ -245,6 +245,29 @@ async fn pending_request(
     }
 }
 
+/// The device's passkeys (`held`, its `touch_credentials`) that the owner's
+/// touch store still holds, for one RP id (the first one's): what `begin`
+/// allows, and what `workspace.whoami` lists so the page learns from the
+/// daemon whether it can touch.
+pub(crate) async fn device_passkeys(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    held: Vec<String>,
+) -> Result<Vec<Credential>, Refused> {
+    let c = Arc::clone(ctx);
+    let creds: Vec<Credential> =
+        tokio::task::spawn_blocking(move || c.touch.credentials_of(owner_uid))
+            .await
+            .map_err(|e| Refused::new(ErrorCode::Internal, "internal", e.to_string()))?
+            .into_iter()
+            .filter(|c| c.kind == "webauthn" && held.contains(&saiife_wire::b64::enc(&c.id)))
+            .collect();
+    let Some(rp_id) = creds.first().map(|c| c.rp_id.clone()) else {
+        return Ok(Vec::new());
+    };
+    Ok(creds.into_iter().filter(|c| c.rp_id == rp_id).collect())
+}
+
 /// `workspace.touch.begin {action, args}`: issues a challenge bound to the
 /// action as the daemon sees it, for the device's own passkey. The answer is
 /// a `TouchRequest` plus `request_id`, `expires_at` and `class`.
@@ -277,16 +300,7 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
         .map_err(refused)?;
     let (class, summary, fields) =
         bind(ctx, owner_uid, &v.owner_user, &src, &action, &inner).await?;
-    // The device's passkeys that the touch store still holds, for one RP id.
-    let held = device.touch_credentials;
-    let c = Arc::clone(ctx);
-    let creds: Vec<Credential> =
-        tokio::task::spawn_blocking(move || c.touch.credentials_of(owner_uid))
-            .await
-            .map_err(|e| Refused::new(ErrorCode::Internal, "internal", e.to_string()))?
-            .into_iter()
-            .filter(|c| c.kind == "webauthn" && held.contains(&saiife_wire::b64::enc(&c.id)))
-            .collect();
+    let creds = device_passkeys(ctx, owner_uid, device.touch_credentials).await?;
     let Some(rp_id) = creds.first().map(|c| c.rp_id.clone()) else {
         return Err(Refused::new(
             ErrorCode::Unavailable,
@@ -294,11 +308,7 @@ pub(crate) async fn begin(ctx: &Arc<Ctx>, v: &Verified) -> Result<Value, Refused
             "this browser has no passkey: pair it again to add one",
         ));
     };
-    let allow: Vec<Vec<u8>> = creds
-        .into_iter()
-        .filter(|c| c.rp_id == rp_id)
-        .map(|c| c.id)
-        .collect();
+    let allow: Vec<Vec<u8>> = creds.into_iter().map(|c| c.id).collect();
     let request_id = ctx.web_touch.next_id();
     // An approval's record carries the approval's own id (what the machine
     // prompt would show); every other touch carries the web request id.

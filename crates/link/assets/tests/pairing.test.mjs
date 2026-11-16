@@ -298,7 +298,7 @@ test("watchConfirm polls whoami every 2 s until done", async () => {
   while (await t.step());
   assert.deepEqual(client.sent, Array(4).fill("workspace.whoami"));
   assert.equal(t.now, 4 * POLL_MS);
-  assert.deepEqual(ends, [{ kind: "done" }]);
+  assert.deepEqual(ends, [{ kind: "done", passkey: false }]);
   assert.equal(t.queue.length, 0);
 });
 
@@ -376,7 +376,7 @@ test("nothing is saved before done, and the device is saved on done", async () =
   const store = memoryStore();
   const device = await pairedInMemory(store);
   const { ends, saved, fetch } = await runWait({ store, device, frames: [NOT_YET, PENDING, DONE] });
-  assert.deepEqual(ends, [{ kind: "done" }]);
+  assert.deepEqual(ends, [{ kind: "done", passkey: false }]);
   assert.equal(saved.length, 1);
   assert.equal(saved[0].at, 3, "saved only after the confirming answer");
   assert.equal(await store.loadDevice(), device);
@@ -407,4 +407,26 @@ test("leaving the view drops the unconfirmed device", async () => {
   assert.equal(saved.length, 0);
   assert.equal(t.queue.length, 0);
   assert.equal(await store.loadDevice(), null);
+});
+
+// Plan 31 (Task 3 m4): whether this browser can touch comes from the
+// daemon's whoami (`passkeys`), never from the page's own claim; a field
+// that is missing (a hub that strips it) or malformed means no passkey.
+test("watchConfirm learns the passkey from the daemon", async () => {
+  const cases = [
+    [{ passkeys: ["AQID"] }, true],
+    [{ passkeys: [] }, false],
+    [{}, false],
+    [{ passkeys: "AQID" }, false],
+    [{ passkeys: [1] }, false],
+    [{ passkey: true }, false],
+  ];
+  for (const [result, want] of cases) {
+    const t = fakeTimers();
+    const client = scriptedClient([{ ok: true, result }]);
+    const ends = [];
+    watchConfirm({ client, schedule: t.schedule, cancel: t.cancel, now: () => t.now, deadline: 60000, onEnd: (e) => ends.push(e) });
+    while (await t.step());
+    assert.deepEqual(ends, [{ kind: "done", passkey: want }], JSON.stringify(result));
+  }
 });

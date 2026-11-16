@@ -260,12 +260,20 @@ export async function pair({
   return { deviceId, shortCode: code, device, passkey: passkey !== null };
 }
 
+// Whether the daemon holds a passkey for this device: whoami's `passkeys`, a
+// non-empty list of ids. Missing (a hub that strips it) or malformed: no.
+export function holdsPasskey(result) {
+  const p = result && typeof result === "object" ? result.passkeys : undefined;
+  return Array.isArray(p) && p.length > 0 && p.every((x) => typeof x === "string" && x.length > 0);
+}
+
 // Polls workspace.whoami every POLL_MS until the owner confirms. While the
 // owner has not, the daemon answers unknown_device (the device sits in the
 // offer book, not the device list) or device_pending; both keep waiting,
 // as does a link that is briefly down, until `deadline`. A rejection looks
 // the same as not yet: it ends at the deadline. onEnd gets one of
-// {kind:"done"}, {kind:"timeout"}, {kind:"refused", message}. Returns
+// {kind:"done", passkey}, {kind:"timeout"}, {kind:"refused", message};
+// `passkey` is the daemon's word (holdsPasskey), not the page's. Returns
 // stop(): no timer and no callback survive it.
 export function watchConfirm({ client, schedule = setTimeout, cancel = clearTimeout, now = Date.now, deadline, onEnd }) {
   let timer = null;
@@ -280,7 +288,7 @@ export function watchConfirm({ client, schedule = setTimeout, cancel = clearTime
     const a = await client.send(ACTIONS.whoami);
     if (stopped) return;
     const o = outcome(a);
-    if (o === "done") return end({ kind: "done" });
+    if (o === "done") return end({ kind: "done", passkey: holdsPasskey(a.result) });
     if (o === "pending" || o === "unpaired" || o === "retry") {
       if (now() >= deadline) return end({ kind: "timeout" });
       timer = schedule(tick, POLL_MS);

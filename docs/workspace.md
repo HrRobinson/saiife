@@ -63,16 +63,21 @@ page forgets its key and shows the pair screen:
 | Screen | What you can do |
 |---|---|
 | Overview | See boxes, load and free slots. Reorder queued boxes. "Lockdown on" (`lockdown.on`) asks "Stop every agent on this machine?" first. The page asks again every 3 s while the tab is visible. It does not use push. |
-| Review | Read the diff and the test result of a finished box. Reject it (discards the box). |
-| Spawn | Start a box from a template. |
-| Inbox | See what waits for you. The page asks again every 5 s while the tab is visible. |
-| Steer | Pause or stop a box. Sending a message, Revise and Resume need a touch (one touch covers a 10-minute window, see [The steer window](#the-steer-window)). |
+| Review | Read the diff and the test result of a finished box. Approve it with a touch (lands it), send it back with a comment (Revise, a touch), or reject it (discards the box). |
+| Spawn | Start a box from a template. A template with secrets or external egress asks for a touch. |
+| Inbox | See what waits for you: a box's land (opens its Review screen) and approval requests you may decide (Approve with a touch). The page asks again every 5 s while the tab is visible. |
+| Steer | Pause or stop a box. Sending a message, Revise and Resume need a touch (one touch covers a 10-minute window, see [The steer window](#the-steer-window)). The box's terminal is shown read only, updated at most once a second while the tab is visible. |
 | Pair | Pair this browser. |
 
 The diff shows the first 2000 lines. A file cut by that limit says how many of
 its lines are not shown. If the daemon cut the diff, the page says so. File
 names and text from a box are shown as plain text. Control and direction
 characters appear as visible escapes.
+
+The terminal pane is plain text with no buttons, links or inputs. The machine
+has already applied the terminal's escapes; anything left that looks like one
+(a clipboard write, a link, a drawn "Approve" button) is shown as text and does
+nothing. When the box finishes, the pane says "The terminal has ended".
 
 ## What needs a touch
 
@@ -90,19 +95,21 @@ A touch is a WebAuthn assertion from a passkey enrolled for this device. It
 binds the exact action the page showed: the daemon makes the challenge from
 the action record (what, which box, expiry), and an assertion for one action
 or one box is refused for another (`touch_mismatch`). A challenge works once
-and is valid for 5 minutes. A timeout, an error or the wrong passkey all deny. There is never a password fallback.
+and is valid for 5 minutes. The prompt times out after 120 seconds. A
+timeout, an error or the wrong passkey all deny: the page says "Not approved"
+and sends nothing. There is never a password fallback.
 
-**The browser touch prompt is not built yet.** The daemon side is: it checks
-touches, opens steer windows and records them. Until the page can ask for a
-touch, it still says "Needs a touch on a paired passkey" and shows the machine
-command.
-
-A pending action has a 6-digit code. The optional `box_waiting` notification
-carries that code and the box, so you can match it in the inbox. It has no
-link. See [notifications](notifications.md).
+The page shows a 6-digit short code before the passkey dialog opens. The
+same code is in the inbox, and in the optional `box_waiting` notification,
+so you can check that the prompt is the one you meant to answer. That
+notification carries the box and the code and no link. See
+[notifications](notifications.md). If this browser has no passkey, the page
+says "Needs a touch on a paired passkey" and shows the machine command
+instead.
 
 - **Land.** The touch is for one pending land of one box. Landing is a
-  pending action the daemon made; the browser answers it.
+  pending action the daemon made; the browser answers it from the box's
+  Review screen, next to the diff.
 - **Spawn.** A template with secrets asks for the secret-sensitive touch; one
   with external egress asks for the egress touch. A template with neither
   needs no touch.
@@ -123,7 +130,12 @@ the touch row will work for that browser.
 
 User verification is required for every touch: Face ID, a fingerprint or the
 key's PIN. A passkey or key that does not verify the user is refused
-(`touch_failed`).
+(`touch_failed`). The page says "Needs Face ID, fingerprint or PIN".
+
+Whether this browser has a passkey is the machine's answer, not the page's:
+after you accept the pairing, the page asks the daemon which passkeys it holds
+for this browser. If there are none, the page says that touches are not
+available on this browser.
 
 A passkey belongs to one origin. A touch made for another origin (a different
 host or port) is refused.

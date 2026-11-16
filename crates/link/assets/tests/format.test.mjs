@@ -32,3 +32,18 @@ test("ago and runtime", () => {
   assert.equal(bytes(2048), "2.0 KiB");
   assert.equal(bytes(3 * 1024 * 1024), "3.0 MiB");
 });
+
+test("visible escapes the shared unsafe set (wire text.rs)", () => {
+  // Zero-width, soft hyphen, tag characters, private use, line separator,
+  // C1 controls, variation selector, BOM: all escaped as code points.
+  assert.equal(visible("a​b"), "a⟨U+200B⟩b");
+  assert.equal(visible("­"), "⟨U+00AD⟩");
+  assert.equal(visible("\u{E0041}"), "⟨U+E0041⟩");
+  assert.equal(visible(""), "⟨U+E000⟩");
+  assert.equal(visible(" "), "⟨U+2028⟩");
+  assert.equal(visible("\u009b"), "⟨U+009B⟩");
+  assert.equal(visible("️﻿"), "⟨U+FE0F⟩⟨U+FEFF⟩");
+  // A lone surrogate is escaped too; ordinary text stays.
+  assert.equal(visible("\ud800"), "⟨U+D800⟩");
+  assert.equal(visible("héllo 漢字 😀"), "héllo 漢字 😀");
+});

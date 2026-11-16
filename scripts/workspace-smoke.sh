@@ -3,8 +3,9 @@
 # It needs a phone (Face ID or a fingerprint) or a security key with a PIN, and it
 # asks you to touch it. The Workspace page in the browser asks for the touch.
 #
-# Steps 2 to 4 need the browser touch prompt (touch.js), which is a later step of
-# plan 31. Until it is built they report bad; steps 1 and 5 can still be run.
+# Steps 2 to 4 use the browser touch prompt (touch.js): the page shows the
+# 6-digit code first, then the passkey dialog (Face ID, fingerprint or PIN;
+# it times out after 120 s and then says "Not approved").
 #
 # Needs:
 #   - a running daemon: the personal broker (`saiife daemon --user`) or a locked
@@ -95,7 +96,7 @@ else
 fi
 
 # 2. approve the fake land with a touch.
-wait_enter "step 2: in the page, open the finished demo box, press Land, and approve with your touch."
+wait_enter "step 2: in the page, open the finished demo box, press Approve with touch, check the 6-digit code, and touch."
 if audit_records | jq -e -s 'any(.[]; .kind == "workspace" and .action == "box.land" and .decision == "allow" and .touch.via == "web" and .touch.uv == true and (.touch.preimage | length > 0))' >/dev/null; then
   ok "audit: box.land carries a touch object (via web, uv true)"
 else
@@ -107,8 +108,10 @@ else
   bad "audit verify exits 0"
 fi
 
-# 3. the same request again is refused.
-wait_enter "step 3: in the page, answer the same Land prompt a second time (the same assertion). It must be refused."
+# 3. the same land again is refused. The page cannot resend an assertion
+# (a replayed one is refused by the daemon: workspace_link
+# assertion_reuse_is_refused); here the land is simply gone.
+wait_enter "step 3: in the page, press Approve with touch on the same box again. It must not land again: the page shows the machine command."
 if audit_records | jq -e -s '[.[] | select(.kind == "workspace" and .action == "box.land" and .decision == "deny")] | length > 0' >/dev/null; then
   ok "audit: the replayed land is refused"
 else

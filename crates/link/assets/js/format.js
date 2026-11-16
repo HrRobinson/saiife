@@ -1,8 +1,9 @@
 // Pure text helpers. No DOM.
+import { isUnsafe } from "./unsafe.js";
 
-const BIDI = new Set([0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c]);
-
-// Show control and bidi characters as visible escapes. Tab and newline stay.
+// Show the characters the shared sanitizer refuses (`is_unsafe_char` in
+// crates/wire/src/text.rs: controls, bidi, zero-width, private use and the
+// rest of unsafe.js) as visible escapes. Tab and newline stay as they are.
 export function visible(s) {
   if (s === null || s === undefined) return "";
   let out = "";
@@ -10,7 +11,7 @@ export function visible(s) {
     const c = ch.codePointAt(0);
     if (c === 0x09 || c === 0x0a) out += ch;
     else if (c === 0x1b) out += "⟨ESC⟩";
-    else if (c < 0x20 || c === 0x7f || BIDI.has(c)) {
+    else if (isUnsafe(c)) {
       out += "⟨U+" + c.toString(16).toUpperCase().padStart(4, "0") + "⟩";
     } else out += ch;
   }

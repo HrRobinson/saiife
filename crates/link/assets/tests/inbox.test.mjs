@@ -51,3 +51,7 @@ test("prompt action", () => {
   assert.equal(promptAction("land"), "box.land");
   assert.equal(promptAction("push_protected"), "class:push_protected");
 });
+
+test("steer class has words (TouchClass::Steer)", () => {
+  assert.equal(className("steer"), "Steer a box");
+});

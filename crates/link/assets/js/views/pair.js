@@ -60,14 +60,17 @@ function form(root, fragment) {
 // The new device stays in memory until the owner confirms; only then is it
 // saved (replacing any older pairing). Leaving, a refusal or the deadline
 // drop it and leave the keystore as it was.
-function waiting(root, code, device, passkey) {
+// `made` is whether this page made a passkey: false is sure (no touches);
+// true is not, since the machine stores it only when it accepts. Whether
+// the browser can touch is the daemon's word, read at confirm.
+function waiting(root, code, device, made) {
   const status = h("p", { class: "muted", role: "status", "aria-live": "polite" }, "Waiting for the machine…");
   show(
     root,
     h("h1", {}, "Confirm on the machine"),
     h("p", { class: "code", "aria-label": `Short code ${code}` }, visible(code)),
     h("p", {}, "Check that your machine shows the same code, then confirm there."),
-    ...(passkey ? [] : [h("p", { class: "muted" }, NO_TOUCHES)]),
+    ...(made ? [] : [h("p", { class: "muted" }, NO_TOUCHES)]),
     status,
   );
   const stop = waitAndSave({
@@ -77,7 +80,16 @@ function waiting(root, code, device, passkey) {
     onEnd: (e) => {
       window.removeEventListener("hashchange", stop);
       if (e.kind === "done") {
-        location.hash = "#/overview";
+        if (e.passkey) {
+          location.hash = "#/overview";
+          return;
+        }
+        show(
+          root,
+          h("h1", {}, "This browser is paired"),
+          h("p", {}, NO_TOUCHES),
+          h("p", {}, h("a", { href: "#/overview" }, "Go to the overview")),
+        );
         return;
       }
       status.className = "error";

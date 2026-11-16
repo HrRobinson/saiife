@@ -1,5 +1,6 @@
 // Signed frames from the browser to the localhost link (plan 28 Frame).
-// No DOM. Every answer is {ok:true, result} or {ok:false, error, rule, message};
+// No DOM. Every answer is {ok:true, result} or {ok:false, error, rule, message}
+// (a refusal may also keep a valid `short_code` and `touch`, plan 31);
 // views key on `rule ?? error` (see actions.js `outcome`).
 import * as keystore from "./keystore.js";
 
@@ -97,6 +98,34 @@ function no(error, message, rule = null) {
   return { ok: false, error, rule, message };
 }
 
+const SHORT_CODE = /^[0-9]{6}$/;
+const HEX32 = /^[0-9a-f]{64}$/;
+const TOUCH_KEYS = ["allow", "challenge", "rp_id", "short_code", "summary", "uv"];
+
+// A refusal's `touch`: exactly plan 26's TouchRequest keys with their
+// types, copied; anything else is null (dropped).
+function touchRequest(t) {
+  if (!plainObject(t)) return null;
+  const keys = Object.keys(t).sort();
+  if (keys.length !== TOUCH_KEYS.length || keys.some((k, i) => k !== TOUCH_KEYS[i])) return null;
+  const ok =
+    typeof t.rp_id === "string" &&
+    typeof t.challenge === "string" && HEX32.test(t.challenge) &&
+    Array.isArray(t.allow) && t.allow.every((x) => typeof x === "string" && B64U.test(x)) &&
+    typeof t.uv === "boolean" &&
+    typeof t.summary === "string" &&
+    typeof t.short_code === "string" && SHORT_CODE.test(t.short_code);
+  if (!ok) return null;
+  return {
+    rp_id: t.rp_id,
+    challenge: t.challenge,
+    allow: [...t.allow],
+    uv: t.uv,
+    summary: t.summary,
+    short_code: t.short_code,
+  };
+}
+
 // Reads one HTTP answer into the one answer shape. Raw text never leaks.
 async function readAnswer(res) {
   let v;
@@ -115,7 +144,12 @@ async function readAnswer(res) {
       typeof v.message === "string" && v.message.length > 0
         ? v.message.slice(0, MAX_MESSAGE)
         : SENTENCES.refused;
-    return no(named, message, rule);
+    const a = no(named, message, rule);
+    // Plan 31: a refusal may carry the touch it asks for; nothing else.
+    if (typeof v.short_code === "string" && SHORT_CODE.test(v.short_code)) a.short_code = v.short_code;
+    const t = touchRequest(v.touch);
+    if (t) a.touch = t;
+    return a;
   }
   return no("bad_answer", SENTENCES.bad);
 }

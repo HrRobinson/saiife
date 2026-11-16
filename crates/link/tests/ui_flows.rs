@@ -107,6 +107,8 @@ async fn pair_then_overview() {
     assert_eq!(who["ok"], true, "{who}");
     assert_eq!(who["result"]["device_id"], d.device_id(), "{who}");
     assert_eq!(who["result"]["label"], LABEL, "{who}");
+    // No passkey came with this pairing: the daemon says so (plan 31).
+    assert_eq!(who["result"]["passkeys"], json!([]), "{who}");
     let ov = frame(&w, &s, &d, "box.overview").await;
     assert_eq!(ov["ok"], true, "{ov}");
     assert_eq!(ov["result"]["boxes"].as_array().unwrap().len(), 4, "{ov}");
@@ -593,6 +595,9 @@ async fn review_screen_is_served() {
     ] {
         assert!(view.contains(sent), "review.js sends {sent}");
     }
+    // Approve answers the box's pending land with this browser's passkey.
+    assert!(view.contains("pendingLand(client, id)"));
+    assert!(view.contains("touch(client, { action, args, ...p, mount })"));
     let (st, _, _) = s.get("/js/diff.js").await;
     assert_eq!(st, StatusCode::OK);
 }
@@ -673,8 +678,46 @@ async fn spawn_task_with_escape_is_refused() {
     assert!(a["message"].as_str().is_some_and(|m| !m.is_empty()), "{a}");
 }
 
+/// `box.term.read {id, after}` pages through the fake's frames: no `after`
+/// is everything (the snapshot first), `after` only what is newer, and a
+/// finished box says `ended` (plan 31, term.js).
+#[tokio::test]
+async fn term_read_pages_on_fake() {
+    let (w, s) = up().await;
+    let d = paired(&w, &s).await;
+    let read = |args: Value| act(&w, &s, &d, "box.term.read", args);
+    let a = read(json!({"id": "b-run"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let r = &a["result"];
+    let frames = r["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 3, "{a}");
+    assert_eq!(frames[0]["snapshot"]["seq"], 1, "{a}");
+    assert_eq!(frames[1]["delta"]["seq"], 2, "{a}");
+    assert_eq!(r["next"], 3, "{a}");
+    assert_eq!(r["ended"], false, "{a}");
+    let a = read(json!({"id": "b-run", "after": 2})).await;
+    let frames = a["result"]["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 1, "{a}");
+    assert_eq!(frames[0]["delta"]["seq"], 3, "{a}");
+    assert_eq!(frames[0]["delta"]["lines"], json!([[0, "$ "]]), "{a}");
+    let a = read(json!({"id": "b-run", "after": 3})).await;
+    assert_eq!(a["result"]["frames"], json!([]), "{a}");
+    assert_eq!(a["result"]["next"], 3, "{a}");
+    let a = read(json!({"id": "b-done"})).await;
+    assert_eq!(a["result"]["ended"], true, "{a}");
+    let a = read(json!({"id": "b-run", "after": "1"})).await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+    // Good reads are not recorded; the refused one is.
+    let recs: Vec<_> = records(&w)
+        .into_iter()
+        .filter(|r| field(r, "action") == "box.term.read")
+        .collect();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+}
+
 /// §9.6: no row is a link that approves. inbox.js builds one `href`, to the
-/// box page, and calls nothing but `box.inbox`.
+/// box page; a land is approved on the Review screen, and a v2 approval
+/// only through `touch` (this browser's passkey).
 #[tokio::test]
 async fn inbox_has_no_approve_url() {
     let (_w, s) = up().await;
@@ -698,9 +741,18 @@ async fn inbox_has_no_approve_url() {
     );
     assert_eq!(
         v.matches("client.send(").count(),
-        1,
-        "the only send is the inbox read"
+        2,
+        "the only sends are the inbox and approval list reads"
     );
+    assert!(v.contains("client.send(ACTIONS.inbox, {})"));
+    assert!(v.contains("client.send(ACTIONS.approvals, {})"));
+    // Approving is only ever a touch, for the request's own id.
+    assert_eq!(
+        v.matches("ACTIONS.approve,").count(),
+        1,
+        "one approve, inside touch()"
+    );
+    assert!(v.contains("await touch(client, {"));
     let (st, _, app) = s.get("/js/app.js").await;
     assert_eq!(st, StatusCode::OK);
     let app = String::from_utf8(app.to_vec()).unwrap();

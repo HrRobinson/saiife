@@ -249,3 +249,53 @@ async fn served_bytes_equal_files() {
         assert_eq!(mime, a.mime);
     }
 }
+
+/// Plan 31: the touch prompt, the terminal pane and the shared unsafe-char
+/// table are embedded and served as JavaScript.
+#[test]
+fn assets_list_touch_and_term() {
+    for p in ["/js/touch.js", "/js/term.js", "/js/unsafe.js"] {
+        let a = ASSETS
+            .iter()
+            .find(|a| a.path == p)
+            .unwrap_or_else(|| panic!("{p} is not in ASSETS"));
+        assert_eq!(a.mime, "text/javascript; charset=utf-8", "{p}");
+        assert!(!a.bytes.is_empty(), "{p}");
+    }
+}
+
+/// `js/unsafe.js` (what `format.js visible()` escapes) equals the shared
+/// sanitizer `saiife_wire::text::is_unsafe_char` for every char, and also
+/// covers the surrogates (a lone one can sit in a JS string).
+#[test]
+fn js_unsafe_table_equals_wire() {
+    let src = text(&assets_dir().join("js/unsafe.js"));
+    let start = src.find("export const UNSAFE").expect("UNSAFE table");
+    let body = &src[start..src[start..].find("]);").map(|i| start + i).unwrap()];
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for line in body.lines().skip(1) {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        let inner = l
+            .strip_prefix('[')
+            .and_then(|x| x.strip_suffix("],"))
+            .unwrap_or_else(|| panic!("table line {l:?}"));
+        let (lo, hi) = inner.split_once(", ").unwrap();
+        let num = |s: &str| u32::from_str_radix(s.strip_prefix("0x").unwrap(), 16).unwrap();
+        ranges.push((num(lo), num(hi)));
+    }
+    assert!(ranges.len() > 10, "{ranges:?}");
+    assert!(
+        ranges.windows(2).all(|w| w[0].1 < w[1].0),
+        "sorted, disjoint"
+    );
+    let in_js = |u: u32| ranges.iter().any(|&(lo, hi)| lo <= u && u <= hi);
+    for u in 0..=0x10FFFFu32 {
+        match char::from_u32(u) {
+            Some(c) => assert_eq!(in_js(u), saiife_wire::text::is_unsafe_char(c), "U+{u:04X}"),
+            None => assert!(in_js(u), "surrogate U+{u:04X}"),
+        }
+    }
+}

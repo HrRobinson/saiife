@@ -15,6 +15,9 @@ export const ACTIONS = Object.freeze({
   templates: "box.templates",
   spawn: "box.spawn",
   whoami: "workspace.whoami",
+  termRead: "box.term.read",
+  approvals: "approval.list",
+  approve: "approval.approve",
   lockdownOn: "lockdown.on",
 });
 

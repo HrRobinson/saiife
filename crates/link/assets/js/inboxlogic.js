@@ -13,6 +13,7 @@ const CLASSES = {
   touch_enrol: "Add a passkey",
   touch_remove: "Remove a passkey",
   touch_test: "Test a passkey",
+  steer: "Steer a box",
 };
 
 // A touch class as words; an unknown class is shown as it came (the view escapes it).

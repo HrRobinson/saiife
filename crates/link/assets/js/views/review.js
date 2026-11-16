@@ -1,4 +1,5 @@
 // Review one done box: its diff and tests, then Approve / Reject / Revise.
+// Approve and Revise ask this browser's passkey (touch.js, plan 31).
 // One box.diff answer is shown as is; the renderer caps it at 2000 lines.
 import { h } from "../dom.js";
 import { visible, short, plural } from "../format.js";
@@ -7,6 +8,7 @@ import { Client } from "../wire.js";
 import { parse, render as renderDiff } from "../diff.js";
 import { show } from "../touchprompt.js";
 import { leaveIfUnpaired } from "../unpaired.js";
+import { touch, pendingLand } from "../touch.js";
 
 const message = (a) => visible(a.message || "That did not work.");
 
@@ -88,12 +90,27 @@ export function view(client, id) {
     let a;
     try {
       a = await client.send(action, args);
+      if (!left && outcome(a) === "needs_touch") {
+        // Land answers the box's pending land (its own touch request);
+        // Revise asks the daemon for one. Either way the code shows first.
+        const mount = (n) => {
+          if (!left) out.replaceChildren(n);
+        };
+        if (action === ACTIONS.land) {
+          const p = await pendingLand(client, id);
+          if (p) a = await touch(client, { action, args, ...p, mount });
+        } else {
+          a = await touch(client, { action, args, mount });
+        }
+      }
     } finally {
       inFlight = false;
       buttons();
     }
     if (left) return;
     if (await leaveIfUnpaired(a)) return;
+    if (a.error === "not_approved") return; // the prompt says "Not approved"
+    if (a.rule === "touch_unavailable") return out.replaceChildren(show(a, { action, id, summary }));
     const o = outcome(a);
     // A touch-level action is never shown as done here.
     if (o === "needs_touch") return out.replaceChildren(show(a, { action, id, summary }));
