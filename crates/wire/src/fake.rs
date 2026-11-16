@@ -64,12 +64,16 @@ fn templates() -> Vec<Template> {
             description: "Claude Code, no secrets, no egress".into(),
             has_secrets: false,
             has_egress: false,
+            login: "api-key".into(),
+            credential_in_box: false,
         },
         Template {
             name: "claude-gh".into(),
             description: "Claude Code with a GitHub token".into(),
             has_secrets: true,
             has_egress: true,
+            login: "api-key".into(),
+            credential_in_box: false,
         },
     ]
 }

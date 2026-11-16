@@ -16,6 +16,9 @@ pub const REPO_DISK: &str = "repo.img";
 /// Daemon-trusted state: the box's terminal recording (plan 38, R15), in
 /// its record dir only (`layout::record_dir`).
 pub const TERM_CAST: &str = "term.cast";
+/// Daemon-trusted state: the box's model placeholder (plan 40, C1), one
+/// line, 0600, in its record dir only ([`RecordPaths::placeholder`]).
+pub const PLACEHOLDER: &str = "placeholder";
 /// Daemon-trusted state: the base manifest of the repo disk (plan 37). It
 /// lives in the box's record dir only (`layout::record_disk_place`), never
 /// in a runtime dir, so [`BoxPaths`] has no helper for it.
@@ -76,8 +79,8 @@ impl BoxPaths {
 
 /// The daemon-trusted files in one box's record dir
 /// (`layout::record_dir`, `<records_root>/<id>`, R37): the land records of
-/// plan 39 (`lands/<n>/`). The VMM never sees this dir; its runtime files
-/// are [`BoxPaths`].
+/// plan 39 (`lands/<n>/`) and the model placeholder (plan 40). The VMM
+/// never sees this dir; its runtime files are [`BoxPaths`].
 #[derive(Debug, Clone)]
 pub struct RecordPaths {
     pub dir: PathBuf,
@@ -90,6 +93,10 @@ impl RecordPaths {
     /// Box `id`'s record dir under the box store root `records_root`.
     pub fn of(records_root: &Path, id: &BoxId) -> RecordPaths {
         RecordPaths::new(crate::layout::record_dir(records_root, id))
+    }
+    /// `placeholder`: the box's model placeholder (plan 40, [`PLACEHOLDER`]).
+    pub fn placeholder(&self) -> PathBuf {
+        self.dir.join(PLACEHOLDER)
     }
     /// `lands/`: the land records (plan 39), one dir per export.
     pub fn lands_dir(&self) -> PathBuf {
@@ -169,6 +176,7 @@ mod tests {
         let p = RecordPaths::of(Path::new("/b"), &id);
         assert_eq!(p.dir, crate::layout::record_dir(Path::new("/b"), &id));
         assert_eq!(p.land_dir(3), PathBuf::from("/b/x/lands/3"));
+        assert_eq!(p.placeholder(), PathBuf::from("/b/x/placeholder"));
         assert_eq!(p.land_blob(3, "ab"), PathBuf::from("/b/x/lands/3/blobs/ab"));
         for f in [
             p.land_delta(3),

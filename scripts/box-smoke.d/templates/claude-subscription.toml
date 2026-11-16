@@ -1,0 +1,23 @@
+# The plan 40 smoke's subscription-login template (scripts/box-smoke.d/50-claude.sh).
+# Owner-run only, and only after the terms check (spec section 7.9): spawn
+# refuses login = "subscription" until a LOCAL build flips
+# SUBSCRIPTION_LOGIN_CLEARED. Install it into the daemon's templates.d and
+# restart the daemon. The vault secret "anthropic-sub" holds the token from
+# `claude setup-token` (stored with --service box-model).
+name = "claude-subscription"
+description = "Claude Code with a Claude subscription login (plan 40 smoke)"
+
+[agent]
+kind = "claude-code"
+command = ["claude"]
+login = "subscription"
+credential = "anthropic-sub"
+
+[image]
+base = "default"
+
+[egress]
+allow = []
+
+[idle]
+stop_after_mins = 30

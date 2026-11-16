@@ -56,12 +56,18 @@ fn set_owner(fd: &OwnedFd, ids: AgentIds) -> Result<(), Errno> {
 /// and the file are owned by `agent`; anywhere else they stay the caller's
 /// (root in the VM). A symlink anywhere on the way is refused; a symlink or
 /// hard link at the target itself is replaced, never written through.
+///
+/// With `keep_existing` a target that exists in any form (file, link,
+/// directory, FIFO, ...) is left as it is and the call succeeds: it is looked
+/// at with `fstatat(AT_SYMLINK_NOFOLLOW)` on the same directory fd, never
+/// opened and never followed.
 pub fn write_file(
     env: &GuestEnv,
     abs: &str,
     data: &[u8],
     mode: u32,
     agent: AgentIds,
+    keep_existing: bool,
 ) -> Result<(), String> {
     let fail = |what: &str, e: Errno| format!("{abs}: {what}: {e}");
     let rel = abs
@@ -105,6 +111,13 @@ pub fn write_file(
             }
             Err(e) => return Err(fail(&format!("open {so_far}"), e)),
         };
+    }
+    if keep_existing {
+        match fs::statat(&dir, *name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return Ok(()),
+            Err(Errno::NOENT) => {}
+            Err(e) => return Err(fail("stat", e)),
+        }
     }
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut tmp = None;
@@ -150,6 +163,115 @@ pub fn write_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::{GuestTools, Timing};
+    use std::os::unix::fs::symlink;
+
+    fn env_in(dir: &std::path::Path) -> GuestEnv {
+        let t = |n: &str| dir.join(n);
+        GuestEnv {
+            root: dir.to_path_buf(),
+            tools: GuestTools {
+                setsid: t("setsid"),
+                runuser: t("runuser"),
+                systemctl: t("systemctl"),
+                chown: t("chown"),
+                git: t("git"),
+            },
+            version: "t".into(),
+            timing: Timing::default(),
+        }
+    }
+
+    fn me() -> AgentIds {
+        AgentIds {
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
+        }
+    }
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir_in(
+            std::env::var_os("SAIIFE_TEST_TMP")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn keep_existing_skips_existing_target() {
+        let d = tmp();
+        let env = env_in(d.path());
+        let p = "/home/agent/.claude.json";
+        write_file(&env, p, b"mine", 0o600, me(), false).unwrap();
+        write_file(&env, p, b"seed", 0o600, me(), true).unwrap();
+        assert_eq!(std::fs::read(env.path(p)).unwrap(), b"mine");
+        // without the flag the file is replaced as before
+        write_file(&env, p, b"new", 0o600, me(), false).unwrap();
+        assert_eq!(std::fs::read(env.path(p)).unwrap(), b"new");
+    }
+
+    #[test]
+    fn keep_existing_writes_when_absent() {
+        let d = tmp();
+        let env = env_in(d.path());
+        let p = "/home/agent/.claude.json";
+        write_file(&env, p, b"seed", 0o600, me(), true).unwrap();
+        assert_eq!(std::fs::read(env.path(p)).unwrap(), b"seed");
+        let m = std::fs::metadata(env.path(p)).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn keep_existing_leaves_links_and_fifos_alone() {
+        let d = tmp();
+        let env = env_in(d.path());
+        let home = env.path("/home/agent");
+        std::fs::create_dir_all(&home).unwrap();
+        let outside = d.path().join("outside");
+        // a dangling link and a link to a file: neither followed nor replaced
+        symlink(&outside, home.join("dangling")).unwrap();
+        std::fs::write(d.path().join("victim"), "keep").unwrap();
+        symlink(d.path().join("victim"), home.join("live")).unwrap();
+        for n in ["dangling", "live"] {
+            write_file(
+                &env,
+                &format!("/home/agent/{n}"),
+                b"seed",
+                0o600,
+                me(),
+                true,
+            )
+            .unwrap();
+            assert!(std::fs::symlink_metadata(home.join(n))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert!(!outside.exists());
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("victim")).unwrap(),
+            "keep"
+        );
+        // a FIFO is never opened (that would block)
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            home.join("fifo"),
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        write_file(&env, "/home/agent/fifo", b"seed", 0o600, me(), true).unwrap();
+        use std::os::unix::fs::FileTypeExt;
+        assert!(std::fs::symlink_metadata(home.join("fifo"))
+            .unwrap()
+            .file_type()
+            .is_fifo());
+    }
 
     #[test]
     fn agent_owned_is_home_and_below() {

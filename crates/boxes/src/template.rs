@@ -70,6 +70,15 @@ pub const MIN_MEM_MIB: u64 = 512;
 /// The most memory a template may give a box, in MiB: the largest tier's
 /// (also the VMM helper's hard ceiling).
 pub const MAX_MEM_MIB: u64 = TIERS[TIERS.len() - 1].mem_mib;
+/// Plan 40 C4: whether a template with `login = "subscription"` may spawn.
+/// False until the owner has checked Anthropic's current terms for
+/// subscription use through a local proxy (spec §7.9, §13). A one-line
+/// change in its own commit, or subscription support is removed.
+pub const SUBSCRIPTION_LOGIN_CLEARED: bool = false;
+/// The refusal while [`SUBSCRIPTION_LOGIN_CLEARED`] is false: at spawn,
+/// in the setup of a box whose template was edited to subscription later,
+/// and (403) on the model forwarder.
+pub const SUBSCRIPTION_GATED: &str = "subscription login is waiting for the owner's terms check (spec §7.9); use login = \"api-key\"";
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude-code.toml");
 /// Largest template file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -137,12 +146,30 @@ pub struct BoxTemplate {
 }
 
 impl BoxTemplate {
+    /// How the model credential reaches the box, for `box ls` and the audit
+    /// (plan 40 C3, R3): `"gateway"`, the host forwarder adds it, or
+    /// `"in_box"`. Spawn refuses `credential_in_box`, so no box has the
+    /// latter today; the one place the value is derived.
+    pub fn credential_mode(&self) -> &'static str {
+        if self.credential_in_box {
+            "in_box"
+        } else {
+            "gateway"
+        }
+    }
+
     pub fn wire(&self) -> saiife_wire::source::Template {
         saiife_wire::source::Template {
             name: self.name.clone(),
             description: self.description.clone(),
             has_secrets: !self.secrets.is_empty(),
             has_egress: !self.egress.is_empty(),
+            login: match self.login {
+                Login::ApiKey => "api-key",
+                Login::Subscription => "subscription",
+            }
+            .into(),
+            credential_in_box: self.credential_in_box,
         }
     }
 }

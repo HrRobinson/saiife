@@ -260,7 +260,7 @@ mod store {
     fn table(images: &[Value]) -> Vec<String> {
         let head = ["ID", "DEFAULT", "UBUNTU", "CLAUDE", "SIZE", "IN USE"];
         let text = |v: &Value| sanitize(v.as_str().unwrap_or("-"));
-        let rows: Vec<(Vec<String>, Option<String>)> = images
+        let rows: Vec<(Vec<String>, Vec<String>)> = images
             .iter()
             .map(|i| {
                 let in_use: Vec<String> = i
@@ -282,7 +282,7 @@ mod store {
                         in_use.join(",")
                     },
                 ];
-                (cells, None)
+                (cells, Vec::new())
             })
             .collect();
         render(&head, &rows)

@@ -1254,14 +1254,11 @@ impl Conn {
 /// Whether `op` takes the descriptors of the `box.fds` before it.
 #[cfg(unix)]
 fn takes_fds(op: &str) -> bool {
-    if saiife_ipc::msg::FD_OPS.contains(&op) {
-        return true;
-    }
     #[cfg(test)]
     if op == TEST_FDS_OP {
         return true;
     }
-    false
+    saiife_ipc::msg::FD_OPS.contains(&op)
 }
 
 /// `box.fds {n}` once its descriptors `got` are in (the connection reads

@@ -23,6 +23,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use saiife_boxes::guest::{GuestError, GuestEvent, GuestLink};
+use saiife_boxes::template::Login;
 use saiife_boxproto::frame::{read_frame, read_msg, write_msg, Frame, FrameError};
 use saiife_boxproto::msg::{Event, HostReply, Reply, Request, Setup, SetupFile};
 use saiife_boxproto::{ports, PROTO};
@@ -1328,6 +1329,46 @@ pub fn claude_settings() -> String {
     serde_json::to_string_pretty(&v).unwrap_or_default()
 }
 
+/// The model environment of Claude Code in the box (plan 40, C2): the model
+/// URL of the gateway's forwarder, the box's placeholder in the variable the
+/// login kind reads (never the real credential: the forwarder swaps it), and
+/// the switches that keep the client from phoning anywhere else.
+pub fn claude_env(login: Login, placeholder: &str) -> Vec<(String, String)> {
+    let var = match login {
+        Login::ApiKey => "ANTHROPIC_API_KEY",
+        Login::Subscription => "CLAUDE_CODE_OAUTH_TOKEN",
+    };
+    [
+        (
+            "ANTHROPIC_BASE_URL",
+            format!("http://127.0.0.1:{}", ports::MODEL_TCP),
+        ),
+        (var, placeholder.to_string()),
+        ("DISABLE_TELEMETRY", "1".into()),
+        ("DISABLE_ERROR_REPORTING", "1".into()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()),
+        ("DISABLE_AUTOUPDATER", "1".into()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// `/home/agent/.claude.json` for a first run (plan 40, C2): onboarding done,
+/// `/work` trusted, and the placeholder's last 20 characters approved, so the
+/// TUI stops on none of those screens. It holds only that tail, never the
+/// whole placeholder.
+pub fn claude_json_seed(placeholder: &str) -> String {
+    let chars: Vec<char> = placeholder.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(20)..].iter().collect();
+    let v = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "projects": {"/work": {"hasTrustDialogAccepted": true}},
+        "customApiKeyResponses": {"approved": [tail], "rejected": []},
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
 /// The setup files for user packs: `(id, toml text)` to
 /// `/home/agent/.config/saiife/packs/<id>.toml`, mode 0644. An id that is
 /// not a valid user pack id is an error naming it (an id is a file name, so
@@ -1343,6 +1384,7 @@ pub fn pack_files(packs: &[(String, String)]) -> Result<Vec<SetupFile>, String> 
                 path: format!("/home/agent/.config/saiife/packs/{id}.toml"),
                 mode: 0o644,
                 text: text.clone(),
+                keep_existing: false,
             })
         })
         .collect()
@@ -1351,6 +1393,51 @@ pub fn pack_files(packs: &[(String, String)]) -> Result<Vec<SetupFile>, String> 
 #[cfg(test)]
 mod settings_tests {
     use super::*;
+
+    fn ph() -> String {
+        concat!("sk-", "ant-", "api03-", "saiife", "0123456789abcdef").to_string()
+    }
+
+    #[test]
+    fn claude_env_is_pinned() {
+        let want = |var: &str| -> Vec<(String, String)> {
+            [
+                ("ANTHROPIC_BASE_URL", "http://127.0.0.1:3129"),
+                (var, "PH"),
+                ("DISABLE_TELEMETRY", "1"),
+                ("DISABLE_ERROR_REPORTING", "1"),
+                ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+                ("DISABLE_AUTOUPDATER", "1"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+        };
+        assert_eq!(claude_env(Login::ApiKey, "PH"), want("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            claude_env(Login::Subscription, "PH"),
+            want("CLAUDE_CODE_OAUTH_TOKEN")
+        );
+    }
+
+    #[test]
+    fn claude_json_seed_is_pinned() {
+        let p = ph();
+        let tail = &p[p.len() - 20..];
+        let v: serde_json::Value = serde_json::from_str(&claude_json_seed(&p)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "projects": {"/work": {"hasTrustDialogAccepted": true}},
+                "customApiKeyResponses": {"approved": [tail], "rejected": []},
+            })
+        );
+        assert!(!claude_json_seed(&p).contains(&p));
+        assert_eq!(tail.len(), 20);
+        // short input: the whole of it, no panic
+        assert!(claude_json_seed("abc").contains("abc"));
+    }
 
     #[test]
     fn claude_settings_are_pinned() {

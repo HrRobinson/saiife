@@ -225,6 +225,13 @@ pub struct Template {
     pub description: String,
     pub has_secrets: bool,
     pub has_egress: bool,
+    /// `api-key` or `subscription` (plan 40).
+    #[serde(default)]
+    pub login: String,
+    /// The template asks for the real credential inside the box (spawn
+    /// refuses it).
+    #[serde(default)]
+    pub credential_in_box: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

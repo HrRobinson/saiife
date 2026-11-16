@@ -311,14 +311,21 @@ impl Init {
         let env = &self.env;
         let ids = setup::agent_ids(env)?;
         for f in &s.files {
-            setup::write_file(env, &f.path, f.text.as_bytes(), f.mode, ids)?;
+            setup::write_file(
+                env,
+                &f.path,
+                f.text.as_bytes(),
+                f.mode,
+                ids,
+                f.keep_existing,
+            )?;
         }
         let vars = agent_env(&s.env);
         let mut text = String::new();
         for (k, v) in &vars {
             text.push_str(&format!("{k}={v}\n"));
         }
-        setup::write_file(env, AGENT_ENV_FILE, text.as_bytes(), 0o600, ids)?;
+        setup::write_file(env, AGENT_ENV_FILE, text.as_bytes(), 0o600, ids, false)?;
         let marker = env.path(SETUP_MARKER);
         if !marker.exists() {
             let work = env.path(WORK);

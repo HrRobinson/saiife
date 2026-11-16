@@ -401,11 +401,13 @@ fn setup_writes_files_and_env() {
             path: "/home/agent/.claude/settings.json".into(),
             mode: 0o600,
             text: "{\"a\":1}".into(),
+            keep_existing: false,
         },
         SetupFile {
             path: "/etc/saiife-guest/hook.json".into(),
             mode: 0o644,
             text: "x".into(),
+            keep_existing: false,
         },
     ];
     assert_eq!(request(&h.env, &Request::Setup(s)), Reply::Ok);
@@ -465,6 +467,7 @@ fn setup_check_refuses_bad_paths() {
             path: p.into(),
             mode: 0o644,
             text: "pwned".into(),
+            keep_existing: false,
         }];
         assert!(
             matches!(request(&h.env, &Request::Setup(s)), Reply::Err { .. }),
@@ -494,6 +497,7 @@ fn setup_does_not_follow_planted_links() {
         path: "/home/agent/.claude/settings.json".into(),
         mode: 0o644,
         text: "x".into(),
+        keep_existing: false,
     }];
     assert!(matches!(
         request(&h.env, &Request::Setup(s)),
@@ -505,6 +509,7 @@ fn setup_does_not_follow_planted_links() {
         path: "/home/agent/notes".into(),
         mode: 0o644,
         text: "new".into(),
+        keep_existing: false,
     }];
     assert_eq!(request(&h.env, &Request::Setup(s)), Reply::Ok);
     assert_eq!(

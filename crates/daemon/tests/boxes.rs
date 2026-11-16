@@ -64,6 +64,8 @@ struct World {
     clock: Arc<AtomicU64>,
     audit: PathBuf,
     _tmp: tempfile::TempDir,
+    /// A second scratch dir a test's own manager lives in.
+    _keep: Option<tempfile::TempDir>,
 }
 
 struct Setup {
@@ -72,6 +74,8 @@ struct Setup {
     built: Option<Arc<Manager>>,
     /// Why boxes are unavailable (a failed preflight), with no manager.
     unavailable: Option<String>,
+    /// A ready (empty) vault in the daemon context, as a real daemon has.
+    ready_vault: bool,
 }
 
 fn world() -> World {
@@ -80,6 +84,7 @@ fn world() -> World {
         template_warnings: Vec::new(),
         built: None,
         unavailable: None,
+        ready_vault: false,
     })
 }
 
@@ -137,7 +142,17 @@ fn world_with(s: Setup) -> World {
             Some(Arc::new(o.manager))
         }
     };
-    let base = CtxInit::minimal(handle, cfg, dirs, &state);
+    let mut base = CtxInit::minimal(handle, cfg, dirs, &state);
+    if s.ready_vault {
+        let key_file = tmp.path().join("vault-key");
+        std::fs::write(&key_file, [7u8; 32]).unwrap();
+        std::fs::set_permissions(
+            &key_file,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        base.vault = saiife_daemon::vault::open(&key_file, &state.join("vault").join("vault.bin"));
+    }
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
         own_user: "saiife".into(),
@@ -160,6 +175,7 @@ fn world_with(s: Setup) -> World {
         clock,
         audit,
         _tmp: tmp,
+        _keep: None,
     }
 }
 
@@ -287,6 +303,7 @@ async fn unavailable_without_manager() {
         template_warnings: Vec::new(),
         built: None,
         unavailable: None,
+        ready_vault: false,
     });
     for (op, args) in EVERY_OP {
         let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
@@ -595,6 +612,7 @@ async fn disk_floor_pauses_running_boxes() {
         template_warnings: Vec::new(),
         built: Some(Arc::new(o.manager)),
         unavailable: None,
+        ready_vault: false,
     });
     let a = w.running(ALICE, "one").await;
     let b = w.running(ALICE, "two").await;
@@ -746,6 +764,7 @@ async fn templates_lists_warnings() {
         template_warnings: built.template_warnings.clone(),
         built: Some(built.manager),
         unavailable: None,
+        ready_vault: false,
     });
     let a = w.ok(ALICE, "box.templates", json!({})).await;
     let names: Vec<&str> = a["templates"]
@@ -905,6 +924,7 @@ async fn restart_changes_are_recorded() {
         template_warnings: Vec::new(),
         built: Some(second.manager),
         unavailable: None,
+        ready_vault: false,
     });
     for rec in box_ops::change_records(&w.ctx, &second.changes) {
         w.ctx.writer.append(rec).await.unwrap();
@@ -1291,6 +1311,7 @@ async fn without_the_boxes_feature_boxes_are_not_enabled() {
         template_warnings: Vec::new(),
         built: None,
         unavailable: Some(why.clone()),
+        ready_vault: false,
     });
     let a = w.call(ALICE, "box.list", json!({})).await;
     assert_eq!(a["error"], "unavailable", "{a}");
@@ -1317,6 +1338,7 @@ async fn unavailable_message_names_the_failed_check() {
         template_warnings: Vec::new(),
         built: None,
         unavailable: Some(why.clone()),
+        ready_vault: false,
     });
     for (op, args) in EVERY_OP {
         let a = w.call(ALICE, op, serde_json::from_str(args).unwrap()).await;
@@ -1814,19 +1836,132 @@ async fn setup_for_has_settings_and_packs() {
     setups.attach(&mgr);
     let s = setups.setup_for(&b).unwrap();
     assert_eq!(s.agent.command, vec!["claude".to_string()]);
-    assert!(s.env.is_empty());
+    assert!(!s.env.is_empty(), "the model env is there");
     assert_eq!((s.rows, s.cols), (40, 120));
-    assert_eq!(s.files.len(), 2, "{:?}", s.files);
+    assert_eq!(s.files.len(), 3, "{:?}", s.files);
     assert_eq!(s.files[0].path, SETTINGS_PATH);
     assert_eq!(s.files[0].mode, 0o644);
     assert_eq!(s.files[0].text, saiife_boxhost::guest::claude_settings());
+    assert_eq!(s.files[1].path, "/home/agent/.claude.json");
     assert_eq!(
-        s.files[1].path,
+        s.files[2].path,
         "/home/agent/.config/saiife/packs/user.mine.toml"
     );
-    assert_eq!(s.files[1].mode, 0o644);
-    assert_eq!(s.files[1].text, pack);
+    assert_eq!(s.files[2].mode, 0o644);
+    assert_eq!(s.files[2].text, pack);
     assert!(setups.setup_for(&id("b99")).is_err());
+}
+
+/// Plan 40 (R2, R3, R6): a Claude Code box's setup carries its placeholder in
+/// the login kind's variable and a once-only `.claude.json` seed; the real
+/// credential is never read; a second setup (cold boot, revise, init
+/// restart) carries the same env and placeholder.
+#[tokio::test]
+async fn setup_has_placeholder_env() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::{TemplateSetup, CLAUDE_JSON_PATH, SETTINGS_PATH};
+    let w = world();
+    let tmp = scratch();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(tmp.path().join("packs"));
+    setups.attach(w.mgr.as_ref().unwrap());
+    let s1 = setups.setup_for(&b).unwrap();
+    let env = |k: &str| s1.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let ph = env("ANTHROPIC_API_KEY").expect("api-key placeholder");
+    assert!(
+        ph.starts_with(concat!("sk-", "ant-", "api03-", "saiife")),
+        "{ph}"
+    );
+    assert!(env("CLAUDE_CODE_OAUTH_TOKEN").is_none());
+    assert_eq!(env("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:3129");
+    for k in [
+        "DISABLE_TELEMETRY",
+        "DISABLE_ERROR_REPORTING",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "DISABLE_AUTOUPDATER",
+    ] {
+        assert_eq!(env(k).as_deref(), Some("1"), "{k}");
+    }
+    // the hooks settings are still there, and the seed is once-only
+    assert_eq!(s1.files[0].path, SETTINGS_PATH);
+    assert_eq!(s1.files[0].text, saiife_boxhost::guest::claude_settings());
+    let seed = s1
+        .files
+        .iter()
+        .find(|f| f.path == CLAUDE_JSON_PATH)
+        .unwrap();
+    assert_eq!((seed.mode, seed.keep_existing), (0o600, true));
+    assert!(seed.text.contains(&ph[ph.len() - 20..]));
+    assert!(!seed.text.contains(&ph));
+    // the placeholder is in the daemon-only record dir
+    let rec = saiife_boxhost::layout::record_dir(w.mgr.as_ref().unwrap().root(), &b);
+    assert!(std::fs::read_to_string(rec.join("placeholder"))
+        .unwrap()
+        .starts_with(ph.as_str()));
+}
+
+/// Plan 40 R6: a second setup of one box (cold boot, revise, init restart)
+/// carries the same env and the same placeholder; another box differs.
+#[tokio::test]
+async fn resetup_keeps_env_and_placeholder() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::TemplateSetup;
+    let w = world();
+    let tmp = scratch();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(tmp.path().join("packs"));
+    setups.attach(w.mgr.as_ref().unwrap());
+    let s1 = setups.setup_for(&b).unwrap();
+    let s2 = setups.setup_for(&b).unwrap();
+    assert!(!s1.env.is_empty());
+    assert_eq!(s1.env, s2.env);
+    assert_eq!(s1, s2);
+    let c = w.spawn(ALICE, "t").await;
+    let c = id(c["box"]["id"].as_str().unwrap());
+    assert_ne!(setups.setup_for(&c).unwrap().env, s1.env);
+}
+
+/// Plan 40 R3: the setup never holds a vault value: a secret stored under
+/// the template's credential name for the model service is absent from the
+/// serialized setup (only the placeholder travels).
+#[tokio::test]
+async fn setup_has_no_secret() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::TemplateSetup;
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: None,
+        unavailable: None,
+        ready_vault: true,
+    });
+    let tmp = scratch();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(tmp.path().join("packs"));
+    setups.attach(w.mgr.as_ref().unwrap());
+    let secret = concat!("sk-", "ant-", "api03-", "REALSECRET0123456789");
+    let entry = saiife_daemon::vault::Entry {
+        name: "anthropic".into(),
+        kind: saiife_daemon::vault::Kind::Token,
+        fields: [(
+            "token".to_string(),
+            zeroize::Zeroizing::new(secret.to_string()),
+        )]
+        .into(),
+        allowed_services: vec!["box-model".into()],
+        created_by: 0,
+        created: "2026-11-16T00:00:00Z".into(),
+        last_used: None,
+        rotate_after: None,
+    };
+    w.ctx.vault.writer().put(entry).unwrap();
+    let json = serde_json::to_string(&setups.setup_for(&b).unwrap()).unwrap();
+    assert!(json.contains("ANTHROPIC_API_KEY"), "the setup is real");
+    assert!(!json.contains(secret));
+    assert!(!json.contains("REALSECRET"));
 }
 
 /// R19: the guest channel and the driver take the VMM uid from one place.
@@ -1947,6 +2082,7 @@ async fn the_context_is_freed_with_the_gateway_wired() {
         template_warnings: Vec::new(),
         built: Some(mgr),
         unavailable: None,
+        ready_vault: false,
     });
     let gw = GatewayHooks::new(
         Arc::clone(&w.ctx),
@@ -1997,4 +2133,91 @@ async fn revise_after_a_cold_stop_runs_again() {
         .prompts()
         .contains(&(b.clone(), "again".to_string())));
     assert!(!w.mgr().get(&b).unwrap().keep);
+}
+
+/// A world whose manager holds the built-in template plus a `fallback`
+/// one that asks for the credential inside the box.
+fn world_with_fallback_template() -> World {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let mut fallback = template::builtin().remove(0);
+    fallback.name = "fallback".into();
+    fallback.credential_in_box = true;
+    let mut templates = template::builtin();
+    templates.push(fallback);
+    let o = Manager::open(ManagerInit {
+        store: Store::open(box_ops::dir_in(&state)).unwrap(),
+        vmm: Arc::new(FakeVmm::new()),
+        guest: Arc::new(FakeGuest::new()),
+        templates,
+        host: Arc::new(two_boxes),
+        clock: Arc::new(|| T0),
+        disk_place: box_ops::disk_place(),
+    })
+    .unwrap();
+    let mut w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(Arc::new(o.manager)),
+        unavailable: None,
+        ready_vault: false,
+    });
+    w._keep = Some(tmp);
+    w
+}
+
+#[tokio::test]
+async fn spawn_record_names_credential_mode() {
+    let w = world();
+    w.spawn(ALICE, "add a cart").await;
+    let recs = w.records();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert_eq!(recs[0]["credential"], "gateway", "{}", recs[0]);
+    // A template that asks for the credential inside the box is refused at
+    // spawn (plan 40 R3): no box, so no spawn record.
+    let w = world_with_fallback_template();
+    let a = w
+        .call(
+            ALICE,
+            "box.spawn",
+            json!({"template": "fallback", "repo": "shop", "task": "t", "start": "queue"}),
+        )
+        .await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("credential_in_box"),
+        "{a}"
+    );
+    assert!(w.records().is_empty(), "{:?}", w.records());
+    assert!(w.ok(ALICE, "box.list", json!({})).await["boxes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn list_reports_credential_mode() {
+    let w = world();
+    w.spawn(ALICE, "add a cart").await;
+    let l = w.ok(ALICE, "box.list", json!({})).await;
+    assert_eq!(l["boxes"][0]["credential"], "gateway", "{l}");
+    assert!(l.get("credential").is_none(), "no top-level key: {l}");
+}
+
+#[tokio::test]
+async fn templates_carry_login_and_fallback_flag() {
+    let w = world_with_fallback_template();
+    let a = w.ok(ALICE, "box.templates", json!({})).await;
+    let by = |n: &str| {
+        a["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by("claude-code")["login"], "api-key", "{a}");
+    assert_eq!(by("claude-code")["credential_in_box"], false, "{a}");
+    assert_eq!(by("fallback")["credential_in_box"], true, "{a}");
 }

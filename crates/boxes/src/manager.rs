@@ -38,7 +38,9 @@ use crate::error::BoxesError;
 use crate::guest::{GuestError, GuestEvent, GuestLink};
 use crate::state::{holds_capacity, transition, Event};
 use crate::store::{BoxRecord, Store};
-use crate::template::{BoxTemplate, ImageRef};
+use crate::template::{
+    BoxTemplate, ImageRef, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
+};
 use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
 
 /// No `Ready` this long after admission → the boot failed.
@@ -54,6 +56,8 @@ pub const MAX_REPO_BYTES: usize = 256;
 const PAIR: &str = "a repo disk and its base manifest come together, or neither";
 const NOT_INCOMING: &str =
     "the repo disk and its base manifest must be in one dir of the box store's .incoming";
+const CREDENTIAL_IN_BOX: &str =
+    "credential_in_box is not supported: the real credential never enters the box";
 const NO_PLACER: &str = "this box manager takes no repo disk";
 const NOT_IN_BOX: &str = "the repo disk's place is not in the box dir";
 
@@ -506,6 +510,13 @@ impl Manager {
         let t = self
             .template(&a.template)
             .ok_or_else(|| BoxError::Invalid(format!("unknown template {}", a.template)))?;
+        // Before any id is claimed (plan 40 C4, ruling R3).
+        if t.login == Login::Subscription && !SUBSCRIPTION_LOGIN_CLEARED {
+            return Err(BoxError::Invalid(SUBSCRIPTION_GATED.into()));
+        }
+        if t.credential_in_box {
+            return Err(BoxError::Invalid(CREDENTIAL_IN_BOX.into()));
+        }
         let size = t.size;
         let host = (self.host)();
         capacity::fits_ever(&host, &size).map_err(|r| BoxError::Invalid(r.message()))?;

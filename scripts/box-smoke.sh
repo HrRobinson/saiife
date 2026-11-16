@@ -13,6 +13,12 @@
 #     $XDG_STATE_HOME/saiife-box-smoke, or ~/.local/state/saiife-box-smoke)
 #   - nothing under /etc, /var, /opt or /run; no sudo, nothing runs as root
 #
+# Environment knobs of the claude fragment (50-claude.sh; its header says more):
+#   SAIIFE_BOX_SMOKE_KEY_FILE=<file>       the API key (one line), read by grep only
+#   SAIIFE_BOX_SMOKE_SUBSCRIPTION=1        also run the subscription leg (only after
+#                                          the owner's terms check, local build)
+#   SAIIFE_BOX_SMOKE_SUB_KEY_FILE=<file>   the `claude setup-token` token, same rules
+#
 # Usage:
 #   bash scripts/box-smoke.sh [--list | --only <name> | --help]
 #

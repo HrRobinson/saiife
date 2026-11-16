@@ -621,12 +621,12 @@ where
     }
 }
 
-fn ms_since(t0: Instant) -> u64 {
+pub(crate) fn ms_since(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Ends once `idle` passed with no byte either way.
-async fn idle_watch(last: &AtomicU64, t0: Instant, idle: Duration) {
+pub(crate) async fn idle_watch(last: &AtomicU64, t0: Instant, idle: Duration) {
     let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
     loop {
         let since = ms_since(t0).saturating_sub(last.load(Ordering::Relaxed));
@@ -638,7 +638,7 @@ async fn idle_watch(last: &AtomicU64, t0: Instant, idle: Duration) {
 }
 
 /// Ends once a lockdown that blocks connectors is on (checked every 5 s).
-async fn lockdown_watch(gw: &GatewayShared) {
+pub(crate) async fn lockdown_watch(gw: &GatewayShared) {
     let mut every = tokio::time::interval(Duration::from_secs(super::LOCKDOWN_CHECK_SECS));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
