@@ -262,7 +262,7 @@ mod imp {
     /// `saiife box spawn` (plan 37): the repo disk is built here, as the
     /// user, and handed to the daemon as descriptors.
     mod spawn {
-        use super::{args, call_passing, sanitize, spawn_timeout, Args, Stop};
+        use super::{args, call, call_passing, sanitize, spawn_timeout, Args, Stop};
         use crate::box_repo::{self, Snapshot};
         use crate::broker::Target;
         use saiife_boxhost::layout::Layout;
@@ -348,6 +348,16 @@ mod imp {
                 on: timings,
                 last: Instant::now(),
             };
+            // Best effort: a daemon that cannot list templates just skips the notice.
+            if let Ok(a) = call(t, "box.templates", Args::new()) {
+                let list: &[Value] = a
+                    .get("templates")
+                    .and_then(Value::as_array)
+                    .map_or(&[], Vec::as_slice);
+                if let Some(n) = super::spawn_notice(list, template) {
+                    eprintln!("saiife: {n}");
+                }
+            }
             let abs = std::fs::canonicalize(repo).map_err(|e| {
                 Stop::Refused(format!("cannot read the repo {}: {e}", repo.display()))
             })?;
@@ -782,13 +792,33 @@ mod imp {
                     notes.push("egress");
                 }
                 let mut under = Vec::new();
+                let notice = text(t, "notice");
+                if !notice.is_empty() {
+                    under.push(format!("  notice: {}", sanitize(notice)));
+                }
                 if flag(t, "credential_in_box") {
                     under.push("  credential_in_box: not supported (refused at spawn)".to_string());
                 }
+                let agent = match text(t, "agent") {
+                    "" => "claude-code",
+                    a => a,
+                };
+                let agent = if flag(t, "beta") {
+                    format!("{} (beta)", sanitize(agent))
+                } else {
+                    sanitize(agent)
+                };
+                let cred = match text(t, "credential") {
+                    "" if flag(t, "credential_in_box") => "in_box",
+                    "" => "gateway",
+                    c => c,
+                };
                 (
                     vec![
                         sanitize(text(t, "name")),
+                        agent,
                         sanitize(text(t, "login")),
+                        sanitize(cred),
                         notes.join(","),
                         sanitize(text(t, "description")),
                     ],
@@ -796,7 +826,24 @@ mod imp {
                 )
             })
             .collect();
-        render(&["NAME", "LOGIN", "NEEDS", "DESCRIPTION"], &rows)
+        render(
+            &[
+                "NAME",
+                "AGENT",
+                "LOGIN",
+                "CREDENTIAL",
+                "NEEDS",
+                "DESCRIPTION",
+            ],
+            &rows,
+        )
+    }
+
+    /// The sanitized notice of the template `name`, if it has one.
+    pub(super) fn spawn_notice(list: &[Value], name: &str) -> Option<String> {
+        let t = list.iter().find(|t| text(t, "name") == name)?;
+        let n = text(t, "notice");
+        (!n.is_empty()).then(|| sanitize(n))
     }
 
     fn print_templates(a: &Args) {
@@ -921,6 +968,60 @@ mod imp {
                 lines[3],
                 "  credential_in_box: not supported (refused at spawn)"
             );
+        }
+
+        #[test]
+        fn templates_show_agent_and_beta() {
+            let list = vec![
+                json!({"name": "codex", "description": "d", "login": "api-key",
+                "agent": "codex", "beta": true, "credential": "gateway",
+                "has_secrets": false, "has_egress": false}),
+            ];
+            let lines = template_lines(&list);
+            assert!(
+                lines[0].contains("AGENT") && lines[0].contains("CREDENTIAL"),
+                "{lines:?}"
+            );
+            assert!(lines[1].contains("codex (beta)"), "{lines:?}");
+            assert!(lines[1].contains("gateway"), "{lines:?}");
+        }
+
+        #[test]
+        fn templates_from_an_old_daemon() {
+            let list = vec![
+                json!({"name": "claude-code", "description": "d", "login": "api-key",
+                "has_secrets": false, "has_egress": false}),
+            ];
+            let lines = template_lines(&list);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[1].contains("claude-code"), "{lines:?}");
+            assert!(!lines[1].contains("beta"), "{lines:?}");
+            assert!(lines[1].contains("gateway"), "{lines:?}");
+        }
+
+        #[test]
+        fn templates_show_gemini_notice() {
+            let list = vec![
+                json!({"name": "gemini", "description": "d", "agent": "gemini", "beta": true,
+                       "notice": "use a billing key\u{202e}"}),
+                json!({"name": "plain", "description": "d"}),
+            ];
+            let lines = template_lines(&list);
+            assert_eq!(lines.len(), 4, "{lines:?}");
+            assert!(
+                lines[2].starts_with("  notice: use a billing key"),
+                "{lines:?}"
+            );
+            assert!(!lines[2].contains('\u{202e}'), "{lines:?}");
+            assert!(lines[3].starts_with("plain"), "{lines:?}");
+            assert_eq!(
+                spawn_notice(&list, "gemini")
+                    .as_deref()
+                    .map(|s| s.starts_with("use a billing key")),
+                Some(true)
+            );
+            assert_eq!(spawn_notice(&list, "plain"), None);
+            assert_eq!(spawn_notice(&list, "nope"), None);
         }
 
         #[test]
