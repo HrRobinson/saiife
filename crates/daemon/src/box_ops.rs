@@ -1791,7 +1791,26 @@ async fn run(
             Ok(done)
         }
         Op::Resume(i) => change("resume", Box::new(move |m| m.resume(&i))).await,
-        Op::Revise(i, text) => change("revise", Box::new(move |m| m.revise(&i, &text))).await,
+        Op::Revise(i, text) => {
+            // A prompt the box held unsent and the revise dropped (R25/N1)
+            // is the record's reason.
+            let note = Arc::new(Mutex::new(None));
+            let slot = Arc::clone(&note);
+            let (answer, mut rec) = change(
+                "revise",
+                Box::new(move |m| {
+                    let (c, n) = m.revise_noted(&i, &text)?;
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = n;
+                    Ok(c)
+                }),
+            )
+            .await?;
+            let n = *note.lock().unwrap_or_else(|e| e.into_inner());
+            if let (Some(n), Some(r)) = (n, rec.as_mut()) {
+                r.reason = Some(n.to_string());
+            }
+            Ok((answer, rec))
+        }
         Op::Discard(i, force) => {
             let gone = i.clone();
             // An approved land not applied yet keeps the box (L4), unless

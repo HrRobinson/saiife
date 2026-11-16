@@ -2809,6 +2809,33 @@ async fn window_frames_are_marked() {
     assert_eq!(field(last, "box"), "b-run", "{last}");
 }
 
+/// R25/N1: a revise that discarded a prompt the box held unsent says so
+/// in its frame record's reason; the answer carries nothing more.
+#[tokio::test]
+async fn a_revise_frame_record_names_a_discarded_held_prompt() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    w.boxes.hold_prompt(&BoxId::parse("b-done").unwrap());
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.revise",
+        json!({"id": "b-done", "comment": "again"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"], json!({}), "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.revise", "{last}");
+    assert_eq!(
+        field(last, "reason"),
+        saiife_wire::source::HELD_PROMPT_DISCARDED,
+        "{last}"
+    );
+}
+
 #[tokio::test]
 async fn resume_and_revise_use_the_window() {
     let (w, mut link, d, soft) = paired_soft().await;

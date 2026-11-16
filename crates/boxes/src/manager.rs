@@ -33,6 +33,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub use saiife_wire::source::HELD_PROMPT_DISCARDED;
 use saiife_wire::source::{
     check_text, BoxError, BoxId, BoxState, Start, MAX_STEER_BYTES, MAX_TASK_BYTES,
 };
@@ -76,6 +77,7 @@ const LOST: &str = "the VM was gone after a daemon restart";
 pub const WHY_LOST: &str = "vm lost after restart";
 pub const WHY_RECONCILED: &str = "reconciled";
 const REORDER: &str = "reorder must list every queued box once";
+const PROMPT_NOT_DELIVERED: &str = "the box's prompt is not delivered yet; steer again once it is";
 
 /// Unix seconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -909,6 +911,14 @@ impl Manager {
 
     /// Steer a Running or Paused box (R3). The state is checked under the
     /// lock; the message is sent with it released.
+    ///
+    /// R26: a steer never overtakes the box's prompt. While a prompt is
+    /// still to be delivered (held, or out to the guest) the steer is
+    /// `Unavailable`, to retry once it is: the guest bounds a send to a
+    /// few seconds, and a held prompt goes out at the next tick once the
+    /// box runs. Nothing can start a prompt between this check and the
+    /// steer's send: a prompt is only claimed at `Ready` (from Starting), by
+    /// the tick (only a held one) or by a revise (from Done or Landed).
     pub fn say(&self, id: &BoxId, msg: &str) -> Result<(), BoxError> {
         check_text(msg, MAX_STEER_BYTES)?;
         {
@@ -917,14 +927,31 @@ impl Manager {
             if !matches!(r.state, BoxState::Running | BoxState::Paused) {
                 return Err(BoxError::WrongState { state: r.state });
             }
+            if r.pending_prompt.is_some() || g.prompting.contains_key(id) {
+                return Err(BoxError::Unavailable(PROMPT_NOT_DELIVERED.into()));
+            }
         }
         self.guest.prompt(id, msg).map_err(BoxError::from)
+    }
+
+    /// [`Manager::revise_noted`] without the note.
+    pub fn revise(&self, id: &BoxId, comment: &str) -> Result<Change, BoxError> {
+        self.revise_noted(id, comment).map(|(c, _)| c)
     }
 
     /// Done or Landed only. VM on: the comment is sent and the box runs
     /// again. VM off: the comment waits for `Ready` and the box rejoins the
     /// queue at the tail.
-    pub fn revise(&self, id: &BoxId, comment: &str) -> Result<Change, BoxError> {
+    ///
+    /// Either way the comment supersedes a prompt the box still holds
+    /// unsent (a stop or pause cut its send short, or lockdown held it):
+    /// that prompt is dropped, never sent after the comment, and the note
+    /// is [`HELD_PROMPT_DISCARDED`] for the caller's record (R25/N1).
+    pub fn revise_noted(
+        &self,
+        id: &BoxId,
+        comment: &str,
+    ) -> Result<(Change, Option<&'static str>), BoxError> {
         check_text(comment, MAX_STEER_BYTES)?;
         let now = self.now();
         let mut g = self.lock();
@@ -958,13 +985,19 @@ impl Manager {
             // A prompt still out from the box's earlier run records nothing.
             g.prompting.remove(id);
             r.state = transition(from, Event::Requeue)?;
-            r.pending_prompt = Some(comment.to_string());
             r.queue_seq = Some(g.take_seq());
             "requeue"
         };
+        // VM on: the comment went out, so nothing is pending. VM off: the
+        // comment is the prompt the next `Ready` sends.
+        let held = std::mem::replace(
+            &mut r.pending_prompt,
+            (!r.vm_on).then(|| comment.to_string()),
+        );
         r.updated_at = now;
         g.put(r.clone())?;
-        Ok(change(&r, from, why))
+        let note = held.is_some().then_some(HELD_PROMPT_DISCARDED);
+        Ok((change(&r, from, why), note))
     }
 
     /// `ids` must be exactly the queued set; positions follow its order.
@@ -1112,8 +1145,11 @@ impl Manager {
     /// `error`) while the send is still the box's one in flight and the
     /// record still holds that prompt. A box that moved on meanwhile (a
     /// requeue gave it a newer prompt, or it was discarded) is left as is,
-    /// and a failed send to a box no longer running with its VM on (a stop
-    /// came in) keeps its prompt and records no error (R25).
+    /// and a failed send to a box no longer running with its VM on (a stop,
+    /// pause or finish came in) keeps its prompt and records no error
+    /// (R25): the tick sends it again once the box runs (after a resume, or
+    /// a daemon restart), and a revise replaces it with its comment and
+    /// notes the discard (N1).
     fn deliver(&self, out: impl IntoIterator<Item = Outgoing>) {
         for o in out {
             let sent = self.guest.prompt(&o.id, &o.text);
@@ -1128,8 +1164,9 @@ impl Manager {
             if r.pending_prompt.as_deref() != Some(o.text.as_str()) {
                 continue;
             }
-            // R25: a send that failed because the box was stopped meanwhile
-            // keeps its prompt for the next start, with no error.
+            // R25: a send that failed because the box moved on meanwhile
+            // keeps its prompt (sent again once the box runs, or replaced
+            // by a revise), with no error.
             if sent.is_err() && !(r.state == BoxState::Running && r.vm_on) {
                 continue;
             }

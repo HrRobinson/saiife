@@ -7,7 +7,7 @@ use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::fake::FakeGuest;
 use saiife_boxes::guest::{GuestEvent, GuestLink};
-use saiife_boxes::manager::{Manager, ManagerInit, DONE_IDLE_SECS};
+use saiife_boxes::manager::{Manager, ManagerInit, DONE_IDLE_SECS, HELD_PROMPT_DISCARDED};
 use saiife_boxes::store::Store;
 use saiife_boxes::template::{self, Size};
 use saiife_boxes::vmm::fake::{FakeVmm, VmOp};
@@ -2133,6 +2133,46 @@ async fn revise_after_a_cold_stop_runs_again() {
         .prompts()
         .contains(&(b.clone(), "again".to_string())));
     assert!(!w.mgr().get(&b).unwrap().keep);
+}
+
+/// R25/N1: a box stopped before its task prompt went out holds it; a
+/// revise replaces it with the comment, and the revise record says the
+/// held prompt was discarded. The next Ready sends only the comment.
+#[tokio::test]
+async fn a_revise_record_names_the_held_prompt_it_discarded() {
+    let w = world();
+    let a = w.spawn(ALICE, "add a cart").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    w.ok(ALICE, "box.stop", json!({"box": b.as_str()})).await;
+    assert_eq!(
+        w.mgr().get(&b).unwrap().pending_prompt.as_deref(),
+        Some("add a cart")
+    );
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "again"}),
+    )
+    .await;
+    let recs = w.records();
+    let last = recs.last().unwrap();
+    assert_eq!(last["action"], "revise", "{last}");
+    assert_eq!(last["reason"], HELD_PROMPT_DISCARDED, "{last}");
+    box_ops::tick_once(&w.ctx).await;
+    w.mgr().guest_event(&b, GuestEvent::Ready).unwrap();
+    assert_eq!(w.guest.prompts(), vec![(b.clone(), "again".to_string())]);
+    // A revise with nothing held has no reason.
+    w.mgr().done(&b).unwrap();
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "more"}),
+    )
+    .await;
+    let recs = w.records();
+    let last = recs.last().unwrap();
+    assert_eq!(last["action"], "revise", "{last}");
+    assert!(last["reason"].is_null(), "{last}");
 }
 
 /// A world whose manager holds the built-in template plus a `fallback`

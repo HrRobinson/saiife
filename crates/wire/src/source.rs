@@ -326,6 +326,11 @@ pub trait BoxSource: Send + Sync {
     fn steer(&self, id: &BoxId, msg: &str) -> Result<(), BoxError>;
     /// Done or Landed -> Running, with the comment as the next prompt.
     fn revise(&self, id: &BoxId, comment: &str) -> Result<(), BoxError>;
+    /// [`BoxSource::revise`], plus [`HELD_PROMPT_DISCARDED`] when the
+    /// comment replaced a prompt the box held unsent, for the record.
+    fn revise_noted(&self, id: &BoxId, comment: &str) -> Result<Option<&'static str>, BoxError> {
+        self.revise(id, comment).map(|()| None)
+    }
     fn pending_actions(&self) -> Vec<PendingAction>;
     /// Evidence is `Some` for Approve, `None` for Reject.
     fn complete(
@@ -339,6 +344,11 @@ pub trait BoxSource: Send + Sync {
 }
 
 pub const MAX_STEER_BYTES: usize = 4096;
+/// The record note of a revise that discarded a prompt the box held unsent
+/// (plan 38 R25/N1): a stop, a pause or a lockdown kept it, and the
+/// revise's comment replaced it.
+pub const HELD_PROMPT_DISCARDED: &str =
+    "a prompt the box held unsent was discarded: the revise replaced it";
 pub const MAX_TASK_BYTES: usize = 8192;
 
 /// Non-empty, at most `max` bytes, no NUL, no C0 controls but `\n` and `\t`,
