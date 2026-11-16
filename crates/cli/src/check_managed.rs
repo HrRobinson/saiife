@@ -174,16 +174,24 @@ mod imp {
     use crate::warn;
 
     /// The worker's deadline, from its spawn (§6.1.2).
-    const WORKER_TIMEOUT: Duration = Duration::from_secs(3);
+    fn worker_timeout() -> Duration {
+        crate::deadline_scale::scaled(Duration::from_secs(3))
+    }
     /// Connecting, including `hello`.
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    fn connect_timeout() -> Duration {
+        crate::deadline_scale::scaled(Duration::from_secs(2))
+    }
     /// The daemon's ack of `audit.append`, from the send (§6.1.2).
-    const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+    fn ack_timeout() -> Duration {
+        crate::deadline_scale::scaled(Duration::from_secs(2))
+    }
     /// The whole hook call, whatever hangs (a stat on a dead FUSE mount, a
     /// slow lookup): well inside the agents' 10 s hook timeout, after
     /// which Codex and Gemini CLI would let the call run (§9.3). The
     /// deadlines above add up to about 5 s.
-    const OVERALL_TIMEOUT: Duration = Duration::from_secs(7);
+    fn overall_timeout() -> Duration {
+        crate::deadline_scale::scaled(Duration::from_secs(7))
+    }
     /// Longest `agent`, `project`, `session`, `tool`, `reason` or
     /// `permission_mode` sent, in characters. A record can still serialize
     /// past `MAX_RECORD_BYTES` (a control character is 6 bytes as
@@ -276,7 +284,7 @@ mod imp {
         std::thread::Builder::new()
             .name("saiife-watchdog".into())
             .spawn(move || {
-                std::thread::sleep(OVERALL_TIMEOUT);
+                std::thread::sleep(overall_timeout());
                 // Busy: the main thread holds it to look at the worker for a moment.
                 // The process is about to exit either way, so never wait for it. On
                 // Windows the exit closes the worker's job, which kills it then.
@@ -513,7 +521,7 @@ mod imp {
             rec
         });
         // One budget for the approval steps and the ack.
-        let deadline = Instant::now() + ACK_TIMEOUT;
+        let deadline = Instant::now() + ack_timeout();
         if asked(&cfg, &judged) {
             let shown_whole =
                 rec.get("input").and_then(Value::as_str) == Some(judged.input.as_str());
@@ -572,7 +580,7 @@ mod imp {
             ) {
                 Ok(c) => {
                     client = c;
-                    deadline = Instant::now() + ACK_TIMEOUT;
+                    deadline = Instant::now() + ack_timeout();
                 }
                 Err(e) => {
                     return blocked(&format!("the audit daemon did not record this call ({e})"))
@@ -640,7 +648,7 @@ mod imp {
         input: &Result<String, String>,
         why: &str,
     ) {
-        let connect = Instant::now() + CONNECT_TIMEOUT;
+        let connect = Instant::now() + connect_timeout();
         let Ok(mut client) = crate::broker::system_client(Path::new(""), 0, connect) else {
             return;
         };
@@ -648,7 +656,7 @@ mod imp {
             return;
         }
         let rec = failed_load_record(agent, event, input, why);
-        let _ = append(&mut client, rec, None, Instant::now() + ACK_TIMEOUT);
+        let _ = append(&mut client, rec, None, Instant::now() + ack_timeout());
     }
 
     /// Off Windows the socket's dir and owner are in the config that failed to load.
@@ -794,7 +802,7 @@ mod imp {
                 client,
                 key.as_ref(),
                 ctx.tool.as_deref(),
-                Instant::now() + ACK_TIMEOUT,
+                Instant::now() + ack_timeout(),
             )
         });
 
@@ -888,7 +896,7 @@ mod imp {
         if let Err(e) = spawned {
             return (payload, Err(format!("could not start: {e}")));
         }
-        let left = (started + WORKER_TIMEOUT).saturating_duration_since(Instant::now());
+        let left = (started + worker_timeout()).saturating_duration_since(Instant::now());
         let answer = match time("judge.wait", || rx.recv_timeout(left)) {
             Ok(Ok(a)) => Ok(a),
             Ok(Err(())) => Err("it panicked".into()),
@@ -1303,7 +1311,7 @@ mod imp {
         /// The answer, or why there is none, within `WORKER_TIMEOUT` of the
         /// request. A worker still running then is killed.
         fn finish(mut self) -> (String, Result<EvalAnswer, String>) {
-            let deadline = self.started + WORKER_TIMEOUT;
+            let deadline = self.started + worker_timeout();
             let r = self.answer(deadline);
             if r.is_err() {
                 self.kill();
@@ -1774,7 +1782,7 @@ mod imp {
         agent: &str,
         event: Option<&str>,
     ) -> Result<Client, String> {
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let deadline = Instant::now() + connect_timeout();
         let mut c = crate::hook_timing::time("begin.connect", || {
             connect_locked(cfg, daemon_uid, deadline)
         })?;
@@ -1860,7 +1868,7 @@ mod imp {
         tool: Option<&str>,
     ) -> Result<Client, String> {
         let mut c = connect_begun(cfg, daemon_uid, agent, event)?;
-        bind(&mut c, key, tool, Instant::now() + ACK_TIMEOUT);
+        bind(&mut c, key, tool, Instant::now() + ack_timeout());
         Ok(c)
     }
 

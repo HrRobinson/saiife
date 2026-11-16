@@ -156,11 +156,16 @@ struct World {
     _hook_turn: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
+const DEADLINE_SCALE: &str = "SAIIFE_TEST_DEADLINE_SCALE";
+const SCALE: &str = "10";
+
 /// The tests that run the managed hook (`world_ask`) take turns: each hook
-/// call spawns `saiife check --managed` and its judging worker, and under
-/// the full parallel test load a hook could miss its fixed deadlines (the
-/// 2 s budget for the approval steps and the daemon's ack, the 3 s worker
-/// deadline) and fail closed without the "Needs approval" line.
+/// call spawns `saiife check --managed` and its judging worker. The hook's
+/// and the CLI's fixed deadlines (2 s connect and ack, 3 s worker, 7 s
+/// overall) are the product's latency contract; these tests are about what
+/// is decided, so the debug binary runs them [`SCALE`] times longer (a
+/// seam a release build does not have) and a loaded machine cannot make
+/// the hook fail closed without the "Needs approval" line.
 static HOOK_TURNS: Mutex<()> = Mutex::new(());
 
 fn config_text(tmp: &Path, port: u16, erp_extra: &str) -> String {
@@ -455,6 +460,7 @@ impl World {
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("audit"))
+            .env(DEADLINE_SCALE, SCALE)
             .stdin(Stdio::null())
             .arg("api")
             .arg("--system-config")
@@ -1538,6 +1544,7 @@ impl World {
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("audit"))
+            .env(DEADLINE_SCALE, SCALE)
             .current_dir(self.path().join("project"))
             .args(["check", "--managed", "--agent", "claude", "--system-config"])
             .arg(self.path().join("etc/config.toml"))

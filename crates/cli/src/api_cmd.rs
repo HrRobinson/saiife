@@ -71,7 +71,9 @@ pub(crate) mod linux {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    fn connect_timeout() -> Duration {
+        crate::deadline_scale::scaled(Duration::from_secs(2))
+    }
     /// A request frame is at most 1 MiB; base64 grows by 4/3.
     pub(crate) const MAX_BODY: usize = 700 * 1024;
 
@@ -105,7 +107,7 @@ pub(crate) mod linux {
     /// The target's daemon and the config it serves (the system config,
     /// or the personal broker's own, read after the broker answered).
     pub(crate) fn connect(t: &Target) -> Result<Daemon, Stop> {
-        let client = broker::connect(t, Instant::now() + CONNECT_TIMEOUT)
+        let client = broker::connect(t, Instant::now() + connect_timeout())
             .map_err(|e| unavailable(broker::unreachable(t, &e)))?;
         let what = if t.is_locked() { "system" } else { "broker" };
         let cfg = load_system(t.config())
