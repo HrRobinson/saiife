@@ -206,6 +206,15 @@ async fn bind_inner(
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid("id is a request number"))?;
             let r = pending_request(ctx, owner_uid, owner_user, rid).await?;
+            // `decide_remote` refuses it too; here no touch is spent on it.
+            if r.body_truncated {
+                return Err(Fail::Policy(Refused::new(
+                    ErrorCode::Forbidden,
+                    "truncated_not_acknowledged",
+                    "the request is shown cut and cannot be approved from the browser: \
+                     approve it with `saiife approvals approve --accept-truncated`",
+                )));
+            }
             let class = crate::approval_ops::effective_class(ctx, &r)
                 .ok_or_else(|| invalid(format!("request #{rid} needs no touch")))?;
             let rec = crate::approvals::action_record(&r, class, [0; 16], [0; 32], 0);
@@ -644,8 +653,8 @@ pub async fn verify_frame(
 
 /// Tells the owner that a box waits in the Workspace inbox: the box id and
 /// the short code to match, nothing else. No URL and no request id (§9.6):
-/// nothing in a notification approves anything. Called by whoever creates
-/// pending actions (plan 39's `Lands::refresh`).
+/// nothing in a notification approves anything. Sent by `Lands::pending`
+/// once per land request id, when it first issues the request.
 pub fn notify_pending(ctx: &Ctx, pa: &PendingAction) {
     let code = pa.view().short_code;
     ctx.notifier.send(crate::notifier::NotifyEvent {
@@ -870,6 +879,8 @@ mod tests {
         assert!(w.window_open("d2", &a, 1001));
     }
 
+    // `ops::test_ctx` is unix-only.
+    #[cfg(unix)]
     #[test]
     fn notification_has_no_approve_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -907,6 +918,8 @@ mod tests {
         assert!(q[0].id.is_none());
     }
 
+    // `ops::test_ctx` is unix-only.
+    #[cfg(unix)]
     #[test]
     fn hostile_looking_input_cannot_make_a_link() {
         // What can vary is the box id and the request id. A box id that

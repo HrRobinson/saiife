@@ -428,6 +428,42 @@ fn pending_issues_four_per_owner() {
     assert_eq!(next, ids[1..].to_vec());
 }
 
+/// `box_waiting`, in the notifier's queue (the test double: no target
+/// is configured, so nothing leaves it).
+fn waiting(w: &World) -> Vec<saiife_daemon::notifier::NotifyEvent> {
+    w.ctx
+        .notifier
+        .queued_events()
+        .into_iter()
+        .filter(|e| e.event == saiife_policy::Event::BoxWaiting)
+        .collect()
+}
+
+#[test]
+fn a_new_land_request_sends_box_waiting_once() {
+    let w = world(3);
+    let b = w.done(ALICE, &changed());
+    assert!(waiting(&w).is_empty());
+    let p = w.lands.pending();
+    assert_eq!(p.len(), 1);
+    let q = waiting(&w);
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert_eq!(q[0].box_id.as_deref(), Some(b.as_str()));
+    let code = p[0].view().short_code;
+    assert!(q[0].summary.contains(&code), "{}", q[0].summary);
+    // Nothing in it approves: no link, no request id.
+    let text = format!("{:?} {:?} {:?}", q[0].summary, q[0].service, q[0].operation);
+    assert!(!text.contains("http"), "{text}");
+    assert!(!text.contains(&p[0].request_id.to_string()), "{text}");
+    assert!(q[0].id.is_none());
+    // The inbox poll lists again: the same request, no second event.
+    for _ in 0..3 {
+        let again = w.lands.pending();
+        assert_eq!(again[0].request_id, p[0].request_id);
+    }
+    assert_eq!(waiting(&w).len(), 1);
+}
+
 #[test]
 fn owner_scoped_pending_hides_others() {
     let w = world(3);

@@ -205,6 +205,9 @@ struct State {
     /// The last export number asked for, per box.
     last_export: BTreeMap<BoxId, u32>,
     pushes: BTreeMap<u64, Push>,
+    /// The request ids `box_waiting` was sent for (kept as long as their
+    /// request).
+    notified: BTreeSet<u64>,
 }
 
 /// The box's current base (R-P3).
@@ -468,6 +471,7 @@ impl Lands {
                 rejected: BTreeMap::new(),
                 last_export: BTreeMap::new(),
                 pushes: BTreeMap::new(),
+                notified: BTreeSet::new(),
             }),
             boxes: Mutex::new(BTreeMap::new()),
         })
@@ -1322,6 +1326,10 @@ impl LandBook for Lands {
             st.reviews.retain(|k, _| live.contains(k));
             st.rejected.retain(|k, _| live.contains(k));
             st.requests.retain(|_, q| live.contains(&q.req.id));
+            let State {
+                requests, notified, ..
+            } = &mut *st;
+            notified.retain(|rid| requests.contains_key(rid));
             let mut per: BTreeMap<u32, usize> = BTreeMap::new();
             for r in done {
                 let Some(c) = st.reviews.get(&r.id) else {
@@ -1366,9 +1374,22 @@ impl LandBook for Lands {
                 Some(p) => out.push(p),
                 None => {
                     if let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, false, now) {
-                        if let Some(q) = lock(&self.state).requests.get(&rid) {
-                            out.push(Self::action(q));
+                        let mut st = lock(&self.state);
+                        let Some(q) = st.requests.get(&rid) else {
+                            continue;
+                        };
+                        let pa = Self::action(q);
+                        // `box_waiting`: once per request id, here where the
+                        // id is first issued, so a later list (the
+                        // Workspace's own inbox poll) never sends it again.
+                        let first = st.notified.insert(rid);
+                        drop(st);
+                        if first {
+                            if let Ok(ctx) = self.ctx() {
+                                crate::workspace_touch::notify_pending(&ctx, &pa);
+                            }
                         }
+                        out.push(pa);
                     }
                 }
             }

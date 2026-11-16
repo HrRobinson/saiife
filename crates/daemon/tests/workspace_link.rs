@@ -1691,6 +1691,58 @@ async fn begin_for_approval_binds_the_stored_request() {
     );
 }
 
+/// A request shown cut cannot be approved from the browser: the begin is
+/// refused before any touch is issued (none is spent on a doomed approval).
+#[tokio::test]
+async fn begin_for_a_truncated_approval_is_refused_before_the_touch() {
+    let (w, mut link, d, _) = paired_with_passkey().await;
+    let mut new = new_connector(Some("deploy"));
+    new.send.body_truncated = true;
+    let cut = w
+        .ctx
+        .approvals
+        .as_ref()
+        .unwrap()
+        .create(
+            new,
+            |_| Ok(None),
+            Duration::from_secs(600),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    assert!(cut.body_truncated);
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": cut.id})),
+    )
+    .await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "truncated_not_acknowledged", "{a}");
+    assert!(
+        a["message"]
+            .as_str()
+            .unwrap()
+            .contains("--accept-truncated"),
+        "{a}"
+    );
+    // Nothing was issued: the next begin gets the first web request id.
+    let r = make_request(&w, Some("deploy"));
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": r.id})),
+    )
+    .await;
+    assert_eq!(a["result"]["request_id"], "1", "{a}");
+    issued(&w, &d, 1);
+}
+
 /// The daemon's own uid is not the device owner's: the owner is a requester
 /// but no approver, so a begin for their own pending request is refused.
 #[tokio::test]
