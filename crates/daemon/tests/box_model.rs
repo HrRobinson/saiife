@@ -429,7 +429,7 @@ async fn world(o: Opts) -> W {
     let root = mgr.root().to_path_buf();
     let ph = |id: &BoxId, login| {
         saiife_boxhost::placeholder::read_or_make_placeholder(
-            &saiife_boxhost::layout::record_dir(&root, id),
+            &saiife_boxhost::paths::RecordPaths::of(&root, id),
             login,
         )
         .unwrap()

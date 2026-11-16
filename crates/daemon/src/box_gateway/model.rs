@@ -437,9 +437,9 @@ async fn box_info(gw: &GatewayShared, id: &BoxId) -> Result<BoxInfo, Deny> {
     tokio::task::spawn_blocking(move || {
         let r = mgr.get(&id).ok()?;
         let t = mgr.templates().into_iter().find(|t| t.name == r.template)?;
-        let dir = saiife_boxhost::layout::record_dir(mgr.root(), &id);
+        let record = saiife_boxhost::paths::RecordPaths::of(mgr.root(), &id);
         // A bad or unreadable file is as good as none: nothing passes.
-        let placeholder = saiife_boxhost::placeholder::read_placeholder(&dir, t.login)
+        let placeholder = saiife_boxhost::placeholder::read_placeholder(&record, t.login)
             .ok()
             .flatten();
         Some(BoxInfo {

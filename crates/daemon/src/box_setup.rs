@@ -22,7 +22,7 @@ use saiife_boxes::BoxId;
 use saiife_boxhost::guest::{
     claude_env, claude_json_seed, claude_settings, pack_files, CastPath, SetupSource, VsockGuest,
 };
-use saiife_boxhost::paths::BoxPaths;
+use saiife_boxhost::paths::{BoxPaths, RecordPaths};
 use saiife_boxhost::placeholder::read_or_make_placeholder;
 use saiife_boxhost::vmm::VmHooks;
 use saiife_boxproto::msg::{AgentSpec, Setup, SetupFile, MAX_FILES, MAX_FILE_TEXT};
@@ -102,7 +102,7 @@ impl SetupSource for TemplateSetup {
         if t.login == Login::Subscription && !SUBSCRIPTION_LOGIN_CLEARED {
             return Err(SUBSCRIPTION_GATED.into());
         }
-        let record = saiife_boxhost::layout::record_dir(mgr.root(), id);
+        let record = RecordPaths::of(mgr.root(), id);
         drop(mgr);
         // Runs on the guest channel's own thread (never under the manager
         // lock or on an async runtime), so the file I/O may block. Every
