@@ -38,7 +38,9 @@ use crate::error::BoxesError;
 use crate::guest::{GuestError, GuestEvent, GuestLink};
 use crate::state::{holds_capacity, transition, Event};
 use crate::store::{BoxRecord, Store};
-use crate::template::{BoxTemplate, ImageRef, Login, SUBSCRIPTION_LOGIN_CLEARED};
+use crate::template::{
+    BoxTemplate, ImageRef, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
+};
 use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
 
 /// No `Ready` this long after admission → the boot failed.
@@ -54,7 +56,6 @@ pub const MAX_REPO_BYTES: usize = 256;
 const PAIR: &str = "a repo disk and its base manifest come together, or neither";
 const NOT_INCOMING: &str =
     "the repo disk and its base manifest must be in one dir of the box store's .incoming";
-const SUBSCRIPTION_GATED: &str = "subscription login is waiting for the owner's terms check (spec §7.9); use login = \"api-key\"";
 const CREDENTIAL_IN_BOX: &str =
     "credential_in_box is not supported: the real credential never enters the box";
 const NO_PLACER: &str = "this box manager takes no repo disk";

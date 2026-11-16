@@ -198,6 +198,12 @@ pub struct GatewayConfig {
     /// have no such field.
     #[cfg(debug_assertions)]
     pub allow_loopback_for_tests: bool,
+    /// Debug builds only: the model forwarder treats subscription login as
+    /// cleared (plan 40 C4) so the subscription swap can be tested. Release
+    /// builds have no such field and use only
+    /// [`saiife_boxes::template::SUBSCRIPTION_LOGIN_CLEARED`].
+    #[cfg(debug_assertions)]
+    pub subscription_cleared_for_tests: bool,
     /// The rate limits' clock (the denied-record window and the bucket).
     pub clock: Clock,
     /// The model forwarder's limits (plan 40, C5).
@@ -211,6 +217,8 @@ impl Default for GatewayConfig {
             limits: Limits::default(),
             #[cfg(debug_assertions)]
             allow_loopback_for_tests: false,
+            #[cfg(debug_assertions)]
+            subscription_cleared_for_tests: false,
             clock: Arc::new(move || u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)),
             model: model::ModelConfig::default(),
         }
@@ -387,6 +395,9 @@ pub struct GatewayShared {
     pub(crate) resolve: Arc<dyn Resolve>,
     pub(crate) limits: Limits,
     allow_loopback: bool,
+    /// Whether the model forwarder may serve a subscription-login box
+    /// (plan 40 C4): the constant, or the debug-only test flag.
+    pub(crate) subscription_cleared: bool,
     pub(crate) clock: Clock,
     denied: Mutex<Denied>,
     runs: Mutex<BTreeMap<BoxId, Arc<BoxRun>>>,
@@ -517,6 +528,11 @@ impl GatewayHooks {
         let allow_loopback = cfg.allow_loopback_for_tests;
         #[cfg(not(debug_assertions))]
         let allow_loopback = false;
+        #[cfg(debug_assertions)]
+        let subscription_cleared = saiife_boxes::template::SUBSCRIPTION_LOGIN_CLEARED
+            || cfg.subscription_cleared_for_tests;
+        #[cfg(not(debug_assertions))]
+        let subscription_cleared = saiife_boxes::template::SUBSCRIPTION_LOGIN_CLEARED;
         let group_rw = ctx.mode == Mode::Locked;
         let lookups = Arc::new(Semaphore::new(cfg.limits.lookups));
         Arc::new(GatewayHooks {
@@ -525,6 +541,7 @@ impl GatewayHooks {
                 resolve,
                 limits: cfg.limits,
                 allow_loopback,
+                subscription_cleared,
                 clock: cfg.clock,
                 denied: Mutex::new(Denied::default()),
                 runs: Mutex::new(BTreeMap::new()),

@@ -17,7 +17,7 @@ use std::time::Duration;
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::Manager;
 use saiife_boxes::store::Store;
-use saiife_boxes::template::AgentKind;
+use saiife_boxes::template::{AgentKind, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED};
 use saiife_boxes::BoxId;
 use saiife_boxhost::guest::{
     claude_env, claude_json_seed, claude_settings, pack_files, CastPath, SetupSource, VsockGuest,
@@ -96,6 +96,12 @@ impl SetupSource for TemplateSetup {
             .into_iter()
             .find(|t| t.name == r.template)
             .ok_or_else(|| format!("the template {:?} is gone", r.template))?;
+        // Plan 40 C4 beyond spawn: a template edited to subscription after
+        // spawn sets up nothing (no OAuth placeholder is made) until the
+        // owner's terms check flips the constant.
+        if t.login == Login::Subscription && !SUBSCRIPTION_LOGIN_CLEARED {
+            return Err(SUBSCRIPTION_GATED.into());
+        }
         let record = saiife_boxhost::layout::record_dir(mgr.root(), id);
         drop(mgr);
         // Runs on the guest channel's own thread (never under the manager

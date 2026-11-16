@@ -304,6 +304,9 @@ struct Opts {
     services: Option<Vec<&'static str>>,
     /// The upstream cannot be reached (connection refused).
     dead_upstream: bool,
+    /// The gateway's debug-only C4 override: the forwarder serves the
+    /// subscription box (the constant itself stays false).
+    subscription_cleared: bool,
 }
 
 impl Default for Opts {
@@ -312,6 +315,7 @@ impl Default for Opts {
             model: ModelConfig::default(),
             services: Some(vec!["box-model"]),
             dead_upstream: false,
+            subscription_cleared: true,
         }
     }
 }
@@ -391,7 +395,9 @@ async fn world(o: Opts) -> W {
     // Spawn refuses subscription login (C4): the boxes are spawned with an
     // api-key "model-sub", then the manager is opened again over the same
     // store with "model-sub" as a subscription template, as a template
-    // edited after spawn would be. The const stays false.
+    // edited after spawn would be. The const stays false: the forwarder
+    // serves this box only through the gateway's debug-only test override
+    // (`Opts::subscription_cleared`).
     let spawn_templates = vec![
         tmpl("model-api", Login::ApiKey, "anthropic"),
         tmpl("model-sub", Login::ApiKey, "anthropic-sub"),
@@ -472,6 +478,7 @@ async fn world(o: Opts) -> W {
         GatewayConfig {
             limits: Limits::default(),
             allow_loopback_for_tests: true,
+            subscription_cleared_for_tests: o.subscription_cleared,
             clock: Arc::new(move || c.load(Ordering::SeqCst)),
             model: o.model,
         },
@@ -723,6 +730,68 @@ async fn subscription_swap() {
     assert!(!has(&s.headers, &w.sub.placeholder));
     let recs = w.wait_records("model", 1).await;
     assert_eq!(recs[0]["login"], "subscription");
+}
+
+/// C4 beyond spawn: with the gate closed (the constant, no test override),
+/// a box whose template was edited to subscription after spawn gets a fixed
+/// 403 for its own valid placeholder, nothing reaches the upstream, and the
+/// `model_denied` records are rate-limited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscription_is_refused_by_the_forwarder() {
+    if saiife_boxes::template::SUBSCRIPTION_LOGIN_CLEARED {
+        return; // the owner opened the gate: nothing is refused
+    }
+    let w = world(Opts {
+        subscription_cleared: false,
+        ..Opts::default()
+    })
+    .await;
+    let bearer = format!("Bearer {}", w.sub.placeholder);
+    for _ in 0..3 {
+        let req = post(
+            "/v1/messages",
+            &[("authorization", &bearer)],
+            &messages_body(),
+        );
+        let (code, _, body) = ask(&w.sub, req).await;
+        assert_eq!(code, 403, "{body}");
+        assert_eq!(body.trim(), saiife_boxes::template::SUBSCRIPTION_GATED);
+        assert!(!body.contains(&w.sub.placeholder));
+    }
+    assert!(w.up.seen().is_empty(), "nothing was forwarded");
+    let recs = w.wait_records("model_denied", 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(w.records("model_denied").len(), 1, "{recs:?}");
+    assert_eq!(recs[0]["reason"], "subscription_gated");
+    assert_eq!(recs[0]["box"], w.sub.id.as_str());
+    assert!(w.records("model").is_empty());
+    // The api-key box is unaffected.
+    assert_eq!(ask(&w.a, api_req(&w.a)).await.0, 200);
+}
+
+/// C4 beyond spawn: the setup of a box whose template was edited to
+/// subscription after spawn is refused with the spawn's message, and its
+/// placeholder file is left as it was (no OAuth placeholder is made).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscription_setup_is_refused() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::TemplateSetup;
+    if saiife_boxes::template::SUBSCRIPTION_LOGIN_CLEARED {
+        return; // the owner opened the gate: nothing is refused
+    }
+    let w = world(Opts::default()).await;
+    let mgr = w.ctx.box_manager.as_ref().unwrap();
+    let file = saiife_boxhost::layout::record_dir(mgr.root(), &w.sub.id).join("placeholder");
+    let before = std::fs::read(&file).unwrap();
+    let setups = TemplateSetup::new(w._tmp.path().join("packs"));
+    setups.attach(mgr);
+    assert_eq!(
+        setups.setup_for(&w.sub.id).unwrap_err(),
+        saiife_boxes::template::SUBSCRIPTION_GATED
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    // An api-key box of the same manager still sets up.
+    assert!(setups.setup_for(&w.a.id).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -117,10 +117,20 @@ fn read_inner(record_dir: &Path, login: Login) -> io::Result<Found> {
 }
 
 /// The box's placeholder: created once (0600, `O_EXCL`), then read back.
-/// Losing the create race reads the winner's file. A file of ours with bad
-/// content (a create that crashed or failed part way) is removed and made
-/// afresh once; it was never sent to a guest. Only the setup source calls
-/// this; the forwarder uses [`read_placeholder`].
+/// A file of ours with bad content (a create that crashed or failed part
+/// way) is removed and made afresh once; it was never sent to a guest. The
+/// forwarder never calls this; it uses [`read_placeholder`].
+///
+/// **One caller per box at a time.** This is not safe against a concurrent
+/// call for the same box: a second caller can read the first one's file
+/// while it is still empty, take it for bad content, remove it and create
+/// its own, so the two callers return different placeholders and only one
+/// is in the file (the other box session then gets `401` until its next
+/// setup). The only caller is the setup source (`SetupSource::setup_for`),
+/// which runs on the guest channel's per-box events thread, and plan 38
+/// keeps one setup in flight per box: a run claims its setup with a
+/// compare-and-swap before calling, and a new boot of the box first stops
+/// the earlier run and joins its threads.
 pub fn read_or_make_placeholder(record_dir: &Path, login: Login) -> io::Result<String> {
     let path = record_dir.join(PLACEHOLDER);
     let mut replaced = false;

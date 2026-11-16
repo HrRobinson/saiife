@@ -9,7 +9,9 @@
 //! header: `x-api-key` for an API key, `authorization: Bearer` for a
 //! subscription. The placeholder anywhere else is refused, and the
 //! credential headers the box sent are always removed before the real one
-//! is added (C5). Bodies, the target and the other headers are passed
+//! is added (C5). A box whose template asks for subscription login gets a
+//! fixed `403` while the owner's terms check is open (C4,
+//! `SUBSCRIPTION_LOGIN_CLEARED`), whatever it sends. Bodies, the target and the other headers are passed
 //! through untouched. Error answers are fixed text: they never quote a
 //! header, the placeholder or the key.
 //!
@@ -37,7 +39,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use saiife_audit::DecisionKind;
-use saiife_boxes::template::Login;
+use saiife_boxes::template::{Login, SUBSCRIPTION_GATED};
 use saiife_boxes::BoxId;
 use saiife_broker::upstream::Resolver;
 use std::convert::Infallible;
@@ -861,6 +863,15 @@ async fn forward(st: &Arc<ConnState>, req: Request<Incoming>) -> Result<Response
         ));
     }
     let info = box_info(gw, &st.run.id).await?;
+    // C4 holds here too: a template edited to subscription after spawn
+    // gets nothing forwarded until the owner's terms check.
+    if info.login == Login::Subscription && !gw.subscription_cleared {
+        return Err(Deny::new(
+            StatusCode::FORBIDDEN,
+            SUBSCRIPTION_GATED,
+            "subscription_gated",
+        ));
+    }
     let not_valid = |reason| Deny::new(StatusCode::UNAUTHORIZED, NOT_VALID, reason);
     let Some(expected) = info.placeholder.as_deref() else {
         return Err(not_valid("no_placeholder"));

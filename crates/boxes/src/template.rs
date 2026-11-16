@@ -19,6 +19,10 @@ pub const MAX_MEM_MIB: u64 = 262_144;
 /// subscription use through a local proxy (spec §7.9, §13). A one-line
 /// change in its own commit, or subscription support is removed.
 pub const SUBSCRIPTION_LOGIN_CLEARED: bool = false;
+/// The refusal while [`SUBSCRIPTION_LOGIN_CLEARED`] is false: at spawn,
+/// in the setup of a box whose template was edited to subscription later,
+/// and (403) on the model forwarder.
+pub const SUBSCRIPTION_GATED: &str = "subscription login is waiting for the owner's terms check (spec §7.9); use login = \"api-key\"";
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude-code.toml");
 /// Largest template file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;

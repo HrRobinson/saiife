@@ -248,6 +248,7 @@ async fn world(o: Opts) -> W {
         GatewayConfig {
             limits: o.limits,
             allow_loopback_for_tests: o.loopback,
+            subscription_cleared_for_tests: false,
             clock: Arc::new(move || c.load(Ordering::SeqCst)),
             model: Default::default(),
         },
