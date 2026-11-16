@@ -64,6 +64,8 @@ struct World {
     clock: Arc<AtomicU64>,
     audit: PathBuf,
     _tmp: tempfile::TempDir,
+    /// A second scratch dir a test's own manager lives in.
+    _keep: Option<tempfile::TempDir>,
 }
 
 struct Setup {
@@ -173,6 +175,7 @@ fn world_with(s: Setup) -> World {
         clock,
         audit,
         _tmp: tmp,
+        _keep: None,
     }
 }
 
@@ -2130,4 +2133,91 @@ async fn revise_after_a_cold_stop_runs_again() {
         .prompts()
         .contains(&(b.clone(), "again".to_string())));
     assert!(!w.mgr().get(&b).unwrap().keep);
+}
+
+/// A world whose manager holds the built-in template plus a `fallback`
+/// one that asks for the credential inside the box.
+fn world_with_fallback_template() -> World {
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let mut fallback = template::builtin().remove(0);
+    fallback.name = "fallback".into();
+    fallback.credential_in_box = true;
+    let mut templates = template::builtin();
+    templates.push(fallback);
+    let o = Manager::open(ManagerInit {
+        store: Store::open(box_ops::dir_in(&state)).unwrap(),
+        vmm: Arc::new(FakeVmm::new()),
+        guest: Arc::new(FakeGuest::new()),
+        templates,
+        host: Arc::new(two_boxes),
+        clock: Arc::new(|| T0),
+        disk_place: box_ops::disk_place(),
+    })
+    .unwrap();
+    let mut w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(Arc::new(o.manager)),
+        unavailable: None,
+        ready_vault: false,
+    });
+    w._keep = Some(tmp);
+    w
+}
+
+#[tokio::test]
+async fn spawn_record_names_credential_mode() {
+    let w = world();
+    w.spawn(ALICE, "add a cart").await;
+    let recs = w.records();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert_eq!(recs[0]["credential"], "gateway", "{}", recs[0]);
+    // A template that asks for the credential inside the box is refused at
+    // spawn (plan 40 R3): no box, so no spawn record.
+    let w = world_with_fallback_template();
+    let a = w
+        .call(
+            ALICE,
+            "box.spawn",
+            json!({"template": "fallback", "repo": "shop", "task": "t", "start": "queue"}),
+        )
+        .await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("credential_in_box"),
+        "{a}"
+    );
+    assert!(w.records().is_empty(), "{:?}", w.records());
+    assert!(w.ok(ALICE, "box.list", json!({})).await["boxes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn list_reports_credential_mode() {
+    let w = world();
+    w.spawn(ALICE, "add a cart").await;
+    let l = w.ok(ALICE, "box.list", json!({})).await;
+    assert_eq!(l["boxes"][0]["credential"], "gateway", "{l}");
+    assert!(l.get("credential").is_none(), "no top-level key: {l}");
+}
+
+#[tokio::test]
+async fn templates_carry_login_and_fallback_flag() {
+    let w = world_with_fallback_template();
+    let a = w.ok(ALICE, "box.templates", json!({})).await;
+    let by = |n: &str| {
+        a["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by("claude-code")["login"], "api-key", "{a}");
+    assert_eq!(by("claude-code")["credential_in_box"], false, "{a}");
+    assert_eq!(by("fallback")["credential_in_box"], true, "{a}");
 }

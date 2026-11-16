@@ -597,7 +597,7 @@ mod imp {
 
     /// A table as lines: columns padded to the widest cell, the last one
     /// not padded. A row's trailer, if any, is a line under it.
-    pub(crate) fn render(head: &[&str], rows: &[(Vec<String>, Option<String>)]) -> Vec<String> {
+    pub(crate) fn render(head: &[&str], rows: &[(Vec<String>, Vec<String>)]) -> Vec<String> {
         let mut w: Vec<usize> = head.iter().map(|h| h.chars().count()).collect();
         for (r, _) in rows {
             for (i, c) in r.iter().enumerate() {
@@ -619,17 +619,20 @@ mod imp {
         for (r, trailer) in rows {
             let cells: Vec<&str> = r.iter().map(String::as_str).collect();
             out.push(line(&cells));
-            out.extend(trailer.clone());
+            out.extend(trailer.iter().cloned());
         }
         out
     }
+
+    /// The line under a box whose model credential is inside it.
+    const IN_BOX_LABEL: &str = "  credential inside box (weaker)";
 
     /// The `ls` table for a `box.list` answer's `boxes`, at time `now`.
     pub(super) fn box_lines(boxes: &[Value], now: u64) -> Vec<String> {
         let head = [
             "ID", "STATE", "TEMPLATE", "REPO", "AGE", "DISK", "QUEUE", "TASK",
         ];
-        let rows: Vec<(Vec<String>, Option<String>)> = boxes
+        let rows: Vec<(Vec<String>, Vec<String>)> = boxes
             .iter()
             .map(|b| {
                 let created = b.get("created_at").and_then(Value::as_u64).unwrap_or(now);
@@ -647,12 +650,20 @@ mod imp {
                         .map_or_else(|| "-".to_string(), |n| n.to_string()),
                     short_task(text(b, "task")),
                 ];
-                let error = b
+                let mut under = Vec::new();
+                // Only a daemon that says so: no box has this today (spawn
+                // refuses the template), the label is for if one ever does.
+                if b.get("credential").and_then(Value::as_str) == Some("in_box") {
+                    under.push(IN_BOX_LABEL.to_string());
+                }
+                if let Some(e) = b
                     .get("error")
                     .and_then(Value::as_str)
                     .filter(|e| !e.is_empty())
-                    .map(|e| format!("  error: {}", sanitize(e)));
-                (cells, error)
+                {
+                    under.push(format!("  error: {}", sanitize(e)));
+                }
+                (cells, under)
             })
             .collect();
         render(&head, &rows)
@@ -703,13 +714,10 @@ mod imp {
         String::from_utf8(out).unwrap_or_default()
     }
 
-    fn print_templates(a: &Args) {
-        let list: &[Value] = a
-            .get("templates")
-            .and_then(Value::as_array)
-            .map_or(&[], Vec::as_slice);
+    /// The `templates` table for a `box.templates` answer's `templates`.
+    pub(super) fn template_lines(list: &[Value]) -> Vec<String> {
         let flag = |t: &Value, k: &str| t.get(k).and_then(Value::as_bool).unwrap_or(false);
-        let rows: Vec<(Vec<String>, Option<String>)> = list
+        let rows: Vec<(Vec<String>, Vec<String>)> = list
             .iter()
             .map(|t| {
                 let mut notes = Vec::new();
@@ -719,17 +727,30 @@ mod imp {
                 if flag(t, "has_egress") {
                     notes.push("egress");
                 }
+                let mut under = Vec::new();
+                if flag(t, "credential_in_box") {
+                    under.push("  credential_in_box: not supported (refused at spawn)".to_string());
+                }
                 (
                     vec![
                         sanitize(text(t, "name")),
+                        sanitize(text(t, "login")),
                         notes.join(","),
                         sanitize(text(t, "description")),
                     ],
-                    None,
+                    under,
                 )
             })
             .collect();
-        for l in render(&["NAME", "NEEDS", "DESCRIPTION"], &rows) {
+        render(&["NAME", "LOGIN", "NEEDS", "DESCRIPTION"], &rows)
+    }
+
+    fn print_templates(a: &Args) {
+        let list: &[Value] = a
+            .get("templates")
+            .and_then(Value::as_array)
+            .map_or(&[], Vec::as_slice);
+        for l in template_lines(list) {
             outln!("{l}");
         }
         for w in a
@@ -807,6 +828,45 @@ mod imp {
             assert_eq!(lines[2], "  error: boot failed: no kvm\\u{202E}");
             assert!(lines[3].starts_with("b2  running"), "{lines:?}");
             assert!(lines[3].contains("2h"), "{lines:?}");
+        }
+
+        #[test]
+        fn fallback_is_labelled() {
+            let boxes = vec![
+                json!({"id": "b1", "state": "running", "template": "t", "repo": "r",
+                       "task": "x", "created_at": 0, "credential": "in_box"}),
+                json!({"id": "b2", "state": "running", "template": "claude-code", "repo": "r",
+                       "task": "y", "created_at": 0, "credential": "gateway"}),
+                json!({"id": "b3", "state": "running", "template": "gone", "repo": "r",
+                       "task": "z", "created_at": 0}),
+            ];
+            let lines = box_lines(&boxes, 7200);
+            assert_eq!(lines.len(), 5, "{lines:?}");
+            assert!(lines[1].starts_with("b1  running"), "{lines:?}");
+            assert_eq!(lines[2], "  credential inside box (weaker)");
+            assert!(lines[3].starts_with("b2  running"), "{lines:?}");
+            assert!(lines[4].starts_with("b3  running"), "{lines:?}");
+            assert!(!lines.iter().skip(3).any(|l| l.contains("credential")));
+        }
+
+        #[test]
+        fn templates_show_login() {
+            let list = vec![
+                json!({"name": "claude-code", "description": "d", "login": "api-key",
+                       "credential_in_box": false, "has_secrets": false, "has_egress": false}),
+                json!({"name": "sub", "description": "e", "login": "subscription",
+                       "credential_in_box": true, "has_secrets": false, "has_egress": true}),
+            ];
+            let lines = template_lines(&list);
+            assert!(lines[0].starts_with("NAME"), "{lines:?}");
+            assert!(lines[0].contains("LOGIN"), "{lines:?}");
+            assert!(lines[1].contains("api-key"), "{lines:?}");
+            assert_eq!(lines.len(), 4, "{lines:?}");
+            assert!(lines[2].contains("subscription"), "{lines:?}");
+            assert_eq!(
+                lines[3],
+                "  credential_in_box: not supported (refused at spawn)"
+            );
         }
 
         #[test]

@@ -1474,7 +1474,7 @@ async fn run(
     };
     match op {
         Op::Spawn(mut args) => {
-            let (r, answer, others) = blocking(move || {
+            let (r, answer, others, credential) = blocking(move || {
                 // The copy runs here, off the runtime and outside every
                 // lock; the manager moves it into the box dir.
                 let root = m.root().to_path_buf();
@@ -1483,6 +1483,11 @@ async fn run(
                 discard_disk(&root, staged.as_deref());
                 let (r, changes) = spawned?;
                 let answer = info_of(&m, &r, Some(r.owner_uid));
+                let credential = m
+                    .templates()
+                    .iter()
+                    .find(|t| t.name == r.template)
+                    .map(|t| t.credential_mode());
                 // Earlier queue heads this spawn's admission pass moved
                 // (possibly other owners' boxes): the tick never sees them.
                 // The new box's own admission is covered by the spawn
@@ -1495,7 +1500,7 @@ async fn run(
                         (c, template)
                     })
                     .collect::<Vec<_>>();
-                Ok((r, answer, others))
+                Ok((r, answer, others, credential))
             })
             .await?;
             write_tick_records(ctx, "tick", None, others, "tick").await;
@@ -1510,6 +1515,9 @@ async fn run(
             );
             if r.state == BoxState::Discarded {
                 rec.reason = r.error.clone();
+            }
+            if let Some(c) = credential {
+                rec.extra.insert("credential".into(), c.into());
             }
             // Admitted at its own spawn: the base image its VM was created
             // from (plan 36).
@@ -1538,9 +1546,16 @@ async fn run(
                     .into_iter()
                     .filter_map(|r| r.error.filter(|e| !e.is_empty()).map(|e| (r.id, e)))
                     .collect();
+                // A record whose template is gone carries no `credential`.
+                let modes: std::collections::HashMap<String, &'static str> = m
+                    .templates()
+                    .iter()
+                    .map(|t| (t.name.clone(), t.credential_mode()))
+                    .collect();
                 let boxes: Vec<Value> = boxes
                     .into_iter()
                     .map(|b| {
+                        let mode = modes.get(&b.template).copied();
                         let err = errors.get(&b.id).cloned();
                         let disk = disk_mib(&root, &b.id);
                         let mut v = serde_json::to_value(b).unwrap_or_default();
@@ -1549,6 +1564,9 @@ async fn run(
                                 o.insert("error".into(), e.into());
                             }
                             o.insert("disk_mib".into(), disk.into());
+                            if let Some(c) = mode {
+                                o.insert("credential".into(), c.into());
+                            }
                         }
                         v
                     })

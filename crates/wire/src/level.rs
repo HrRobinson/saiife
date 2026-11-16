@@ -316,6 +316,8 @@ mod tests {
             description: String::new(),
             has_secrets: s,
             has_egress: e,
+            login: "api-key".into(),
+            credential_in_box: false,
         };
         assert_eq!(spawn_level(&t(false, false)), Level::Signed);
         assert_eq!(spawn_level(&t(true, false)), Level::Touch);

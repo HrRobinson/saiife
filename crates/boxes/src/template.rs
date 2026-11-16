@@ -86,12 +86,30 @@ pub struct BoxTemplate {
 }
 
 impl BoxTemplate {
+    /// How the model credential reaches the box, for `box ls` and the audit
+    /// (plan 40 C3, R3): `"gateway"`, the host forwarder adds it, or
+    /// `"in_box"`. Spawn refuses `credential_in_box`, so no box has the
+    /// latter today; the one place the value is derived.
+    pub fn credential_mode(&self) -> &'static str {
+        if self.credential_in_box {
+            "in_box"
+        } else {
+            "gateway"
+        }
+    }
+
     pub fn wire(&self) -> saiife_wire::source::Template {
         saiife_wire::source::Template {
             name: self.name.clone(),
             description: self.description.clone(),
             has_secrets: !self.secrets.is_empty(),
             has_egress: !self.egress.is_empty(),
+            login: match self.login {
+                Login::ApiKey => "api-key",
+                Login::Subscription => "subscription",
+            }
+            .into(),
+            credential_in_box: self.credential_in_box,
         }
     }
 }
