@@ -22,7 +22,6 @@ use saiife_boxes::template::{self, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
 use saiife_boxes::{BoxError, BoxId, BoxState};
 use saiife_boxhost::guest::{SetupSource, VsockGuest};
-use saiife_boxhost::layout::Layout;
 use saiife_boxhost::paths::{BoxPaths, RecordPaths, BASE_MANIFEST};
 use saiife_boxhost::vmm::VmHooks;
 use saiife_boxproto::delta::{write_delta, DeltaItem, EntryHead, Op};
@@ -309,7 +308,10 @@ struct World {
     guest: Arc<VsockGuest>,
     clock: Arc<AtomicU64>,
     audit: PathBuf,
+    /// The box records (the store root; the land records live here, R37).
     root: PathBuf,
+    /// The VMM runtime dirs (`Layout.boxes`), apart from the records.
+    runtime: PathBuf,
     served: Mutex<BTreeMap<BoxId, Served>>,
     keys: BTreeMap<u32, SoftAuthenticator>,
     _tmp: tempfile::TempDir,
@@ -405,19 +407,13 @@ fn world_with(slots: u64, attach: bool) -> World {
         keys.insert(uid, s);
     }
     let guest = VsockGuest::new(Arc::new(Setups), false, me());
-    let layout = Layout {
-        boxes: root.clone(),
-        images: state.join("images"),
-        vmm: state.join("vmm"),
-        vault: state.join("vault"),
-        locked: false,
-    };
+    // the VMM runtime dirs, apart from the records (R37)
+    let runtime = state.join("runtime");
     let c = Arc::clone(&clock);
     let lands = Lands::with_clock(
         Arc::clone(&ctx),
         Arc::clone(&mgr),
         Arc::clone(&guest),
-        layout,
         Arc::new(move || c.load(Ordering::SeqCst)),
     );
     if attach {
@@ -431,6 +427,7 @@ fn world_with(slots: u64, attach: bool) -> World {
         clock,
         audit,
         root,
+        runtime,
         served: Mutex::new(BTreeMap::new()),
         keys,
         _tmp: tmp,
@@ -448,7 +445,9 @@ impl World {
 
     /// Box `i`'s runtime dir (the vsock sockets).
     fn rt(&self, i: &BoxId) -> BoxPaths {
-        BoxPaths::of(&self.root, i)
+        let p = BoxPaths::of(&self.runtime, i);
+        std::fs::create_dir_all(&p.dir).unwrap();
+        p
     }
 
     /// A spawned box of `uid` (Queued, or Starting when there is room).
@@ -812,6 +811,44 @@ fn complete_approve_lands_and_advances() {
         })
     );
     assert_eq!(w.mgr.get(&i).unwrap().lands, 1);
+}
+
+/// R37: the land records are daemon-trusted state, kept in the box's
+/// record dir and never in the runtime dir the VMM shares.
+#[test]
+fn land_records_live_in_the_record_dir() {
+    let w = world(2);
+    let i = w.done(ALICE, &changed());
+    let n = w.lands.latest(&i).unwrap().n;
+    let p = w.pending_of(&i);
+    let ev = w.evidence(ALICE, &p);
+    w.src(Some(ALICE))
+        .complete(p.request_id, Decision::Approve, Some(ev))
+        .unwrap();
+    let rec = w.paths(&i);
+    assert!(rec.land_review(n).exists());
+    assert!(rec.land_approved(n).exists());
+    let lands_in_runtime = w.rt(&i).dir.join("lands");
+    assert!(!lands_in_runtime.exists(), "{}", lands_in_runtime.display());
+}
+
+/// Plan 31's hand-off: a Workspace source looks the land book up when it
+/// is made, so one made after the book is attached late has it (pending
+/// records, the L4 discard guard) and one made before has none.
+#[test]
+fn workspace_source_looks_the_book_up_at_call_time() {
+    let w = world_with(2, false);
+    let i = w.done(ALICE, &changed());
+    let before = box_ops::workspace_source(&w.ctx, Some(ALICE)).expect("a manager");
+    assert!(before.pending_actions().is_empty());
+    assert!(w.ctx.box_lands.set(Arc::clone(&w.lands)).is_ok());
+    let after = box_ops::workspace_source(&w.ctx, Some(ALICE)).expect("a manager");
+    let p = after.pending_actions();
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].box_id, Some(i));
+    // the owner scope holds: another owner sees none of it
+    let bob = box_ops::workspace_source(&w.ctx, Some(BOB)).expect("a manager");
+    assert!(bob.pending_actions().is_empty());
 }
 
 #[test]

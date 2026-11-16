@@ -49,7 +49,6 @@ use saiife_boxes::source::LandBook;
 use saiife_boxes::store::BoxRecord;
 use saiife_boxes::{BoxError, BoxId, BoxState};
 use saiife_boxhost::guest::VsockGuest;
-use saiife_boxhost::layout::Layout;
 use saiife_boxhost::paths::RecordPaths;
 use saiife_boxhost::review::{self, Flag, Review};
 use saiife_boxproto::delta::{apply_manifest, Valid};
@@ -221,7 +220,6 @@ pub struct Lands {
     ctx: Weak<Ctx>,
     mgr: Arc<Manager>,
     guest: Arc<VsockGuest>,
-    layout: Layout,
     clock: Clock,
     state: Mutex<State>,
     /// One lock per box: exports, approvals and advances of a box in turn.
@@ -440,15 +438,11 @@ fn hits_for(ctx: &Ctx, rec: &BoxRecord) -> impl Fn(&[&str]) -> Vec<Flag> {
 
 impl Lands {
     /// The book over `mgr`'s boxes, reaching each box's guest through
-    /// `guest` and its files through `layout` (whose `boxes` is the
-    /// manager's root). The context is held weakly (it holds the book).
-    pub fn new(
-        ctx: Arc<Ctx>,
-        mgr: Arc<Manager>,
-        guest: Arc<VsockGuest>,
-        layout: Layout,
-    ) -> Arc<Lands> {
-        Self::with_clock(ctx, mgr, guest, layout, Arc::new(crate::touch::unix_now))
+    /// `guest`. Its land records are in each box's record dir under the
+    /// manager's store root (`RecordPaths`, R37), never in a VMM runtime
+    /// dir. The context is held weakly (it holds the book).
+    pub fn new(ctx: Arc<Ctx>, mgr: Arc<Manager>, guest: Arc<VsockGuest>) -> Arc<Lands> {
+        Self::with_clock(ctx, mgr, guest, Arc::new(crate::touch::unix_now))
     }
 
     /// [`Lands::new`] with its own clock (tests).
@@ -456,7 +450,6 @@ impl Lands {
         ctx: Arc<Ctx>,
         mgr: Arc<Manager>,
         guest: Arc<VsockGuest>,
-        layout: Layout,
         clock: Clock,
     ) -> Arc<Lands> {
         // Request ids start at a random point past 2^32: a restart never
@@ -467,7 +460,6 @@ impl Lands {
             ctx: Arc::downgrade(&ctx),
             mgr,
             guest,
-            layout,
             clock,
             state: Mutex::new(State {
                 next_rid: (1u64 << 32) + u64::from(seed),
@@ -500,8 +492,10 @@ impl Lands {
             .ok_or_else(|| unavailable("the daemon is stopping"))
     }
 
+    /// Box `id`'s record dir (daemon-trusted, R37): its base manifest and
+    /// its land records.
     fn paths(&self, id: &BoxId) -> RecordPaths {
-        RecordPaths::new(self.layout.box_paths(id).dir)
+        RecordPaths::of(self.mgr.root(), id)
     }
 
     fn box_lock(&self, id: &BoxId) -> Arc<Mutex<()>> {

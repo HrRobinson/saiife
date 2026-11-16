@@ -297,7 +297,7 @@ pub struct Built {
     /// record root on the fake VM.
     pub disk_root: PathBuf,
     /// Real boxes only: what is wired once the daemon context exists (the
-    /// box gateway's hook, the guest event forwarder). Call it with the
+    /// box gateway's hook, the land book, the guest event forwarder). Call it with the
     /// context and the daemon's runtime before any box can boot.
     pub on_ctx: Option<OnCtx>,
 }
@@ -451,18 +451,35 @@ fn build_real(
     )?;
     setups.attach(&built.manager);
     built.on_ctx = Some(Box::new(move |ctx, rt| {
-        use crate::box_gateway::{GatewayConfig, GatewayHooks, SystemResolve};
-        let hooks = GatewayHooks::new(
-            Arc::clone(ctx),
-            rt.clone(),
-            Arc::new(SystemResolve::new()),
-            GatewayConfig::default(),
-        );
-        gateway.fill(hooks);
-        let _in_rt = rt.enter();
-        start_event_forwarder(Arc::clone(ctx), guest);
+        on_real_ctx(ctx, rt, gateway, guest)
     }));
     Ok(Ok(built))
+}
+
+/// What real boxes need of the daemon context, once it exists: the box
+/// gateway's hook (until then every boot fails closed), the land book over
+/// the guest channel (plan 39; without it land and push answer
+/// `unavailable`), and the guest event forwarder on `rt`.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+fn on_real_ctx(
+    ctx: &Arc<Ctx>,
+    rt: &tokio::runtime::Handle,
+    gateway: Arc<crate::box_setup::LateHooks>,
+    guest: Arc<saiife_boxhost::guest::VsockGuest>,
+) {
+    use crate::box_gateway::{GatewayConfig, GatewayHooks, SystemResolve};
+    let hooks = GatewayHooks::new(
+        Arc::clone(ctx),
+        rt.clone(),
+        Arc::new(SystemResolve::new()),
+        GatewayConfig::default(),
+    );
+    gateway.fill(hooks);
+    if attach_lands(ctx, Arc::clone(&guest)).is_none() {
+        eprintln!("saiifed: boxes: the land book was not attached: land and push are unavailable");
+    }
+    let _in_rt = rt.enter();
+    start_event_forwarder(Arc::clone(ctx), guest);
 }
 
 /// Without real boxes: plan 34's answer; on Linux it says the build has
@@ -1287,19 +1304,34 @@ fn source(mgr: &Arc<Manager>, scope: Option<u32>, book: &Book) -> ManagerSource 
     }
 }
 
+/// The Workspace's box source for `owner` (`None`: every owner) over the
+/// context's box manager, with the land book as it is attached now; `None`
+/// without a manager.
+///
+/// **Hook for plan 31:** every Workspace box source is built here, once per
+/// call, never once at start and kept: the land book is attached after the
+/// context exists ([`attach_lands`]), so a source made earlier would miss
+/// it, and the Workspace's `discard` would pass the L4 guard (and the
+/// book's box lock) while `pending_actions` and `complete` stayed empty.
+/// Plan 31 replaces `Ctx.boxes` (`NoBoxes` today) with calls to this.
+pub fn workspace_source(ctx: &Ctx, owner: Option<u32>) -> Option<ManagerSource> {
+    let mgr = ctx.box_manager.as_ref()?;
+    Some(source(mgr, owner, &book(ctx)))
+}
+
 /// Attach the land book (plan 39) over the context's box manager, reaching
-/// each box's guest through `guest` and its files through `layout`. Once
-/// per context; `None` without a manager or when one is attached already.
-/// The daemon's start calls it once boxes run on a real VMM (plan 35); a
-/// test calls it with its own guest.
+/// each box's guest through `guest`; its records are in each box's record
+/// dir (R37). Once per context; `None` without a manager or when one is
+/// attached already. Real boxes attach it in [`Built::on_ctx`] (the
+/// `on_real_ctx` of `build_real`); a test calls it with its own guest.
+/// Every user of the book looks it up per call (`ctx.box_lands`).
 #[cfg(unix)]
 pub fn attach_lands(
     ctx: &Arc<Ctx>,
     guest: Arc<saiife_boxhost::guest::VsockGuest>,
-    layout: saiife_boxhost::layout::Layout,
 ) -> Option<Arc<crate::box_land::Lands>> {
     let mgr = ctx.box_manager.clone()?;
-    let lands = crate::box_land::Lands::new(Arc::clone(ctx), mgr, guest, layout);
+    let lands = crate::box_land::Lands::new(Arc::clone(ctx), mgr, guest);
     ctx.box_lands.set(Arc::clone(&lands)).ok()?;
     Some(lands)
 }
@@ -1934,5 +1966,52 @@ mod tests {
         let none = |_: &str| -> Option<OsString> { None };
         let (d, _) = templates_dir(&Mode::Personal, Path::new("/c/config.toml"), &none);
         assert_eq!(d, Path::new("/c/templates.d"));
+    }
+
+    /// Real boxes attach the land book (plan 39) when the context exists:
+    /// without it every land and push answered `unavailable`.
+    #[cfg(all(target_os = "linux", feature = "boxes", feature = "fake-vmm"))]
+    #[test]
+    fn real_boxes_attach_the_land_book() {
+        let tmp = tempfile::tempdir_in(
+            std::env::var_os("SAIIFE_TEST_TMP")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        )
+        .unwrap();
+        let state = tmp.path().join("state");
+        let env =
+            |k: &str| -> Option<OsString> { (k == FAKE_SLOTS_ENV).then(|| OsString::from("1")) };
+        let built = build_fake(&state, &Mode::Personal, &state.join("config.toml"), &env).unwrap();
+        let cw = saiife_audit::ChainWriter::open(
+            &tmp.path().join("audit"),
+            saiife_audit::WriterOptions {
+                mode: "personal".into(),
+                saiife: "test".into(),
+                key: None,
+            },
+        )
+        .unwrap();
+        let cfg = crate::writer::WriterConfig {
+            checkpoint_every: 1000,
+            checkpoint_interval: std::time::Duration::from_secs(900),
+            fsync: saiife_policy::Fsync::Always,
+        };
+        let (handle, _join) = crate::writer::spawn(cw, cfg, None).unwrap();
+        let dirs: Arc<dyn saiife_policy::Directory + Send + Sync> =
+            Arc::new(saiife_policy::FixedDirectory::from_text("", ""));
+        let ctx = Arc::new(Ctx::new(crate::ops::CtxInit {
+            box_manager: Some(built.manager),
+            ..crate::ops::CtxInit::minimal(handle, cfg, dirs, &state)
+        }));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let setups = crate::box_setup::TemplateSetup::new(tmp.path().join("packs"));
+        let guest = saiife_boxhost::guest::VsockGuest::new(setups, false, 1000);
+        assert!(ctx.box_lands.get().is_none());
+        on_real_ctx(&ctx, rt.handle(), crate::box_setup::LateHooks::new(), guest);
+        assert!(ctx.box_lands.get().is_some());
     }
 }
