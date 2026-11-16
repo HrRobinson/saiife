@@ -203,14 +203,18 @@ fn next_event(s: &mut UnixStream, within: Duration) -> Option<Event> {
 fn pty_until(s: &mut UnixStream, needle: &str, within: Duration) -> String {
     let until = Instant::now() + within;
     let mut got = Vec::new();
-    while Instant::now() < until {
-        s.set_read_timeout(Some(Duration::from_millis(200)))
+    // One read timeout for the whole wait: a timeout in the middle of a
+    // frame would drop its bytes and desynchronise the stream, so it may
+    // only ever fire at the ceiling, where the wait has failed anyway.
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        s.set_read_timeout(Some(left.max(Duration::from_millis(1))))
             .unwrap();
         match read_frame(s) {
             Ok(Some(Frame::Bytes(b))) => got.extend_from_slice(&b),
             Ok(Some(Frame::Json(v))) => panic!("json on pty: {v}"),
+            // EOF: the agent is gone, nothing more will come
             Ok(None) => break,
-            Err(_) => {}
+            Err(_) => break,
         }
         if String::from_utf8_lossy(&got).contains(needle) {
             break;

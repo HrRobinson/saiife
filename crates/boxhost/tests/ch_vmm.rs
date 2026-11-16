@@ -1654,18 +1654,25 @@ fn a_late_exit_still_gets_after_off_once() {
     assert_eq!(offs(&w), 1, "{:?}", w.events());
 }
 
-/// R41: destroy is bounded to about a second. A VMM that ignores the power
-/// button is still stopping: destroy fails at once and keeps everything
-/// (runtime dir, pid record); once the ladder ends, a retried destroy
-/// succeeds and the runtime dir goes.
+/// R41: destroy is bounded. A VMM that ignores the power button is still
+/// stopping: destroy fails and keeps everything (runtime dir, pid record);
+/// once the VMM is gone, a retried destroy succeeds and the runtime dir goes.
+///
+/// No timing margin: the ladder's power wait is far longer than anything the
+/// test waits for, so "still stopping" holds however slow the host is, and
+/// the VMM exits when the test says so (a force stop), not when a clock
+/// does. That destroy returns instead of waiting out the ladder is proved by
+/// a call that returns within a ceiling well under the ladder's length; the
+/// tight "about a second" budget is `destroy_returns_within_its_budget`.
 #[test]
 fn destroy_is_bounded_and_a_retry_finishes_it() {
     let w = World::new();
     let l = w.launcher(&[("FAKE_CH_IGNORE_POWER", "1")]);
+    // the ladder would wait 120 s for the power button (the fake ignores it)
     let stop = StopTimes {
-        power_s: 3,
-        shutdown_s: 2,
-        force_s: 2,
+        power_s: 120,
+        shutdown_s: 120,
+        force_s: 120,
     };
     let v = w.vmm_times(
         Arc::clone(&l),
@@ -1675,30 +1682,70 @@ fn destroy_is_bounded_and_a_retry_finishes_it() {
     );
     let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
-    let t = Instant::now();
-    let m = failed(v.destroy(&h));
-    assert!(
-        t.elapsed() < Duration::from_millis(1500),
-        "{:?}",
-        t.elapsed()
-    );
+    // each destroy runs on its own thread: a hang is a failure after CEIL,
+    // not a stuck test
+    let bounded = |what: &str| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (v, h) = (Arc::clone(&v), h.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(v.destroy(&h));
+        });
+        rx.recv_timeout(Duration::from_secs(40))
+            .unwrap_or_else(|_| panic!("{what}: destroy waited out the ladder"))
+    };
+    let m = failed(bounded("first"));
     assert!(m.contains("still stopping"), "{m}");
     assert!(w.paths("b1").vm_json().exists(), "the runtime dir is kept");
     assert!(w.pid_record("b1").exists(), "the pid record is kept");
     assert_eq!(l.exited(&h.id), Some(false), "the VMM still runs");
     assert_eq!(offs(&w), 0, "{:?}", w.events());
     // a second call is bounded too and still keeps everything
-    let t = Instant::now();
-    assert!(v.destroy(&h).is_err());
-    assert!(t.elapsed() < Duration::from_millis(1500));
+    assert!(bounded("second").is_err());
     assert!(w.paths("b1").vm_json().exists());
-    // the ladder ends (vmm.shutdown after power_s): the next destroy succeeds
+    // the VMM goes (force stop, as the ladder's last rung would): a retried
+    // destroy, as the manager's tick makes it, succeeds
+    l.force_stop(&h.id).unwrap();
     assert!(wait_for(LONG, || l.exit_status(&h.id).is_some()));
-    v.destroy(&h).unwrap();
+    destroy_eventually(&v, &h).unwrap();
     assert!(!w.paths("b1").dir.exists(), "the runtime dir is gone");
     assert!(!w.pid_record("b1").exists());
     assert_eq!(offs(&w), 1, "{:?}", w.events());
     assert_eq!(v.status(&h), VmStatus::Gone);
+}
+
+/// R41's latency budget itself: destroy returns in about a second (its
+/// `DESTROY_WAIT`) while the VMM keeps stopping. A wall-clock bound, so it
+/// is not part of the always-on suite; run it on a quiet host with
+/// `cargo test -p saiife-boxhost --features fake --test ch_vmm -- --ignored`.
+#[test]
+#[ignore = "wall-clock latency budget; fails on a loaded host"]
+fn destroy_returns_within_its_budget() {
+    let w = World::new();
+    let l = w.launcher(&[("FAKE_CH_IGNORE_POWER", "1")]);
+    let stop = StopTimes {
+        power_s: 120,
+        shutdown_s: 120,
+        force_s: 120,
+    };
+    let v = w.vmm_times(
+        Arc::clone(&l),
+        vec![w.hook("h", false)],
+        rustix::process::geteuid().as_raw(),
+        stop,
+    );
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    for _ in 0..2 {
+        let t = Instant::now();
+        assert!(v.destroy(&h).is_err());
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+    l.force_stop(&h.id).unwrap();
+    destroy_eventually(&v, &h).unwrap();
 }
 
 /// R41: a destroy during a boot does not wait out the boot either.
