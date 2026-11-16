@@ -781,7 +781,7 @@ async fn subscription_setup_is_refused() {
     }
     let w = world(Opts::default()).await;
     let mgr = w.ctx.box_manager.as_ref().unwrap();
-    let file = saiife_boxhost::layout::record_dir(mgr.root(), &w.sub.id).join("placeholder");
+    let file = saiife_boxhost::paths::RecordPaths::of(mgr.root(), &w.sub.id).placeholder();
     let before = std::fs::read(&file).unwrap();
     let setups = TemplateSetup::new(w._tmp.path().join("packs"));
     setups.attach(mgr);

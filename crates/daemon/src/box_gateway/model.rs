@@ -11,9 +11,9 @@
 //! credential headers the box sent are always removed before the real one
 //! is added (C5). A box whose template asks for subscription login gets a
 //! fixed `403` while the owner's terms check is open (C4,
-//! `SUBSCRIPTION_LOGIN_CLEARED`), whatever it sends. Bodies, the target and the other headers are passed
-//! through untouched. Error answers are fixed text: they never quote a
-//! header, the placeholder or the key.
+//! `SUBSCRIPTION_LOGIN_CLEARED`), whatever it sends. Bodies, the target and
+//! the other headers are passed through untouched. Error answers are fixed
+//! text: they never quote a header, the placeholder or the key.
 //!
 //! Bounds: the box's connection limit and new-connection bucket (as the
 //! egress port), hyper's request head limits and a head deadline, a capped

@@ -40,7 +40,8 @@ pub fn incoming_in(boxes_root: &Path) -> PathBuf {
 
 /// Box `id`'s record dir, `<records_root>/<id>` (the box store's,
 /// daemon-only, R37): its base manifest, its terminal recording
-/// (`paths::TERM_CAST`, R15) and, until create, its repo disk.
+/// (`paths::TERM_CAST`, R15), the model placeholder (plan 40) and, until
+/// create, its repo disk.
 pub fn record_dir(records_root: &Path, id: &BoxId) -> PathBuf {
     records_root.join(id.as_str())
 }
