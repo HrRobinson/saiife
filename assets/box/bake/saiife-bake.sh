@@ -2,7 +2,8 @@
 # Guest side of the box base image bake. Runs as root from cloud-init
 # (runcmd) on the bake VM; ported from the spike's spike-bake.sh. The host
 # attaches the payload disk (LABEL=SAIIFE) with saiife, claude, guest/,
-# recipe.env and an empty out/ directory.
+# recipe.env and an empty out/ directory, plus the optional agent files of
+# plan 42 (codex.tar.gz, gemini.zip, node.tar.xz and their configs).
 set -euxo pipefail
 
 TTY=/dev/ttyS0
@@ -113,6 +114,77 @@ make_agent_user() {
     printf 'LABEL=repo /work ext4 defaults,nofail,x-systemd.device-timeout=5s 0 2\n' >>/etc/fstab
 }
 
+# Codex (plan 42 D10, R7): the release tarball holds exactly one file, the
+# static musl binary. The archive is only unpacked, never sourced.
+install_codex() {
+  local tmp n bin
+  tmp=$(mktemp -d)
+  tar -xzf "$MNT/codex.tar.gz" -C "$tmp" --no-same-owner --no-same-permissions
+  n=$(find "$tmp" -mindepth 1 -printf x | wc -c)
+  bin="$tmp/codex-x86_64-unknown-linux-musl"
+  if [ "$n" != 1 ] || [ -L "$bin" ] || [ ! -f "$bin" ]; then
+    echo "codex.tar.gz: want exactly one regular file codex-x86_64-unknown-linux-musl" >&2
+    return 1
+  fi
+  install -o root -g root -m 0755 "$bin" "/usr/local/bin/codex"
+  rm -rf -- "$tmp"
+  install -d -o root -g root -m 0755 "/etc/codex"
+  install -o root -g root -m 0644 "$MNT/codex-requirements.toml" "/etc/codex/requirements.toml"
+  "/usr/local/bin/codex" --version
+}
+
+# Gemini CLI (plan 42 D10, R9, R11, R14) on its own Node.js. The zip is
+# unpacked with Python's zipfile (members are kept under the target dir),
+# never run by the shell; one gemini.js at its root or in bundle/.
+install_gemini() {
+  local js c n tmp
+  if [ ! -f "$MNT/gemini.zip" ] || [ ! -f "$MNT/node.tar.xz" ]; then
+    echo "gemini needs both gemini.zip and node.tar.xz" >&2
+    return 1
+  fi
+  install -d -o root -g root -m 0755 "/opt/saiife-node"
+  tar -xJf "$MNT/node.tar.xz" -C "/opt/saiife-node" --strip-components=1 --no-same-owner
+  install -d -o root -g root -m 0755 "/opt/gemini-cli"
+  python3 -I -m zipfile -e "$MNT/gemini.zip" "/opt/gemini-cli"
+  n=0
+  js=
+  for c in "/opt/gemini-cli/gemini.js" "/opt/gemini-cli/bundle/gemini.js"; do
+    if [ -f "$c" ] && [ ! -L "$c" ]; then
+      js=$c
+      n=$((n + 1))
+    fi
+  done
+  if [ "$n" != 1 ]; then
+    echo "gemini.zip: want exactly one gemini.js at its root or in bundle/" >&2
+    return 1
+  fi
+  tmp=$(mktemp)
+  printf '#!/bin/sh\nexec /opt/saiife-node/bin/node %s "$@"\n' "$js" >"$tmp"
+  install -o root -g root -m 0755 "$tmp" "/usr/local/bin/gemini"
+  rm -f -- "$tmp"
+  # the managed system settings: the repo's settings never reach the hooks
+  install -d -o root -g root -m 0755 "/etc/gemini-cli"
+  install -o root -g root -m 0644 "$MNT/gemini-system-settings.json" "/etc/gemini-cli/settings.json"
+  # the baked home: the agent may add files to .gemini (sticky), never
+  # replace saiife's
+  install -d -o root -g root -m 0755 "/opt/saiife-gemini-home"
+  install -d -o root -g agent -m 1775 "/opt/saiife-gemini-home/.gemini"
+  install -o root -g root -m 0644 "$MNT/gemini-user-settings.json" "/opt/saiife-gemini-home/.gemini/settings.json"
+  install -o root -g root -m 0644 /dev/null "/opt/saiife-gemini-home/.gemini/.env"
+  install -d -o root -g root -m 0755 "/opt/saiife-gemini-home/.gemini/extensions"
+  "/usr/local/bin/gemini" --version
+}
+
+# Only for the payload files present: recipe.env does not say.
+install_agents() {
+  if [ -f "$MNT/codex.tar.gz" ]; then
+    install_codex
+  fi
+  if [ -f "$MNT/gemini.zip" ] || [ -f "$MNT/node.tar.xz" ]; then
+    install_gemini
+  fi
+}
+
 trim() {
   mkdir -p /etc/systemd/journald.conf.d
   printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=32M\n' \
@@ -214,6 +286,7 @@ main() {
   install_guest_units
   install_growroot
   make_agent_user
+  install_agents
   trim
   write_docker_store_config
   pull_images

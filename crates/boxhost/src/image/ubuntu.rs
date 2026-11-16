@@ -255,6 +255,8 @@ mod tests {
                 sha256: "UNPINNED".into(),
             },
             direct_kernel: false,
+            codex: None,
+            gemini: None,
         };
         let w = World {
             cache: d.join("cache"),

@@ -26,6 +26,19 @@ pub struct BakeInputs {
     /// `assets/box/guest`
     pub guest_assets: PathBuf,
     pub recipe: Recipe,
+    /// The optional agent downloads, verified against their pins.
+    pub agents: AgentArchives,
+}
+
+/// The optional agent downloads (plan 42 D10), already in the cache and
+/// verified. Whether the bake installs an agent comes only from which of
+/// these are in the payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentArchives {
+    /// `codex.tar.gz`
+    pub codex: Option<PathBuf>,
+    /// `gemini.zip` and the `node.tar.xz` it runs on.
+    pub gemini: Option<(PathBuf, PathBuf)>,
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -172,7 +185,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// A 512 MiB vfat image labelled SAIIFE: saiife, claude, guest/, recipe.env
-/// and an empty out/ the guest writes its results into.
+/// and an empty out/ the guest writes its results into. With Codex:
+/// `codex.tar.gz` and `codex-requirements.toml`; with Gemini: `gemini.zip`,
+/// `node.tar.xz`, `gemini-system-settings.json` and
+/// `gemini-user-settings.json` (plan 42 D10, R14).
 pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<(), String> {
     let env = recipe_env(&inputs.recipe)?;
     let stage = Stage::new(out, "payload")?;
@@ -183,6 +199,39 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
         .map_err(|e| format!("copy {}: {e}", inputs.claude_bin.display()))?;
     copy_tree(&inputs.guest_assets, &s.join("guest"))?;
     fs::write(s.join("recipe.env"), env).map_err(|e| format!("write recipe.env: {e}"))?;
+    let mut names = vec!["saiife", "claude", "guest", "recipe.env", "out"];
+    let copy = |src: &Path, name: &str| {
+        fs::copy(src, s.join(name)).map_err(|e| format!("copy {}: {e}", src.display()))
+    };
+    let write = |name: &str, body: String| {
+        fs::write(s.join(name), body).map_err(|e| format!("write {name}: {e}"))
+    };
+    if let Some(codex) = &inputs.agents.codex {
+        copy(codex, "codex.tar.gz")?;
+        write(
+            "codex-requirements.toml",
+            crate::guest::codex_requirements(),
+        )?;
+        names.extend(["codex.tar.gz", "codex-requirements.toml"]);
+    }
+    if let Some((gemini, node)) = &inputs.agents.gemini {
+        copy(gemini, "gemini.zip")?;
+        copy(node, "node.tar.xz")?;
+        write(
+            "gemini-system-settings.json",
+            crate::guest::gemini_system_settings(),
+        )?;
+        write(
+            "gemini-user-settings.json",
+            crate::guest::gemini_user_settings(),
+        )?;
+        names.extend([
+            "gemini.zip",
+            "node.tar.xz",
+            "gemini-system-settings.json",
+            "gemini-user-settings.json",
+        ]);
+    }
     fs::create_dir(s.join("out")).map_err(|e| format!("create out: {e}"))?;
     fs::write(s.join("out").join(".keep"), "").map_err(|e| format!("write .keep: {e}"))?;
     sized_file(out, PAYLOAD_BYTES)?;
@@ -191,7 +240,6 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
         Tool::MkfsVfat,
         &[OsStr::new("-n"), OsStr::new("SAIIFE"), out.as_os_str()],
     )?;
-    let names = ["saiife", "claude", "guest", "recipe.env", "out"];
     let mut args: Vec<OsString> = vec!["-s".into(), "-i".into(), out.into()];
     args.extend(names.iter().map(|n| s.join(n).into_os_string()));
     args.push("::".into());
@@ -377,6 +425,8 @@ mod tests {
                 sha256: "a".repeat(64),
             },
             direct_kernel: true,
+            codex: None,
+            gemini: None,
         }
     }
 
@@ -525,6 +575,7 @@ mod tests {
             claude_bin: claude,
             guest_assets: g,
             recipe: recipe(),
+            agents: AgentArchives::default(),
         };
         make_payload(&tools, &payload, &inputs).unwrap();
         assert_eq!(fs::metadata(&payload).unwrap().len(), PAYLOAD_BYTES);
@@ -552,6 +603,188 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with("-stage"))
             .collect();
         assert!(left.is_empty());
+    }
+
+    /// A fake mcopy that keeps a copy of every file it is handed in
+    /// `<dir>/seen/` and logs its arguments.
+    fn keeping_world() -> (tempfile::TempDir, Tools, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("calls.log");
+        let seen = d.path().join("seen");
+        fs::create_dir(&seen).unwrap();
+        let mk = fake(d.path(), "mkfs.vfat", &log);
+        let mc = d.path().join("mcopy");
+        fs::write(
+            &mc,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf ' %s' \"$a\" >>'{l}'; if [ -f \"$a\" ]; then cp \"$a\" '{s}/'; fi; done\nprintf '\\n' >>'{l}'\n",
+                l = log.display(),
+                s = seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&mc, fs::Permissions::from_mode(0o755)).unwrap();
+        let env = move |k: &str| -> Option<OsString> {
+            match k {
+                "SAIIFE_TOOL_MKFS_VFAT" => Some(mk.clone().into_os_string()),
+                "SAIIFE_TOOL_MCOPY" => Some(mc.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let tools = Tools::system(d.path()).with_env(&env);
+        (d, tools, log, seen)
+    }
+
+    #[test]
+    fn payload_carries_enabled_agents() {
+        use crate::guest;
+        const AGENT_FILES: [&str; 6] = [
+            "codex.tar.gz",
+            "codex-requirements.toml",
+            "gemini.zip",
+            "node.tar.xz",
+            "gemini-system-settings.json",
+            "gemini-user-settings.json",
+        ];
+        let cases: [(bool, bool); 4] = [(false, false), (true, false), (false, true), (true, true)];
+        for (codex, gemini) in cases {
+            let (d, tools, log, seen) = keeping_world();
+            let p = d.path();
+            for (n, body) in [
+                ("saiife-bin", "s"),
+                ("claude-bin", "c"),
+                ("codex-x", "codex archive"),
+                ("gemini-x", "gemini archive"),
+                ("node-x", "node archive"),
+            ] {
+                fs::write(p.join(n), body).unwrap();
+            }
+            fs::create_dir(p.join("guest")).unwrap();
+            let inputs = BakeInputs {
+                saiife_bin: p.join("saiife-bin"),
+                claude_bin: p.join("claude-bin"),
+                guest_assets: p.join("guest"),
+                recipe: recipe(),
+                agents: AgentArchives {
+                    codex: codex.then(|| p.join("codex-x")),
+                    gemini: gemini.then(|| (p.join("gemini-x"), p.join("node-x"))),
+                },
+            };
+            make_payload(&tools, &p.join("payload.img"), &inputs).unwrap();
+            let calls = fs::read_to_string(&log).unwrap();
+            let copy = calls.lines().last().unwrap();
+            let want: Vec<&str> = AGENT_FILES
+                .iter()
+                .copied()
+                .filter(|n| {
+                    if n.starts_with("codex") {
+                        codex
+                    } else {
+                        gemini
+                    }
+                })
+                .collect();
+            for n in AGENT_FILES {
+                let there = copy.contains(&format!("/{n} "));
+                assert_eq!(there, want.contains(&n), "{codex} {gemini} {n}: {copy}");
+                assert_eq!(seen.join(n).exists(), want.contains(&n), "{n}");
+            }
+            let read = |n: &str| fs::read_to_string(seen.join(n)).unwrap();
+            if codex {
+                assert_eq!(read("codex.tar.gz"), "codex archive");
+                assert_eq!(read("codex-requirements.toml"), guest::codex_requirements());
+            }
+            if gemini {
+                assert_eq!(read("gemini.zip"), "gemini archive");
+                assert_eq!(read("node.tar.xz"), "node archive");
+                assert_eq!(
+                    read("gemini-system-settings.json"),
+                    guest::gemini_system_settings()
+                );
+                assert_eq!(
+                    read("gemini-user-settings.json"),
+                    guest::gemini_user_settings()
+                );
+            }
+            // recipe.env does not change with the agents (D10)
+            assert_eq!(read("recipe.env"), recipe_env(&recipe()).unwrap());
+        }
+    }
+
+    #[test]
+    fn bake_script_checks() {
+        use crate::guest;
+        let d = tempfile::tempdir().unwrap();
+        let sh = d.path().join("saiife-bake.sh");
+        fs::write(&sh, BAKE_SCRIPT).unwrap();
+        // syntax only: the script is never run on the host
+        let st = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&sh)
+            .status()
+            .unwrap();
+        assert!(st.success(), "bash -n");
+        assert!(BAKE_SCRIPT.contains("\nset -euxo pipefail\n"));
+        for l in [
+            "install_agents",
+            "--no-same-owner",
+            "python3 -I -m zipfile -e",
+            "codex-x86_64-unknown-linux-musl",
+            "--strip-components=1",
+            "exec /opt/saiife-node/bin/node %s \"$@\"",
+        ] {
+            assert!(BAKE_SCRIPT.contains(l), "{l}");
+        }
+        // after the agent user (its group owns the gemini dir), before trim
+        let main = script_fn("main");
+        let user = main.find("  make_agent_user\n").unwrap();
+        let agents = main.find("  install_agents\n").unwrap();
+        assert!(user < agents && agents < main.find("  trim\n").unwrap());
+        // the R14 tree, with its owners and modes
+        for path in [
+            guest::CODEX_REQUIREMENTS_PATH,
+            guest::GEMINI_SYSTEM_SETTINGS_PATH,
+            guest::GEMINI_HOME,
+            guest::GEMINI_USER_SETTINGS_PATH,
+        ] {
+            assert!(BAKE_SCRIPT.contains(&format!("\"{path}\"")), "{path}");
+        }
+        let lines: Vec<&str> = BAKE_SCRIPT.lines().map(str::trim).collect();
+        let has = |l: &str| lines.contains(&l);
+        let home = guest::GEMINI_HOME;
+        for l in [
+            "install -d -o root -g root -m 0755 \"/etc/codex\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/codex-requirements.toml\" \"{}\"",
+                guest::CODEX_REQUIREMENTS_PATH
+            ),
+            "install -d -o root -g root -m 0755 \"/etc/gemini-cli\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/gemini-system-settings.json\" \"{}\"",
+                guest::GEMINI_SYSTEM_SETTINGS_PATH
+            ),
+            format!("install -d -o root -g root -m 0755 \"{home}\""),
+            format!("install -d -o root -g agent -m 1775 \"{home}/.gemini\""),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/gemini-user-settings.json\" \"{}\"",
+                guest::GEMINI_USER_SETTINGS_PATH
+            ),
+            format!("install -o root -g root -m 0644 /dev/null \"{home}/.gemini/.env\""),
+            format!("install -d -o root -g root -m 0755 \"{home}/.gemini/extensions\""),
+        ] {
+            assert!(has(&l), "missing line: {l}");
+        }
+        assert!(
+            guest::GEMINI_USER_SETTINGS_PATH.starts_with(&format!("{home}/.gemini/")),
+            "the user settings live in the baked home"
+        );
+        // the archives are data: nothing from them is sourced or evaluated
+        let agents_fns = ["install_agents", "install_codex", "install_gemini"]
+            .map(script_fn)
+            .concat();
+        for bad in ["eval ", "source ", ". \"$", "bash \"$"] {
+            assert!(!agents_fns.contains(bad), "{bad}");
+        }
     }
 
     #[test]

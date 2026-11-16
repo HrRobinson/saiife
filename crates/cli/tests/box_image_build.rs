@@ -385,6 +385,118 @@ fn build_refuses_unpinned_claude() {
 }
 
 #[test]
+fn image_build_with_codex_unpinned_fails() {
+    let w = world(Ch::Ok);
+    let s = w.saiife_bin.display().to_string();
+    // The shipped recipe, with only its Claude Code pin filled in: its
+    // [codex] section is off and UNPINNED.
+    let shipped = saiife_boxhost::image::DEFAULT_RECIPE;
+    let (head, tail) = shipped.split_once("[claude]\n").unwrap();
+    let rest = tail.split_once("\n[").map_or("", |(_, r)| r);
+    let recipe = format!(
+        "{head}[claude]\nversion = \"0.0.0-test\"\nurl = \"https://example.invalid/claude\"\nsha256 = \"{}\"\n[{rest}",
+        w.claude_sha
+    );
+    assert!(recipe.contains("[codex]\nenabled = false\n"), "{recipe}");
+    std::fs::write(&w.recipe, recipe).unwrap();
+    let r = w.recipe.display().to_string();
+    let o = w.build(
+        &["--recipe", &r, "--saiife-bin", &s, "--with", "codex"],
+        &[],
+    );
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains(
+            "codex.sha256 is UNPINNED; pin the Codex release first (or set codex.enabled = false)"
+        ),
+        "{err}"
+    );
+    assert_eq!(w.log(), "", "nothing fetched, nothing ran");
+    assert!(!w.p().join("cache").exists(), "nothing fetched");
+    w.assert_no_image();
+    // Claude Code is always in the image: --with claude-code is refused.
+    let o = w.build(
+        &["--recipe", &r, "--saiife-bin", &s, "--with", "claude-code"],
+        &[],
+    );
+    let (_, err) = text(&o);
+    assert_ne!(o.status.code(), Some(0), "{err}");
+    assert!(err.contains("always in the image"), "{err}");
+    assert_eq!(w.log(), "", "nothing ran");
+}
+
+#[test]
+fn build_with_agents_fetches_and_lists_them() {
+    let w = world(Ch::Ok);
+    let serve = w.p().join("serve");
+    let mut shas = Vec::new();
+    for (name, body) in [
+        ("codex.tar.gz", "fake codex"),
+        ("gemini-cli-bundle.zip", "fake gemini"),
+        ("node.tar.xz", "fake node"),
+    ] {
+        std::fs::write(serve.join(name), body).unwrap();
+        shas.push(sha256_file(&serve.join(name)).unwrap());
+    }
+    let mut recipe =
+        recipe_text(&w.img_sha, &w.claude_sha).replace("[boot]\ndirect_kernel = false\n", "");
+    recipe.push_str(&format!(
+        "[codex]\nenabled = false\nversion = \"0.1.0\"\nurl = \"https://example.invalid/codex.tar.gz\"\nsha256 = \"{}\"\n[gemini]\nenabled = true\nversion = \"0.2.0\"\nurl = \"https://example.invalid/gemini-cli-bundle.zip\"\nsha256 = \"{}\"\nnode_version = \"22.0.0\"\nnode_url = \"https://example.invalid/node.tar.xz\"\nnode_sha256 = \"{}\"\n[boot]\ndirect_kernel = false\n",
+        shas[0], shas[1], shas[2]
+    ));
+    std::fs::write(&w.recipe, recipe).unwrap();
+    let r = w.recipe.display().to_string();
+    let s = w.saiife_bin.display().to_string();
+    let o = w.build(
+        &["--recipe", &r, "--saiife-bin", &s, "--with", "codex"],
+        &[],
+    );
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}\n{err}\n{}", w.log());
+    let json = w
+        .names("base-")
+        .into_iter()
+        .find(|p| p.extension().unwrap() == "json")
+        .unwrap();
+    let m = Manifest::parse(&std::fs::read_to_string(json).unwrap()).unwrap();
+    let got: Vec<(&str, &str, &str)> = m
+        .agents
+        .iter()
+        .map(|(k, p)| (k.as_str(), p.version.as_str(), p.sha256.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("codex", "0.1.0", shas[0].as_str()),
+            ("gemini", "0.2.0", shas[1].as_str()),
+            ("node", "22.0.0", shas[2].as_str()),
+        ]
+    );
+    let log = w.log();
+    for n in ["codex.tar.gz", "gemini-cli-bundle.zip", "node.tar.xz"] {
+        assert!(
+            log.contains(&format!("curl https://example.invalid/{n}")),
+            "{log}"
+        );
+    }
+    let cache = w.p().join("cache/saiife/box-image");
+    for (n, sha) in [
+        ("codex", &shas[0]),
+        ("gemini", &shas[1]),
+        ("node", &shas[2]),
+    ] {
+        let f = cache.join(format!("{n}-{sha}"));
+        let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "{n}");
+    }
+    // the payload carries them (the fake mcopy logs its arguments)
+    for n in ["/codex.tar.gz ", "/gemini.zip ", "/node.tar.xz "] {
+        assert!(log.contains(n), "{n}: {log}");
+    }
+}
+
+#[test]
 fn failed_bake_keeps_logs_removes_image() {
     let w = world(Ch::NoMarker);
     let o = w.pinned(&[]);

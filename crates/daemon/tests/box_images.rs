@@ -82,6 +82,7 @@ fn manifest_for(sha: &str) -> Manifest {
             version: "9.9.9".into(),
             sha256: hex('4'),
         },
+        agents: Default::default(),
         packages: Vec::new(),
         images: Vec::new(),
         boot: ManifestBoot::Firmware,

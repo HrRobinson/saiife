@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use saiife_boxes::template::ImageRef;
+use saiife_boxes::template::{AgentKind, ImageRef};
 use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 use saiife_wire::source::BoxId;
 
@@ -65,6 +65,17 @@ pub struct ResolvedImage {
     pub sha256: String,
     pub virtual_gib: u64,
     pub boot: Boot,
+    /// The agents a box on this image can run (plan 42 D10): always
+    /// `claude-code`, plus `codex`, plus `gemini` (with its Node runtime).
+    pub agents: Vec<String>,
+}
+
+/// The refusal of a box whose image lacks its agent (plan 42 D10).
+pub fn missing_agent(image_id: &str, agent: AgentKind) -> String {
+    format!(
+        "the image {image_id} has no {a}: build one with \"saiife box image build --with {a}\"",
+        a = agent.name()
+    )
 }
 
 pub trait ImageResolver: Send + Sync {
@@ -862,11 +873,16 @@ impl Vmm for ChVmm {
                 "the box dir is too long: a socket path would be {n} bytes, over {MAX_SOCK_PATH}"
             )));
         }
-        inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
+        // The image first: a box whose image lacks its agent is refused
+        // before anything is made (plan 42 D10).
         let image = inner
             .images
             .resolve(&spec.image)
             .map_err(VmmError::Failed)?;
+        if !image.agents.iter().any(|a| a == spec.agent.name()) {
+            return Err(VmmError::Failed(missing_agent(&image.id, spec.agent)));
+        }
+        inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
         if spec.size.disk_gib < image.virtual_gib {
             return Err(VmmError::Failed(format!(
                 "the box disk ({} GiB) is smaller than the base image ({} GiB)",

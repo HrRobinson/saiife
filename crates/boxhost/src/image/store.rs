@@ -446,12 +446,14 @@ impl ImageResolver for Store {
                 }
             }
         };
+        let agents = m.agent_names();
         Ok(ResolvedImage {
             id,
             raw,
             sha256: m.sha256,
             virtual_gib: m.virtual_gib,
             boot,
+            agents,
         })
     }
 }
@@ -725,6 +727,7 @@ mod tests {
                 boot: Boot::Firmware {
                     fw: w.root.join("vmm/CLOUDHV.fd"),
                 },
+                agents: vec!["claude-code".into()],
             }
         );
         assert_eq!(store.resolve(&ImageRef::Pinned(a.id.clone())).unwrap(), got);
@@ -742,6 +745,33 @@ mod tests {
             e,
             format!("no default box image: {}", crate::image::DEFAULT_IMAGE_HINT)
         );
+    }
+
+    #[test]
+    fn resolved_image_agents() {
+        use crate::image::ManifestPin;
+        let w = world();
+        let store = w.store.clone().with_firmware(w.root.join("fw"));
+        let pin = |c: char| ManifestPin {
+            version: "1".into(),
+            sha256: c.to_string().repeat(64),
+        };
+        let cases: [(&str, &[&str], &[&str]); 4] = [
+            ("a", &[], &["claude-code"]),
+            ("b", &["codex"], &["claude-code", "codex"]),
+            ("c", &["gemini", "node"], &["claude-code", "gemini"]),
+            // Gemini without its Node runtime is not runnable.
+            ("d", &["codex", "gemini"], &["claude-code", "codex"]),
+        ];
+        for (name, keys, want) in cases {
+            let (p, mut m) = src(&w, &format!("{name}.raw"), &format!("image-{name}\n"));
+            for k in keys {
+                m.agents.insert((*k).to_string(), pin('7'));
+            }
+            w.store.insert(&File::open(&p).unwrap(), &m, None).unwrap();
+            let got = store.resolve(&ImageRef::Pinned(m.id.clone())).unwrap();
+            assert_eq!(got.agents, *want, "{name}");
+        }
     }
 
     #[test]
@@ -815,6 +845,7 @@ mod tests {
                     kernel: w.store.images_dir().join(format!("{}.vmlinuz", m.id)),
                     cmdline: "console=ttyS0 root=/dev/vda1".into(),
                 },
+                agents: vec!["claude-code".into()],
             }
         );
     }

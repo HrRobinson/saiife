@@ -29,6 +29,10 @@ pub enum ImageAction {
         /// Also keep the image's kernel for direct kernel boot.
         #[arg(long)]
         direct_kernel: bool,
+        /// Also bake in an optional agent (beta): codex or gemini. Turns its
+        /// recipe section on for this build; it must be pinned. Repeatable.
+        #[arg(long = "with", value_name = "AGENT")]
+        with: Vec<String>,
     },
     /// Put a built image into the daemon's store (`<path>` is the
     /// `base-<sha256>.raw`; its `.json` manifest and any `.vmlinuz` are
@@ -332,13 +336,14 @@ mod imp {
     use crate::text::sanitize;
     use saiife_boxhost::bake::{self, BakeInputs};
     use saiife_boxhost::image::{
-        self, ubuntu, Manifest, ManifestBoot, ManifestPackage, ManifestPin, ManifestUbuntu,
-        ManifestVmm, Recipe,
+        self, ubuntu, AgentKind, Manifest, ManifestBoot, ManifestPackage, ManifestPin,
+        ManifestUbuntu, ManifestVmm, Recipe,
     };
     use saiife_boxhost::layout::Layout;
     use saiife_boxhost::pins;
     use saiife_boxhost::tools::{Tool, Tools};
     use sha2::Digest;
+    use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File};
     use std::io;
@@ -395,6 +400,8 @@ mod imp {
         pub cache: PathBuf,
         pub saiife_bin: PathBuf,
         pub direct_kernel: bool,
+        /// `--with`: the optional agents turned on for this build (D9).
+        pub with: Vec<AgentKind>,
         pub vmm: PathBuf,
         pub keyring: PathBuf,
         pub guest_assets: PathBuf,
@@ -426,11 +433,17 @@ mod imp {
             out,
             saiife_bin,
             direct_kernel,
+            with,
         } = action
         else {
             return Err(Fail::Failed("not a build".into()));
         };
         let failed = Fail::Failed;
+        let with = with
+            .iter()
+            .map(|a| parse_with(a))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failed)?;
         let home = abs_env("HOME");
         let cache_home = abs_env("XDG_CACHE_HOME")
             .or_else(|| home.as_ref().map(|h| h.join(".cache")))
@@ -494,6 +507,7 @@ mod imp {
             cache,
             saiife_bin,
             direct_kernel,
+            with,
             vmm,
             keyring,
             guest_assets,
@@ -518,6 +532,22 @@ mod imp {
         outln!("  {}", sanitize(&done.manifest.display().to_string()));
         outln!("next: saiife box image import {raw}");
         Ok(())
+    }
+
+    /// One `--with` value (plan 42 D9). Claude Code is always in the image.
+    fn parse_with(a: &str) -> Result<AgentKind, String> {
+        match a {
+            "codex" => Ok(AgentKind::Codex),
+            "gemini" => Ok(AgentKind::Gemini),
+            "claude-code" => Err(
+                "--with claude-code: Claude Code is always in the image; --with takes codex or gemini"
+                    .into(),
+            ),
+            other => Err(format!(
+                "--with {}: unknown agent; --with takes codex or gemini",
+                sanitize(other)
+            )),
+        }
     }
 
     /// The space a file takes on disk: `st_blocks * 512`.
@@ -565,6 +595,7 @@ mod imp {
             &claude_bin,
             0o755,
         )?;
+        let agents = fetch_agents(tools, b, &recipe)?;
         let work = work_dir(b, &out);
         fs::DirBuilder::new()
             .mode(0o700)
@@ -580,6 +611,7 @@ mod imp {
             &recipe,
             &ubuntu_img,
             &claude_bin,
+            &agents,
             &base_tmp,
             &kernel_tmp,
             actual_size,
@@ -719,8 +751,45 @@ mod imp {
         Ok(out)
     }
 
+    /// The enabled optional agents (D10), fetched into the cache as
+    /// `<name>-<sha256>` (0644) and verified against their pins.
+    fn fetch_agents(
+        tools: &Tools,
+        b: &Build,
+        recipe: &Recipe,
+    ) -> Result<bake::AgentArchives, String> {
+        let get = |name: &str, pin: &image::AgentPin| -> Result<PathBuf, String> {
+            let dest = b.cache.join(format!("{name}-{}", pin.sha256));
+            pins::fetch(tools, &pin.url, &pin.sha256, &dest, 0o644)?;
+            Ok(dest)
+        };
+        let codex = recipe.codex.as_ref().map(|p| get("codex", p)).transpose()?;
+        let gemini = match &recipe.gemini {
+            Some(g) => Some((get("gemini", &g.cli)?, get("node", &g.node)?)),
+            None => None,
+        };
+        Ok(bake::AgentArchives { codex, gemini })
+    }
+
+    /// The manifest's `agents` (D10), from the recipe as for `claude`.
+    fn manifest_agents(recipe: &Recipe) -> BTreeMap<String, ManifestPin> {
+        let pin = |p: &image::AgentPin| ManifestPin {
+            version: p.version.clone(),
+            sha256: p.sha256.clone(),
+        };
+        let mut m = BTreeMap::new();
+        if let Some(c) = &recipe.codex {
+            m.insert("codex".to_string(), pin(c));
+        }
+        if let Some(g) = &recipe.gemini {
+            m.insert("gemini".to_string(), pin(&g.cli));
+            m.insert("node".to_string(), pin(&g.node));
+        }
+        m
+    }
+
     fn load_recipe(b: &Build) -> Result<Recipe, String> {
-        let mut r = image::parse_recipe(&b.recipe_text)?;
+        let mut r = image::parse_recipe_with(&b.recipe_text, &b.with)?;
         r.direct_kernel |= b.direct_kernel;
         Ok(r)
     }
@@ -768,6 +837,7 @@ mod imp {
         recipe: &Recipe,
         ubuntu_img: &Path,
         claude_bin: &Path,
+        agents: &bake::AgentArchives,
         base_tmp: &Path,
         kernel_tmp: &Path,
         actual_size: fn(&Path) -> io::Result<u64>,
@@ -806,6 +876,7 @@ mod imp {
             claude_bin: claude_bin.to_path_buf(),
             guest_assets: b.guest_assets.clone(),
             recipe: recipe.clone(),
+            agents: agents.clone(),
         };
         bake::make_payload(tools, &payload, &inputs)?;
 
@@ -881,6 +952,7 @@ mod imp {
                 version: recipe.claude.version.clone(),
                 sha256: recipe.claude.sha256.clone(),
             },
+            agents: manifest_agents(recipe),
             packages,
             images: recipe.images.clone(),
             boot,

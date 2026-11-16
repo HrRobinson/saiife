@@ -218,6 +218,7 @@ mod tests {
                 disk_gib: 30,
             },
             image: ImageRef::Default,
+            agent: crate::template::AgentKind::ClaudeCode,
             dir: dir.to_path_buf(),
         }
     }

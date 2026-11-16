@@ -9,5 +9,18 @@ pull = []
 version = "UNPINNED"
 url = "UNPINNED"
 sha256 = "UNPINNED"
+[codex]
+enabled = false
+version = "UNPINNED"
+url = "UNPINNED"      # https://github.com/openai/codex/releases/download/rust-v<ver>/codex-x86_64-unknown-linux-musl.tar.gz
+sha256 = "UNPINNED"
+[gemini]
+enabled = false
+version = "UNPINNED"
+url = "UNPINNED"      # https://github.com/google-gemini/gemini-cli/releases/download/v<ver>/gemini-cli-bundle.zip
+sha256 = "UNPINNED"
+node_version = "UNPINNED"
+node_url = "UNPINNED" # https://nodejs.org/dist/v<ver>/node-v<ver>-linux-x64.tar.xz
+node_sha256 = "UNPINNED"
 [boot]
 direct_kernel = false

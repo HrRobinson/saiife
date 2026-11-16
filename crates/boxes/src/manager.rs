@@ -39,7 +39,7 @@ use crate::guest::{GuestError, GuestEvent, GuestLink};
 use crate::state::{holds_capacity, transition, Event};
 use crate::store::{BoxRecord, Store};
 use crate::template::{
-    BoxTemplate, ImageRef, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
+    AgentKind, BoxTemplate, ImageRef, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
 };
 use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
 
@@ -628,12 +628,12 @@ impl Manager {
             }
             let admitted = out.len();
             out.push(change(&r, from, "admitted"));
+            let t = self.template(&r.template);
             let spec = VmSpec {
                 id: r.id.clone(),
                 size: r.size,
-                image: self
-                    .template(&r.template)
-                    .map_or(ImageRef::Default, |t| t.image.clone()),
+                image: t.map_or(ImageRef::Default, |t| t.image.clone()),
+                agent: t.map_or(AgentKind::ClaudeCode, |t| t.agent),
                 dir: g.store.box_dir(&r.id),
             };
             let booted = self.vmm.create(&spec).and_then(|h| {
