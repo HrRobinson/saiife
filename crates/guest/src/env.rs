@@ -45,6 +45,12 @@ pub struct Timing {
     pub control_deadline: Duration,
     /// Overall deadline of one local.sock connection.
     pub local_deadline: Duration,
+    /// Plan 39 (I-2): every git child of one export is killed at this
+    /// deadline, well under the host's 120 s `EXPORT_TIMEOUT`.
+    pub export_deadline: Duration,
+    /// Plan 39 (I-2): the same for an advance (the host waits 60 s) and the
+    /// first base snapshot (inside setup; the host waits 60 s).
+    pub git_deadline: Duration,
 }
 
 impl Default for Timing {
@@ -58,6 +64,8 @@ impl Default for Timing {
             activity_every: Duration::from_secs(5),
             control_deadline: Duration::from_secs(10),
             local_deadline: Duration::from_secs(2),
+            export_deadline: Duration::from_secs(90),
+            git_deadline: Duration::from_secs(45),
         }
     }
 }

@@ -690,9 +690,10 @@ pub(crate) async fn source_for(
         }
     }
     let scope = (!(admin && reads.contains(&action))).then_some(owner);
-    let cell: crate::box_ops::CtxCell = Arc::default();
-    let _ = cell.set(Arc::downgrade(ctx));
-    Ok(Arc::new(crate::box_ops::workspace_source(m, scope, cell)))
+    match crate::box_ops::workspace_source(ctx, scope) {
+        Some(src) => Ok(Arc::new(src)),
+        None => Ok(Arc::clone(&ctx.boxes)),
+    }
 }
 
 /// A Touch action: without a proof `touch_required`; with one, the proof

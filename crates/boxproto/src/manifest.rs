@@ -99,7 +99,7 @@ pub fn check_path(p: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_hex(s: &str, lens: &[usize]) -> bool {
+pub(crate) fn is_hex(s: &str, lens: &[usize]) -> bool {
     lens.contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -110,7 +110,7 @@ pub fn is_oid(s: &str) -> bool {
     is_hex(s, &[40, 64])
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

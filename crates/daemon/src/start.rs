@@ -1179,8 +1179,9 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     if let Some(a) = &box_audit {
         a.attach(&ctx);
     }
-    // Real boxes (plan 38): the box gateway's hook (until now every boot
-    // failed closed) and the guest event forwarder, on this runtime. No box
+    // Real boxes (plans 38, 39): the box gateway's hook (until now every
+    // boot failed closed), the land book and the guest event forwarder, on
+    // this runtime. No box
     // boots before `serve` runs the tick and the box ops.
     if let Some(wire) = box_on_ctx {
         wire(&ctx, rt.handle());

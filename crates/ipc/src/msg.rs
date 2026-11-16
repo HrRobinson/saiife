@@ -276,6 +276,27 @@ pub const OP_BOX_DONE: &str = "box.done";
 /// local): `{}` -> `{removed: [id]}`. Root or an admin removes every one;
 /// anyone else only their own discarded boxes.
 pub const OP_BOX_GC: &str = "box.gc";
+// Land and push (plan 39), control socket, machine local. The box is always
+// the `box` argument; request ids are decimal strings. `box.land` (a remote
+// frame action as well, above) is `{request_id, assertion}` -> `{land}`
+// followed by one fd byte carrying `lands/<n>/delta.bin`; `box.push` is
+// `{request_id, assertion}` -> `{}`.
+/// `{box, files?: [path]}` -> `{request_id, touch, expires_at, review, diff}`.
+pub const OP_BOX_LAND_BEGIN: &str = "box.land.begin";
+/// `{request_id}` -> `{}`.
+pub const OP_BOX_LAND_REJECT: &str = "box.land.reject";
+/// `{box, n}` (an approved, unapplied land) -> `{land}` + the delta fd.
+pub const OP_BOX_LAND_FETCH: &str = "box.land.fetch";
+/// `{box, n, commit}` -> `{}`.
+pub const OP_BOX_LAND_APPLIED: &str = "box.land.applied";
+/// `{box, remote, commit}` -> `{request_id, touch, expires_at}`.
+pub const OP_BOX_PUSH_BEGIN: &str = "box.push.begin";
+/// `{request_id, ok, detail}` -> `{}`.
+pub const OP_BOX_PUSH_DONE: &str = "box.push.done";
+/// The ops whose `ok` answer is followed by one fd byte (`fdpass::FD_BYTE`)
+/// carrying exactly one descriptor: read it with
+/// `client::Client::call_recv_fds`.
+pub const FD_ANSWER_OPS: &[&str] = &[OP_BOX_LAND, OP_BOX_LAND_FETCH];
 /// Control socket only, machine local (plan 37): `{n}` -> `{}`. The frame is
 /// followed at once by one byte, `fdpass::FD_BYTE`, carrying `n` (1 to
 /// `fdpass::MAX_FDS`) descriptors, which the connection keeps for its next

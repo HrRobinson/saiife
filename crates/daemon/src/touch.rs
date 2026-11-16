@@ -23,7 +23,8 @@ use saiife_touch::{
 const DIR: &str = "touch";
 const ID_FILE: &str = "instance_id";
 const CREDS_FILE: &str = "credentials.json";
-/// Live challenges in all, and per uid.
+/// Live challenges in all, and per uid. Per uid 8 (plan 39 errata R-2):
+/// up to 4 land requests of the Workspace leave room for other touches.
 const MAX_LIVE: usize = 32;
 const MAX_PER_UID: usize = 8;
 
@@ -35,8 +36,10 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// What a challenge was issued for. The uid in `Enrol`, `Remove` and `Test` is the
-/// peer's; a `Web` key is per device.
+/// What a challenge was issued for. The uid in `Enrol`, `Remove` and
+/// `Test` is the peer's; a `Web` key is per device. `Land` and `Push`
+/// carry a box land or push request id (plan 39, owner-approved contract
+/// addition).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IssueKey {
     Approve(u64),
@@ -48,6 +51,8 @@ pub enum IssueKey {
         device: String,
         request_id: u64,
     },
+    Land(u64),
+    Push(u64),
 }
 
 /// One live challenge.
@@ -373,10 +378,14 @@ mod tests {
             issue(&t, IssueKey::Approve(i), 1000, NOW).unwrap();
         }
         assert!(issue(&t, IssueKey::Approve(8), 1000, NOW).is_err());
+        // Land, push and Workspace keys count against the same per-uid cap.
+        let e = issue(&t, IssueKey::Land(1), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress");
+        assert!(issue(&t, IssueKey::Push(1), 1000, NOW).is_err());
         // The same key replaces.
         issue(&t, IssueKey::Approve(0), 1000, NOW).unwrap();
         // Expired ones drop.
-        issue(&t, IssueKey::Approve(5), 1000, NOW + 301).unwrap();
+        issue(&t, IssueKey::Approve(9), 1000, NOW + 301).unwrap();
         // 32 in all over 4 uids at 8 each; a fifth uid is refused.
         let (t, _) = TouchState::open(d.path());
         let mut n = 0u64;

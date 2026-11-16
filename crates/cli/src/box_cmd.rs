@@ -2,6 +2,7 @@
 //! templates|gc` (plan 34): boxes through the daemon's `box.*` ops. Exit
 //! codes: 0 ok, 2 refused (not found, wrong state, invalid, busy, lockdown),
 //! 5 the daemon cannot be reached or has no boxes in this version.
+//! `diff|land|apply|push` (plan 39) are `crate::box_land_cmd`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -62,6 +63,40 @@ pub enum BoxAction {
         /// Do not ask first.
         #[arg(long)]
         yes: bool,
+        /// Discard even when an approved land has no commit yet (see
+        /// `saiife box apply`).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show what a box changed, for review.
+    Diff {
+        id: String,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+        /// The changed files only.
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Land a box's changes as a commit on saiife/box-<id> (a touch of your key).
+    Land {
+        id: String,
+        /// Land only these paths (comma-separated, or repeat the flag).
+        #[arg(long, value_delimiter = ',')]
+        files: Vec<String>,
+        /// Land changes to git config (.gitattributes, .gitmodules,
+        /// .lfsconfig, ...) too, once you have reviewed them.
+        #[arg(long)]
+        allow_git_config: bool,
+    },
+    /// Write the commits of a box's approved lands (approved in the Workspace).
+    Apply { id: String },
+    /// Push saiife/box-<id> to a remote (a touch of your key).
+    Push {
+        id: String,
+        /// The remote to push to.
+        #[arg(long, default_value = "origin")]
+        remote: String,
     },
     /// Mark a box's work as finished.
     Done { id: String },
@@ -124,6 +159,15 @@ pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
 pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
     if let BoxAction::Attach { id } = &action {
         return imp::attach(config.as_deref(), id);
+    }
+    if matches!(
+        action,
+        BoxAction::Diff { .. }
+            | BoxAction::Land { .. }
+            | BoxAction::Apply { .. }
+            | BoxAction::Push { .. }
+    ) {
+        return crate::box_land_cmd::run(config.as_deref(), action);
     }
     match imp::go(config.as_deref(), action) {
         Ok(()) => ExitCode::SUCCESS,
@@ -474,7 +518,7 @@ mod imp {
             BoxAction::Revise { id, comment } => {
                 per_box(&t, "box.revise", &id, args([("comment", json!(comment))]))?;
             }
-            BoxAction::Discard { id, yes } => {
+            BoxAction::Discard { id, yes, force } => {
                 let q = format!("Discard box {} and delete its disks?", sanitize(&id));
                 let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
                 let go = confirm(&q, yes, tty, &mut std::io::stdin().lock())?;
@@ -482,7 +526,11 @@ mod imp {
                     outln!("not discarded");
                     return Ok(());
                 }
-                let a = call(&t, "box.discard", args([("box", json!(id))]))?;
+                let mut a = args([("box", json!(id))]);
+                if force {
+                    a.insert("force".into(), json!(true));
+                }
+                let a = call(&t, "box.discard", a)?;
                 let b = a.get("box").cloned().unwrap_or(Value::Null);
                 outln!("box {} discarded", sanitize(text(&b, "id")));
             }
@@ -504,7 +552,13 @@ mod imp {
                     print_templates(&a);
                 }
             }
-            BoxAction::Vmm { .. } | BoxAction::Image { .. } | BoxAction::Attach { .. } => {
+            BoxAction::Vmm { .. }
+            | BoxAction::Image { .. }
+            | BoxAction::Attach { .. }
+            | BoxAction::Diff { .. }
+            | BoxAction::Land { .. }
+            | BoxAction::Apply { .. }
+            | BoxAction::Push { .. } => {
                 unreachable!("handled above")
             }
             BoxAction::Gc => {
