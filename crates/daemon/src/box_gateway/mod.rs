@@ -200,6 +200,8 @@ pub struct GatewayConfig {
     pub allow_loopback_for_tests: bool,
     /// The rate limits' clock (the denied-record window and the bucket).
     pub clock: Clock,
+    /// The model forwarder's limits (plan 40, C5).
+    pub model: model::ModelConfig,
 }
 
 impl Default for GatewayConfig {
@@ -210,6 +212,7 @@ impl Default for GatewayConfig {
             #[cfg(debug_assertions)]
             allow_loopback_for_tests: false,
             clock: Arc::new(move || u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            model: model::ModelConfig::default(),
         }
     }
 }
@@ -390,6 +393,8 @@ pub struct GatewayShared {
     /// [`LOOKUP_PERMITS`] around every [`Resolve::lookup`], whatever the
     /// resolver.
     pub(crate) lookups: Arc<Semaphore>,
+    /// The model forwarder's limits.
+    pub(crate) model: model::ModelConfig,
 }
 
 impl GatewayShared {
@@ -524,6 +529,7 @@ impl GatewayHooks {
                 denied: Mutex::new(Denied::default()),
                 runs: Mutex::new(BTreeMap::new()),
                 lookups,
+                model: cfg.model,
             }),
             rt,
             group_rw,

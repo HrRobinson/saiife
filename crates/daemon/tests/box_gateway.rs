@@ -249,6 +249,7 @@ async fn world(o: Opts) -> W {
             limits: o.limits,
             allow_loopback_for_tests: o.loopback,
             clock: Arc::new(move || c.load(Ordering::SeqCst)),
+            model: Default::default(),
         },
     );
     let dir = tmp.path().join("b");
@@ -980,16 +981,21 @@ async fn unknown_box_is_403() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_port_is_503_until_plan_40() {
+async fn model_port_refuses_a_box_without_its_placeholder() {
+    // The model forwarder itself is tests/box_model.rs (plan 40); here no
+    // placeholder was made for the box, so nothing passes.
     let w = world(Opts::default()).await;
     let mut s = w.dial(ports::MODEL).await;
     let _ = s
-        .write_all(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n")
+        .write_all(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
         .await;
     let a = read_all(&mut s).await;
     let t = String::from_utf8_lossy(&a);
-    assert!(t.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{t}");
-    assert!(t.ends_with("model access is not set up yet"), "{t}");
+    assert!(t.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{t}");
+    assert!(
+        t.ends_with("this box's model credential is not valid\n"),
+        "{t}"
+    );
     use std::os::unix::fs::PermissionsExt;
     for port in [ports::EGRESS, ports::MODEL] {
         let m = std::fs::symlink_metadata(w.paths.vsock_port(port)).unwrap();
