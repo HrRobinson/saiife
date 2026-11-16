@@ -16,7 +16,7 @@ use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::builtins::Catalog;
 use saiifeguard::canon::PathStyle;
 use saiifeguard::canon::PathVars;
-use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::engine::{AllowTrace, Decision, Engine, DEFAULT_BUDGET};
 use saiifeguard::payload::{context_from_hook_json_bounded, HookContext, PayloadError};
 use saiifeguard::profile::Profile;
 use saiifeguard::userpack::{load_user_packs, UserSrc};
@@ -445,7 +445,11 @@ fn engine_for(
     // they never replace one), compiled strictly for `profile`.
     packs.extend(user.packs.iter().cloned());
     let vars = path_vars(Some(&start), project.root.as_deref());
-    let engine = Engine::new(packs).with_paths(vars.clone());
+    // The engine's 50 ms is the hook's latency contract; a test build may scale it
+    // (`deadline_scale`), a release build never does.
+    let engine = Engine::new(packs)
+        .with_budget(crate::deadline_scale::scaled(DEFAULT_BUDGET))
+        .with_paths(vars.clone());
     Active {
         engine,
         vars,
