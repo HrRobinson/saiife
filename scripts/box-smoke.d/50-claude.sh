@@ -10,8 +10,10 @@
 #   - api-key leg (always runs):
 #       SAIIFE_BOX_SMOKE_KEY_FILE=<file holding your Anthropic API key, one
 #       line, nothing else>; the vault entry, made by you beforehand:
-#         saiife secret add anthropic --kind token --service box-model \
+#         saiife secret add anthropic --kind token --service box-model-anthropic \
 #           --from-file "$SAIIFE_BOX_SMOKE_KEY_FILE"
+#     (D6, plan 42: the plan 40 name `box-model` is still accepted on the
+#     Anthropic route as a legacy alias, OD4; use the new name)
 #     the built-in `claude-code` template is used (credential "anthropic");
 #   - subscription leg (runs only with SAIIFE_BOX_SMOKE_SUBSCRIPTION=1): FIRST
 #     do the terms check (Anthropic's current terms for using a Claude
@@ -19,7 +21,7 @@
 #     allows it, flip SUBSCRIPTION_LOGIN_CLEARED in crates/boxes in a LOCAL
 #     build (its own commit if you keep it), then
 #       export SAIIFE_BOX_SMOKE_SUB_KEY_FILE=<file with the `claude setup-token` token>
-#       saiife secret add anthropic-sub --kind token --service box-model \
+#       saiife secret add anthropic-sub --kind token --service box-model-anthropic \
 #         --from-file "$SAIIFE_BOX_SMOKE_SUB_KEY_FILE"
 #       install scripts/box-smoke.d/templates/claude-subscription.toml into
 #       templates.d (as 30-guest does for bash.toml) and restart the daemon;
@@ -39,7 +41,10 @@
 #
 # Result keys, per kind (api_key, subscription): claude_turn_ok_<kind>,
 # claude_no_prompt_<kind>, model_records_<kind>, placeholder_accepted_<kind>,
-# key_not_on_disk_<kind>; and once: no_placeholder_401.
+# key_not_on_disk_<kind>, model_paths_<kind>; and once: no_placeholder_401.
+# model_paths_<kind> (plan 42 R4, OD3, R12): every distinct "METHOD PATH" the
+# gateway refused with reason path_not_allowed is printed for the owner; PASS
+# when none. The owner widens the Anthropic allow-list only from that output.
 
 P40_TASK="Reply with the single word ok, then stop."
 P40_RUN_LIMIT_S=120
@@ -267,10 +272,33 @@ p40_curl_401() {
   return 1
 }
 
+# model_paths: distinct "METHOD PATH" of this box's model_denied records with
+# reason path_not_allowed (audit Record extra is flattened: top-level keys)
+p40_model_paths() {
+  local dir f files=() list
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    [ -d "$dir" ] && [ ! -r "$dir" ] && continue
+    for f in "$dir"/*.jsonl; do
+      [ -r "$f" ] && files+=("$f")
+    done
+  done < <(p40_audit_dirs)
+  [ "${#files[@]}" -gt 0 ] || { p40_log "no readable audit files in: $(p40_audit_dirs | tr '\n' ' ')"; return 1; }
+  list=$(jq -rn --arg b "$P40_BOX" \
+    '[inputs | select(.kind == "model_denied" and .box == $b and .reason == "path_not_allowed")
+      | "\(.method // "?") \(.path // "?")"] | unique | .[]' "${files[@]}") || return 1
+  if [ -n "$list" ]; then
+    p40_log "model_paths: refused (method path) pairs for box $P40_BOX:"
+    printf '%s\n' "$list" >&2
+    return 1
+  fi
+  p40_log "model_paths: none refused for box $P40_BOX"
+}
+
 # p40_leg_fail KIND: every result key of the leg is FAIL (it could not run)
 p40_leg_fail() {
   local k
-  for k in claude_turn_ok claude_no_prompt model_records placeholder_accepted key_not_on_disk; do
+  for k in claude_turn_ok claude_no_prompt model_records model_paths placeholder_accepted key_not_on_disk; do
     p40_result "${k}_$1" FAIL
   done
 }
@@ -289,7 +317,7 @@ p40_leg() {
     return 0
   fi
   t0=$(p40_now_ms)
-  if ! check "[$kind] box spawn --template $tpl --task (secret must be in the vault with --service box-model)" p40_spawn "$tpl" "$P40_TASK"; then
+  if ! check "[$kind] box spawn --template $tpl --task (secret must be in the vault with --service box-model-anthropic; legacy: box-model)" p40_spawn "$tpl" "$P40_TASK"; then
     p40_leg_fail "$kind"
     return 0
   fi
@@ -318,6 +346,11 @@ p40_leg() {
     p40_result "model_records_$kind" 1
   else
     p40_result "model_records_$kind" 0
+  fi
+  if check "[$kind] model_paths_$kind: no model_denied path_not_allowed during the turn (any listed above are for the owner, OD3)" p40_model_paths; then
+    p40_result "model_paths_$kind" 1
+  else
+    p40_result "model_paths_$kind" 0
   fi
   check "[$kind] the placeholder is not the key; its file is 0600" p40_placeholder_ok
   saiife box stop "$P40_BOX" >/dev/null 2>&1 || true
