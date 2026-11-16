@@ -13,6 +13,7 @@ pub mod launch;
 pub mod layout;
 pub mod paths;
 pub mod pins;
+pub mod placeholder;
 pub mod preflight;
 pub mod repo_handover;
 pub mod review;

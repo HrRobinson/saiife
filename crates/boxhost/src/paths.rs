@@ -16,6 +16,9 @@ pub const REPO_DISK: &str = "repo.img";
 /// Daemon-trusted state: the box's terminal recording (plan 38, R15), in
 /// its record dir only (`layout::record_dir`).
 pub const TERM_CAST: &str = "term.cast";
+/// Daemon-trusted state: the box's model placeholder (plan 40, C1), one
+/// line, 0600, in its record dir only (`placeholder::read_or_make_placeholder`).
+pub const PLACEHOLDER: &str = "placeholder";
 /// Daemon-trusted state: the base manifest of the repo disk (plan 37). It
 /// lives in the box's record dir only (`layout::record_disk_place`), never
 /// in a runtime dir, so [`BoxPaths`] has no helper for it.

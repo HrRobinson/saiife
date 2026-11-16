@@ -12,7 +12,7 @@ use saiife_boxes::manager::{
     Change, DiskPlace, DiskPlacer, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS,
 };
 use saiife_boxes::store::{BoxRecord, Store};
-use saiife_boxes::template::Size;
+use saiife_boxes::template::{Login, Size};
 use saiife_boxes::vmm::fake::{FakeVmm, VmOp};
 use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 use saiife_boxes::{BoxError, BoxId, BoxState};
@@ -141,6 +141,45 @@ fn unknown_template_is_invalid() {
         Err(BoxError::Invalid("unknown template nope".into()))
     );
     assert!(w.mgr.list().is_empty());
+}
+
+#[test]
+fn subscription_is_gated() {
+    let mut t = template_sized("sub", Size::default());
+    t.login = Login::Subscription;
+    let w = world_with(1, vec![t]);
+    assert_eq!(
+        w.mgr.spawn(&w.args("sub", "x", Start::Queue)),
+        Err(BoxError::Invalid(
+            "subscription login is waiting for the owner's terms check (spec §7.9); use login = \"api-key\"".into()
+        ))
+    );
+    assert!(w.mgr.list().is_empty());
+    assert!(!w.root.join("b1").exists());
+}
+
+#[test]
+fn api_key_spawns() {
+    let mut t = template_sized("key", Size::default());
+    t.login = Login::ApiKey;
+    let w = world_with(1, vec![t]);
+    let r = w.mgr.spawn(&w.args("key", "x", Start::Queue)).unwrap();
+    assert_eq!(r.id, id("b1"));
+}
+
+#[test]
+fn credential_in_box_is_refused() {
+    let mut t = template_sized("inbox", Size::default());
+    t.credential_in_box = true;
+    let w = world_with(1, vec![t]);
+    assert_eq!(
+        w.mgr.spawn(&w.args("inbox", "x", Start::Queue)),
+        Err(BoxError::Invalid(
+            "credential_in_box is not supported: the real credential never enters the box".into()
+        ))
+    );
+    assert!(w.mgr.list().is_empty());
+    assert!(!w.root.join("b1").exists());
 }
 
 #[test]
