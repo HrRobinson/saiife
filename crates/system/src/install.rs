@@ -60,7 +60,7 @@ pub struct InstallOptions {
     /// for production).
     pub allow_test_build: bool,
     /// Also install boxes (`--boxes`, plan 35): the `saiife-box` user, the box
-    /// dirs, the VMM, the `saiife-box@` unit and its polkit rule. Linux only.
+    /// dirs, the VMM, the `saiife-box-<tier>@` units and their polkit rule. Linux only.
     pub boxes: bool,
     /// With `boxes`: copy the VMM from this dir (verified against the pins)
     /// instead of downloading it.

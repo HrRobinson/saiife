@@ -52,7 +52,7 @@
 
 **Goal:** Replace `FakeVmm` with a real driver:
 - `ChVmm: saiife_boxes::Vmm` runs one unprivileged Cloud Hypervisor v54.0 process per box, driven over its REST API on a Unix socket, with Landlock on;
-- the VMM is started through a small helper, `saiife __box-vmm <dir>`, that checks the launch spec and the binary's pinned digest, then execs Cloud Hypervisor; personal mode runs it as a child of the daemon, locked mode as a systemd template unit `saiife-box@<id>.service` under the `saiife-box` user;
+- the VMM is started through a small helper, `saiife __box-vmm <dir>`, that checks the launch spec and the binary's pinned digest, then execs Cloud Hypervisor; personal mode runs it as a child of the daemon, locked mode as a systemd template unit `saiife-box@<id>.service` (as built: one per size tier, `saiife-box-<tier>@<id>.service`, item 12) under the `saiife-box` user;
 - every call is bounded by a timeout, and stop is the spike's ladder: power button, then `vmm.shutdown`, then the launcher's last resort;
 - `saiife box vmm fetch` downloads the pinned VMM and firmware; `saiife doctor` reports box readiness.
 
@@ -60,7 +60,7 @@
 - **New crates (Task 1), all tokio-free:** `saiife-boxhost` (`crates/boxhost`, unix-only: everything the host does to a VM), `saiife-boxproto` (`crates/boxproto`, portable: the `saiife-guest/1` protocol and the delta format), `saiife-guest` (`crates/guest`, Linux-only: the in-box init). Task 1 declares every module plans 35–40 fill, so those plans add none.
 - **The API client is a small synchronous HTTP/1.1 client over `std::os::unix::net::UnixStream`**, not hyper: `Vmm` is a sync trait, the API is eight fixed calls with tiny JSON bodies, and a tokio-free crate keeps the CI tokio gate. (Spec §7.1 says "with `hyper`"; this is a deviation, flagged.)
 - **The daemon never builds a Cloud Hypervisor command line.** It writes `<box>/vm.json` (a `LaunchSpec`); the helper validates it against the dirs it derives itself (never from the file), checks the binary's SHA-256 against the pin, builds argv with `launch::argv` (a port of `scripts/spike/vm.sh` `ch_boot`) and execs.
-- **Locked mode replaces §5.1's `Delegate=yes` with a template unit.** Each VMM is `saiife-box@<id>.service` (`User=saiife-box`, `DeviceAllow=/dev/kvm rw`, its own cgroup from systemd). The daemon starts and stops it with systemd's D-Bus `StartUnit`/`StopUnit`, allowed by a polkit rule that matches only that unit pattern and only the `saiife` user. Root is needed once, at `saiife system install --boxes`.
+- **Locked mode replaces §5.1's `Delegate=yes` with a template unit.** Each VMM is `saiife-box@<id>.service` (as built: `saiife-box-<tier>@<id>.service`, item 12; `User=saiife-box`, `DeviceAllow=/dev/kvm rw`, its own cgroup from systemd). The daemon starts and stops it with systemd's D-Bus `StartUnit`/`StopUnit`, allowed by a polkit rule that matches only that unit pattern and only the `saiife` user. Root is needed once, at `saiife system install --boxes`.
 - **Host-side listeners are bound before boot** by `VmHooks` (vsock listeners from plan 38, gateway listeners from plans 38 and 40), so the guest never connects to a socket that is not there yet.
 
 **Tech Stack:** Rust. `serde`, `serde_json`, `ring` (SHA-256), `rustix` (already in `Cargo.lock`); the daemon adds `zbus = "=5.19.0"` (already in `Cargo.lock` via `saiife-keychain`). No new crates.
@@ -115,7 +115,7 @@ Owner hard rules (`.superpowers/sdd/hard-rules.md`) bind every task. The ones th
 | `StopTimes` default | `power_s = 60`, `shutdown_s = 30` | V2, spike `ch_stop` |
 | `BOOT_TIMEOUT_SECS` | `90` | V4 |
 | `MAX_SOCK_PATH` | `100` bytes | V7 |
-| unit | `saiife-box@<id>.service`, id `b[0-9]{1,9}` | plan 34 B5 |
+| unit | `saiife-box-<tier>@<id>.service` (item 12), id `b[0-9]{1,9}` | plan 34 B5 |
 | polkit rule file | `/etc/polkit-1/rules.d/50-saiife-box.rules` | |
 | locked roots | `/var/lib/saiife-box/{boxes,images}`, `/opt/saiife/vmm` | V5, V6 |
 
@@ -125,7 +125,7 @@ Owner hard rules (`.superpowers/sdd/hard-rules.md`) bind every task. The ones th
 2. **A swapped VMM binary** (one byte changed in `cloud-hypervisor`). Expected: `box vmm fetch` refuses it and the helper refuses to launch it, in release builds always (Task 2: `fetch_refuses_wrong_digest`; Task 4: `helper_refuses_unpinned_binary`).
 3. **A guest that ignores the power button, or a VMM that hangs.** Expected: `stop` returns at once; the VMM is gone after `power_s + shutdown_s` plus the last resort; `status` is `Off`; nothing leaks (Task 5: `stop_ladder_escalates`, `stop_returns_within_a_second`, `hung_api_times_out`).
 4. **Daemon restart while VMs run** (personal mode: the child handles are lost). Expected: `status` answers from the API socket (`Running`/`Paused`), a dead socket is `Gone`, and a later `stop` still works through the API (Task 5: `status_after_restart_uses_the_api`, `stop_after_restart_without_child`).
-5. **A polkit rule that grants more than intended** (another unit, another verb, another user). Expected: the rule text allows only `start`/`stop` of `saiife-box@b<digits>.service` for user `saiife` (Task 6: `polkit_rule_is_narrow`).
+5. **A polkit rule that grants more than intended** (another unit, another verb, another user). Expected: the rule text allows only `start`/`stop` of `saiife-box-<tier>@b<digits>.service` (tiers s, m, l, xl, xxl; item 12) for user `saiife` (Task 6: `polkit_rule_is_narrow`).
 
 ---
 
@@ -330,7 +330,7 @@ Behaviour (one test each):
 ```rust
 // boxhost launch.rs
 pub trait UnitBus: Send + Sync { fn start(&self, unit: &str) -> Result<(), String>; fn stop(&self, unit: &str) -> Result<(), String>; fn active(&self, unit: &str) -> Result<bool, String>; }
-pub fn unit_name(id: &BoxId) -> Result<String, String>;   // "saiife-box@<id>.service"; id must match b[0-9]{1,9}
+pub fn unit_name(id: &BoxId, tier: &str) -> Result<String, String>;   // "saiife-box-<tier>@<id>.service" (as built, item 12); id must match b[0-9]{1,9}
 pub struct UnitLauncher { /* Arc<dyn UnitBus> */ }
 impl UnitLauncher { pub fn new(bus: Arc<dyn UnitBus>) -> UnitLauncher; }
 impl Launcher for UnitLauncher { /* start -> bus.start; exited -> Some(!active); force_stop -> bus.stop; kind "unit" */ }

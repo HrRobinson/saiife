@@ -2013,4 +2013,18 @@ fn unit_boot_starts_the_recorded_tier_unit() {
         .unwrap()
         .iter()
         .any(|c| c.starts_with("start")));
+    // ... and, with no unit of it running, it can be discarded as told
+    v.destroy(&old).unwrap();
+
+    // a tier smaller than the record's own sizes is not trusted
+    let w = World::new();
+    let (v, _l) = w.vmm(&[]);
+    let h = w.create(&v, "b1");
+    let mut data: serde_json::Value = serde_json::from_str(&h.data).unwrap();
+    data["tier"] = "s".into(); // 1 vCPU, 2 GiB; the box has 2 and 4 GiB
+    let small = VmHandle {
+        data: data.to_string(),
+        ..h
+    };
+    assert!(failed(v.boot(&small)).contains("no size tier"));
 }

@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
-use saiife_boxes::template::{tier_named, Tier};
+use saiife_boxes::template::{tier_named, Tier, TIERS};
 use saiife_wire::source::BoxId;
 use serde::{Deserialize, Serialize};
 
@@ -847,6 +847,12 @@ pub fn unit_name(id: &BoxId, tier: &str) -> Result<String, String> {
     Ok(format!("saiife-box-{tier}@{s}.service"))
 }
 
+/// The untiered unit of earlier builds, `saiife-box@<id>.service` (asked
+/// about only, read only: the polkit rule no longer lets anyone start it).
+fn legacy_unit_name(id: &BoxId) -> Result<String, String> {
+    unit_name(id, "m").map(|_| format!("saiife-box@{}.service", id.as_str()))
+}
+
 /// Locked mode: the VMM runs as the systemd unit
 /// `saiife-box-<tier>@<id>.service` (the box's size tier, from its record,
 /// see [`Launcher::bind`]) under the `saiife-box` user, started and
@@ -886,7 +892,7 @@ impl UnitLauncher {
 
 /// StartUnit's answer when the unit file is not there.
 fn not_installed(e: &str) -> bool {
-    e.contains("NoSuchUnit") || e.contains("not found")
+    e.contains("org.freedesktop.systemd1.NoSuchUnit")
 }
 
 impl Launcher for UnitLauncher {
@@ -915,10 +921,25 @@ impl Launcher for UnitLauncher {
         })
     }
 
-    /// Fails closed: a bus error, or no tier, is "cannot tell", never "gone".
+    /// Fails closed: a bus error is "cannot tell", never "gone". With no
+    /// tier bound (an older record) every unit the box could run in, each
+    /// tier's and the untiered `saiife-box@<id>`, is asked (read only, no
+    /// polkit): gone only when all of them are, so such a box can still be
+    /// discarded once nothing of it runs.
     fn exited(&self, id: &BoxId) -> Option<bool> {
         let Ok(unit) = self.unit(id) else {
-            return Some(false);
+            let units = TIERS
+                .iter()
+                .map(|t| unit_name(id, t.name))
+                .chain([legacy_unit_name(id)])
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(units) = units else {
+                return Some(false);
+            };
+            let all_gone = units
+                .iter()
+                .all(|u| matches!(self.bus.active(u), Ok(false)));
+            return Some(all_gone);
         };
         match self.bus.active(&unit) {
             Ok(true) | Err(_) => Some(false),
@@ -1026,7 +1047,17 @@ mod tests {
         let e = l.start(&id, &paths).unwrap_err();
         assert!(e.contains("tier") && e.contains("spawn it again"), "{e}");
         assert!(l.force_stop(&id).is_err());
-        assert_eq!(l.exited(&id), Some(false), "no tier: cannot tell");
+        // no tier: gone only when every unit the box could be in is
+        assert_eq!(l.exited(&id), Some(true));
+        let asked = bus.calls.lock().unwrap().clone();
+        assert_eq!(asked.len(), TIERS.len() + 1, "{asked:?}");
+        assert!(asked.contains(&"active saiife-box@b7.service".to_string()));
+        *bus.active.lock().unwrap() = Ok(true);
+        assert_eq!(l.exited(&id), Some(false));
+        *bus.active.lock().unwrap() = Err("no bus".into());
+        assert_eq!(l.exited(&id), Some(false));
+        *bus.active.lock().unwrap() = Ok(false);
+        bus.calls.lock().unwrap().clear();
         l.bind(&id, Some("bogus"));
         assert!(l.start(&id, &paths).is_err());
         assert!(bus.calls.lock().unwrap().is_empty());
@@ -1045,8 +1076,11 @@ mod tests {
                 && e.contains("system install --boxes"),
             "{e}"
         );
-        *bus.start.lock().unwrap() = Err("Access denied".into());
-        assert_eq!(l.start(&id, &paths).unwrap_err(), "Access denied");
+        *bus.start.lock().unwrap() = Err("Access denied: unit not found in the cache".into());
+        assert_eq!(
+            l.start(&id, &paths).unwrap_err(),
+            "Access denied: unit not found in the cache"
+        );
         l.bind(&id, None);
         assert!(l.start(&id, &paths).is_err());
         assert_eq!(bus.calls.lock().unwrap().len(), 3);

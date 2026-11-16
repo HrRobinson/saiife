@@ -477,6 +477,18 @@ pub(crate) fn install_boxes_with(
             f.sha256 = Some(fsops::sha256_hex(text.as_bytes()));
         }
     }
+    // An upgrade from the untiered unit: its instances are stopped and the
+    // file goes (polkit no longer lets the daemon start or stop it).
+    let legacy = layout.at(LEGACY_BOX_UNIT_PATH);
+    if fsops::lstat(&legacy)
+        .map_err(|e| refused(&legacy, e.to_string()))?
+        .is_some()
+    {
+        let _ = host.systemctl(&["stop", "saiife-box@*.service"]);
+        if fsops::remove_if_listed(&legacy).map_err(step("unit"))? {
+            created.changed.push(legacy.display().to_string());
+        }
+    }
     match host.systemctl(&["daemon-reload"]) {
         Ok(o) if o.status == 0 => {}
         Ok(o) => {
@@ -871,6 +883,26 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         assert!(again.groups.is_empty() && again.users.is_empty());
         assert!(again.memberships.is_empty());
         assert!(again.changed.is_empty(), "{:?}", again.changed);
+    }
+
+    /// An upgrade from the untiered unit stops its instances and removes it.
+    #[test]
+    fn install_boxes_replaces_the_untiered_unit() {
+        let w = world();
+        let legacy = w.layout.at(LEGACY_BOX_UNIT_PATH);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "[Unit]\n").unwrap();
+        run(&w, &mut Created::default()).unwrap();
+        assert!(!legacy.exists());
+        assert!(TIERS
+            .iter()
+            .all(|t| w.layout.at(&box_unit_path(t)).exists()));
+        assert!(w
+            .host
+            .state()
+            .calls
+            .iter()
+            .any(|l| l == "systemctl stop saiife-box@*.service"));
     }
 
     /// F5: dirs it does not own keep the mode and owner they have.

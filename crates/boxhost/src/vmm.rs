@@ -816,13 +816,17 @@ const MAX_HANDLE_DATA: usize = 4096;
 
 /// `data["tier"]` of a handle's data (the box's size tier, recorded at
 /// create), when the data is short JSON and the tier one of `TIERS`.
+/// The tier must hold the handle's own `vcpus` and `mem_mib` (both
+/// daemon-written at create; a mismatch is not trusted).
 fn tier_of_data(data: &str) -> Option<String> {
     if data.len() > MAX_HANDLE_DATA {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(data).ok()?;
-    let t = v.get("tier")?.as_str()?;
-    saiife_boxes::template::tier_named(t).map(|t| t.name.to_string())
+    let t = saiife_boxes::template::tier_named(v.get("tier")?.as_str()?)?;
+    let vcpus = v.get("vcpus")?.as_u64()?;
+    let mem_mib = v.get("mem_mib")?.as_u64()?;
+    (u64::from(t.vcpus) >= vcpus && t.mem_mib >= mem_mib).then(|| t.name.to_string())
 }
 
 /// `data["image"]` of a handle's data, when the data is short JSON and the

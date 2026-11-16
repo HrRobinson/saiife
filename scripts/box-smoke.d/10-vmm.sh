@@ -428,6 +428,8 @@ smoke_vmm() {
     if [ "${SAIIFE_SMOKE_SUDO_DAEMON:-}" = 1 ]; then
       check "locked: the daemon user cannot start saiife-box-m@x1.service" \
         p35_refused sudo -n -u saiife systemctl start --no-ask-password saiife-box-m@x1.service
+      # proves polkit only on a host upgraded from the untiered unit; on a
+      # fresh install the unit does not exist
       check "locked: the daemon user cannot start saiife-box@b1.service" \
         p35_refused sudo -n -u saiife systemctl start --no-ask-password saiife-box@b1.service
     else
