@@ -1068,7 +1068,9 @@ impl Manager {
     /// under the lock again, clears each from its record (a failure goes to
     /// `error`) while the send is still the box's one in flight and the
     /// record still holds that prompt. A box that moved on meanwhile (a
-    /// requeue gave it a newer prompt, or it was discarded) is left as is.
+    /// requeue gave it a newer prompt, or it was discarded) is left as is,
+    /// and a failed send to a box no longer running with its VM on (a stop
+    /// came in) keeps its prompt and records no error (R25).
     fn deliver(&self, out: impl IntoIterator<Item = Outgoing>) {
         for o in out {
             let sent = self.guest.prompt(&o.id, &o.text);
@@ -1081,6 +1083,11 @@ impl Manager {
                 continue;
             };
             if r.pending_prompt.as_deref() != Some(o.text.as_str()) {
+                continue;
+            }
+            // R25: a send that failed because the box was stopped meanwhile
+            // keeps its prompt for the next start, with no error.
+            if sent.is_err() && !(r.state == BoxState::Running && r.vm_on) {
                 continue;
             }
             r.pending_prompt = None;

@@ -1788,6 +1788,8 @@ struct SlowGuest {
     delay: std::time::Duration,
     prompts: Mutex<Vec<(BoxId, String)>>,
     started: std::sync::atomic::AtomicUsize,
+    /// Each prompt fails once its delay is over (the VM went away).
+    fail: bool,
 }
 
 impl SlowGuest {
@@ -1796,6 +1798,16 @@ impl SlowGuest {
             delay: std::time::Duration::from_millis(delay_ms),
             prompts: Mutex::new(Vec::new()),
             started: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        })
+    }
+    /// A guest whose prompts fail after `delay_ms`.
+    fn failing(delay_ms: u64) -> Arc<SlowGuest> {
+        Arc::new(SlowGuest {
+            delay: std::time::Duration::from_millis(delay_ms),
+            prompts: Mutex::new(Vec::new()),
+            started: std::sync::atomic::AtomicUsize::new(0),
+            fail: true,
         })
     }
     fn prompts(&self) -> Vec<(BoxId, String)> {
@@ -1819,6 +1831,9 @@ impl saiife_boxes::guest::GuestLink for SlowGuest {
         self.started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(self.delay);
+        if self.fail {
+            return Err(saiife_boxes::guest::GuestError::NotConnected);
+        }
         self.prompts
             .lock()
             .unwrap()
@@ -1922,6 +1937,53 @@ fn a_late_prompt_outcome_never_touches_a_box_that_moved_on() {
     let r = mgr.get(&a).unwrap();
     assert_eq!(r.pending_prompt.as_deref(), Some("second"));
     assert_eq!(r.error, None);
+}
+
+/// Plan 38 R25: a box stopped while its prompt was out keeps the prompt
+/// (the send failed because the VM went away) and records no error.
+#[test]
+fn a_prompt_lost_to_a_stop_is_kept_without_an_error() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let g = SlowGuest::failing(1000);
+    let mgr = slow_manager(&w, &g);
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.guest_event(&a2, GuestEvent::Ready).unwrap());
+    g.wait_started(1);
+    mgr.stop(&a, false).unwrap();
+    t.join().unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert!(!r.vm_on, "{r:?}");
+    assert_eq!(r.pending_prompt.as_deref(), Some("the task"));
+    assert_eq!(r.error, None);
+    let saved = Store::open(w.root.clone())
+        .unwrap()
+        .load(&a)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.pending_prompt.as_deref(), Some("the task"));
+}
+
+/// A prompt that fails while the box still runs is cleared and its error
+/// recorded, as before.
+#[test]
+fn a_prompt_failing_on_a_running_box_records_the_error() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let g = SlowGuest::failing(10);
+    let mgr = slow_manager(&w, &g);
+    mgr.guest_event(&a, GuestEvent::Ready).unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert_eq!(r.state, BoxState::Running);
+    assert_eq!(r.pending_prompt, None);
+    assert!(
+        r.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("prompt failed")),
+        "{:?}",
+        r.error
+    );
 }
 
 /// I2: a revise whose box was stopped while the comment was out is not
