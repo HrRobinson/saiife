@@ -780,20 +780,23 @@ mod tests {
 
     use saiife_daemon::rejudge::Bytes;
 
-    /// The `saiife` binary of this build, next to the test binary's `deps`.
+    /// The `saiife` binary of this build: the nearest ancestor of the test
+    /// binary that holds it. That is the parent of `deps` in cargo's old
+    /// layout and above `build/saiife/<hash>/out` in the newer build-dir one.
     fn saiife_exe() -> PathBuf {
         let me = std::env::current_exe().unwrap();
+        let name = format!("saiife{}", std::env::consts::EXE_SUFFIX);
         let exe = me
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join(format!("saiife{}", std::env::consts::EXE_SUFFIX));
-        assert!(
-            exe.is_file(),
-            "{} is missing: `cargo test -p saiife` builds it",
-            exe.display()
-        );
-        exe
+            .ancestors()
+            .skip(1)
+            .map(|d| d.join(&name))
+            .find(|p| p.is_file());
+        exe.unwrap_or_else(|| {
+            panic!(
+                "no {name} above {}: `cargo test -p saiife` builds it",
+                me.display()
+            )
+        })
     }
 
     /// The real worker binary, with `SAIIFE_EVAL_FAULT=fault` on the
