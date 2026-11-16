@@ -535,13 +535,7 @@ async fn unsigned_junk_is_not_recorded() {
 #[tokio::test]
 async fn touch_action_is_refused_touch_required() {
     let (w, mut link, d) = paired().await;
-    for action in [
-        "box.land",
-        "box.push",
-        "box.pr",
-        "approval.approve",
-        "box.steer",
-    ] {
+    for action in ["box.land", "approval.approve", "box.steer"] {
         let a = send(&w, &mut link, &d, action, json!({"id": "b-done"})).await;
         assert_eq!(a["error"], "forbidden", "{action}: {a}");
         assert_eq!(a["rule"], "touch_required", "{action}: {a}");
@@ -552,6 +546,12 @@ async fn touch_action_is_refused_touch_required() {
     assert_eq!(last["decision"], "deny", "{last}");
     assert_eq!(last["rule"], "touch_required");
     assert_eq!(field(last, "level"), "touch");
+    // box.push and box.pr are unavailable by design (plan 39).
+    for action in ["box.push", "box.pr"] {
+        let a = send(&w, &mut link, &d, action, json!({"id": "b-done"})).await;
+        assert_eq!(a["error"], "unavailable", "{action}: {a}");
+        assert_eq!(a["rule"], "unavailable", "{action}: {a}");
+    }
 }
 
 #[tokio::test]
@@ -2201,6 +2201,37 @@ async fn foreign_origin_is_refused() {
     assert_eq!(a["error"], "forbidden", "{a}");
     assert_eq!(a["rule"], "touch_mismatch", "{a}");
     assert_eq!(completes(&w), 0);
+}
+
+#[tokio::test]
+async fn listed_origin_not_enrolled_for_the_credential_is_refused() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    // A second origin is listed, but the passkey was enrolled for ORIGIN only.
+    let other = "https://other.example.com";
+    let cfg: saiife_policy::SystemConfig = toml::from_str(&format!(
+        "version = 2\n[workspace]\norigins = [\"{ORIGIN}\", \"{other}\"]\n"
+    ))
+    .unwrap();
+    w.ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+    let pa = pending_land(&w);
+    let asr = soft.assert_webauthn("localhost", other, &challenge(&pa.record));
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.land",
+        land_args(&pa),
+        proof_json(pa.request_id, &asr),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    assert_eq!(completes(&w), 0);
+    // The enrolled origin still works.
+    let proof = sign_for(&soft, pa.request_id, &challenge(&pa.record));
+    let a = send_touch(&w, &mut link, &d, "box.land", land_args(&pa), proof).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(completes(&w), 1);
 }
 
 #[tokio::test]
