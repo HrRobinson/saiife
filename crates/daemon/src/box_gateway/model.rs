@@ -1,13 +1,19 @@
-//! The model forwarder on a box's `vsock.sock_5002` (plan 40, Task 2; spec
-//! §7.4, §7.9): an HTTP/1.1 server that streams each request to the one
-//! fixed upstream, `https://api.anthropic.com`, after swapping the box's
-//! placeholder for the real credential from the vault.
+//! The model forwarder on a box's `vsock.sock_5002` (plan 40, Task 2; plan
+//! 42 Task 3; spec §7.4, §7.9): an HTTP/1.1 server that streams each
+//! request to its route's one fixed upstream (`api.anthropic.com`,
+//! `api.openai.com` or `generativelanguage.googleapis.com`, port 443; see
+//! [`super::routes`]) after swapping the box's placeholder for the real
+//! credential from the vault. The route comes from the box's template,
+//! read per request; the box never picks it.
 //!
 //! The guest is untrusted. A request passes only when it is `GET` or
-//! `POST`, has an origin-form target, asks for no upgrade, and carries this
-//! box's own placeholder (checked in constant time) in exactly the login's
-//! header: `x-api-key` for an API key, `authorization: Bearer` for a
-//! subscription. The placeholder anywhere else is refused, and the
+//! `POST`, has an origin-form target, asks for no upgrade, has a plain path
+//! on its route's allow-list (plan 42 D4; on Google, no `key` query
+//! parameter), and carries this box's own placeholder (checked in constant
+//! time) in exactly its credential's header: `x-api-key` for an Anthropic
+//! API key, `authorization: Bearer` for an Anthropic subscription or an
+//! OpenAI key, `x-goog-api-key` for a Google key. The placeholder anywhere
+//! else in the headers or the target is refused, and every provider's
 //! credential headers the box sent are always removed before the real one
 //! is added (C5). A box whose template asks for subscription login gets a
 //! fixed `403` while the owner's terms check is open (C4,
@@ -26,12 +32,11 @@
 //! and query strings are never recorded.
 
 use super::egress::{answer, idle_watch, lockdown_watch, ms_since};
+use super::routes::{self, Route};
 use super::{lock, stopped, BoxRun, GatewayShared, Slot};
 use crate::vault::{Kind, VaultState};
 use bytes::Bytes;
-use http::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, SET_COOKIE, UPGRADE,
-};
+use http::header::{HeaderName, HeaderValue, CONNECTION, CONTENT_TYPE, HOST, SET_COOKIE, UPGRADE};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
@@ -39,7 +44,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use saiife_audit::DecisionKind;
-use saiife_boxes::template::{Login, SUBSCRIPTION_GATED};
+use saiife_boxes::template::{Login, ModelCred, Provider, SUBSCRIPTION_GATED};
 use saiife_boxes::BoxId;
 use saiife_broker::upstream::Resolver;
 use std::convert::Infallible;
@@ -54,18 +59,26 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
-/// The model host; the box cannot choose another (R5).
-pub const MODEL_HOST: &str = "api.anthropic.com";
-/// The model port.
+/// The Anthropic route's host (plan 40's name; every route's host is
+/// fixed, the box cannot choose another, R5).
+pub const MODEL_HOST: &str = routes::ANTHROPIC.host;
+/// The model port, on every route.
 pub const MODEL_PORT: u16 = 443;
-/// The vault service a model credential must allow (C8).
-pub const MODEL_SERVICE: &str = "box-model";
+/// The Anthropic route's first vault service (C8; plan 42 D6).
+pub const MODEL_SERVICE: &str = routes::ANTHROPIC.services[0];
 
 /// The answer to a request without this box's placeholder in the right
 /// header (fixed text).
 pub const NOT_VALID: &str = "this box's model credential is not valid";
 /// C7.
 pub const LOCKDOWN_MSG: &str = "lockdown is on";
+/// A path off the route's allow-list (plan 42 D4; fixed text, never the
+/// path).
+pub const NOT_FORWARDED: &str = "this path is not forwarded to the model service";
+/// A path trick (plan 42 D4).
+pub const NOT_PLAIN: &str = "the request path is not plain";
+/// A `key` query parameter on the Google route (plan 42 D4).
+pub const QUERY_KEY: &str = "the key query parameter is not forwarded";
 
 /// Request headers per request (hyper answers `431` above).
 const MAX_HEADERS: usize = 100;
@@ -121,15 +134,20 @@ const HOP_BY_HOP: [&str; 9] = [
     "proxy-authorization",
 ];
 
-/// Request headers that carry a credential or say who the client is; the
-/// box's are always removed (C5).
-const REQUEST_REMOVED: [&str; 6] = [
+/// Request headers that carry any provider's credential, steer billing to
+/// another project, or say who the client is; the box's are always removed
+/// (C5, plan 42 D4). Then only the route's own header is set.
+const REQUEST_REMOVED: [&str; 10] = [
     "x-api-key",
     "authorization",
     "cookie",
     "proxy-authorization",
     "forwarded",
     "host",
+    "x-goog-api-key",
+    "openai-organization",
+    "openai-project",
+    "x-goog-user-project",
 ];
 
 fn remove_hop_by_hop(h: &mut HeaderMap) {
@@ -148,27 +166,24 @@ fn remove_hop_by_hop(h: &mut HeaderMap) {
     }
 }
 
-fn header_for(login: Login) -> HeaderName {
-    match login {
-        Login::ApiKey => HeaderName::from_static("x-api-key"),
-        Login::Subscription => AUTHORIZATION,
-    }
-}
-
-/// C5's removals, then `host: api.anthropic.com` and the login's header
-/// with `real` (marked sensitive). Nothing else is changed. An empty value
-/// or one that is not a valid header value is an error (fixed text).
+/// C5's removals, then `host` set to the route's host and the
+/// credential's one header with `real` (marked sensitive). Nothing else is
+/// changed: never the target or the body. An empty value or one that is
+/// not a valid header value is an error (fixed text).
 pub fn rewrite_request(
     req: &mut http::request::Parts,
-    login: Login,
+    cred: ModelCred,
     real: &str,
 ) -> Result<(), &'static str> {
     if real.is_empty() || real.trim() != real {
         return Err("the credential is not a usable token");
     }
-    let value = match login {
-        Login::ApiKey => Zeroizing::new(real.to_string()),
-        Login::Subscription => Zeroizing::new(format!("Bearer {real}")),
+    let (name, bearer) = routes::cred_header(cred);
+    let host = routes::route(routes::provider_of(cred)).host;
+    let value = if bearer {
+        Zeroizing::new(format!("Bearer {real}"))
+    } else {
+        Zeroizing::new(real.to_string())
     };
     let mut value =
         HeaderValue::from_str(&value).map_err(|_| "the credential is not a usable token")?;
@@ -186,8 +201,8 @@ pub fn rewrite_request(
     for n in forwarded {
         h.remove(n);
     }
-    h.insert(HOST, HeaderValue::from_static(MODEL_HOST));
-    h.insert(header_for(login), value);
+    h.insert(HOST, HeaderValue::from_static(host));
+    h.insert(name, value);
     Ok(())
 }
 
@@ -195,33 +210,38 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Whether `expected` is in `target` as sent or once percent-decoded.
+fn in_target(target: &[u8], expected: &[u8]) -> bool {
+    contains(target, expected) || contains(&routes::percent_decode(target), expected)
+}
+
 /// Whether the request carries `expected` (this box's placeholder) in
-/// exactly the login's header, once, and nowhere else in its headers. The
+/// exactly the credential's header, once, and nowhere else in its headers
+/// or its target (path and query, also percent-decoded; plan 42 D4). The
 /// error is for the record's reason only; the box always gets
 /// [`NOT_VALID`].
 pub fn check_credential(
     parts: &http::request::Parts,
-    login: Login,
+    cred: ModelCred,
     expected: &str,
 ) -> Result<(), &'static str> {
     if expected.is_empty() {
         return Err("no placeholder");
     }
-    let name = header_for(login);
+    let (name, bearer) = routes::cred_header(cred);
     let mut values = parts.headers.get_all(&name).iter();
     let (Some(v), None) = (values.next(), values.next()) else {
         return Err("not exactly one credential header");
     };
     let got = v.as_bytes();
-    let token = match login {
-        Login::ApiKey => got,
-        Login::Subscription => {
-            const BEARER: &[u8] = b"bearer ";
-            if got.len() < BEARER.len() || !got[..BEARER.len()].eq_ignore_ascii_case(BEARER) {
-                return Err("not a bearer token");
-            }
-            &got[BEARER.len()..]
+    let token = if bearer {
+        const BEARER: &[u8] = b"bearer ";
+        if got.len() < BEARER.len() || !got[..BEARER.len()].eq_ignore_ascii_case(BEARER) {
+            return Err("not a bearer token");
         }
+        &got[BEARER.len()..]
+    } else {
+        got
     };
     if !saiife_boxhost::placeholder::placeholder_matches(expected, token) {
         return Err("not this box's placeholder");
@@ -232,6 +252,10 @@ pub fn check_credential(
         .any(|(k, v)| *k != name && contains(v.as_bytes(), expected.as_bytes()));
     if elsewhere {
         return Err("the placeholder in another header");
+    }
+    let target = parts.uri.path_and_query().map_or("", |p| p.as_str());
+    if in_target(target.as_bytes(), expected.as_bytes()) {
+        return Err("the placeholder in the target");
     }
     Ok(())
 }
@@ -362,11 +386,13 @@ fn plain(code: StatusCode, msg: &str) -> Response<ResBody> {
 
 // ---------------------------------------------------------------- refusals
 
-/// A refused request: its answer and its `model_denied` reason.
+/// A refused request: its answer, its `model_denied` reason and, for
+/// `path_not_allowed`, the recorded path.
 struct Deny {
     code: StatusCode,
     msg: String,
     reason: &'static str,
+    path: Option<String>,
 }
 
 impl Deny {
@@ -375,13 +401,14 @@ impl Deny {
             code,
             msg: msg.into(),
             reason,
+            path: None,
         }
     }
 }
 
-/// Write the `model_denied` record of `reason` unless its key wrote one in
-/// the last 60 s.
-async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str) {
+/// Write the `model_denied` record of `reason` (with `path` when given)
+/// unless its key wrote one in the last 60 s.
+async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str, path: Option<String>) {
     let key = (id.clone(), Some(DENIED_KEY.to_string()), reason);
     let Some(suppressed) = lock(&gw.denied).admit(key, (gw.clock)()) else {
         return;
@@ -393,6 +420,9 @@ async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str) {
     rec.session = Some(format!("box-{}", id.as_str()));
     let x = &mut rec.extra;
     x.insert("box".into(), id.as_str().into());
+    if let Some(p) = path {
+        x.insert("path".into(), p.into());
+    }
     if suppressed > 0 {
         x.insert("suppressed".into(), suppressed.into());
     }
@@ -407,12 +437,14 @@ async fn model_deny(gw: Arc<GatewayShared>, id: BoxId, reason: &'static str) {
 struct BoxInfo {
     session: String,
     login: Login,
+    cred: ModelCred,
+    provider: Provider,
     credential: String,
     placeholder: Option<String>,
 }
 
-/// The box's record, its template's login and credential name, and its
-/// placeholder, read on the blocking pool (the manager's lock and the
+/// The box's record, its template's login, credential kind, provider and
+/// credential name, and its placeholder, read on the blocking pool (the manager's lock and the
 /// placeholder file are never touched on the runtime thread).
 async fn box_info(gw: &GatewayShared, id: &BoxId) -> Result<BoxInfo, Deny> {
     let unknown = || {
@@ -438,13 +470,16 @@ async fn box_info(gw: &GatewayShared, id: &BoxId) -> Result<BoxInfo, Deny> {
         let r = mgr.get(&id).ok()?;
         let t = mgr.templates().into_iter().find(|t| t.name == r.template)?;
         let record = saiife_boxhost::paths::RecordPaths::of(mgr.root(), &id);
-        // A bad or unreadable file is as good as none: nothing passes.
+        // A bad or unreadable file, or one made for another agent or login
+        // (plan 42 D3), is as good as none: nothing passes.
         let placeholder = saiife_boxhost::placeholder::read_placeholder(&record, t.model_cred())
             .ok()
             .flatten();
         Some(BoxInfo {
             session: r.session,
             login: t.login,
+            cred: t.model_cred(),
+            provider: t.agent.provider(),
             credential: t.credential,
             placeholder,
         })
@@ -455,10 +490,12 @@ async fn box_info(gw: &GatewayShared, id: &BoxId) -> Result<BoxInfo, Deny> {
     .ok_or_else(unknown)
 }
 
-/// The vault value of `name` for the model (C8): a token secret that
-/// allows [`MODEL_SERVICE`]. Read per request, so a rotated key applies at
-/// once; the lock is held for the lookup only.
-fn vault_value(gw: &GatewayShared, name: &str) -> Result<Zeroizing<String>, Deny> {
+/// The vault value of `name` for `route` (C8, plan 42 D6): a token secret
+/// that allows any of the route's services; a refusal names the first.
+/// Read per request, so a rotated key applies at once; the lock is held for
+/// the lookup only.
+fn vault_value(gw: &GatewayShared, name: &str, route: &Route) -> Result<Zeroizing<String>, Deny> {
+    let service = route.services[0];
     let Some(ctx) = gw.ctx() else {
         return Err(Deny::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -470,8 +507,8 @@ fn vault_value(gw: &GatewayShared, name: &str) -> Result<Zeroizing<String>, Deny
         Deny::new(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "the vault has no secret {name} for {MODEL_SERVICE}: \
-                 saiife secret add {name} --kind token --service {MODEL_SERVICE}"
+                "the vault has no secret {name} for {service}: \
+                 saiife secret add {name} --kind token --service {service}"
             ),
             reason,
         )
@@ -487,7 +524,11 @@ fn vault_value(gw: &GatewayShared, name: &str) -> Result<Zeroizing<String>, Deny
     let Some(e) = v.get(name) else {
         return Err(missing("secret_missing"));
     };
-    if !e.allowed_services.iter().any(|s| s == MODEL_SERVICE) {
+    if !e
+        .allowed_services
+        .iter()
+        .any(|s| route.services.contains(&s.as_str()))
+    {
         return Err(missing("secret_not_allowed"));
     }
     let token = match (e.kind, e.fields.get("token")) {
@@ -510,8 +551,10 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// One TLS connection to the upstream; it ends with the box connection.
+/// One TLS connection to an upstream host; it ends with the box
+/// connection, and is reused only for the same host.
 struct UpConn {
+    host: &'static str,
     sender: SendRequest<UpBody>,
     _task: AbortOnDrop,
 }
@@ -616,13 +659,13 @@ impl ConnState {
         Ok(c)
     }
 
-    /// A new connection to the fixed upstream, within the connect deadline:
-    /// the lookup (on the blocking pool, holding the box's and the
-    /// gateway's lookup permits until it really ends), every answer an
-    /// allowed address, TCP, TLS for `api.anthropic.com`, the HTTP/1.1
-    /// handshake. The port is always [`MODEL_PORT`], whatever the resolver
-    /// answers ([`upstream_addr`]).
-    async fn connect(&self) -> Result<UpConn, Fail> {
+    /// A new connection to the route's fixed `host`, within the connect
+    /// deadline: the lookup (on the blocking pool, holding the box's and
+    /// the gateway's lookup permits until it really ends), every answer an
+    /// allowed address, TCP, TLS for `host`, the HTTP/1.1 handshake. The
+    /// port is always [`MODEL_PORT`], whatever the resolver answers
+    /// ([`upstream_addr`]).
+    async fn connect(&self, host: &'static str) -> Result<UpConn, Fail> {
         let (tls, resolver) = self.client()?;
         let gw = &self.gw;
         let mine = Arc::clone(&self.run.lookups)
@@ -634,7 +677,7 @@ impl ConnState {
         let work = async move {
             let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
                 let _permits = (mine, all);
-                resolver.resolve(MODEL_HOST, MODEL_PORT)
+                resolver.resolve(host, MODEL_PORT)
             })
             .await
             .map_err(|_| Fail::Unreachable)?
@@ -658,8 +701,8 @@ impl ConnState {
             }
             let tcp = tcp.ok_or(Fail::Unreachable)?;
             let _ = tcp.set_nodelay(true);
-            let name = rustls::pki_types::ServerName::try_from(MODEL_HOST)
-                .map_err(|_| Fail::Unreachable)?;
+            let name =
+                rustls::pki_types::ServerName::try_from(host).map_err(|_| Fail::Unreachable)?;
             let tls = tls
                 .connect(name, tcp)
                 .await
@@ -674,6 +717,7 @@ impl ConnState {
                 let _ = conn.await;
             });
             Ok(UpConn {
+                host,
                 sender,
                 _task: AbortOnDrop(task),
             })
@@ -683,32 +727,37 @@ impl ConnState {
             .map_err(|_| Fail::ConnectTimeout)?
     }
 
-    /// The kept connection when it can take a request, else a new one.
-    async fn ready_conn(&self) -> Result<UpConn, Fail> {
+    /// The kept connection when it is to `host` and can take a request,
+    /// else a new one.
+    async fn ready_conn(&self, host: &'static str) -> Result<UpConn, Fail> {
         let kept = lock(&self.upstream).take();
         if let Some(mut u) = kept {
-            if !u.sender.is_closed() {
+            if u.host == host && !u.sender.is_closed() {
                 let wait = Duration::from_secs(self.gw.model.connect_secs);
                 if let Ok(Ok(())) = tokio::time::timeout(wait, u.sender.ready()).await {
                     return Ok(u);
                 }
             }
         }
-        self.connect().await
+        self.connect(host).await
     }
 
-    /// Send `req`; a kept connection that turns out closed before the
+    /// Send `req` to `host`; a kept connection that turns out closed before the
     /// request was written is replaced once (the request comes back
     /// unsent, so it is never sent twice).
-    async fn exchange(&self, req: Request<UpBody>) -> Result<Response<Incoming>, Fail> {
-        let mut u = self.ready_conn().await?;
+    async fn exchange(
+        &self,
+        req: Request<UpBody>,
+        host: &'static str,
+    ) -> Result<Response<Incoming>, Fail> {
+        let mut u = self.ready_conn(host).await?;
         let r = match u.sender.try_send_request(req).await {
             Ok(r) => r,
             Err(mut e) => {
                 let Some(req) = e.take_message() else {
                     return Err(Fail::Send);
                 };
-                u = self.connect().await?;
+                u = self.connect(host).await?;
                 u.sender.send_request(req).await.map_err(|_| Fail::Send)?
             }
         };
@@ -726,6 +775,7 @@ struct RecInfo {
     method: String,
     path: String,
     login: Login,
+    provider: Provider,
 }
 
 fn login_name(l: Login) -> &'static str {
@@ -744,6 +794,20 @@ fn record_path(p: &str) -> String {
     p[..end].to_string()
 }
 
+/// The path recorded for `path_not_allowed`: no query, the box's
+/// placeholder never written (as sent or percent-encoded), cut to
+/// [`RECORD_PATH_MAX`] bytes.
+fn denied_path(path: &str, placeholder: Option<&str>) -> String {
+    let Some(ph) = placeholder.filter(|p| !p.is_empty()) else {
+        return record_path(path);
+    };
+    let shown = path.replace(ph, "[placeholder]");
+    if in_target(shown.as_bytes(), ph.as_bytes()) {
+        return "[a path holding the box placeholder]".to_string();
+    }
+    record_path(&shown)
+}
+
 async fn model_record(gw: &GatewayShared, r: &RecInfo, status: u16, c: &Counters, outcome: &str) {
     let Some(ctx) = gw.ctx() else {
         eprintln!("saiifed: boxes: a model record was not written: saiife is stopping");
@@ -759,6 +823,7 @@ async fn model_record(gw: &GatewayShared, r: &RecInfo, status: u16, c: &Counters
     x.insert("bytes_up".into(), c.up.load(Ordering::Relaxed).into());
     x.insert("bytes_down".into(), c.down.load(Ordering::Relaxed).into());
     x.insert("ms".into(), ms_since(c.t0).into());
+    x.insert("provider".into(), r.provider.name().into());
     x.insert("login".into(), login_name(r.login).into());
     // R3: the real credential never enters the box.
     x.insert("credential".into(), "gateway".into());
@@ -871,10 +936,28 @@ async fn forward(st: &Arc<ConnState>, req: Request<Incoming>) -> Result<Response
         ));
     }
     let not_valid = |reason| Deny::new(StatusCode::UNAUTHORIZED, NOT_VALID, reason);
+    // The route is the template's; the credential kind must belong to it
+    // (both come from the template, so this only fails closed).
+    if routes::provider_of(info.cred) != info.provider {
+        return Err(not_valid("no_placeholder"));
+    }
+    let route = routes::route(info.provider);
+    let path = parts.uri.path();
+    if !routes::path_plain(path) {
+        return Err(Deny::new(StatusCode::BAD_REQUEST, NOT_PLAIN, "path"));
+    }
+    if !routes::path_allowed(route, path) {
+        let mut d = Deny::new(StatusCode::FORBIDDEN, NOT_FORWARDED, "path_not_allowed");
+        d.path = Some(denied_path(path, info.placeholder.as_deref()));
+        return Err(d);
+    }
+    if route.provider == Provider::Google && parts.uri.query().is_some_and(routes::query_has_key) {
+        return Err(Deny::new(StatusCode::BAD_REQUEST, QUERY_KEY, "query_key"));
+    }
     let Some(expected) = info.placeholder.as_deref() else {
         return Err(not_valid("no_placeholder"));
     };
-    check_credential(&parts, info.login, expected).map_err(|_| not_valid("bad_credential"))?;
+    check_credential(&parts, info.cred, expected).map_err(|_| not_valid("bad_credential"))?;
     let cap = gw.model.body_max;
     if body.size_hint().lower() > cap {
         return Err(Deny::new(
@@ -883,13 +966,13 @@ async fn forward(st: &Arc<ConnState>, req: Request<Incoming>) -> Result<Response
             "body_too_large",
         ));
     }
-    let real = vault_value(gw, &info.credential)?;
-    rewrite_request(&mut parts, info.login, &real).map_err(|_| {
+    let real = vault_value(gw, &info.credential, route)?;
+    rewrite_request(&mut parts, info.cred, &real).map_err(|_| {
         Deny::new(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "the vault secret {} is not a usable token for {MODEL_SERVICE}",
-                info.credential
+                "the vault secret {} is not a usable token for {}",
+                info.credential, route.services[0]
             ),
             "secret_invalid",
         )
@@ -902,6 +985,7 @@ async fn forward(st: &Arc<ConnState>, req: Request<Incoming>) -> Result<Response
         method: parts.method.to_string(),
         path: record_path(parts.uri.path()),
         login: info.login,
+        provider: route.provider,
     };
     let c = Arc::new(Counters::new());
     let req = Request::from_parts(
@@ -915,7 +999,7 @@ async fn forward(st: &Arc<ConnState>, req: Request<Incoming>) -> Result<Response
     let idle = Duration::from_secs(gw.model.idle_secs);
     let mut stop = st.run.stop.subscribe();
     let got = tokio::select! {
-        r = st.exchange(req) => r,
+        r = st.exchange(req, route.host) => r,
         () = idle_watch(&c.last, c.t0, idle) => Err(Fail::Idle),
         () = lockdown_watch(gw) => Err(Fail::Lockdown),
         () = stopped(&mut stop) => Err(Fail::Stopped),
@@ -979,7 +1063,7 @@ pub(crate) async fn serve_run(mut stream: UnixStream, run: Arc<BoxRun>, gw: Arc<
         Err((msg, reason)) => {
             answer(&mut stream, 429, msg).await;
             drop(stream);
-            model_deny(Arc::clone(&gw), run.id.clone(), reason).await;
+            model_deny(Arc::clone(&gw), run.id.clone(), reason, None).await;
             return;
         }
     };
@@ -995,7 +1079,12 @@ pub(crate) async fn serve_run(mut stream: UnixStream, run: Arc<BoxRun>, gw: Arc<
             let resp = match forward(&st, req).await {
                 Ok(r) => r,
                 Err(d) => {
-                    tokio::spawn(model_deny(Arc::clone(&st.gw), st.run.id.clone(), d.reason));
+                    tokio::spawn(model_deny(
+                        Arc::clone(&st.gw),
+                        st.run.id.clone(),
+                        d.reason,
+                        d.path,
+                    ));
                     plain(d.code, &d.msg)
                 }
             };
@@ -1065,7 +1154,7 @@ mod tests {
             ("content-length", "12"),
             ("user-agent", "claude-cli"),
         ]);
-        rewrite_request(&mut p, Login::ApiKey, REAL).unwrap();
+        rewrite_request(&mut p, ModelCred::AnthropicApiKey, REAL).unwrap();
         assert_eq!(
             names(&p.headers),
             vec![
@@ -1084,7 +1173,7 @@ mod tests {
         assert_eq!(p.method, Method::POST);
 
         let mut p = parts(&[("authorization", "Bearer box"), ("x-api-key", PH)]);
-        rewrite_request(&mut p, Login::Subscription, REAL).unwrap();
+        rewrite_request(&mut p, ModelCred::AnthropicSubscription, REAL).unwrap();
         assert_eq!(
             names(&p.headers),
             vec![
@@ -1096,7 +1185,7 @@ mod tests {
 
         for bad in ["", " x", "x\r\nevil: 1", "x\n"] {
             let mut p = parts(&[("x-api-key", PH)]);
-            assert!(rewrite_request(&mut p, Login::ApiKey, bad).is_err());
+            assert!(rewrite_request(&mut p, ModelCred::AnthropicApiKey, bad).is_err());
             // Nothing changed on an error.
             assert_eq!(p.headers["x-api-key"], PH);
         }
@@ -1106,31 +1195,48 @@ mod tests {
     fn check_credential_rules() {
         let ok = |h: &[(&str, &str)], l| check_credential(&parts(h), l, PH).is_ok();
         let bearer = format!("Bearer {PH}");
-        assert!(ok(&[("x-api-key", PH)], Login::ApiKey));
+        assert!(ok(&[("x-api-key", PH)], ModelCred::AnthropicApiKey));
         assert!(ok(
             &[("x-api-key", PH), ("authorization", "Bearer x")],
-            Login::ApiKey
+            ModelCred::AnthropicApiKey
         ));
-        assert!(!ok(&[], Login::ApiKey));
-        assert!(!ok(&[("authorization", &bearer)], Login::ApiKey));
-        assert!(!ok(&[("x-api-key", PH), ("x-api-key", PH)], Login::ApiKey));
+        assert!(!ok(&[], ModelCred::AnthropicApiKey));
+        assert!(!ok(
+            &[("authorization", &bearer)],
+            ModelCred::AnthropicApiKey
+        ));
+        assert!(!ok(
+            &[("x-api-key", PH), ("x-api-key", PH)],
+            ModelCred::AnthropicApiKey
+        ));
         assert!(!ok(
             &[("x-api-key", PH), ("x-other", &bearer)],
-            Login::ApiKey
+            ModelCred::AnthropicApiKey
         ));
-        assert!(!ok(&[("x-api-key", &format!("{PH} "))], Login::ApiKey));
-        assert!(ok(&[("authorization", &bearer)], Login::Subscription));
+        assert!(!ok(
+            &[("x-api-key", &format!("{PH} "))],
+            ModelCred::AnthropicApiKey
+        ));
+        assert!(ok(
+            &[("authorization", &bearer)],
+            ModelCred::AnthropicSubscription
+        ));
         assert!(ok(
             &[("authorization", &format!("bearer {PH}"))],
-            Login::Subscription
+            ModelCred::AnthropicSubscription
         ));
-        assert!(!ok(&[("authorization", PH)], Login::Subscription));
-        assert!(!ok(&[("x-api-key", PH)], Login::Subscription));
+        assert!(!ok(
+            &[("authorization", PH)],
+            ModelCred::AnthropicSubscription
+        ));
+        assert!(!ok(&[("x-api-key", PH)], ModelCred::AnthropicSubscription));
         assert!(!ok(
             &[("authorization", &bearer), ("x-api-key", PH)],
-            Login::Subscription
+            ModelCred::AnthropicSubscription
         ));
-        assert!(check_credential(&parts(&[("x-api-key", "")]), Login::ApiKey, "").is_err());
+        assert!(
+            check_credential(&parts(&[("x-api-key", "")]), ModelCred::AnthropicApiKey, "").is_err()
+        );
     }
 
     #[test]
@@ -1167,6 +1273,21 @@ mod tests {
         assert_eq!(upstream_addr(true, a("10.0.0.1:8443")), a("10.0.0.1:443"));
         let want = if cfg!(debug_assertions) { 8443 } else { 443 };
         assert_eq!(upstream_addr(true, a("127.0.0.1:8443")).port(), want);
+    }
+
+    #[test]
+    fn denied_path_hides_the_placeholder() {
+        assert_eq!(denied_path("/v1/files", Some(PH)), "/v1/files");
+        assert_eq!(denied_path("/v1/files", None), "/v1/files");
+        assert_eq!(
+            denied_path(&format!("/v1/files/{PH}/x"), Some(PH)),
+            "/v1/files/[placeholder]/x"
+        );
+        let enc = format!("/v1/files/%{:02X}{}", PH.as_bytes()[0], &PH[1..]);
+        let shown = denied_path(&enc, Some(PH));
+        assert!(!shown.contains(&PH[1..]), "{shown}");
+        let long = format!("/{}{PH}", "a".repeat(250));
+        assert!(!denied_path(&long, Some(PH)).contains(&PH[..6]));
     }
 
     #[test]

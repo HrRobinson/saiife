@@ -18,6 +18,7 @@
 
 pub mod egress;
 pub mod model;
+mod routes;
 
 use crate::ops::{Ctx, Mode};
 use saiife_audit::DecisionKind;
