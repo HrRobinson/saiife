@@ -184,12 +184,12 @@ p39_diff_shows() {
 p39_hash_matches() {
   local box=$1 trailer rec
   trailer=$(git -C "$P39_REPO" log -1 --format='%(trailers:key=Saiife-Diff-Sha256,valueonly)' "refs/heads/saiife/box-$box" | tr -d '[:space:]')
-  rec=$(p39_audit 'last(inputs | select(.kind == "box" and .extra.action == "land" and .extra.box == $b) | .extra.diff_sha256) // empty' --arg b "$box") || return 1
+  rec=$(p39_audit 'last(inputs | select(.kind == "box" and .action == "land" and .box == $b) | .diff_sha256) // empty' --arg b "$box") || return 1
   [[ "$trailer" =~ ^[0-9a-f]{64}$ ]] && [ "$trailer" = "$rec" ]
 }
 
 p39_audit_count() { # BOX ACTION
-  p39_audit '[inputs | select(.kind == "box" and .extra.action == $a and .extra.box == $b)] | length' --arg a "$2" --arg b "$1"
+  p39_audit '[inputs | select(.kind == "box" and .action == $a and .box == $b)] | length' --arg a "$2" --arg b "$1"
 }
 
 # p39_skip KEY WHY: record a skipped key.

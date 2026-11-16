@@ -111,6 +111,7 @@ p40_keyfile_ok() {
   ! grep -q '^$' "$1" || return 1
   ! grep -q $'\r' "$1" || return 1
   ! grep -q '[[:blank:]]$' "$1" || return 1
+  ! grep -q '^[[:blank:]]' "$1" || return 1
   [ "$(grep -c . "$1")" = 1 ]
 }
 
