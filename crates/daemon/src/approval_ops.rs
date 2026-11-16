@@ -23,6 +23,7 @@ use crate::ops::{Conn, Ctx, VERSION};
 use crate::reauth::{parse_auth_hex, Reauth, ReauthResult, Subject};
 use crate::touch::{unix_now, IssueKey};
 use crate::vault::VaultError;
+use crate::workspace_link::Refused;
 use saiife_audit::{DecisionKind, Record};
 use saiife_broker::pipeline::{self, Outcome, PendingCall, StoredCall};
 use saiife_ipc::msg::{
@@ -873,6 +874,278 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     m.insert("request".into(), rid.into());
     m.insert("state".into(), action.into());
     ok(id, m)
+}
+
+// ------------------------------------------------- the Workspace's decisions
+
+/// Whether the Workspace device owner `owner_user` (uid `owner_uid`) may
+/// decide approval requests: the personal broker's own user, else a listed
+/// approver (by name or group, from the daemon's directory).
+fn owner_is_approver(ctx: &Ctx, owner_uid: u32, owner_user: &str) -> bool {
+    if ctx.mode == crate::ops::Mode::Personal {
+        return owner_uid == ctx.own_uid;
+    }
+    match ctx.policy().system {
+        Some(s) => crate::approvers::is_approver(&s.approval, ctx.directory.as_ref(), owner_user),
+        None => false,
+    }
+}
+
+/// `approval.list` from the Workspace: the pending requests the device
+/// owner may decide, each masked and cut short as `approval.list` gives
+/// them, plus `touch_class` (D8). A non-approver gets none.
+pub(crate) async fn list_remote(ctx: &Arc<Ctx>, owner_uid: u32, owner_user: &str) -> Vec<Value> {
+    if !owner_is_approver(ctx, owner_uid, owner_user) {
+        return Vec::new();
+    }
+    let filter = Filter {
+        uid: None,
+        sid: None,
+        states: vec![State::Pending],
+    };
+    let items = on_store(ctx, move |_, s| s.list(filter)).await;
+    items
+        .unwrap_or_default()
+        .iter()
+        .map(|r| with_effective_class(ctx, r, brief(r)))
+        .collect()
+}
+
+/// An `approval`/`refused` record of a decision from the Workspace, and the
+/// refusal that answers it.
+async fn refuse_remote(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    by_uid: u32,
+    device: &saiife_wire::device::Device,
+    code: ErrorCode,
+    rule: &'static str,
+    why: &str,
+) -> Refused {
+    let mut rec = ctx.approval_record(r, "refused");
+    rec.extra.insert("by_uid".into(), by_uid.into());
+    rec.extra.insert(
+        "workspace".into(),
+        json!({"device": device.id, "label": device.label}),
+    );
+    rec.rule = Some(rule.into());
+    rec.reason = Some(why.into());
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!(
+            "saiife: warning: cannot record a refused approval of #{}: {e}",
+            r.id
+        );
+    }
+    Refused::new(code, rule, format!("refused ({rule}): {why}"))
+}
+
+/// A decision on approval request `rid` by the Workspace device `device`
+/// of `owner_user` (uid `owner_uid`), as [`decide`] makes one for a local
+/// peer: who may see it, the approver and same-user rules, the same store
+/// transition and the same record plus `extra.workspace = {device, label}`.
+/// An approval needs `evidence` (the verified UV touch for exactly this
+/// request): it replaces the polkit re-authentication of `same_user =
+/// "reauth"`, so that setting lets the requester approve with a touch and
+/// `deny` does not. A request cut short for display is not approved from
+/// the browser (it has no way to acknowledge the cut). A request's own
+/// requester may withdraw it without being an approver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn decide_remote(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    owner_user: &str,
+    rid: u64,
+    approve: bool,
+    note: Option<String>,
+    evidence: Option<TouchEvidence>,
+    device: &saiife_wire::device::Device,
+) -> Result<Value, Refused> {
+    use crate::approvals::record_with_touch;
+    let personal = ctx.mode == crate::ops::Mode::Personal;
+    let approver = owner_is_approver(ctx, owner_uid, owner_user);
+    let Some(stored) = on_store(ctx, move |_, s| s.get(rid)).await else {
+        return Err(Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            "approvals are not available on this machine",
+        ));
+    };
+    // An unknown request, and one the owner may not see, answer alike.
+    let requester =
+        |r: &ApprovalRequest| crate::ops::same_principal(r.uid, r.sid.as_deref(), owner_uid, None);
+    let r = match stored {
+        Some(r) if requester(&r) || approver => r,
+        _ => {
+            return Err(Refused::new(
+                ErrorCode::BadRequest,
+                "not_found",
+                format!("no approval request #{rid} (or not yours)"),
+            ))
+        }
+    };
+    let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
+        return Err(Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            "no valid policy is loaded: nobody can approve",
+        ));
+    };
+    let forbid = ErrorCode::Forbidden;
+    if approve && r.body_truncated {
+        return Err(refuse_remote(
+            ctx,
+            &r,
+            owner_uid,
+            device,
+            forbid,
+            "truncated_not_acknowledged",
+            "the request is shown cut and cannot be approved from the browser: \
+             approve it with `saiife approvals approve --accept-truncated`",
+        )
+        .await);
+    }
+    let cancel = !approve && requester(&r);
+    let note = if cancel {
+        Some(match note {
+            Some(n)
+                if !n.is_empty() && n.len() + CANCELLED.len() + 2 <= crate::approvals::NOTE_MAX =>
+            {
+                format!("{CANCELLED}: {n}")
+            }
+            _ => CANCELLED.to_string(),
+        })
+    } else {
+        note
+    };
+    if !cancel {
+        if !approver {
+            let why = Refusal::NotApprover;
+            return Err(refuse_remote(
+                ctx,
+                &r,
+                owner_uid,
+                device,
+                forbid,
+                why.rule(),
+                &why.to_string(),
+            )
+            .await);
+        }
+        // The same-user rule (the personal broker's one user decides alone).
+        if !personal && requester(&r) && cfg.same_user == saiife_policy::SameUser::Deny {
+            let why = Refusal::SameUserDenied;
+            return Err(refuse_remote(
+                ctx,
+                &r,
+                owner_uid,
+                device,
+                forbid,
+                why.rule(),
+                &why.to_string(),
+            )
+            .await);
+        }
+    }
+    if approve && evidence.is_none() {
+        return Err(Refused::new(
+            forbid,
+            "touch_required",
+            format!("approving request #{rid} needs a touch"),
+        ));
+    }
+    let to = if approve {
+        State::Approved
+    } else {
+        State::Rejected
+    };
+    let moved = on_store(ctx, move |_, s| {
+        s.transition_by(
+            rid,
+            &[State::Pending],
+            to,
+            Some((owner_uid, None)),
+            note,
+            now(),
+        )
+    })
+    .await;
+    let r = match moved {
+        None => {
+            return Err(Refused::new(
+                ErrorCode::Unavailable,
+                "unavailable",
+                "approvals are not available on this machine",
+            ))
+        }
+        Some(Ok(r)) => r,
+        Some(Err(StoreError::WrongState {
+            state,
+            newly_expired,
+        })) => {
+            if let Some(gone) = newly_expired {
+                ctx.record_expired(vec![*gone]).await;
+            }
+            return Err(Refused::new(
+                ErrorCode::BadRequest,
+                "invalid",
+                format!("request #{rid} is {}", state_name(state)),
+            ));
+        }
+        Some(Err(StoreError::Unknown)) => {
+            return Err(Refused::new(
+                ErrorCode::BadRequest,
+                "not_found",
+                format!("no approval request #{rid} (or not yours)"),
+            ))
+        }
+        Some(Err(e)) => {
+            return Err(Refused::new(
+                ErrorCode::BadRequest,
+                "invalid",
+                e.to_string(),
+            ))
+        }
+    };
+    let action = if approve { "approved" } else { "rejected" };
+    let mut rec = ctx.approval_record(&r, action);
+    rec.extra.insert("by_uid".into(), owner_uid.into());
+    rec.extra.insert(
+        "workspace".into(),
+        json!({"device": device.id, "label": device.label}),
+    );
+    if let Some(ev) = &evidence {
+        rec = record_with_touch(rec, ev);
+    }
+    if let Err(e) = ctx.writer.append(rec).await {
+        if approve {
+            // An approval that is not on record is not acted on.
+            fail(
+                ctx,
+                &r,
+                "unrecorded",
+                &format!("the approval was not recorded: {e}"),
+            )
+            .await;
+        }
+        return Err(Refused::new(
+            ErrorCode::Unrecorded,
+            "unrecorded",
+            format!("request #{rid} is {action}, but its record could not be written: {e}"),
+        ));
+    }
+    if approve && matches!(r.kind, ApprovalType::Connector | ApprovalType::Mcp) {
+        let c = Arc::clone(ctx);
+        tokio::spawn(async move { send(c, r, owner_uid).await });
+    } else if approve {
+        if let Err(why) = grant(ctx, &r).await {
+            return Err(Refused::new(
+                ErrorCode::Internal,
+                "internal",
+                format!("request #{rid} is approved, but its grant could not be kept: {why}"),
+            ));
+        }
+    }
+    Ok(json!({"request": rid, "state": action}))
 }
 
 /// Why [`touch_for`] did not verify a touch.

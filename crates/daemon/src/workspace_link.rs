@@ -27,7 +27,8 @@ use saiife_wire::level::{actions as a, spawn_level, Level};
 use saiife_wire::pair::PairRequest;
 use saiife_wire::seal::{machine_hello_msg, SealBinding};
 use saiife_wire::source::{
-    check_text, BoxError, BoxId, BoxSource, Decision, SpawnReq, Start, MAX_TASK_BYTES,
+    check_text, BoxError, BoxId, BoxSource, Decision, SpawnReq, Start, MAX_STEER_BYTES,
+    MAX_TASK_BYTES,
 };
 use saiife_wire::verify::Verified;
 use saiife_wire::{b64, WireError};
@@ -77,19 +78,10 @@ impl Refused {
     }
 }
 
-/// Remote actions plan 31 fills in (touch-bound ones and their helpers).
-/// Until then every one is refused: Touch ones `touch_required`, the Signed
-/// ones `unavailable`.
-pub const LATER: &[&str] = &[
-    "box.push",
-    "box.pr",
-    "box.steer",
-    "box.revise",
-    "box.resume",
-    "approval.list",
-    "approval.approve",
-    "approval.reject",
-];
+/// Remote actions no plan of this version fills in: `box.push` (plan 39
+/// makes push a CLI-only, touch-bound path) and `box.pr`. Both answer
+/// `unavailable`, with or without a touch.
+pub const LATER: &[&str] = &["box.push", "box.pr"];
 
 /// The Signed actions [`execute`] carries out (every other Signed entry of
 /// `saiife_wire::level::REMOTE` is in [`LATER`]; a test keeps it so).
@@ -108,6 +100,8 @@ pub const HANDLED: &[&str] = &[
     a::BOX_SPAWN,
     a::LOCKDOWN_ON,
     a::WORKSPACE_TOUCH_BEGIN,
+    a::APPROVAL_LIST,
+    a::APPROVAL_REJECT,
 ];
 
 /// The handled actions that change something: always recorded.
@@ -118,7 +112,11 @@ const CHANGES: &[&str] = &[
     a::BOX_DISCARD,
     a::BOX_REORDER,
     a::BOX_SPAWN,
-    a::BOX_LAND,
+    a::BOX_STEER,
+    a::BOX_REVISE,
+    a::BOX_RESUME,
+    a::APPROVAL_APPROVE,
+    a::APPROVAL_REJECT,
     a::LOCKDOWN_ON,
     a::WORKSPACE_TOUCH_BEGIN,
 ];
@@ -512,7 +510,9 @@ async fn run(
     // The evidence of a touch that verified, kept for the record even when
     // the action then fails.
     let mut evidence: Option<Value> = None;
-    let mut out = act(ctx, v, &mut level, touch, &mut evidence).await;
+    // Whether a steer window (not a touch) covered the frame.
+    let mut window = false;
+    let mut out = act(ctx, v, &mut level, touch, &mut evidence, &mut window).await;
     // The begin's audit detail is not part of its answer.
     let begun = match (&mut out, action) {
         (Ok(Value::Object(m)), a::WORKSPACE_TOUCH_BEGIN) => m.remove("touch_begin"),
@@ -536,6 +536,9 @@ async fn run(
         }
         if let Some(ev) = evidence {
             rec.extra.insert("touch".into(), ev);
+        }
+        if window {
+            rec.extra.insert("window".into(), true.into());
         }
         if let Some(r) = refused {
             deny(&mut rec, r);
@@ -725,6 +728,26 @@ async fn touched(
             blocking(&src, move |b| b.complete(rid, Decision::Approve, Some(ev))).await?;
             Ok(json!({}))
         }
+        Proven::Web(..) if action == a::BOX_SPAWN => {
+            let req = spawn_req(&v.frame.args)?;
+            let id = blocking(&src, move |b| b.spawn(&req)).await?;
+            Ok(json!({ "id": id }))
+        }
+        Proven::Approval(ev, rid) if action == a::APPROVAL_APPROVE => {
+            let device = device_of(ctx, v)?;
+            crate::approval_ops::decide_remote(
+                ctx,
+                owner_uid,
+                &v.owner_user,
+                rid,
+                true,
+                None,
+                Some(ev),
+                &device,
+            )
+            .await
+            .map_err(Fail::Policy)
+        }
         _ => Err(Fail::Policy(Refused::new(
             ErrorCode::Unavailable,
             "unavailable",
@@ -733,12 +756,127 @@ async fn touched(
     }
 }
 
+/// The frame's device, still paired.
+fn device_of(ctx: &Arc<Ctx>, v: &Verified) -> Result<saiife_wire::device::Device, Fail> {
+    ctx.workspace.device(&v.device_id).ok_or_else(|| {
+        Fail::Policy(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_device",
+            "this device is no longer paired",
+        ))
+    })
+}
+
+/// `box.steer {id, msg}`, `box.revise {id, comment}`, `box.resume {id}`.
+/// A verified touch for the box opens the device's window on it
+/// ([`WebTouches::open_window`](crate::workspace_touch::WebTouches)) and the
+/// action runs; without a proof, an open window on exactly this box lets it
+/// run (recorded `window: true`); else `touch_required`. The text is checked
+/// before a proof is verified, so a bad text does not spend the touch.
+async fn steer(
+    ctx: &Arc<Ctx>,
+    v: &Verified,
+    proof: Option<&TouchProof>,
+    evidence: &mut Option<Value>,
+    window: &mut bool,
+) -> Result<Value, Fail> {
+    use crate::workspace_touch::Proven;
+    let action = v.frame.action.as_str();
+    let args = &v.frame.args;
+    let now = ctx.workspace.now();
+    if proof.is_none() {
+        let covered =
+            id_arg(args).is_ok_and(|id| ctx.web_touch.window_open(&v.device_id, &id, now));
+        if !covered {
+            return Err(touch_required(action));
+        }
+    }
+    let text_key = match action {
+        a::BOX_STEER => Some("msg"),
+        a::BOX_REVISE => Some("comment"),
+        _ => None,
+    };
+    match text_key {
+        Some(k) => only(args, &["id", k])?,
+        None => only(args, &["id"])?,
+    }
+    let id = id_arg(args)?;
+    let text = match text_key {
+        Some(k) => Some(text_arg(args, k, MAX_STEER_BYTES)?.to_string()),
+        None => None,
+    };
+    let Some(owner_uid) = uid_of(ctx, &v.owner_user).await else {
+        return Err(Fail::Policy(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_owner",
+            "the device owner is not a user of this machine",
+        )));
+    };
+    let src = source_for(ctx, v, action, args).await?;
+    match proof {
+        Some(p) => {
+            let proven = crate::workspace_touch::verify_frame(ctx, v, owner_uid, &src, p)
+                .await
+                .map_err(Fail::Policy)?;
+            *evidence = Some(proven.evidence().to_audit());
+            if !matches!(proven, Proven::Web(..)) {
+                return Err(Fail::Policy(Refused::new(
+                    ErrorCode::Internal,
+                    "internal",
+                    "a steer touch did not verify as one",
+                )));
+            }
+            ctx.web_touch.open_window(&v.device_id, &id, now);
+        }
+        None => *window = true,
+    }
+    let name = action.to_string();
+    blocking(&src, move |b| match (name.as_str(), text) {
+        (a::BOX_STEER, Some(t)) => b.steer(&id, &t),
+        (a::BOX_REVISE, Some(t)) => b.revise(&id, &t),
+        _ => b.resume(&id),
+    })
+    .await?;
+    Ok(json!({}))
+}
+
+/// The device owner's uid.
+async fn owner_uid_of(ctx: &Arc<Ctx>, v: &Verified) -> Result<u32, Fail> {
+    uid_of(ctx, &v.owner_user).await.ok_or_else(|| {
+        Fail::Policy(Refused::new(
+            ErrorCode::Forbidden,
+            "unknown_owner",
+            "the device owner is not a user of this machine",
+        ))
+    })
+}
+
+/// The `box.spawn` args as a request (the caller has checked the template).
+fn spawn_req(args: &Map<String, Value>) -> Result<SpawnReq, Fail> {
+    only(args, &["template", "repo", "task", "start"])?;
+    let template = text_arg(args, "template", MAX_NAME_BYTES)?.to_string();
+    let repo = text_arg(args, "repo", MAX_NAME_BYTES)?.to_string();
+    let task = text_arg(args, "task", MAX_TASK_BYTES)?.to_string();
+    let start = match args.get("start").and_then(Value::as_str) {
+        Some("now") => Start::Now,
+        Some("queue") => Start::Queue,
+        _ => return Err(invalid("start is \"now\" or \"queue\"")),
+    };
+    Ok(SpawnReq {
+        template,
+        repo,
+        task,
+        start,
+    })
+}
+
 async fn act(
     ctx: &Arc<Ctx>,
     v: &Verified,
     level: &mut Level,
     touch: Option<&TouchProof>,
     evidence: &mut Option<Value>,
+    window: &mut bool,
 ) -> Result<Value, Fail> {
     let action = v.frame.action.as_str();
     let args = &v.frame.args;
@@ -753,6 +891,9 @@ async fn act(
     match v.level {
         // box.push and box.pr stay unavailable (the LATER check below).
         Level::Touch if matches!(action, a::BOX_PUSH | a::BOX_PR) => {}
+        Level::Touch if matches!(action, a::BOX_STEER | a::BOX_REVISE | a::BOX_RESUME) => {
+            return steer(ctx, v, touch, evidence, window).await
+        }
         Level::Touch => return touched(ctx, v, touch, evidence).await,
         Level::MachineOnly => {
             return Err(Fail::Policy(Refused::new(
@@ -849,31 +990,52 @@ async fn act(
             Ok(json!({}))
         }
         a::BOX_SPAWN => {
-            only(args, &["template", "repo", "task", "start"])?;
-            let template = text_arg(args, "template", MAX_NAME_BYTES)?.to_string();
-            let repo = text_arg(args, "repo", MAX_NAME_BYTES)?.to_string();
-            let task = text_arg(args, "task", MAX_TASK_BYTES)?.to_string();
-            let start = match args.get("start").and_then(Value::as_str) {
-                Some("now") => Start::Now,
-                Some("queue") => Start::Queue,
-                _ => return Err(invalid("start is \"now\" or \"queue\"")),
-            };
+            let req = spawn_req(args)?;
             let templates = blocking(&src, |b| Ok(b.templates())).await?;
-            let Some(t) = templates.iter().find(|t| t.name == template) else {
-                return Err(invalid(format!("no template {template:?}")));
+            let Some(t) = templates.iter().find(|t| t.name == req.template) else {
+                return Err(invalid(format!("no template {:?}", req.template)));
             };
             *level = spawn_level(t);
             if *level != Level::Signed {
                 return touched(ctx, v, touch, evidence).await;
             }
-            let req = SpawnReq {
-                template,
-                repo,
-                task,
-                start,
-            };
             let id = blocking(&src, move |b| b.spawn(&req)).await?;
             Ok(json!({ "id": id }))
+        }
+        a::APPROVAL_LIST => {
+            only(args, &[])?;
+            let owner_uid = owner_uid_of(ctx, v).await?;
+            let items = crate::approval_ops::list_remote(ctx, owner_uid, &v.owner_user).await;
+            Ok(json!({ "items": items }))
+        }
+        a::APPROVAL_REJECT => {
+            only(args, &["id", "note"])?;
+            let rid = args
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("id is a request number"))?;
+            let note = match args.get("note") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => {
+                    crate::approvals::check_note(s).map_err(|e| invalid(e.to_string()))?;
+                    Some(s.clone())
+                }
+                Some(_) => return Err(invalid("note is a string")),
+            };
+            let owner_uid = owner_uid_of(ctx, v).await?;
+            let device = device_of(ctx, v)?;
+            crate::approval_ops::decide_remote(
+                ctx,
+                owner_uid,
+                &v.owner_user,
+                rid,
+                false,
+                note,
+                None,
+                &device,
+            )
+            .await
+            .map_err(Fail::Policy)
         }
         a::WORKSPACE_TOUCH_BEGIN => crate::workspace_touch::begin(ctx, v)
             .await

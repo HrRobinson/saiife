@@ -91,6 +91,7 @@ struct World {
     audit: PathBuf,
     state: PathBuf,
     _tmp: tempfile::TempDir,
+    _keep: Option<tempfile::TempDir>,
 }
 
 /// The personal broker of this test's uid (named `me`), its Workspace in
@@ -162,6 +163,7 @@ async fn build_as(
         audit,
         state,
         _tmp: tmp,
+        _keep: None,
     }
 }
 
@@ -2038,7 +2040,8 @@ async fn assertion_reuse_is_refused() {
         proof.clone(),
     )
     .await;
-    assert_eq!(first["rule"], "unavailable", "{first}");
+    // Verified and run: b-run is not paused, so the box source refuses.
+    assert_eq!(first["rule"], "wrong_state", "{first}");
     let again = send_touch(
         &w,
         &mut link,
@@ -2075,7 +2078,7 @@ async fn a_replayed_counter_is_refused() {
         sign_for(&soft, rid, &ch),
     )
     .await;
-    assert_eq!(ok["rule"], "unavailable", "{ok}");
+    assert_eq!(ok["rule"], "wrong_state", "{ok}");
     // A counter that does not advance past the stored one.
     soft.counter_step = 0;
     let (rid, ch) = begin_touch(&w, &mut link, &d, "box.resume", json!({"id": "b-run"})).await;
@@ -2459,8 +2462,10 @@ async fn approval_proof_verifies_for_its_request_only() {
         .err()
         .unwrap();
     assert_eq!(e.rule, "touch_mismatch", "{e:?}");
-    // Over the link the approval is verified, then unavailable until
-    // the action exists; the evidence is still recorded.
+    // Over the link the approval is verified and decided; the evidence
+    // is recorded.
+    let cfg: saiife_policy::SystemConfig = toml::from_str("version = 2\n").unwrap();
+    w.ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
     let (rid, ch) = begin_touch(&w, &mut link, &d, "approval.approve", json!({"id": r1.id})).await;
     let a = send_touch(
         &w,
@@ -2471,7 +2476,7 @@ async fn approval_proof_verifies_for_its_request_only() {
         sign_for(&soft, rid, &ch),
     )
     .await;
-    assert_eq!(a["rule"], "unavailable", "{a}");
+    assert_eq!(a["result"]["state"], "approved", "{a}");
     let rs = records(&w);
     assert_eq!(field(rs.last().unwrap(), "touch")["kind"], "webauthn");
 }
@@ -2505,4 +2510,637 @@ async fn refusal_records_the_rule() {
     assert_eq!(last["rule"], "touch_failed", "{last}");
     assert!(field(last, "touch").is_null(), "{last}");
     assert!(!last.to_string().contains(&junk), "{last}");
+}
+
+// ---------------------------------------------------------------- Task 6
+
+/// A touch for `action` on `args`, then the frame carrying it.
+async fn touched_frame(
+    w: &World,
+    link: &mut Link,
+    d: &TestDevice,
+    soft: &SoftAuthenticator,
+    action: &str,
+    args: Value,
+) -> Value {
+    let bound = match action {
+        "box.steer" | "box.revise" | "box.resume" => json!({"id": args["id"]}),
+        _ => args.clone(),
+    };
+    let (rid, ch) = begin_touch(w, link, d, action, bound).await;
+    send_touch(w, link, d, action, args, sign_for(soft, rid, &ch)).await
+}
+
+/// A world whose Workspace clock can be moved forward.
+async fn skewed() -> (
+    World,
+    Link,
+    TestDevice,
+    SoftAuthenticator,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let skew = Arc::new(AtomicU64::new(0));
+    let s2 = Arc::clone(&skew);
+    let (ws, warning) = Workspace::open(dir_in(&state));
+    assert!(warning.is_none(), "{warning:?}");
+    let ws = ws.with_clock(Arc::new(move || now_secs() + s2.load(Ordering::SeqCst)));
+    let w = build(tmp, state, ws).await;
+    let mut link = Link::open(&w).await;
+    let (d, soft) = pair_with_soft(&w, &mut link).await;
+    (w, link, d, soft, skew)
+}
+
+#[tokio::test]
+async fn steer_window_is_per_box_and_expires() {
+    use std::sync::atomic::Ordering;
+    let (w, mut link, d, soft, skew) = skewed().await;
+    // No touch, no window.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "hi"}),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    // A touch on b-run runs and opens b-run's window.
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.steer",
+        json!({"id": "b-run", "msg": "first"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    // A plain frame on b-run runs; on another box it needs a touch.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "second"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-q1", "msg": "third"}),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    let steers: Vec<_> = w
+        .boxes
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, FakeCall::Steer(..)))
+        .collect();
+    assert_eq!(steers.len(), 2, "{steers:?}");
+    // Inside the window still; past 600 s it is closed.
+    skew.store(500, Ordering::SeqCst);
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "late"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    skew.store(601, Ordering::SeqCst);
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "later"}),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_required", "{a}");
+}
+
+#[tokio::test]
+async fn revoke_closes_windows() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.steer",
+        json!({"id": "b-run", "msg": "x"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let id = BoxId::parse("b-run").unwrap();
+    let now = w.ctx.workspace.now();
+    assert!(w.ctx.web_touch.window_open(&d.device_id(), &id, now));
+    let r = control(&w, OP_WORKSPACE_REVOKE, json!({"device_id": d.device_id()})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(!w.ctx.web_touch.window_open(&d.device_id(), &id, now));
+}
+
+#[tokio::test]
+async fn window_frames_are_marked() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.steer",
+        json!({"id": "b-run", "msg": "one"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.steer", "{last}");
+    assert_eq!(field(last, "touch")["via"], "web", "{last}");
+    assert!(field(last, "window").is_null(), "{last}");
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-run", "msg": "two"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.steer", "{last}");
+    assert_eq!(field(last, "window"), true, "{last}");
+    assert!(field(last, "touch").is_null(), "{last}");
+    assert_eq!(field(last, "box"), "b-run", "{last}");
+}
+
+#[tokio::test]
+async fn resume_and_revise_use_the_window() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    // Pause b-run (signed), then resume it under a touch.
+    let a = send(&w, &mut link, &d, "box.pause", json!({"id": "b-run"})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let a = send(&w, &mut link, &d, "box.resume", json!({"id": "b-run"})).await;
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.resume",
+        json!({"id": "b-run"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    // The window of b-run covers a steer, but not b-done's revise.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.revise",
+        json!({"id": "b-done", "comment": "again"}),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.revise",
+        json!({"id": "b-done", "comment": "again"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    // b-done runs again; its window now covers a second revise and a pause.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "box.steer",
+        json!({"id": "b-done", "msg": "and more"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let calls = w.boxes.calls();
+    assert!(calls
+        .iter()
+        .any(|c| matches!(c, FakeCall::Revise(i, t) if i.as_str() == "b-done" && t == "again")));
+    assert!(calls
+        .iter()
+        .any(|c| matches!(c, FakeCall::Resume(i) if i.as_str() == "b-run")));
+    // Bad text is refused before the touch is spent.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.revise", json!({"id": "b-run"})).await;
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.revise",
+        json!({"id": "b-run", "comment": "x\u{1b}y"}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.revise",
+        json!({"id": "b-run", "comment": "fine"}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_ne!(a["rule"], "touch_failed", "{a}");
+}
+
+#[tokio::test]
+async fn lockdown_refuses_steer_even_in_window() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.steer",
+        json!({"id": "b-run", "msg": "x"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let l = send(&w, &mut link, &d, "lockdown.on", json!({})).await;
+    assert_eq!(l["ok"], true, "{l}");
+    let before = w.boxes.calls().len();
+    for (action, args) in [
+        ("box.steer", json!({"id": "b-run", "msg": "y"})),
+        ("box.resume", json!({"id": "b-run"})),
+        ("box.revise", json!({"id": "b-done", "comment": "y"})),
+    ] {
+        let a = send(&w, &mut link, &d, action, args.clone()).await;
+        assert_eq!(a["error"], "lockdown", "{action}: {a}");
+        // A touch does not lift it either, and is not spent.
+        let a = touched_frame(&w, &mut link, &d, &soft, action, args).await;
+        assert_eq!(a["error"], "lockdown", "{action}: {a}");
+    }
+    assert_eq!(w.boxes.calls().len(), before);
+}
+
+#[tokio::test]
+async fn spawn_secret_template_with_touch_spawns() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    let args = json!({"template": "claude-gh", "repo": "erp", "task": "push it", "start": "now"});
+    let a = touched_frame(&w, &mut link, &d, &soft, "box.spawn", args.clone()).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let id = a["result"]["id"].as_str().unwrap().to_string();
+    match w.boxes.calls().as_slice() {
+        [FakeCall::Spawn(req)] => {
+            assert_eq!(req.template, "claude-gh");
+            assert_eq!(req.repo, "erp");
+            assert_eq!(req.task, "push it");
+            assert_eq!(req.start, Start::Now);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(w.boxes.list().iter().any(|b| b.id.as_str() == id));
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.spawn", "{last}");
+    assert_eq!(last["decision"], "allow", "{last}");
+    assert_eq!(field(last, "touch")["via"], "web", "{last}");
+    // A touch for another task cannot spawn this one.
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "box.spawn", args.clone()).await;
+    let mut other = args.clone();
+    other["task"] = json!("push something else");
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "box.spawn",
+        other,
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(a["rule"], "touch_mismatch", "{a}");
+    assert_eq!(w.boxes.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn push_and_pr_stay_unavailable() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    for action in ["box.push", "box.pr"] {
+        let a = send(&w, &mut link, &d, action, json!({"id": "b-done"})).await;
+        assert_eq!(a["error"], "unavailable", "{action}: {a}");
+        assert_eq!(a["rule"], "unavailable", "{action}: {a}");
+        // Even with a (junk-free) touch the answer is the same.
+        let a = send_touch(
+            &w,
+            &mut link,
+            &d,
+            action,
+            json!({"id": "b-done"}),
+            sign_for(&soft, 1, &[0; 32]),
+        )
+        .await;
+        assert_eq!(a["rule"], "unavailable", "{action}: {a}");
+    }
+    assert!(w.boxes.calls().is_empty());
+}
+
+/// The `approval` records so far, oldest first.
+fn approval_records(w: &World) -> Vec<Value> {
+    fn walk(p: &Path, out: &mut Vec<Value>) {
+        let mut entries: Vec<_> = std::fs::read_dir(p).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.path());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if let Ok(t) = std::fs::read_to_string(&p) {
+                for line in t.lines() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        if v["kind"] == "approval" {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&w.audit, &mut out);
+    out
+}
+
+/// The paired device of [`paired_soft`], served by a locked daemon of
+/// another uid whose policy is `policy`.
+async fn paired_locked(policy: &str) -> (World, Link, TestDevice, SoftAuthenticator) {
+    let (w0, link0, d, soft) = paired_soft().await;
+    drop(link0);
+    let state = w0.state.clone();
+    // The state dir lives as long as the new world.
+    let keep = w0._tmp;
+    let (ws, warning) = Workspace::open(dir_in(&state));
+    assert!(warning.is_none(), "{warning:?}");
+    let mut w = build_as(scratch(), state, ws, DaemonMode::Locked, me() + 1).await;
+    w._keep = Some(keep);
+    let cfg: saiife_policy::SystemConfig = toml::from_str(policy).unwrap();
+    w.ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+    let link = Link::open(&w).await;
+    (w, link, d, soft)
+}
+
+fn request_of(w: &World, uid: u32, user: &str) -> saiife_daemon::approvals::Request {
+    let mut n = new_connector(Some("deploy"));
+    n.uid = uid;
+    n.user = user.into();
+    w.ctx
+        .approvals
+        .as_ref()
+        .unwrap()
+        .create(
+            n,
+            |_| Ok(None),
+            Duration::from_secs(600),
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+}
+
+const APPROVER_POLICY: &str =
+    "version = 2\nlocked = true\n[approval]\napprovers = [\"me\"]\nsame_user = \"deny\"\n";
+
+#[tokio::test]
+async fn approval_list_is_for_approvers() {
+    // A non-approver (a locked daemon with no approvers) gets nothing.
+    let (w, mut link, d, _) = paired_locked("version = 2\nlocked = true\n").await;
+    let r = request_of(&w, 4242, "other");
+    let a = send(&w, &mut link, &d, "approval.list", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"], json!({"items": []}), "{a}");
+    drop(r);
+    // An approver sees the pending requests, with their touch class.
+    let (w, mut link, d, _) = paired_locked(APPROVER_POLICY).await;
+    let r = request_of(&w, 4242, "other");
+    let decided = request_of(&w, 4242, "other");
+    w.ctx
+        .approvals
+        .as_ref()
+        .unwrap()
+        .transition(
+            decided.id,
+            &[saiife_daemon::approvals::State::Pending],
+            saiife_daemon::approvals::State::Rejected,
+            Some(me()),
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    let a = send(&w, &mut link, &d, "approval.list", json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let items = a["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{a}");
+    assert_eq!(items[0]["id"], r.id, "{a}");
+    assert_eq!(items[0]["touch_class"], "deploy", "{a}");
+    assert!(items[0].get("request_sealed").is_none(), "{a}");
+    assert!(items[0].get("grant_key").is_none(), "{a}");
+    // List takes no arguments.
+    let a = send(&w, &mut link, &d, "approval.list", json!({"x": 1})).await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+}
+
+#[tokio::test]
+async fn approval_approve_needs_touch_and_approver() {
+    // Personal broker: its own user approves.
+    let (w, mut link, d, soft) = paired_soft().await;
+    let cfg: saiife_policy::SystemConfig = toml::from_str("version = 2\n").unwrap();
+    w.ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+    let r = make_request(&w, Some("deploy"));
+    let a = send(&w, &mut link, &d, "approval.approve", json!({"id": r.id})).await;
+    assert_eq!(a["rule"], "touch_required", "{a}");
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "approval.approve",
+        json!({"id": r.id}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"]["state"], "approved", "{a}");
+    let rs = approval_records(&w);
+    let rec = rs
+        .iter()
+        .rev()
+        .find(|v| field(v, "action") == "approved")
+        .unwrap_or_else(|| panic!("{rs:?}"));
+    assert_eq!(field(rec, "id"), r.id, "{rec}");
+    assert_eq!(field(rec, "touch")["via"], "web", "{rec}");
+    assert_eq!(field(rec, "workspace")["device"], d.device_id(), "{rec}");
+    assert_eq!(field(rec, "workspace")["label"], "phone", "{rec}");
+    assert_eq!(field(rec, "by_uid"), me(), "{rec}");
+    let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
+    assert_eq!(s.state, saiife_daemon::approvals::State::Approved);
+    // Approved once: a second decision finds it decided.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "workspace.touch.begin",
+        begin_args("approval.approve", json!({"id": r.id})),
+    )
+    .await;
+    assert_eq!(a["rule"], "invalid", "{a}");
+
+    // Another requester's request, an approver of a locked daemon.
+    let (w, mut link, d, soft) = paired_locked(APPROVER_POLICY).await;
+    let r = request_of(&w, 4242, "other");
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "approval.approve",
+        json!({"id": r.id}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"]["state"], "approved", "{a}");
+
+    // The device owner is no approver: forbidden, nothing decided.
+    // (Their own request, so they may see it, but not decide it.)
+    let (w, mut link, d, soft) = paired_locked("version = 2\nlocked = true\n").await;
+    let r = request_of(&w, me(), ME);
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "approval.approve",
+        json!({"id": r.id}),
+        sign_for(&soft, 1, &[0; 32]),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "not_approver", "{a}");
+    let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
+    assert_eq!(s.state, saiife_daemon::approvals::State::Pending);
+}
+
+#[tokio::test]
+async fn requester_cannot_approve_own_request() {
+    let (w, mut link, d, soft) = paired_locked(APPROVER_POLICY).await;
+    let r = request_of(&w, me(), ME);
+    let (rid, ch) = begin_touch(&w, &mut link, &d, "approval.approve", json!({"id": r.id})).await;
+    let a = send_touch(
+        &w,
+        &mut link,
+        &d,
+        "approval.approve",
+        json!({"id": r.id}),
+        sign_for(&soft, rid, &ch),
+    )
+    .await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "same_user", "{a}");
+    let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
+    assert_eq!(s.state, saiife_daemon::approvals::State::Pending);
+    let rs = approval_records(&w);
+    assert!(
+        rs.iter()
+            .any(|v| field(v, "action") == "refused" && v["rule"] == "same_user"),
+        "{rs:?}"
+    );
+    // [approval] same_user = "reauth": the web touch is the re-authentication.
+    let (w, mut link, d, soft) = paired_locked(
+        "version = 2\nlocked = true\n[approval]\napprovers = [\"me\"]\nsame_user = \"reauth\"\n",
+    )
+    .await;
+    let r = request_of(&w, me(), ME);
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "approval.approve",
+        json!({"id": r.id}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+}
+
+#[tokio::test]
+async fn approval_reject_is_signed() {
+    let (w, mut link, d, _) = paired_locked(APPROVER_POLICY).await;
+    let r = request_of(&w, 4242, "other");
+    // No touch needed; the note is kept.
+    let a = send(
+        &w,
+        &mut link,
+        &d,
+        "approval.reject",
+        json!({"id": r.id, "note": "not now"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"]["state"], "rejected", "{a}");
+    let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
+    assert_eq!(s.state, saiife_daemon::approvals::State::Rejected);
+    let rs = approval_records(&w);
+    let rec = rs
+        .iter()
+        .rev()
+        .find(|v| field(v, "action") == "rejected")
+        .unwrap_or_else(|| panic!("{rs:?}"));
+    assert_eq!(field(rec, "workspace")["device"], d.device_id(), "{rec}");
+    assert!(field(rec, "touch").is_null(), "{rec}");
+    // Decided already; unknown; bad arguments.
+    for (args, rule) in [
+        (json!({"id": r.id}), "invalid"),
+        (json!({"id": 999}), "not_found"),
+        (json!({"id": "x"}), "invalid"),
+        (json!({"id": r.id, "extra": 1}), "invalid"),
+        (json!({"id": r.id, "note": "x\u{1b}"}), "invalid"),
+    ] {
+        let a = send(&w, &mut link, &d, "approval.reject", args.clone()).await;
+        assert_eq!(a["ok"], false, "{args}: {a}");
+        assert_eq!(a["rule"], rule, "{args}: {a}");
+    }
+    // A non-approver cannot reject another user's request.
+    let (w, mut link, d, _) = paired_locked("version = 2\nlocked = true\n").await;
+    let r = request_of(&w, 4242, "other");
+    let a = send(&w, &mut link, &d, "approval.reject", json!({"id": r.id})).await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(a["rule"], "not_found", "{a}");
+    // The requester may withdraw their own request.
+    let r = request_of(&w, me(), ME);
+    let a = send(&w, &mut link, &d, "approval.reject", json!({"id": r.id})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let s = w.ctx.approvals.as_ref().unwrap().get(r.id).unwrap();
+    assert_eq!(s.state, saiife_daemon::approvals::State::Rejected);
+}
+
+#[tokio::test]
+async fn later_list_matches_remote() {
+    assert_eq!(LATER, ["box.push", "box.pr"]);
+    for (name, lvl) in REMOTE {
+        if *lvl == Level::Signed {
+            assert!(
+                HANDLED.contains(name) || LATER.contains(name),
+                "{name} is Signed and neither handled nor LATER"
+            );
+        }
+        if LATER.contains(name) {
+            assert!(!HANDLED.contains(name), "{name}");
+        }
+    }
+    for n in ["approval.list", "approval.reject"] {
+        assert!(HANDLED.contains(&n), "{n}");
+    }
 }

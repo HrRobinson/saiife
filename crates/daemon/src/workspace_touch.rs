@@ -541,6 +541,11 @@ pub async fn verify_frame(
                     "no pending action: it expired or was decided",
                 )
             })?;
+            // Only a land's pending action: a push (or any other kind a box
+            // source may hold) is touched through its own action.
+            if !is_land(&pa) {
+                return Err(mismatch("the pending action is not a land"));
+            }
             if pa.record.fields.get("diff_sha256") != Some(&diff) || pa.box_id.as_ref() != Some(&id)
             {
                 return Err(mismatch(
@@ -613,6 +618,11 @@ pub async fn verify_frame(
             format!("{other} takes no touch"),
         )),
     }
+}
+
+/// Whether `pa` is a land (its class and its record's class both).
+fn is_land(pa: &PendingAction) -> bool {
+    pa.class == TouchClass::Land && pa.record.class == TouchClass::Land
 }
 
 /// `[workspace] origins` of the loaded policy, else the default.
@@ -761,6 +771,35 @@ mod tests {
             client_data_json: b64::enc(cdj),
             signature: b64::enc(b"sig"),
         }
+    }
+
+    #[test]
+    fn only_a_land_is_a_land() {
+        let pending = |class, record_class| PendingAction {
+            request_id: 1,
+            class,
+            box_id: None,
+            summary: "x".into(),
+            record: ActionRecord {
+                instance_id: [0; 16],
+                request_id: 1,
+                class: record_class,
+                summary: "x".into(),
+                fields: BTreeMap::new(),
+                nonce: [0; 32],
+                expires_at: 1,
+            },
+            created_at: 0,
+            expires_at: 1,
+        };
+        assert!(is_land(&pending(TouchClass::Land, TouchClass::Land)));
+        // A push (or anything else) is not approved by a box.land frame.
+        assert!(!is_land(&pending(
+            TouchClass::PushProtected,
+            TouchClass::PushProtected
+        )));
+        assert!(!is_land(&pending(TouchClass::Land, TouchClass::Deploy)));
+        assert!(!is_land(&pending(TouchClass::Deploy, TouchClass::Land)));
     }
 
     #[test]

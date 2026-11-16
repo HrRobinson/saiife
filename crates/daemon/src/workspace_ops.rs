@@ -512,6 +512,7 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     // Already revoked and saved: nothing to grant, no prompt. Any passkey a
     // failed removal left behind is taken out now (a retry).
     if ctx.workspace.revoked_and_saved(&device_id) {
+        ctx.web_touch.close_device(&device_id);
         let r = take_passkeys(ctx, &device.touch_credentials).await;
         audit_removal(ctx, conn, &device_id, &r, REVOKED_KEEPS).await;
         return revoked_answer(id, device_id);
@@ -530,6 +531,8 @@ async fn revoke(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         return e;
     }
     let outcome = ctx.workspace.revoke(&device_id);
+    // Its steer windows end with it, whatever the outcome of the save.
+    ctx.web_touch.close_device(&device_id);
     // The revoke is in effect in memory now (plan 29 ordering). Its passkeys
     // leave the touch store next; a failure there never undoes the revoke.
     let removal = take_passkeys(ctx, &device.touch_credentials).await;
