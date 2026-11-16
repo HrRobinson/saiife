@@ -536,14 +536,23 @@ pub async fn verify_frame(
             let id = id_arg(args).map_err(refused)?;
             let diff = str_arg(args, "diff_sha256").map_err(refused)?.to_string();
             let s = Arc::clone(src);
-            let pa = tokio::task::spawn_blocking(move || {
-                s.pending_actions()
+            let want = id.clone();
+            let (seen, pa) = tokio::task::spawn_blocking(move || {
+                let seen = s.list().iter().any(|b| b.id == want);
+                let pa = s
+                    .pending_actions()
                     .into_iter()
-                    .find(|p| p.request_id == rid)
+                    .find(|p| p.request_id == rid);
+                (seen, pa)
             })
             .await
-            .map_err(internal)?
-            .ok_or_else(|| {
+            .map_err(internal)?;
+            // A box the owner's source does not see (another user's) is
+            // `not_found`, as for every other box action of the frame.
+            if !seen {
+                return Err(refused(not_found("box")));
+            }
+            let pa = pa.ok_or_else(|| {
                 Refused::new(
                     ErrorCode::Forbidden,
                     "touch_failed",
