@@ -13,6 +13,9 @@ struct State {
     terminals: HashMap<BoxId, Vec<TermFrame>>,
     diffs: HashMap<BoxId, DiffSummary>,
     disconnected: HashSet<BoxId>,
+    last_errors: HashMap<BoxId, String>,
+    restored: HashSet<BoxId>,
+    forgotten: Vec<BoxId>,
 }
 
 #[derive(Default)]
@@ -51,6 +54,30 @@ impl FakeGuest {
     pub fn disconnect(&self, id: &BoxId) {
         self.lock().disconnected.insert(id.clone());
     }
+
+    /// What `last_error` answers for the box.
+    pub fn set_last_error(&self, id: &BoxId, e: Option<&str>) {
+        let mut s = self.lock();
+        match e {
+            Some(e) => s.last_errors.insert(id.clone(), e.to_string()),
+            None => s.last_errors.remove(id),
+        };
+    }
+
+    /// What `restored` answers for the box.
+    pub fn set_restored(&self, id: &BoxId, on: bool) {
+        let mut s = self.lock();
+        if on {
+            s.restored.insert(id.clone());
+        } else {
+            s.restored.remove(id);
+        }
+    }
+
+    /// The ids `forget` was called with, in order.
+    pub fn forgotten(&self) -> Vec<BoxId> {
+        self.lock().forgotten.clone()
+    }
 }
 
 impl GuestLink for FakeGuest {
@@ -61,6 +88,18 @@ impl GuestLink for FakeGuest {
         }
         s.prompts.push((id.clone(), text.to_string()));
         Ok(())
+    }
+
+    fn last_error(&self, id: &BoxId) -> Option<String> {
+        self.lock().last_errors.get(id).cloned()
+    }
+
+    fn restored(&self, id: &BoxId) -> bool {
+        self.lock().restored.contains(id)
+    }
+
+    fn forget(&self, id: &BoxId) {
+        self.lock().forgotten.push(id.clone());
     }
 
     /// `ended` stays false: the box state is the manager's business.

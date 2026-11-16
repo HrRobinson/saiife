@@ -1540,3 +1540,461 @@ fn image_paths_follow_the_box_layout() {
     let none = |_: &str| -> Option<OsString> { None };
     assert!(box_ops::image_paths(&s, &Mode::Personal, &none).is_none());
 }
+
+// ---- plan 38, Task 8: the guest channel's events, setup and rulings ----
+
+/// A guest channel's event queue, played by the test.
+#[derive(Default)]
+struct StubEvents {
+    q: std::sync::Mutex<std::collections::VecDeque<(BoxId, GuestEvent)>>,
+    calls: AtomicU64,
+}
+
+impl StubEvents {
+    fn push(&self, id: &BoxId, ev: GuestEvent) {
+        self.q.lock().unwrap().push_back((id.clone(), ev));
+    }
+}
+
+impl box_ops::GuestEvents for StubEvents {
+    fn recv_events(&self, timeout: Duration) -> Vec<(BoxId, GuestEvent)> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let v: Vec<_> = self.q.lock().unwrap().drain(..).collect();
+        if v.is_empty() {
+            std::thread::sleep(timeout.min(Duration::from_millis(20)));
+        }
+        v
+    }
+}
+
+async fn wait_until(what: &str, f: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn state_of(w: &World, b: &BoxId) -> String {
+    w.mgr().get(b).unwrap().state.to_string_lossy()
+}
+
+fn starting(w: &World, a: &Value) -> BoxId {
+    let b = id(a["box"]["id"].as_str().unwrap());
+    assert_eq!(state_of(w, &b), "starting");
+    b
+}
+
+#[tokio::test]
+async fn forwarder_moves_ready_box_to_running() {
+    let w = world();
+    let a = w.spawn(ALICE, "add a cart").await;
+    let b = starting(&w, &a);
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    ev.push(&b, GuestEvent::Ready);
+    wait_until("running", || state_of(&w, &b) == "running").await;
+    assert_eq!(
+        w.guest.prompts(),
+        vec![(b.clone(), "add a cart".to_string())]
+    );
+    wait_until("the record", || {
+        w.records().iter().any(|r| r["via"] == "guest")
+    })
+    .await;
+    let recs: Vec<Value> = w
+        .records()
+        .into_iter()
+        .filter(|r| r["via"] == "guest")
+        .collect();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r["action"], "tick");
+    assert_eq!(r["box"], b.as_str());
+    assert_eq!(r["from"], "starting");
+    assert_eq!(r["to"], "running");
+    assert_eq!(r["reason"], "ready");
+    assert_eq!(r["template"], "claude-code");
+    // Activity is no change: no record.
+    ev.push(&b, GuestEvent::Activity);
+    wait_until("drained", || ev.q.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        w.records().iter().filter(|r| r["via"] == "guest").count(),
+        1
+    );
+}
+
+/// R30: the forwarder changes state only through the daemon's guest_event,
+/// so lockdown `all` holds the prompt a Ready would send.
+#[tokio::test]
+async fn ready_under_lockdown_keeps_the_prompt() {
+    let w = world();
+    let a = w.spawn(ALICE, "add a cart").await;
+    let b = starting(&w, &a);
+    lock_all(&w);
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    ev.push(&b, GuestEvent::Ready);
+    wait_until("running", || state_of(&w, &b) == "running").await;
+    assert!(w.guest.prompts().is_empty(), "held under lockdown");
+    assert_eq!(
+        w.mgr().get(&b).unwrap().pending_prompt.as_deref(),
+        Some("add a cart")
+    );
+    w.ctx.lockdown.set(None).unwrap();
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(
+        w.guest.prompts(),
+        vec![(b.clone(), "add a cart".to_string())]
+    );
+}
+
+/// The safety net (R22 made a fresh init set up again): an agent that exits
+/// while its box is starting stops the box (Done, disks kept) instead of
+/// waiting for the boot timeout, which would destroy it.
+#[tokio::test]
+async fn exited_while_starting_stops_the_box() {
+    let w = world();
+    let a = w.spawn(ALICE, "t").await;
+    let b = starting(&w, &a);
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    ev.push(&b, GuestEvent::Exited);
+    wait_until("done", || state_of(&w, &b) == "done").await;
+    let r = w.mgr().get(&b).unwrap();
+    assert!(!r.vm_on);
+    assert!(r.vm.is_some(), "the VM is kept, not destroyed");
+    assert_eq!(r.error.as_deref(), Some(box_ops::EXITED_WHILE_STARTING));
+    assert!(!w.vmm.calls().iter().any(|c| c.op == VmOp::Destroy));
+    wait_until("the record", || {
+        w.records().iter().any(|r| r["via"] == "guest")
+    })
+    .await;
+    let recs = w.records();
+    let rec = recs.iter().find(|r| r["via"] == "guest").unwrap();
+    assert_eq!(
+        (&rec["from"], &rec["to"], &rec["reason"]),
+        (
+            &json!("starting"),
+            &json!("done"),
+            &json!("agent exited while starting")
+        )
+    );
+    // A stale event for a box that moved on is dropped quietly.
+    ev.push(&b, GuestEvent::Ready);
+    wait_until("drained", || ev.q.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(state_of(&w, &b), "done");
+}
+
+/// R2: a box the boot timeout ends keeps its guest's last error, cleaned
+/// and capped.
+#[tokio::test]
+async fn boot_timeout_keeps_the_guest_error() {
+    let w = world();
+    let a = w.spawn(ALICE, "t").await;
+    let b = starting(&w, &a);
+    let long = format!(
+        "the guest setup failed: \u{1b}[31mchown of /work failed\u{1b}[0m {}",
+        "x".repeat(4000)
+    );
+    w.guest.set_last_error(&b, Some(&long));
+    w.clock
+        .fetch_add(saiife_boxes::manager::BOOT_TIMEOUT_SECS, Ordering::SeqCst);
+    box_ops::tick_once(&w.ctx).await;
+    let r = w.mgr().get(&b).unwrap();
+    assert_eq!(r.state.to_string_lossy(), "discarded");
+    let e = r.error.unwrap();
+    assert!(
+        e.starts_with("boot timed out; guest: the guest setup failed: "),
+        "{e}"
+    );
+    assert!(e.contains("chown of /work failed"), "{e}");
+    assert!(!e.contains('\u{1b}'), "{e}");
+    assert!(
+        e.len() <= "boot timed out; guest: ".len() + box_ops::MAX_GUEST_NOTE,
+        "{}",
+        e.len()
+    );
+    // A box without a guest error keeps the plain timeout.
+    let a2 = w.spawn(ALICE, "u").await;
+    let b2 = starting(&w, &a2);
+    w.clock
+        .fetch_add(saiife_boxes::manager::BOOT_TIMEOUT_SECS, Ordering::SeqCst);
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(
+        w.mgr().get(&b2).unwrap().error.as_deref(),
+        Some(saiife_boxes::manager::WHY_BOOT_TIMED_OUT)
+    );
+}
+
+/// R14: a box booted from its kept snapshot gets no Ready; once the guest
+/// channel says it is back set up, the tick runs it and sends its prompt.
+#[tokio::test]
+async fn restored_box_runs_without_ready() {
+    let w = world();
+    let b = id(&w.running(ALICE, "one").await);
+    w.ok(ALICE, "box.stop", json!({"box": b.as_str(), "keep": true}))
+        .await;
+    assert!(w.mgr().get(&b).unwrap().keep);
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "again"}),
+    )
+    .await;
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(state_of(&w, &b), "starting");
+    // Not back yet: the box waits.
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(state_of(&w, &b), "starting");
+    w.guest.set_restored(&b, true);
+    assert_eq!(box_ops::tick_once(&w.ctx).await, 1);
+    assert_eq!(state_of(&w, &b), "running");
+    assert!(w
+        .guest
+        .prompts()
+        .contains(&(b.clone(), "again".to_string())));
+    let recs = w.records();
+    let r = recs.iter().find(|r| r["via"] == "restore").unwrap();
+    assert_eq!(
+        (&r["from"], &r["to"]),
+        (&json!("starting"), &json!("running"))
+    );
+}
+
+/// Only a box with a kept snapshot is taken as restored.
+#[tokio::test]
+async fn a_fresh_box_is_never_taken_as_restored() {
+    let w = world();
+    let a = w.spawn(ALICE, "t").await;
+    let b = starting(&w, &a);
+    w.guest.set_restored(&b, true);
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(state_of(&w, &b), "starting");
+}
+
+#[tokio::test]
+async fn discard_and_gc_forget_the_guest_run() {
+    let w = world();
+    let b = w.running(ALICE, "one").await;
+    w.ok(ALICE, "box.stop", json!({"box": b})).await;
+    w.ok(ALICE, "box.discard", json!({"box": b})).await;
+    assert_eq!(w.guest.forgotten(), vec![id(&b)]);
+    // A boot failure leaves a discarded record; gc removes it and forgets.
+    w.vmm.fail_next(VmOp::Boot, "no kvm");
+    let a = w.spawn(ALICE, "two").await;
+    let b2 = a["box"]["id"].as_str().unwrap().to_string();
+    assert_eq!(a["box"]["state"], "discarded");
+    w.ok(ROOT, "box.gc", json!({})).await;
+    assert_eq!(w.guest.forgotten(), vec![id(&b), id(&b2)]);
+}
+
+/// The setup of a real box: the template's command, no env, the in-box
+/// settings, and the user packs of the daemon's policy.d/packs.
+#[tokio::test]
+async fn setup_for_has_settings_and_packs() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::{packs_dir, TemplateSetup, SETTINGS_PATH};
+    let w = world();
+    let tmp = scratch();
+    let config = tmp.path().join("saiife").join("config.toml");
+    let dir = packs_dir(&config);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pack = "[pack]\nid = \"user.mine\"\n\n[[deny]]\nid = \"no-curl\"\ntool = \"Bash\"\npattern = \"curl\"\n";
+    std::fs::write(dir.join("mine.toml"), pack).unwrap();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(dir);
+    let mgr = Arc::clone(w.mgr.as_ref().unwrap());
+    setups.attach(&mgr);
+    let s = setups.setup_for(&b).unwrap();
+    assert_eq!(s.agent.command, vec!["claude".to_string()]);
+    assert!(s.env.is_empty());
+    assert_eq!((s.rows, s.cols), (40, 120));
+    assert_eq!(s.files.len(), 2, "{:?}", s.files);
+    assert_eq!(s.files[0].path, SETTINGS_PATH);
+    assert_eq!(s.files[0].mode, 0o644);
+    assert_eq!(s.files[0].text, saiife_boxhost::guest::claude_settings());
+    assert_eq!(
+        s.files[1].path,
+        "/home/agent/.config/saiife/packs/user.mine.toml"
+    );
+    assert_eq!(s.files[1].mode, 0o644);
+    assert_eq!(s.files[1].text, pack);
+    assert!(setups.setup_for(&id("b99")).is_err());
+}
+
+/// R19: the guest channel and the driver take the VMM uid from one place.
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+#[test]
+fn personal_vmm_uid_is_the_daemon_euid() {
+    use saiife_daemon::box_vmm::vmm_uid;
+    let tmp = scratch();
+    let l = saiife_boxhost::layout::Layout::personal(&tmp.path().join("s"), &tmp.path().join("d"));
+    assert_eq!(
+        vmm_uid(&l, &Mode::Personal).unwrap(),
+        rustix::process::geteuid().as_raw()
+    );
+    let e = vmm_uid(&l, &Mode::Locked).unwrap_err();
+    assert!(e.contains("system bus"), "{e}");
+}
+
+/// The stub's wait panics once, then serves events: the forwarder goes on.
+#[derive(Default)]
+struct PanicOnce {
+    inner: StubEvents,
+    panicked: std::sync::atomic::AtomicBool,
+}
+
+impl box_ops::GuestEvents for PanicOnce {
+    fn recv_events(&self, timeout: Duration) -> Vec<(BoxId, GuestEvent)> {
+        if !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("p38 test: the guest wait panicked");
+        }
+        self.inner.recv_events(timeout)
+    }
+}
+
+#[tokio::test]
+async fn forwarder_survives_a_panicking_wait() {
+    let w = world();
+    let a = w.spawn(ALICE, "t").await;
+    let b = starting(&w, &a);
+    let ev = Arc::new(PanicOnce::default());
+    ev.inner.push(&b, GuestEvent::Ready);
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    wait_until("running", || state_of(&w, &b) == "running").await;
+    assert!(ev.panicked.load(Ordering::SeqCst));
+}
+
+/// A VMM that holds its hooks, as `ChVmm` does: the daemon context holds
+/// the manager, which holds this, which holds the gateway hook.
+struct HookedVmm {
+    inner: FakeVmm,
+    _hooks: Vec<Arc<dyn saiife_boxhost::vmm::VmHooks>>,
+}
+
+impl saiife_boxes::vmm::Vmm for HookedVmm {
+    fn create(
+        &self,
+        spec: &saiife_boxes::vmm::VmSpec,
+    ) -> Result<saiife_boxes::vmm::VmHandle, saiife_boxes::vmm::VmmError> {
+        self.inner.create(spec)
+    }
+    fn boot(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.boot(h)
+    }
+    fn pause(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.pause(h)
+    }
+    fn resume(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.resume(h)
+    }
+    fn stop(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.stop(h)
+    }
+    fn snapshot(
+        &self,
+        h: &saiife_boxes::vmm::VmHandle,
+        dest: &Path,
+    ) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.snapshot(h, dest)
+    }
+    fn status(&self, h: &saiife_boxes::vmm::VmHandle) -> saiife_boxes::vmm::VmStatus {
+        self.inner.status(h)
+    }
+    fn destroy(&self, h: &saiife_boxes::vmm::VmHandle) -> Result<(), saiife_boxes::vmm::VmmError> {
+        self.inner.destroy(h)
+    }
+}
+
+/// The real hook chain (context -> manager -> VMM -> late hook -> gateway)
+/// is no cycle: once the daemon drops its context, the context is freed
+/// (its vault key zeroized) and the forwarder ends.
+#[tokio::test]
+async fn the_context_is_freed_with_the_gateway_wired() {
+    use saiife_daemon::box_gateway::{GatewayConfig, GatewayHooks, SystemResolve};
+    use saiife_daemon::box_setup::LateHooks;
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let late = LateHooks::new();
+    let vmm = Arc::new(HookedVmm {
+        inner: FakeVmm::new(),
+        _hooks: vec![late.clone()],
+    });
+    let guest: Arc<dyn GuestLink> = Arc::new(FakeGuest::new());
+    let host = two_boxes();
+    let mgr = Arc::new(
+        Manager::open(ManagerInit {
+            store: Store::open(box_ops::dir_in(&state)).unwrap(),
+            vmm,
+            guest,
+            templates: template::builtin(),
+            host: Arc::new(move || host),
+            clock: Arc::new(|| T0),
+            disk_place: box_ops::disk_place(),
+        })
+        .unwrap()
+        .manager,
+    );
+    let w = world_with(Setup {
+        manager: true,
+        template_warnings: Vec::new(),
+        built: Some(mgr),
+        unavailable: None,
+    });
+    let gw = GatewayHooks::new(
+        Arc::clone(&w.ctx),
+        tokio::runtime::Handle::current(),
+        Arc::new(SystemResolve::new()),
+        GatewayConfig::default(),
+    );
+    assert!(late.fill(gw));
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    wait_until("polling", || ev.calls.load(Ordering::SeqCst) >= 2).await;
+    let weak = Arc::downgrade(&w.ctx);
+    let World { ctx, mgr, .. } = w;
+    drop(mgr);
+    drop(ctx);
+    // the forwarder may hold it for one round
+    wait_until("the context freed", || weak.upgrade().is_none()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let n = ev.calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ev.calls.load(Ordering::SeqCst), n, "still polling");
+}
+
+/// R22: a cold boot is set up like a first boot. A Done box with its VM
+/// off (no snapshot kept) is revised, boots again, and its guest's
+/// set_up:false -> Setup -> Started arrives as a Ready: it runs again and
+/// gets the comment.
+#[tokio::test]
+async fn revise_after_a_cold_stop_runs_again() {
+    let w = world();
+    let b = id(&w.running(ALICE, "one").await);
+    w.ok(ALICE, "box.stop", json!({"box": b.as_str()})).await;
+    assert!(!w.mgr().get(&b).unwrap().vm_on);
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "again"}),
+    )
+    .await;
+    box_ops::tick_once(&w.ctx).await;
+    assert_eq!(state_of(&w, &b), "starting");
+    let ev = Arc::new(StubEvents::default());
+    box_ops::start_event_forwarder(Arc::clone(&w.ctx), ev.clone());
+    ev.push(&b, GuestEvent::Ready);
+    wait_until("running", || state_of(&w, &b) == "running").await;
+    assert!(w
+        .guest
+        .prompts()
+        .contains(&(b.clone(), "again".to_string())));
+    assert!(!w.mgr().get(&b).unwrap().keep);
+}

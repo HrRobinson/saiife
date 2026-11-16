@@ -80,10 +80,13 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process", "net", "system"] }
-# The UnitLauncher and UnitBus the locked-mode box unit bus implements (plan 35).
+# The UnitLauncher and UnitBus the locked-mode box unit bus implements (plan 35),
+# and the per-box gateway (plan 38, Task 6): VmHooks, BoxPaths and the vsock
+# listeners (tokio-free, unix-only), and the fixed ports.
 saiife-boxhost = { path = "../boxhost" }
+saiife-boxproto = { path = "../boxproto" }
 
-# The system bus, for the saiife-box@ units (plan 35, Task 6); as in saiife-keychain
+# The system bus, for the saiife-box-<tier>@ units (plan 35, Task 6); as in saiife-keychain
 # (no blocking-api: each call runs on a thread that blocks on the runtime).
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }

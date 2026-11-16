@@ -252,3 +252,66 @@ fn helper_makes_the_snapshot_dir_and_refuses_a_symlink() {
     assert!(stderr(&o).contains("snapshot"), "{}", stderr(&o));
     assert!(!f.out.exists());
 }
+
+/// `__box-vmm` with `args` after the box dir.
+fn run_args(f: &Fx, args: &[&str]) -> Output {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    c.args(["__box-vmm"])
+        .arg(&f.paths.dir)
+        .args(args)
+        .env_clear()
+        .env("HOME", f.root.join("home"))
+        .env("XDG_STATE_HOME", f.root.join("s"))
+        .env("XDG_DATA_HOME", f.root.join("d"))
+        .env("XDG_RUNTIME_DIR", f.root.join("r"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_TOOL_CH", &f.ch)
+        .env("SAIIFE_TEST_NO_PIN", "1")
+        .stdin(Stdio::null());
+    c.output().unwrap()
+}
+
+/// Fail closed even if the daemon's rebuild of the spec regressed: a
+/// locked VMM never starts without Landlock, and no VMM above the
+/// template ceilings (32 vCPUs, 256 GiB).
+#[test]
+fn helper_refuses_landlock_off_locked_and_oversize() {
+    let f = fx();
+    let off = LaunchSpec {
+        landlock: false,
+        ..f.spec.clone()
+    };
+    launch::write_spec(&off, &f.paths).unwrap();
+    for args in [&[][..], &["--locked"][..]] {
+        let o = run_args(&f, args);
+        assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+        assert!(!f.out.exists(), "the VMM was not started");
+    }
+    let o = run_args(&f, &[]);
+    assert!(stderr(&o).contains("landlock"), "{}", stderr(&o));
+    for (vcpus, mem_mib) in [(64, 1024), (2, 1 << 20)] {
+        let big = LaunchSpec {
+            vcpus,
+            mem_mib,
+            ..f.spec.clone()
+        };
+        launch::write_spec(&big, &f.paths).unwrap();
+        let o = run(&f, true);
+        assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains("vcpus") || e.contains("mem_mib"), "{e}");
+        assert!(!f.out.exists(), "the VMM was not started");
+    }
+}
+
+/// Locked, the daemon writes vm.json and the VMM user runs the helper: a
+/// vm.json the helper's own user owns (made or replaced by a VMM in the
+/// group-writable runtime dir) is refused, checked on the open file.
+#[test]
+fn helper_refuses_a_spec_its_own_user_wrote_when_locked() {
+    let f = fx();
+    let o = run_args(&f, &["--locked"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).contains("owned by"), "{}", stderr(&o));
+    assert!(!f.out.exists(), "the VMM was not started");
+}

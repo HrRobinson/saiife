@@ -33,7 +33,7 @@ use saiife_wire::source::BoxId;
 
 use crate::ch::{Action, Api, ApiError, VmState};
 use crate::disk::make_overlay;
-use crate::launch::{self, read_spec, write_spec, Boot, LaunchSpec, Launcher, MAX_SOCK_PATH};
+use crate::launch::{self, write_spec, Boot, LaunchSpec, Launcher, MAX_SOCK_PATH};
 use crate::layout::Layout;
 use crate::paths::BoxPaths;
 use crate::pins::CH_VERSION;
@@ -528,6 +528,60 @@ impl ChVmmInit {
     /// The snapshot to restore this boot from, if any (the VMM of the box is
     /// confirmed gone). Not trusted: discarded with its marker, noted to
     /// the hooks, and the box cold-boots.
+    /// The spec of a boot, from daemon-held state only: the image and sizes
+    /// in the handle's data (the box record's), the image as the store
+    /// resolves it now (base, firmware or kernel and cmdline), the driver's
+    /// Landlock setting, and the repo disk create handed to the runtime dir.
+    /// `restore` is the caller's (from the vault marker).
+    fn launch_spec(&self, h: &VmHandle, paths: &BoxPaths) -> Result<LaunchSpec, String> {
+        let stale = || {
+            "the box's VM record has no image, sizes or repo flag (made by an older saiife): \
+             discard the box and spawn it again"
+                .to_string()
+        };
+        let image = image_of_data(&h.data).ok_or_else(stale)?;
+        let v: serde_json::Value = serde_json::from_str(&h.data).map_err(|_| stale())?;
+        let mem_mib = v.get("mem_mib").and_then(serde_json::Value::as_u64);
+        let vcpus = v
+            .get("vcpus")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        let repo = v.get("repo").and_then(serde_json::Value::as_bool);
+        let (Some(mem_mib), Some(vcpus), Some(repo)) = (mem_mib, vcpus, repo) else {
+            return Err(stale());
+        };
+        // the runtime dir is VMM-writable: its repo.img must be the one
+        // create handed over, no more, no less (not followed: check_plain)
+        let present = std::fs::symlink_metadata(paths.repo_disk()).is_ok();
+        if present != repo {
+            return Err(if repo {
+                "the box's repo disk is missing from its runtime dir".into()
+            } else {
+                "a repo disk the box was not created with is in its runtime dir".into()
+            });
+        }
+        let resolved = self.images.resolve(&ImageRef::Pinned(image.clone()))?;
+        if resolved.id != image {
+            return Err(format!(
+                "the image store resolved {image} to {}",
+                resolved.id
+            ));
+        }
+        let spec = LaunchSpec {
+            version: 1,
+            id: h.id.clone(),
+            vcpus,
+            mem_mib,
+            base: resolved.raw,
+            repo,
+            boot: resolved.boot,
+            landlock: self.landlock,
+            restore: None,
+        };
+        launch::check_limits(&spec)?;
+        Ok(spec)
+    }
+
     fn decide_restore(&self, id: &BoxId, paths: &BoxPaths, spec: &LaunchSpec) -> Option<PathBuf> {
         let vault = &self.layout.vault;
         let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
@@ -556,6 +610,15 @@ impl ChVmmInit {
 }
 
 impl ChVmm {
+    /// Tells the launcher the box's tier from the daemon's record (the
+    /// handle) before it is asked anything about the box; locked, the tier
+    /// names the unit, and a handle without one fails closed.
+    fn bind(&self, h: &VmHandle) {
+        self.inner
+            .launcher
+            .bind(&h.id, tier_of_data(&h.data).as_deref());
+    }
+
     pub fn new(init: ChVmmInit) -> ChVmm {
         ChVmm {
             inner: Arc::new(init),
@@ -610,7 +673,10 @@ impl ChVmm {
                 crate::vault::pid_path(&inner.layout.vault, id).display()
             )));
         }
-        let mut spec = read_spec(paths).map_err(VmmError::Failed)?;
+        // Never read back from vm.json: it is in the runtime dir, which the
+        // VMM user can write (R37). The spec is rebuilt from the daemon's
+        // own state and written fresh every boot.
+        let mut spec = inner.launch_spec(h, paths).map_err(VmmError::Failed)?;
         // CH opens these by path and follows links (S4 sweep): serial.log is
         // replaced when it is not a plain file (unlink removes a link, not its
         // target); the disks hold the box's data, so they are refused.
@@ -748,6 +814,21 @@ impl ChVmm {
 /// The longest handle data [`image_of_data`] parses.
 const MAX_HANDLE_DATA: usize = 4096;
 
+/// `data["tier"]` of a handle's data (the box's size tier, recorded at
+/// create), when the data is short JSON and the tier one of `TIERS`.
+/// The tier must hold the handle's own `vcpus` and `mem_mib` (both
+/// daemon-written at create; a mismatch is not trusted).
+fn tier_of_data(data: &str) -> Option<String> {
+    if data.len() > MAX_HANDLE_DATA {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let t = saiife_boxes::template::tier_named(v.get("tier")?.as_str()?)?;
+    let vcpus = v.get("vcpus")?.as_u64()?;
+    let mem_mib = v.get("mem_mib")?.as_u64()?;
+    (u64::from(t.vcpus) >= vcpus && t.mem_mib >= mem_mib).then(|| t.name.to_string())
+}
+
 /// `data["image"]` of a handle's data, when the data is short JSON and the
 /// image a valid id.
 fn image_of_data(data: &str) -> Option<String> {
@@ -807,6 +888,15 @@ impl Vmm for ChVmm {
         // from the runtime dir (R37, R40); base.json stays in the record.
         // The last step that can fail before the spec: a failed create
         // gives the disk back to the record, which a discard removes.
+        // locked: the unit of the smallest tier that holds the box (its
+        // MemoryMax= and CPUQuota= are the tier's, written by the installer)
+        let tier = saiife_boxes::template::tier_for(spec.size.vcpus, spec.size.mem_mib)
+            .ok_or_else(|| {
+                VmmError::Failed(format!(
+                    "no size tier holds {} vCPUs and {} MiB",
+                    spec.size.vcpus, spec.size.mem_mib
+                ))
+            })?;
         let handover =
             crate::repo_handover::take_repo_disk(&spec.dir, &paths.dir, inner.layout.locked)
                 .map_err(VmmError::Failed)?;
@@ -817,8 +907,10 @@ impl Vmm for ChVmm {
             vcpus: spec.size.vcpus,
             mem_mib: spec.size.mem_mib,
             base: image.raw.clone(),
-            // not followed: a symlink here is refused at boot (check_plain)
-            repo: std::fs::symlink_metadata(paths.repo_disk()).is_ok(),
+            // what this create handed over, not what the VMM-writable
+            // runtime dir holds: a repo.img found there is not the box's
+            // (boot then refuses it)
+            repo: handover.moved() != crate::repo_handover::Moved::Nothing,
             boot: image.boot.clone(),
             landlock: inner.landlock,
             restore: None,
@@ -828,23 +920,38 @@ impl Vmm for ChVmm {
             return Err(VmmError::Failed(e));
         }
         handover.commit().map_err(VmmError::Failed)?;
-        // mem_mib bounds the snapshot copy (`snapshot::seal`); the
-        // VMM-writable vm.json is not asked for it.
+        // The handle (kept in the daemon-only box record) holds what boot
+        // rebuilds the spec from: the image, the admitted sizes. mem_mib also
+        // bounds the snapshot copy (`snapshot::seal`). The VMM-writable
+        // vm.json is never asked for any of it.
         let data = serde_json::json!({
             "launcher": inner.launcher.kind(),
             "image": image.id,
             "mem_mib": spec.size.mem_mib,
+            "vcpus": spec.size.vcpus,
+            "repo": ls.repo,
+            "tier": tier.name,
         });
-        Ok(VmHandle {
+        let h = VmHandle {
             id: spec.id.clone(),
             driver: format!("ch-{CH_VERSION}"),
             data: data.to_string(),
-        })
+        };
+        self.bind(&h);
+        Ok(h)
     }
 
     /// Runs the hooks, starts the VMM (restoring a trusted snapshot), waits
     /// for its API socket and returns; the guest's readiness arrives later.
     fn boot(&self, h: &VmHandle) -> Result<(), VmmError> {
+        if tier_of_data(&h.data).is_none() {
+            return Err(VmmError::Failed(
+                "the box's VM record has no size tier (made by an older saiife): \
+                 discard the box and spawn it again"
+                    .into(),
+            ));
+        }
+        self.bind(h);
         let paths = self.inner.paths(&h.id);
         // an earlier run that is gone by now gets its after_off first
         self.settle(&h.id);
@@ -899,6 +1006,7 @@ impl Vmm for ChVmm {
     /// Asks for the stop and returns; the reaper sends the power button and
     /// escalates (`StopTimes`). During a boot, the stop follows the start.
     fn stop(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.bind(h);
         self.settle(&h.id);
         {
             let mut g = self.runs();
@@ -951,6 +1059,7 @@ impl Vmm for ChVmm {
     }
 
     fn status(&self, h: &VmHandle) -> VmStatus {
+        self.bind(h);
         if matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             return VmStatus::Running;
         }
@@ -973,6 +1082,7 @@ impl Vmm for ChVmm {
     /// run and every file (runtime dir, vault, pid record): nothing is
     /// removed under a live VMM. The manager's tick retries it.
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
+        self.bind(h);
         let until = Instant::now() + DESTROY_WAIT;
         while matches!(self.runs().get(&h.id), Some(Slot::Starting { .. })) {
             if Instant::now() >= until {

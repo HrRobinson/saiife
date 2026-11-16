@@ -12,9 +12,16 @@ pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
 pub mod box_images;
+// The per-box gateway: allow-listed CONNECT egress and the model port (plan 38).
+#[cfg(unix)]
+pub mod box_gateway;
 pub mod box_ops;
 #[cfg(unix)]
 pub mod box_repo;
+// The guest channel's setup, the late gateway hook and the recording's
+// place for real boxes (plan 38, Task 8).
+#[cfg(unix)]
+pub mod box_setup;
 /// The system bus calls behind the locked-mode `UnitLauncher` (plan 35).
 #[cfg(target_os = "linux")]
 pub mod box_unit;

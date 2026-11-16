@@ -5,7 +5,7 @@
 //! descriptors only (S4), read-only, and records the SHA-256 of every file
 //! in `<vault>/<id>.marker`.
 //! At boot `verify` re-hashes the vault copy, compares, and runs
-//! `check_config` on the very bytes it hashed; the restore reads only that
+//! `check_config` and `check_state` on the very bytes it hashed; the restore reads only that
 //! copy. The box dir's `snapshot/` is never a restore source; it is made
 //! before the VMM starts (`launch::ensure_snapshot_dir`) and only emptied.
 
@@ -377,17 +377,22 @@ pub fn verify(
     if names.iter().collect::<Vec<_>>() != m.files.keys().collect::<Vec<_>>() {
         return Err("snapshot: the vault copy's files differ from the marker".into());
     }
-    let mut config = None;
+    let (mut config, mut state, mut ranges_len) = (None, None, 0);
     for n in &names {
         let p = dir.join(n);
-        let got = if n == "config.json" {
+        let got = if n == "config.json" || n == "state.json" {
             let b = read_bounded(&p, MAX_CONFIG)?;
             let h = hex(ring::digest::digest(&ring::digest::SHA256, &b));
-            config = Some(b);
+            if n == "config.json" {
+                config = Some(b);
+            } else {
+                state = Some(b);
+            }
             h
         } else {
             let mut f = open_ro(&p)?;
             let len = f.metadata().map_err(|e| e.to_string())?.len();
+            ranges_len = len;
             hash_file(&mut f, len)?
         };
         if m.files.get(n) != Some(&got) {
@@ -397,6 +402,10 @@ pub fn verify(
     let config = config.ok_or("snapshot: no config.json")?;
     let v: Value = serde_json::from_slice(&config).map_err(|e| format!("config.json: {e}"))?;
     check_config(&v, paths, spec)?;
+    // the vCPUs and RAM are rebuilt from state.json, not from the config
+    let state = state.ok_or("snapshot: no state.json")?;
+    let st: Value = serde_json::from_slice(&state).map_err(|e| format!("state.json: {e}"))?;
+    check_state(&st, spec, ranges_len)?;
     Ok(dir)
 }
 
@@ -472,6 +481,8 @@ pub fn check_config(v: &Value, paths: &BoxPaths, spec: &LaunchSpec) -> Result<()
             return Err("memory: a file-backed zone".into());
         }
     }
+    check_sizes(v, spec)?;
+    check_platform(v.get("platform"))?;
     check_payload(v.get("payload"), spec)?;
     check_disks(v.get("disks"), paths, spec)?;
     if let Some(rng) = v.get("rng").filter(|r| !nullish(Some(r))) {
@@ -494,6 +505,184 @@ pub fn check_config(v: &Value, paths: &BoxPaths, spec: &LaunchSpec) -> Result<()
         return Err("vsock: socket is not the box's vsock.sock".into());
     }
     check_landlock(v, paths, spec)
+}
+
+/// On restore Cloud Hypervisor takes the vCPUs and memory from the
+/// snapshot's config, which the VMM wrote, not from argv: they must be
+/// what the box was admitted with (`spec`, the daemon's), with no hotplug
+/// room, shared or hugepage memory and no NUMA or memory zones.
+fn check_sizes(v: &Value, spec: &LaunchSpec) -> Result<(), String> {
+    let n = |p: &str| v.pointer(p).and_then(Value::as_u64);
+    let vcpus = u64::from(spec.vcpus);
+    if n("/cpus/boot_vcpus") != Some(vcpus) || n("/cpus/max_vcpus") != Some(vcpus) {
+        return Err(format!("cpus: not the box's {} vCPUs", spec.vcpus));
+    }
+    if n("/memory/size") != Some(spec.mem_mib << 20) {
+        return Err(format!("memory: not the box's {} MiB", spec.mem_mib));
+    }
+    for k in ["hotplug_size", "hotplugged_size", "zones"] {
+        if !nullish(v.pointer(&format!("/memory/{k}"))) {
+            return Err(format!("memory: {k} is set"));
+        }
+    }
+    for k in ["shared", "hugepages"] {
+        if v.pointer(&format!("/memory/{k}")).and_then(Value::as_bool) == Some(true) {
+            return Err(format!("memory: {k} is on"));
+        }
+    }
+    if !nullish(v.get("numa")) {
+        return Err("numa: set".into());
+    }
+    Ok(())
+}
+
+/// `launch::argv` sets no `--platform`: a snapshot's platform section may
+/// hold CH's defaults only (one PCI segment), never confidential-VM modes
+/// (`tdx`, `sev_snp`), iommufd, IOMMU segments, OEM strings or SMBIOS
+/// identity fields.
+fn check_platform(p: Option<&Value>) -> Result<(), String> {
+    let Some(p) = p.filter(|p| !nullish(Some(p))) else {
+        return Ok(());
+    };
+    if !p.is_object() {
+        return Err("platform: not an object".into());
+    }
+    only_keys(
+        "platform",
+        p,
+        &[
+            "num_pci_segments",
+            "iommu_address_width_bits",
+            "vfio_p2p_dma",
+        ],
+    )?;
+    match p.get("num_pci_segments") {
+        None | Some(Value::Null) => Ok(()),
+        Some(n) if n.as_u64() == Some(1) => Ok(()),
+        Some(_) => Err("platform: more than one PCI segment".into()),
+    }
+}
+
+/// `state.json`'s top-level snapshot child named `id`.
+fn child<'a>(v: &'a Value, id: &str) -> Result<&'a Value, String> {
+    v.get("snapshots")
+        .and_then(|s| s.get(id))
+        .ok_or_else(|| format!("state.json: no {id} section"))
+}
+
+/// `snapshot_data.state` of a snapshot node: CH stores it as a JSON string
+/// (`SnapshotData::new_from_state`) and reads nothing else.
+fn state_of(node: &Value, id: &str) -> Result<Value, String> {
+    match node.pointer("/snapshot_data/state") {
+        Some(Value::String(s)) => {
+            serde_json::from_str(s).map_err(|e| format!("state.json: {id} state: {e}"))
+        }
+        _ => Err(format!("state.json: {id} has no state")),
+    }
+}
+
+/// The CH v54 snapshot ids of the vCPU and memory managers.
+pub const CPU_MANAGER: &str = "cpu-manager";
+pub const MEMORY_MANAGER: &str = "memory-manager";
+
+/// On restore Cloud Hypervisor rebuilds the vCPUs and the guest RAM from
+/// `state.json` and fills the RAM from `memory-ranges`, both written by
+/// the VMM: they must match what the box was admitted with (`spec`). One
+/// vCPU state per vCPU (`"0"`..), the RAM mappings summing to `mem_mib`
+/// MiB with no virtio-mem, boot and current RAM equal to it, no hotplug
+/// slot in use, the saved ranges at most the RAM and the `memory-ranges`
+/// file (`ranges_len` bytes) at most the RAM plus [`SLACK_MIB`]. Anything
+/// missing or unparseable is refused: the box boots cold. Not checked:
+/// `arch_mem_regions`, `start_of_device_area` and `next_memory_slot`
+/// (guest-visible layout; host RAM is bounded by the mappings above).
+pub fn check_state(v: &Value, spec: &LaunchSpec, ranges_len: u64) -> Result<(), String> {
+    let mem = spec.mem_mib << 20;
+    let cpus = child(v, CPU_MANAGER)?
+        .get("snapshots")
+        .and_then(Value::as_object)
+        .ok_or("state.json: no vCPU states")?;
+    let want: Vec<String> = (0..spec.vcpus).map(|i| i.to_string()).collect();
+    let mut got: Vec<&String> = cpus.keys().collect();
+    got.sort_by_key(|k| k.parse::<u64>().unwrap_or(u64::MAX));
+    if got.len() != want.len() || got.iter().zip(&want).any(|(g, w)| *g != w) {
+        return Err(format!(
+            "state.json: {} vCPU states, not the box's {}",
+            cpus.len(),
+            spec.vcpus
+        ));
+    }
+    let m = state_of(child(v, MEMORY_MANAGER)?, MEMORY_MANAGER)?;
+    let n = |k: &str| m.get(k).and_then(Value::as_u64);
+    if n("boot_ram") != Some(mem) || n("current_ram") != Some(mem) {
+        return Err(format!(
+            "state.json: RAM is not the box's {} MiB",
+            spec.mem_mib
+        ));
+    }
+    let maps = m
+        .get("guest_ram_mappings")
+        .and_then(Value::as_array)
+        .ok_or("state.json: no RAM mappings")?;
+    let mut sum: u64 = 0;
+    for g in maps {
+        if g.get("virtio_mem").and_then(Value::as_bool) != Some(false) {
+            return Err("state.json: a virtio-mem RAM mapping".into());
+        }
+        let size = g
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or("state.json: a RAM mapping without a size")?;
+        sum = sum.checked_add(size).ok_or("state.json: RAM overflows")?;
+    }
+    if sum != mem {
+        return Err(format!(
+            "state.json: RAM mappings are not the box's {} MiB",
+            spec.mem_mib
+        ));
+    }
+    let slots = m
+        .get("hotplug_slots")
+        .and_then(Value::as_array)
+        .ok_or("state.json: no hotplug slots")?;
+    for s in slots {
+        let used = ["active", "inserting", "removing"]
+            .iter()
+            .any(|k| s.get(*k).and_then(Value::as_bool) != Some(false))
+            || s.get("length").and_then(Value::as_u64) != Some(0);
+        if used {
+            return Err("state.json: a hotplug slot is in use".into());
+        }
+    }
+    for k in ["selected_slot", "next_hotplug_slot"] {
+        if !m
+            .get(k)
+            .and_then(Value::as_u64)
+            .is_some_and(|i| i < slots.len().max(1) as u64)
+        {
+            return Err(format!("state.json: hotplug {k} out of range"));
+        }
+    }
+    let ranges = m
+        .pointer("/memory_ranges/data")
+        .and_then(Value::as_array)
+        .ok_or("state.json: no memory ranges")?;
+    let mut total: u64 = 0;
+    for r in ranges {
+        let len = r
+            .get("length")
+            .and_then(Value::as_u64)
+            .ok_or("state.json: a memory range without a length")?;
+        total = total
+            .checked_add(len)
+            .ok_or("state.json: memory ranges overflow")?;
+    }
+    if total > mem {
+        return Err("state.json: memory ranges larger than the box's RAM".into());
+    }
+    if ranges_len > max_total(spec.mem_mib) {
+        return Err("memory-ranges: larger than the box's RAM".into());
+    }
+    Ok(())
 }
 
 fn check_payload(p: Option<&Value>, spec: &LaunchSpec) -> Result<(), String> {
@@ -586,7 +775,7 @@ mod tests {
             restore: None,
         };
         let v = serde_json::json!({
-            "cpus": {"boot_vcpus": 2},
+            "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
             "memory": {"size": 1u64 << 30, "zones": null},
             "payload": {"firmware": "/v/CLOUDHV.fd", "kernel": null, "cmdline": null, "initramfs": null},
             "disks": [{"path": "/b/b1/root.qcow2", "vhost_user": false}, {"path": "/b/b1/repo.img"}],
@@ -629,6 +818,42 @@ mod tests {
             ("memory", |v| {
                 v["memory"]["zones"] = serde_json::json!([{"file": "/dev/shm/x"}])
             }),
+            ("cpus", |v| v["cpus"]["boot_vcpus"] = 32.into()),
+            ("cpus", |v| v["cpus"]["max_vcpus"] = 32.into()),
+            ("memory", |v| v["memory"]["size"] = (4u64 << 30).into()),
+            ("memory", |v| {
+                v["memory"]["hotplug_size"] = (1u64 << 34).into()
+            }),
+            ("memory", |v| v["memory"]["shared"] = true.into()),
+            ("memory", |v| v["memory"]["hugepages"] = true.into()),
+            ("numa", |v| {
+                v["numa"] = serde_json::json!([{"guest_numa_id": 0}])
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"num_pci_segments": 1, "tdx": true})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"sev_snp": true})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"oem_strings": ["x"]})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"iommu_segments": [1]})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"system_uuid": "u"})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"num_pci_segments": 2})
+            }),
+            ("platform", |v| v["platform"] = "x".into()),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"iommufd": true})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"serial_number": "s"})
+            }),
             ("rng", |v| v["rng"]["src"] = "/etc/shadow".into()),
             ("serial", |v| v["serial"]["file"] = "/etc/x".into()),
             ("console", |v| v["console"]["file"] = "/etc/x".into()),
@@ -650,5 +875,168 @@ mod tests {
         let (p, mut s, v) = fixture();
         s.repo = false;
         assert!(check_config(&v, &p, &s).unwrap_err().contains("disks"));
+    }
+
+    #[test]
+    fn a_default_platform_passes() {
+        let (p, s, mut v) = fixture();
+        v["platform"] = serde_json::json!({
+            "num_pci_segments": 1, "iommu_address_width_bits": 64,
+            "iommufd": false, "vfio_p2p_dma": true, "tdx": false, "sev_snp": false
+        });
+        check_config(&v, &p, &s).unwrap();
+        v["platform"]["num_pci_segments"] = Value::Null;
+        check_config(&v, &p, &s).unwrap();
+    }
+
+    /// A CH v54-shaped `state.json` for the fixture's 2 vCPUs and 1 GiB.
+    fn state() -> Value {
+        let slot = serde_json::json!({"base": 0, "length": 0, "active": false,
+                                      "inserting": false, "removing": false});
+        let mem = serde_json::json!({
+            "memory_ranges": {"data": [{"gpa": 0, "length": 1u64 << 29},
+                                       {"gpa": 1u64 << 32, "length": 1u64 << 29}]},
+            "guest_ram_mappings": [
+                {"slot": 0, "gpa": 0, "size": 1u64 << 29, "zone_id": "mem0",
+                 "virtio_mem": false, "file_offset": 0},
+                {"slot": 1, "gpa": 1u64 << 32, "size": 1u64 << 29, "zone_id": "mem0",
+                 "virtio_mem": false, "file_offset": 0}],
+            "start_of_device_area": 1u64 << 40,
+            "boot_ram": 1u64 << 30, "current_ram": 1u64 << 30,
+            "arch_mem_regions": [],
+            "hotplug_slots": vec![slot; 8],
+            "next_memory_slot": 2, "selected_slot": 0, "next_hotplug_slot": 0
+        });
+        let vcpu = serde_json::json!({"snapshots": {}, "snapshot_data": {"state": "{}"}});
+        serde_json::json!({
+            "snapshots": {
+                "cpu-manager": {"snapshots": {"0": vcpu, "1": vcpu}, "snapshot_data": null},
+                "memory-manager": {"snapshots": {}, "snapshot_data": {"state": mem.to_string()}},
+                "device-manager": {"snapshots": {}, "snapshot_data": null}
+            },
+            "snapshot_data": {"state": "{}"}
+        })
+    }
+
+    /// Edits the memory manager's (string-encoded) state.
+    fn mem_edit(v: &mut Value, f: impl FnOnce(&mut Value)) {
+        let p = "/snapshots/memory-manager/snapshot_data/state";
+        let mut m: Value = serde_json::from_str(v.pointer(p).unwrap().as_str().unwrap()).unwrap();
+        f(&mut m);
+        *v.pointer_mut(p).unwrap() = m.to_string().into();
+    }
+
+    #[test]
+    fn a_ch_shaped_state_passes() {
+        let (_, s, _) = fixture();
+        check_state(&state(), &s, 1 << 30).unwrap();
+        // the memory-ranges file may be smaller (sparse policies) or carry slack
+        check_state(&state(), &s, 12).unwrap();
+        check_state(&state(), &s, max_total(s.mem_mib)).unwrap();
+    }
+
+    #[test]
+    fn a_state_beyond_the_admitted_sizes_is_refused() {
+        type Edit = fn(&mut Value);
+        let cases: &[(&str, Edit)] = &[
+            ("vCPU", |v| {
+                v["snapshots"]["cpu-manager"]["snapshots"]["2"] = serde_json::json!({})
+            }),
+            ("vCPU", |v| {
+                let c = v["snapshots"]["cpu-manager"]["snapshots"]
+                    .as_object_mut()
+                    .unwrap();
+                let one = c.remove("1").unwrap();
+                c.insert("7".into(), one);
+            }),
+            ("vCPU", |v| {
+                v["snapshots"]["cpu-manager"]["snapshots"] = Value::Null
+            }),
+            ("cpu-manager", |v| {
+                v["snapshots"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cpu-manager");
+            }),
+            ("memory-manager", |v| {
+                v["snapshots"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("memory-manager");
+            }),
+            ("state", |v| {
+                v["snapshots"]["memory-manager"]["snapshot_data"]["state"] = "{not json".into()
+            }),
+            ("RAM", |v| {
+                mem_edit(v, |m| m["boot_ram"] = (1u64 << 34).into())
+            }),
+            ("RAM", |v| {
+                mem_edit(v, |m| m["current_ram"] = (1u64 << 34).into())
+            }),
+            ("RAM mappings", |v| {
+                mem_edit(v, |m| {
+                    m["guest_ram_mappings"][1]["size"] = (1u64 << 34).into()
+                })
+            }),
+            ("RAM mappings", |v| {
+                mem_edit(v, |m| {
+                    m["guest_ram_mappings"].as_array_mut().unwrap().pop();
+                })
+            }),
+            ("virtio-mem", |v| {
+                mem_edit(v, |m| {
+                    m["guest_ram_mappings"][0]["virtio_mem"] = true.into()
+                })
+            }),
+            ("overflows", |v| {
+                mem_edit(v, |m| {
+                    m["guest_ram_mappings"][0]["size"] = u64::MAX.into();
+                })
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["hotplug_slots"][3]["active"] = true.into())
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["hotplug_slots"][0]["length"] = (1u64 << 30).into())
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["hotplug_slots"] = Value::Null)
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["selected_slot"] = 8.into())
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["next_hotplug_slot"] = (-1).into())
+            }),
+            ("state", |v| {
+                let p = "/snapshots/memory-manager/snapshot_data/state";
+                let m: Value =
+                    serde_json::from_str(v.pointer(p).unwrap().as_str().unwrap()).unwrap();
+                *v.pointer_mut(p).unwrap() = m;
+            }),
+            ("memory ranges", |v| {
+                mem_edit(v, |m| {
+                    m["memory_ranges"]["data"][0]["length"] = (1u64 << 34).into()
+                })
+            }),
+            ("memory ranges", |v| {
+                mem_edit(v, |m| m["memory_ranges"] = serde_json::json!([]))
+            }),
+        ];
+        for (what, edit) in cases {
+            let (_, s, _) = fixture();
+            let mut v = state();
+            edit(&mut v);
+            let e = check_state(&v, &s, 1 << 30).unwrap_err();
+            assert!(e.contains(what), "{what}: {e}");
+        }
+        let (_, s, _) = fixture();
+        let e = check_state(&state(), &s, max_total(s.mem_mib) + 1).unwrap_err();
+        assert!(e.contains("memory-ranges"), "{e}");
+        let mut more = s.clone();
+        more.vcpus = 4;
+        assert!(check_state(&state(), &more, 1 << 30)
+            .unwrap_err()
+            .contains("vCPU"));
     }
 }

@@ -1,0 +1,1112 @@
+#![cfg(feature = "fake")]
+//! `VsockGuest` against a guest played with the protocol codec (plan 38, Task 4).
+//! A fake multiplexer on `vsock.sock` forwards `CONNECT 1024` to a test-side
+//! control server; the test connects to the host listeners as the guest would.
+
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use saiife_boxes::guest::{GuestError, GuestEvent, GuestLink};
+use saiife_boxhost::guest::{SetupSource, VsockGuest};
+use saiife_boxhost::paths::BoxPaths;
+use saiife_boxhost::vmm::VmHooks;
+use saiife_boxproto::frame::{read_msg, write_frame, write_msg, Frame, MAX_FRAME};
+use saiife_boxproto::msg::{AgentSpec, Event, HostReply, Reply, Request, Setup};
+use saiife_boxproto::ports;
+use saiife_boxproto::PROTO;
+use saiife_wire::source::{BoxId, TermFrame};
+
+fn me() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+fn b1() -> BoxId {
+    BoxId::parse("b1").unwrap()
+}
+
+fn setup() -> Setup {
+    Setup {
+        agent: AgentSpec {
+            command: vec!["claude".into()],
+            user: "agent".into(),
+            cwd: "/work".into(),
+        },
+        env: vec![],
+        files: vec![],
+        rows: 40,
+        cols: 120,
+    }
+}
+
+struct Setups(Result<Setup, String>);
+impl SetupSource for Setups {
+    fn setup_for(&self, _id: &BoxId) -> Result<Setup, String> {
+        self.0.clone()
+    }
+}
+
+type Handler = dyn Fn(Request, &mut UnixStream) + Send + Sync;
+
+/// The test world: a box dir, the fake multiplexer, the control server.
+struct World {
+    _t: tempfile::TempDir,
+    paths: BoxPaths,
+    requests: Arc<Mutex<Vec<Request>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl World {
+    fn new(handler: Arc<Handler>) -> World {
+        let base = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let t = tempfile::Builder::new()
+            .prefix("g")
+            .tempdir_in(base)
+            .unwrap();
+        let dir = t.path().join("b1");
+        std::fs::create_dir(&dir).unwrap();
+        let paths = BoxPaths::new(dir);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let l = UnixListener::bind(paths.vsock()).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let (reqs, st) = (requests.clone(), stop.clone());
+        thread::spawn(move || {
+            while !st.load(Ordering::SeqCst) {
+                let s = match l.accept() {
+                    Ok((s, _)) => s,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                let (reqs, h) = (reqs.clone(), handler.clone());
+                thread::spawn(move || mux_conn(s, reqs, h));
+            }
+        });
+        World {
+            _t: t,
+            paths,
+            requests,
+            stop,
+        }
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn guest(&self, setups: Result<Setup, String>) -> Arc<VsockGuest> {
+        let g = VsockGuest::new(Arc::new(Setups(setups)), false, me());
+        g.before_boot(&b1(), &self.paths).unwrap();
+        g
+    }
+
+    fn connect(&self, port: u32) -> UnixStream {
+        let s = UnixStream::connect(self.paths.vsock_port(port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        s
+    }
+
+    /// Says hello on a fresh events connection and expects Welcome.
+    fn hello(&self, set_up: bool) -> UnixStream {
+        let mut s = self.connect(ports::EVENTS);
+        write_msg(&mut s, &hello_msg(PROTO, set_up)).unwrap();
+        let r: HostReply = read_msg(&mut s).unwrap().unwrap();
+        assert_eq!(
+            r,
+            HostReply::Welcome {
+                proto: PROTO.into()
+            }
+        );
+        s
+    }
+}
+
+fn hello_msg(proto: &str, set_up: bool) -> Event {
+    Event::Hello {
+        proto: proto.into(),
+        guest: "0.1".into(),
+        uptime_ms: 5,
+        set_up,
+    }
+}
+
+/// One multiplexer connection: `CONNECT 1024\n` → `OK 1\n`, then one request.
+fn mux_conn(mut s: UnixStream, reqs: Arc<Mutex<Vec<Request>>>, h: Arc<Handler>) {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while line.len() < 32 {
+        if s.read(&mut b).unwrap_or(0) == 0 {
+            return;
+        }
+        line.push(b[0]);
+        if b[0] == b'\n' {
+            break;
+        }
+    }
+    if line != b"CONNECT 1024\n" {
+        return;
+    }
+    s.write_all(b"OK 1\n").unwrap();
+    let req: Request = match read_msg(&mut s) {
+        Ok(Some(r)) => r,
+        _ => return,
+    };
+    reqs.lock().unwrap().push(req.clone());
+    h(req, &mut s);
+}
+
+fn ok_handler() -> Arc<Handler> {
+    Arc::new(|_r, s| {
+        let _ = write_msg(s, &Reply::Ok);
+    })
+}
+
+/// Collects events for `b1` until `want` are seen or `within` passes.
+fn events_until(g: &VsockGuest, want: usize, within: Duration) -> Vec<GuestEvent> {
+    let end = Instant::now() + within;
+    let mut out = Vec::new();
+    while out.len() < want && Instant::now() < end {
+        for (id, e) in g.recv_events(Duration::from_millis(100)) {
+            assert_eq!(id, b1());
+            out.push(e);
+        }
+    }
+    out
+}
+
+fn wait_for(what: &str, within: Duration, f: impl Fn() -> bool) {
+    let end = Instant::now() + within;
+    while !f() {
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Reads until EOF (or error): the host closed the connection.
+fn closed_by_host(s: &mut UnixStream) -> bool {
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+const T: Duration = Duration::from_secs(5);
+
+#[test]
+fn hello_setup_started_is_ready() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    wait_for("setup", T, || !w.requests().is_empty());
+    assert_eq!(w.requests(), vec![Request::Setup(setup())]);
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Activity).unwrap();
+    write_msg(&mut s, &Event::TurnFinished).unwrap();
+    write_msg(&mut s, &Event::Exited { code: Some(0) }).unwrap();
+    let ev = events_until(&g, 4, T);
+    assert_eq!(
+        ev,
+        vec![
+            GuestEvent::Ready,
+            GuestEvent::Activity,
+            GuestEvent::TurnFinished,
+            GuestEvent::Exited
+        ]
+    );
+    assert_eq!(g.last_error(&b1()), None);
+    g.after_off(&b1());
+}
+
+#[test]
+fn second_started_is_not_ready_again() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Activity).unwrap();
+    let ev = events_until(&g, 2, T);
+    assert_eq!(ev, vec![GuestEvent::Ready, GuestEvent::Activity]);
+    assert!(g.recv_events(Duration::from_millis(200)).is_empty());
+    g.after_off(&b1());
+}
+
+#[test]
+fn wrong_proto_is_refused() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.connect(ports::EVENTS);
+    write_msg(&mut s, &hello_msg("saiife-guest/2", false)).unwrap();
+    let r: HostReply = read_msg(&mut s).unwrap().unwrap();
+    assert!(matches!(r, HostReply::Refuse { .. }), "{r:?}");
+    assert!(closed_by_host(&mut s));
+    let e = g.last_error(&b1()).expect("last error");
+    assert!(e.contains("saiife-guest/2"), "{e}");
+    assert!(w.requests().is_empty());
+    g.after_off(&b1());
+}
+
+#[test]
+fn oversized_first_frame_is_refused() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.connect(ports::EVENTS);
+    let mut head = vec![0x01];
+    head.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
+    s.write_all(&head).unwrap();
+    let r: HostReply = read_msg(&mut s).unwrap().unwrap();
+    assert!(matches!(r, HostReply::Refuse { .. }), "{r:?}");
+    assert!(closed_by_host(&mut s));
+    assert!(g.last_error(&b1()).is_some());
+    g.after_off(&b1());
+}
+
+#[test]
+fn slow_hello_times_out() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.connect(ports::EVENTS);
+    let t0 = Instant::now();
+    // A trickling guest: one byte of a valid hello every 500 ms.
+    let mut buf = Vec::new();
+    write_msg(&mut buf, &hello_msg(PROTO, false)).unwrap();
+    let mut w2 = s.try_clone().unwrap();
+    thread::spawn(move || {
+        for b in buf {
+            if w2.write_all(&[b]).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+    let mut got = Vec::new();
+    let _ = s.read_to_end(&mut got);
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_secs(9), "{took:?}");
+    assert!(took < Duration::from_secs(13), "{took:?}");
+    assert!(
+        !got.windows(7).any(|w| w == b"welcome"),
+        "a trickled hello was welcomed"
+    );
+    assert!(g.last_error(&b1()).is_some());
+    assert!(w.requests().is_empty());
+    g.after_off(&b1());
+}
+
+#[test]
+fn events_before_hello_are_ignored() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.connect(ports::EVENTS);
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Activity).unwrap();
+    let r: HostReply = read_msg(&mut s).unwrap().unwrap();
+    assert!(matches!(r, HostReply::Refuse { .. }), "{r:?}");
+    assert!(closed_by_host(&mut s));
+    assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    assert!(w.requests().is_empty());
+    // A proper hello afterwards works.
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    g.after_off(&b1());
+}
+
+#[test]
+fn rehello_does_not_resetup() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s1 = w.hello(false);
+    write_msg(&mut s1, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    // The guest reconnects: the old connection is replaced.
+    let mut s2 = w.hello(true);
+    assert!(closed_by_host(&mut s1), "old events connection still open");
+    write_msg(&mut s2, &Event::Started).unwrap();
+    write_msg(&mut s2, &Event::Activity).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Activity]);
+    assert!(g.recv_events(Duration::from_millis(200)).is_empty());
+    assert_eq!(w.requests().len(), 1, "setup was sent again");
+    g.after_off(&b1());
+}
+
+#[test]
+fn restarted_guest_exited_is_queued() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(true);
+    write_msg(&mut s, &Event::Exited { code: None }).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Exited]);
+    assert!(w.requests().is_empty());
+    g.after_off(&b1());
+}
+
+#[test]
+fn setup_failure_is_kept() {
+    let w = World::new(Arc::new(|_r, s| {
+        let _ = write_msg(
+            s,
+            &Reply::Err {
+                why: "chown of /work failed".into(),
+            },
+        );
+    }));
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    wait_for("setup error", T, || g.last_error(&b1()).is_some());
+    let _ = write_msg(&mut s, &Event::Started);
+    assert!(g.recv_events(Duration::from_millis(500)).is_empty());
+    let e = g.last_error(&b1()).unwrap();
+    assert!(e.contains("chown of /work failed"), "{e}");
+    g.after_off(&b1());
+}
+
+#[test]
+fn setup_source_failure_is_kept() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Err("no such template".into()));
+    let mut s = w.hello(false);
+    wait_for("setup error", T, || g.last_error(&b1()).is_some());
+    let _ = write_msg(&mut s, &Event::Started);
+    assert!(g.recv_events(Duration::from_millis(500)).is_empty());
+    assert!(g.last_error(&b1()).unwrap().contains("no such template"));
+    assert!(w.requests().is_empty());
+    g.after_off(&b1());
+}
+
+#[test]
+fn invalid_frame_after_welcome_closes_the_link() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_frame(&mut s, &Frame::Json(serde_json::json!({"t": "nope"}))).unwrap();
+    let _ = write_msg(&mut s, &Event::Started);
+    assert!(closed_by_host(&mut s));
+    assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    g.after_off(&b1());
+}
+
+#[test]
+fn event_flood_is_bounded() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    let mut buf = Vec::new();
+    for i in 0..5000 {
+        let e = if i % 2 == 0 {
+            Event::Activity
+        } else {
+            Event::TurnFinished
+        };
+        write_msg(&mut buf, &e).unwrap();
+    }
+    for _ in 0..2000 {
+        write_msg(&mut buf, &Event::Exited { code: Some(1) }).unwrap();
+    }
+    write_msg(&mut buf, &Event::Activity).unwrap();
+    s.write_all(&buf).unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    // The host drops the connection once it read our EOF.
+    assert!(closed_by_host(&mut s));
+    let ev = g.recv_events(Duration::from_millis(200));
+    assert!(ev.len() <= 8, "{} events queued: {ev:?}", ev.len());
+    let ev: Vec<GuestEvent> = ev.into_iter().map(|(_, e)| e).collect();
+    assert_eq!(ev.first(), Some(&GuestEvent::Ready));
+    assert!(ev.contains(&GuestEvent::Exited));
+    // The last Activity was held back by the rate limit (I1) and comes once
+    // its 5 s window opens.
+    assert_eq!(
+        events_until(&g, 1, Duration::from_secs(7)),
+        vec![GuestEvent::Activity]
+    );
+    g.after_off(&b1());
+}
+
+/// I1: 1000 Activity and TurnFinished frames back to back cost the daemon
+/// one of each, then the newest held back once its window opens: never
+/// more than one Activity per 5 s and one TurnFinished per 1 s.
+#[test]
+fn chatter_is_rate_limited_per_run() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    let t0 = Instant::now();
+    let mut buf = Vec::new();
+    for i in 0..1000 {
+        let e = if i % 2 == 0 {
+            Event::Activity
+        } else {
+            Event::TurnFinished
+        };
+        write_msg(&mut buf, &e).unwrap();
+    }
+    s.write_all(&buf).unwrap();
+    // Within the first second: the first of each, nothing more.
+    let mut first = Vec::new();
+    while t0.elapsed() < Duration::from_millis(800) {
+        first.extend(
+            g.recv_events(Duration::from_millis(50))
+                .into_iter()
+                .map(|(_, e)| e),
+        );
+    }
+    assert_eq!(
+        first,
+        vec![GuestEvent::Activity, GuestEvent::TurnFinished],
+        "the flood's first window"
+    );
+    // The newest held back (a TurnFinished) once its 1 s window opens.
+    assert_eq!(
+        events_until(&g, 1, Duration::from_secs(3)),
+        vec![GuestEvent::TurnFinished]
+    );
+    assert!(g.recv_events(Duration::from_millis(1500)).is_empty());
+    // A reconnecting guest does not reset the limit: the run keeps it.
+    drop(s);
+    let mut s2 = w.hello(true);
+    write_msg(&mut s2, &Event::Activity).unwrap();
+    if t0.elapsed() < Duration::from_millis(4500) {
+        assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    }
+    assert_eq!(
+        events_until(&g, 1, Duration::from_secs(7)),
+        vec![GuestEvent::Activity]
+    );
+    assert!(t0.elapsed() >= Duration::from_secs(5), "{:?}", t0.elapsed());
+    g.after_off(&b1());
+}
+
+/// m2: what a stopped run left queued never reaches the box's next run.
+#[test]
+fn a_stopped_runs_events_do_not_reach_the_next_run() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Exited { code: Some(0) }).unwrap();
+    // The run took the Exited (its terminal says ended); both events are
+    // still queued, nobody received them.
+    wait_for("exited", T, || {
+        g.terminal(&b1(), None).is_ok_and(|b| b.ended)
+    });
+    drop(s);
+    g.after_off(&b1());
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    g.after_off(&b1());
+}
+
+#[test]
+fn prompt_types_text_and_enter() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let _s = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    g.prompt(&b1(), "fix the tests").unwrap();
+    assert_eq!(
+        w.requests()[1],
+        Request::Type {
+            text: "fix the tests".into(),
+            enter: true
+        }
+    );
+    assert_eq!(
+        g.diff(&b1()),
+        Err(GuestError::Unavailable(
+            "the diff is read through the land book".into()
+        ))
+    );
+    g.after_off(&b1());
+}
+
+#[test]
+fn prompt_without_link_is_not_connected() {
+    let w = World::new(ok_handler());
+    let g = VsockGuest::new(Arc::new(Setups(Ok(setup()))), false, me());
+    assert_eq!(g.prompt(&b1(), "x"), Err(GuestError::NotConnected));
+    assert_eq!(g.terminal(&b1(), None), Err(GuestError::NotConnected));
+    // Booted but no hello yet: still not connected.
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert_eq!(g.prompt(&b1(), "x"), Err(GuestError::NotConnected));
+    assert!(w.requests().is_empty());
+    g.after_off(&b1());
+}
+
+fn screen_text(g: &VsockGuest) -> String {
+    let b = g.terminal(&b1(), None).unwrap();
+    b.frames
+        .iter()
+        .flat_map(|f| match f {
+            TermFrame::Snapshot { lines, .. } => lines.clone(),
+            TermFrame::Delta { lines, .. } => lines.iter().map(|(_, l)| l.clone()).collect(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn terminal_serves_screen_frames() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"hello from the box".to_vec())).unwrap();
+    wait_for("screen", T, || {
+        screen_text(&g).contains("hello from the box")
+    });
+    // A second write within 200 ms still shows up (the flush timer).
+    write_frame(&mut p, &Frame::Bytes(b"\r\nsecond line".to_vec())).unwrap();
+    wait_for("flush", T, || {
+        let b = g.terminal(&b1(), Some(0)).unwrap();
+        b.frames.iter().any(|f| match f {
+            TermFrame::Snapshot { lines, .. } => lines.iter().any(|l| l.contains("second line")),
+            TermFrame::Delta { lines, .. } => lines.iter().any(|(_, l)| l.contains("second line")),
+        })
+    });
+    assert!(!g.terminal(&b1(), None).unwrap().ended);
+    g.after_off(&b1());
+    assert!(g.terminal(&b1(), None).unwrap().ended);
+}
+
+#[test]
+fn pty_json_frame_closes_and_reconnect_works() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Json(serde_json::json!({"t": "x"}))).unwrap();
+    assert!(closed_by_host(&mut p));
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"back again".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("back again"));
+    g.after_off(&b1());
+}
+
+#[test]
+fn request_stream_stops_on_false() {
+    let w = World::new(Arc::new(|r, s| {
+        if matches!(r, Request::Export { .. }) {
+            for i in 0..5u8 {
+                if write_frame(s, &Frame::Bytes(vec![i])).is_err() {
+                    return;
+                }
+            }
+        } else {
+            let _ = write_msg(s, &Reply::Ok);
+        }
+    }));
+    let g = w.guest(Ok(setup()));
+    let _s = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    let mut got = Vec::new();
+    g.request_stream(&b1(), &Request::Export { n: 1 }, T, &mut |f| {
+        got.push(f);
+        Ok(got.len() < 2)
+    })
+    .unwrap();
+    assert_eq!(got, vec![Frame::Bytes(vec![0]), Frame::Bytes(vec![1])]);
+    // Until the guest closes: all five.
+    let mut all = 0;
+    g.request_stream(&b1(), &Request::Export { n: 1 }, T, &mut |_f| {
+        all += 1;
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(all, 5);
+    // on_frame's error is the call's error.
+    let e = g
+        .request_stream(&b1(), &Request::Export { n: 1 }, T, &mut |_f| {
+            Err("bad tar".into())
+        })
+        .unwrap_err();
+    assert!(matches!(e, GuestError::Unavailable(m) if m.contains("bad tar")));
+    g.after_off(&b1());
+}
+
+#[test]
+fn request_times_out() {
+    let w = World::new(Arc::new(|_r, _s| thread::sleep(Duration::from_secs(3))));
+    let g = w.guest(Ok(setup()));
+    let _s = w.hello(true);
+    let t0 = Instant::now();
+    let e = g
+        .request(&b1(), &Request::Poweroff, Duration::from_millis(500))
+        .unwrap_err();
+    assert!(matches!(e, GuestError::Unavailable(_)), "{e:?}");
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    g.after_off(&b1());
+}
+
+#[test]
+fn after_off_cleans_up() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"recorded output".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("recorded output"));
+    assert!(g.live_threads() > 0);
+    let t0 = Instant::now();
+    g.after_off(&b1());
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert_eq!(g.live_threads(), 0, "threads still running");
+    assert!(!w.paths.vsock_port(ports::EVENTS).exists());
+    assert!(!w.paths.vsock_port(ports::PTY).exists());
+    assert!(w.paths.vsock().exists(), "vsock.sock belongs to the VMM");
+    assert!(closed_by_host(&mut s));
+    assert!(closed_by_host(&mut p));
+    let cast = std::fs::read_to_string(w.paths.dir.join("term.cast")).unwrap();
+    assert!(
+        cast.lines().next().unwrap().contains("\"version\":2"),
+        "{cast}"
+    );
+    assert!(cast.contains("recorded output"), "{cast}");
+    assert_eq!(g.prompt(&b1(), "x"), Err(GuestError::NotConnected));
+    // A second after_off is harmless.
+    g.after_off(&b1());
+}
+
+#[test]
+fn recv_events_times_out_empty() {
+    let g = VsockGuest::new(Arc::new(Setups(Ok(setup()))), false, me());
+    let t0 = Instant::now();
+    assert!(g.recv_events(Duration::from_millis(300)).is_empty());
+    assert!(t0.elapsed() >= Duration::from_millis(290));
+    assert!(t0.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn resize_reaches_guest_and_screen() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let _s = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    g.resize(&b1(), 30, 100).unwrap();
+    assert_eq!(
+        w.requests()[1],
+        Request::Resize {
+            rows: 30,
+            cols: 100
+        }
+    );
+    let b = g.terminal(&b1(), None).unwrap();
+    assert!(
+        b.frames.iter().any(|f| matches!(
+            f,
+            TermFrame::Snapshot {
+                rows: 30,
+                cols: 100,
+                ..
+            }
+        )),
+        "{b:?}"
+    );
+    g.after_off(&b1());
+}
+
+#[test]
+fn reboot_resets_the_run() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    g.after_off(&b1());
+    g.before_boot(&b1(), &w.paths).unwrap();
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    assert_eq!(w.requests().len(), 2);
+    g.after_off(&b1());
+}
+
+/// Says a hello on a fresh events connection and returns the host's answer
+/// (`None` when the host closed without one).
+fn try_hello(w: &World, set_up: bool) -> (UnixStream, Option<HostReply>) {
+    let mut s = w.connect(ports::EVENTS);
+    let _ = write_msg(&mut s, &hello_msg(PROTO, set_up));
+    let r = read_msg::<HostReply>(&mut s).ok().flatten();
+    (s, r)
+}
+
+#[test]
+fn setup_flood_is_bounded() {
+    // The guest's control end accepts the setup and never answers.
+    let w = World::new(Arc::new(|_r, _s| thread::sleep(Duration::from_secs(30))));
+    let g = w.guest(Ok(setup()));
+    let _first = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    let (_s, r) = try_hello(&w, false);
+    assert_eq!(
+        r,
+        Some(HostReply::Refuse {
+            why: "setup already in progress".into()
+        })
+    );
+    // Silent connections hold hello threads; hello floods reconnect.
+    let mut held = Vec::new();
+    let mut max_live = 0;
+    for i in 0..60 {
+        let mut s = w.connect(ports::EVENTS);
+        if i % 3 != 0 {
+            let _ = write_msg(&mut s, &hello_msg(PROTO, false));
+        }
+        held.push(s);
+        max_live = max_live.max(g.live_threads());
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    max_live = max_live.max(g.live_threads());
+    // Two acceptors plus at most eight connection handlers.
+    assert!(max_live <= 10, "{max_live} threads");
+    let setups = w
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::Setup(_)))
+        .count();
+    assert_eq!(setups, 1, "setup sent {setups} times");
+    let t0 = Instant::now();
+    g.after_off(&b1());
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert_eq!(g.live_threads(), 0);
+}
+
+#[test]
+fn setup_hello_after_setup_is_refused() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    let (_s2, r) = try_hello(&w, false);
+    assert_eq!(
+        r,
+        Some(HostReply::Refuse {
+            why: "already set up".into()
+        })
+    );
+    // The refused hello did not replace the session.
+    write_msg(&mut s, &Event::Activity).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Activity]);
+    assert_eq!(w.requests().len(), 1);
+    g.after_off(&b1());
+}
+
+#[test]
+fn forget_drops_only_a_stopped_box() {
+    let w = World::new(ok_handler());
+    let g = VsockGuest::new(Arc::new(Setups(Ok(setup()))), false, me());
+    assert!(!g.forget(&b1()));
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert!(!g.forget(&b1()));
+    assert!(g.terminal(&b1(), None).is_ok());
+    g.after_off(&b1());
+    assert!(g.forget(&b1()));
+    assert_eq!(g.terminal(&b1(), None), Err(GuestError::NotConnected));
+    assert!(!g.forget(&b1()));
+}
+
+#[test]
+fn cast_goes_to_the_configured_dir() {
+    let w = World::new(ok_handler());
+    let base = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    let state = tempfile::Builder::new()
+        .prefix("s")
+        .tempdir_in(base)
+        .unwrap();
+    let dir = state.path().to_path_buf();
+    let g = VsockGuest::with_cast_path(
+        Arc::new(Setups(Ok(setup()))),
+        false,
+        me(),
+        Arc::new(move |id: &BoxId, _p: &BoxPaths| dir.join(format!("{}.cast", id.as_str()))),
+    );
+    g.before_boot(&b1(), &w.paths).unwrap();
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"kept apart".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("kept apart"));
+    g.after_off(&b1());
+    let cast = std::fs::read_to_string(state.path().join("b1.cast")).unwrap();
+    assert!(cast.contains("kept apart"), "{cast}");
+    assert!(std::fs::symlink_metadata(w.paths.dir.join("term.cast")).is_err());
+}
+
+#[test]
+fn over_cap_rejections_are_throttled() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    // Eight silent hellos hold every connection slot (10 s each).
+    let held: Vec<UnixStream> = (0..8).map(|_| w.connect(ports::EVENTS)).collect();
+    wait_for("slots held", T, || g.live_threads() == 10);
+    let n = 20;
+    let t0 = Instant::now();
+    let mut burst: Vec<UnixStream> = (0..n).map(|_| w.connect(ports::EVENTS)).collect();
+    for s in &mut burst {
+        assert!(closed_by_host(s), "an over-cap connection was kept");
+    }
+    let took = t0.elapsed();
+    // One rejection per 20 ms at most.
+    assert!(
+        took >= Duration::from_millis(20 * (n as u64 - 1)),
+        "{n} rejections in {took:?}"
+    );
+    assert!(g.live_threads() <= 10);
+    drop(held);
+    g.after_off(&b1());
+}
+
+#[test]
+fn failed_setup_allows_retry() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let w = World::new(Arc::new(move |_r, s| {
+        let reply = if c.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::Err {
+                why: "chown of /work failed".into(),
+            }
+        } else {
+            Reply::Ok
+        };
+        let _ = write_msg(s, &reply);
+    }));
+    let g = w.guest(Ok(setup()));
+    let _s1 = w.hello(false);
+    wait_for("setup error", T, || g.last_error(&b1()).is_some());
+    // A later bad hello does not hide the setup failure.
+    let (_bad, r) = {
+        let mut s = w.connect(ports::EVENTS);
+        write_msg(&mut s, &hello_msg("saiife-guest/9", false)).unwrap();
+        let r = read_msg::<HostReply>(&mut s).ok().flatten();
+        (s, r)
+    };
+    assert!(matches!(r, Some(HostReply::Refuse { .. })), "{r:?}");
+    let e = g.last_error(&b1()).unwrap();
+    assert!(e.contains("chown of /work failed"), "{e}");
+    // A retry is welcomed and set up again (after the 1 s setup floor).
+    let mut s2 = hello_after_floor(&w);
+    wait_for("second setup", T, || w.requests().len() == 2);
+    assert!(matches!(w.requests()[1], Request::Setup(_)));
+    write_msg(&mut s2, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    g.after_off(&b1());
+}
+
+/// Ruling R14 (plan 38, Task 8): a set_up:true hello on a fresh run never
+/// yields Ready, but the daemon can ask whether the guest came back set up
+/// with its agent alive (a restored snapshot); an Exited ends that.
+#[test]
+fn restored_is_a_set_up_hello_without_exit() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    assert!(!GuestLink::restored(&*g, &b1()), "no hello yet");
+    let mut s = w.hello(true);
+    wait_for("restored", T, || GuestLink::restored(&*g, &b1()));
+    write_msg(&mut s, &Event::Started).unwrap();
+    write_msg(&mut s, &Event::Exited { code: None }).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Exited]);
+    assert!(!GuestLink::restored(&*g, &b1()), "the agent exited");
+    g.after_off(&b1());
+    assert!(!GuestLink::restored(&*g, &b1()), "the run is off");
+}
+
+#[test]
+fn a_fresh_setup_is_not_restored() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    assert!(!GuestLink::restored(&*g, &b1()));
+    g.after_off(&b1());
+}
+
+/// The trait's last_error and forget reach the VsockGuest's own.
+#[test]
+fn guest_link_last_error_and_forget() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Err("no such template".into()));
+    let _s = w.hello(false);
+    wait_for("setup error", T, || {
+        GuestLink::last_error(&*g, &b1()).is_some()
+    });
+    assert!(GuestLink::last_error(&*g, &b1())
+        .unwrap()
+        .contains("no such template"));
+    GuestLink::forget(&*g, &b1());
+    assert!(g.last_error(&b1()).is_some(), "kept while the run is on");
+    g.after_off(&b1());
+    GuestLink::forget(&*g, &b1());
+    assert_eq!(GuestLink::last_error(&*g, &b1()), None);
+}
+
+/// Ruling R22: a cold boot is a new run; its fresh init asks for the setup
+/// (set_up:false) and gets it, and its Started is a Ready again.
+#[test]
+fn cold_boot_sets_up_again() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    drop(s);
+    g.after_off(&b1());
+    g.before_boot(&b1(), &w.paths).unwrap();
+    let mut s = w.hello(false);
+    wait_for("second setup", T, || w.requests().len() == 2);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    assert!(!GuestLink::restored(&*g, &b1()));
+    g.after_off(&b1());
+}
+
+/// Ruling R22: within a run, a restarted guest init (its events session
+/// ended with the old process) is set up again; Ready stays once per run.
+#[test]
+fn restarted_init_in_run_is_set_up_again() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    write_msg(&mut s, &Event::Started).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Ready]);
+    // While the first session is live, a set_up:false hello is refused.
+    let (_x, r) = try_hello(&w, false);
+    assert_eq!(
+        r,
+        Some(HostReply::Refuse {
+            why: "already set up".into()
+        })
+    );
+    // The old init process dies: its session ends.
+    drop(s);
+    let mut s2 = hello_after_floor(&w);
+    wait_for("second setup", T, || w.requests().len() == 2);
+    assert!(matches!(w.requests()[1], Request::Setup(_)));
+    write_msg(&mut s2, &Event::Started).unwrap();
+    write_msg(&mut s2, &Event::Activity).unwrap();
+    assert_eq!(events_until(&g, 1, T), vec![GuestEvent::Activity]);
+    g.after_off(&b1());
+}
+
+/// A set_up:false hello retried until welcomed (the setup floor and the end
+/// of the earlier session pass), as a restarting guest init does.
+fn hello_after_floor(w: &World) -> UnixStream {
+    let end = Instant::now() + T;
+    loop {
+        let (s, r) = try_hello(w, false);
+        if r == Some(HostReply::Welcome {
+            proto: PROTO.into(),
+        }) {
+            return s;
+        }
+        assert!(Instant::now() < end, "never welcomed again: {r:?}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// T8-R22: setups of one run are at least 1 s apart; a fresh init that
+/// would be set up sooner is refused ("setup too soon") and its retry a
+/// second later is set up.
+#[test]
+fn setups_are_a_second_apart() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let t0 = Instant::now();
+    let s = w.hello(false);
+    wait_for("setup", T, || w.requests().len() == 1);
+    drop(s);
+    // The session ends at once; the next set_up:false hello comes too soon.
+    let mut too_soon = 0;
+    let s2 = loop {
+        let (s2, r) = try_hello(&w, false);
+        match r {
+            Some(HostReply::Welcome { .. }) => break s2,
+            Some(HostReply::Refuse { why }) if why == "setup too soon" => too_soon += 1,
+            Some(HostReply::Refuse { why }) if why == "already set up" => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(t0.elapsed() < T, "never welcomed again");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(too_soon > 0, "no hello was refused as too soon");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1000),
+        "{:?}",
+        t0.elapsed()
+    );
+    wait_for("second setup", T, || w.requests().len() == 2);
+    // A flood of fresh inits within the floor makes no setups.
+    drop(s2);
+    let t1 = Instant::now();
+    while t1.elapsed() < Duration::from_millis(700) {
+        let _ = try_hello(&w, false);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let setups = w
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::Setup(_)))
+        .count();
+    assert_eq!(setups, 2, "setup sent {setups} times");
+    g.after_off(&b1());
+}
+
+/// m3: a box's next run goes on numbering its terminal frames after the
+/// earlier run's, so a reader's `after` stays monotonic.
+#[test]
+fn terminal_seq_goes_on_across_runs() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"first run".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("first run"));
+    g.after_off(&b1());
+    let last = g.terminal(&b1(), None).unwrap().next;
+    assert!(last >= 1);
+    g.before_boot(&b1(), &w.paths).unwrap();
+    assert!(g.terminal(&b1(), Some(last)).unwrap().frames.is_empty());
+    let mut p = w.connect(ports::PTY);
+    write_frame(&mut p, &Frame::Bytes(b"second run".to_vec())).unwrap();
+    wait_for("screen", T, || screen_text(&g).contains("second run"));
+    let b = g.terminal(&b1(), Some(last)).unwrap();
+    assert!(
+        matches!(b.frames.first(), Some(TermFrame::Snapshot { seq, .. }) if *seq == last + 1),
+        "{b:?}"
+    );
+    g.after_off(&b1());
+}
+
+/// m5: the guest channel unlinks only its own listeners; the gateway's
+/// (egress, model) are left for the gateway's own after_off.
+#[test]
+fn after_off_leaves_the_gateways_sockets() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let eg = saiife_boxhost::vsock::listen(&w.paths, ports::EGRESS, false).unwrap();
+    let md = saiife_boxhost::vsock::listen(&w.paths, ports::MODEL, false).unwrap();
+    g.after_off(&b1());
+    assert!(!w.paths.vsock_port(ports::EVENTS).exists());
+    assert!(!w.paths.vsock_port(ports::PTY).exists());
+    assert!(w.paths.vsock_port(ports::EGRESS).exists());
+    assert!(w.paths.vsock_port(ports::MODEL).exists());
+    drop((eg, md));
+}

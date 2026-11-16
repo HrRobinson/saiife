@@ -13,6 +13,9 @@ pub const ROOT_DISK: &str = "root.qcow2";
 /// guest. Spawn places it in the record dir; `ChVmm::create` moves it here
 /// (`repo_handover`).
 pub const REPO_DISK: &str = "repo.img";
+/// Daemon-trusted state: the box's terminal recording (plan 38, R15), in
+/// its record dir only (`layout::record_dir`).
+pub const TERM_CAST: &str = "term.cast";
 /// Daemon-trusted state: the base manifest of the repo disk (plan 37). It
 /// lives in the box's record dir only (`layout::record_disk_place`), never
 /// in a runtime dir, so [`BoxPaths`] has no helper for it.

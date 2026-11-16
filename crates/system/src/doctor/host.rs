@@ -955,8 +955,9 @@ fn boxes_with(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Ve
 #[cfg(target_os = "linux")]
 fn boxes_checks(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Check> {
     use crate::boxes_install::{
-        BOXES_DIR, BOX_STATE_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR,
+        box_unit_path, BOXES_DIR, BOX_STATE_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR,
     };
+    use saiife_boxes::template::TIERS;
     use saiife_boxhost::layout::{image_records_in, Layout as BoxLayout};
     use saiife_boxhost::preflight;
     use saiife_boxhost::tools::Tools;
@@ -965,7 +966,24 @@ fn boxes_checks(ctx: &Ctx, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> 
     let at = |p: &Path| ctx.layout.try_at(p).unwrap_or_else(|_| p.to_path_buf());
     let locked = ctx.locked();
     let (layout, image_records) = if locked {
-        if fs::symlink_metadata(ctx.layout.at(BOX_UNIT_PATH)).is_err() {
+        let missing: Vec<String> = TIERS
+            .iter()
+            .map(box_unit_path)
+            .filter(|p| fs::symlink_metadata(ctx.layout.at(p)).is_err())
+            .collect();
+        if !missing.is_empty() && missing.len() < TIERS.len() {
+            return vec![Check::new(
+                "boxes.installed",
+                Status::Fail,
+                TITLE,
+                format!(
+                    "box units missing ({}): {}",
+                    missing.join(", "),
+                    preflight::INSTALL_HINT
+                ),
+            )];
+        }
+        if !missing.is_empty() {
             return vec![Check::new(
                 "boxes.installed",
                 Status::Info,
@@ -1967,10 +1985,27 @@ mod tests {
 
     #[test]
     fn boxes_installed_reports_each_check() {
-        use crate::boxes_install::{BOXES_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR};
+        use crate::boxes_install::{box_unit_path, BOXES_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR};
+        use saiife_boxes::template::TIERS;
         let t = T::new(false);
         fs::create_dir_all(t.at("/etc/systemd/system")).unwrap();
-        fs::write(t.at(BOX_UNIT_PATH), "[Unit]\n").unwrap();
+        // one tier unit missing: a broken install, not "not installed"
+        for tier in &TIERS[1..] {
+            fs::write(t.at(&box_unit_path(tier)), "[Unit]\n").unwrap();
+        }
+        let r = t.doctor();
+        assert_eq!(
+            status(&r, "boxes.installed"),
+            Status::Fail,
+            "{}",
+            r.to_text()
+        );
+        assert!(
+            r.to_text().contains("saiife-box-s@.service"),
+            "{}",
+            r.to_text()
+        );
+        fs::write(t.at(&box_unit_path(&TIERS[0])), "[Unit]\n").unwrap();
         for d in [BOXES_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR] {
             fs::create_dir_all(t.at(d)).unwrap();
         }
@@ -2013,7 +2048,7 @@ mod tests {
     #[test]
     fn locked_boxes_unreadable_as_a_user_are_not_checked() {
         use crate::boxes_install::{
-            BOXES_DIR, BOX_STATE_DIR, BOX_UNIT_PATH, IMAGES_DIR, VAULT_DIR, VMM_DIR,
+            box_unit_path, BOXES_DIR, BOX_STATE_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR,
         };
         if rustix::process::geteuid().is_root() {
             return; // root reads a 0000 dir: nothing to test
@@ -2021,7 +2056,9 @@ mod tests {
         let setup = |as_root: bool| {
             let t = T::new(as_root);
             fs::create_dir_all(t.at("/etc/systemd/system")).unwrap();
-            fs::write(t.at(BOX_UNIT_PATH), "[Unit]\n").unwrap();
+            for tier in saiife_boxes::template::TIERS {
+                fs::write(t.at(&box_unit_path(tier)), "[Unit]\n").unwrap();
+            }
             for d in [BOXES_DIR, IMAGES_DIR, VAULT_DIR, VMM_DIR] {
                 fs::create_dir_all(t.at(d)).unwrap();
             }

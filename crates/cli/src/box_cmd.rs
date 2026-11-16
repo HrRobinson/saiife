@@ -86,6 +86,9 @@ pub enum BoxAction {
         #[command(subcommand)]
         action: crate::box_vmm_cmd::VmmAction,
     },
+    /// Watch a box's terminal, read-only (q quits). Without a terminal it
+    /// prints the current screen once.
+    Attach { id: String },
     /// Base images for boxes.
     Image {
         #[command(subcommand)]
@@ -119,6 +122,9 @@ pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
 
 #[cfg(unix)]
 pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
+    if let BoxAction::Attach { id } = &action {
+        return imp::attach(config.as_deref(), id);
+    }
     match imp::go(config.as_deref(), action) {
         Ok(()) => ExitCode::SUCCESS,
         Err(imp::Stop::Refused(m)) => {
@@ -387,6 +393,27 @@ mod imp {
         }
     }
 
+    /// `box attach`: the viewer owns its exit code.
+    pub(super) fn attach(config: Option<&Path>, id: &str) -> std::process::ExitCode {
+        let fail = |m: String, code: u8| {
+            eprintln!("saiife: {}", sanitize(&m));
+            std::process::ExitCode::from(code)
+        };
+        let Ok(id) = saiife_wire::source::BoxId::parse(id) else {
+            return fail(format!("{id:?} is not a box id"), 2);
+        };
+        let t = match broker::resolve_here(config) {
+            Ok(t) => t,
+            Err(m) => return fail(m, 5),
+        };
+        let mut c = match broker::connect(&t, Instant::now() + CONNECT_TIMEOUT) {
+            Ok(c) => c,
+            Err(e) => return fail(broker::unreachable(&t, &e), 5),
+        };
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        crate::box_attach::run(&mut c, &id, tty)
+    }
+
     pub(super) fn go(config: Option<&Path>, action: BoxAction) -> Result<(), Stop> {
         if let BoxAction::Vmm { action } = action {
             return match crate::box_vmm_cmd::run(config, action) {
@@ -477,7 +504,9 @@ mod imp {
                     print_templates(&a);
                 }
             }
-            BoxAction::Vmm { .. } | BoxAction::Image { .. } => unreachable!("handled above"),
+            BoxAction::Vmm { .. } | BoxAction::Image { .. } | BoxAction::Attach { .. } => {
+                unreachable!("handled above")
+            }
             BoxAction::Gc => {
                 let a = call(&t, "box.gc", Args::new())?;
                 let removed: Vec<String> = a

@@ -16,6 +16,8 @@ path = "src/bin/saiife-fake-fido.rs"
 required-features = ["fake-fido"]
 
 [dependencies]
+# Shared text-safety table (tokio-free).
+saiife-wire = { path = "../wire" }
 saiife-guard = { path = "../guard" }
 saiife-audit = { path = "../audit" }
 saiife-agents = { path = "../agents" }
@@ -28,6 +30,8 @@ saiife-broker = { path = "../broker" }
 saiife-mcp = { path = "../mcp" }
 # `saiife daemon --user` opens the keychain that holds the vault key.
 saiife-keychain = { path = "../keychain" }
+# `saiife __guest`: the box guest init (runs inside the VM; tokio-free).
+saiife-guest = { path = "../guest" }
 # `saiife dev`: compose stacks behind one local HTTPS proxy (plans 22 to 24).
 saiife-dev = { path = "../dev" }
 # `saiife mcp`: the JSON-RPC/MCP codec and types (tokio-free).
@@ -78,7 +82,7 @@ saiife-wire = { path = "../wire" }
 # The random name of a spawn's staging dir; the version saiife-boxhost uses.
 ring = "=0.17.14"
 # Signals for the worker fault seam (debug builds); no unsafe calls.
-rustix = { version = "1", features = ["process", "termios", "fs"] }
+rustix = { version = "1", features = ["process", "termios", "fs", "event"] }
 base64 = "=0.23.1"
 # A runtime for `saiife workspace serve`, and the SIGINT wait of `workspace pair`
 # (the version saiife-link uses).

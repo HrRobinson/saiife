@@ -17,8 +17,10 @@
 #
 # Run it in personal mode first, then again after
 #   sudo saiife system install --boxes
-# in locked mode (the fragment sees /etc/systemd/system/saiife-box@.service
-# and adds the locked checks).
+# in locked mode (the fragment sees /etc/systemd/system/saiife-box-m@.service
+# and adds the locked checks). The default template (2 vCPUs, 4 GiB) runs
+# in the size tier m unit; SAIIFE_SMOKE_TIER names another tier when the
+# smoke's template is bigger.
 #
 # Before plan 38 a box never reaches `running` (that needs the guest's Ready):
 # it is discarded by the 90 s boot timeout with an error naming it, which is
@@ -42,7 +44,8 @@
 #     through the unit's read-only bind of vault/<id>.snap);
 #   - locked: the unit's box dir bind is writable under ProtectSystem=strict.
 
-P35_UNIT=/etc/systemd/system/saiife-box@.service
+P35_TIER=${SAIIFE_SMOKE_TIER:-m}
+P35_UNIT=/etc/systemd/system/saiife-box-$P35_TIER@.service
 P35_BOOT_LIMIT_S=90
 P35_STOP_LIMIT_S=95
 P35_BOX=""
@@ -151,11 +154,14 @@ p35_wait_vmm() {
   return 1
 }
 
+# p35_unit BOX: the box's systemd unit (its size tier's template)
+p35_unit() { printf 'saiife-box-%s@%s.service\n' "$P35_TIER" "$1"; }
+
 # p35_pid BOX: the VMM's pid, read only (never signalled)
 p35_pid() {
   local pid=""
   if [ -n "$P35_LOCKED" ]; then
-    pid=$(systemctl show -p MainPID --value "saiife-box@$1.service" 2>/dev/null || true)
+    pid=$(systemctl show -p MainPID --value "$(p35_unit "$1")" 2>/dev/null || true)
   else
     local rec
     rec="$(p35_vault_dir)/$1.pid"
@@ -230,7 +236,7 @@ p35_seen() {
 # (systemctl show: read only)
 p35_unit_off() {
   local out active main
-  out=$(systemctl show -p ActiveState,MainPID "saiife-box@$1.service" 2>/dev/null) || return 1
+  out=$(systemctl show -p ActiveState,MainPID "$(p35_unit "$1")" 2>/dev/null) || return 1
   active=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')
   main=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p')
   case "$active" in
@@ -310,9 +316,19 @@ p35_record_snapshot() {
 # p35_refused CMD...: CMD fails
 p35_refused() { ! "$@" >/dev/null 2>&1; }
 
+# locked: the unit is capped at its tier (m: 4096 + 256 MiB, no swap, 200%)
+p35_unit_capped() {
+  local out
+  out=$(systemctl show -p MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec "$(p35_unit "$1")" 2>/dev/null) || return 1
+  [ "$P35_TIER" != m ] && return 0
+  printf '%s\n' "$out" | grep -qx 'MemoryMax=4563402752' &&
+    printf '%s\n' "$out" | grep -qx 'MemorySwapMax=0' &&
+    printf '%s\n' "$out" | grep -qx 'CPUQuotaPerSecUSec=2s'
+}
+
 # locked: the unit runs as saiife-box
 p35_unit_user() {
-  [ "$(systemctl show -p User --value "saiife-box@$1.service" 2>/dev/null)" = saiife-box ]
+  [ "$(systemctl show -p User --value "$(p35_unit "$1")" 2>/dev/null)" = saiife-box ]
 }
 
 smoke_vmm() {
@@ -345,6 +361,7 @@ smoke_vmm() {
   check "ch.log shows Landlock on (no landlock error)" p35_landlock_on "$P35_BOX"
   if [ -n "$P35_LOCKED" ]; then
     check "locked: the unit runs as saiife-box" p35_unit_user "$P35_BOX"
+    check "locked: the unit is capped at its size tier" p35_unit_capped "$P35_BOX"
   fi
   if [ "${RECORD:-}" = 1 ]; then
     check "RECORD=1: API fixtures captured" p35_record "$P35_BOX"
@@ -403,15 +420,20 @@ smoke_vmm() {
   fi
 
   if [ -n "$P35_LOCKED" ]; then
-    # polkit lets only the daemon user start saiife-box@b<digits> units:
-    # neither you nor the daemon user can start a unit of another shape
-    check "locked: you cannot start saiife-box@x1.service (polkit refuses)" \
-      p35_refused systemctl start --no-ask-password saiife-box@x1.service
+    # polkit lets only the daemon user start saiife-box-<tier>@b<digits>
+    # units: neither you nor the daemon user can start a unit of another
+    # shape (a bad id, or the old untiered template)
+    check "locked: you cannot start saiife-box-m@x1.service (polkit refuses)" \
+      p35_refused systemctl start --no-ask-password saiife-box-m@x1.service
     if [ "${SAIIFE_SMOKE_SUDO_DAEMON:-}" = 1 ]; then
-      check "locked: the daemon user cannot start saiife-box@x1.service" \
-        p35_refused sudo -n -u saiife systemctl start --no-ask-password saiife-box@x1.service
+      check "locked: the daemon user cannot start saiife-box-m@x1.service" \
+        p35_refused sudo -n -u saiife systemctl start --no-ask-password saiife-box-m@x1.service
+      # proves polkit only on a host upgraded from the untiered unit; on a
+      # fresh install the unit does not exist
+      check "locked: the daemon user cannot start saiife-box@b1.service" \
+        p35_refused sudo -n -u saiife systemctl start --no-ask-password saiife-box@b1.service
     else
-      check "locked: the daemon user cannot start saiife-box@x1.service (owner step: rerun with SAIIFE_SMOKE_SUDO_DAEMON=1)" false
+      check "locked: the daemon user cannot start saiife-box-m@x1.service (owner step: rerun with SAIIFE_SMOKE_SUDO_DAEMON=1)" false
     fi
   fi
   p35_log "owner checks (by hand): snapshot names/VmConfig vs check_config, restore from the vault copy under Landlock, the unit's writable box dir bind"

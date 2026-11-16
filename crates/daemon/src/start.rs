@@ -1031,17 +1031,18 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     };
     // The recovery's state changes are `box` records, written with the
     // start records below (R29).
-    let (box_manager, box_template_warnings, box_recovered, box_audit, box_disk_root) = match boxes
-    {
-        Some(b) => (
-            Some(b.manager),
-            b.template_warnings,
-            b.changes,
-            Some(b.audit),
-            Some(b.disk_root),
-        ),
-        None => (None, Vec::new(), Vec::new(), None, None),
-    };
+    let (box_manager, box_template_warnings, box_recovered, box_audit, box_disk_root, box_on_ctx) =
+        match boxes {
+            Some(b) => (
+                Some(b.manager),
+                b.template_warnings,
+                b.changes,
+                Some(b.audit),
+                Some(b.disk_root),
+                b.on_ctx,
+            ),
+            None => (None, Vec::new(), Vec::new(), None, None, None),
+        };
     // The base image store (plan 36) whenever this build and mode have
     // boxes, with or without a manager: a failed preflight for want of a
     // default image is mended by an import.
@@ -1177,6 +1178,12 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     ctx.mcp.attach(Arc::downgrade(&ctx));
     if let Some(a) = &box_audit {
         a.attach(&ctx);
+    }
+    // Real boxes (plan 38): the box gateway's hook (until now every boot
+    // failed closed) and the guest event forwarder, on this runtime. No box
+    // boots before `serve` runs the tick and the box ops.
+    if let Some(wire) = box_on_ctx {
+        wire(&ctx, rt.handle());
     }
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
     // The service's own judgment of each co-signed call (plan 21), for the

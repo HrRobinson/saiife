@@ -1,7 +1,9 @@
 //! `saiife __box-vmm <dir> [--locked]` (plan 35, Task 4): reads the box's
-//! `vm.json`, checks every path in it, verifies the pinned binaries, then
-//! execs Cloud Hypervisor with stdout and stderr in `ch.log`. Nothing runs
-//! unless every check passed. Exit 3: refused. Exit 4: exec failed.
+//! `vm.json` (written by the daemon at each boot, in the VMM-writable
+//! runtime dir; locked, one its own user owns is refused), refuses Landlock
+//! off and sizes above the template ceilings, checks every path in it,
+//! verifies the pinned binaries, then execs Cloud Hypervisor with stdout
+//! and stderr in `ch.log`. Nothing runs unless every check passed. Exit 3: refused. Exit 4: exec failed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,7 +70,13 @@ mod imp {
         };
         let allowed = Allowed::for_layout(&layout);
         let paths = BoxPaths::new(dir);
-        let spec = launch::read_spec(&paths)?;
+        // locked: the daemon wrote vm.json; one this (VMM) user owns is not
+        // the daemon's
+        let me = rustix::process::geteuid().as_raw();
+        let spec = launch::read_spec_owned(&paths, locked.then_some(me))?;
+        // vm.json is in the VMM-writable runtime dir: fail closed on a
+        // spec no daemon writes, before anything else
+        launch::check_limits(&spec)?;
         launch::check_spec(&spec, &paths, &allowed)?;
         let tools = Tools::system(&layout.vmm).with_env(&env);
         let ch = tools.path(Tool::Ch).to_path_buf();

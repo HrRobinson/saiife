@@ -2,9 +2,12 @@
 //! guest events, the periodic tick, recovery after a daemon restart and gc.
 //!
 //! One `Mutex` guards every record and every `Store` call (the store is
-//! single-writer by contract). It is held across VMM and guest calls, which
-//! the trait contracts bound to about a second. Time comes from the injected
-//! [`Clock`]; the manager never reads the system clock.
+//! single-writer by contract). It is held across VMM calls, which the trait
+//! contract bounds to about a second, but never across a guest call: a
+//! prompt's timing is the guest's, so it is taken out under the lock, sent
+//! with the lock released and its outcome recorded under the lock again
+//! (only while the box's send is still the one in flight). Time comes from
+//! the injected [`Clock`]; the manager never reads the system clock.
 //!
 //! Each state change is saved before the method returns. Two saves come
 //! before any VMM work and are strict: spawn's first save (on failure the
@@ -40,6 +43,8 @@ use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
 
 /// No `Ready` this long after admission → the boot failed.
 pub const BOOT_TIMEOUT_SECS: u64 = 90;
+/// The `why` (and error) of a box the boot timeout ended.
+pub const WHY_BOOT_TIMED_OUT: &str = "boot timed out";
 /// A finished turn with no activity for this long → `Done`.
 pub const DONE_IDLE_SECS: u64 = 30;
 /// Idle stop for a box whose template was deleted.
@@ -143,6 +148,18 @@ struct Inner {
     /// lock: their dirs have no record yet, and gc must not take them for
     /// orphans.
     placing: BTreeSet<BoxId>,
+    /// Boxes with a prompt out to the guest (sent with the lock released),
+    /// each with its send's token. One at a time per box; a requeue or a
+    /// discard drops the entry, so a late outcome changes nothing.
+    prompting: BTreeMap<BoxId, u64>,
+    next_token: u64,
+}
+
+/// A prompt taken out under the lock, to send once it is released.
+struct Outgoing {
+    id: BoxId,
+    text: String,
+    token: u64,
 }
 
 impl Inner {
@@ -190,6 +207,40 @@ impl Inner {
         let s = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         s
+    }
+
+    /// Marks a send to `id` in flight; `None` while one already is.
+    fn claim_send(&mut self, id: &BoxId) -> Option<u64> {
+        if self.prompting.contains_key(id) {
+            return None;
+        }
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
+        self.prompting.insert(id.clone(), token);
+        Some(token)
+    }
+
+    /// Ends the send `token` to `id`: `true` when it was still the box's
+    /// send in flight (nothing requeued or discarded the box meanwhile).
+    fn end_send(&mut self, id: &BoxId, token: u64) -> bool {
+        if self.prompting.get(id) == Some(&token) {
+            self.prompting.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `r`'s pending prompt, to send with the lock released. It stays in
+    /// the record (and on disk) until the send's outcome is recorded.
+    fn claim_pending(&mut self, r: &BoxRecord) -> Option<Outgoing> {
+        let text = r.pending_prompt.clone()?;
+        let token = self.claim_send(&r.id)?;
+        Some(Outgoing {
+            id: r.id.clone(),
+            text,
+            token,
+        })
     }
 }
 
@@ -252,6 +303,8 @@ impl Manager {
             records: BTreeMap::new(),
             next_seq: 1,
             placing: BTreeSet::new(),
+            prompting: BTreeMap::new(),
+            next_token: 0,
         };
         let mut max_seq = 0;
         let mut changes = Vec::new();
@@ -761,6 +814,8 @@ impl Manager {
             g.put(r.clone())?;
             return Ok(change(&r, from, "discard"));
         }
+        // A prompt still out to the box records nothing when it ends.
+        g.prompting.remove(id);
         if let Err(e) = g.store.remove(id) {
             // Keep it as a Discarded record so gc retries.
             let _ = g.put(r);
@@ -782,13 +837,16 @@ impl Manager {
         Ok(change(&r, from, "done"))
     }
 
-    /// Steer a Running or Paused box (R3).
+    /// Steer a Running or Paused box (R3). The state is checked under the
+    /// lock; the message is sent with it released.
     pub fn say(&self, id: &BoxId, msg: &str) -> Result<(), BoxError> {
         check_text(msg, MAX_STEER_BYTES)?;
-        let g = self.lock();
-        let r = g.get(id)?;
-        if !matches!(r.state, BoxState::Running | BoxState::Paused) {
-            return Err(BoxError::WrongState { state: r.state });
+        {
+            let g = self.lock();
+            let r = g.get(id)?;
+            if !matches!(r.state, BoxState::Running | BoxState::Paused) {
+                return Err(BoxError::WrongState { state: r.state });
+            }
         }
         self.guest.prompt(id, msg).map_err(BoxError::from)
     }
@@ -806,12 +864,29 @@ impl Manager {
             return Err(BoxError::WrongState { state: from });
         }
         let why = if r.vm_on {
-            self.guest.prompt(id, comment).map_err(BoxError::from)?;
-            r.state = transition(from, Event::Revise)?;
+            let to = transition(from, Event::Revise)?;
+            let token = g.claim_send(id).ok_or_else(|| {
+                BoxError::Unavailable("a prompt to the box is still being sent".into())
+            })?;
+            // Sent with the lock released; the box is re-read after.
+            drop(g);
+            let sent = self.guest.prompt(id, comment);
+            g = self.lock();
+            let ours = g.end_send(id, token);
+            sent.map_err(BoxError::from)?;
+            r = g.get(id)?.clone();
+            // The box moved on while the comment was out (stopped, requeued
+            // or discarded): it is not revived.
+            if !ours || r.state != from || !r.vm_on {
+                return Err(BoxError::WrongState { state: r.state });
+            }
+            r.state = to;
             r.turn_finished_at = None;
             r.last_activity = now;
             "revise"
         } else {
+            // A prompt still out from the box's earlier run records nothing.
+            g.prompting.remove(id);
             r.state = transition(from, Event::Requeue)?;
             r.pending_prompt = Some(comment.to_string());
             r.queue_seq = Some(g.take_seq());
@@ -877,13 +952,17 @@ impl Manager {
         let mut g = self.lock();
         let mut r = g.get(id)?.clone();
         let from = r.state;
+        let mut send = None;
         let out = match ev {
             GuestEvent::Ready => {
                 r.state = transition(from, Event::Ready)?;
+                // A kept snapshot is restored at most once (or not at all on
+                // a cold boot): once the box runs, it is no longer kept.
+                r.keep = false;
                 r.last_activity = now;
                 r.turn_finished_at = None;
                 if prompt {
-                    self.send_pending(&mut r);
+                    send = g.claim_pending(&r);
                 }
                 Some(change(&r, from, "ready"))
             }
@@ -902,16 +981,88 @@ impl Manager {
             }
         };
         r.updated_at = now;
-        g.put(r)?;
+        let saved = g.put(r);
+        drop(g);
+        self.deliver(send);
+        saved?;
         Ok(out)
     }
 
-    /// Send and clear `r`'s pending prompt; a failure goes to `error`.
-    fn send_pending(&self, r: &mut BoxRecord) {
-        if let Some(p) = r.pending_prompt.take() {
-            if let Err(e) = self.guest.prompt(&r.id, &p) {
+    /// Add `note` to the box's `error` (`"<error>; <note>"`, or `note` alone).
+    /// The caller cleans and caps guest-derived text first.
+    pub fn note_error(&self, id: &BoxId, note: &str) -> Result<(), BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        r.error = Some(match r.error.take().filter(|e| !e.is_empty()) {
+            Some(e) => format!("{e}; {note}"),
+            None => note.to_string(),
+        });
+        r.updated_at = now;
+        g.put(r)
+    }
+
+    /// One step under the lock: a box that is still Starting is stopped
+    /// (Done, its VM off and kept, no snapshot) with `note` added to its
+    /// error; any other state is left alone (`None`). For a guest whose
+    /// agent exited before it was ready.
+    pub fn stop_if_starting(
+        &self,
+        id: &BoxId,
+        note: &str,
+        why: &'static str,
+    ) -> Result<Option<Change>, BoxError> {
+        let now = self.now();
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let from = r.state;
+        if from != BoxState::Starting {
+            return Ok(None);
+        }
+        let to = transition(from, Event::Stop)?;
+        if let Some(h) = r.vm.clone().filter(|_| r.vm_on) {
+            self.vmm
+                .stop(&h)
+                .map_err(|e| BoxError::Unavailable(format!("stop failed: {}", vmm_msg(e))))?;
+        }
+        r.state = to;
+        r.vm_on = false;
+        r.keep = false;
+        r.error = Some(match r.error.take().filter(|e| !e.is_empty()) {
+            Some(e) => format!("{e}; {note}"),
+            None => note.to_string(),
+        });
+        r.updated_at = now;
+        g.put(r.clone())?;
+        Ok(Some(change(&r, from, why)))
+    }
+
+    /// Sends prompts taken out under the lock, with it released; then,
+    /// under the lock again, clears each from its record (a failure goes to
+    /// `error`) while the send is still the box's one in flight and the
+    /// record still holds that prompt. A box that moved on meanwhile (a
+    /// requeue gave it a newer prompt, or it was discarded) is left as is.
+    fn deliver(&self, out: impl IntoIterator<Item = Outgoing>) {
+        for o in out {
+            let sent = self.guest.prompt(&o.id, &o.text);
+            let now = self.now();
+            let mut g = self.lock();
+            if !g.end_send(&o.id, o.token) {
+                continue;
+            }
+            let Some(mut r) = g.records.get(&o.id).cloned() else {
+                continue;
+            };
+            if r.pending_prompt.as_deref() != Some(o.text.as_str()) {
+                continue;
+            }
+            r.pending_prompt = None;
+            if let Err(e) = sent {
                 r.error = Some(format!("prompt failed: {}", guest_msg(e)));
             }
+            r.updated_at = now;
+            // Best effort, like every save after a call that happened.
+            let _ = g.put(r);
         }
     }
 
@@ -931,6 +1082,8 @@ impl Manager {
         let host = (self.host)();
         let mut g = self.lock();
         let mut out = Vec::new();
+        // Held prompts are sent after the pass, with the lock released.
+        let mut sends = Vec::new();
         let ids: Vec<BoxId> = g.records.keys().cloned().collect();
         for id in ids {
             let mut r = g.records[&id].clone();
@@ -950,9 +1103,9 @@ impl Manager {
             let started = r.started_at.unwrap_or(r.updated_at);
             if r.state == BoxState::Starting && now.saturating_sub(started) >= BOOT_TIMEOUT_SECS {
                 let from = r.state;
-                self.boot_failed(&mut r, "boot timed out".into(), true);
+                self.boot_failed(&mut r, WHY_BOOT_TIMED_OUT.into(), true);
                 r.updated_at = now;
-                out.push(change(&r, from, "boot timed out"));
+                out.push(change(&r, from, WHY_BOOT_TIMED_OUT));
                 let _ = g.put(r);
                 continue;
             }
@@ -988,10 +1141,13 @@ impl Manager {
                 }
             }
             if admit && r.state == BoxState::Running && r.vm_on && r.pending_prompt.is_some() {
-                self.send_pending(&mut r);
-                r.last_activity = now;
-                r.turn_finished_at = None;
-                changed = true;
+                // None while a send to the box is still out (it ends that).
+                if let Some(o) = g.claim_pending(&r) {
+                    sends.push(o);
+                    r.last_activity = now;
+                    r.turn_finished_at = None;
+                    changed = true;
+                }
             }
             if changed {
                 r.updated_at = now;
@@ -1001,6 +1157,8 @@ impl Manager {
         if admit {
             out.extend(self.admission(&mut g, &host, now));
         }
+        drop(g);
+        self.deliver(sends);
         out
     }
 
