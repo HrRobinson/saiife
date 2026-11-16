@@ -1,0 +1,48 @@
+# Supply-chain gate (cargo-deny). CI job: cargo-deny.
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+unmaintained = "all"
+unsound = "all"
+# No-fix informational advisories only, each to be reviewed by 2027-02-11.
+# Fixable ones (rustls and tokio bumps) are deliberately not listed here.
+ignore = [
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained, no patched release; used by the broker for PEM parsing. Review 2027-02-11" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained, no patched release; transitive via the Linux keychain (zbus). Review 2027-02-11" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained, no patched release; transitive via the Linux keychain (zbus). Review 2027-02-11" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained, no patched release; transitive via the Linux keychain (zbus). Review 2027-02-11" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    # option-ext only (file-level copyleft, unmodified).
+    "MPL-2.0",
+    # This project's own license, on the workspace crates.
+    "FSL-1.1-ALv2",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+deny = [
+    # The project deliberately avoids C TLS stacks.
+    { crate = "openssl-sys" },
+    { crate = "aws-lc-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
