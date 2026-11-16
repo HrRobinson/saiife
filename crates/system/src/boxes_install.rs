@@ -478,13 +478,28 @@ pub(crate) fn install_boxes_with(
         }
     }
     // An upgrade from the untiered unit: its instances are stopped and the
-    // file goes (polkit no longer lets the daemon start or stop it).
+    // file goes (polkit no longer lets the daemon start or stop it). A stop
+    // that fails keeps the file and refuses: with the file gone, a VMM still
+    // running in it could be stopped by nothing but root.
     let legacy = layout.at(LEGACY_BOX_UNIT_PATH);
     if fsops::lstat(&legacy)
         .map_err(|e| refused(&legacy, e.to_string()))?
         .is_some()
     {
-        let _ = host.systemctl(&["stop", "saiife-box@*.service"]);
+        match host.systemctl(&["stop", "saiife-box@*.service"]) {
+            Ok(o) if o.status == 0 => {}
+            Ok(o) => {
+                return Err(InstallError::Step {
+                    step: "unit".into(),
+                    detail: format!(
+                        "systemctl stop saiife-box@*.service exited {}: {}",
+                        o.status,
+                        o.stderr.trim()
+                    ),
+                })
+            }
+            Err(e) => return Err(step("unit")(e)),
+        }
         if fsops::remove_if_listed(&legacy).map_err(step("unit"))? {
             created.changed.push(legacy.display().to_string());
         }
@@ -903,6 +918,32 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
             .calls
             .iter()
             .any(|l| l == "systemctl stop saiife-box@*.service"));
+    }
+
+    /// A stop of the untiered instances that fails keeps the unit file and
+    /// refuses, so a VMM still running in it can be stopped on a rerun.
+    #[test]
+    fn a_failed_stop_keeps_the_untiered_unit() {
+        let w = world();
+        let legacy = w.layout.at(LEGACY_BOX_UNIT_PATH);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "[Unit]\n").unwrap();
+        w.host.set(|s| {
+            s.run.insert(
+                "systemctl stop saiife-box@*.service".into(),
+                crate::host::CmdOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Job timed out.".into(),
+                },
+            );
+        });
+        let e = run(&w, &mut Created::default()).unwrap_err();
+        assert!(
+            matches!(&e, InstallError::Step { step, detail } if step == "unit" && detail.contains("timed out")),
+            "{e:?}"
+        );
+        assert!(legacy.exists());
     }
 
     /// F5: dirs it does not own keep the mode and owner they have.

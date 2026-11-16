@@ -573,7 +573,7 @@ enum Slot {
 /// No host cap (personal-mode gap): the child shares the daemon's cgroup,
 /// so a compromised VMM can use more memory and CPU than the box was
 /// admitted with, up to the user's own limits. Locked mode's unit has a
-/// fixed ceiling ([`UNIT_MEMORY_MAX_MIB`], [`UNIT_CPU_QUOTA_PCT`]).
+/// ceiling per size tier ([`unit_memory_max_mib`], [`unit_cpu_quota_pct`]).
 pub struct ChildLauncher {
     program: PathBuf,
     mode: Mode,
