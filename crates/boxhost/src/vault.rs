@@ -226,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc")]
     fn own_process_is_alive_by_its_start_time() {
         let t = tmp();
         let v = t.path().join("vault");
