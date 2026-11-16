@@ -2267,10 +2267,12 @@ mod tests {
         assert_eq!(got[0].pack.as_deref(), Some("core.secrets"));
     }
 
-    /// The `rejudge_denied` records in the audit, waiting (on the real clock) for `n`.
+    /// The `rejudge_denied` records in the audit, waiting (on the real clock, up to a
+    /// ceiling that only a failure reaches) for `n`. It yields to the runtime between
+    /// reads, so a task that writes one (the fold timer) can run.
     #[cfg(unix)]
-    fn rejudge_records(dir: &std::path::Path, n: usize) -> Vec<Record> {
-        let end = std::time::Instant::now() + Duration::from_secs(10);
+    async fn rejudge_records(dir: &std::path::Path, n: usize) -> Vec<Record> {
+        let end = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let got: Vec<Record> = saiife_audit::store::read_all(&dir.join("audit"))
                 .records
@@ -2280,6 +2282,7 @@ mod tests {
             if got.len() >= n || std::time::Instant::now() > end {
                 return got;
             }
+            tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -2287,11 +2290,15 @@ mod tests {
     /// Whole-branch review, F4: one `rejudge_denied` record per call, up to 60 per
     /// principal a minute; the rest of that minute fold into one record with
     /// `suppressed`, written when the minute ends. Another principal is not held back.
+    ///
+    /// The calls run on the real clock: a paused one jumps to the re-judge deadline
+    /// (and the fold timer) while the blocking re-judge or the audit writer works. The
+    /// window is far longer than any machine takes for them, so none of them can land
+    /// past its end; the test then ends it by pausing the clock and moving it on.
     #[cfg(unix)]
     #[tokio::test]
     async fn rejudge_denied_folds_past_the_rate() {
-        // The real clock: a paused one jumps to the fold timer while a record is written.
-        const WINDOW: Duration = Duration::from_secs(8);
+        const WINDOW: Duration = Duration::from_secs(3600);
         let t = tempfile::tempdir().unwrap();
         let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, 0);
         ctx.cosign.lock().unwrap().rate.window = Some(WINDOW);
@@ -2322,7 +2329,7 @@ mod tests {
         let body = forged(&ctx, 4242, 0);
         ask(&ctx, Instant::now(), body, &ME).await;
         assert!(start.elapsed() < WINDOW, "{:?}", start.elapsed());
-        let got = rejudge_records(t.path(), cap + 1);
+        let got = rejudge_records(t.path(), cap + 1).await;
         assert_eq!(got.len(), cap + 1);
         assert!(got.iter().all(|r| !r.extra.contains_key("suppressed")));
         assert_eq!(got.iter().filter(|r| r.uid == Some(5000)).count(), cap);
@@ -2332,9 +2339,14 @@ mod tests {
             ctx.cosign.lock().unwrap().rejudge_denied.0,
             (cap + 11) as u64
         );
-        // The minute ends: one record for the 10 held back, the last of them.
-        tokio::time::sleep_until(start + WINDOW + Duration::from_millis(200)).await;
-        let got = rejudge_records(t.path(), cap + 2);
+        // The minute ends: one record for the 10 held back, the last of them. The
+        // window's fold timer fires when the clock passes its end; the clock then runs
+        // on from there.
+        tokio::time::pause();
+        tokio::time::advance(WINDOW).await;
+        tokio::time::resume();
+        assert!(Instant::now() >= start + WINDOW);
+        let got = rejudge_records(t.path(), cap + 2).await;
         assert_eq!(got.len(), cap + 2, "one fold record");
         let fold = &got[cap + 1];
         assert_eq!(fold.uid, Some(5000));
@@ -2344,7 +2356,7 @@ mod tests {
         // A new minute: one record per call again.
         let body = forged(&ctx, 5000, 1000);
         ask(&ctx, Instant::now(), body, &flood).await;
-        let got = rejudge_records(t.path(), cap + 3);
+        let got = rejudge_records(t.path(), cap + 3).await;
         assert_eq!(got.len(), cap + 3);
         assert!(!got[cap + 2].extra.contains_key("suppressed"));
     }
