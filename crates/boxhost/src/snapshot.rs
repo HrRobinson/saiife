@@ -557,7 +557,7 @@ fn check_platform(p: Option<&Value>) -> Result<(), String> {
         ],
     )?;
     match p.get("num_pci_segments") {
-        None => Ok(()),
+        None | Some(Value::Null) => Ok(()),
         Some(n) if n.as_u64() == Some(1) => Ok(()),
         Some(_) => Err("platform: more than one PCI segment".into()),
     }
@@ -571,13 +571,12 @@ fn child<'a>(v: &'a Value, id: &str) -> Result<&'a Value, String> {
 }
 
 /// `snapshot_data.state` of a snapshot node: CH stores it as a JSON string
-/// (`SnapshotData::new_from_state`); an inline object is read as is.
+/// (`SnapshotData::new_from_state`) and reads nothing else.
 fn state_of(node: &Value, id: &str) -> Result<Value, String> {
     match node.pointer("/snapshot_data/state") {
         Some(Value::String(s)) => {
             serde_json::from_str(s).map_err(|e| format!("state.json: {id} state: {e}"))
         }
-        Some(o @ Value::Object(_)) => Ok(o.clone()),
         _ => Err(format!("state.json: {id} has no state")),
     }
 }
@@ -593,7 +592,9 @@ pub const MEMORY_MANAGER: &str = "memory-manager";
 /// MiB with no virtio-mem, boot and current RAM equal to it, no hotplug
 /// slot in use, the saved ranges at most the RAM and the `memory-ranges`
 /// file (`ranges_len` bytes) at most the RAM plus [`SLACK_MIB`]. Anything
-/// missing or unparseable is refused: the box boots cold.
+/// missing or unparseable is refused: the box boots cold. Not checked:
+/// `arch_mem_regions`, `start_of_device_area` and `next_memory_slot`
+/// (guest-visible layout; host RAM is bounded by the mappings above).
 pub fn check_state(v: &Value, spec: &LaunchSpec, ranges_len: u64) -> Result<(), String> {
     let mem = spec.mem_mib << 20;
     let cpus = child(v, CPU_MANAGER)?
@@ -650,6 +651,15 @@ pub fn check_state(v: &Value, spec: &LaunchSpec, ranges_len: u64) -> Result<(), 
             || s.get("length").and_then(Value::as_u64) != Some(0);
         if used {
             return Err("state.json: a hotplug slot is in use".into());
+        }
+    }
+    for k in ["selected_slot", "next_hotplug_slot"] {
+        if !m
+            .get(k)
+            .and_then(Value::as_u64)
+            .is_some_and(|i| i < slots.len().max(1) as u64)
+        {
+            return Err(format!("state.json: hotplug {k} out of range"));
         }
     }
     let ranges = m
@@ -838,6 +848,12 @@ mod tests {
                 v["platform"] = serde_json::json!({"num_pci_segments": 2})
             }),
             ("platform", |v| v["platform"] = "x".into()),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"iommufd": true})
+            }),
+            ("platform", |v| {
+                v["platform"] = serde_json::json!({"serial_number": "s"})
+            }),
             ("rng", |v| v["rng"]["src"] = "/etc/shadow".into()),
             ("serial", |v| v["serial"]["file"] = "/etc/x".into()),
             ("console", |v| v["console"]["file"] = "/etc/x".into()),
@@ -868,6 +884,8 @@ mod tests {
             "num_pci_segments": 1, "iommu_address_width_bits": 64,
             "iommufd": false, "vfio_p2p_dma": true, "tdx": false, "sev_snp": false
         });
+        check_config(&v, &p, &s).unwrap();
+        v["platform"]["num_pci_segments"] = Value::Null;
         check_config(&v, &p, &s).unwrap();
     }
 
@@ -983,6 +1001,18 @@ mod tests {
             }),
             ("hotplug", |v| {
                 mem_edit(v, |m| m["hotplug_slots"] = Value::Null)
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["selected_slot"] = 8.into())
+            }),
+            ("hotplug", |v| {
+                mem_edit(v, |m| m["next_hotplug_slot"] = (-1).into())
+            }),
+            ("state", |v| {
+                let p = "/snapshots/memory-manager/snapshot_data/state";
+                let m: Value =
+                    serde_json::from_str(v.pointer(p).unwrap().as_str().unwrap()).unwrap();
+                *v.pointer_mut(p).unwrap() = m;
             }),
             ("memory ranges", |v| {
                 mem_edit(v, |m| {

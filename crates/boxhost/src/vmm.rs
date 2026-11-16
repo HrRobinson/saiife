@@ -696,13 +696,7 @@ impl ChVmm {
             inner.unwind(id, paths, false);
             return Err(VmmError::Failed(e));
         }
-        // locked: the unit is capped at what the box was admitted with
-        // before every start; no cap, no start
-        let started = inner
-            .launcher
-            .limit(id, &launch::VmmLimits::of(&spec))
-            .and_then(|()| inner.launcher.start(id, paths));
-        if let Err(e) = started {
+        if let Err(e) = inner.launcher.start(id, paths) {
             inner.unwind(id, paths, false);
             return Err(VmmError::Failed(e));
         }

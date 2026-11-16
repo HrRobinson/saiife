@@ -338,7 +338,8 @@ pub fn write_spec(spec: &LaunchSpec, paths: &BoxPaths) -> Result<(), String> {
     let target = paths.vm_json();
     if let Ok(m) = std::fs::symlink_metadata(&target) {
         if m.is_dir() {
-            std::fs::remove_dir(&target)
+            // remove_dir_all removes links inside, never their targets
+            std::fs::remove_dir_all(&target)
                 .map_err(|e| format!("vm.json: a directory that cannot be removed: {e}"))?;
         } else if !m.file_type().is_file() {
             std::fs::remove_file(&target).map_err(|e| format!("vm.json: {e}"))?;
@@ -422,36 +423,18 @@ pub fn read_spec_owned(paths: &BoxPaths, not_uid: Option<u32>) -> Result<LaunchS
 /// RAM: Cloud Hypervisor's own heap, threads, queues and caches.
 pub const VMM_OVERHEAD_MIB: u64 = 256;
 
-/// The host's caps on a box's VMM process (locked: the unit's cgroup),
-/// from the spec the daemon built: the guest RAM plus
-/// [`VMM_OVERHEAD_MIB`], and one CPU per vCPU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VmmLimits {
-    /// `MemoryMax=`, in bytes.
-    pub memory_max: u64,
-    /// `CPUQuota=` as systemd's `CPUQuotaPerSecUSec`: CPU time per second.
-    pub cpu_usec_per_sec: u64,
-}
-
-impl VmmLimits {
-    pub fn of(spec: &LaunchSpec) -> VmmLimits {
-        VmmLimits {
-            memory_max: spec.mem_mib.saturating_add(VMM_OVERHEAD_MIB) << 20,
-            cpu_usec_per_sec: u64::from(spec.vcpus) * 1_000_000,
-        }
-    }
-}
+/// The locked unit's fixed `MemoryMax=`, in MiB: the largest guest any
+/// template may ask for plus [`VMM_OVERHEAD_MIB`]. A ceiling, not the
+/// box's size (the unit is one template for every box, and the daemon
+/// may not set unit properties); the box's own size is held by the spec
+/// the daemon rebuilds and the snapshot checks.
+pub const UNIT_MEMORY_MAX_MIB: u64 = saiife_boxes::template::MAX_MEM_MIB + VMM_OVERHEAD_MIB;
+/// The locked unit's fixed `CPUQuota=`, in percent: one CPU per vCPU of
+/// the largest template.
+pub const UNIT_CPU_QUOTA_PCT: u32 = saiife_boxes::template::MAX_VCPUS * 100;
 
 /// Starts and stops the VMM process of a box.
 pub trait Launcher: Send + Sync {
-    /// Caps what the next start of the box's VMM may use; called right
-    /// before every `start`, which does not happen when it fails. Locked:
-    /// the unit's `MemoryMax=` and `CPUQuota=`. Personal mode has no cap
-    /// (the default): the VMM is a child of the daemon in the user's own
-    /// session, and only the guest's size in the spec bounds it.
-    fn limit(&self, _id: &BoxId, _limits: &VmmLimits) -> Result<(), String> {
-        Ok(())
-    }
     /// Returns once the process is started.
     fn start(&self, id: &BoxId, paths: &BoxPaths) -> Result<(), String>;
     /// The only liveness source (S3, ruling R19); never the VMM's API.
@@ -579,9 +562,9 @@ enum Slot {
 /// tell whether it still runs.
 ///
 /// No host cap (personal-mode gap): the child shares the daemon's cgroup,
-/// so `Launcher::limit` is a no-op here; a compromised VMM can use more
-/// memory and CPU than the box was admitted with, up to the user's own
-/// limits. Locked mode caps the unit ([`UnitLauncher`]).
+/// so a compromised VMM can use more memory and CPU than the box was
+/// admitted with, up to the user's own limits. Locked mode's unit has a
+/// fixed ceiling ([`UNIT_MEMORY_MAX_MIB`], [`UNIT_CPU_QUOTA_PCT`]).
 pub struct ChildLauncher {
     program: PathBuf,
     mode: Mode,
@@ -830,9 +813,6 @@ impl Launcher for ChildLauncher {
 /// the daemon's implementation runs each call on a short-lived thread.
 pub trait UnitBus: Send + Sync {
     fn start(&self, unit: &str) -> Result<(), String>;
-    /// Sets the unit's `MemoryMax=` and `CPUQuota=` for its next run
-    /// (runtime properties, gone at reboot; set before every start).
-    fn set_limits(&self, unit: &str, limits: &VmmLimits) -> Result<(), String>;
     fn stop(&self, unit: &str) -> Result<(), String>;
     /// `Ok(false)` only when the unit is known to have no process: `inactive`
     /// or `failed`, or not loaded at all (systemd drops inactive units).
@@ -868,13 +848,6 @@ impl UnitLauncher {
 }
 
 impl Launcher for UnitLauncher {
-    /// Fails closed: a unit whose caps could not be set is not started.
-    fn limit(&self, id: &BoxId, limits: &VmmLimits) -> Result<(), String> {
-        self.bus
-            .set_limits(&unit_name(id)?, limits)
-            .map_err(|e| format!("cannot cap the box's VMM unit: {e}"))
-    }
-
     fn start(&self, id: &BoxId, _paths: &BoxPaths) -> Result<(), String> {
         self.bus.start(&unit_name(id)?)
     }
@@ -905,8 +878,6 @@ pub struct FakeUnitBus {
     pub calls: Mutex<Vec<String>>,
     /// What `active` answers.
     pub active: Mutex<Result<bool, String>>,
-    /// What `set_limits` answers.
-    pub limits: Mutex<Result<(), String>>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -915,7 +886,6 @@ impl FakeUnitBus {
         FakeUnitBus {
             calls: Mutex::new(Vec::new()),
             active: Mutex::new(Ok(false)),
-            limits: Mutex::new(Ok(())),
         }
     }
 
@@ -939,14 +909,6 @@ impl UnitBus for FakeUnitBus {
     fn start(&self, unit: &str) -> Result<(), String> {
         self.record("start", unit);
         Ok(())
-    }
-    fn set_limits(&self, unit: &str, limits: &VmmLimits) -> Result<(), String> {
-        let l = format!("{unit} {} {}", limits.memory_max, limits.cpu_usec_per_sec);
-        self.record("limit", &l);
-        self.limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
     fn stop(&self, unit: &str) -> Result<(), String> {
         self.record("stop", unit);
@@ -1001,7 +963,11 @@ mod tests {
             let p = paths.vm_json();
             let _ = std::fs::remove_file(&p);
             match plant {
-                "dir" => std::fs::create_dir(&p).unwrap(),
+                "dir" => {
+                    std::fs::create_dir(&p).unwrap();
+                    std::fs::write(p.join("x"), b"x").unwrap();
+                    std::os::unix::fs::symlink(&victim, p.join("l")).unwrap();
+                }
                 "fifo" => rustix::fs::mknodat(
                     rustix::fs::CWD,
                     &p,
@@ -1028,41 +994,6 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["vm.json", "vm.json.tmp"]);
-    }
-
-    /// Locked: the unit is capped at the spec's RAM plus the VMM's
-    /// overhead and one CPU per vCPU; a bus error fails closed.
-    #[test]
-    fn unit_launcher_caps_the_unit_from_the_spec() {
-        let e = env();
-        let bus = std::sync::Arc::new(FakeUnitBus::new());
-        let l = UnitLauncher::new(bus.clone());
-        let id = BoxId::parse("b7").unwrap();
-        let s = LaunchSpec {
-            vcpus: 3,
-            mem_mib: 2048,
-            ..spec(&e, "b7")
-        };
-        let lim = VmmLimits::of(&s);
-        assert_eq!(lim.memory_max, (2048 + VMM_OVERHEAD_MIB) << 20);
-        assert_eq!(lim.cpu_usec_per_sec, 3_000_000);
-        l.limit(&id, &lim).unwrap();
-        assert_eq!(
-            bus.calls.lock().unwrap().clone(),
-            [format!(
-                "limit saiife-box@b7.service {} 3000000",
-                (2048 + VMM_OVERHEAD_MIB) << 20
-            )]
-        );
-        *bus.limits.lock().unwrap() = Err("denied".into());
-        let err = l.limit(&id, &lim).unwrap_err();
-        assert!(err.contains("cap") && err.contains("denied"), "{err}");
-        // a bad id never reaches the bus
-        assert!(l.limit(&BoxId::parse("x1").unwrap(), &lim).is_err());
-        assert_eq!(bus.calls.lock().unwrap().len(), 2);
-        // personal: no cap, nothing refused
-        let c = ChildLauncher::helper(PathBuf::from("/x"), e.root.join("vault"));
-        assert_eq!(c.limit(&id, &lim), Ok(()));
     }
 
     #[test]

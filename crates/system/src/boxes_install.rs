@@ -49,6 +49,13 @@ pub const MODE_RO: u32 = 0o2750;
 /// and other boxes are not in its namespace at all. `ProtectSystem=strict`
 /// keeps the rest of the tree read-only; `/opt/saiife/vmm` is named
 /// read-only for clarity.
+///
+/// Outside Cloud Hypervisor the unit is capped at a fixed ceiling, the
+/// largest template (`MemoryMax=` = `launch::UNIT_MEMORY_MAX_MIB`,
+/// `CPUQuota=` = `launch::UNIT_CPU_QUOTA_PCT`), no swap (`MemorySwapMax=0`,
+/// or `MemoryMax=` only moves pages to swap), plus `TasksMax=` and
+/// `LimitNOFILE=`: not the box's own size, which the daemon's rebuilt spec
+/// and the snapshot checks hold. The daemon cannot set unit properties.
 pub const BOX_UNIT: &str = "\
 [Unit]
 Description=saiife box %i (Cloud Hypervisor)
@@ -71,20 +78,25 @@ BindPaths=/var/lib/saiife-box/boxes/%i
 BindReadOnlyPaths=/var/lib/saiife-box/images
 BindReadOnlyPaths=-/var/lib/saiife-box/vault/%i.snap
 ReadOnlyPaths=/opt/saiife/vmm
+MemoryMax=262400M
+MemorySwapMax=0
+CPUQuota=3200%
+TasksMax=512
+LimitNOFILE=4096
 TimeoutStopSec=30
 KillMode=control-group
 Restart=no
 ";
 
 /// The polkit rule: the daemon user may start and stop `saiife-box@b<N>`
-/// units and set their runtime properties (the daemon sets each box's
-/// `MemoryMax=` and `CPUQuota=` before every start, from the size the box
-/// was admitted with), nothing else. It names the Linux daemon user
+/// units, nothing else. Never `set-property`: polkit cannot limit which
+/// properties, and a runtime `DeviceAllow=` or path change would loosen
+/// the sandbox below. It names the Linux daemon user
 /// ([`crate::layout::DAEMON_USER`]); `install_boxes` refuses any other.
 pub const POLKIT_RULE: &str = r#"polkit.addRule(function(action, subject) {
   if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "saiife") {
     var unit = action.lookup("unit"), verb = action.lookup("verb");
-    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop" || verb == "set-property")) {
+    if (/^saiife-box@b[0-9]{1,9}\.service$/.test(unit) && (verb == "start" || verb == "stop")) {
       return polkit.Result.YES;
     }
   }
@@ -641,6 +653,23 @@ mod tests {
             .collect()
     }
 
+    /// The unit's fixed caps are the largest template plus the VMM's
+    /// overhead (a ceiling: the daemon cannot set per-box properties).
+    #[test]
+    fn box_unit_caps_are_the_template_ceiling() {
+        use saiife_boxhost::launch::{UNIT_CPU_QUOTA_PCT, UNIT_MEMORY_MAX_MIB, VMM_OVERHEAD_MIB};
+        assert_eq!(UNIT_MEMORY_MAX_MIB, 262_144 + VMM_OVERHEAD_MIB);
+        assert_eq!(UNIT_CPU_QUOTA_PCT, 32 * 100);
+        let line = |l: String| assert!(BOX_UNIT.lines().any(|x| x == l), "{l}");
+        line(format!("MemoryMax={UNIT_MEMORY_MAX_MIB}M"));
+        line(format!("CPUQuota={UNIT_CPU_QUOTA_PCT}%"));
+        // without it memory.max pushes anonymous pages to (zram) swap
+        line("MemorySwapMax=0".into());
+        line("TasksMax=512".into());
+        line("LimitNOFILE=4096".into());
+        assert_eq!(BOX_UNIT.matches("MemoryMax=").count(), 1);
+    }
+
     #[test]
     fn box_unit_text_is_pinned() {
         let want = "[Unit]\nDescription=saiife box %i (Cloud Hypervisor)\n[Service]\nType=exec\n\
@@ -653,6 +682,7 @@ BindPaths=/var/lib/saiife-box/boxes/%i\n\
 BindReadOnlyPaths=/var/lib/saiife-box/images\n\
 BindReadOnlyPaths=-/var/lib/saiife-box/vault/%i.snap\n\
 ReadOnlyPaths=/opt/saiife/vmm\n\
+MemoryMax=262400M\nMemorySwapMax=0\nCPUQuota=3200%\nTasksMax=512\nLimitNOFILE=4096\n\
 TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
         assert_eq!(BOX_UNIT, want);
     }
@@ -677,8 +707,9 @@ TimeoutStopSec=30\nKillMode=control-group\nRestart=no\n";
     #[test]
     fn polkit_rule_is_narrow() {
         assert!(POLKIT_RULE.contains(r"/^saiife-box@b[0-9]{1,9}\.service$/.test(unit)"));
-        assert!(POLKIT_RULE
-            .contains(r#"(verb == "start" || verb == "stop" || verb == "set-property")"#));
+        assert!(POLKIT_RULE.contains(r#"(verb == "start" || verb == "stop")) {"#));
+        assert_eq!(POLKIT_RULE.matches("verb ==").count(), 2);
+        assert!(!POLKIT_RULE.contains("set-property"));
         assert!(POLKIT_RULE.contains(r#"subject.user == "saiife""#));
         assert!(POLKIT_RULE.contains(r#"action.id == "org.freedesktop.systemd1.manage-units""#));
         assert_eq!(POLKIT_RULE.matches("return polkit.Result").count(), 1);

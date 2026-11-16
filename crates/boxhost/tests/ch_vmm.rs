@@ -1572,13 +1572,6 @@ impl saiife_boxhost::launch::UnitBus for QueuedStopBus {
         *self.active.lock().unwrap() = true;
         Ok(())
     }
-    fn set_limits(
-        &self,
-        unit: &str,
-        limits: &saiife_boxhost::launch::VmmLimits,
-    ) -> Result<(), String> {
-        self.fake.set_limits(unit, limits)
-    }
     fn stop(&self, unit: &str) -> Result<(), String> {
         self.fake.stop(unit)?;
         let (active, child, id, delay) = (
@@ -1959,51 +1952,4 @@ fn restore_refuses_a_state_the_box_was_not_admitted_with() {
         );
         assert!(!w.marker("b1").exists() && !w.snap("b1").exists(), "{what}");
     }
-}
-
-/// Locked: every boot caps the box's unit at the RAM and vCPUs the box
-/// was admitted with (the daemon's handle, not vm.json) before it starts
-/// it; a unit whose caps cannot be set is never started.
-#[test]
-fn unit_boot_caps_the_unit_before_starting_it() {
-    use saiife_boxhost::launch::VMM_OVERHEAD_MIB;
-    let w = World::new();
-    let child = w.launcher(&[]);
-    let bus = Arc::new(QueuedStopBus {
-        fake: FakeUnitBus::new(),
-        child,
-        paths: w.paths("b1"),
-        id: BoxId::parse("b1").unwrap(),
-        delay: Duration::from_millis(10),
-        active: Arc::new(Mutex::new(false)),
-    });
-    let v = w.vmm_with(
-        Arc::new(UnitLauncher::new(bus.clone())),
-        vec![w.hook("h", false)],
-    );
-    let h = w.create(&v, "b1");
-    v.boot(&h).unwrap();
-    let calls = bus.fake.calls.lock().unwrap().clone();
-    let limit = format!(
-        "limit saiife-box@b1.service {} 2000000",
-        (4096 + VMM_OVERHEAD_MIB) << 20
-    );
-    let at = |c: &str| calls.iter().position(|x| x == c);
-    assert!(
-        at(&limit).unwrap() < at("start saiife-box@b1.service").unwrap(),
-        "{calls:?}"
-    );
-
-    let w = World::new();
-    let bus = Arc::new(FakeUnitBus::new());
-    *bus.limits.lock().unwrap() = Err("access denied".into());
-    let v = w.vmm_with(
-        Arc::new(UnitLauncher::new(bus.clone())),
-        vec![w.hook("h", false)],
-    );
-    let h = w.create(&v, "b1");
-    let e = failed(v.boot(&h));
-    assert!(e.contains("cap") && e.contains("access denied"), "{e}");
-    let calls = bus.calls.lock().unwrap().clone();
-    assert!(!calls.iter().any(|c| c.starts_with("start")), "{calls:?}");
 }

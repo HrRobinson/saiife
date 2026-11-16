@@ -1,7 +1,6 @@
 //! Locked mode: start, stop and ask about the `saiife-box@<id>.service`
 //! units over the system bus (plan 35, Task 6). The polkit rule the install
-//! writes lets the daemon user do exactly `start`, `stop` and `set-property`
-//! (the per-box `MemoryMax=`/`CPUQuota=` before each start) on those units.
+//! writes lets the daemon user do exactly `start` and `stop` on those units.
 //!
 //! [`UnitBus`] is sync and is called from `spawn_blocking` threads (every box
 //! manager call is), never from an async task: `Handle::block_on` panics in a
@@ -16,7 +15,7 @@ use std::future::Future;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use saiife_boxhost::launch::{UnitBus, VmmLimits};
+use saiife_boxhost::launch::UnitBus;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
@@ -116,26 +115,6 @@ async fn job(conn: Connection, method: &str, unit: String, mode: &str) -> Result
     .map_err(|e| format!("{method} {unit}: {e}"))
 }
 
-/// `SetUnitProperties` with `runtime` true (a drop-in under /run, gone
-/// at reboot): `MemoryMax=` and `CPUQuota=` (as `CPUQuotaPerSecUSec`).
-async fn set_limits(conn: Connection, unit: String, l: VmmLimits) -> Result<(), String> {
-    use zbus::zvariant::Value;
-    let props: Vec<(&str, Value<'_>)> = vec![
-        ("MemoryMax", Value::from(l.memory_max)),
-        ("CPUQuotaPerSecUSec", Value::from(l.cpu_usec_per_sec)),
-    ];
-    conn.call_method(
-        Some(DEST),
-        MANAGER_PATH,
-        Some(MANAGER),
-        "SetUnitProperties",
-        &(unit.as_str(), true, props),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("SetUnitProperties {unit}: {e}"))
-}
-
 async fn is_active(conn: Connection, unit: String) -> Result<bool, String> {
     let reply = match conn
         .call_method(
@@ -187,11 +166,6 @@ impl UnitBus for SystemdBus {
     fn start(&self, unit: &str) -> Result<(), String> {
         let unit = unit.to_string();
         self.run(|c| job(c, "StartUnit", unit, "fail"))
-    }
-
-    fn set_limits(&self, unit: &str, limits: &VmmLimits) -> Result<(), String> {
-        let (unit, l) = (unit.to_string(), *limits);
-        self.run(move |c| set_limits(c, unit, l))
     }
 
     fn stop(&self, unit: &str) -> Result<(), String> {
