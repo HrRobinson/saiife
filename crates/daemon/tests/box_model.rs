@@ -191,12 +191,18 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
+        "/nohead" => {
+            // No answer at all, far longer than the test's idle limit.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            full(200, "{}")
+        }
         _ => full(200, r#"{"type":"message","ok":true}"#),
     })
 }
 
-/// The fake `api.anthropic.com` and the client that trusts it.
-async fn upstream() -> (Up, Upstream) {
+/// The fake `api.anthropic.com` and the client that trusts it. With
+/// `dead`, the resolver points at a port nothing listens on.
+async fn upstream(dead: bool) -> (Up, Upstream) {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
@@ -242,6 +248,12 @@ async fn upstream() -> (Up, Upstream) {
     });
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
+    let port = if dead {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        l.local_addr().unwrap().port()
+    } else {
+        port
+    };
     let client = Upstream::with_roots(
         roots,
         Arc::new(OnlyModelHost(port)),
@@ -290,6 +302,8 @@ struct Opts {
     model: ModelConfig,
     /// The `anthropic` vault entry's services; `None`: no such entry.
     services: Option<Vec<&'static str>>,
+    /// The upstream cannot be reached (connection refused).
+    dead_upstream: bool,
 }
 
 impl Default for Opts {
@@ -297,6 +311,7 @@ impl Default for Opts {
         Opts {
             model: ModelConfig::default(),
             services: Some(vec!["box-model"]),
+            dead_upstream: false,
         }
     }
 }
@@ -436,7 +451,7 @@ async fn world(o: Opts) -> W {
     v.put(vault_entry("anthropic-sub", REAL_SUB, &["box-model"]))
         .unwrap();
 
-    let (up, client) = upstream().await;
+    let (up, client) = upstream(o.dead_upstream).await;
     let base = CtxInit::minimal(handle, cfg, dirs, &state);
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
@@ -1290,4 +1305,63 @@ async fn slow_head_is_closed() {
     assert!(ended.is_ok(), "the slow head was never closed");
     assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     assert!(w.up.seen().is_empty());
+}
+
+/// The failure answers after the credential check: an unusable vault
+/// value (503), an upstream that never answers (504) and one that cannot
+/// be reached (502) quote no credential, and neither does the audit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failure_answers_never_echo_credentials() {
+    const BAD_KEY: &str = concat!("sk-", "ant-", "api03-", "BADKEY", "4242 ");
+    let w = world(Opts {
+        model: ModelConfig {
+            idle_secs: 1,
+            ..ModelConfig::default()
+        },
+        ..Opts::default()
+    })
+    .await;
+    let pa = w.a.placeholder.clone();
+    let mut bodies = Vec::new();
+    w.rotate(BAD_KEY);
+    let (code, h, b) = ask(&w.a, post("/v1/messages", &[("x-api-key", &pa)], "{}")).await;
+    assert_eq!(code, 503, "{b}");
+    assert!(b.contains("is not a usable token"), "{b}");
+    bodies.push(format!("{h:?}{b}"));
+    assert!(w.up.seen().is_empty());
+    let recs = w.wait_records("model_denied", 1).await;
+    assert_eq!(recs[0]["reason"], "secret_invalid");
+    w.rotate(REAL_KEY);
+    let (code, h, b) = ask(&w.a, post("/nohead", &[("x-api-key", &pa)], "{}")).await;
+    assert_eq!(code, 504, "{b}");
+    bodies.push(format!("{h:?}{b}"));
+    let recs = w.wait_records("model", 1).await;
+    assert_eq!(recs[0]["status"], 504);
+    assert_eq!(recs[0]["outcome"], "idle");
+
+    let dead = world(Opts {
+        dead_upstream: true,
+        ..Opts::default()
+    })
+    .await;
+    let pd = dead.a.placeholder.clone();
+    let (code, h, b) = ask(&dead.a, post("/v1/messages", &[("x-api-key", &pd)], "{}")).await;
+    assert_eq!(code, 502, "{b}");
+    bodies.push(format!("{h:?}{b}"));
+    let recs = dead.wait_records("model", 1).await;
+    assert_eq!(recs[0]["status"], 502);
+
+    for b in &bodies {
+        for secret in [pa.as_str(), pd.as_str(), REAL_KEY, BAD_KEY.trim(), REAL_SUB] {
+            assert!(
+                !b.contains(secret),
+                "a failure answer quoted a credential: {b}"
+            );
+        }
+    }
+    for audit in [w.audit_text(), dead.audit_text()] {
+        for secret in [pa.as_str(), pd.as_str(), REAL_KEY, BAD_KEY.trim()] {
+            assert!(!audit.contains(secret), "the audit holds {secret}");
+        }
+    }
 }

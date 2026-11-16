@@ -580,6 +580,18 @@ impl Fail {
     }
 }
 
+/// The address to connect to for resolver answer `a`: port
+/// [`MODEL_PORT`], by construction in release builds. Only a debug build
+/// whose gateway has the loopback test flag keeps a loopback answer's port
+/// (the tests' loopback upstream).
+fn upstream_addr(test_loopback: bool, a: SocketAddr) -> SocketAddr {
+    if cfg!(debug_assertions) && test_loopback && a.ip().is_loopback() {
+        a
+    } else {
+        SocketAddr::new(a.ip(), MODEL_PORT)
+    }
+}
+
 /// One box connection: its run, and its upstream connection once made
 /// (reused for the keep-alive requests on it).
 struct ConnState {
@@ -607,8 +619,8 @@ impl ConnState {
     /// the lookup (on the blocking pool, holding the box's and the
     /// gateway's lookup permits until it really ends), every answer an
     /// allowed address, TCP, TLS for `api.anthropic.com`, the HTTP/1.1
-    /// handshake. The resolver is the daemon's (host-side): its answer's
-    /// port is used, as the broker's client does.
+    /// handshake. The port is always [`MODEL_PORT`], whatever the resolver
+    /// answers ([`upstream_addr`]).
     async fn connect(&self) -> Result<UpConn, Fail> {
         let (tls, resolver) = self.client()?;
         let gw = &self.gw;
@@ -628,6 +640,7 @@ impl ConnState {
             .map_err(|_| Fail::Unreachable)?
             .into_iter()
             .take(super::MAX_ANSWERS)
+            .map(|a| upstream_addr(gw.allow_loopback, a))
             .collect();
             if addrs.is_empty() {
                 return Err(Fail::Unreachable);
@@ -1131,6 +1144,20 @@ mod tests {
                 "request-id: req_1".into(),
             ]
         );
+    }
+
+    #[test]
+    fn upstream_port_is_fixed() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(upstream_addr(false, a("1.2.3.4:8443")), a("1.2.3.4:443"));
+        assert_eq!(
+            upstream_addr(false, a("127.0.0.1:8443")),
+            a("127.0.0.1:443")
+        );
+        // The test flag keeps only a loopback answer's port, in debug builds.
+        assert_eq!(upstream_addr(true, a("10.0.0.1:8443")), a("10.0.0.1:443"));
+        let want = if cfg!(debug_assertions) { 8443 } else { 443 };
+        assert_eq!(upstream_addr(true, a("127.0.0.1:8443")).port(), want);
     }
 
     #[test]
