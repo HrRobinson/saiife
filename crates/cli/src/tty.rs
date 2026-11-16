@@ -122,11 +122,20 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
 
+    /// The bytes are written from a thread: macOS's socket buffer (8 KiB)
+    /// is smaller than the longest line, so a write first never returns.
     fn line(bytes: &[u8]) -> Result<Zeroizing<String>, String> {
         let (mut w, r) = UnixStream::pair().unwrap();
-        w.write_all(bytes).unwrap();
-        drop(w);
-        read_line(r.as_fd())
+        let bytes = bytes.to_vec();
+        let writer = std::thread::spawn(move || {
+            // The reader stops at a newline or the length limit and may
+            // close its end first: a broken pipe here is expected.
+            let _ = w.write_all(&bytes);
+        });
+        let got = read_line(r.as_fd());
+        drop(r);
+        writer.join().unwrap();
+        got
     }
 
     #[test]
