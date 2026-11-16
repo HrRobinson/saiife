@@ -18,9 +18,11 @@ set -euo pipefail
 # debian:bullseye, from registry-1.docker.io manifests/bullseye
 # (docker-content-digest) and the hub.docker.com tag API, which agree;
 # tag updated 2026-08-25, verified 2026-11-12.
-# Bullseye's regular security support ended 2026-08-31. The image's default apt
-# sources are used. If CI's `apt-get update` starts failing because the suite
-# moved, switch the sources to archive.debian.org (verified by the image's keyring).
+# Bullseye's LTS ended 2026-08-31 and its packages moved to archive.debian.org
+# (deb.debian.org's bullseye-security indexes still name files its pool has
+# dropped: 404, seen 2026-11-16). apt uses archive.debian.org for all three
+# suites, verified by the image's own keyring; the Release files there carry
+# no Valid-Until.
 DEBIAN_IMAGE="debian:bullseye@sha256:6f519a81440354a85eb592c5f32109ab80605f6b892455983a6f618bf87fabe9"
 # rustup-init 1.29.2 from static.rust-lang.org; the SHA-256 values are from the
 # published rustup-init.sha256 files (verified 2026-11-12).
@@ -87,6 +89,11 @@ docker run --rm \
   -e RUSTUP_VERSION="$RUSTUP_VERSION" -e TRIPLE="$triple" -e RUSTUP_SHA256="$rustup_sha" \
   -e INNER="$inner" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "$DEBIAN_IMAGE" bash -euo pipefail -c '
+    rm -f /etc/apt/sources.list.d/*
+    printf "deb http://archive.debian.org/debian %s main\n" bullseye bullseye-updates \
+      > /etc/apt/sources.list
+    echo "deb http://archive.debian.org/debian-security bullseye-security main" \
+      >> /etc/apt/sources.list
     apt-get update
     apt-get install -y --no-install-recommends \
       ca-certificates curl gcc libc6-dev libudev-dev pkg-config binutils util-linux
