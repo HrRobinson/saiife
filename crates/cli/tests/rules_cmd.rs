@@ -50,13 +50,7 @@ fn rules(env: &Env, args: &[&str], answers: &str) -> Output {
 
 /// The personal broker's user pack dir under the test HOME.
 fn personal_packs(env: &Env) -> PathBuf {
-    if cfg!(windows) {
-        env.home
-            .path()
-            .join("AppData/Local/saiife/personal/policy.d/packs")
-    } else {
-        env.home.path().join(".config/saiife/broker/policy.d/packs")
-    }
+    common::personal_packs_dir(env.home.path())
 }
 
 fn pack_files(dir: &Path) -> Vec<PathBuf> {
@@ -999,10 +993,7 @@ fn list_json_shape() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let got: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let id = pack.file_stem().unwrap().to_string_lossy().into_owned();
-    let file = fs::canonicalize(env.root().join("CLAUDE.md"))
-        .unwrap()
-        .display()
-        .to_string();
+    let file = common::canonical_shown(&env.root().join("CLAUDE.md"));
     let p = &got["packs"][0];
     assert_eq!(got["packs"].as_array().unwrap().len(), 1);
     assert_eq!(p["id"], id);

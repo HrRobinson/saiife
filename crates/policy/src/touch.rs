@@ -159,6 +159,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "the golden hash is of a POSIX host's policy")]
     fn policy_hash_unchanged_without_marks() {
         let c = cfg(
             "version = 2\n[services.erp]\nconnector = \"x\"\nsecret = \"k\"\n\

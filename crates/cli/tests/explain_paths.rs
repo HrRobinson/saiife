@@ -99,7 +99,7 @@ fn nothing_is_reported_inactive_when_everything_is_bound() {
 }
 
 fn put_pack(env: &Env, text: &str) {
-    let dir = env.home.path().join(".config/saiife/broker/policy.d/packs");
+    let dir = common::personal_packs_dir(env.home.path());
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("user.t.toml"), text).unwrap();
 }
