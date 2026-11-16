@@ -79,8 +79,8 @@ impl BoxPaths {
 
 /// The daemon-trusted files in one box's record dir
 /// (`layout::record_dir`, `<records_root>/<id>`, R37): the land records of
-/// plan 39 (`lands/<n>/`) and the model placeholder (plan 40). The VMM never sees this dir; its runtime files
-/// are [`BoxPaths`].
+/// plan 39 (`lands/<n>/`) and the model placeholder (plan 40). The VMM
+/// never sees this dir; its runtime files are [`BoxPaths`].
 #[derive(Debug, Clone)]
 pub struct RecordPaths {
     pub dir: PathBuf,
