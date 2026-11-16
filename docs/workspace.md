@@ -79,6 +79,29 @@ has already applied the terminal's escapes; anything left that looks like one
 (a clipboard write, a link, a drawn "Approve" button) is shown as text and does
 nothing. When the box finishes, the pane says "The terminal has ended".
 
+## Who sees what
+
+A paired browser acts as the user who paired it (the device owner). It sees
+and changes that user's boxes only. Another user's box is answered as if it
+did not exist (`not_found`).
+
+A browser whose owner is an admin (root, or a member of `[admin] groups`) sees
+more. It can read every user's boxes: the overview and the list, a box's
+diff, its terminal, and the inbox, which then shows other users' land
+requests too. That matches the CLI, where an admin's `saiife box` commands
+list and read every user's boxes.
+
+It cannot act on them. Every action that changes another user's box from the
+browser is refused with `forbidden` (rule `not_owner`) and recorded: land,
+steer, revise, resume, pause, stop, discard and reorder. An admin's browser
+changes only the admin's own boxes. To act on another user's box, an admin
+uses `saiife box` on the machine.
+
+Why: a paired browser is a key in a web page on some other device. If it is
+lost or taken over, it should not be able to land, steer or discard every
+user's work on the machine. Reading lets an admin see what runs; acting on
+another user's box stays on the machine, where the admin is logged in.
+
 ## What needs a touch
 
 Anything that only takes power away is safe from a signed browser. Anything
