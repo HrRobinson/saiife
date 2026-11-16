@@ -51,6 +51,8 @@ P42C_LOCKED_UNIT=/etc/systemd/system/saiife-box@.service
 P42C_LOCKED_AUDIT=/var/log/saiife/audit
 P42C_LOCKED_RUN=/var/lib/saiife-box/boxes
 P42C_T_RUNNING=0
+P42C_T_DONE=0
+P42C_LEGFAIL=0
 
 p42c_log() { printf '%s\n' "$*" >&2; }
 
@@ -153,6 +155,7 @@ p42c_wait_state() {
     st=$(p42c_state "$P42C_BOX")
     if [ "$st" = "$1" ]; then
       [ "$1" != running ] || P42C_T_RUNNING=$(date +%s)
+      [ "$1" != done ] || P42C_T_DONE=$(date +%s)
       return 0
     fi
     case "$st" in
@@ -161,6 +164,7 @@ p42c_wait_state() {
         return 1
         ;;
       done)
+        P42C_T_DONE=$(date +%s)
         if [ "$1" = running ]; then P42C_T_RUNNING=$(date +%s); return 0; fi
         ;;
     esac
@@ -200,21 +204,23 @@ p42c_ask() {
   fi
 }
 
-# p42c_audit_files: fills P42C_FILES with the readable audit files; 1 when none
-p42c_audit_files() {
-  local dir f
-  P42C_FILES=()
+# p42c_audit_cat: every audit line (JSONL) readable for this run, on stdout.
+# Locked mode reads with `sudo -n` (a refusal is a FAIL naming the read).
+p42c_audit_cat() {
+  local dir n=0
+  if p42c_locked && ! sudo -n true 2>/dev/null; then
+    p42c_log "locked mode: reading $P42C_LOCKED_AUDIT needs sudo -n (sudo -n cat $P42C_LOCKED_AUDIT/*.jsonl was refused)"
+    return 1
+  fi
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
-    if [ -d "$dir" ] && [ ! -r "$dir" ]; then
-      p42c_log "audit dir $dir is not readable by you (locked: rerun as a user who can read it)"
-      continue
+    if p42c_locked; then
+      if p42c_as sh -c 'cat "$1"/*.jsonl' _ "$dir" 2>/dev/null; then n=$((n + 1)); fi
+    elif [ -d "$dir" ] && [ -r "$dir" ]; then
+      if cat "$dir"/*.jsonl 2>/dev/null; then n=$((n + 1)); fi
     fi
-    for f in "$dir"/*.jsonl; do
-      [ -r "$f" ] && P42C_FILES+=("$f")
-    done
   done < <(p42c_audit_dirs)
-  [ "${#P42C_FILES[@]}" -gt 0 ] || { p42c_log "no readable audit files in: $(p42c_audit_dirs | tr '\n' ' ')"; return 1; }
+  [ "$n" -gt 0 ] || { p42c_log "no readable audit files in: $(p42c_audit_dirs | tr '\n' ' ')"; return 1; }
 }
 
 # model records of this box: provider of the route, status 200, credential
@@ -222,13 +228,13 @@ p42c_audit_files() {
 # audit Record flattens its extra map: box, provider, status, credential,
 # method and path are top-level keys.
 p42c_model_records() {
-  p42c_audit_files || return 1
-  jq -en --arg b "$P42C_BOX" --arg p "$(p42c_provider)" \
+  local recs
+  recs=$(p42c_audit_cat) || return 1
+  printf '%s\n' "$recs" | jq -en --arg b "$P42C_BOX" --arg p "$(p42c_provider)" \
     '[inputs | select(.kind == "model" and .box == $b)] as $m
      | ($m | length > 0)
        and ([$m[] | select(.provider == $p and .status == 200 and .credential == "gateway")] | length > 0)
-       and ([$m[] | select(.credential != "gateway")] | length == 0)' \
-    "${P42C_FILES[@]}" >/dev/null
+       and ([$m[] | select(.credential != "gateway")] | length == 0)' >/dev/null
 }
 
 # model_paths (OD3, R4, R12): every distinct "METHOD PATH" the gateway
@@ -236,11 +242,11 @@ p42c_model_records() {
 # either way; the owner widens the exact (method, path, query) list only from
 # this output. PASS when there are none.
 p42c_model_paths() {
-  local list
-  p42c_audit_files || return 1
-  list=$(jq -rn --arg b "$P42C_BOX" \
+  local recs list
+  recs=$(p42c_audit_cat) || return 1
+  list=$(printf '%s\n' "$recs" | jq -rn --arg b "$P42C_BOX" \
     '[inputs | select(.kind == "model_denied" and .box == $b and .reason == "path_not_allowed")
-      | "\(.method // "?") \(.path // "?")"] | unique | .[]' "${P42C_FILES[@]}") || return 1
+      | "\(.method // "?") \(.path // "?")"] | unique | .[]') || return 1
   if [ -n "$list" ]; then
     p42c_log "model_paths: refused (method path) pairs for box $P42C_BOX:"
     printf '%s\n' "$list" >&2
@@ -249,18 +255,22 @@ p42c_model_paths() {
   p42c_log "model_paths: none refused for box $P42C_BOX"
 }
 
-# websocket_fallback_codex (R12 list has no websocket route): every model
-# record of the turn is POST /v1/responses (no 400 upgrade refusals), and the
-# first record comes within 30 s of `running`.
+# websocket_fallback_codex (R12: no websocket route): the turn used the HTTP
+# route. PASS needs at least one POST /v1/responses model record, no
+# model_denied record for the box with reason upgrade (or any 400 refusal that
+# names an upgrade), and the first model record within 30 s of `running`.
+# The allow-listed GET /v1/models records are fine.
 p42c_ws_fallback() {
-  p42c_audit_files || return 1
-  jq -en --arg b "$P42C_BOX" --argjson t0 "$P42C_T_RUNNING" \
+  local recs
+  recs=$(p42c_audit_cat) || return 1
+  printf '%s\n' "$recs" | jq -en --arg b "$P42C_BOX" --argjson t0 "$P42C_T_RUNNING" \
     '[inputs | select(.box == $b and (.kind == "model" or .kind == "model_denied"))] as $m
-     | ($m | length > 0)
-       and ([$m[] | select(.kind == "model_denied")] | length == 0)
-       and ([$m[] | select(.method != "POST" or .path != "/v1/responses")] | length == 0)
-       and (([$m[] | .ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601] | min) - $t0 <= 30)' \
-    "${P42C_FILES[@]}" >/dev/null
+     | ([$m[] | select(.kind == "model")] ) as $ok
+     | ([$ok[] | select(.method == "POST" and .path == "/v1/responses")] | length > 0)
+       and ([$m[] | select(.kind == "model_denied"
+                            and (((.reason // "") | test("upgrade"))
+                                 or (.status // 0) == 400))] | length == 0)
+       and (([$ok[] | .ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601] | min) - $t0 <= 30)' >/dev/null
 }
 
 # the placeholder file is not the key, and (personal mode) 0600
@@ -395,7 +405,7 @@ p42c_plant_repo() {
     git init -q -b main .
     git config user.name smoke
     git config user.email smoke@example.invalid
-    printf 'one\n' >a.txt
+    printf 'P42CTRL_%s\n' "$P42C_NONCE" >a.txt
     case "codex" in
       codex)
         mkdir .codex
@@ -423,20 +433,33 @@ p42c_plant_repo() {
   P42C_HOSTILE=$d
 }
 
-# The hook proof: saiife's own guard hook still ran for this box during the
-# turn. 50-claude.sh reads no guard record, so this relies on the audit's
-# `guard` records (daemon ops audit.append). A guard record is taken to be
-# this box's when it has box == BOX, or agent == "codex"; the second form is a
-# fallback for builds that do not tag guard records with the box id, so a
-# stale record of an earlier run could satisfy it: check the printed count.
+# The hook proof: saiife's own guard hook still ran during this box's turn.
+# 50-claude.sh reads no guard record. Guard records carry NO box id (keys:
+# kind "guard", agent, session, ts), so the proof is bounded by time and
+# agent: a guard record with agent == "codex" and ts between the box reaching
+# running and reaching done (2 s slack). A concurrent host session of the same
+# agent could still satisfy it: run the smoke with no other codex session.
 p42c_guard_fired() {
-  local n
-  p42c_audit_files || return 1
-  n=$(jq -n --arg b "$P42C_BOX" --arg a "codex" \
-    '[inputs | select(.kind == "guard" and ((.box // "") == $b or (.agent // "") == $a))] | length' \
-    "${P42C_FILES[@]}") || return 1
-  p42c_log "guard records for box $P42C_BOX (or agent codex): $n"
+  local recs n
+  recs=$(p42c_audit_cat) || return 1
+  n=$(printf '%s\n' "$recs" | jq -n --arg a "codex" --argjson t0 "$P42C_T_RUNNING" --argjson t1 "$P42C_T_DONE" \
+    '[inputs | select(.kind == "guard" and (.agent // "") == $a
+        and ((.ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $t | $t >= $t0 and $t <= $t1 + 2))] | length') || return 1
+  p42c_log "guard records for agent codex between running and done: $n"
   [ "${n:-0}" -gt 0 ]
+}
+
+# positive control for the disk greps: a.txt of the hostile repo holds a known
+# string (checked out in /work, so plain bytes in repo.img). Informational:
+# 0 matches means the greps cannot see file contents, and every 0 above
+# ("no key", "no marker") is unproven.
+p42c_disk_control() {
+  local dir out n
+  dir=$(p42c_run_dir "$P42C_BOX")
+  out=$(p42c_as cat "$dir/repo.img" 2>/dev/null | tr '\0' '\n' | grep -c -a -F "P42CTRL_${P42C_NONCE}" || true)
+  n=$(printf '%s' "$out" | tr -d '[:space:]')
+  p42c_log "disk_grep_control_codex: known string found ${n:-0} time(s) in repo.img (expected >= 1; 0 means the 0-match checks are unproven)"
+  p42c_result "disk_grep_control_codex" "${n:-0}"
 }
 
 # no marker anywhere on the guest's disks after the turn (the hostile hooks
@@ -476,6 +499,7 @@ p42c_repo_ignored_leg() {
   saiife box stop "$P42C_BOX" >/dev/null 2>&1 || true
   sleep 3
   check "[codex] no marker on either disk (the planted hooks never ran)" p42c_no_marker || ok=0
+  p42c_disk_control
   p42c_end_box
   if [ "$ok" = 1 ]; then p42c_result "codex_repo_config_ignored" 1; else p42c_result "codex_repo_config_ignored" 0; fi
 }
@@ -483,7 +507,8 @@ p42c_repo_ignored_leg() {
 # p42c_leg_fail: every result key of the leg is FAIL (it could not run)
 p42c_leg_fail() {
   local k
-  for k in codex_turn_ok codex_no_prompt model_records_codex placeholder_accepted_codex model_paths_codex key_not_on_disk_codex codex_repo_config_ignored no_placeholder_401_codex codex_hooks_managed websocket_fallback_codex; do
+  P42C_LEGFAIL=1
+  for k in codex_turn_ok codex_no_prompt model_records_codex placeholder_accepted_codex model_paths_codex key_not_on_disk_codex codex_repo_config_ignored codex_hooks_managed websocket_fallback_codex; do
     p42c_result "$k" FAIL
   done
 }
@@ -491,6 +516,7 @@ p42c_leg_fail() {
 # the main leg: spawn, turn, by-eye checks, records, key not on disk
 p42c_leg() {
   local t0
+  P42C_LEGFAIL=0
   P42C_KEYFILE=$(p42c_keyfile_var)
   p42c_log "== codex (template codex, beta)"
   if ! check "[codex] key file readable, one line, no blank line, no CR (CRLF), no trailing blank" p42c_keyfile_ok "$P42C_KEYFILE"; then
@@ -602,7 +628,9 @@ smoke_codex() {
   command -v jq >/dev/null || { check "jq is installed (the fragment reads box ls --json and the audit)" false; return 0; }
   command -v git >/dev/null || { check "git is installed (the hostile repo)" false; return 0; }
   p42c_leg
-  p42c_repo_ignored_leg
+  if [ "$P42C_LEGFAIL" = 0 ]; then
+    p42c_repo_ignored_leg
+  fi
   p42c_401_leg
   return 0
 }

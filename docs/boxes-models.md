@@ -34,11 +34,26 @@ ChatGPT sign-in for Codex and "Login with Google" for Gemini are not built.
 
 ## Gemini notice
 
-Use a billing-enabled API key for private code. On the free tier, Google may use prompts and responses to improve its products. `saiife box templates` and `saiife box spawn --template gemini` print this notice.
+Printed by `saiife box templates` and `saiife box spawn --template gemini`:
+
+> Gemini: use a billing-enabled API key for private code; on the free tier Google may use prompts and responses to improve its products
 
 ## What the gateway forwards
 
-The gateway forwards only an exact list of model API calls (method, path and query) per provider. Any other call gets 403. Each refused call is logged in the audit as `model_denied` with reason `path_not_allowed`, with its method and path. The owner smoke (`scripts/box-smoke.sh --only claude|codex|gemini`) lists these as `model_paths_<agent>`.
+The gateway forwards only the calls below, matched on method, exact path and query. Any other call gets 403. Each refused call is logged in the audit as `model_denied` with reason `path_not_allowed`, with its method and path. The owner smoke lists these as `model_paths_<agent>`. `{ID}` is one path segment of 1 to 128 characters from `A-Z a-z 0-9 . _ -` (not `.` or `..`). A query key not listed, a repeated key, or a value that fails its rule is refused.
+
+| Provider | Method and path | Allowed query keys |
+| --- | --- | --- |
+| Anthropic | `POST /v1/messages` | `beta=true` |
+| Anthropic | `POST /v1/messages/count_tokens` | `beta=true` |
+| Anthropic | `GET /v1/models` | `beta=true`, `limit` (1 to 4 digits) |
+| Anthropic | `GET /v1/models/{ID}` | `beta=true` |
+| OpenAI | `POST /v1/responses` | none |
+| OpenAI | `GET /v1/models` | `client_version` (up to 32 of `0-9 A-Z a-z . + -`) |
+| OpenAI | `GET /v1/models/{ID}` | none |
+| Google | `POST /v1beta/models/{ID}:streamGenerateContent` | `alt=sse` (required) |
+| Google | `POST /v1beta/models/{ID}:generateContent` | none |
+| Google | `POST /v1beta/models/{ID}:countTokens` | none |
 
 ## Before release (TODO)
 

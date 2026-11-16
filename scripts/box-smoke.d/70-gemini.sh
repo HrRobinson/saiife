@@ -57,6 +57,8 @@ P42G_LOCKED_UNIT=/etc/systemd/system/saiife-box@.service
 P42G_LOCKED_AUDIT=/var/log/saiife/audit
 P42G_LOCKED_RUN=/var/lib/saiife-box/boxes
 P42G_T_RUNNING=0
+P42G_T_DONE=0
+P42G_LEGFAIL=0
 
 p42g_log() { printf '%s\n' "$*" >&2; }
 
@@ -159,6 +161,7 @@ p42g_wait_state() {
     st=$(p42g_state "$P42G_BOX")
     if [ "$st" = "$1" ]; then
       [ "$1" != running ] || P42G_T_RUNNING=$(date +%s)
+      [ "$1" != done ] || P42G_T_DONE=$(date +%s)
       return 0
     fi
     case "$st" in
@@ -167,6 +170,7 @@ p42g_wait_state() {
         return 1
         ;;
       done)
+        P42G_T_DONE=$(date +%s)
         if [ "$1" = running ]; then P42G_T_RUNNING=$(date +%s); return 0; fi
         ;;
     esac
@@ -206,21 +210,23 @@ p42g_ask() {
   fi
 }
 
-# p42g_audit_files: fills P42G_FILES with the readable audit files; 1 when none
-p42g_audit_files() {
-  local dir f
-  P42G_FILES=()
+# p42g_audit_cat: every audit line (JSONL) readable for this run, on stdout.
+# Locked mode reads with `sudo -n` (a refusal is a FAIL naming the read).
+p42g_audit_cat() {
+  local dir n=0
+  if p42g_locked && ! sudo -n true 2>/dev/null; then
+    p42g_log "locked mode: reading $P42G_LOCKED_AUDIT needs sudo -n (sudo -n cat $P42G_LOCKED_AUDIT/*.jsonl was refused)"
+    return 1
+  fi
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
-    if [ -d "$dir" ] && [ ! -r "$dir" ]; then
-      p42g_log "audit dir $dir is not readable by you (locked: rerun as a user who can read it)"
-      continue
+    if p42g_locked; then
+      if p42g_as sh -c 'cat "$1"/*.jsonl' _ "$dir" 2>/dev/null; then n=$((n + 1)); fi
+    elif [ -d "$dir" ] && [ -r "$dir" ]; then
+      if cat "$dir"/*.jsonl 2>/dev/null; then n=$((n + 1)); fi
     fi
-    for f in "$dir"/*.jsonl; do
-      [ -r "$f" ] && P42G_FILES+=("$f")
-    done
   done < <(p42g_audit_dirs)
-  [ "${#P42G_FILES[@]}" -gt 0 ] || { p42g_log "no readable audit files in: $(p42g_audit_dirs | tr '\n' ' ')"; return 1; }
+  [ "$n" -gt 0 ] || { p42g_log "no readable audit files in: $(p42g_audit_dirs | tr '\n' ' ')"; return 1; }
 }
 
 # model records of this box: provider of the route, status 200, credential
@@ -228,13 +234,13 @@ p42g_audit_files() {
 # audit Record flattens its extra map: box, provider, status, credential,
 # method and path are top-level keys.
 p42g_model_records() {
-  p42g_audit_files || return 1
-  jq -en --arg b "$P42G_BOX" --arg p "$(p42g_provider)" \
+  local recs
+  recs=$(p42g_audit_cat) || return 1
+  printf '%s\n' "$recs" | jq -en --arg b "$P42G_BOX" --arg p "$(p42g_provider)" \
     '[inputs | select(.kind == "model" and .box == $b)] as $m
      | ($m | length > 0)
        and ([$m[] | select(.provider == $p and .status == 200 and .credential == "gateway")] | length > 0)
-       and ([$m[] | select(.credential != "gateway")] | length == 0)' \
-    "${P42G_FILES[@]}" >/dev/null
+       and ([$m[] | select(.credential != "gateway")] | length == 0)' >/dev/null
 }
 
 # model_paths (OD3, R4, R12): every distinct "METHOD PATH" the gateway
@@ -242,31 +248,17 @@ p42g_model_records() {
 # either way; the owner widens the exact (method, path, query) list only from
 # this output. PASS when there are none.
 p42g_model_paths() {
-  local list
-  p42g_audit_files || return 1
-  list=$(jq -rn --arg b "$P42G_BOX" \
+  local recs list
+  recs=$(p42g_audit_cat) || return 1
+  list=$(printf '%s\n' "$recs" | jq -rn --arg b "$P42G_BOX" \
     '[inputs | select(.kind == "model_denied" and .box == $b and .reason == "path_not_allowed")
-      | "\(.method // "?") \(.path // "?")"] | unique | .[]' "${P42G_FILES[@]}") || return 1
+      | "\(.method // "?") \(.path // "?")"] | unique | .[]') || return 1
   if [ -n "$list" ]; then
     p42g_log "model_paths: refused (method path) pairs for box $P42G_BOX:"
     printf '%s\n' "$list" >&2
     return 1
   fi
   p42g_log "model_paths: none refused for box $P42G_BOX"
-}
-
-# websocket_fallback_codex (R12 list has no websocket route): every model
-# record of the turn is POST /v1/responses (no 400 upgrade refusals), and the
-# first record comes within 30 s of `running`.
-p42g_ws_fallback() {
-  p42g_audit_files || return 1
-  jq -en --arg b "$P42G_BOX" --argjson t0 "$P42G_T_RUNNING" \
-    '[inputs | select(.box == $b and (.kind == "model" or .kind == "model_denied"))] as $m
-     | ($m | length > 0)
-       and ([$m[] | select(.kind == "model_denied")] | length == 0)
-       and ([$m[] | select(.method != "POST" or .path != "/v1/responses")] | length == 0)
-       and (([$m[] | .ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601] | min) - $t0 <= 30)' \
-    "${P42G_FILES[@]}" >/dev/null
 }
 
 # the placeholder file is not the key, and (personal mode) 0600
@@ -401,7 +393,7 @@ p42g_plant_repo() {
     git init -q -b main .
     git config user.name smoke
     git config user.email smoke@example.invalid
-    printf 'one\n' >a.txt
+    printf 'P42CTRL_%s\n' "$P42G_NONCE" >a.txt
     case "gemini" in
       codex)
         mkdir .codex
@@ -429,20 +421,33 @@ p42g_plant_repo() {
   P42G_HOSTILE=$d
 }
 
-# The hook proof: saiife's own guard hook still ran for this box during the
-# turn. 50-claude.sh reads no guard record, so this relies on the audit's
-# `guard` records (daemon ops audit.append). A guard record is taken to be
-# this box's when it has box == BOX, or agent == "gemini"; the second form is a
-# fallback for builds that do not tag guard records with the box id, so a
-# stale record of an earlier run could satisfy it: check the printed count.
+# The hook proof: saiife's own guard hook still ran during this box's turn.
+# 50-claude.sh reads no guard record. Guard records carry NO box id (keys:
+# kind "guard", agent, session, ts), so the proof is bounded by time and
+# agent: a guard record with agent == "gemini" and ts between the box reaching
+# running and reaching done (2 s slack). A concurrent host session of the same
+# agent could still satisfy it: run the smoke with no other gemini session.
 p42g_guard_fired() {
-  local n
-  p42g_audit_files || return 1
-  n=$(jq -n --arg b "$P42G_BOX" --arg a "gemini" \
-    '[inputs | select(.kind == "guard" and ((.box // "") == $b or (.agent // "") == $a))] | length' \
-    "${P42G_FILES[@]}") || return 1
-  p42g_log "guard records for box $P42G_BOX (or agent gemini): $n"
+  local recs n
+  recs=$(p42g_audit_cat) || return 1
+  n=$(printf '%s\n' "$recs" | jq -n --arg a "gemini" --argjson t0 "$P42G_T_RUNNING" --argjson t1 "$P42G_T_DONE" \
+    '[inputs | select(.kind == "guard" and (.agent // "") == $a
+        and ((.ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $t | $t >= $t0 and $t <= $t1 + 2))] | length') || return 1
+  p42g_log "guard records for agent gemini between running and done: $n"
   [ "${n:-0}" -gt 0 ]
+}
+
+# positive control for the disk greps: a.txt of the hostile repo holds a known
+# string (checked out in /work, so plain bytes in repo.img). Informational:
+# 0 matches means the greps cannot see file contents, and every 0 above
+# ("no key", "no marker") is unproven.
+p42g_disk_control() {
+  local dir out n
+  dir=$(p42g_run_dir "$P42G_BOX")
+  out=$(p42g_as cat "$dir/repo.img" 2>/dev/null | tr '\0' '\n' | grep -c -a -F "P42CTRL_${P42G_NONCE}" || true)
+  n=$(printf '%s' "$out" | tr -d '[:space:]')
+  p42g_log "disk_grep_control_gemini: known string found ${n:-0} time(s) in repo.img (expected >= 1; 0 means the 0-match checks are unproven)"
+  p42g_result "disk_grep_control_gemini" "${n:-0}"
 }
 
 # no marker anywhere on the guest's disks after the turn (the hostile hooks
@@ -460,8 +465,8 @@ p42g_no_marker() {
 # <a>_repo_config_ignored (R7, R9, R11): a hostile /work config changes
 # nothing. A second box, on the planted repo, with a task that calls a tool
 # so the PreToolUse / BeforeTool guard hook has something to guard.
-# LIMIT: the hostile ~/.codex/hooks.json of the brief cannot be planted from
-# the host before the turn (the guest home is made at boot); only /work is.
+# LIMIT: only /work is planted (the guest home is made at boot, so nothing
+# can be put under the baked /opt/saiife-gemini-home from the host).
 p42g_repo_ignored_leg() {
   local ok=1
   p42g_log "== gemini, hostile repo config"
@@ -482,6 +487,7 @@ p42g_repo_ignored_leg() {
   saiife box stop "$P42G_BOX" >/dev/null 2>&1 || true
   sleep 3
   check "[gemini] no marker on either disk (the planted hooks never ran)" p42g_no_marker || ok=0
+  p42g_disk_control
   p42g_end_box
   if [ "$ok" = 1 ]; then p42g_result "gemini_repo_config_ignored" 1; else p42g_result "gemini_repo_config_ignored" 0; fi
 }
@@ -489,7 +495,8 @@ p42g_repo_ignored_leg() {
 # p42g_leg_fail: every result key of the leg is FAIL (it could not run)
 p42g_leg_fail() {
   local k
-  for k in gemini_turn_ok gemini_no_prompt model_records_gemini placeholder_accepted_gemini model_paths_gemini key_not_on_disk_gemini gemini_repo_config_ignored no_placeholder_401_gemini gemini_system_settings_loaded gemini_user_settings_locked; do
+  P42G_LEGFAIL=1
+  for k in gemini_turn_ok gemini_no_prompt model_records_gemini placeholder_accepted_gemini model_paths_gemini key_not_on_disk_gemini gemini_repo_config_ignored gemini_system_settings_loaded; do
     p42g_result "$k" FAIL
   done
 }
@@ -497,6 +504,7 @@ p42g_leg_fail() {
 # the main leg: spawn, turn, by-eye checks, records, key not on disk
 p42g_leg() {
   local t0
+  P42G_LEGFAIL=0
   P42G_KEYFILE=$(p42g_keyfile_var)
   p42g_log "== gemini (template gemini, beta)"
   if ! check "[gemini] key file readable, one line, no blank line, no CR (CRLF), no trailing blank" p42g_keyfile_ok "$P42G_KEYFILE"; then
@@ -600,10 +608,9 @@ p42g_by_eye() {
 # a hostile agent cannot (it can sudo). The tokens are split in the typed
 # line so the echoed command never matches.
 p42g_user_locked() {
-  local line m
+  local line scr
   line='f=/opt/saiife-gemini-home/.gemini/settings.json; echo GU''_U=$(id -un); (: >>"$f") 2>/dev/null && echo GU''_W=allowed || echo GU''_W=denied; mv "$f" "$f.x" 2>/dev/null && echo GU''_R=allowed || echo GU''_R=denied; rm -f "$f" 2>/dev/null; test -e "$f" && echo GU''_D=denied || echo GU''_D=allowed; echo GU''_END=1'
-  m=$(p42g_say_grep "$P42G_BOX" "$line" 'GU_END=1') || { p42g_result gemini_user_settings_locked 0; return 1; }
-  local scr
+  p42g_say_grep "$P42G_BOX" "$line" 'GU_END=1' >/dev/null || { p42g_result gemini_user_settings_locked 0; return 1; }
   scr=$(p42g_screen | grep -Eo 'GU_[UWRD]=[a-z]+' | sort -u | tr '\n' ' ')
   p42g_log "user settings probe: $scr"
   # sorted order of the keys: D, R, U, W
@@ -611,14 +618,15 @@ p42g_user_locked() {
     *GU_D=denied*GU_R=denied*GU_U=agent*GU_W=denied*) p42g_result gemini_user_settings_locked 1 ;;
     *) p42g_result gemini_user_settings_locked 0; return 1 ;;
   esac
-  : "$m"
 }
 
 smoke_gemini() {
   command -v jq >/dev/null || { check "jq is installed (the fragment reads box ls --json and the audit)" false; return 0; }
   command -v git >/dev/null || { check "git is installed (the hostile repo)" false; return 0; }
   p42g_leg
-  p42g_repo_ignored_leg
+  if [ "$P42G_LEGFAIL" = 0 ]; then
+    p42g_repo_ignored_leg
+  fi
   p42g_401_leg
   return 0
 }
