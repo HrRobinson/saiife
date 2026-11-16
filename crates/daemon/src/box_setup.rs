@@ -3,8 +3,9 @@
 //! gateway hook ([`LateHooks`]) and where a box's terminal recording goes
 //! ([`cast_path`]).
 //!
-//! The setup is the box template's command, no env (plan 40 adds the
-//! model's), the in-box Claude Code settings (G11) and the user packs of
+//! The setup is the box template's command, the model env and first-run
+//! seed of Claude Code (plan 40: the box's placeholder, never the real
+//! credential), the in-box Claude Code settings (G11) and the user packs of
 //! this daemon's `policy.d/packs`, on a 40 x 120 terminal. A pack that
 //! cannot be sent (an invalid id, too big, over the file count) is skipped
 //! with one stderr line naming it: a spawn is never refused for a pack.
@@ -16,9 +17,13 @@ use std::time::Duration;
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::Manager;
 use saiife_boxes::store::Store;
+use saiife_boxes::template::AgentKind;
 use saiife_boxes::BoxId;
-use saiife_boxhost::guest::{claude_settings, pack_files, CastPath, SetupSource, VsockGuest};
+use saiife_boxhost::guest::{
+    claude_env, claude_json_seed, claude_settings, pack_files, CastPath, SetupSource, VsockGuest,
+};
 use saiife_boxhost::paths::BoxPaths;
+use saiife_boxhost::placeholder::read_or_make_placeholder;
 use saiife_boxhost::vmm::VmHooks;
 use saiife_boxproto::msg::{AgentSpec, Setup, SetupFile, MAX_FILES, MAX_FILE_TEXT};
 use saiife_policy::userpacks::{read_user_packs, MAX_USER_PACK_BYTES, USER_PACKS_DIR};
@@ -27,6 +32,9 @@ use crate::box_ops::GuestEvents;
 
 /// Where the in-box Claude Code settings go (G11).
 pub const SETTINGS_PATH: &str = "/home/agent/.claude/settings.json";
+/// Claude Code's own state file, seeded once (never overwritten: it is sent
+/// with `keep_existing`).
+pub const CLAUDE_JSON_PATH: &str = "/home/agent/.claude.json";
 /// The agent's terminal (G4).
 pub const ROWS: u16 = 40;
 pub const COLS: u16 = 120;
@@ -88,9 +96,30 @@ impl SetupSource for TemplateSetup {
             .into_iter()
             .find(|t| t.name == r.template)
             .ok_or_else(|| format!("the template {:?} is gone", r.template))?;
+        let record = saiife_boxhost::layout::record_dir(mgr.root(), id);
         drop(mgr);
-        build_setup(id, &t.command, &user_packs(id, &self.packs))
+        // Runs on the guest channel's own thread (never under the manager
+        // lock or on an async runtime), so the file I/O may block. Every
+        // fresh guest init asks again (plan 38 R22): the placeholder is
+        // read back, so a re-setup carries the same env and approval.
+        let model = match t.agent {
+            AgentKind::ClaudeCode => {
+                let p = read_or_make_placeholder(&record, t.login)
+                    .map_err(|e| format!("the box's model placeholder: {e}"))?;
+                Some(ModelSetup {
+                    env: claude_env(t.login, &p),
+                    seed: claude_json_seed(&p),
+                })
+            }
+        };
+        build_setup(id, &t.command, model, &user_packs(id, &self.packs))
     }
+}
+
+/// What the model path adds to a Claude Code box's setup.
+pub struct ModelSetup {
+    pub env: Vec<(String, String)>,
+    pub seed: String,
 }
 
 /// The user packs as `(id, text)`; a dir that cannot be read sends none
@@ -106,20 +135,33 @@ fn user_packs(id: &BoxId, dir: &Path) -> Vec<(String, String)> {
     }
 }
 
-/// The setup of box `id`: `command`, no env, the Claude Code settings, then
-/// each pack that fits (invalid id, a text over [`MAX_FILE_TEXT`], past
+/// The setup of box `id`: `command`, the model env and `.claude.json` seed
+/// when given (they count against the env and file limits; only packs are
+/// skippable), the Claude Code settings, then each pack that fits (invalid id, a text over [`MAX_FILE_TEXT`], past
 /// [`MAX_FILES`] files or past [`MAX_USER_PACK_BYTES`] of packs: skipped,
 /// one line each). `Setup::check` runs last; its error is the answer.
 pub fn build_setup(
     id: &BoxId,
     command: &[String],
+    model: Option<ModelSetup>,
     packs: &[(String, String)],
 ) -> Result<Setup, String> {
     let mut files = vec![SetupFile {
         path: SETTINGS_PATH.into(),
         mode: 0o644,
         text: claude_settings(),
+        keep_existing: false,
     }];
+    let mut env = Vec::new();
+    if let Some(m) = model {
+        env = m.env;
+        files.push(SetupFile {
+            path: CLAUDE_JSON_PATH.into(),
+            mode: 0o600,
+            text: m.seed,
+            keep_existing: true,
+        });
+    }
     let mut pack_bytes = 0usize;
     for (pid, text) in packs {
         let skip = |why: &str| log(id, &format!("user pack {pid:?} skipped: {why}"));
@@ -149,7 +191,7 @@ pub fn build_setup(
             user: "agent".into(),
             cwd: "/work".into(),
         },
-        env: Vec::new(),
+        env,
         files,
         rows: ROWS,
         cols: COLS,
@@ -243,7 +285,7 @@ mod tests {
             "user.one".to_string(),
             "[pack]\nid = \"user.one\"\n".to_string(),
         )];
-        let s = build_setup(&b1(), &cmd(), &packs).unwrap();
+        let s = build_setup(&b1(), &cmd(), None, &packs).unwrap();
         assert_eq!(s.agent.command, cmd());
         assert_eq!(s.agent.user, "agent");
         assert_eq!(s.agent.cwd, "/work");
@@ -260,6 +302,39 @@ mod tests {
         assert_eq!(s.files[1].text, packs[0].1);
     }
 
+    fn model() -> ModelSetup {
+        ModelSetup {
+            env: vec![("ANTHROPIC_API_KEY".into(), "PH".into())],
+            seed: "{}".into(),
+        }
+    }
+
+    /// The seed is sent once-only (keep_existing), 0600; the env travels.
+    #[test]
+    fn model_env_and_seed_are_in_the_setup() {
+        let s = build_setup(&b1(), &cmd(), Some(model()), &[]).unwrap();
+        assert_eq!(s.env, model().env);
+        let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec![SETTINGS_PATH, CLAUDE_JSON_PATH]);
+        let seed = &s.files[1];
+        assert_eq!((seed.mode, seed.keep_existing), (0o600, true));
+        assert!(!s.files[0].keep_existing);
+        assert_eq!(s.files[0].text, claude_settings());
+    }
+
+    /// The seed counts against the file limit; packs are what gives way.
+    #[test]
+    fn the_seed_survives_a_pack_flood() {
+        let packs: Vec<(String, String)> = (0..100)
+            .map(|i| (format!("user.p{i}"), "x".to_string()))
+            .collect();
+        let s = build_setup(&b1(), &cmd(), Some(model()), &packs).unwrap();
+        assert_eq!(s.files.len(), MAX_FILES);
+        assert!(s.files.iter().any(|f| f.path == CLAUDE_JSON_PATH));
+        assert!(s.files.iter().any(|f| f.path == SETTINGS_PATH));
+        assert!(s.check().is_ok());
+    }
+
     #[test]
     fn bad_packs_are_skipped_not_refused() {
         let big = "x".repeat(MAX_FILE_TEXT + 1);
@@ -268,7 +343,7 @@ mod tests {
             ("user.big".to_string(), big),
             ("user.ok".to_string(), "b".to_string()),
         ];
-        let s = build_setup(&b1(), &cmd(), &packs).unwrap();
+        let s = build_setup(&b1(), &cmd(), None, &packs).unwrap();
         let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -284,7 +359,7 @@ mod tests {
         let packs: Vec<(String, String)> = (0..100)
             .map(|i| (format!("user.p{i}"), "x".to_string()))
             .collect();
-        let s = build_setup(&b1(), &cmd(), &packs).unwrap();
+        let s = build_setup(&b1(), &cmd(), None, &packs).unwrap();
         assert_eq!(s.files.len(), MAX_FILES);
         assert!(s.check().is_ok());
     }
@@ -297,7 +372,7 @@ mod tests {
             ("user.b".to_string(), half),
             ("user.c".to_string(), "small".to_string()),
         ];
-        let s = build_setup(&b1(), &cmd(), &packs).unwrap();
+        let s = build_setup(&b1(), &cmd(), None, &packs).unwrap();
         let names: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
             names,
@@ -311,7 +386,7 @@ mod tests {
 
     #[test]
     fn an_invalid_setup_is_the_error() {
-        let e = build_setup(&b1(), &[], &[]).unwrap_err();
+        let e = build_setup(&b1(), &[], None, &[]).unwrap_err();
         assert!(e.contains("agent command is empty"), "{e}");
     }
 

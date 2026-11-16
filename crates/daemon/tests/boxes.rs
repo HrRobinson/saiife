@@ -1814,19 +1814,110 @@ async fn setup_for_has_settings_and_packs() {
     setups.attach(&mgr);
     let s = setups.setup_for(&b).unwrap();
     assert_eq!(s.agent.command, vec!["claude".to_string()]);
-    assert!(s.env.is_empty());
+    assert!(!s.env.is_empty(), "the model env is there");
     assert_eq!((s.rows, s.cols), (40, 120));
-    assert_eq!(s.files.len(), 2, "{:?}", s.files);
+    assert_eq!(s.files.len(), 3, "{:?}", s.files);
     assert_eq!(s.files[0].path, SETTINGS_PATH);
     assert_eq!(s.files[0].mode, 0o644);
     assert_eq!(s.files[0].text, saiife_boxhost::guest::claude_settings());
+    assert_eq!(s.files[1].path, "/home/agent/.claude.json");
     assert_eq!(
-        s.files[1].path,
+        s.files[2].path,
         "/home/agent/.config/saiife/packs/user.mine.toml"
     );
-    assert_eq!(s.files[1].mode, 0o644);
-    assert_eq!(s.files[1].text, pack);
+    assert_eq!(s.files[2].mode, 0o644);
+    assert_eq!(s.files[2].text, pack);
     assert!(setups.setup_for(&id("b99")).is_err());
+}
+
+/// Plan 40 (R2, R3, R6): a Claude Code box's setup carries its placeholder in
+/// the login kind's variable and a once-only `.claude.json` seed; the real
+/// credential is never read; a second setup (cold boot, revise, init
+/// restart) carries the same env and placeholder.
+#[tokio::test]
+async fn setup_has_placeholder_env() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::{TemplateSetup, CLAUDE_JSON_PATH, SETTINGS_PATH};
+    let w = world();
+    let tmp = scratch();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(tmp.path().join("packs"));
+    setups.attach(w.mgr.as_ref().unwrap());
+    let s1 = setups.setup_for(&b).unwrap();
+    let env = |k: &str| s1.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let ph = env("ANTHROPIC_API_KEY").expect("api-key placeholder");
+    assert!(
+        ph.starts_with(concat!("sk-", "ant-", "api03-", "saiife")),
+        "{ph}"
+    );
+    assert!(env("CLAUDE_CODE_OAUTH_TOKEN").is_none());
+    assert_eq!(env("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:3129");
+    for k in [
+        "DISABLE_TELEMETRY",
+        "DISABLE_ERROR_REPORTING",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "DISABLE_AUTOUPDATER",
+    ] {
+        assert_eq!(env(k).as_deref(), Some("1"), "{k}");
+    }
+    // the hooks settings are still there, and the seed is once-only
+    assert_eq!(s1.files[0].path, SETTINGS_PATH);
+    assert_eq!(s1.files[0].text, saiife_boxhost::guest::claude_settings());
+    let seed = s1
+        .files
+        .iter()
+        .find(|f| f.path == CLAUDE_JSON_PATH)
+        .unwrap();
+    assert_eq!((seed.mode, seed.keep_existing), (0o600, true));
+    assert!(seed.text.contains(&ph[ph.len() - 20..]));
+    assert!(!seed.text.contains(&ph));
+    // the placeholder is in the daemon-only record dir
+    let rec = saiife_boxhost::layout::record_dir(w.mgr.as_ref().unwrap().root(), &b);
+    assert!(std::fs::read_to_string(rec.join("placeholder"))
+        .unwrap()
+        .starts_with(ph.as_str()));
+}
+
+/// Plan 40 R6: a second setup of one box (cold boot, revise, init restart)
+/// carries the same env and the same placeholder; another box differs.
+#[tokio::test]
+async fn resetup_keeps_env_and_placeholder() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::TemplateSetup;
+    let w = world();
+    let tmp = scratch();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(tmp.path().join("packs"));
+    setups.attach(w.mgr.as_ref().unwrap());
+    let s1 = setups.setup_for(&b).unwrap();
+    let s2 = setups.setup_for(&b).unwrap();
+    assert!(!s1.env.is_empty());
+    assert_eq!(s1.env, s2.env);
+    assert_eq!(s1, s2);
+    let c = w.spawn(ALICE, "t").await;
+    let c = id(c["box"]["id"].as_str().unwrap());
+    assert_ne!(setups.setup_for(&c).unwrap().env, s1.env);
+}
+
+/// Plan 40 R3: the setup never holds a vault value: nothing here reads the
+/// vault, so a secret stored under the template's credential name is absent
+/// from the serialized setup.
+#[tokio::test]
+async fn setup_has_no_secret() {
+    use saiife_boxhost::guest::SetupSource;
+    use saiife_daemon::box_setup::TemplateSetup;
+    let w = world();
+    let tmp = scratch();
+    let a = w.spawn(ALICE, "t").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    let setups = TemplateSetup::new(tmp.path().join("packs"));
+    setups.attach(w.mgr.as_ref().unwrap());
+    let json = serde_json::to_string(&setups.setup_for(&b).unwrap()).unwrap();
+    let secret = concat!("sk-", "ant-", "api03-", "REALSECRET0123456789");
+    assert!(!json.contains(secret));
+    assert!(!json.contains("REALSECRET"));
 }
 
 /// R19: the guest channel and the driver take the VMM uid from one place.

@@ -165,6 +165,11 @@ pub struct SetupFile {
     pub path: String,
     pub mode: u32,
     pub text: String,
+    /// Leave the file alone when its target exists in any form (a file, a
+    /// link, a directory): a seed the agent may have changed since. Absent
+    /// in older frames, so false there.
+    #[serde(default)]
+    pub keep_existing: bool,
 }
 
 /// The most environment variables a setup carries.
@@ -275,10 +280,25 @@ mod tests {
                 path: "/home/agent/x".into(),
                 mode: 0o644,
                 text: "hi".into(),
+                keep_existing: false,
             }],
             rows: 40,
             cols: 120,
         }
+    }
+
+    /// An older frame without the field still parses, as false.
+    #[test]
+    fn setup_file_keep_existing_defaults_to_false() {
+        let f: SetupFile =
+            serde_json::from_str(r#"{"path":"/home/agent/x","mode":420,"text":"hi"}"#).unwrap();
+        assert!(!f.keep_existing);
+        let f = SetupFile {
+            keep_existing: true,
+            ..f
+        };
+        let back: SetupFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert!(back.keep_existing);
     }
 
     #[test]
@@ -316,7 +336,7 @@ mod tests {
         pin(
             Request::Setup(setup()),
             json!({"t":"setup","agent":{"command":["claude"],"user":"agent","cwd":"/work"},
-                   "env":[["A","b"]],"files":[{"path":"/home/agent/x","mode":420,"text":"hi"}],
+                   "env":[["A","b"]],"files":[{"path":"/home/agent/x","mode":420,"text":"hi","keep_existing":false}],
                    "rows":40,"cols":120}),
         );
         pin(
@@ -469,6 +489,7 @@ mod tests {
                     path: format!("/home/agent/f{i}"),
                     mode: 0o600,
                     text: String::new(),
+                    keep_existing: false,
                 })
                 .collect()
         });
