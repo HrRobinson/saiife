@@ -30,7 +30,7 @@ use saiife_audit::{DecisionKind, Record};
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::{Change, Manager, SpawnArgs, MAX_REPO_BYTES};
-use saiife_boxes::source::{info, ManagerSource};
+use saiife_boxes::source::{info, LandBook, ManagerSource};
 use saiife_boxes::store::BoxRecord;
 use saiife_boxes::template::{TemplateWarning, Trust};
 use saiife_boxes::{BoxError, BoxId, BoxState};
@@ -104,6 +104,27 @@ pub const OPS: &[&str] = &[
     saiife_ipc::msg::OP_BOX_IMAGE_IMPORT,
     saiife_ipc::msg::OP_BOX_IMAGE_DEFAULT,
     saiife_ipc::msg::OP_BOX_IMAGE_RM,
+    // Land and push (plan 39): `crate::box_land::handle`.
+    saiife_ipc::msg::OP_BOX_LAND_BEGIN,
+    saiife_ipc::msg::OP_BOX_LAND,
+    saiife_ipc::msg::OP_BOX_LAND_REJECT,
+    saiife_ipc::msg::OP_BOX_LAND_FETCH,
+    saiife_ipc::msg::OP_BOX_LAND_APPLIED,
+    saiife_ipc::msg::OP_BOX_PUSH_BEGIN,
+    saiife_ipc::msg::OP_BOX_PUSH,
+    saiife_ipc::msg::OP_BOX_PUSH_DONE,
+];
+
+/// The ops of [`OPS`] the land book serves (plan 39).
+const LAND_OPS: &[&str] = &[
+    saiife_ipc::msg::OP_BOX_LAND_BEGIN,
+    saiife_ipc::msg::OP_BOX_LAND,
+    saiife_ipc::msg::OP_BOX_LAND_REJECT,
+    saiife_ipc::msg::OP_BOX_LAND_FETCH,
+    saiife_ipc::msg::OP_BOX_LAND_APPLIED,
+    saiife_ipc::msg::OP_BOX_PUSH_BEGIN,
+    saiife_ipc::msg::OP_BOX_PUSH,
+    saiife_ipc::msg::OP_BOX_PUSH_DONE,
 ];
 
 /// `<state_dir>/boxes`: the box records, the daemon's own in both modes
@@ -854,6 +875,7 @@ pub async fn guest_event_via(
     .await?;
     if let Some(c) = &c {
         write_tick_records(ctx, "tick", None, vec![(c.clone(), template)], via).await;
+        refresh_done(ctx, std::slice::from_ref(c));
     }
     Ok(c)
 }
@@ -902,8 +924,10 @@ pub async fn tick_once(ctx: &Ctx) -> usize {
         }
     };
     let n = low.len() + changes.len();
+    let moved: Vec<Change> = changes.iter().map(|(c, _)| c.clone()).collect();
     write_tick_records(ctx, "disk_low", Some(DISK_LOW_WHY), low, "tick").await;
     write_tick_records(ctx, "tick", None, changes, "tick").await;
+    refresh_done(ctx, &moved);
     n + promote_restored(ctx).await
 }
 
@@ -1018,7 +1042,7 @@ pub(crate) fn box_rec(
 
 /// The answer to a refused op: `bad_request` with `rule` for not found,
 /// wrong state and invalid; `busy`; `unavailable`.
-fn refusal(id: u64, e: &BoxError) -> Value {
+pub(crate) fn refusal(id: u64, e: &BoxError) -> Value {
     let code = match e {
         BoxError::NotFound | BoxError::WrongState { .. } | BoxError::Invalid(_) => {
             ErrorCode::BadRequest
@@ -1068,18 +1092,22 @@ fn arg_bool(args: &Map<String, Value>, name: &str) -> Result<bool, BoxError> {
 /// One op with its arguments checked.
 enum Op {
     Spawn(SpawnArgs),
-    List { all: bool },
+    List {
+        all: bool,
+    },
     Templates,
     Pause(BoxId),
     Stop(BoxId, bool),
-    Discard(BoxId),
+    /// `force`: even with an approved land not applied.
+    Discard(BoxId, bool),
     Done(BoxId),
     Resume(BoxId),
     Revise(BoxId, String),
     Steer(BoxId, String),
     Reorder(Vec<BoxId>),
     Gc,
-    Diff(BoxId),
+    /// `refresh`: export again rather than answer the cached review.
+    Diff(BoxId, bool),
     TermRead(BoxId, Option<u64>),
 }
 
@@ -1133,7 +1161,7 @@ impl Op {
             OP_BOX_TEMPLATES => Op::Templates,
             OP_BOX_PAUSE => Op::Pause(arg_id(a)?),
             OP_BOX_STOP => Op::Stop(arg_id(a)?, arg_bool(a, "keep")?),
-            OP_BOX_DISCARD => Op::Discard(arg_id(a)?),
+            OP_BOX_DISCARD => Op::Discard(arg_id(a)?, arg_bool(a, "force")?),
             OP_BOX_DONE => Op::Done(arg_id(a)?),
             OP_BOX_RESUME => Op::Resume(arg_id(a)?),
             OP_BOX_REVISE => Op::Revise(arg_id(a)?, arg_text(a, "comment", MAX_STEER_BYTES)?),
@@ -1152,7 +1180,7 @@ impl Op {
                 Op::Reorder(ids)
             }
             OP_BOX_GC => Op::Gc,
-            OP_BOX_DIFF => Op::Diff(arg_id(a)?),
+            OP_BOX_DIFF => Op::Diff(arg_id(a)?, arg_bool(a, "refresh")?),
             OP_BOX_TERM_READ => {
                 let after = match a.get("after") {
                     None | Some(Value::Null) => None,
@@ -1180,12 +1208,12 @@ impl Op {
         match self {
             Op::Pause(i)
             | Op::Stop(i, _)
-            | Op::Discard(i)
+            | Op::Discard(i, _)
             | Op::Done(i)
             | Op::Resume(i)
             | Op::Revise(i, _)
             | Op::Steer(i, _)
-            | Op::Diff(i)
+            | Op::Diff(i, _)
             | Op::TermRead(i, _) => Some(i),
             _ => None,
         }
@@ -1193,7 +1221,7 @@ impl Op {
 }
 
 /// A manager call off the runtime thread.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
 ) -> Result<T, BoxError> {
     tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
@@ -1232,10 +1260,86 @@ fn disk_mib(root: &Path, id: &BoxId) -> u64 {
     0
 }
 
+/// The context's land book (plan 39), if one is attached.
+type Book = Option<Arc<dyn LandBook>>;
+
+fn book(ctx: &Ctx) -> Book {
+    #[cfg(unix)]
+    {
+        ctx.box_lands
+            .get()
+            .map(|l| Arc::clone(l) as Arc<dyn LandBook>)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
+/// The box source over `mgr` as `scope` sees it, with the land book when
+/// there is one: every `ManagerSource` of the daemon is made here.
+fn source(mgr: &Arc<Manager>, scope: Option<u32>, book: &Book) -> ManagerSource {
+    let src = ManagerSource::new(Arc::clone(mgr), scope);
+    match book {
+        Some(b) => src.with_lands(Arc::clone(b)),
+        None => src,
+    }
+}
+
+/// Attach the land book (plan 39) over the context's box manager, reaching
+/// each box's guest through `guest` and its files through `layout`. Once
+/// per context; `None` without a manager or when one is attached already.
+/// The daemon's start calls it once boxes run on a real VMM (plan 35); a
+/// test calls it with its own guest.
+#[cfg(unix)]
+pub fn attach_lands(
+    ctx: &Arc<Ctx>,
+    guest: Arc<saiife_boxhost::guest::VsockGuest>,
+    layout: saiife_boxhost::layout::Layout,
+) -> Option<Arc<crate::box_land::Lands>> {
+    let mgr = ctx.box_manager.clone()?;
+    let lands = crate::box_land::Lands::new(Arc::clone(ctx), mgr, guest, layout);
+    ctx.box_lands.set(Arc::clone(&lands)).ok()?;
+    Some(lands)
+}
+
+/// A box that just became `Done` gets its review now, before an idle stop
+/// can turn its VM off (plan 39). Each refresh runs off the runtime and is
+/// not waited for (an export may take up to two minutes); a refused export
+/// is recorded by the book.
+fn refresh_done(ctx: &Ctx, changes: &[Change]) {
+    #[cfg(unix)]
+    {
+        let Some(lands) = ctx.box_lands.get() else {
+            return;
+        };
+        for c in changes {
+            if c.to != BoxState::Done || c.from == BoxState::Done {
+                continue;
+            }
+            let (l, id) = (Arc::clone(lands), c.id.clone());
+            tokio::task::spawn_blocking(move || match l.refresh(&id) {
+                Ok(_) => {}
+                // An idle stop or a stop: the VM is off already.
+                Err(BoxError::Unavailable(m)) if m == crate::box_land::vm_off(&id) => {}
+                Err(e) => eprintln!("saiifed: boxes: no review of {}: {e}", id.as_str()),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (ctx, changes);
+}
+
 /// `{box: BoxInfo}`: box `r` as `scope` sees it (queue positions among
 /// that owner's boxes; `None`: the whole queue).
-fn info_of(mgr: &Arc<Manager>, r: &BoxRecord, scope: Option<u32>) -> Map<String, Value> {
-    let src = ManagerSource::new(Arc::clone(mgr), scope);
+fn info_of(
+    mgr: &Arc<Manager>,
+    r: &BoxRecord,
+    scope: Option<u32>,
+    book: &Book,
+) -> Map<String, Value> {
+    let src = source(mgr, scope, book);
     let i = src
         .list()
         .into_iter()
@@ -1295,6 +1399,13 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let Some(mgr) = ctx.box_manager.clone() else {
         return err(id, ErrorCode::Unavailable, unavailable(ctx));
     };
+    // Land and push (plan 39): the land book's own ops.
+    if LAND_OPS.contains(&req.op.as_str()) {
+        #[cfg(unix)]
+        return crate::box_land::handle(ctx, conn, req).await;
+        #[cfg(not(unix))]
+        return err(id, ErrorCode::Unavailable, UNAVAILABLE);
+    }
     let peer = conn.peer.clone();
     let action = req.op.strip_prefix("box.").unwrap_or(&req.op).to_string();
     let op = match Op::parse(&req.op, &req.args, peer.uid, !passed.is_empty()) {
@@ -1445,16 +1556,18 @@ async fn run(
     let m = Arc::clone(mgr);
     let c = Arc::clone(caller);
     let uid = caller.peer.uid;
+    let lands = book(ctx);
     // A per-box change: the manager call, then the box as it is now.
     let change = |action: &'static str, f: Step| {
         let (m, c) = (Arc::clone(mgr), Arc::clone(caller));
         let before = before.clone();
+        let lands = lands.clone();
         async move {
             let b = before.ok_or(BoxError::NotFound)?;
             let (ch, answer) = blocking(move || {
                 let ch = f(&m)?;
                 let answer = match m.get(&ch.id) {
-                    Ok(r) => info_of(&m, &r, c.scope_for(&r)),
+                    Ok(r) => info_of(&m, &r, c.scope_for(&r), &lands),
                     Err(_) => under("box", &json!({"id": ch.id.as_str()})),
                 };
                 Ok((ch, answer))
@@ -1474,6 +1587,7 @@ async fn run(
     };
     match op {
         Op::Spawn(mut args) => {
+            let lands = lands.clone();
             let (r, answer, others) = blocking(move || {
                 // The copy runs here, off the runtime and outside every
                 // lock; the manager moves it into the box dir.
@@ -1482,7 +1596,7 @@ async fn run(
                 let spawned = m.spawn_changes(&args);
                 discard_disk(&root, staged.as_deref());
                 let (r, changes) = spawned?;
-                let answer = info_of(&m, &r, Some(r.owner_uid));
+                let answer = info_of(&m, &r, Some(r.owner_uid), &lands);
                 // Earlier queue heads this spawn's admission pass moved
                 // (possibly other owners' boxes): the tick never sees them.
                 // The new box's own admission is covered by the spawn
@@ -1522,7 +1636,7 @@ async fn run(
             let scope = (!(all && caller.privileged)).then_some(uid);
             let disk_root = ctx.box_disk_root.clone();
             blocking(move || {
-                let boxes = ManagerSource::new(Arc::clone(&m), scope).list();
+                let boxes = source(&m, scope, &lands).list();
                 // Usage is read from the box dirs after every manager lock
                 // is released (the lists above are snapshots); the disks are
                 // in the driver's runtime dirs (R37).
@@ -1580,12 +1694,42 @@ async fn run(
         }
         Op::Pause(i) => change("pause", Box::new(move |m| m.pause(&i))).await,
         Op::Stop(i, keep) => change("stop", Box::new(move |m| m.stop(&i, keep))).await,
-        Op::Done(i) => change("done", Box::new(move |m| m.done(&i))).await,
+        Op::Done(i) => {
+            let id = i.clone();
+            let done = change("done", Box::new(move |m| m.done(&i))).await?;
+            let moved = Change {
+                id,
+                from: BoxState::Running,
+                to: BoxState::Done,
+                why: "done",
+                image: None,
+            };
+            refresh_done(ctx, &[moved]);
+            Ok(done)
+        }
         Op::Resume(i) => change("resume", Box::new(move |m| m.resume(&i))).await,
         Op::Revise(i, text) => change("revise", Box::new(move |m| m.revise(&i, &text))).await,
-        Op::Discard(i) => {
+        Op::Discard(i, force) => {
             let gone = i.clone();
-            let (_, rec) = change("discard", Box::new(move |m| m.discard(&i))).await?;
+            // An approved land not applied yet keeps the box (L4), unless
+            // forced; a land record that cannot be read counts as one.
+            let book = lands.clone();
+            let (_, rec) = change(
+                "discard",
+                Box::new(move |m| match &book {
+                    // Checked and discarded under the book's box lock.
+                    Some(b) => {
+                        let mut done = None;
+                        b.discard_with(&i, force, &mut || {
+                            done = Some(m.discard(&i)?);
+                            Ok(())
+                        })?;
+                        done.ok_or(BoxError::NotFound)
+                    }
+                    None => m.discard(&i),
+                }),
+            )
+            .await?;
             // its run is stopped: the guest channel drops its last screen
             blocking(move || {
                 m.guest().forget(&gone);
@@ -1593,6 +1737,12 @@ async fn run(
             })
             .await?;
             let b = before.ok_or(BoxError::NotFound)?;
+            let mut rec = rec;
+            if force {
+                if let Some(r) = rec.as_mut() {
+                    r.extra.insert("force".into(), true.into());
+                }
+            }
             Ok((under("box", &json!({"id": b.id.as_str()})), rec))
         }
         Op::Steer(i, msg) => {
@@ -1622,7 +1772,7 @@ async fn run(
                 if c.privileged && want == all {
                     m.reorder(&ids2)
                 } else {
-                    ManagerSource::new(Arc::clone(&m), Some(c.peer.uid)).reorder(&ids2)
+                    source(&m, Some(c.peer.uid), &lands).reorder(&ids2)
                 }
             })
             .await?;
@@ -1681,16 +1831,30 @@ async fn run(
             }
             Ok((a, Some(rec)))
         }
-        Op::Diff(i) => {
+        Op::Diff(i, refresh) => {
+            // With the land book: the review too (plan 39), the cached one
+            // unless `refresh`.
+            #[cfg(unix)]
+            if let Some(l) = ctx.box_lands.get().cloned() {
+                return blocking(move || {
+                    let r = match (refresh, l.latest(&i)) {
+                        (false, Some(r)) => r,
+                        _ => l.refresh(&i)?,
+                    };
+                    Ok((crate::box_land::diff_answer(&r), None))
+                })
+                .await;
+            }
+            let _ = refresh;
             blocking(move || {
-                let d = ManagerSource::new(m, None).diff(&i)?;
+                let d = source(&m, None, &lands).diff(&i)?;
                 Ok((under("diff", &d), None))
             })
             .await
         }
         Op::TermRead(i, after) => {
             blocking(move || {
-                let b = ManagerSource::new(m, None).terminal(&i, after)?;
+                let b = source(&m, None, &lands).terminal(&i, after)?;
                 Ok((obj(&b), None))
             })
             .await
