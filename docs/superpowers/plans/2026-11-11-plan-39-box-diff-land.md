@@ -71,7 +71,7 @@ Plan 35's Global Constraints apply (including `CARGO_PROFILE_DEV_DEBUG=0`), with
 | unified header | `diff --saiife a/<p> b/<p>`; `new file mode 100644`, `deleted file mode 100755`, `old mode …`/`new mode …`; `--- a/<p>` or `--- /dev/null`; `+++ b/<p>` or `+++ /dev/null`; hunks with 3 context lines; `\ No newline at end of file` |
 | binary line | `Binary file b/<p>: <size> bytes, sha256 <hex>` (deleted: `Binary file a/<p> deleted`) |
 | symlink | rendered as a one-line text file whose content is the target, with mode `120000` in the header |
-| land dir | `<box>/lands/<n>/` (0700): `blobs/<sha256>`, `delta.bin` (canonical, new content only, for the CLI), `review.json`, `request.json`, `approved.json`, `applied.json` |
+| land dir | `<record dir>/lands/<n>/` (0700; the box's record dir, `RecordPaths::of(<store root>, id)`, never the VMM runtime dir, R37): `blobs/<sha256>`, `delta.bin` (canonical, new content only, for the CLI), `review.json`, `request.json`, `approved.json`, `applied.json` |
 | `target_ref` | `saiife/box-<id>` |
 | land commit message | `saiife box <id>: land <n>\n\n<first line of the task, ≤ 72 chars>\n\nSaiife-Box: <id>\nSaiife-Land: <n>\nSaiife-Diff-Sha256: <sha>\n` |
 | worktree | `$XDG_DATA_HOME/saiife/worktrees/<repo>-<id>` |
@@ -157,7 +157,7 @@ Every git call: `GIT_DIR=<root>/var/lib/saiife-guest/base.git GIT_WORK_TREE=<roo
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct Flag { pub path: String, pub why: String }   // L6 texts: "protected path", "rule <pack>: <reason>", "becomes executable", "new symlink", "binary", "differs only in case from <other>"
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] pub struct Review { pub n: u32, pub summary: saiife_wire::DiffSummary, pub flags: Vec<Flag>, pub entries: Vec<EntryHead>, pub base_head: Option<String> }
 pub type Hits<'a> = &'a dyn Fn(&[&str]) -> Vec<Flag>;   // the daemon passes plan 32's diff_hits mapped to Flag
-pub fn receive(guest: &VsockGuest, id: &BoxId, paths: &BoxPaths, base: &BaseManifest, n: u32) -> Result<Valid, DeltaError>;   // request_stream(Export{n}) into lands/<n>/blobs; on error removes lands/<n>
+pub fn receive(guest: &VsockGuest, id: &BoxId, paths: &RecordPaths, base: &BaseManifest, n: u32) -> Result<Valid, DeltaError>;   // request_stream(Export{n}) into lands/<n>/blobs; on error removes lands/<n>
 pub fn render(base: &BaseManifest, v: &Valid, blobs: &Path, only: Option<&BTreeSet<String>>) -> (String /* full unified */, Vec<FileChange>);
 pub fn review(id: &BoxId, base: &BaseManifest, v: &Valid, blobs: &Path, only: Option<&BTreeSet<String>>, hits: Hits) -> Review;   // diff_sha256 = sha256(full); unified cut at a line end ≤ MAX_DIFF_BYTES
 pub fn write_land_files(paths: &BoxPaths, r: &Review, only: Option<&BTreeSet<String>>) -> Result<(), String>;   // delta.bin (new content of the selected entries) + review.json, 0600

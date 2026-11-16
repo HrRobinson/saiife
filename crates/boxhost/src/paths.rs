@@ -1,7 +1,7 @@
 //! The files in one box's runtime directory (`<layout.boxes>/<id>`, shared
 //! with the VMM; R37). Only VMM-side files live here: the spec, sockets,
 //! logs, disks and `snapshot/`. Daemon-trusted files (`base.json`,
-//! `term.cast`, `lands/`, `placeholder`, review and land state; plans 37-39)
+//! `term.cast`, `lands/`: review and land state; plans 37-39)
 //! belong in the box's record dir, which the box store owns.
 
 use saiife_wire::source::BoxId;
