@@ -189,6 +189,13 @@ install_gemini() {
 install_claude_managed() {
   install -d -o root -g root -m 0755 "/etc/claude-code"
   install -o root -g root -m 0644 "$MNT/claude-managed-settings.json" "/etc/claude-code/managed-settings.json"
+  # git's ssh (FU2 fix 5): the managed env names this wrapper; it reads only
+  # saiife's ssh config. The system git config forces the same keys.
+  install -d -o root -g root -m 0755 "/usr/local/libexec"
+  install -o root -g root -m 0755 "$MNT/saiife-ssh" "/usr/local/libexec/saiife-ssh"
+  install -d -o root -g root -m 0755 "/etc/ssh"
+  install -o root -g root -m 0644 "$MNT/saiife-ssh-config" "/etc/ssh/saiife_ssh_config"
+  install -o root -g root -m 0644 "$MNT/saiife-gitconfig" "/etc/gitconfig"
 }
 
 # Claude Code always; the others only for the payload files present:

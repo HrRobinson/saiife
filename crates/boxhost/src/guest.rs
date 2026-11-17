@@ -1482,9 +1482,13 @@ pub fn claude_proxy_env() -> Vec<(String, String)> {
 /// boundary (the VM and its gateway) stays the control. Only variables whose
 /// tool reads an empty value as unset are here (git `GIT_PROXY_COMMAND` and
 /// `GIT_EXEC_PATH`, the loader, bash and sh rc files, curl's and Python's
-/// proxies, Python, Perl, Ruby and Node search paths). One whose empty value
-/// makes the tool run `""` is pinned instead ([`claude_exec_env`]).
-pub const CLAUDE_EXEC_BLANKED_ENV: [&str; 19] = [
+/// proxies, Python, Perl, Ruby and Node search paths; git's `GIT_ASKPASS`
+/// (empty: no askpass, and no fall back to `core.askPass` or `SSH_ASKPASS`)
+/// and `GIT_CONFIG_PARAMETERS` (empty: no `-c` pairs; the
+/// `GIT_CONFIG_COUNT` pairs still apply); `DISPLAY`, which ssh ignores when
+/// empty). One whose empty value makes the tool run `""` is pinned instead
+/// ([`claude_exec_env`], [`claude_git_env`]).
+pub const CLAUDE_EXEC_BLANKED_ENV: [&str; 22] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -1504,31 +1508,136 @@ pub const CLAUDE_EXEC_BLANKED_ENV: [&str; 19] = [
     "RUBYOPT",
     "RUBYLIB",
     "NODE_PATH",
+    "GIT_ASKPASS",
+    "GIT_CONFIG_PARAMETERS",
+    "DISPLAY",
 ];
 
-/// The ssh client git runs for an ssh remote: OpenSSH's, from the recipe's
-/// `openssh-client` package.
-pub const CLAUDE_GIT_SSH: &str = "/usr/bin/ssh";
+/// OpenSSH's client, from the recipe's `openssh-client` package.
+pub const OPENSSH: &str = "/usr/bin/ssh";
+
+/// The ssh program git runs for an ssh remote in a box (FU2 fix round 5):
+/// a root-owned wrapper ([`saiife_ssh_wrapper`]) that runs [`OPENSSH`] with
+/// only saiife's ssh config ([`SAIIFE_SSH_CONFIG_PATH`]), so the agent's
+/// `~/.ssh/config` (`ProxyCommand`, `LocalCommand`) is never read.
+pub const CLAUDE_GIT_SSH: &str = "/usr/local/libexec/saiife-ssh";
+
+/// The only ssh config [`CLAUDE_GIT_SSH`] reads (baked root-owned 0644).
+pub const SAIIFE_SSH_CONFIG_PATH: &str = "/etc/ssh/saiife_ssh_config";
+
+/// The system git config, baked root-owned 0644 with [`GIT_FORCED_CONFIG`].
+pub const SYSTEM_GITCONFIG_PATH: &str = "/etc/gitconfig";
+
+/// The wrapper at [`CLAUDE_GIT_SSH`] (baked root:root 0755).
+pub fn saiife_ssh_wrapper() -> String {
+    format!(
+        "#!/bin/sh\n\
+         # saiife (FU2): git's ssh in a box. It reads only saiife's ssh config,\n\
+         # never ~/.ssh/config, and never prompts.\n\
+         exec {OPENSSH} -F {SAIIFE_SSH_CONFIG_PATH} -o BatchMode=yes \"$@\"\n"
+    )
+}
+
+/// The ssh config at [`SAIIFE_SSH_CONFIG_PATH`] (baked root:root 0644): no
+/// command ssh would run on its own (proxy, jump host, local command, known
+/// hosts command), no shared control socket, no prompt. Known hosts stay
+/// OpenSSH's defaults (`~/.ssh/known_hosts`, an unknown host is refused in
+/// batch mode).
+pub fn saiife_ssh_config() -> String {
+    "# saiife (FU2): the only ssh config git's ssh reads in a box\n\
+     Host *\n\
+     \tProxyCommand none\n\
+     \tProxyJump none\n\
+     \tPermitLocalCommand no\n\
+     \tLocalCommand none\n\
+     \tKnownHostsCommand none\n\
+     \tControlMaster no\n\
+     \tControlPath none\n\
+     \tBatchMode yes\n"
+        .to_string()
+}
+
+/// git config keys saiife forces in a box (FU2 fix round 5), in the system
+/// config ([`system_gitconfig`]) and again, because a repo's `.git/config`
+/// outranks the system file, from the managed env as `GIT_CONFIG_COUNT`
+/// pairs, which "override values in configuration files"
+/// (<https://git-scm.com/docs/git-config#ENVIRONMENT>). An empty
+/// `credential.helper` clears the helper list; an empty `core.askPass` names
+/// none; `core.pager = cat` is git's "no pager". `core.hooksPath` is left
+/// alone (ruling G11): repo hooks are repo content, run by a git command the
+/// guard sees.
+pub const GIT_FORCED_CONFIG: [(&str, &str); 5] = [
+    ("core.sshCommand", CLAUDE_GIT_SSH),
+    ("core.askPass", ""),
+    ("core.fsmonitor", "false"),
+    ("core.pager", "cat"),
+    ("credential.helper", ""),
+];
+
+/// The system git config at [`SYSTEM_GITCONFIG_PATH`].
+pub fn system_gitconfig() -> String {
+    let mut out = String::from("# saiife (FU2): the system git config in a box\n");
+    let mut section = "";
+    for (k, v) in GIT_FORCED_CONFIG {
+        let (sec, name) = k.split_once('.').expect("section.name");
+        if sec != section {
+            out.push_str(&format!("[{sec}]\n"));
+            section = sec;
+        }
+        out.push_str(&format!("\t{name} = {v}\n").replace(" = \n", " =\n"));
+    }
+    out
+}
+
+/// git's and ssh's program and prompt variables, pinned (FU2 fix round 5):
+/// - `GIT_SSH_COMMAND` and `GIT_SSH`: [`CLAUDE_GIT_SSH`]. git runs a
+///   set-but-empty one as `""`, and `GIT_SSH_COMMAND` outranks every
+///   `core.sshCommand`. `GIT_SSH_VARIANT=ssh`: OpenSSH's arguments, without
+///   git's `-G` probe of an unknown program name.
+/// - `SSH_ASKPASS_REQUIRE=never`: ssh never runs an askpass program;
+///   `SSH_ASKPASS=/bin/false` as well (ssh would run an empty one as `""`).
+/// - `GIT_EDITOR=/bin/true` (git runs an empty one as `""`); a commit with no
+///   message then aborts. `GIT_PAGER=cat`: git's "no pager", never run.
+/// - `GIT_CONFIG_NOSYSTEM=0` and `GIT_CONFIG_SYSTEM`: the baked system
+///   config is read, not a planted one.
+/// - `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`: the
+///   [`GIT_FORCED_CONFIG`] pairs.
+pub fn claude_git_env() -> Vec<(String, String)> {
+    let mut v = pairs(&[
+        ("GIT_SSH_COMMAND", CLAUDE_GIT_SSH.into()),
+        ("GIT_SSH", CLAUDE_GIT_SSH.into()),
+        ("GIT_SSH_VARIANT", "ssh".into()),
+        ("SSH_ASKPASS", "/bin/false".into()),
+        ("SSH_ASKPASS_REQUIRE", "never".into()),
+        ("GIT_EDITOR", "/bin/true".into()),
+        ("GIT_PAGER", "cat".into()),
+        ("GIT_CONFIG_NOSYSTEM", "0".into()),
+        ("GIT_CONFIG_SYSTEM", SYSTEM_GITCONFIG_PATH.into()),
+        ("GIT_CONFIG_COUNT", GIT_FORCED_CONFIG.len().to_string()),
+    ]);
+    for (i, (k, val)) in GIT_FORCED_CONFIG.iter().enumerate() {
+        v.push((format!("GIT_CONFIG_KEY_{i}"), k.to_string()));
+        v.push((format!("GIT_CONFIG_VALUE_{i}"), val.to_string()));
+    }
+    v
+}
 
 /// Variables pinned to a fixed absolute value, because a project `env` could
 /// point them at its own program and an empty value would break the tool:
 /// - `PATH` and `SHELL`: the guest agent's own values (the agent user's
 ///   login shell is bash, `make_agent_user` in the bake); `CLAUDE_CODE_SHELL`
 ///   the same bash, so Claude Code's Bash tool never runs a planted shell.
-/// - `GIT_SSH_COMMAND` and `GIT_SSH` (FU2 fix round 4): git runs either on
-///   every ssh fetch and push, and runs a set-but-empty one as a program
-///   ("cannot run : No such file or directory"), so both are pinned to
-///   [`CLAUDE_GIT_SSH`]. `GIT_SSH_COMMAND` outranks `core.sshCommand`, so a
-///   `core.sshCommand` from any git config is not honoured in a Claude box:
-///   the box has no trusted (host-side) git config to take one from.
+/// - git and ssh: [`claude_git_env`]. A user's `core.sshCommand` is not
+///   honoured in a Claude box: the box has no trusted (host-side) git config
+///   to take one from.
 pub fn claude_exec_env() -> Vec<(String, String)> {
-    pairs(&[
+    let mut v = pairs(&[
         ("PATH", ports::AGENT_PATH.into()),
         ("SHELL", "/bin/bash".into()),
         ("CLAUDE_CODE_SHELL", "/bin/bash".into()),
-        ("GIT_SSH_COMMAND", CLAUDE_GIT_SSH.into()),
-        ("GIT_SSH", CLAUDE_GIT_SSH.into()),
-    ])
+    ]);
+    v.extend(claude_git_env());
+    v
 }
 
 /// The managed `env` (FU2): [`claude_static_env`], [`claude_proxy_env`],
@@ -1971,8 +2080,26 @@ mod settings_tests {
             ("PATH", "/usr/local/bin:/usr/bin:/bin"),
             ("SHELL", "/bin/bash"),
             ("CLAUDE_CODE_SHELL", "/bin/bash"),
-            ("GIT_SSH_COMMAND", "/usr/bin/ssh"),
-            ("GIT_SSH", "/usr/bin/ssh"),
+            ("GIT_SSH_COMMAND", "/usr/local/libexec/saiife-ssh"),
+            ("GIT_SSH", "/usr/local/libexec/saiife-ssh"),
+            ("GIT_SSH_VARIANT", "ssh"),
+            ("SSH_ASKPASS", "/bin/false"),
+            ("SSH_ASKPASS_REQUIRE", "never"),
+            ("GIT_EDITOR", "/bin/true"),
+            ("GIT_PAGER", "cat"),
+            ("GIT_CONFIG_NOSYSTEM", "0"),
+            ("GIT_CONFIG_SYSTEM", "/etc/gitconfig"),
+            ("GIT_CONFIG_COUNT", "5"),
+            ("GIT_CONFIG_KEY_0", "core.sshCommand"),
+            ("GIT_CONFIG_VALUE_0", "/usr/local/libexec/saiife-ssh"),
+            ("GIT_CONFIG_KEY_1", "core.askPass"),
+            ("GIT_CONFIG_VALUE_1", ""),
+            ("GIT_CONFIG_KEY_2", "core.fsmonitor"),
+            ("GIT_CONFIG_VALUE_2", "false"),
+            ("GIT_CONFIG_KEY_3", "core.pager"),
+            ("GIT_CONFIG_VALUE_3", "cat"),
+            ("GIT_CONFIG_KEY_4", "credential.helper"),
+            ("GIT_CONFIG_VALUE_4", ""),
             ("LD_PRELOAD", ""),
             ("LD_LIBRARY_PATH", ""),
             ("LD_AUDIT", ""),
@@ -1992,11 +2119,14 @@ mod settings_tests {
             ("RUBYOPT", ""),
             ("RUBYLIB", ""),
             ("NODE_PATH", ""),
+            ("GIT_ASKPASS", ""),
+            ("GIT_CONFIG_PARAMETERS", ""),
+            ("DISPLAY", ""),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.into()))
         .collect();
-        assert_eq!(want_env.len(), 55);
+        assert_eq!(want_env.len(), 76);
         let hook = |c: &str| serde_json::json!({"type": "command", "command": c, "timeout": 10});
         assert_eq!(
             managed(),
@@ -2029,24 +2159,82 @@ mod settings_tests {
         assert_eq!(saiife_boxproto::ports::PROXY_TCP, 3128);
     }
 
-    /// FU2 fix round 4: git's ssh program is pinned, never blanked (git runs
-    /// a set-but-empty `GIT_SSH(_COMMAND)` as `""`) nor left unmanaged (a
-    /// project `env` would run its own command on every fetch and push), and
-    /// the pinned client is in the image recipe.
+    /// FU2 fix rounds 4 and 5: git's ssh program is pinned to saiife's
+    /// wrapper, never blanked (git runs a set-but-empty `GIT_SSH(_COMMAND)` as
+    /// `""`) nor left unmanaged (a project `env` would run its own command on
+    /// every fetch and push); ssh and git prompts are off; the forced git
+    /// config is in the env as `GIT_CONFIG_COUNT` pairs; OpenSSH is in the
+    /// image recipe.
     #[test]
     fn claude_managed_env_pins_git_ssh() {
         let v = managed();
         let env = v["env"].as_object().unwrap();
-        assert_eq!(CLAUDE_GIT_SSH, "/usr/bin/ssh");
-        assert_eq!(env["GIT_SSH_COMMAND"], "/usr/bin/ssh");
-        assert_eq!(env["GIT_SSH"], "/usr/bin/ssh");
-        for k in ["GIT_SSH", "GIT_SSH_COMMAND", "CLAUDE_CODE_SHELL"] {
+        assert_eq!(CLAUDE_GIT_SSH, "/usr/local/libexec/saiife-ssh");
+        assert_eq!(OPENSSH, "/usr/bin/ssh");
+        assert_eq!(env["GIT_SSH_COMMAND"], "/usr/local/libexec/saiife-ssh");
+        assert_eq!(env["GIT_SSH"], "/usr/local/libexec/saiife-ssh");
+        assert_eq!(env["SSH_ASKPASS_REQUIRE"], "never");
+        let pinned = [
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_SSH_VARIANT",
+            "CLAUDE_CODE_SHELL",
+            "SSH_ASKPASS",
+            "GIT_EDITOR",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
+        ];
+        for k in pinned {
             assert!(!CLAUDE_EXEC_BLANKED_ENV.contains(&k), "{k}");
             assert!(!CLAUDE_BLANKED_ENV.contains(&k), "{k}");
+            assert!(!env[k].as_str().unwrap().is_empty(), "{k}");
+        }
+        assert_eq!(env["GIT_CONFIG_COUNT"], GIT_FORCED_CONFIG.len().to_string());
+        for (i, (k, val)) in GIT_FORCED_CONFIG.iter().enumerate() {
+            assert_eq!(env[&format!("GIT_CONFIG_KEY_{i}")], *k);
+            assert_eq!(env[&format!("GIT_CONFIG_VALUE_{i}")], *val);
         }
         let recipe: toml::Value = toml::from_str(crate::image::DEFAULT_RECIPE).unwrap();
         let apt = recipe["packages"]["apt"].as_array().unwrap();
         assert!(apt.iter().any(|p| p.as_str() == Some("openssh-client")));
+    }
+
+    /// The baked ssh wrapper, ssh config and system git config, exactly.
+    #[test]
+    fn git_ssh_files_are_pinned() {
+        assert_eq!(SAIIFE_SSH_CONFIG_PATH, "/etc/ssh/saiife_ssh_config");
+        assert_eq!(SYSTEM_GITCONFIG_PATH, "/etc/gitconfig");
+        assert_eq!(
+            saiife_ssh_wrapper(),
+            "#!/bin/sh\n\
+             # saiife (FU2): git's ssh in a box. It reads only saiife's ssh config,\n\
+             # never ~/.ssh/config, and never prompts.\n\
+             exec /usr/bin/ssh -F /etc/ssh/saiife_ssh_config -o BatchMode=yes \"$@\"\n"
+        );
+        assert_eq!(
+            saiife_ssh_config(),
+            "# saiife (FU2): the only ssh config git's ssh reads in a box\n\
+             Host *\n\
+             \tProxyCommand none\n\
+             \tProxyJump none\n\
+             \tPermitLocalCommand no\n\
+             \tLocalCommand none\n\
+             \tKnownHostsCommand none\n\
+             \tControlMaster no\n\
+             \tControlPath none\n\
+             \tBatchMode yes\n"
+        );
+        assert_eq!(
+            system_gitconfig(),
+            "# saiife (FU2): the system git config in a box\n\
+             [core]\n\
+             \tsshCommand = /usr/local/libexec/saiife-ssh\n\
+             \taskPass =\n\
+             \tfsmonitor = false\n\
+             \tpager = cat\n\
+             [credential]\n\
+             \thelper =\n"
+        );
     }
 
     /// The image is shared by every box: the managed file holds no
@@ -2071,8 +2259,7 @@ mod settings_tests {
                     || val == "localhost,127.0.0.1"
                     || (k == "PATH" && val == "/usr/local/bin:/usr/bin:/bin")
                     || (["SHELL", "CLAUDE_CODE_SHELL"].contains(&k.as_str()) && val == "/bin/bash")
-                    || (["GIT_SSH", "GIT_SSH_COMMAND"].contains(&k.as_str())
-                        && val == "/usr/bin/ssh"),
+                    || claude_git_env().contains(&(k.clone(), val.to_string())),
                 "{k}={val}"
             );
         }
@@ -2353,6 +2540,14 @@ mod settings_tests {
                 "GIT_SSH_COMMAND": evil,
                 "GIT_SSH": "/work/bin/ssh",
                 "CLAUDE_CODE_SHELL": "/work/bin/sh",
+                "SSH_ASKPASS": "/work/bin/askpass",
+                "SSH_ASKPASS_REQUIRE": "force",
+                "GIT_ASKPASS": "/work/bin/askpass",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.sshCommand",
+                "GIT_CONFIG_VALUE_0": evil,
+                "GIT_CONFIG_PARAMETERS": "'core.sshcommand'='touch /tmp/planted'",
+                "GIT_CONFIG_SYSTEM": "/work/gitconfig",
             },
             "enableAllProjectMcpServers": true,
             "allowedMcpServers": [{"serverName": "evil"}],
@@ -2445,8 +2640,16 @@ mod settings_tests {
                 assert_eq!(env["PATH"], "/usr/local/bin:/usr/bin:/bin", "{name}");
                 assert_eq!(env["CLAUDE_CODE_SHELL"], "/bin/bash", "{name}");
                 for k in ["GIT_SSH_COMMAND", "GIT_SSH"] {
-                    assert_eq!(env[k], "/usr/bin/ssh", "{name} {k}");
+                    assert_eq!(env[k], "/usr/local/libexec/saiife-ssh", "{name} {k}");
                 }
+                assert_eq!(env["SSH_ASKPASS_REQUIRE"], "never", "{name}");
+                assert_eq!(env["GIT_ASKPASS"], "", "{name}");
+                assert_eq!(env["GIT_CONFIG_COUNT"], "5", "{name}");
+                assert_eq!(env["GIT_CONFIG_SYSTEM"], "/etc/gitconfig", "{name}");
+                assert_eq!(
+                    env["GIT_CONFIG_VALUE_0"], "/usr/local/libexec/saiife-ssh",
+                    "{name}"
+                );
                 // the guard and turn hooks get only the fixed env, whatever
                 // the agent's env holds
                 let fixed: serde_json::Map<String, serde_json::Value> = [
