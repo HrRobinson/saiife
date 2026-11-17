@@ -309,12 +309,22 @@ fn validate_cols(
         params_used: Vec::new(),
         entity_params: Vec::new(),
         masking: false,
+        loose_join: false,
     };
     let out = w.query(&mut q, 0, &mut Vec::new(), true)?;
     let entity_bound = params
         .iter()
         .any(|p| matches!(p.ty, ParamType::Entity { .. }) && p.bound.is_some());
-    if w.masking && (entity_bound || !w.entity_params.is_empty()) {
+    // Every output column must read data (R2-2); checked as masking, so
+    // only with an entity param in play.
+    if out.iter().any(|c| !c.info.data) {
+        w.masking = true;
+    }
+    let entity_in_play = entity_bound || !w.entity_params.is_empty();
+    if entity_in_play && w.loose_join {
+        return fail(ErrorClass::ParamMisuse);
+    }
+    if w.masking && entity_in_play {
         return fail(ErrorClass::NullMasking);
     }
     let aggregates_nullable = out
@@ -353,6 +363,10 @@ struct Info {
     nullable_agg: bool,
     /// A column reference resolved in the innermost query block.
     local: bool,
+    /// Reads table data: a base column (directly, through an expression, an
+    /// aggregate, or a CTE/subquery column), or is a COUNT. A value with no
+    /// data is a number even for an absent key (review R2-2).
+    data: bool,
 }
 
 impl Info {
@@ -372,6 +386,7 @@ impl Info {
             agg: a.agg || b.agg,
             nullable_agg: a.nullable_agg || b.nullable_agg,
             local: false,
+            data: a.data || b.data,
         }
     }
 
@@ -385,11 +400,6 @@ impl Info {
         self.origin = None;
         self.local = false;
         self
-    }
-
-    /// No column and no aggregate: a constant.
-    fn constant(&self) -> bool {
-        !self.col && !self.agg
     }
 }
 
@@ -642,6 +652,55 @@ fn split_placeholder(t: &str) -> Option<(&str, Option<Suffix>)> {
     ok.then_some((base, sfx))
 }
 
+/// The top-level AND conjuncts of an expression (through parentheses).
+fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            conjuncts(left, out);
+            conjuncts(right, out);
+        }
+        Expr::Nested(i) => conjuncts(i, out),
+        _ => out.push(e),
+    }
+}
+
+/// The rendered qualifier of a rewritten column reference.
+fn qualifier(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Nested(i) => qualifier(i),
+        Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[0].value),
+        _ => None,
+    }
+}
+
+/// Some top-level AND conjunct of a (rewritten) ON clause is
+/// `joined.col = before.col` (either order).
+fn links(on: &Expr, joined: Option<&str>, before: &[String]) -> bool {
+    let Some(joined) = joined else {
+        return false;
+    };
+    let mut cs = Vec::new();
+    conjuncts(on, &mut cs);
+    cs.iter().any(|c| match c {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match (qualifier(left), qualifier(right)) {
+            (Some(a), Some(b)) => {
+                let earlier = |x: &str| before.iter().any(|r| r == x);
+                (a == joined && earlier(b)) || (b == joined && earlier(a))
+            }
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 struct Walk<'a> {
     schema: &'a Schema,
     public: &'a [PublicValues],
@@ -653,6 +712,9 @@ struct Walk<'a> {
     /// A null-masking construct was seen (R45-5); refused at the end if an
     /// entity parameter is in play.
     masking: bool,
+    /// A join of the outermost block has no `column = column` link to the
+    /// tables before it; refused when an entity param is in play (R2-4).
+    loose_join: bool,
 }
 
 impl<'a> Walk<'a> {
@@ -750,6 +812,8 @@ impl<'a> Walk<'a> {
         sc: &mut Vec<Scope>,
         block_ok: bool,
     ) -> R<Vec<OutCol>> {
+        // R2-4 (a): only the outermost block may carry an entity param.
+        let block_ok = block_ok && depth == 0;
         let s = &*sel;
         if !s.optimizer_hints.is_empty()
             || s.select_modifiers.is_some()
@@ -804,8 +868,12 @@ impl<'a> Walk<'a> {
                 // The right side of a LEFT JOIN restricts nothing.
                 self.factor(&mut j.relation, depth, sc, block_ok && inner)?;
             }
-            for j in &mut twj.joins {
-                match &mut j.join_operator {
+            let renders: Vec<String> = sc
+                .last()
+                .map(|s| s.sources.iter().map(|x| x.render.clone()).collect())
+                .unwrap_or_default();
+            for (k, j) in twj.joins.iter_mut().enumerate() {
+                let on = match &mut j.join_operator {
                     JoinOperator::Join(JoinConstraint::On(e))
                     | JoinOperator::Inner(JoinConstraint::On(e)) => {
                         let ocx = Cx {
@@ -813,12 +881,22 @@ impl<'a> Walk<'a> {
                             ..cx
                         };
                         self.expr(e, sc, ocx)?;
+                        e
                     }
                     JoinOperator::Left(JoinConstraint::On(e))
                     | JoinOperator::LeftOuter(JoinConstraint::On(e)) => {
                         self.expr(e, sc, cx)?;
+                        e
                     }
                     _ => return construct(),
+                };
+                // Source k + 1 is the joined one; 0..=k come before it.
+                if depth == 0 {
+                    let joined = renders.get(k + 1).map(String::as_str);
+                    let before = renders.get(..=k).unwrap_or_default();
+                    if !links(on, joined, before) {
+                        self.loose_join = true;
+                    }
                 }
             }
         }
@@ -1071,6 +1149,7 @@ impl<'a> Walk<'a> {
                             agg: false,
                             nullable_agg: false,
                             local: false,
+                            data: true,
                         };
                         let cloud = c.alias.clone().unwrap_or_else(|| c.name.clone());
                         (cloud, c.name.clone(), info)
@@ -1266,7 +1345,14 @@ impl<'a> Walk<'a> {
                 list,
                 negated,
             } => {
+                if list.is_empty() {
+                    return construct();
+                }
                 let i = self.expr(x, sc, child)?;
+                // NULL [NOT] IN (...) is not always NULL (review R2-1).
+                if i.nullable_agg {
+                    self.masking = true;
+                }
                 let op = if *negated { Cmp::Ne } else { Cmp::In };
                 for item in list {
                     self.operand(item, &i, op, sc, cx)?;
@@ -1279,6 +1365,10 @@ impl<'a> Walk<'a> {
                 negated,
             } => {
                 let i = self.expr(x, sc, child)?;
+                // NULL [NOT] IN (empty subquery) is 0 / 1 (review R2-1).
+                if i.nullable_agg {
+                    self.masking = true;
+                }
                 let ok = cx.entity_ok && !*negated;
                 self.query(subquery, cx.depth + 1, sc, ok)?;
                 Ok(i.with_ty(Some(ColType::Integer)))
@@ -1334,8 +1424,14 @@ impl<'a> Walk<'a> {
                     .chain(&conds)
                     .chain(&results)
                     .any(|i| i.nullable_agg);
-                let const_branch = results.iter().any(Info::constant);
-                if touches_agg || (cx.in_value_agg && const_branch) {
+                // Inside a value aggregate only no ELSE or ELSE NULL keeps an
+                // empty match NULL (review R2-3).
+                let else_value = match else_result.as_deref() {
+                    None => false,
+                    Some(Expr::Value(v)) => !matches!(v.value, Value::Null),
+                    Some(_) => true,
+                };
+                if touches_agg || (cx.in_value_agg && else_value) {
                     self.masking = true;
                 }
                 let ty = results.iter().find_map(|r| r.ty);
@@ -1637,6 +1733,9 @@ impl<'a> Walk<'a> {
         let mut info = Info::join_all(&infos);
         if is_agg {
             info.agg = true;
+            if l == "count" {
+                info.data = true;
+            }
             if l != "count" {
                 info.nullable_agg = true;
             }
