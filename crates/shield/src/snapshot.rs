@@ -39,7 +39,9 @@ pub struct Progress {
 
 // ------------------------------------------------------------- names ----
 
-/// R43-2: lower-case, every character outside `[a-z0-9_]` becomes `_`,
+/// R43-7 fold first (`æ→ae ø→oe å→aa ß→ss`, marks dropped, lower-case, every
+/// run of non-alphanumerics, `_` included, becomes one separator), then R43-2:
+/// lower-case, every character outside `[a-z0-9_]` becomes `_`,
 /// leading and trailing `_` are dropped. An empty result is `fallback`; a
 /// leading digit gets `fallback_` in front.
 pub(crate) fn clean_name(raw: &str, fallback: &str) -> String {

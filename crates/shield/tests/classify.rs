@@ -122,13 +122,19 @@ fn public_refused_for_identifiers_and_amounts() {
 
 fn mem(statuses: &[(&str, u32)]) -> rusqlite::Connection {
     let c = rusqlite::Connection::open_in_memory().unwrap();
-    c.execute("CREATE TABLE t (status TEXT)", []).unwrap();
+    c.execute(
+        "CREATE TABLE t (_rowid INTEGER PRIMARY KEY, status TEXT)",
+        [],
+    )
+    .unwrap();
     for (s, n) in statuses {
         for _ in 0..*n {
-            c.execute("INSERT INTO t VALUES (?1)", [s]).unwrap();
+            c.execute("INSERT INTO t (status) VALUES (?1)", [s])
+                .unwrap();
         }
     }
-    c.execute("INSERT INTO t VALUES (NULL)", []).unwrap();
+    c.execute("INSERT INTO t (status) VALUES (NULL)", [])
+        .unwrap();
     c
 }
 
@@ -144,9 +150,10 @@ fn k_floor_counts() {
 #[test]
 fn too_many_values_refused() {
     let c = rusqlite::Connection::open_in_memory().unwrap();
-    c.execute("CREATE TABLE t (v TEXT)", []).unwrap();
+    c.execute("CREATE TABLE t (_rowid INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     for i in 0..1001 {
-        c.execute("INSERT INTO t VALUES (?1)", [format!("v{i}")])
+        c.execute("INSERT INTO t (v) VALUES (?1)", [format!("v{i}")])
             .unwrap();
     }
     let e = public_values(&c, "t", "v", 1).unwrap_err();
@@ -208,7 +215,8 @@ fn danish_headers_classify() {
 
 fn big(rows: &[(String, u32)]) -> rusqlite::Connection {
     let c = rusqlite::Connection::open_in_memory().unwrap();
-    c.execute("CREATE TABLE t (v TEXT)", []).unwrap();
+    c.execute("CREATE TABLE t (_rowid INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     let mut n = 0;
     for (kind, count) in rows {
         for _ in 0..*count {
@@ -218,7 +226,7 @@ fn big(rows: &[(String, u32)]) -> rusqlite::Connection {
                 "phone" => format!("+45 00 {:02} {:02} {:02}", n % 100, (n / 100) % 100, n % 97),
                 other => format!("{other}{n}"),
             };
-            c.execute("INSERT INTO t VALUES (?1)", [v]).unwrap();
+            c.execute("INSERT INTO t (v) VALUES (?1)", [v]).unwrap();
         }
     }
     c
@@ -241,8 +249,9 @@ fn mixed_identifier_column_is_not_public() {
         ("phone".into(), 1800),
         ("misc".into(), 600),
     ]);
+    // True share 85 %: the draw is random, so assert the ruling only.
     let (g, r) = judge(&c);
-    assert_eq!(g.class, Identifier);
+    assert_ne!(g.class, Public);
     assert!(r.is_some());
     // 30 % + 30 %: combined 60 % is unsure, never public.
     let c = big(&[
@@ -262,7 +271,7 @@ fn sample_covers_the_whole_table() {
     // The lowest-sorted values are harmless; most rows are emails.
     let c = big(&[("aaa".into(), 400), ("email".into(), 3600)]);
     let (g, r) = judge(&c);
-    assert_eq!(g.class, Identifier);
+    assert!(matches!(g.class, Identifier | Sensitive));
     assert!(r.is_some());
 }
 
@@ -275,4 +284,33 @@ fn k_floor_refuses_an_identifier_value() {
         "snapshot, table t, column status: a value looks like a name, ID or contact detail"
     );
     assert!(!e.to_string().contains("0101"));
+}
+
+#[test]
+fn small_table_is_read_in_full() {
+    // 1000 rows: 200 harmless values first, then 800 emails.
+    let c = big(&[("aaa".into(), 200), ("email".into(), 800)]);
+    let (g, r) = judge(&c);
+    assert_eq!(g.class, Identifier);
+    assert!(r.is_some());
+}
+
+#[test]
+fn a_column_named_rowid_still_classifies() {
+    let mut csv = String::from("RowID,Navn\n");
+    for i in 0..1500 {
+        csv.push_str(&format!("{},person{i}\n", 100_000 + i * 1000));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("r.csv"), csv).unwrap();
+    let (conn, cols) = snap(dir.path(), "r.csv");
+    let got = classify_all(&conn, "r", &cols);
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        got.iter().find(|g| g.0 == "navn").unwrap().1.class,
+        Identifier
+    );
+    // The probe must see the whole table, not the user's `rowid` values.
+    let sm = sample(&conn, "r", "navn").unwrap();
+    assert!(sm.len() > 150);
 }

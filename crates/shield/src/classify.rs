@@ -265,10 +265,13 @@ pub fn stats(
     .map_err(|_| sqlite_err())
 }
 
-/// Up to 200 distinct non-null values as text, read locally for `guess`,
-/// drawn across the whole table. Method: random `rowid` probes over
-/// `[min, max]` (at most 1000 primary-key lookups, so O(sample), no sort of
-/// the table); a table whose rowid range is at most 1000 is read in order.
+/// Distinct non-null values as text, read locally for `guess`, drawn across
+/// the whole table. Method: random probes of the snapshot's `"_rowid"`
+/// primary key over `[min, max]`, at most 1000 lookups and 200 distinct
+/// values, so O(sample) and no sort of the table. A table whose `_rowid`
+/// range is at most 1000 is read in full (up to 1000 distinct values), so
+/// no row is missed. Shares computed over the result (`identifier_share`)
+/// are over these distinct non-null values, not over rows.
 pub fn sample(conn: &Connection, table: &str, column: &str) -> Result<Vec<String>, ShieldError> {
     let mut seed = [0u8; 8];
     getrandom::fill(&mut seed).map_err(|_| ShieldError::Io("no randomness".into()))?;
@@ -288,7 +291,7 @@ pub fn sample_seeded(
     let (t, c) = (quote(table), quote(column));
     let (lo, hi): (Option<i64>, Option<i64>) = conn
         .query_row(
-            &format!("SELECT MIN(rowid), MAX(rowid) FROM {t}"),
+            &format!("SELECT MIN(\"_rowid\"), MAX(\"_rowid\") FROM {t}"),
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -313,14 +316,11 @@ pub fn sample_seeded(
         let mut rows = st.query([]).map_err(|_| sqlite_err())?;
         while let Some(r) = rows.next().map_err(|_| sqlite_err())? {
             take(r.get(0).map_err(|_| sqlite_err())?, &mut out);
-            if out.len() >= WANT {
-                break;
-            }
         }
     } else {
         let mut st = conn
             .prepare(&format!(
-                "SELECT CAST({c} AS TEXT) FROM {t} WHERE rowid = ?1"
+                "SELECT CAST({c} AS TEXT) FROM {t} WHERE \"_rowid\" = ?1"
             ))
             .map_err(|_| sqlite_err())?;
         // SplitMix64.
