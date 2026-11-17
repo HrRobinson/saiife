@@ -524,7 +524,8 @@ fn boot_refuses_missing_agent() {
     let mut spec = w2.spec("b1");
     spec.agent = AgentKind::Codex;
     v2.create(&spec).unwrap();
-    // Claude Code is in every image
+    // Claude Code runs on every image whose manifest has its managed
+    // settings (FU2), as this fixture's does
     assert!(w.create(&v, "b2").id.as_str() == "b2");
 }
 

@@ -106,15 +106,18 @@ impl GuestEnv {
 /// The agent's environment: the fixed values, then the setup's own (a later
 /// entry wins when the process is spawned).
 pub fn agent_env(setup_env: &[(String, String)]) -> Vec<(String, String)> {
+    use saiife_boxproto::ports::{
+        AGENT_HOME, AGENT_LANG, AGENT_NO_PROXY, AGENT_PATH, AGENT_PROXY, AGENT_USER,
+    };
     let fixed = [
-        ("HOME", "/home/agent"),
-        ("USER", "agent"),
-        ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        ("HOME", AGENT_HOME),
+        ("USER", AGENT_USER),
+        ("PATH", AGENT_PATH),
         ("TERM", "xterm-256color"),
-        ("LANG", "C.UTF-8"),
-        ("HTTPS_PROXY", "http://127.0.0.1:3128"),
-        ("HTTP_PROXY", "http://127.0.0.1:3128"),
-        ("NO_PROXY", "localhost,127.0.0.1"),
+        ("LANG", AGENT_LANG),
+        ("HTTPS_PROXY", AGENT_PROXY),
+        ("HTTP_PROXY", AGENT_PROXY),
+        ("NO_PROXY", AGENT_NO_PROXY),
     ];
     let mut out: Vec<(String, String)> = fixed
         .iter()
@@ -143,6 +146,13 @@ mod tests {
     fn agent_env_is_fixed_then_setup() {
         let e = agent_env(&[("FOO".into(), "bar".into())]);
         assert_eq!(e[0], ("HOME".into(), "/home/agent".into()));
+        // the values the host pins in the agents' managed settings (FU2)
+        let get = |k: &str| e.iter().find(|(n, _)| n == k).unwrap().1.clone();
+        assert_eq!(get("PATH"), "/usr/local/bin:/usr/bin:/bin");
+        assert_eq!(get("HTTPS_PROXY"), "http://127.0.0.1:3128");
+        assert_eq!(get("HTTP_PROXY"), "http://127.0.0.1:3128");
+        assert_eq!(get("NO_PROXY"), "localhost,127.0.0.1");
+        assert_eq!(get("LANG"), "C.UTF-8");
         assert_eq!(e.len(), 9);
         assert_eq!(e[8], ("FOO".into(), "bar".into()));
     }
