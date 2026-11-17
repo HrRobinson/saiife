@@ -320,3 +320,98 @@ expect = "{expect}"
     assert_eq!(code(&run("check")), 0);
     assert_eq!(code(&run("test")), 1);
 }
+
+/// A user pack that does not compile is an error of `policy check`, for either
+/// profile; a good one is counted on the `ok:` line.
+#[test]
+fn policy_check_reports_a_broken_user_pack() {
+    let tmp = common::tmp::short_tempdir();
+    let p = tmp.path();
+    fs::write(p.join("passwd"), "agent-shop:x:4001:4001::/h:/bin/sh\n").unwrap();
+    fs::write(p.join("group"), "").unwrap();
+    let cfg = p.join("config.toml");
+    fs::write(&cfg, format!("version = 2\n{}", no_daemon(p))).unwrap();
+    let packs = p.join("policy.d/packs");
+    fs::create_dir_all(&packs).unwrap();
+    let pack = |pattern: &str| {
+        format!(
+            "[pack]\nid = \"user.t\"\ntriggers = [\"zz\"]\n[[deny]]\nid = \"d\"\npattern = {pattern}\nreason = \"r\"\n"
+        )
+    };
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_saiife"))
+            .args(["policy", "check"])
+            .arg(&cfg)
+            .arg("--passwd")
+            .arg(p.join("passwd"))
+            .arg("--group")
+            .arg(p.join("group"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    fs::write(packs.join("user.t.toml"), pack("'('")).unwrap();
+    let o = run();
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("saiife: error: user pack ") && stderr(&o).contains("uncompilable"),
+        "{}",
+        stderr(&o)
+    );
+    fs::write(packs.join("user.t.toml"), pack("'^zz$'")).unwrap();
+    let o = run();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).trim_end().ends_with(", 1 user packs)"),
+        "{}",
+        stdout(&o)
+    );
+}
+
+/// `policy test` judges a command example with the policy's user packs: a
+/// `user.*` deny is a deny, and its `ask = true` rule an ask.
+#[test]
+fn policy_test_judges_with_user_packs() {
+    let tmp = common::tmp::short_tempdir();
+    let p = tmp.path();
+    fs::write(p.join("passwd"), "agent-shop:x:4001:4001::/h:/bin/sh\n").unwrap();
+    fs::write(p.join("group"), "").unwrap();
+    let cfg = p.join("config.toml");
+    let examples = |deny: &str, ask: &str| {
+        format!(
+            "version = 2\n{}\n[[example]]\nuser = \"agent-shop\"\ncommand = \"zz\"\nexpect = \"{deny}\"\n[[example]]\nuser = \"agent-shop\"\ncommand = \"zy now\"\nexpect = \"{ask}\"\n",
+            no_daemon(p)
+        )
+    };
+    let packs = p.join("policy.d/packs");
+    fs::create_dir_all(&packs).unwrap();
+    fs::write(
+        packs.join("user.t.toml"),
+        "[pack]\nid = \"user.t\"\ntriggers = [\"zz\", \"zy\"]\n[[deny]]\nid = \"d\"\npattern = '^zz$'\nreason = \"r\"\n[[deny]]\nid = \"e\"\npattern = '^zy(?:\\s|$)'\nreason = \"r\"\nask = true\n",
+    )
+    .unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_saiife"))
+            .args(["policy", "test"])
+            .arg(&cfg)
+            .arg("--passwd")
+            .arg(p.join("passwd"))
+            .arg("--group")
+            .arg(p.join("group"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    fs::write(&cfg, examples("deny", "ask")).unwrap();
+    let o = run();
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("ok   example 2"), "{}", stdout(&o));
+    fs::write(&cfg, examples("allow", "deny")).unwrap();
+    let o = run();
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("FAIL example 1") && stdout(&o).contains("FAIL example 2"),
+        "{}",
+        stdout(&o)
+    );
+}

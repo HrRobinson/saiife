@@ -633,3 +633,35 @@ fn lock_check_page_names_the_stand_in_cosigner() {
     assert!(t.contains("127.0.0.1:7433"));
     assert!(flat(&t).contains("stand-in co-signer"));
 }
+
+// ---- docs/never-rules.md (plan 33) ----
+
+#[test]
+fn never_rules_page_names_its_limits() {
+    let root = root();
+    assert!(root.join("docs/never-rules.md").is_file());
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(
+        readme.contains("docs/never-rules.md"),
+        "README does not link it"
+    );
+    let raw = fs::read_to_string(root.join("docs/never-rules.md")).unwrap();
+    let page = flat(&raw);
+    for want in [
+        "advisory in boxes",
+        "not enforced",
+        "Obfuscation and interpreters (python -c) can still slip past a command rule.",
+    ] {
+        assert!(
+            page.contains(&want.to_lowercase()),
+            "never-rules.md lacks {want:?}"
+        );
+    }
+    for h in [
+        "\n## Import\n",
+        "\n## Sync\n",
+        "\n## What is not enforced\n",
+    ] {
+        assert!(raw.contains(h), "never-rules.md lacks the heading {h:?}");
+    }
+}

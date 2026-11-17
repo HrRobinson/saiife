@@ -1445,3 +1445,75 @@ mod locked {
         );
     }
 }
+
+// ---- rules: a changed or gone source (plan 33) ----
+
+fn rules_cmd(env: &Env, args: &[&str], answers: &str) -> std::process::Output {
+    let absent = common::absent_system_config(env.home.path());
+    let mut child = env
+        .command_in(env.root(), &["rules"])
+        .args(args)
+        .env("SAIIFE_TEST_SYSTEM_CONFIG", &absent)
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answers.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn status_plain(env: &Env) -> (i32, String) {
+    let absent = common::absent_system_config(env.home.path());
+    let out = env
+        .command_in(env.root(), &["status"])
+        .env("SAIIFE_TEST_SYSTEM_CONFIG", &absent)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap();
+    (code(&out), stdout(&out))
+}
+
+#[test]
+fn status_notes_a_changed_source() {
+    let env = initialized(&["claude"]);
+    env.write("CLAUDE.md", "Never run `deploy-prod`.\n");
+    let o = rules_cmd(&env, &["import", "CLAUDE.md"], "e\n\ny\n");
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let (c0, t0) = status_plain(&env);
+    assert_eq!(c0, 0, "{t0}");
+    assert!(!t0.contains("rules:"), "{t0}");
+
+    env.write("CLAUDE.md", "Never run `deploy-prod`.\nNever run `x`.\n");
+    let (c, t) = status_plain(&env);
+    assert_eq!(c, c0, "{t}");
+    let note = t
+        .lines()
+        .find(|l| l.contains("changed since it was imported"))
+        .unwrap_or_else(|| panic!("no note: {t}"));
+    assert!(
+        note.contains("rules: ") && note.contains("CLAUDE.md"),
+        "{note}"
+    );
+    assert!(note.contains("(user.claude-md-"), "{note}");
+    assert!(note.ends_with("run saiife rules sync"), "{note}");
+
+    let s = rules_cmd(&env, &["sync"], "s\n");
+    assert_eq!(code(&s), 0, "{}", String::from_utf8_lossy(&s.stderr));
+    let (_, t2) = status_plain(&env);
+    assert!(!t2.contains("changed since"), "{t2}");
+
+    std::fs::remove_file(env.root().join("CLAUDE.md")).unwrap();
+    let (c3, t3) = status_plain(&env);
+    assert_eq!(c3, c0, "{t3}");
+    assert!(
+        t3.contains("is gone; its rules stay in force (user.claude-md-"),
+        "{t3}"
+    );
+}

@@ -52,10 +52,12 @@ pub struct NotifyEvent {
     /// `refresh_failed`: why (`http_<status>`, `network`, `bad_response`,
     /// `instance_mismatch`, `persist`); a fixed word, never a body.
     pub reason: Option<String>,
+    /// `box_waiting`: the box (`b-...`); never a request id or a link.
+    pub box_id: Option<String>,
 }
 
 impl NotifyEvent {
-    fn payload(&self) -> Value {
+    pub(crate) fn payload(&self) -> Value {
         let mut m = serde_json::Map::new();
         m.insert("event".into(), self.event.as_str().into());
         if let Some(v) = self.id {
@@ -72,6 +74,9 @@ impl NotifyEvent {
         }
         if let Some(v) = &self.reason {
             m.insert("reason".into(), v.clone().into());
+        }
+        if let Some(v) = &self.box_id {
+            m.insert("box".into(), v.clone().into());
         }
         m.insert("host".into(), self.host.clone().into());
         m.insert("summary".into(), self.summary.clone().into());
@@ -615,6 +620,7 @@ async fn smtp(env: &dyn Env, s: &SmtpCfg, ev: &NotifyEvent) -> Result<(), Fail> 
         ("operation", ev.operation.clone()),
         ("uid", ev.uid.map(|u| u.to_string())),
         ("reason", ev.reason.clone()),
+        ("box", ev.box_id.clone()),
         ("host", Some(ev.host.clone())),
         ("summary", Some(ev.summary.clone())),
     ] {

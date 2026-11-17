@@ -30,6 +30,18 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+#[cfg(unix)]
+mod box_attach;
+mod box_cmd;
+mod box_image_cmd;
+// `box diff | land | apply | push` and the land commit (plan 39).
+#[cfg(unix)]
+mod box_land_cmd;
+// The repo disk of `box spawn` (plan 37).
+#[cfg(unix)]
+mod box_repo;
+mod box_vmm_cmd;
+mod box_vmm_helper;
 #[cfg(any(unix, windows))]
 mod broker;
 mod check;
@@ -61,6 +73,7 @@ mod read_segments_cmd;
 mod rejudge;
 mod report;
 mod report_html;
+mod rules_cmd;
 mod run_cmd;
 mod secret_cmd;
 mod status_cmd;
@@ -68,12 +81,16 @@ mod status_cmd;
 mod system_cmd;
 mod system_view;
 mod text;
+mod touch_cmd;
+#[cfg(any(unix, windows))]
+mod tty;
 mod win_locked;
+mod workspace_cmd;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
-use saiifeguard::profile::select_active;
+use saiifeguard::profile::{select_active, Profile};
 
 #[derive(Parser)]
 #[command(
@@ -106,6 +123,10 @@ enum Cmd {
         /// Explain a write tool (Write, Edit, apply_patch, …) changing this path.
         #[arg(long, value_name = "PATH")]
         write: Option<String>,
+        /// Judge as the host (default) or as inside a box: the box profile
+        /// leaves out user rules marked `where = "host"`.
+        #[arg(long, value_parser = ["host", "box"], default_value = "host")]
+        profile: String,
     },
     /// Hook mode: read a pre-tool JSON payload on stdin, decide, audit, respond.
     Check {
@@ -129,6 +150,10 @@ enum Cmd {
         /// ConfigChange hook: `config-change`). Locked mode only.
         #[arg(long, value_parser = ["config-change"], requires = "managed")]
         event: Option<String>,
+        /// Judge as the host (default) or as inside a box: the box profile
+        /// leaves out user rules marked `where = "host"`.
+        #[arg(long, hide = true, value_parser = ["host", "box"], default_value = "host")]
+        profile: String,
     },
     /// Turn saiife on for this project: write the guard hook into each
     /// agent's project config and create .saiife/config.toml.
@@ -248,6 +273,21 @@ enum Cmd {
     /// spec on stdin, confines itself, execs the server.
     #[command(name = "__mcp-spawn", hide = true)]
     McpSpawn,
+    /// The box VMM launcher (the daemon runs it): checks a box's vm.json,
+    /// then execs the pinned Cloud Hypervisor. Unix only.
+    #[command(name = "__box-vmm", hide = true)]
+    BoxVmm {
+        dir: std::path::PathBuf,
+        /// The locked layout (system install) instead of the user's own.
+        #[arg(long)]
+        locked: bool,
+    },
+    /// The box guest init and its helpers (inside the box VM only).
+    #[command(name = "__guest", hide = true)]
+    Guest {
+        #[command(subcommand)]
+        cmd: GuestCmd,
+    },
     /// Test seam (debug builds): a scripted MCP stdio server.
     #[cfg(debug_assertions)]
     #[command(name = "__fake-mcp-server", hide = true)]
@@ -327,8 +367,17 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<approvals_cmd::ApprovalsAction>,
     },
+    /// Locked mode and the personal broker: enrol, list, remove and test the FIDO2 keys your touch approvals use.
+    Touch {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: touch_cmd::TouchAction,
+    },
     /// Locked mode (Linux, macOS, approver): approve request <id>. For your own
     /// request (`same_user = "reauth"`) you are asked to authenticate.
+    /// A touch-class request asks you to touch your enrolled key (saiife touch).
     Approve {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
@@ -363,6 +412,15 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<lockdown_cmd::LockdownAction>,
     },
+    /// The Workspace link (Linux, macOS): pair a browser, list or remove
+    /// paired browsers, run the localhost UI and the hub client.
+    Workspace {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: workspace_cmd::WorkspaceAction,
+    },
     /// Check and test a policy kept in a file (`check`, `test`), or show
     /// and reload the one in force (`show`, `reload`: locked mode).
     Policy {
@@ -381,10 +439,30 @@ enum Cmd {
         #[command(subcommand)]
         action: env_cmd::EnvAction,
     },
+    /// Boxes: sandboxed VMs where an agent works on a copy of a repo (preview).
+    Box {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: box_cmd::BoxAction,
+    },
     /// Local dev environments: compose stacks behind one HTTPS proxy (preview).
     Dev {
         #[command(subcommand)]
         action: dev_cmd::DevAction,
+    },
+    /// Never-rules from CLAUDE.md, AGENTS.md, GEMINI.md and rules files, as enforced packs.
+    Rules {
+        #[arg(
+            long = "config",
+            visible_alias = "system-config",
+            value_name = "FILE",
+            global = true
+        )]
+        config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<rules_cmd::RulesAction>,
     },
     /// Locked mode: install or uninstall the system setup (root, or an elevated
     /// administrator on Windows).
@@ -393,6 +471,14 @@ enum Cmd {
         #[command(subcommand)]
         action: system_cmd::SystemAction,
     },
+}
+
+#[derive(Subcommand)]
+enum GuestCmd {
+    /// The guest service (saiife-guest.service): hello, setup, the agent.
+    Init,
+    /// Report an event to the guest init; the Stop hook sends `turn-finished`.
+    Event { name: String },
 }
 
 #[derive(Subcommand)]
@@ -419,6 +505,8 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
     const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
     match cmd {
         Cmd::McpSpawn => Some(NO_GATEWAY),
+        Cmd::BoxVmm { .. } => Some("saiife: __box-vmm: boxes need Linux or macOS"),
+        Cmd::Guest { .. } => Some("saiife: __guest: runs inside a box VM"),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
         // No wildcard: a new subcommand must be put on one side or the other here, or this
@@ -427,6 +515,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Doctor { .. }
         | Cmd::Audit { .. }
         | Cmd::Approvals { .. }
+        | Cmd::Touch { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Check { .. }
@@ -437,8 +526,11 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         | Cmd::Api(_)
         | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
+        | Cmd::Workspace { .. }
         | Cmd::Env { .. }
+        | Cmd::Box { .. }
         | Cmd::Dev { .. }
+        | Cmd::Rules { .. }
         | Cmd::Policy { .. }
         | Cmd::Test { .. }
         | Cmd::Explain { .. }
@@ -483,6 +575,7 @@ fn main() -> ExitCode {
         managed,
         system_config,
         event,
+        profile,
     } = &cli.command
     {
         if *managed {
@@ -495,13 +588,25 @@ fn main() -> ExitCode {
             }
             return check_managed::run(agent, config, event.as_deref());
         }
-        return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
+        return check::run(
+            &cli.packs,
+            *hook_exit,
+            agent,
+            system_config.as_deref(),
+            Profile::from_name(profile).unwrap_or_default(),
+        );
     }
     if let Cmd::Eval { serve } = cli.command {
         return match serve {
             true => eval::serve_main(),
             false => eval::worker_main(),
         };
+    }
+    if let Cmd::BoxVmm { dir, locked } = cli.command {
+        return box_vmm_helper::run(dir, locked);
+    }
+    if let Cmd::Guest { cmd } = cli.command {
+        return guest_cmd(cmd);
     }
     if let Cmd::McpSpawn = cli.command {
         #[cfg(target_os = "linux")]
@@ -611,6 +716,13 @@ fn main() -> ExitCode {
     {
         return lockdown_cmd::run(system_config, action);
     }
+    if let Cmd::Workspace {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return workspace_cmd::run(system_config, action);
+    }
     if let Cmd::Approvals {
         system_config,
         list,
@@ -618,6 +730,13 @@ fn main() -> ExitCode {
     } = cli.command
     {
         return approvals_cmd::run(system_config, list, action);
+    }
+    if let Cmd::Touch {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return touch_cmd::run(system_config, action);
     }
     if let Cmd::Approve {
         system_config,
@@ -663,8 +782,18 @@ fn main() -> ExitCode {
     {
         return env_cmd::run(system_config, action);
     }
+    if let Cmd::Box {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return box_cmd::run(system_config, action);
+    }
     if let Cmd::Dev { action } = cli.command {
         return dev_cmd::run(action);
+    }
+    if let Cmd::Rules { config, action } = cli.command {
+        return rules_cmd::run(config, cli.packs, action);
     }
     #[cfg(any(unix, windows))]
     if let Cmd::System { action } = cli.command {
@@ -688,9 +817,23 @@ fn main() -> ExitCode {
         .as_deref()
         .and_then(saiife_agents::config::find_project_root);
     let vars = || paths::path_vars(cwd.as_deref(), project.as_deref());
-    let engine = || Engine::new(select_active(packs.clone(), &cli.packs)).with_paths(vars());
-
-    let active = || select_active(packs.clone(), &cli.packs);
+    // The developer's own user packs follow the built-ins in `test`,
+    // `explain` and `packs`. One that does not load is reported and left
+    // out, as the developer hook does.
+    let profile = match &cli.command {
+        Cmd::Explain { profile, .. } => Profile::from_name(profile).unwrap_or_default(),
+        _ => Profile::Host,
+    };
+    let user = match &cli.command {
+        Cmd::Test { .. } | Cmd::Explain { .. } | Cmd::Packs { .. } => dev_user_pack_list(profile),
+        _ => Vec::new(),
+    };
+    let active = || {
+        let mut a = select_active(packs.clone(), &cli.packs);
+        a.extend(user.iter().cloned());
+        a
+    };
+    let engine = || Engine::new(active()).with_paths(vars());
 
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine(), &command),
@@ -698,6 +841,7 @@ fn main() -> ExitCode {
             command,
             read,
             write,
+            ..
         } => match (command, read, write) {
             (_, Some(path), _) => {
                 cmd_explain_path(&engine(), &active(), &vars(), Access::Read, &path)
@@ -714,6 +858,8 @@ fn main() -> ExitCode {
         Cmd::Check { .. }
         | Cmd::Eval { .. }
         | Cmd::McpSpawn
+        | Cmd::BoxVmm { .. }
+        | Cmd::Guest { .. }
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
         | Cmd::Secret { .. }
@@ -722,10 +868,14 @@ fn main() -> ExitCode {
         | Cmd::Api(_)
         | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
+        | Cmd::Workspace { .. }
         | Cmd::Approvals { .. }
+        | Cmd::Touch { .. }
         | Cmd::Policy { .. }
         | Cmd::Env { .. }
+        | Cmd::Box { .. }
         | Cmd::Dev { .. }
+        | Cmd::Rules { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {
@@ -740,7 +890,7 @@ fn main() -> ExitCode {
             root,
         } => init_cmd::run(&packs, &agents, &cli.packs, root),
         Cmd::Status { root } => status_cmd::run(&packs, root),
-        Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
+        Cmd::Packs { id } => packs_cmd::run(&packs, &user, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
             action:
                 Some(AuditAction::Verify {
@@ -775,6 +925,30 @@ fn main() -> ExitCode {
             },
             &packs,
         ),
+    }
+}
+
+/// `saiife __guest`: the box guest init, or one event to it.
+fn guest_cmd(cmd: GuestCmd) -> ExitCode {
+    let env = saiife_guest::GuestEnv::system();
+    let r = match cmd {
+        GuestCmd::Init => saiife_guest::run_init(&env),
+        GuestCmd::Event { name } => match name.as_str() {
+            "turn-finished" => {
+                saiife_guest::send_local_event(&env, &saiife_guest::Event::TurnFinished)
+            }
+            other => {
+                eprintln!("saiife: __guest event: unknown event {other:?} (known: turn-finished)");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("saiife: __guest: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -1138,6 +1312,7 @@ fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
             version: p.version,
             default_on: p.default_on,
             rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+            sha256: None,
         })
         .collect()
 }
@@ -1175,6 +1350,25 @@ fn arg_error(e: clap::Error) -> ExitCode {
         return check::arg_error(&args, first);
     }
     e.exit()
+}
+
+/// The personal user packs compiled for `profile`. A failure is a warning:
+/// the packs are left out.
+fn dev_user_pack_list(profile: Profile) -> Vec<saiifeguard::Pack> {
+    let files = match check::dev_user_packs() {
+        Ok(f) => f,
+        Err(e) => {
+            warn(&format!("{e} (not loaded)"));
+            return Vec::new();
+        }
+    };
+    match check::compile_user_packs(&files, profile) {
+        Ok(p) => p,
+        Err(e) => {
+            warn(&format!("{e} (not loaded)"));
+            Vec::new()
+        }
+    }
 }
 
 fn cmd_test(engine: &Engine, command: &str) -> ExitCode {

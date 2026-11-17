@@ -10,13 +10,37 @@ repository.workspace = true
 name = "saiife_daemon"
 path = "src/lib.rs"
 
+[features]
+# A fake VM behind the box manager (plan 34, Task 8): test builds only. The
+# release workflows never enable it, so a release daemon has no boxes.
+fake-vmm = ["saiife-boxes/fake"]
+# Real boxes (plan 35, ruling R38): the Cloud Hypervisor driver behind the
+# box preflight. Off by default until plan 41 ships: the Linux CI step runs
+# the box tests with it, the release workflows never set it, so a release
+# daemon answers every box op "boxes are not enabled in this build".
+boxes = []
+# Test builds only (never in release CI): `SAIIFE_WORKSPACE_FAKE_BOXES=1`
+# serves the wire crate's demo boxes so the Workspace UI can be tried (plan 29).
+fake-boxes = ["saiife-wire/fake"]
+
 [dependencies]
 saiife-audit = { path = "../audit" }
+# The box manager behind the `box.*` ops (plan 34, Task 8).
+saiife-boxes = { path = "../boxes" }
+saiife-boxproto = { path = "../boxproto" }
 saiife-ipc = { path = "../ipc" }
 saiife-policy = { path = "../policy" }
+# Touch classes, action records and refusals (plan 26, Task 6).
+saiife-touch = { path = "../touch" }
+# The touch instance id and challenge nonces (plan 26, Task 7), and the
+# Workspace machine key's random source (plan 29); as in saiife-touch.
+ring = "=0.17.14"
 # `approval.create` checks that the claimed `[guard] ask` rule denies the
 # command (plan 11, Task 4).
 saiife-guard = { path = "../guard" }
+# The Workspace link (plan 29) and the box ids and levels (plan 34): signed
+# frames, pairing, the box source seam.
+saiife-wire = { path = "../wire" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
@@ -43,7 +67,8 @@ saiife-broker = { path = "../broker" }
 bytes = "=1.12.1"
 base64 = "=0.23.1"
 # The HTTP gateway on gateway.sock (Task 10); versions as in saiife-broker.
-hyper = { version = "=1.12.0", features = ["server", "http1"] }
+# client: the box model forwarder's upstream side (plan 40).
+hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
 http = "=1.5.0"
 http-body-util = "=0.1.5"
@@ -56,6 +81,16 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process", "net", "system"] }
+# The UnitLauncher and UnitBus the locked-mode box unit bus implements (plan 35),
+# and the per-box gateway (plan 38, Task 6): VmHooks, BoxPaths and the vsock
+# listeners (tokio-free, unix-only), and the fixed ports.
+saiife-boxhost = { path = "../boxhost" }
+saiife-boxproto = { path = "../boxproto" }
+
+# The system bus, for the saiife-box-<tier>@ units (plan 35, Task 6); as in saiife-keychain
+# (no blocking-api: each call runs on a thread that blocks on the runtime).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]
@@ -68,10 +103,15 @@ saiife-darwin = { path = "../darwin" }
 
 [dev-dependencies]
 tempfile = "3"
+# Soft authenticators for the touch tests (plan 26).
+saiife-touch = { path = "../touch", features = ["soft"] }
+saiife-wire = { path = "../wire", features = ["fake"] }
 # The gateway tests: a hyper client over the socket and a loopback TLS
 # upstream; versions as in saiife-broker.
 # test-util: the hook table's tests run on a paused clock (plan 20).
-tokio = { version = "=1.53.3", features = ["rt", "net", "io-util", "sync", "time", "macros", "test-util"] }
+# rt-multi-thread: hooks.rs has a multi-thread test; on Linux zbus enables
+# it anyway, on Windows nothing else does.
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros", "test-util"] }
 hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

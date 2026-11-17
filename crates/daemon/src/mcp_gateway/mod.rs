@@ -1195,6 +1195,8 @@ pub enum PeerSocket {
     Control,
     Gateway,
     Tcp,
+    // Workspace (plan 29): the link socket.
+    Link,
 }
 
 impl PeerSocket {
@@ -1203,6 +1205,8 @@ impl PeerSocket {
             PeerSocket::Control => "control socket",
             PeerSocket::Gateway => "gateway socket",
             PeerSocket::Tcp => "gateway TCP listener",
+            // Workspace (plan 29).
+            PeerSocket::Link => "link socket",
         }
     }
 }

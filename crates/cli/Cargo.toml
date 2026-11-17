@@ -10,7 +10,14 @@ repository.workspace = true
 name = "saiife"
 path = "src/main.rs"
 
+[[bin]]
+name = "saiife-fake-fido"
+path = "src/bin/saiife-fake-fido.rs"
+required-features = ["fake-fido"]
+
 [dependencies]
+# Shared text-safety table (tokio-free).
+saiife-wire = { path = "../wire" }
 saiife-guard = { path = "../guard" }
 saiife-audit = { path = "../audit" }
 saiife-agents = { path = "../agents" }
@@ -23,6 +30,8 @@ saiife-broker = { path = "../broker" }
 saiife-mcp = { path = "../mcp" }
 # `saiife daemon --user` opens the keychain that holds the vault key.
 saiife-keychain = { path = "../keychain" }
+# `saiife __guest`: the box guest init (runs inside the VM; tokio-free).
+saiife-guest = { path = "../guest" }
 # `saiife dev`: compose stacks behind one local HTTPS proxy (plans 22 to 24).
 saiife-dev = { path = "../dev" }
 # `saiife mcp`: the JSON-RPC/MCP codec and types (tokio-free).
@@ -39,13 +48,45 @@ time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 saiife-win = { path = "../win" }
 # `saiife api` sends and reads bodies as base64 (the version saiife-broker uses).
 base64 = "=0.23.1"
+# `saiife workspace serve` runs the Workspace link (plan 29).
+saiife-link = { path = "../link" }
+# 0.14.1 is from 2024-07-05; no default features: no image crate.
+qrcode = { version = "=0.14.1", default-features = false }
 # Secret values `saiife secret` reads are wiped when dropped.
 zeroize = "=1.9.1"
+# `saiife touch` and touch approvals: the soft key is compiled in; only debug
+# builds pick it (the `SAIIFE_TEST_TOUCH_SOFT` seam).
+saiife-touch = { path = "../touch", features = ["soft"] }
+# The FIDO key transport (protocol types, error table, and with `fido-hid` the
+# CTAP2 calls over USB HID; off by default: the static musl Linux builds have
+# no libudev). Same version as saiife: the helper's hello checks it.
+saiife-fido = { path = "../fido" }
+
+[features]
+fido-hid = ["saiife-fido/hid"]
+# The scripted helper `saiife-fake-fido` for CLI tests.
+fake-fido = ["saiife-fido/fake"]
+# A fake VM behind the daemon's box manager (plan 34): test builds only. The
+# release workflows never enable it. The daemon runs inside this binary
+# (`saiife daemon`), so the feature reaches the daemon the tests start.
+fake-vmm = ["saiife-daemon/fake-vmm"]
+# Real boxes in the daemon this binary runs (plan 35, R38): off by default;
+# the release workflows never set it.
+boxes = ["saiife-daemon/boxes"]
 
 [target.'cfg(unix)'.dependencies]
+saiife-boxhost = { path = "../boxhost" }
+# The base manifest of a box's repo disk (plan 37); the BoxId its base ref
+# names comes from saiife-wire above.
+saiife-boxproto = { path = "../boxproto" }
+# The random name of a spawn's staging dir; the version saiife-boxhost uses.
+ring = "=0.17.14"
 # Signals for the worker fault seam (debug builds); no unsafe calls.
-rustix = { version = "1", features = ["process", "termios", "fs"] }
+rustix = { version = "1", features = ["process", "termios", "fs", "event"] }
 base64 = "=0.23.1"
+# A runtime for `saiife workspace serve`, and the SIGINT wait of `workspace pair`
+# (the version saiife-link uses).
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "signal"] }
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 
@@ -67,6 +108,8 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 # The approvals tests serve an in-process daemon context to the CLI (an
 # approver with a second uid at the ops level); the version saiife-daemon uses.
 tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+# The workspace tests pair a `TestDevice` through link.sock.
+saiife-wire = { path = "../wire", features = ["fake"] }
 
 [target.'cfg(windows)'.dependencies]
 # A console prompt without echo, for `secret add` and `connect` (never for approvals: W16).

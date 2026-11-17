@@ -22,6 +22,16 @@ pub struct PersonalPaths {
     pub audit_dir: PathBuf,
 }
 
+/// Where a developer's user packs live: `policy.d/packs` beside the
+/// personal config file.
+pub fn user_packs_dir(p: &PersonalPaths) -> PathBuf {
+    p.config
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("policy.d")
+        .join("packs")
+}
+
 const NO_RUNTIME: &str = "XDG_RUNTIME_DIR is not set or not absolute; log in through a session manager or run as a systemd --user unit";
 
 const NO_RUNTIME_MACOS: &str =
@@ -210,6 +220,10 @@ mod tests {
         assert_eq!(p.config, Path::new("/c/saiife/broker/config.toml"));
         assert_eq!(p.state_dir, Path::new("/s/saiife/broker"));
         assert_eq!(p.audit_dir, Path::new("/d/saiife/broker/audit"));
+        assert_eq!(
+            user_packs_dir(&p),
+            Path::new("/c/saiife/broker/policy.d/packs")
+        );
     }
 
     #[test]

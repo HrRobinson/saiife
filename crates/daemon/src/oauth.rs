@@ -727,6 +727,7 @@ async fn refresh_failed(ctx: &Arc<Ctx>, w: &Want<'_>, what: &str, reason: String
             host: crate::signals::hostname(),
             summary: crate::signals::clean(&format!("{what} for secret {} ({reason})", w.secret)),
             reason: Some(reason),
+            box_id: None,
         });
     }
 }

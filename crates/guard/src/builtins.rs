@@ -89,18 +89,23 @@ pub fn builtin_rule_denies(pack: &str, id: &str, command: &str) -> bool {
     // Compiled once per process (the daemon asks for every request).
     static PACKS: std::sync::OnceLock<Vec<Pack>> = std::sync::OnceLock::new();
     let packs = PACKS.get_or_init(|| builtin_packs().0);
-    let Some(only) = packs
-        .iter()
-        .find(|p| p.id == pack)
-        .and_then(|p| p.only_deny_id(id))
-    else {
+    match packs.iter().find(|p| p.id == pack) {
+        Some(p) => pack_rule_denies(p, id, command),
+        None => false,
+    }
+}
+
+/// Whether the `[[deny]]` rule `id` of `pack` alone denies `command` (a user
+/// pack's `ask` rule, checked again by the daemon).
+pub fn pack_rule_denies(pack: &Pack, id: &str, command: &str) -> bool {
+    let Some(only) = pack.only_deny_id(id) else {
         return false;
     };
     let engine = crate::engine::Engine::new(vec![only]);
     match engine.evaluate(command) {
         crate::engine::Decision::Deny {
             pack: p, pattern, ..
-        } => p == pack && engine.rule_id(&p, &pattern) == Some(id),
+        } => p == pack.id && engine.rule_id(&p, &pattern) == Some(id),
         _ => false,
     }
 }
@@ -255,6 +260,7 @@ impl Catalog {
                     warnings.push(PackWarning {
                         source: e.source.to_string(),
                         message: format!("{what}: {err}"),
+                        dropped: true,
                     });
                 }
             }

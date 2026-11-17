@@ -15,6 +15,8 @@ use saiife_broker::pipeline::limit_event;
 use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 #[cfg(unix)]
+use saiife_ipc::msg::LINK_SOCKET_NAME;
+#[cfg(unix)]
 use saiife_ipc::msg::{GATEWAY_SOCKET_NAME, SOCKET_NAME};
 use saiife_policy::PackInfo;
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
@@ -988,6 +990,63 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
+    // The box manager (plans 34, 35): on the fake VM in a `fake-vmm` test
+    // build with SAIIFE_BOX_FAKE_VMM=1, else on Linux the Cloud Hypervisor
+    // driver once the box preflight passed; otherwise the box ops answer
+    // `unavailable` with the failed check. Its problems are stderr lines,
+    // never a failed start. It runs on a blocking thread while this one
+    // drives the runtime: locked mode connects to the system bus, and the
+    // recovery asks the units' state over it.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the runtime: {e}"))?;
+    let built = {
+        let (s, c) = (state_dir.clone(), config.clone());
+        // spawn_blocking inside the future: it needs the runtime's context
+        rt.block_on(async move {
+            tokio::task::spawn_blocking(move || crate::box_ops::build(&s, &mode, &c)).await
+        })
+        .unwrap_or_else(|e| Err(format!("the box build did not finish: {e}")))
+    };
+    let mut box_unavailable = None;
+    let boxes = match built {
+        Ok(Ok(b)) => {
+            if b.fake {
+                eprintln!("{}", crate::box_ops::FAKE_NOTICE);
+            }
+            for w in &b.warnings {
+                eprintln!("saiifed: boxes: {w}");
+            }
+            Some(b)
+        }
+        Ok(Err(why)) => {
+            box_unavailable = Some(why);
+            None
+        }
+        Err(e) => {
+            eprintln!("saiifed: boxes: {e}");
+            None
+        }
+    };
+    // The recovery's state changes are `box` records, written with the
+    // start records below (R29).
+    let (box_manager, box_template_warnings, box_recovered, box_audit, box_disk_root, box_on_ctx) =
+        match boxes {
+            Some(b) => (
+                Some(b.manager),
+                b.template_warnings,
+                b.changes,
+                Some(b.audit),
+                Some(b.disk_root),
+                b.on_ctx,
+            ),
+            None => (None, Vec::new(), Vec::new(), None, None, None),
+        };
+    // The base image store (plan 36) whenever this build and mode have
+    // boxes, with or without a manager: a failed preflight for want of a
+    // default image is mended by an import.
+    let box_images = crate::box_ops::image_paths(&state_dir, &mode, &|k| std::env::var_os(k));
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
@@ -1010,6 +1069,39 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     if let Some(why) = &grants_unreadable {
         eprintln!("saiife: warning: {why}: approved commands need approval again");
     }
+    // The touch devices; an unusable directory or file is no devices (every
+    // touch is refused) and a `touch_unreadable` record.
+    let (touch, touch_unreadable) = crate::touch::TouchState::open(&state_dir);
+    if let Some(why) = &touch_unreadable {
+        eprintln!("saiife: warning: {why}: touch approvals are unavailable");
+    }
+    let touch = Arc::new(touch);
+    // The Workspace link's machine key and paired devices (plan 29); a
+    // file that cannot be used leaves the Workspace with no trusted device.
+    let (workspace, workspace_warning) =
+        crate::workspace::Workspace::open(crate::workspace::dir_in(&state_dir));
+    if let Some(why) = &workspace_warning {
+        eprintln!("saiife: warning: {why}: the Workspace trusts no device");
+    }
+    #[cfg(feature = "fake-boxes")]
+    let fake_demo: Option<Arc<dyn saiife_wire::BoxSource>> =
+        if std::env::var("SAIIFE_WORKSPACE_FAKE_BOXES").is_ok_and(|v| v == "1") {
+            eprintln!("saiifed: Workspace uses fake boxes (test build)");
+            Some(Arc::new(saiife_wire::fake::FakeBoxSource::demo(
+                crate::workspace::now_secs(),
+            )))
+        } else {
+            None
+        };
+    #[cfg(not(feature = "fake-boxes"))]
+    let fake_demo: Option<Arc<dyn saiife_wire::BoxSource>> = None;
+    let boxes_fallback: Arc<dyn saiife_wire::BoxSource> = Arc::new(saiife_wire::source::NoBoxes);
+    // `Ctx.boxes` is the fake demo when asked (test builds), else `NoBoxes`:
+    // with a manager, every Workspace frame builds its own source from the
+    // device owner (`workspace_link::source_for`, over
+    // `box_ops::workspace_source`), so nothing here is an unscoped manager
+    // view that later code could reach by mistake.
+    let (boxes, workspace_demo) = crate::box_ops::pick_workspace_boxes(boxes_fallback, fake_demo);
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
     // The MCP gateway (plan 17): children never get read access to the
@@ -1068,12 +1160,32 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         approvals,
         lockdown,
         grants,
+        touch,
         mcp,
         refuse_own_uid_peers: mode == Mode::Locked
             && !crate::mcp_gateway::own_uid_peers_allowed()
             && !test_pipe_in_use,
+        // Workspace (plan 29)
+        workspace: Arc::new(workspace),
+        boxes,
+        workspace_demo,
+        box_manager,
+        box_unavailable,
+        box_template_warnings,
+        box_images,
+        box_disk_root,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
+    if let Some(a) = &box_audit {
+        a.attach(&ctx);
+    }
+    // Real boxes (plans 38, 39): the box gateway's hook (until now every
+    // boot failed closed), the land book and the guest event forwarder, on
+    // this runtime. No box
+    // boots before `serve` runs the tick and the box ops.
+    if let Some(wire) = box_on_ctx {
+        wire(&ctx, rt.handle());
+    }
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
     // The service's own judgment of each co-signed call (plan 21), for the
     // system daemon only: the personal broker has no co-signer.
@@ -1096,16 +1208,13 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         });
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("cannot start the runtime: {e}"))?;
     let loaded_files = loaded.as_ref().ok().map(|(l, _, _)| files_json(l));
     let notes: Vec<_> = [
         ("ca_refused", ca_refused),
         ("tokens_reset", tokens_reset),
         ("lockdown_unreadable", lockdown_unreadable),
         ("grants_unreadable", grants_unreadable),
+        ("touch_unreadable", touch_unreadable),
     ]
     .into_iter()
     .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
@@ -1140,6 +1249,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     // Requests approved but not sent when the daemon stopped become
     // `send_failed` (`interrupted`); none is sent again by itself.
     more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
+    more.extend(crate::box_ops::change_records(&ctx, &box_recovered));
     #[cfg(unix)]
     let place = daemon_cfg.socket_dir.clone();
     let code = rt.block_on(serve(
@@ -1639,6 +1749,8 @@ struct Endpoints {
     listener: UnixListener,
     sock_path: PathBuf,
     rest: UnixGateway,
+    // Workspace (plan 29): `link.sock` and its accept loop.
+    link: UnixGateway,
 }
 
 /// What is left to stop once the control socket stopped accepting.
@@ -1684,13 +1796,33 @@ impl Endpoints {
                     return Err(ExitCode::from(2));
                 }
             };
+        // Workspace (plan 29): `link.sock`, the same perms; every frame's
+        // device owner must be the peer's uid.
+        let (link_listener, link_path) =
+            match bind(&socket_dir, LINK_SOCKET_NAME, ctx.own_uid, perms) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("saiife: {e}");
+                    drop(listener);
+                    drop(gw_listener);
+                    let _ = std::fs::remove_file(&sock_path);
+                    let _ = std::fs::remove_file(&gw_path);
+                    let _ = ctx.writer.stop(None).await;
+                    return Err(ExitCode::from(2));
+                }
+            };
         let task = tokio::spawn(gateway::serve(gw_listener, Arc::clone(ctx)));
+        let link_task = tokio::spawn(server::serve_link(link_listener, Arc::clone(ctx)));
         Ok(Endpoints {
             listener,
             sock_path,
             rest: UnixGateway {
                 task,
                 path: gw_path,
+            },
+            link: UnixGateway {
+                task: link_task,
+                path: link_path,
             },
         })
     }
@@ -1703,6 +1835,10 @@ impl Endpoints {
     fn stop_accepting(self) -> UnixGateway {
         drop(self.listener);
         let _ = std::fs::remove_file(&self.sock_path);
+        // Workspace (plan 29): link.sock stops accepting with the control
+        // socket (its accept loop holds the listener).
+        self.link.task.abort();
+        let _ = std::fs::remove_file(&self.link.path);
         self.rest
     }
 }
@@ -1852,6 +1988,8 @@ async fn serve(
 
     // The notification delivery task; it holds only a weak reference.
     let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
+    // The box manager's tick (none without boxes); it holds the context weakly.
+    crate::box_ops::start_tick(Arc::clone(&ctx));
     // Audit forwarding, per the policy loaded at start (none while it is
     // invalid; a valid reload starts it).
     match ctx.policy().system {

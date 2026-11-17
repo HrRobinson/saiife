@@ -92,8 +92,6 @@ pub(crate) mod linux {
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
     use std::io::{IsTerminal, Read};
-    #[cfg(unix)]
-    use std::os::fd::AsFd;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
@@ -665,68 +663,24 @@ pub(crate) mod linux {
         Ok(buf)
     }
 
-    /// One line from the console without echo: `rpassword` reads `CONIN$`, never a piped
-    /// stdin. For the values of `secret add` and `connect`. Approvals never ask for a
-    /// password on Windows (W16). With no console it refuses and says what else works.
-    #[cfg(windows)]
+    /// One line from the terminal (or, on Windows, the console) without echo:
+    /// `tty::read_hidden`. Windows reads `CONIN$`, never a piped stdin; with no
+    /// console it refuses and says what else works. Approvals never ask for a
+    /// password on Windows (W16).
     fn prompt(label: &str) -> Result<Zeroizing<String>, Stop> {
-        let line = rpassword::prompt_password(label)
-            .map(Zeroizing::new)
-            .map_err(|e| {
-                Stop::Refused(format!(
-                    "cannot read the console ({e}); use --from-file or --from-env"
-                ))
-            })?;
-        if line.is_empty() {
-            return Err(Stop::Refused("no value read".into()));
-        }
+        let line = crate::tty::read_hidden(label).map_err(|m| {
+            Stop::Refused(if m == crate::tty::TOO_LONG {
+                "secret value is too long".into()
+            } else if cfg!(windows) && m.starts_with("cannot read the console") {
+                format!("{m}; use --from-file or --from-env")
+            } else {
+                m
+            })
+        })?;
         if line.len() > MAX_VALUE_BYTES {
             return Err(Stop::Refused("secret value is too long".into()));
         }
         Ok(line)
-    }
-
-    /// Puts the terminal back as it was, on every path out (return, error,
-    /// panic). Ctrl-C does not need a signal handler: `ISIG` is off while
-    /// the prompt is up, so it arrives as a byte and ends the prompt here.
-    #[cfg(unix)]
-    struct Restore {
-        orig: rustix::termios::Termios,
-    }
-
-    #[cfg(unix)]
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = rustix::termios::tcsetattr(
-                std::io::stdin().as_fd(),
-                rustix::termios::OptionalActions::Flush,
-                &self.orig,
-            );
-        }
-    }
-
-    /// One line from the terminal without echo.
-    #[cfg(unix)]
-    fn prompt(label: &str) -> Result<Zeroizing<String>, Stop> {
-        use rustix::termios::{InputModes, LocalModes, OptionalActions, SpecialCodeIndex};
-        let stdin = std::io::stdin();
-        let fd = stdin.as_fd();
-        let tty = |e: rustix::io::Errno| Stop::Refused(format!("cannot read the terminal: {e}"));
-        let orig = rustix::termios::tcgetattr(fd).map_err(tty)?;
-        let mut raw = orig.clone();
-        raw.local_modes &= !(LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG);
-        raw.input_modes &= !InputModes::IXON;
-        raw.special_codes[SpecialCodeIndex::VMIN] = 1;
-        raw.special_codes[SpecialCodeIndex::VTIME] = 0;
-        let _restore = Restore { orig };
-        rustix::termios::tcsetattr(fd, OptionalActions::Flush, &raw).map_err(tty)?;
-        eprint!("{label}");
-        let r = read_line(fd);
-        eprintln!();
-        match r {
-            Ok(b) => utf8(&b),
-            Err(e) => Err(e),
-        }
     }
 
     /// A prompt that may be left empty.
@@ -753,50 +707,6 @@ pub(crate) mod linux {
             return Err(Stop::Refused("secret value is too long".into()));
         }
         Ok(Zeroizing::new(v.to_string()))
-    }
-
-    #[cfg(unix)]
-    fn read_line(fd: std::os::fd::BorrowedFd<'_>) -> Result<Zeroizing<Vec<u8>>, Stop> {
-        let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
-        let mut b = [0u8; 1];
-        loop {
-            match rustix::io::read(fd, &mut b) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(Stop::Refused(format!("cannot read the terminal: {e}"))),
-            }
-            match b[0] {
-                // Ctrl-C: stop here; `Restore` puts the terminal back.
-                0x03 => return Err(Stop::Refused("interrupted".into())),
-                b'\n' | b'\r' => break,
-                // Ctrl-D ends the value, or aborts when nothing was typed.
-                0x04 => {
-                    if buf.is_empty() {
-                        return Err(Stop::Refused("no value read".into()));
-                    }
-                    break;
-                }
-                0x7f | 0x08 => {
-                    // Drop the last character, whole (UTF-8).
-                    while buf.last().is_some_and(|c| c & 0xC0 == 0x80) {
-                        buf.pop();
-                    }
-                    buf.pop();
-                }
-                c if c < 0x20 => {}
-                c => {
-                    if buf.len() >= MAX_VALUE_BYTES {
-                        return Err(Stop::Refused("secret value is too long".into()));
-                    }
-                    buf.push(c);
-                }
-            }
-        }
-        if buf.is_empty() {
-            return Err(Stop::Refused("no value read".into()));
-        }
-        Ok(buf)
     }
 
     #[cfg(test)]

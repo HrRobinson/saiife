@@ -11,13 +11,23 @@ use saiifeguard::Pack;
 use crate::project::project_packs;
 use crate::warn;
 
-pub fn run(builtin: &[Pack], cli_packs: &[String], vars: &PathVars, id: Option<&str>) -> ExitCode {
+pub fn run(
+    builtin: &[Pack],
+    user: &[Pack],
+    cli_packs: &[String],
+    vars: &PathVars,
+    id: Option<&str>,
+) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let project = project_packs(&cwd, builtin);
     for w in &project.warnings {
         warn(w);
     }
     if let Some(id) = id {
+        if let Some(pack) = user.iter().find(|p| p.id == id) {
+            out!("{}", render_user_pack(pack, Some(vars)));
+            return ExitCode::SUCCESS;
+        }
         let Some(pack) = builtin.iter().find(|p| p.id == id) else {
             eprintln!("saiife: unknown pack {id:?} (`saiife packs` lists them)");
             return ExitCode::from(2);
@@ -32,6 +42,7 @@ pub fn run(builtin: &[Pack], cli_packs: &[String], vars: &PathVars, id: Option<&
         None => outln!("No .saiife/config.toml here or above; showing the defaults."),
     }
     out!("{}", render(builtin, &project.enabled, cli_packs));
+    out!("{}", render_user_rows(user));
     ExitCode::SUCCESS
 }
 
@@ -51,6 +62,37 @@ pub fn render(builtin: &[Pack], project: &[String], cli_packs: &[String]) -> Str
         ));
     }
     out
+}
+
+/// The user packs as rows of the table `render` prints: DEFAULT says `user`
+/// (a user pack is always on), so they are told apart from the built-ins.
+pub fn render_user_rows(user: &[Pack]) -> String {
+    user.iter()
+        .map(|p| {
+            format!(
+                "{:<18} {:<7} {:<4} {:>5}  {}\n",
+                p.id,
+                "user",
+                "on",
+                p.rule_count(),
+                p.description
+            )
+        })
+        .collect()
+}
+
+/// A user pack in full: the same rules as a built-in, under a header that
+/// says where it comes from.
+pub fn render_user_pack(p: &Pack, vars: Option<&PathVars>) -> String {
+    let full = render_pack_with(p, true, vars);
+    let rules = full.split_once("on by default: yes   on here: yes\n");
+    format!(
+        "{} — {}\n{}\nuser pack: always on\n{}",
+        p.id,
+        p.name,
+        p.description,
+        rules.map_or("", |(_, r)| r)
+    )
 }
 
 /// The variable a rule needs that has no value on this machine.

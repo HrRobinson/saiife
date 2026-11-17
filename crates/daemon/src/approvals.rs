@@ -160,6 +160,11 @@ pub struct Request {
     /// Absent (false) in a request stored before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub display_faithful: bool,
+    /// The touch class the request needs (plan 26): the `name()` of a
+    /// `saiife_touch::TouchClass`. Absent in a request stored before it
+    /// existed and for an unmarked one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touch_class: Option<String>,
     /// Base64 of the sealed exact request.
     pub request_sealed: Option<String>,
     pub state: State,
@@ -195,6 +200,8 @@ pub struct NewRequest {
     pub scope: Option<String>,
     /// [`Request::ask_rule`].
     pub ask_rule: Option<String>,
+    /// [`Request::touch_class`].
+    pub touch_class: Option<String>,
     /// The send's display fields ([`Request::body_display`] ...); empty
     /// (`Default`) for a command request.
     pub send: SendDisplay,
@@ -396,6 +403,82 @@ pub fn reauth_detail(r: &Request) -> String {
         ApprovalType::Command => r.ask_rule.clone().unwrap_or_else(|| "command".into()),
     };
     format!("#{} {what}", r.id)
+}
+
+/// The action a touch on request `r` approves (plan 26): what the approver
+/// is shown, as the stored (already masked) fields. Absent options are
+/// omitted, never empty strings.
+pub fn action_record(
+    r: &Request,
+    class: saiife_touch::TouchClass,
+    instance_id: [u8; 16],
+    nonce: [u8; 32],
+    expires_at: u64,
+) -> saiife_touch::ActionRecord {
+    let mut f: BTreeMap<String, String> = BTreeMap::new();
+    let kind = match r.kind {
+        ApprovalType::Connector => "connector",
+        ApprovalType::Command => "command",
+        ApprovalType::Mcp => "mcp",
+    };
+    f.insert("type".into(), kind.into());
+    f.insert("project".into(), r.project.clone());
+    match r.kind {
+        ApprovalType::Connector | ApprovalType::Mcp => {
+            let opt = [
+                ("service", &r.service),
+                ("operation", &r.operation),
+                ("capability", &r.capability),
+                ("env", &r.env),
+                ("body_sha256", &r.body_sha256),
+            ];
+            for (k, v) in opt {
+                if let Some(v) = v {
+                    f.insert(k.into(), v.clone());
+                }
+            }
+            if r.env_base {
+                f.insert("env_base".into(), "true".into());
+            }
+            f.insert("body_truncated".into(), r.body_truncated.to_string());
+            if let Some(a) = &r.amount {
+                f.insert("amount".into(), format!("{} {}", a.minor, a.currency));
+            }
+            for (k, v) in &r.params {
+                f.insert(format!("param.{k}"), v.clone());
+            }
+        }
+        ApprovalType::Command => {
+            let opt = [
+                ("input", &r.input),
+                ("scope", &r.scope),
+                ("ask_rule", &r.ask_rule),
+            ];
+            for (k, v) in opt {
+                if let Some(v) = v {
+                    f.insert(k.into(), v.clone());
+                }
+            }
+        }
+    }
+    saiife_touch::ActionRecord {
+        instance_id,
+        request_id: r.id,
+        class,
+        summary: reauth_detail(r),
+        fields: f,
+        nonce,
+        expires_at,
+    }
+}
+
+/// `rec` with the verified touch evidence as its one extra `touch` key.
+pub fn record_with_touch(
+    mut rec: saiife_audit::Record,
+    ev: &saiife_touch::TouchEvidence,
+) -> saiife_audit::Record {
+    rec.extra.insert("touch".into(), ev.to_audit());
+    rec
 }
 
 /// Fill an `approval` record for `r`: `base` is the daemon's record of
@@ -810,6 +893,7 @@ impl Store {
             env: req.send.env,
             env_base: req.send.env_base,
             display_faithful: req.send.faithful,
+            touch_class: req.touch_class,
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,
@@ -1101,6 +1185,178 @@ mod sid_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn record_with_touch_adds_one_key() {
+        use saiife_audit::{DecisionKind, NewRecord, Record};
+        use saiife_touch::{soft::SoftAuthenticator, TouchClass};
+        let r = from_json(connector_json());
+        let a = action_record(&r, TouchClass::Deploy, [1; 16], [2; 32], 1_800_000_300);
+        let s = SoftAuthenticator::new_es256();
+        let ev = saiife_touch::verify(
+            &[s.credential("saiife.local", 1000, "key")],
+            &a,
+            &s.assert_ctap("saiife.local", &saiife_touch::challenge(&a)),
+            "saiife.local",
+            1_800_000_000,
+        )
+        .unwrap();
+        let base = Record::new(
+            NewRecord {
+                agent: "claude",
+                project: "/p",
+                session: None,
+                tool: "approval",
+                input: "#7 erp payments.create",
+                decision: DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+                mode: "locked",
+                policy: None,
+                permission_mode: None,
+            },
+            "0.0.0",
+        );
+        let with = record_with_touch(base.clone(), &ev);
+        assert_eq!(with.extra["touch"], ev.to_audit());
+        let mut without = with.clone();
+        without.extra.remove("touch");
+        assert_eq!(without, base);
+    }
+
+    fn from_json(v: serde_json::Value) -> Request {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn connector_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": 7, "created": "2026-11-11T10:00:00Z", "expires": "2026-11-11T11:00:00Z",
+            "uid": 1000, "user": "agent", "session": null, "agent": "claude",
+            "project": "/p", "type": "connector", "service": "erp",
+            "operation": "payments.create", "capability": "payments:write",
+            "params": {"id": "42", "memo": "x"}, "input": null, "grant_key": null,
+            "body_display": "{}", "body_sha256": "ab".repeat(32), "body_truncated": false,
+            "amount": {"minor": 1250, "currency": "EUR"}, "headers": [],
+            "env": "prod", "request_sealed": null, "state": "pending",
+            "decided_by": null, "note": null, "result_ref": null
+        })
+    }
+
+    fn command_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": 8, "created": "2026-11-11T10:00:00Z", "expires": "2026-11-11T11:00:00Z",
+            "uid": 1000, "user": "agent", "session": null, "agent": "claude",
+            "project": "/p", "type": "command", "service": null, "operation": null,
+            "capability": null, "params": {}, "input": "git push --force",
+            "grant_key": null, "scope": "/p", "ask_rule": "core.git/push-force",
+            "request_sealed": null, "state": "pending",
+            "decided_by": null, "note": null, "result_ref": null
+        })
+    }
+
+    /// A request file written before plan 26 has no `touch_class`.
+    #[test]
+    fn old_request_file_loads() {
+        let r = from_json(connector_json());
+        assert_eq!(r.touch_class, None);
+        let back = serde_json::to_value(&r).unwrap();
+        assert!(back.get("touch_class").is_none(), "{back}");
+        let mut with = r.clone();
+        with.touch_class = Some("deploy".into());
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["touch_class"],
+            "deploy"
+        );
+    }
+
+    fn rec(r: &Request) -> saiife_touch::ActionRecord {
+        action_record(
+            r,
+            saiife_touch::TouchClass::Deploy,
+            [1; 16],
+            [2; 32],
+            1_800_000_300,
+        )
+    }
+
+    #[test]
+    fn action_record_fields() {
+        let r = from_json(connector_json());
+        let a = rec(&r);
+        let want: BTreeMap<String, String> = [
+            ("type", "connector"),
+            ("project", "/p"),
+            ("service", "erp"),
+            ("operation", "payments.create"),
+            ("capability", "payments:write"),
+            ("env", "prod"),
+            ("body_sha256", &"ab".repeat(32)),
+            ("body_truncated", "false"),
+            ("amount", "1250 EUR"),
+            ("param.id", "42"),
+            ("param.memo", "x"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(a.fields, want);
+        assert_eq!(a.summary, reauth_detail(&r));
+        assert_eq!(a.request_id, 7);
+        assert_eq!(a.instance_id, [1; 16]);
+        assert_eq!(a.nonce, [2; 32]);
+        assert_eq!(a.expires_at, 1_800_000_300);
+
+        let mut base = connector_json();
+        base["env"] = serde_json::Value::Null;
+        base["env_base"] = true.into();
+        base["body_sha256"] = serde_json::Value::Null;
+        base["amount"] = serde_json::Value::Null;
+        let f = rec(&from_json(base)).fields;
+        assert_eq!(f["env_base"], "true");
+        for k in ["env", "body_sha256", "amount"] {
+            assert!(!f.contains_key(k), "{k}");
+        }
+        assert!(f.values().all(|v| !v.is_empty()));
+
+        let c = from_json(command_json());
+        let a = rec(&c);
+        let want: BTreeMap<String, String> = [
+            ("type", "command"),
+            ("project", "/p"),
+            ("input", "git push --force"),
+            ("scope", "/p"),
+            ("ask_rule", "core.git/push-force"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(a.fields, want);
+        assert_eq!(a.summary, reauth_detail(&c));
+    }
+
+    #[test]
+    fn action_record_tracks_the_request() {
+        use saiife_touch::challenge;
+        let r = from_json(connector_json());
+        let base = challenge(&rec(&r));
+        let changed = |f: &dyn Fn(&mut Request)| {
+            let mut x = r.clone();
+            f(&mut x);
+            challenge(&rec(&x))
+        };
+        assert_ne!(base, changed(&|x| x.body_sha256 = Some("cd".repeat(32))));
+        assert_ne!(base, changed(&|x| x.env = Some("test".into())));
+        assert_ne!(
+            base,
+            changed(&|x| {
+                x.params.insert("id".into(), "43".into());
+            })
+        );
+        assert_ne!(base, changed(&|x| x.id = 9));
+        assert_eq!(base, changed(&|x| x.note = Some("hi".into())));
+        assert_eq!(base, changed(&|x| x.state = State::Approved));
+    }
     use super::*;
     #[cfg(unix)]
     use crate::vault::{Shared, VaultState};
@@ -1136,6 +1392,7 @@ mod tests {
             grant_key: None,
             scope: None,
             ask_rule: None,
+            touch_class: None,
             send: SendDisplay::default(),
         }
     }

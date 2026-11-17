@@ -536,6 +536,8 @@ async fn ask_creates_pending_no_upstream_call() {
     assert_eq!(stored.stored.via, "cli");
     assert_eq!(stored.stored.env, None);
     assert_eq!(stored.capability.as_deref(), Some("refunds:write"));
+    // No mark: no touch class.
+    assert_eq!(stored.touch_class, None);
     assert_eq!(stored.params.get()["order_id"], "7");
     use base64::Engine as _;
     let body = base64::engine::general_purpose::STANDARD
@@ -564,6 +566,48 @@ async fn ask_creates_pending_no_upstream_call() {
     // The stored request keeps the exact value (it is sealed).
     assert_eq!(p.stored.params["name"], TOKEN);
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn allowed_marked_call_asks() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    // Allowed AND marked as a deploy: it asks all the same (spec 8.2).
+    let snap = snapshot("deploy = [\"orders:read\"]");
+    let c = call("orders.list", &[]);
+    let (o, _) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(env.approvals.lock().unwrap().len(), 1);
+    // The class of the real capability goes to the daemon with the call.
+    assert_eq!(env.approvals.lock().unwrap()[0].touch_class, Some("deploy"));
+    // The same call with no mark is sent.
+    let (o, _) = run(
+        &c,
+        &snapshot(""),
+        &catalog(),
+        &Limiter::new(),
+        &env,
+        Some(&up),
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn approved_marked_call_sends() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let snap = snapshot("deploy = [\"orders:read\"]");
+    let c = call("orders.list", &[]);
+    let lim = Limiter::new();
+    let (o, _) = run(&c, &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let stored = env.approvals.lock().unwrap().pop().unwrap().stored;
+    let (_, o, _) = send_approved(&stored, &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

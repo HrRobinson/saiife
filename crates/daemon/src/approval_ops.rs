@@ -21,7 +21,9 @@ use crate::approvals::{
 use crate::approvers::{may_decide, Refusal};
 use crate::ops::{Conn, Ctx, VERSION};
 use crate::reauth::{parse_auth_hex, Reauth, ReauthResult, Subject};
+use crate::touch::{unix_now, IssueKey};
 use crate::vault::VaultError;
+use crate::workspace_link::Refused;
 use saiife_audit::{DecisionKind, Record};
 use saiife_broker::pipeline::{self, Outcome, PendingCall, StoredCall};
 use saiife_ipc::msg::{
@@ -29,6 +31,7 @@ use saiife_ipc::msg::{
     OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_GRANT_CONSUME,
 };
 use saiife_ipc::peer::PeerCred;
+use saiife_touch::{Assertion, TouchClass, TouchError, TouchEvidence, LOCAL_RP_ID};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -141,6 +144,15 @@ fn display_is_faithful(p: &PendingCall) -> bool {
         && (p.body_sha256.is_none() || p.body_display.is_some())
 }
 
+/// The class a new connector request is stored with: the stronger of the
+/// broker's class (of the real capability) and the daemon's (of the masked
+/// one), so masking can never weaken it. A name this version cannot read
+/// is the strictest (`deploy`), as at decide.
+fn combined_class(broker: Option<&str>, daemon: Option<&str>) -> Option<String> {
+    let strictest = |n: &str| TouchClass::from_name(n).unwrap_or(TouchClass::Deploy);
+    TouchClass::stronger(broker.map(strictest), daemon.map(strictest)).map(|c| c.name().to_string())
+}
+
 /// Step 8 for the daemon: seal `p`'s exact request (bound to its id), store
 /// it with the masked display copy, and write its `approval`/`created`
 /// record. Errs with the deny rule; nothing is left pending on an error.
@@ -157,6 +169,21 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
     );
     let faithful = display_is_faithful(p);
+    // Fail closed: the class comes from the environment-applied snapshot of
+    // the call's env. Without a snapshot, or for a service it does not know,
+    // the request cannot be classified, so nothing is stored.
+    let touch_class = {
+        const UNCLASSIFIED: &str = "touch_policy_unavailable";
+        let policy = ctx.policy();
+        let g = policy.gateway.as_deref().ok_or(UNCLASSIFIED)?;
+        let cfg = &g.snapshot_for(p.stored.env.as_deref()).config;
+        if !cfg.services.contains_key(&p.stored.service) {
+            return Err(UNCLASSIFIED.into());
+        }
+        let here =
+            saiife_policy::touch::class_for_call(cfg, &p.stored.service, p.capability.as_deref());
+        combined_class(p.touch_class, here)
+    };
     let new = NewRequest {
         uid: p.stored.uid,
         sid: p.stored.sid.clone(),
@@ -173,6 +200,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class,
         send: SendDisplay {
             body_display: p.body_display.clone(),
             body_sha256: p.body_sha256.clone(),
@@ -228,6 +256,7 @@ pub(crate) async fn create_mcp(
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class: None,
         send: SendDisplay {
             body_display: Some(p.display.clone()),
             body_sha256: Some(p.stored.arguments_sha256.clone()),
@@ -363,7 +392,7 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     }
 }
 
-fn unavailable(id: u64, ctx: &Ctx) -> Value {
+pub(crate) fn unavailable(id: u64, ctx: &Ctx) -> Value {
     let why = match &ctx.approvals {
         Err(e) => format!("approvals are unavailable: {e}"),
         Ok(_) => "approvals are unavailable".into(),
@@ -371,7 +400,7 @@ fn unavailable(id: u64, ctx: &Ctx) -> Value {
     err(id, ErrorCode::Unavailable, &why)
 }
 
-fn unknown(id: u64, rid: u64) -> Value {
+pub(crate) fn unknown(id: u64, rid: u64) -> Value {
     err(
         id,
         ErrorCode::BadRequest,
@@ -447,14 +476,19 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let mut m = Map::new();
     m.insert(
         "items".into(),
-        Value::Array(items.iter().map(brief).collect()),
+        Value::Array(
+            items
+                .iter()
+                .map(|r| with_effective_class(ctx, r, brief(r)))
+                .collect(),
+        ),
     );
     ok(id, m)
 }
 
 /// The approval request's id: arg `request` (a frame's own `id` is the
 /// frame's, so the spec's `id` cannot be an argument).
-fn request_id(req: &Request) -> Result<u64, Value> {
+pub(crate) fn request_id(req: &Request) -> Result<u64, Value> {
     req.args
         .get("request")
         .and_then(Value::as_u64)
@@ -473,7 +507,11 @@ fn is_requester(r: &ApprovalRequest, peer: &PeerCred) -> bool {
 }
 
 /// Request `rid` when `peer` may see it.
-async fn visible(ctx: &Arc<Ctx>, peer: &PeerCred, rid: u64) -> Result<Option<ApprovalRequest>, ()> {
+pub(crate) async fn visible(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    rid: u64,
+) -> Result<Option<ApprovalRequest>, ()> {
     let r = on_store(ctx, move |_, s| s.get(rid)).await.ok_or(())?;
     match r {
         Some(r) if is_requester(&r, peer) || is_approver(ctx, peer).await => Ok(Some(r)),
@@ -492,10 +530,52 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(None) => unknown(id, rid),
         Ok(Some(r)) => {
             let mut m = Map::new();
-            m.insert("item".into(), item(&r));
+            m.insert("item".into(), with_effective_class(ctx, &r, item(&r)));
             ok(id, m)
         }
     }
+}
+
+/// `v` (the [`item`] or [`brief`] of `r`) with `touch_class` the class a
+/// decision needs now (D8), not only the stored one: `approval.list` and
+/// `approval.show` agree.
+fn with_effective_class(ctx: &Ctx, r: &ApprovalRequest, mut v: Value) -> Value {
+    if let (Some(c), Some(o)) = (effective_class(ctx, r), v.as_object_mut()) {
+        o.insert("touch_class".into(), c.name().into());
+    }
+    v
+}
+
+/// The touch class approving `r` needs (D8): the stronger of the stored
+/// class and the class under the current policy. Only connector requests
+/// get a class *now*, from the environment-applied snapshot of `r.env`
+/// (as `create` classifies); no gateway, an environment with no snapshot
+/// or a service the snapshot does not know give none *now*, so the stored
+/// class still counts: never weaker. A stored class this version cannot
+/// read is the strictest (`deploy`, needs UV), never none.
+pub(crate) fn effective_class(ctx: &Ctx, r: &ApprovalRequest) -> Option<TouchClass> {
+    let strictest = |n: &str| TouchClass::from_name(n).unwrap_or(TouchClass::Deploy);
+    let stored = r.touch_class.as_deref().map(strictest);
+    let now = match r.kind {
+        ApprovalType::Connector => class_now(ctx, r).map(strictest),
+        ApprovalType::Command | ApprovalType::Mcp => None,
+    };
+    TouchClass::stronger(stored, now)
+}
+
+/// The class name of connector request `r` under the current policy.
+fn class_now(ctx: &Ctx, r: &ApprovalRequest) -> Option<&'static str> {
+    let policy = ctx.policy();
+    let g = policy.gateway.as_deref()?;
+    let snap = match r.env.as_deref() {
+        Some(e) => g.by_env.get(e)?,
+        None => &g.snap,
+    };
+    let service = r.service.as_deref()?;
+    if !snap.config.services.contains_key(service) {
+        return None;
+    }
+    saiife_policy::touch::class_for_call(&snap.config, service, r.capability.as_deref())
 }
 
 /// The re-authentication of a caller whose process start time is not
@@ -526,7 +606,7 @@ pub(crate) fn auth_arg(args: &Map<String, Value>) -> Result<Option<[u8; 32]>, St
 
 /// Refuse a decision on `r` by `by`: an `approval`/`refused` record with
 /// `rule`, and `forbidden` with the rule.
-async fn refuse(
+pub(crate) async fn refuse(
     ctx: &Arc<Ctx>,
     r: &ApprovalRequest,
     by: &PeerCred,
@@ -621,6 +701,18 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         return refuse(ctx, &r, &peer, id, "truncated_not_acknowledged", why).await;
     }
 
+    // A touch-class approval needs a `touch` argument that is an assertion.
+    // Checked before who may decide, as the acknowledgement is: no
+    // re-authentication prompt for an approval refused anyway. It is
+    // verified (and its challenge spent) only after that, below.
+    let early_touch = match effective_class(ctx, &r).filter(|_| approve) {
+        None => None,
+        Some(class) => match touch_arg(&r, &req, class) {
+            Ok(a) => Some(a),
+            Err(e) => return touch_refused(ctx, &r, &peer, id, e).await,
+        },
+    };
+
     // The requester may always withdraw its own request: a rejection that
     // lets nothing through needs no approver and no re-authentication.
     let cancel = !approve && is_requester(&r, &peer);
@@ -689,18 +781,74 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         return refuse(ctx, &r, &peer, id, why.rule(), &why.to_string()).await;
     }
 
+    // A touch-class approval needs an assertion over the challenge issued
+    // for this request (`touch.begin`). A rejection or a withdrawal lets
+    // nothing through and needs none. The class is taken again: a reload
+    // during the re-authentication can only make it stronger (D8), and a
+    // class that appeared meanwhile still needs its `touch` argument.
+    let evidence = match effective_class(ctx, &r).filter(|_| approve) {
+        None => None,
+        Some(class) => {
+            let asr = match early_touch {
+                Some(a) => Ok(a),
+                None => touch_arg(&r, &req, class),
+            };
+            match asr {
+                Ok(asr) => match touch_for(ctx, &r, &peer, asr, class).await {
+                    Ok(ev) => Some(ev),
+                    Err(e) => return touch_refused(ctx, &r, &peer, id, e).await,
+                },
+                Err(e) => return touch_refused(ctx, &r, &peer, id, e).await,
+            }
+        }
+    };
+
+    match apply_decision(ctx, rid, approve, &peer, note, evidence.as_ref(), None).await {
+        Ok(action) => {
+            let mut m = Map::new();
+            m.insert("request".into(), rid.into());
+            m.insert("state".into(), action.into());
+            ok(id, m)
+        }
+        Err(DecideErr::Unavailable) => unavailable(id, ctx),
+        Err(DecideErr::Unknown) => unknown(id, rid),
+        Err(DecideErr::Other(code, m)) => err(id, code, &m),
+    }
+}
+
+/// Why [`apply_decision`] did not decide.
+enum DecideErr {
+    Unavailable,
+    Unknown,
+    Other(ErrorCode, String),
+}
+
+/// The one tail of every decision, from a local peer ([`decide`]) or the
+/// Workspace ([`decide_remote`]): the store transition by `by`, the
+/// `approval` record (with the touch evidence and `workspace`, when
+/// given), failing an approval that is not on record, and then sending
+/// (connector, MCP) or keeping the grant (command). Returns the state name.
+async fn apply_decision(
+    ctx: &Arc<Ctx>,
+    rid: u64,
+    approve: bool,
+    by: &PeerCred,
+    note: Option<String>,
+    evidence: Option<&TouchEvidence>,
+    workspace: Option<Value>,
+) -> Result<&'static str, DecideErr> {
     let to = if approve {
         State::Approved
     } else {
         State::Rejected
     };
-    let by = (peer.uid, peer.sid.clone());
+    let who = (by.uid, by.sid.clone());
     let moved = on_store(ctx, move |_, s| {
-        s.transition_by(rid, &[State::Pending], to, Some(by), note, now())
+        s.transition_by(rid, &[State::Pending], to, Some(who), note, now())
     })
     .await;
     let r = match moved {
-        None => return unavailable(id, ctx),
+        None => return Err(DecideErr::Unavailable),
         Some(Ok(r)) => r,
         Some(Err(StoreError::WrongState {
             state,
@@ -709,21 +857,23 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             if let Some(gone) = newly_expired {
                 ctx.record_expired(vec![*gone]).await;
             }
-            return err(
-                id,
+            return Err(DecideErr::Other(
                 ErrorCode::BadRequest,
-                &format!("request #{rid} is {}", state_name(state)),
-            );
+                format!("request #{rid} is {}", state_name(state)),
+            ));
         }
-        Some(Err(StoreError::Unknown)) => return unknown(id, rid),
-        Some(Err(e)) => return err(id, ErrorCode::BadRequest, &e.to_string()),
+        Some(Err(StoreError::Unknown)) => return Err(DecideErr::Unknown),
+        Some(Err(e)) => return Err(DecideErr::Other(ErrorCode::BadRequest, e.to_string())),
     };
     let action = if approve { "approved" } else { "rejected" };
-    let recorded = ctx
-        .writer
-        .append(decided_record(ctx, &r, action, &peer))
-        .await;
-    if let Err(e) = recorded {
+    let mut rec = decided_record(ctx, &r, action, by);
+    if let Some(w) = workspace {
+        rec.extra.insert("workspace".into(), w);
+    }
+    if let Some(ev) = evidence {
+        rec = crate::approvals::record_with_touch(rec, ev);
+    }
+    if let Err(e) = ctx.writer.append(rec).await {
         if approve {
             // An approval that is not on record is not acted on.
             fail(
@@ -734,31 +884,392 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             )
             .await;
         }
-        return err(
-            id,
+        return Err(DecideErr::Other(
             ErrorCode::Unrecorded,
-            &format!("request #{rid} is {action}, but its record could not be written: {e}"),
-        );
+            format!("request #{rid} is {action}, but its record could not be written: {e}"),
+        ));
     }
     if approve && matches!(r.kind, ApprovalType::Connector | ApprovalType::Mcp) {
         let c = Arc::clone(ctx);
-        let by = peer.uid;
+        let by = by.uid;
         tokio::spawn(async move { send(c, r, by).await });
     } else if approve {
         // A command: the grant is kept before the answer, so the command
         // can run as soon as the approver is told.
         if let Err(why) = grant(ctx, &r).await {
-            return err(
-                id,
+            return Err(DecideErr::Other(
                 ErrorCode::Internal,
-                &format!("request #{rid} is approved, but its grant could not be kept: {why}"),
-            );
+                format!("request #{rid} is approved, but its grant could not be kept: {why}"),
+            ));
         }
     }
-    let mut m = Map::new();
-    m.insert("request".into(), rid.into());
-    m.insert("state".into(), action.into());
-    ok(id, m)
+    Ok(action)
+}
+
+// ------------------------------------------------- the Workspace's decisions
+
+/// The device owner as a peer: its uid, and on Windows the SID the
+/// directory resolves for its name (none when it cannot: then the identity
+/// checks fail closed, see `approvers::approver_standing`).
+pub(crate) fn owner_peer(ctx: &Ctx, owner_uid: u32, owner_user: &str) -> PeerCred {
+    PeerCred {
+        uid: owner_uid,
+        gid: owner_uid,
+        pid: 0,
+        sid: ctx.directory.sid_of(owner_user),
+        group_sids: Vec::new(),
+    }
+}
+
+/// Whether the device owner is a listed approver: the personal broker's own
+/// user, else the policy's list (`peer_is_listed`, as the CLI's decision
+/// does; a SID-bearing owner never matches by name alone).
+fn owner_is_approver(ctx: &Ctx, owner: &PeerCred, owner_user: &str) -> bool {
+    if ctx.mode == crate::ops::Mode::Personal {
+        return ctx.peer_is_own(owner);
+    }
+    match ctx.policy().system {
+        Some(s) => {
+            crate::approvers::peer_is_listed(&s.approval, ctx.directory.as_ref(), owner_user, owner)
+        }
+        None => false,
+    }
+}
+
+/// Request `rid` when the device owner may see it: its requester, or a
+/// listed approver ([`owner_is_approver`]). `Err`: no store.
+async fn visible_to_owner(
+    ctx: &Arc<Ctx>,
+    owner: &PeerCred,
+    owner_user: &str,
+    rid: u64,
+) -> Result<Option<ApprovalRequest>, ()> {
+    let r = on_store(ctx, move |_, s| s.get(rid)).await.ok_or(())?;
+    Ok(r.filter(|r| is_requester(r, owner) || owner_is_approver(ctx, owner, owner_user)))
+}
+
+/// Whether the device owner may decide (approve) request `r`: the CLI's
+/// identity checks (`approver_standing`), then `same_user`: `deny` refuses
+/// the requester, `reauth` lets them through because the UV touch is the
+/// re-authentication. The personal broker's own user decides alone.
+pub(crate) fn owner_may_decide(
+    ctx: &Ctx,
+    owner: &PeerCred,
+    owner_user: &str,
+    r: &ApprovalRequest,
+) -> Result<(), Refusal> {
+    use crate::approvers::{approver_standing, Standing};
+    if ctx.mode == crate::ops::Mode::Personal {
+        return match ctx.peer_is_own(owner) {
+            true => Ok(()),
+            false => Err(Refusal::NotApprover),
+        };
+    }
+    // A request with a SID against an owner whose SID cannot be resolved:
+    // the owner's standing is unknown, and a name alone is never enough (it
+    // is what the CLI's decision avoids), so they are no approver of it
+    // (`not_approver`), whatever `same_user` says.
+    if r.sid.is_some() && owner.sid.is_none() {
+        return Err(Refusal::NotApprover);
+    }
+    let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
+        return Err(Refusal::NotApprover);
+    };
+    match approver_standing(
+        &cfg,
+        ctx.directory.as_ref(),
+        owner_user,
+        (r.uid, r.sid.as_deref()),
+        owner,
+    )? {
+        Standing::Other => Ok(()),
+        Standing::SameUser => match cfg.same_user {
+            saiife_policy::SameUser::Deny => Err(Refusal::SameUserDenied),
+            saiife_policy::SameUser::Reauth => Ok(()),
+        },
+    }
+}
+
+/// Request `rid` as a Workspace touch would decide it: visible to the owner
+/// (requester or approver), pending, and decidable by them
+/// ([`owner_may_decide`]), so a doomed approval is refused before its touch
+/// is spent. `Err(None)`: the store is unavailable.
+pub(crate) async fn request_to_approve(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    owner_user: &str,
+    rid: u64,
+) -> Result<Result<ApprovalRequest, Refusal>, ApprovalLookup> {
+    let peer = owner_peer(ctx, owner_uid, owner_user);
+    let r = match visible_to_owner(ctx, &peer, owner_user, rid).await {
+        Err(()) => return Err(ApprovalLookup::Unavailable),
+        Ok(None) => return Err(ApprovalLookup::Unknown),
+        Ok(Some(r)) => r,
+    };
+    if r.state != State::Pending {
+        return Err(ApprovalLookup::NotPending);
+    }
+    Ok(owner_may_decide(ctx, &peer, owner_user, &r).map(|()| r))
+}
+
+/// Why [`request_to_approve`] has no request to approve.
+pub(crate) enum ApprovalLookup {
+    Unavailable,
+    Unknown,
+    NotPending,
+}
+
+/// `approval.list` from the Workspace: the pending requests the device
+/// owner may decide, each masked and cut short as `approval.list` gives
+/// them, plus `touch_class` (D8). A non-approver gets none; an unavailable
+/// store is `unavailable`.
+pub(crate) async fn list_remote(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    owner_user: &str,
+) -> Result<Vec<Value>, Refused> {
+    let owner = owner_peer(ctx, owner_uid, owner_user);
+    let filter = Filter {
+        uid: None,
+        sid: None,
+        states: vec![State::Pending],
+    };
+    let Some(items) = on_store(ctx, move |_, s| s.list(filter)).await else {
+        return Err(Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            "approvals are not available on this machine",
+        ));
+    };
+    if !owner_is_approver(ctx, &owner, owner_user) {
+        return Ok(Vec::new());
+    }
+    Ok(items
+        .iter()
+        .filter(|r| owner_may_decide(ctx, &owner, owner_user, r).is_ok())
+        .map(|r| with_effective_class(ctx, r, brief(r)))
+        .collect())
+}
+
+/// An `approval`/`refused` record of a decision from the Workspace, and the
+/// refusal that answers it.
+async fn refuse_remote(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    owner: &PeerCred,
+    device: &saiife_wire::device::Device,
+    code: ErrorCode,
+    rule: &'static str,
+    why: &str,
+) -> Refused {
+    let mut rec = decided_record(ctx, r, "refused", owner);
+    rec.extra.insert(
+        "workspace".into(),
+        json!({"device": device.id, "label": device.label}),
+    );
+    rec.rule = Some(rule.into());
+    rec.reason = Some(why.into());
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!(
+            "saiife: warning: cannot record a refused approval of #{}: {e}",
+            r.id
+        );
+    }
+    Refused::new(code, rule, format!("refused ({rule}): {why}"))
+}
+
+/// A decision on approval request `rid` by the Workspace device `device`
+/// of `owner_user` (uid `owner_uid`), as [`decide`] makes one for a local
+/// peer: the same visibility, the same identity checks
+/// ([`owner_may_decide`] over `approver_standing`, which `may_decide` also
+/// uses) and the same tail ([`apply_decision`]), recorded with
+/// `extra.workspace = {device, label}`. An approval needs `evidence` (the
+/// verified UV touch for exactly this request): it replaces the polkit
+/// re-authentication of `same_user = "reauth"`. A request cut short for
+/// display is not approved from the browser (it has no way to acknowledge
+/// the cut). A request's own requester may withdraw it without being an
+/// approver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn decide_remote(
+    ctx: &Arc<Ctx>,
+    owner_uid: u32,
+    owner_user: &str,
+    rid: u64,
+    approve: bool,
+    note: Option<String>,
+    evidence: Option<TouchEvidence>,
+    device: &saiife_wire::device::Device,
+) -> Result<Value, Refused> {
+    let owner = owner_peer(ctx, owner_uid, owner_user);
+    let unavailable = || {
+        Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            "approvals are not available on this machine",
+        )
+    };
+    let not_found = || {
+        Refused::new(
+            ErrorCode::BadRequest,
+            "not_found",
+            format!("no approval request #{rid} (or not yours)"),
+        )
+    };
+    // An unknown request, and one the owner may not see, answer alike.
+    let r = match visible_to_owner(ctx, &owner, owner_user, rid).await {
+        Err(()) => return Err(unavailable()),
+        Ok(None) => return Err(not_found()),
+        Ok(Some(r)) => r,
+    };
+    if ctx.policy().system.is_none() {
+        return Err(Refused::new(
+            ErrorCode::Unavailable,
+            "unavailable",
+            "no valid policy is loaded: nobody can approve",
+        ));
+    }
+    let forbid = ErrorCode::Forbidden;
+    if approve && r.body_truncated {
+        return Err(refuse_remote(
+            ctx,
+            &r,
+            &owner,
+            device,
+            forbid,
+            "truncated_not_acknowledged",
+            "the request is shown cut and cannot be approved from the browser: \
+             approve it with `saiife approvals approve --accept-truncated`",
+        )
+        .await);
+    }
+    // The requester may always withdraw its own request.
+    let cancel = !approve && is_requester(&r, &owner);
+    let note = if cancel {
+        Some(match note {
+            Some(n)
+                if !n.is_empty() && n.len() + CANCELLED.len() + 2 <= crate::approvals::NOTE_MAX =>
+            {
+                format!("{CANCELLED}: {n}")
+            }
+            _ => CANCELLED.to_string(),
+        })
+    } else {
+        note
+    };
+    if !cancel {
+        if let Err(why) = owner_may_decide(ctx, &owner, owner_user, &r) {
+            return Err(refuse_remote(
+                ctx,
+                &r,
+                &owner,
+                device,
+                forbid,
+                why.rule(),
+                &why.to_string(),
+            )
+            .await);
+        }
+    }
+    if approve && evidence.is_none() {
+        return Err(Refused::new(
+            forbid,
+            "touch_required",
+            format!("approving request #{rid} needs a touch"),
+        ));
+    }
+    let ws = json!({"device": device.id, "label": device.label});
+    match apply_decision(ctx, rid, approve, &owner, note, evidence.as_ref(), Some(ws)).await {
+        Ok(action) => Ok(json!({"request": rid, "state": action})),
+        Err(DecideErr::Unavailable) => Err(unavailable()),
+        Err(DecideErr::Unknown) => Err(not_found()),
+        Err(DecideErr::Other(code, m)) => Err(Refused::new(
+            code,
+            match code {
+                ErrorCode::Unrecorded => "unrecorded",
+                ErrorCode::Internal => "internal",
+                _ => "invalid",
+            },
+            m,
+        )),
+    }
+}
+
+/// Why [`touch_for`] did not verify a touch.
+enum TouchRefused {
+    /// The `touch` argument is not an assertion.
+    BadRequest(String),
+    /// Refused as `refuse` records it; the request stays pending.
+    Refused(Refusal),
+}
+
+/// The `touch` argument of an approval of `r`, which needs a touch of
+/// class `class`. Absent or null: refused (`touch_unavailable`, recorded
+/// by [`touch_refused`]). Not an assertion: a bad request. Neither spends
+/// the challenge: nothing was verified.
+fn touch_arg(
+    r: &ApprovalRequest,
+    req: &Request,
+    class: TouchClass,
+) -> Result<Assertion, TouchRefused> {
+    let rid = r.id;
+    let Some(t) = req.args.get("touch").filter(|t| !t.is_null()) else {
+        return Err(TouchRefused::Refused(Refusal::TouchUnavailable(format!(
+            "request #{rid} needs a touch ({}) from an enrolled device",
+            class.name()
+        ))));
+    };
+    serde_json::from_value(t.clone())
+        .map_err(|e| TouchRefused::BadRequest(format!("touch is not an assertion: {e}")))
+}
+
+/// The answer to a decision whose touch was refused: `bad_request`, or an
+/// `approval`/`refused` record and `forbidden`. The request stays pending.
+async fn touch_refused(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    peer: &PeerCred,
+    id: u64,
+    e: TouchRefused,
+) -> Value {
+    match e {
+        TouchRefused::BadRequest(m) => err(id, ErrorCode::BadRequest, &m),
+        TouchRefused::Refused(why) => refuse(ctx, r, peer, id, why.rule(), &why.to_string()).await,
+    }
+}
+
+/// Verifies `asr`, the parsed `touch` argument of a decision on `r` (see
+/// [`touch_arg`]), as a touch of class `class` by `peer`, against the live
+/// `Approve(r.id)` challenge and the peer's own credentials (D6). The
+/// action record is built from `r`, the request `decide` loaded, and the
+/// challenge's nonce and expiry; nothing but the assertion comes from the
+/// client. Once here the challenge is spent whatever the outcome; an
+/// absent or unparsable `touch` never gets here, so it spends nothing.
+async fn touch_for(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    peer: &PeerCred,
+    asr: Assertion,
+    class: TouchClass,
+) -> Result<TouchEvidence, TouchRefused> {
+    let rid = r.id;
+    let c = Arc::clone(ctx);
+    let r = r.clone();
+    let uid = peer.uid;
+    tokio::task::spawn_blocking(move || {
+        let instance = c.touch.instance_id();
+        c.touch.consume(
+            &IssueKey::Approve(rid),
+            uid,
+            |i| crate::approvals::action_record(&r, class, instance, i.nonce, i.expires_at),
+            &asr,
+            LOCAL_RP_ID,
+            unix_now(),
+        )
+    })
+    .await
+    .unwrap_or(Err(TouchError::Unavailable))
+    .map(|(ev, _)| ev)
+    .map_err(|e| TouchRefused::Refused(Refusal::from(e)))
 }
 
 // ------------------------------------------------------------ commands
@@ -1120,8 +1631,24 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         f.rule_id.clone().unwrap_or_default(),
         f.input.clone(),
     );
-    let matches = tokio::task::spawn_blocking(move || {
-        saiifeguard::builtins::builtin_rule_denies(&pack, &rule_id, &input)
+    // A user pack's rule is checked against the pack file the daemon holds.
+    let user = sys.user_packs.iter().find(|u| u.id == pack).cloned();
+    let matches = tokio::task::spawn_blocking(move || match user {
+        Some(u) => {
+            let src = [saiifeguard::userpack::UserSrc {
+                source: &u.path,
+                text: &u.text,
+            }];
+            saiifeguard::userpack::load_user_packs_cached(
+                &src,
+                saiifeguard::canon::PathStyle::host(),
+                saiifeguard::profile::Profile::Host,
+            )
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .is_some_and(|p| saiifeguard::builtins::pack_rule_denies(&p, &rule_id, &input))
+        }
+        None => saiifeguard::builtins::builtin_rule_denies(&pack, &rule_id, &input),
     })
     .await
     .unwrap_or(false);
@@ -1155,6 +1682,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         grant_key: Some(crate::grants::hex(&f.key(peer))),
         scope: Some(f.key_project.clone()),
         ask_rule: f.ask(),
+        touch_class: None,
         send: SendDisplay::default(),
     };
     match store_new(ctx, new, None, sys.approval.timeout).await {
@@ -1957,8 +2485,40 @@ mod tests {
             body_sha256: body_sha256.map(str::to_string),
             amount: None,
             headers: vec![],
+            touch_class: None,
             stored,
         }
+    }
+
+    /// The stored class is the stronger of the broker's and the daemon's;
+    /// an unreadable name is the strictest.
+    #[test]
+    fn combined_class_is_the_stronger() {
+        assert_eq!(combined_class(None, None), None);
+        assert_eq!(
+            combined_class(Some("deploy"), None).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(None, Some("deploy")).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(Some("egress:external"), Some("deploy")).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(Some("deploy"), Some("egress:external")).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            combined_class(Some("egress:external"), None).as_deref(),
+            Some("egress:external")
+        );
+        assert_eq!(
+            combined_class(Some("future"), None).as_deref(),
+            Some("deploy")
+        );
     }
 
     /// Plan 15's binary raw body meets plan 17's dedupe: a body the
@@ -1969,6 +2529,115 @@ mod tests {
         assert!(display_is_faithful(&pending(Some("text upload"), Some(&h))));
         assert!(display_is_faithful(&pending(None, None)));
         assert!(!display_is_faithful(&pending(None, Some(&h))));
+    }
+
+    /// A connector call to a `deploy`-marked operation is stored with its
+    /// touch class; an unmarked one with none.
+    #[tokio::test]
+    async fn connector_create_sets_the_class() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        let key = d.path().join("vault-key");
+        std::fs::write(&key, [7u8; 32]).unwrap();
+        std::fs::set_permissions(
+            &key,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        let v = crate::vault::open(&key, &d.path().join("vault").join("vault.bin"));
+        assert!(matches!(v, crate::vault::VaultState::Ready(_)));
+        let c = Arc::get_mut(&mut ctx).unwrap();
+        c.approvals = Ok(store);
+        c.vault = crate::vault::Shared::new(v);
+        let cfg: saiife_policy::SystemConfig = toml::from_str(
+            "version = 2\nlocked = true\n[services.s3_ask]\nconnector = \"s3\"\n\
+             deploy = [\"objects:write\"]\n",
+        )
+        .unwrap();
+        let g = crate::ops::GatewayPolicy::build(
+            &cfg,
+            &[],
+            saiife_broker::Catalog::default(),
+            saiife_policy::Mode::Locked,
+        )
+        .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            ok: true,
+            system: Some(Arc::new(cfg)),
+            gateway: Some(Arc::new(g)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+        let mut marked = pending(None, None);
+        marked.capability = Some("objects:write".into());
+        let id = create(&ctx, &marked, "claude").await.unwrap();
+        let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+        assert_eq!(r.touch_class.as_deref(), Some("deploy"));
+
+        let mut plain = pending(Some("other"), None);
+        plain.capability = Some("objects:read".into());
+        let id = create(&ctx, &plain, "claude").await.unwrap();
+        let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+        assert_eq!(r.touch_class, None);
+
+        // An unparsable or missing capability on a deploy-marked service is
+        // the strictest class, never none.
+        for cap in [Some("not a capability"), None] {
+            let mut bad = pending(Some("third"), None);
+            bad.capability = cap.map(str::to_string);
+            let id = create(&ctx, &bad, "claude").await.unwrap();
+            let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+            assert_eq!(r.touch_class.as_deref(), Some("deploy"), "{cap:?}");
+        }
+
+        // Final review Minor 2: the masked capability classifies weaker
+        // than the real one (the masker rewrote its qualifier); the broker's
+        // class of the real one still counts.
+        let mut masked = pending(Some("fourth"), None);
+        masked.capability = Some("objects:read".into());
+        masked.touch_class = Some("deploy");
+        let id = create(&ctx, &masked, "claude").await.unwrap();
+        let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
+        assert_eq!(r.touch_class.as_deref(), Some("deploy"));
+
+        // A service the snapshot does not know cannot be classified.
+        let before = ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .list(crate::approvals::Filter::default())
+            .len();
+        let mut unknown = pending(Some("fourth"), None);
+        unknown.stored.service = "nope".into();
+        let e = create(&ctx, &unknown, "claude").await.unwrap_err();
+        assert_eq!(e, "touch_policy_unavailable");
+        assert_eq!(
+            ctx.approvals
+                .as_ref()
+                .unwrap()
+                .list(crate::approvals::Filter::default())
+                .len(),
+            before
+        );
+    }
+
+    /// No gateway snapshot: the request is refused and nothing is stored.
+    #[tokio::test]
+    async fn connector_create_without_a_gateway_refuses() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().approvals = Ok(store);
+        let e = create(&ctx, &pending(None, None), "claude")
+            .await
+            .unwrap_err();
+        assert_eq!(e, "touch_policy_unavailable");
+        assert!(ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .list(crate::approvals::Filter::default())
+            .is_empty());
     }
 
     #[test]
@@ -2019,6 +2688,7 @@ mod tests {
             grant_key: None,
             scope: None,
             ask_rule: None,
+            touch_class: None,
             send: SendDisplay::default(),
         };
         let rid = ctx
@@ -2160,6 +2830,7 @@ mod tests {
             grant_key: None,
             scope: None,
             ask_rule: None,
+            touch_class: None,
             send: SendDisplay::default(),
         };
         let rid = ctx
@@ -2318,5 +2989,837 @@ mod tests {
             assert!(v.contains("bad_request"), "{v}");
             assert!(v.contains("auth is 64 lowercase hex characters"), "{v}");
         }
+    }
+}
+
+/// Touch-class approvals (plan 26, Task 8): `touch.begin {purpose:
+/// "approve"}` and the touch `approval.decide` needs, through
+/// `dispatch_conn` as a client sends them.
+#[cfg(all(test, unix))]
+pub(crate) mod touch_tests {
+    use super::*;
+    use crate::touch::TouchState;
+    use saiife_broker::mask::Masker;
+    use saiife_touch::soft::SoftAuthenticator;
+    use saiife_touch::{reverify, Assertion, Touch as _, TouchRequest, LOCAL_RP_ID};
+    use std::path::Path;
+
+    pub(crate) const OWN: u32 = 1000;
+    pub(crate) const MARKED: &str = "version = 2\n[services.s3_ask]\nconnector = \"s3\"\n\
+                          deploy = [\"objects:write\"]\n";
+    pub(crate) const PLAIN: &str = "version = 2\n[services.s3_ask]\nconnector = \"s3\"\n";
+    pub(crate) const LOCKED: &str = "version = 2\nlocked = true\n[approval]\n\
+                          approvers = [\"ann\", \"bob\"]\nsame_user = \"deny\"\n\
+                          [services.s3_ask]\nconnector = \"s3\"\ndeploy = [\"objects:write\"]\n";
+    const PASSWD: &str = "agent:x:1000:1000::/home/agent:/bin/sh\n\
+                          ann:x:4242:4242::/home/ann:/bin/sh\n\
+                          bob:x:4343:4343::/home/bob:/bin/sh\n";
+    const GROUP: &str = "agent:x:1000:\nann:x:4242:\nbob:x:4343:\n";
+
+    /// A connector call of `OWN` to `s3_ask` with capability `cap`; `key`
+    /// tells requests apart.
+    pub(crate) fn call(key: &str, cap: &str) -> PendingCall {
+        let stored: StoredCall = serde_json::from_value(json!({
+            "uid": OWN, "user": "agent", "session": null, "project": "/p",
+            "service": "s3_ask", "operation": "s3.put_object",
+            "params": {"bucket": "reports", "key": key},
+            "body_b64": null, "body_sha256": null, "headers": [],
+            "overlay": null, "via": "cli",
+        }))
+        .unwrap();
+        PendingCall {
+            operation: stored.operation.clone(),
+            capability: Some(cap.into()),
+            params: Masker::new(&[]).mask_params(&stored.params),
+            project: stored.project.clone(),
+            body_display: None,
+            body_truncated: false,
+            body_sha256: None,
+            amount: None,
+            headers: vec![],
+            // The daemon classifies alone here (the broker's class is
+            // tested in `connector_create_sets_the_class`).
+            touch_class: None,
+            stored,
+        }
+    }
+
+    /// Replaces the context's policy (a reload).
+    fn set_policy(ctx: &Ctx, text: &str) {
+        let cfg: saiife_policy::SystemConfig = toml::from_str(text).unwrap();
+        let mode = match cfg.locked {
+            true => saiife_policy::Mode::Locked,
+            false => saiife_policy::Mode::Developer,
+        };
+        let g =
+            crate::ops::GatewayPolicy::build(&cfg, &[], saiife_broker::Catalog::default(), mode)
+                .unwrap();
+        *ctx.policy.lock().unwrap() = crate::ops::PolicyState {
+            ok: true,
+            system: Some(Arc::new(cfg)),
+            gateway: Some(Arc::new(g)),
+            ..crate::ops::PolicyState::invalid(0)
+        };
+    }
+
+    pub(crate) struct World {
+        pub(crate) d: tempfile::TempDir,
+        pub(crate) ctx: Arc<Ctx>,
+        _join: std::thread::JoinHandle<()>,
+        pub(crate) soft: SoftAuthenticator,
+    }
+
+    /// A context with a store, a vault and `policy`; `soft` is enrolled
+    /// for `OWN` unless `enrol` is false.
+    pub(crate) fn world_in(mode: crate::ops::Mode, own: u32, policy: &str, enrol: bool) -> World {
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, join) = crate::ops::test_ctx(d.path(), mode, own);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        let key = d.path().join("vault-key");
+        std::fs::write(&key, [7u8; 32]).unwrap();
+        std::fs::set_permissions(
+            &key,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        let v = crate::vault::open(&key, &d.path().join("vault").join("vault.bin"));
+        assert!(matches!(v, crate::vault::VaultState::Ready(_)));
+        let c = Arc::get_mut(&mut ctx).unwrap();
+        c.approvals = Ok(store);
+        c.vault = crate::vault::Shared::new(v);
+        c.directory = Arc::new(saiife_policy::FixedDirectory::from_text(PASSWD, GROUP));
+        set_policy(&ctx, policy);
+        let soft = SoftAuthenticator::new_es256();
+        if enrol {
+            ctx.touch
+                .add(soft.credential(LOCAL_RP_ID, own, "key"))
+                .unwrap();
+        }
+        World {
+            d,
+            ctx,
+            _join: join,
+            soft,
+        }
+    }
+
+    pub(crate) fn personal(policy: &str) -> World {
+        world_in(crate::ops::Mode::Personal, OWN, policy, true)
+    }
+
+    fn conn(uid: u32) -> Conn {
+        Conn::new(
+            PeerCred {
+                uid,
+                gid: uid,
+                pid: 1,
+                sid: None,
+                group_sids: Vec::new(),
+            },
+            Some(1),
+        )
+    }
+
+    pub(crate) async fn op(ctx: &Arc<Ctx>, uid: u32, op: &str, args: Value) -> Value {
+        let req = Request {
+            id: 7,
+            op: op.into(),
+            args: args.as_object().unwrap().clone(),
+        };
+        crate::ops::dispatch_conn(ctx, &conn(uid), req).await
+    }
+
+    pub(crate) async fn ask(w: &World, key: &str, cap: &str) -> u64 {
+        create(&w.ctx, &call(key, cap), "claude").await.unwrap()
+    }
+
+    pub(crate) async fn begin(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Value {
+        op(
+            ctx,
+            uid,
+            saiife_ipc::msg::OP_TOUCH_BEGIN,
+            json!({"purpose": "approve", "request": rid}),
+        )
+        .await
+    }
+
+    /// `touch.begin`'s answer as the client reads it.
+    pub(crate) fn treq(v: &Value) -> TouchRequest {
+        assert_eq!(v["ok"], true, "{v}");
+        serde_json::from_value(v.clone()).unwrap()
+    }
+
+    pub(crate) async fn decide_with(
+        ctx: &Arc<Ctx>,
+        uid: u32,
+        rid: u64,
+        action: &str,
+        touch: Option<&Assertion>,
+    ) -> Value {
+        let mut args = json!({"request": rid, "action": action});
+        if let Some(t) = touch {
+            args["touch"] = serde_json::to_value(t).unwrap();
+        }
+        op(ctx, uid, OP_APPROVAL_DECIDE, args).await
+    }
+
+    fn state(w: &World, rid: u64) -> State {
+        w.ctx.approvals.as_ref().unwrap().get(rid).unwrap().state
+    }
+
+    pub(crate) fn records(d: &Path) -> Vec<Value> {
+        let mut files: Vec<_> = std::fs::read_dir(d.join("audit"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|f| {
+                std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The `approval` records of request `rid` with `action`.
+    pub(crate) fn approval_records(w: &World, rid: u64, action: &str) -> Vec<Value> {
+        records(w.d.path())
+            .into_iter()
+            .filter(|r| r["kind"] == "approval" && r["id"] == rid && r["action"] == action)
+            .collect()
+    }
+
+    pub(crate) fn refused_rule(v: &Value) -> &str {
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["error"], "forbidden", "{v}");
+        v["rule"].as_str().unwrap()
+    }
+
+    /// Nothing of `rid` was sent (or tried): no approved, sent or failed record.
+    fn nothing_sent(w: &World, rid: u64) {
+        for a in ["approved", "sent", "send_failed"] {
+            assert!(approval_records(w, rid, a).is_empty(), "{a}");
+        }
+        assert!(records(w.d.path())
+            .iter()
+            .all(|r| r["kind"] != "connector" || r["approval"] != rid));
+    }
+
+    fn flip_signature(a: &mut Assertion) {
+        match a {
+            Assertion::Ctap2 { signature, .. } => signature[5] ^= 1,
+            Assertion::WebAuthn { signature, .. } => signature[5] ^= 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_request_needs_a_touch() {
+        let w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:write").await;
+        let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
+        assert_eq!(refused_rule(&v), "touch_unavailable");
+        assert!(
+            v["message"].as_str().unwrap().contains(&format!(
+                "request #{rid} needs a touch (deploy) from an enrolled device"
+            )),
+            "{v}"
+        );
+        assert_eq!(state(&w, rid), State::Pending);
+        let refused = approval_records(&w, rid, "refused");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["rule"], "touch_unavailable");
+        nothing_sent(&w, rid);
+    }
+
+    #[tokio::test]
+    async fn touch_approves_and_is_recorded() {
+        let w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:write").await;
+        let b = begin(&w.ctx, OWN, rid).await;
+        assert_eq!(b["class"], "deploy", "{b}");
+        assert!(b["expires_at"].as_u64().is_some(), "{b}");
+        let tr = treq(&b);
+        assert_eq!(tr.rp_id, LOCAL_RP_ID);
+        assert!(tr.uv);
+        assert_eq!(tr.allow, vec![w.soft.credential_id()]);
+        assert_eq!(tr.short_code, saiife_touch::short_code(&tr.challenge));
+        let asr = w.soft.request(&tr).unwrap();
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&asr)).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["state"], "approved", "{v}");
+        let rec = approval_records(&w, rid, "approved");
+        assert_eq!(rec.len(), 1);
+        let t = &rec[0]["touch"];
+        let id = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            w.soft.credential_id(),
+        );
+        assert_eq!(t["cred_id"], id, "{t}");
+        assert_eq!(t["uv"], true, "{t}");
+        assert_eq!(t["via"], "local", "{t}");
+        let hex: String = tr.challenge.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(t["challenge"], hex, "{t}");
+        let enrolled = w.soft.credential(LOCAL_RP_ID, OWN, "key");
+        assert_eq!(reverify(t, &enrolled), Ok(()));
+        // The counter was saved.
+        assert_eq!(w.ctx.touch.credentials_of(OWN)[0].sign_count, 1);
+    }
+
+    #[tokio::test]
+    async fn same_assertion_twice_is_refused() {
+        let w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:write").await;
+        let tr = treq(&begin(&w.ctx, OWN, rid).await);
+        let good = w.soft.request(&tr).unwrap();
+        let mut bad = good.clone();
+        flip_signature(&mut bad);
+        // 1. A bad signature: refused, and the challenge is burned.
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&bad)).await;
+        assert_eq!(refused_rule(&v), "touch_failed");
+        // 2. The untampered assertion now: no live challenge.
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&good)).await;
+        assert_eq!(refused_rule(&v), "touch_failed");
+        assert!(v["message"].as_str().unwrap().contains("no live challenge"));
+        // 3. A new challenge (a new nonce): the old assertion is for another.
+        let tr2 = treq(&begin(&w.ctx, OWN, rid).await);
+        assert_ne!(tr2.challenge, tr.challenge);
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&good)).await;
+        assert_eq!(refused_rule(&v), "touch_mismatch");
+        assert_eq!(state(&w, rid), State::Pending);
+        nothing_sent(&w, rid);
+    }
+
+    #[tokio::test]
+    async fn restart_forgets_challenges() {
+        let mut w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:write").await;
+        let tr = treq(&begin(&w.ctx, OWN, rid).await);
+        let asr = w.soft.request(&tr).unwrap();
+        // The daemon restarts: the touch state is opened again from disk.
+        let (fresh, why) = TouchState::open(&w.d.path().join("state"));
+        assert!(why.is_none());
+        assert_eq!(fresh.instance_id(), w.ctx.touch.instance_id());
+        assert_eq!(fresh.credentials_of(OWN).len(), 1);
+        Arc::get_mut(&mut w.ctx).unwrap().touch = Arc::new(fresh);
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&asr)).await;
+        assert_eq!(refused_rule(&v), "touch_failed");
+        assert_eq!(state(&w, rid), State::Pending);
+        nothing_sent(&w, rid);
+    }
+
+    #[tokio::test]
+    async fn touch_for_request_a_cannot_approve_b() {
+        let w = personal(MARKED);
+        let a = ask(&w, "a", "objects:write").await;
+        let b = ask(&w, "b", "objects:write").await;
+        assert_ne!(a, b);
+        let tr_a = treq(&begin(&w.ctx, OWN, a).await);
+        let asr_a = w.soft.request(&tr_a).unwrap();
+        treq(&begin(&w.ctx, OWN, b).await);
+        let v = decide_with(&w.ctx, OWN, b, "approve", Some(&asr_a)).await;
+        assert_eq!(refused_rule(&v), "touch_mismatch");
+        assert_eq!(state(&w, a), State::Pending);
+        assert_eq!(state(&w, b), State::Pending);
+        nothing_sent(&w, a);
+        nothing_sent(&w, b);
+    }
+
+    #[tokio::test]
+    async fn challenge_of_another_uid_is_refused() {
+        let w = world_in(crate::ops::Mode::Locked, 0, LOCKED, false);
+        let ann = SoftAuthenticator::new_es256();
+        let bob = SoftAuthenticator::new_es256();
+        w.ctx
+            .touch
+            .add(ann.credential(LOCAL_RP_ID, 4242, "ann"))
+            .unwrap();
+        w.ctx
+            .touch
+            .add(bob.credential(LOCAL_RP_ID, 4343, "bob"))
+            .unwrap();
+        let rid = ask(&w, "a", "objects:write").await;
+        let tr = treq(&begin(&w.ctx, 4242, rid).await);
+        assert_eq!(tr.allow, vec![ann.credential_id()]);
+        let asr = ann.request(&tr).unwrap();
+        let v = decide_with(&w.ctx, 4343, rid, "approve", Some(&asr)).await;
+        assert_eq!(refused_rule(&v), "touch_mismatch");
+        assert_eq!(state(&w, rid), State::Pending);
+        nothing_sent(&w, rid);
+        // A requester that is no approver cannot begin one.
+        let v = begin(&w.ctx, 1000, rid).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["error"], "forbidden", "{v}");
+        // An uninvolved uid sees no such request.
+        let v = begin(&w.ctx, 5555, rid).await;
+        assert!(
+            v["message"].as_str().unwrap().contains("(or not yours)"),
+            "{v}"
+        );
+    }
+
+    /// D6: Bob's own live challenge answered by Ann's enrolled key. Ann's
+    /// key is enrolled, but not for Bob: refused, the request pending.
+    #[tokio::test]
+    async fn another_approvers_key_cannot_answer_my_challenge() {
+        let w = world_in(crate::ops::Mode::Locked, 0, LOCKED, false);
+        let ann = SoftAuthenticator::new_es256();
+        let bob = SoftAuthenticator::new_es256();
+        w.ctx
+            .touch
+            .add(ann.credential(LOCAL_RP_ID, 4242, "ann"))
+            .unwrap();
+        w.ctx
+            .touch
+            .add(bob.credential(LOCAL_RP_ID, 4343, "bob"))
+            .unwrap();
+        let rid = ask(&w, "a", "objects:write").await;
+        let tr = treq(&begin(&w.ctx, 4343, rid).await);
+        assert_eq!(tr.allow, vec![bob.credential_id()]);
+        // Ann's key signs Bob's request (a real key would refuse: it is not
+        // in `allow`).
+        let asr = ann.assert_ctap(&tr.rp_id, &tr.challenge);
+        let v = decide_with(&w.ctx, 4343, rid, "approve", Some(&asr)).await;
+        assert_eq!(refused_rule(&v), "touch_mismatch");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enrolled for you"),
+            "{v}"
+        );
+        assert_eq!(state(&w, rid), State::Pending);
+        let refused = approval_records(&w, rid, "refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["rule"], "touch_mismatch");
+        assert_eq!(refused[0]["by_uid"], 4343);
+        nothing_sent(&w, rid);
+        // Ann's counter did not move.
+        assert_eq!(w.ctx.touch.credentials_of(4242)[0].sign_count, 0);
+    }
+
+    /// Counts re-authentication prompts; every one is denied.
+    struct CountingReauth(std::sync::atomic::AtomicUsize);
+
+    impl Reauth for CountingReauth {
+        fn available(&self) -> bool {
+            true
+        }
+        fn check(&self, _who: &Subject, _d: &str, _t: Duration) -> ReauthResult {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ReauthResult::Denied("counted".into())
+        }
+    }
+
+    /// Final review Minor 5: a same-user approval in locked mode that has
+    /// no usable `touch` is refused before the re-authentication prompt.
+    #[tokio::test]
+    async fn missing_touch_is_refused_before_the_prompt() {
+        const SAME: &str = "version = 2\nlocked = true\n[approval]\n\
+                            approvers = [\"agent\"]\nsame_user = \"reauth\"\n\
+                            [services.s3_ask]\nconnector = \"s3\"\n\
+                            deploy = [\"objects:write\"]\n";
+        let mut w = world_in(crate::ops::Mode::Locked, 0, SAME, false);
+        let counter = Arc::new(CountingReauth(Default::default()));
+        Arc::get_mut(&mut w.ctx).unwrap().reauth = counter.clone();
+        let prompts = || counter.0.load(std::sync::atomic::Ordering::SeqCst);
+        let rid = ask(&w, "a", "objects:write").await;
+        // No touch: refused (`touch_unavailable`, recorded), no prompt.
+        let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
+        assert_eq!(refused_rule(&v), "touch_unavailable");
+        assert_eq!(prompts(), 0);
+        let refused = approval_records(&w, rid, "refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["rule"], "touch_unavailable");
+        // A touch that is no assertion: a bad request, no prompt.
+        let v = op(
+            &w.ctx,
+            OWN,
+            OP_APPROVAL_DECIDE,
+            json!({"request": rid, "action": "approve", "touch": {"kind": "nope"}}),
+        )
+        .await;
+        assert_eq!(v["error"], "bad_request", "{v}");
+        assert_eq!(prompts(), 0);
+        // With a parsable touch the prompt runs first (and is denied here).
+        let fake = SoftAuthenticator::new_es256().assert_ctap(LOCAL_RP_ID, &[0; 32]);
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&fake)).await;
+        assert_eq!(refused_rule(&v), "reauth_failed");
+        assert_eq!(prompts(), 1);
+        assert_eq!(state(&w, rid), State::Pending);
+    }
+
+    #[tokio::test]
+    async fn uv_missing_for_deploy() {
+        let mut w = personal(MARKED);
+        w.soft.uv = false;
+        let rid = ask(&w, "a", "objects:write").await;
+        let tr = treq(&begin(&w.ctx, OWN, rid).await);
+        let asr = w.soft.request(&tr).unwrap();
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&asr)).await;
+        assert_eq!(refused_rule(&v), "touch_failed");
+        assert!(
+            v["message"].as_str().unwrap().contains("user verification"),
+            "{v}"
+        );
+        assert_eq!(state(&w, rid), State::Pending);
+    }
+
+    #[tokio::test]
+    async fn no_device_is_unavailable() {
+        let w = world_in(crate::ops::Mode::Personal, OWN, MARKED, false);
+        let rid = ask(&w, "a", "objects:write").await;
+        let v = begin(&w.ctx, OWN, rid).await;
+        assert_eq!(refused_rule(&v), "touch_unavailable");
+        let refused = approval_records(&w, rid, "refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["rule"], "touch_unavailable");
+        assert_eq!(state(&w, rid), State::Pending);
+    }
+
+    #[tokio::test]
+    async fn reject_needs_no_touch() {
+        let w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:write").await;
+        let v = decide_with(&w.ctx, OWN, rid, "reject", None).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["state"], "rejected", "{v}");
+        let rec = approval_records(&w, rid, "rejected");
+        assert_eq!(rec.len(), 1);
+        assert!(rec[0].get("touch").is_none(), "{}", rec[0]);
+    }
+
+    #[tokio::test]
+    async fn reload_removing_a_mark_keeps_the_touch() {
+        let w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:write").await;
+        set_policy(&w.ctx, PLAIN);
+        let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
+        assert_eq!(refused_rule(&v), "touch_unavailable");
+        assert_eq!(state(&w, rid), State::Pending);
+        // The stored class is shown, and a touch still approves.
+        let s = op(&w.ctx, OWN, OP_APPROVAL_SHOW, json!({"request": rid})).await;
+        assert_eq!(s["item"]["touch_class"], "deploy", "{s}");
+        let tr = treq(&begin(&w.ctx, OWN, rid).await);
+        let asr = w.soft.request(&tr).unwrap();
+        let v = decide_with(&w.ctx, OWN, rid, "approve", Some(&asr)).await;
+        assert_eq!(v["state"], "approved", "{v}");
+    }
+
+    #[tokio::test]
+    async fn mark_added_after_ask_needs_touch() {
+        let w = personal(PLAIN);
+        let rid = ask(&w, "a", "objects:write").await;
+        let r = w.ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+        assert_eq!(r.touch_class, None);
+        set_policy(&w.ctx, MARKED);
+        let s = op(&w.ctx, OWN, OP_APPROVAL_SHOW, json!({"request": rid})).await;
+        assert_eq!(s["item"]["touch_class"], "deploy", "{s}");
+        // Final review Minor 10: the list shows the same, effective class.
+        let l = op(&w.ctx, OWN, OP_APPROVAL_LIST, json!({})).await;
+        let items = l["items"].as_array().unwrap();
+        let it = items.iter().find(|i| i["id"] == rid).unwrap();
+        assert_eq!(it["touch_class"], "deploy", "{l}");
+        let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
+        assert_eq!(refused_rule(&v), "touch_unavailable");
+        assert_eq!(state(&w, rid), State::Pending);
+    }
+
+    #[tokio::test]
+    async fn unmarked_request_unchanged() {
+        let w = personal(MARKED);
+        let rid = ask(&w, "a", "objects:read").await;
+        let s = op(&w.ctx, OWN, OP_APPROVAL_SHOW, json!({"request": rid})).await;
+        assert!(s["item"].get("touch_class").is_none(), "{s}");
+        let v = begin(&w.ctx, OWN, rid).await;
+        assert_eq!(v["error"], "bad_request", "{v}");
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("request #{rid} needs no touch")));
+        let v = decide_with(&w.ctx, OWN, rid, "approve", None).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["state"], "approved", "{v}");
+        let rec = approval_records(&w, rid, "approved");
+        assert_eq!(rec.len(), 1);
+        assert!(rec[0].get("touch").is_none(), "{}", rec[0]);
+    }
+
+    /// A stored class this version cannot read is the strictest, never none.
+    #[tokio::test]
+    async fn unreadable_stored_class_is_deploy() {
+        let w = world_in(crate::ops::Mode::Personal, OWN, PLAIN, false);
+        let mut r: ApprovalRequest = serde_json::from_value(json!({
+            "id": 1, "created": "c", "expires": "e", "uid": OWN, "user": "u",
+            "session": null, "agent": "a", "project": "p", "type": "connector",
+            "service": "s3_ask", "operation": null, "capability": "objects:read",
+            "params": {}, "input": null, "grant_key": null, "state": "pending",
+            "request_sealed": null, "decided_by": null, "note": null, "result_ref": null
+        }))
+        .unwrap();
+        assert_eq!(effective_class(&w.ctx, &r), None);
+        r.touch_class = Some("future-class".into());
+        assert_eq!(
+            effective_class(&w.ctx, &r),
+            Some(saiife_touch::TouchClass::Deploy)
+        );
+        // An unknown environment, or a service the policy lost, keeps the
+        // stored class.
+        r.touch_class = Some("egress:external".into());
+        r.env = Some("gone".into());
+        assert_eq!(
+            effective_class(&w.ctx, &r),
+            Some(saiife_touch::TouchClass::EgressExternal)
+        );
+        // An mcp request gets no class from the policy now.
+        set_policy(&w.ctx, MARKED);
+        r.env = None;
+        r.touch_class = None;
+        r.capability = None;
+        assert_eq!(
+            effective_class(&w.ctx, &r),
+            Some(saiife_touch::TouchClass::Deploy)
+        );
+        r.kind = ApprovalType::Mcp;
+        assert_eq!(effective_class(&w.ctx, &r), None);
+    }
+
+    // ------------------------------------------- the Workspace's decisions
+
+    use saiife_policy::{Directory, GroupEntry, UserEntry};
+
+    const SID_ANN: &str = "S-1-5-21-1-2-3-1001";
+    const SID_BOB: &str = "S-1-5-21-1-2-3-1002";
+
+    /// ann and bob have SIDs (Windows accounts), carl and ghost none (ghost
+    /// is an account whose SID cannot be resolved).
+    struct SidDir;
+
+    const ACCOUNTS: [(&str, u32, Option<&str>); 5] = [
+        ("ann", 4242, Some(SID_ANN)),
+        ("bob", 4343, Some(SID_BOB)),
+        ("carl", 4545, None),
+        ("ghost", 4444, None),
+        ("dave", 7777, None),
+    ];
+
+    impl Directory for SidDir {
+        fn user(&self, name: &str) -> Option<UserEntry> {
+            ACCOUNTS
+                .iter()
+                .find(|a| a.0 == name)
+                .map(|a| UserEntry { uid: a.1, gid: a.1 })
+        }
+        fn name_of(&self, uid: u32) -> Option<String> {
+            ACCOUNTS.iter().find(|a| a.1 == uid).map(|a| a.0.into())
+        }
+        fn group(&self, _: &str) -> Option<GroupEntry> {
+            None
+        }
+        fn groups_of(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn sid_of(&self, name: &str) -> Option<String> {
+            ACCOUNTS
+                .iter()
+                .find(|a| a.0 == name)
+                .and_then(|a| a.2.map(String::from))
+        }
+    }
+
+    struct Remote {
+        d: tempfile::TempDir,
+        ctx: Arc<Ctx>,
+        _join: std::thread::JoinHandle<()>,
+    }
+
+    fn remote(same_user: &str) -> Remote {
+        let d = tempfile::tempdir().unwrap();
+        let (mut ctx, join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 9);
+        let store = crate::approvals::Store::open(&d.path().join("approvals")).unwrap();
+        let c = Arc::get_mut(&mut ctx).unwrap();
+        c.approvals = Ok(store);
+        c.directory = Arc::new(SidDir);
+        set_policy(
+            &ctx,
+            &format!(
+                "version = 2\nlocked = true\n[approval]\n\
+                 approvers = [\"ann\", \"bob\", \"carl\", \"ghost\"]\nsame_user = \"{same_user}\"\n"
+            ),
+        );
+        Remote {
+            d,
+            ctx,
+            _join: join,
+        }
+    }
+
+    fn made_by(w: &Remote, uid: u32, sid: Option<&str>) -> u64 {
+        let n = NewRequest {
+            uid,
+            sid: sid.map(String::from),
+            user: "requester".into(),
+            session: None,
+            agent: "agent".into(),
+            project: "erp".into(),
+            kind: ApprovalType::Connector,
+            service: Some("stripe".into()),
+            operation: Some("refund".into()),
+            capability: None,
+            params: Default::default(),
+            input: None,
+            grant_key: None,
+            scope: None,
+            ask_rule: None,
+            touch_class: Some("deploy".into()),
+            send: Default::default(),
+        };
+        w.ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .create(n, |_| Ok(None), Duration::from_secs(600), SystemTime::now())
+            .unwrap()
+            .id
+    }
+
+    fn device() -> saiife_wire::device::Device {
+        saiife_wire::device::Device {
+            id: "dev-1".into(),
+            label: "phone".into(),
+            owner_user: "x".into(),
+            public_key: String::new(),
+            state: saiife_wire::device::DeviceState::Active,
+            added_at: 0,
+            touch_credentials: Vec::new(),
+        }
+    }
+
+    async fn remote_decide(
+        w: &Remote,
+        user: &str,
+        uid: u32,
+        rid: u64,
+        approve: bool,
+    ) -> Result<Value, Refused> {
+        decide_remote(&w.ctx, uid, user, rid, approve, None, None, &device()).await
+    }
+
+    fn rule(r: Result<Value, Refused>) -> String {
+        r.err().map(|e| e.rule.to_string()).unwrap_or_default()
+    }
+
+    /// The request's SID is the owner's resolved SID: the requester, so
+    /// `deny` refuses (and records it); a withdrawal is allowed.
+    #[tokio::test]
+    async fn remote_same_sid_is_the_requester() {
+        let w = remote("deny");
+        let rid = made_by(&w, 4242, Some(SID_ANN));
+        assert_eq!(
+            rule(remote_decide(&w, "ann", 4242, rid, true).await),
+            "same_user"
+        );
+        let rec = records(w.d.path())
+            .into_iter()
+            .find(|r| r["kind"] == "approval" && r["action"] == "refused")
+            .unwrap();
+        assert_eq!(rec["rule"], "same_user");
+        assert_eq!(rec["workspace"]["device"], "dev-1");
+        assert_eq!(rec["by_sid"], SID_ANN);
+        // The requester withdraws: no approver check, noted as cancelled.
+        let a = remote_decide(&w, "ann", 4242, rid, false).await.unwrap();
+        assert_eq!(a["state"], "rejected");
+        let r = w.ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+        assert!(r.note.unwrap().starts_with(CANCELLED));
+    }
+
+    /// The request has a SID and the owner's cannot be resolved: the owner
+    /// is no approver of it (`not_approver`, recorded), under `deny` and
+    /// `reauth` alike, for approving and for rejecting; it is no requester
+    /// either, so it cannot withdraw it.
+    #[tokio::test]
+    async fn remote_unresolved_owner_sid_fails_closed() {
+        for same_user in ["deny", "reauth"] {
+            let w = remote(same_user);
+            let rid = made_by(&w, 4444, Some(SID_ANN));
+            for approve in [true, false] {
+                let e = remote_decide(&w, "ghost", 4444, rid, approve).await;
+                assert_eq!(rule(e), "not_approver", "{same_user} approve={approve}");
+            }
+            let r = w.ctx.approvals.as_ref().unwrap().get(rid).unwrap();
+            assert_eq!(r.state, State::Pending, "{same_user}");
+            let rec = records(w.d.path())
+                .into_iter()
+                .find(|r| r["kind"] == "approval" && r["action"] == "refused")
+                .unwrap();
+            assert_eq!(rec["rule"], "not_approver", "{same_user}");
+            assert!(list_remote(&w.ctx, 4444, "ghost").await.unwrap().is_empty());
+        }
+    }
+
+    /// Another SID: an approver decides (the touch is still required to approve).
+    #[tokio::test]
+    async fn remote_other_sid_may_decide() {
+        let w = remote("deny");
+        let rid = made_by(&w, 4242, Some(SID_ANN));
+        assert_eq!(
+            rule(remote_decide(&w, "bob", 4343, rid, true).await),
+            "touch_required"
+        );
+        let a = remote_decide(&w, "bob", 4343, rid, false).await.unwrap();
+        assert_eq!(a["state"], "rejected");
+        let rec = records(w.d.path())
+            .into_iter()
+            .find(|r| r["kind"] == "approval" && r["action"] == "rejected")
+            .unwrap();
+        assert_eq!(rec["by_sid"], SID_BOB);
+        assert_eq!(rec["workspace"]["label"], "phone");
+        // The listing agrees: bob sees ann's, not his own.
+        let own = made_by(&w, 4343, Some(SID_BOB));
+        let pending = made_by(&w, 4242, Some(SID_ANN));
+        let items = list_remote(&w.ctx, 4343, "bob").await.unwrap();
+        let ids: Vec<_> = items.iter().map(|i| i["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, vec![pending], "{own}");
+    }
+
+    /// uid-only requests behave as before.
+    #[tokio::test]
+    async fn remote_uid_only_requests() {
+        let w = remote("deny");
+        let own = made_by(&w, 4545, None);
+        assert_eq!(
+            rule(remote_decide(&w, "carl", 4545, own, true).await),
+            "same_user"
+        );
+        let other = made_by(&w, 4242, None);
+        assert_eq!(
+            rule(remote_decide(&w, "carl", 4545, other, true).await),
+            "touch_required"
+        );
+        // A user who is no approver, neither requester: unknown to them.
+        let e = decide_remote(&w.ctx, 7777, "dave", other, false, None, None, &device()).await;
+        assert_eq!(rule(e), "not_found");
+        // A requester who is no approver sees the request but may not approve it
+        // (a recorded refusal).
+        let w = remote("deny");
+        let mine = made_by(&w, 7777, None);
+        assert_eq!(
+            rule(remote_decide(&w, "dave", 7777, mine, true).await),
+            "not_approver"
+        );
+        let rec = records(w.d.path())
+            .into_iter()
+            .find(|r| r["kind"] == "approval" && r["action"] == "refused")
+            .unwrap();
+        assert_eq!(rec["rule"], "not_approver");
+        assert_eq!(rec["workspace"]["device"], "dev-1");
+        // A store that is gone is `unavailable`, not an empty list.
+        let mut w = remote("deny");
+        Arc::get_mut(&mut w.ctx).unwrap().approvals = Err("gone".into());
+        assert!(list_remote(&w.ctx, 4545, "carl").await.is_err());
     }
 }

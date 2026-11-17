@@ -63,6 +63,22 @@ pub fn unit_text(systemd: u32) -> String {
     }
 }
 
+/// What the daemon unit gains when boxes are installed (plan 35): the
+/// `saiife-box` group (the box dirs are group `saiife-box`) and write access
+/// to the box state below `ProtectSystem=strict`.
+pub const BOXES_LINES: &str =
+    "SupplementaryGroups=saiife-box\nReadWritePaths=/var/lib/saiife-box\n";
+
+/// [`unit_text`], with [`BOXES_LINES`] after `LimitCORE=0` when `boxes`.
+/// Without `boxes` it is byte-identical to [`unit_text`].
+pub fn unit_text_for(systemd: u32, boxes: bool) -> String {
+    let text = unit_text(systemd);
+    if !boxes {
+        return text;
+    }
+    text.replacen("LimitCORE=0\n", &format!("LimitCORE=0\n{BOXES_LINES}"), 1)
+}
+
 /// How the vault key is stored for this systemd version.
 pub fn vault_key_mode(systemd: u32) -> VaultKeyMode {
     if systemd >= ENCRYPTED_CREDENTIALS_SINCE {
@@ -145,6 +161,31 @@ WantedBy=multi-user.target
             .collect();
         let got: Vec<&str> = u.lines().collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn daemon_unit_with_boxes() {
+        for v in [249, 255] {
+            assert_eq!(unit_text_for(v, false), unit_text(v));
+            let with = unit_text_for(v, true);
+            assert!(with.contains(
+                "LimitCORE=0\nSupplementaryGroups=saiife-box\nReadWritePaths=/var/lib/saiife-box\n\n[Install]"
+            ));
+            // Exactly the two added lines.
+            let base = unit_text(v);
+            let added: Vec<&str> = with
+                .lines()
+                .filter(|l| !base.lines().any(|b| b == *l))
+                .collect();
+            assert_eq!(
+                added,
+                [
+                    "SupplementaryGroups=saiife-box",
+                    "ReadWritePaths=/var/lib/saiife-box"
+                ]
+            );
+            assert_eq!(with.lines().count(), base.lines().count() + 2);
+        }
     }
 
     #[test]

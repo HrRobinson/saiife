@@ -350,3 +350,46 @@ fn root_flag_is_hidden() {
         .stdout(contains("--agents"))
         .stdout(predicates::str::contains("--root").not());
 }
+
+#[test]
+fn vmm_dir_needs_boxes() {
+    saiife()
+        .args(["system", "install", "--vmm-dir", "/nonexistent-vmm"])
+        .assert()
+        .code(2)
+        .stderr(contains("--boxes"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn boxes_with_a_vmm_that_is_not_the_pinned_one_is_refused() {
+    let root = fake_root();
+    let r = root.path().to_str().unwrap();
+    let vmm = tempfile::tempdir().unwrap();
+    fs::write(
+        vmm.path().join("cloud-hypervisor"),
+        b"not the pinned binary",
+    )
+    .unwrap();
+    fs::write(vmm.path().join("CLOUDHV.fd"), b"not the pinned firmware").unwrap();
+    saiife()
+        .args([
+            "system",
+            "install",
+            "--root",
+            r,
+            "--non-interactive",
+            "--boxes",
+        ])
+        .arg("--vmm-dir")
+        .arg(vmm.path())
+        .assert()
+        .code(2)
+        .stderr(contains("cloud-hypervisor").and(contains("pinned")));
+    // Nothing of the box side was made.
+    assert!(!root.path().join("var/lib/saiife-box").exists());
+    assert!(!root
+        .path()
+        .join("etc/systemd/system/saiife-box-m@.service")
+        .exists());
+}

@@ -1,0 +1,32 @@
+name = "claude-code"
+description = "Claude Code in its TUI"
+
+[agent]
+kind = "claude-code"
+command = ["claude"]
+login = "api-key"
+credential = "anthropic"
+
+[image]
+base = "default"
+
+[size]
+vcpus = 2
+mem_mib = 4096
+mem_max_mib = 8192
+disk_gib = 30
+
+[egress]
+allow = []
+
+[secrets]
+names = []
+
+[rules]
+profile = "default"
+
+[touch]
+classes = ["land", "push_protected"]
+
+[idle]
+stop_after_mins = 120

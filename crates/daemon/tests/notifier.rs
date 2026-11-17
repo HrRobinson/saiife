@@ -224,6 +224,7 @@ fn ev(event: Event, id: u64, summary: &str) -> NotifyEvent {
         host: "box1".into(),
         summary: summary.into(),
         reason: None,
+        box_id: None,
     }
 }
 

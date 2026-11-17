@@ -6,7 +6,40 @@
 //! is additive to the default-on set. saiife resolves an environment's
 //! enabled list and hands it to the binary; the crate stays app-agnostic.
 
-use crate::pack::Pack;
+use crate::pack::{Pack, RuleWhere};
+
+/// Where the guard runs: on the host, or inside a box. A user rule marked
+/// `where = "host"` is left out of the box profile; every other rule stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    #[default]
+    Host,
+    Box,
+}
+
+impl Profile {
+    pub fn from_name(s: &str) -> Option<Profile> {
+        match s {
+            "host" => Some(Profile::Host),
+            "box" => Some(Profile::Box),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Host => "host",
+            Profile::Box => "box",
+        }
+    }
+}
+
+impl RuleWhere {
+    /// Whether a rule marked so is in force under `p`: not a host rule in a box.
+    pub fn applies_in(self, p: Profile) -> bool {
+        !matches!((self, p), (RuleWhere::Host, Profile::Box))
+    }
+}
 
 /// Keep the packs that are active under this profile: every `default_on` pack,
 /// plus any whose `id` appears in `enabled`.
@@ -50,5 +83,22 @@ reason = "r"
         let packs = vec![pack("core.x", true), pack("opt.y", false)];
         let active = select_active(packs, &["opt.y".to_string()]);
         assert_eq!(active.len(), 2);
+    }
+
+    #[test]
+    fn profile_names_round_trip() {
+        assert_eq!(Profile::from_name("host"), Some(Profile::Host));
+        assert_eq!(Profile::from_name("box"), Some(Profile::Box));
+        assert_eq!(Profile::from_name("vm"), None);
+        assert_eq!(Profile::Box.name(), "box");
+        assert_eq!(Profile::default(), Profile::Host);
+    }
+
+    #[test]
+    fn host_rules_do_not_apply_in_a_box() {
+        assert!(!RuleWhere::Host.applies_in(Profile::Box));
+        assert!(RuleWhere::Host.applies_in(Profile::Host));
+        assert!(RuleWhere::Everywhere.applies_in(Profile::Box));
+        assert!(RuleWhere::Everywhere.applies_in(Profile::Host));
     }
 }

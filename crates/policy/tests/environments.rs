@@ -81,6 +81,7 @@ fn catalog() -> Vec<PackInfo> {
         version: 1,
         default_on,
         rules: Vec::new(),
+        sha256: None,
     };
     vec![
         p("core.git", true),

@@ -22,6 +22,8 @@
 
 pub mod authright;
 pub mod binary;
+#[cfg(unix)]
+pub mod boxes_install;
 pub mod default_config;
 #[cfg(any(unix, windows))]
 pub mod doctor;
@@ -59,4 +61,4 @@ pub use host::{
 };
 pub use layout::Layout;
 pub use supported::{check_supported, refusal_line, Support, NOT_SUPPORTED_OS};
-pub use unit::{unit_text, vault_key_mode};
+pub use unit::{unit_text, unit_text_for, vault_key_mode};

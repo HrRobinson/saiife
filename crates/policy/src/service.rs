@@ -39,6 +39,13 @@ pub struct ServiceCfg {
     pub mode: CloudMode,
     #[serde(default, skip_serializing_if = "CloudCfg::is_default")]
     pub cloud: CloudCfg,
+    /// Capability patterns (matched like `ask`, broadly) that are deploys:
+    /// a call matching one always needs a touch (spec §8.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deploy: Vec<String>,
+    /// The service talks to a real system: every call needs a touch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub real_system: bool,
 }
 
 /// How a cloud connector gets its credential: sign requests with the stored
@@ -195,6 +202,9 @@ pub struct HttpOperationCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct SecretCfg {
     pub run_allow: Vec<PathBuf>,
+    /// Any service using this secret needs a touch on every call.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 /// Basenames a `run_allow` entry may not have: an interpreter, a shell or a

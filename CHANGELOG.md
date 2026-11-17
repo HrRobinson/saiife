@@ -169,6 +169,7 @@ server and gateway, the personal broker and fleet packages.
 - `system install` now holds a root-only lock (`/etc/saiife-install.lock`), on Linux too. An overlapping install waits up to 2 minutes, then exits 2. `--allow-test-build` exists only in builds with debug assertions.
 - Windows: an MSI per architecture, Authenticode-signed when the release has the signing secrets, with Intune and GPO recipes.
 - See `docs/fleet.md`.
+- The Linux deb and rpm now carry FIDO key support through a helper, `/usr/libexec/saiife/saiife-fido`. The static `saiife` checks it (root-owned, not writable by others), refuses another version and passes the PIN over a pipe. `saiife doctor` gains a `touch-helper` check. The tarball and `install.sh` installs still refuse with the no-support line. See `docs/touch.md`.
 
 ### Known limits
 

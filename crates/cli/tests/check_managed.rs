@@ -2131,3 +2131,96 @@ fn hook_ops_on_the_real_daemon_change_nothing() {
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
     assert_eq!(last_guard(&d)["decision"], "allow");
 }
+
+// ---------------------------------------------------- user packs (plan 32)
+
+const USER_PACK: &str = r#"[pack]
+id = "user.t"
+name = "Team rules"
+triggers = ["deploy-prod"]
+
+[[deny]]
+id = "l3-1"
+pattern = '^deploy-prod\b'
+reason = 'CLAUDE.md:3 "Never run deploy-prod"'
+source = { file = "CLAUDE.md", line = 3, line_sha256 = "ab" }
+"#;
+
+/// A daemon whose config dir holds `policy.d/packs/user.t.toml` = `pack`
+/// (none when `None`) before it starts.
+fn daemon_with_pack(pack: Option<&str>) -> TestDaemon {
+    let mut d = TestDaemon::prepare(&Opts::default());
+    if let Some(text) = pack {
+        let dir = d.path().join("etc/policy.d/packs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("user.t.toml"), text).unwrap();
+    }
+    d.spawn_and_wait();
+    d
+}
+
+#[test]
+fn managed_user_pack_denies_with_source_reason() {
+    let d = daemon_with_pack(Some(USER_PACK));
+    let cwd = tempfile::tempdir().unwrap();
+    let (o, _, _sb) = managed(&d.config(), &bash(cwd.path(), "deploy-prod --now"));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains(r#"BLOCKED by user.t: CLAUDE.md:3 "Never run deploy-prod""#),
+        "{}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["pack"], "user.t");
+    assert_eq!(r["rule_id"], "l3-1");
+    let (o, _, _sb) = managed(&d.config(), &bash(cwd.path(), "ls"));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+}
+
+#[test]
+fn managed_broken_user_pack_denies_every_call() {
+    let bad = USER_PACK.replace(r"'^deploy-prod\b'", "'('");
+    let d = daemon_with_pack(Some(&bad));
+    let cwd = tempfile::tempdir().unwrap();
+    let (o, _, _sb) = managed(&d.config(), &bash(cwd.path(), "ls"));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "error_denied", "{r}");
+    let reason = r["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("user pack") && reason.contains("user.t.toml"),
+        "{r}"
+    );
+    // A tool the guard does not judge is denied too.
+    let home = common::FixtureHome::new();
+    let mcp = home.real(&fixture("claude/webfetch.json"));
+    let (o, _, _sb) = managed(&d.config(), &mcp);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "error_denied", "{r}");
+    assert!(
+        r["reason"].as_str().unwrap_or("").contains("user pack"),
+        "{r}"
+    );
+}
+
+#[test]
+fn managed_hash_names_the_user_pack() {
+    // One config dir: the same hook, before and after the pack file exists.
+    let d = daemon_with_pack(None);
+    let cwd = tempfile::tempdir().unwrap();
+    let hash = |cmd: &str| {
+        let (o, _, _sb) = managed(&d.config(), &bash(cwd.path(), cmd));
+        assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+        last_guard(&d)["policy"].clone()
+    };
+    let without = hash("ls");
+    let dir = d.path().join("etc/policy.d/packs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("user.t.toml"), USER_PACK).unwrap();
+    let (a, b) = (hash("ls"), hash("ls -l"));
+    assert!(is_policy_hash(&a) && is_policy_hash(&without));
+    assert_eq!(a, b);
+    assert_ne!(a, without);
+}

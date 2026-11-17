@@ -1,0 +1,49 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { visible, ago, runtime, short, bytes, plural } from "../js/format.js";
+
+test("visible escapes bidi and controls", () => {
+  assert.equal(visible("a\u202eb"), "a⟨U+202E⟩b");
+  assert.equal(visible("\u001b]52;c;x\u0007"), "⟨ESC⟩]52;c;x⟨U+0007⟩");
+  assert.equal(visible("x\u007f"), "x⟨U+007F⟩");
+  assert.equal(visible("\u2066\u2069\u200e\u200f"), "⟨U+2066⟩⟨U+2069⟩⟨U+200E⟩⟨U+200F⟩");
+  assert.equal(visible("plain\ttext\n"), "plain\ttext\n");
+  assert.equal(visible("a\u061cb"), "a⟨U+061C⟩b");
+  assert.equal(visible(null), "");
+});
+
+test("plural counts", () => {
+  assert.equal(plural(1, "file"), "1 file");
+  assert.equal(plural(0, "file"), "0 files");
+  assert.equal(plural(2, "line"), "2 lines");
+});
+
+test("ago and runtime", () => {
+  assert.equal(ago(5), "5 s");
+  assert.equal(ago(180), "3 min");
+  assert.equal(ago(7200), "2 h");
+  assert.equal(ago(3 * 86400), "3 d");
+  assert.equal(runtime(1000, 1000 + 90), "1 min");
+  assert.equal(runtime(1000, 1000 + 3600 * 5), "5 h");
+  assert.equal(runtime(1000, 900), "0 s");
+  assert.equal(short("0123456789abcdef"), "01234567");
+  assert.equal(short("0123456789abcdef", 4), "0123");
+  assert.equal(bytes(512), "512 B");
+  assert.equal(bytes(2048), "2.0 KiB");
+  assert.equal(bytes(3 * 1024 * 1024), "3.0 MiB");
+});
+
+test("visible escapes the shared unsafe set (wire text.rs)", () => {
+  // Zero-width, soft hyphen, tag characters, private use, line separator,
+  // C1 controls, variation selector, BOM: all escaped as code points.
+  assert.equal(visible("a\u200bb"), "a⟨U+200B⟩b");
+  assert.equal(visible("\u00ad"), "⟨U+00AD⟩");
+  assert.equal(visible("\u{E0041}"), "⟨U+E0041⟩");
+  assert.equal(visible("\ue000"), "⟨U+E000⟩");
+  assert.equal(visible("\u2028"), "⟨U+2028⟩");
+  assert.equal(visible("\u009b"), "⟨U+009B⟩");
+  assert.equal(visible("️\ufeff"), "⟨U+FE0F⟩⟨U+FEFF⟩");
+  // A lone surrogate is escaped too; ordinary text stays.
+  assert.equal(visible("\ud800"), "⟨U+D800⟩");
+  assert.equal(visible("héllo 漢字 \u{1F600}"), "héllo 漢字 \u{1F600}");
+});

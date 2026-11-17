@@ -1,0 +1,45 @@
+[package]
+name = "saiife-link"
+description = "The Workspace link: the localhost UI server and the hub client between a browser or phone and saiifed's link.sock."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_link"
+path = "src/lib.rs"
+
+# Versions as in crates/broker and crates/daemon (all in Cargo.lock).
+[dependencies]
+saiife-ipc = { path = "../ipc" }
+saiife-wire = { path = "../wire" }
+serde_json = "1"
+tokio = { version = "=1.53.3", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros"] }
+hyper = { version = "=1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "=0.8.4"
+sha1 = "=0.10.7"
+base64 = "=0.23.1"
+getrandom = "0.3"
+ring = "=0.17.14"
+
+[dev-dependencies]
+hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
+saiife-wire = { path = "../wire", features = ["fake"] }
+saiife-daemon = { path = "../daemon", features = ["fake-boxes"] }
+saiife-audit = { path = "../audit" }
+saiife-touch = { path = "../touch" }
+saiife-policy = { path = "../policy" }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+tempfile = "3"
+rustix = { version = "1", features = ["process"] }
+tokio = { version = "=1.53.3", features = ["rt", "net", "io-util", "sync", "time", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

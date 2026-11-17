@@ -139,12 +139,14 @@ model.
 - [Fleet install](docs/fleet.md): `.deb`, `.rpm`, macOS `.pkg` and Windows `.msi`
   packages, with Ansible, Jamf, Intune and GPO recipes.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
+- [Touch approvals](docs/touch.md): approve with a FIDO2 key; `doctor` checks the key is usable.
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
   and [collections](docs/collections.md).
 - [Dev environments](docs/dev.md): saiife dev, compose stacks behind one HTTPS proxy (preview).
 - [MCP](docs/mcp.md): `saiife mcp` (connectors as MCP tools) and the MCP
   gateway for third-party servers.
 - [Packs](docs/packs/README.md): the rule sets, what each blocks and allows.
+- [Never-rules](docs/never-rules.md): your own packs (`policy.d/packs`), `ask` rules and how they work in boxes.
 - Agents: [Claude Code](docs/agents/claude-code.md),
   [Codex](docs/agents/codex.md), [Gemini CLI](docs/agents/gemini.md).
 - Recipe: [Codex with a local Ollama model](docs/recipes/codex-ollama.md).

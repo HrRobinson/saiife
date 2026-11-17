@@ -17,6 +17,8 @@ pub const BINARY: &str = "/opt/saiife/bin/saiife";
 pub const ETC_DIR: &str = "/etc/saiife";
 pub const CONFIG: &str = "/etc/saiife/config.toml";
 pub const POLICY_D: &str = "/etc/saiife/policy.d";
+/// User packs (plan 32): checked like the drop-ins above them.
+pub const POLICY_PACKS_D: &str = "/etc/saiife/policy.d/packs";
 pub const CREDSTORE: &str = "/etc/saiife/credstore";
 pub const VAULT_KEY: &str = "/etc/saiife/credstore/vault-key";
 pub const INSTALLED: &str = "/etc/saiife/installed.toml";
@@ -51,6 +53,9 @@ pub const FLEET_INSTALL: &str = "/etc/saiife/fleet/install.toml";
 pub const INSTALL_LOCK: &str = "/etc/saiife-install.lock";
 /// The staging copy a package ships; `install` copies it to [`BINARY`].
 pub const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
+/// The FIDO helper the Linux deb and rpm ship (plan 41 F2): root-owned, run
+/// by the static `saiife` for key touches. Linux only (no macOS or Windows path).
+pub const FIDO_HELPER: &str = "/usr/libexec/saiife/saiife-fido";
 
 /// The polkit action file, byte for byte. `auth_self`, never
 /// `auth_self_keep`: every approval asks for the password again. The
@@ -222,6 +227,7 @@ pub fn windows_path(linux: &str) -> Option<&'static str> {
         ETC_DIR => r"C:\ProgramData\saiife\etc",
         CONFIG => r"C:\ProgramData\saiife\etc\config.toml",
         POLICY_D => r"C:\ProgramData\saiife\etc\policy.d",
+        POLICY_PACKS_D => r"C:\ProgramData\saiife\etc\policy.d\packs",
         INSTALLED => r"C:\ProgramData\saiife\etc\installed.toml",
         CA_DIR => r"C:\ProgramData\saiife\etc\ca",
         FLEET_DIR => r"C:\ProgramData\saiife\etc\fleet",
@@ -575,13 +581,14 @@ mod windows_tests {
     use saiife_agents::Agent;
 
     /// Every Linux constant with a Windows path, with its §5.3a value.
-    const WINDOWS_TABLE: [(&str, &str); 26] = [
+    const WINDOWS_TABLE: [(&str, &str); 27] = [
         (OPT_DIR, r"C:\ProgramData\saiife"),
         (BIN_DIR, r"C:\ProgramData\saiife\bin"),
         (BINARY, r"C:\ProgramData\saiife\bin\saiife.exe"),
         (ETC_DIR, r"C:\ProgramData\saiife\etc"),
         (CONFIG, r"C:\ProgramData\saiife\etc\config.toml"),
         (POLICY_D, r"C:\ProgramData\saiife\etc\policy.d"),
+        (POLICY_PACKS_D, r"C:\ProgramData\saiife\etc\policy.d\packs"),
         (INSTALLED, r"C:\ProgramData\saiife\etc\installed.toml"),
         (CA_DIR, r"C:\ProgramData\saiife\etc\ca"),
         (FLEET_DIR, r"C:\ProgramData\saiife\etc\fleet"),
@@ -621,7 +628,7 @@ mod windows_tests {
 
     /// The constants W9 gives no Windows path, those it does not name, and a
     /// string that is no constant.
-    const NO_WINDOWS_PATH: [&str; 9] = [
+    const NO_WINDOWS_PATH: [&str; 10] = [
         RUN_DIR,
         SOCKET,
         UNIT,
@@ -630,6 +637,7 @@ mod windows_tests {
         PKCHECK,
         CREDSTORE,
         INSTALL_LOCK,
+        FIDO_HELPER,
         "/etc/saiife/other",
     ];
 
@@ -957,6 +965,7 @@ mod tests {
         assert_eq!(ETC_DIR, "/etc/saiife");
         assert_eq!(CONFIG, "/etc/saiife/config.toml");
         assert_eq!(POLICY_D, "/etc/saiife/policy.d");
+        assert_eq!(POLICY_PACKS_D, "/etc/saiife/policy.d/packs");
         assert_eq!(CREDSTORE, "/etc/saiife/credstore");
         assert_eq!(VAULT_KEY, "/etc/saiife/credstore/vault-key");
         assert_eq!(INSTALLED, "/etc/saiife/installed.toml");
@@ -985,6 +994,7 @@ mod tests {
         assert_eq!(FLEET_CONFIG, "/etc/saiife/fleet/config.toml");
         assert_eq!(FLEET_INSTALL, "/etc/saiife/fleet/install.toml");
         assert_eq!(PACKAGE_BINARY, "/usr/libexec/saiife/saiife");
+        assert_eq!(FIDO_HELPER, "/usr/libexec/saiife/saiife-fido");
     }
 
     /// The Linux constants that differ on macOS, with their §5.3 value.
@@ -1017,13 +1027,14 @@ mod tests {
     ];
 
     /// Every path constant of this module.
-    const ALL_PATHS: [&str; 27] = [
+    const ALL_PATHS: [&str; 28] = [
         OPT_DIR,
         BIN_DIR,
         BINARY,
         ETC_DIR,
         CONFIG,
         POLICY_D,
+        POLICY_PACKS_D,
         CREDSTORE,
         VAULT_KEY,
         INSTALLED,
@@ -1060,6 +1071,7 @@ mod tests {
             assert_eq!(macos_path(p), None, "{p} is the same on macOS");
         }
         assert_eq!(macos_path("/etc/saiife/other"), None);
+        assert_eq!(macos_path(FIDO_HELPER), None);
         assert_eq!(DAEMON_LOG, "/var/log/saiife/daemon.log");
         assert_eq!(
             CLAUDE_MDM_PROFILE,

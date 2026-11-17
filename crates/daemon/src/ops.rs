@@ -368,6 +368,11 @@ pub struct Ctx {
     pub reauth_cooldowns: Mutex<crate::reauth::Cooldowns>,
     /// One-use command grants (`[guard] ask`, spec §6.10.4).
     pub grants: crate::grants::Grants,
+    /// The touch devices, the instance id and the live touch challenges.
+    pub touch: Arc<crate::touch::TouchState>,
+    /// The Workspace's web touches: request ids, spent challenges and steer
+    /// windows (plan 31).
+    pub web_touch: Arc<crate::workspace_touch::WebTouches>,
     /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
     pub signals: crate::signals::Signals,
     /// Held for the whole of a policy reload (SIGHUP and `policy.reload`),
@@ -389,9 +394,37 @@ pub struct Ctx {
     /// The Claude Code co-signer's address or bind error, and its record
     /// folding (plan 20).
     pub cosign: Mutex<crate::cosign::CosignState>,
+    /// The box manager behind the `box.*` ops (plan 34); `None`: boxes are
+    /// unavailable, and [`Ctx::box_unavailable`] says why when it can.
+    pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
+    /// Why there is no box manager when the box preflight failed (plan 35):
+    /// what every `box.*` op answers instead of the fixed `unavailable`.
+    pub box_unavailable: Option<String>,
+    /// The template files skipped at start, for `box.templates`.
+    pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
+    /// The box image store's dirs (plan 36); `None`: the `box.image.*`
+    /// ops are unavailable. Set whenever this build and mode have boxes,
+    /// with or without a manager (`box_ops::image_paths`).
+    pub box_images: Option<crate::box_images::ImagePaths>,
+    /// Where the boxes' disks are (`box_ops::Built::disk_root`); `None`:
+    /// the manager's store root.
+    pub box_disk_root: Option<PathBuf>,
+    /// The Workspace serves the fake demo boxes (`fake-boxes` test builds),
+    /// not the manager: frames then read `boxes` as it is.
+    pub workspace_demo: bool,
+    /// The land book (plan 39), set once the context is shared
+    /// (`box_ops::attach_lands`): it needs the box's guest channel, which
+    /// only a daemon with real boxes has. Empty: lands are unavailable.
+    #[cfg(unix)]
+    pub box_lands: std::sync::OnceLock<Arc<crate::box_land::Lands>>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Notices,
+    // Workspace (plan 29)
+    /// The machine key, paired devices, pairing offers and frame verifier.
+    pub workspace: Arc<crate::workspace::Workspace>,
+    /// What Workspace frames act on (no boxes unless a build wires some).
+    pub boxes: Arc<dyn saiife_wire::BoxSource>,
 }
 
 /// When each (uid, kind) notice was last written; shared with the hook
@@ -426,11 +459,29 @@ pub struct CtxInit {
     pub lockdown: crate::lockdown::Store,
     /// One-use command grants (`<state>/state/grants.json`).
     pub grants: crate::grants::Grants,
+    /// The touch state (`<state>/state/touch`).
+    pub touch: Arc<crate::touch::TouchState>,
     /// The MCP gateway (plan 17, Task 6); attached to the context by
     /// [`Ctx::new`]'s caller once the context is shared.
     pub mcp: Arc<crate::mcp_gateway::Gateway>,
     /// See [`Ctx::refuse_own_uid_peers`]. `minimal` leaves it off.
     pub refuse_own_uid_peers: bool,
+    // Workspace (plan 29)
+    pub workspace: Arc<crate::workspace::Workspace>,
+    pub boxes: Arc<dyn saiife_wire::BoxSource>,
+    /// See [`Ctx::box_manager`]. `minimal` leaves it `None`.
+    pub box_manager: Option<Arc<saiife_boxes::manager::Manager>>,
+    /// See [`Ctx::box_unavailable`]. `minimal` leaves it `None`.
+    pub box_unavailable: Option<String>,
+    /// See [`Ctx::box_template_warnings`].
+    pub box_template_warnings: Vec<saiife_boxes::template::TemplateWarning>,
+    /// See [`Ctx::box_images`]. `minimal` leaves it `None`.
+    pub box_images: Option<crate::box_images::ImagePaths>,
+    /// See [`Ctx::box_disk_root`]. `minimal` leaves it `None`.
+    pub box_disk_root: Option<PathBuf>,
+    /// The Workspace serves the fake demo boxes (`fake-boxes` test builds),
+    /// not the manager: frames then read `boxes` as it is.
+    pub workspace_demo: bool,
 }
 
 impl CtxInit {
@@ -479,10 +530,20 @@ impl CtxInit {
                 std::time::SystemTime::now(),
             )
             .0,
+            touch: Arc::new(crate::touch::TouchState::open(state_dir).0),
             mcp: Arc::new(crate::mcp_gateway::Gateway::new(
                 crate::mcp_gateway::GatewaySetup::in_state(state_dir),
             )),
             refuse_own_uid_peers: false,
+            // Workspace (plan 29)
+            workspace: Arc::new(crate::workspace::Workspace::memory()),
+            boxes: Arc::new(saiife_wire::source::NoBoxes),
+            box_manager: None,
+            box_unavailable: None,
+            box_template_warnings: Vec::new(),
+            box_images: None,
+            box_disk_root: None,
+            workspace_demo: false,
         }
     }
 }
@@ -707,6 +768,8 @@ impl Ctx {
             reauth: crate::reauth::host_reauth(),
             reauth_cooldowns: Mutex::default(),
             grants: i.grants,
+            touch: i.touch,
+            web_touch: Arc::new(crate::workspace_touch::WebTouches::new()),
             signals: Default::default(),
             reloads: tokio::sync::Mutex::new(()),
             mcp: i.mcp,
@@ -714,9 +777,20 @@ impl Ctx {
             refuse_own_uid_peers: i.refuse_own_uid_peers,
             hooks,
             cosign: Mutex::default(),
+            box_manager: i.box_manager,
+            box_unavailable: i.box_unavailable,
+            box_template_warnings: i.box_template_warnings,
+            box_images: i.box_images,
+            box_disk_root: i.box_disk_root,
+            workspace_demo: i.workspace_demo,
+            #[cfg(unix)]
+            box_lands: std::sync::OnceLock::new(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices,
+            // Workspace (plan 29)
+            workspace: i.workspace,
+            boxes: i.boxes,
         }
     }
 
@@ -1130,6 +1204,16 @@ pub struct Conn {
     pub id: crate::hooks::ConnId,
     /// Fired when the hook table closes this connection (a hook overrun).
     pub close: Arc<tokio::sync::Notify>,
+    /// The descriptors the last `box.fds` passed (plan 37), kept for the
+    /// next request; closed by any request not in `FD_OPS`, and with the
+    /// connection.
+    #[cfg(unix)]
+    pub fds: Arc<Mutex<Vec<std::os::fd::OwnedFd>>>,
+    /// The descriptors an op's `ok` answer carries (plan 39: `box.land`,
+    /// `box.land.fetch`): the connection sends them in one fd byte right
+    /// after that answer. Emptied before every request.
+    #[cfg(unix)]
+    pub out_fds: Arc<Mutex<Vec<std::os::fd::OwnedFd>>>,
 }
 
 impl Conn {
@@ -1140,8 +1224,92 @@ impl Conn {
             steps: Arc::default(),
             id: crate::server::next_conn_id(),
             close: Arc::default(),
+            #[cfg(unix)]
+            fds: Arc::default(),
+            #[cfg(unix)]
+            out_fds: Arc::default(),
         }
     }
+
+    /// The descriptors the last `box.fds` passed, the stash emptied. Dropping
+    /// them closes them, outside the stash's lock.
+    #[cfg(unix)]
+    pub fn take_fds(&self) -> Vec<std::os::fd::OwnedFd> {
+        std::mem::take(&mut *lock(&self.fds))
+    }
+
+    /// Hand `fds` to the connection, to go right after this op's answer.
+    #[cfg(unix)]
+    pub fn give_fds(&self, fds: Vec<std::os::fd::OwnedFd>) {
+        *lock(&self.out_fds) = fds;
+    }
+
+    /// What the last op handed over to go after its answer, emptied.
+    #[cfg(unix)]
+    pub fn take_out_fds(&self) -> Vec<std::os::fd::OwnedFd> {
+        std::mem::take(&mut *lock(&self.out_fds))
+    }
+}
+
+/// Whether `op` takes the descriptors of the `box.fds` before it.
+#[cfg(unix)]
+fn takes_fds(op: &str) -> bool {
+    #[cfg(test)]
+    if op == TEST_FDS_OP {
+        return true;
+    }
+    saiife_ipc::msg::FD_OPS.contains(&op)
+}
+
+/// `box.fds {n}` once its descriptors `got` are in (the connection reads
+/// them, `crate::server`): kept for the next request when `n` is 1 to
+/// `MAX_FDS` and names exactly what came, and nothing is kept yet.
+/// Otherwise `bad_request`, with every descriptor closed, kept or new.
+#[cfg(unix)]
+pub fn box_fds(conn: &Conn, req: &Request, got: Vec<std::os::fd::OwnedFd>) -> Value {
+    use saiife_ipc::fdpass::MAX_FDS;
+    let held = conn.take_fds();
+    if !held.is_empty() {
+        return err(
+            req.id,
+            ErrorCode::BadRequest,
+            "box.fds was sent twice: both sets of descriptors are closed",
+        );
+    }
+    let n = req.args.get("n").and_then(Value::as_u64);
+    let fits = matches!(n, Some(n) if (1..=MAX_FDS as u64).contains(&n) && n == got.len() as u64);
+    if !fits {
+        let msg = format!(
+            "box.fds needs n, 1 to {MAX_FDS}, naming the descriptors passed ({} came)",
+            got.len()
+        );
+        return err(req.id, ErrorCode::BadRequest, &msg);
+    }
+    *lock(&conn.fds) = got;
+    ok(req.id, Map::new())
+}
+
+/// A test-only op that takes the stash and answers what each descriptor
+/// reads from its start (`fds_reach_the_next_op`).
+#[cfg(all(test, unix))]
+pub(crate) const TEST_FDS_OP: &str = "test.fds";
+
+#[cfg(all(test, unix))]
+fn test_fds(conn: &Conn, id: u64) -> Value {
+    use std::os::unix::fs::FileExt;
+    let texts: Vec<Value> = conn
+        .take_fds()
+        .into_iter()
+        .map(|fd| {
+            let f = std::fs::File::from(fd);
+            let mut buf = vec![0u8; 256];
+            let n = f.read_at(&mut buf, 0).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned().into()
+        })
+        .collect();
+    let mut m = Map::new();
+    m.insert("texts".into(), texts.into());
+    ok(id, m)
 }
 
 /// The last answers of a connection's `grant.consume` and
@@ -1171,9 +1339,35 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 /// Every op but `hello`.
 pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let peer = &conn.peer;
+    // Passed descriptors are for the very next request, and only for one
+    // that takes them: any other closes them.
+    #[cfg(unix)]
+    if !takes_fds(&req.op) {
+        drop(conn.take_fds());
+    }
+    #[cfg(unix)]
+    drop(conn.take_out_fds());
     match req.op.as_str() {
+        #[cfg(all(test, unix))]
+        TEST_FDS_OP => test_fds(conn, req.id),
+        // The connection reads `box.fds` itself (`crate::server`), on the
+        // control socket of a unix daemon only.
+        saiife_ipc::msg::OP_BOX_FDS => err(
+            req.id,
+            ErrorCode::BadRequest,
+            "box.fds is taken by a unix control connection only",
+        ),
         OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
+        // Machine local only: the touch admin ops (enrol, remove, list,
+        // test) trust that this peer reached the local socket, the only
+        // transport `dispatch_conn` serves today (`Conn` names none). A
+        // future link transport (plan 29) must not route these ops here.
+        saiife_ipc::msg::OP_TOUCH_BEGIN
+        | saiife_ipc::msg::OP_TOUCH_ENROL
+        | saiife_ipc::msg::OP_TOUCH_REMOVE
+        | saiife_ipc::msg::OP_TOUCH_LIST
+        | saiife_ipc::msg::OP_TOUCH_CHECK => crate::touch_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello_in(req.id, ctx.mode.as_str()),
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_HOOK_BEGIN => hook_begin(ctx, conn, req),
@@ -1191,11 +1385,25 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_MCP_LIST | OP_MCP_CALL => crate::mcp_ops::handle(ctx, peer, req).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
-        other => err(
-            req.id,
-            ErrorCode::UnknownOp,
-            &format!("unknown op {other:?}"),
-        ),
+        // Workspace (plan 29): machine side, control socket only.
+        saiife_ipc::msg::OP_WORKSPACE_PAIR_BEGIN
+        | saiife_ipc::msg::OP_WORKSPACE_PAIR_STATUS
+        | saiife_ipc::msg::OP_WORKSPACE_PAIR_CONFIRM
+        | saiife_ipc::msg::OP_WORKSPACE_DEVICES
+        | saiife_ipc::msg::OP_WORKSPACE_REVOKE => {
+            crate::workspace_ops::handle(ctx, conn, req).await
+        }
+        op if crate::box_ops::OPS.contains(&op) => crate::box_ops::handle(ctx, conn, req).await,
+        other => {
+            // An fd op this daemon does not serve: what it was passed goes.
+            #[cfg(unix)]
+            drop(conn.take_fds());
+            err(
+                req.id,
+                ErrorCode::UnknownOp,
+                &format!("unknown op {other:?}"),
+            )
+        }
     }
 }
 
@@ -1491,6 +1699,12 @@ fn status(ctx: &Ctx, id: u64) -> Value {
         m.insert("cosign".into(), c.status());
         m.insert("hooks_rejudge_denied".into(), c.rejudge_denied_status());
     }
+    // Workspace (plan 29): frames refused before their signature verified
+    // (never recorded).
+    m.insert(
+        "workspace".into(),
+        json!({"refused_unsigned": ctx.workspace.refused_unsigned()}),
+    );
     ok(id, m)
 }
 

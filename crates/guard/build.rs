@@ -11,7 +11,8 @@
 mod pack_raw;
 
 use pack_raw::{
-    OperandSyntax, RawMeta, RawPackFile, RawPathRule, RawRule, RuleAccess, RulePlatform, Str,
+    user_key_in_builtin, user_key_in_builtin_path, user_key_refusal, OperandSyntax, RawMeta,
+    RawPackFile, RawPathRule, RawRule, RuleAccess, RulePlatform, Str,
 };
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -45,11 +46,33 @@ fn main() {
         // left out at run time for a typo.
         let raw: RawPackFile =
             toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        check_builtin(n, &raw);
         writeln!(out, "    ({n:?}, {}),", pack(&raw)).unwrap();
     }
     out.push_str("];\n");
     let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("builtin_packs.rs");
     std::fs::write(&dest, out).unwrap_or_else(|e| panic!("{}: {e}", dest.display()));
+}
+
+/// A built-in pack may not use a user-pack key (`where`, `source`, `ask`,
+/// `[import]`, `[[unenforced]]`): refuse it here, naming the file.
+fn check_builtin(file: &str, p: &RawPackFile) {
+    if p.import.is_some() {
+        panic!("{}", user_key_refusal(file, "import"));
+    }
+    if !p.unenforced.is_empty() {
+        panic!("{}", user_key_refusal(file, "unenforced"));
+    }
+    for r in p.allow.iter().chain(p.deny.iter()) {
+        if let Some(key) = user_key_in_builtin(r) {
+            panic!("{}", user_key_refusal(file, key));
+        }
+    }
+    for r in p.allow_path.iter().chain(p.deny_path.iter()) {
+        if let Some(key) = user_key_in_builtin_path(r) {
+            panic!("{}", user_key_refusal(file, key));
+        }
+    }
 }
 
 // Each writer destructures its type in full, so a new field fails this build
@@ -62,9 +85,13 @@ fn pack(p: &RawPackFile) -> String {
         deny,
         allow_path,
         deny_path,
+        import,
+        unenforced,
     } = p;
+    let _ = (import, unenforced);
     format!(
-        "RawPackFile {{ pack: {}, allow: {}, deny: {}, allow_path: {}, deny_path: {} }}",
+        "RawPackFile {{ pack: {}, allow: {}, deny: {}, allow_path: {}, deny_path: {}, \
+         import: None, unenforced: Cow::Borrowed(&[]) }}",
         meta(pack),
         list(allow, rule),
         list(deny, rule),
@@ -119,7 +146,12 @@ fn rule(r: &RawRule) -> String {
         operand_min_len,
         operand_substitution,
         no_redirections,
+        where_,
+        source,
+        ask,
     } = r;
+    // Refused before this, in `check_builtin`, which knows the file.
+    let _ = (where_, source, ask);
     let share = match operand_match_share {
         Some(x) if x.is_finite() => format!("Some({x:?})"),
         Some(x) => panic!("rule {pattern:?}: operand_match_share {x} is not a number"),
@@ -139,7 +171,7 @@ fn rule(r: &RawRule) -> String {
          command_long_only: {command_long_only}, when_no_operand: {when_no_operand}, \
          target_options: {}, operand_match_share: {share}, \
          operand_min_len: {operand_min_len}, operand_substitution: {operand_substitution}, \
-         no_redirections: {no_redirections} }}",
+         no_redirections: {no_redirections}, where_: None, source: None, ask: false }}",
         opt(id),
         platform(plat),
         s(pattern),
@@ -159,7 +191,10 @@ fn path_rule(r: &RawPathRule) -> String {
         access,
         reason,
         ancestors,
+        where_,
+        source,
     } = r;
+    let _ = (where_, source);
     let access = match access {
         RuleAccess::Read => "RuleAccess::Read",
         RuleAccess::Write => "RuleAccess::Write",
@@ -169,7 +204,7 @@ fn path_rule(r: &RawPathRule) -> String {
     };
     format!(
         "RawPathRule {{ platform: {}, glob: {}, access: {access}, reason: {}, \
-         ancestors: {ancestors} }}",
+         ancestors: {ancestors}, where_: None, source: None }}",
         platform(plat),
         s(glob),
         opt(reason),

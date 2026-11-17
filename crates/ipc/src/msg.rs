@@ -41,10 +41,13 @@ pub const OP_POLICY_SHOW: &str = "policy.show";
 /// `{}` -> `{result: "loaded"}` or `{result: "rejected", reason}`.
 pub const OP_POLICY_RELOAD: &str = "policy.reload";
 /// Approval requests: approvers see all, a requester its own.
-/// `{states?: ["pending", ...], own?: bool}` -> `{items}`.
+/// `{states?: ["pending", ...], own?: bool}` -> `{items}`. An item's
+/// `touch_class` is the effective class (D8), as `approval.show` gives it.
 pub const OP_APPROVAL_LIST: &str = "approval.list";
 /// `{request}` -> `{item}` (the masked request). The id is `request`: a
-/// frame's `id` is its own.
+/// frame's `id` is its own. `touch_class`, when present, is the class a
+/// decision needs now: the stronger of the stored one and the current
+/// policy's (D8).
 pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// `{request, action: "approve"|"reject", note?, ack_truncated?, auth?}` ->
 /// `{request, state}`. `auth` (macOS) is the 64 lowercase hex characters
@@ -54,7 +57,121 @@ pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// approval is refused (`reauth_unavailable`); bad hex is `bad_request`.
 /// In this version the macOS daemon refuses every same-user approval
 /// (`reauth_unavailable`): its prompt cannot show which request it is.
+/// `touch` (an `Assertion` JSON: the device's answer to the `TouchRequest`
+/// of `touch.begin {purpose: "approve"}`) is optional. When approving needs
+/// a touch (the request's effective class, as `approval.show` gives it),
+/// it is checked before who may decide and before any re-authentication
+/// prompt: absent or null is refused (`touch_unavailable`, recorded) and
+/// not an `Assertion` is `bad_request`; neither spends the challenge. It is
+/// verified only after that: then the live challenge of the request is
+/// spent whatever the outcome, and only the decider's own devices count
+/// (D6). A failed verify is refused (`touch_failed` / `touch_mismatch` /
+/// `touch_unavailable`, recorded). The request stays pending on every
+/// refusal. A rejection or a withdrawal needs no touch.
 pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
+/// Starts a touch (plan 26). Every challenge lives 300 s and is single use;
+/// a new `touch.begin` for the same purpose and target replaces the live
+/// one (per request for `approve`, shared by all approvers; per uid for the
+/// others). At most 32 are live, 4 per uid: over that is `busy`.
+///
+/// A `TouchRequest` is `{rp_id, challenge (hex), allow (base64url
+/// credential ids; empty: any device), uv, summary, short_code}`: what the
+/// client asks the device for.
+///
+/// - `{purpose: "approve", request}`: an approver (personal mode: the own
+///   user), for a pending request whose effective class needs a touch.
+///   Answers a `TouchRequest` (`allow`: the caller's own devices) plus
+///   `{expires_at, class}` (`class` is the effective touch class). A
+///   request id that is no u64, an unknown or invisible request, one not
+///   pending, or one that needs no touch is `bad_request`; no approver is
+///   `forbidden`; no device enrolled for the caller is refused
+///   (`touch_unavailable`, an `approval`/`refused` record); approvals
+///   unavailable is `unavailable`.
+/// - `{purpose: "enrol", label}`: answers an `EnrolRequest` `{rp_id,
+///   rp_name, user_id (base64url of the uid, 4 bytes big-endian),
+///   user_name, challenge (hex), exclude (base64url ids of every device
+///   enrolled on this machine)}` plus `{touch, approve_with?, expires_at}`.
+///   `touch` is the `TouchRequest` the *new* device answers (its `proof`,
+///   `allow` empty, `uv` true); `approve_with`, present only when the
+///   caller already has a device, is the `TouchRequest` one of those
+///   answers (its `approval`, `allow` its devices). All three carry the
+///   same challenge. A label that is no string or fails the label rules
+///   is `bad_request`.
+/// - `{purpose: "remove", credential}`: `credential` is the base64url id of
+///   one of the caller's own devices (else `bad_request`). Answers a
+///   `TouchRequest` (`allow`: all the caller's devices; the challenge names
+///   `credential`) plus `{expires_at}`; no `class`.
+/// - `{purpose: "test"}`: answers a `TouchRequest` (`allow`: the caller's
+///   devices) plus `{expires_at}`; no `class`. No device enrolled is
+///   refused (`touch_unavailable`, nothing recorded).
+///
+/// Every purpose but `approve` (and an unknown purpose, then
+/// `bad_request`) needs root, an `[admin] groups` member or an approver
+/// (personal mode: the own user), else `forbidden`, checked first.
+///
+/// Error rules of the touch ops: a refusal is `forbidden` with `rule` one
+/// of `touch_unavailable` (no device, no assertion sent, or the touch
+/// files cannot be written), `touch_failed` (no live challenge, expired,
+/// bad signature, no UV where needed, a replayed counter, malformed) or
+/// `touch_mismatch` (for another action, uid, device or origin, or a
+/// device not enrolled for the caller). A malformed argument is
+/// `bad_request` and spends no challenge. `touch.enrol` and
+/// `touch.remove` refusals after the argument checks write a `touch`
+/// record `{action: "touch_failed", op, rule, reason}`; `touch.check` and
+/// `touch.begin {purpose: "test"}` record nothing. Machine local only: a
+/// link transport must not route these ops.
+pub const OP_TOUCH_BEGIN: &str = "touch.begin";
+/// Finishes an enrolment: `{label, auth_data, proof, approval?}`.
+/// `auth_data` is the base64url attestation authData of the new device
+/// (AT set); `proof` the new device's `Assertion` over the challenge
+/// (`touch` of the enrol answer; UV needed); `approval` an `Assertion` of
+/// one of the caller's own devices over the same challenge
+/// (`approve_with`), needed when the caller already has a device. The
+/// caller's live enrol challenge is spent in every case, and must name the
+/// same `label`. Answers `{id, label, approved_by}`: `id` the new base64url
+/// credential id, `approved_by` the approving device's base64url id or
+/// `"host"` (the first device: host access is the proof). A
+/// `touch_enrolled` record is written first; if it cannot be, the device
+/// is removed again and the answer is `unrecorded`. A missing label, bad
+/// base64url, or a `proof` / `approval` that is no `Assertion` is
+/// `bad_request`. Refusals (`forbidden` with `rule`, recorded): no live
+/// challenge or expired (`touch_failed`), another label (`touch_mismatch`),
+/// an unparsable attestation, a failed proof (no UV: `touch_failed`), a
+/// device enrolled already (`touch_failed`), no `approval` when one is
+/// needed (`touch_unavailable`), an approval by a device not the caller's
+/// (`touch_mismatch`), 16 devices already or unwritable files
+/// (`touch_failed`).
+pub const OP_TOUCH_ENROL: &str = "touch.enrol";
+/// Removes an enrolled device: `{credential, assertion?, host?}`.
+/// `credential` is a base64url credential id; `host` a boolean; anything
+/// else is `bad_request`. Without `host`: `credential` must be one of the
+/// caller's own devices (else `bad_request`), and `assertion` is the
+/// answer of one of them to `touch.begin {purpose: "remove", credential}`;
+/// without it the removal is refused (`touch_unavailable`). The caller's
+/// live remove challenge is spent whatever the outcome, and a challenge
+/// that names another device is `touch_mismatch`. `host: true` (recovery
+/// when every device is lost) is root only (else `forbidden`, nothing
+/// recorded) and removes any uid's device without a touch. Answers `{id,
+/// label, approved_by}`: the touching device's base64url id, or `"root"`.
+/// A `touch_removed` record is written first; if it cannot be, the device
+/// is restored and the answer is `unrecorded`.
+pub const OP_TOUCH_REMOVE: &str = "touch.remove";
+/// Lists enrolled devices: `{all?}` (a boolean, else `bad_request`). The
+/// caller's own devices, or with `all: true` (root or an admin only, else
+/// `forbidden`) every device on the machine. Answers `{credentials: [{id,
+/// label, kind, alg, rp_id, created, sign_count, owner_uid}]}`: `id`
+/// base64url, `kind` `"fido2"` or `"webauthn"`, `alg` `"es256"` or
+/// `"ed25519"`, `created` a UTC timestamp
+/// (`2026-11-11T09:30:00.000Z`). Never the public key. Touch files that
+/// cannot be read list nothing.
+pub const OP_TOUCH_LIST: &str = "touch.list";
+/// Checks a test touch: `{assertion}`, the answer to `touch.begin
+/// {purpose: "test"}` (missing or no `Assertion`: `bad_request`). Spends
+/// the caller's live test challenge, verifies the assertion against the
+/// caller's devices with UV and saves the counter. Answers `{label, uv,
+/// sign_count}`; a refusal is `forbidden` with `rule`. Nothing is
+/// recorded.
+pub const OP_TOUCH_CHECK: &str = "touch.check";
 /// The managed hook, for a call a `[guard] ask` rule denied: use up the
 /// caller's grant for it. `{rec}` (the guard record it will send; the
 /// daemon computes the key from the peer uid and `agent`, `project`,
@@ -93,6 +210,123 @@ pub const OP_HOOK_BEGIN: &str = "hook.begin";
 /// same call with its own optional `tool_use_id` and `input_sha256`
 /// arguments beside `rec`; the daemon never writes those two.
 pub const OP_HOOK_BIND: &str = "hook.bind";
+
+// Workspace (plan 29)
+/// The Workspace link's socket, beside [`SOCKET_NAME`]; served by the daemon
+/// for the user's `saiife workspace serve` process only.
+pub const LINK_SOCKET_NAME: &str = "link.sock";
+/// Control socket, machine side (CLI): start a pairing. `{label?}` ->
+/// `{pair_id, fragment, machine_id, expires_at}`.
+pub const OP_WORKSPACE_PAIR_BEGIN: &str = "workspace.pair.begin";
+/// Control socket: where a pairing stands. `{pair_id}` -> the `PairStatus`
+/// JSON of saiife-wire.
+pub const OP_WORKSPACE_PAIR_STATUS: &str = "workspace.pair.status";
+/// Control socket: the machine owner accepts or rejects a pairing.
+/// `{pair_id, accept: bool, auth?}` -> `{device_id, state}` (`auth` as in
+/// [`OP_APPROVAL_DECIDE`]).
+pub const OP_WORKSPACE_PAIR_CONFIRM: &str = "workspace.pair.confirm";
+/// Control socket: the paired devices. `{}` -> `{devices: [Device without
+/// public_key]}`.
+pub const OP_WORKSPACE_DEVICES: &str = "workspace.devices";
+/// Control socket: revoke a device. `{device_id, auth?}` -> `{device_id,
+/// state: "revoked"}`.
+pub const OP_WORKSPACE_REVOKE: &str = "workspace.revoke";
+/// link.sock only: what a device needs to pair and seal. `{}` ->
+/// `{machine_id, machine_pub, epoch, frame_version: 1}`.
+pub const OP_WORKSPACE_HELLO: &str = "workspace.hello";
+/// link.sock only: a device's pairing request (the `PairRequest` fields) ->
+/// `{device_id, short_code}`.
+pub const OP_WORKSPACE_PAIR_FINISH: &str = "workspace.pair.finish";
+/// link.sock only: one signed frame. `{body, sig, touch?, via: "local"|"hub",
+/// channel_device?}` -> `{result}`. `channel_device` is the device id the hub
+/// seal channel was opened for; required for `via` = `hub`. The daemon reads
+/// the action out of `body` and decides by `saiife_wire::level_for`.
+pub const OP_WORKSPACE_FRAME: &str = "workspace.frame";
+/// link.sock only: the machine key signs for the link. `{purpose: "seal",
+/// data: b64u (session_id ‖ machine_eph), device_id | pair_id}` (exactly one;
+/// signed as `saiife_wire::seal::machine_hello_msg`) or `{purpose:
+/// "hub_hello", data: b64u (nonce ‖ machine_id)}` -> `{sig: b64u,
+/// device_pub?: b64u}`. `device_pub` is only given for a `seal` with
+/// `device_id`.
+pub const OP_WORKSPACE_SIGN: &str = "workspace.sign";
+// Frame actions, dispatched inside `workspace.frame` (level from
+// `saiife_wire::level_for`, names equal `saiife_wire::level::actions`).
+pub const OP_BOX_OVERVIEW: &str = "box.overview";
+pub const OP_BOX_LIST: &str = "box.list";
+pub const OP_BOX_DIFF: &str = "box.diff";
+pub const OP_BOX_TERM_READ: &str = "box.term.read";
+pub const OP_BOX_STOP: &str = "box.stop";
+pub const OP_BOX_PAUSE: &str = "box.pause";
+pub const OP_BOX_RESUME: &str = "box.resume";
+pub const OP_BOX_DISCARD: &str = "box.discard";
+pub const OP_BOX_REORDER: &str = "box.reorder";
+pub const OP_BOX_STEER: &str = "box.steer";
+pub const OP_BOX_REVISE: &str = "box.revise";
+pub const OP_BOX_LAND: &str = "box.land";
+pub const OP_BOX_PUSH: &str = "box.push";
+pub const OP_BOX_PR: &str = "box.pr";
+pub const OP_BOX_SPAWN: &str = "box.spawn";
+pub const OP_BOX_TEMPLATES: &str = "box.templates";
+pub const OP_BOX_INBOX: &str = "box.inbox";
+/// `saiife box done` (control socket, machine local): `{box}` -> `{box: BoxInfo}`.
+/// (A per-box op names its box `box`: the frame's own `id` is the request's.)
+/// A Running box becomes Done.
+pub const OP_BOX_DONE: &str = "box.done";
+/// Removes discarded boxes and orphan box dirs (control socket, machine
+/// local): `{}` -> `{removed: [id]}`. Root or an admin removes every one;
+/// anyone else only their own discarded boxes.
+pub const OP_BOX_GC: &str = "box.gc";
+// Land and push (plan 39), control socket, machine local. The box is always
+// the `box` argument; request ids are decimal strings. `box.land` (a remote
+// frame action as well, above) is `{request_id, assertion}` -> `{land}`
+// followed by one fd byte carrying `lands/<n>/delta.bin`; `box.push` is
+// `{request_id, assertion}` -> `{}`.
+/// `{box, files?: [path]}` -> `{request_id, touch, expires_at, review, diff}`.
+pub const OP_BOX_LAND_BEGIN: &str = "box.land.begin";
+/// `{request_id}` -> `{}`.
+pub const OP_BOX_LAND_REJECT: &str = "box.land.reject";
+/// `{box, n}` (an approved, unapplied land) -> `{land}` + the delta fd.
+pub const OP_BOX_LAND_FETCH: &str = "box.land.fetch";
+/// `{box, n, commit}` -> `{}`.
+pub const OP_BOX_LAND_APPLIED: &str = "box.land.applied";
+/// `{box, remote, commit}` -> `{request_id, touch, expires_at}`.
+pub const OP_BOX_PUSH_BEGIN: &str = "box.push.begin";
+/// `{request_id, ok, detail}` -> `{}`.
+pub const OP_BOX_PUSH_DONE: &str = "box.push.done";
+/// The ops whose `ok` answer is followed by one fd byte (`fdpass::FD_BYTE`)
+/// carrying exactly one descriptor: read it with
+/// `client::Client::call_recv_fds`.
+pub const FD_ANSWER_OPS: &[&str] = &[OP_BOX_LAND, OP_BOX_LAND_FETCH];
+/// Control socket only, machine local (plan 37): `{n}` -> `{}`. The frame is
+/// followed at once by one byte, `fdpass::FD_BYTE`, carrying `n` (1 to
+/// `fdpass::MAX_FDS`) descriptors, which the connection keeps for its next
+/// request. Only an op in [`FD_OPS`] takes them; any other op closes them.
+/// A second `box.fds` while descriptors are kept is `bad_request`.
+pub const OP_BOX_FDS: &str = "box.fds";
+/// The box base images (plan 36; control socket, machine local). None of
+/// them takes or answers an `id` key: the frame's own `id` is the request's.
+/// `{}` -> `{images: [Manifest + {default: bool, in_use: [box id]}],
+/// warnings: [string]}`. Any local peer.
+pub const OP_BOX_IMAGE_LS: &str = "box.image.ls";
+/// `{manifest, default?}`, after a `box.fds` of `[raw, kernel?]` ->
+/// `{image}`. Root or an `[admin]` member (locked); the daemon's own user
+/// (personal).
+pub const OP_BOX_IMAGE_IMPORT: &str = "box.image.import";
+/// `{image}` -> `{}`: makes an image in the store the default.
+pub const OP_BOX_IMAGE_DEFAULT: &str = "box.image.default";
+/// `{image}` -> `{}`: removes an image no box names and that is not the
+/// default.
+pub const OP_BOX_IMAGE_RM: &str = "box.image.rm";
+/// The ops that take the descriptors of the `box.fds` just before them.
+pub const FD_OPS: &[&str] = &[OP_BOX_SPAWN, OP_BOX_IMAGE_IMPORT];
+/// The only ops link.sock answers; every other name is `unknown_op`.
+pub const LINK_OPS: &[&str] = &[
+    OP_HELLO,
+    OP_WORKSPACE_HELLO,
+    OP_WORKSPACE_PAIR_FINISH,
+    OP_WORKSPACE_FRAME,
+    OP_WORKSPACE_SIGN,
+];
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
@@ -240,6 +474,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ops_constants_documented() {
+        assert_eq!(OP_TOUCH_BEGIN, "touch.begin");
+        assert_eq!(OP_TOUCH_ENROL, "touch.enrol");
+        assert_eq!(OP_TOUCH_REMOVE, "touch.remove");
+        assert_eq!(OP_TOUCH_LIST, "touch.list");
+        assert_eq!(OP_TOUCH_CHECK, "touch.check");
+    }
+
+    #[test]
     fn err_with_adds_fields_but_keeps_the_shape() {
         let mut x = serde_json::Map::new();
         x.insert("rule".into(), json!("no_scope"));
@@ -253,6 +496,18 @@ mod tests {
             serde_json::to_value(ErrorCode::UpstreamFailed).unwrap(),
             "upstream_failed"
         );
+    }
+
+    #[test]
+    fn link_ops_are_few() {
+        assert_eq!(LINK_OPS.len(), 5);
+        for op in LINK_OPS {
+            assert!(
+                !op.starts_with("workspace.pair.") || *op == OP_WORKSPACE_PAIR_FINISH,
+                "{op}"
+            );
+        }
+        assert_eq!(LINK_SOCKET_NAME, "link.sock");
     }
 
     #[test]

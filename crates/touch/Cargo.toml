@@ -1,0 +1,26 @@
+[package]
+name = "saiife-touch"
+description = "saiife touch approvals: action-bound FIDO2 and WebAuthn assertions, verified on ring."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_touch"
+path = "src/lib.rs"
+
+[features]
+soft = []
+
+[dependencies]
+ring = "=0.17.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "=0.23.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

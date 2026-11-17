@@ -19,6 +19,8 @@ pub struct Opts {
     pub user: Option<String>,
     /// TOML appended to the config (e.g. `[guard]\nbogus = 1\n`).
     pub extra: String,
+    /// Extra environment for the daemon process (e.g. `SAIIFE_BOX_FAKE_VMM`).
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for Opts {
@@ -28,6 +30,7 @@ impl Default for Opts {
             checkpoint_interval: "15m".into(),
             user: None,
             extra: String::new(),
+            env: Vec::new(),
         }
     }
 }
@@ -160,7 +163,12 @@ impl TestDaemon {
     /// Prepare, spawn and wait (at most 5 s) for the socket.
     pub fn start(opts: Opts) -> TestDaemon {
         let mut d = TestDaemon::prepare(&opts);
-        d.spawn_and_wait();
+        let env: Vec<(&str, &str)> = opts
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        d.spawn_and_wait_with(&env);
         d
     }
 
@@ -225,6 +233,12 @@ impl TestDaemon {
             // Many test daemons run at once: each binds its co-signer on
             // a free port, not the fixed 127.0.0.1:7433.
             .env("SAIIFE_TEST_COSIGN_ADDR", "127.0.0.1:0")
+            // I-C / M-2 (debug-only seams): a `boxes` build's locked box
+            // layout is re-rooted here and the KVM device is a path here,
+            // so no test daemon reads the host's install or `/dev/kvm`, nor
+            // reaches the system bus.
+            .env("SAIIFE_TEST_BOX_ROOT", self.path().join("box-root"))
+            .env("SAIIFE_TEST_KVM", self.path().join("kvm"))
             .env_remove("NOTIFY_SOCKET")
             .env_remove("STATE_DIRECTORY")
             .env_remove("CREDENTIALS_DIRECTORY")

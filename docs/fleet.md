@@ -17,6 +17,9 @@ The package owns these paths:
 - `/usr/libexec/saiife/saiife`, the staging copy of the binary;
 - the directory it is in;
 - `/usr/bin/saiife`, a symlink to the staging copy;
+- `/usr/libexec/saiife/saiife-fido`, the FIDO helper for key support (it needs
+  libc 2.31 or newer and libudev: the deb depends on `libc6 (>= 2.31)` and
+  `libudev1`, the rpm requires glibc 2.31 and `libudev.so.1()(64bit)`);
 - docs under `/usr/share/doc/saiife/`.
 
 It ships nothing under `/opt/saiife`, `/etc`, `/var`, `/run` or

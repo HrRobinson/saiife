@@ -25,6 +25,7 @@ PHASES="${PHASES:-fresh upgrade remove signature}"
 OUT=/tmp/p18-t3-rpm
 mkdir -p "$OUT"
 PKG_BIN=/usr/libexec/saiife/saiife
+FIDO_BIN=/usr/libexec/saiife/saiife-fido
 REFUSAL='locked mode is not supported here'
 REMOVAL='saiife: removing the package uninstalls locked mode'
 
@@ -67,6 +68,15 @@ phase_fresh() {
     cat "$OUT/files.txt"
     grep -qx -- "-rwxr-xr-x root root $PKG_BIN" "$OUT/files.txt" || fail "$PKG_BIN is not 0755 root:root in the rpm"
     ok "$PKG_BIN is 0755 root:root"
+    grep -qx -- "-rwxr-xr-x root root $FIDO_BIN" "$OUT/files.txt" || fail "$FIDO_BIN is not 0755 root:root in the rpm"
+    if ! { [ -f "$FIDO_BIN" ] && [ ! -L "$FIDO_BIN" ]; }; then fail "$FIDO_BIN is not a regular file"; fi
+    # EOF on stdin after the hello line proves the loader, glibc and libudev
+    # resolve; the helper touches no key.
+    hello="$("$FIDO_BIN" </dev/null)" || fail "$FIDO_BIN </dev/null did not exit 0"
+    if ! { [ "$(printf '%s\n' "$hello" | wc -l)" -eq 1 ] && printf '%s\n' "$hello" | grep -Eq '^\{"t":"hello","proto":1,'; }; then
+        fail "$FIDO_BIN printed no single hello line: $hello"
+    fi
+    ok "$FIDO_BIN is 0755 root:root and prints its hello"
     [ ! -e /opt/saiife ] || fail "/opt/saiife exists in a container"
     [ ! -e /etc/systemd/system/saiifed.service ] || fail "the unit exists in a container"
     ok "no /opt/saiife and no unit"
@@ -102,7 +112,7 @@ phase_remove() {
     has "$OUT/remove.out" 'nothing to uninstall' || fail "dnf remove output lacks 'nothing to uninstall'"
     ok "prerm found nothing to uninstall"
     if rpm -q saiife >/dev/null 2>&1; then fail "rpm still knows saiife"; fi
-    [ ! -e "$PKG_BIN" ] && [ ! -L /usr/bin/saiife ] && [ ! -e /usr/libexec/saiife ] || fail "the payload is not gone"
+    [ ! -e "$PKG_BIN" ] && [ ! -e "$FIDO_BIN" ] && [ ! -L /usr/bin/saiife ] && [ ! -e /usr/libexec/saiife ] || fail "the payload is not gone"
     ok "the payload is gone"
 }
 

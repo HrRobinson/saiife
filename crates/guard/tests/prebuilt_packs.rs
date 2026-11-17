@@ -78,3 +78,34 @@ fn first_use_regexes_judge_every_corpus_case_alike() {
     }
     assert!(judged > 3000, "{judged}");
 }
+
+/// The box profile leaves out only a user rule marked `where = "host"`: every
+/// rule of every built-in pack is kept.
+#[test]
+fn builtins_keep_every_rule_in_box_profile() {
+    use saiifeguard::profile::Profile;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|x| x != "toml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let load = |profile| {
+            let mut w = Vec::new();
+            let p =
+                saiifeguard::pack::load_pack_in("<t>", &text, PathStyle::Windows, profile, &mut w)
+                    .unwrap();
+            p.rule_count()
+        };
+        assert_eq!(
+            load(Profile::Host),
+            load(Profile::Box),
+            "{}",
+            path.display()
+        );
+        seen += 1;
+    }
+    assert!(seen > 5, "{seen}");
+}

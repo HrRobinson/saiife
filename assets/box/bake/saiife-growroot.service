@@ -1,0 +1,11 @@
+[Unit]
+Description=Grow the root partition and filesystem to the disk
+After=systemd-remount-fs.service
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/growpart /dev/vda 1
+ExecStart=/usr/sbin/resize2fs /dev/vda1
+
+[Install]
+WantedBy=multi-user.target

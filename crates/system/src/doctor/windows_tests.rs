@@ -98,6 +98,8 @@ impl Env {
             // The fixture has no import the real allowlist would refuse; a test that wants
             // a refused binary swaps the file afterwards.
             allow_test_build: false,
+            boxes: false,
+            vmm_dir: None,
         };
         let lock = lock_install(&self.layout, &self.host).unwrap();
         let began = std::cell::Cell::new(false);
@@ -126,6 +128,7 @@ impl Env {
             &DoctorOptions {
                 user: user.map(str::to_string),
                 home: None,
+                ..Default::default()
             },
         )
     }

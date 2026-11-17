@@ -1,0 +1,13 @@
+[Unit]
+Description=saiife guest init (hello, setup, the agent on a PTY, events)
+After=local-fs.target saiife-events.service saiife-control.service
+# R22: refused hellos and init restarts must never leave the unit failed.
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/saiife __guest init
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

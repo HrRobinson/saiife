@@ -136,6 +136,7 @@ fn an_expired_request(t: &Tree) -> u64 {
         grant_key: None,
         scope: None,
         ask_rule: None,
+        touch_class: None,
         send: Default::default(),
     };
     let long_ago = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -566,6 +567,7 @@ fn builtin_catalog() -> Vec<saiife_policy::PackInfo> {
             version: p.version,
             default_on: p.default_on,
             rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+            sha256: None,
         })
         .collect()
 }

@@ -23,6 +23,52 @@ pub enum RulePlatform {
     Windows,
 }
 
+/// `where` of a user rule: which profile it is in force in. A value not listed
+/// here fails the pack's load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleWhere {
+    /// Only on the host, not inside a box.
+    Host,
+    /// On the host and inside a box.
+    Everywhere,
+}
+
+/// Where a user rule was imported from: a line of a file, pinned by its hash.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSource {
+    pub file: Str,
+    pub line: u32,
+    pub line_sha256: Str,
+}
+
+/// The file a user pack was imported from, pinned by its hash.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawImport {
+    pub file: Str,
+    pub sha256: Str,
+}
+
+/// Why a line of an imported file has no rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnenforcedWhy {
+    Judgement,
+    Skipped,
+    Unverified,
+}
+
+/// A line of an imported file that no rule enforces.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawUnenforced {
+    pub source: RawSource,
+    pub text: Str,
+    pub why: UnenforcedWhy,
+}
+
 /// How a command reads its operands as patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +107,12 @@ pub struct RawPackFile {
     pub allow_path: List<RawPathRule>,
     #[serde(default)]
     pub deny_path: List<RawPathRule>,
+    /// User packs only (`build.rs` refuses it in a built-in pack).
+    #[serde(default)]
+    pub import: Option<RawImport>,
+    /// User packs only.
+    #[serde(default)]
+    pub unenforced: List<RawUnenforced>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -127,6 +179,15 @@ pub struct RawRule {
     pub operand_substitution: bool,
     #[serde(default)]
     pub no_redirections: bool,
+    /// User packs only: the profile the rule is in force in.
+    #[serde(default, rename = "where")]
+    pub where_: Option<RuleWhere>,
+    /// User packs only: the imported line the rule came from.
+    #[serde(default)]
+    pub source: Option<RawSource>,
+    /// User packs only: a deny that is a request to approve, not a block.
+    #[serde(default)]
+    pub ask: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -141,6 +202,44 @@ pub struct RawPathRule {
     pub reason: Option<Str>,
     #[serde(default)]
     pub ancestors: bool,
+    /// User packs only (see [`RawRule::where_`]).
+    #[serde(default, rename = "where")]
+    pub where_: Option<RuleWhere>,
+    /// User packs only (see [`RawRule::source`]).
+    #[serde(default)]
+    pub source: Option<RawSource>,
+}
+
+/// The first user-pack-only key a rule sets: a built-in pack may set none.
+#[allow(dead_code)] // used by build.rs, which includes this file
+pub fn user_key_in_builtin(r: &RawRule) -> Option<&'static str> {
+    if r.where_.is_some() {
+        Some("where")
+    } else if r.source.is_some() {
+        Some("source")
+    } else if r.ask {
+        Some("ask")
+    } else {
+        None
+    }
+}
+
+/// [`user_key_in_builtin`] for a path rule.
+#[allow(dead_code)] // used by build.rs, which includes this file
+pub fn user_key_in_builtin_path(r: &RawPathRule) -> Option<&'static str> {
+    if r.where_.is_some() {
+        Some("where")
+    } else if r.source.is_some() {
+        Some("source")
+    } else {
+        None
+    }
+}
+
+/// What the build says of a built-in pack that sets a user-pack key.
+#[allow(dead_code)] // used by build.rs, which includes this file
+pub fn user_key_refusal(source: &str, key: &str) -> String {
+    format!("{source}: {key} is a user-pack key; built-in packs may not use it")
 }
 
 fn default_access() -> RuleAccess {
@@ -153,4 +252,36 @@ fn default_true() -> bool {
 
 fn default_version() -> u32 {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(extra: &str) -> RawRule {
+        toml::from_str(&format!("pattern = 'x'\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn user_keys_in_a_builtin_are_named() {
+        assert_eq!(user_key_in_builtin(&rule("")), None);
+        assert_eq!(
+            user_key_in_builtin(&rule("where = \"host\"")),
+            Some("where")
+        );
+        assert_eq!(user_key_in_builtin(&rule("ask = true")), Some("ask"));
+        let src = "source = { file = \"f\", line = 1, line_sha256 = \"a\" }";
+        assert_eq!(user_key_in_builtin(&rule(src)), Some("source"));
+        let p: RawPathRule = toml::from_str(
+            "glob = '/x'\nwhere = \"box\""
+                .replace("box", "everywhere")
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(user_key_in_builtin_path(&p), Some("where"));
+        assert_eq!(
+            user_key_refusal("core.toml", "ask"),
+            "core.toml: ask is a user-pack key; built-in packs may not use it"
+        );
+    }
 }

@@ -38,6 +38,23 @@ pub enum Refusal {
     ReauthBusy,
     /// A recent re-authentication failed: seconds left before the next.
     ReauthCooldown(u64),
+    /// A touch assertion was refused (expired, replayed, bad signature ...).
+    TouchFailed(String),
+    /// No device or no live challenge: never falls back to a password.
+    TouchUnavailable(String),
+    /// A valid assertion for something else, or by an unknown device.
+    TouchMismatch(String),
+}
+
+impl From<saiife_touch::TouchError> for Refusal {
+    fn from(e: saiife_touch::TouchError) -> Self {
+        let d = e.to_string();
+        match e.rule() {
+            "touch_unavailable" => Refusal::TouchUnavailable(d),
+            "touch_mismatch" => Refusal::TouchMismatch(d),
+            _ => Refusal::TouchFailed(d),
+        }
+    }
 }
 
 impl Refusal {
@@ -51,6 +68,9 @@ impl Refusal {
             Refusal::ReauthError(_) => "reauth_error",
             Refusal::ReauthBusy => "reauth_busy",
             Refusal::ReauthCooldown(_) => "reauth_cooldown",
+            Refusal::TouchFailed(_) => "touch_failed",
+            Refusal::TouchUnavailable(_) => "touch_unavailable",
+            Refusal::TouchMismatch(_) => "touch_mismatch",
         }
     }
 }
@@ -74,6 +94,9 @@ impl fmt::Display for Refusal {
             Refusal::ReauthCooldown(s) => {
                 write!(f, "a recent re-authentication failed; try again in {s} s")
             }
+            Refusal::TouchFailed(d) => write!(f, "touch failed: {d}"),
+            Refusal::TouchUnavailable(d) => write!(f, "touch unavailable: {d}"),
+            Refusal::TouchMismatch(d) => write!(f, "touch mismatch: {d}"),
         }
     }
 }
@@ -142,6 +165,54 @@ impl<'a> From<(u32, Option<&'a str>)> for Requester<'a> {
     }
 }
 
+/// How an approver stands to a request, once they are known to be the
+/// peer's own account and listed: the requester or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Other,
+    SameUser,
+}
+
+/// The identity checks of [`may_decide`], without any re-authentication, so
+/// the CLI's decision and the Workspace's (a UV touch stands in for the
+/// re-authentication there) cannot differ: the looked-up name is the peer's
+/// own account, the peer is listed, and whether the peer is the requester.
+/// A requester with a SID against a peer with none (its SID could not be
+/// resolved) counts as the same user: unknown is never "someone else".
+pub fn approver_standing<'r>(
+    cfg: &ApprovalCfg,
+    dir: &dyn Directory,
+    approver_user: &str,
+    requester: impl Into<Requester<'r>>,
+    peer: &PeerCred,
+) -> Result<Standing, Refusal> {
+    let requester = requester.into();
+    let approver_uid = peer.uid;
+    // The name was looked up from this peer. On Windows that is by SID, and an elevated
+    // admin's uid label is 0 whatever its name's label is, so the SIDs are compared.
+    let same_account = match peer.sid.as_deref() {
+        Some(sid) => dir.sid_of(approver_user).as_deref() == Some(sid),
+        None => dir.user(approver_user).map(|u| u.uid) == Some(approver_uid),
+    };
+    if !same_account {
+        return Err(Refusal::ReauthError(MISMATCH.to_string()));
+    }
+    if !peer_is_listed(cfg, dir, approver_user, peer) {
+        return Err(Refusal::NotApprover);
+    }
+    let same = crate::ops::same_principal(
+        approver_uid,
+        peer.sid.as_deref(),
+        requester.uid,
+        requester.sid,
+    ) || (requester.sid.is_some() && peer.sid.is_none());
+    Ok(if same {
+        Standing::SameUser
+    } else {
+        Standing::Other
+    })
+}
+
 /// May the CLI connected as `peer` decide a request made by
 /// `requester_uid`? The approver's uid is `peer.uid`. Every error refuses
 /// (fail closed).
@@ -182,24 +253,7 @@ pub fn may_decide<'r>(
 ) -> Result<(), Refusal> {
     let requester = requester.into();
     let approver_uid = peer.uid;
-    // The name was looked up from this peer. On Windows that is by SID, and an elevated
-    // admin's uid label is 0 whatever its name's label is, so the SIDs are compared.
-    let same_account = match peer.sid.as_deref() {
-        Some(sid) => dir.sid_of(approver_user).as_deref() == Some(sid),
-        None => dir.user(approver_user).map(|u| u.uid) == Some(approver_uid),
-    };
-    if !same_account {
-        return Err(Refusal::ReauthError(MISMATCH.to_string()));
-    }
-    if !peer_is_listed(cfg, dir, approver_user, peer) {
-        return Err(Refusal::NotApprover);
-    }
-    if !crate::ops::same_principal(
-        approver_uid,
-        peer.sid.as_deref(),
-        requester.uid,
-        requester.sid,
-    ) {
+    if approver_standing(cfg, dir, approver_user, requester, peer)? == Standing::Other {
         return Ok(());
     }
     match cfg.same_user {
@@ -268,6 +322,24 @@ mod requester_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn touch_refusal_rules() {
+        use saiife_touch::TouchError;
+        let m = Refusal::from(TouchError::UnknownCredential);
+        assert_eq!(m.rule(), "touch_mismatch");
+        assert_eq!(
+            m.to_string(),
+            "touch mismatch: this device is not enrolled for you"
+        );
+        assert_eq!(Refusal::from(TouchError::Expired).rule(), "touch_failed");
+        assert!(Refusal::from(TouchError::Expired)
+            .to_string()
+            .starts_with("touch failed: "));
+        let u = Refusal::from(TouchError::Unavailable);
+        assert_eq!(u.rule(), "touch_unavailable");
+        assert!(u.to_string().starts_with("touch unavailable: "));
+    }
     use super::*;
     use crate::sessions::ProcStat;
     use saiife_policy::FixedDirectory;

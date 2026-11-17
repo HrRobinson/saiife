@@ -404,7 +404,20 @@ impl Client {
         daemon_uid: u32,
         deadline: Instant,
     ) -> Result<Client, ClientError> {
-        let sock = socket_dir.join(SOCKET_NAME);
+        Client::connect_named(socket_dir, SOCKET_NAME, daemon_uid, deadline)
+    }
+
+    /// As [`Client::connect`] for another socket of the daemon in `socket_dir`
+    /// (`name` is a file name such as [`crate::msg::LINK_SOCKET_NAME`]), with
+    /// the same owner and peer checks.
+    #[cfg(unix)]
+    pub fn connect_named(
+        socket_dir: &Path,
+        name: &str,
+        daemon_uid: u32,
+        deadline: Instant,
+    ) -> Result<Client, ClientError> {
+        let sock = socket_dir.join(name);
         check_owner(socket_dir, &sock, daemon_uid)?;
         let stream = connect_by(&sock, deadline)?;
         // Closes the check-then-connect race: whoever answers must be the daemon.
@@ -507,12 +520,131 @@ impl Client {
         r
     }
 
+    /// As [`Client::call`], with `fds` (1 to [`crate::fdpass::MAX_FDS`])
+    /// passed for this one call: `box.fds {n}` and the descriptors go first,
+    /// and only once the daemon has taken them is the request sent. The
+    /// deadline bounds the whole, the descriptors' send included. A refused
+    /// `box.fds` is returned as the error and the request is not sent.
+    #[cfg(unix)]
+    pub fn call_with_fds(
+        &mut self,
+        op: &str,
+        args: Map<String, Value>,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        deadline: Instant,
+    ) -> Result<Map<String, Value>, ClientError> {
+        self.usable()?;
+        if fds.is_empty() || fds.len() > crate::fdpass::MAX_FDS {
+            return Err(ClientError::Protocol(format!(
+                "box.fds passes 1 to {} descriptors, not {}",
+                crate::fdpass::MAX_FDS,
+                fds.len()
+            )));
+        }
+        if !matches!(self.stream, Transport::Unix(_)) {
+            return Err(ClientError::Protocol(
+                "descriptors pass over a unix socket only".into(),
+            ));
+        }
+        let mut n = Map::new();
+        n.insert("n".into(), Value::from(fds.len()));
+        let send = |t: &mut Transport| -> Result<(), ClientError> {
+            // One arm outside tests: the pipe transport is a test double here.
+            #[allow(clippy::infallible_destructuring_match)]
+            let s = match t {
+                Transport::Unix(s) => s,
+                #[cfg(test)]
+                Transport::Pipe(_) => {
+                    return Err(ClientError::Protocol("not a unix socket".into()))
+                }
+            };
+            let left = remaining(deadline).ok_or(ClientError::Timeout)?;
+            s.set_write_timeout(Some(left))
+                .map_err(|e| ClientError::Frame(FrameError::Io(e)))?;
+            crate::fdpass::send_fds(&*s, fds).map_err(|e| ClientError::from(FrameError::Io(e)))
+        };
+        let r = self.exchange_then(crate::msg::OP_BOX_FDS, n, deadline, false, send);
+        if let Err(e) = &r {
+            if !matches!(e, ClientError::Refused { .. }) || self.poisoned.is_some() {
+                self.poison(e);
+            }
+            return r;
+        }
+        self.call(op, args, deadline)
+    }
+
+    /// As [`Client::call`] for an op whose `ok` answer is followed by the fd
+    /// byte (`crate::msg::FD_ANSWER_OPS`): the descriptors that came with
+    /// it, at most `max`. A refusal has no byte after it and is returned as
+    /// the error, the connection still usable. A byte that does not come in
+    /// time, or is not the fd byte, leaves the connection unusable.
+    #[cfg(unix)]
+    pub fn call_recv_fds(
+        &mut self,
+        op: &str,
+        args: Map<String, Value>,
+        max: usize,
+        deadline: Instant,
+    ) -> Result<(Map<String, Value>, Vec<std::os::fd::OwnedFd>), ClientError> {
+        let ans = self.call(op, args, deadline)?;
+        let r = (|| {
+            // One arm outside tests: the pipe transport is a test double here.
+            #[allow(clippy::infallible_destructuring_match)]
+            let s = match &self.stream {
+                Transport::Unix(s) => s,
+                #[cfg(test)]
+                Transport::Pipe(_) => {
+                    return Err(ClientError::Protocol("not a unix socket".into()))
+                }
+            };
+            let left = remaining(deadline).ok_or(ClientError::Timeout)?;
+            s.set_read_timeout(Some(left))
+                .map_err(|e| ClientError::Frame(FrameError::Io(e)))?;
+            crate::fdpass::recv_fds(s, max).map_err(|e| ClientError::from(FrameError::Io(e)))
+        })();
+        match r {
+            Ok(fds) => Ok((ans, fds)),
+            Err(e) => {
+                self.poison(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Not on this platform: descriptors pass over a unix socket only.
+    #[cfg(windows)]
+    pub fn call_with_fds(
+        &mut self,
+        op: &str,
+        args: Map<String, Value>,
+        fds: &[std::os::windows::io::BorrowedHandle<'_>],
+        deadline: Instant,
+    ) -> Result<Map<String, Value>, ClientError> {
+        let _ = (op, args, fds, deadline);
+        Err(ClientError::Protocol(
+            "descriptors pass over a unix socket only".into(),
+        ))
+    }
+
     fn exchange(
         &mut self,
         op: &str,
         args: Map<String, Value>,
         deadline: Instant,
         keep_refusal: bool,
+    ) -> Result<Map<String, Value>, ClientError> {
+        self.exchange_then(op, args, deadline, keep_refusal, |_| Ok(()))
+    }
+
+    /// One request and its answer, with `after_write` run on the stream
+    /// between the two (the descriptors of `box.fds`).
+    fn exchange_then(
+        &mut self,
+        op: &str,
+        args: Map<String, Value>,
+        deadline: Instant,
+        keep_refusal: bool,
+        after_write: impl FnOnce(&mut Transport) -> Result<(), ClientError>,
     ) -> Result<Map<String, Value>, ClientError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -526,6 +658,7 @@ impl Client {
             deadline,
         };
         write_frame(&mut io, &req.to_value())?;
+        after_write(io.s)?;
         let ans = read_frame_max(&mut io, MAX_ANSWER_FRAME)?;
         let id_ok = ans.get("id").and_then(Value::as_u64) == Some(id);
         match ans.get("ok").and_then(Value::as_bool) {
@@ -1178,6 +1311,16 @@ mod tests {
         assert!(l.accept().is_err(), "listener must never be connected to");
     }
 
+    #[test]
+    fn connect_named_checks_the_owner() {
+        let d = dir_0755();
+        let l = UnixListener::bind(d.path().join(crate::msg::LINK_SOCKET_NAME)).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let r = Client::connect_named(d.path(), crate::msg::LINK_SOCKET_NAME, me() + 1, dl(500));
+        assert!(matches!(r, Err(ClientError::Owner { .. })), "{r:?}");
+        assert!(l.accept().is_err(), "listener must never be connected to");
+    }
+
     /// A root-owned socket dir is accepted, as the daemon accepts it (M2):
     /// the check gets past `/` to the (missing) socket.
     #[test]
@@ -1227,6 +1370,139 @@ mod tests {
         assert_eq!(a["id"], 3);
         drop(c);
         h.join().unwrap();
+    }
+
+    /// A fake daemon that takes `box.fds` as the daemon does: the byte
+    /// right after the frame, then `ok`, or `bad_request` when `refuse`.
+    /// The next request is answered with what its first descriptor reads.
+    fn fake_fds(d: &std::path::Path, refuse: bool) -> std::thread::JoinHandle<Vec<String>> {
+        let l = UnixListener::bind(d.join(SOCKET_NAME)).unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let h = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":h["id"],"ok":true,"proto":1})).unwrap();
+            let mut ops = Vec::new();
+            let mut kept = Vec::new();
+            while let Ok(m) = read_frame(&mut s) {
+                let op = m["op"].as_str().unwrap().to_string();
+                ops.push(op.clone());
+                let a = if op == crate::msg::OP_BOX_FDS {
+                    kept = crate::fdpass::recv_fds(&s, crate::fdpass::MAX_FDS).unwrap();
+                    assert_eq!(m["n"], kept.len());
+                    if refuse {
+                        kept.clear();
+                        json!({"id":m["id"],"ok":false,"error":"bad_request","message":"no"})
+                    } else {
+                        json!({"id":m["id"],"ok":true})
+                    }
+                } else {
+                    let mut text = String::new();
+                    if let Some(fd) = kept.drain(..).next() {
+                        let mut f = std::fs::File::from(fd);
+                        f.read_to_string(&mut text).unwrap();
+                    }
+                    json!({"id":m["id"],"ok":true,"text":text})
+                };
+                write_frame(&mut s, &a).unwrap();
+            }
+            ops
+        })
+    }
+
+    #[test]
+    fn call_with_fds_sends_the_fds_before_the_request() {
+        let d = dir_0755();
+        let h = fake_fds(d.path(), false);
+        let f = d.path().join("payload");
+        std::fs::write(&f, "carried").unwrap();
+        let file = std::fs::File::open(&f).unwrap();
+        let mut c = Client::connect(d.path(), me(), dl(2000)).unwrap();
+        use std::os::fd::AsFd;
+        let a = c
+            .call_with_fds("box.spawn", Map::new(), &[file.as_fd()], dl(2000))
+            .unwrap();
+        assert_eq!(a["text"], "carried");
+        // Out of range counts send nothing.
+        for n in [0, crate::fdpass::MAX_FDS + 1] {
+            let fds = vec![file.as_fd(); n];
+            let r = c.call_with_fds("box.spawn", Map::new(), &fds, dl(2000));
+            assert!(matches!(r, Err(ClientError::Protocol(_))), "{r:?}");
+        }
+        assert!(!c.is_poisoned());
+        drop(c);
+        assert_eq!(h.join().unwrap(), ["box.fds", "box.spawn"]);
+    }
+
+    /// `call_recv_fds`: the fd byte after an `ok` answer is read with its
+    /// descriptor; a refusal has none and leaves the connection usable.
+    #[test]
+    fn call_recv_fds_reads_the_fd_after_the_answer() {
+        let d = dir_0755();
+        let f = d.path().join("delta");
+        std::fs::write(&f, "delta bytes").unwrap();
+        let l = UnixListener::bind(d.path().join(SOCKET_NAME)).unwrap();
+        let fp = f.clone();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let h = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":h["id"],"ok":true,"proto":1})).unwrap();
+            // A refusal: no byte.
+            let m = read_frame(&mut s).unwrap();
+            write_frame(
+                &mut s,
+                &json!({"id":m["id"],"ok":false,"error":"bad_request","message":"no"}),
+            )
+            .unwrap();
+            // An answer and its descriptor.
+            let m = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":m["id"],"ok":true,"land":{"n":1}})).unwrap();
+            let file = std::fs::File::open(&fp).unwrap();
+            use std::os::fd::AsFd;
+            crate::fdpass::send_fds(&s, &[file.as_fd()]).unwrap();
+            // An answer and no byte: the client times out.
+            let m = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &json!({"id":m["id"],"ok":true})).unwrap();
+            let _ = read_frame(&mut s);
+        });
+        let mut c = Client::connect(d.path(), me(), dl(2000)).unwrap();
+        let r = c.call_recv_fds("box.land", Map::new(), 1, dl(2000));
+        assert!(
+            matches!(&r, Err(ClientError::Refused { code, .. }) if code == "bad_request"),
+            "{r:?}"
+        );
+        assert!(!c.is_poisoned());
+        let (a, fds) = c
+            .call_recv_fds("box.land", Map::new(), 1, dl(2000))
+            .unwrap();
+        assert_eq!(a["land"]["n"], 1);
+        assert_eq!(fds.len(), 1);
+        let mut text = String::new();
+        std::fs::File::from(fds.into_iter().next().unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "delta bytes");
+        let r = c.call_recv_fds("box.land", Map::new(), 1, dl(300));
+        assert!(r.is_err(), "{r:?}");
+        assert!(c.is_poisoned());
+        drop(c);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn refused_box_fds_sends_no_request() {
+        let d = dir_0755();
+        let h = fake_fds(d.path(), true);
+        let file = std::fs::File::open(d.path()).unwrap();
+        let mut c = Client::connect(d.path(), me(), dl(2000)).unwrap();
+        use std::os::fd::AsFd;
+        let r = c.call_with_fds("box.spawn", Map::new(), &[file.as_fd()], dl(2000));
+        assert!(
+            matches!(&r, Err(ClientError::Refused { code, .. }) if code == "bad_request"),
+            "{r:?}"
+        );
+        assert!(!c.is_poisoned());
+        drop(c);
+        assert_eq!(h.join().unwrap(), ["box.fds"]);
     }
 
     #[test]

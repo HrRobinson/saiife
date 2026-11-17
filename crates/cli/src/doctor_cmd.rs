@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 #[cfg(unix)]
 use saiife_policy::{Directory, Getent};
-use saiife_system::doctor::{self, DoctorOptions};
+use saiife_system::doctor::{self, DoctorOptions, TouchSupport};
 use saiife_system::{host_for, Layout};
 
 use crate::text::sanitize;
@@ -52,7 +52,17 @@ pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode 
     // The profile comes from the registry by SID: the environment is the caller's.
     #[cfg(windows)]
     let home = None;
-    let report = doctor::run(&layout, host.as_ref(), &dir, &DoctorOptions { user, home });
+    let report = doctor::run(
+        &layout,
+        host.as_ref(),
+        &dir,
+        &DoctorOptions {
+            user,
+            home,
+            touch: touch_support(),
+            boxes_enabled: cfg!(feature = "boxes"),
+        },
+    );
     if json {
         outln!(
             "{}",
@@ -62,6 +72,20 @@ pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode 
         out!("{}", report.to_text());
     }
     ExitCode::from(report.exit_code())
+}
+
+/// The key support the `touch-*` checks report (plan 41 Task 4).
+fn touch_support() -> TouchSupport {
+    use crate::touch_cmd::KeySupport;
+    match crate::touch_cmd::support() {
+        KeySupport::Soft | KeySupport::InProcess => TouchSupport::InProcess,
+        KeySupport::Helper { version, .. } => TouchSupport::Helper { version },
+        KeySupport::HelperBroken(why) => TouchSupport::HelperBroken(why),
+        #[cfg(target_os = "linux")]
+        KeySupport::None => TouchSupport::HelperMissing,
+        #[cfg(not(target_os = "linux"))]
+        KeySupport::None => TouchSupport::None,
+    }
 }
 
 /// The agent user to check on Windows. Elevated: `--user`, or every scoped user when it is

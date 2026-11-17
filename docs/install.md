@@ -247,6 +247,11 @@ warning. Check the files with `SHA256SUMS` and `SHA256SUMS.asc` first. See
 [Fleet install](fleet.md) for the fleet files, upgrades, removal, Ansible and
 Intune.
 
+On Linux the package also ships `/usr/libexec/saiife/saiife-fido`, the helper
+that gives the static `saiife` FIDO key support (see [Touch](touch.md#7-builds)).
+The deb depends on `libc6 (>= 2.31)` and `libudev1`; the rpm requires glibc 2.31
+and `libudev.so.1()(64bit)`.
+
 ### Check it
 
 ```sh

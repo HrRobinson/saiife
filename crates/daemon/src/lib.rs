@@ -11,6 +11,27 @@ pub mod approval_ops;
 pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
+pub mod box_images;
+// The per-box gateway: allow-listed CONNECT egress and the model port (plan 38).
+#[cfg(unix)]
+pub mod box_gateway;
+// The land book: reviews, land touch records, approvals (plan 39).
+#[cfg(unix)]
+pub mod box_land;
+pub mod box_ops;
+#[cfg(unix)]
+pub mod box_repo;
+// The guest channel's setup, the late gateway hook and the recording's
+// place for real boxes (plan 38, Task 8).
+#[cfg(unix)]
+pub mod box_setup;
+/// The system bus calls behind the locked-mode `UnitLauncher` (plan 35).
+#[cfg(target_os = "linux")]
+pub mod box_unit;
+/// The Cloud Hypervisor box driver and its audit hook (plan 35; the
+/// `boxes` feature, R38).
+#[cfg(all(target_os = "linux", feature = "boxes"))]
+pub mod box_vmm;
 pub mod cloud_ops;
 pub mod cosign;
 pub mod disk;
@@ -49,7 +70,14 @@ pub use saiife_broker::mail::smtp;
 mod start;
 pub use start::VAULT_KEY_FILE;
 pub mod tokens;
+pub mod touch;
+pub mod touch_ops;
 pub mod vault;
+pub mod workspace;
+// Workspace (plan 29): link.sock and frame execution.
+pub mod workspace_link;
+pub mod workspace_ops;
+pub mod workspace_touch;
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};

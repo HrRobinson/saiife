@@ -35,6 +35,10 @@ pub struct SystemConfig {
     pub doctor: DoctorCfg,
     #[serde(default)]
     pub gateway: GatewayCfg,
+    /// `[workspace]` (plan 31): the origins a browser may touch from. Left
+    /// out of the serialised form (and so the policy hash) while default.
+    #[serde(default, skip_serializing_if = "WorkspaceCfg::is_default")]
+    pub workspace: WorkspaceCfg,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceCfg>,
     /// `[mcp.<name>]`: gateway servers (plan 17). Locked mode only.
@@ -45,6 +49,10 @@ pub struct SystemConfig {
     pub secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     pub scope: Vec<Scope>,
+    /// `policy.d/packs/*.toml`, filled by the loader (never a config key; the
+    /// hash covers them through [`crate::PackInfo::sha256`]).
+    #[serde(skip)]
+    pub user_packs: Vec<crate::userpacks::UserPackFile>,
     #[serde(default)]
     pub example: Vec<Example>,
     /// `[environments.<name>]` (spec §6.11): overlays bound to a scope by
@@ -426,6 +434,80 @@ fn valid_name(name: &str) -> bool {
 /// `[approval] approvers` is empty.
 pub const NO_APPROVERS_WARNING: &str = "[approval] approvers is empty: nobody can approve requests";
 
+/// `[workspace]`: the web origins a Workspace touch may come from (plan 31).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCfg {
+    #[serde(default = "default_origins")]
+    pub origins: Vec<String>,
+}
+
+/// The default origin: the plan 29 UI port on localhost.
+pub fn default_origins() -> Vec<String> {
+    vec!["http://localhost:47810".to_string()]
+}
+
+impl Default for WorkspaceCfg {
+    fn default() -> Self {
+        WorkspaceCfg {
+            origins: default_origins(),
+        }
+    }
+}
+
+impl WorkspaceCfg {
+    pub fn is_default(&self) -> bool {
+        *self == WorkspaceCfg::default()
+    }
+
+    /// Each origin is `http://localhost:<1..=65535>` or `https://<host>[:port]`
+    /// with a lowercase DNS host; no path, query, userinfo or trailing slash.
+    pub fn validate(&self) -> Result<(), String> {
+        for o in &self.origins {
+            if !valid_origin(o) {
+                return Err(format!(
+                    "[workspace] origins: {o:?} is not http://localhost:<port> or https://<lowercase host>[:port]"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_port(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('0')
+        && p.len() <= 5
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+}
+
+fn valid_dns_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+fn valid_origin(o: &str) -> bool {
+    if let Some(port) = o.strip_prefix("http://localhost:") {
+        return valid_port(port);
+    }
+    let Some(rest) = o.strip_prefix("https://") else {
+        return false;
+    };
+    match rest.split_once(':') {
+        Some((host, port)) => valid_dns_host(host) && valid_port(port),
+        None => valid_dns_host(rest),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GatewayCfg {
@@ -533,9 +615,14 @@ pub enum Event {
     Lockdown,
     /// An OAuth2 refresh failed (plan 14, decision 8).
     RefreshFailed,
+    /// A box waits for a touch in the Workspace inbox (plan 31). Carries the
+    /// box id and a short code; never a link.
+    BoxWaiting,
 }
 
 impl Event {
+    /// The events sent when `[notify] on` is absent. `BoxWaiting` is not in
+    /// it: adding it would change the policy hash of every existing config.
     pub const ALL: [Event; 7] = [
         Event::ApprovalCreated,
         Event::LimitReached,
@@ -555,6 +642,7 @@ impl Event {
             Event::ForwardFailing => "forward_failing",
             Event::Lockdown => "lockdown",
             Event::RefreshFailed => "refresh_failed",
+            Event::BoxWaiting => "box_waiting",
         }
     }
 }
@@ -982,6 +1070,17 @@ mod tests {
             let b = format!("[audit.forward.\"{n}\"]\ntype = \"file\"\npath = \"/x\"\n");
             assert!(fwd_valid(&b).is_ok(), "{n}");
         }
+    }
+
+    #[test]
+    fn box_waiting_event_parses() {
+        let c: SystemConfig =
+            toml::from_str("version = 2\n[notify]\non = [\"box_waiting\"]\n").unwrap();
+        assert_eq!(c.notify.on, vec![Event::BoxWaiting]);
+        assert_eq!(Event::BoxWaiting.as_str(), "box_waiting");
+        // Opt in: the default list is unchanged, so the policy hash of an
+        // existing config is too.
+        assert!(!Event::ALL.contains(&Event::BoxWaiting));
     }
 
     #[test]
