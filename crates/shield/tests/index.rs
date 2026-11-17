@@ -2,7 +2,8 @@
 //! allow list. Every value here is made up.
 
 use saiife_shield::index::{
-    build_index, build_index_with_run_bytes, read_allow, write_allow, IndexKey, KnownIndex,
+    build_index, build_index_with_run_bytes, read_allow, split_phrases, write_allow, IndexKey,
+    KnownIndex,
 };
 use saiife_shield::norm::normalize;
 use saiife_shield::public::PublicValues;
@@ -662,4 +663,226 @@ mod unix {
         std::fs::copy(ds.join("index.bloom"), other.join("index.bloom")).unwrap();
         assert!(KnownIndex::open(&other, key(1)).is_err());
     }
+}
+
+// ------------------------------------------------------ fix round 1 ----
+
+#[test]
+fn phrase_lookup_splits_like_the_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ds, _) = standard_build(tmp.path(), 10);
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    // R-15: a whole sentence with a known phrase in it hits.
+    assert!(ix
+        .contains_phrase("x y z; the lady who runs the bakery on main street")
+        .unwrap());
+    assert!(ix
+        .contains_phrase("Hi. The lady who runs the bakery on main street! Bye now")
+        .unwrap());
+    // The whole normalized input is tried too.
+    assert!(ix.contains_phrase("met her twice").unwrap());
+    // Single words still miss.
+    for w in ["bakery", "lady", "street"] {
+        assert!(!ix.contains_phrase(w).unwrap(), "{w}");
+    }
+    assert_eq!(
+        split_phrases("one two. Three four five!\nsix seven eight nine; ten"),
+        vec!["three four five", "six seven eight nine"]
+    );
+    let long = vec!["w"; 41].join(" ");
+    assert!(split_phrases(&long).is_empty());
+}
+
+/// An entity table where one customer (key 1) has 20 invoice rows and 12
+/// other customers share a first name.
+fn denormalized_rows() -> Vec<Vec<Cell>> {
+    let mut rows = Vec::new();
+    for _ in 0..20 {
+        rows.push(vec![
+            Cell::Int(1),
+            t("Ingeborg"),
+            t("Quistgaard"),
+            t("ingeborg.quistgaard.1@example.invalid"),
+        ]);
+    }
+    for i in 0..12 {
+        rows.push(vec![
+            Cell::Int(100 + i),
+            t("Mette"),
+            t(&format!("Zz{i}son")),
+            t(&format!("m{i}@example.invalid")),
+        ]);
+    }
+    rows
+}
+
+#[test]
+fn floor_counts_people_not_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cols = ["id", "first_name", "last_name", "email"];
+    let schema = one_table(
+        "customers",
+        vec![
+            col("id", ColType::Integer, ColumnClass::Identifier),
+            col("first_name", ColType::Text, ColumnClass::Identifier),
+            col("last_name", ColType::Text, ColumnClass::Identifier),
+            col("email", ColType::Text, ColumnClass::Identifier),
+        ],
+        32,
+        true,
+    );
+    let (ds, snap) = snapshot(tmp.path(), "customers", &cols, denormalized_rows());
+    build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    // R-14: one person in 20 rows is one record.
+    assert!(ix.contains_value("Quistgaard").unwrap());
+    assert!(ix
+        .contains_value("ingeborg.quistgaard.1@example.invalid")
+        .unwrap());
+    assert!(ix.contains_value("Ingeborg Quistgaard").unwrap());
+    // Twelve people share "Mette": common.
+    assert!(!ix.contains_value("Mette").unwrap());
+    assert!(ix.contains_value("Zz3son").unwrap());
+
+    // The same rows in a table with no entity count rows.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let mut plain = schema.clone();
+    plain.entities.clear();
+    let (ds2, snap2) = snapshot(tmp2.path(), "customers", &cols, denormalized_rows());
+    build_index(&snap2, &plain, 10, &key(1), &ds2, &mut |_| {}).unwrap();
+    let ix2 = KnownIndex::open(&ds2, key(1)).unwrap();
+    assert!(!ix2.contains_value("Quistgaard").unwrap());
+}
+
+#[test]
+fn digit_groupings_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cols = ["phone", "ref"];
+    let schema = one_table(
+        "people",
+        vec![
+            col("phone", ColType::Text, ColumnClass::Identifier),
+            col("ref", ColType::Text, ColumnClass::Identifier),
+        ],
+        2,
+        false,
+    );
+    let rows = vec![
+        vec![t("12 34 56 78"), t("010180-1234")],
+        vec![t("87654321"), t("x-9")],
+    ];
+    let (ds, snap) = snapshot(tmp.path(), "people", &cols, rows);
+    build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    for s in [
+        "12 34 56 78",
+        "12345678",
+        "12-34-56-78",
+        "010180-1234",
+        "0101801234",
+        "87654321",
+        "87 65 43 21",
+        "8765.4321",
+    ] {
+        assert!(ix.contains_value(s).unwrap(), "{s}");
+    }
+    assert!(!ix.contains_value("12345679").unwrap());
+}
+
+#[test]
+fn floor_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = one_table(
+        "people",
+        vec![col("first_name", ColType::Text, ColumnClass::Identifier)],
+        21,
+        false,
+    );
+    let mut rows: Vec<Vec<Cell>> = (0..10).map(|_| vec![t("Kirsten")]).collect();
+    rows.extend((0..11).map(|_| vec![t("Valdemar")]));
+    let (ds, snap) = snapshot(tmp.path(), "people", &["first_name"], rows);
+    let s = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    assert!(ix.contains_value("Kirsten").unwrap(), "exactly k: in");
+    assert!(!ix.contains_value("Valdemar").unwrap(), "k + 1: out");
+    assert_eq!(s.left_out_common, 1);
+}
+
+/// R43-10: a schema word never enters the index, even as a rare real value.
+/// The firewall passes schema words, so the index would not stop it anyway.
+#[test]
+fn rare_value_equal_to_a_column_name_is_not_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = one_table(
+        "people",
+        vec![
+            col("last_name", ColType::Text, ColumnClass::Identifier),
+            col("email", ColType::Text, ColumnClass::Identifier),
+        ],
+        2,
+        false,
+    );
+    let rows = vec![
+        vec![t("Email"), t("a.1@example.invalid")],
+        vec![t("Brorson"), t("b.2@example.invalid")],
+    ];
+    let (ds, snap) = snapshot(tmp.path(), "people", &["last_name", "email"], rows);
+    build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    assert!(!ix.contains_value("Email").unwrap());
+    assert!(ix.contains_value("Brorson").unwrap());
+}
+
+#[test]
+fn progress_never_goes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rows: Vec<Vec<Cell>> = (0..500)
+        .map(|i| vec![t(&format!("rare{i}")), t("called about the late invoice")])
+        .collect();
+    let schema = one_table(
+        "things",
+        vec![
+            col("name", ColType::Text, ColumnClass::Identifier),
+            col("notes", ColType::Text, ColumnClass::FreeText),
+        ],
+        500,
+        false,
+    );
+    let (_, snap) = snapshot(tmp.path(), "things", &["name", "notes"], rows);
+    let mut seen: Vec<u64> = Vec::new();
+    build_index_with_run_bytes(
+        &snap,
+        &schema,
+        10,
+        &key(3),
+        &tmp.path().join("o"),
+        &mut |n| seen.push(n),
+        4096,
+    )
+    .unwrap();
+    assert!(seen.len() > 2);
+    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+}
+
+#[test]
+fn a_public_values_error_fails_the_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `credit_limit` is an amount name: public_values refuses it.
+    let schema = one_table(
+        "people",
+        vec![
+            col("first_name", ColType::Text, ColumnClass::Identifier),
+            col("credit_limit", ColType::Text, ColumnClass::Public),
+        ],
+        12,
+        false,
+    );
+    let rows = (0..12)
+        .map(|i| vec![t(&format!("Nm{i}")), t("high")])
+        .collect();
+    let (ds, snap) = snapshot(tmp.path(), "people", &["first_name", "credit_limit"], rows);
+    let e = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("credit_limit"), "{msg}");
+    assert!(!msg.contains("high"), "{msg}");
 }

@@ -14,10 +14,12 @@
 //! `h2` bytes 8..16 (low bit set), hash `i` is `(h1 + i·h2) mod bits`.
 //!
 //! Which values enter (R43-10): an identifier or quasi value only if it
-//! occurs in at most `k` rows of its column (`GROUP BY … HAVING COUNT(*) <=
-//! k`, on the raw value: a value split over spellings may enter although it
-//! is common in total, which only blocks more); an entity's full name (its
-//! name columns together) under the same floor; and each free-text phrase
+//! occurs in at most `k` records of its column (`GROUP BY … HAVING n <= k`,
+//! on the raw value: a value split over spellings may enter although it is
+//! common in total, which only blocks more). `n` is `COUNT(DISTINCT key)` in
+//! an entity table (R-14: one person in many rows is one record), else
+//! `COUNT(*)`. An entity's full name (its name columns together) enters
+//! under the same floor, and so does each free-text phrase
 //! (split at `. ! ? ; \n`) of 3 to 40 tokens, whole. Single words of free
 //! text never enter. Allow words (schema words, aliases, the k-floor public
 //! values, and `allow.json` if the dataset dir has one) never enter.
@@ -28,7 +30,10 @@
 //! (an integer as `i64` text, `4411`; any other number as Rust's shortest
 //! round-trip `f64` text, so `12.50`, `12,5` and the REAL 12.5 are all
 //! `12.5`, and `3.0` is `3`), and a date's ISO form (`03.05.1980` is
-//! `1980-05-03`), each normalized.
+//! `1980-05-03`), each normalized, and for a value of digits and
+//! separators (space, `-`, `.`, `/`) only, its digits alone (`12 34 56 78`
+//! is `12345678`). A phrase lookup tries the whole input and every piece of
+//! [`split_phrases`] (R-15).
 //!
 //! The build streams the entries into sorted runs of at most 64 MB (new
 //! 0600 files in the output dir, removed on success and on every error),
@@ -170,7 +175,21 @@ fn value_forms(s: &str) -> Vec<String> {
     if let Some(d) = parse_date(t) {
         push(normalize(&d));
     }
+    if let Some(d) = digits_only(t) {
+        push(d);
+    }
     out
+}
+
+/// A value of digits and separators (space, `-`, `.`, `/`) only, with at
+/// least one separator: its digits alone (`12 34 56 78` is `12345678`,
+/// `010180-1234` is `0101801234`).
+fn digits_only(t: &str) -> Option<String> {
+    let ok = t.chars().any(|c| c.is_ascii_digit())
+        && t.chars().any(|c| matches!(c, ' ' | '-' | '.' | '/'))
+        && t.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ' ' | '-' | '.' | '/'));
+    ok.then(|| t.chars().filter(char::is_ascii_digit).collect())
 }
 
 /// The phrases of a free-text cell: split at `. ! ? ; \n`, each of 3 to 40
@@ -182,6 +201,12 @@ fn phrases(text: &str) -> impl Iterator<Item = String> + '_ {
             .contains(&t.len())
             .then(|| t.join(" "))
     })
+}
+
+/// R-15: the phrases of `s` as the build makes them (normalized pieces of 3
+/// to 40 tokens, split at `. ! ? ; \n`).
+pub fn split_phrases(s: &str) -> Vec<String> {
+    phrases(s).collect()
 }
 
 /// A cell as text: integers and reals in plain notation, a `bool` column as
@@ -567,10 +592,15 @@ pub fn build_index_with_run_bytes(
     let mut allow = schema_words(schema);
     for t in &schema.tables {
         for c in t.columns.iter().filter(|c| c.class == ColumnClass::Public) {
-            // A refused public mark allows nothing.
-            if let Ok(pv) = public_values(&snap, &t.name, &c.name, k) {
-                allow.extend(pv.passing.iter().map(|v| normalize(v)));
-            }
+            let pv =
+                public_values(&snap, &t.name, &c.name, k).map_err(|_| ShieldError::Source {
+                    file: "snapshot".into(),
+                    table: Some(t.name.clone()),
+                    column: Some(c.name.clone()),
+                    row: None,
+                    why: "the public column's values could not be read",
+                })?;
+            allow.extend(pv.passing.iter().map(|v| normalize(v)));
         }
     }
     let allow_path = out_dir.join(ALLOW_FILE);
@@ -612,6 +642,16 @@ pub fn build_index_with_run_bytes(
                 })
             }
         };
+        // R-14: in an entity table the floor counts people (distinct keys),
+        // not rows: one customer in many rows of a denormalized table is
+        // one record.
+        let people = match schema.entity_for(&t.name) {
+            Some(e) => {
+                need(&e.key)?;
+                format!("COUNT(DISTINCT {})", quote_ident(&e.key))
+            }
+            None => "COUNT(*)".to_string(),
+        };
         for c in &t.columns {
             if matches!(
                 c.class,
@@ -624,7 +664,7 @@ pub fn build_index_with_run_bytes(
                 ColumnClass::Identifier | ColumnClass::Quasi => {
                     let sql = format!(
                         "SELECT {qc} FROM {qt} WHERE {qc} IS NOT NULL \
-                         GROUP BY {qc} HAVING COUNT(*) <= ?1"
+                         GROUP BY {qc} HAVING {people} <= ?1"
                     );
                     let mut st = snap.prepare(&sql).map_err(rd)?;
                     let mut rows = st.query([k]).map_err(rd)?;
@@ -638,6 +678,7 @@ pub fn build_index_with_run_bytes(
                     stats.left_out_common += count_common(
                         &snap,
                         &format!("SELECT 1 FROM {qt} WHERE {qc} IS NOT NULL GROUP BY {qc}"),
+                        &people,
                         k,
                     )?;
                 }
@@ -674,7 +715,7 @@ pub fn build_index_with_run_bytes(
                 .collect::<Vec<_>>()
                 .join(" OR ");
             let sql = format!(
-                "SELECT {list} FROM {qt} WHERE {any} GROUP BY {list} HAVING COUNT(*) <= ?1"
+                "SELECT {list} FROM {qt} WHERE {any} GROUP BY {list} HAVING {people} <= ?1"
             );
             let mut st = snap.prepare(&sql).map_err(rd)?;
             let mut rows = st.query([k]).map_err(rd)?;
@@ -693,6 +734,7 @@ pub fn build_index_with_run_bytes(
             stats.left_out_common += count_common(
                 &snap,
                 &format!("SELECT 1 FROM {qt} WHERE {any} GROUP BY {list}"),
+                &people,
                 k,
             )?;
         }
@@ -701,7 +743,9 @@ pub fn build_index_with_run_bytes(
 
     let (index_path, count) =
         with_private_part(out_dir, INDEX_FILE, |part| sorter.finish_into(part))?;
-    (sorter.progress)(count);
+    // The offered count: it never goes back (the deduplicated count can be
+    // smaller); `BuildStats::entries` has the final count.
+    (sorter.progress)(sorter.offered);
     // The runs are gone before the Bloom filter is built.
     drop(sorter);
     if let Err(e) = with_private_part(out_dir, BLOOM_FILE, |part| write_bloom(&index_path, part)) {
@@ -740,9 +784,9 @@ fn snapshot_columns(snap: &Connection, table: &str) -> Result<Vec<String>, Shiel
 }
 
 /// How many groups of `grouped` (a `SELECT 1 … GROUP BY …`) have more than
-/// `k` rows.
-fn count_common(snap: &Connection, grouped: &str, k: i64) -> Result<u64, ShieldError> {
-    let sql = format!("SELECT COUNT(*) FROM ({grouped} HAVING COUNT(*) > ?1)");
+/// `k` records (`count` is `COUNT(*)` or `COUNT(DISTINCT key)`).
+fn count_common(snap: &Connection, grouped: &str, count: &str, k: i64) -> Result<u64, ShieldError> {
+    let sql = format!("SELECT COUNT(*) FROM ({grouped} HAVING {count} > ?1)");
     let n: i64 = snap.query_row(&sql, [k], |r| r.get(0)).map_err(rd)?;
     Ok(n.max(0) as u64)
 }
@@ -828,13 +872,21 @@ impl KnownIndex {
         Ok(false)
     }
 
-    /// Is `s`, normalized, a known free-text phrase? Domain `p`.
+    /// R-15: does `s` hold a known free-text phrase? Tries the whole
+    /// normalized input, then every piece of [`split_phrases`] (the build's
+    /// own splitter), so a sentence copied from a note hits whatever the
+    /// caller's splitter did. Domain `p`.
     pub fn contains_phrase(&self, s: &str) -> Result<bool, ShieldError> {
         let n = normalize(s);
-        if n.is_empty() {
-            return Ok(false);
+        if !n.is_empty() && self.has(DOMAIN_PHRASE, &n)? {
+            return Ok(true);
         }
-        self.has(DOMAIN_PHRASE, &n)
+        for p in phrases(s) {
+            if p != n && self.has(DOMAIN_PHRASE, &p)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The Bloom filter's answer alone for [`Self::contains_value`] (tests
@@ -967,10 +1019,16 @@ mod tests {
     #[test]
     fn forms_agree() {
         assert_eq!(value_forms(" 4411 "), vec!["4411"]);
-        assert_eq!(value_forms("12.50"), vec!["12 50", "12 5"]);
+        assert_eq!(value_forms("12.50"), vec!["12 50", "12 5", "1250"]);
         assert_eq!(value_forms("Berg, Anna"), vec!["berg anna", "anna berg"]);
-        assert_eq!(value_forms("03.05.1980"), vec!["03 05 1980", "1980 05 03"]);
+        assert_eq!(
+            value_forms("03.05.1980"),
+            vec!["03 05 1980", "1980 05 03", "03051980"]
+        );
         assert!(value_forms(" ,; ").is_empty());
+        assert_eq!(value_forms("12 34"), vec!["12 34", "1234"]);
+        assert_eq!(digits_only("12a 34"), None);
+        assert_eq!(digits_only("1234"), None);
         let p: Vec<String> = phrases("one two. three four five!\nsix seven eight nine").collect();
         assert_eq!(p, vec!["three four five", "six seven eight nine"]);
     }
