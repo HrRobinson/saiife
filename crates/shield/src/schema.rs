@@ -369,7 +369,7 @@ impl ParamType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bound {
     Keys(Vec<i64>),
@@ -381,7 +381,7 @@ pub enum Bound {
     Text(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Param {
     /// `p1`, `p2`, ...
     pub name: String,
@@ -389,6 +389,34 @@ pub struct Param {
     pub bound: Option<Bound>,
     /// Local only: never sent to the cloud.
     pub display: String,
+}
+
+/// I8: a bound holds real values (keys, amounts, dates, text): `Debug`
+/// shows the kind only, and for keys their count.
+impl fmt::Debug for Bound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Bound::Keys(k) => write!(f, "Keys(<{} keys>)", k.len()),
+            Bound::Amount(_) => f.write_str("Amount(..)"),
+            Bound::Integer(_) => f.write_str("Integer(..)"),
+            Bound::Percent(_) => f.write_str("Percent(..)"),
+            Bound::Date(_) => f.write_str("Date(..)"),
+            Bound::DateRange(..) => f.write_str("DateRange(..)"),
+            Bound::Text(_) => f.write_str("Text(..)"),
+        }
+    }
+}
+
+/// I8: the name, the type and the bound's kind; never `display`.
+impl fmt::Debug for Param {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Param")
+            .field("name", &self.name)
+            .field("ty", &self.ty)
+            .field("bound", &self.bound)
+            .field("display", &"..")
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +514,39 @@ mod tests {
         assert_eq!(t.tag(), "text:customers.city");
         assert_eq!(ParamType::DateRange.tag(), "date_range");
         assert_eq!(ParamType::Amount.tag(), "amount");
+    }
+
+    /// I8: the Debug text of a parameter carries no real value.
+    #[test]
+    fn param_debug_has_no_values() {
+        let p = Param {
+            name: "p1".into(),
+            ty: ParamType::Entity {
+                table: "customers".into(),
+                word: "customer".into(),
+            },
+            bound: Some(Bound::Keys(vec![4411, 4412])),
+            display: "Anna Berg (customer #4411)".into(),
+        };
+        let d = format!("{p:?}");
+        assert!(!d.contains("Anna") && !d.contains("4411"), "{d}");
+        assert!(d.contains("p1") && d.contains("customers"), "{d}");
+        for b in [
+            Bound::Text("Anna Berg".into()),
+            Bound::Keys(vec![4411]),
+            Bound::Amount(dec("4411.50")),
+            Bound::Integer(4411),
+            Bound::Percent(dec("44.11")),
+            Bound::Date("1980-04-11".into()),
+            Bound::DateRange("1980-04-11".into(), "1980-04-12".into()),
+        ] {
+            let d = format!("{b:?}");
+            assert!(
+                !d.contains("Anna") && !d.contains("4411") && !d.contains("1980"),
+                "{d}"
+            );
+            assert!(!format!("{:?}", Some(b)).contains("44"));
+        }
     }
 
     #[test]

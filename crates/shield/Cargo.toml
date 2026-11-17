@@ -24,5 +24,12 @@ csv = "=1.4.0"
 calamine = "=0.37.0"
 sqlparser = "=0.63.0"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.6", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+zip = { version = "=9.2.2", default-features = false }
+
 [lints]
 workspace = true

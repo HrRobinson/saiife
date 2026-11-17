@@ -2212,13 +2212,16 @@ dependencies = [
  "getrandom 0.3.4",
  "ring",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sqlparser",
  "strsim",
+ "tempfile",
  "thiserror 1.0.69",
  "unicode-normalization",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

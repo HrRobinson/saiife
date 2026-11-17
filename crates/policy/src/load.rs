@@ -90,6 +90,8 @@ struct DropIn {
     scope: Vec<Scope>,
     #[serde(default)]
     example: Vec<Example>,
+    #[serde(default)]
+    blind: crate::blind::BlindCfg,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +159,20 @@ pub fn load_system_with(
         }
     }
 
+    let mut blind_dataset_origin: BTreeMap<String, String> = BTreeMap::new();
+    for ds in &cfg.blind.dataset {
+        // A duplicate inside config.toml is caught by `BlindCfg::validate`.
+        blind_dataset_origin
+            .entry(ds.name.clone())
+            .or_insert_with(|| config_name.clone());
+    }
+    let mut blind_key_origin: BTreeMap<&'static str, String> = BTreeMap::new();
+    for (key, set) in blind_singletons(&cfg.blind) {
+        if set {
+            blind_key_origin.insert(key, config_name.clone());
+        }
+    }
+
     for path in dropin_paths(dropin_dir)? {
         let text = read_policy_file(&path, &mut files)?;
         let table = parse_table(&path, &text)?;
@@ -214,6 +230,36 @@ pub fn load_system_with(
             cfg.scope.push(s);
         }
         cfg.example.extend(d.example);
+
+        let mut b = d.blind;
+        for ds in b.dataset.drain(..) {
+            if let Some(first) = blind_dataset_origin.get(&ds.name) {
+                return Err(invalid(
+                    &path,
+                    format!("blind dataset {:?} is already defined in {first}", ds.name),
+                ));
+            }
+            blind_dataset_origin.insert(ds.name.clone(), name.clone());
+            cfg.blind.dataset.push(ds);
+        }
+        for (key, set) in blind_singletons(&b) {
+            if !set {
+                continue;
+            }
+            if let Some(first) = blind_key_origin.get(key) {
+                return Err(invalid(
+                    &path,
+                    format!("blind.{key} is already set in {first}"),
+                ));
+            }
+            blind_key_origin.insert(key, name.clone());
+        }
+        cfg.blind.k = cfg.blind.k.or(b.k);
+        cfg.blind.list_cap = cfg.blind.list_cap.or(b.list_cap);
+        cfg.blind.session_minutes = cfg.blind.session_minutes.or(b.session_minutes);
+        cfg.blind.outbox_days = cfg.blind.outbox_days.or(b.outbox_days);
+        cfg.blind.ner = cfg.blind.ner.take().or(b.ner);
+        cfg.blind.cloud = cfg.blind.cloud.take().or(b.cloud);
     }
 
     // User packs (plan 32): read below policy.d/packs, their `ask` rules
@@ -244,6 +290,9 @@ pub fn load_system_with(
         .validate()
         .map_err(|why| invalid(config_file, why))?;
     cfg.audit
+        .validate()
+        .map_err(|why| invalid(config_file, why))?;
+    cfg.blind
         .validate()
         .map_err(|why| invalid(config_file, why))?;
     for (name, sec) in &cfg.secrets {
@@ -294,6 +343,18 @@ pub fn load_system_with(
         files,
         warnings,
     })
+}
+
+/// The single-valued `[blind]` keys and whether `b` sets each.
+fn blind_singletons(b: &crate::blind::BlindCfg) -> [(&'static str, bool); 6] {
+    [
+        ("k", b.k.is_some()),
+        ("list_cap", b.list_cap.is_some()),
+        ("session_minutes", b.session_minutes.is_some()),
+        ("outbox_days", b.outbox_days.is_some()),
+        ("ner", b.ner.is_some()),
+        ("cloud", b.cloud.is_some()),
+    ]
 }
 
 /// The `<pack>/<rule>` of a `[guard] ask` entry (`core.git/force-push`).
