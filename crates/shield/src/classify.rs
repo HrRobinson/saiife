@@ -90,6 +90,36 @@ fn name_in(name: &str, words: &[&str]) -> bool {
     words.iter().any(|w| name_has(name, w))
 }
 
+/// R-22: a source name split at its CamelCase boundaries, lower case, with
+/// `_` between parts and for every non-alphanumeric: `CustomerID` is
+/// `customer_id`, `EmployeeNr` is `employee_nr`, `IDNumber` is `id_number`,
+/// `Paid` is `paid`. (The snapshot's `clean_name` does not split, so
+/// `CustomerID` is `customerid` there.)
+pub fn camel_split(raw: &str) -> String {
+    let cs: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len() + 4);
+    for (i, &c) in cs.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            out.push('_');
+            continue;
+        }
+        if c.is_uppercase() && i > 0 {
+            let prev = cs[i - 1];
+            let next_lower = cs.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower) {
+                out.push('_');
+            }
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// R-22: [`id_shaped`] on the source name after [`camel_split`].
+pub fn source_id_shaped(raw: &str) -> bool {
+    id_shaped(&camel_split(raw))
+}
+
 /// C1 / R-16 (spec §2.1.2: IDs are never public): the name says the column
 /// holds IDs or names. `id`, a name ending in `_id`, `_no`, `_nr`, `nr` or
 /// `nummer` (`customer_id`, `order_no`, `kundenr`, `kundenummer`), or one
@@ -490,6 +520,21 @@ mod tests {
         }
         for n in ["status", "segment", "paid", "valid", "idea", "notes"] {
             assert!(!id_shaped(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn camel_case_names() {
+        assert_eq!(camel_split("CustomerID"), "customer_id");
+        assert_eq!(camel_split("EmployeeNr"), "employee_nr");
+        assert_eq!(camel_split("IDNumber"), "id_number");
+        assert_eq!(camel_split("ID"), "id");
+        assert_eq!(camel_split("Kunde Nr."), "kunde_nr_");
+        for n in ["CustomerID", "EmployeeNr", "ID", "orderNo", "KundeNummer"] {
+            assert!(source_id_shaped(n), "{n}");
+        }
+        for n in ["Paid", "Valid", "PAID", "Status", "Idea"] {
+            assert!(!source_id_shaped(n), "{n}");
         }
     }
 

@@ -20,8 +20,9 @@
 //! spellings may enter although it is common in total, which only blocks
 //! more). A value of 5 or more tokens also enters as every contiguous
 //! 4-token window (each through [`value_forms`]), under the same floor, so
-//! a 2-to-4-token scan finds a long address (I3); `BuildStats` records the
-//! longest value's token count. `n` is `COUNT(DISTINCT key)` in
+//! a 2-to-4-token scan finds a long address (I3), at most 64 windows per
+//! value (R-22: the first ones); `BuildStats` records the longest value's
+//! token count. `n` is `COUNT(DISTINCT key)` in
 //! an entity table (R-14: one person in many rows is one record), else
 //! `COUNT(*)`. An entity's full name (its name columns together) enters
 //! under the same floor. Free text has no floor: every phrase (split at
@@ -102,6 +103,9 @@ const PHRASE_SPLIT: [char; 5] = ['.', '!', '?', ';', '\n'];
 const LONG_VALUE: usize = 5;
 /// I3: the window size (plan 44 scans 2 to 4 tokens).
 const WINDOW: usize = 4;
+/// R-22: at most this many windows per value (all variants together), so a
+/// long text column classed identifier cannot blow up the index.
+const MAX_WINDOWS: usize = 64;
 
 type Entry = [u8; ENTRY];
 
@@ -252,15 +256,22 @@ fn digits_only(t: &str) -> Option<String> {
 /// I3: for a value of [`LONG_VALUE`] or more tokens, the [`value_forms`]
 /// of every contiguous [`WINDOW`]-token window of each of its variants, so
 /// a lookup of a window (itself through `value_forms`) hits. Empty for a
-/// shorter value.
+/// shorter value. At most [`MAX_WINDOWS`] windows per value, the first
+/// ones in order (a lookup of a later window of a very long value misses;
+/// the whole value still hits).
 fn window_forms(s: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut left = MAX_WINDOWS;
     for text in variants(s) {
         let toks = tokens(&text);
         if toks.len() < LONG_VALUE {
             continue;
         }
         for w in toks.windows(WINDOW) {
+            if left == 0 {
+                return out;
+            }
+            left -= 1;
             for f in value_forms(&w.join(" ")) {
                 if !out.contains(&f) {
                     out.push(f);
@@ -1117,6 +1128,12 @@ mod tests {
             vec!["soeren aeroe", "aeroe soeren", "soren aero", "aero soren"]
         );
         assert!(window_forms("a b c d").is_empty());
+        // R-22: at most 64 windows per value.
+        let long: Vec<String> = (0..100).map(|i| format!("w{i:03}")).collect();
+        let wf = window_forms(&long.join(" "));
+        assert!(wf.contains(&"w000 w001 w002 w003".to_string()));
+        assert!(wf.contains(&"w063 w064 w065 w066".to_string()));
+        assert!(!wf.contains(&"w064 w065 w066 w067".to_string()));
         assert_eq!(
             window_forms("e d c b a"),
             vec!["e d c b", "b c d e", "d c b a", "a b c d"]

@@ -643,3 +643,95 @@ fn propose_and_finish_share_the_public_gate() {
         }
     }
 }
+
+/// R-22: a CamelCase ID name (`EmployeeID`, `CustomerID`), cleaned to
+/// `employeeid`, is still ID-shaped by its source name: refused at
+/// propose and at finish. `Paid` and `Valid` are not IDs.
+#[test]
+fn camel_case_id_names_are_never_public() {
+    use saiife_shield::source::{Cell, SourceTable, VecSource};
+    let mut rows = Vec::new();
+    for i in 0..3000i64 {
+        rows.push(vec![
+            Cell::Int(1 + i % 20),
+            Cell::Int(1 + i % 100),
+            Cell::Bool(i % 3 == 0),
+            Cell::Text(["ok", "bad", "pending"][(i % 3) as usize].into()),
+        ]);
+    }
+    let src = VecSource {
+        tables: vec![(
+            SourceTable {
+                name: "Orders".into(),
+                columns: vec![
+                    "EmployeeID".into(),
+                    "CustomerID".into(),
+                    "Paid".into(),
+                    "Valid".into(),
+                ],
+            },
+            rows,
+        )],
+    };
+    let t = tempfile::tempdir().unwrap();
+    let dir = ds(t.path());
+    let restage = || {
+        let mut s = src.clone();
+        stage_snapshot(&dir, &mut s, &mut |_| {}).unwrap();
+        propose(&dir.stage().join("snapshot.sqlite"), 10).unwrap()
+    };
+    let props = restage();
+    let p = |c: &str| props.iter().find(|p| p.column == c).unwrap().clone();
+    for c in ["employeeid", "customerid"] {
+        assert_ne!(p(c).guess.class, ColumnClass::Public, "{c}");
+        assert_eq!(p(c).public_refusal, Some("holds names or IDs"), "{c}");
+    }
+    for c in ["paid", "valid"] {
+        assert_eq!(p(c).public_refusal, None, "{c}");
+    }
+    let schema_with = |public: &[&str]| -> Schema {
+        use saiife_shield::schema::{ColumnInfo, TableInfo};
+        let columns = props
+            .iter()
+            .map(|p| ColumnInfo {
+                name: p.column.clone(),
+                ty: p.ty,
+                class: if public.contains(&p.column.as_str()) {
+                    ColumnClass::Public
+                } else {
+                    ColumnClass::Sensitive
+                },
+                alias: None,
+            })
+            .collect();
+        Schema {
+            dataset: "crm".parse().unwrap(),
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                alias: None,
+                rows: 0,
+                columns,
+            }],
+            entities: vec![],
+        }
+    };
+    for c in ["employeeid", "customerid"] {
+        restage();
+        match finish(&dir, &schema_with(&[c]), 10, &key(), &mut ok, &mut |_| {}) {
+            Err(ShieldError::Corrupt(why)) => {
+                assert_eq!(why, "a public column holds names, IDs or amounts")
+            }
+            other => panic!("{c}: expected a refusal, got {other:?}"),
+        }
+    }
+    restage();
+    finish(
+        &dir,
+        &schema_with(&["paid", "valid"]),
+        10,
+        &key(),
+        &mut ok,
+        &mut |_| {},
+    )
+    .unwrap();
+}

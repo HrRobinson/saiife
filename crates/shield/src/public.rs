@@ -2,8 +2,8 @@
 //! IDs or amounts; otherwise only values seen at least `k` times are listed.
 
 use crate::classify::{
-    checks, guess, id_shaped, identifier_share, looks_like_identifier, sqlite_err, ColumnStats,
-    UNKNOWN,
+    checks, guess, id_shaped, identifier_share, looks_like_identifier, source_id_shaped,
+    sqlite_err, ColumnStats, UNKNOWN,
 };
 use crate::error::ShieldError;
 use crate::norm::normalize;
@@ -83,16 +83,22 @@ pub(crate) fn entity_column(entities: &[EntitySpec], table: &str, column: &str) 
     })
 }
 
-/// S4: the one public gate. [`public_refusal`], then the policy's entity
-/// columns (`propose` has no policy yet and passes none).
+/// S4: the one public gate. The source name (R-22: `CustomerID`, which
+/// the snapshot calls `customerid`) through [`source_id_shaped`], then
+/// [`public_refusal`], then the policy's entity columns (`propose` has no
+/// policy yet and passes none).
 pub(crate) fn public_gate(
     entities: &[EntitySpec],
     table: &str,
     name: &str,
+    source: Option<&str>,
     ty: ColType,
     st: &ColumnStats,
     sample: &[String],
 ) -> Option<&'static str> {
+    if source.is_some_and(source_id_shaped) {
+        return Some("holds names or IDs");
+    }
     public_refusal(name, ty, st, sample).or_else(|| {
         entity_column(entities, table, name).then_some("an entity's key or name column")
     })

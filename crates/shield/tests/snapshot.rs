@@ -923,3 +923,35 @@ fn open_ro_has_no_double_quoted_strings() {
         .query_row("SELECT \"a\" FROM t", [], |r| r.get::<_, String>(0))
         .is_ok());
 }
+
+/// R-22: decimal commas only in `;`/tab files; English thousands in a
+/// comma CSV, or an all-`1,234`-shaped column anywhere, stay TEXT.
+#[test]
+fn decimal_comma_only_where_unambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = csv_src(b"a,b\nx,\"1,234\"\ny,\"45,000\"\nz,\"12,500\"\n", "en.csv");
+    let info = build(&mut src, dir.path()).unwrap();
+    assert_eq!(col_types(&info, "en")[1].1, ColType::Text);
+    let c = open_ro(&info.path).unwrap();
+    let v: String = c
+        .query_row("SELECT b FROM en WHERE a = 'y'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "45,000");
+    // `;`: the Danish forms are REAL ...
+    let mut src = csv_src("a;b\nx;12,50\ny;1.234,50\n".as_bytes(), "da.csv");
+    let info = build(&mut src, &dir.path().join("da")).unwrap();
+    assert_eq!(col_types(&info, "da")[1].1, ColType::Real);
+    let c = open_ro(&info.path).unwrap();
+    let got: Vec<f64> = c
+        .prepare("SELECT b FROM da ORDER BY _rowid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(got, vec![12.5, 1234.5]);
+    // ... but a column of only `1,234` shapes is ambiguous: TEXT.
+    let mut src = csv_src("a;b\nx;1,234\ny;-45,000\n".as_bytes(), "amb.csv");
+    let info = build(&mut src, &dir.path().join("amb")).unwrap();
+    assert_eq!(col_types(&info, "amb")[1].1, ColType::Text);
+}

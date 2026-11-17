@@ -74,6 +74,12 @@ pub trait RowSource {
     fn set_spool_dir(&mut self, _dir: &Path) {}
     /// Removes any such copy.
     fn release(&mut self) {}
+    /// R-22: may a column of decimal commas (`12,50`) be read as REAL?
+    /// Only a `;` or tab CSV says yes: in a comma CSV, `"1,234"` is an
+    /// English thousands group, and xlsx and SQLite give typed numbers.
+    fn decimal_comma(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) fn src_err(
@@ -460,6 +466,10 @@ impl RowSource for CsvSource {
         2
     }
 
+    fn decimal_comma(&self) -> bool {
+        self.delim != b','
+    }
+
     fn set_spool_dir(&mut self, dir: &Path) {
         self.spool_dir = Some(dir.to_path_buf());
     }
@@ -702,11 +712,11 @@ impl SqliteSource {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| bad("the file is not a readable SQLite database"))?;
+        crate::dataset::no_dqs(&conn)
+            .map_err(|()| bad("the file is not a readable SQLite database"))?;
         // The paged SELECTs sort: never into a temp file.
         crate::dataset::memory_temp_store(&conn)
             .map_err(|_| bad("the file is not a readable SQLite database"))?;
-        crate::dataset::no_dqs(&conn)
-            .map_err(|()| bad("the file is not a readable SQLite database"))?;
         let names: Vec<String> = (|| {
             let mut st = conn.prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \

@@ -171,6 +171,18 @@ pub(crate) fn parse_decimal_comma(s: &str) -> Option<f64> {
     plain.parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
+/// R-22: `-?\d{1,3},\d{3}` is an English thousands group as much as a
+/// Danish decimal (`1,234`): a column of only these is never REAL.
+fn ambiguous_comma(s: &str) -> bool {
+    let b = s.strip_prefix('-').unwrap_or(s);
+    let Some((i, f)) = b.split_once(',') else {
+        return false;
+    };
+    (1..=3).contains(&i.len())
+        && f.len() == 3
+        && i.bytes().chain(f.bytes()).all(|c| c.is_ascii_digit())
+}
+
 fn days_in(y: u32, m: u32) -> u32 {
     match m {
         2 if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) => 29,
@@ -221,19 +233,23 @@ pub(crate) fn parse_bool(s: &str) -> Option<bool> {
 struct Infer {
     int: bool,
     real: bool,
-    /// I6: every non-empty cell is a Danish decimal comma.
+    /// I6: every non-empty cell is a Danish decimal comma (and the source
+    /// allows them, R-22).
     dcomma: bool,
+    /// R-22: some cell is not of the ambiguous `1,234` shape.
+    dcomma_clear: bool,
     date: bool,
     boolean: bool,
     seen: bool,
 }
 
 impl Infer {
-    fn new() -> Infer {
+    fn new(decimal_comma: bool) -> Infer {
         Infer {
             int: true,
             real: true,
-            dcomma: true,
+            dcomma: decimal_comma,
+            dcomma_clear: false,
             date: true,
             boolean: true,
             seen: false,
@@ -251,6 +267,9 @@ impl Infer {
                 let t = s.trim();
                 if t.is_empty() {
                     return;
+                }
+                if !ambiguous_comma(t) {
+                    self.dcomma_clear = true;
                 }
                 (
                     self.int && parse_int(t).is_some(),
@@ -290,7 +309,7 @@ impl Infer {
     /// The column is REAL through decimal commas (never mixed with dot
     /// decimals, which give TEXT).
     fn decimal_comma(&self) -> bool {
-        self.seen && !self.int && !self.real && self.dcomma
+        self.seen && !self.int && !self.real && self.dcomma && self.dcomma_clear
     }
 }
 
@@ -418,7 +437,7 @@ fn write_tables(
         };
 
         // Pass 1: limits, widths and types.
-        let mut inf = vec![Infer::new(); ncol];
+        let mut inf = vec![Infer::new(src.decimal_comma()); ncol];
         let mut n = 0u64;
         for row in src.rows(&t.name)? {
             let row = row?;
@@ -543,8 +562,8 @@ pub fn open_ro(path: &Path) -> Result<Connection, ShieldError> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| bad())?;
-    memory_temp_store(&conn).map_err(|_| bad())?;
     no_dqs(&conn).map_err(|()| bad())?;
+    memory_temp_store(&conn).map_err(|_| bad())?;
     Ok(conn)
 }
 
@@ -599,7 +618,7 @@ mod tests {
     #[test]
     fn inference_order() {
         let ty = |cells: &[Cell]| {
-            let mut i = Infer::new();
+            let mut i = Infer::new(true);
             cells.iter().for_each(|c| i.see(c));
             i.ty()
         };
@@ -631,6 +650,14 @@ mod tests {
             ty(&[Cell::Text("12,50".into()), Cell::Real(1.5)]),
             ColType::Text
         );
+        assert_eq!(ty(&[Cell::Text("1,234".into())]), ColType::Text);
+        assert_eq!(
+            ty(&[Cell::Text("1,234".into()), Cell::Text("1,5".into())]),
+            ColType::Real
+        );
+        let mut i = Infer::new(false);
+        i.see(&Cell::Text("12,50".into()));
+        assert_eq!(i.ty(), ColType::Text);
         assert_eq!(parse_decimal_comma("1.234,50"), Some(1234.5));
         assert_eq!(parse_decimal_comma("-12,5"), Some(-12.5));
         for bad in ["1,", ",5", "1.23,5", "1234.567,8", "12.50", "1,2,3", "a,5"] {

@@ -386,9 +386,9 @@ impl Lexicon {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| ShieldError::Sqlite("could not open the lexicon".into()))?;
+        no_dqs(&conn).map_err(|()| ShieldError::Sqlite("could not open the lexicon".into()))?;
         memory_temp_store(&conn)
             .map_err(|_| ShieldError::Sqlite("could not open the lexicon".into()))?;
-        no_dqs(&conn).map_err(|()| ShieldError::Sqlite("could not open the lexicon".into()))?;
         let mut show = HashMap::new();
         {
             let mut st = conn.prepare("SELECT tbl, show FROM spec").map_err(lx)?;

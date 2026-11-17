@@ -785,19 +785,39 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
         false,
         "could not read the snapshot",
     )?)?;
+    // R-22: the source names (`CustomerID`) from the stage sidecar, when
+    // the snapshot was staged by `stage_snapshot`.
+    let info_path = snapshot.with_file_name(STAGE_INFO_FILE);
+    let source_names = if exists(&info_path) {
+        let si: StageInfo = read_json(
+            open_sealed(&info_path, 0o400)?,
+            "the staged build is incomplete",
+        )?;
+        si.source_names
+    } else {
+        BTreeMap::new()
+    };
     let conn = open_ro(snapshot)?;
     let mut out = Vec::new();
     for (table, cols) in snapshot_layout(&conn)? {
         for (column, ty) in cols {
             let st = classify::stats(&conn, &table, &column, ty)?;
+            let source = source_names
+                .get(&format!("{table}.{column}"))
+                .map(String::as_str);
             let sample = classify::sample_seeded(
                 &conn,
                 &table,
                 &column,
                 sample_seed(&sha, &table, &column),
             )?;
-            let guess = classify::guess(&column, ty, &st, &sample);
-            let mut refusal = public_gate(&[], &table, &column, ty, &st, &sample);
+            // R-22: an ID-shaped source name is guessed by its split form
+            // (`employee_id`), never as a public category.
+            let split = source
+                .filter(|s| classify::source_id_shaped(s))
+                .map(classify::camel_split);
+            let guess = classify::guess(split.as_deref().unwrap_or(&column), ty, &st, &sample);
+            let mut refusal = public_gate(&[], &table, &column, source, ty, &st, &sample);
             let mut preview = None;
             // M5: no k-floor listing of free text (the gate refuses it, S4).
             if refusal.is_none() && guess.class != ColumnClass::FreeText {
@@ -902,7 +922,21 @@ fn finish_inner(
                 // Defence in depth for a hand-edited policy: the wizard's
                 // refusal is checked again before any value is listed.
                 let st = classify::stats(&conn, &t.name, &c.name, c.ty)?;
-                if public_gate(&policy.entities, &t.name, &c.name, c.ty, &st, &sample).is_some() {
+                let source = si
+                    .source_names
+                    .get(&format!("{}.{}", t.name, c.name))
+                    .map(String::as_str);
+                if public_gate(
+                    &policy.entities,
+                    &t.name,
+                    &c.name,
+                    source,
+                    c.ty,
+                    &st,
+                    &sample,
+                )
+                .is_some()
+                {
                     return Err(ShieldError::Corrupt(PUBLIC_REFUSED));
                 }
                 public.push(public_values(&conn, &t.name, &c.name, k)?);
