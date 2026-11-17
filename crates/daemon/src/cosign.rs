@@ -2268,8 +2268,9 @@ mod tests {
     }
 
     /// The `rejudge_denied` records in the audit, waiting (on the real clock, up to a
-    /// ceiling that only a failure reaches) for `n`. It yields to the runtime between
-    /// reads, so a task that writes one (the fold timer) can run.
+    /// ceiling that only a failure reaches) for `n`. It sleeps on the runtime between
+    /// reads, so a task that writes one (the fold timer) can run. Every call is made
+    /// with the clock running (not paused), so the sleep is a real 20 ms.
     #[cfg(unix)]
     async fn rejudge_records(dir: &std::path::Path, n: usize) -> Vec<Record> {
         let end = std::time::Instant::now() + Duration::from_secs(60);
@@ -2282,8 +2283,7 @@ mod tests {
             if got.len() >= n || std::time::Instant::now() > end {
                 return got;
             }
-            tokio::task::yield_now().await;
-            std::thread::sleep(Duration::from_millis(20));
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 

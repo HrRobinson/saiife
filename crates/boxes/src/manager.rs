@@ -78,9 +78,14 @@ pub const WHY_LOST: &str = "vm lost after restart";
 pub const WHY_RECONCILED: &str = "reconciled";
 const REORDER: &str = "reorder must list every queued box once";
 const PROMPT_NOT_DELIVERED: &str = "the box's prompt is not delivered yet; steer again once it is";
-/// A paused box sends its held prompt only once it runs again.
-const PROMPT_HELD_PAUSED: &str =
-    "the box's prompt is not delivered yet; resume the box first, then steer again";
+/// A paused box sends its held prompt only once it runs again, and, under
+/// lockdown `all` (R30), only once lockdown lifts too. The manager does not
+/// know the lockdown level, so the text names both.
+const PROMPT_HELD_PAUSED: &str = "the box's prompt is not delivered yet; resume the box first \
+     (under lockdown `all` it also waits for lockdown to lift), then steer again";
+/// A VM-on revise sent the held prompt but not its comment (R25/N1).
+pub const COMMENT_AFTER_HELD_FAILED: &str = "the held prompt was sent and the box runs again, \
+     but the revise comment was not: send the comment again as a steer";
 
 /// Unix seconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -963,7 +968,9 @@ impl Manager {
     /// A revise is a follow-up comment: a prompt the box still holds unsent
     /// (a stop or pause cut its send short, or lockdown held it; often the
     /// task itself) goes first, never dropped. VM on: the held prompt is
-    /// sent, then the comment, under one send token. VM off: the next
+    /// sent, then the comment, under one send token; if only the comment
+    /// fails, the box still runs (the agent works on the held prompt) and
+    /// the error says to send the comment again. VM off: the next
     /// `Ready` sends `held + "\n\n" + comment`, refused (`Invalid`, nothing
     /// changed) when over [`MAX_REVISED_PROMPT_BYTES`]. The note is then
     /// [`HELD_PROMPT_SENT_FIRST`], for the caller's record (R25/N1).
@@ -1002,13 +1009,25 @@ impl Manager {
             let ours = g.end_send(id, token);
             if let Err(e) = sent {
                 // The held prompt went out but the comment did not: it is
-                // delivered, so the box (still as it was) no longer holds it.
+                // delivered and the agent works on it, so the box (still as
+                // it was) runs again, as after a full revise, and no longer
+                // holds it. The comment's error is still returned, saying so.
                 if let Some(mut cur) = g.records.get(id).cloned().filter(|c| {
                     held_out && ours && c.state == from && c.vm_on && c.pending_prompt == held
                 }) {
+                    cur.state = to;
+                    cur.turn_finished_at = None;
+                    cur.last_activity = now;
                     cur.pending_prompt = None;
                     cur.updated_at = now;
                     let _ = g.put(cur);
+                    let why = match BoxError::from(e) {
+                        BoxError::Unavailable(m) => m,
+                        other => other.to_string(),
+                    };
+                    return Err(BoxError::Unavailable(format!(
+                        "{COMMENT_AFTER_HELD_FAILED}: {why}"
+                    )));
                 }
                 return Err(BoxError::from(e));
             }
@@ -1248,8 +1267,9 @@ impl Manager {
 
     /// Destroy retries for Discarded records that still hold a VM (R41;
     /// each record backed off after a failed retry, R44), boot timeouts,
-    /// finished turns and idle stops, which only take power away; then, with `admit`, the prompts a `Ready` under lockdown held
-    /// (for Running boxes) and the admission pass. The daemon passes
+    /// finished turns and idle stops, which only take power away; then,
+    /// with `admit`, the prompts a `Ready` under lockdown held (for Running
+    /// boxes) and the admission pass. The daemon passes
     /// `admit = false` under lockdown `all` (R30): the queue and held
     /// prompts wait until it lifts.
     pub fn tick_with(&self, admit: bool) -> Vec<Change> {

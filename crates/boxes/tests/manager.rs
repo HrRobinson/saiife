@@ -2475,8 +2475,8 @@ fn a_lockdown_held_prompt_goes_ahead_of_a_vm_on_revise() {
 }
 
 /// N1: a VM-on revise whose held prompt went out but whose comment send
-/// failed returns the error and keeps the box Done; the held prompt is
-/// delivered, so it is not held any more. A held send that fails sends no
+/// failed returns the error and moves the box to Running, since the agent
+/// works on the delivered held prompt, which is not held any more. A held send that fails sends no
 /// comment and keeps it held.
 #[test]
 fn a_vm_on_revise_whose_comment_fails_still_counts_the_held_prompt_delivered() {
@@ -2498,12 +2498,38 @@ fn a_vm_on_revise_whose_comment_fails_still_counts_the_held_prompt_delivered() {
             assert_eq!(s.text, "more");
             s.release.send(false).unwrap();
         }
-        assert!(t.join().unwrap().is_err(), "held {held_ok}");
+        let e = t.join().unwrap().unwrap_err();
+        // Delivered, the held prompt is the agent's work: the box runs
+        // again (not shown as Done), and the error says to re-send the
+        // comment. Not delivered, nothing changed.
+        assert_eq!(
+            e.to_string().contains("send the comment again"),
+            held_ok,
+            "held {held_ok}: {e}"
+        );
         no_prompt(&rx);
         let r = mgr.get(&a).unwrap();
-        assert_eq!(r.state, BoxState::Done, "held {held_ok}");
+        let state = if held_ok {
+            BoxState::Running
+        } else {
+            BoxState::Done
+        };
+        assert_eq!(r.state, state, "held {held_ok}");
+        if held_ok {
+            assert_eq!(r.turn_finished_at, None);
+        }
         let want = (!held_ok).then_some("the task");
         assert_eq!(r.pending_prompt.as_deref(), want, "held {held_ok}");
+        if held_ok {
+            // The comment goes again as a steer to the running box.
+            let m2 = mgr.clone();
+            let a2 = a.clone();
+            let t = std::thread::spawn(move || m2.say(&a2, "more"));
+            let s = next_prompt(&rx);
+            assert_eq!(s.text, "more");
+            s.release.send(true).unwrap();
+            t.join().unwrap().unwrap();
+        }
     }
 }
 
@@ -2585,7 +2611,8 @@ fn say_waits_until_the_task_prompt_is_delivered() {
 }
 
 /// m2: a paused box whose prompt is held sends it only once it runs, so
-/// its steer refusal says to resume the box first.
+/// its steer refusal says to resume the box first. Held by lockdown `all`
+/// (as here), it also waits for lockdown to lift, and the refusal says so.
 #[test]
 fn a_paused_box_with_a_held_prompt_refuses_a_steer_until_resumed() {
     let w = world(1);
@@ -2596,11 +2623,17 @@ fn a_paused_box_with_a_held_prompt_refuses_a_steer_until_resumed() {
     mgr.pause(&a).unwrap();
     let e = mgr.say(&a, "steer").unwrap_err();
     assert!(
-        matches!(&e, BoxError::Unavailable(m) if m.contains("resume the box first")),
+        matches!(&e, BoxError::Unavailable(m)
+            if m.contains("resume the box first") && m.contains("lockdown to lift")),
         "{e}"
     );
     no_prompt(&rx);
     mgr.resume(&a).unwrap();
+    // Resumed, still under lockdown `all`: the prompt keeps waiting.
+    mgr.tick_with(false);
+    no_prompt(&rx);
+    assert!(mgr.say(&a, "steer").is_err());
+    no_prompt(&rx);
     let m2 = mgr.clone();
     let t = std::thread::spawn(move || m2.tick());
     next_prompt(&rx).release.send(true).unwrap();
