@@ -18,7 +18,7 @@ use crate::workspace::SignPurpose;
 use saiife_audit::{DecisionKind, Record};
 use saiife_ipc::msg::{
     err, err_with, ok, ErrorCode, Request, LINK_OPS, OP_HELLO, OP_WORKSPACE_FRAME,
-    OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_SIGN,
+    OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_SIGN, OP_WORKSPACE_WAKE,
 };
 use saiife_ipc::peer::comm;
 use saiife_wire::device::DeviceState;
@@ -129,7 +129,7 @@ const MAX_NAME_BYTES: usize = 256;
 const HUB_NONCE: std::ops::RangeInclusive<usize> = 16..=64;
 
 /// `link.sock`: `hello`, `workspace.hello`, `workspace.pair.finish`,
-/// `workspace.frame` and `workspace.sign`. Any other op is `unknown_op`,
+/// `workspace.frame`, `workspace.sign` and `workspace.wake`. Any other op is `unknown_op`,
 /// with nothing read and nothing recorded.
 pub async fn dispatch_link(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if !LINK_OPS.contains(&req.op.as_str()) {
@@ -141,6 +141,7 @@ pub async fn dispatch_link(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_WORKSPACE_PAIR_FINISH => pair_finish(ctx, conn, req).await,
         OP_WORKSPACE_FRAME => frame(ctx, conn, req).await,
         OP_WORKSPACE_SIGN => sign(ctx, conn, req).await,
+        OP_WORKSPACE_WAKE => wake(ctx, conn, req).await,
         _ => unknown(&req),
     }
 }
@@ -1143,6 +1144,30 @@ async fn owns_active_device(ctx: &Arc<Ctx>, peer_uid: u32) -> bool {
 /// approver, as `workspace_ops` decides for `workspace.pair.begin`).
 async fn may_pair(ctx: &Arc<Ctx>, peer: &saiife_ipc::peer::PeerCred) -> bool {
     ctx.peer_is_admin(peer).await || crate::approval_ops::is_approver(ctx, peer).await
+}
+
+/// `workspace.wake`: `{}` -> `{push, seq}` for the hub link's content-free
+/// wake-ups. Only a peer who may hold the hub link (as for a `hub_hello`
+/// sign) learns the count. Never recorded.
+async fn wake(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
+    if ctx.workspace.locked() {
+        return locked().answer(req.id);
+    }
+    if let Some(k) = req.args.keys().next() {
+        return bad(format!("workspace.wake does not take {k:?}")).answer(req.id);
+    }
+    if !owns_active_device(ctx, conn.peer.uid).await && !may_pair(ctx, &conn.peer).await {
+        return forbidden(
+            "no_active_device",
+            "hub wake-ups are only for a user with a paired device or one who may pair",
+        )
+        .answer(req.id);
+    }
+    let push = ctx.policy().system.is_some_and(|s| s.workspace.push);
+    let mut m = Map::new();
+    m.insert("push".into(), push.into());
+    m.insert("seq".into(), ctx.workspace.wakes().into());
+    ok(req.id, m)
 }
 
 async fn sign_inner(

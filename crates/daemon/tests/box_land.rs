@@ -444,8 +444,11 @@ fn a_new_land_request_sends_box_waiting_once() {
     let w = world(3);
     let b = w.done(ALICE, &changed());
     assert!(waiting(&w).is_empty());
+    assert_eq!(w.ctx.workspace.wakes(), 0);
     let p = w.lands.pending();
     assert_eq!(p.len(), 1);
+    // One content-free hub wake-up for it (sent only if `[workspace] push`).
+    assert_eq!(w.ctx.workspace.wakes(), 1);
     let q = waiting(&w);
     assert_eq!(q.len(), 1, "{q:?}");
     assert_eq!(q[0].box_id.as_deref(), Some(b.as_str()));
@@ -462,6 +465,7 @@ fn a_new_land_request_sends_box_waiting_once() {
         assert_eq!(again[0].request_id, p[0].request_id);
     }
     assert_eq!(waiting(&w).len(), 1);
+    assert_eq!(w.ctx.workspace.wakes(), 1);
 }
 
 #[test]
