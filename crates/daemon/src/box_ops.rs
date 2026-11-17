@@ -1792,8 +1792,8 @@ async fn run(
         }
         Op::Resume(i) => change("resume", Box::new(move |m| m.resume(&i))).await,
         Op::Revise(i, text) => {
-            // A prompt the box held unsent and the revise dropped (R25/N1)
-            // is the record's reason.
+            // A prompt the box held unsent, sent ahead of the revise's
+            // comment (R25/N1), is the record's reason.
             let note = Arc::new(Mutex::new(None));
             let slot = Arc::clone(&note);
             let (answer, mut rec) = change(

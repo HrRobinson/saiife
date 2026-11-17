@@ -33,10 +33,10 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub use saiife_wire::source::HELD_PROMPT_DISCARDED;
 use saiife_wire::source::{
     check_text, BoxError, BoxId, BoxState, Start, MAX_STEER_BYTES, MAX_TASK_BYTES,
 };
+pub use saiife_wire::source::{HELD_PROMPT_SENT_FIRST, MAX_REVISED_PROMPT_BYTES};
 
 use crate::capacity::{self, Committed, HostFacts};
 use crate::error::BoxesError;
@@ -78,6 +78,9 @@ pub const WHY_LOST: &str = "vm lost after restart";
 pub const WHY_RECONCILED: &str = "reconciled";
 const REORDER: &str = "reorder must list every queued box once";
 const PROMPT_NOT_DELIVERED: &str = "the box's prompt is not delivered yet; steer again once it is";
+/// A paused box sends its held prompt only once it runs again.
+const PROMPT_HELD_PAUSED: &str =
+    "the box's prompt is not delivered yet; resume the box first, then steer again";
 
 /// Unix seconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -814,6 +817,13 @@ impl Manager {
             }
             return Ok(change(&r, from, "stop"));
         };
+        // A snapshot taken while the task prompt is out to the guest (m3)
+        // may or may not hold it: the guest can have typed it already or
+        // not, and the prompt stays pending either way until its send
+        // ends. A failed send keeps it (R25), so a box restored from this
+        // snapshot can get the task twice (sent again at the next run) or,
+        // when the send succeeded after the snapshot, not at all. Neither
+        // is detectable from here; it is accepted, not handled.
         let snap = keep && from != BoxState::Starting;
         let paused_here = snap && from != BoxState::Paused;
         if paused_here {
@@ -928,7 +938,14 @@ impl Manager {
                 return Err(BoxError::WrongState { state: r.state });
             }
             if r.pending_prompt.is_some() || g.prompting.contains_key(id) {
-                return Err(BoxError::Unavailable(PROMPT_NOT_DELIVERED.into()));
+                // Paused, the held prompt waits for a resume: retrying alone
+                // never helps.
+                let why = if r.state == BoxState::Paused {
+                    PROMPT_HELD_PAUSED
+                } else {
+                    PROMPT_NOT_DELIVERED
+                };
+                return Err(BoxError::Unavailable(why.into()));
             }
         }
         self.guest.prompt(id, msg).map_err(BoxError::from)
@@ -943,10 +960,13 @@ impl Manager {
     /// again. VM off: the comment waits for `Ready` and the box rejoins the
     /// queue at the tail.
     ///
-    /// Either way the comment supersedes a prompt the box still holds
-    /// unsent (a stop or pause cut its send short, or lockdown held it):
-    /// that prompt is dropped, never sent after the comment, and the note
-    /// is [`HELD_PROMPT_DISCARDED`] for the caller's record (R25/N1).
+    /// A revise is a follow-up comment: a prompt the box still holds unsent
+    /// (a stop or pause cut its send short, or lockdown held it; often the
+    /// task itself) goes first, never dropped. VM on: the held prompt is
+    /// sent, then the comment, under one send token. VM off: the next
+    /// `Ready` sends `held + "\n\n" + comment`, refused (`Invalid`, nothing
+    /// changed) when over [`MAX_REVISED_PROMPT_BYTES`]. The note is then
+    /// [`HELD_PROMPT_SENT_FIRST`], for the caller's record (R25/N1).
     pub fn revise_noted(
         &self,
         id: &BoxId,
@@ -960,17 +980,38 @@ impl Manager {
         if !matches!(from, BoxState::Done | BoxState::Landed) {
             return Err(BoxError::WrongState { state: from });
         }
+        let held = r.pending_prompt.clone();
         let why = if r.vm_on {
             let to = transition(from, Event::Revise)?;
             let token = g.claim_send(id).ok_or_else(|| {
                 BoxError::Unavailable("a prompt to the box is still being sent".into())
             })?;
-            // Sent with the lock released; the box is re-read after.
+            // Sent with the lock released, the held prompt first; the box is
+            // re-read after.
             drop(g);
-            let sent = self.guest.prompt(id, comment);
+            let mut held_out = false;
+            let mut sent = Ok(());
+            if let Some(h) = held.as_deref() {
+                sent = self.guest.prompt(id, h);
+                held_out = sent.is_ok();
+            }
+            if sent.is_ok() {
+                sent = self.guest.prompt(id, comment);
+            }
             g = self.lock();
             let ours = g.end_send(id, token);
-            sent.map_err(BoxError::from)?;
+            if let Err(e) = sent {
+                // The held prompt went out but the comment did not: it is
+                // delivered, so the box (still as it was) no longer holds it.
+                if let Some(mut cur) = g.records.get(id).cloned().filter(|c| {
+                    held_out && ours && c.state == from && c.vm_on && c.pending_prompt == held
+                }) {
+                    cur.pending_prompt = None;
+                    cur.updated_at = now;
+                    let _ = g.put(cur);
+                }
+                return Err(BoxError::from(e));
+            }
             r = g.get(id)?.clone();
             // The box moved on while the comment was out (stopped, requeued
             // or discarded): it is not revived.
@@ -980,23 +1021,35 @@ impl Manager {
             r.state = to;
             r.turn_finished_at = None;
             r.last_activity = now;
+            r.pending_prompt = None;
             "revise"
         } else {
+            let next = match &held {
+                Some(h) => {
+                    let joined = format!("{h}\n\n{comment}");
+                    if joined.len() > MAX_REVISED_PROMPT_BYTES {
+                        return Err(BoxError::Invalid(format!(
+                            "the box still holds its unsent prompt ({} bytes), which goes \
+                             ahead of the comment; together they are over \
+                             {MAX_REVISED_PROMPT_BYTES} bytes: shorten the comment",
+                            h.len()
+                        )));
+                    }
+                    joined
+                }
+                None => comment.to_string(),
+            };
             // A prompt still out from the box's earlier run records nothing.
             g.prompting.remove(id);
             r.state = transition(from, Event::Requeue)?;
             r.queue_seq = Some(g.take_seq());
+            // The next `Ready` sends it.
+            r.pending_prompt = Some(next);
             "requeue"
         };
-        // VM on: the comment went out, so nothing is pending. VM off: the
-        // comment is the prompt the next `Ready` sends.
-        let held = std::mem::replace(
-            &mut r.pending_prompt,
-            (!r.vm_on).then(|| comment.to_string()),
-        );
         r.updated_at = now;
         g.put(r.clone())?;
-        let note = held.is_some().then_some(HELD_PROMPT_DISCARDED);
+        let note = held.is_some().then_some(HELD_PROMPT_SENT_FIRST);
         Ok((change(&r, from, why), note))
     }
 
@@ -1148,8 +1201,8 @@ impl Manager {
     /// and a failed send to a box no longer running with its VM on (a stop,
     /// pause or finish came in) keeps its prompt and records no error
     /// (R25): the tick sends it again once the box runs (after a resume, or
-    /// a daemon restart), and a revise replaces it with its comment and
-    /// notes the discard (N1).
+    /// a daemon restart), and a revise sends it ahead of its comment, with
+    /// a note (N1).
     fn deliver(&self, out: impl IntoIterator<Item = Outgoing>) {
         for o in out {
             let sent = self.guest.prompt(&o.id, &o.text);
@@ -1165,8 +1218,8 @@ impl Manager {
                 continue;
             }
             // R25: a send that failed because the box moved on meanwhile
-            // keeps its prompt (sent again once the box runs, or replaced
-            // by a revise), with no error.
+            // keeps its prompt (sent again once the box runs, or ahead of a
+            // revise's comment), with no error.
             if sent.is_err() && !(r.state == BoxState::Running && r.vm_on) {
                 continue;
             }

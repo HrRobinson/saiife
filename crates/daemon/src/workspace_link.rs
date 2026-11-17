@@ -518,7 +518,7 @@ async fn run(
         (Ok(Value::Object(m)), a::WORKSPACE_TOUCH_BEGIN) => m.remove("touch_begin"),
         _ => None,
     };
-    // Nor is a revise's note (a held prompt it discarded): it is the
+    // Nor is a revise's note (a held prompt sent ahead of it): it is the
     // record's reason.
     let noted = match (&mut out, action) {
         (Ok(Value::Object(m)), a::BOX_REVISE) => m.remove(REVISE_NOTE),

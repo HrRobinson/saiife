@@ -386,10 +386,15 @@ impl FakeBoxSource {
     }
 
     /// Fake-only: the box holds a prompt unsent (a stop cut its send
-    /// short): its next successful revise reports
-    /// [`HELD_PROMPT_DISCARDED`].
+    /// short). The next revise of it that succeeds reports
+    /// [`HELD_PROMPT_SENT_FIRST`], once however often this was called (the
+    /// held prompt goes out with that revise); a refused revise keeps it
+    /// held, and later revises report nothing.
     pub fn hold_prompt(&self, id: &BoxId) {
-        self.lock().held.push(id.clone());
+        let mut s = self.lock();
+        if !s.held.contains(id) {
+            s.held.push(id.clone());
+        }
     }
 
     /// Every mutating call so far, in order (failed calls are recorded too).
@@ -618,7 +623,7 @@ impl BoxSource for FakeBoxSource {
         s.set_state(i, BoxState::Running)?;
         let held = s.held.len();
         s.held.retain(|h| h != i);
-        Ok((s.held.len() != held).then_some(HELD_PROMPT_DISCARDED))
+        Ok((s.held.len() != held).then_some(HELD_PROMPT_SENT_FIRST))
     }
 
     fn pending_actions(&self) -> Vec<PendingAction> {
