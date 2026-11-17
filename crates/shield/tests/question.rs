@@ -274,9 +274,11 @@ fn typo_offers_did_you_mean() {
     match &d.pending[0] {
         Pending::DidYouMean {
             param,
+            word,
             written,
             suggestion,
         } => {
+            assert_eq!(word, "customer");
             assert_eq!(param, "p1");
             assert_eq!(written, "Ana Berg");
             assert_eq!(suggestion.display, "Anna Berg");
@@ -685,8 +687,23 @@ impl NameDetector for Words {
     }
 }
 
-fn check(step: Result<Step, saiife_shield::ShieldError>, f: &Fx, r: &mut Rng) {
+/// Outcomes of the generated questions, so an all-`Err` regression fails.
+#[derive(Default, Debug)]
+struct Tally {
+    parsed: usize,
+    asked: usize,
+    answered_ready: usize,
+}
+
+fn check(step: Result<Step, saiife_shield::ShieldError>, f: &Fx, r: &mut Rng, t: &mut Tally) {
     let Ok(mut step) = step else { return };
+    if !matches!(step, Step::Refuse(_)) {
+        t.parsed += 1;
+    }
+    if matches!(step, Step::Ask(_)) {
+        t.asked += 1;
+    }
+    let mut answered = false;
     // Walk the answers to the end: every step is Ok or Err, never a panic.
     for _ in 0..8 {
         let d = match step {
@@ -699,20 +716,30 @@ fn check(step: Result<Step, saiife_shield::ShieldError>, f: &Fx, r: &mut Rng) {
                     assert!(p.bound.is_some());
                     assert!(d.text.contains(&format!(":{}", p.name)));
                 }
+                if answered {
+                    t.answered_ready += 1;
+                }
                 return;
             }
             Step::Refuse(_) => return,
         };
-        let a = match &d.pending[0] {
+        let (a, past_list) = match &d.pending[0] {
             Pending::Pick { candidates, .. } => {
-                Answer::Pick(r.below(candidates.len() as u64 + 2) as usize)
+                let n = r.below(candidates.len() as u64 + 2) as usize;
+                (Answer::Pick(n), n > candidates.len())
             }
-            Pending::DidYouMean { .. } => Answer::DidYouMean(r.below(2) == 0),
-            Pending::KeepName { .. } => Answer::KeepName(r.below(2) == 0),
+            Pending::DidYouMean { .. } => (Answer::DidYouMean(r.below(2) == 0), false),
+            Pending::KeepName { .. } => (Answer::KeepName(r.below(2) == 0), false),
         };
+        answered = true;
         match answer(d, a, &f.lex) {
             Ok(s) => step = s,
-            Err(_) => return,
+            // Only a pick past the list is a caller error here: a draft
+            // made by `parameterize` always answers.
+            Err(e) => {
+                assert!(past_list, "{a:?}: {e}");
+                return;
+            }
         }
     }
 }
@@ -730,6 +757,7 @@ fn never_panics_on_arbitrary_text() {
         ("İ", SpanLabel::Misc),
         ("ß", SpanLabel::Org),
     ]);
+    let mut t = Tally::default();
     for i in 0..600 {
         let q = random_question(&mut r);
         let lang = match i % 3 {
@@ -743,7 +771,7 @@ fn never_panics_on_arbitrary_text() {
             _ => &list,
         };
         let step = parameterize(&q, lang, &f.schema, &f.lex, det);
-        check(step, &f, &mut r);
+        check(step, &f, &mut r, &mut t);
     }
     // Raw random code points, including lone combining marks and controls.
     for _ in 0..200 {
@@ -752,6 +780,216 @@ fn never_panics_on_arbitrary_text() {
             .filter_map(|_| char::from_u32(r.below(0x3_0000) as u32))
             .collect();
         let step = parameterize(&q, None, &f.schema, &f.lex, &chaos);
-        check(step, &f, &mut r);
+        check(step, &f, &mut r, &mut t);
     }
+    // A floor: most generated questions parse, many ask, and answers lead
+    // to Ready drafts.
+    assert!(
+        t.parsed >= 300 && t.asked >= 50 && t.answered_ready >= 20,
+        "{t:?}"
+    );
+}
+
+// ------------------------------------------- Draft is public data (P-16) ----
+
+#[test]
+fn typed_param_token_refuses() {
+    let f = fx();
+    for (q, tok) in [
+        ("What does :p9 owe?", ":p9"),
+        ("What does Søren Ærø owe :P1", ":P1"),
+        ("x:p12y", ":p12"),
+    ] {
+        match refusal(run(&f, q, &none())) {
+            Refusal::BadLiteral { span } => assert_eq!(&q[span.0..span.1], tok),
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    // `:p` without a digit after it is fine.
+    let d = ready(run(&f, "ratio :p and :pa", &none()));
+    assert_eq!(d.text, "ratio :p and :pa");
+}
+
+#[test]
+fn did_you_mean_no_renumbers_and_maps_the_span() {
+    let f = fx();
+    let det = ListDetector::new(&[("Ana Berg", SpanLabel::Person)]);
+    // A bound entity before the typo (its written text is not in the draft)
+    // and an integer after it.
+    let q = "Søren Ærø paid Ana Berg 500 and Ana Berg";
+    let d = ask(run(&f, q, &det));
+    assert_eq!(d.text, ":p1 paid :p2 :p3 and :p4");
+    let d = ask(answer(d, Answer::DidYouMean(false), &f.lex).unwrap());
+    assert_eq!(d.text, ":p1 paid Ana Berg :p2 and :p3");
+    let names: Vec<&str> = d.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["p1", "p2", "p3"]);
+    assert_eq!(d.params[1].bound, Some(Bound::Integer(500)));
+    match &d.pending[0] {
+        Pending::KeepName { span, name } => {
+            assert_eq!(name, "Ana Berg");
+            let at = q.find("Ana Berg").unwrap();
+            assert_eq!(*span, (at, at + 8));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(&d.pending[1], Pending::DidYouMean { param, .. } if param == "p3"));
+    let d = ask(answer(d, Answer::KeepName(true), &f.lex).unwrap());
+    let d = ask(answer(d, Answer::DidYouMean(false), &f.lex).unwrap());
+    assert_eq!(d.text, ":p1 paid Ana Berg :p2 and Ana Berg");
+    match &d.pending[0] {
+        Pending::KeepName { span, .. } => assert_eq!(*span, (q.len() - 8, q.len())),
+        other => panic!("{other:?}"),
+    }
+    let d = ready(answer(d, Answer::KeepName(true), &f.lex).unwrap());
+    assert_eq!(d.params.len(), 2);
+}
+
+/// A later task builds a draft as a struct literal and answers it.
+#[test]
+fn hand_made_draft_answers() {
+    use saiife_shield::lexicon::Candidate;
+    use saiife_shield::schema::Param;
+    let f = fx();
+    let anna = |key: i64, city: &str| Candidate {
+        key,
+        table: "customers".into(),
+        display: "Anna Berg".into(),
+        show: vec![("city".into(), city.into())],
+    };
+    let d = Draft {
+        lang: Lang::En,
+        original: "Anna Berg over 10".into(),
+        text: ":p1 over :p2".into(),
+        params: vec![
+            Param {
+                name: "p1".into(),
+                ty: customers(),
+                bound: None,
+                display: "Anna Berg".into(),
+            },
+            Param {
+                name: "p2".into(),
+                ty: ParamType::Integer,
+                bound: Some(Bound::Integer(10)),
+                display: "10".into(),
+            },
+        ],
+        pending: vec![Pending::Pick {
+            param: "p1".into(),
+            word: "customer".into(),
+            candidates: vec![anna(1, "Aarhus"), anna(2, "Odense")],
+            too_many: false,
+        }],
+    };
+    assert_eq!(
+        template_key(&d),
+        (
+            ":p1 over :p2".to_string(),
+            vec!["entity:customers".to_string(), "integer".to_string()]
+        )
+    );
+    let r = ready(answer(d.clone(), Answer::Pick(2), &f.lex).unwrap());
+    assert_eq!(r.params[0].bound, Some(Bound::Keys(vec![2])));
+    assert_eq!(r.params[0].display, "Anna Berg, Odense (customer #2)");
+
+    // Inconsistent drafts are errors, never panics.
+    let mut bad: Vec<Draft> = Vec::new();
+    let mut x = d.clone();
+    x.text = ":p1 over 10".into(); // :p2 missing
+    bad.push(x);
+    let mut x = d.clone();
+    x.text = ":p2 over :p1".into(); // out of order
+    bad.push(x);
+    let mut x = d.clone();
+    x.text = ":p1 over :p2 :p3".into(); // extra
+    bad.push(x);
+    let mut x = d.clone();
+    x.text = ":P1 over :p2".into();
+    bad.push(x);
+    let mut x = d.clone();
+    x.text = ":p01 over :p2".into();
+    bad.push(x);
+    let mut x = d.clone();
+    x.params[1].name = "p7".into();
+    bad.push(x);
+    let mut x = d.clone();
+    x.params[0].bound = Some(Bound::Keys(vec![1])); // pending names a bound param
+    bad.push(x);
+    let mut x = d.clone();
+    x.pending.clear(); // an unbound param nobody asks about
+    x.pending.push(Pending::KeepName {
+        span: (0, 4),
+        name: "Anna".into(),
+    });
+    bad.push(x);
+    let mut x = d.clone();
+    if let Pending::Pick { param, .. } = &mut x.pending[0] {
+        *param = "p9".into();
+    }
+    bad.push(x);
+    let mut x = d.clone();
+    x.pending.push(Pending::KeepName {
+        span: (1, 99),
+        name: "nna".into(),
+    });
+    bad.push(x);
+    let mut x = d.clone();
+    x.pending.push(Pending::KeepName {
+        span: (0, 4),
+        name: "Zed".into(),
+    });
+    bad.push(x);
+    for (i, x) in bad.into_iter().enumerate() {
+        assert!(answer(x, Answer::Pick(1), &f.lex).is_err(), "case {i}");
+    }
+
+    // DidYouMean "no" on a hand-made draft: the name goes back, mapped
+    // through the verbatim text around the parameters.
+    let d = Draft {
+        lang: Lang::En,
+        original: "10 to Ana Berg, 10".into(),
+        text: ":p1 to :p2, :p3".into(),
+        params: vec![
+            Param {
+                name: "p1".into(),
+                ty: ParamType::Integer,
+                bound: Some(Bound::Integer(10)),
+                display: "10".into(),
+            },
+            Param {
+                name: "p2".into(),
+                ty: customers(),
+                bound: None,
+                display: "Ana Berg".into(),
+            },
+            Param {
+                name: "p3".into(),
+                ty: ParamType::Integer,
+                bound: Some(Bound::Integer(10)),
+                display: "10".into(),
+            },
+        ],
+        pending: vec![Pending::DidYouMean {
+            param: "p2".into(),
+            word: "customer".into(),
+            written: "Ana Berg".into(),
+            suggestion: anna(1, "Aarhus"),
+        }],
+    };
+    let k = ask(answer(d.clone(), Answer::DidYouMean(false), &f.lex).unwrap());
+    assert_eq!(k.text, ":p1 to Ana Berg, :p2");
+    assert!(matches!(&k.pending[0], Pending::KeepName { span, .. } if *span == (6, 14)));
+    // A written name that is not in the original cannot be put back.
+    let mut x = d.clone();
+    if let Pending::DidYouMean { written, .. } = &mut x.pending[0] {
+        *written = "Zed Zulu".into();
+    }
+    assert!(answer(x, Answer::DidYouMean(false), &f.lex).is_err());
+    // A suggestion from another table than the param's type.
+    let mut x = d;
+    x.params[1].ty = ParamType::Entity {
+        table: "orders".into(),
+        word: "order".into(),
+    };
+    assert!(answer(x, Answer::DidYouMean(true), &f.lex).is_err());
 }

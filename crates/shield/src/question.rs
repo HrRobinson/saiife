@@ -43,8 +43,16 @@ pub const MAX_SPAN_TOKENS: usize = 6;
 
 // ------------------------------------------------------------- types ----
 
-/// A question with its parameters. `original` and `text` hold what the
-/// user wrote: local only, and left out of `Debug`.
+/// A question with its parameters: plain public data (ruling P-16), so a
+/// draft can be built by hand. `original` and `text` hold what the user
+/// wrote: local only, and left out of `Debug`.
+///
+/// The invariants [`answer`] checks (an inconsistent draft is an `Err`):
+/// `text` holds `:p1`..`:pK` once each, in order, for the K `params` (named
+/// `p1`..`pK`), and nothing else shaped like a parameter; the text between
+/// them is copied from `original` verbatim; a `Pick` or `DidYouMean` names an
+/// unbound param, whose `display` is the text as written; a `KeepName` span
+/// is the name's bytes in `original`.
 #[derive(Clone)]
 pub struct Draft {
     pub lang: Lang,
@@ -54,9 +62,6 @@ pub struct Draft {
     pub params: Vec<Param>,
     /// In question order; `pending[0]` is the one [`answer`] answers.
     pub pending: Vec<Pending>,
-    /// The spans of the original, in order: the source of `text`, `params`
-    /// and `pending`, which are rebuilt from it after every answer.
-    items: Vec<Item>,
 }
 
 #[derive(Clone)]
@@ -71,8 +76,11 @@ pub enum Pending {
         too_many: bool,
     },
     /// An unknown name close to one known name (R43-8).
+    /// `word` is the entity word in the question's language, as in `Pick`
+    /// (needed when a "yes" leads to a list or a refusal).
     DidYouMean {
         param: String,
+        word: String,
         written: String,
         suggestion: Candidate,
     },
@@ -137,23 +145,6 @@ enum State {
     },
     /// Waiting for KeepName.
     KeepAsk,
-    /// Kept as plain text after the touch.
-    Kept,
-}
-
-impl State {
-    fn is_param(&self) -> bool {
-        matches!(
-            self,
-            State::Bound { .. } | State::Pick { .. } | State::DidYouMean { .. }
-        )
-    }
-    fn is_pending(&self) -> bool {
-        matches!(
-            self,
-            State::Pick { .. } | State::DidYouMean { .. } | State::KeepAsk
-        )
-    }
 }
 
 /// An entity table's parameter type and its word in the question's language.
@@ -276,6 +267,12 @@ pub fn parameterize(
     det: &dyn NameDetector,
 ) -> Result<Step, ShieldError> {
     let lang = lang.unwrap_or_else(|| detect_lang(question));
+
+    // 0. A typed `:p9` would read as a parameter name (and R44-8 skips
+    // those in the number scan): refuse it like a bad literal.
+    if let Some((a, b)) = param_token(question, 0) {
+        return Ok(Step::Refuse(Refusal::BadLiteral { span: (a, b) }));
+    }
 
     // 1. Literals.
     let lits: Vec<LiteralSpan> = match find_literals(question, lang) {
@@ -400,12 +397,12 @@ pub fn parameterize(
             },
             Raw::Entity(table) => {
                 let e = ent(schema, &table, lang)?;
+                let word = e.word.clone();
                 match resolve_state(lex, e, &table, written)? {
                     Some(s) => s,
                     None => match suggest(lex, schema, lang, written)? {
                         Some(s) => s,
                         None => {
-                            let word = ent(schema, &table, lang)?.word;
                             return Ok(Step::Refuse(Refusal::NoMatch {
                                 word,
                                 written: written.to_string(),
@@ -418,7 +415,11 @@ pub fn parameterize(
         };
         items.push(Item { start, end, state });
     }
-    build(lang, question.to_string(), items)
+    let d = build(lang, question.to_string(), items)?;
+    // The built draft must meet the invariants `answer` checks (a `:pN`
+    // run into a digit, say): otherwise fail closed.
+    check(&d)?;
+    Ok(step(d))
 }
 
 /// Resolves `phrase` in `table`: one match is bound, several are a pick,
@@ -460,36 +461,30 @@ fn suggest(
     })
 }
 
-/// The public fields from the items: `:pN` in question order.
-fn build(lang: Lang, original: String, items: Vec<Item>) -> Result<Step, ShieldError> {
+/// The draft from the items: `:pN` in question order.
+fn build(lang: Lang, original: String, items: Vec<Item>) -> Result<Draft, ShieldError> {
     let mut text = String::with_capacity(original.len());
     let mut params = Vec::new();
     let mut pending = Vec::new();
     let mut at = 0;
-    for it in &items {
+    for it in items {
         if it.start < at {
             return Err(bad_span());
         }
         text.push_str(original.get(at..it.start).ok_or_else(bad_span)?);
         let written = slice(&original, it.start, it.end)?;
         at = it.end;
-        if !it.state.is_param() {
-            text.push_str(written);
-            if matches!(it.state, State::KeepAsk) {
+        let name = format!("p{}", params.len() + 1);
+        let (ty, bound, display) = match it.state {
+            State::KeepAsk => {
+                text.push_str(written);
                 pending.push(Pending::KeepName {
                     span: (it.start, it.end),
                     name: written.to_string(),
                 });
+                continue;
             }
-            continue;
-        }
-        let name = format!("p{}", params.len() + 1);
-        text.push(':');
-        text.push_str(&name);
-        let (ty, bound, display) = match &it.state {
-            State::Bound { ty, bound, display } => {
-                (ty.clone(), Some(bound.clone()), display.clone())
-            }
+            State::Bound { ty, bound, display } => (ty, Some(bound), display),
             State::Pick {
                 ent,
                 candidates,
@@ -497,22 +492,24 @@ fn build(lang: Lang, original: String, items: Vec<Item>) -> Result<Step, ShieldE
             } => {
                 pending.push(Pending::Pick {
                     param: name.clone(),
-                    word: ent.word.clone(),
-                    candidates: candidates.clone(),
-                    too_many: *too_many,
+                    word: ent.word,
+                    candidates,
+                    too_many,
                 });
-                (ent.ty.clone(), None, written.to_string())
+                (ent.ty, None, written.to_string())
             }
             State::DidYouMean { ent, suggestion } => {
                 pending.push(Pending::DidYouMean {
                     param: name.clone(),
+                    word: ent.word,
                     written: written.to_string(),
-                    suggestion: suggestion.clone(),
+                    suggestion,
                 });
-                (ent.ty.clone(), None, written.to_string())
+                (ent.ty, None, written.to_string())
             }
-            State::KeepAsk | State::Kept => return Err(bad_span()),
         };
+        text.push(':');
+        text.push_str(&name);
         params.push(Param {
             name,
             ty,
@@ -521,80 +518,311 @@ fn build(lang: Lang, original: String, items: Vec<Item>) -> Result<Step, ShieldE
         });
     }
     text.push_str(original.get(at..).ok_or_else(bad_span)?);
-    let done = pending.is_empty();
-    let d = Draft {
+    Ok(Draft {
         lang,
         original,
         text,
         params,
         pending,
-        items,
-    };
-    Ok(if done { Step::Ready(d) } else { Step::Ask(d) })
+    })
 }
 
-// ------------------------------------------------------------ answer ----
+fn step(d: Draft) -> Step {
+    if d.pending.is_empty() {
+        Step::Ready(d)
+    } else {
+        Step::Ask(d)
+    }
+}
+
+// ------------------------------------------------- the public draft ----
 
 fn misfit() -> ShieldError {
     ShieldError::Corrupt("the answer does not fit the question")
 }
 
-/// Answers `draft.pending[0]`. An answer of the wrong kind, or a pick past
-/// the list, is a caller bug (`Err`).
-pub fn answer(draft: Draft, a: Answer, lex: &Lexicon) -> Result<Step, ShieldError> {
-    let Draft {
-        lang,
-        original,
-        mut items,
-        ..
-    } = draft;
-    let i = items
+fn bad_draft() -> ShieldError {
+    ShieldError::Corrupt("the draft is not consistent")
+}
+
+/// The first parameter-shaped token in `s` (`:p` or `:P`, then an ASCII
+/// digit) as (start, end of its digit run). Byte scan: `:`, `p` and digits
+/// are ASCII, so they never sit inside a multi-byte character.
+fn param_token(s: &str, from: usize) -> Option<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i + 2 < b.len() {
+        if b[i] == b':' && (b[i + 1] == b'p' || b[i + 1] == b'P') && b[i + 2].is_ascii_digit() {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            return Some((i, j));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The K+1 verbatim segments of `text` around `:p1`..`:pK`, which must each
+/// appear exactly once, in order, written exactly so (no `:P1`, no `:p01`).
+fn split_text(text: &str, k: usize) -> Result<Vec<&str>, ShieldError> {
+    let mut segs = Vec::with_capacity(k + 1);
+    let mut last = 0;
+    let mut n = 0usize;
+    while let Some((i, j)) = param_token(text, last) {
+        n += 1;
+        let tok = text.get(i..j).ok_or_else(bad_draft)?;
+        if n > k || tok != format!(":p{n}") {
+            return Err(bad_draft());
+        }
+        segs.push(text.get(last..i).ok_or_else(bad_draft)?);
+        last = j;
+    }
+    if n != k {
+        return Err(bad_draft());
+    }
+    segs.push(text.get(last..).ok_or_else(bad_draft)?);
+    Ok(segs)
+}
+
+fn param_index(d: &Draft, name: &str) -> Result<usize, ShieldError> {
+    d.params
         .iter()
-        .position(|it| it.state.is_pending())
-        .ok_or_else(misfit)?;
-    let written = slice(&original, items[i].start, items[i].end)?.to_string();
-    let next = match (&items[i].state, a) {
-        (State::Pick { ent, too_many, .. }, Answer::Pick(0)) => {
-            let word = ent.word.clone();
-            return Ok(Step::Refuse(if *too_many {
+        .position(|p| p.name == name)
+        .ok_or_else(bad_draft)
+}
+
+/// The invariants of [`Draft`]; any break is an `Err`.
+fn check(d: &Draft) -> Result<(), ShieldError> {
+    split_text(&d.text, d.params.len())?;
+    for (i, p) in d.params.iter().enumerate() {
+        if p.name != format!("p{}", i + 1) {
+            return Err(bad_draft());
+        }
+    }
+    let mut asked: Vec<usize> = Vec::new();
+    for p in &d.pending {
+        match p {
+            Pending::Pick { param, .. } | Pending::DidYouMean { param, .. } => {
+                let i = param_index(d, param)?;
+                if d.params[i].bound.is_some() || asked.contains(&i) {
+                    return Err(bad_draft());
+                }
+                asked.push(i);
+            }
+            Pending::KeepName { span, name } => {
+                if span.0 >= span.1 || d.original.get(span.0..span.1) != Some(name.as_str()) {
+                    return Err(bad_draft());
+                }
+            }
+        }
+    }
+    // Every unbound param waits for an answer.
+    if d.params.iter().filter(|p| p.bound.is_none()).count() != asked.len() {
+        return Err(bad_draft());
+    }
+    Ok(())
+}
+
+/// The char boundaries `q` of `s` (including `s.len()`) where `seg` starts.
+fn starts(s: &str, seg: &str) -> Vec<usize> {
+    s.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
+        .filter(|&q| s.get(q..).is_some_and(|t| t.starts_with(seg)))
+        .collect()
+}
+
+/// Where param `n` (1-based) sits in `original`, given that its text there
+/// is `w`: `original` = s0 W1 s1 .. WK sK with each other W non-empty. The
+/// one placement that fits, or `Err` when none or several do (fail closed).
+/// Every offset is found by matching on `original` itself (S-1).
+fn locate(original: &str, segs: &[&str], n: usize, w: &str) -> Result<(usize, usize), ShieldError> {
+    let k = segs.len().checked_sub(1).ok_or_else(bad_draft)?;
+    if n == 0 || n > k || w.is_empty() || !original.starts_with(segs[0]) {
+        return Err(bad_draft());
+    }
+    // Where W_n can start: after s0 W1 s1 .. W(n-1) s(n-1).
+    let mut f: Vec<usize> = vec![segs[0].len()];
+    for seg in &segs[1..n] {
+        let lo = *f.iter().min().ok_or_else(bad_draft)?;
+        f = starts(original, seg)
+            .into_iter()
+            .filter(|&q| q > lo)
+            .map(|q| q + seg.len())
+            .collect();
+    }
+    // Where s_n can start: before W(n+1) s(n+1) .. WK sK, which ends the text.
+    let last = original
+        .len()
+        .checked_sub(segs[k].len())
+        .filter(|&p| original.get(p..) == Some(segs[k]))
+        .ok_or_else(bad_draft)?;
+    let mut r: Vec<usize> = vec![last];
+    for seg in segs[n..k].iter().rev() {
+        let hi = *r.iter().max().ok_or_else(bad_draft)?;
+        r = starts(original, seg)
+            .into_iter()
+            .filter(|&p| p + seg.len() < hi)
+            .collect();
+    }
+    let mut found = None;
+    for p in f {
+        let q = p.checked_add(w.len()).ok_or_else(bad_draft)?;
+        if original.get(p..q) == Some(w) && r.contains(&q) {
+            if found.is_some() {
+                return Err(bad_draft());
+            }
+            found = Some((p, q));
+        }
+    }
+    found.ok_or_else(bad_draft)
+}
+
+/// DidYouMean "no": the written name goes back in place of `:pN`, the param
+/// is dropped, the later ones are renumbered, and the name waits for the
+/// keep-as-text touch (at the front of `pending`).
+fn unbind(d: &mut Draft, i: usize, written: String) -> Result<(), ShieldError> {
+    let k = d.params.len();
+    let n = i + 1;
+    let (text, span) = {
+        let segs = split_text(&d.text, k)?;
+        let span = locate(&d.original, &segs, n, &written)?;
+        let mut t = String::with_capacity(d.text.len() + written.len());
+        for (j, seg) in segs.iter().enumerate() {
+            t.push_str(seg);
+            let m = j + 1;
+            if m > k {
+                break;
+            }
+            if m == n {
+                t.push_str(&written);
+            } else {
+                let num = if m > n { m - 1 } else { m };
+                t.push_str(&format!(":p{num}"));
+            }
+        }
+        (t, span)
+    };
+    d.text = text;
+    d.params.remove(i);
+    for (j, p) in d.params.iter_mut().enumerate().skip(i) {
+        p.name = format!("p{}", j + 1);
+    }
+    let rename = |param: &mut String| -> Result<(), ShieldError> {
+        let m: usize = param
+            .strip_prefix('p')
+            .and_then(|x| x.parse().ok())
+            .ok_or_else(bad_draft)?;
+        if m > n {
+            *param = format!("p{}", m - 1);
+        }
+        Ok(())
+    };
+    for p in d.pending.iter_mut() {
+        match p {
+            Pending::Pick { param, .. } | Pending::DidYouMean { param, .. } => rename(param)?,
+            Pending::KeepName { .. } => {}
+        }
+    }
+    d.pending.insert(
+        0,
+        Pending::KeepName {
+            span,
+            name: written,
+        },
+    );
+    Ok(())
+}
+
+/// Answers `draft.pending[0]`, working from the draft's public fields only.
+/// An answer of the wrong kind, a pick past the list, or a draft that breaks
+/// the invariants of [`Draft`] is an `Err`.
+pub fn answer(draft: Draft, a: Answer, lex: &Lexicon) -> Result<Step, ShieldError> {
+    let mut d = draft;
+    check(&d)?;
+    if d.pending.is_empty() {
+        return Err(misfit());
+    }
+    let p0 = d.pending.remove(0);
+    match (p0, a) {
+        (
+            Pending::Pick {
+                param,
+                word,
+                too_many,
+                ..
+            },
+            Answer::Pick(0),
+        ) => {
+            let i = param_index(&d, &param)?;
+            let written = d.params[i].display.clone();
+            return Ok(Step::Refuse(if too_many {
                 Refusal::TooMany { word }
             } else {
                 Refusal::NoMatch { word, written }
             }));
         }
         (
-            State::Pick {
-                ent, candidates, ..
+            Pending::Pick {
+                param,
+                word,
+                candidates,
+                ..
             },
             Answer::Pick(n),
         ) => {
+            let i = param_index(&d, &param)?;
             let c = candidates.get(n - 1).ok_or_else(misfit)?;
-            State::Bound {
-                ty: ent.ty.clone(),
-                bound: Bound::Keys(vec![c.key]),
-                display: entity_display(c, &ent.word),
-            }
+            let p = &mut d.params[i];
+            p.bound = Some(Bound::Keys(vec![c.key]));
+            p.display = entity_display(c, &word);
         }
-        (State::DidYouMean { ent, suggestion }, Answer::DidYouMean(true)) => {
-            match resolve_state(lex, ent.clone(), &suggestion.table, &suggestion.display)? {
-                Some(s) => s,
-                None => {
-                    return Ok(Step::Refuse(Refusal::NoMatch {
-                        word: ent.word.clone(),
-                        written,
-                    }))
+        (
+            Pending::DidYouMean {
+                param,
+                word,
+                written,
+                suggestion,
+            },
+            Answer::DidYouMean(true),
+        ) => {
+            let i = param_index(&d, &param)?;
+            if !matches!(&d.params[i].ty, ParamType::Entity { table, .. } if *table == suggestion.table)
+            {
+                return Err(bad_draft());
+            }
+            match lex.resolve(&suggestion.table, &suggestion.display)? {
+                (Resolve::One(c), _) => {
+                    let p = &mut d.params[i];
+                    p.bound = Some(Bound::Keys(vec![c.key]));
+                    p.display = entity_display(&c, &word);
                 }
+                (Resolve::Many(candidates), too_many) => d.pending.insert(
+                    0,
+                    Pending::Pick {
+                        param,
+                        word,
+                        candidates,
+                        too_many,
+                    },
+                ),
+                (Resolve::None, _) => return Ok(Step::Refuse(Refusal::NoMatch { word, written })),
             }
         }
-        (State::DidYouMean { .. }, Answer::DidYouMean(false)) => State::KeepAsk,
-        (State::KeepAsk, Answer::KeepName(true)) => State::Kept,
-        (State::KeepAsk, Answer::KeepName(false)) => {
-            return Ok(Step::Refuse(Refusal::NameRefused { name: written }))
+        (Pending::DidYouMean { param, written, .. }, Answer::DidYouMean(false)) => {
+            let i = param_index(&d, &param)?;
+            unbind(&mut d, i, written)?;
+        }
+        (Pending::KeepName { .. }, Answer::KeepName(true)) => {}
+        (Pending::KeepName { name, .. }, Answer::KeepName(false)) => {
+            return Ok(Step::Refuse(Refusal::NameRefused { name }))
         }
         _ => return Err(misfit()),
-    };
-    items[i].state = next;
-    build(lang, original, items)
+    }
+    check(&d)?;
+    Ok(step(d))
 }
 
 /// The approved-method match key (plan 45 Task 6): the parameterized text
