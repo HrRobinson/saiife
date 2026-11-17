@@ -1,0 +1,22 @@
+[package]
+name = "saiife-shield-ner"
+description = "Data Shield local name detector: WordPiece, BIO decoding and the saiife-ner runtime (tokio-free)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_shield_ner"
+path = "src/lib.rs"
+
+[dependencies]
+saiife-shield = { path = "../shield" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+sha2 = "0.10"
+unicode-normalization = "=0.1.25"
+
+[lints]
+workspace = true

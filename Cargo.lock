@@ -2173,6 +2173,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-shield-ner"
+version = "0.2.0"
+dependencies = [
+ "saiife-shield",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "saiife-system"
 version = "0.2.0"
 dependencies = [
