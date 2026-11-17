@@ -1,10 +1,18 @@
 //! ONNX token classification with the pure-Rust `tract` runtime (R46-2,
 //! R46-5).
 //!
-//! The model file is untrusted input to tract: every tract error maps to a
-//! fixed text (tract's own messages never leave this module), tract calls
-//! run under `catch_unwind`, and the output shape is checked before any
-//! value is read.
+//! The model file is untrusted input to tract. Guaranteed here: every tract
+//! error maps to a fixed `NerError::Model` text (tract's error values are
+//! dropped, never formatted), tract calls run under `catch_unwind` so a
+//! tract panic returns a fixed-text error, and the output shape is checked
+//! before any value is read.
+//!
+//! NOT guaranteed here: `catch_unwind` runs after the process's panic hook,
+//! and the default hook has already printed tract's panic message to stderr.
+//! During `detect` that message can carry WordPiece ids of the request text
+//! (against R46-4). The process owner (the `saiife-ner` helper's `main`)
+//! must install a silent panic hook (`std::panic::set_hook`) before calling
+//! `NerModel::load`.
 
 use crate::bio::{decode_bio, merge_windows, windows, wire_kind};
 use crate::labels::{parse_labels, LabelsFile};
@@ -39,7 +47,8 @@ pub struct NerModel {
     table: Vec<String>,
 }
 
-/// Runs `f`, turning a panic inside tract into a fixed-text error.
+/// Runs `f`, turning a panic inside tract into a fixed-text error. The
+/// panic hook still runs first: see the module doc (silent hook required).
 fn guarded<T>(f: impl FnOnce() -> Result<T, NerError>, on_panic: NerError) -> Result<T, NerError> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(Err(on_panic))
 }
