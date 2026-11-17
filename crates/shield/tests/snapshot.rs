@@ -86,10 +86,10 @@ fn semicolon_csv_and_bom() {
     assert_eq!(t[0].name, "kunder");
     assert_eq!(t[0].columns, vec!["Kunde", "Beløb"]);
     let info = build(&mut src, dir.path()).unwrap();
-    assert_eq!(info.tables[0].3[1].0, "bel_b");
+    assert_eq!(info.tables[0].3[1].0, "beloeb");
     let c = open_ro(&info.path).unwrap();
     let v: String = c
-        .query_row("SELECT bel_b FROM kunder WHERE kunde=1", [], |r| r.get(0))
+        .query_row("SELECT beloeb FROM kunder WHERE kunde=1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, "a;b");
 
@@ -250,7 +250,7 @@ fn xlsx_two_sheets_two_tables() {
     );
     assert_eq!(
         col_types(&info, "fakturaer")[2],
-        ("bel_b".into(), ColType::Real)
+        ("beloeb".into(), ColType::Real)
     );
     let c = open_ro(&info.path).unwrap();
     let n: String = c

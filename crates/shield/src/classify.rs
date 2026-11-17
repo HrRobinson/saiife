@@ -4,6 +4,7 @@
 
 use crate::error::ShieldError;
 use crate::schema::{ColType, ColumnClass};
+use crate::source::quote_ident as quote;
 use rusqlite::Connection;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,13 +44,15 @@ const IDENT_WORDS: &[&str] = &[
     "konto",
     "iban",
 ];
+// Every entry is in the folded form `clean_name` gives a column name
+// (`født` is `foedt`): a test asserts it, so no entry can be unreachable.
 const QUASI_WORDS: &[&str] = &[
-    "postcode", "postnr", "zip", "city", "by", "birth", "fodsel", "født", "gender", "køn", "title",
-    "stilling", "age", "alder",
+    "postcode", "postnr", "zip", "city", "by", "birth", "fodsel", "foedsel", "foedt", "fodt",
+    "gender", "koen", "kon", "title", "stilling", "age", "alder",
 ];
 const AMOUNT_WORDS: &[&str] = &[
-    "amount", "beløb", "balance", "saldo", "salary", "løn", "price", "pris", "limit", "total",
-    "sum",
+    "amount", "beloeb", "belob", "balance", "saldo", "salary", "loen", "lon", "price", "pris",
+    "limit", "total", "sum",
 ];
 const FREETEXT_WORDS: &[&str] = &[
     "note",
@@ -59,7 +62,7 @@ const FREETEXT_WORDS: &[&str] = &[
     "description",
     "memo",
     "remark",
-    "bemærkning",
+    "bemaerkning",
     "kommentar",
     "beskrivelse",
 ];
@@ -232,12 +235,10 @@ pub mod checks {
     }
 }
 
-fn quote(id: &str) -> String {
-    format!("\"{}\"", id.replace('"', "\"\""))
-}
-
-fn sqlite_err() -> ShieldError {
-    ShieldError::Sqlite("sqlite: statistics query failed".into())
+/// The one fixed sqlite error of the classifier and the k-floor (M3: no text
+/// from rusqlite, it can carry values).
+pub(crate) fn sqlite_err() -> ShieldError {
+    ShieldError::Sqlite("sqlite: classifier query failed".into())
 }
 
 /// Row, non-null and distinct counts and the longest value, in one pass.
@@ -264,22 +265,99 @@ pub fn stats(
     .map_err(|_| sqlite_err())
 }
 
-/// Up to 200 distinct non-null values as text, read locally for `guess`.
+/// Up to 200 distinct non-null values as text, read locally for `guess`,
+/// drawn across the whole table. Method: random `rowid` probes over
+/// `[min, max]` (at most 1000 primary-key lookups, so O(sample), no sort of
+/// the table); a table whose rowid range is at most 1000 is read in order.
 pub fn sample(conn: &Connection, table: &str, column: &str) -> Result<Vec<String>, ShieldError> {
-    let (t, c) = (quote(table), quote(column));
-    let sql = format!(
-        "SELECT DISTINCT CAST({c} AS TEXT) FROM {t} WHERE {c} IS NOT NULL ORDER BY 1 LIMIT ?1"
-    );
-    let mut st = conn.prepare(&sql).map_err(|_| sqlite_err())?;
-    let rows = st
-        .query_map([200i64], |r| r.get::<_, String>(0))
-        .map_err(|_| sqlite_err())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| sqlite_err())
+    let mut seed = [0u8; 8];
+    getrandom::fill(&mut seed).map_err(|_| ShieldError::Io("no randomness".into()))?;
+    sample_seeded(conn, table, column, u64::from_le_bytes(seed))
 }
 
-fn share(sample: &[String], f: fn(&str) -> bool) -> bool {
-    !sample.is_empty() && sample.iter().filter(|v| f(v)).count() * 5 >= sample.len() * 4
+/// `sample` with a fixed seed, so a test can repeat a draw.
+#[doc(hidden)]
+pub fn sample_seeded(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    seed: u64,
+) -> Result<Vec<String>, ShieldError> {
+    const WANT: usize = 200;
+    const PROBES: u64 = 1000;
+    let (t, c) = (quote(table), quote(column));
+    let (lo, hi): (Option<i64>, Option<i64>) = conn
+        .query_row(
+            &format!("SELECT MIN(rowid), MAX(rowid) FROM {t}"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| sqlite_err())?;
+    let (Some(lo), Some(hi)) = (lo, hi) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut take = |v: Option<String>, out: &mut Vec<String>| {
+        if let Some(v) = v {
+            if seen.insert(v.clone()) {
+                out.push(v);
+            }
+        }
+    };
+    let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
+    if span <= u128::from(PROBES) {
+        let mut st = conn
+            .prepare(&format!("SELECT CAST({c} AS TEXT) FROM {t}"))
+            .map_err(|_| sqlite_err())?;
+        let mut rows = st.query([]).map_err(|_| sqlite_err())?;
+        while let Some(r) = rows.next().map_err(|_| sqlite_err())? {
+            take(r.get(0).map_err(|_| sqlite_err())?, &mut out);
+            if out.len() >= WANT {
+                break;
+            }
+        }
+    } else {
+        let mut st = conn
+            .prepare(&format!(
+                "SELECT CAST({c} AS TEXT) FROM {t} WHERE rowid = ?1"
+            ))
+            .map_err(|_| sqlite_err())?;
+        // SplitMix64.
+        let mut x = seed;
+        for _ in 0..PROBES {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let id = (i128::from(lo) + (u128::from(z) % span) as i128) as i64;
+            let v: Option<Option<String>> = match st.query_row([id], |r| r.get(0)) {
+                Ok(v) => Some(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(_) => return Err(sqlite_err()),
+            };
+            take(v.flatten(), &mut out);
+            if out.len() >= WANT {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// True when any identifier check matches the value.
+pub(crate) fn looks_like_identifier(v: &str) -> bool {
+    checks::email(v) || checks::iban(v) || checks::phone(v) || checks::cpr(v) || checks::luhn(v)
+}
+
+/// The share (0.0 to 1.0) of the sample that any identifier check matches.
+pub fn identifier_share(sample: &[String]) -> f32 {
+    if sample.is_empty() {
+        return 0.0;
+    }
+    let n = sample.iter().filter(|v| looks_like_identifier(v)).count();
+    n as f32 / sample.len() as f32
 }
 
 fn g(class: ColumnClass, confidence: f32, reason: &'static str) -> Guess {
@@ -297,13 +375,12 @@ pub fn guess(name: &str, ty: ColType, st: &ColumnStats, sample: &[String]) -> Gu
     if name_in(name, IDENT_WORDS) {
         return g(Identifier, 0.95, "the name says it holds names or IDs");
     }
-    if share(sample, checks::email)
-        || share(sample, checks::iban)
-        || share(sample, checks::phone)
-        || share(sample, checks::cpr)
-        || share(sample, checks::luhn)
-    {
+    let ids = identifier_share(sample);
+    if ids >= 0.8 {
         return g(Identifier, 0.95, "the values look like names or IDs");
+    }
+    if ids >= 0.2 {
+        return g(Sensitive, 0.5, "some values look like identifiers");
     }
     if name_in(name, QUASI_WORDS) {
         return g(Quasi, 0.9, "the name says it can single out a person");
@@ -365,6 +442,18 @@ mod tests {
         assert!(!name_has("postcodes", "postcode"));
         assert!(amount_name("credit_limit"));
         assert!(!amount_name("status"));
+    }
+
+    #[test]
+    fn word_lists_are_in_cleaned_form() {
+        for w in IDENT_WORDS
+            .iter()
+            .chain(QUASI_WORDS)
+            .chain(AMOUNT_WORDS)
+            .chain(FREETEXT_WORDS)
+        {
+            assert_eq!(&crate::snapshot::clean_name(w, "c"), w, "{w}");
+        }
     }
 
     #[test]

@@ -43,8 +43,10 @@ pub struct Progress {
 /// R43-2: lower-case, every character outside `[a-z0-9_]` becomes `_`,
 /// leading and trailing `_` are dropped. An empty result is `fallback`; a
 /// leading digit gets `fallback_` in front.
-fn clean_name(raw: &str, fallback: &str) -> String {
-    let mut s: String = raw
+pub(crate) fn clean_name(raw: &str, fallback: &str) -> String {
+    // R43-7 first: `Løn` is `loen`, `Beløb` is `beloeb`, `Kunde Nr.` is `kunde_nr`.
+    let folded = crate::norm::normalize(raw).replace(' ', "_");
+    let mut s: String = folded
         .chars()
         .map(|c| {
             let c = c.to_ascii_lowercase();
@@ -535,7 +537,9 @@ mod tests {
     #[test]
     fn name_cleaning() {
         assert_eq!(clean_name("Kunde Nr.", "c"), "kunde_nr");
-        assert_eq!(clean_name("Beløb", "c"), "bel_b");
+        assert_eq!(clean_name("Løn", "c"), "loen");
+        assert_eq!(clean_name("CPR-nr", "c"), "cpr_nr");
+        assert_eq!(clean_name("Beløb", "c"), "beloeb");
         assert_eq!(clean_name("2024 Sales", "c"), "c_2024_sales");
         assert_eq!(clean_name("***", "c"), "c");
         assert_eq!(clean_name("_rowid", "c"), "rowid");

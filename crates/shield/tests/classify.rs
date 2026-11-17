@@ -86,6 +86,10 @@ fn checks_vectors() {
     assert!(!checks::cpr("320190-1234"));
     assert!(!checks::cpr("011390-1234"));
     assert!(!checks::cpr("010190-123"));
+    assert!(!checks::cpr("310490-1234")); // April has 30 days
+    assert!(!checks::cpr("300290-1234")); // no Feb 30
+    assert!(!checks::cpr("290291-1234")); // 1991 is not a leap year
+    assert!(checks::cpr("290292-1234")); // yy % 4 == 0
     assert!(checks::email("a.b@example.invalid"));
     assert!(!checks::email("a@b"));
     assert!(!checks::email("no at sign"));
@@ -150,4 +154,125 @@ fn too_many_values_refused() {
     let s = e.to_string();
     assert!(s.contains("too many values to be a category"));
     assert!(!s.contains("v0"));
+    assert_eq!(
+        s,
+        "snapshot, table t, column v: too many values to be a category"
+    );
+}
+
+fn classify_all(
+    conn: &rusqlite::Connection,
+    table: &str,
+    cols: &[(String, ColType)],
+) -> Vec<(String, saiife_shield::classify::Guess)> {
+    cols.iter()
+        .map(|(c, ty)| {
+            let st = stats(conn, table, c, *ty).unwrap();
+            let sm = sample(conn, table, c).unwrap();
+            (c.clone(), guess(c, *ty, &st, &sm))
+        })
+        .collect()
+}
+
+#[test]
+fn danish_headers_classify() {
+    let mut csv = String::from("Løn,Beløb,Født,Køn,Bemærkning,CPR-nr\n");
+    for i in 0..60u32 {
+        csv.push_str(&format!(
+            "{}.50,{},19{:02}-01-15,{},ring op senere,0101{:02}-{:04}\n",
+            20000 + i * 137,
+            1000 + i * 71,
+            40 + i % 50,
+            if i % 2 == 0 { "M" } else { "K" },
+            40 + i % 50,
+            1000 + i * 3
+        ));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hr.csv"), csv).unwrap();
+    let (conn, cols) = snap(dir.path(), "hr.csv");
+    let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["loen", "beloeb", "foedt", "koen", "bemaerkning", "cpr_nr"]
+    );
+    let got = classify_all(&conn, "hr", &cols);
+    let class = |n: &str| got.iter().find(|g| g.0 == n).unwrap().1.class;
+    assert_eq!(class("loen"), Sensitive);
+    assert_eq!(class("beloeb"), Sensitive);
+    assert_eq!(class("foedt"), Quasi);
+    assert_eq!(class("koen"), Quasi);
+    assert_eq!(class("bemaerkning"), FreeText);
+    assert_eq!(class("cpr_nr"), Identifier);
+}
+
+fn big(rows: &[(String, u32)]) -> rusqlite::Connection {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute("CREATE TABLE t (v TEXT)", []).unwrap();
+    let mut n = 0;
+    for (kind, count) in rows {
+        for _ in 0..*count {
+            n += 1;
+            let v = match kind.as_str() {
+                "email" => format!("zed{n}@example.invalid"),
+                "phone" => format!("+45 00 {:02} {:02} {:02}", n % 100, (n / 100) % 100, n % 97),
+                other => format!("{other}{n}"),
+            };
+            c.execute("INSERT INTO t VALUES (?1)", [v]).unwrap();
+        }
+    }
+    c
+}
+
+fn judge(c: &rusqlite::Connection) -> (saiife_shield::classify::Guess, Option<&'static str>) {
+    let st = stats(c, "t", "v", ColType::Text).unwrap();
+    let sm = sample(c, "t", "v").unwrap();
+    (
+        guess("v", ColType::Text, &st, &sm),
+        public_refusal("v", ColType::Text, &st, &sm),
+    )
+}
+
+#[test]
+fn mixed_identifier_column_is_not_public() {
+    // 40 % emails + 45 % phones: neither check reaches 80 % alone.
+    let c = big(&[
+        ("email".into(), 1600),
+        ("phone".into(), 1800),
+        ("misc".into(), 600),
+    ]);
+    let (g, r) = judge(&c);
+    assert_eq!(g.class, Identifier);
+    assert!(r.is_some());
+    // 30 % + 30 %: combined 60 % is unsure, never public.
+    let c = big(&[
+        ("email".into(), 1200),
+        ("phone".into(), 1200),
+        ("misc".into(), 1600),
+    ]);
+    let (g, r) = judge(&c);
+    assert_eq!(g.class, Sensitive);
+    assert_eq!(g.reason, "some values look like identifiers");
+    assert!(uncertain(&g));
+    assert_eq!(r, Some("holds names or IDs"));
+}
+
+#[test]
+fn sample_covers_the_whole_table() {
+    // The lowest-sorted values are harmless; most rows are emails.
+    let c = big(&[("aaa".into(), 400), ("email".into(), 3600)]);
+    let (g, r) = judge(&c);
+    assert_eq!(g.class, Identifier);
+    assert!(r.is_some());
+}
+
+#[test]
+fn k_floor_refuses_an_identifier_value() {
+    let c = mem(&[("open", 20), ("paid", 20), ("010190-1234", 15)]);
+    let e = public_values(&c, "t", "status", 10).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "snapshot, table t, column status: a value looks like a name, ID or contact detail"
+    );
+    assert!(!e.to_string().contains("0101"));
 }

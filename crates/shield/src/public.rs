@@ -1,9 +1,12 @@
 //! Plan 43 T4: public marks. A `public` column is refused when it holds names,
 //! IDs or amounts; otherwise only values seen at least `k` times are listed.
 
-use crate::classify::{checks, guess, ColumnStats};
+use crate::classify::{
+    checks, guess, identifier_share, looks_like_identifier, sqlite_err, ColumnStats,
+};
 use crate::error::ShieldError;
 use crate::schema::{ColType, ColumnClass};
+use crate::source::quote_ident as quote;
 use rusqlite::Connection;
 
 const MAX_VALUES: usize = 1000;
@@ -19,6 +22,9 @@ pub fn public_refusal(
     if g.class == ColumnClass::Identifier && g.confidence >= 0.85 {
         return Some("holds names or IDs");
     }
+    if identifier_share(sample) >= 0.2 {
+        return Some("holds names or IDs");
+    }
     if checks::amount_name(name) || ty == ColType::Real {
         return Some("holds amounts");
     }
@@ -30,14 +36,6 @@ pub struct PublicValues {
     pub column: String,
     pub passing: Vec<String>,
     pub total_distinct: u64,
-}
-
-fn quote(id: &str) -> String {
-    format!("\"{}\"", id.replace('"', "\"\""))
-}
-
-fn sqlite_err() -> ShieldError {
-    ShieldError::Sqlite("sqlite: public values query failed".into())
 }
 
 fn refuse(table: &str, column: &str, why: &'static str) -> ShieldError {
@@ -98,6 +96,13 @@ pub fn public_values(
         .map_err(|_| sqlite_err())?;
     if passing.len() > MAX_VALUES {
         return Err(refuse(table, column, "too many values to be a category"));
+    }
+    if passing.iter().any(|v| looks_like_identifier(v)) {
+        return Err(refuse(
+            table,
+            column,
+            "a value looks like a name, ID or contact detail",
+        ));
     }
     Ok(PublicValues {
         column: column.to_string(),
