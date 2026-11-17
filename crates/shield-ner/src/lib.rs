@@ -1,13 +1,15 @@
-//! saiife Data Shield local name detector: protocol-independent pieces
-//! (labels file, WordPiece tokenizer, BIO decoding). Tokio-free.
+//! saiife Data Shield local name detector: labels file, WordPiece tokenizer,
+//! BIO decoding and the tract (ONNX) runtime. Tokio-free.
 #![forbid(unsafe_code)]
 
 pub mod bio;
 pub mod labels;
+pub mod model;
 pub mod wordpiece;
 
 pub use bio::{decode_bio, merge_windows, windows};
 pub use labels::{parse_labels, LabelsFile};
+pub use model::NerModel;
 pub use wordpiece::{Encoding, WordPiece};
 
 /// Errors carry fixed texts only: never input text or parser messages.

@@ -70,6 +70,12 @@ fn parse_tag(l: &str) -> Option<(bool, &'static str)> {
     }
 }
 
+/// The wire entity kind of a model label (`B-PER` -> `PER`), `None` for O
+/// and unknown kinds.
+pub(crate) fn wire_kind(l: &str) -> Option<&'static str> {
+    parse_tag(l).map(|(_, w)| w)
+}
+
 struct Open {
     label: &'static str,
     start: usize,

@@ -17,6 +17,12 @@ serde_json = "1"
 thiserror = "1"
 sha2 = "0.10"
 unicode-normalization = "=0.1.25"
+tract-onnx = "=0.23.9"
+
+[dev-dependencies]
+# The exact prost tract-onnx 0.23.9 resolves to (it does not re-export it):
+# the tests encode a synthetic ModelProto.
+prost = "=0.14.4"
 
 [lints]
 workspace = true
