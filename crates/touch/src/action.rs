@@ -22,17 +22,22 @@ pub enum TouchClass {
     Test,
     /// A Workspace steer window (plan 31).
     Steer,
-    /// Data Shield (plan 43): release an answer that passed the gates.
+    /// Data Shield (plan 43, spec §2.1.4): release judgment-mode fiction
+    /// derived from `sensitive` columns, or an answer the k-guard cannot
+    /// bring to k by generalizing (later stages).
     BlindRelease,
-    /// Data Shield: reveal a masked value.
+    /// Data Shield: a real `identifier`, `quasi` or `sensitive` value
+    /// would leave (G1).
     BlindReveal,
-    /// Data Shield: create or rotate a dataset key.
+    /// Data Shield: rotate or delete a dataset key.
     BlindKeys,
-    /// Data Shield: loosen a dataset's limits.
+    /// Data Shield: make a column class less strict.
     BlindLoosen,
-    /// Data Shield: approve a pending release.
+    /// Data Shield: approve a method for reuse (also needs the approver
+    /// role).
     BlindApprove,
-    /// Data Shield: name an entity.
+    /// Data Shield: send a proper name the dataset does not know in the
+    /// stripped question (§2.1.7).
     BlindName,
 }
 

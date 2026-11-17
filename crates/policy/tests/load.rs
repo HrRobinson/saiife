@@ -1427,3 +1427,47 @@ fn blind_more_refusals() {
     );
     assert!(e.contains("users has an entry"), "{e}");
 }
+
+/// M7: an entity needs a table, a key and name columns; words, when set,
+/// are not empty; one entity per table.
+#[test]
+fn blind_entity_validated() {
+    let ent = |body: &str| format!("version = 2\n{BLIND_CRM}[[blind.dataset.entity]]\n{body}");
+    let ok = "table = \"customers\"\nkey = \"id\"\nnames = [\"first_name\"]\n";
+    let (_d, cfg) = etc(&ent(ok), &[]);
+    load_system(&cfg).unwrap();
+    let cases = [
+        (
+            "table = \"\"\nkey = \"id\"\nnames = [\"n\"]\n",
+            "crm: entity table is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"\"\nnames = [\"n\"]\n",
+            "crm: entity customers: key is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = []\n",
+            "crm: entity customers: names is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = [\"\"]\n",
+            "crm: entity customers: names has an empty entry",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = [\"n\"]\nword = \"\"\n",
+            "crm: entity customers: word is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = [\"n\"]\nword_da = \"\"\n",
+            "crm: entity customers: word_da is empty",
+        ),
+        (
+            &format!("{ok}[[blind.dataset.entity]]\n{ok}"),
+            "crm: entity customers is given twice",
+        ),
+    ];
+    for (body, want) in cases {
+        let e = blind_err(&ent(body), &[]);
+        assert!(e.contains(want), "{want}: {e}");
+    }
+}

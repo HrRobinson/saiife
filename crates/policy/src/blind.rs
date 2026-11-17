@@ -272,6 +272,37 @@ impl BlindDataset {
                 ));
             }
         }
+        let mut tables = BTreeSet::new();
+        for e in &self.entity {
+            if e.table.is_empty() {
+                return Err(format!("[[blind.dataset]] {n}: entity table is empty"));
+            }
+            let t = &e.table;
+            if !tables.insert(t.as_str()) {
+                return Err(format!("[[blind.dataset]] {n}: entity {t} is given twice"));
+            }
+            if e.key.is_empty() {
+                return Err(format!("[[blind.dataset]] {n}: entity {t}: key is empty"));
+            }
+            if e.names.is_empty() {
+                return Err(format!("[[blind.dataset]] {n}: entity {t}: names is empty"));
+            }
+            if e.names.iter().chain(&e.show).any(String::is_empty) {
+                let key = if e.names.iter().any(String::is_empty) {
+                    "names"
+                } else {
+                    "show"
+                };
+                return Err(format!(
+                    "[[blind.dataset]] {n}: entity {t}: {key} has an empty entry"
+                ));
+            }
+            for (key, w) in [("word", &e.word), ("word_da", &e.word_da)] {
+                if w.as_deref() == Some("") {
+                    return Err(format!("[[blind.dataset]] {n}: entity {t}: {key} is empty"));
+                }
+            }
+        }
         if let BlindSource::Postgres { host, .. } = &self.source {
             let local =
                 host.starts_with('/') || matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
