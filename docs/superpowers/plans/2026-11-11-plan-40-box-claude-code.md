@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Threat-model boundary (2026-11-17).** In-box hardening is best-effort defence in depth: the agent can already run arbitrary code in its box (passwordless sudo, FU4). What is guaranteed: the guard hook's integrity against repo config (`env -i` hooks, root-managed settings), no real credentials in the box, egress only via the gateway, and every change reviewed and landed by touch on the host. Future findings in this class are triaged against this boundary.
+
 > **Reconciled 2026-11-12** against plan 34 as built on `v3-p34` (`ee5e264`; rulings R8, R11, R28) and the v2 vault and broker code on `v3-dev`. Changes:
 > 1. **Already in plan 34 (not rebuilt here):** `BoxTemplate.credential_in_box: bool`, parsed from `[agent] credential_in_box`, default `false`, built-in `false` (`crates/boxes/src/template.rs:63`, R8). Task 1 keeps only the subscription gate and the placeholder.
 > 2. Names checked: `Login { ApiKey, Subscription }` (`template.rs:38`), `AgentKind::ClaudeCode` (`:33`), `BoxTemplate.credential: String` (`:62`); the built-in `claude-code` has no egress and no secrets (`builtin/claude-code.toml`), so its phone spawn is Signed (R11).

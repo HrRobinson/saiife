@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Threat-model boundary (2026-11-17).** In-box hardening is best-effort defence in depth: the agent can already run arbitrary code in its box (passwordless sudo, FU4). What is guaranteed: the guard hook's integrity against repo config (`env -i` hooks, root-managed settings), no real credentials in the box, egress only via the gateway, and every change reviewed and landed by touch on the host. Future findings in this class are triaged against this boundary.
+
 > **Depends on:** plan 40 merged into `v3-dev` (done at `ea324ebe`, in `bac68f00`): the model forwarder `crates/daemon/src/box_gateway/model.rs`, the placeholder `crates/boxhost/src/placeholder.rs` behind `RecordPaths::placeholder()` (R1, R2, R15), `TemplateSetup::setup_for` (`crates/daemon/src/box_setup.rs`), R3 (no credential in the box), R9/R13 (parked minors; this plan closes R13 M5, the path allow-list). Plan 36's recipe and bake (`assets/box/recipe.toml`, `crates/boxhost/src/image.rs`, `crates/boxhost/src/bake.rs`, `assets/box/bake/saiife-bake.sh`). The owner's smoke runs need owner accounts for OpenAI and Google AI Studio.
 
 **Goal:** Two more built-in box templates, `codex` (OpenAI Codex CLI) and `gemini` (Google Gemini CLI), marked **beta** in `saiife box templates` and the Workspace. Each runs interactively in its TUI inside the box and talks to its model only through the host gateway, which swaps the box's placeholder for the real API key. The real key never enters the box.

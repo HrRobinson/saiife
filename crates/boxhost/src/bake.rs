@@ -187,18 +187,19 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
 /// A generated payload file's contents.
 pub type FileBody = fn() -> String;
 
-/// The payload files of git's ssh wrapper, its ssh config and the system
-/// git config (FU2 fix round 5), with their contents. Baked with Claude
-/// Code's managed settings, which name the wrapper.
-pub const CLAUDE_GIT_FILES: [(&str, FileBody); 3] = [
+/// The payload files of git's ssh wrapper, its ssh config (FU2 fix round
+/// 5) and every agent's git config at `/etc/saiife/gitconfig` (COORD-7),
+/// with their contents. Always baked (`install_saiife_git`): every agent's
+/// launch env names the git config, whose `core.sshCommand` is the wrapper.
+pub const GIT_FILES: [(&str, FileBody); 3] = [
     ("saiife-ssh", crate::guest::saiife_ssh_wrapper),
     ("saiife-ssh-config", crate::guest::saiife_ssh_config),
-    ("saiife-gitconfig", crate::guest::system_gitconfig),
+    ("saiife-gitconfig", crate::guest::saiife_gitconfig),
 ];
 
 /// A 512 MiB vfat image labelled SAIIFE: saiife, claude,
 /// `claude-managed-settings.json` (FU2), git's ssh wrapper, ssh config and
-/// system git config ([`CLAUDE_GIT_FILES`]), guest/, recipe.env and an empty
+/// git config ([`GIT_FILES`]), guest/, recipe.env and an empty
 /// out/ the guest writes its results into. With Codex:
 /// `codex.tar.gz`, `codex-requirements.toml` and
 /// `codex-managed-config.toml`; with Gemini: `gemini.zip`,
@@ -236,7 +237,7 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
         "claude-managed-settings.json",
         crate::guest::claude_managed_settings(),
     )?;
-    for (name, body) in CLAUDE_GIT_FILES {
+    for (name, body) in GIT_FILES {
         write(name, body())?;
     }
     if let Some(codex) = &inputs.agents.codex {
@@ -759,15 +760,19 @@ mod tests {
                 read("claude-managed-settings.json"),
                 guest::claude_managed_settings()
             );
-            // and git's ssh wrapper, ssh config and system git config
-            // (FU2 fix round 5)
-            for (n, body) in CLAUDE_GIT_FILES {
+            // and git's ssh wrapper, ssh config (FU2 fix round 5) and every
+            // agent's git config (COORD-7), whatever the agents
+            for (n, body) in GIT_FILES {
                 assert!(copy.contains(&format!("/{n} ")), "{n}: {copy}");
                 assert_eq!(read(n), body(), "{n}");
             }
             assert_eq!(read("saiife-ssh"), guest::saiife_ssh_wrapper());
             assert_eq!(read("saiife-ssh-config"), guest::saiife_ssh_config());
-            assert_eq!(read("saiife-gitconfig"), guest::system_gitconfig());
+            assert_eq!(read("saiife-gitconfig"), guest::saiife_gitconfig());
+            assert_eq!(
+                read("saiife-gitconfig"),
+                saiife_boxproto::launch::gitconfig_text()
+            );
             // recipe.env does not change with the agents (D10)
             assert_eq!(read("recipe.env"), recipe_env(&recipe()).unwrap());
         }
@@ -805,18 +810,25 @@ mod tests {
         // Claude Code's managed settings: always, from install_agents (FU2)
         let claude = script_fn("install_claude_managed");
         assert!(claude.contains(&format!("\"{}\"", guest::CLAUDE_MANAGED_SETTINGS_PATH)));
-        // git's ssh files go in with the managed settings that name them, so
-        // the claude_managed_settings capability covers them (FU2 fix 5)
+        // git's files (COORD-7): always, first, in their own function; no
+        // /etc/gitconfig any more
+        let git = script_fn("install_saiife_git");
         for path in [
             guest::CLAUDE_GIT_SSH,
             guest::SAIIFE_SSH_CONFIG_PATH,
-            guest::SYSTEM_GITCONFIG_PATH,
+            guest::GIT_CONFIG_GLOBAL_PATH,
         ] {
-            assert!(claude.contains(&format!("\"{path}\"")), "{path}");
+            assert!(git.contains(&format!("\"{path}\"")), "{path}");
         }
+        assert_eq!(guest::GIT_CONFIG_GLOBAL_PATH, "/etc/saiife/gitconfig");
+        assert!(!BAKE_SCRIPT.contains("\"/etc/gitconfig\""));
         let agents_fn = script_fn("install_agents");
-        let first = agents_fn.lines().nth(1).map(str::trim);
-        assert_eq!(first, Some("install_claude_managed"), "{agents_fn}");
+        let calls: Vec<&str> = agents_fn.lines().skip(1).take(2).map(str::trim).collect();
+        assert_eq!(
+            calls,
+            ["install_saiife_git", "install_claude_managed"],
+            "{agents_fn}"
+        );
         // the R14 tree, with its owners and modes
         for path in [
             guest::CLAUDE_MANAGED_SETTINGS_PATH,
@@ -843,9 +855,10 @@ mod tests {
                 "install -o root -g root -m 0644 \"$MNT/saiife-ssh-config\" \"{}\"",
                 guest::SAIIFE_SSH_CONFIG_PATH
             ),
+            "install -d -o root -g root -m 0755 \"/etc/saiife\"".to_string(),
             format!(
                 "install -o root -g root -m 0644 \"$MNT/saiife-gitconfig\" \"{}\"",
-                guest::SYSTEM_GITCONFIG_PATH
+                guest::GIT_CONFIG_GLOBAL_PATH
             ),
             format!(
                 "install -o root -g root -m 0644 \"$MNT/claude-managed-settings.json\" \"{}\"",
@@ -883,6 +896,7 @@ mod tests {
         // the archives are data: nothing from them is sourced or evaluated
         let agents_fns = [
             "install_agents",
+            "install_saiife_git",
             "install_claude_managed",
             "install_codex",
             "install_gemini",

@@ -226,7 +226,7 @@ fn setup(cmd: &[&str]) -> Setup {
             user: "agent".into(),
             cwd: "/work".into(),
         },
-        env: vec![("FOO".into(), "bar".into())],
+        env: vec![("OPENAI_API_KEY".into(), "bar".into())],
         files: vec![],
         rows: 40,
         cols: 120,
@@ -425,7 +425,7 @@ fn setup_writes_files_and_env() {
     let text = std::fs::read_to_string(&envf).unwrap();
     assert!(text.starts_with("HOME=/home/agent\nUSER=agent\n"), "{text}");
     assert!(text.contains("HTTPS_PROXY=http://127.0.0.1:3128\n"));
-    assert!(text.ends_with("FOO=bar\n"), "{text}");
+    assert!(text.ends_with("OPENAI_API_KEY=bar\n"), "{text}");
     assert_eq!(std::fs::metadata(&envf).unwrap().mode() & 0o7777, 0o600);
     // First setup: /work handed to the agent (never following links), the marker set.
     let work = h.env.path("/work");
@@ -439,6 +439,30 @@ fn setup_writes_files_and_env() {
     let mut pty = accept(&h.pty, T);
     // `env` prints in no fixed order: read up to the line after it
     let out = pty_until(&mut pty, "END-OF-ENV", T);
+    // COORD-7: exactly the allowlist (the shell adds PWD, SHLVL and `_`;
+    // the fake runuser adds nothing, the real one the same HOME, SHELL,
+    // USER and LOGNAME values)
+    let mut got: Vec<String> = out
+        .split("END-OF-ENV")
+        .next()
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            !["PWD=", "SHLVL=", "_=", "OLDPWD="]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .collect();
+    got.sort();
+    let mut want: Vec<String> =
+        saiife_boxproto::launch::launch_env(&[("OPENAI_API_KEY".into(), "bar".into())])
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+    want.sort();
+    assert_eq!(got, want, "{out}");
     for want in [
         "HOME=/home/agent",
         "USER=agent",
@@ -447,13 +471,40 @@ fn setup_writes_files_and_env() {
         "LANG=C.UTF-8",
         "HTTP_PROXY=http://127.0.0.1:3128",
         "NO_PROXY=localhost,127.0.0.1",
-        "FOO=bar",
+        "GIT_CONFIG_GLOBAL=/etc/saiife/gitconfig",
+        "OPENAI_API_KEY=bar",
     ] {
         assert!(out.contains(want), "{want} missing in {out}");
     }
     assert!(!out.contains("CARGO"), "inherited env: {out}");
     assert!(!out.contains("TMPDIR"), "inherited env: {out}");
     let _ = next_event(&mut ev, Duration::from_millis(10));
+}
+
+/// COORD-7: a setup that names a loader, shell or git variable is refused
+/// by the guest's own check; nothing is written or started.
+#[test]
+fn setup_check_refuses_non_model_env() {
+    let h = host();
+    let _init = start(&h.env);
+    let _ev = welcomed(&h);
+    for n in [
+        "LD_PRELOAD",
+        "BASH_ENV",
+        "NODE_OPTIONS",
+        "GIT_CONFIG_COUNT",
+        "PATH",
+    ] {
+        let mut s = setup(&["/bin/true"]);
+        s.env.push((n.into(), "/work/x".into()));
+        assert!(
+            matches!(request(&h.env, &Request::Setup(s)), Reply::Err { .. }),
+            "{n}"
+        );
+    }
+    assert!(!h.env.path("/var/lib/saiife-guest/setup-done").exists());
+    assert!(!h.env.path("/etc/saiife-guest/agent.env").exists());
+    assert_eq!(calls(&h.env), "");
 }
 
 #[test]

@@ -103,28 +103,11 @@ impl GuestEnv {
     }
 }
 
-/// The agent's environment: the fixed values, then the setup's own (a later
-/// entry wins when the process is spawned).
+/// The agent's environment (COORD-7): exactly the allowlist of
+/// [`saiife_boxproto::launch::launch_env`], the same for every agent but its
+/// model variables. The spawn clears the init's own env first.
 pub fn agent_env(setup_env: &[(String, String)]) -> Vec<(String, String)> {
-    use saiife_boxproto::ports::{
-        AGENT_HOME, AGENT_LANG, AGENT_NO_PROXY, AGENT_PATH, AGENT_PROXY, AGENT_USER,
-    };
-    let fixed = [
-        ("HOME", AGENT_HOME),
-        ("USER", AGENT_USER),
-        ("PATH", AGENT_PATH),
-        ("TERM", "xterm-256color"),
-        ("LANG", AGENT_LANG),
-        ("HTTPS_PROXY", AGENT_PROXY),
-        ("HTTP_PROXY", AGENT_PROXY),
-        ("NO_PROXY", AGENT_NO_PROXY),
-    ];
-    let mut out: Vec<(String, String)> = fixed
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    out.extend(setup_env.iter().cloned());
-    out
+    saiife_boxproto::launch::launch_env(setup_env)
 }
 
 #[cfg(test)]
@@ -143,8 +126,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_env_is_fixed_then_setup() {
-        let e = agent_env(&[("FOO".into(), "bar".into())]);
+    fn agent_env_is_the_allowlist() {
+        use saiife_boxproto::launch::{fixed_env, git_env};
+        let e = agent_env(&[
+            ("OPENAI_API_KEY".into(), "PH".into()),
+            ("LD_PRELOAD".into(), "/work/x.so".into()),
+        ]);
         assert_eq!(e[0], ("HOME".into(), "/home/agent".into()));
         // the values the host pins in the agents' managed settings (FU2)
         let get = |k: &str| e.iter().find(|(n, _)| n == k).unwrap().1.clone();
@@ -153,7 +140,10 @@ mod tests {
         assert_eq!(get("HTTP_PROXY"), "http://127.0.0.1:3128");
         assert_eq!(get("NO_PROXY"), "localhost,127.0.0.1");
         assert_eq!(get("LANG"), "C.UTF-8");
-        assert_eq!(e.len(), 9);
-        assert_eq!(e[8], ("FOO".into(), "bar".into()));
+        assert_eq!(get("GIT_CONFIG_GLOBAL"), "/etc/saiife/gitconfig");
+        let mut want = fixed_env();
+        want.extend(git_env());
+        want.push(("OPENAI_API_KEY".into(), "PH".into()));
+        assert_eq!(e, want);
     }
 }

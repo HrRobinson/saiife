@@ -226,6 +226,14 @@ impl Setup {
             if !env_name_ok(k) {
                 return Err("bad environment variable name".into());
             }
+            // COORD-7: the agent's env is an allowlist; the host may add
+            // only an agent's model variables (no loader, shell or git
+            // variable can ride in).
+            if !crate::launch::is_model_var(k) {
+                return Err(format!(
+                    "environment variable {k} is not an agent model variable"
+                ));
+            }
             if v.contains('\0') || v.contains('\n') {
                 return Err(format!("environment variable {k} has NUL or newline"));
             }
@@ -278,7 +286,7 @@ mod tests {
                 user: "agent".into(),
                 cwd: "/work".into(),
             },
-            env: vec![("A".into(), "b".into())],
+            env: vec![("OPENAI_API_KEY".into(), "b".into())],
             files: vec![SetupFile {
                 path: "/home/agent/x".into(),
                 mode: 0o644,
@@ -339,7 +347,7 @@ mod tests {
         pin(
             Request::Setup(setup()),
             json!({"t":"setup","agent":{"command":["claude"],"user":"agent","cwd":"/work"},
-                   "env":[["A","b"]],"files":[{"path":"/home/agent/x","mode":420,"text":"hi","keep_existing":false}],
+                   "env":[["OPENAI_API_KEY","b"]],"files":[{"path":"/home/agent/x","mode":420,"text":"hi","keep_existing":false}],
                    "rows":40,"cols":120}),
         );
         pin(
@@ -449,15 +457,60 @@ mod tests {
         for n in ["a", "1A", "A-B", "", &"A".repeat(65)] {
             bad(&|s| s.env = vec![(n.into(), "v".into())]);
         }
+        bad(&|s| s.env = vec![("OPENAI_API_KEY".into(), "a\nb".into())]);
+        bad(&|s| s.env = vec![("OPENAI_API_KEY".into(), "a\0b".into())]);
+        bad(&|s| {
+            s.env = (0..65)
+                .map(|_| ("OPENAI_API_KEY".to_string(), String::new()))
+                .collect()
+        });
         let mut s = setup();
-        s.env = vec![("_A9".into(), "v".into()), ("A".repeat(64), "v".into())];
+        s.env = (0..64)
+            .map(|_| ("OPENAI_API_KEY".to_string(), String::new()))
+            .collect();
         assert_eq!(s.check(), Ok(()));
-        bad(&|s| s.env = vec![("A".into(), "a\nb".into())]);
-        bad(&|s| s.env = vec![("A".into(), "a\0b".into())]);
-        bad(&|s| s.env = (0..65).map(|i| (format!("V{i}"), String::new())).collect());
+        // COORD-7: only an agent's model variables; every agent's are fine
         let mut s = setup();
-        s.env = (0..64).map(|i| (format!("V{i}"), String::new())).collect();
+        s.env = crate::launch::MODEL_ENV
+            .iter()
+            .flat_map(|(_, vars)| vars.iter())
+            .map(|v| (v.to_string(), "v".to_string()))
+            .collect();
         assert_eq!(s.check(), Ok(()));
+        for n in [
+            "_A9",
+            "A",
+            "FOO",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "PROMPT_COMMAND",
+            "PYTHONPATH",
+            "PATH",
+            "HOME",
+            "SHELL",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SSH_COMMAND",
+            "GIT_TEMPLATE_DIR",
+            "SSH_SK_PROVIDER",
+            "HTTPS_PROXY",
+        ] {
+            let mut s = setup();
+            s.env.push((n.into(), "v".into()));
+            assert_eq!(
+                s.check(),
+                Err(format!(
+                    "environment variable {n} is not an agent model variable"
+                )),
+                "{n}"
+            );
+        }
         for p in [
             "rel/x",
             "/etc/passwd",
