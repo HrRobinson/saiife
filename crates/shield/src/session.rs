@@ -43,14 +43,20 @@ impl hkdf::KeyType for Len32 {
 }
 
 /// HKDF-SHA-256 with a 16-byte session id as salt.
-pub(crate) fn derive_session_key(salt: &[u8], ikm: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn derive_session_key(
+    salt: &[u8],
+    ikm: &[u8],
+    info: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, ShieldError> {
     let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(ikm);
     let mut out = Zeroizing::new([0u8; 32]);
-    if let Ok(okm) = prk.expand(&[info], Len32) {
-        // 32 bytes is far below the 255 * 32 HKDF limit, so this cannot fail.
-        let _ = okm.fill(&mut out[..]);
-    }
-    out
+    let info_parts = [info];
+    let okm = prk
+        .expand(&info_parts, Len32)
+        .map_err(|_| ShieldError::Corrupt("session key derivation"))?;
+    okm.fill(&mut out[..])
+        .map_err(|_| ShieldError::Corrupt("session key derivation"))?;
+    Ok(out)
 }
 
 pub struct Session {
@@ -90,7 +96,7 @@ impl Session {
         now_unix: u64,
     ) -> Result<Session, ShieldError> {
         let id = SessionId(random_bytes::<16>()?);
-        let key = derive_session_key(&id.0, &keys.standin[..], HKDF_INFO);
+        let key = derive_session_key(&id.0, &keys.standin[..], HKDF_INFO)?;
         Ok(Session {
             id,
             uid,
@@ -252,7 +258,7 @@ mod tests {
     #[test]
     fn hkdf_vector() {
         let ikm = concat!("dataset-", "standin-", "key-", "for-the-vector-test").as_bytes();
-        let out = derive_session_key(b"0123456789abcdef", ikm, HKDF_INFO);
+        let out = derive_session_key(b"0123456789abcdef", ikm, HKDF_INFO).unwrap();
         let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,

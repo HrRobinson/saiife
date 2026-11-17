@@ -286,7 +286,17 @@ impl KeySet {
 
     /// JSON with base64 keys; the daemon seals these bytes (plan 47).
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut out = Zeroizing::new(Vec::with_capacity(512));
+        // Upper bound, so the buffer never reallocates and leaves unwiped key
+        // text behind: 2 keys of 44 base64 bytes plus fixed text and escaped
+        // strings (at most 6 bytes per input byte), then 44 + text per retired key.
+        let cap = 128
+            + 6 * self.created.len()
+            + self
+                .retired
+                .iter()
+                .map(|r| 112 + 6 * r.retired_at.len())
+                .sum::<usize>();
+        let mut out = Zeroizing::new(Vec::with_capacity(cap));
         out.extend_from_slice(format!("{{\"version\":{},\"standin\":\"", self.version).as_bytes());
         base64_encode_into(&mut out, &*self.standin);
         out.extend_from_slice(b"\",\"index\":\"");
@@ -488,6 +498,15 @@ mod tests {
             assert!(!dbg.contains(&format!("{:?}", &k[..])));
         }
         assert!(dbg.contains("version") && dbg.contains("2026-02-01"));
+        let mut many = KeySet::generate("2026-01-01T00:00:00Z").unwrap();
+        for i in 0..8 {
+            many.rotate(&format!("2026-02-0{}T00:00:00Z", i + 1))
+                .unwrap();
+        }
+        let mb = many.to_bytes();
+        assert!(mb.len() <= mb.capacity());
+        assert_eq!(KeySet::from_bytes(&mb).unwrap(), many);
+        assert_eq!(many.retired.len(), 8);
         assert!(KeySet::from_bytes(b"{}").is_err());
         assert!(KeySet::from_bytes(b"not json").is_err());
         let bad = br#"{"version":1,"standin":"AAAA","index":"AAAA","created":"x","retired":[]}"#;
