@@ -1479,8 +1479,12 @@ pub fn claude_proxy_env() -> Vec<(String, String)> {
 /// runtime runs, pinned empty in the managed `env` (FU2 fix round 2). A
 /// floor, not a guarantee: a denylist always misses something, so the guard
 /// hook itself runs in a fixed environment ([`hook_env_prefix`]) and the host
-/// boundary (the VM and its gateway) stays the control.
-pub const CLAUDE_EXEC_BLANKED_ENV: [&str; 22] = [
+/// boundary (the VM and its gateway) stays the control. `GIT_SSH` and
+/// `GIT_SSH_COMMAND` are not blanked: git runs a set-but-empty one as a
+/// program ("cannot run : No such file or directory"), which breaks git over
+/// ssh and overrides the user's `core.sshCommand`; where ssh can reach is the
+/// egress gateway's call.
+pub const CLAUDE_EXEC_BLANKED_ENV: [&str; 20] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -1491,8 +1495,6 @@ pub const CLAUDE_EXEC_BLANKED_ENV: [&str; 22] = [
     "CLAUDE_CODE_SHELL_PREFIX",
     "ALL_PROXY",
     "all_proxy",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
     "GIT_PROXY_COMMAND",
     "GIT_EXEC_PATH",
     "PYTHONSTARTUP",
@@ -1963,8 +1965,6 @@ mod settings_tests {
             ("CLAUDE_CODE_SHELL_PREFIX", ""),
             ("ALL_PROXY", ""),
             ("all_proxy", ""),
-            ("GIT_SSH", ""),
-            ("GIT_SSH_COMMAND", ""),
             ("GIT_PROXY_COMMAND", ""),
             ("GIT_EXEC_PATH", ""),
             ("PYTHONSTARTUP", ""),
@@ -1979,7 +1979,10 @@ mod settings_tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.into()))
         .collect();
-        assert_eq!(want_env.len(), 55);
+        assert_eq!(want_env.len(), 53);
+        for k in ["GIT_SSH", "GIT_SSH_COMMAND"] {
+            assert!(!want_env.contains_key(k), "{k}: git over ssh");
+        }
         let hook = |c: &str| serde_json::json!({"type": "command", "command": c, "timeout": 10});
         assert_eq!(
             managed(),
@@ -2681,6 +2684,14 @@ model_provider = "saiife"
     ///   the higher layer (the safe reading: a lower table's keys survive);
     /// - the provider is the active `profile`'s `model_provider`, else the
     ///   top-level one.
+    ///
+    /// Simplifications: the source's separate "profile" layer (between the
+    /// user and project layers) is not modelled, a profile is only a table
+    /// in the merged config; and Codex's `--profile` / `-p` CLI override of
+    /// the active profile is not modelled (only `-c` flags are). Both pick a
+    /// profile by name, and the managed layer pins `profiles.saiife` and
+    /// `profile`; the model does not show what a `--profile evil` run with a
+    /// lower `[profiles.evil]` would select.
     mod codex_effective {
         use toml::{Table, Value};
 
