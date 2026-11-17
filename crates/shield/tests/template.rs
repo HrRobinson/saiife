@@ -161,7 +161,11 @@ fn bad_slot_is_template_slot() {
 
 #[test]
 fn braces_escape() {
-    let t = parse("{{x}} and {int(x)}", &["x"]);
+    // round 2 (R1): a literal brace is outside the fixed-text charset, so an
+    // escaped brace is refused at parse (template_slot)
+    let e = parse_template("{{x}} and {int(x)}", &cols(&["x"]), &[p1()], 100).unwrap_err();
+    assert_eq!(e.class, ErrorClass::TemplateSlot);
+    let t = parse("x and {int(x)}", &["x"]);
     let f = fill(
         &t,
         &rs(&["x"], vec![vec![CellValue::Int(5)]]),
@@ -169,7 +173,7 @@ fn braces_escape() {
         Lang::En,
     )
     .unwrap();
-    assert_eq!(f.text, "{x} and 5");
+    assert_eq!(f.text, "x and 5");
     assert_eq!(f.printed.len(), 1);
 }
 
@@ -304,11 +308,11 @@ fn rows_total_rows_and_dates() {
         ],
     );
     let t = parse(
-        "{rows()} of {total_rows()} on {date(d)} / {date(r1.d)}",
+        "{rows()} of {total_rows()} on {date(d)} and {date(r1.d)}",
         &["d"],
     );
     let f = fill(&t, &r, &[], Lang::En).unwrap();
-    assert_eq!(f.text, "2 of 2 on 1 July 2026 / 15 August 2026");
+    assert_eq!(f.text, "2 of 2 on 1 July 2026 and 15 August 2026");
     assert_eq!(f.printed[2].dates, vec!["2026-07-01".to_string()]);
     r.truncated = true;
     r.total_rows = Some(2314);
@@ -397,13 +401,13 @@ fn never_panics_on_hostile_utf8() {
             }
         }
     }
-    let t = parse("{list(x)} {date(x)} {int(x)}", &["x"]);
+    let t = parse("{list(x)} on {date(x)} and {int(x)}", &["x"]);
     for tx in texts {
         let r = rs(&["x"], vec![vec![CellValue::Text(tx.into())]]);
         let _ = fill(&t, &r, &[], Lang::En);
     }
     // list verbatim text: spans stay on char boundaries
-    let t = parse("é{list(x)}ß", &["x"]);
+    let t = parse("é {list(x)} og", &["x"]);
     let r = rs(&["x"], vec![vec![CellValue::Text("İ😀".into())]]);
     let f = fill(&t, &r, &[], Lang::En).unwrap();
     let p = &f.printed[0];

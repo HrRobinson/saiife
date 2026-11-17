@@ -197,7 +197,9 @@ fn dates_checked() {
     assert!(check(&f, "q?", Lang::En).is_err());
     let f = filled("In Q3 2026 only.", &[]);
     assert!(check(&f, "q?", Lang::En).is_err());
-    assert!(check(&f, "what about Q3 2026?", Lang::En).is_ok());
+    // round 2 (R2/R5): `Q3` is glued to its digit, so even a question-sourced
+    // quarter is outside the fixed-text grammar; the planner writes plainer text
+    assert!(check(&f, "what about Q3 2026?", Lang::En).is_err());
     let f = filled("In 1 July 2026 only.", &[]);
     assert!(check(&f, "what about Q3 2026?", Lang::En).is_err());
 }
@@ -368,7 +370,8 @@ fn sign_flip_refused() {
     assert!(check(&f, "q?", Lang::En).is_err());
     // question signs
     let f = filled("It fell by -5 points.", &[]);
-    assert!(check(&f, "did it fall -5?", Lang::En).is_ok());
+    // round 2 (R1/R2): a glued sign never passes, even when the question has it
+    assert!(check(&f, "did it fall -5?", Lang::En).is_err());
     assert!(check(&f, "did it fall 5?", Lang::En).is_err());
     // a hyphen after a word is not a sign
     let f = filled("Item A-5 ok.", &[("5", &["5"], &[], false)]);
@@ -438,4 +441,272 @@ fn quantity_words_refused() {
     // ordinary words stay fine
     let f = filled("The pairing and halfway house are ordinary.", &[]);
     assert!(check(&f, "q?", Lang::En).is_ok());
+}
+
+// ---- fix round 2: the fixed text is an allow-listed grammar (R1-R7) ----
+
+use saiife_shield::sql::ErrorClass;
+
+fn grammar_cols() -> Vec<String> {
+    ["x", "a", "b", "owed", "limit"].map(String::from).to_vec()
+}
+
+fn parse_err(tpl: &str) -> bool {
+    matches!(
+        parse_template(tpl, &grammar_cols(), &[p1()], 100),
+        Err(e) if e.class == ErrorClass::TemplateSlot
+    )
+}
+
+/// The slot-printed span texts mark the numeric slots of `text`.
+fn both_refuse(tpl: &str, text: &str, spans: &[&str], lang: Lang) {
+    assert!(parse_err(tpl), "parse_template accepted {tpl:?}");
+    let sp: Vec<(&str, &[&str], &[&str], bool)> = spans
+        .iter()
+        .map(|s| (*s, &["1"][..], &[][..], false))
+        .collect();
+    let f = filled(text, &sp);
+    assert!(check(&f, "q?", lang).is_err(), "check accepted {text:?}");
+}
+
+#[test]
+fn grammar_refuses_sign_and_dash_lookalikes() {
+    let signs = [
+        "\u{b1}",
+        "\u{2010}",
+        "\u{2011}",
+        "\u{2012}",
+        "\u{2013}",
+        "\u{2014}",
+        "\u{fe63}",
+        "\u{ff0d}",
+        "\u{2796}",
+        "\u{2212}",
+        "-\u{2060}",
+        "-\u{200b}",
+        "- ",
+        "+",
+        "-",
+        "~",
+    ];
+    for g in signs {
+        let tpl = format!("Balance is {g}{{money(x)}} now.");
+        let text = format!("Balance is {g}18,420.00 now.");
+        both_refuse(&tpl, &text, &["18,420.00"], Lang::En);
+    }
+    both_refuse(
+        "It is ({money(x)}) now.",
+        "It is (18,420.00) now.",
+        &["18,420.00"],
+        Lang::En,
+    );
+    both_refuse(
+        "It is '{money(x)}' now.",
+        "It is '18,420.00' now.",
+        &["18,420.00"],
+        Lang::En,
+    );
+    both_refuse(
+        "It is {money(x)}/yr now.",
+        "It is 18,420.00/yr now.",
+        &["18,420.00"],
+        Lang::En,
+    );
+}
+
+#[test]
+fn grammar_refuses_scale_words_and_glue() {
+    for w in [
+        "mio.", "bn", "k", "m", "thousand", "million", "billion", "x", "e", "gange", "times",
+        "percent", "procent", "pct", "tusind", "mrd", "lakh", "Hundred",
+    ] {
+        let tpl = format!("It is {{money(x)}} {w} now.");
+        let text = format!("It is 18,420.00 {w} now.");
+        both_refuse(&tpl, &text, &["18,420.00"], Lang::En);
+        let tpl = format!("It is {w} {{money(x)}} now.");
+        let text = format!("It is {w} 18,420.00 now.");
+        both_refuse(&tpl, &text, &["18,420.00"], Lang::En);
+    }
+    for glued in ["thousand", "e3", "k", "x"] {
+        let tpl = format!("It is {{money(x)}}{glued} now.");
+        let text = format!("It is 18,420.00{glued} now.");
+        both_refuse(&tpl, &text, &["18,420.00"], Lang::En);
+    }
+    both_refuse("A{int(x)} b", "A18 b", &["18"], Lang::En);
+}
+
+#[test]
+fn grammar_refuses_joined_slots() {
+    both_refuse(
+        "{int(a)}\u{200b}{int(b)}",
+        "1\u{200b}2",
+        &["1", "2"],
+        Lang::En,
+    );
+    both_refuse("{int(a)}{int(b)}", "12", &["1", "2"], Lang::En);
+    both_refuse("{int(a)} {int(b)}", "1 2", &["1", "2"], Lang::En);
+    both_refuse("{int(a)}, {int(b)}", "1, 2", &["1", "2"], Lang::En);
+    both_refuse("{int(a)} - {int(b)}", "1 - 2", &["1", "2"], Lang::En);
+    both_refuse("{int(a)}\u{a0}{int(b)}", "1\u{a0}2", &["1", "2"], Lang::En);
+    both_refuse(
+        "{int(a)}\u{202f}{int(b)}",
+        "1\u{202f}2",
+        &["1", "2"],
+        Lang::En,
+    );
+}
+
+#[test]
+fn grammar_refuses_lookalike_and_foreign_words() {
+    for w in [
+        "\u{ff54}\u{ff48}\u{ff52}\u{ff45}\u{ff45}",
+        "t\u{4bb}ree",
+        "\u{1d42d}\u{1d421}\u{1d42b}\u{1d41e}\u{1d41e}",
+        "\u{4e09}",
+        "\u{5341}",
+        "\u{3007}",
+        "caf\u{e8}",
+        "na\u{ef}ve",
+        "\u{20ac}",
+        "\u{a3}",
+        "%",
+        "#",
+        "{{",
+    ] {
+        let tpl = format!("It was {w} times.");
+        assert!(parse_err(&tpl), "{w}");
+        let f = filled(&format!("It was {w} times."), &[]);
+        assert!(check(&f, "it was it", Lang::En).is_err(), "{w}");
+    }
+    // English number words in a Danish answer
+    for w in ["three", "ten", "twenty-one", "hundred"] {
+        let f = filled(&format!("Det er {w} fakturaer."), &[]);
+        assert!(check(&f, "hvor mange?", Lang::Da).is_err(), "{w}");
+    }
+}
+
+#[test]
+fn grammar_refuses_roman_numerals() {
+    for t in [
+        "In Q III only.",
+        "Year MMXXVI only.",
+        "In QIII only.",
+        "Part II of it.",
+        "(IV) here.",
+    ] {
+        assert!(parse_err(t), "{t}");
+        let f = filled(t, &[]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "{t}");
+    }
+    let f = filled("I think so.", &[]);
+    assert!(check(&f, "q?", Lang::En).is_ok());
+}
+
+#[test]
+fn more_quantity_words_refused() {
+    for w in [
+        "nil",
+        "nought",
+        "naught",
+        "once",
+        "quarter",
+        "single",
+        "both",
+        "score",
+        "gross",
+        "thirds",
+        "halves",
+        "twofold",
+        "tenfold",
+        "quadruple",
+        "dusin",
+        "snes",
+        "kvart",
+        "halvdelen",
+        "billion",
+        "billioner",
+        "ninefold",
+        "septillionth",
+        "femogtredivte",
+        "firedobbelt",
+        "kvartdel",
+        "stykvis",
+    ] {
+        let f = filled(&format!("It was {w} as much."), &[]);
+        let why = refusal(&f, "how much?", Lang::En);
+        assert!(why.contains(w), "{w}: {why}");
+        assert!(check(&f, &format!("is it {w}?"), Lang::En).is_ok(), "{w}");
+    }
+}
+
+#[test]
+fn grammar_still_passes_the_good_cases() {
+    for lang in [Lang::En, Lang::Da] {
+        assert!(check(&spec_filled(lang), "q?", lang).is_ok());
+    }
+    assert!(!parse_err("Anna owes {money(x)}, and {int(a)} more."));
+    assert!(!parse_err("From {int(a)} to {int(b)} items."));
+    assert!(!parse_err("Owes {money(x)}.\n{int(a)} invoices!"));
+    let f = filled(
+        "From 3 to 7 items.",
+        &[("3", &["3"], &[], false), ("7", &["7"], &[], false)],
+    );
+    assert!(check(&f, "q?", Lang::En).is_ok());
+    assert!(check(&money_filled(-18420.0), "q?", Lang::En).is_ok());
+    let f = filled("Kunden skylder 7 kr. i alt.", &[("7", &["7"], &[], false)]);
+    assert!(check(&f, "q?", Lang::Da).is_ok());
+    let f = filled(
+        "Har du \u{e6}\u{f8}\u{e5} \u{c6}\u{d8}\u{c5} caf\u{e9}?",
+        &[],
+    );
+    assert!(check(&f, "q?", Lang::Da).is_ok());
+}
+
+// R5: digits in fixed text are delimited like a numeric slot, and need the
+// question as their source. Plan 44 carry M1: phone numbers, amounts and ids
+// in a template's fixed text are covered by the same rules.
+#[test]
+fn fixed_digits_are_delimited_and_sourced() {
+    // glued or signed: refused at parse and at check even with the question
+    for (tpl, q) in [
+        ("Over 10,000kr only.", "over 10,000kr?"),
+        ("Over (10,000) only.", "over 10,000?"),
+        ("Over -10,000 only.", "over -10,000?"),
+        ("Part B2B only.", "b2b 2?"),
+        ("Over 10,000 mio. only.", "over 10,000?"),
+        ("Over 10,000 x 3 only.", "over 10,000 3?"),
+        ("Over 10 000 only.", "over 10 000?"),
+        ("Call 12 34 56 78 now.", "call 12 34 56 78?"),
+        ("Call 4411-2200 now.", "call 4411?"),
+    ] {
+        assert!(parse_err(tpl), "parse accepted {tpl:?}");
+        let f = filled(tpl, &[]);
+        assert!(check(&f, q, Lang::En).is_err(), "check accepted {tpl:?}");
+    }
+    // delimited and in the question: passes both
+    for (tpl, q, lang) in [
+        ("Only invoices over 10,000 count.", "over 10 000?", Lang::En),
+        ("Kun over 10.000 tæller.", "over 10.000?", Lang::Da),
+        ("Between 3 and 7 items.", "from 3 to 7?", Lang::En),
+    ] {
+        assert!(!parse_err(tpl), "parse refused {tpl:?}");
+        let f = filled(tpl, &[]);
+        assert!(check(&f, q, lang).is_ok(), "check refused {tpl:?}");
+    }
+    // delimited but not in the question: parse cannot know, check refuses
+    for tpl in ["Call 4411 now.", "Pay 1,500.00 now.", "Phone 555 now."] {
+        assert!(!parse_err(tpl), "{tpl}");
+        let f = filled(tpl, &[]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "{tpl}");
+    }
+}
+
+// R7 [call: controller, 2026-11-17]: the grammar is small on purpose; a claim
+// with no number in it is the business of the method preview, the answer's
+// method line and approved methods, not of the checker.
+#[test]
+fn semantic_claims_without_numbers_are_not_the_checkers_job() {
+    let f = filled("Anna Berg owes nothing.", &[]);
+    assert!(check(&f, "what does Anna Berg owe?", Lang::En).is_ok());
+    assert!(!parse_err("Anna Berg owes nothing."));
 }

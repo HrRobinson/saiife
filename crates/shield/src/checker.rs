@@ -12,11 +12,21 @@
 //! digits) refuses, a sign glued to a number belongs to it (`-18,420.00` is
 //! not `18,420.00`), a date span is classified on its own and refuses on any
 //! parser error, and a quantity word the number lexicon lacks (`twice`,
-//! `halvt`, `hundreds`) refuses unless the question has it. ASCII Roman
-//! numerals and slash dates are read as digits or words and refuse with the
-//! generic reason.
+//! `halvt`, `hundreds`) refuses unless the question has it (a Danish answer
+//! also runs the English number words). Roman numerals are not read as
+//! numbers: the fixed-text grammar refuses them outright (R6), and so does
+//! any slash date, whose `/` fails the delimiting rules or the date parser.
+//!
+//! The template's fixed text is also an allow-listed grammar (ruling T5-c,
+//! `grammar.rs`): a small charset, numbers set off by spaces, no scale or sign
+//! words beside a number, no Roman numerals. `parse_template` enforces it and
+//! `check` re-checks it over the filled text, so no equivalent spelling of a
+//! number has to be denied one by one.
 
-use crate::lang::{find_dates, find_literals, find_numbers, find_unreadable_numerics, Literal};
+use crate::grammar::{grammar_ok, Seg};
+use crate::lang::{
+    find_dates, find_literals, find_numbers, find_unreadable_numerics, number_words, Literal,
+};
 use crate::schema::{Decimal, Lang};
 use crate::template::{Filled, Printed};
 
@@ -173,12 +183,42 @@ const QUANTITY_WORDS: &[&str] = &[
     "nittende",
     "tyvende",
     "tredivte",
+    "nil",
+    "nought",
+    "naught",
+    "once",
+    "quarter",
+    "single",
+    "both",
+    "score",
+    "gross",
+    "thirds",
+    "halves",
+    "twofold",
+    "tenfold",
+    "quadruple",
+    "dusin",
+    "snes",
+    "kvart",
+    "halvdelen",
+    "billion",
+    "billioner",
+];
+
+/// Suffixes that make a word a quantity word when a stem of at least three
+/// letters precedes them (`ninefold`, `kvartdel`, `stykvis`).
+const QUANTITY_SUFFIXES: &[&str] = &[
+    "tredivte", "dobbelt", "dobbelte", "fold", "del", "dele", "vis", "illionth",
 ];
 
 fn is_quantity_word(w: &str) -> bool {
     QUANTITY_WORDS.contains(&w)
         || (w.len() > 6 && (w.ends_with("teenth") || w.ends_with("tieth")))
         || (w.ends_with("tyvende") && w.len() > 7)
+        || QUANTITY_SUFFIXES.iter().any(|suf| {
+            w.strip_suffix(suf)
+                .is_some_and(|stem| stem.chars().count() >= 3)
+        })
 }
 
 /// Alphabetic words with byte spans and a char-wise lowercase form.
@@ -335,7 +375,9 @@ pub fn check(f: &Filled, question: &str, lang: Lang) -> Result<CheckReport, Chec
     // question.
     let q_words: Vec<String> = words(question).into_iter().map(|(_, _, w)| w).collect();
     for (s, e, w) in words(text) {
-        if !is_quantity_word(&w) || q_words.contains(&w) {
+        // A Danish answer also runs the English number-word lexicon.
+        let number_word = lang == Lang::Da && number_words(Lang::En).is_number_word(&w);
+        if !(is_quantity_word(&w) || number_word) || q_words.contains(&w) {
             continue;
         }
         match place(&f.printed, s, e) {
@@ -349,5 +391,31 @@ pub fn check(f: &Filled, question: &str, lang: Lang) -> Result<CheckReport, Chec
             _ => return Err(refuse(DATA_WORD_REASON.into())),
         }
     }
+    fixed_text_grammar(f)?;
     Ok(report)
+}
+
+const GRAMMAR_REASON: &str = "the answer's fixed text is outside the allowed grammar";
+
+/// Re-check the fixed text (outside every printed span) against the grammar
+/// of `grammar.rs`, with each numeric or date span as a number slot.
+fn fixed_text_grammar(f: &Filled) -> Result<(), CheckRefusal> {
+    let mut spans: Vec<&Printed> = f.printed.iter().collect();
+    spans.sort_by_key(|p| (p.start, p.end));
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut at = 0;
+    for p in spans {
+        let (Some(fixed), Some(_)) = (f.text.get(at..p.start), f.text.get(p.start..p.end)) else {
+            return Err(refuse(SPAN_REASON.into()));
+        };
+        segs.push(Seg::Text(fixed));
+        let numeric = !p.from_param && !(p.values.is_empty() && p.dates.is_empty());
+        segs.push(if numeric { Seg::Num } else { Seg::Other });
+        at = p.end;
+    }
+    let Some(tail) = f.text.get(at..) else {
+        return Err(refuse(SPAN_REASON.into()));
+    };
+    segs.push(Seg::Text(tail));
+    grammar_ok(&segs).map_err(|_| refuse(GRAMMAR_REASON.into()))
 }

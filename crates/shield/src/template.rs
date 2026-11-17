@@ -8,6 +8,7 @@
 //! refuses (`check_failed`): nothing is ever printed as 0 or empty.
 
 use crate::calc::{CellValue, ResultSet};
+use crate::grammar::{grammar_ok, Seg};
 use crate::schema::{Decimal, Lang, Param};
 use crate::sql::{ErrorClass, MethodError};
 
@@ -211,8 +212,9 @@ fn parse_slot(
 }
 
 /// Parse a template. Unknown function, column or parameter, a row beyond
-/// `list_cap`, a bad `round` digit, or an unbalanced brace is `template_slot`
-/// carrying the planner's own slot text.
+/// `list_cap`, a bad `round` digit, an unbalanced brace, or fixed text outside
+/// the allow-listed grammar (see `grammar.rs`) is `template_slot` carrying the
+/// planner's own slot text or a short fixed reason.
 pub fn parse_template(
     s: &str,
     columns: &[String],
@@ -265,6 +267,16 @@ pub fn parse_template(
     if !text.is_empty() {
         parts.push(Part::Text(text));
     }
+    // The fixed text is an allow-listed grammar (R45-10, ruling T5-c).
+    let segs: Vec<Seg> = parts
+        .iter()
+        .map(|p| match p {
+            Part::Text(t) => Seg::Text(t),
+            Part::Slot(Slot::Cmp(..) | Slot::Param(_)) => Seg::Other,
+            Part::Slot(_) => Seg::Num,
+        })
+        .collect();
+    grammar_ok(&segs).map_err(slot_err)?;
     Ok(Template { parts })
 }
 
