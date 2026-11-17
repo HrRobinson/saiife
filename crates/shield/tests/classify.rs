@@ -142,7 +142,8 @@ fn mem(statuses: &[(&str, u32)]) -> rusqlite::Connection {
 fn k_floor_counts() {
     let c = mem(&[("open", 12), ("paid", 30), ("disputed", 3)]);
     let pv = public_values(&c, "t", "status", 10).unwrap();
-    assert_eq!(pv.column, "status");
+    // M3 / R-18: `table.column` everywhere.
+    assert_eq!(pv.column, "t.status");
     assert_eq!(pv.passing, vec!["open", "paid"]);
     assert_eq!(pv.total_distinct, 3);
 }

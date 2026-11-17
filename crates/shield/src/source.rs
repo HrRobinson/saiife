@@ -22,8 +22,8 @@ const SNIFF: usize = 64 * 1024;
 const PAGE: i64 = 10_000;
 
 /// One cell as the source gives it. CSV gives only `Null` and `Text`; the
-/// snapshot infers the column type.
-#[derive(Debug, Clone, PartialEq)]
+/// snapshot infers the column type. `Debug` shows the kind only (I8).
+#[derive(Clone, PartialEq)]
 pub enum Cell {
     Null,
     Int(i64),
@@ -32,6 +32,19 @@ pub enum Cell {
     /// ISO `YYYY-MM-DD`.
     Date(String),
     Bool(bool),
+}
+
+impl std::fmt::Debug for Cell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Cell::Null => "Null",
+            Cell::Int(_) => "Int(..)",
+            Cell::Real(_) => "Real(..)",
+            Cell::Text(_) => "Text(..)",
+            Cell::Date(_) => "Date(..)",
+            Cell::Bool(_) => "Bool(..)",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -925,10 +938,21 @@ impl RowSource for SqliteSource {
 
 // ----------------------------------------------------------- in memory ----
 
-/// Rows held in memory: tests and the Postgres bridge (plan 47).
-#[derive(Debug, Clone, Default)]
+/// Rows held in memory: tests and the Postgres bridge (plan 47). `Debug`
+/// shows the tables and row counts, never a cell (I8).
+#[derive(Clone, Default)]
 pub struct VecSource {
     pub tables: Vec<(SourceTable, Vec<Vec<Cell>>)>,
+}
+
+impl std::fmt::Debug for VecSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut l = f.debug_list();
+        for (t, rows) in &self.tables {
+            l.entry(&(t, rows.len()));
+        }
+        l.finish()
+    }
 }
 
 impl RowSource for VecSource {
@@ -969,6 +993,35 @@ mod tests {
             .conn
             .query_row("SELECT \"nosuchcol\" FROM a", [], |r| r.get::<_, i64>(0))
             .is_err());
+    }
+
+    /// I8: cells and in-memory rows print no value.
+    #[test]
+    fn cell_debug_has_no_values() {
+        let cells = vec![
+            Cell::Text("Anna Berg".into()),
+            Cell::Int(4411),
+            Cell::Real(44.11),
+            Cell::Date("1980-04-11".into()),
+            Cell::Bool(true),
+            Cell::Null,
+        ];
+        let d = format!("{cells:?}");
+        for v in ["Anna", "4411", "44.11", "1980"] {
+            assert!(!d.contains(v), "{d}");
+        }
+        let src = VecSource {
+            tables: vec![(
+                SourceTable {
+                    name: "people".into(),
+                    columns: vec!["name".into()],
+                },
+                vec![vec![Cell::Text("Anna Berg".into())]],
+            )],
+        };
+        let d = format!("{src:?}");
+        assert!(!d.contains("Anna"), "{d}");
+        assert!(d.contains("people"), "{d}");
     }
 
     #[test]

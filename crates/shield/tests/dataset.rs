@@ -483,3 +483,81 @@ fn propose_and_finish_agree_on_borderline_columns() {
     assert!(first.iter().any(|r| !r), "some column must pass");
     finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
 }
+
+/// I7: every EntitySpec column is checked against the snapshot, with a
+/// fixed text naming only the table and column.
+#[test]
+fn entity_spec_columns_are_checked() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 300, 600, 7);
+    let dir = ds(t.path());
+    let base = stage(&dir, &csv);
+    type Edit = fn(&mut saiife_shield::schema::EntitySpec);
+    let cases: [(Edit, &str); 6] = [
+        (
+            |e| e.show = vec!["city".into(), "segmnt".into()],
+            "policy, table customers, column segmnt: an entity column is not in the snapshot",
+        ),
+        (
+            |e| e.names = vec!["first_nam".into()],
+            "policy, table customers, column first_nam: an entity column is not in the snapshot",
+        ),
+        (
+            |e| e.names.clear(),
+            "policy, table customers: an entity has no name columns",
+        ),
+        (
+            |e| e.key = "kid".into(),
+            "policy, table customers, column kid: an entity column is not in the snapshot",
+        ),
+        (
+            |e| e.key = "email".into(),
+            "policy, table customers, column email: an entity key is not an INTEGER column",
+        ),
+        (
+            |e| e.table = "kunder".into(),
+            "policy, table kunder: an entity table is not in the snapshot",
+        ),
+    ];
+    for (edit, want) in cases {
+        let mut schema = base.clone();
+        edit(
+            schema
+                .entities
+                .iter_mut()
+                .find(|e| e.table == "customers")
+                .unwrap(),
+        );
+        let err = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+        assert_eq!(err.to_string(), want);
+    }
+    // The unedited policy still builds.
+    finish(&dir, &base, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+}
+
+/// M5: a column guessed free text gets no public preview (no k-floor
+/// listing of its values is read).
+#[test]
+fn free_text_gets_no_public_preview() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 300, 3000, 9);
+    let dir = ds(t.path());
+    let mut src = fixtures::MultiSource::csv_dir(&csv).unwrap();
+    stage_snapshot(&dir, &mut src, &mut |_| {}).unwrap();
+    let props = propose(&dir.stage().join("snapshot.sqlite"), 2).unwrap();
+    let notes = props
+        .iter()
+        .find(|p| p.table == "invoices" && p.column == "notes")
+        .unwrap();
+    assert_eq!(notes.guess.class, ColumnClass::FreeText);
+    assert_eq!(notes.public_preview, None);
+    // M3 / R-18: a preview names its column `table.column`.
+    let status = props
+        .iter()
+        .find(|p| p.table == "invoices" && p.column == "status")
+        .unwrap();
+    assert_eq!(
+        status.public_preview.as_ref().unwrap().column,
+        "invoices.status"
+    );
+}

@@ -614,12 +614,61 @@ fn check_schema(schema: &Schema, layout: &Layout) -> Result<(), ShieldError> {
             return Err(bad);
         }
     }
+    check_entities(schema, layout)
+}
+
+/// A fixed policy error naming a table and maybe a column (never a value).
+fn policy_err(table: &str, column: Option<&str>, why: &'static str) -> ShieldError {
+    ShieldError::Source {
+        file: "policy".into(),
+        table: Some(table.to_string()),
+        column: column.map(str::to_string),
+        row: None,
+        why,
+    }
+}
+
+/// I7: every EntitySpec names a snapshot table, an INTEGER key column, at
+/// least one name column, and only snapshot columns to show. (Queries quote
+/// these names; an unknown one must fail here, not read as nothing.)
+fn check_entities(schema: &Schema, layout: &Layout) -> Result<(), ShieldError> {
+    const MISSING: &str = "an entity column is not in the snapshot";
+    for e in &schema.entities {
+        let Some((_, cols)) = layout.iter().find(|(t, _)| *t == e.table) else {
+            return Err(policy_err(
+                &e.table,
+                None,
+                "an entity table is not in the snapshot",
+            ));
+        };
+        let ty = |c: &str| cols.iter().find(|(n, _)| n == c).map(|x| x.1);
+        match ty(&e.key) {
+            None => return Err(policy_err(&e.table, Some(&e.key), MISSING)),
+            Some(ColType::Integer) => {}
+            Some(_) => {
+                return Err(policy_err(
+                    &e.table,
+                    Some(&e.key),
+                    "an entity key is not an INTEGER column",
+                ))
+            }
+        }
+        if e.names.is_empty() {
+            return Err(policy_err(&e.table, None, "an entity has no name columns"));
+        }
+        for c in e.names.iter().chain(&e.show) {
+            if ty(c).is_none() {
+                return Err(policy_err(&e.table, Some(c), MISSING));
+            }
+        }
+    }
     Ok(())
 }
 
-/// The format most of `sample` passes, for a text column.
+/// The format most of `sample` passes, for a text or integer column (M2:
+/// phones and CPRs are often inferred as INTEGER).
 fn format_of(ty: ColType, sample: &[String]) -> Format {
-    if ty != ColType::Text || sample.is_empty() {
+    if !matches!(ty, ColType::Text | ColType::Integer) || sample.is_empty() {
         return Format::Plain;
     }
     type Check = fn(&str) -> bool;
@@ -769,7 +818,9 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
             let guess = classify::guess(&column, ty, &st, &sample);
             let mut refusal = public_refusal(&column, ty, &st, &sample);
             let mut preview = None;
-            if refusal.is_none() {
+            // M5: no k-floor listing of free text (it would show the
+            // repeated notes, names and all).
+            if refusal.is_none() && guess.class != ColumnClass::FreeText {
                 match public_values(&conn, &table, &column, k) {
                     Ok(pv) => preview = Some(pv),
                     Err(ShieldError::Source { why, .. }) => refusal = Some(why),
@@ -876,9 +927,7 @@ fn finish_inner(
                 {
                     return Err(ShieldError::Corrupt(PUBLIC_REFUSED));
                 }
-                let mut pv = public_values(&conn, &t.name, &c.name, k)?;
-                pv.column = format!("{}.{}", t.name, c.name);
-                public.push(pv);
+                public.push(public_values(&conn, &t.name, &c.name, k)?);
             }
             formats.insert(format!("{}.{}", t.name, c.name), format_of(c.ty, &sample));
         }
@@ -1092,6 +1141,21 @@ pub fn load_manifest(dir: &DatasetDir) -> Result<Manifest, ShieldError> {
         }
     }
     Ok(m)
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// M2: phones and CPRs inferred as INTEGER get their format too.
+    #[test]
+    fn integer_columns_get_a_format() {
+        let phones: Vec<String> = (0..10).map(|i| format!("{}", 20_000_000 + i)).collect();
+        assert_eq!(format_of(ColType::Integer, &phones), Format::Phone);
+        let cprs: Vec<String> = (0..10).map(|i| format!("{}", 1_201_801_230 + i)).collect();
+        assert_eq!(format_of(ColType::Integer, &cprs), Format::Cpr);
+        assert_eq!(format_of(ColType::Real, &phones), Format::Plain);
+    }
 }
 
 #[cfg(all(test, unix))]

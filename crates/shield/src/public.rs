@@ -37,6 +37,7 @@ pub fn public_refusal(
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublicValues {
+    /// R-18: `table.column`, in a proposal and in the manifest alike.
     pub column: String,
     pub passing: Vec<String>,
     pub total_distinct: u64,
@@ -109,7 +110,7 @@ pub fn public_values(
         ));
     }
     Ok(PublicValues {
-        column: column.to_string(),
+        column: format!("{table}.{column}"),
         passing,
         total_distinct: total_distinct.max(0) as u64,
     })
