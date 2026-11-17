@@ -7,9 +7,10 @@
 
 use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::Engine;
-use saiifeguard::pathrule::{Access, RuleAccess};
+use saiifeguard::pathrule::{glob_root_style, Access, RuleAccess};
 use saiifeguard::profile::Profile;
 use saiifeguard::userpack::{broad_findings, load_user_packs, UserSrc};
+use saiifeguard::winpath;
 use saiifeguard::wrappers::is_transparent;
 use saiifeguard::Decision;
 
@@ -65,6 +66,12 @@ pub(crate) fn escape(w: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// `c:`, a drive with no path.
+fn is_drive(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 fn has_wildcard(glob: &str) -> bool {
@@ -159,9 +166,10 @@ fn path_proposal(
     } else {
         let base = glob.trim_end_matches('/');
         // Plan 32 refuses the glob "/" (empty component), so the root gets
-        // only "/**": every path below it (deviation from P2, reported).
-        let globs = if base.is_empty() {
-            vec!["/**".to_string()]
+        // only "/**": every path below it (deviation from P2, reported). A
+        // drive's root (`c:/`) likewise gets only `c:/**`.
+        let globs = if base.is_empty() || is_drive(base) {
+            vec![format!("{base}/**")]
         } else {
             vec![base.to_string(), format!("{base}/**")]
         };
@@ -173,7 +181,12 @@ fn path_proposal(
         .map(|p| format!("{p}/saiife-example-other"))
         .into_iter()
         .collect();
-    let host_hint = glob == "/etc" || glob.starts_with("/etc/");
+    let folded = winpath::fold(glob);
+    let host_hint = glob == "/etc"
+        || glob.starts_with("/etc/")
+        || folded
+            .strip_prefix("c:/windows")
+            .is_some_and(|r| r.is_empty() || r.starts_with('/'));
     Proposal {
         src: c.src.clone(),
         kind: ProposalKind::Path { globs, access },
@@ -360,10 +373,32 @@ fn path_access(a: RuleAccess) -> Access {
 
 /// Compile the proposal alone and judge every example. On success `p.broad`
 /// is set from plan 32's everyday probes.
+///
+/// Everything follows `vars`' style (the host's): the pack is loaded for it,
+/// a glob rooted for the other OS is refused (it could never block here), and
+/// path examples are spelled as this host spells them (`\` on Windows) and
+/// judged by the guard as it judges this host's paths (on Windows: either
+/// separator, names case-folded). So a rule is verified where it will run.
 pub fn verify(p: &mut Proposal, vars: &PathVars) -> Result<(), String> {
+    let style = vars.style();
     if let ProposalKind::Path { globs, .. } = &p.kind {
         for g in globs {
+            if let Some(root) = glob_root_style(g).filter(|r| *r != style) {
+                return Err(match root {
+                    PathStyle::Posix => format!(
+                        "`{g}` is a POSIX path: on Windows no path starts with `/`, so it never blocks"
+                    ),
+                    PathStyle::Windows => {
+                        format!("`{g}` is a Windows path: it never blocks on this host")
+                    }
+                });
+            }
             bind(g, vars)?;
+        }
+        if style == PathStyle::Windows {
+            for e in p.block.iter_mut().chain(p.allow.iter_mut()) {
+                *e = e.replace('/', "\\");
+            }
         }
     }
     let text = one_rule_pack(p, p.src.line);
@@ -372,7 +407,7 @@ pub fn verify(p: &mut Proposal, vars: &PathVars) -> Result<(), String> {
             source: "proposal",
             text: &text,
         }],
-        PathStyle::host(),
+        style,
         Profile::Host,
     )
     .map_err(|e| e.message)?;
@@ -457,13 +492,7 @@ pub fn proposals_for(
 mod tests {
     use super::*;
     use crate::rules_cmd::extract::line_sha256;
-
-    fn vars() -> PathVars {
-        PathVars::new()
-            .with_cwd("/saiife-test/project")
-            .with_var("PROJECT", "/saiife-test/project")
-            .with_var("HOME", "/saiife-test/home")
-    }
+    use crate::rules_cmd::test_host::{posix_vars, styles, vars, win_vars, windows};
 
     fn cand(targets: Vec<Target>) -> Candidate {
         let text = "- Never do the thing.".to_string();
@@ -584,22 +613,70 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn path_rule_shape() {
-        let mut p = one(path("/etc", RuleAccess::Write));
-        let ProposalKind::Path { globs, access } = &p.kind else {
-            panic!()
-        };
-        assert_eq!(globs, &strs(&["/etc", "/etc/**"]));
-        assert_eq!(*access, RuleAccess::Write);
-        assert_eq!(p.block, strs(&["/etc/saiife-example"]));
-        assert_eq!(p.allow, strs(&["/saiife-example-other"]));
-        assert_eq!(verify(&mut p, &vars()), Ok(()));
+        for v in styles() {
+            // A system dir of the host, its examples spelled as it spells them.
+            let (dir, globs, block, allow) = if windows(&v) {
+                (
+                    "c:/Windows",
+                    ["c:/Windows", "c:/Windows/**"],
+                    r"c:\Windows\saiife-example",
+                    r"c:\saiife-example-other",
+                )
+            } else {
+                (
+                    "/etc",
+                    ["/etc", "/etc/**"],
+                    "/etc/saiife-example",
+                    "/saiife-example-other",
+                )
+            };
+            let mut p = one(path(dir, RuleAccess::Write));
+            assert_eq!(verify(&mut p, &v), Ok(()), "{dir}");
+            let ProposalKind::Path { globs: g, access } = &p.kind else {
+                panic!()
+            };
+            assert_eq!(g, &strs(&globs));
+            assert_eq!(*access, RuleAccess::Write);
+            assert_eq!(p.block, strs(&[block]));
+            assert_eq!(p.allow, strs(&[allow]));
+            assert!(p.host_hint, "{dir}");
 
-        let mut h = one(path("$PROJECT/.git/hooks", RuleAccess::Write));
-        assert_eq!(verify(&mut h, &vars()), Ok(()));
-        let mut r = one(path("~/.ssh", RuleAccess::Read));
-        assert_eq!(verify(&mut r, &vars()), Ok(()));
+            let mut h = one(path("$PROJECT/.git/hooks", RuleAccess::Write));
+            assert_eq!(verify(&mut h, &v), Ok(()));
+            let mut r = one(path("~/.ssh", RuleAccess::Read));
+            assert_eq!(verify(&mut r, &v), Ok(()));
+            if windows(&v) {
+                assert_eq!(r.block, strs(&[r"~\.ssh\saiife-example"]));
+            }
+        }
+    }
+
+    /// A rule rooted for the other OS never blocks a path of this one (W6):
+    /// it is unverified, and says why.
+    #[test]
+    fn a_rule_for_the_other_os_is_unverified() {
+        let mut p = one(path("/etc", RuleAccess::Write));
+        let e = verify(&mut p, &win_vars()).unwrap_err();
+        assert!(e.contains("POSIX path") && e.contains("Windows"), "{e}");
+        if cfg!(unix) {
+            let mut p = one(path("c:/Windows", RuleAccess::Write));
+            let e = verify(&mut p, &posix_vars()).unwrap_err();
+            assert!(e.contains("Windows path"), "{e}");
+        }
+    }
+
+    /// Windows compares names case-folded: a near miss that differs only in
+    /// case is blocked there, and the check says so.
+    #[test]
+    fn windows_near_misses_are_judged_case_folded() {
+        let mut p = one(path("c:/Windows", RuleAccess::Write));
+        p.allow.push(r"C:\WINDOWS\SAIIFE-EXAMPLE".to_string());
+        let e = verify(&mut p, &win_vars()).unwrap_err();
+        assert!(e.contains("which it should allow"), "{e}");
+        let mut q = one(path("~/.ssh", RuleAccess::Read));
+        q.block.push(r"C:\SAIIFE-TEST\HOME\.SSH\ID_RSA".to_string());
+        assert_eq!(verify(&mut q, &win_vars()), Ok(()));
     }
 
     #[test]
@@ -615,26 +692,43 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn broad_proposals_are_flagged() {
-        let (ok, bad, _) = proposals_for(
-            &[
-                cand(vec![cmd(&["ls"])]),
-                cand(vec![path("/", RuleAccess::Write)]),
-                cand(vec![cmd(&["pkill"])]),
-            ],
-            "CLAUDE.md",
-            &vars(),
+        for v in styles() {
+            let (root, glob) = if windows(&v) {
+                ("c:/", "c:/**")
+            } else {
+                ("/", "/**")
+            };
+            let (ok, bad, _) = proposals_for(
+                &[
+                    cand(vec![cmd(&["ls"])]),
+                    cand(vec![path(root, RuleAccess::Write)]),
+                    cand(vec![cmd(&["pkill"])]),
+                ],
+                "CLAUDE.md",
+                &v,
+            );
+            assert_eq!(ok.len(), 3, "{bad:?}");
+            assert_eq!(ok[0].broad.as_deref(), Some("blocks everyday `ls`"));
+            assert!(ok[1].broad.is_some(), "{root}");
+            let ProposalKind::Path { globs, .. } = &ok[1].kind else {
+                panic!()
+            };
+            assert_eq!(globs, &strs(&[glob]));
+            assert!(ok[1].allow.is_empty());
+            assert!(ok[2].broad.is_none());
+        }
+    }
+
+    /// A Windows rule broad on Windows is marked there.
+    #[test]
+    fn broad_windows_path_rules_are_flagged() {
+        let mut p = one(path("~/**", RuleAccess::Any));
+        assert_eq!(verify(&mut p, &win_vars()), Ok(()));
+        assert_eq!(
+            p.broad.as_deref(),
+            Some(r"blocks everyday `C:\saiife-probe\home\notes.txt`")
         );
-        assert_eq!(ok.len(), 3, "{bad:?}");
-        assert_eq!(ok[0].broad.as_deref(), Some("blocks everyday `ls`"));
-        assert!(ok[1].broad.is_some());
-        let ProposalKind::Path { globs, .. } = &ok[1].kind else {
-            panic!()
-        };
-        assert_eq!(globs, &strs(&["/**"]));
-        assert!(ok[1].allow.is_empty());
-        assert!(ok[2].broad.is_none());
     }
 
     #[test]
@@ -685,17 +779,27 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn wildcard_globs_verify() {
-        for g in ["/etc/**", "/etc/*.conf", "$HOME/.ssh/*"] {
-            let p = one(path(g, RuleAccess::Write));
-            let mut p = p;
-            assert_eq!(verify(&mut p, &vars()), Ok(()), "{g}");
+        for v in styles() {
+            let (globs, near) = if windows(&v) {
+                (
+                    ["c:/Windows/**", "c:/Windows/*.ini", "$HOME/.ssh/*"],
+                    r"c:\saiife-example-other",
+                )
+            } else {
+                (
+                    ["/etc/**", "/etc/*.conf", "$HOME/.ssh/*"],
+                    "/saiife-example-other",
+                )
+            };
+            for g in globs {
+                let mut p = one(path(g, RuleAccess::Write));
+                assert_eq!(verify(&mut p, &v), Ok(()), "{g}");
+            }
+            let mut p = one(path(globs[0], RuleAccess::Write));
+            assert_eq!(verify(&mut p, &v), Ok(()));
+            assert_eq!(p.allow, strs(&[near]));
         }
-        assert_eq!(
-            one(path("/etc/**", RuleAccess::Write)).allow,
-            strs(&["/saiife-example-other"])
-        );
     }
 
     #[test]
