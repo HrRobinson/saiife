@@ -434,12 +434,23 @@ fn valid_name(name: &str) -> bool {
 /// `[approval] approvers` is empty.
 pub const NO_APPROVERS_WARNING: &str = "[approval] approvers is empty: nobody can approve requests";
 
-/// `[workspace]`: the web origins a Workspace touch may come from (plan 31).
+/// `[workspace]`: the web origins a Workspace touch may come from (plan 31),
+/// and whether the hub link may ask the hub for content-free push wake-ups.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCfg {
     #[serde(default = "default_origins")]
     pub origins: Vec<String>,
+    /// `push`: when a box waits in the inbox or an approval is created, the
+    /// hub link sends the hub `{"t":"wake"}` (no content) so it pushes a
+    /// fixed alert to the owner's phone. Off by default; left out of the
+    /// serialised form (and so the policy hash) while off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub push: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The default origin: the plan 29 UI port on localhost.
@@ -451,6 +462,7 @@ impl Default for WorkspaceCfg {
     fn default() -> Self {
         WorkspaceCfg {
             origins: default_origins(),
+            push: false,
         }
     }
 }

@@ -50,6 +50,12 @@ pub struct HubOpts {
     pub opens: Rate,
     /// Session `seal_hello`s accepted (each asks the daemon to sign).
     pub seal_hellos: Rate,
+    /// How often the daemon is asked for new Workspace events
+    /// (`workspace.wake`) while the hub link is up.
+    pub wake_poll: std::time::Duration,
+    /// At most one `{"t":"wake"}` this often; the events in between are
+    /// coalesced into one wake when it ends.
+    pub wake_interval: std::time::Duration,
 }
 
 /// A token-bucket rate: `per_sec` a second, bursts of `burst`.

@@ -652,11 +652,13 @@ pub async fn verify_frame(
 }
 
 /// Tells the owner that a box waits in the Workspace inbox: the box id and
-/// the short code to match, nothing else. No URL and no request id (§9.6):
+/// the short code to match, nothing else; and counts a hub wake-up. No URL and no request id (§9.6):
 /// nothing in a notification approves anything. Sent by `Lands::pending`
 /// once per finished run of a box (box and review), when it first offers
 /// that run's land request; a request issued again sends nothing.
 pub fn notify_pending(ctx: &Ctx, pa: &PendingAction) {
+    // A hub wake-up too (content-free; sent only with `[workspace] push`).
+    ctx.workspace.note_wake();
     let code = pa.view().short_code;
     ctx.notifier.send(crate::notifier::NotifyEvent {
         event: saiife_policy::Event::BoxWaiting,
