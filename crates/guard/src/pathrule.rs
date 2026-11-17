@@ -137,6 +137,19 @@ fn drive_anchored(glob: &str) -> bool {
     b.len() > 3 && (b[0].is_ascii_alphabetic() || b[0] == b'?') && b[1] == b':' && b[2] == b'/'
 }
 
+/// The OS whose paths alone a glob can match: `Posix` for one rooted at `/`,
+/// `Windows` for one rooted at a drive; `None` when any host's paths can match
+/// (a variable, `~` or `**/` start). A Windows path never starts with `/` (W6).
+pub fn glob_root_style(glob: &str) -> Option<PathStyle> {
+    if drive_anchored(glob) {
+        Some(PathStyle::Windows)
+    } else if glob.starts_with('/') {
+        Some(PathStyle::Posix)
+    } else {
+        None
+    }
+}
+
 /// The variable a valid glob starts with (`~` is `HOME`), if any.
 pub fn glob_variable(glob: &str) -> Option<&'static str> {
     split_var(glob).ok().and_then(|(v, _)| v)
