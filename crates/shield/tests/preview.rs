@@ -291,7 +291,7 @@ fn clause_phrases() {
     );
     assert_eq!(
         p.text,
-        "I'm summing all invoices (amount) per city, the top 5 by total amount."
+        "I'm summing all invoices (amount) matched with their customers per city, the top 5 by total amount."
     );
     let p = da(
         "SELECT c.city, SUM(i.amount) AS s FROM invoices i JOIN customers c ON c.id = i.customer_id \
@@ -299,7 +299,7 @@ fn clause_phrases() {
     );
     assert_eq!(
         p.text,
-        "Jeg lægger alle invoices (amount) sammen pr. city, de 5 største efter samlet amount."
+        "Jeg lægger alle invoices (amount) sammen koblet med deres customers pr. city, de 5 største efter samlet amount."
     );
     let p = en("SELECT i.status, COUNT(*) AS n FROM invoices i WHERE i.status = 'open' GROUP BY i.status ORDER BY i.status");
     assert!(p.text.contains("ordered by status"), "{}", p.text);
@@ -431,4 +431,71 @@ fn never_panics_on_any_utf8() {
             let _ = preview(&v, &ps[1..], &schema(), Lang::En);
         }
     }
+}
+
+#[test]
+fn joins_are_described() {
+    // A child join filters the key side: only invoices with a payment.
+    let sql = "SELECT MAX(i.amount) AS s FROM invoices i JOIN payments p ON p.invoice_id = i.id";
+    assert_eq!(
+        en(sql).text,
+        "I'm finding the highest amount in invoices only invoices that have payments."
+    );
+    assert_eq!(
+        da(sql).text,
+        "Jeg finder den højeste amount i invoices kun invoices der har payments."
+    );
+    // A parent join (many-to-one), the parent not pinned.
+    let sql = "SELECT SUM(i.amount) AS s FROM invoices i JOIN customers c ON c.id = i.customer_id";
+    assert_eq!(
+        en(sql).text,
+        "I'm summing all invoices (amount) matched with their customers."
+    );
+    assert_eq!(
+        da(sql).text,
+        "Jeg lægger alle invoices (amount) sammen koblet med deres customers."
+    );
+    // The pinned entity table is implicit: the spec examples stay as they are.
+    assert!(!en(BALANCE).text.contains("matched"));
+    // A join with no phrase is a counted fragment, never dropped.
+    let sql = "SELECT SUM(i.amount) AS s FROM invoices i JOIN customers c \
+               ON c.id = i.customer_id WHERE c.id = :p1";
+    assert_eq!(en(sql).fragments, 0);
+}
+
+#[test]
+fn ambiguous_columns_are_qualified() {
+    let sql = "SELECT COUNT(*) AS n FROM invoices i JOIN payments p ON p.invoice_id = i.id \
+               WHERE i.amount > 100 AND i.status = 'open'";
+    let p = en(sql);
+    assert!(
+        p.text.contains("where invoices.amount is above 100"),
+        "{}",
+        p.text
+    );
+    assert!(p.text.contains("with status 'open'"), "{}", p.text);
+}
+
+#[test]
+fn fragments_show_param_values() {
+    let sql = "SELECT i.status, SUM(i.amount) AS s FROM invoices i GROUP BY i.status \
+               HAVING SUM(i.amount) > :p3";
+    let p = en(sql);
+    assert_eq!(p.fragments, 1);
+    assert!(
+        p.text.contains("`SUM(invoices.amount) > 500.00`"),
+        "{}",
+        p.text
+    );
+    assert!(!p.text.contains(":p3"), "{}", p.text);
+}
+
+#[test]
+fn danish_having_connector() {
+    let sql = "SELECT i.status, COUNT(*) AS n FROM invoices i GROUP BY i.status \
+               HAVING COUNT(*) > 2";
+    assert_eq!(
+        da(sql).text,
+        "Jeg tæller invoices pr. status, beholder kun grupper hvor `COUNT(*) > 2`."
+    );
 }
