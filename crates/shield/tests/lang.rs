@@ -295,6 +295,14 @@ fn never_panics_on_any_utf8() {
         "of",
         "2026-07-01",
         "1.7.2026",
+        "B2B",
+        "address2",
+        "abc",
+        "10,000",
+        "1.500",
+        "kg",
+        "£",
+        "pct",
     ];
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     for _ in 0..4000 {
@@ -307,6 +315,7 @@ fn never_panics_on_any_utf8() {
         let _ = find_unreadable_numerics(&t);
         for l in [Lang::En, Lang::Da] {
             let _ = find_literals(&t, l);
+            let _ = find_literals_detected(&t, l);
             let _ = find_numbers(&t, l);
             let _ = find_dates(&t, l);
             let nw = number_words(l);
@@ -317,4 +326,112 @@ fn never_panics_on_any_utf8() {
             let _ = nw.is_number_word(&t);
         }
     }
+}
+
+// ---------------------------------------- final review fix wave (I1, I3) ----
+
+#[test]
+fn function_words_decide_the_language() {
+    // Ruling P-27.
+    assert_eq!(
+        detect_lang("What does Søren Ærø owe, and is it over 10,000?"),
+        Lang::En
+    );
+    assert_eq!(detect_lang("hvad skylder søren ærø"), Lang::Da);
+    assert_eq!(detect_lang("Søren Ærø"), Lang::Da);
+    // A tie: the letter decides.
+    assert_eq!(detect_lang("Søren har what"), Lang::Da);
+    assert_eq!(detect_lang("Anna har what"), Lang::En);
+    // One Danish word is not enough without a letter.
+    assert_eq!(detect_lang("Anna har"), Lang::En);
+    assert_eq!(detect_lang("Søren har"), Lang::Da);
+}
+
+#[test]
+fn single_three_digit_group_is_ambiguous_when_detected() {
+    for (t, lang) in [
+        ("over 10,000", Lang::En),
+        ("over 10.000", Lang::En),
+        ("over 1,500", Lang::Da),
+        ("over 999.999 kr", Lang::Da),
+        ("$1,500", Lang::En),
+        ("10,000k", Lang::En),
+    ] {
+        let e = find_literals_detected(t, lang).unwrap_err();
+        assert_eq!(e.why, AMBIGUOUS_NUMBER, "{t}");
+        assert!(!e.to_string().contains(&t[e.start..e.end]), "{t}");
+    }
+    // Not ambiguous: two separators, a space group, other group sizes.
+    let ok = |t: &str, l| {
+        let v = find_literals_detected(t, l).unwrap();
+        assert_eq!(v.len(), 1, "{t}");
+        v[0].lit.clone()
+    };
+    assert_eq!(ok("10.000,50", Lang::En), amount("10000.50", None));
+    assert_eq!(ok("10,000.50", Lang::Da), amount("10000.50", None));
+    assert_eq!(ok("1.234.567", Lang::En), amount("1234567", None));
+    assert_eq!(ok("10 000", Lang::En), amount("10000", None));
+    assert_eq!(ok("3.14", Lang::En), amount("3.14", None));
+    assert_eq!(ok("12,5", Lang::Da), amount("12.5", None));
+    assert_eq!(ok("1234,567", Lang::Da), amount("1234.567", None));
+    assert_eq!(ok("1.7.2026", Lang::Da), Literal::Date("2026-07-01".into()));
+    // An explicit language keeps reading by its decimal mark.
+    assert_eq!(one("10,000", Lang::Da), amount("10.000", None));
+    assert_eq!(one("10,000", Lang::En), amount("10000", None));
+    assert_eq!(one("10.000", Lang::Da), amount("10000", None));
+}
+
+#[test]
+fn glued_digits_stay_text() {
+    // Ruling P-29: a letter right before, or a letter right after that is
+    // not k/m, st/nd/rd/th or a currency word.
+    for t in [
+        "address2",
+        "an empty address2 here",
+        "segment B2B",
+        "abc12",
+        "12abc",
+        "15kg",
+        "covid19",
+        "x1,000",
+        "$5abc",
+        "v1.2.3",
+    ] {
+        for l in [Lang::En, Lang::Da] {
+            assert!(find_literals(t, l).unwrap().is_empty(), "{t}");
+            assert!(find_literals_detected(t, l).unwrap().is_empty(), "{t}");
+        }
+    }
+    assert_eq!(one("15k", Lang::En), amount("15000", None));
+    assert_eq!(one("2m", Lang::En), amount("2000000", None));
+    assert_eq!(one("3rd", Lang::En), Literal::Integer(3));
+    assert_eq!(one("21st", Lang::En), Literal::Integer(21));
+    assert_eq!(one("500kr", Lang::Da), amount("500", Some("kr")));
+    // Next to a glued run, a real literal is still found.
+    let t = "address2 over 500";
+    let v = find_literals(t, Lang::En).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(&t[v[0].start..v[0].end], "500");
+}
+
+#[test]
+fn minus_sign_is_not_in_the_span() {
+    let t = "balance under -500";
+    let v = find_literals(t, Lang::En).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(&t[v[0].start..v[0].end], "500");
+    assert_eq!(v[0].lit, Literal::Integer(500));
+    assert_eq!(&t[..v[0].start], "balance under -");
+}
+
+#[test]
+fn euro_pound_and_pct() {
+    assert_eq!(one("€500", Lang::En), amount("500", Some("EUR")));
+    assert_eq!(one("€ 1.500,50", Lang::Da), amount("1500.50", Some("EUR")));
+    assert_eq!(one("£20", Lang::En), amount("20", Some("GBP")));
+    assert_eq!(one("£1,500", Lang::En), amount("1500", Some("GBP")));
+    assert_eq!(one("500 EUR", Lang::En), amount("500", Some("EUR")));
+    assert_eq!(one("12 pct", Lang::Da), Literal::Percent(d("12")));
+    assert_eq!(one("5,5 pct", Lang::Da), Literal::Percent(d("5.5")));
+    assert_eq!(one("7 percent", Lang::En), Literal::Percent(d("7")));
 }

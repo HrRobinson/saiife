@@ -35,15 +35,16 @@ const EN_WORDS: &[&str] = &[
     "than",
 ];
 
-/// R44-1: Danish when the text holds `æ`, `ø` or `å`, or has at least two
-/// Danish function words and more of them than English ones; else English.
+/// Language detection (R44-1 as amended by ruling P-27): the function words
+/// decide. Danish when there are more Danish than English function words and
+/// at least two of them; English when there are more English ones. Else
+/// (a tie, a single Danish word, or no function words) an `æ`, `ø` or `å`
+/// makes it Danish, and its absence English. A Danish name in an English
+/// question (`What does Søren Ærø owe?`) is English.
 pub fn detect_lang(text: &str) -> Lang {
-    if text
+    let danish_letter = text
         .chars()
-        .any(|c| matches!(c, 'æ' | 'ø' | 'å' | 'Æ' | 'Ø' | 'Å'))
-    {
-        return Lang::Da;
-    }
+        .any(|c| matches!(c, 'æ' | 'ø' | 'å' | 'Æ' | 'Ø' | 'Å'));
     let (mut da, mut en) = (0usize, 0usize);
     for w in text
         .split(|c: char| !c.is_alphabetic())
@@ -57,7 +58,9 @@ pub fn detect_lang(text: &str) -> Lang {
             en += 1;
         }
     }
-    if da >= 2 && da > en {
+    if en > da {
+        Lang::En
+    } else if danish_letter || (da > en && da >= 2) {
         Lang::Da
     } else {
         Lang::En
@@ -919,7 +922,6 @@ fn date_at(text: &str, i: usize, lang: Lang) -> Result<Option<(usize, Literal)>,
             && digits_at(b, i + 5) == 2
             && b.get(i + 7) == Some(&b'-')
             && digits_at(b, i + 8) == 2
-            && digits_at(b, i + 8) == 2
         {
             let end = i + 10;
             let (y, m, d) = (
@@ -1100,6 +1102,46 @@ fn int_literal(d: Decimal) -> Option<i64> {
     i64::try_from(d.units).ok()
 }
 
+/// The reason a number is refused under ruling P-27.
+pub const AMBIGUOUS_NUMBER: &str = "ambiguous number; write 10 000 or pass --lang";
+
+/// Ruling P-27: `10,000` / `10.000` (1-3 digits, one `,` or `.`, exactly
+/// three digits, nothing more) reads as ten thousand in one language and as
+/// ten in the other. `end` is where [`scan_digits`] stopped.
+fn ambiguous_grouping(text: &str, i: usize, end: usize) -> bool {
+    let b = text.as_bytes();
+    let n = digits_at(b, i);
+    (1..=3).contains(&n)
+        && matches!(b.get(i + n), Some(b'.' | b','))
+        && digits_at(b, i + n + 1) == 3
+        && i + n + 4 == end
+}
+
+/// End of a digit run glued into a word (ruling P-29: `address2`, `B2B`,
+/// `abc12`, `15kg`): letters and digits, and a `.` or `,` between a
+/// character of the run and a digit. Starts at `i`, a digit or a letter.
+fn glued_end(text: &str, i: usize) -> usize {
+    let b = text.as_bytes();
+    let mut e = i;
+    while let Some(c) = text.get(e..).and_then(|t| t.chars().next()) {
+        if c.is_alphanumeric() {
+            e += c.len_utf8();
+        } else if e > i && (c == '.' || c == ',') && b.get(e + 1).is_some_and(u8::is_ascii_digit) {
+            e += 1;
+        } else {
+            break;
+        }
+    }
+    e
+}
+
+/// A letter right at `end` (no space): the number is glued to a word.
+fn glued_after(text: &str, end: usize) -> bool {
+    text.get(end..)
+        .and_then(|t| t.chars().next())
+        .is_some_and(char::is_alphabetic)
+}
+
 /// A number that starts with a digit (after an optional currency prefix).
 fn digit_literal(
     text: &str,
@@ -1107,9 +1149,13 @@ fn digit_literal(
     lang: Lang,
     prefix_cur: Option<&'static str>,
     span_start: usize,
+    detected: bool,
 ) -> Result<(usize, Literal), LiteralError> {
     let (end, mut value, grouped) =
         scan_digits(text, i, lang).map_err(|(s, e)| lit_err(s, e, "bad digit grouping"))?;
+    if detected && ambiguous_grouping(text, i, end) {
+        return Err(lit_err(span_start, end, AMBIGUOUS_NUMBER));
+    }
     let digits_len = end - i;
     let mut end = end;
     let mut currency: Option<&'static str> = prefix_cur;
@@ -1202,7 +1248,29 @@ fn word_literal(text: &str, i: usize, lang: Lang) -> Option<(usize, Literal)> {
 
 /// R44-2: every literal in the question, in order of appearance, each with
 /// its byte span. A literal that does not parse refuses the question.
+///
+/// `lang` was given explicitly (`--lang`): `10,000` and `10.000` read by its
+/// decimal mark. Use [`find_literals_detected`] when `lang` came from
+/// [`detect_lang`].
+///
+/// Ruling P-29: a digit run glued to a word (`address2`, `B2B`, `abc12`:
+/// a letter right before it, or a letter right after it other than the
+/// `k`/`m` multipliers, the ordinals `st`/`nd`/`rd`/`th` and a currency
+/// word) is not a literal; it stays text (the firewall's allow-list word
+/// exemption applies to it, and any other glued digit is a `number` hit).
 pub fn find_literals(text: &str, lang: Lang) -> Result<Vec<LiteralSpan>, LiteralError> {
+    literals(text, lang, false)
+}
+
+/// [`find_literals`] for a language [`detect_lang`] chose (ruling P-27): a
+/// number with a single `,` or `.` followed by exactly three digits and a
+/// first group of 1-3 digits (`10,000`, `1.500`) is ambiguous and refused
+/// ([`AMBIGUOUS_NUMBER`]), never read as a guess.
+pub fn find_literals_detected(text: &str, lang: Lang) -> Result<Vec<LiteralSpan>, LiteralError> {
+    literals(text, lang, true)
+}
+
+fn literals(text: &str, lang: Lang, detected: bool) -> Result<Vec<LiteralSpan>, LiteralError> {
     // Fail closed: a digit this parser cannot read is never passed through.
     if let Some(&(st, en)) = non_ascii_numeric_runs(text).first() {
         return Err(lit_err(st, en, "non-ASCII digit"));
@@ -1219,6 +1287,11 @@ pub fn find_literals(text: &str, lang: Lang) -> Result<Vec<LiteralSpan>, Literal
             i += w;
             continue;
         }
+        // P-29: a digit glued to the letter before it stays text.
+        if c.is_ascii_digit() && prev_char(text, i).is_some_and(char::is_alphabetic) {
+            i = glued_end(text, i);
+            continue;
+        }
         if c.is_ascii_digit() || starts_word {
             if let Some((end, lit)) = date_at(text, i, lang)? {
                 out.push(LiteralSpan { start: i, end, lit });
@@ -1230,13 +1303,23 @@ pub fn find_literals(text: &str, lang: Lang) -> Result<Vec<LiteralSpan>, Literal
             .then(|| currency_prefix(text, i))
             .flatten()
         {
-            let (end, lit) = digit_literal(text, p, lang, Some(cur), i)?;
+            let (end, lit) = digit_literal(text, p, lang, Some(cur), i, detected)?;
+            if glued_after(text, end) {
+                // P-29: the currency stays text with the glued run.
+                i = glued_end(text, p);
+                continue;
+            }
             out.push(LiteralSpan { start: i, end, lit });
             i = end;
             continue;
         }
         if c.is_ascii_digit() {
-            let (end, lit) = digit_literal(text, i, lang, None, i)?;
+            let (end, lit) = digit_literal(text, i, lang, None, i, detected)?;
+            if glued_after(text, end) {
+                // P-29: `12abc` stays text.
+                i = glued_end(text, i);
+                continue;
+            }
             out.push(LiteralSpan { start: i, end, lit });
             i = end;
             continue;
