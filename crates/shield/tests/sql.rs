@@ -1675,10 +1675,126 @@ fn no_constant_differences() {
     }
     for sql in [
         "SELECT (SUM(i.amount) + MAX(i.amount)) - MIN(i.amount) AS z FROM invoices i",
-        "SELECT (SUM(i.amount) + MAX(i.amount)) - (MAX(i.amount) + MIN(i.amount)) AS z \
-         FROM invoices i",
         "SELECT SUM(i.amount) AS s, MAX(i.amount) AS m FROM invoices i",
     ] {
         prepares(&ok(sql).sql);
+    }
+}
+
+/// Two per-customer CTEs over different tables (or the same body twice).
+fn two_ctes(a: &str, b: &str, outer: &str) -> String {
+    format!(
+        "WITH a AS (SELECT {a}), b AS (SELECT {b}) \
+         SELECT {outer} FROM customers c JOIN a ON a.cid = c.id JOIN b ON b.cid = c.id \
+         WHERE c.id = :p1"
+    )
+}
+
+const INV: &str = "i.customer_id AS cid, SUM(i.amount) AS s FROM invoices i GROUP BY i.customer_id";
+const PAY: &str = "p.customer_id AS cid, SUM(p.amount) AS s FROM payments p GROUP BY p.customer_id";
+
+#[test]
+fn constants_compared_by_structure() {
+    // Round 5 (H1/H2/I1/M1): expressions are compared by a structural
+    // fingerprint (aggregate kind, DISTINCT, column origin through CTEs),
+    // never by rendered text. One rule: no fingerprint twice in one
+    // arithmetic tree; no two outputs of a block with one fingerprint.
+    let inv2 = "j.customer_id AS cid, sum(j.amount) AS s FROM invoices j GROUP BY j.customer_id";
+    for sql in [
+        // I1: case, parentheses.
+        "SELECT SUM(i.amount) - sum(i.amount) AS z FROM invoices i".to_string(),
+        "SELECT SUM(i.amount) - SUM((i.amount)) AS z FROM invoices i".to_string(),
+        "SELECT SUM(i.amount) / Sum(i.amount) AS z FROM invoices i".to_string(),
+        "SELECT ((SUM(i.amount))) - (sum(((i.amount)))) AS z FROM invoices i".to_string(),
+        "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s, sum(i.amount) AS s2 \
+         FROM invoices i GROUP BY i.customer_id) \
+         SELECT SUM(t.s) - SUM(t.s2) AS z FROM customers c JOIN t ON t.cid = c.id \
+         WHERE c.id = :p1"
+            .to_string(),
+        // H1: reordered leaves.
+        "SELECT SUM(i.amount) + MAX(i.amount) - MAX(i.amount) - SUM(i.amount) AS z \
+         FROM invoices i"
+            .to_string(),
+        // M1: any fingerprint twice in one arithmetic tree.
+        "SELECT SUM(i.amount) - MAX(i.amount) - SUM(i.amount) + MAX(i.amount) AS z \
+         FROM invoices i"
+            .to_string(),
+        "SELECT (SUM(i.amount) * MAX(i.amount)) - (MAX(i.amount) * SUM(i.amount)) AS z \
+         FROM invoices i"
+            .to_string(),
+        "SELECT (SUM(i.amount) + MAX(i.amount)) - (MAX(i.amount) + MIN(i.amount)) AS z \
+         FROM invoices i"
+            .to_string(),
+        // MIN/MAX DISTINCT is meaningless.
+        "SELECT MIN(DISTINCT i.amount) AS m FROM invoices i".to_string(),
+        "SELECT MAX(DISTINCT i.amount) AS m FROM invoices i".to_string(),
+        // H2: duplicate outputs, in a block and through a CTE.
+        "SELECT SUM(i.amount) AS a, sum((i.amount)) AS b FROM invoices i".to_string(),
+        "SELECT i.status, (i.status) AS s2 FROM invoices i".to_string(),
+        "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s FROM invoices i \
+         GROUP BY i.customer_id) \
+         SELECT SUM(t.s) AS a, sum(t.s) AS b FROM customers c JOIN t ON t.cid = c.id \
+         WHERE c.id = :p1"
+            .to_string(),
+        // Two CTEs with the same body: the same fingerprint through origin.
+        two_ctes(INV, inv2, "SUM(a.s) - SUM(b.s) AS z"),
+        two_ctes(INV, inv2, "SUM(a.s) / SUM(b.s) AS z"),
+        two_ctes(INV, inv2, "SUM(a.s) AS x, SUM(b.s) AS y"),
+    ] {
+        assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    // Allowed: different origins; DISTINCT is part of the fingerprint
+    // (SUM(DISTINCT x) / SUM(x) is not a constant: it varies with repeats).
+    for sql in [
+        two_ctes(INV, PAY, "SUM(a.s) / SUM(b.s) AS r"),
+        two_ctes(INV, PAY, "SUM(a.s) - SUM(b.s) AS d"),
+        two_ctes(INV, PAY, "SUM(a.s) AS x, SUM(b.s) AS y"),
+        "SELECT SUM(DISTINCT i.amount) / SUM(i.amount) AS r FROM invoices i".to_string(),
+        "SELECT MAX(i.amount) - MIN(i.amount) AS w, SUM(i.amount) / COUNT(*) AS m \
+         FROM invoices i"
+            .to_string(),
+    ] {
+        prepares(&ok(&sql).sql);
+    }
+    // The rendered SQL is canonical: aggregate names upper-case, redundant
+    // parentheses gone.
+    let v = ok("SELECT sum((i.amount)) AS s, (count(*)) AS n FROM invoices i");
+    assert!(v.sql.contains("SUM(\"_p_i\".\"amount\")"), "{}", v.sql);
+    assert!(v.sql.contains("COUNT(*)"), "{}", v.sql);
+    assert!(!v.sql.contains("(("), "{}", v.sql);
+    prepares(&v.sql);
+    // Parentheses that carry precedence stay.
+    let v = ok("SELECT (SUM(i.amount) + MAX(i.amount)) * COUNT(*) AS z FROM invoices i");
+    assert!(v.sql.contains(") * COUNT(*)"), "{}", v.sql);
+}
+
+#[test]
+fn count_distinct_key_only_as_outer_output() {
+    // M2: COUNT(DISTINCT key/FK) only as an outermost output item.
+    let k = "FROM customers c JOIN invoices i ON i.customer_id = c.id WHERE c.id = :p1";
+    for sql in [
+        format!("SELECT COUNT(DISTINCT c.id) - COUNT(DISTINCT i.customer_id) AS z {k}"),
+        format!("SELECT COUNT(*) - COUNT(DISTINCT i.id) AS z {k}"),
+        format!("SELECT COUNT(*) AS n {k} HAVING COUNT(DISTINCT i.id) > 1"),
+        format!("SELECT COUNT(DISTINCT i.id) AS m {k} HAVING m > 1"),
+        "WITH t AS (SELECT i.status AS st FROM invoices i GROUP BY i.status \
+         HAVING COUNT(DISTINCT i.customer_id) = 2) SELECT t.st FROM t"
+            .to_string(),
+        "WITH t AS (SELECT i.status AS st, COUNT(DISTINCT i.customer_id) AS k \
+         FROM invoices i GROUP BY i.status) SELECT t.st FROM t WHERE t.k = 2"
+            .to_string(),
+        "WITH t AS (SELECT i.status AS st, COUNT(DISTINCT i.customer_id) AS k \
+         FROM invoices i GROUP BY i.status) SELECT t.st, t.k FROM t"
+            .to_string(),
+    ] {
+        assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    for sql in [
+        format!("SELECT COUNT(DISTINCT i.id) AS m, COUNT(*) AS n {k}"),
+        "SELECT c.city, COUNT(DISTINCT c.id) AS n FROM customers c GROUP BY c.city \
+         ORDER BY n DESC LIMIT 5"
+            .to_string(),
+    ] {
+        prepares(&ok(&sql).sql);
     }
 }

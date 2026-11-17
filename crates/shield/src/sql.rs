@@ -22,8 +22,12 @@
 //! - Entity key and C-G1 FK columns are structural (judged by origin through
 //!   CTEs): only in a key-pair ON, the entity pin, GROUP BY, a plain output
 //!   column, or `COUNT(DISTINCT col)`.
-//! - No two outputs of a block with the same expression, and no `-` or `/`
-//!   whose sides are the same multiset of `+`-joined aggregates.
+//! - Expressions are compared by a structural fingerprint (aggregate kind,
+//!   DISTINCT, column origin through CTEs), never by rendered text: no
+//!   fingerprint twice in one arithmetic tree, no two outputs of a block
+//!   with one fingerprint. `COUNT(DISTINCT key)` is an outermost output only.
+//! - The rendered SQL is canonical: aggregate names upper-case, `date` /
+//!   `strftime` lower-case, parentheses kept only around arithmetic.
 //!
 //! Every `match` over the parser's AST ends in a refusal, never in an
 //! accept. Masking routes (CASE, COALESCE, IS NULL, constants, subqueries,
@@ -446,10 +450,18 @@ struct Item {
     repeats: bool,
     /// A CTE column that is the CTE's only GROUP BY item: one row per value.
     unique: bool,
+    /// The structural fingerprint (round 5): built from the aggregate kind,
+    /// DISTINCT, date-function arguments and column origins (snapshot names,
+    /// through CTEs), never from rendered text.
+    fp: String,
+    /// `Agg` / `Arith`: the fingerprints of the aggregates in the tree.
+    leaves: Vec<String>,
+    /// `COUNT(DISTINCT key/FK)`: allowed only as an outermost output (M2).
+    key_count: bool,
 }
 
 impl Item {
-    fn new(kind: Kind, ty: Option<ColType>) -> Item {
+    fn new(kind: Kind, ty: Option<ColType>, fp: String) -> Item {
         Item {
             kind,
             ty,
@@ -459,6 +471,9 @@ impl Item {
             nullable: false,
             repeats: false,
             unique: false,
+            fp,
+            leaves: Vec::new(),
+            key_count: false,
         }
     }
 
@@ -500,6 +515,8 @@ struct OutCol {
     repeats: bool,
     /// The block's only GROUP BY item: one row per value (F3).
     unique: bool,
+    /// The fingerprint of the expression it exposes.
+    fp: String,
 }
 
 #[derive(Debug)]
@@ -748,38 +765,6 @@ fn conjuncts<'e>(e: &'e mut Expr, out: &mut Vec<&'e mut Expr>) {
     }
 }
 
-/// The rendered text of a rewritten expression, without outer parentheses:
-/// how GROUP BY items and output columns are matched.
-fn key_text(e: &Expr) -> String {
-    match e {
-        Expr::Nested(i) => key_text(i),
-        _ => e.to_string(),
-    }
-}
-
-/// The `+`-joined leaves of a rewritten expression (through parentheses),
-/// as sorted rendered texts: `(a + b) - (b + a)` has equal sides (G3).
-fn plus_leaves(e: &Expr) -> Vec<String> {
-    fn walk(e: &Expr, out: &mut Vec<String>) {
-        match e {
-            Expr::Nested(i) => walk(i, out),
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::Plus,
-                right,
-            } => {
-                walk(left, out);
-                walk(right, out);
-            }
-            other => out.push(other.to_string()),
-        }
-    }
-    let mut out = Vec::new();
-    walk(e, &mut out);
-    out.sort();
-    out
-}
-
 /// The sources of one block reachable from `start` without edge `skip`
 /// (the joins of a block form a tree: each join links one new source).
 fn side(n: usize, edges: &[Edge], skip: usize, start: usize) -> Vec<bool> {
@@ -1002,7 +987,7 @@ impl<'a> Walk<'a> {
         }
 
         // The output columns.
-        let mut items: Vec<(Option<String>, String, Item)> = Vec::new();
+        let mut items: Vec<(Option<String>, Item)> = Vec::new();
         let mut aliases = Vec::new();
         for item in projection.iter_mut() {
             match item {
@@ -1013,7 +998,6 @@ impl<'a> Walk<'a> {
                         _ => None,
                     };
                     let it = self.term(e, &sc, false)?;
-                    let text = key_text(e);
                     if let Some(name) = &written {
                         // Keep the cloud name as the output name.
                         *item = SelectItem::ExprWithAlias {
@@ -1021,7 +1005,7 @@ impl<'a> Walk<'a> {
                             alias: quoted(name),
                         };
                     }
-                    items.push((written, text, it));
+                    items.push((written, it));
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let name = alias.value.clone();
@@ -1031,7 +1015,7 @@ impl<'a> Walk<'a> {
                     let it = self.term(expr, &sc, false)?;
                     *alias = quoted(&name);
                     aliases.push((name.clone(), expr.clone(), it.clone()));
-                    items.push((Some(name), key_text(expr), it));
+                    items.push((Some(name), it));
                 }
                 _ => return construct(),
             }
@@ -1047,9 +1031,10 @@ impl<'a> Walk<'a> {
                 return construct();
             }
         }
-        // G3: two outputs with one expression feed a constant `x - x` later.
+        // G3 / H2: two outputs with one fingerprint feed a constant `x - x`
+        // later (also through a CTE, whose columns carry the fingerprint).
         for (i, a) in items.iter().enumerate() {
-            if items[..i].iter().any(|b| b.1 == a.1) {
+            if items[..i].iter().any(|b| b.1.fp == a.1.fp) {
                 return construct();
             }
         }
@@ -1071,7 +1056,7 @@ impl<'a> Walk<'a> {
                     if !it.is_col() {
                         return construct();
                     }
-                    groups.push(key_text(e));
+                    groups.push((it.src, it.fp));
                 }
             }
             _ => return construct(),
@@ -1109,8 +1094,12 @@ impl<'a> Walk<'a> {
         // or (outermost only) a column of the source a `key = :pN` pins.
         let aggregating = self.agg_seen || !groups.is_empty() || having.is_some();
         let mut out = Vec::with_capacity(items.len());
-        for (name, text, it) in items {
-            let grouped = it.is_col() && groups.contains(&text);
+        for (name, it) in items {
+            // M2: COUNT(DISTINCT key) is not a value a CTE passes on.
+            if it.key_count && !outer {
+                return construct();
+            }
+            let grouped = it.is_col() && groups.contains(&(it.src, it.fp.clone()));
             if aggregating && it.is_col() && !grouped {
                 let pin_ok = outer && it.src.is_some_and(|s| pinned.contains(&s));
                 if !pin_ok {
@@ -1129,6 +1118,7 @@ impl<'a> Walk<'a> {
                 counted: grouped || it.kind == (Kind::Agg { count: true }),
                 repeats: it.is_col() && (it.repeats || it.src.is_some_and(|s| sc.repeated[s])),
                 unique: it.kind == Kind::Col && groups.len() == 1 && grouped,
+                fp: it.fp,
             });
         }
         Ok(out)
@@ -1375,7 +1365,8 @@ impl<'a> Walk<'a> {
                 t.columns
                     .iter()
                     .map(|c| {
-                        let mut it = Item::new(Kind::Col, Some(c.ty));
+                        let fp = format!("{}.{}", t.name, c.name);
+                        let mut it = Item::new(Kind::Col, Some(c.ty), fp);
                         it.origin = Some((t.name.clone(), c.name.clone()));
                         it.base = true;
                         let cloud = c.alias.clone().unwrap_or_else(|| c.name.clone());
@@ -1387,7 +1378,7 @@ impl<'a> Walk<'a> {
                 .iter()
                 .filter_map(|c| {
                     let n = c.name.clone()?;
-                    let mut it = Item::new(Kind::Col, c.ty);
+                    let mut it = Item::new(Kind::Col, c.ty, c.fp.clone());
                     it.origin = c.origin.clone();
                     it.nullable = c.nullable;
                     it.repeats = c.repeats;
@@ -1491,27 +1482,44 @@ impl<'a> Walk<'a> {
                 *e = new;
                 Ok(it)
             }
-            Expr::Nested(inner) => self.term(inner, sc, alias_ok),
+            Expr::Nested(inner) => {
+                let it = self.term(inner, sc, alias_ok)?;
+                // Canonical rendering: parentheses stay only where they carry
+                // precedence (around arithmetic).
+                if !matches!(**inner, Expr::BinaryOp { .. }) {
+                    let new = (**inner).clone();
+                    *e = new;
+                }
+                Ok(it)
+            }
             Expr::Function(f) => self.function(f, sc),
             Expr::BinaryOp { left, op, right } => {
-                let divide = match op {
-                    BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply => {
-                        false
-                    }
-                    BinaryOperator::Divide => true,
+                let sym = match op {
+                    BinaryOperator::Plus => "+",
+                    BinaryOperator::Minus => "-",
+                    BinaryOperator::Multiply => "*",
+                    BinaryOperator::Divide => "/",
                     _ => return construct(),
                 };
+                let divide = sym == "/";
                 let a = self.term(left, sc, alias_ok)?;
                 let b = self.term(right, sc, alias_ok)?;
-                // `x - x`, `x / x` are constants whatever the data (F5), also
-                // as `(a + b) - (b + a)` (G3).
-                let same = key_text(left) == key_text(right)
-                    || (matches!(op, BinaryOperator::Minus | BinaryOperator::Divide)
-                        && plus_leaves(left) == plus_leaves(right));
-                if !a.is_agg() || !b.is_agg() || same {
+                // One rule for constants (F5, G3, H1, M1): no fingerprint twice
+                // in one arithmetic tree (`x - x`, `(a + b) - (b + a)`,
+                // `a * b - b * a`, ...). COUNT(DISTINCT key) is no operand (M2).
+                if !a.is_agg() || !b.is_agg() || a.key_count || b.key_count {
                     return construct();
                 }
-                let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty));
+                let mut leaves = a.leaves;
+                for l in b.leaves {
+                    if leaves.contains(&l) {
+                        return construct();
+                    }
+                    leaves.push(l);
+                }
+                let fp = format!("({} {sym} {})", a.fp, b.fp);
+                let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty), fp);
+                it.leaves = leaves;
                 it.nullable = a.nullable || b.nullable || divide;
                 Ok(it)
             }
@@ -1549,10 +1557,20 @@ impl<'a> Walk<'a> {
         if !list.clauses.is_empty() {
             return construct();
         }
-        match lname.as_str() {
-            "date" | "strftime" => self.date_fn(lname == "strftime", list, sc),
-            l => self.aggregate(l, list, sc),
-        }
+        let date = matches!(lname.as_str(), "date" | "strftime");
+        let item = if date {
+            self.date_fn(lname == "strftime", list, sc)?
+        } else {
+            self.aggregate(&lname, list, sc)?
+        };
+        // Canonical rendering of the name.
+        let canon = if date {
+            lname
+        } else {
+            lname.to_ascii_uppercase()
+        };
+        f.name = ObjectName::from(vec![Ident::new(canon)]);
+        Ok(item)
     }
 
     /// `COUNT(*)`, or an aggregate over one plain column.
@@ -1563,11 +1581,18 @@ impl<'a> Walk<'a> {
             Some(_) => return construct(),
         };
         let count = l == "count";
+        // MIN / MAX DISTINCT means nothing more than MIN / MAX.
+        if distinct && matches!(l, "min" | "max") {
+            return construct();
+        }
         let [arg] = list.args.as_mut_slice() else {
             return construct();
         };
-        let arg_ty = match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if count && !distinct => None,
+        let mut key_count = false;
+        let (arg_ty, arg_fp) = match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if count && !distinct => {
+                (None, "*".to_string())
+            }
             FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => {
                 // An output alias is not a column here.
                 let it = self.term(x, sc, false)?;
@@ -1576,8 +1601,11 @@ impl<'a> Walk<'a> {
                 }
                 // G1: a key or FK column is counted distinct, never summed,
                 // compared through MIN/MAX, or counted per row.
-                if self.structural(&it) && !(count && distinct) {
-                    return construct();
+                if self.structural(&it) {
+                    if !(count && distinct) {
+                        return construct();
+                    }
+                    key_count = true;
                 }
                 // F3 (c): a SUM / AVG / COUNT(col) over a value the join
                 // repeats counts it once per repeat. COUNT(*), COUNT(DISTINCT)
@@ -1587,7 +1615,7 @@ impl<'a> Walk<'a> {
                 if repeated && inflates {
                     return construct();
                 }
-                it.ty
+                (it.ty, it.fp)
             }
             _ => return construct(),
         };
@@ -1597,7 +1625,11 @@ impl<'a> Walk<'a> {
             "sum" | "avg" => Some(ColType::Real),
             _ => arg_ty,
         };
-        let mut it = Item::new(Kind::Agg { count }, ty);
+        let d = if distinct { " distinct" } else { "" };
+        let fp = format!("{l}{d}({arg_fp})");
+        let mut it = Item::new(Kind::Agg { count }, ty, fp.clone());
+        it.leaves = vec![fp];
+        it.key_count = key_count;
         it.nullable = !count;
         Ok(it)
     }
@@ -1614,6 +1646,7 @@ impl<'a> Walk<'a> {
             return construct();
         }
         let mut src = None;
+        let mut parts = Vec::with_capacity(n);
         for (i, a) in list.args.iter_mut().enumerate() {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a else {
                 return construct();
@@ -1624,6 +1657,7 @@ impl<'a> Walk<'a> {
                     return construct();
                 }
                 src = it.src;
+                parts.push(it.fp);
                 continue;
             }
             let Expr::Value(v) = x else {
@@ -1637,13 +1671,16 @@ impl<'a> Walk<'a> {
             if !ok {
                 return fail(ErrorClass::LiteralNotAllowed);
             }
+            parts.push(v.value.to_string());
         }
         let ty = if strftime {
             ColType::Text
         } else {
             ColType::Date
         };
-        let mut it = Item::new(Kind::DateOf, Some(ty));
+        let name = if strftime { "strftime" } else { "date" };
+        let fp = format!("{name}({})", parts.join(","));
+        let mut it = Item::new(Kind::DateOf, Some(ty), fp);
         it.src = src;
         Ok(it)
     }
@@ -1705,7 +1742,7 @@ impl<'a> Walk<'a> {
     fn subject(&mut self, e: &mut Expr, sc: &Scope, having: bool) -> R<Item> {
         let it = self.term(e, sc, having)?;
         let ok = if having {
-            matches!(it.kind, Kind::Agg { .. })
+            matches!(it.kind, Kind::Agg { .. }) && !it.key_count
         } else {
             it.is_col()
         };
