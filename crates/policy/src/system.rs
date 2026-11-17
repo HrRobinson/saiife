@@ -39,6 +39,9 @@ pub struct SystemConfig {
     /// out of the serialised form (and so the policy hash) while default.
     #[serde(default, skip_serializing_if = "WorkspaceCfg::is_default")]
     pub workspace: WorkspaceCfg,
+    /// `[blind]` (plan 43): the Data Shield. Left out of the hash while default.
+    #[serde(default, skip_serializing_if = "crate::blind::BlindCfg::is_default")]
+    pub blind: crate::blind::BlindCfg,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceCfg>,
     /// `[mcp.<name>]`: gateway servers (plan 17). Locked mode only.
@@ -422,7 +425,7 @@ impl ApprovalCfg {
 }
 
 /// A user or group name (as `users::valid_name`).
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && !name
