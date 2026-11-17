@@ -373,12 +373,13 @@ fn write_tables(
     }
     let tnames = unique_names(tables.iter().map(|t| t.name.as_str()), true);
 
-    // The file exists already (0600, ours); SQLite must not create anything.
+    // The file exists already: we just made it (create_new, 0600,
+    // O_NOFOLLOW) in a checked 0700 dir, and SQLite opens it without CREATE.
+    // No SQLITE_OPEN_NOFOLLOW: SQLite applies it to every path component, so
+    // a symlinked ancestor (macOS /var, /home -> /var/home) would refuse.
     let conn = Connection::open_with_flags(
         part,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(sql_err)?;
     conn.pragma_update_and_check(None, "journal_mode", "OFF", |r| r.get::<_, String>(0))

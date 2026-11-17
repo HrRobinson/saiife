@@ -709,10 +709,12 @@ impl SqliteSource {
                         .is_ok()
                 });
             pk.sort();
-            let order = if pk.is_empty() {
-                cols.clone()
-            } else {
+            let order = if !pk.is_empty() {
                 pk.into_iter().map(|p| p.1).collect::<Vec<_>>().join(", ")
+            } else if cols.is_empty() {
+                "NULL".to_string()
+            } else {
+                cols.clone()
             };
             tables.push(SqlTable {
                 info: SourceTable { name, columns },

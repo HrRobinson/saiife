@@ -704,3 +704,48 @@ fn huge_digit_strings_stay_text() {
         .unwrap();
     assert_eq!(v, "12345678901234567890");
 }
+
+// ---- fix round 2 ----
+
+#[cfg(unix)]
+#[test]
+fn builds_through_a_symlinked_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let out = link.join("crm").join("stage");
+    let mut src = csv_src(b"id,name\n1,Anna\n", "p.csv");
+    let info = build_snapshot(&mut src, &out, &mut |_| {}).unwrap();
+    assert!(real.join("crm/stage/snapshot.sqlite").exists());
+    let c = open_ro(&info.path).unwrap();
+    let n: String = c
+        .query_row("SELECT name FROM p WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, "Anna");
+    // And a SQLite source reached through the symlink.
+    let db = real.join("s.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
+        .unwrap();
+    let mut s = SqliteSource::open(&link.join("s.db")).unwrap();
+    assert_eq!(s.rows("t").unwrap().count(), 1);
+}
+
+#[test]
+fn sqlite_table_with_only_blob_columns_and_no_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("b.db");
+    rusqlite::Connection::open(&p)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE b (rowid BLOB, _rowid_ BLOB, oid BLOB);
+             INSERT INTO b VALUES (x'01', x'02', x'03'), (x'04', x'05', x'06');",
+        )
+        .unwrap();
+    let mut src = SqliteSource::open(&p).unwrap();
+    let rows: Vec<_> = src.rows("b").unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(rows, vec![Vec::<Cell>::new(), Vec::new()]);
+}
