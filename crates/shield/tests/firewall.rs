@@ -322,6 +322,7 @@ fn context_turns_are_typed_and_pass() {
     s.push_turn(Turn {
         question: "What does :p1 owe?".into(),
         symbols: vec![("p1".into(), sym.clone())],
+        released: vec![],
     });
     let d = clean_draft(&f);
     let e = envelope(&f, &mut s, &d);
@@ -343,6 +344,7 @@ fn context_entities_are_renamed_in_order() {
     s.push_turn(Turn {
         question: "Over :p1 for :p3 and :p2, then :p3 again".into(),
         symbols: vec![("p2".into(), a.clone()), ("p3".into(), b.clone())],
+        released: vec![],
     });
     let e = envelope(&f, &mut s, &clean_draft(&f));
     let t = &e.context[0];
@@ -674,6 +676,7 @@ fn unknown_fields_are_refused_at_every_level() {
     s.push_turn(Turn {
         question: "What does :p1 owe?".into(),
         symbols: vec![("p1".into(), sym)],
+        released: vec![],
     });
     let mut e = envelope(&f, &mut s, &clean_draft(&f));
     e.retry = Some(Retry {
@@ -1538,4 +1541,158 @@ fn oversize_synthetic_text_and_raw_names_in_parts() {
             .any(|x| x.part.starts_with("synthetic.#") && x.part.contains("[0].#")),
         "{h:?}"
     );
+}
+
+// ---------------------------------- final review fix wave (I2, I3, I4) ----
+
+/// A caller that keeps its expectations from the build: symbols from the
+/// session (never from the envelope checked).
+fn caller<R>(
+    f: &Fx,
+    det: &dyn NameDetector,
+    released: &[String],
+    lang: Lang,
+    issued: &[String],
+    run: impl FnOnce(&Firewall<'_>) -> R,
+) -> R {
+    let w = Firewall {
+        index: &f.index,
+        allow: &f.allow,
+        detector: det,
+        released_names: released,
+        expected: Expected {
+            list_cap: LIST_CAP,
+            lang,
+            schema_sha256: &f.schema_hash,
+            synthetic_sha256: &f.hash,
+            symbols: issued,
+            previous_method_sha256: None,
+        },
+    };
+    run(&w)
+}
+
+#[test]
+fn issued_symbols_build_the_expected_pin() {
+    let f = fx();
+    let mut s = session(&f);
+    let earlier = s.symbol_for("customer", "customers", 7);
+    s.push_turn(Turn {
+        question: "What does :p1 owe?".into(),
+        symbols: vec![("p1".into(), earlier.clone())],
+        released: vec![],
+    });
+    let mut p2 = customer(12);
+    p2.name = "p2".into();
+    let d = draft(
+        Lang::En,
+        "Does :p1 owe more than :p2?",
+        vec![customer(401), p2],
+    );
+    let e = envelope(&f, &mut s, &d);
+    // Called after the build: it holds the two new symbols and the
+    // context turn's.
+    let issued = s.issued_symbols();
+    assert_eq!(issued.len(), 3, "{issued:?}");
+    assert_eq!(e.context.len(), 1);
+    for sym in e
+        .params
+        .iter()
+        .chain(e.context[0].params.iter())
+        .filter_map(|p| p.symbol.as_ref())
+    {
+        assert!(issued.contains(sym), "{sym}");
+    }
+    let nodet = none();
+    caller(&f, &nodet, &[], e.lang, &issued, |w| {
+        assert_eq!(w.check_bytes(&e.canonical()).unwrap(), Verdict::Pass);
+    });
+    // A well-formed stand-in this session never issued.
+    let mut other = session(&f);
+    let stranger = other.symbol_for("customer", "customers", 99);
+    assert!(!issued.contains(&stranger));
+    let mut bad = e.clone();
+    bad.params[1].symbol = Some(stranger);
+    caller(&f, &nodet, &[], e.lang, &issued, |w| {
+        let h = hits(w.check_bytes(&bad.canonical()).unwrap());
+        assert_eq!(h, vec![bad_part("params[1].symbol")]);
+    });
+    // Called before the build, the pin misses the new symbols.
+    let mut s2 = session(&f);
+    let early = s2.issued_symbols();
+    let e2 = envelope(&f, &mut s2, &d);
+    caller(&f, &nodet, &[], e2.lang, &early, |w| {
+        assert!(w.check_bytes(&e2.canonical()).unwrap() != Verdict::Pass);
+    });
+}
+
+#[test]
+fn glued_digits_reach_the_firewall_as_text() {
+    // Ruling P-29: the parameterizer leaves `address2` as text and the
+    // allow-list word exemption passes it; any other glued digit blocks.
+    let f = fx_with(|s| {
+        let t = s.tables.iter_mut().find(|t| t.name == "customers").unwrap();
+        let c = t.columns.iter_mut().find(|c| c.name == "postcode").unwrap();
+        c.alias = Some("address2".into());
+    });
+    let nodet = none();
+    let run = |q: &str| {
+        let d = match parameterize(q, None, f.schema(), &f.lex, &nodet).unwrap() {
+            Step::Ready(d) => d,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_eq!(d.text, q);
+        let mut s = session(&f);
+        let e = envelope(&f, &mut s, &d);
+        let issued = s.issued_symbols();
+        caller(&f, &nodet, &[], e.lang, &issued, |w| {
+            w.check_bytes(&e.canonical()).unwrap()
+        })
+    };
+    assert_eq!(
+        run("Which customers have an empty address2?"),
+        Verdict::Pass
+    );
+    let q = "Which customers have an empty abc12?";
+    let h = hits(run(q));
+    assert!(
+        h.iter().any(|x| x.kind == "number"
+            && x.part == "question"
+            && x.span.is_some_and(|(a, b)| q.get(a..b) == Some("12"))),
+        "{h:?}"
+    );
+}
+
+#[test]
+fn released_name_passes_in_follow_up_turns() {
+    // Ruling P-28: a name released in turn 1 is resent as context; the
+    // caller passes this ask's releases with the session's.
+    let f = fx();
+    let mut s = session(&f);
+    s.push_turn(Turn {
+        question: "What does Zed Zulu owe?".into(),
+        symbols: vec![],
+        released: vec!["Zed Zulu".into()],
+    });
+    let d = clean_draft(&f);
+    let e = envelope(&f, &mut s, &d);
+    assert_eq!(e.context.len(), 1);
+    assert!(e.context[0].question.contains("Zed Zulu"));
+    let issued = s.issued_symbols();
+    let det = ListDetector::new(&[("Zed Zulu", SpanLabel::Person)]);
+    let this_ask: Vec<String> = vec![];
+    let mut released = this_ask.clone();
+    released.extend(s.released_names());
+    caller(&f, &det, &released, e.lang, &issued, |w| {
+        assert_eq!(w.check_bytes(&e.canonical()).unwrap(), Verdict::Pass);
+    });
+    // Without the session's releases the follow-up is blocked.
+    caller(&f, &det, &this_ask, e.lang, &issued, |w| {
+        let h = hits(w.check_bytes(&e.canonical()).unwrap());
+        assert!(
+            h.iter()
+                .any(|x| x.kind == "name" && x.part.starts_with("context[0]")),
+            "{h:?}"
+        );
+    });
 }

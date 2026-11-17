@@ -83,7 +83,8 @@ fn fx() -> Fx {
                 Cell::Text((*f).into()),
                 Cell::Text((*l).into()),
                 Cell::Text((*c).into()),
-                Cell::Text("retail".into()),
+                // A public value with a digit in it (ruling P-29).
+                Cell::Text(if *f == "Mette" { "B2B" } else { "retail" }.into()),
             ]
         })
         .collect();
@@ -158,14 +159,15 @@ fn simple_entity_and_amount() {
         "What does Søren Ærø owe, and is it over 10 000?",
         &none(),
     ));
-    // R44-1: an æ, ø or å makes the question Danish, names included.
-    assert_eq!(d.lang, Lang::Da);
+    // Ruling P-27 (was R44-1): the function words decide; a Danish name in
+    // an English question leaves it English.
+    assert_eq!(d.lang, Lang::En);
     assert_eq!(d.text, "What does :p1 owe, and is it over :p2?");
     assert_eq!(d.params.len(), 2);
     assert_eq!(d.params[0].name, "p1");
     assert_eq!(d.params[0].ty, customers());
     assert_eq!(d.params[0].bound, Some(Bound::Keys(vec![3])));
-    assert_eq!(d.params[0].display, "Søren Ærø, Aalborg (kunde #3)");
+    assert_eq!(d.params[0].display, "Søren Ærø, Aalborg (customer #3)");
     assert_eq!(d.params[1].name, "p2");
     assert_eq!(d.params[1].ty, ParamType::Amount);
     assert_eq!(d.params[1].bound, Some(Bound::Amount(dec("10000"))));
@@ -352,7 +354,7 @@ fn bad_literal_refuses() {
     let f = fx();
     let q = "invoices from 31 February 2026";
     match refusal(run(&f, q, &none())) {
-        Refusal::BadLiteral { span } => assert!(span.0 < span.1 && span.1 <= q.len()),
+        Refusal::BadLiteral { span, .. } => assert!(span.0 < span.1 && span.1 <= q.len()),
         other => panic!("{other:?}"),
     }
 }
@@ -616,6 +618,14 @@ const PIECES: &[&str] = &[
     "over",
     "Zed Zulu",
     "Ana Berg",
+    "B2B",
+    "address2",
+    "abc12",
+    "12abc",
+    "10,000",
+    "1.500",
+    "$5abc",
+    "-500",
 ];
 
 fn random_question(r: &mut Rng) -> String {
@@ -801,7 +811,7 @@ fn typed_param_token_refuses() {
         ("x:p12y", ":p12"),
     ] {
         match refusal(run(&f, q, &none())) {
-            Refusal::BadLiteral { span } => assert_eq!(&q[span.0..span.1], tok),
+            Refusal::BadLiteral { span, .. } => assert_eq!(&q[span.0..span.1], tok),
             other => panic!("{q}: {other:?}"),
         }
     }
@@ -992,4 +1002,72 @@ fn hand_made_draft_answers() {
         word: "order".into(),
     };
     assert!(answer(x, Answer::DidYouMean(true), &f.lex).is_err());
+}
+
+// ---------------------------------------- final review fix wave (I1, I3) ----
+
+#[test]
+fn danish_name_in_english_question_never_binds_ten() {
+    // Ruling P-27: function words decide (English), and `10,000` with an
+    // auto-detected language is ambiguous: refused, never Amount 10.
+    let f = fx();
+    let q = "What does Søren Ærø owe, and is it over 10,000?";
+    match refusal(run(&f, q, &none())) {
+        Refusal::BadLiteral { span, why } => {
+            assert_eq!(&q[span.0..span.1], "10,000");
+            assert_eq!(why, saiife_shield::lang::AMBIGUOUS_NUMBER);
+        }
+        other => panic!("{other:?}"),
+    }
+    // An explicit language keeps today's reading.
+    let d = ready(parameterize(q, Some(Lang::Da), &f.schema, &f.lex, &none()).unwrap());
+    assert_eq!(d.lang, Lang::Da);
+    assert_eq!(d.params[1].bound, Some(Bound::Amount(dec("10.000"))));
+    let d = ready(parameterize(q, Some(Lang::En), &f.schema, &f.lex, &none()).unwrap());
+    assert_eq!(d.params[1].bound, Some(Bound::Amount(dec("10000"))));
+    // Two separators are not ambiguous.
+    let d = ready(run(&f, "What does Søren Ærø owe over 10.000,50?", &none()));
+    assert_eq!(d.lang, Lang::En);
+    assert_eq!(d.params[1].bound, Some(Bound::Amount(dec("10000.50"))));
+    // A Danish question with the same name stays Danish.
+    let d = ready(run(&f, "hvad skylder søren ærø", &none()));
+    assert_eq!(d.lang, Lang::Da);
+}
+
+#[test]
+fn digits_glued_to_words_stay_text() {
+    // Ruling P-29.
+    let f = fx();
+    let d = ready(run(&f, "customers with an empty address2", &none()));
+    assert_eq!(d.text, "customers with an empty address2");
+    assert!(d.params.is_empty());
+    for q in ["customers in abc12", "customers in 12abc", "weight 15kg"] {
+        let d = ready(run(&f, q, &none()));
+        assert_eq!(d.text, q);
+        assert!(d.params.is_empty(), "{q}");
+    }
+    // A public value with a digit is a text parameter, not `B:p1B`.
+    let det = ListDetector::new(&[("B2B", SpanLabel::Misc)]);
+    let d = ready(run(&f, "customers in segment B2B", &det));
+    assert_eq!(d.text, "customers in segment :p1");
+    assert_eq!(
+        d.params[0].ty,
+        ParamType::Text {
+            table: "customers".into(),
+            column: "segment".into()
+        }
+    );
+    assert_eq!(d.params[0].bound, Some(Bound::Text("B2B".into())));
+    // The allowed suffixes still make literals.
+    let d = ready(run(&f, "over 15k on the 3rd", &none()));
+    assert_eq!(d.text, "over :p1 on the :p2");
+}
+
+#[test]
+fn minus_sign_stays_in_the_text() {
+    let f = fx();
+    let d = ready(run(&f, "balance under -500", &none()));
+    assert_eq!(d.text, "balance under -:p1");
+    assert_eq!(d.params[0].ty, ParamType::Integer);
+    assert_eq!(d.params[0].bound, Some(Bound::Integer(500)));
 }

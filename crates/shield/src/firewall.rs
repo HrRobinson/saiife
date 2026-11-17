@@ -49,9 +49,14 @@
 //! the envelope's tables and columns, at most 5 rows a table, every value
 //! of the generator's shape for its column, and hash
 //! ([`crate::envelope::synthetic_sha256`]) to the expected hash. Only then
-//! (P-24) is the generator's own number inside a synthetic text
-//! (`Synthetic_4711`) or a synthetic date exempt from the number, date and
-//! known-value scans; patterns and names still run on all of it.
+//! (P-24) are the generator's own spans exempt: the number inside a
+//! synthetic text (`Synthetic_4711`, `synthetic12@example.invalid`), a
+//! whole synthetic date and a whole k-floor public value. The number,
+//! known-value and pattern scans skip those spans (a synthetic date has a
+//! phone number's digit count; a k-floor value is pattern-scanned as a
+//! typed part where the schema lists it, under `schema...values`); the
+//! name scan runs on all of the text, and every scan runs on the rest of
+//! it (`Synthetic_` and the column name).
 //!
 //! [`Firewall::check_bytes`] takes the exact bytes to send: they must
 //! deserialize into [`Envelope`] (unknown fields refused at every level)
@@ -183,7 +188,11 @@ pub struct Firewall<'a> {
     pub index: &'a KnownIndex,
     pub allow: &'a AllowList,
     pub detector: &'a dyn NameDetector,
-    /// The names a `blind:name` touch of this ask released.
+    /// The names a `blind:name` touch released (ruling P-28): this ask's
+    /// releases together with [`crate::session::Session::released_names`]
+    /// (the live turns' releases), because the context turns resend those
+    /// turns' questions. Bounded by the session (at most 10 turns, 30
+    /// minutes).
     pub released_names: &'a [String],
     /// What the caller put in the envelope (P-22, P-25, P-26).
     pub expected: Expected<'a>,
@@ -192,6 +201,12 @@ pub struct Firewall<'a> {
 /// The caller-held expectations of one envelope (ruling P-26): the caller
 /// keeps them from the moment it builds the envelope, and the firewall
 /// requires the envelope to match them byte for byte.
+///
+/// Never derive any field from the envelope being checked (for example
+/// `schema_sha256(&e.schema)` or the symbols of `e.params`): the pin is then
+/// circular and checks nothing. Build each from the inputs the caller gave
+/// `build_envelope`, and `symbols` from
+/// [`crate::session::Session::issued_symbols`] after the build.
 #[derive(Debug, Clone, Copy)]
 pub struct Expected<'a> {
     /// The `list_cap` passed to `build_envelope`.
@@ -203,7 +218,9 @@ pub struct Expected<'a> {
     /// [`synthetic_sha256`] of the `synthetic_rows` output passed to
     /// `build_envelope`.
     pub synthetic_sha256: &'a str,
-    /// Every stand-in the session issued (P-25).
+    /// Every stand-in the session issued (P-25):
+    /// [`crate::session::Session::issued_symbols`], called after
+    /// `build_envelope`.
     pub symbols: &'a [String],
     /// [`method_sha256`] of the previous method received from the planner,
     /// for a retry; `None` for a first request.
@@ -1471,7 +1488,9 @@ pub(crate) fn standalone_hits(e: &Envelope) -> Vec<Hit> {
     let mut ignored = Vec::new();
     let texts = envelope_parts(e, None, &mut ignored);
     let mut hits = Vec::new();
-    // No clock: count one more personal value rather than skip the scan.
+    // No clock: the birth-date scan cannot run (an empty cutoff matches no
+    // date), so count one `pattern:birth_date` hit on `clock` instead: the
+    // summary never reads cleaner than a real scan would.
     let cutoff = match birth_cutoff() {
         Ok(c) => c,
         Err(_) => {

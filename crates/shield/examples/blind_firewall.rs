@@ -160,12 +160,8 @@ fn main() {
         let synth = synthetic_rows(schema, &m.formats, &m.public, 5, &mut rng);
         let hash = synthetic_sha256(&synth);
         let e = build_envelope(d, s, schema, &m.public, synth, LIST_CAP, None);
-        let issued: Vec<String> = e
-            .params
-            .iter()
-            .filter_map(|p| p.symbol.clone())
-            .filter(|sym| s.key_for_symbol(sym).is_some())
-            .collect();
+        // P-25 / I2: from the session, after the build (never the envelope).
+        let issued = s.issued_symbols();
         (e, hash, issued)
     };
     let raw = |q: &str, lang: Lang| Draft {

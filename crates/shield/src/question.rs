@@ -27,7 +27,7 @@
 //! user wrote, or a candidate (ruling P-14).
 
 use crate::error::ShieldError;
-use crate::lang::{detect_lang, find_literals, Literal, LiteralSpan};
+use crate::lang::{detect_lang, find_literals, find_literals_detected, Literal, LiteralSpan};
 use crate::lexicon::{Candidate, Lexicon, Resolve, SpanHit};
 use crate::ner::{DetectError, NameDetector, NameSpan, SpanLabel};
 use crate::norm::token_spans;
@@ -49,10 +49,12 @@ pub const MAX_SPAN_TOKENS: usize = 6;
 ///
 /// The invariants [`answer`] checks (an inconsistent draft is an `Err`):
 /// `text` holds `:p1`..`:pK` once each, in order, for the K `params` (named
-/// `p1`..`pK`), and nothing else shaped like a parameter; the text between
-/// them is copied from `original` verbatim; a `Pick` or `DidYouMean` names an
-/// unbound param, whose `display` is the text as written; a `KeepName` span
-/// is the name's bytes in `original`.
+/// `p1`..`pK`), and nothing else shaped like a parameter; a `Pick` or
+/// `DidYouMean` names an unbound param, each unbound param has exactly one
+/// such step; a `KeepName` span is the name's bytes in `original`.
+/// [`parameterize`] also copies the text between the parameters from
+/// `original` verbatim and sets each `display` to the text as written, but
+/// [`answer`] does not verify either: a hand-built draft must keep them.
 #[derive(Clone)]
 pub struct Draft {
     pub lang: Lang,
@@ -108,8 +110,12 @@ pub enum Step {
 pub enum Refusal {
     /// `no <word> named that`; `written` is the user's text (local only).
     NoMatch { word: String, written: String },
-    /// A literal that does not parse as its type (byte range).
-    BadLiteral { span: (usize, usize) },
+    /// A literal that does not parse as its type (byte range), with a fixed
+    /// reason (e.g. [`crate::lang::AMBIGUOUS_NUMBER`]); never the text.
+    BadLiteral {
+        span: (usize, usize),
+        why: &'static str,
+    },
     /// The user declined to keep an unknown name as text, or the touch failed.
     NameRefused { name: String },
     /// "None of these" on a list that was cut at the candidate cap.
@@ -266,20 +272,34 @@ pub fn parameterize(
     lex: &Lexicon,
     det: &dyn NameDetector,
 ) -> Result<Step, ShieldError> {
-    let lang = lang.unwrap_or_else(|| detect_lang(question));
+    // Ruling P-27: an explicit language reads `10,000` by its decimal mark;
+    // a detected one refuses it as ambiguous.
+    let (lang, detected) = match lang {
+        Some(l) => (l, false),
+        None => (detect_lang(question), true),
+    };
 
     // 0. A typed `:p9` would read as a parameter name (and R44-8 skips
     // those in the number scan): refuse it like a bad literal.
     if let Some((a, b)) = param_token(question, 0) {
-        return Ok(Step::Refuse(Refusal::BadLiteral { span: (a, b) }));
+        return Ok(Step::Refuse(Refusal::BadLiteral {
+            span: (a, b),
+            why: "a parameter name typed in the question",
+        }));
     }
 
     // 1. Literals.
-    let lits: Vec<LiteralSpan> = match find_literals(question, lang) {
+    let found = if detected {
+        find_literals_detected(question, lang)
+    } else {
+        find_literals(question, lang)
+    };
+    let lits: Vec<LiteralSpan> = match found {
         Ok(v) => v,
         Err(e) => {
             return Ok(Step::Refuse(Refusal::BadLiteral {
                 span: (e.start, e.end),
+                why: e.why,
             }))
         }
     };
@@ -909,9 +929,11 @@ impl fmt::Debug for Refusal {
                 .field("word", word)
                 .field("written", &"<hidden>")
                 .finish(),
-            Refusal::BadLiteral { span } => {
-                f.debug_struct("BadLiteral").field("span", span).finish()
-            }
+            Refusal::BadLiteral { span, why } => f
+                .debug_struct("BadLiteral")
+                .field("span", span)
+                .field("why", why)
+                .finish(),
             Refusal::NameRefused { .. } => f
                 .debug_struct("NameRefused")
                 .field("name", &"<hidden>")

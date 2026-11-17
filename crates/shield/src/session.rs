@@ -33,6 +33,10 @@ pub struct Turn {
     pub question: String,
     /// `(parameter name, symbol)`, e.g. `("p1", "Customer_K7QF")`.
     pub symbols: Vec<(String, String)>,
+    /// The names a `blind:name` touch released in this turn (ruling P-28):
+    /// the turn's question is resent as context, so its released names stay
+    /// released while the turn is alive. Local only, never sent.
+    pub released: Vec<String>,
 }
 
 struct Len32;
@@ -190,6 +194,31 @@ impl Session {
             .map(|(k, _)| k.clone())
     }
 
+    /// Every stand-in the session has issued and that still resolves (the
+    /// live map's values; a collided short form is gone from it), sorted.
+    /// This is the source of [`crate::firewall::Expected::symbols`] (P-25).
+    /// Call it **after** [`crate::envelope::build_envelope`]: building the
+    /// envelope issues the symbols of the new question's entities.
+    pub fn issued_symbols(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.symbols.values().cloned().collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The names released by `blind:name` in the live turns (ruling P-28),
+    /// deduplicated. The firewall's `released_names` is this ask's releases
+    /// together with these.
+    pub fn released_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for n in self.turns.iter().flat_map(|t| t.released.iter()) {
+            if !v.contains(n) {
+                v.push(n.clone());
+            }
+        }
+        v
+    }
+
     /// Keeps the last 10 turns.
     pub fn push_turn(&mut self, t: Turn) {
         self.turns.push_back(t);
@@ -293,6 +322,7 @@ mod tests {
         s.push_turn(Turn {
             question: "q".into(),
             symbols: vec![("p1".into(), a.clone())],
+            released: vec![],
         });
         let b = s.symbol_for_with("Customer", "customers", 2, &derive);
         assert_eq!(b, "Customer_AAAA02");
@@ -312,6 +342,55 @@ mod tests {
         let c = s.symbol_for_with("Customer", "customers", 3, &derive);
         assert_eq!(c, "Customer_AAAA03");
         assert_eq!(s.key_for_symbol("Customer_AAAA"), None);
+    }
+
+    #[test]
+    fn issued_symbols_are_the_live_ones() {
+        let mut s = Session::new(1, ds("sales"), &keys(), 1000).unwrap();
+        assert!(s.issued_symbols().is_empty());
+        let derive = |w: &str, _t: &str, id: i64, len: usize| -> String {
+            if len == 4 {
+                format!("{w}_AAAA")
+            } else {
+                format!("{w}_AAAA{id:02}")
+            }
+        };
+        s.symbol_for_with("Customer", "customers", 1, &derive);
+        assert_eq!(s.issued_symbols(), vec!["Customer_AAAA".to_string()]);
+        s.symbol_for_with("Customer", "customers", 2, &derive);
+        // The collided short form is no longer issued.
+        assert_eq!(
+            s.issued_symbols(),
+            vec!["Customer_AAAA01".to_string(), "Customer_AAAA02".to_string()]
+        );
+    }
+
+    #[test]
+    fn released_names_follow_live_turns() {
+        let mut s = Session::new(1, ds("sales"), &keys(), 0).unwrap();
+        s.push_turn(Turn {
+            question: "q0".into(),
+            symbols: vec![],
+            released: vec!["Zed Zulu".into()],
+        });
+        s.push_turn(Turn {
+            question: "q1".into(),
+            symbols: vec![],
+            released: vec!["Zed Zulu".into(), "Ada Moe".into()],
+        });
+        assert_eq!(
+            s.released_names(),
+            vec!["Zed Zulu".to_string(), "Ada Moe".to_string()]
+        );
+        for i in 2..12 {
+            s.push_turn(Turn {
+                question: format!("q{i}"),
+                symbols: vec![],
+                released: vec![],
+            });
+        }
+        // Both turns dropped out of the context: their releases with them.
+        assert!(s.released_names().is_empty());
     }
 
     #[test]
@@ -408,6 +487,7 @@ mod tests {
             s.push_turn(Turn {
                 question: format!("q{i}"),
                 symbols: vec![],
+                released: vec![],
             });
         }
         assert_eq!(s.turns.len(), 10);
