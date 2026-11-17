@@ -354,13 +354,16 @@ pub(crate) fn review_lines(diff: &Value, review: Option<&Value>, stat: bool) -> 
 
 /// FU1: the warning `box diff` prints before the diff when the box changed
 /// files while its in-box guard reported no checks (`guard.skipped`).
-pub(crate) fn guard_warning(guard: Option<&Value>) -> Option<&'static str> {
+pub(crate) fn guard_warning(guard: Option<&Value>) -> Option<String> {
     let skipped = guard
         .and_then(|g| g.get("skipped"))
         .and_then(Value::as_bool);
-    (skipped == Some(true)).then_some(
-        "warning: guard_skipped: the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)",
-    )
+    (skipped == Some(true)).then(|| {
+        format!(
+            "warning: guard_skipped: {}",
+            saiife_wire::source::GUARD_SKIPPED_WHY
+        )
+    })
 }
 
 fn diff(t: &Target, id: &BoxId, as_json: bool, stat: bool) -> Result<(), Stop> {
@@ -1440,6 +1443,13 @@ mod tests {
     #[test]
     fn guard_warning_only_when_skipped() {
         let w = guard_warning(Some(&json!({"skipped": true, "checks": 0, "turns": 2}))).unwrap();
+        assert_eq!(
+            w,
+            format!(
+                "warning: guard_skipped: {}",
+                saiife_wire::source::GUARD_SKIPPED_WHY
+            )
+        );
         assert!(
             w.starts_with("warning: guard_skipped: the box changed files"),
             "{w}"

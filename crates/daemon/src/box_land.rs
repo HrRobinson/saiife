@@ -704,9 +704,9 @@ impl Lands {
     /// time, one `guard_skipped` record. A signal only: the guest can forge
     /// the counts, and nothing is blocked.
     fn note_guard(&self, ctx: &Ctx, id: &BoxId, owner: u32, files: usize) {
-        match self.mgr.note_review(id, files) {
-            Ok(true) => {}
-            Ok(false) => return,
+        let c = match self.mgr.note_review(id, files) {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
             Err(e) => {
                 eprintln!(
                     "saiifed: boxes: box {}: cannot note the guard check count: {e}",
@@ -714,16 +714,12 @@ impl Lands {
                 );
                 return;
             }
-        }
-        let rec = self.mgr.get(id).ok();
+        };
         let mut r = self.record(ctx, "guard_skipped", id, Some(owner));
         r.reason = Some(GUARD_SKIPPED.into());
         let x = &mut r.extra;
-        x.insert(
-            "guard_checks".into(),
-            rec.as_ref().map_or(0, |r| r.guard_checks).into(),
-        );
-        x.insert("turns".into(), rec.as_ref().map_or(0, |r| r.turns).into());
+        x.insert("guard_checks".into(), c.guard_checks.into());
+        x.insert("turns".into(), c.turns.into());
         x.insert("files".into(), files.into());
         self.write(ctx, r);
     }
@@ -1006,6 +1002,9 @@ impl Lands {
         // The box's files are done with: the audit write (an fsync) holds
         // no box lock.
         drop(held);
+        // FU1: a review made while the box ran was not judged (M2); the
+        // land is the last look (the box is Landed now).
+        self.note_guard(&ctx, &id, q.req.owner, q.review.summary.files.len());
         let mut r = self.record(&ctx, "land", &id, Some(q.req.owner));
         let x = &mut r.extra;
         x.insert("land".into(), n.into());
@@ -1592,8 +1591,8 @@ fn list_some(v: &[String]) -> String {
     s
 }
 
-/// FU1: what a `guard_skipped` flag means, for the audit and the CLI.
-pub const GUARD_SKIPPED: &str = "the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)";
+/// FU1: what a `guard_skipped` flag means (the one shared text).
+pub use saiife_wire::source::GUARD_SKIPPED_WHY as GUARD_SKIPPED;
 
 /// FU1: `{skipped, checks, turns}`: the box's guard signal for a review.
 pub fn guard_json(r: &BoxRecord) -> Value {

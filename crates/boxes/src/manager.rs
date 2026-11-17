@@ -114,6 +114,13 @@ pub struct SpawnArgs {
     pub base_manifest: Option<PathBuf>,
 }
 
+/// FU1: a box's guard counts when its `guard_skipped` flag was set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardCounts {
+    pub guard_checks: u64,
+    pub turns: u64,
+}
+
 /// One state change, for the audit log. `from == to` is a change too when the
 /// VM turned off (idle stop of a done box) or a stop was idempotent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,8 +993,16 @@ impl Manager {
         let from = r.state;
         let mut send = None;
         if let GuestEvent::GuardChecks(n) = ev {
+            // Saved only on the first check (the flag reads `== 0`); later
+            // counts stay in memory and ride on the record's next save, so
+            // a flooding guest drives no record writes (review I1).
+            let first = r.guard_checks == 0;
             r.guard_checks = r.guard_checks.saturating_add(u64::from(n));
-            return g.put(r).map(|()| None);
+            if first {
+                return g.put(r).map(|()| None);
+            }
+            g.records.insert(r.id.clone(), r);
+            return Ok(None);
         }
         let out = match ev {
             GuestEvent::Ready => {
@@ -1029,17 +1044,29 @@ impl Manager {
     /// FU1: after a fresh review of the box: when it changed files
     /// (`changed_files > 0`) and its in-box guard reported no check over its
     /// whole life since spawn (counters never reset, so one early check masks
-    /// a later disable), set the sticky `guard_skipped` flag. `Ok(true)` only
-    /// the first time (the caller audits it once). Advisory: lands go on.
-    pub fn note_review(&self, id: &BoxId, changed_files: usize) -> Result<bool, BoxError> {
+    /// a later disable), set the sticky `guard_skipped` flag. Judged only
+    /// once the box is Done or Landed: a review of a running box may beat a
+    /// guard_checks still in flight (review M2). `Some(counts)` only the
+    /// first time (the caller audits it once, with these counts, read in the
+    /// same locked step). Advisory: lands go on.
+    pub fn note_review(
+        &self,
+        id: &BoxId,
+        changed_files: usize,
+    ) -> Result<Option<GuardCounts>, BoxError> {
         let mut g = self.lock();
         let mut r = g.get(id)?.clone();
-        if r.guard_skipped || changed_files == 0 || r.guard_checks > 0 {
-            return Ok(false);
+        let settled = matches!(r.state, BoxState::Done | BoxState::Landed);
+        if !settled || r.guard_skipped || changed_files == 0 || r.guard_checks > 0 {
+            return Ok(None);
         }
         r.guard_skipped = true;
+        let c = GuardCounts {
+            guard_checks: r.guard_checks,
+            turns: r.turns,
+        };
         g.put(r)?;
-        Ok(true)
+        Ok(Some(c))
     }
 
     /// Add `note` to the box's `error` (`"<error>; <note>"`, or `note` alone).

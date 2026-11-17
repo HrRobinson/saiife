@@ -55,6 +55,11 @@ pub enum BoxState {
     Discarded,
 }
 
+/// FU1: what a box's `guard_skipped` flag means. The one text for the
+/// daemon's audit record, `saiife box diff` and (mirrored, checked by
+/// `crates/link/tests/assets.rs`) the Workspace Review badge.
+pub const GUARD_SKIPPED_WHY: &str = "the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BoxInfo {

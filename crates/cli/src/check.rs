@@ -1107,9 +1107,11 @@ reason = "drops the thing"
         assert_eq!(ev, saiife_guest::Event::GuardChecks { n: 1 });
     }
 
-    /// FU1: no socket (off the box, or the guest is gone): quiet and quick.
+    /// FU1: no socket (off the box, or the guest is gone): it returns
+    /// quickly (no output and an unchanged verdict are pinned on the binary
+    /// by `hook_exit::box_profile_guard_send_changes_no_outcome`).
     #[test]
-    fn guard_check_send_without_a_socket_is_quiet() {
+    fn guard_check_send_without_a_socket_is_quick() {
         let t = tempfile::tempdir().unwrap();
         let mut env = saiife_guest::GuestEnv::system();
         env.root = t.path().to_path_buf();

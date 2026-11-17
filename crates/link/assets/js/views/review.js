@@ -36,8 +36,9 @@ function testsLine(t) {
 }
 
 // FU1: the box changed files while its in-box guard reported no checks.
+// Verbatim saiife_wire::source::GUARD_SKIPPED_WHY (crates/link/tests/assets.rs checks it).
 export const GUARD_SKIPPED =
-  "The box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies).";
+  "the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)";
 
 // A warning badge when the daemon flagged the box; nothing otherwise.
 function guardNote(g) {
