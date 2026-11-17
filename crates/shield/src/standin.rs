@@ -270,7 +270,10 @@ impl KeySet {
             standin: old,
             retired_at: now.to_string(),
         });
-        self.version += 1;
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or(ShieldError::Limit("key version"))?;
         Ok(())
     }
 
@@ -284,18 +287,27 @@ impl KeySet {
         });
     }
 
-    /// JSON with base64 keys; the daemon seals these bytes (plan 47).
-    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
-        // Upper bound, so the buffer never reallocates and leaves unwiped key
-        // text behind: 2 keys of 44 base64 bytes plus fixed text and escaped
-        // strings (at most 6 bytes per input byte), then 44 + text per retired key.
-        let cap = 128
-            + 6 * self.created.len()
+    /// Upper bound of `to_bytes` output, so the buffer never reallocates and
+    /// leaves unwiped key text behind. Top level is 161 bytes: 11 for
+    /// `{"version":`, 10 digits, 13 for `,"standin":"`, 44 base64, 11 for
+    /// `","index":"`, 44 base64, 12 for `","created":`, 2 quotes, 12 for
+    /// `,"retired":[` and 2 for `]}`; rounded to 192. The created text adds at
+    /// most 6 bytes per input byte. Each retired key is 97 bytes: 1 comma, 11
+    /// for `{"version":`, 10 digits, 13 for `,"standin":"`, 44 base64, 15 for
+    /// `","retired_at":`, 2 quotes and 1 for `}`; rounded to 128, plus at most
+    /// 6 bytes per byte of its date text.
+    fn bytes_bound(&self) -> usize {
+        192 + 6 * self.created.len()
             + self
                 .retired
                 .iter()
-                .map(|r| 112 + 6 * r.retired_at.len())
-                .sum::<usize>();
+                .map(|r| 128 + 6 * r.retired_at.len())
+                .sum::<usize>()
+    }
+
+    /// JSON with base64 keys; the daemon seals these bytes (plan 47).
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let cap = self.bytes_bound();
         let mut out = Zeroizing::new(Vec::with_capacity(cap));
         out.extend_from_slice(format!("{{\"version\":{},\"standin\":\"", self.version).as_bytes());
         base64_encode_into(&mut out, &*self.standin);
@@ -482,6 +494,24 @@ mod tests {
     }
 
     #[test]
+    fn to_bytes_never_reallocates() {
+        let long = "\u{1}\"".repeat(300);
+        for (created, at) in [("", ""), ("x", "y"), (long.as_str(), long.as_str())] {
+            let mut ks = KeySet::generate(created).unwrap();
+            for i in 0..8 {
+                ks.rotate(at).unwrap();
+                ks.retired[i].version = u32::MAX;
+            }
+            ks.version = u32::MAX;
+            let bound = ks.bytes_bound();
+            let b = ks.to_bytes();
+            assert!(b.len() <= bound, "{} > {bound}", b.len());
+            assert_eq!(b.capacity(), bound);
+            assert_eq!(KeySet::from_bytes(&b).unwrap(), ks);
+        }
+    }
+
+    #[test]
     fn keyset_round_trip_and_debug() {
         let mut ks = KeySet::generate("2026-01-01T00:00:00Z").unwrap();
         ks.rotate("2026-02-01T00:00:00Z").unwrap();
@@ -504,7 +534,6 @@ mod tests {
                 .unwrap();
         }
         let mb = many.to_bytes();
-        assert!(mb.len() <= mb.capacity());
         assert_eq!(KeySet::from_bytes(&mb).unwrap(), many);
         assert_eq!(many.retired.len(), 8);
         assert!(KeySet::from_bytes(b"{}").is_err());
