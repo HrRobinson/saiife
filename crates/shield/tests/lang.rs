@@ -184,3 +184,137 @@ fn literals_in_a_question() {
     assert_eq!(v.len(), 3);
     assert_eq!(v[2].lit, Literal::Integer(12));
 }
+
+#[test]
+fn kelvin_and_dotted_i_never_panic() {
+    for t in [
+        "5\u{212A}",
+        "5\u{212A}r",
+        "500 \u{212A}r",
+        "July 5\u{212A}",
+        "5\u{130}",
+        "5\u{df}",
+        "5\u{17f}t",
+        "5\u{130}nd",
+        "1\u{212A}\u{212A}",
+        "Q3\u{212A} 2026",
+    ] {
+        for l in [Lang::En, Lang::Da] {
+            let _ = find_literals(t, l);
+            let _ = find_numbers(t, l);
+            let _ = find_dates(t, l);
+            let _ = detect_lang(t);
+        }
+    }
+    // the Kelvin sign is not the multiplier k
+    assert_eq!(find_numbers("5\u{212A}", Lang::En)[0].2, d("5"));
+}
+
+#[test]
+fn non_ascii_numerics_are_seen() {
+    let n = |t: &str| find_numbers(t, Lang::En);
+    assert_eq!(n("x\u{b2}")[0].2, d("2"));
+    assert_eq!(n("\u{ff15}")[0].2, d("5"));
+    assert_eq!(n("\u{ff15}\u{ff15}")[0], (0, 6, d("55")));
+    for t in ["\u{661}\u{662}\u{663}", "\u{bd}", "\u{2153}"] {
+        assert!(n(t).is_empty(), "{t}");
+        assert_eq!(find_unreadable_numerics(t), vec![(0, t.len())], "{t}");
+    }
+    assert!(find_unreadable_numerics("\u{b2} \u{ff15} 12").is_empty());
+    for t in [
+        "x\u{b2}",
+        "\u{ff15}",
+        "\u{661}\u{662}\u{663}",
+        "\u{bd}",
+        "\u{2153}",
+    ] {
+        let e = find_literals(t, Lang::En).unwrap_err();
+        assert!(e.end > e.start);
+    }
+}
+
+fn xorshift(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
+}
+
+#[test]
+fn never_panics_on_any_utf8() {
+    let frags = [
+        "5",
+        "10",
+        "2026",
+        "1",
+        ",",
+        ".",
+        " ",
+        "-",
+        "%",
+        "k",
+        "K",
+        "m",
+        "st",
+        "nd",
+        "rd",
+        "th",
+        "\u{212A}",
+        "\u{130}",
+        "\u{df}",
+        "\u{17f}",
+        "æ",
+        "ø",
+        "å",
+        "\u{1f600}",
+        "e\u{301}",
+        "\u{5d0}\u{5d1}",
+        "\u{627}\u{644}",
+        "\u{661}",
+        "\u{ff15}",
+        "\u{b2}",
+        "\u{bd}",
+        "July",
+        "juli",
+        "Q3",
+        "kr.",
+        "$",
+        "€",
+        "twenty",
+        "one",
+        "a",
+        "en",
+        "og",
+        "and",
+        "hundred",
+        "tusind",
+        "kvartal",
+        "quarter",
+        "\u{a0}",
+        "\u{202f}",
+        "of",
+        "2026-07-01",
+        "1.7.2026",
+    ];
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..4000 {
+        let n = 1 + xorshift(&mut seed) % 8;
+        let mut t = String::new();
+        for _ in 0..n {
+            t.push_str(frags[(xorshift(&mut seed) % frags.len() as u64) as usize]);
+        }
+        let _ = detect_lang(&t);
+        let _ = find_unreadable_numerics(&t);
+        for l in [Lang::En, Lang::Da] {
+            let _ = find_literals(&t, l);
+            let _ = find_numbers(&t, l);
+            let _ = find_dates(&t, l);
+            let nw = number_words(l);
+            for (i, _) in t.char_indices() {
+                let _ = nw.parse_at(&t, i);
+            }
+            let _ = nw.parse_at(&t, t.len());
+            let _ = nw.is_number_word(&t);
+        }
+    }
+}
