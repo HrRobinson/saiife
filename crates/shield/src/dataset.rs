@@ -132,16 +132,44 @@ pub(crate) fn with_private_part<T>(
     final_name: &str,
     write: impl FnOnce(&Path) -> Result<T, ShieldError>,
 ) -> Result<(PathBuf, T), ShieldError> {
+    private_part(dir, final_name, false, write)
+}
+
+/// [`with_private_part`] for a file that is rewritten in place (the approved
+/// method store): an existing `dir/final_name` must be a regular file (never
+/// a symlink) and is replaced by the rename; the new file stays 0600 (it is
+/// fsynced, not sealed 0400). Everything else is as in `with_private_part`.
+pub(crate) fn replace_private_part<T>(
+    dir: &Path,
+    final_name: &str,
+    write: impl FnOnce(&Path) -> Result<T, ShieldError>,
+) -> Result<(PathBuf, T), ShieldError> {
+    private_part(dir, final_name, true, write)
+}
+
+fn private_part<T>(
+    dir: &Path,
+    final_name: &str,
+    replace: bool,
+    write: impl FnOnce(&Path) -> Result<T, ShieldError>,
+) -> Result<(PathBuf, T), ShieldError> {
     ensure_private_dir(dir)?;
     let path = dir.join(final_name);
-    if std::fs::symlink_metadata(&path).is_ok() {
-        return Err(io("a dataset file already exists"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) if replace && md.is_file() => {}
+        Ok(_) => return Err(io("a dataset file already exists")),
+        Err(_) => {}
     }
     let part = dir.join(format!("{final_name}.part"));
     let file = create_private_file(&part)?;
     let mut guard = PartGuard(&part, false);
     let v = write(&part)?;
-    seal_file(&file)?;
+    if replace {
+        file.sync_all()
+            .map_err(|_| io("could not write a dataset file"))?;
+    } else {
+        seal_file(&file)?;
+    }
     drop(file);
     std::fs::rename(&part, &path).map_err(|_| io("could not write a dataset file"))?;
     guard.1 = true;

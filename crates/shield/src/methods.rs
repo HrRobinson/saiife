@@ -5,13 +5,13 @@
 //! re-validates each stored method, and one that no longer validates is
 //! suspended. Nothing here is fuzzy.
 
+use crate::dataset::replace_private_part;
 use crate::error::ShieldError;
 use crate::plan::PlanReply;
 use crate::public::PublicValues;
 use crate::schema::{DatasetName, Lang, Param, ParamType, Schema};
 use crate::sql::{validate, validate_check, ErrorClass, MethodError};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::Path;
 
 /// The file format version.
@@ -155,8 +155,11 @@ impl MethodStore {
         Ok(MethodStore { methods: f.methods })
     }
 
-    /// Temp file in the same directory, fsync, rename over the target, fsync
-    /// the directory; mode 0600 on unix.
+    /// Written through the shared private-file protocol (dataset.rs): the
+    /// directory is ours and 0700, the part file is created new, 0600 and
+    /// never through a symlink, fsynced, then renamed over the target (a
+    /// planted symlink at the part or final path refuses), and the directory
+    /// is fsynced.
     pub fn save(&self, path: &Path) -> Result<(), ShieldError> {
         let dir = match path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
@@ -164,44 +167,17 @@ impl MethodStore {
         };
         let name = path
             .file_name()
+            .and_then(|n| n.to_str())
             .ok_or_else(|| io_err("the methods path has no file name"))?;
-        let mut tmp_name = std::ffi::OsString::from(".");
-        tmp_name.push(name);
-        tmp_name.push(format!(".tmp{}", std::process::id()));
-        let tmp = dir.join(tmp_name);
         let body = serde_json::to_vec_pretty(&FileForm {
             v: FILE_VERSION,
             methods: self.methods.clone(),
         })
         .map_err(|_| io_err("could not encode the methods file"))?;
-        let write = || -> std::io::Result<()> {
-            let mut o = std::fs::OpenOptions::new();
-            o.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                o.mode(0o600);
-            }
-            let mut f = o.open(&tmp)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            f.write_all(&body)?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, path)?;
-            #[cfg(unix)]
-            {
-                std::fs::File::open(dir)?.sync_all()?;
-            }
-            Ok(())
-        };
-        write().map_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-            io_err("could not write the methods file")
+        replace_private_part(dir, name, |part| {
+            std::fs::write(part, &body).map_err(|_| io_err("could not write the methods file"))
         })
+        .map(|_| ())
     }
 
     /// R45-11: equal dataset, language, template key and ordered param tags;
@@ -512,6 +488,61 @@ mod tests {
         assert!(!e.contains("secret-cell"), "{e}");
         std::fs::write(&p, "{\"v\":9,\"methods\":[]}").unwrap();
         assert!(MethodStore::load(&p).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_planted_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = scratch("symlink");
+        let victim = d.join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let dir = d.join("ds");
+        std::fs::create_dir(&dir).unwrap();
+        let p = dir.join("methods.json");
+        let mut s = MethodStore::default();
+        s.add(method("balance of a", &["entity:customers"], Lang::En));
+        // A link at the temp paths (the helper's .part and the old pid name).
+        symlink(&victim, dir.join("methods.json.part")).unwrap();
+        symlink(
+            &victim,
+            dir.join(format!(".methods.json.tmp{}", std::process::id())),
+        )
+        .unwrap();
+        assert!(s.save(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        std::fs::remove_file(dir.join("methods.json.part")).unwrap();
+        // A link at the final path is refused, the target untouched.
+        symlink(&victim, &p).unwrap();
+        assert!(s.save(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        // A symlinked directory is refused.
+        let link = d.join("dslink");
+        symlink(&dir, &link).unwrap();
+        assert!(s.save(&link.join("methods.json")).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_makes_the_dir_private_and_keeps_no_part() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("dirmode");
+        let dir = d.join("ds");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let p = dir.join("methods.json");
+        let mut s = MethodStore::default();
+        s.add(method("balance of a", &["entity:customers"], Lang::En));
+        s.save(&p).unwrap();
+        s.save(&p).unwrap(); // a rewrite replaces the file
+        let mode = |q: &std::path::Path| std::fs::metadata(q).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&p), 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(MethodStore::load(&p).unwrap(), s);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
