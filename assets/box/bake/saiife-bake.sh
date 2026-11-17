@@ -184,10 +184,11 @@ install_gemini() {
   rm -rf -- "$th"
 }
 
-# Every agent's git (COORD-7): the launch env names /etc/saiife/gitconfig as
-# git's global config and forces its keys; core.sshCommand is this ssh
-# wrapper, which reads only saiife's ssh config. No /etc/gitconfig: git
-# reads no system file in a box. Always: claude is always baked.
+# Every agent's git (COORD-7): every agent's launch env names
+# /etc/saiife/gitconfig as git's global config (GIT_CONFIG_NOSYSTEM=1, so no
+# /etc/gitconfig is read or baked) and forces its keys, and the forced
+# core.sshCommand is this ssh wrapper, which reads only saiife's ssh config.
+# Always, whatever agents the payload holds: every agent depends on them.
 install_saiife_git() {
   install -d -o root -g root -m 0755 "/usr/local/libexec"
   install -o root -g root -m 0755 "$MNT/saiife-ssh" "/usr/local/libexec/saiife-ssh"

@@ -1566,24 +1566,22 @@ pub fn saiife_gitconfig() -> String {
 /// git's environment variables that outrank a forced key, each pinned to
 /// that key's value in [`GIT_FORCED_CONFIG`] wherever a settings layer can
 /// set them: git runs a set-but-empty one as `""` (checked with git 2.55
-/// for `GIT_SSH_COMMAND`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR` and
-/// `GIT_EXTERNAL_DIFF`), so none is blanked.
-pub const GIT_ENV_TWINS: [(&str, &str); 6] = [
+/// for `GIT_SSH_COMMAND`, `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR`), so none
+/// is blanked. `GIT_EXTERNAL_DIFF` is neither pinned nor blanked (fix round
+/// 1, ruling G14): `diff.external` is not forced, and an empty value makes
+/// `git diff` die; a settings-injected one is the residual named at
+/// [`GIT_FORCED_CONFIG`].
+pub const GIT_ENV_TWINS: [(&str, &str); 5] = [
     ("GIT_SSH_COMMAND", "core.sshCommand"),
     ("GIT_SSH", "core.sshCommand"),
     ("GIT_EDITOR", "core.editor"),
     ("GIT_SEQUENCE_EDITOR", "sequence.editor"),
     ("GIT_PAGER", "core.pager"),
-    ("GIT_EXTERNAL_DIFF", "diff.external"),
 ];
 
-/// The protocols `GIT_ALLOW_PROTOCOL` lists when pinned: a set value
-/// replaces every `protocol.*` key ("as if protocol.allow is never" plus
-/// the listed ones always, git-config(1)), and an empty one allows nothing,
-/// so a settings layer that sets `GIT_ALLOW_PROTOCOL=ext` would re-open
-/// `ext::` (checked with git 2.55). Pinned to git's known protocols but
-/// `ext`.
-pub const GIT_ALLOW_PROTOCOL: &str = "file:git:http:https:ssh";
+/// The protocols `GIT_ALLOW_PROTOCOL` lists when pinned: see
+/// [`launch::GIT_ALLOW_PROTOCOL`] (no `file`, no `ext`; COORD-8).
+pub use launch::GIT_ALLOW_PROTOCOL;
 
 /// git's and ssh's program and prompt variables, pinned wherever a settings
 /// layer can set them (COORD-7; FU2 fix rounds 4 and 5):
@@ -2062,8 +2060,6 @@ mod settings_tests {
             "Bash|PowerShell|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit"
         );
         assert_eq!(saiife_agents::claude::TIMEOUT_SECS, 10);
-        // the labelled plain diff of the forced table (COORD-7)
-        const DIFF: &str = "f() { /usr/bin/diff -u --label \"a/$1\" --label \"b/$1\" -- \"$2\" \"$5\"; [ $? -le 2 ]; }; f";
         let want_env: serde_json::Map<String, serde_json::Value> = [
             ("ANTHROPIC_BASE_URL", "http://127.0.0.1:3129"),
             ("DISABLE_TELEMETRY", "1"),
@@ -2083,7 +2079,7 @@ mod settings_tests {
             ("no_proxy", "localhost,127.0.0.1"),
             ("GIT_CONFIG_GLOBAL", "/etc/saiife/gitconfig"),
             ("GIT_CONFIG_NOSYSTEM", "1"),
-            ("GIT_CONFIG_COUNT", "15"),
+            ("GIT_CONFIG_COUNT", "14"),
             ("GIT_CONFIG_KEY_0", "core.sshCommand"),
             ("GIT_CONFIG_VALUE_0", "/usr/local/libexec/saiife-ssh"),
             ("GIT_CONFIG_KEY_1", "core.askPass"),
@@ -2106,25 +2102,22 @@ mod settings_tests {
             ("GIT_CONFIG_VALUE_9", "/bin/false"),
             ("GIT_CONFIG_KEY_10", "gpg.ssh.program"),
             ("GIT_CONFIG_VALUE_10", "/bin/false"),
-            ("GIT_CONFIG_KEY_11", "diff.external"),
-            ("GIT_CONFIG_VALUE_11", DIFF),
-            ("GIT_CONFIG_KEY_12", "sequence.editor"),
+            ("GIT_CONFIG_KEY_11", "sequence.editor"),
+            ("GIT_CONFIG_VALUE_11", "true"),
+            ("GIT_CONFIG_KEY_12", "core.editor"),
             ("GIT_CONFIG_VALUE_12", "true"),
-            ("GIT_CONFIG_KEY_13", "core.editor"),
-            ("GIT_CONFIG_VALUE_13", "true"),
-            ("GIT_CONFIG_KEY_14", "core.hooksPath"),
-            ("GIT_CONFIG_VALUE_14", "/dev/null"),
+            ("GIT_CONFIG_KEY_13", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_13", "/dev/null"),
             ("GIT_SSH_COMMAND", "/usr/local/libexec/saiife-ssh"),
             ("GIT_SSH", "/usr/local/libexec/saiife-ssh"),
             ("GIT_EDITOR", "true"),
             ("GIT_SEQUENCE_EDITOR", "true"),
             ("GIT_PAGER", "cat"),
-            ("GIT_EXTERNAL_DIFF", DIFF),
             ("GIT_SSH_VARIANT", "ssh"),
             ("SSH_ASKPASS", "/bin/false"),
             ("SSH_ASKPASS_REQUIRE", "never"),
             ("SSH_SK_PROVIDER", "internal"),
-            ("GIT_ALLOW_PROTOCOL", "file:git:http:https:ssh"),
+            ("GIT_ALLOW_PROTOCOL", "git:http:https:ssh"),
             ("LD_PRELOAD", ""),
             ("LD_LIBRARY_PATH", ""),
             ("LD_AUDIT", ""),
@@ -2174,7 +2167,7 @@ mod settings_tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.into()))
         .collect();
-        assert_eq!(want_env.len(), 105);
+        assert_eq!(want_env.len(), 102);
         let hook = |c: &str| serde_json::json!({"type": "command", "command": c, "timeout": 10});
         assert_eq!(
             managed(),
@@ -2230,7 +2223,6 @@ mod settings_tests {
             "SSH_ASKPASS",
             "GIT_EDITOR",
             "GIT_SEQUENCE_EDITOR",
-            "GIT_EXTERNAL_DIFF",
             "GIT_PAGER",
             "GIT_CONFIG_NOSYSTEM",
             "GIT_CONFIG_GLOBAL",
@@ -2273,7 +2265,7 @@ mod settings_tests {
             ("no_proxy", "localhost,127.0.0.1"),
             ("GIT_CONFIG_GLOBAL", "/etc/saiife/gitconfig"),
             ("GIT_CONFIG_NOSYSTEM", "1"),
-            ("GIT_CONFIG_COUNT", "15"),
+            ("GIT_CONFIG_COUNT", "14"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2839,7 +2831,7 @@ mod settings_tests {
                 }
                 assert_eq!(env["SSH_ASKPASS_REQUIRE"], "never", "{name}");
                 assert_eq!(env["GIT_ASKPASS"], "", "{name}");
-                assert_eq!(env["GIT_CONFIG_COUNT"], "15", "{name}");
+                assert_eq!(env["GIT_CONFIG_COUNT"], "14", "{name}");
                 assert_eq!(env["GIT_CONFIG_GLOBAL"], "/etc/saiife/gitconfig", "{name}");
                 assert_eq!(env["GIT_CONFIG_NOSYSTEM"], "1", "{name}");
                 assert_eq!(
@@ -2850,14 +2842,19 @@ mod settings_tests {
                 for (k, v) in tool_env_pins() {
                     assert_eq!(env[&k], v.as_str(), "{name} {k}");
                 }
-                assert_eq!(env["GIT_EXTERNAL_DIFF"], launch::GIT_DIFF_COMMAND, "{name}");
+                // fix round 1 (G14): not pinned, a residual under the
+                // threat-model boundary; the planted value stays
+                assert!(!managed()["env"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("GIT_EXTERNAL_DIFF"));
+                assert!(!tool_env_pins()
+                    .iter()
+                    .any(|(k, _)| k == "GIT_EXTERNAL_DIFF"));
                 assert_eq!(env["GIT_SEQUENCE_EDITOR"], "true", "{name}");
                 assert_eq!(env["GIT_EDITOR"], "true", "{name}");
                 assert_eq!(env["GIT_TEMPLATE_DIR"], "", "{name}");
-                assert_eq!(
-                    env["GIT_ALLOW_PROTOCOL"], "file:git:http:https:ssh",
-                    "{name}"
-                );
+                assert_eq!(env["GIT_ALLOW_PROTOCOL"], "git:http:https:ssh", "{name}");
                 assert_eq!(env["SSH_SK_PROVIDER"], "internal", "{name}");
                 assert_eq!(env["SSH_SK_HELPER"], "", "{name}");
                 assert_eq!(env["HOME"], "/home/agent", "{name}");

@@ -38,17 +38,6 @@ pub const GIT_CONFIG_GLOBAL_PATH: &str = "/etc/saiife/gitconfig";
 /// runs `/usr/bin/ssh` with only saiife's ssh config.
 pub const GIT_SSH_WRAPPER: &str = "/usr/local/libexec/saiife-ssh";
 
-/// `diff.external` (and `GIT_EXTERNAL_DIFF` where pinned). git has no value
-/// that turns an external diff off (an empty one makes `git diff` fail with
-/// "cannot run :"), so the forced value is a plain unified diff of the two
-/// files, labelled `a/<path>` and `b/<path>` like git's own, from diffutils
-/// (Essential on Ubuntu). git runs it through `sh -c` with its seven
-/// arguments (path, old file, old hex, old mode, new file, new hex, new
-/// mode); exit 1 (differ) and 2 (binary) count as success, as git expects 0
-/// without `diff.trustExitCode`.
-pub const GIT_DIFF_COMMAND: &str =
-    "f() { /usr/bin/diff -u --label \"a/$1\" --label \"b/$1\" -- \"$2\" \"$5\"; [ $? -le 2 ]; }; f";
-
 /// The git config keys saiife forces in a box: the baked
 /// [`GIT_CONFIG_GLOBAL_PATH`] file ([`gitconfig_text`]) and the
 /// `GIT_CONFIG_COUNT` pairs of [`git_env`] are both built from this table.
@@ -61,11 +50,17 @@ pub const GIT_DIFF_COMMAND: &str =
 /// - `protocol.*`: unknown protocols only when the user typed them, https
 ///   always, `ext::` never, local files only when typed.
 /// - signing programs `/bin/false` (a signed commit fails, nothing runs).
-/// - `diff.external`: [`GIT_DIFF_COMMAND`].
 /// - editors `true` (an edit-less commit aborts; a rebase todo is kept).
 /// - `core.hooksPath=/dev/null`: "disable all hooks entirely"
 ///   (git-config(1)); repo hooks never run on the agent's git commands.
-pub const GIT_FORCED_CONFIG: [(&str, &str); 15] = [
+///
+/// Not forced (fix round 1, ruling G14): `diff.external`. git has no value
+/// that turns an external diff off (an empty one makes `git diff` die with
+/// "cannot run :"), and a stand-in program degrades every diff. A repo's
+/// `diff.external`, or a settings-injected `GIT_EXTERNAL_DIFF`, therefore
+/// runs an in-box command when the agent diffs: a residual triaged under the
+/// threat-model boundary (the agent can already run repo code in its box).
+pub const GIT_FORCED_CONFIG: [(&str, &str); 14] = [
     ("core.sshCommand", GIT_SSH_WRAPPER),
     ("core.askPass", ""),
     ("core.fsmonitor", "false"),
@@ -77,11 +72,29 @@ pub const GIT_FORCED_CONFIG: [(&str, &str); 15] = [
     ("protocol.file.allow", "user"),
     ("gpg.program", "/bin/false"),
     ("gpg.ssh.program", "/bin/false"),
-    ("diff.external", GIT_DIFF_COMMAND),
     ("sequence.editor", "true"),
     ("core.editor", "true"),
     ("core.hooksPath", "/dev/null"),
 ];
+
+/// git config defaults baked into [`GIT_CONFIG_GLOBAL_PATH`] only, never
+/// forced (fix round 1, M2): an identity, so a commit in a box works
+/// without repo config; the repo's own config overrides it. `git config
+/// --global` cannot change it (the file is root-owned).
+pub const GIT_DEFAULT_CONFIG: [(&str, &str); 2] = [
+    ("user.name", "saiife box agent"),
+    ("user.email", "agent@box.invalid"),
+];
+
+/// `GIT_ALLOW_PROTOCOL` where a settings layer could set it: a set value
+/// replaces every `protocol.*` key (git-config(1): "as if protocol.allow is
+/// never", the listed ones always), so `GIT_ALLOW_PROTOCOL=ext` would re-open
+/// `ext::` (checked with git 2.55). Pinned to git's network protocols:
+/// neither `ext` (never in [`GIT_FORCED_CONFIG`]) nor `file` (`user` there;
+/// listing it would make it `always`, so a submodule's `file://` URL would
+/// clone, checked; unlisted, a typed local clone is refused too, the price of
+/// the pin).
+pub const GIT_ALLOW_PROTOCOL: &str = "git:http:https:ssh";
 
 /// The value of `key` in [`GIT_FORCED_CONFIG`].
 pub fn forced(key: &str) -> &'static str {
@@ -95,7 +108,9 @@ pub fn forced(key: &str) -> &'static str {
 /// The model variables the host may send in a setup, per agent (plan 40 C2,
 /// plan 42 D5): the only ones `Setup::check` accepts. A setup does not name
 /// its agent kind, so the check accepts the union; the host sends one
-/// agent's.
+/// agent's. A new model variable needs an image rebuild: the guest baked
+/// into an older image runs its own `Setup::check` and refuses a variable it
+/// does not know (fail closed).
 pub const MODEL_ENV: [(&str, &[&str]); 3] = [
     (
         "claude",
@@ -183,17 +198,18 @@ pub fn launch_env(setup_env: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 /// One git config value, quoted: `"`, `\` escaped, so `;`, `#` and spaces
-/// in [`GIT_DIFF_COMMAND`] stay part of the value.
+/// stay part of the value.
 fn quote(v: &str) -> String {
     format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// The text of [`GIT_CONFIG_GLOBAL_PATH`]: [`GIT_FORCED_CONFIG`] as git
-/// config sections (`protocol.https.allow` is `[protocol "https"] allow`).
+/// The text of [`GIT_CONFIG_GLOBAL_PATH`]: [`GIT_FORCED_CONFIG`], then
+/// [`GIT_DEFAULT_CONFIG`], as git config sections (`protocol.https.allow` is
+/// `[protocol "https"] allow`).
 pub fn gitconfig_text() -> String {
     let mut out = String::from("# saiife: the git config of every agent in a box (COORD-7)\n");
     let mut section = String::new();
-    for (k, v) in GIT_FORCED_CONFIG {
+    for (k, v) in GIT_FORCED_CONFIG.iter().chain(GIT_DEFAULT_CONFIG.iter()) {
         let (head, name) = k.rsplit_once('.').expect("section.name");
         let head = match head.split_once('.') {
             Some((sec, sub)) => format!("[{sec} \"{sub}\"]"),
@@ -255,11 +271,14 @@ mod tests {
     }
 
     /// One table, two outputs: the env pairs and the baked file carry
-    /// exactly [`GIT_FORCED_CONFIG`], in order.
+    /// exactly [`GIT_FORCED_CONFIG`], in order; the file then adds only the
+    /// non-forced [`GIT_DEFAULT_CONFIG`], which never reaches the env.
     #[test]
     fn the_forced_git_table_feeds_the_env_and_the_file() {
         let table: Vec<(String, String)> = kv(&GIT_FORCED_CONFIG);
-        assert_eq!(parse(&gitconfig_text()), table);
+        let mut file = table.clone();
+        file.extend(kv(&GIT_DEFAULT_CONFIG));
+        assert_eq!(parse(&gitconfig_text()), file);
         let env = git_env();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("GIT_CONFIG_COUNT"), Some(table.len().to_string()));
@@ -273,10 +292,52 @@ mod tests {
             Some("/etc/saiife/gitconfig")
         );
         assert_eq!(get("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        for (k, _) in GIT_DEFAULT_CONFIG {
+            assert!(!env.iter().any(|(_, v)| v == k), "{k} is forced");
+        }
     }
 
-    /// The table, verbatim (the brief's values; `diff.external` is the
-    /// labelled plain diff because git runs an empty one as `""`).
+    /// Fix round 1 (M2): a default identity, baked, not forced.
+    #[test]
+    fn the_default_identity_is_baked_not_forced() {
+        assert_eq!(
+            kv(&GIT_DEFAULT_CONFIG),
+            kv(&[
+                ("user.name", "saiife box agent"),
+                ("user.email", "agent@box.invalid")
+            ])
+        );
+        assert!(gitconfig_text()
+            .ends_with("[user]\n\tname = \"saiife box agent\"\n\temail = \"agent@box.invalid\"\n"));
+        for (k, _) in GIT_DEFAULT_CONFIG {
+            assert!(!GIT_FORCED_CONFIG.iter().any(|(f, _)| *f == k), "{k}");
+        }
+    }
+
+    /// COORD-8: the pinned `GIT_ALLOW_PROTOCOL` agrees with the table: every
+    /// listed protocol is allowed there (not `never`), and `file` (`user`,
+    /// which a listing would turn into `always`) and `ext` are not listed.
+    #[test]
+    fn git_allow_protocol_agrees_with_the_table() {
+        assert_eq!(GIT_ALLOW_PROTOCOL, "git:http:https:ssh");
+        let listed: Vec<&str> = GIT_ALLOW_PROTOCOL.split(':').collect();
+        for p in &listed {
+            let policy = GIT_FORCED_CONFIG
+                .iter()
+                .find(|(k, _)| *k == format!("protocol.{p}.allow"))
+                .map(|(_, v)| *v)
+                .unwrap_or(forced("protocol.allow"));
+            assert_ne!(policy, "never", "{p}");
+        }
+        for p in ["file", "ext"] {
+            assert!(!listed.contains(&p), "{p}");
+        }
+        assert_eq!(forced("protocol.file.allow"), "user");
+        assert_eq!(forced("protocol.ext.allow"), "never");
+    }
+
+    /// The table, verbatim (the brief's values but `diff.external`, dropped
+    /// in fix round 1: ruling G14).
     #[test]
     fn the_forced_git_table_is_pinned() {
         assert_eq!(
@@ -293,16 +354,15 @@ mod tests {
                 ("protocol.file.allow", "user"),
                 ("gpg.program", "/bin/false"),
                 ("gpg.ssh.program", "/bin/false"),
-                (
-                    "diff.external",
-                    "f() { /usr/bin/diff -u --label \"a/$1\" --label \"b/$1\" -- \"$2\" \"$5\"; [ $? -le 2 ]; }; f",
-                ),
                 ("sequence.editor", "true"),
                 ("core.editor", "true"),
                 ("core.hooksPath", "/dev/null"),
             ])
         );
         assert_eq!(forced("core.hooksPath"), "/dev/null");
+        assert!(!GIT_FORCED_CONFIG
+            .iter()
+            .any(|(k, _)| k.starts_with("diff.")));
         assert!(gitconfig_text().contains("[protocol \"https\"]\n\tallow = \"always\"\n"));
         assert!(gitconfig_text().contains("[gpg \"ssh\"]\n\tprogram = \"/bin/false\"\n"));
         assert!(gitconfig_text().contains("[credential]\n\thelper = \"\"\n"));
