@@ -1110,7 +1110,7 @@ fn reads_user_packs_below_policy_d() {
     assert_eq!(u.rules, vec!["l1-1", "l1-2"]);
     assert_eq!(u.ask, vec!["l1-1"]);
     assert_eq!(u.text, USER_A);
-    let path = d.path().join("policy.d/packs/user.a.toml");
+    let path = d.path().join("policy.d").join("packs").join("user.a.toml");
     assert_eq!(u.path, path.display().to_string());
     assert!(p.files.contains(&(u.path.clone(), u.sha256.clone())));
     assert_eq!(u.sha256.len(), 64);

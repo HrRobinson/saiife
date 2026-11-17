@@ -133,7 +133,9 @@ pub enum BoxAction {
 
 /// The table and JSON output of the box commands, for `box image` too.
 #[cfg(unix)]
-pub(crate) use imp::{ascii_json, disk, render};
+pub(crate) use imp::ascii_json;
+#[cfg(target_os = "linux")]
+pub(crate) use imp::{disk, render};
 
 #[cfg(not(unix))]
 pub fn run(config: Option<PathBuf>, action: BoxAction) -> ExitCode {
@@ -636,6 +638,7 @@ mod imp {
     }
 
     /// Allocated MiB as `412M`, or `3.1G` from 1 GiB.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn disk(mib: u64) -> String {
         if mib < 1024 {
             format!("{mib}M")

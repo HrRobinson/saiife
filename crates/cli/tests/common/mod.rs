@@ -69,6 +69,16 @@ pub fn set_profile(cmd: &mut Command, home: &Path) {
         .env("APPDATA", home.join("AppData").join("Roaming"));
 }
 
+/// The personal broker's user pack dir under the test HOME: on Windows it is
+/// under `LOCALAPPDATA`, which [`set_profile`] points into HOME.
+pub fn personal_packs_dir(home: &Path) -> PathBuf {
+    if cfg!(windows) {
+        home.join("AppData/Local/saiife/personal/policy.d/packs")
+    } else {
+        home.join(".config/saiife/broker/policy.d/packs")
+    }
+}
+
 /// `path` canonical, as saiife prints it: on Windows without the `\\\\?\\`
 /// that canonicalizing adds there.
 pub fn canonical_shown(path: &Path) -> String {

@@ -413,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn llm_path_rule_keeps_its_access() {
         let j = r#"{"rules":[{"kind":"path","line":4,"path":"/saiife-test/secrets","access":"read","block":["/saiife-test/secrets/k"],"allow":["/saiife-test/other/k"]}]}"#;
         let v = parse(j, &[4]).unwrap();

@@ -584,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn path_rule_shape() {
         let mut p = one(path("/etc", RuleAccess::Write));
         let ProposalKind::Path { globs, access } = &p.kind else {
@@ -614,6 +615,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn broad_proposals_are_flagged() {
         let (ok, bad, _) = proposals_for(
             &[
@@ -683,6 +685,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn wildcard_globs_verify() {
         for g in ["/etc/**", "/etc/*.conf", "$HOME/.ssh/*"] {
             let p = one(path(g, RuleAccess::Write));

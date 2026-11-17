@@ -2919,9 +2919,10 @@ mod tests {
             r.to_text()
         );
         let ids: Vec<&str> = rest.iter().map(|c| c.id.as_str()).collect();
-        let mut want = vec!["system.supported", "install.record", "touch-key"];
+        let mut want = vec!["system.supported", "install.record"];
+        // The touch checks are Linux only (doctor::touch).
         if cfg!(target_os = "linux") {
-            want.push("touch-helper");
+            want.extend(["touch-key", "touch-helper"]);
         }
         assert_eq!(ids, want, "{}", r.to_text());
         let c = get(&r, "install.record");

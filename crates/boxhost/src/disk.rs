@@ -351,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn usage_counts_allocated_bytes() {
         use std::os::unix::fs::symlink;
         let d = tempfile::tempdir().unwrap();

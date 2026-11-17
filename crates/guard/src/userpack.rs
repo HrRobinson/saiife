@@ -680,6 +680,7 @@ line_sha256 = "cd"
     const PATHS: &str = "[pack]\nid = \"user.t\"\n[[deny_path]]\nglob = \"**/.git/hooks/**\"\naccess = \"write\"\nreason = \"no hooks\"\n[[deny_path]]\nglob = \"$PROJECT/CLAUDE.md\"\naccess = \"write\"\nreason = \"no claude\"\n";
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn diff_hits_flags_protected_paths() {
         let packs = one(PATHS, Profile::Box);
         let hits = diff_hits(
@@ -713,6 +714,7 @@ line_sha256 = "cd"
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn diff_hits_skips_host_rules() {
         let text = PATHS.replace("access = ", "where = \"host\"\naccess = ");
         let packs = one(&text, Profile::Box);
@@ -726,6 +728,7 @@ line_sha256 = "cd"
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn broad_findings_flag_the_hostile() {
         let broad = one(
             "[pack]\nid = \"user.b\"\ntriggers = [\"ls\"]\n[[deny]]\nid = \"d\"\npattern = '^\\S+'\nreason = \"r\"\n",

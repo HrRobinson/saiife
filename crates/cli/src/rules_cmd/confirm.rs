@@ -349,6 +349,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn ask_only_where_offered() {
         let (r, out) = run(vec![prop(1, cmd(&["shred"]))], false, "a\ne\n\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Enforce);
@@ -378,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn edit_reproposes() {
         let (r, _) = run(
             vec![prop(1, cmd(&["shred"]))],

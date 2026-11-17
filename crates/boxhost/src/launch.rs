@@ -1097,6 +1097,7 @@ mod tests {
     /// `vm.json`, or a planted `vm.json.tmp`, never stops the daemon's
     /// write, and a link's target is never written.
     #[test]
+    #[cfg(target_os = "linux")]
     fn write_spec_replaces_whatever_the_vmm_left() {
         use std::os::unix::fs::FileTypeExt;
         let e = env();
@@ -1521,6 +1522,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc")]
     fn a_starting_record_comes_before_the_spawn() {
         use std::sync::Arc;
         let e = env();
@@ -1571,6 +1573,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc")]
     fn start_does_its_io_outside_the_lock() {
         use std::sync::{mpsc, Arc};
         use std::time::{Duration, Instant};

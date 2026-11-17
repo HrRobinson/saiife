@@ -196,11 +196,14 @@ pub(crate) fn copy_in(
 ) -> Result<File, IntakeError> {
     let failed = IntakeError::Failed;
     let flags = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let fd = openat(dir, name, flags, Mode::from_raw_mode(mode))
-        .map_err(|e| failed(format!("cannot make {name}: {e}")))?;
+    // mode_t is narrower than u32 on macOS.
+    let mode = rustix::fs::RawMode::try_from(mode)
+        .map(Mode::from_raw_mode)
+        .map_err(|_| failed(format!("{name}: bad mode {mode:o}")))?;
+    let fd =
+        openat(dir, name, flags, mode).map_err(|e| failed(format!("cannot make {name}: {e}")))?;
     // The umask may have taken bits: the mode is set as asked.
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
-        .map_err(|e| failed(format!("{name}: {e}")))?;
+    rustix::fs::fchmod(&fd, mode).map_err(|e| failed(format!("{name}: {e}")))?;
     let dst = File::from(fd);
     saiife_boxhost::disk::copy_sparse_upto(src, &dst, len)
         .map_err(|e| failed(format!("cannot copy {name}: {e}")))?;
@@ -534,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn base_manifest_read_refuses_what_is_no_plain_file() {
         let t = tempfile::tempdir().unwrap();
         let paths = box_with_manifest(t.path());

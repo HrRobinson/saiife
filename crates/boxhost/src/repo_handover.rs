@@ -296,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "Linux hole reporting")]
     fn copies_across_devices_keeping_holes() {
         let (_t, rec, rt) = dirs();
         plant(&rec);
