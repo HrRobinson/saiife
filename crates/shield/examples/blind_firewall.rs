@@ -12,8 +12,10 @@
 
 use rusqlite::{Connection, OpenFlags};
 use saiife_shield::dataset::{load_manifest, DatasetDir};
-use saiife_shield::envelope::{build_envelope, synthetic_sha256, Envelope};
-use saiife_shield::firewall::{Firewall, Verdict};
+use saiife_shield::envelope::{
+    build_envelope, cloud_schema, schema_sha256, synthetic_sha256, Envelope,
+};
+use saiife_shield::firewall::{Expected, Firewall, Verdict};
 use saiife_shield::index::{read_allow, IndexKey, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
 use saiife_shield::ner::{ListDetector, SpanLabel};
@@ -124,17 +126,26 @@ fn main() {
         .map(|n| (n.as_str(), SpanLabel::Person))
         .collect();
     let det = ListDetector::new(&entries);
-    // The scan runs on the final bytes (`check_bytes`, P-22) with the
-    // caller's list cap and synthetic hash.
+    // The scan runs on the final bytes (`check_bytes`, P-22) with what the
+    // caller kept when it built the envelope (P-26): the list cap, the
+    // language, the schema and synthetic hashes, and the stand-ins the
+    // session issued (looked up in the session, P-25).
+    let schema_hash = schema_sha256(&cloud_schema(schema, &m.public));
     let mut times: Vec<Duration> = Vec::with_capacity(QUESTIONS * 2);
-    let mut scan = |e: &Envelope, hash: &str| {
+    let mut scan = |e: &Envelope, hash: &str, lang: Lang, issued: &[String]| {
         let fw = Firewall {
             index: &index,
             allow: &allow,
             detector: &det,
             released_names: &[],
-            list_cap: LIST_CAP,
-            synthetic_sha256: hash,
+            expected: Expected {
+                list_cap: LIST_CAP,
+                lang,
+                schema_sha256: &schema_hash,
+                synthetic_sha256: hash,
+                symbols: issued,
+                previous_method_sha256: None,
+            },
         };
         let bytes = e.canonical();
         let t0 = Instant::now();
@@ -148,10 +159,14 @@ fn main() {
     let mut envelope = |d: &Draft, s: &mut Session| {
         let synth = synthetic_rows(schema, &m.formats, &m.public, 5, &mut rng);
         let hash = synthetic_sha256(&synth);
-        (
-            build_envelope(d, s, schema, &m.public, synth, LIST_CAP, None),
-            hash,
-        )
+        let e = build_envelope(d, s, schema, &m.public, synth, LIST_CAP, None);
+        let issued: Vec<String> = e
+            .params
+            .iter()
+            .filter_map(|p| p.symbol.clone())
+            .filter(|sym| s.key_for_symbol(sym).is_some())
+            .collect();
+        (e, hash, issued)
     };
     let raw = |q: &str, lang: Lang| Draft {
         lang,
@@ -176,8 +191,8 @@ fn main() {
         let lang = saiife_shield::lang::detect_lang(&q);
         match parameterize(&q, None, schema, &lex, &det) {
             Ok(Step::Ready(d)) => {
-                let (e, hash) = envelope(&d, &mut session);
-                match scan(&e, &hash) {
+                let (e, hash, issued) = envelope(&d, &mut session);
+                match scan(&e, &hash, d.lang, &issued) {
                     Verdict::Pass => {
                         let bytes = e.canonical();
                         let text = String::from_utf8_lossy(&bytes);
@@ -194,8 +209,8 @@ fn main() {
             Ok(Step::Refuse(_)) | Err(_) => refused += 1,
         }
         // The raw question, as if the parameterizer had missed the name.
-        let (e, hash) = envelope(&raw(&q, lang), &mut session);
-        match scan(&e, &hash) {
+        let (e, hash, issued) = envelope(&raw(&q, lang), &mut session);
+        match scan(&e, &hash, lang, &issued) {
             Verdict::Block(_) => probes_blocked += 1,
             Verdict::Pass => leaks += 1,
         }
@@ -225,8 +240,8 @@ fn main() {
                 display: String::new(),
             });
         }
-        let (e, hash) = envelope(&d, &mut session);
-        match scan(&e, &hash) {
+        let (e, hash, issued) = envelope(&d, &mut session);
+        match scan(&e, &hash, lang, &issued) {
             Verdict::Pass => passed += 1,
             Verdict::Block(_) => false_blocks += 1,
         }

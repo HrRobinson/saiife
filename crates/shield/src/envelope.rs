@@ -156,20 +156,12 @@ fn param_tag(schema: &Schema, ty: &ParamType) -> String {
     }
 }
 
-/// Builds the envelope of a draft. An entity parameter gets its session
-/// stand-in when it is bound to exactly one key; otherwise it has no symbol
-/// and the firewall refuses the envelope (`bad_part`). The context is the
-/// session's last turns (at most 10), each entity typed by its cloud table
-/// when the session can still reverse the symbol.
-pub fn build_envelope(
-    d: &Draft,
-    session: &mut Session,
-    schema: &Schema,
-    public: &[PublicValues],
-    synthetic: SyntheticRows,
-    list_cap: u32,
-    retry: Option<Retry>,
-) -> Envelope {
+/// The schema part of every envelope of a dataset: the one builder, used by
+/// [`build_envelope`] and by the caller that hashes it for the firewall
+/// ([`schema_sha256`], ruling P-26). Cloud names, row bands, types,
+/// classes, each public column's k-floor list as `public_values` gives it,
+/// and the English entity word.
+pub fn cloud_schema(schema: &Schema, public: &[PublicValues]) -> CloudSchema {
     let tables = schema
         .tables
         .iter()
@@ -197,6 +189,24 @@ pub fn build_envelope(
             entity: schema.entity_for(&t.name).map(|e| e.word.clone()),
         })
         .collect();
+    CloudSchema { tables }
+}
+
+/// Builds the envelope of a draft. An entity parameter gets its session
+/// stand-in when it is bound to exactly one key; otherwise it has no symbol
+/// and the firewall refuses the envelope (`bad_part`). The context is the
+/// session's last turns (at most 10), each entity typed by its cloud table
+/// when the session can still reverse the symbol.
+pub fn build_envelope(
+    d: &Draft,
+    session: &mut Session,
+    schema: &Schema,
+    public: &[PublicValues],
+    synthetic: SyntheticRows,
+    list_cap: u32,
+    retry: Option<Retry>,
+) -> Envelope {
+    let schema_part = cloud_schema(schema, public);
 
     let mut params = Vec::with_capacity(d.params.len());
     for p in &d.params {
@@ -227,7 +237,7 @@ pub fn build_envelope(
         v: ENVELOPE_VERSION,
         kind: ENVELOPE_KIND.to_string(),
         lang: d.lang,
-        schema: CloudSchema { tables },
+        schema: schema_part,
         synthetic,
         question: d.text.clone(),
         params,
@@ -284,15 +294,32 @@ fn context_turn(t: &Turn, session: &Session, schema: &Schema) -> CloudTurn {
     }
 }
 
+/// `sha256:` + hex of the canonical JSON of any serializable part.
+fn part_sha256<T: Serialize + ?Sized>(part: &T) -> String {
+    let v = serde_json::to_value(part).unwrap_or(Value::Null);
+    let mut out = Vec::new();
+    write_canonical(&v, &mut out);
+    sha256_hex(&out)
+}
+
+/// The hash the firewall compares the envelope's schema part with (P-26):
+/// the caller hashes [`cloud_schema`]'s output when it builds the envelope.
+pub fn schema_sha256(schema: &CloudSchema) -> String {
+    part_sha256(schema)
+}
+
+/// The hash of a retry's previous method, as the caller received it from
+/// the planner (P-26): canonical JSON of the string.
+pub fn method_sha256(method: &str) -> String {
+    part_sha256(method)
+}
+
 /// `sha256:` + hex of the canonical JSON of synthetic rows: the caller
 /// hashes `synthetic_rows`' output before `build_envelope` and gives the
 /// hash to the firewall, which hashes the envelope's rows the same way
 /// (P-22).
 pub fn synthetic_sha256(rows: &SyntheticRows) -> String {
-    let v = serde_json::to_value(rows).unwrap_or(Value::Null);
-    let mut out = Vec::new();
-    write_canonical(&v, &mut out);
-    sha256_hex(&out)
+    part_sha256(rows)
 }
 
 /// Canonical JSON of a value: object keys sorted bytewise, no whitespace,

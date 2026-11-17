@@ -7,15 +7,15 @@ mod fixtures;
 
 use saiife_shield::dataset::{finish, propose, stage_snapshot, DatasetDir, Manifest};
 use saiife_shield::envelope::{
-    build_envelope, sha256_hex, synthetic_sha256, CloudParam, CloudTurn, Envelope, Retry,
-    SyntheticRows,
+    build_envelope, cloud_schema, method_sha256, schema_sha256, sha256_hex, synthetic_sha256,
+    CloudParam, CloudTurn, Envelope, Retry, SyntheticRows,
 };
-use saiife_shield::firewall::{Firewall, Hit, Verdict, MAX_FREE_TEXT_CHARS};
+use saiife_shield::firewall::{Expected, Firewall, Hit, Verdict, MAX_FREE_TEXT_CHARS};
 use saiife_shield::index::{read_allow, AllowList, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
 use saiife_shield::ner::{DetectError, ListDetector, NameDetector, NameSpan, SpanLabel};
 use saiife_shield::question::{parameterize, Draft, Step};
-use saiife_shield::schema::{Bound, Lang, Param, ParamType, Schema};
+use saiife_shield::schema::{Bound, ColumnClass, Lang, Param, ParamType, Schema};
 use saiife_shield::session::{Session, Turn};
 use saiife_shield::standin::KeySet;
 use saiife_shield::synth::{os_rng, synthetic_rows};
@@ -41,6 +41,8 @@ struct Fx {
     /// caller computes it before `build_envelope`, P-22).
     synth: SyntheticRows,
     hash: String,
+    /// The hash of `cloud_schema`'s output (P-26).
+    schema_hash: String,
 }
 
 /// The list cap the tests' caller puts in every envelope.
@@ -109,6 +111,7 @@ fn fx_with(edit: impl FnOnce(&mut Schema)) -> Fx {
     let lex = Lexicon::open(&dir.lexicon()).unwrap();
     let synth = synthetic_rows(&m.schema, &m.formats, &m.public, 5, &mut os_rng());
     let hash = synthetic_sha256(&synth);
+    let schema_hash = schema_sha256(&cloud_schema(&m.schema, &m.public));
     Fx {
         _t: t,
         m,
@@ -118,6 +121,7 @@ fn fx_with(edit: impl FnOnce(&mut Schema)) -> Fx {
         keys,
         synth,
         hash,
+        schema_hash,
     }
 }
 
@@ -133,14 +137,78 @@ fn none() -> ListDetector {
     ListDetector::new(&[])
 }
 
-fn fw<'a>(f: &'a Fx, det: &'a dyn NameDetector, released: &'a [String]) -> Firewall<'a> {
-    Firewall {
-        index: &f.index,
-        allow: &f.allow,
-        detector: det,
-        released_names: released,
-        list_cap: LIST_CAP,
-        synthetic_sha256: &f.hash,
+/// The test caller: it holds the fixture's list cap, schema hash and
+/// synthetic hash. Unless a test pins them itself (`exp`), the expected
+/// language, symbols and retry hash are those of the envelope checked, so
+/// each test exercises the part it names.
+#[derive(Clone, Copy)]
+struct Tw<'a> {
+    f: &'a Fx,
+    det: &'a dyn NameDetector,
+    released: &'a [String],
+    synth: &'a str,
+}
+
+fn fw<'a>(f: &'a Fx, det: &'a dyn NameDetector, released: &'a [String]) -> Tw<'a> {
+    Tw {
+        f,
+        det,
+        released,
+        synth: &f.hash,
+    }
+}
+
+/// Every stand-in of an envelope.
+fn symbols(e: &Envelope) -> Vec<String> {
+    e.params
+        .iter()
+        .chain(e.context.iter().flat_map(|t| t.params.iter()))
+        .filter_map(|p| p.symbol.clone())
+        .collect()
+}
+
+impl Tw<'_> {
+    fn firewall<R>(&self, x: Expected<'_>, run: impl FnOnce(&Firewall<'_>) -> R) -> R {
+        let w = Firewall {
+            index: &self.f.index,
+            allow: &self.f.allow,
+            detector: self.det,
+            released_names: self.released,
+            expected: x,
+        };
+        run(&w)
+    }
+
+    /// The expectations of a caller that built `e` (symbols and retry from
+    /// it), in `lang`.
+    fn with<R>(&self, lang: Lang, e: Option<&Envelope>, run: impl FnOnce(&Firewall<'_>) -> R) -> R {
+        let syms = e.map(symbols).unwrap_or_default();
+        let mh = e
+            .and_then(|e| e.retry.as_ref())
+            .map(|r| method_sha256(&r.previous_method));
+        let x = Expected {
+            list_cap: LIST_CAP,
+            lang,
+            schema_sha256: &self.f.schema_hash,
+            synthetic_sha256: self.synth,
+            symbols: &syms,
+            previous_method_sha256: mh.as_deref(),
+        };
+        self.firewall(x, run)
+    }
+
+    fn check_outgoing(&self, e: &Envelope, lang: Lang) -> Result<Verdict, ShieldError> {
+        self.with(lang, Some(e), |w| w.check_outgoing(e, lang))
+    }
+
+    fn check_bytes(&self, b: &[u8]) -> Result<Verdict, ShieldError> {
+        let e: Option<Envelope> = serde_json::from_slice(b).ok();
+        let lang = e.as_ref().map_or(Lang::En, |e| e.lang);
+        self.with(lang, e.as_ref(), |w| w.check_bytes(b))
+    }
+
+    fn check_incoming(&self, r: &[(&str, &str)]) -> Result<Verdict, ShieldError> {
+        self.with(Lang::En, None, |w| w.check_incoming(r))
     }
 }
 
@@ -685,7 +753,11 @@ fn numbers_only_from_closed_sets() {
     ] {
         let mut e = base.clone();
         e.schema.tables[0].rows = band.into();
-        assert_eq!(check(&e), vec![bad("schema.tables[0].rows")], "{band}");
+        assert_eq!(
+            check(&e),
+            vec![bad("schema"), bad("schema.tables[0].rows")],
+            "{band}"
+        );
     }
     // JSON in a string is text: its digit is a number.
     let mut e = base.clone();
@@ -781,8 +853,8 @@ fn synthetic_rows_must_be_the_generated_ones() {
     e.synthetic.get_mut("customers").unwrap()[0]
         .insert("city".into(), Value::String(RARE_LAST.into()));
     let h2 = synthetic_sha256(&e.synthetic);
-    let w2 = Firewall {
-        synthetic_sha256: &h2,
+    let w2 = Tw {
+        synth: &h2,
         ..fw(&f, &nodet, &[])
     };
     let h = hits(w2.check_outgoing(&e, e.lang).unwrap());
@@ -1259,4 +1331,211 @@ fn never_panics_on_arbitrary_input() {
             let _ = w.check_bytes(&canon[cut..]);
         }
     }
+}
+
+fn bad_part(part: &str) -> Hit {
+    Hit {
+        kind: "bad_part",
+        part: part.into(),
+        span: None,
+    }
+}
+
+#[test]
+fn schema_is_pinned_by_the_callers_hash() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    assert_eq!(schema_sha256(&base.schema), f.schema_hash);
+    assert_eq!(w.check_outgoing(&base, base.lang).unwrap(), Verdict::Pass);
+    let (ti, ci) = col_index(&base, "customers", "segment");
+    let vals = base.schema.tables[ti].columns[ci].values.clone().unwrap();
+    let v0 = vals[0].clone();
+    let (si, sc) = col_index(&base, "invoices", "status");
+    let other = base.schema.tables[si].columns[sc].values.clone().unwrap()[0].clone();
+    let (ii, ic) = col_index(&base, "customers", "id");
+    type Edit = Box<dyn Fn(&mut Envelope)>;
+    let set_values = |v: Vec<String>| -> Edit {
+        Box::new(move |e: &mut Envelope| e.schema.tables[ti].columns[ci].values = Some(v.clone()))
+    };
+    let cases: Vec<(&str, Edit)> = vec![
+        ("punctuation", set_values(vec![format!("{v0}!!!")])),
+        ("case", set_values(vec![v0.to_uppercase()])),
+        ("repeats", set_values(vec![v0.clone(); 1000])),
+        ("another column's value", {
+            let mut v = vals.clone();
+            v.push(other.clone());
+            set_values(v)
+        }),
+        (
+            "entity word with a zero-width space",
+            Box::new(move |e: &mut Envelope| {
+                e.schema.tables[ti].entity = Some("customer\u{200B}".into())
+            }),
+        ),
+        (
+            "another valid band",
+            Box::new(move |e: &mut Envelope| {
+                let b = if e.schema.tables[ti].rows == "about 400" {
+                    "about 3 million"
+                } else {
+                    "about 400"
+                };
+                e.schema.tables[ti].rows = b.into();
+            }),
+        ),
+        (
+            "tables swapped",
+            Box::new(|e: &mut Envelope| e.schema.tables.swap(0, 1)),
+        ),
+        (
+            "columns swapped",
+            Box::new(move |e: &mut Envelope| e.schema.tables[ti].columns.swap(0, 1)),
+        ),
+        (
+            "class flipped",
+            Box::new(move |e: &mut Envelope| {
+                let c = &mut e.schema.tables[ii].columns[ic];
+                c.class = if c.class == ColumnClass::Quasi {
+                    ColumnClass::Identifier
+                } else {
+                    ColumnClass::Quasi
+                };
+            }),
+        ),
+    ];
+    for (what, edit) in &cases {
+        let mut e = base.clone();
+        edit(&mut e);
+        let h = hits(w.check_outgoing(&e, e.lang).unwrap());
+        assert!(h.contains(&bad_part("schema")), "{what}: {h:?}");
+        assert_eq!(h, hits(w.check_bytes(&e.canonical()).unwrap()), "{what}");
+    }
+}
+
+#[test]
+fn lang_symbols_and_retry_are_the_callers() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    let issued = vec![base.params[0].symbol.clone().unwrap()];
+    let expected =
+        |lang: Lang, syms: &[String], mh: Option<String>, run: &dyn Fn(&Firewall<'_>)| {
+            let x = Expected {
+                list_cap: LIST_CAP,
+                lang,
+                schema_sha256: &f.schema_hash,
+                synthetic_sha256: &f.hash,
+                symbols: syms,
+                previous_method_sha256: mh.as_deref(),
+            };
+            w.firewall(x, |fw| run(fw));
+        };
+    let other = if base.lang == Lang::Da {
+        Lang::En
+    } else {
+        Lang::Da
+    };
+    // The legitimate envelope.
+    expected(base.lang, &issued, None, &|fw| {
+        assert_eq!(fw.check_outgoing(&base, base.lang).unwrap(), Verdict::Pass);
+        assert_eq!(fw.check_bytes(&base.canonical()).unwrap(), Verdict::Pass);
+    });
+    // The wrong language: as the argument, or in the envelope.
+    expected(base.lang, &issued, None, &|fw| {
+        let h = hits(fw.check_outgoing(&base, other).unwrap());
+        assert_eq!(h, vec![bad_part("lang")]);
+        let mut e = base.clone();
+        e.lang = other;
+        let h = hits(fw.check_outgoing(&e, base.lang).unwrap());
+        assert!(h.contains(&bad_part("lang")), "{h:?}");
+        assert_eq!(h, hits(fw.check_bytes(&e.canonical()).unwrap()));
+    });
+    // A well-formed stand-in the session never issued (P-25).
+    let stranger = vec![s.symbol_for("customer", "customers", 7)];
+    expected(base.lang, &stranger, None, &|fw| {
+        let h = hits(fw.check_outgoing(&base, base.lang).unwrap());
+        assert_eq!(h, vec![bad_part("params[0].symbol")]);
+    });
+    // The retry: exactly the method the caller received.
+    let mut e = base.clone();
+    e.retry = Some(Retry {
+        previous_method: "SELECT nope FROM customers WHERE id = :p1".into(),
+        error_class: "unknown_column credit_limit".into(),
+    });
+    let right = Some(method_sha256("SELECT nope FROM customers WHERE id = :p1"));
+    let wrong = Some(method_sha256("SELECT nope FROM customers WHERE id = :p1 "));
+    expected(base.lang, &issued, right.clone(), &|fw| {
+        assert_eq!(fw.check_outgoing(&e, e.lang).unwrap(), Verdict::Pass);
+        let h = hits(fw.check_outgoing(&base, base.lang).unwrap());
+        assert_eq!(h, vec![bad_part("retry")], "an expected retry is missing");
+    });
+    expected(base.lang, &issued, wrong, &|fw| {
+        let h = hits(fw.check_outgoing(&e, e.lang).unwrap());
+        assert_eq!(h, vec![bad_part("retry.previous_method")]);
+    });
+    expected(base.lang, &issued, None, &|fw| {
+        let h = hits(fw.check_outgoing(&e, e.lang).unwrap());
+        assert_eq!(h, vec![bad_part("retry")], "a retry nobody expected");
+    });
+}
+
+#[test]
+fn oversize_synthetic_text_and_raw_names_in_parts() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    // A synthetic text over the cap is marked oversize.
+    let mut e = base.clone();
+    e.synthetic.get_mut("customers").unwrap()[0].insert(
+        "city".into(),
+        Value::String("x".repeat(MAX_FREE_TEXT_CHARS + 1)),
+    );
+    let h2 = synthetic_sha256(&e.synthetic);
+    let w = Tw {
+        synth: &h2,
+        ..fw(&f, &nodet, &[])
+    };
+    let h = hits(w.check_outgoing(&e, e.lang).unwrap());
+    assert!(
+        h.contains(&Hit {
+            kind: "oversize",
+            part: "synthetic.customers[0].city".into(),
+            span: None
+        }),
+        "{h:?}"
+    );
+    // Names of an unpinned schema never reach a part name.
+    let mut e = base.clone();
+    let zw = "customers\u{200B}";
+    let ti = e
+        .schema
+        .tables
+        .iter()
+        .position(|t| t.name == "customers")
+        .unwrap();
+    e.schema.tables[ti].name = zw.into();
+    let mut rows = e.synthetic.remove("customers").unwrap();
+    rows[0].insert("id".into(), Value::Null);
+    e.synthetic.insert(zw.into(), rows);
+    let h2 = synthetic_sha256(&e.synthetic);
+    let w = Tw {
+        synth: &h2,
+        ..fw(&f, &nodet, &[])
+    };
+    let h = hits(w.check_outgoing(&e, e.lang).unwrap());
+    assert!(h.contains(&bad_part("schema")));
+    for x in &h {
+        assert!(!x.part.contains('\u{200B}'), "{x:?}");
+    }
+    assert!(
+        h.iter()
+            .any(|x| x.part.starts_with("synthetic.#") && x.part.contains("[0].#")),
+        "{h:?}"
+    );
 }

@@ -34,17 +34,22 @@
 //! 5. **Names.** The detector over free text; a `Person` span that is not a
 //!    released name (`blind:name`) or a stand-in of this envelope is `name`.
 //!
-//! The firewall is a strict schema allowlist (ruling P-22): every number
-//! comes from a closed set. `v` is 1; `list_cap` is the cap the caller
-//! expects ([`Firewall::list_cap`]); a row band is exactly what
-//! [`rows_band`] renders for the number it names; parameter names are
-//! `p1..pK` in order in the question and in every context turn, each one
-//! referenced as `:pN` in its text. Synthetic rows (R44-6) hold exactly the
-//! envelope's tables and columns, at most 5 rows a table, every value of
-//! the generator's shape for its column, and their canonical hash
-//! ([`crate::envelope::synthetic_sha256`]) equals the one the caller
-//! computed from `synthetic_rows`' output ([`Firewall::synthetic_sha256`]).
-//! Only then (P-24) is the generator's own number inside a synthetic text
+//! The firewall is a strict schema allowlist (rulings P-22, P-25, P-26):
+//! the caller keeps an [`Expected`] from the moment it builds the envelope,
+//! and every part that is not free text must match it. `v` is 1;
+//! `list_cap` and `lang` are the expected ones; the schema part hashes
+//! ([`crate::envelope::schema_sha256`]) to the hash of
+//! [`crate::envelope::cloud_schema`]'s output, so every name, band, class,
+//! entity word and public value list is pinned byte for byte; every
+//! stand-in is one the session issued; a retry carries exactly the method
+//! the caller received ([`crate::envelope::method_sha256`]). The form checks
+//! (row bands as [`rows_band`] renders them, allow-list words, R44-4
+//! symbols, parameter names `p1..pK` in order, each used as `:pN` in its
+//! own text) stay as defence in depth. Synthetic rows (R44-6) hold exactly
+//! the envelope's tables and columns, at most 5 rows a table, every value
+//! of the generator's shape for its column, and hash
+//! ([`crate::envelope::synthetic_sha256`]) to the expected hash. Only then
+//! (P-24) is the generator's own number inside a synthetic text
 //! (`Synthetic_4711`) or a synthetic date exempt from the number, date and
 //! known-value scans; patterns and names still run on all of it.
 //!
@@ -68,8 +73,8 @@
 //! text. Error texts are fixed strings.
 
 use crate::envelope::{
-    synthetic_sha256, CloudColumn, CloudParam, CloudSchema, Envelope, ENVELOPE_KIND,
-    ENVELOPE_VERSION,
+    method_sha256, schema_sha256, synthetic_sha256, CloudColumn, CloudParam, CloudSchema, Envelope,
+    ENVELOPE_KIND, ENVELOPE_VERSION,
 };
 use crate::error::ShieldError;
 use crate::index::{AllowList, KnownIndex};
@@ -180,11 +185,29 @@ pub struct Firewall<'a> {
     pub detector: &'a dyn NameDetector,
     /// The names a `blind:name` touch of this ask released.
     pub released_names: &'a [String],
-    /// The `list_cap` the caller put in the envelope (P-22).
+    /// What the caller put in the envelope (P-22, P-25, P-26).
+    pub expected: Expected<'a>,
+}
+
+/// The caller-held expectations of one envelope (ruling P-26): the caller
+/// keeps them from the moment it builds the envelope, and the firewall
+/// requires the envelope to match them byte for byte.
+#[derive(Debug, Clone, Copy)]
+pub struct Expected<'a> {
+    /// The `list_cap` passed to `build_envelope`.
     pub list_cap: u32,
-    /// [`synthetic_sha256`] of the `synthetic_rows` output the caller passed
-    /// to `build_envelope` (P-22).
+    /// The draft's language.
+    pub lang: Lang,
+    /// [`schema_sha256`] of [`crate::envelope::cloud_schema`]'s output.
+    pub schema_sha256: &'a str,
+    /// [`synthetic_sha256`] of the `synthetic_rows` output passed to
+    /// `build_envelope`.
     pub synthetic_sha256: &'a str,
+    /// Every stand-in the session issued (P-25).
+    pub symbols: &'a [String],
+    /// [`method_sha256`] of the previous method received from the planner,
+    /// for a retry; `None` for a first request.
+    pub previous_method_sha256: Option<&'a str>,
 }
 
 impl fmt::Debug for Firewall<'_> {
@@ -193,7 +216,8 @@ impl fmt::Debug for Firewall<'_> {
             .field("index", &self.index)
             .field("allow", &self.allow)
             .field("released_names", &self.released_names.len())
-            .field("list_cap", &self.list_cap)
+            .field("list_cap", &self.expected.list_cap)
+            .field("lang", &self.expected.lang)
             .finish_non_exhaustive()
     }
 }
@@ -510,21 +534,21 @@ fn synthetic_shape(
     }
 }
 
-/// A name for a part path: the name when it is a word of the allow list,
-/// else `#<index>` (a part name never carries an unchecked text).
-fn path_name(allow: Option<&AllowList>, name: &str, i: usize) -> String {
-    if allow.is_some() && allowed(allow, name) {
+/// A name for a part path: the name when it is byte-equal to a name of a
+/// schema part the caller's hash pinned, else `#<index>` (a part name never
+/// carries an unchecked text).
+fn path_name(pinned: bool, name: &str, known: bool, i: usize) -> String {
+    if pinned && known {
         name.to_string()
     } else {
         format!("#{i}")
     }
 }
 
-/// What the caller expects of an envelope (P-22).
+/// What the caller expects of an envelope, with the allow list.
 struct Expect<'x> {
     allow: &'x AllowList,
-    list_cap: u32,
-    synthetic_sha256: &'x str,
+    expected: Expected<'x>,
 }
 
 /// Part 1 and the strings of an envelope. `expect` None (the summary): the
@@ -538,8 +562,17 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
     if e.v != ENVELOPE_VERSION {
         hit(hits, BAD_PART, &p("v"), None);
     }
-    if expect.is_some_and(|x| x.list_cap != e.list_cap) {
+    if expect.is_some_and(|x| x.expected.list_cap != e.list_cap) {
         hit(hits, BAD_PART, &p("list_cap"), None);
+    }
+    if expect.is_some_and(|x| x.expected.lang != e.lang) {
+        hit(hits, BAD_PART, &p("lang"), None);
+    }
+    // P-26: the schema part is byte-pinned by the caller's hash. The form
+    // checks below stay as defence in depth.
+    let schema_ok = expect.is_some_and(|x| schema_sha256(&e.schema) == x.expected.schema_sha256);
+    if expect.is_some() && !schema_ok {
+        hit(hits, BAD_PART, &p("schema"), None);
     }
     if e.kind != ENVELOPE_KIND {
         hit(hits, BAD_PART, &p("kind"), None);
@@ -589,7 +622,8 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
 
     // Synthetic rows: exactly the schema's tables and columns, the caller's
     // hash, each value of the generator's exact shape.
-    let hash_ok = expect.is_none_or(|x| synthetic_sha256(&e.synthetic) == x.synthetic_sha256);
+    let hash_ok =
+        expect.is_none_or(|x| synthetic_sha256(&e.synthetic) == x.expected.synthetic_sha256);
     let want: BTreeSet<&str> = e.schema.tables.iter().map(|t| t.name.as_str()).collect();
     let have: BTreeSet<&str> = e.synthetic.keys().map(String::as_str).collect();
     if !hash_ok || want != have {
@@ -597,7 +631,10 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
     }
     for (ti, (tname, rows)) in e.synthetic.iter().enumerate() {
         let table = e.schema.tables.iter().find(|t| &t.name == tname);
-        let tp = p(&format!("synthetic.{}", path_name(allow, tname, ti)));
+        let tp = p(&format!(
+            "synthetic.{}",
+            path_name(schema_ok, tname, table.is_some(), ti)
+        ));
         if table.is_none() || rows.len() > MAX_SYNTHETIC_ROWS {
             hit(hits, BAD_PART, &tp, None);
         }
@@ -612,7 +649,10 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
             }
             for (ci, (cname, v)) in row.iter().enumerate() {
                 let col = table.and_then(|t| t.columns.iter().find(|c| &c.name == cname));
-                let vp = format!("{tp}[{ri}].{}", path_name(allow, cname, ci));
+                let vp = format!(
+                    "{tp}[{ri}].{}",
+                    path_name(schema_ok, cname, col.is_some(), ci)
+                );
                 if col.is_none() {
                     hit(hits, BAD_PART, &vp, None);
                     texts.push(Text::new(format!("{vp}#name"), cname, Class::Typed));
@@ -627,7 +667,10 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
                     if hash_ok {
                         t.exempt = shape.unwrap_or_default();
                     }
-                    t.oversize = s.chars().count() > MAX_FREE_TEXT_CHARS;
+                    if s.chars().count() > MAX_FREE_TEXT_CHARS {
+                        hit(hits, OVERSIZE, &t.part, None);
+                        t.oversize = true;
+                    }
                     texts.push(t);
                 }
             }
@@ -665,6 +708,35 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
             &mut texts,
         );
         texts.push(t);
+    }
+
+    // P-25: every stand-in is one the session issued, byte for byte.
+    if let Some(x) = expect {
+        let all = e
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, cp)| (format!("params[{i}].symbol"), cp))
+            .chain(e.context.iter().enumerate().flat_map(|(t, turn)| {
+                turn.params
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, cp)| (format!("context[{t}].params[{i}].symbol"), cp))
+            }));
+        for (part, cp) in all {
+            if let Some(sym) = &cp.symbol {
+                if !x.expected.symbols.iter().any(|s| s == sym) {
+                    hit(hits, BAD_PART, &part, None);
+                }
+            }
+        }
+        // P-26: a retry carries exactly the method the caller received.
+        match (&e.retry, x.expected.previous_method_sha256) {
+            (None, None) => {}
+            (Some(r), Some(h)) if method_sha256(&r.previous_method) == h => {}
+            (Some(_), Some(_)) => hit(hits, BAD_PART, &p("retry.previous_method"), None),
+            _ => hit(hits, BAD_PART, &p("retry"), None),
+        }
     }
 
     // The retry.
@@ -972,10 +1044,16 @@ fn cpr_spans(s: &str) -> Vec<(usize, usize)> {
 }
 
 /// Today minus 15 years as `YYYY-MM-DD` (29 February becomes the 28th).
-fn birth_cutoff() -> String {
-    let days = std::time::SystemTime::now()
+/// A clock before 1970 is an error: the scan never runs with a wrong date.
+fn birth_cutoff() -> Result<String, ShieldError> {
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| (d.as_secs() / 86_400) as i64);
+        .map_err(|_| ShieldError::Corrupt("the system clock is before 1970"))?
+        .as_secs();
+    Ok(cutoff_from_days((secs / 86_400) as i64))
+}
+
+fn cutoff_from_days(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     let y = y - BIRTH_YEARS;
     let d = d.min(days_in_month(y, m));
@@ -1274,7 +1352,7 @@ impl Firewall<'_> {
         hits: &mut Vec<Hit>,
     ) -> Result<(), ShieldError> {
         let max_words = self.max_allow_tokens();
-        let cutoff = birth_cutoff();
+        let cutoff = birth_cutoff()?;
         let prepared: Vec<(&Text, Tokens, Vec<bool>)> = texts
             .iter()
             .filter(|t| !t.oversize)
@@ -1321,21 +1399,20 @@ impl Firewall<'_> {
     ) -> Result<(), ShieldError> {
         let expect = Expect {
             allow: self.allow,
-            list_cap: self.list_cap,
-            synthetic_sha256: self.synthetic_sha256,
+            expected: self.expected,
         };
         let texts = envelope_parts(e, Some(&expect), hits);
         self.scan_texts(&texts, primary, &symbols_of(e), hits)
     }
 
-    /// Every outgoing envelope, before it is encoded and sent.
+    /// Every outgoing envelope, before it is encoded and sent. `lang` and
+    /// the envelope's language must both be the caller's expected one.
     pub fn check_outgoing(&self, e: &Envelope, lang: Lang) -> Result<Verdict, ShieldError> {
-        let mut primary = vec![lang];
-        if e.lang != lang {
-            primary.push(e.lang);
-        }
         let mut hits = Vec::new();
-        self.envelope_hits(e, &primary, &mut hits)?;
+        if lang != self.expected.lang {
+            hit(&mut hits, BAD_PART, "lang", None);
+        }
+        self.envelope_hits(e, &[self.expected.lang], &mut hits)?;
         Ok(verdict(hits))
     }
 
@@ -1356,7 +1433,7 @@ impl Firewall<'_> {
         if e.canonical() != body {
             hit(&mut hits, BAD_PART, "body", None);
         }
-        self.envelope_hits(&e, &[e.lang], &mut hits)?;
+        self.envelope_hits(&e, &[self.expected.lang], &mut hits)?;
         Ok(verdict(hits))
     }
 
@@ -1393,8 +1470,15 @@ impl Firewall<'_> {
 pub(crate) fn standalone_hits(e: &Envelope) -> Vec<Hit> {
     let mut ignored = Vec::new();
     let texts = envelope_parts(e, None, &mut ignored);
-    let cutoff = birth_cutoff();
     let mut hits = Vec::new();
+    // No clock: count one more personal value rather than skip the scan.
+    let cutoff = match birth_cutoff() {
+        Ok(c) => c,
+        Err(_) => {
+            hit(&mut hits, BIRTH_DATE, "clock", None);
+            String::new()
+        }
+    };
     for t in texts.iter().filter(|t| !t.oversize) {
         let which = Patterns {
             phone: true,
@@ -1586,8 +1670,10 @@ mod tests {
 
     #[test]
     fn birth_cutoff_is_fifteen_years_back() {
-        let c = birth_cutoff();
+        let c = birth_cutoff().unwrap();
         assert!(iso_date_ok(&c));
+        assert_eq!(cutoff_from_days(0), "1955-01-01");
+        assert_eq!(cutoff_from_days(19_782), "2009-02-28", "29 February 2024");
         assert!(c.as_str() > "2010-01-01" && c.as_str() < "2100-01-01");
     }
 }
