@@ -200,6 +200,7 @@ use crate::index::{
     build_index, write_allow, BuildStats, IndexKey, ALLOW_FILE, BLOOM_FILE, INDEX_FILE,
 };
 use crate::lexicon::{build_lexicon, LEXICON_FILE};
+use crate::norm::normalize;
 use crate::public::{public_refusal, public_values, PublicValues};
 use crate::schema::{rows_band, ColType, ColumnClass, DatasetName, Schema};
 use crate::snapshot::{build_snapshot, open_ro, SnapshotInfo, SNAPSHOT_FILE};
@@ -621,6 +622,38 @@ fn format_of(ty: ColType, sample: &[String]) -> Format {
     Format::Plain
 }
 
+/// D3: the classifier's sample seed for one column, from the snapshot's
+/// hash and the names, so `propose` and `finish` read the same sample and
+/// reach the same public verdict for a borderline column.
+fn sample_seed(snapshot_sha256: &str, table: &str, column: &str) -> u64 {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in ["saiife-shield-sample", snapshot_sha256, table, column] {
+        ctx.update(part.as_bytes());
+        ctx.update(&[0]);
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&ctx.finish().as_ref()[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// C1 (spec §2.1.2): an entity's key or name column, or a foreign key
+/// named `<entity table stem>_id`, is never public.
+fn entity_column(schema: &Schema, table: &str, column: &str) -> bool {
+    let col = column.to_lowercase();
+    schema.entities.iter().any(|e| {
+        if e.table == table && (e.key == column || e.names.iter().any(|n| n == column)) {
+            return true;
+        }
+        let t = e.table.to_lowercase();
+        let mut stems = vec![t.clone(), normalize(&e.word).replace(' ', "_")];
+        stems.extend(t.strip_suffix("es").map(str::to_string));
+        stems.extend(t.strip_suffix('s').map(str::to_string));
+        stems
+            .iter()
+            .any(|s| !s.is_empty() && col == format!("{s}_id"))
+    })
+}
+
 /// Now as RFC 3339 UTC, second precision.
 fn now_utc() -> String {
     let secs = std::time::SystemTime::now()
@@ -701,12 +734,22 @@ pub fn stage_snapshot(
 /// them (too many values, a value that looks like an ID) is a refusal too.
 pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
     check_k(k)?;
+    let sha = sha256_of(open_nofollow(
+        snapshot,
+        false,
+        "could not read the snapshot",
+    )?)?;
     let conn = open_ro(snapshot)?;
     let mut out = Vec::new();
     for (table, cols) in snapshot_layout(&conn)? {
         for (column, ty) in cols {
             let st = classify::stats(&conn, &table, &column, ty)?;
-            let sample = classify::sample(&conn, &table, &column)?;
+            let sample = classify::sample_seeded(
+                &conn,
+                &table,
+                &column,
+                sample_seed(&sha, &table, &column),
+            )?;
             let guess = classify::guess(&column, ty, &st, &sample);
             let mut refusal = public_refusal(&column, ty, &st, &sample);
             let mut preview = None;
@@ -790,6 +833,7 @@ fn finish_inner(
     let conn = open_ro(&snap_path)?;
     let layout = snapshot_layout(&conn)?;
     check_schema(schema, &layout)?;
+    let policy = schema.clone();
     let mut schema = schema.clone();
     let mut public = Vec::new();
     let mut formats = BTreeMap::new();
@@ -805,12 +849,15 @@ fn finish_inner(
         t.rows = n.max(0) as u64;
         rows_bands.insert(t.name.clone(), rows_band(t.rows));
         for c in &t.columns {
-            let sample = classify::sample(&conn, &t.name, &c.name)?;
+            let seed = sample_seed(&snapshot_sha256, &t.name, &c.name);
+            let sample = classify::sample_seeded(&conn, &t.name, &c.name, seed)?;
             if c.class == ColumnClass::Public {
                 // Defence in depth for a hand-edited policy: the wizard's
                 // refusal is checked again before any value is listed.
                 let st = classify::stats(&conn, &t.name, &c.name, c.ty)?;
-                if public_refusal(&c.name, c.ty, &st, &sample).is_some() {
+                if public_refusal(&c.name, c.ty, &st, &sample).is_some()
+                    || entity_column(&policy, &t.name, &c.name)
+                {
                     return Err(ShieldError::Corrupt(PUBLIC_REFUSED));
                 }
                 let mut pv = public_values(&conn, &t.name, &c.name, k)?;

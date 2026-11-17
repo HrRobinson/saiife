@@ -2,7 +2,7 @@
 //! IDs or amounts; otherwise only values seen at least `k` times are listed.
 
 use crate::classify::{
-    checks, guess, identifier_share, looks_like_identifier, sqlite_err, ColumnStats,
+    checks, guess, id_shaped, identifier_share, looks_like_identifier, sqlite_err, ColumnStats,
 };
 use crate::error::ShieldError;
 use crate::schema::{ColType, ColumnClass};
@@ -11,13 +11,17 @@ use rusqlite::Connection;
 
 const MAX_VALUES: usize = 1000;
 
-/// Why a `public` mark must be refused for this column, or `None`.
+/// Why a `public` mark must be refused for this column, or `None`. An
+/// ID-shaped name ([`id_shaped`]) is always refused, whatever its values.
 pub fn public_refusal(
     name: &str,
     ty: ColType,
     st: &ColumnStats,
     sample: &[String],
 ) -> Option<&'static str> {
+    if id_shaped(name) {
+        return Some("holds names or IDs");
+    }
     let g = guess(name, ty, st, sample);
     if g.class == ColumnClass::Identifier && g.confidence >= 0.85 {
         return Some("holds names or IDs");
@@ -72,7 +76,7 @@ pub fn public_values(
         },
         &[],
     );
-    if name_guess.class == ColumnClass::Identifier {
+    if name_guess.class == ColumnClass::Identifier || id_shaped(column) {
         return Err(refuse(table, column, "holds names or IDs"));
     }
     let (t, c) = (quote(table), quote(column));

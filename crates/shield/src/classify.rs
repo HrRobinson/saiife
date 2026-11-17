@@ -90,6 +90,20 @@ fn name_in(name: &str, words: &[&str]) -> bool {
     words.iter().any(|w| name_has(name, w))
 }
 
+/// C1 / R-16 (spec §2.1.2: IDs are never public): the name says the column
+/// holds IDs or names. `id`, a name ending in `_id`, `_no`, `_nr`, `nr` or
+/// `nummer` (`customer_id`, `order_no`, `kundenr`, `kundenummer`), or one
+/// holding an identifier word. Every ID column is caught, not only those of
+/// people: a product or status ID cannot be public either (fails closed).
+pub fn id_shaped(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n == "id"
+        || ["_id", "_no", "_nr", "nr", "nummer"]
+            .iter()
+            .any(|s| n.ends_with(s))
+        || name_in(&n, IDENT_WORDS)
+}
+
 pub mod checks {
     use super::{name_in, AMOUNT_WORDS};
 
@@ -407,6 +421,7 @@ pub fn guess(name: &str, ty: ColType, st: &ColumnStats, sample: &[String]) -> Gu
         }
     }
     if matches!(ty, ColType::Text | ColType::Integer)
+        && !id_shaped(name)
         && st.non_null > 0
         && st.distinct <= 50
         && (st.distinct as f64) / (st.non_null as f64) <= 0.01
@@ -453,6 +468,25 @@ mod tests {
             .chain(FREETEXT_WORDS)
         {
             assert_eq!(&crate::snapshot::clean_name(w, "c"), w, "{w}");
+        }
+    }
+
+    #[test]
+    fn id_shaped_names() {
+        for n in [
+            "id",
+            "ID",
+            "customer_id",
+            "order_no",
+            "konto_nr",
+            "kundenr",
+            "kundenummer",
+            "email",
+        ] {
+            assert!(id_shaped(n), "{n}");
+        }
+        for n in ["status", "segment", "paid", "valid", "idea", "notes"] {
+            assert!(!id_shaped(n), "{n}");
         }
     }
 

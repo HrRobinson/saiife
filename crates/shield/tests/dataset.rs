@@ -379,3 +379,107 @@ fn modes_are_tight() {
     std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(matches!(load_manifest(&dir), Err(ShieldError::Corrupt(_))));
 }
+
+/// C1: a public mark on an entity's name column (or key) is refused by
+/// `finish`, even when the column itself looks like a harmless category.
+#[test]
+fn public_entity_column_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 600, 1200, 5);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    assert_eq!(
+        schema.column("customers", "segment").unwrap().class,
+        ColumnClass::Public
+    );
+    schema
+        .entities
+        .iter_mut()
+        .find(|e| e.table == "customers")
+        .unwrap()
+        .names
+        .push("segment".into());
+    match finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}) {
+        Err(ShieldError::Corrupt(why)) => {
+            assert_eq!(why, "a public column holds names, IDs or amounts")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// D3: `propose` and `finish` draw the same sample of a column, so a
+/// borderline column gets the same public verdict in both.
+#[test]
+fn propose_and_finish_agree_on_borderline_columns() {
+    use saiife_shield::schema::{ColType, ColumnInfo, TableInfo};
+    use saiife_shield::source::{Cell, SourceTable, VecSource};
+    const COLS: usize = 16;
+    const ROWS: u64 = 5000;
+    let names: Vec<String> = (0..COLS).map(|c| format!("c{c:02}")).collect();
+    let mut x: u64 = 0x5eed;
+    let mut rows = Vec::with_capacity(ROWS as usize);
+    for i in 0..ROWS {
+        let mut r = Vec::with_capacity(COLS);
+        for c in 0..COLS {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // About 20 % of the (all distinct) values are emails: the share
+            // in a 200-value sample sits on the 0.2 refusal line.
+            r.push(Cell::Text(if (x >> 33) % 100 < 20 {
+                format!("u{i}c{c}@example.invalid")
+            } else {
+                format!("w{i}c{c}")
+            }));
+        }
+        rows.push(r);
+    }
+    let mut src = VecSource {
+        tables: vec![(
+            SourceTable {
+                name: "t".into(),
+                columns: names.clone(),
+            },
+            rows,
+        )],
+    };
+    let t = tempfile::tempdir().unwrap();
+    let dir = ds(t.path());
+    stage_snapshot(&dir, &mut src, &mut |_| {}).unwrap();
+    let snap = dir.stage().join("snapshot.sqlite");
+    let verdicts = |props: &[saiife_shield::dataset::Proposal]| -> Vec<bool> {
+        props.iter().map(|p| p.public_refusal.is_some()).collect()
+    };
+    let first = verdicts(&propose(&snap, 10).unwrap());
+    for _ in 0..3 {
+        assert_eq!(verdicts(&propose(&snap, 10).unwrap()), first);
+    }
+    // Mark every column `propose` did not refuse as public: `finish` must
+    // accept them all.
+    let columns = names
+        .iter()
+        .zip(&first)
+        .map(|(n, refused)| ColumnInfo {
+            name: n.clone(),
+            ty: ColType::Text,
+            class: if *refused {
+                ColumnClass::Sensitive
+            } else {
+                ColumnClass::Public
+            },
+            alias: None,
+        })
+        .collect();
+    let schema = Schema {
+        dataset: "crm".parse().unwrap(),
+        tables: vec![TableInfo {
+            name: "t".into(),
+            alias: None,
+            rows: 0,
+            columns,
+        }],
+        entities: vec![],
+    };
+    assert!(first.iter().any(|r| !r), "some column must pass");
+    finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+}

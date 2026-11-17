@@ -314,3 +314,37 @@ fn a_column_named_rowid_still_classifies() {
     let sm = sample(&conn, "r", "navn").unwrap();
     assert!(sm.len() > 150);
 }
+
+/// C1 / R-16: an ID-shaped name is never public, even when its values
+/// repeat (a foreign key) or are few (a low-cardinality ID).
+#[test]
+fn public_refused_for_foreign_keys() {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute(
+        "CREATE TABLE invoices (_rowid INTEGER PRIMARY KEY, customer_id INTEGER, \
+         salesperson_id INTEGER, kundenr INTEGER, order_no INTEGER)",
+        [],
+    )
+    .unwrap();
+    for i in 0..3000i64 {
+        c.execute(
+            "INSERT INTO invoices (customer_id, salesperson_id, kundenr, order_no) \
+             VALUES (?1, ?2, ?3, ?4)",
+            [1 + i % 100, 1 + i % 20, 1 + i % 20, 1 + i % 20],
+        )
+        .unwrap();
+    }
+    for col in ["customer_id", "salesperson_id", "kundenr", "order_no"] {
+        let st = stats(&c, "invoices", col, ColType::Integer).unwrap();
+        assert!(st.distinct < st.non_null, "{col}: values repeat");
+        let sm = sample(&c, "invoices", col).unwrap();
+        let g = guess(col, ColType::Integer, &st, &sm);
+        assert_ne!(g.class, Public, "{col} must never be suggested public");
+        assert_eq!(
+            public_refusal(col, ColType::Integer, &st, &sm),
+            Some("holds names or IDs"),
+            "{col}"
+        );
+        assert!(public_values(&c, "invoices", col, 2).is_err(), "{col}");
+    }
+}
