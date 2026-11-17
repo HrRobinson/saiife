@@ -19,8 +19,9 @@
 //! common in total, which only blocks more). `n` is `COUNT(DISTINCT key)` in
 //! an entity table (R-14: one person in many rows is one record), else
 //! `COUNT(*)`. An entity's full name (its name columns together) enters
-//! under the same floor, and so does each free-text phrase
-//! (split at `. ! ? ; \n`) of 3 to 40 tokens, whole. Single words of free
+//! under the same floor. Free text has no floor: every phrase (split at
+//! `. ! ? ; \n`) of 3 to 40 tokens enters whole, however often it occurs
+//! (a common phrase like `paid by card` enters too). Single words of free
 //! text never enter. Allow words (schema words, aliases, the k-floor public
 //! values, and `allow.json` if the dataset dir has one) never enter.
 //!
@@ -98,7 +99,7 @@ impl fmt::Debug for IndexKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct BuildStats {
     /// Distinct entries in `index.bin`.
     pub entries: u64,

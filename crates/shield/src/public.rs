@@ -31,7 +31,7 @@ pub fn public_refusal(
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublicValues {
     pub column: String,
     pub passing: Vec<String>,

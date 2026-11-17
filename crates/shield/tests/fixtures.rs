@@ -3,6 +3,10 @@
 //! Every value is made up from a fixed seed: no real people, no real data.
 #![allow(dead_code)]
 
+use saiife_shield::dataset::Proposal;
+use saiife_shield::schema::{ColumnClass, ColumnInfo, EntitySpec, Schema, TableInfo};
+use saiife_shield::source::{CsvSource, RowIter, RowSource, SourceTable};
+use saiife_shield::ShieldError;
 use std::io;
 use std::path::Path;
 
@@ -140,6 +144,12 @@ fn ascii_fold(s: &str) -> String {
 /// Writes `customers.csv` (`rows` rows) and `invoices.csv` (2 x `rows` rows)
 /// into `dir`.
 pub fn write_fixture(dir: &Path, rows: u64, seed: u64) -> io::Result<()> {
+    write_fixture_sized(dir, rows, rows.saturating_mul(2), seed)
+}
+
+/// Writes `customers.csv` (`rows` rows) and `invoices.csv` (`invoices` rows)
+/// into `dir`.
+pub fn write_fixture_sized(dir: &Path, rows: u64, invoices: u64, seed: u64) -> io::Result<()> {
     let mut r = Rng::new(seed);
     let mut cust = csv::Writer::from_path(dir.join("customers.csv"))?;
     cust.write_record([
@@ -196,7 +206,7 @@ pub fn write_fixture(dir: &Path, rows: u64, seed: u64) -> io::Result<()> {
 
     let mut inv = csv::Writer::from_path(dir.join("invoices.csv"))?;
     inv.write_record(["id", "customer_id", "amount", "status", "issued", "notes"])?;
-    for id in 1..=rows.saturating_mul(2) {
+    for id in 1..=invoices {
         let cid = 1 + r.below(rows.max(1));
         let (first, city) = names
             .get(((cid - 1) as usize).min(names.len().saturating_sub(1)))
@@ -218,6 +228,110 @@ pub fn write_fixture(dir: &Path, rows: u64, seed: u64) -> io::Result<()> {
     }
     inv.flush()?;
     Ok(())
+}
+
+/// Several sources read as one (the CSV files of a fixture dir): tables in
+/// order, rows routed by table name.
+pub struct MultiSource(pub Vec<Box<dyn RowSource>>);
+
+impl MultiSource {
+    /// Every `*.csv` in `dir`, sorted by name.
+    pub fn csv_dir(dir: &Path) -> io::Result<MultiSource> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "csv"))
+            .collect();
+        files.sort();
+        let mut v: Vec<Box<dyn RowSource>> = Vec::new();
+        for p in files {
+            let f = std::fs::File::open(&p)?;
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let s = CsvSource::open(Box::new(f), &name)
+                .map_err(|_| io::Error::other("could not open a CSV"))?;
+            v.push(Box::new(s));
+        }
+        Ok(MultiSource(v))
+    }
+}
+
+impl RowSource for MultiSource {
+    fn tables(&self) -> Vec<SourceTable> {
+        self.0.iter().flat_map(|s| s.tables()).collect()
+    }
+    fn rows(&mut self, table: &str) -> Result<RowIter<'_>, ShieldError> {
+        for s in &mut self.0 {
+            if s.tables().iter().any(|t| t.name == table) {
+                return s.rows(table);
+            }
+        }
+        Err(ShieldError::Corrupt("no such table in the source"))
+    }
+    fn first_data_row(&self) -> u64 {
+        self.0.first().map_or(1, |s| s.first_data_row())
+    }
+    fn set_spool_dir(&mut self, dir: &Path) {
+        self.0.iter_mut().for_each(|s| s.set_spool_dir(dir));
+    }
+    fn release(&mut self) {
+        self.0.iter_mut().for_each(|s| s.release());
+    }
+}
+
+/// The schema of "accept every proposal": each column gets the suggested
+/// class (a refused `public` suggestion becomes `sensitive`), and a table
+/// with an `id` and name columns is an entity with the default words
+/// `record` / `post`. Row counts are 0: `finish` fills them in.
+pub fn accept_all(name: &str, props: &[Proposal]) -> Schema {
+    let mut tables: Vec<TableInfo> = Vec::new();
+    for p in props {
+        let class = match (p.guess.class, p.public_refusal) {
+            (ColumnClass::Public, Some(_)) => ColumnClass::Sensitive,
+            (c, _) => c,
+        };
+        let col = ColumnInfo {
+            name: p.column.clone(),
+            ty: p.ty,
+            class,
+            alias: None,
+        };
+        match tables.iter_mut().find(|t| t.name == p.table) {
+            Some(t) => t.columns.push(col),
+            None => tables.push(TableInfo {
+                name: p.table.clone(),
+                alias: None,
+                rows: 0,
+                columns: vec![col],
+            }),
+        }
+    }
+    let mut entities = Vec::new();
+    for t in &tables {
+        let has = |c: &str| t.columns.iter().any(|x| x.name == c);
+        let names: Vec<String> = ["first_name", "last_name", "name"]
+            .into_iter()
+            .filter(|c| has(c))
+            .map(String::from)
+            .collect();
+        if has("id") && !names.is_empty() {
+            entities.push(EntitySpec {
+                table: t.name.clone(),
+                key: "id".into(),
+                names,
+                show: vec![],
+                word: "record".into(),
+                word_da: "post".into(),
+            });
+        }
+    }
+    Schema {
+        dataset: name.parse().expect("a valid dataset name"),
+        tables,
+        entities,
+    }
 }
 
 #[test]
