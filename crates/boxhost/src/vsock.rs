@@ -50,6 +50,7 @@ fn answer_ok(line: &[u8]) -> bool {
 /// Pin `name` in `dir` (O_PATH, no follow) and require a socket owned by
 /// `uid`. Nothing is opened for I/O, so a FIFO cannot block. The returned fd
 /// is the exact object that was checked.
+#[cfg(target_os = "linux")]
 fn open_checked(
     dir: &rustix::fd::OwnedFd,
     name: &std::ffi::OsStr,
@@ -87,6 +88,7 @@ fn open_checked(
 /// without ever blocking past `deadline`. A full accept backlog (a wedged
 /// VMM) shows up as EAGAIN, which is retried until the deadline. The returned
 /// stream is blocking again.
+#[cfg(target_os = "linux")]
 fn connect_fd(target: &rustix::fd::OwnedFd, deadline: Instant) -> io::Result<UnixStream> {
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::io::Errno;
@@ -232,6 +234,7 @@ fn is_socket(dir: &rustix::fd::OwnedFd, name: &std::ffi::OsStr) -> io::Result<Op
 /// A stale socket there is replaced; anything else (file, symlink, FIFO,
 /// directory) is refused with `AlreadyExists` and left alone. The mode is
 /// 0660 when `group_rw`, else 0600.
+#[cfg(target_os = "linux")]
 pub fn listen(paths: &BoxPaths, port: u32, group_rw: bool) -> io::Result<UnixListener> {
     use rustix::fs::{fstat, openat, unlinkat, AtFlags, FileType, Mode, OFlags};
     use std::os::fd::AsRawFd;
@@ -292,6 +295,35 @@ pub fn listen(paths: &BoxPaths, port: u32, group_rw: bool) -> io::Result<UnixLis
     Ok(listener)
 }
 
+/// Boxes run on Linux only: O_PATH and `/proc/self/fd` have no equivalent
+/// here, so the vsock calls refuse instead of weakening the checks.
+#[cfg(not(target_os = "linux"))]
+fn linux_only() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "boxes need Linux")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_checked(
+    dir: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    uid: u32,
+) -> io::Result<rustix::fd::OwnedFd> {
+    let _ = (dir, name, uid);
+    Err(linux_only())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_fd(target: &rustix::fd::OwnedFd, deadline: Instant) -> io::Result<UnixStream> {
+    let _ = (target, deadline);
+    Err(linux_only())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn listen(paths: &BoxPaths, port: u32, group_rw: bool) -> io::Result<UnixListener> {
+    let _ = (paths, port, group_rw);
+    Err(linux_only())
+}
+
 /// Remove the host-bound sockets of every guest-initiated port. Only
 /// sockets are unlinked; `vsock.sock` itself belongs to the VMM.
 pub fn unlink_all(paths: &BoxPaths) {
@@ -313,7 +345,7 @@ pub fn unlink_ports(paths: &BoxPaths, ports: &[u32]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};

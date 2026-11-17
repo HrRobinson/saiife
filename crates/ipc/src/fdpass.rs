@@ -151,6 +151,7 @@ mod tests {
     /// How many open descriptors of this process name a file in `dir`.
     /// Only this test's own files count, so descriptors that parallel
     /// tests open and close meanwhile cannot change the answer.
+    #[cfg(target_os = "linux")]
     fn open_in(dir: &Path) -> usize {
         std::fs::read_dir("/proc/self/fd")
             .unwrap()

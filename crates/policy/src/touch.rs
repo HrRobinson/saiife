@@ -159,6 +159,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the golden hash is of a Linux host's policy"
+    )]
     fn policy_hash_unchanged_without_marks() {
         let c = cfg(
             "version = 2\n[services.erp]\nconnector = \"x\"\nsecret = \"k\"\n\

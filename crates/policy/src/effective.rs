@@ -391,6 +391,10 @@ mod tests {
     /// Taken from the pre-change code (HEAD 321a784, before user packs
     /// existed): a host with no user packs hashes byte-identically.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the golden hash is of a Linux host's policy"
+    )]
     fn hash_unchanged_without_user_packs() {
         assert_eq!(
             hash_of(&cfg(CFG_A), &catalog(), None),

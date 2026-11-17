@@ -555,10 +555,11 @@ impl Walk {
         let Some(sdir) = self.stage_parent(p)? else {
             return Ok(None);
         };
-        let mode = if st.st_mode & 0o111 != 0 {
-            0o755
+        // `Entry::mode` is u32; mode_t is narrower on macOS.
+        let (mode, perm) = if st.st_mode & 0o111 != 0 {
+            (0o755, Mode::from_raw_mode(0o755))
         } else {
-            0o644
+            (0o644, Mode::from_raw_mode(0o644))
         };
         let out = rustix::fs::openat(
             &sdir,
@@ -584,8 +585,7 @@ impl Walk {
                 .map_err(|e| format!("staging {p:?}: {e}"))?;
             n_total += n as u64;
         }
-        rustix::fs::fchmod(&out, Mode::from_raw_mode(mode))
-            .map_err(|e| format!("staging {p:?}: {e}"))?;
+        rustix::fs::fchmod(&out, perm).map_err(|e| format!("staging {p:?}: {e}"))?;
         self.bytes += n_total;
         self.d4 = self.d4.saturating_add(round_up(n_total));
         self.entries.insert(

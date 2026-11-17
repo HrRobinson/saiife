@@ -2073,6 +2073,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn personal_templates_dir_ignores_relative_xdg() {
         let env = |k: &str| -> Option<OsString> {
             match k {

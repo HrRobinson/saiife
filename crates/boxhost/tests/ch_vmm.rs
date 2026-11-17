@@ -492,7 +492,11 @@ fn create_keeps_existing_overlay() {
 
 #[test]
 fn create_refuses_long_socket_paths() {
-    let w = World::new();
+    let mut w = World::new();
+    // Long whatever the temp root: 50 bytes of boxes dir plus a 40-byte id
+    // and the socket name are over MAX_SOCK_PATH on their own.
+    w.layout.boxes = w.root.join("d".repeat(50));
+    std::fs::create_dir(&w.layout.boxes).unwrap();
     let (v, _l) = w.vmm(&[]);
     let id = "x".repeat(40);
     let m = failed(v.create(&w.spec(&id)));

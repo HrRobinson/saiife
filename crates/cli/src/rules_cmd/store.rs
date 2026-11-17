@@ -468,6 +468,7 @@ mod tests {
     const FILE: &str = "/saiife-test/project/CLAUDE.md";
 
     #[test]
+    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn render_round_trips_through_view() {
         let l1 = src(1, "- Never run `deploy-prod`.");
         let l2 = src(2, "- Never run `terraform apply`.");

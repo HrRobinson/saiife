@@ -95,9 +95,10 @@ jobs:
         run: cargo test -p saiife-darwin -- --exact macos::tests::own_connection_has_own_uid
         env:
           TMPDIR: ${{ runner.temp }}
+      # The files, not the dir: the runner's Node 24 loads a dir argument as a module.
       - name: Workspace UI node tests (offline)
         if: matrix.os == 'ubuntu-latest'
-        run: node --version && node --test crates/link/assets/tests/
+        run: node --version && node --test crates/link/assets/tests/*.test.mjs
       - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-macos-sign.sh

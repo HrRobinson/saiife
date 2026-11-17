@@ -3,5 +3,12 @@
 # only (/DEPENDENTLOADFLAG:0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32), never in the
 # application or current directory. scripts/check-windows.sh sets RUSTFLAGS,
 # which replaces these for its compile-only check.
+# /STACK: an 8 MiB main-thread stack, as Linux and macOS give. Windows reserves
+# 1 MiB, and a debug build's clap derive for `saiife box` alone takes over
+# 300 KiB of stack, so every command of a debug saiife.exe overflowed.
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
+  "-C", "link-arg=/STACK:8388608",
+]

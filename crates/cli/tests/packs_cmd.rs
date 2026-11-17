@@ -75,7 +75,7 @@ fn explain_prints_inactive_note() {
 #[test]
 fn packs_lists_user_packs() {
     let env = Env::new(&[]);
-    let dir = env.home.path().join(".config/saiife/broker/policy.d/packs");
+    let dir = common::personal_packs_dir(env.home.path());
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("user.t.toml"),

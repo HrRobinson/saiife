@@ -1,8 +1,8 @@
 //! The host review (plan 39 Task 3): receive over a fake guest (plan 38's
 //! test multiplexer serving canned exports made with `write_delta`),
 //! validate, store, render, flag, hash, write the land files.
-// saiife-boxhost is unix-only (plan 35).
-#![cfg(unix)]
+// Boxes run on Linux only: the vsock listener refuses elsewhere.
+#![cfg(target_os = "linux")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
