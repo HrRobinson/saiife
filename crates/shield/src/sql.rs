@@ -16,9 +16,14 @@
 //!   `col` is a plain column or a date expression over one.
 //! - `GROUP BY` plain columns or date expressions; `HAVING` an AND of
 //!   `aggregate op (:pN | literal)`; `ORDER BY` any item above, ASC/DESC;
-//!   `LIMIT`/`OFFSET` integer literals.
+//!   `LIMIT n` with an integer literal `n >= 1`; no `OFFSET`.
 //! - In an aggregating block a plain column must be grouped, except (in the
 //!   outermost block) a column of the entity table its `key = :pN` pins.
+//! - Entity key and C-G1 FK columns are structural (judged by origin through
+//!   CTEs): only in a key-pair ON, the entity pin, GROUP BY, a plain output
+//!   column, or `COUNT(DISTINCT col)`.
+//! - No two outputs of a block with the same expression, and no `-` or `/`
+//!   whose sides are the same multiset of `+`-joined aggregates.
 //!
 //! Every `match` over the parser's AST ends in a refusal, never in an
 //! accept. Masking routes (CASE, COALESCE, IS NULL, constants, subqueries,
@@ -671,11 +676,16 @@ fn number_ok(s: &str) -> bool {
         && f.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn int_literal(e: &Expr) -> R<()> {
+/// A `LIMIT` count: an integer literal of at least 1 (G2: `LIMIT 0` gives a
+/// false "no rows" for an existing entity).
+fn limit_literal(e: &Expr) -> R<()> {
     match e {
         Expr::Value(v) => match &v.value {
             Value::Number(s, false)
-                if !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit()) =>
+                if !s.is_empty()
+                    && s.len() <= 9
+                    && s.bytes().all(|b| b.is_ascii_digit())
+                    && s.bytes().any(|b| b != b'0') =>
             {
                 Ok(())
             }
@@ -745,6 +755,29 @@ fn key_text(e: &Expr) -> String {
         Expr::Nested(i) => key_text(i),
         _ => e.to_string(),
     }
+}
+
+/// The `+`-joined leaves of a rewritten expression (through parentheses),
+/// as sorted rendered texts: `(a + b) - (b + a)` has equal sides (G3).
+fn plus_leaves(e: &Expr) -> Vec<String> {
+    fn walk(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Nested(i) => walk(i, out),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Plus,
+                right,
+            } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            other => out.push(other.to_string()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    out.sort();
+    out
 }
 
 /// The sources of one block reachable from `start` without edge `skip`
@@ -855,27 +888,18 @@ impl<'a> Walk<'a> {
         let r = self.select(sel, order_by.as_mut(), outer);
         self.agg_seen = saved;
         let out = r?;
-        match limit_clause {
-            None => {}
+        // G2: an OFFSET can skip the entity's only row; none in stage 1.
+        let limit = match limit_clause {
+            None => None,
             Some(LimitClause::LimitOffset {
                 limit,
-                offset,
+                offset: None,
                 limit_by,
-            }) => {
-                if !limit_by.is_empty() {
-                    return construct();
-                }
-                if let Some(l) = limit {
-                    int_literal(l)?;
-                }
-                if let Some(o) = offset {
-                    int_literal(&o.value)?;
-                }
-            }
-            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                int_literal(offset)?;
-                int_literal(limit)?;
-            }
+            }) if limit_by.is_empty() => limit.as_ref(),
+            Some(_) => return construct(),
+        };
+        if let Some(l) = limit {
+            limit_literal(l)?;
         }
         Ok(out)
     }
@@ -1023,6 +1047,12 @@ impl<'a> Walk<'a> {
                 return construct();
             }
         }
+        // G3: two outputs with one expression feed a constant `x - x` later.
+        for (i, a) in items.iter().enumerate() {
+            if items[..i].iter().any(|b| b.1 == a.1) {
+                return construct();
+            }
+        }
 
         let mut pinned = Vec::new();
         if let Some(e) = selection {
@@ -1068,7 +1098,10 @@ impl<'a> Walk<'a> {
                 if o.with_fill.is_some() || o.options.nulls_first.is_some() || !sort_ok {
                     return construct();
                 }
-                self.term(&mut o.expr, &sc, true)?;
+                let it = self.term(&mut o.expr, &sc, true)?;
+                if self.structural(&it) {
+                    return construct();
+                }
             }
         }
 
@@ -1311,7 +1344,7 @@ impl<'a> Walk<'a> {
         })
     }
 
-    /// An entity key or a C-G1 FK column: no literal may pin it (F2).
+    /// An entity key or a C-G1 FK column.
     fn is_key_col(&self, x: &(String, String)) -> bool {
         self.is_int(x)
             && self
@@ -1319,6 +1352,16 @@ impl<'a> Walk<'a> {
                 .entities
                 .iter()
                 .any(|e| Self::is_entity_key(e, x) || self.is_fk_of(e, x))
+    }
+
+    /// G1: a plain column whose origin (through CTEs) is an entity key or a
+    /// C-G1 FK column is structural. It may appear only in a key-pair ON,
+    /// the entity pin (`key = :pN` / `key IN (:pN)`), GROUP BY, a plain
+    /// output column, or `COUNT(DISTINCT col)`. Anywhere else (a comparison
+    /// with a literal, a non-entity parameter or a column; inside another
+    /// aggregate; ORDER BY) it can defeat the pin, so it is refused.
+    fn structural(&self, it: &Item) -> bool {
+        it.kind == Kind::Col && it.origin.as_ref().is_some_and(|o| self.is_key_col(o))
     }
 
     // ---- names ----
@@ -1460,8 +1503,12 @@ impl<'a> Walk<'a> {
                 };
                 let a = self.term(left, sc, alias_ok)?;
                 let b = self.term(right, sc, alias_ok)?;
-                // `x - x`, `x / x` are constants whatever the data (F5).
-                if !a.is_agg() || !b.is_agg() || key_text(left) == key_text(right) {
+                // `x - x`, `x / x` are constants whatever the data (F5), also
+                // as `(a + b) - (b + a)` (G3).
+                let same = key_text(left) == key_text(right)
+                    || (matches!(op, BinaryOperator::Minus | BinaryOperator::Divide)
+                        && plus_leaves(left) == plus_leaves(right));
+                if !a.is_agg() || !b.is_agg() || same {
                     return construct();
                 }
                 let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty));
@@ -1525,6 +1572,11 @@ impl<'a> Walk<'a> {
                 // An output alias is not a column here.
                 let it = self.term(x, sc, false)?;
                 if it.kind != Kind::Col {
+                    return construct();
+                }
+                // G1: a key or FK column is counted distinct, never summed,
+                // compared through MIN/MAX, or counted per row.
+                if self.structural(&it) && !(count && distinct) {
                     return construct();
                 }
                 // F3 (c): a SUM / AVG / COUNT(col) over a value the join
@@ -1680,10 +1732,10 @@ impl<'a> Walk<'a> {
             },
             _ => return construct(),
         };
-        // F2: no literal on an entity key or an FK column (it would defeat
-        // the pin), and no number against text or a string against a number.
-        let key = partner.kind == Kind::Col
-            && partner.origin.as_ref().is_some_and(|o| self.is_key_col(o));
+        // F2 / G1: no literal on an entity key or an FK column (it would
+        // defeat the pin), and no number against text or a string against a
+        // number.
+        let key = self.structural(partner);
         let text = matches!(partner.ty, Some(ColType::Text | ColType::Date));
         let literal_ok = |ok: bool| {
             if ok && !key {
@@ -1741,6 +1793,14 @@ impl<'a> Walk<'a> {
         let Some(p) = self.params.iter().find(|p| p.name == base) else {
             return misuse();
         };
+        // G1: on a key or FK column only the entity pin below is allowed.
+        if self.structural(partner) {
+            match &p.ty {
+                ParamType::Entity { .. } => {}
+                ParamType::Text { .. } => return fail(ErrorClass::ParamType),
+                _ => return misuse(),
+            }
+        }
         let type_ok = match (&p.ty, sfx) {
             (ParamType::Entity { table, .. }, None) => {
                 let Some(ent) = self.schema.entity_for(table) else {

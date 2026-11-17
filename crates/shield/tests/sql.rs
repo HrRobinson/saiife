@@ -137,6 +137,14 @@ fn params() -> Vec<Param> {
             },
         ),
         plain("p5", ParamType::Date),
+        plain("p6", ParamType::Integer),
+        plain(
+            "p7",
+            ParamType::Text {
+                table: "customers".into(),
+                column: "id".into(),
+            },
+        ),
     ]
 }
 
@@ -241,7 +249,7 @@ fn entity_filters_and_count_only() {
     // Arithmetic over COUNTs, a plain list or a bare pinned column is not
     // count-only.
     for sql in [
-        format!("SELECT COUNT(*) / COUNT(i.id) AS r {J}"),
+        format!("SELECT COUNT(*) / COUNT(i.amount) AS r {J}"),
         format!("SELECT i.amount {J}"),
         format!("SELECT COUNT(*) AS n, c.credit_limit {J}"),
     ] {
@@ -290,7 +298,7 @@ fn legitimate_methods_pass() {
             .to_string(),
         "SELECT DISTINCT c.city FROM customers c WHERE c.city IN (:p4) ORDER BY c.city".to_string(),
         "SELECT i.id, i.amount FROM invoices i WHERE i.amount >= 90 AND i.amount < -1.5 \
-         AND i.status IN ('open', 'paid') AND i.issued <> :p5 LIMIT 5 OFFSET 10"
+         AND i.status IN ('open', 'paid') AND i.issued <> :p5 LIMIT 5"
             .to_string(),
         format!("SELECT SUM(i.amount) / COUNT(*) AS mean, AVG(DISTINCT i.amount) AS a {J}"),
     ] {
@@ -307,7 +315,7 @@ fn wide_method_renders_and_prepares() {
          SELECT c.city, COUNT(DISTINCT c.id) AS n, AVG(b.total) AS avg_total, \
          MAX(b.total) AS top, SUM(b.total) / COUNT(*) AS mean \
          FROM customers c JOIN big b ON b.cid = c.id \
-         WHERE c.city = :p4 GROUP BY c.city ORDER BY n DESC LIMIT 10 OFFSET 5";
+         WHERE c.city = :p4 GROUP BY c.city ORDER BY n DESC LIMIT 10";
     let v = ok(sql);
     assert_eq!(v.params_used, vec!["p3", "p2", "p4"]);
     assert!(v.entity_params.is_empty());
@@ -784,7 +792,7 @@ fn bare_columns_only_grouped_or_pinned() {
     for sql in [
         BALANCE,
         "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city",
-        "SELECT c.first_name, c.city, COUNT(i.id) AS n FROM invoices i JOIN customers c \
+        "SELECT c.first_name, c.city, COUNT(i.amount) AS n FROM invoices i JOIN customers c \
          ON c.id = i.customer_id WHERE c.id = :p1",
         "SELECT c.city FROM customers c GROUP BY c.city",
     ] {
@@ -1053,7 +1061,7 @@ fn checks_validate() {
     let ps = params();
     let c = SelfCheck::Equal {
         a: "SELECT COUNT(*) AS n FROM invoices i".into(),
-        b: "SELECT COUNT(i.id) AS n FROM invoices i".into(),
+        b: "SELECT COUNT(i.amount) AS n FROM invoices i".into(),
     };
     match validate_check(&c, &s, &public(), &ps).unwrap() {
         ValidatedCheck::Equal { a, b } => {
@@ -1070,7 +1078,7 @@ fn checks_validate() {
     let bad = SelfCheck::RowsBetween { min: 2, max: 1 };
     assert!(validate_check(&bad, &s, &public(), &ps).is_err());
     let two = SelfCheck::Equal {
-        a: "SELECT COUNT(*) AS n, MAX(i.id) AS m FROM invoices i".into(),
+        a: "SELECT COUNT(*) AS n, MAX(i.amount) AS m FROM invoices i".into(),
         b: "SELECT COUNT(*) AS n FROM invoices i".into(),
     };
     assert_eq!(
@@ -1517,4 +1525,160 @@ fn identical_arith_operands_refused() {
         assert_eq!(refused(sql), ErrorClass::ConstructNotAllowed, "{sql}");
     }
     ok("SELECT SUM(i.amount) - MIN(i.amount) AS z FROM invoices i");
+}
+
+#[test]
+fn key_columns_are_structural() {
+    // G1: an entity key or FK column (by origin, through CTEs) appears only
+    // in a key-pair ON, the entity pin, GROUP BY, a plain output column or
+    // COUNT(DISTINCT col). Anywhere else it can defeat the pin.
+    use ErrorClass::*;
+    let cte = "WITH t AS (SELECT i.customer_id AS cid FROM invoices i GROUP BY i.customer_id)";
+    for (sql, want) in [
+        // Literal inside an aggregate in HAVING (CTE and outermost).
+        (
+            "WITH t AS (SELECT i.customer_id AS cid, COUNT(*) AS k FROM invoices i \
+             GROUP BY i.customer_id HAVING MIN(i.customer_id) = 7) \
+             SELECT COUNT(*) AS n FROM customers c JOIN t ON c.id = t.cid WHERE c.id = :p1"
+                .to_string(),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} HAVING MIN(c.id) = 7"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} HAVING MAX(i.customer_id) > :p6"),
+            ConstructNotAllowed,
+        ),
+        // Non-entity params on a key or FK column.
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.customer_id = :p6"),
+            ParamMisuse,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND c.id = :p6"),
+            ParamMisuse,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.customer_id <> :p6"),
+            ParamMisuse,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.customer_id = :p2"),
+            ParamMisuse,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND c.id IN (:p6)"),
+            ParamMisuse,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.issued >= :p3_from AND i.id < :p6"),
+            ParamMisuse,
+        ),
+        (
+            format!("{cte} SELECT COUNT(*) AS n FROM t WHERE t.cid = :p6"),
+            ParamMisuse,
+        ),
+        // A Text param typed on a key column.
+        (
+            format!("SELECT COUNT(*) AS n {J} AND c.id = :p7"),
+            ParamType,
+        ),
+        // Inside MIN/MAX/SUM/AVG/COUNT(col), directly or through a CTE.
+        (format!("SELECT MIN(c.id) AS m {J}"), ConstructNotAllowed),
+        (
+            format!("SELECT MAX(i.customer_id) AS m {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT SUM(i.id) AS s FROM invoices i".to_string(),
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT AVG(DISTINCT p.invoice_id) AS s FROM payments p".to_string(),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(i.customer_id) AS k {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("{cte} SELECT MAX(t.cid) AS m FROM t"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} HAVING SUM(i.id) > 2"),
+            ConstructNotAllowed,
+        ),
+        // ORDER BY is not a structural place either.
+        (
+            "SELECT i.id, i.amount FROM invoices i ORDER BY i.id LIMIT 3".to_string(),
+            ConstructNotAllowed,
+        ),
+    ] {
+        assert_eq!(refused(&sql), want, "{sql}");
+    }
+    // The structural places stay open.
+    for sql in [
+        format!("SELECT COUNT(DISTINCT i.customer_id) AS k, COUNT(DISTINCT i.id) AS m {J}"),
+        "SELECT c.id, c.first_name, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.id, c.first_name ORDER BY total DESC LIMIT 10"
+            .to_string(),
+        format!(
+            "{cte} SELECT COUNT(*) AS n FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1"
+        ),
+        format!("{cte} SELECT COUNT(DISTINCT t.cid) AS n FROM t"),
+        "SELECT i.id, i.amount FROM invoices i WHERE i.amount > :p2".to_string(),
+    ] {
+        prepares(&ok(&sql).sql);
+    }
+}
+
+#[test]
+fn no_offset_and_limit_at_least_one() {
+    // G2: OFFSET or LIMIT 0 give zero rows for an existing entity.
+    for tail in [
+        "LIMIT 1 OFFSET 1",
+        "LIMIT 0",
+        "LIMIT 00",
+        "LIMIT 1, 1",
+        "LIMIT 5 OFFSET 0",
+    ] {
+        let sql = format!("SELECT COUNT(*) AS n {J} {tail}");
+        assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    for tail in ["LIMIT 1", "LIMIT 10"] {
+        prepares(&ok(&format!("SELECT COUNT(*) AS n {J} {tail}")).sql);
+    }
+}
+
+#[test]
+fn no_constant_differences() {
+    // G3: duplicate output expressions in one block, and `-` / `/` whose
+    // sides are the same multiset of `+`-joined aggregates.
+    for sql in [
+        "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s, SUM(i.amount) AS s2 \
+         FROM invoices i GROUP BY i.customer_id) \
+         SELECT SUM(t.s) - SUM(t.s2) AS z FROM customers c JOIN t ON t.cid = c.id \
+         WHERE c.id = :p1",
+        "SELECT SUM(i.amount) AS a, SUM(i.amount) AS b FROM invoices i",
+        "SELECT i.status, i.status AS s2 FROM invoices i",
+        "SELECT (SUM(i.amount) + MAX(i.amount)) - (MAX(i.amount) + SUM(i.amount)) AS z \
+         FROM invoices i",
+        "SELECT (SUM(i.amount) + MAX(i.amount)) / (MAX(i.amount) + SUM(i.amount)) AS z \
+         FROM invoices i",
+        "SELECT SUM(i.amount) + COUNT(*) + MAX(i.amount) - (MAX(i.amount) + (COUNT(*) + \
+         SUM(i.amount))) AS z FROM invoices i",
+    ] {
+        assert_eq!(refused(sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    for sql in [
+        "SELECT (SUM(i.amount) + MAX(i.amount)) - MIN(i.amount) AS z FROM invoices i",
+        "SELECT (SUM(i.amount) + MAX(i.amount)) - (MAX(i.amount) + MIN(i.amount)) AS z \
+         FROM invoices i",
+        "SELECT SUM(i.amount) AS s, MAX(i.amount) AS m FROM invoices i",
+    ] {
+        prepares(&ok(sql).sql);
+    }
 }
