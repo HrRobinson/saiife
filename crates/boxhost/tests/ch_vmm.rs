@@ -1092,7 +1092,7 @@ fn after_off_runs_once() {
     // the box is created again)
     let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
-    v.destroy(&h).unwrap();
+    destroy_eventually(&v, &h).unwrap();
     assert_eq!(w.events(), ["h.before", "h.off", "h.before", "h.off"]);
 }
 
@@ -1106,13 +1106,77 @@ fn destroy_is_idempotent() {
     assert_eq!(v.status(&h), VmStatus::Gone);
     let h = w.create(&v, "b1");
     v.boot(&h).unwrap();
-    v.destroy(&h).unwrap();
+    // a running VMM: one destroy waits only `DESTROY_WAIT` for the exit, so
+    // it is retried as the manager's tick does (a loaded host may need it)
+    destroy_eventually(&v, &h).unwrap();
     assert!(
         l.exit_status(&h.id).is_some(),
         "destroy waited for the exit"
     );
     assert_eq!(v.status(&h), VmStatus::Gone);
     v.destroy(&h).unwrap();
+    v.destroy(&h).unwrap();
+}
+
+/// `after_off` of hook "h" waits (once) until the test releases it, and
+/// says when it is entered: the window in which a hook has reported Off.
+struct GatedOff {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+impl VmHooks for GatedOff {
+    fn before_boot(&self, _id: &BoxId, _paths: &BoxPaths) -> Result<(), String> {
+        self.log.lock().unwrap().push("g.before".into());
+        Ok(())
+    }
+    fn after_off(&self, _id: &BoxId) {
+        if let Some(tx) = self.entered.lock().unwrap().take() {
+            let _ = tx.send(());
+            let _ = self.release.lock().unwrap().recv_timeout(LONG);
+        }
+        self.log.lock().unwrap().push("g.off".into());
+    }
+    fn restore_refused(&self, _id: &BoxId, _why: &str) {}
+}
+
+/// The reaper marks the run off before `after_off`: a boot made while a
+/// hook is in `after_off` (it has seen the exit, and may have reported Off)
+/// is not refused as "already running"; it waits for that `after_off` and
+/// the next run's `before_boot` follows it. No timing: the hook holds the
+/// window open until the test has made the boot.
+#[test]
+fn a_boot_after_the_off_is_never_already_running() {
+    let w = World::new();
+    let l = w.launcher(&[]);
+    let (etx, erx) = std::sync::mpsc::channel();
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    let gate = Arc::new(GatedOff {
+        entered: Mutex::new(Some(etx)),
+        release: Mutex::new(rrx),
+        log: Arc::clone(&w.log),
+    });
+    let v = w.vmm_with(Arc::clone(&l), vec![gate]);
+    let h = w.create(&v, "b1");
+    v.boot(&h).unwrap();
+    v.stop(&h).unwrap();
+    erx.recv_timeout(LONG).expect("after_off was entered");
+    let (btx, brx) = std::sync::mpsc::channel();
+    {
+        let (v, h) = (Arc::clone(&v), h.clone());
+        std::thread::spawn(move || {
+            let _ = btx.send(v.boot(&h));
+        });
+    }
+    // the old order refused at once: done was stored after after_off
+    match brx.recv_timeout(Duration::from_millis(300)) {
+        Err(_) => {}
+        Ok(r) => panic!("the boot did not wait for after_off: {r:?}"),
+    }
+    rtx.send(()).unwrap();
+    brx.recv_timeout(LONG).expect("the boot returned").unwrap();
+    assert_eq!(w.events(), ["g.before", "g.off", "g.before"]);
+    destroy_eventually(&v, &h).unwrap();
 }
 
 /// R37: after a confirmed exit, destroy removes the box's runtime dir (by
@@ -1333,7 +1397,7 @@ fn tampered_vault_copy_cold_boots() {
     );
     assert!(!w.marker("b1").exists() && !w.snap("b1").exists());
     // an extra file in the copy is refused too
-    v.destroy(&h).unwrap();
+    destroy_eventually(&v, &h).unwrap();
     let h = w.snapshotted(&v, "b1");
     std::fs::write(w.snap("b1").join("extra"), b"x").unwrap();
     v.boot(&h).unwrap();

@@ -1001,14 +1001,18 @@ impl VsockGuest {
         let welcome = HostReply::Welcome {
             proto: PROTO.into(),
         };
+        // Stored BEFORE the Welcome is written: a guest that has read it can
+        // be sent requests at once. An unsent Welcome puts both back.
+        let was_welcomed = run.welcomed.swap(true, Ordering::SeqCst);
+        // a set_up:false hello (a fresh init) ends any restored state
+        let was_restored = run.restored.swap(set_up, Ordering::SeqCst);
         if let Err(e) = write_msg(&mut &*s, &welcome) {
+            run.welcomed.store(was_welcomed, Ordering::SeqCst);
+            run.restored.store(was_restored, Ordering::SeqCst);
             run.log_once("welcome not sent", &format!("welcome not sent: {e}"));
             unclaim();
             return;
         }
-        run.welcomed.store(true, Ordering::SeqCst);
-        // a set_up:false hello (a fresh init) ends any restored state
-        run.restored.store(set_up, Ordering::SeqCst);
         if !set_up {
             let Some(g) = me.upgrade() else {
                 unclaim();

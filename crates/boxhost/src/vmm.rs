@@ -144,7 +144,8 @@ struct Run {
     paths: BoxPaths,
     /// Set by the reaper when it ends.
     done: AtomicBool,
-    /// Set (before `done`) when the reaper saw the VMM exit.
+    /// Set (before `done`, and both before `after_off`) when the reaper
+    /// saw the VMM exit.
     confirmed: AtomicBool,
 }
 
@@ -521,15 +522,22 @@ impl ChVmmInit {
         } else {
             self.ladder(run);
         }
-        if self.gone(&run.id) {
-            self.after_off(&run.id);
-            remove_sockets(&run.paths);
+        // The run is marked off (confirmed, then done) BEFORE `after_off`:
+        // whoever sees the Off a hook reports can boot at once. A boot,
+        // stop or destroy that finds the run off joins this reaper first,
+        // so `after_off` and the socket removal still precede the next run.
+        let confirmed = self.gone(&run.id);
+        if confirmed {
             run.confirmed.store(true, Ordering::SeqCst);
         } else {
             // `ChVmm::settle` confirms it later (status, stop, boot, destroy).
             log(&run.id, "the VMM did not stop; it may still be running");
         }
         run.done.store(true, Ordering::SeqCst);
+        if confirmed {
+            self.after_off(&run.id);
+            remove_sockets(&run.paths);
+        }
     }
 
     /// Undo a failed boot after every hook's `before_boot` succeeded.
@@ -996,7 +1004,7 @@ impl Vmm for ChVmm {
             g.insert(h.id.clone(), Slot::Starting { stop: false })
         };
         if let Some(Slot::Run(e)) = old {
-            let _ = e.reaper.join(); // done: returns at once
+            let _ = e.reaper.join(); // done: returns once its after_off has run
         }
         let r = self.boot_inner(h, &paths).and_then(|()| {
             match self.spawn_reaper(&h.id, paths.clone(), false) {
@@ -1160,7 +1168,7 @@ impl Vmm for ChVmm {
                 None => return Err(VmmError::Failed("the VMM is still stopping".into())),
             }
         };
-        let _ = e.reaper.join(); // done: returns at once
+        let _ = e.reaper.join(); // done: returns once its after_off has run
         self.inner.remove_runtime(&h.id)
     }
 }
