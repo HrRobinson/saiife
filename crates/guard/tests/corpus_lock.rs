@@ -451,8 +451,9 @@ fn many_operands_stay_within_budget() {
 /// production budget (50 ms; they take about 2-13 ms in a debug build), where
 /// one regex compile per operand (~0.2 ms each, 2000 of them) would not be.
 /// A wall-clock bound cannot be an always-on test (a loaded runner failed it),
-/// so this one is run by hand, on a quiet machine:
-/// `cargo test -p saiife-guard --test corpus_lock -- --ignored many_operands_cost_little_time`.
+/// so this one is run by hand, on a quiet machine, with
+/// `scripts/bench-check.sh --latency-tests` (which is:
+/// `cargo test -p saiife-guard --test corpus_lock -- --ignored many_operands_cost_little_time`).
 /// The best of five runs of each command is the one bounded.
 #[test]
 #[ignore = "a wall-clock bound: run it on a quiet machine, never under CI load"]

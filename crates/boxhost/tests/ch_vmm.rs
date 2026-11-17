@@ -1716,7 +1716,7 @@ fn destroy_is_bounded_and_a_retry_finishes_it() {
 /// R41's latency budget itself: destroy returns in about a second (its
 /// `DESTROY_WAIT`) while the VMM keeps stopping. A wall-clock bound, so it
 /// is not part of the always-on suite; run it on a quiet host with
-/// `cargo test -p saiife-boxhost --features fake --test ch_vmm -- --ignored`.
+/// `scripts/bench-check.sh --latency-tests` (Linux only).
 #[test]
 #[ignore = "wall-clock latency budget; fails on a loaded host"]
 fn destroy_returns_within_its_budget() {
