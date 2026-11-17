@@ -10,6 +10,9 @@ pub enum GuestEvent {
     Ready,
     Activity,
     TurnFinished,
+    /// FU1: the in-box guard hook ran this many checks (the guest's word: a
+    /// signal, never proof). Counts, so merged by sum, never rate limited.
+    GuardChecks(u32),
     Exited,
 }
 

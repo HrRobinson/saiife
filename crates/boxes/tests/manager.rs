@@ -9,7 +9,8 @@ use common::{id, template_sized, world, world_with, World};
 use saiife_boxes::capacity::{self, Committed};
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::{
-    Change, DiskPlace, DiskPlacer, GcReport, Manager, SpawnArgs, BOOT_TIMEOUT_SECS, DONE_IDLE_SECS,
+    Change, DiskPlace, DiskPlacer, GcReport, GuardCounts, Manager, SpawnArgs, BOOT_TIMEOUT_SECS,
+    DONE_IDLE_SECS,
 };
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::{Login, Size};
@@ -586,6 +587,98 @@ fn turn_finished_then_idle_is_done() {
     let g = w.mgr.get(&i).unwrap();
     assert!(g.vm_on);
     w.assert_saved(&i);
+}
+
+/// FU1: GuardChecks only counts (saturating); it is not activity: no idle
+/// or Done clock moves.
+#[test]
+fn guard_checks_count_and_are_not_activity() {
+    let w = world(1);
+    let i = running(&w, "a");
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    let before = w.mgr.get(&i).unwrap();
+    w.advance(30);
+    assert_eq!(
+        w.mgr.guest_event(&i, GuestEvent::GuardChecks(3)).unwrap(),
+        None
+    );
+    w.mgr
+        .guest_event(&i, GuestEvent::GuardChecks(u32::MAX))
+        .unwrap();
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!(r.guard_checks, 3 + u64::from(u32::MAX));
+    assert_eq!(r.last_activity, before.last_activity);
+    assert_eq!(r.turn_finished_at, before.turn_finished_at);
+    assert_eq!(r.updated_at, before.updated_at);
+    assert_eq!(r.turns, 1);
+    assert!(!r.guard_skipped);
+    // The next ordinary save carries the in-memory count.
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    assert_eq!(w.mgr.get(&i).unwrap().turns, 2);
+    w.assert_saved(&i);
+    assert_eq!(w.on_disk(&i).unwrap().guard_checks, 3 + u64::from(u32::MAX));
+}
+
+/// FU1 (review I1): a flood of GuardChecks saves the record once (the
+/// 0 -> nonzero step the flag depends on); the count stays exact in memory.
+#[test]
+fn guard_check_flood_saves_the_record_once() {
+    let w = world(1);
+    let i = running(&w, "a");
+    let file = Store::open(w.root.clone())
+        .unwrap()
+        .box_dir(&i)
+        .join("box.json");
+    w.mgr.guest_event(&i, GuestEvent::GuardChecks(1)).unwrap();
+    assert_eq!(w.on_disk(&i).unwrap().guard_checks, 1);
+    let saved = std::fs::read(&file).unwrap();
+    for _ in 0..1000 {
+        w.mgr.guest_event(&i, GuestEvent::GuardChecks(2)).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        saved,
+        "no save after the first"
+    );
+    assert_eq!(w.mgr.get(&i).unwrap().guard_checks, 2001);
+}
+
+/// FU1: a box that changed files with no guard check is flagged, once, and
+/// only once it is Done or Landed (review M2: a running box's review may
+/// beat a guard check still in flight).
+#[test]
+fn note_review_flags_changes_without_guard_checks_once() {
+    let w = world(2);
+    let i = running(&w, "a");
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    // Running: not judged yet.
+    assert_eq!(w.mgr.note_review(&i, 2), Ok(None));
+    assert!(!w.mgr.get(&i).unwrap().guard_skipped);
+    w.mgr.done(&i).unwrap();
+    // No changes: never flagged.
+    assert_eq!(w.mgr.note_review(&i, 0), Ok(None));
+    assert!(!w.mgr.get(&i).unwrap().guard_skipped);
+    assert_eq!(
+        w.mgr.note_review(&i, 2),
+        Ok(Some(GuardCounts {
+            guard_checks: 0,
+            turns: 1
+        }))
+    );
+    assert!(w.mgr.get(&i).unwrap().guard_skipped);
+    w.assert_saved(&i);
+    assert_eq!(w.mgr.note_review(&i, 2), Ok(None));
+    // Sticky: a later check does not clear it.
+    w.mgr.guest_event(&i, GuestEvent::GuardChecks(1)).unwrap();
+    assert_eq!(w.mgr.note_review(&i, 2), Ok(None));
+    assert!(w.mgr.get(&i).unwrap().guard_skipped);
+    // A box whose guard reported checks is not flagged.
+    let j = running(&w, "b");
+    w.mgr.guest_event(&j, GuestEvent::GuardChecks(1)).unwrap();
+    w.mgr.done(&j).unwrap();
+    assert_eq!(w.mgr.note_review(&j, 5), Ok(None));
+    assert!(!w.mgr.get(&j).unwrap().guard_skipped);
+    assert_eq!(w.mgr.note_review(&id("b9"), 1), Err(BoxError::NotFound));
 }
 
 #[test]
@@ -1221,7 +1314,14 @@ fn list_order_matches_plan_28() {
 fn templates_are_the_init_templates() {
     let w = world(1);
     let names: Vec<String> = w.mgr.templates().into_iter().map(|t| t.name).collect();
-    assert_eq!(names, vec!["claude-code".to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            "claude-code".to_string(),
+            "codex".to_string(),
+            "gemini".to_string()
+        ]
+    );
 }
 
 #[test]

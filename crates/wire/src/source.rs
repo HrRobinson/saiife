@@ -55,6 +55,11 @@ pub enum BoxState {
     Discarded,
 }
 
+/// FU1: what a box's `guard_skipped` flag means. The one text for the
+/// daemon's audit record, `saiife box diff` and (mirrored, checked by
+/// `crates/link/tests/assets.rs`) the Workspace Review badge.
+pub const GUARD_SKIPPED_WHY: &str = "the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BoxInfo {
@@ -69,6 +74,10 @@ pub struct BoxInfo {
     pub updated_at: u64,
     pub queue_pos: Option<u32>,
     pub lands: u32,
+    /// FU1: the box changed files while its in-box guard reported no
+    /// checks (an advisory signal). Absent in older answers, so false.
+    #[serde(default)]
+    pub guard_skipped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,6 +241,18 @@ pub struct Template {
     /// refuses it).
     #[serde(default)]
     pub credential_in_box: bool,
+    /// `claude-code`, `codex` or `gemini` (plan 42 D8); empty from an old daemon.
+    #[serde(default)]
+    pub agent: String,
+    /// The agent is a beta template; the label comes only from this.
+    #[serde(default)]
+    pub beta: bool,
+    /// `gateway` or `in_box`: how the model credential reaches the box.
+    #[serde(default)]
+    pub credential: String,
+    /// A notice to show with the template (Gemini key billing); empty if none.
+    #[serde(default)]
+    pub notice: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +552,7 @@ mod tests {
                 updated_at: 3,
                 queue_pos: None,
                 lands: 0,
+                guard_skipped: false,
             }],
             load: Some(Load {
                 cpu_pct: 7,
@@ -542,8 +564,18 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&o).unwrap(),
-            r#"{"boxes":[{"id":"b-1","state":"running","template":"rust","repo":"erp","task":"fix it","created_at":1,"started_at":2,"updated_at":3,"queue_pos":null,"lands":0}],"load":{"cpu_pct":7,"mem_used_mb":100,"mem_total_mb":200},"slots_total":4,"slots_free":3}"#
+            r#"{"boxes":[{"id":"b-1","state":"running","template":"rust","repo":"erp","task":"fix it","created_at":1,"started_at":2,"updated_at":3,"queue_pos":null,"lands":0,"guard_skipped":false}],"load":{"cpu_pct":7,"mem_used_mb":100,"mem_total_mb":200},"slots_total":4,"slots_free":3}"#
         );
+    }
+
+    /// FU1: an answer from before `guard_skipped` still parses, as false.
+    #[test]
+    fn box_info_without_guard_skipped_parses() {
+        let b: BoxInfo = serde_json::from_str(
+            r#"{"id":"b-1","state":"running","template":"rust","repo":"erp","task":"t","created_at":1,"started_at":null,"updated_at":3,"queue_pos":null,"lands":0}"#,
+        )
+        .unwrap();
+        assert!(!b.guard_skipped);
     }
 
     #[test]

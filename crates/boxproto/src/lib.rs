@@ -3,6 +3,7 @@
 
 pub mod delta;
 pub mod frame;
+pub mod launch;
 pub mod manifest;
 pub mod msg;
 pub mod ports;

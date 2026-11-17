@@ -39,7 +39,7 @@ use crate::guest::{GuestError, GuestEvent, GuestLink};
 use crate::state::{holds_capacity, transition, Event};
 use crate::store::{BoxRecord, Store};
 use crate::template::{
-    BoxTemplate, ImageRef, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
+    AgentKind, BoxTemplate, ImageRef, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
 };
 use crate::vmm::{VmSpec, VmStatus, Vmm, VmmError};
 
@@ -112,6 +112,13 @@ pub struct SpawnArgs {
     /// The base manifest of that disk, in the same dir; it goes to its
     /// [`DiskPlace`] too. Both or neither.
     pub base_manifest: Option<PathBuf>,
+}
+
+/// FU1: a box's guard counts when its `guard_skipped` flag was set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardCounts {
+    pub guard_checks: u64,
+    pub turns: u64,
 }
 
 /// One state change, for the audit log. `from == to` is a change too when the
@@ -587,6 +594,9 @@ impl Manager {
             pending_prompt: (!a.task.is_empty()).then(|| a.task.clone()),
             error: None,
             image: None,
+            guard_checks: 0,
+            turns: 0,
+            guard_skipped: false,
         };
         if let Err(e) = g.save_new(r) {
             self.release(g, &id);
@@ -628,12 +638,12 @@ impl Manager {
             }
             let admitted = out.len();
             out.push(change(&r, from, "admitted"));
+            let t = self.template(&r.template);
             let spec = VmSpec {
                 id: r.id.clone(),
                 size: r.size,
-                image: self
-                    .template(&r.template)
-                    .map_or(ImageRef::Default, |t| t.image.clone()),
+                image: t.map_or(ImageRef::Default, |t| t.image.clone()),
+                agent: t.map_or(AgentKind::ClaudeCode, |t| t.agent),
                 dir: g.store.box_dir(&r.id),
             };
             let booted = self.vmm.create(&spec).and_then(|h| {
@@ -961,7 +971,9 @@ impl Manager {
     }
 
     /// Ready and Exited are transitions (`Some(change)`); Activity and
-    /// TurnFinished only update the idle clocks.
+    /// TurnFinished only update the idle clocks (TurnFinished also counts
+    /// `turns`); GuardChecks only adds to `guard_checks` (FU1: not activity,
+    /// so no clock moves).
     pub fn guest_event(&self, id: &BoxId, ev: GuestEvent) -> Result<Option<Change>, BoxError> {
         self.guest_event_with(id, ev, true)
     }
@@ -980,6 +992,18 @@ impl Manager {
         let mut r = g.get(id)?.clone();
         let from = r.state;
         let mut send = None;
+        if let GuestEvent::GuardChecks(n) = ev {
+            // Saved only on the first check (the flag reads `== 0`); later
+            // counts stay in memory and ride on the record's next save, so
+            // a flooding guest drives no record writes (review I1).
+            let first = r.guard_checks == 0;
+            r.guard_checks = r.guard_checks.saturating_add(u64::from(n));
+            if first {
+                return g.put(r).map(|()| None);
+            }
+            g.records.insert(r.id.clone(), r);
+            return Ok(None);
+        }
         let out = match ev {
             GuestEvent::Ready => {
                 r.state = transition(from, Event::Ready)?;
@@ -1000,8 +1024,10 @@ impl Manager {
             }
             GuestEvent::TurnFinished => {
                 r.turn_finished_at = Some(now);
+                r.turns = r.turns.saturating_add(1);
                 None
             }
+            GuestEvent::GuardChecks(_) => None,
             GuestEvent::Exited => {
                 r.state = transition(from, Event::Finish)?;
                 Some(change(&r, from, "exited"))
@@ -1013,6 +1039,34 @@ impl Manager {
         self.deliver(send);
         saved?;
         Ok(out)
+    }
+
+    /// FU1: after a fresh review of the box: when it changed files
+    /// (`changed_files > 0`) and its in-box guard reported no check over its
+    /// whole life since spawn (counters never reset, so one early check masks
+    /// a later disable), set the sticky `guard_skipped` flag. Judged only
+    /// once the box is Done or Landed: a review of a running box may beat a
+    /// guard_checks still in flight (review M2). `Some(counts)` only the
+    /// first time (the caller audits it once, with these counts, read in the
+    /// same locked step). Advisory: lands go on.
+    pub fn note_review(
+        &self,
+        id: &BoxId,
+        changed_files: usize,
+    ) -> Result<Option<GuardCounts>, BoxError> {
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        let settled = matches!(r.state, BoxState::Done | BoxState::Landed);
+        if !settled || r.guard_skipped || changed_files == 0 || r.guard_checks > 0 {
+            return Ok(None);
+        }
+        r.guard_skipped = true;
+        let c = GuardCounts {
+            guard_checks: r.guard_checks,
+            turns: r.turns,
+        };
+        g.put(r)?;
+        Ok(Some(c))
     }
 
     /// Add `note` to the box's `error` (`"<error>; <note>"`, or `note` alone).

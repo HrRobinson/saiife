@@ -31,6 +31,11 @@ pub enum Event {
     Started,
     Activity,
     TurnFinished,
+    /// FU1: the in-box guard hook ran `n` checks (n >= 1). A signal only:
+    /// the guest, and an agent with sudo, can forge it.
+    GuardChecks {
+        n: u32,
+    },
     Exited {
         code: Option<i32>,
     },
@@ -53,6 +58,11 @@ enum EventDef {
     Started,
     Activity,
     TurnFinished,
+    /// FU1: the in-box guard hook ran `n` checks (n >= 1). A signal only:
+    /// the guest, and an agent with sudo, can forge it.
+    GuardChecks {
+        n: u32,
+    },
     Exited {
         code: Option<i32>,
     },
@@ -62,7 +72,11 @@ impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = serde_json::Value::deserialize(d)?;
         no_extra_keys(&v, &["started", "activity", "turn_finished"]).map_err(D::Error::custom)?;
-        EventDef::deserialize(v).map_err(D::Error::custom)
+        let e = EventDef::deserialize(v).map_err(D::Error::custom)?;
+        if e == (Event::GuardChecks { n: 0 }) {
+            return Err(D::Error::custom("guard_checks n must be at least 1"));
+        }
+        Ok(e)
     }
 }
 
@@ -179,6 +193,9 @@ pub const MAX_FILES: usize = 64;
 /// The most bytes of one setup file's text.
 pub const MAX_FILE_TEXT: usize = 256 * 1024;
 const FILE_ROOTS: [&str; 2] = ["/home/agent/", "/etc/saiife-guest/"];
+/// Where the agent may run: the repo, or (Gemini CLI, plan 42 R9/R11) its
+/// baked root-owned home with the repo as an include directory.
+pub const AGENT_CWDS: [&str; 2] = ["/work", "/opt/saiife-gemini-home"];
 
 fn env_name_ok(n: &str) -> bool {
     let b = n.as_bytes();
@@ -213,8 +230,8 @@ impl Setup {
         if self.agent.user != "agent" {
             return Err("agent user must be agent".into());
         }
-        if self.agent.cwd != "/work" {
-            return Err("agent cwd must be /work".into());
+        if !AGENT_CWDS.contains(&self.agent.cwd.as_str()) {
+            return Err("agent cwd must be /work or /opt/saiife-gemini-home".into());
         }
         if self.env.len() > MAX_ENV {
             return Err(format!("more than {MAX_ENV} environment variables"));
@@ -222,6 +239,14 @@ impl Setup {
         for (k, v) in &self.env {
             if !env_name_ok(k) {
                 return Err("bad environment variable name".into());
+            }
+            // COORD-7: the agent's env is an allowlist; the host may add
+            // only an agent's model variables (no loader, shell or git
+            // variable can ride in).
+            if !crate::launch::is_model_var(k) {
+                return Err(format!(
+                    "environment variable {k} is not an agent model variable"
+                ));
             }
             if v.contains('\0') || v.contains('\n') {
                 return Err(format!("environment variable {k} has NUL or newline"));
@@ -275,7 +300,7 @@ mod tests {
                 user: "agent".into(),
                 cwd: "/work".into(),
             },
-            env: vec![("A".into(), "b".into())],
+            env: vec![("OPENAI_API_KEY".into(), "b".into())],
             files: vec![SetupFile {
                 path: "/home/agent/x".into(),
                 mode: 0o644,
@@ -316,6 +341,10 @@ mod tests {
         pin(Event::Activity, json!({"t":"activity"}));
         pin(Event::TurnFinished, json!({"t":"turn_finished"}));
         pin(
+            Event::GuardChecks { n: 2 },
+            json!({"t":"guard_checks","n":2}),
+        );
+        pin(
             Event::Exited { code: Some(1) },
             json!({"t":"exited","code":1}),
         );
@@ -336,7 +365,7 @@ mod tests {
         pin(
             Request::Setup(setup()),
             json!({"t":"setup","agent":{"command":["claude"],"user":"agent","cwd":"/work"},
-                   "env":[["A","b"]],"files":[{"path":"/home/agent/x","mode":420,"text":"hi","keep_existing":false}],
+                   "env":[["OPENAI_API_KEY","b"]],"files":[{"path":"/home/agent/x","mode":420,"text":"hi","keep_existing":false}],
                    "rows":40,"cols":120}),
         );
         pin(
@@ -365,6 +394,18 @@ mod tests {
         );
     }
 
+    /// FU1: a guard_checks event counts at least one check.
+    #[test]
+    fn guard_checks_zero_is_refused() {
+        assert!(serde_json::from_value::<Event>(json!({"t":"guard_checks","n":0})).is_err());
+        assert!(serde_json::from_value::<Event>(json!({"t":"guard_checks"})).is_err());
+        assert!(serde_json::from_value::<Event>(json!({"t":"guard_checks","n":-1})).is_err());
+        assert_eq!(
+            serde_json::from_value::<Event>(json!({"t":"guard_checks","n":1})).unwrap(),
+            Event::GuardChecks { n: 1 }
+        );
+    }
+
     #[test]
     fn unknown_field_is_refused() {
         // every variant, with an extra key, must be refused by its own enum
@@ -378,6 +419,7 @@ mod tests {
         assert!(serde_json::from_value::<Event>(e("activity", json!({}))).is_err());
         assert!(serde_json::from_value::<Event>(e("turn_finished", json!({}))).is_err());
         assert!(serde_json::from_value::<Event>(e("exited", json!({"code":1}))).is_err());
+        assert!(serde_json::from_value::<Event>(e("guard_checks", json!({"n":1}))).is_err());
         assert!(serde_json::from_value::<Event>(e(
             "hello",
             json!({"proto":"p","guest":"g","uptime_ms":1,"set_up":true})
@@ -425,18 +467,81 @@ mod tests {
         bad(&|s| s.agent.command = vec!["a\0b".into()]);
         bad(&|s| s.agent.user = "root".into());
         bad(&|s| s.agent.cwd = "/tmp".into());
+        for cwd in [
+            "/",
+            "/home",
+            "/home/agent",
+            "/home/agent/",
+            "/home/agent/x",
+            "/opt",
+            "/opt/saiife-gemini-home/",
+            "/opt/saiife-gemini-home/x",
+            "/work/",
+            "/work/x",
+            "/etc",
+        ] {
+            bad(&|s| s.agent.cwd = cwd.into());
+        }
+        let mut home = setup();
+        home.agent.cwd = "/opt/saiife-gemini-home".into();
+        assert_eq!(home.check(), Ok(()));
         for n in ["a", "1A", "A-B", "", &"A".repeat(65)] {
             bad(&|s| s.env = vec![(n.into(), "v".into())]);
         }
+        bad(&|s| s.env = vec![("OPENAI_API_KEY".into(), "a\nb".into())]);
+        bad(&|s| s.env = vec![("OPENAI_API_KEY".into(), "a\0b".into())]);
+        bad(&|s| {
+            s.env = (0..65)
+                .map(|_| ("OPENAI_API_KEY".to_string(), String::new()))
+                .collect()
+        });
         let mut s = setup();
-        s.env = vec![("_A9".into(), "v".into()), ("A".repeat(64), "v".into())];
+        s.env = (0..64)
+            .map(|_| ("OPENAI_API_KEY".to_string(), String::new()))
+            .collect();
         assert_eq!(s.check(), Ok(()));
-        bad(&|s| s.env = vec![("A".into(), "a\nb".into())]);
-        bad(&|s| s.env = vec![("A".into(), "a\0b".into())]);
-        bad(&|s| s.env = (0..65).map(|i| (format!("V{i}"), String::new())).collect());
+        // COORD-7: only an agent's model variables; every agent's are fine
         let mut s = setup();
-        s.env = (0..64).map(|i| (format!("V{i}"), String::new())).collect();
+        s.env = crate::launch::MODEL_ENV
+            .iter()
+            .flat_map(|(_, vars)| vars.iter())
+            .map(|v| (v.to_string(), "v".to_string()))
+            .collect();
         assert_eq!(s.check(), Ok(()));
+        for n in [
+            "_A9",
+            "A",
+            "FOO",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "PROMPT_COMMAND",
+            "PYTHONPATH",
+            "PATH",
+            "HOME",
+            "SHELL",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SSH_COMMAND",
+            "GIT_TEMPLATE_DIR",
+            "SSH_SK_PROVIDER",
+            "HTTPS_PROXY",
+        ] {
+            let mut s = setup();
+            s.env.push((n.into(), "v".into()));
+            assert_eq!(
+                s.check(),
+                Err(format!(
+                    "environment variable {n} is not an agent model variable"
+                )),
+                "{n}"
+            );
+        }
         for p in [
             "rel/x",
             "/etc/passwd",

@@ -66,6 +66,10 @@ fn templates() -> Vec<Template> {
             has_egress: false,
             login: "api-key".into(),
             credential_in_box: false,
+            agent: "claude-code".into(),
+            beta: false,
+            credential: "gateway".into(),
+            notice: String::new(),
         },
         Template {
             name: "claude-gh".into(),
@@ -74,6 +78,10 @@ fn templates() -> Vec<Template> {
             has_egress: true,
             login: "api-key".into(),
             credential_in_box: false,
+            agent: "claude-code".into(),
+            beta: false,
+            credential: "gateway".into(),
+            notice: String::new(),
         },
     ]
 }
@@ -255,6 +263,7 @@ impl FakeState {
             updated_at: now,
             queue_pos,
             lands: 0,
+            guard_skipped: false,
         });
     }
 

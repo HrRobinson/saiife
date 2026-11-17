@@ -1,0 +1,35 @@
+name = "gemini"
+description = "Google Gemini CLI in its TUI (beta)"
+
+[agent]
+kind = "gemini"
+# Plan 42 R9/R11: Gemini runs in its baked root-owned home
+# /opt/saiife-gemini-home (no /work settings, .env or project agents load)
+# and reaches the repo as an include directory.
+command = ["gemini", "--include-directories", "/work"]
+login = "api-key"
+credential = "gemini"
+
+[image]
+base = "default"
+
+[size]
+vcpus = 2
+mem_mib = 4096
+mem_max_mib = 8192
+disk_gib = 30
+
+[egress]
+allow = []
+
+[secrets]
+names = []
+
+[rules]
+profile = "default"
+
+[touch]
+classes = ["land", "push_protected"]
+
+[idle]
+stop_after_mins = 120

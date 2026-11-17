@@ -903,6 +903,38 @@ fn diff_output_is_sanitized() {
     assert_eq!(Value::Object(hostile_diff()), v);
 }
 
+/// FU1: a flagged box's `box diff` warns first (text); `--json` carries
+/// the guard object; an unflagged one prints no warning.
+#[test]
+fn diff_warns_when_guard_skipped() {
+    let w = world();
+    let mut d = hostile_diff();
+    d.insert(
+        "guard".into(),
+        json!({"skipped": true, "checks": 0, "turns": 2}),
+    );
+    w.stub.0.lock().unwrap().diff = d.clone();
+    let o = w.bx(&["diff", "b1"]);
+    assert_eq!(code(&o), 0, "{}{}", out(&o), err(&o));
+    let first = out(&o).lines().next().unwrap_or("").to_string();
+    assert!(
+        first.starts_with("warning: guard_skipped: the box changed files"),
+        "{first}"
+    );
+    let v: Value = serde_json::from_str(&out(&w.bx(&["diff", "b1", "--json"]))).unwrap();
+    assert_eq!(
+        v["guard"],
+        json!({"skipped": true, "checks": 0, "turns": 2})
+    );
+    d.insert(
+        "guard".into(),
+        json!({"skipped": false, "checks": 5, "turns": 2}),
+    );
+    w.stub.0.lock().unwrap().diff = d;
+    let o = w.bx(&["diff", "b1"]);
+    assert!(!out(&o).contains("guard_skipped"), "{}", out(&o));
+}
+
 #[test]
 fn push_to_local_remote() {
     let w = world();

@@ -1,5 +1,6 @@
 //! The events connection to the host: the hello, and the thread that reports
-//! `started` (G1), `activity` (G2), `turn_finished` and `exited`, re-helloing
+//! `started` (G1), `activity` (G2), `turn_finished`, `guard_checks` (FU1) and
+//! `exited`, re-helloing
 //! (G3) when the connection goes away.
 #![cfg(target_os = "linux")]
 
@@ -11,7 +12,7 @@ use saiife_boxproto::PROTO;
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,7 +22,7 @@ const TICK: Duration = Duration::from_millis(50);
 /// How often it checks that the host is still there.
 const PROBE_EVERY: Duration = Duration::from_millis(500);
 /// Unsent events kept across a lost link (they are few: activity is
-/// throttled and turn_finished coalesced).
+/// throttled, turn_finished and guard_checks coalesced).
 const MAX_PENDING: usize = 64;
 /// Write deadline on the events connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,12 +54,15 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
-/// What the PTY pump and local.sock raise for the events thread. Flags, not a
-/// queue: a flood of output or of `turn_finished` costs nothing.
+/// What the PTY pump and local.sock raise for the events thread. Flags and a
+/// counter, not a queue: a flood of output, `turn_finished` or `guard_checks`
+/// costs nothing.
 #[derive(Default)]
 pub struct Signals {
     output: AtomicBool,
     turn_finished: AtomicBool,
+    /// FU1: guard checks reported since the last tick (saturating).
+    guard_checks: AtomicU32,
 }
 
 impl Signals {
@@ -68,6 +72,36 @@ impl Signals {
     pub fn turn_finished(&self) {
         self.turn_finished.store(true, Ordering::Relaxed);
     }
+    /// Adds `n` guard checks (saturating at `u32::MAX`).
+    pub fn guard_checks(&self, n: u32) {
+        let mut c = self.guard_checks.load(Ordering::Relaxed);
+        while let Err(now) = self.guard_checks.compare_exchange_weak(
+            c,
+            c.saturating_add(n),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            c = now;
+        }
+    }
+    /// The guard checks since the last call, and zero again.
+    pub fn take_guard_checks(&self) -> u32 {
+        self.guard_checks.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Queues an event; a `guard_checks` merges into one already pending
+/// (saturating sum), so a flood never grows the queue.
+fn push_pending(pending: &mut VecDeque<Event>, ev: Event) {
+    if let Event::GuardChecks { n } = ev {
+        for p in pending.iter_mut() {
+            if let Event::GuardChecks { n: have } = p {
+                *have = have.saturating_add(n);
+                return;
+            }
+        }
+    }
+    pending.push_back(ev);
 }
 
 /// What the control side and the agent's waiter tell the events thread.
@@ -244,11 +278,17 @@ pub fn run(
         if signals.turn_finished.swap(false, Ordering::Relaxed) {
             out.push(Event::TurnFinished);
         }
+        let checks = signals.take_guard_checks();
+        if checks > 0 {
+            out.push(Event::GuardChecks { n: checks });
+        }
         if let Some(e) = exited {
             st.spawned = None;
             out.push(e);
         }
-        pending.extend(out);
+        for e in out {
+            push_pending(&mut pending, e);
+        }
         while pending.len() > MAX_PENDING {
             pending.pop_front();
         }
@@ -276,5 +316,42 @@ pub fn run(
             }
             pending.pop_front();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_checks_coalesce_in_the_pending_queue() {
+        let mut q = VecDeque::new();
+        push_pending(&mut q, Event::TurnFinished);
+        for _ in 0..1000 {
+            push_pending(&mut q, Event::GuardChecks { n: 2 });
+        }
+        push_pending(&mut q, Event::Exited { code: Some(0) });
+        push_pending(&mut q, Event::GuardChecks { n: u32::MAX });
+        assert_eq!(
+            Vec::from(q),
+            vec![
+                Event::TurnFinished,
+                Event::GuardChecks { n: u32::MAX },
+                Event::Exited { code: Some(0) },
+            ]
+        );
+    }
+
+    #[test]
+    fn guard_checks_signal_sums_and_saturates() {
+        let s = Signals::default();
+        assert_eq!(s.take_guard_checks(), 0);
+        s.guard_checks(3);
+        s.guard_checks(4);
+        assert_eq!(s.take_guard_checks(), 7);
+        assert_eq!(s.take_guard_checks(), 0);
+        s.guard_checks(u32::MAX);
+        s.guard_checks(9);
+        assert_eq!(s.take_guard_checks(), u32::MAX);
     }
 }

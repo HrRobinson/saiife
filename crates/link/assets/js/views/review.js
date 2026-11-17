@@ -35,6 +35,23 @@ function testsLine(t) {
   );
 }
 
+// FU1: the box changed files while its in-box guard reported no checks.
+// Verbatim saiife_wire::source::GUARD_SKIPPED_WHY (crates/link/tests/assets.rs checks it).
+export const GUARD_SKIPPED =
+  "the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)";
+
+// A warning badge when the daemon flagged the box; nothing otherwise.
+function guardNote(g) {
+  if (!g || g.skipped !== true) return null;
+  return h(
+    "p",
+    { class: "banner", role: "note" },
+    h("span", { class: "badge", title: GUARD_SKIPPED }, "guard skipped"),
+    " ",
+    GUARD_SKIPPED.charAt(0).toUpperCase() + GUARD_SKIPPED.slice(1),
+  );
+}
+
 // The digest, short; a tap shows all of it.
 function digest(sha) {
   let open = false;
@@ -161,7 +178,9 @@ export function view(client, id, { credentials } = {}) {
     const d = a.result || {};
     sha = typeof d.diff_sha256 === "string" ? d.diff_sha256 : null;
     const files = Array.isArray(d.files) ? d.files : [];
+    const guard = guardNote(d.guard);
     const kids = [
+      ...(guard ? [guard] : []),
       h("p", {}, `Base commit `, h("code", {}, short(visible(d.base_commit))), " · Diff ", sha === null ? "?" : digest(sha)),
       h("p", {}, `${plural(files.length, "file")} changed`),
       h("ul", { class: "files" }, files.map(fileRow)),

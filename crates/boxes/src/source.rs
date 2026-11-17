@@ -97,6 +97,7 @@ pub fn info(r: &BoxRecord, queue_pos: Option<u32>) -> BoxInfo {
         updated_at: r.updated_at,
         queue_pos,
         lands: r.lands,
+        guard_skipped: r.guard_skipped,
     }
 }
 

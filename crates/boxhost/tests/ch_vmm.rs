@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use saiife_boxes::template::{ImageRef, Size};
+use saiife_boxes::template::{AgentKind, ImageRef, Size};
 use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 use saiife_boxhost::launch::{
     argv, read_spec, Boot, ChildLauncher, FakeUnitBus, Launcher, UnitLauncher,
@@ -16,7 +16,10 @@ use saiife_boxhost::layout::Layout;
 use saiife_boxhost::paths::BoxPaths;
 use saiife_boxhost::pins::sha256_file;
 use saiife_boxhost::tools::Tools;
-use saiife_boxhost::vmm::{ChVmm, ChVmmInit, ImageResolver, ResolvedImage, StopTimes, VmHooks};
+use saiife_boxhost::vmm::{
+    missing_agent, ChVmm, ChVmmInit, ImageResolver, ResolvedImage, StopTimes, VmHooks,
+    STALE_CLAUDE_IMAGE,
+};
 use saiife_wire::source::BoxId;
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -119,6 +122,7 @@ impl World {
             boot: Boot::Firmware {
                 fw: root.join("v/CLOUDHV.fd"),
             },
+            agents: vec!["claude-code".into()],
         };
         World {
             records: root.join("r"),
@@ -314,6 +318,7 @@ impl World {
                 ..Size::default()
             },
             image: ImageRef::Default,
+            agent: AgentKind::ClaudeCode,
             dir,
         }
     }
@@ -474,6 +479,91 @@ fn create_refuses_small_disk() {
     assert!(!w.paths("b1").vm_json().exists());
     assert!(!w.paths("b1").repo_disk().exists());
     assert_eq!(std::fs::read(spec.dir.join("repo.img")).unwrap(), b"repo");
+}
+
+#[test]
+fn boot_refuses_missing_agent() {
+    let w = World::new();
+    assert_eq!(w.image.agents, vec!["claude-code".to_string()]);
+    let (v, _l) = w.vmm(&[]);
+    // the record dir only, as the store makes it: create makes the runtime
+    // dir, and must not get that far
+    let dir = w.records.join("b1");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("repo.img"), b"repo").unwrap();
+    for agent in [AgentKind::Codex, AgentKind::Gemini] {
+        let spec = VmSpec {
+            id: BoxId::parse("b1").unwrap(),
+            size: Size {
+                disk_gib: 8,
+                ..Size::default()
+            },
+            image: ImageRef::Default,
+            agent,
+            dir: dir.clone(),
+        };
+        let e = failed(v.create(&spec));
+        assert_eq!(e, missing_agent(&format!("base-{HEX}"), agent));
+        assert_eq!(
+            e,
+            format!(
+                "the image base-{HEX} has no {}: build one with \"saiife box image build --with {}\", then import it and make it the default (\"saiife box image import <path> --default\")",
+                agent.name(),
+                agent.name()
+            )
+        );
+        assert!(!w.root.join("b1").exists(), "no runtime dir");
+        assert!(!w.paths("b1").root_disk().exists(), "no overlay");
+        assert!(!w.root.join("t/qemu-argv").exists(), "qemu-img never ran");
+        assert_eq!(std::fs::read(dir.join("repo.img")).unwrap(), b"repo");
+    }
+    // the same image with the agent baked in boots it
+    let mut w2 = World::new();
+    w2.image.agents.push("codex".into());
+    let (v2, _l2) = w2.vmm(&[]);
+    let mut spec = w2.spec("b1");
+    spec.agent = AgentKind::Codex;
+    v2.create(&spec).unwrap();
+    // Claude Code runs on every image whose manifest has its managed
+    // settings (FU2), as this fixture's does
+    assert!(w.create(&v, "b2").id.as_str() == "b2");
+}
+
+/// FU2: a Claude Code box on an image without the managed-settings
+/// capability is refused before anything is made, with the rebuild hint;
+/// the same box on a current image is made.
+#[test]
+fn create_refuses_claude_on_a_stale_image() {
+    let mut w = World::new();
+    w.image.agents.clear();
+    let (v, _l) = w.vmm(&[]);
+    let dir = w.records.join("b1");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("repo.img"), b"repo").unwrap();
+    let spec = VmSpec {
+        id: BoxId::parse("b1").unwrap(),
+        size: Size {
+            disk_gib: 8,
+            ..Size::default()
+        },
+        image: ImageRef::Default,
+        agent: AgentKind::ClaudeCode,
+        dir: dir.clone(),
+    };
+    let e = failed(v.create(&spec));
+    assert_eq!(
+        e,
+        "rebuild the image (saiife box image build) and import it as default"
+    );
+    assert_eq!(e, STALE_CLAUDE_IMAGE);
+    assert!(!w.root.join("b1").exists(), "no runtime dir");
+    assert!(!w.paths("b1").root_disk().exists(), "no overlay");
+    assert!(!w.root.join("t/qemu-argv").exists(), "qemu-img never ran");
+    // a current image (the default World) makes the box
+    let w2 = World::new();
+    assert_eq!(w2.image.agents, vec!["claude-code".to_string()]);
+    let (v2, _l2) = w2.vmm(&[]);
+    assert_eq!(w2.create(&v2, "b1").id.as_str(), "b1");
 }
 
 #[test]

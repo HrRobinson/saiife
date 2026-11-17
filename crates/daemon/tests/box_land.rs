@@ -945,6 +945,81 @@ fn hostile_export_audits_diff_rejected() {
     assert_eq!(r.n, 4);
 }
 
+/// FU1: a box that changed files while its in-box guard reported no
+/// check is flagged once (one `guard_skipped` record), shown in the diff
+/// answer, and its land carries the flag; landing is not blocked.
+#[test]
+fn guard_skipped_is_flagged_once_and_shown() {
+    let w = world(2);
+    let i = w.running(ALICE, &base_tree(), &changed());
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    let s = i.as_str();
+    // Running: a review is not judged yet (a guard check may be in flight).
+    let d = w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    assert_eq!(d["guard"]["skipped"], false, "{d}");
+    assert!(w.actions("guard_skipped").is_empty());
+    w.mgr.done(&i).unwrap();
+    let d = w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    assert_eq!(
+        d["guard"],
+        json!({"skipped": true, "checks": 0, "turns": 1}),
+        "{d}"
+    );
+    w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    let g = w.actions("guard_skipped");
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0]["box"], s);
+    assert_eq!(g[0]["guard_checks"], 0);
+    assert_eq!(g[0]["turns"], 1);
+    assert_eq!(g[0]["files"], 3);
+    assert!(w.mgr.get(&i).unwrap().guard_skipped);
+    // Advisory: the land goes on, and says so.
+    w.cli_land(ALICE, &i);
+    let l = w.actions("land");
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0]["guard_skipped"], true);
+}
+
+/// FU1 (review M2): a box reviewed only while it ran is judged at its land.
+#[test]
+fn guard_skipped_is_judged_at_the_land() {
+    let w = world(2);
+    let i = w.running(ALICE, &base_tree(), &changed());
+    w.lands.refresh(&i).unwrap();
+    w.mgr.done(&i).unwrap();
+    assert!(w.actions("guard_skipped").is_empty());
+    w.cli_land(ALICE, &i);
+    let g = w.actions("guard_skipped");
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0]["files"], 3);
+    assert_eq!(w.actions("land")[0]["guard_skipped"], true);
+}
+
+/// FU1: a box whose guard reported checks is not flagged.
+#[test]
+fn guard_checks_keep_the_flag_off() {
+    let w = world(2);
+    let i = w.running(ALICE, &base_tree(), &changed());
+    w.mgr.guest_event(&i, GuestEvent::GuardChecks(4)).unwrap();
+    w.mgr.done(&i).unwrap();
+    let s = i.as_str();
+    let d = w.ok(ALICE, "box.diff", json!({"box": s}));
+    assert_eq!(
+        d["guard"],
+        json!({"skipped": false, "checks": 4, "turns": 0}),
+        "{d}"
+    );
+    assert!(w.actions("guard_skipped").is_empty());
+    w.cli_land(ALICE, &i);
+    assert_eq!(w.actions("land")[0]["guard_skipped"], false);
+    // No changes, no checks: never flagged.
+    let j = w.running(ALICE, &base_tree(), &base_tree());
+    w.mgr.done(&j).unwrap();
+    let d = w.ok(ALICE, "box.diff", json!({"box": j.as_str()}));
+    assert_eq!(d["guard"]["skipped"], false, "{d}");
+    assert!(w.actions("guard_skipped").is_empty());
+}
+
 // ---- Task 5: the control-socket ops ----
 
 fn rt() -> &'static tokio::runtime::Runtime {

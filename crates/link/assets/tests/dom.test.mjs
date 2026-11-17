@@ -29,6 +29,8 @@ test("h makes text nodes from strings", () => {
 test("h refuses onclick attribute", () => {
   assert.throws(() => h("button", { onclick: "x()" }), /not allowed/);
   assert.throws(() => h("button", { style: "color:red" }), /not allowed/);
+  // A tooltip is plain text (FU1's guard badge).
+  assert.equal(h("span", { title: "<b>x</b>" }).attrs.title, "<b>x</b>");
   let hit = 0;
   const b = h("button", { on: { click: () => hit++ } }, "Go");
   b.listeners.click();

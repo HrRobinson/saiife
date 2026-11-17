@@ -1,10 +1,10 @@
 //! The model forwarder (plan 40, Task 2; spec §7.4, §7.9): a box's
 //! `vsock.sock_5002` driven through the real gateway listeners in a
 //! tempdir box directory. The upstream is a loopback rustls server with an
-//! rcgen certificate for `api.anthropic.com`, trusted through
-//! `Upstream::with_roots`, and its resolver maps that one name to it: no
-//! test touches the network, and no VM is ever started. The vault keys are
-//! built with `concat!`.
+//! rcgen certificate for the three model hosts of plan 42 D1, trusted
+//! through `Upstream::with_roots`, and its resolver maps exactly those three
+//! names to it and records each name asked: no test touches the network,
+//! and no VM is ever started. The vault keys are built with `concat!`.
 #![cfg(all(unix, feature = "fake-vmm", debug_assertions))]
 
 use bytes::Bytes;
@@ -22,7 +22,7 @@ use saiife_boxes::guest::fake::FakeGuest;
 use saiife_boxes::guest::GuestLink;
 use saiife_boxes::manager::{Manager, ManagerInit, SpawnArgs};
 use saiife_boxes::store::Store;
-use saiife_boxes::template::{self, BoxTemplate, Login, Size};
+use saiife_boxes::template::{self, AgentKind, BoxTemplate, Login, ModelCred, Size};
 use saiife_boxes::vmm::fake::FakeVmm;
 use saiife_boxes::BoxId;
 use saiife_boxhost::paths::BoxPaths;
@@ -56,6 +56,14 @@ const T0: u64 = 1_000_000;
 const REAL_KEY: &str = concat!("sk-", "ant-", "api03-", "REALKEY", "0123456789");
 const ROTATED_KEY: &str = concat!("sk-", "ant-", "api03-", "ROTATED", "9876543210");
 const REAL_SUB: &str = concat!("sk-", "ant-", "oat01-", "REALSUB", "0123456789");
+const REAL_OPENAI: &str = concat!("sk-", "proj-", "REALOPENAI", "0123456789");
+const REAL_GOOGLE: &str = concat!("AIza", "REALGOOGLE", "0123456789");
+/// The three model hosts (plan 42 D1).
+const HOSTS: [&str; 3] = [
+    "api.anthropic.com",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+];
 /// A marker in request bodies: never in the audit.
 const BODY_MARK: &str = "BODYMARK-7f3a";
 
@@ -104,18 +112,29 @@ struct Up {
     conns: Arc<AtomicUsize>,
     /// `/forever`'s body could no longer be sent (the connection is gone).
     closed: Arc<AtomicBool>,
-    /// When `/sse` sent its third event.
+    /// When the `sse` behaviour sent its third event.
     third_at: Arc<Mutex<Option<Instant>>>,
+    /// Every host name the forwarder asked the resolver for.
+    asked: Arc<Mutex<Vec<String>>>,
 }
 
 impl Up {
     fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
 }
 
 fn sse_event(i: usize) -> Bytes {
     Bytes::from(format!("event: ping\ndata: {{\"n\":{i}}}\n\n"))
+}
+
+/// The request body that picks the fake upstream's `kind` behaviour.
+fn fake(kind: &str) -> String {
+    format!(r#"{{"saiife_fake":"{kind}"}}"#)
 }
 
 async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBody>, Infallible> {
@@ -125,6 +144,8 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
         .await
         .map(|c| c.to_bytes())
         .unwrap_or_default();
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let stream_asked = text.contains(r#""stream":true"#);
     up.seen.lock().unwrap().push(Seen {
         method: parts.method.to_string(),
         uri: parts.uri.to_string(),
@@ -148,8 +169,24 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             .unwrap()
     };
     let path = parts.uri.path().to_string();
-    Ok(match path.as_str() {
-        "/sse" => {
+    // The test behaviours are picked by the request body on
+    // `POST /v1/messages` ([`fake`]; plan 42 R12: only exact paths pass).
+    // Codex's streamed Responses call and Gemini's streamed call answer
+    // with the same three events as `sse`.
+    let streamed = (path == "/v1/responses" && stream_asked)
+        || path == "/v1beta/models/m:streamGenerateContent";
+    let kind = if streamed {
+        "sse"
+    } else if path == "/v1/messages" {
+        ["sse", "forever", "stall", "nohead"]
+            .into_iter()
+            .find(|k| text == fake(k))
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    Ok(match kind {
+        "sse" => {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let third = Arc::clone(&up.third_at);
             tokio::spawn(async move {
@@ -167,7 +204,7 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
-        "/forever" => {
+        "forever" => {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let closed = Arc::clone(&up.closed);
             tokio::spawn(async move {
@@ -181,7 +218,7 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
-        "/stall" => {
+        "stall" => {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let _ = tx.send(sse_event(0)).await;
@@ -191,7 +228,7 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
             });
             stream(rx)
         }
-        "/nohead" => {
+        "nohead" => {
             // No answer at all, far longer than the test's idle limit.
             tokio::time::sleep(Duration::from_secs(30)).await;
             full(200, "{}")
@@ -200,14 +237,14 @@ async fn upstream_answer(req: Request<Incoming>, up: Up) -> Result<Response<UpBo
     })
 }
 
-/// The fake `api.anthropic.com` and the client that trusts it. With
-/// `dead`, the resolver points at a port nothing listens on.
+/// The fake model hosts and the client that trusts them. With `dead`, the
+/// resolver points at a port nothing listens on.
 async fn upstream(dead: bool) -> (Up, Upstream) {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec!["api.anthropic.com".to_string()])
+    let leaf = CertificateParams::new(HOSTS.iter().map(|h| h.to_string()).collect::<Vec<_>>())
         .unwrap()
         .signed_by(&leaf_key, &ca)
         .unwrap();
@@ -256,20 +293,28 @@ async fn upstream(dead: bool) -> (Up, Upstream) {
     };
     let client = Upstream::with_roots(
         roots,
-        Arc::new(OnlyModelHost(port)),
+        Arc::new(OnlyModelHosts {
+            port,
+            asked: Arc::clone(&up.asked),
+        }),
         Duration::from_secs(30),
     );
     (up, client)
 }
 
-/// `api.anthropic.com` is the loopback upstream; every other name fails.
-struct OnlyModelHost(u16);
+/// The three model hosts are the loopback upstream; every other name
+/// fails. Every name asked is recorded.
+struct OnlyModelHosts {
+    port: u16,
+    asked: Arc<Mutex<Vec<String>>>,
+}
 
-impl Resolver for OnlyModelHost {
+impl Resolver for OnlyModelHosts {
     fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        self.asked.lock().unwrap().push(host.to_string());
         assert_eq!(port, 443, "the forwarder asks for the fixed port");
-        if host == "api.anthropic.com" {
-            Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, self.0))])
+        if HOSTS.contains(&host) {
+            Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, self.port))])
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "unknown test host"))
         }
@@ -300,7 +345,13 @@ struct Bx {
 
 struct Opts {
     model: ModelConfig,
-    /// The `anthropic` vault entry's services; `None`: no such entry.
+    /// The agent of boxes `a` and `b` (plan 42); `sub` is always Claude's.
+    agent: AgentKind,
+    /// Boxes `a` and `b` are spawned as `agent`, then their template is
+    /// edited to this agent (as a template switched after spawn).
+    switch_to: Option<AgentKind>,
+    /// The services of `agent`'s vault entry ([`cred_name`]); `None`: no
+    /// such entry.
     services: Option<Vec<&'static str>>,
     /// The upstream cannot be reached (connection refused).
     dead_upstream: bool,
@@ -313,10 +364,46 @@ impl Default for Opts {
     fn default() -> Self {
         Opts {
             model: ModelConfig::default(),
+            agent: AgentKind::ClaudeCode,
+            switch_to: None,
             services: Some(vec!["box-model"]),
             dead_upstream: false,
             subscription_cleared: true,
         }
+    }
+}
+
+impl Opts {
+    /// Boxes `a` and `b` of `agent`, its key allowing the route's service.
+    fn agent(agent: AgentKind) -> Opts {
+        let services = match agent {
+            AgentKind::ClaudeCode => vec!["box-model"],
+            AgentKind::Codex => vec!["box-model-openai"],
+            AgentKind::Gemini => vec!["box-model-google"],
+        };
+        Opts {
+            agent,
+            services: Some(services),
+            ..Opts::default()
+        }
+    }
+}
+
+/// The vault entry name of `agent`'s templates (plan 42 D7).
+fn cred_name(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::ClaudeCode => "anthropic",
+        AgentKind::Codex => "openai",
+        AgentKind::Gemini => "gemini",
+    }
+}
+
+/// The real key in `agent`'s vault entry.
+fn real_key(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::ClaudeCode => REAL_KEY,
+        AgentKind::Codex => REAL_OPENAI,
+        AgentKind::Gemini => REAL_GOOGLE,
     }
 }
 
@@ -331,7 +418,14 @@ fn host_facts() -> HostFacts {
 }
 
 fn tmpl(name: &str, login: Login, credential: &str) -> BoxTemplate {
-    let mut t = template::builtin().remove(0);
+    tmpl_of(AgentKind::ClaudeCode, name, login, credential)
+}
+
+fn tmpl_of(agent: AgentKind, name: &str, login: Login, credential: &str) -> BoxTemplate {
+    let mut t = template::builtin()
+        .into_iter()
+        .find(|t| t.agent == agent)
+        .unwrap();
     t.name = name.into();
     t.login = login;
     t.credential = credential.into();
@@ -398,10 +492,10 @@ async fn world(o: Opts) -> W {
     // edited after spawn would be. The const stays false: the forwarder
     // serves this box only through the gateway's debug-only test override
     // (`Opts::subscription_cleared`).
-    let spawn_templates = vec![
-        tmpl("model-api", Login::ApiKey, "anthropic"),
-        tmpl("model-sub", Login::ApiKey, "anthropic-sub"),
-    ];
+    let spawn_api = tmpl_of(o.agent, "model-api", Login::ApiKey, cred_name(o.agent));
+    let spawn_cred = spawn_api.model_cred();
+    let now = o.switch_to.unwrap_or(o.agent);
+    let spawn_templates = vec![spawn_api, tmpl("model-sub", Login::ApiKey, "anthropic-sub")];
     let first = manager(&state, spawn_templates);
     let spawn = |t: &str| {
         first
@@ -422,7 +516,7 @@ async fn world(o: Opts) -> W {
     let mgr = manager(
         &state,
         vec![
-            tmpl("model-api", Login::ApiKey, "anthropic"),
+            tmpl_of(now, "model-api", Login::ApiKey, cred_name(now)),
             tmpl("model-sub", Login::Subscription, "anthropic-sub"),
         ],
     );
@@ -435,9 +529,9 @@ async fn world(o: Opts) -> W {
         .unwrap()
     };
     let (pa, pb, ps) = (
-        ph(&ra.id, Login::ApiKey),
-        ph(&rb.id, Login::ApiKey),
-        ph(&rs.id, Login::Subscription),
+        ph(&ra.id, spawn_cred),
+        ph(&rb.id, spawn_cred),
+        ph(&rs.id, ModelCred::AnthropicSubscription),
     );
 
     let key_file = tmp.path().join("vault-key");
@@ -452,7 +546,8 @@ async fn world(o: Opts) -> W {
         panic!("vault not ready");
     };
     if let Some(services) = &o.services {
-        v.put(vault_entry("anthropic", REAL_KEY, services)).unwrap();
+        v.put(vault_entry(cred_name(o.agent), real_key(o.agent), services))
+            .unwrap();
     }
     v.put(vault_entry("anthropic-sub", REAL_SUB, &["box-model"]))
         .unwrap();
@@ -1021,7 +1116,11 @@ async fn body_cap_is_413() {
 async fn sse_events_arrive_incrementally() {
     let w = world(Opts::default()).await;
     let (mut tx, _task) = client(&w.a).await;
-    let req = post("/sse", &[("x-api-key", &w.a.placeholder)], "{}");
+    let req = post(
+        "/v1/messages",
+        &[("x-api-key", &w.a.placeholder)],
+        &fake("sse"),
+    );
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
         .unwrap()
@@ -1063,7 +1162,11 @@ async fn sse_events_arrive_incrementally() {
 async fn client_disconnect_closes_upstream() {
     let w = world(Opts::default()).await;
     let (mut tx, task) = client(&w.a).await;
-    let req = post("/forever", &[("x-api-key", &w.a.placeholder)], "{}");
+    let req = post(
+        "/v1/messages",
+        &[("x-api-key", &w.a.placeholder)],
+        &fake("forever"),
+    );
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
         .unwrap()
@@ -1100,7 +1203,11 @@ async fn idle_upstream_times_out() {
     })
     .await;
     let (mut tx, _task) = client(&w.a).await;
-    let req = post("/stall", &[("x-api-key", &w.a.placeholder)], "{}");
+    let req = post(
+        "/v1/messages",
+        &[("x-api-key", &w.a.placeholder)],
+        &fake("stall"),
+    );
     let t0 = Instant::now();
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
@@ -1199,8 +1306,8 @@ async fn missing_secret_is_503() {
     assert_eq!(code, 503);
     assert_eq!(
         body.trim(),
-        "the vault has no secret anthropic for box-model: \
-         saiife secret add anthropic --kind token --service box-model"
+        "the vault has no secret anthropic for box-model-anthropic: \
+         saiife secret add anthropic --kind token --service box-model-anthropic"
     );
     assert!(w.up.seen().is_empty());
     let recs = w.wait_records("model_denied", 1).await;
@@ -1217,7 +1324,7 @@ async fn secret_without_box_model_service_is_503() {
     let (code, _, body) = ask(&w.a, api_req(&w.a)).await;
     assert_eq!(code, 503);
     assert!(
-        body.contains("saiife secret add anthropic --kind token --service box-model"),
+        body.contains("saiife secret add anthropic --kind token --service box-model-anthropic"),
         "{body}"
     );
     assert!(w.up.seen().is_empty());
@@ -1336,7 +1443,11 @@ async fn denied_records_are_rate_limited() {
 async fn lockdown_cuts_streams() {
     let w = world(Opts::default()).await;
     let (mut tx, _task) = client(&w.a).await;
-    let req = post("/forever", &[("x-api-key", &w.a.placeholder)], "{}");
+    let req = post(
+        "/v1/messages",
+        &[("x-api-key", &w.a.placeholder)],
+        &fake("forever"),
+    );
     let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
         .await
         .unwrap()
@@ -1430,7 +1541,11 @@ async fn failure_answers_never_echo_credentials() {
     let recs = w.wait_records("model_denied", 1).await;
     assert_eq!(recs[0]["reason"], "secret_invalid");
     w.rotate(REAL_KEY);
-    let (code, h, b) = ask(&w.a, post("/nohead", &[("x-api-key", &pa)], "{}")).await;
+    let (code, h, b) = ask(
+        &w.a,
+        post("/v1/messages", &[("x-api-key", &pa)], &fake("nohead")),
+    )
+    .await;
     assert_eq!(code, 504, "{b}");
     bodies.push(format!("{h:?}{b}"));
     let recs = w.wait_records("model", 1).await;
@@ -1462,4 +1577,786 @@ async fn failure_answers_never_echo_credentials() {
             assert!(!audit.contains(secret), "the audit holds {secret}");
         }
     }
+}
+
+// ---------------------------------------------------------------- plan 42
+
+const NOT_FORWARDED: &str = "this path is not forwarded to the model service";
+const NOT_PLAIN: &str = "the request path is not plain";
+const QUERY_KEY: &str = "the key query parameter is not forwarded";
+const ALL_AGENTS: [AgentKind; 3] = [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Gemini];
+
+/// The header and value that carry `ph` on `agent`'s route.
+fn auth(agent: AgentKind, ph: &str) -> (&'static str, String) {
+    match agent {
+        AgentKind::ClaudeCode => ("x-api-key", ph.to_string()),
+        AgentKind::Codex => ("authorization", format!("Bearer {ph}")),
+        AgentKind::Gemini => ("x-goog-api-key", ph.to_string()),
+    }
+}
+
+/// An allowed path of `agent`'s route.
+fn ok_path(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::ClaudeCode => "/v1/messages",
+        AgentKind::Codex => "/v1/responses",
+        AgentKind::Gemini => "/v1beta/models/m:generateContent",
+    }
+}
+
+fn host_of(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::ClaudeCode => "api.anthropic.com",
+        AgentKind::Codex => "api.openai.com",
+        AgentKind::Gemini => "generativelanguage.googleapis.com",
+    }
+}
+
+/// A request from box `b` of `agent` with its own credential header.
+fn req_as(agent: AgentKind, b: &Bx, path: &str, extra: &[(&str, &str)]) -> Request<Full<Bytes>> {
+    let (k, v) = auth(agent, &b.placeholder);
+    let mut h: Vec<(&str, &str)> = vec![(k, &v)];
+    h.extend_from_slice(extra);
+    post(path, &h, "{}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_swap() {
+    let w = world(Opts::agent(AgentKind::Codex)).await;
+    let bearer = format!("Bearer {}", w.a.placeholder);
+    let req = post(
+        "/v1/responses",
+        &[
+            ("authorization", &bearer),
+            ("content-type", "application/json"),
+        ],
+        &messages_body(),
+    );
+    let (code, _, body) = ask(&w.a, req).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body, r#"{"type":"message","ok":true}"#);
+    let seen = w.up.seen();
+    assert_eq!(seen.len(), 1);
+    let s = &seen[0];
+    assert_eq!(s.uri, "/v1/responses");
+    assert_eq!(s.headers["host"], "api.openai.com");
+    assert_eq!(s.headers["authorization"], format!("Bearer {REAL_OPENAI}"));
+    assert_eq!(s.headers.get_all("authorization").iter().count(), 1);
+    assert!(s.headers.get("x-api-key").is_none());
+    assert!(s.headers.get("x-goog-api-key").is_none());
+    assert!(!has(&s.headers, &w.a.placeholder));
+    assert_eq!(s.body, Bytes::from(messages_body()));
+    assert_eq!(w.up.asked(), vec!["api.openai.com".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn google_swap() {
+    let w = world(Opts::agent(AgentKind::Gemini)).await;
+    let target = "/v1beta/models/m:streamGenerateContent?alt=sse";
+    let req = post(
+        target,
+        &[
+            ("x-goog-api-key", &w.a.placeholder),
+            ("content-type", "application/json"),
+        ],
+        &messages_body(),
+    );
+    let (code, _, body) = ask(&w.a, req).await;
+    assert_eq!(code, 200, "{body}");
+    let want: String = (0..3)
+        .map(|i| String::from_utf8(sse_event(i).to_vec()).unwrap())
+        .collect();
+    assert_eq!(body, want);
+    let s = &w.up.seen()[0];
+    assert_eq!(s.uri, target);
+    assert_eq!(s.headers["host"], "generativelanguage.googleapis.com");
+    assert_eq!(s.headers["x-goog-api-key"], REAL_GOOGLE);
+    assert_eq!(s.headers.get_all("x-goog-api-key").iter().count(), 1);
+    assert!(s.headers.get("authorization").is_none());
+    assert!(s.headers.get("x-api-key").is_none());
+    assert!(!has(&s.headers, &w.a.placeholder));
+    assert!(!s.uri.contains(&w.a.placeholder));
+    assert_eq!(w.up.asked(), vec![HOSTS[2].to_string()]);
+}
+
+/// Review Focus 1: a codex box cannot use Anthropic's header or path, and
+/// no other host is ever resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_comes_from_the_template() {
+    let w = world(Opts::agent(AgentKind::Codex)).await;
+    let ph = &w.a.placeholder;
+    let bearer = format!("Bearer {ph}");
+    let req = post("/v1/responses", &[("x-api-key", ph)], "{}");
+    let (code, _, body) = ask(&w.a, req).await;
+    assert_eq!(code, 401, "{body}");
+    assert_eq!(body.trim(), NOT_VALID);
+    let req = post("/v1/responses", &[("x-goog-api-key", ph)], "{}");
+    assert_eq!(ask(&w.a, req).await.0, 401);
+    let req = post("/v1/messages", &[("authorization", &bearer)], "{}");
+    let (code, _, body) = ask(&w.a, req).await;
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(body.trim(), NOT_FORWARDED);
+    let req = post("/v1/messages", &[("x-api-key", ph)], "{}");
+    assert_eq!(ask(&w.a, req).await.0, 403);
+    // A host header naming another provider changes nothing.
+    let req = post(
+        "/v1/responses",
+        &[("authorization", &bearer), ("host", "api.anthropic.com")],
+        "{}",
+    );
+    assert_eq!(ask(&w.a, req).await.0, 200);
+    assert!(
+        w.up.asked().iter().all(|h| h == "api.openai.com"),
+        "{:?}",
+        w.up.asked()
+    );
+    assert_eq!(w.up.seen().len(), 1);
+    assert_eq!(w.up.seen()[0].headers["host"], "api.openai.com");
+}
+
+/// A request from box `b` of `agent`: `method` and `target`, its own
+/// credential header, an empty body for GET.
+fn reqm(agent: AgentKind, b: &Bx, method: &str, target: &str) -> Request<Full<Bytes>> {
+    let (k, v) = auth(agent, &b.placeholder);
+    let body = if method == "POST" { "{}" } else { "" };
+    Request::builder()
+        .method(method)
+        .uri(target)
+        .header(k, v)
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Review Focus 1 and SEC4 (ruling R12): every (method, path, query) off
+/// the route's exact list is a 403 with a `model_denied` record per
+/// distinct (method, path), and the upstream sees nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paths_outside_the_route_are_403() {
+    let id129 = format!("/v1/models/{}", "a".repeat(129));
+    let cases: [(AgentKind, Vec<(&str, &str)>); 3] = [
+        (
+            AgentKind::ClaudeCode,
+            vec![
+                ("POST", "/v1/responses?x=1"),
+                ("GET", "/api/hello"),
+                ("POST", "/v1/files"),
+                ("POST", "/v1/messages/batches"),
+                ("POST", "/v1/messages/batches/x"),
+                ("GET", "/v1/messages/batches"),
+                ("GET", "/v1/messages"),
+                ("POST", "/v1/models"),
+                ("POST", "/v1/messages?x=1"),
+                ("POST", "/v1/messages?beta=true&beta=true"),
+                ("GET", "/v1/models?after_id=x"),
+                ("GET", &id129),
+                ("GET", "/v1/models/a$b"),
+            ],
+        ),
+        (
+            AgentKind::Codex,
+            vec![
+                ("POST", "/v1/messages?x=1"),
+                ("POST", "/v1/files"),
+                ("GET", "/v1/responses/abc"),
+                ("POST", "/v1/responses/compact"),
+                ("POST", "/v1/responses?stream=true"),
+                ("GET", "/v1/responses"),
+                ("POST", "/v1/chat/completions"),
+            ],
+        ),
+        (
+            AgentKind::Gemini,
+            vec![
+                ("POST", "/upload/v1beta/files?uploadType=resumable"),
+                ("POST", "/v1/responses"),
+                ("GET", "/v1beta/models"),
+                ("POST", "/v1beta/models/m:streamGenerateContent?alt=json"),
+                ("POST", "/v1beta/models/m:streamGenerateContent"),
+                ("POST", "/v1beta/models/m:generateContent?alt=sse"),
+                ("POST", "/v1beta/models/a$b:generateContent"),
+            ],
+        ),
+    ];
+    for (agent, reqs) in cases {
+        let w = world(Opts::agent(agent)).await;
+        let mut want: Vec<(String, String)> = Vec::new();
+        for (m, target) in &reqs {
+            let (code, h, body) = ask(&w.a, reqm(agent, &w.a, m, target)).await;
+            assert_eq!(code, 403, "{agent:?} {m} {target}: {body}");
+            assert_eq!(body.trim(), NOT_FORWARDED);
+            let path = target.split('?').next().unwrap();
+            assert!(!format!("{h:?}{body}").contains(path));
+            let k = (m.to_string(), path.to_string());
+            if !want.contains(&k) {
+                want.push(k);
+            }
+        }
+        assert!(w.up.seen().is_empty(), "{agent:?}");
+        assert!(w.up.asked().is_empty(), "{agent:?}");
+        let recs = w.wait_records("model_denied", want.len()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let recs_now = w.records("model_denied");
+        assert_eq!(recs_now.len(), want.len(), "{agent:?}: {recs:?}");
+        let mut got: Vec<(String, String)> = recs_now
+            .iter()
+            .map(|r| {
+                assert_eq!(r["reason"], "path_not_allowed", "{agent:?}");
+                assert_eq!(r["box"], w.a.id.as_str());
+                (
+                    r["method"].as_str().unwrap().to_string(),
+                    r["path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "{agent:?}");
+        let audit = w.audit_text();
+        for q in [
+            "x=1",
+            "uploadType",
+            "alt=json",
+            "after_id",
+            "stream=true",
+            "beta=true",
+        ] {
+            assert!(
+                !audit.contains(q),
+                "{agent:?}: the audit holds the query {q}"
+            );
+        }
+        assert!(w.records("model").is_empty());
+    }
+    // Methods other than GET and POST stop earlier (405).
+    for (agent, m, target) in [
+        (AgentKind::Codex, "DELETE", "/v1/responses/abc"),
+        (AgentKind::ClaudeCode, "HEAD", "/api/hello"),
+    ] {
+        let w = world(Opts::agent(agent)).await;
+        let (code, _, _) = ask(&w.a, reqm(agent, &w.a, m, target)).await;
+        assert_eq!(code, 405, "{m} {target}");
+        assert!(w.up.seen().is_empty());
+    }
+}
+
+/// R12: each allowed (method, path, query) of each route reaches its
+/// upstream unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_allow_list_passes() {
+    let cases: [(AgentKind, &[(&str, &str)]); 3] = [
+        (
+            AgentKind::ClaudeCode,
+            &[
+                ("POST", "/v1/messages"),
+                ("POST", "/v1/messages?beta=true"),
+                ("POST", "/v1/messages/count_tokens"),
+                ("POST", "/v1/messages/count_tokens?beta=true"),
+                ("GET", "/v1/models"),
+                ("GET", "/v1/models?beta=true"),
+                ("GET", "/v1/models?beta=true&limit=1000"),
+                ("GET", "/v1/models/claude-opus-4-1"),
+                ("GET", "/v1/models/claude-opus-4-1?beta=true"),
+            ],
+        ),
+        (
+            AgentKind::Codex,
+            &[
+                ("POST", "/v1/responses"),
+                ("GET", "/v1/models"),
+                ("GET", "/v1/models?client_version=0.169.0"),
+                ("GET", "/v1/models/gpt-5.1-codex"),
+            ],
+        ),
+        (
+            AgentKind::Gemini,
+            &[
+                ("POST", "/v1beta/models/m:streamGenerateContent?alt=sse"),
+                ("POST", "/v1beta/models/gemini-2.5-pro:generateContent"),
+                ("POST", "/v1beta/models/gemini-2.5-pro:countTokens"),
+            ],
+        ),
+    ];
+    for (agent, reqs) in cases {
+        let w = world(Opts::agent(agent)).await;
+        for (m, target) in reqs {
+            let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, target)).await;
+            assert_eq!(code, 200, "{agent:?} {m} {target}: {body}");
+        }
+        let seen = w.up.seen();
+        assert_eq!(seen.len(), reqs.len(), "{agent:?}");
+        for (s, (m, target)) in seen.iter().zip(reqs.iter()) {
+            assert_eq!(s.method, *m);
+            assert_eq!(s.uri, *target);
+            assert_eq!(s.headers["host"], host_of(agent));
+        }
+        assert!(w.up.asked().iter().all(|h| h == host_of(agent)));
+        assert!(w.records("model_denied").is_empty(), "{agent:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn path_tricks_are_400() {
+    let cases: [(AgentKind, &[&str]); 3] = [
+        (
+            AgentKind::ClaudeCode,
+            &[
+                "/v1/messages/../x",
+                "/v1/messages/%2E%2E/x",
+                "/v1//messages",
+                "/v1/messages%2fx",
+                "/v1/messages\\x",
+                "/v1/models/%2e%2e/files",
+                "/v1/messages/./count_tokens",
+                "/v1/messages%5Cx",
+                "/v1/messages%00",
+            ],
+        ),
+        (
+            AgentKind::Codex,
+            &[
+                "/v1/responses/%2e%2e/x",
+                "/v1/responses//x",
+                "/v1/responses\\x",
+            ],
+        ),
+        (
+            AgentKind::Gemini,
+            &["/v1beta/models/..", "/v1beta//models", "/v1beta/models%2Fx"],
+        ),
+    ];
+    for (agent, paths) in cases {
+        let w = world(Opts::agent(agent)).await;
+        for p in paths {
+            let (code, _, body) = ask(&w.a, req_as(agent, &w.a, p, &[])).await;
+            assert_eq!(code, 400, "{agent:?} {p}: {body}");
+            assert_eq!(body.trim(), NOT_PLAIN, "{p}");
+        }
+        assert!(w.up.seen().is_empty());
+        assert!(w.up.asked().is_empty());
+        let recs = w.wait_records("model_denied", 1).await;
+        assert_eq!(recs[0]["reason"], "path", "{agent:?}");
+    }
+    // A NUL or a byte outside visible ASCII, by hand.
+    let w = world(Opts::default()).await;
+    for target in [
+        &b"/v1/messages\x00"[..],
+        b"/v1/messages/\xc3\xa9",
+        b"/v1/messages\x7f",
+    ] {
+        let mut bytes = b"POST ".to_vec();
+        bytes.extend_from_slice(target);
+        bytes.extend_from_slice(
+            format!(
+                " HTTP/1.1\r\nHost: x\r\nx-api-key: {}\r\nContent-Length: 2\r\n\r\n{{}}",
+                w.a.placeholder
+            )
+            .as_bytes(),
+        );
+        let (code, t) = raw(&w.a, &bytes).await;
+        assert_eq!(code, 400, "{t}");
+    }
+    assert!(w.up.seen().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookalike_prefix_is_403() {
+    for (agent, p) in [
+        (AgentKind::ClaudeCode, "/v1/messagesX"),
+        (AgentKind::ClaudeCode, "/v1/models-all"),
+        (AgentKind::Codex, "/v1/responsesX"),
+        (AgentKind::Gemini, "/v1beta/modelsX"),
+    ] {
+        let w = world(Opts::agent(agent)).await;
+        let (code, _, body) = ask(&w.a, req_as(agent, &w.a, p, &[])).await;
+        assert_eq!(code, 403, "{p}: {body}");
+        assert_eq!(body.trim(), NOT_FORWARDED);
+        assert!(w.up.seen().is_empty());
+        let recs = w.wait_records("model_denied", 1).await;
+        assert_eq!(recs[0]["reason"], "path_not_allowed");
+        assert_eq!(recs[0]["method"], "POST");
+        assert_eq!(recs[0]["path"], p);
+    }
+}
+
+/// The placeholder in the target. R12 leaves one place it can pass the
+/// allow-list, a model ID segment, and there it is a 401; anywhere else
+/// (a query value, percent-encoded) the exact list refuses it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placeholder_in_target_is_401() {
+    for agent in ALL_AGENTS {
+        let w = world(Opts::agent(agent)).await;
+        let ph = w.a.placeholder.clone();
+        // Percent-encoding its first character does not hide it.
+        let enc = format!("%{:02X}{}", ph.as_bytes()[0], &ph[1..]);
+        let (m, in_id) = match agent {
+            AgentKind::Gemini => ("POST", format!("/v1beta/models/{ph}:generateContent")),
+            _ => ("GET", format!("/v1/models/{ph}")),
+        };
+        let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, &in_id)).await;
+        assert_eq!(code, 401, "{agent:?} {in_id}: {body}");
+        assert_eq!(body.trim(), NOT_VALID);
+        let base = ok_path(agent);
+        for target in [
+            format!("{base}/{ph}"),
+            format!("{base}?beta={ph}"),
+            format!("{base}?alt=sse&q=x{ph}y"),
+            format!("{base}/{enc}"),
+            format!("{base}?q={enc}"),
+            format!("/v1/models?client_version={ph}"),
+            match agent {
+                AgentKind::Gemini => format!("/v1beta/models/{enc}:generateContent"),
+                _ => format!("/v1/models/{enc}"),
+            },
+        ] {
+            let m = if target.starts_with("/v1/models") {
+                "GET"
+            } else {
+                "POST"
+            };
+            let (code, _, body) = ask(&w.a, reqm(agent, &w.a, m, &target)).await;
+            // Off the exact list: 403 before the credential check.
+            assert_eq!(code, 403, "{agent:?} {target}: {body}");
+            assert_eq!(body.trim(), NOT_FORWARDED);
+        }
+        assert!(w.up.seen().is_empty(), "{agent:?}");
+        let recs = w.wait_records("model_denied", 1).await;
+        assert_eq!(recs[0]["reason"], "bad_credential");
+        assert!(!w.audit_text().contains(&ph));
+        assert!(!w.audit_text().contains(&ph[1..]));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_key_is_400() {
+    let w = world(Opts::agent(AgentKind::Gemini)).await;
+    let base = "/v1beta/models/m:streamGenerateContent";
+    for q in ["?alt=sse&key=x", "?key=x", "?%6Bey=x", "?alt=sse;key=x"] {
+        let target = format!("{base}{q}");
+        let (code, _, body) = ask(&w.a, req_as(AgentKind::Gemini, &w.a, &target, &[])).await;
+        assert_eq!(code, 400, "{q}: {body}");
+        assert_eq!(body.trim(), QUERY_KEY);
+    }
+    assert!(w.up.seen().is_empty());
+    let recs = w.wait_records("model_denied", 1).await;
+    assert_eq!(recs[0]["reason"], "query_key");
+    // Lookalike names are not `key`, but R12's exact list refuses them.
+    let target = format!("{base}?alt=sse&keys=1&Key=2");
+    let (code, _, body) = ask(&w.a, req_as(AgentKind::Gemini, &w.a, &target, &[])).await;
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(body.trim(), NOT_FORWARDED);
+    assert!(w.up.seen().is_empty());
+}
+
+/// Review Focus 2: another provider's credential and billing headers never
+/// reach the upstream; only the route's own header carries the real key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_headers_are_stripped() {
+    let smuggled = [
+        ("x-api-key", "box-own-a"),
+        ("x-goog-api-key", "box-own-g"),
+        ("authorization", "Bearer box-own-o"),
+        ("openai-organization", "org-box"),
+        ("openai-project", "proj-box"),
+        ("x-goog-user-project", "gp-box"),
+    ];
+    for agent in ALL_AGENTS {
+        let w = world(Opts::agent(agent)).await;
+        let (k, v) = auth(agent, &w.a.placeholder);
+        let mut h: Vec<(&str, &str)> = smuggled.iter().filter(|(n, _)| *n != k).copied().collect();
+        h.push((k, &v));
+        h.push(("user-agent", "agent/1"));
+        let (code, _, body) = ask(&w.a, post(ok_path(agent), &h, "{}")).await;
+        assert_eq!(code, 200, "{agent:?}: {body}");
+        let s = &w.up.seen()[0];
+        for (n, val) in smuggled {
+            if n == k {
+                continue;
+            }
+            assert!(
+                s.headers.get(n).is_none(),
+                "{agent:?}: {n} reached the upstream"
+            );
+            assert!(
+                !has(&s.headers, val),
+                "{agent:?}: {val} reached the upstream"
+            );
+        }
+        let want = match agent {
+            AgentKind::Codex => format!("Bearer {REAL_OPENAI}"),
+            other => real_key(other).to_string(),
+        };
+        assert_eq!(s.headers[k], want.as_str());
+        assert_eq!(s.headers.get_all(k).iter().count(), 1);
+        assert_eq!(s.headers["user-agent"], "agent/1");
+        assert_eq!(s.headers["host"], host_of(agent));
+    }
+}
+
+/// Review Focus 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_services_are_per_provider() {
+    let openai_missing = "the vault has no secret openai for box-model-openai: \
+                          saiife secret add openai --kind token --service box-model-openai";
+    for services in [vec!["box-model-anthropic"], vec!["box-model"]] {
+        let w = world(Opts {
+            services: Some(services.clone()),
+            ..Opts::agent(AgentKind::Codex)
+        })
+        .await;
+        let (code, _, body) = ask(&w.a, req_as(AgentKind::Codex, &w.a, "/v1/responses", &[])).await;
+        assert_eq!(code, 503, "{services:?}: {body}");
+        assert_eq!(body.trim(), openai_missing);
+        assert!(w.up.seen().is_empty());
+        let recs = w.wait_records("model_denied", 1).await;
+        assert_eq!(recs[0]["reason"], "secret_not_allowed");
+    }
+    let w = world(Opts {
+        services: Some(vec!["box-model-openai"]),
+        ..Opts::agent(AgentKind::Gemini)
+    })
+    .await;
+    let (code, _, body) = ask(
+        &w.a,
+        req_as(AgentKind::Gemini, &w.a, ok_path(AgentKind::Gemini), &[]),
+    )
+    .await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(
+        body.trim(),
+        "the vault has no secret gemini for box-model-google: \
+         saiife secret add gemini --kind token --service box-model-google"
+    );
+    // Anthropic: the legacy name and the new one both pass.
+    for services in [
+        vec!["box-model"],
+        vec!["box-model-anthropic"],
+        vec!["github", "box-model-anthropic"],
+    ] {
+        let w = world(Opts {
+            services: Some(services.clone()),
+            ..Opts::default()
+        })
+        .await;
+        let (code, _, body) = ask(&w.a, api_req(&w.a)).await;
+        assert_eq!(code, 200, "{services:?}: {body}");
+    }
+    let w = world(Opts {
+        services: Some(vec!["box-model-openai"]),
+        ..Opts::default()
+    })
+    .await;
+    let (code, _, body) = ask(&w.a, api_req(&w.a)).await;
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("--service box-model-anthropic"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn records_name_the_provider() {
+    for (agent, provider) in [
+        (AgentKind::ClaudeCode, "anthropic"),
+        (AgentKind::Codex, "openai"),
+        (AgentKind::Gemini, "google"),
+    ] {
+        let w = world(Opts::agent(agent)).await;
+        let (path, query) = match agent {
+            AgentKind::ClaudeCode => ("/v1/messages", "?beta=true"),
+            AgentKind::Codex => ("/v1/responses", ""),
+            AgentKind::Gemini => ("/v1beta/models/m:streamGenerateContent", "?alt=sse"),
+        };
+        let target = format!("{path}{query}");
+        let (code, _, body) = ask(&w.a, req_as(agent, &w.a, &target, &[])).await;
+        assert_eq!(code, 200, "{body}");
+        let recs = w.wait_records("model", 1).await;
+        let r = &recs[0];
+        assert_eq!(r["provider"], provider);
+        assert_eq!(r["login"], "api-key");
+        assert_eq!(r["credential"], "gateway");
+        assert_eq!(r["path"], path);
+        assert_eq!(r["box"], w.a.id.as_str());
+        assert_eq!(r["outcome"], "done");
+        let audit = w.audit_text();
+        assert!(!audit.contains("beta=true"));
+        assert!(!audit.contains("alt=sse"));
+        assert!(!audit.contains(real_key(agent)));
+        assert!(!audit.contains(&w.a.placeholder));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_refused_on_every_route() {
+    for agent in ALL_AGENTS {
+        let w = world(Opts::agent(agent)).await;
+        let (k, v) = auth(agent, &w.a.placeholder);
+        let path = match agent {
+            AgentKind::Codex => "/v1/responses",
+            other => ok_path(other),
+        };
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(k, v)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (code, _, body) = ask(&w.a, req).await;
+        assert_eq!(code, 400, "{agent:?}: {body}");
+        assert!(w.up.seen().is_empty());
+    }
+}
+
+/// The three events reach the box one by one: the first before the
+/// upstream sent the third.
+async fn sse_arrives_incrementally(w: &W, req: Request<Full<Bytes>>) {
+    let (mut tx, _task) = client(&w.a).await;
+    let resp = tokio::time::timeout(Duration::from_secs(15), tx.send_request(req))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(15), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let first_at = Instant::now();
+    assert_eq!(first.into_data().unwrap(), sse_event(0));
+    let mut rest = Vec::new();
+    while let Some(f) = tokio::time::timeout(Duration::from_secs(15), body.frame())
+        .await
+        .unwrap()
+    {
+        if let Ok(d) = f.unwrap().into_data() {
+            rest.extend_from_slice(&d);
+        }
+    }
+    let mut want = Vec::new();
+    want.extend_from_slice(&sse_event(1));
+    want.extend_from_slice(&sse_event(2));
+    assert_eq!(rest, want);
+    let third_at =
+        w.up.third_at
+            .lock()
+            .unwrap()
+            .expect("the third event was sent");
+    assert!(
+        first_at < third_at,
+        "the first event arrived only after the third was sent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sse_streams_on_every_route() {
+    let w = world(Opts::agent(AgentKind::Codex)).await;
+    let bearer = format!("Bearer {}", w.a.placeholder);
+    let req = post(
+        "/v1/responses",
+        &[("authorization", &bearer), ("accept", "text/event-stream")],
+        r#"{"model":"m","stream":true,"input":[]}"#,
+    );
+    sse_arrives_incrementally(&w, req).await;
+    let w = world(Opts::agent(AgentKind::Gemini)).await;
+    let req = post(
+        "/v1beta/models/m:streamGenerateContent?alt=sse",
+        &[("x-goog-api-key", &w.a.placeholder)],
+        "{}",
+    );
+    sse_arrives_incrementally(&w, req).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_routes_never_echo_credentials() {
+    for agent in [AgentKind::Codex, AgentKind::Gemini] {
+        let w = world(Opts {
+            model: ModelConfig {
+                body_max: 64,
+                ..ModelConfig::default()
+            },
+            ..Opts::agent(agent)
+        })
+        .await;
+        let pa = w.a.placeholder.clone();
+        let pb = w.b.placeholder.clone();
+        let (k, v) = auth(agent, &pa);
+        let (_, vb) = auth(agent, &pb);
+        let base = ok_path(agent);
+        let mut bodies = Vec::new();
+        let reqs = vec![
+            post(base, &[(k, &vb)], "{}"),
+            post(base, &[("x-api-key", &pa)], "{}"),
+            post(base, &[(k, &v), ("x-other", &pa)], "{}"),
+            post(&format!("{base}/{pa}"), &[(k, &v)], "{}"),
+            post(&format!("{base}?q={pa}"), &[(k, &v)], "{}"),
+            post(&format!("/v1/files/{pa}"), &[(k, &v)], "{}"),
+            post(&format!("{base}/../{pa}"), &[(k, &v)], "{}"),
+            post(&format!("{base}?key={pa}"), &[(k, &v)], "{}"),
+            post(base, &[(k, &v)], &"q".repeat(100)),
+            post(
+                base,
+                &[(k, &v), ("upgrade", "websocket"), ("connection", "upgrade")],
+                "{}",
+            ),
+        ];
+        for req in reqs {
+            let (code, h, body) = ask(&w.a, req).await;
+            assert!(code >= 400, "{agent:?} {code}");
+            bodies.push(format!("{h:?}{body}"));
+        }
+        w.lockdown();
+        bodies.push(ask(&w.a, req_as(agent, &w.a, base, &[])).await.2);
+        w.ctx.lockdown.set(None).unwrap();
+        w.ctx.vault.writer().remove(cred_name(agent)).unwrap();
+        let (code, _, b) = ask(&w.a, req_as(agent, &w.a, base, &[])).await;
+        assert_eq!(code, 503);
+        bodies.push(b);
+        let real = real_key(agent);
+        for b in &bodies {
+            for secret in [pa.as_str(), pb.as_str(), real] {
+                assert!(
+                    !b.contains(secret),
+                    "{agent:?}: an error answer quoted a credential: {b}"
+                );
+            }
+        }
+        assert!(w.up.seen().is_empty(), "{agent:?}");
+        let audit = w.audit_text();
+        for secret in [pa.as_str(), pb.as_str(), real] {
+            assert!(
+                !audit.contains(secret),
+                "{agent:?}: the audit holds a credential"
+            );
+        }
+    }
+}
+
+/// Review Focus 5: a box spawned as claude-code whose template now names
+/// codex fails closed, and its placeholder file is never remade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn template_switched_agent_is_401() {
+    let w = world(Opts {
+        switch_to: Some(AgentKind::Codex),
+        ..Opts::default()
+    })
+    .await;
+    let mgr = w.ctx.box_manager.as_ref().unwrap();
+    let file = saiife_boxhost::paths::RecordPaths::of(mgr.root(), &w.a.id).placeholder();
+    let before = std::fs::read(&file).unwrap();
+    let ph = &w.a.placeholder;
+    let bearer = format!("Bearer {ph}");
+    for h in [
+        ("x-api-key", ph.as_str()),
+        ("authorization", bearer.as_str()),
+    ] {
+        let (code, _, body) = ask(&w.a, post("/v1/responses", &[h], "{}")).await;
+        assert_eq!(code, 401, "{h:?}: {body}");
+        assert_eq!(body.trim(), NOT_VALID);
+    }
+    assert!(w.up.seen().is_empty());
+    assert!(w.up.asked().is_empty());
+    let recs = w.wait_records("model_denied", 1).await;
+    assert_eq!(recs[0]["reason"], "no_placeholder");
+    assert_eq!(std::fs::read(&file).unwrap(), before);
 }
