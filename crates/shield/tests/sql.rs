@@ -1861,3 +1861,82 @@ fn arithmetic_is_capped() {
         prepares(&ok(&sql).sql);
     }
 }
+
+// ---- plan 45 T2 fix round 2: join edges and the fan-out rule ----
+
+/// `schema()` plus invoice_lines(id, invoice_id, qty, sku): invoice_id is the
+/// C-G1 FK of `invoices.id` (invoices is declared as an entity).
+fn schema_lines() -> Schema {
+    use ColType::*;
+    use ColumnClass::*;
+    let mut s = schema();
+    s.tables.push(TableInfo {
+        name: "invoice_lines".into(),
+        alias: None,
+        rows: 20000,
+        columns: vec![
+            col("id", Integer, Identifier),
+            col("invoice_id", Integer, Identifier),
+            col("qty", Integer, Sensitive),
+            col("sku", Text, Public),
+        ],
+    });
+    s
+}
+
+#[test]
+fn fan_out_over_a_declared_child_is_refused() {
+    let s = schema_lines();
+    // The invoice amount repeats once per line.
+    let sql = "SELECT SUM(i.amount) AS s FROM invoices i \
+               JOIN invoice_lines l ON l.invoice_id = i.id";
+    assert_eq!(
+        class_of(sql, &s, &no_entity()),
+        ErrorClass::ConstructNotAllowed
+    );
+    // A many-to-one lookup: aggregate the child, join its parent.
+    let sql = "SELECT SUM(l.qty) AS q FROM invoice_lines l \
+               JOIN invoices i ON i.id = l.invoice_id";
+    let v = validate(sql, &s, &public(), &no_entity()).expect("allowed");
+    assert_eq!(
+        v.sources,
+        vec!["invoice_lines".to_string(), "invoices".to_string()]
+    );
+    assert_eq!(
+        v.joins,
+        vec![saiife_shield::sql::JoinEdge {
+            joined: 1,
+            key: 1,
+            fk: 0,
+            key_table: "invoices".into(),
+            fk_table: "invoice_lines".into(),
+            fan: true,
+        }]
+    );
+    assert!(v.pinned_sources.is_empty());
+}
+
+#[test]
+fn second_instance_of_a_table_is_refused() {
+    let sql = "SELECT COUNT(*) AS n FROM customers a JOIN customers b ON a.id = b.id \
+               WHERE a.id = :p1";
+    assert!(validate(sql, &schema(), &public(), &params()).is_err());
+}
+
+#[test]
+fn join_edges_and_pinned_source() {
+    let v = ok(BALANCE);
+    assert_eq!(
+        v.sources,
+        vec!["invoices".to_string(), "customers".to_string()]
+    );
+    assert_eq!(v.joins.len(), 1);
+    assert_eq!(
+        (v.joins[0].joined, v.joins[0].key, v.joins[0].fk),
+        (1, 1, 0)
+    );
+    assert_eq!(v.joins[0].key_table, "customers");
+    assert_eq!(v.joins[0].fk_table, "invoices");
+    assert!(v.joins[0].fan);
+    assert_eq!(v.pinned_sources, vec![1]);
+}

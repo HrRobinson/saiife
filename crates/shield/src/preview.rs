@@ -19,9 +19,8 @@ use crate::sql::Validated;
 use ring::digest;
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderByKind,
-    OrderBySort, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins, UnaryOperator,
-    Value,
+    GroupByExpr, LimitClause, ObjectNamePart, OrderByKind, OrderBySort, Query, Select, SelectItem,
+    SetExpr, TableFactor, TableWithJoins, UnaryOperator, Value,
 };
 
 /// The reserved prefix of planner-chosen reference names (see `sql.rs`).
@@ -48,7 +47,7 @@ pub fn preview(v: &Validated, params: &[Param], schema: &Schema, lang: Lang) -> 
         tables: Vec::new(),
         fragments: 0,
     };
-    let body = describe(&mut cx, &v.ast, &v.sql);
+    let body = describe(&mut cx, v);
     let text = match lang {
         Lang::En => format!("I'm {body}."),
         Lang::Da => format!("Jeg {body}."),
@@ -842,52 +841,15 @@ fn group_phrase(cx: &mut Cx, g: &GroupByExpr) -> Option<String> {
     }
 }
 
-/// Entity tables pinned by `key = :pN` / `key IN (:pN)` in the `WHERE`.
-fn pinned_tables(cx: &Cx, sel: &Select) -> Vec<String> {
-    let mut cs = Vec::new();
-    if let Some(w) = &sel.selection {
-        conjuncts(w, &mut cs);
-    }
-    let mut out = Vec::new();
-    for c in cs {
-        let (col, ph) = match unnest(c) {
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::Eq,
-                right,
-            } => {
-                if placeholder(right).is_some() {
-                    (col_of(cx, left), placeholder(right))
-                } else {
-                    (col_of(cx, right), placeholder(left))
-                }
-            }
-            Expr::InList {
-                expr,
-                list,
-                negated: false,
-            } if list.len() == 1 => (col_of(cx, expr), placeholder(&list[0])),
-            _ => continue,
-        };
-        let entity = ph
-            .and_then(|n| cx.param(n))
-            .is_some_and(|p| matches!(p.ty, ParamType::Entity { .. }));
-        if let (Some((t, _)), true) = (col, entity) {
-            out.push(t);
-        }
-    }
-    out
-}
-
-/// The phrases of the joins: a join to the pinned entity table is implicit,
-/// a parent join and a child join have a phrase, anything else is a fragment.
-fn join_phrases(cx: &mut Cx, sel: &Select) -> Vec<String> {
-    let pinned = pinned_tables(cx, sel);
-    let is_key =
-        |s: &Schema, t: &str, c: &str| s.entities.iter().any(|e| e.table == t && e.key == c);
+/// The phrases of the joins, from the validator's own join edges (declared
+/// key pairs, ruling C-G1) and nothing else. A join to a source the entity
+/// parameter pins is implicit; a parent join and a child join have a phrase;
+/// a join without a matching edge is shown as a counted fragment, never
+/// dropped.
+fn join_phrases(cx: &mut Cx, sel: &Select, v: &Validated) -> Vec<String> {
     let mut out = Vec::new();
     for twj in &sel.from {
-        for j in &twj.joins {
+        for (k, j) in twj.joins.iter().enumerate() {
             let joined = match &j.relation {
                 TableFactor::Table { name, .. } => name
                     .0
@@ -899,44 +861,28 @@ fn join_phrases(cx: &mut Cx, sel: &Select) -> Vec<String> {
                     .unwrap_or_default(),
                 _ => String::new(),
             };
-            let on = match &j.join_operator {
-                JoinOperator::Join(JoinConstraint::On(e))
-                | JoinOperator::Inner(JoinConstraint::On(e)) => Some(e),
-                _ => None,
-            };
-            let pair = on.and_then(|e| match unnest(e) {
-                Expr::BinaryOp {
-                    left,
-                    op: BinaryOperator::Eq,
-                    right,
-                } => Some((col_of(cx, left)?, col_of(cx, right)?)),
-                _ => None,
+            let edge = v.joins.get(k).filter(|e| {
+                e.joined == k + 1
+                    && v.sources.get(e.joined) == Some(&joined)
+                    && v.sources.get(e.key) == Some(&e.key_table)
+                    && v.sources.get(e.fk) == Some(&e.fk_table)
             });
-            let phrase = pair.and_then(|(a, b)| {
-                let (key, fk) = if is_key(cx.schema, &a.0, &a.1) {
-                    (a, b)
-                } else if is_key(cx.schema, &b.0, &b.1) {
-                    (b, a)
-                } else {
-                    return None;
-                };
-                if key.0 == joined {
-                    // The joined table is the parent (many-to-one).
-                    if pinned.contains(&joined) {
+            let phrase = edge.and_then(|e| {
+                if e.key == e.joined {
+                    if v.pinned_sources.contains(&e.joined) {
                         Some(String::new())
                     } else {
+                        let t = &e.key_table;
                         Some(cx.t(
-                            &format!("matched with their {joined}"),
-                            &format!("koblet med deres {joined}"),
+                            &format!("matched with their {t}"),
+                            &format!("koblet med deres {t}"),
                         ))
                     }
-                } else if fk.0 == joined {
-                    // The joined table is the child: the key side keeps
-                    // only the rows that have one.
-                    let k = &key.0;
+                } else if e.fk == e.joined {
+                    let (kt, ft) = (&e.key_table, &e.fk_table);
                     Some(cx.t(
-                        &format!("only {k} that have {joined}"),
-                        &format!("kun {k} der har {joined}"),
+                        &format!("only {kt} that have {ft}"),
+                        &format!("kun {kt} der har {ft}"),
                     ))
                 } else {
                     None
@@ -956,7 +902,8 @@ fn join_phrases(cx: &mut Cx, sel: &Select) -> Vec<String> {
 }
 
 /// The whole sentence body after `I'm` / `Jeg`.
-fn describe(cx: &mut Cx, q: &Query, sql: &str) -> String {
+fn describe(cx: &mut Cx, v: &Validated) -> String {
+    let (q, sql) = (&v.ast, &v.sql);
     let SetExpr::Select(sel) = q.body.as_ref() else {
         let f = cx.frag(sql);
         return cx.t(&format!("running {f}"), &format!("kører {f}"));
@@ -1039,7 +986,7 @@ fn describe(cx: &mut Cx, q: &Query, sql: &str) -> String {
         head.push(' ');
         head.push_str(&cx.t("without duplicate rows", "uden dublerede rækker"));
     }
-    for p in join_phrases(cx, sel) {
+    for p in join_phrases(cx, sel, v) {
         head.push(' ');
         head.push_str(&p);
     }

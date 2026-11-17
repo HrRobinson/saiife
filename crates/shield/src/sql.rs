@@ -240,9 +240,38 @@ pub struct EntityFilter {
     pub linked: Vec<(String, String)>,
 }
 
+/// One join of the outermost block, as the validator checked it against the
+/// declared key pairs (ruling C-G1). The preview reads joins from here and
+/// nowhere else (one source of truth).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinEdge {
+    /// The index in [`Validated::sources`] of the table this `JOIN` adds
+    /// (the first `JOIN` adds source 1; source 0 is the `FROM` table).
+    pub joined: usize,
+    /// Source index of the key side (the entity key, one row per key).
+    pub key: usize,
+    /// Source index of the FK side.
+    pub fk: usize,
+    /// Snapshot table (or CTE) name of the key side.
+    pub key_table: String,
+    /// Snapshot table (or CTE) name of the FK side.
+    pub fk_table: String,
+    /// One-to-many: the FK side has several rows per key (a plain FK table,
+    /// not a CTE grouped by that column).
+    pub fan: bool,
+}
+
 /// A validated method.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
+    /// The outermost block's sources in `FROM` order: snapshot table or CTE
+    /// name. Indexes in [`JoinEdge`] and `pinned_sources` refer to it.
+    pub sources: Vec<String>,
+    /// One edge per `JOIN` of the outermost block, in order.
+    pub joins: Vec<JoinEdge>,
+    /// Sources of the outermost block that an entity parameter pins
+    /// (`key = :pN` / `key IN (:pN)` on that very source).
+    pub pinned_sources: Vec<usize>,
     /// Rewritten to snapshot names.
     pub ast: Query,
     /// Rendered from `ast`: the SQL that runs.
@@ -360,6 +389,7 @@ fn validate_cols(
         links: Vec::new(),
         agg_seen: false,
         outer: true,
+        outer_view: None,
     };
     let out = w.query(&mut q, true)?;
     // A bound entity the method ignores answers another question.
@@ -407,8 +437,12 @@ fn validate_cols(
         .collect();
     let count_only = !out.is_empty() && out.iter().all(|c| c.counted);
     let rendered = q.to_string();
+    let (sources, joins, pinned_sources) = w.outer_view.take().unwrap_or_default();
     Ok((
         Validated {
+            sources,
+            joins,
+            pinned_sources,
             ast: *q,
             sql: rendered,
             cloud_sql: sql.to_string(),
@@ -823,6 +857,8 @@ struct Walk<'a> {
     agg_seen: bool,
     /// The block being walked is the outermost one.
     outer: bool,
+    /// The outermost block's sources, join edges and pinned sources.
+    outer_view: Option<(Vec<String>, Vec<JoinEdge>, Vec<usize>)>,
 }
 
 impl<'a> Walk<'a> {
@@ -955,6 +991,7 @@ impl<'a> Walk<'a> {
             return fail(ErrorClass::TooManyColumns);
         }
         let mut sc = Scope::default();
+        let mut view_edges: Vec<JoinEdge> = Vec::new();
 
         // FROM and JOIN: register every source, then check each ON.
         if let Some(twj) = from.first_mut() {
@@ -992,6 +1029,28 @@ impl<'a> Walk<'a> {
                 edges.push(self.on_clause(on, k + 1, &sc)?);
             }
             sc.repeated = fan_out(sc.sources.len(), &edges)?;
+            let label = |i: usize| -> String {
+                sc.sources
+                    .get(i)
+                    .map_or_else(String::new, |x| match &x.cols {
+                        Cols::Base(ti) => self.schema.tables[*ti].name.clone(),
+                        Cols::Cte(_) => {
+                            x.ident.strip_prefix("cte:").unwrap_or(&x.ident).to_string()
+                        }
+                    })
+            };
+            view_edges = edges
+                .iter()
+                .enumerate()
+                .map(|(k, &(key, fk, fan))| JoinEdge {
+                    joined: k + 1,
+                    key,
+                    fk,
+                    key_table: label(key),
+                    fk_table: label(fk),
+                    fan,
+                })
+                .collect();
         }
 
         // The output columns.
@@ -1096,6 +1155,21 @@ impl<'a> Walk<'a> {
                     return construct();
                 }
             }
+        }
+
+        if outer {
+            let names = sc
+                .sources
+                .iter()
+                .map(|x| match &x.cols {
+                    Cols::Base(ti) => self.schema.tables[*ti].name.clone(),
+                    Cols::Cte(_) => x.ident.strip_prefix("cte:").unwrap_or(&x.ident).to_string(),
+                })
+                .collect();
+            let mut pins = pinned.clone();
+            pins.sort_unstable();
+            pins.dedup();
+            self.outer_view = Some((names, view_edges, pins));
         }
 
         // Addendum (a): in an aggregating block a plain column is grouped,

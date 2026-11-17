@@ -499,3 +499,58 @@ fn danish_having_connector() {
         "Jeg tæller invoices pr. status, beholder kun grupper hvor `COUNT(*) > 2`."
     );
 }
+
+#[test]
+fn joins_come_from_the_validators_edges() {
+    let ps = params();
+    let v = validated(BALANCE, &ps);
+    let base = preview(&v, &ps, &schema(), Lang::En);
+    // The pinned entity join is implicit.
+    assert!(!base.text.contains("matched") && base.fragments == 0);
+
+    // K1: the join's own source is not the pinned one: never dropped.
+    let mut other = v.clone();
+    other.pinned_sources = vec![0];
+    let p = preview(&other, &ps, &schema(), Lang::En);
+    assert!(
+        p.text.contains("matched with their customers"),
+        "{}",
+        p.text
+    );
+    let mut none = v.clone();
+    none.pinned_sources.clear();
+    let p = preview(&none, &ps, &schema(), Lang::En);
+    assert!(
+        p.text.contains("matched with their customers"),
+        "{}",
+        p.text
+    );
+
+    // K2: no declared edge for the join: a counted fragment, no guessed phrase.
+    let mut undeclared = v.clone();
+    undeclared.joins.clear();
+    let p = preview(&undeclared, &ps, &schema(), Lang::En);
+    assert_eq!(p.fragments, 1, "{}", p.text);
+    assert!(p.text.contains("JOIN customers"), "{}", p.text);
+    assert!(
+        !p.text.contains("matched") && !p.text.contains("only "),
+        "{}",
+        p.text
+    );
+    assert!(!p.text.contains("_p_"), "{}", p.text);
+
+    // The edge decides the direction: a child edge reads as a child join.
+    let mut child = v.clone();
+    child.joins[0].joined = 1;
+    child.joins[0].key = 0;
+    child.joins[0].fk = 1;
+    child.joins[0].key_table = "invoices".into();
+    child.joins[0].fk_table = "customers".into();
+    child.pinned_sources.clear();
+    let p = preview(&child, &ps, &schema(), Lang::En);
+    assert!(
+        p.text.contains("only invoices that have customers"),
+        "{}",
+        p.text
+    );
+}
