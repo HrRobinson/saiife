@@ -225,15 +225,18 @@ mod tests {
     fn offsets_survive_normalization() {
         for (lower, strip) in [(true, true), (true, false), (false, true), (false, false)] {
             let w = wp(lower, strip);
-            for text in [
-                "Hvad skylder Åse Østergård?",
-                "A\u{030a}se",
-                "x A\u{030a}se!",
-            ] {
+            let cases: [(&str, &[&str]); 3] = [
+                (
+                    "Hvad skylder Åse Østergård?",
+                    &["Hvad", "skylder", "Åse", "Østergård", "?"],
+                ),
+                ("A\u{030a}se", &["A\u{030a}se"]),
+                ("x A\u{030a}se!", &["x", "A\u{030a}se", "!"]),
+            ];
+            for (text, expect) in cases {
                 let e = w.encode(text);
-                for (s, en) in &e.words {
-                    assert!(text.get(*s..*en).is_some());
-                }
+                let got: Vec<&str> = e.words.iter().map(|(s, en)| &text[*s..*en]).collect();
+                assert_eq!(got, expect, "lower={lower} strip={strip}");
             }
         }
         // stripped accents: decomposed and composed A-ring both reach "å"?
