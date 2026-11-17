@@ -17,8 +17,9 @@
 //!    covered by an allow-list word; every whole sentence (split as
 //!    [`crate::index::split_phrases`] splits) and the whole text go through
 //!    [`KnownIndex::contains_phrase`].
-//! 3. **Numbers** (R44-8, ruling P-4) over the question and the context
-//!    questions (and synthetic text, minus the generator's own numbers):
+//! 3. **Numbers** (R44-8, ruling P-4) over the question, the context
+//!    questions, the retry's previous method and synthetic text (minus the
+//!    generator's own numbers):
 //!    every run of numeric characters, every number [`find_numbers`] finds
 //!    (both languages; the other language's words that are common words of
 //!    this one, Danish `to` and `fire` in English, are left out), every
@@ -33,20 +34,27 @@
 //! 5. **Names.** The detector over free text; a `Person` span that is not a
 //!    released name (`blind:name`) or a stand-in of this envelope is `name`.
 //!
-//! Synthetic numbers (JSON numbers, and the generated number inside a
-//! synthetic text such as `Synthetic_4711`, or a synthetic date) are exempt
-//! from the number, date and known-value scans (R44-6): part 1 checked that
-//! they have exactly the generator's shape and range, so they are drawn, not
-//! read. Anything else in a synthetic text goes through every scan.
+//! The firewall is a strict schema allowlist (ruling P-22): every number
+//! comes from a closed set. `v` is 1; `list_cap` is the cap the caller
+//! expects ([`Firewall::list_cap`]); a row band is exactly what
+//! [`rows_band`] renders for the number it names; parameter names are
+//! `p1..pK` in order in the question and in every context turn, each one
+//! referenced as `:pN` in its text. Synthetic rows (R44-6) hold exactly the
+//! envelope's tables and columns, at most 5 rows a table, every value of
+//! the generator's shape for its column, and their canonical hash
+//! ([`crate::envelope::synthetic_sha256`]) equals the one the caller
+//! computed from `synthetic_rows`' output ([`Firewall::synthetic_sha256`]).
+//! Only then (P-24) is the generator's own number inside a synthetic text
+//! (`Synthetic_4711`) or a synthetic date exempt from the number, date and
+//! known-value scans; patterns and names still run on all of it.
 //!
-//! [`Firewall::check_bytes`] parses the whole HTTP body (strictly: a
-//! duplicate key is `bad_part`) and scans every string and key. An object
-//! of kind `saiife-blind-plan` (top level, or a string holding JSON) must be
-//! an envelope whose canonical bytes are exactly the bytes it came from; it
-//! gets the full envelope scans, so `check_bytes(e.canonical())` gives the
-//! same hits as `check_outgoing`. Other strings get scans 2-5 as free text
-//! in both languages; strings equal to a caller's fixed constant (the system
-//! prompt, the model id) are skipped ([`Firewall::check_bytes_with`]).
+//! [`Firewall::check_bytes`] takes the exact bytes to send: they must
+//! deserialize into [`Envelope`] (unknown fields refused at every level)
+//! and be byte-equal to that envelope's [`Envelope::canonical`], else the
+//! verdict is `bad_part` on `body`. Strings are never re-parsed as JSON:
+//! they are scanned as they are. Then the scans of `check_outgoing` run, so
+//! `check_bytes(e.canonical())` gives the same hits as `check_outgoing`.
+//! Plan 47 wraps these bytes verbatim in its own typed request frame (P-23).
 //!
 //! Incoming text (method, template, intent line) gets the known-value scan
 //! (number-only windows aside: the validator refuses literals) and the
@@ -60,15 +68,17 @@
 //! text. Error texts are fixed strings.
 
 use crate::envelope::{
-    CloudColumn, CloudParam, CloudSchema, Envelope, ENVELOPE_KIND, ENVELOPE_VERSION,
+    synthetic_sha256, CloudColumn, CloudParam, CloudSchema, Envelope, ENVELOPE_KIND,
+    ENVELOPE_VERSION,
 };
 use crate::error::ShieldError;
 use crate::index::{AllowList, KnownIndex};
 use crate::lang::{find_dates, find_numbers, find_unreadable_numerics, number_words};
 use crate::ner::{NameDetector, SpanLabel};
 use crate::norm::{normalize, token_spans};
-use crate::schema::{ColType, ColumnClass, Decimal, Lang};
-use serde_json::{Map, Value};
+use crate::schema::{rows_band, ColType, ColumnClass, Decimal, Lang};
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt;
 
 // -------------------------------------------------------------- values ----
@@ -98,8 +108,6 @@ pub const MAX_METHOD_CHARS: usize = 20_000;
 pub const MAX_SYNTHETIC_ROWS: usize = 5;
 /// The whole HTTP body `check_bytes` accepts.
 pub const MAX_BODY_BYTES: usize = 4 << 20;
-/// Strings holding JSON inside strings, at most this deep.
-const MAX_NESTING: usize = 4;
 /// The known-value window (spec §2.2.5: 2-4 tokens).
 const WINDOW: usize = 4;
 /// The longest allow-list word (in tokens) looked for in a text.
@@ -172,6 +180,11 @@ pub struct Firewall<'a> {
     pub detector: &'a dyn NameDetector,
     /// The names a `blind:name` touch of this ask released.
     pub released_names: &'a [String],
+    /// The `list_cap` the caller put in the envelope (P-22).
+    pub list_cap: u32,
+    /// [`synthetic_sha256`] of the `synthetic_rows` output the caller passed
+    /// to `build_envelope` (P-22).
+    pub synthetic_sha256: &'a str,
 }
 
 impl fmt::Debug for Firewall<'_> {
@@ -180,6 +193,7 @@ impl fmt::Debug for Firewall<'_> {
             .field("index", &self.index)
             .field("allow", &self.allow)
             .field("released_names", &self.released_names.len())
+            .field("list_cap", &self.list_cap)
             .finish_non_exhaustive()
     }
 }
@@ -191,10 +205,10 @@ type Tokens = Vec<(String, usize, usize)>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
-    /// Every scan (question, context questions, synthetic text, other
-    /// strings of a body).
+    /// Every scan (question, context questions, synthetic text, the
+    /// retry's previous method).
     Free,
-    /// The retry's previous method: known values, patterns, names.
+    /// Incoming text: known values and patterns.
     Method,
     /// Typed parts: patterns only (part 1 checked their form).
     Typed,
@@ -284,16 +298,6 @@ fn capitalize(word: &str) -> String {
         .collect()
 }
 
-/// `p` followed by a number from 1, no leading zero.
-fn param_name_ok(n: &str) -> bool {
-    n.strip_prefix('p').is_some_and(|d| {
-        !d.is_empty()
-            && d.len() <= 6
-            && !d.starts_with('0')
-            && d.bytes().all(|b| b.is_ascii_digit())
-    })
-}
-
 /// The tag of a parameter: a fixed type, or `entity:<cloud table>` /
 /// `text:<cloud table>.<cloud column>` of this schema. Returns the entity
 /// word the stand-in must carry: `Some(Some(w))` for a named entity table,
@@ -351,7 +355,8 @@ fn error_class_ok(schema: &CloudSchema, s: &str) -> bool {
         })
 }
 
-/// `about <n>[ thousand| million| billion]` or `<100` (`rows_band`).
+/// Exactly a [`rows_band`] output: the number it names, rendered again,
+/// gives the same bytes (P-22).
 fn band_ok(s: &str) -> bool {
     if s == "<100" {
         return true;
@@ -360,11 +365,20 @@ fn band_ok(s: &str) -> bool {
         return false;
     };
     let (n, unit) = rest.split_once(' ').unwrap_or((rest, ""));
-    matches!(unit, "" | "thousand" | "million" | "billion")
-        && !n.is_empty()
-        && n.len() <= 4
-        && !n.starts_with('0')
-        && n.bytes().all(|b| b.is_ascii_digit())
+    let mult: u64 = match unit {
+        "" => 1,
+        "thousand" => 1_000,
+        "million" => 1_000_000,
+        "billion" => 1_000_000_000,
+        _ => return false,
+    };
+    if n.is_empty() || n.len() > 4 || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    n.parse::<u64>()
+        .ok()
+        .and_then(|v| v.checked_mul(mult))
+        .is_some_and(|v| rows_band(v) == s)
 }
 
 /// A generator number: 1..=99 999, no leading zero.
@@ -407,13 +421,20 @@ fn synthetic_shape(
     v: &Value,
     allow: Option<&AllowList>,
 ) -> Result<Vec<(usize, usize)>, ()> {
+    let list = col.values.as_deref().unwrap_or(&[]);
     if v.is_null() {
-        return Ok(Vec::new());
+        // The generator writes NULL only for a public column with no k-floor
+        // value.
+        return if col.class == ColumnClass::Public && list.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(())
+        };
     }
     match col.class {
         ColumnClass::Public => {
             let s = v.as_str().ok_or(())?;
-            let in_list = col.values.as_ref().is_none_or(|l| l.iter().any(|x| x == s));
+            let in_list = list.iter().any(|x| x == s);
             return if in_list && allowed(allow, s) {
                 Ok(vec![(0, s.len())])
             } else {
@@ -499,20 +520,26 @@ fn path_name(allow: Option<&AllowList>, name: &str, i: usize) -> String {
     }
 }
 
-/// Part 1 and the strings of an envelope. `allow` None (the summary): the
-/// allow-list checks are skipped and every hit of part 1 is dropped by the
-/// caller.
-fn envelope_parts(
-    e: &Envelope,
-    allow: Option<&AllowList>,
-    prefix: &str,
-    hits: &mut Vec<Hit>,
-) -> Vec<Text> {
+/// What the caller expects of an envelope (P-22).
+struct Expect<'x> {
+    allow: &'x AllowList,
+    list_cap: u32,
+    synthetic_sha256: &'x str,
+}
+
+/// Part 1 and the strings of an envelope. `expect` None (the summary): the
+/// checks against the caller's expectations are skipped, and the caller
+/// drops every hit of part 1.
+fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>) -> Vec<Text> {
     let mut texts: Vec<Text> = Vec::new();
-    let p = |s: &str| format!("{prefix}{s}");
+    let allow = expect.map(|x| x.allow);
+    let p = |s: &str| s.to_string();
 
     if e.v != ENVELOPE_VERSION {
         hit(hits, BAD_PART, &p("v"), None);
+    }
+    if expect.is_some_and(|x| x.list_cap != e.list_cap) {
+        hit(hits, BAD_PART, &p("list_cap"), None);
     }
     if e.kind != ENVELOPE_KIND {
         hit(hits, BAD_PART, &p("kind"), None);
@@ -560,7 +587,14 @@ fn envelope_parts(
         }
     }
 
-    // Synthetic rows: each value has the generator's exact shape.
+    // Synthetic rows: exactly the schema's tables and columns, the caller's
+    // hash, each value of the generator's exact shape.
+    let hash_ok = expect.is_none_or(|x| synthetic_sha256(&e.synthetic) == x.synthetic_sha256);
+    let want: BTreeSet<&str> = e.schema.tables.iter().map(|t| t.name.as_str()).collect();
+    let have: BTreeSet<&str> = e.synthetic.keys().map(String::as_str).collect();
+    if !hash_ok || want != have {
+        hit(hits, BAD_PART, &p("synthetic"), None);
+    }
     for (ti, (tname, rows)) in e.synthetic.iter().enumerate() {
         let table = e.schema.tables.iter().find(|t| &t.name == tname);
         let tp = p(&format!("synthetic.{}", path_name(allow, tname, ti)));
@@ -568,7 +602,14 @@ fn envelope_parts(
             hit(hits, BAD_PART, &tp, None);
         }
         texts.push(Text::new(format!("{tp}#name"), tname, Class::Typed));
+        let cols: BTreeSet<&str> = table
+            .map(|t| t.columns.iter().map(|c| c.name.as_str()).collect())
+            .unwrap_or_default();
         for (ri, row) in rows.iter().enumerate() {
+            let keys: BTreeSet<&str> = row.keys().map(String::as_str).collect();
+            if keys != cols {
+                hit(hits, BAD_PART, &format!("{tp}[{ri}]"), None);
+            }
             for (ci, (cname, v)) in row.iter().enumerate() {
                 let col = table.and_then(|t| t.columns.iter().find(|c| &c.name == cname));
                 let vp = format!("{tp}[{ri}].{}", path_name(allow, cname, ci));
@@ -582,17 +623,12 @@ fn envelope_parts(
                 }
                 if let Value::String(s) = v {
                     let mut t = Text::new(vp, s, Class::Free);
-                    t.exempt = shape.unwrap_or_default();
+                    // P-24: exempt only when the shape and the hash hold.
+                    if hash_ok {
+                        t.exempt = shape.unwrap_or_default();
+                    }
                     t.oversize = s.chars().count() > MAX_FREE_TEXT_CHARS;
                     texts.push(t);
-                } else if !matches!(v, Value::Null | Value::Bool(_) | Value::Number(_)) {
-                    // Arrays and objects are never synthetic values: scan
-                    // every string inside them as free text too.
-                    let mut inner = Vec::new();
-                    strings_of(v, &vp, &mut inner);
-                    for (part, s) in inner {
-                        texts.push(Text::new(part, &s, Class::Free));
-                    }
                 }
             }
         }
@@ -605,8 +641,8 @@ fn envelope_parts(
         hit(hits, OVERSIZE, &q.part, None);
         q.oversize = true;
     }
+    check_params(e, &e.params, &p("params"), &q.text, hits, &mut texts);
     texts.push(q);
-    check_params(e, &e.params, &p("params"), true, hits, &mut texts);
 
     // The context.
     if e.context.len() > MAX_CONTEXT_TURNS {
@@ -620,15 +656,15 @@ fn envelope_parts(
             hit(hits, OVERSIZE, &t.part, None);
             t.oversize = true;
         }
-        texts.push(t);
         check_params(
             e,
             &turn.params,
             &format!("{tp}.params"),
-            false,
+            &t.text,
             hits,
             &mut texts,
         );
+        texts.push(t);
     }
 
     // The retry.
@@ -641,11 +677,8 @@ fn envelope_parts(
             &r.error_class,
             Class::Typed,
         ));
-        let mut m = Text::new(
-            p("retry.previous_method"),
-            &r.previous_method,
-            Class::Method,
-        );
+        let mut m = Text::new(p("retry.previous_method"), &r.previous_method, Class::Free);
+        m.params = e.params.iter().map(|x| x.name.clone()).collect();
         if r.previous_method.chars().count() > MAX_METHOD_CHARS {
             hit(hits, OVERSIZE, &m.part, None);
             m.oversize = true;
@@ -655,24 +688,21 @@ fn envelope_parts(
     texts
 }
 
-/// Names `p1..pK` in order for the question (`sequential`), else distinct
-/// `p<n>`; tags from the fixed list; an entity has a well-formed stand-in,
+/// Names exactly `p1..pK` in order, each referenced as `:pN` in `text`
+/// (P-22); tags from the fixed list; an entity has a well-formed stand-in,
 /// nothing else has one.
 fn check_params(
     e: &Envelope,
     params: &[CloudParam],
     base: &str,
-    sequential: bool,
+    text: &str,
     hits: &mut Vec<Hit>,
     texts: &mut Vec<Text>,
 ) {
+    let refs: Vec<&str> = param_refs(text).into_iter().map(|r| r.2).collect();
     for (i, cp) in params.iter().enumerate() {
         let pp = format!("{base}[{i}]");
-        let name_ok = if sequential {
-            cp.name == format!("p{}", i + 1)
-        } else {
-            param_name_ok(&cp.name) && params.iter().filter(|x| x.name == cp.name).count() == 1
-        };
+        let name_ok = cp.name == format!("p{}", i + 1) && refs.contains(&cp.name.as_str());
         if !name_ok {
             hit(hits, BAD_PART, &format!("{pp}.name"), None);
         }
@@ -702,25 +732,6 @@ fn check_params(
         if let Some(sym) = &cp.symbol {
             texts.push(Text::new(format!("{pp}.symbol"), sym, Class::Typed));
         }
-    }
-}
-
-/// Every string in a JSON value, with a positional path.
-fn strings_of(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
-    match v {
-        Value::String(s) => out.push((path.to_string(), s.clone())),
-        Value::Array(a) => {
-            for (i, x) in a.iter().enumerate() {
-                strings_of(x, &format!("{path}[{i}]"), out);
-            }
-        }
-        Value::Object(m) => {
-            for (i, (k, x)) in m.iter().enumerate() {
-                out.push((format!("{path}.#{i}#key"), k.clone()));
-                strings_of(x, &format!("{path}.#{i}"), out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1025,7 +1036,7 @@ fn ambiguous_in_other(lang: Lang, word: &str) -> bool {
 }
 
 /// `:p<digits>` references: (start, end, name without the colon).
-fn param_refs(s: &str) -> Vec<(usize, usize, &str)> {
+pub(crate) fn param_refs(s: &str) -> Vec<(usize, usize, &str)> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -1111,78 +1122,6 @@ fn number_hits(
     for sp in spans {
         hit(hits, NUMBER, &t.part, Some(sp));
     }
-}
-
-// ---------------------------------------------------------------- strict ----
-
-/// A JSON value parsed with duplicate keys refused.
-struct Strict(Value);
-
-impl<'de> serde::Deserialize<'de> for Strict {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_any(StrictVisitor).map(Strict)
-    }
-}
-
-struct StrictVisitor;
-
-impl<'de> serde::de::Visitor<'de> for StrictVisitor {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("JSON")
-    }
-    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::Bool(v))
-    }
-    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-        Ok(Value::from(v))
-    }
-    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-        Ok(Value::from(v))
-    }
-    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
-        serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("not a JSON number"))
-    }
-    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-    fn visit_string<E>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
-    }
-    fn visit_unit<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-    fn visit_none<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
-        let mut v = Vec::new();
-        while let Some(Strict(x)) = a.next_element()? {
-            v.push(x);
-        }
-        Ok(Value::Array(v))
-    }
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
-        let mut m = Map::new();
-        while let Some(k) = a.next_key::<String>()? {
-            let Strict(x) = a.next_value()?;
-            if m.insert(k, x).is_some() {
-                return Err(serde::de::Error::custom("duplicate key"));
-            }
-        }
-        Ok(Value::Object(m))
-    }
-}
-
-fn parse_strict(b: &[u8]) -> Option<Value> {
-    serde_json::from_slice::<Strict>(b).ok().map(|s| s.0)
-}
-
-fn is_envelope_kind(v: &Value) -> bool {
-    v.get("kind").and_then(Value::as_str) == Some(ENVELOPE_KIND)
 }
 
 // ------------------------------------------------------------- firewall ----
@@ -1378,10 +1317,14 @@ impl Firewall<'_> {
         &self,
         e: &Envelope,
         primary: &[Lang],
-        prefix: &str,
         hits: &mut Vec<Hit>,
     ) -> Result<(), ShieldError> {
-        let texts = envelope_parts(e, Some(self.allow), prefix, hits);
+        let expect = Expect {
+            allow: self.allow,
+            list_cap: self.list_cap,
+            synthetic_sha256: self.synthetic_sha256,
+        };
+        let texts = envelope_parts(e, Some(&expect), hits);
         self.scan_texts(&texts, primary, &symbols_of(e), hits)
     }
 
@@ -1392,138 +1335,29 @@ impl Firewall<'_> {
             primary.push(e.lang);
         }
         let mut hits = Vec::new();
-        self.envelope_hits(e, &primary, "", &mut hits)?;
+        self.envelope_hits(e, &primary, &mut hits)?;
         Ok(verdict(hits))
     }
 
-    /// The whole HTTP body plan 47 sends: [`Self::check_bytes_with`] with no
-    /// fixed constants.
+    /// The exact bytes to send (P-22): a typed [`Envelope`], unknown
+    /// fields refused at every level, byte-equal to its canonical form; then
+    /// every scan of [`Self::check_outgoing`] in the envelope's language.
+    /// Bytes that are not such an envelope are `bad_part` on `body`.
     pub fn check_bytes(&self, body: &[u8]) -> Result<Verdict, ShieldError> {
-        self.check_bytes_with(body, &[])
-    }
-
-    /// The whole HTTP body. A string equal to one of `fixed` (the system
-    /// prompt, the model id: constants of the caller's code, never data) is
-    /// not scanned.
-    pub fn check_bytes_with(&self, body: &[u8], fixed: &[&str]) -> Result<Verdict, ShieldError> {
         let mut hits = Vec::new();
         if body.len() > MAX_BODY_BYTES {
             hit(&mut hits, OVERSIZE, "body", None);
             return Ok(verdict(hits));
         }
-        let Some(v) = parse_strict(body) else {
+        let Ok(e) = serde_json::from_slice::<Envelope>(body) else {
             hit(&mut hits, BAD_PART, "body", None);
             return Ok(verdict(hits));
         };
-        let mut generic = Vec::new();
-        self.walk(&v, Some(body), "", 0, fixed, &mut generic, &mut hits)?;
-        let both = [Lang::En, Lang::Da];
-        self.scan_texts(&generic, &both, &[], &mut hits)?;
+        if e.canonical() != body {
+            hit(&mut hits, BAD_PART, "body", None);
+        }
+        self.envelope_hits(&e, &[e.lang], &mut hits)?;
         Ok(verdict(hits))
-    }
-
-    /// The part path of a key: the key when it is plain lowercase ASCII and
-    /// not a known value, else `#<index>`.
-    fn key_path(&self, path: &str, k: &str, i: usize) -> Result<String, ShieldError> {
-        let plain = !k.is_empty()
-            && k.len() <= 32
-            && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-            && !self.index.contains_value(k)?;
-        let seg = if plain {
-            k.to_string()
-        } else {
-            format!("#{i}")
-        };
-        Ok(if path.is_empty() || path.ends_with('/') {
-            format!("{path}{seg}")
-        } else {
-            format!("{path}.{seg}")
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        &self,
-        v: &Value,
-        raw: Option<&[u8]>,
-        path: &str,
-        depth: usize,
-        fixed: &[&str],
-        generic: &mut Vec<Text>,
-        hits: &mut Vec<Hit>,
-    ) -> Result<(), ShieldError> {
-        let here = if path.is_empty() { "body" } else { path };
-        // The string a nested value came from (`messages[0].content`).
-        let from = here.strip_suffix('/').unwrap_or(here);
-        if is_envelope_kind(v) {
-            match serde_json::from_value::<Envelope>(v.clone()) {
-                Ok(e) => {
-                    if raw.is_some_and(|r| r != e.canonical().as_slice()) {
-                        hit(hits, BAD_PART, from, None);
-                    }
-                    let prefix = if path.is_empty() || path.ends_with('/') {
-                        path.to_string()
-                    } else {
-                        format!("{path}/")
-                    };
-                    return self.envelope_hits(&e, &[e.lang], &prefix, hits);
-                }
-                Err(_) => hit(hits, BAD_PART, from, None),
-            }
-        }
-        match v {
-            Value::String(s) => {
-                if fixed.contains(&s.as_str()) {
-                    return Ok(());
-                }
-                let t = s.trim_start();
-                if t.starts_with('{') || t.starts_with('[') {
-                    if let Some(inner) = parse_strict(s.as_bytes()) {
-                        if inner.is_object() || inner.is_array() {
-                            if depth >= MAX_NESTING {
-                                hit(hits, BAD_PART, here, None);
-                                return Ok(());
-                            }
-                            return self.walk(
-                                &inner,
-                                Some(s.as_bytes()),
-                                &format!("{here}/"),
-                                depth + 1,
-                                fixed,
-                                generic,
-                                hits,
-                            );
-                        }
-                    }
-                }
-                generic.push(Text::new(here.to_string(), s, Class::Free));
-            }
-            Value::Array(a) => {
-                for (i, x) in a.iter().enumerate() {
-                    self.walk(
-                        x,
-                        None,
-                        &format!("{here}[{i}]"),
-                        depth,
-                        fixed,
-                        generic,
-                        hits,
-                    )?;
-                }
-            }
-            Value::Object(m) => {
-                let base = if path.is_empty() { "" } else { path };
-                for (i, (k, x)) in m.iter().enumerate() {
-                    let kp = self.key_path(base, k, i)?;
-                    if !fixed.contains(&k.as_str()) {
-                        generic.push(Text::new(format!("{kp}#key"), k, Class::Free));
-                    }
-                    self.walk(x, None, &kp, depth, fixed, generic, hits)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     /// The planner's reply: method text, the template's fixed text and the
@@ -1558,7 +1392,7 @@ impl Firewall<'_> {
 /// them: part 1's checks are not counted.
 pub(crate) fn standalone_hits(e: &Envelope) -> Vec<Hit> {
     let mut ignored = Vec::new();
-    let texts = envelope_parts(e, None, "", &mut ignored);
+    let texts = envelope_parts(e, None, &mut ignored);
     let cutoff = birth_cutoff();
     let mut hits = Vec::new();
     for t in texts.iter().filter(|t| !t.oversize) {
@@ -1629,8 +1463,6 @@ mod tests {
             .map(|x| x.2)
             .collect();
         assert_eq!(r, vec!["p1", "p12", "p3"]);
-        assert!(param_name_ok("p1") && param_name_ok("p10"));
-        assert!(!param_name_ok("p0") && !param_name_ok("p01") && !param_name_ok("q1"));
     }
 
     #[test]
@@ -1645,7 +1477,17 @@ mod tests {
         for b in ["<100", "about 3 million", "about 400", "about 20 thousand"] {
             assert!(band_ok(b), "{b}");
         }
-        for b in ["about 03", "about 3 people", "3 million", "about "] {
+        for b in [
+            "about 03",
+            "about 3 people",
+            "3 million",
+            "about ",
+            "about 1234 million",
+            "about 3500",
+            "about 30 thousand ",
+            "about 0",
+            "<1000",
+        ] {
             assert!(!band_ok(b), "{b}");
         }
         let schema = CloudSchema {
@@ -1729,7 +1571,17 @@ mod tests {
         let f = col("note", ColType::Text, FreeText);
         assert!(synthetic_shape(&f, &s("(free text)"), None).is_ok());
         assert!(synthetic_shape(&f, &s("called Søren"), None).is_err());
-        assert!(synthetic_shape(&f, &Value::Null, None).is_ok());
+        // NULL only where the generator writes it: a public column with no
+        // k-floor value.
+        assert!(synthetic_shape(&f, &Value::Null, None).is_err());
+        assert!(synthetic_shape(&n, &Value::Null, None).is_err());
+        let mut p = col("seg", ColType::Text, Public);
+        assert!(synthetic_shape(&p, &Value::Null, None).is_ok());
+        assert!(synthetic_shape(&p, &s("vip"), None).is_err());
+        p.values = Some(vec!["vip".into()]);
+        assert!(synthetic_shape(&p, &Value::Null, None).is_err());
+        assert_eq!(synthetic_shape(&p, &s("vip"), None), Ok(vec![(0, 3)]));
+        assert!(synthetic_shape(&p, &s("retail"), None).is_err());
     }
 
     #[test]

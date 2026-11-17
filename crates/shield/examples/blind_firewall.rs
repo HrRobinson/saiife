@@ -6,13 +6,13 @@
 //! or Danish, or by email); half are clean parameterized questions. Each
 //! naming question must be resolved locally (sent only with a stand-in) or
 //! blocked, and its raw text, sent as is, must be blocked. Prints the counts
-//! and the p50/p99 time of `check_outgoing`; exits 1 on a leak. For the
+//! and the p50/p99 time of `check_bytes` on the canonical bytes; exits 1 on a leak. For the
 //! owner smoke (`scripts/blind-smoke.d/20-firewall.sh`). Prints counts and
 //! times only, never a value.
 
 use rusqlite::{Connection, OpenFlags};
 use saiife_shield::dataset::{load_manifest, DatasetDir};
-use saiife_shield::envelope::build_envelope;
+use saiife_shield::envelope::{build_envelope, synthetic_sha256, Envelope};
 use saiife_shield::firewall::{Firewall, Verdict};
 use saiife_shield::index::{read_allow, IndexKey, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const QUESTIONS: usize = 1000;
+const LIST_CAP: u32 = 50;
 
 /// The fixed test key of `blind_build`: never use it for real data.
 fn test_key() -> IndexKey {
@@ -123,18 +124,22 @@ fn main() {
         .map(|n| (n.as_str(), SpanLabel::Person))
         .collect();
     let det = ListDetector::new(&entries);
-    let fw = Firewall {
-        index: &index,
-        allow: &allow,
-        detector: &det,
-        released_names: &[],
-    };
-
+    // The scan runs on the final bytes (`check_bytes`, P-22) with the
+    // caller's list cap and synthetic hash.
     let mut times: Vec<Duration> = Vec::with_capacity(QUESTIONS * 2);
-    let mut scan = |e: &saiife_shield::envelope::Envelope, lang: Lang| {
+    let mut scan = |e: &Envelope, hash: &str| {
+        let fw = Firewall {
+            index: &index,
+            allow: &allow,
+            detector: &det,
+            released_names: &[],
+            list_cap: LIST_CAP,
+            synthetic_sha256: hash,
+        };
+        let bytes = e.canonical();
         let t0 = Instant::now();
         let v = fw
-            .check_outgoing(e, lang)
+            .check_bytes(&bytes)
             .unwrap_or_else(|_| fail("the firewall failed"));
         times.push(t0.elapsed());
         v
@@ -142,7 +147,11 @@ fn main() {
     let mut rng = os_rng();
     let mut envelope = |d: &Draft, s: &mut Session| {
         let synth = synthetic_rows(schema, &m.formats, &m.public, 5, &mut rng);
-        build_envelope(d, s, schema, &m.public, synth, 50, None)
+        let hash = synthetic_sha256(&synth);
+        (
+            build_envelope(d, s, schema, &m.public, synth, LIST_CAP, None),
+            hash,
+        )
     };
     let raw = |q: &str, lang: Lang| Draft {
         lang,
@@ -167,8 +176,8 @@ fn main() {
         let lang = saiife_shield::lang::detect_lang(&q);
         match parameterize(&q, None, schema, &lex, &det) {
             Ok(Step::Ready(d)) => {
-                let e = envelope(&d, &mut session);
-                match scan(&e, d.lang) {
+                let (e, hash) = envelope(&d, &mut session);
+                match scan(&e, &hash) {
                     Verdict::Pass => {
                         let bytes = e.canonical();
                         let text = String::from_utf8_lossy(&bytes);
@@ -185,8 +194,8 @@ fn main() {
             Ok(Step::Refuse(_)) | Err(_) => refused += 1,
         }
         // The raw question, as if the parameterizer had missed the name.
-        let e = envelope(&raw(&q, lang), &mut session);
-        match scan(&e, lang) {
+        let (e, hash) = envelope(&raw(&q, lang), &mut session);
+        match scan(&e, &hash) {
             Verdict::Block(_) => probes_blocked += 1,
             Verdict::Pass => leaks += 1,
         }
@@ -216,8 +225,8 @@ fn main() {
                 display: String::new(),
             });
         }
-        let e = envelope(&d, &mut session);
-        match scan(&e, lang) {
+        let (e, hash) = envelope(&d, &mut session);
+        match scan(&e, &hash) {
             Verdict::Pass => passed += 1,
             Verdict::Block(_) => false_blocks += 1,
         }

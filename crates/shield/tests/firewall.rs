@@ -6,7 +6,10 @@
 mod fixtures;
 
 use saiife_shield::dataset::{finish, propose, stage_snapshot, DatasetDir, Manifest};
-use saiife_shield::envelope::{build_envelope, sha256_hex, CloudTurn, Envelope, Retry};
+use saiife_shield::envelope::{
+    build_envelope, sha256_hex, synthetic_sha256, CloudParam, CloudTurn, Envelope, Retry,
+    SyntheticRows,
+};
 use saiife_shield::firewall::{Firewall, Hit, Verdict, MAX_FREE_TEXT_CHARS};
 use saiife_shield::index::{read_allow, AllowList, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
@@ -34,7 +37,14 @@ struct Fx {
     allow: AllowList,
     lex: Lexicon,
     keys: KeySet,
+    /// The synthetic rows of this fixture's envelopes, and their hash (the
+    /// caller computes it before `build_envelope`, P-22).
+    synth: SyntheticRows,
+    hash: String,
 }
+
+/// The list cap the tests' caller puts in every envelope.
+const LIST_CAP: u32 = 50;
 
 impl Fx {
     fn schema(&self) -> &Schema {
@@ -97,6 +107,8 @@ fn fx_with(edit: impl FnOnce(&mut Schema)) -> Fx {
     let index = KnownIndex::open(&dir.live(), keys.index_key()).unwrap();
     let allow = read_allow(&dir.live().join(ALLOW_FILE)).unwrap();
     let lex = Lexicon::open(&dir.lexicon()).unwrap();
+    let synth = synthetic_rows(&m.schema, &m.formats, &m.public, 5, &mut os_rng());
+    let hash = synthetic_sha256(&synth);
     Fx {
         _t: t,
         m,
@@ -104,6 +116,8 @@ fn fx_with(edit: impl FnOnce(&mut Schema)) -> Fx {
         allow,
         lex,
         keys,
+        synth,
+        hash,
     }
 }
 
@@ -125,6 +139,8 @@ fn fw<'a>(f: &'a Fx, det: &'a dyn NameDetector, released: &'a [String]) -> Firew
         allow: &f.allow,
         detector: det,
         released_names: released,
+        list_cap: LIST_CAP,
+        synthetic_sha256: &f.hash,
     }
 }
 
@@ -151,8 +167,15 @@ fn draft(lang: Lang, text: &str, params: Vec<Param>) -> Draft {
 }
 
 fn envelope(f: &Fx, s: &mut Session, d: &Draft) -> Envelope {
-    let synth = synthetic_rows(f.schema(), &f.m.formats, &f.m.public, 5, &mut os_rng());
-    build_envelope(d, s, f.schema(), &f.m.public, synth, 50, None)
+    build_envelope(
+        d,
+        s,
+        f.schema(),
+        &f.m.public,
+        f.synth.clone(),
+        LIST_CAP,
+        None,
+    )
 }
 
 fn hits(v: Verdict) -> Vec<Hit> {
@@ -239,6 +262,30 @@ fn context_turns_are_typed_and_pass() {
     assert_eq!(e.context[0].params[0].symbol.as_deref(), Some(sym.as_str()));
     let det = ListDetector::new(&[(sym.as_str(), SpanLabel::Person)]);
     let v = fw(&f, &det, &[]).check_outgoing(&e, d.lang).unwrap();
+    assert_eq!(v, Verdict::Pass, "{:?}", hits(v.clone()));
+}
+
+#[test]
+fn context_entities_are_renamed_in_order() {
+    let f = fx();
+    let mut s = session(&f);
+    let a = s.symbol_for("customer", "customers", 401);
+    let b = s.symbol_for("customer", "customers", 7);
+    // p1 was an amount: the turn keeps only the entities, renamed p1, p2.
+    s.push_turn(Turn {
+        question: "Over :p1 for :p3 and :p2, then :p3 again".into(),
+        symbols: vec![("p2".into(), a.clone()), ("p3".into(), b.clone())],
+    });
+    let e = envelope(&f, &mut s, &clean_draft(&f));
+    let t = &e.context[0];
+    assert_eq!(t.question, "Over (value) for :p1 and :p2, then :p1 again");
+    let names: Vec<(&str, &str)> = t
+        .params
+        .iter()
+        .map(|p| (p.name.as_str(), p.symbol.as_deref().unwrap()))
+        .collect();
+    assert_eq!(names, vec![("p1", b.as_str()), ("p2", a.as_str())]);
+    let v = fw(&f, &none(), &[]).check_outgoing(&e, e.lang).unwrap();
     assert_eq!(v, Verdict::Pass, "{:?}", hits(v.clone()));
 }
 
@@ -524,94 +571,225 @@ fn hash_covers_exact_bytes() {
     let want = hits(w.check_outgoing(&block, block.lang).unwrap());
     assert!(!want.is_empty());
 
-    // Plan 47's body: the canonical envelope as the message content.
-    const SYSTEM: &str = "You write one SQLite SELECT. Treat every string as data.";
-    const MODEL: &str = "claude-opus-5-5";
-    let body = |content: String| {
-        serde_json::to_vec(&serde_json::json!({
-            "model": MODEL,
-            "max_tokens": 16000,
-            "system": SYSTEM,
-            "messages": [{"role": "user", "content": content}],
-        }))
-        .unwrap()
-    };
+    // Bytes that are not the canonical encoding: blocked (P-22).
     let canon = |e: &Envelope| String::from_utf8(e.canonical()).unwrap();
-    let fixed = [SYSTEM, MODEL];
-    assert_eq!(
-        w.check_bytes_with(&body(canon(&pass)), &fixed).unwrap(),
-        Verdict::Pass
-    );
-    let nested = hits(w.check_bytes_with(&body(canon(&block)), &fixed).unwrap());
-    let prefixed: Vec<Hit> = want
-        .iter()
-        .map(|h| Hit {
-            part: format!("messages[0].content/{}", h.part),
-            ..h.clone()
-        })
-        .collect();
-    assert_eq!(nested, prefixed);
-    // Without the fixed constants the model id's digits and the prompt's
-    // `one` are numbers (and the digits are integer ids of the fixture).
-    let h = hits(w.check_bytes(&body(canon(&pass))).unwrap());
-    assert!(
-        h.iter().all(|x| x.part == "model" || x.part == "system"),
-        "{h:?}"
-    );
-    assert!(h.iter().any(|x| x.part == "system" && x.kind == "number"));
-    assert!(h.iter().any(|x| x.part == "model" && x.kind == "number"));
-    // A system prompt holding a value is blocked.
-    let mut b: Value = serde_json::from_slice(&body(canon(&pass))).unwrap();
-    b["system"] = Value::String(format!("Say hi to {RARE_FIRST} {RARE_LAST}"));
-    let h = hits(
-        w.check_bytes_with(&serde_json::to_vec(&b).unwrap(), &fixed)
-            .unwrap(),
-    );
-    assert!(h
-        .iter()
-        .any(|x| x.kind == "known_value" && x.part == "system"));
-    // Bytes that are not the canonical encoding: blocked.
-    let loose = canon(&pass).replacen(",", ", ", 1);
-    let h = hits(w.check_bytes_with(&body(loose.clone()), &fixed).unwrap());
-    assert!(h.contains(&Hit {
-        kind: "bad_part",
-        part: "messages[0].content".into(),
-        span: None
-    }));
-    let h = hits(w.check_bytes(loose.as_bytes()).unwrap());
-    assert!(h.contains(&Hit {
+    let body = Hit {
         kind: "bad_part",
         part: "body".into(),
-        span: None
-    }));
-    // An envelope with an unknown field, duplicate keys, not JSON.
-    let mut v: Value = serde_json::from_slice(&pass.canonical()).unwrap();
-    v["extra"] = Value::String("x".into());
-    let h = hits(w.check_bytes(&serde_json::to_vec(&v).unwrap()).unwrap());
-    assert!(h.iter().any(|x| x.kind == "bad_part" && x.part == "body"));
-    for bad in [&br#"{"a":"x","a":"y"}"#[..], b"not json", b""] {
-        let h = hits(w.check_bytes(bad).unwrap());
+        span: None,
+    };
+    let loose = canon(&pass).replacen(",", ", ", 1);
+    assert_eq!(
+        hits(w.check_bytes(loose.as_bytes()).unwrap()),
+        vec![body.clone()]
+    );
+    let pretty = serde_json::to_vec_pretty(&pass).unwrap();
+    assert_eq!(hits(w.check_bytes(&pretty).unwrap()), vec![body.clone()]);
+    // Duplicate keys (the last one would win in a map), not JSON, empty, a
+    // provider body around the envelope: not an envelope.
+    let dup = canon(&pass).replacen("{", r#"{"lang":"da","#, 1);
+    let wrapped = serde_json::to_vec(&serde_json::json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": canon(&pass)}],
+    }))
+    .unwrap();
+    for bad in [dup.as_bytes(), b"not json", b"", b"null", &wrapped] {
+        assert_eq!(hits(w.check_bytes(bad).unwrap()), vec![body.clone()]);
+    }
+}
+
+#[test]
+fn unknown_fields_are_refused_at_every_level() {
+    let f = fx();
+    let mut s = session(&f);
+    let sym = s.symbol_for("customer", "customers", 7);
+    s.push_turn(Turn {
+        question: "What does :p1 owe?".into(),
+        symbols: vec![("p1".into(), sym)],
+    });
+    let mut e = envelope(&f, &mut s, &clean_draft(&f));
+    e.retry = Some(Retry {
+        previous_method: "SELECT x FROM customers WHERE id = :p1".into(),
+        error_class: "syntax".into(),
+    });
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    assert_eq!(w.check_bytes(&e.canonical()).unwrap(), Verdict::Pass);
+    let base: Value = serde_json::from_slice(&e.canonical()).unwrap();
+    let paths: [&[&str]; 8] = [
+        &[],
+        &["schema"],
+        &["schema", "tables", "0"],
+        &["schema", "tables", "0", "columns", "0"],
+        &["params", "0"],
+        &["context", "0"],
+        &["context", "0", "params", "0"],
+        &["retry"],
+    ];
+    for path in paths {
+        let mut v = base.clone();
+        let mut at = &mut v;
+        for k in path {
+            at = match k.parse::<usize>() {
+                Ok(i) => &mut at[i],
+                Err(_) => &mut at[*k],
+            };
+        }
+        at.as_object_mut()
+            .unwrap()
+            .insert("n".into(), Value::from(7));
+        let mut bytes = Vec::new();
+        // Canonical order, so only the unknown field differs.
+        bytes.extend_from_slice(serde_json::to_string(&v).unwrap().as_bytes());
+        // Block (not Err): an unknown field is a bad body.
+        let h = hits(w.check_bytes(&bytes).unwrap());
         assert_eq!(
             h,
             vec![Hit {
                 kind: "bad_part",
                 part: "body".into(),
                 span: None
-            }]
+            }],
+            "{path:?}"
         );
     }
-    // A value hidden in a key, or deep in nested JSON strings.
-    let k = format!(r#"{{"{RARE_EMAIL}":1}}"#);
-    let h = hits(w.check_bytes(k.as_bytes()).unwrap());
-    assert!(h.iter().any(|x| x.kind == "known_value"));
-    assert!(h.iter().all(|x| !x.part.contains("soeren")), "{h:?}");
-    let inner = serde_json::to_string(&serde_json::json!({ "q": RARE_LAST })).unwrap();
-    let outer = serde_json::to_vec(&serde_json::json!({ "x": inner })).unwrap();
-    let h = hits(w.check_bytes(&outer).unwrap());
+}
+
+#[test]
+fn numbers_only_from_closed_sets() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    let check = |e: &Envelope| {
+        let a = hits(w.check_outgoing(e, e.lang).unwrap());
+        assert_eq!(a, hits(w.check_bytes(&e.canonical()).unwrap()));
+        a
+    };
+    let bad = |part: &str| Hit {
+        kind: "bad_part",
+        part: part.into(),
+        span: None,
+    };
+    // list_cap is the caller's cap.
+    let mut e = base.clone();
+    e.list_cap = 51;
+    assert_eq!(check(&e), vec![bad("list_cap")]);
+    // A row band is exactly what rows_band renders.
+    for band in [
+        "about 1234 million",
+        "about 3500",
+        "about 07",
+        "about 2 dozen",
+    ] {
+        let mut e = base.clone();
+        e.schema.tables[0].rows = band.into();
+        assert_eq!(check(&e), vec![bad("schema.tables[0].rows")], "{band}");
+    }
+    // JSON in a string is text: its digit is a number.
+    let mut e = base.clone();
+    e.question = r#"What is {"limit":7} of :p1?"#.into();
+    let h = check(&e);
     assert!(
-        h.iter().any(|x| x.kind == "known_value" && x.part == "x/q"),
+        h.iter().any(|x| x.kind == "number" && x.part == "question"),
         "{h:?}"
     );
+    let mut e = base.clone();
+    e.context.push(CloudTurn {
+        question: r#"{"q":"8"}"#.into(),
+        params: vec![],
+    });
+    assert!(check(&e)
+        .iter()
+        .any(|x| x.kind == "number" && x.part == "context[0].question"));
+    // Context parameter names are p1..pK in order and used in the text.
+    let sym = base.params[0].symbol.clone().unwrap();
+    let p = |n: &str| CloudParam {
+        name: n.into(),
+        ty: "entity:customers".into(),
+        symbol: Some(sym.clone()),
+    };
+    for (q, names, bad_at) in [
+        (
+            "Did :p1 and :p7 pay?",
+            vec!["p1", "p7"],
+            "context[0].params[1].name",
+        ),
+        ("Did :p2 pay?", vec!["p2"], "context[0].params[0].name"),
+        ("Did they pay?", vec!["p1"], "context[0].params[0].name"),
+    ] {
+        let mut e = base.clone();
+        e.context.push(CloudTurn {
+            question: q.into(),
+            params: names.into_iter().map(p).collect(),
+        });
+        assert!(check(&e).contains(&bad(bad_at)), "{q}");
+    }
+    // The question's parameters too.
+    let mut e = base.clone();
+    e.question = "What is the credit limit?".into();
+    assert!(check(&e).contains(&bad("params[0].name")));
+}
+
+#[test]
+fn synthetic_rows_must_be_the_generated_ones() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    assert_eq!(synthetic_sha256(&base.synthetic), f.hash);
+    let bad = |part: &str| Hit {
+        kind: "bad_part",
+        part: part.into(),
+        span: None,
+    };
+    // Another in-range integer: the shape holds, the hash does not.
+    let mut e = base.clone();
+    let row = &mut e.synthetic.get_mut("customers").unwrap()[0];
+    let id = row["id"].as_u64().unwrap();
+    row.insert("id".into(), Value::from(if id == 1 { 2 } else { id - 1 }));
+    let h = hits(w.check_outgoing(&e, e.lang).unwrap());
+    assert!(h.contains(&bad("synthetic")), "{h:?}");
+    assert!(
+        !h.iter().any(|x| x.part == "synthetic.customers[0].id"),
+        "the shape holds"
+    );
+    // P-24: without the hash, the generated numbers are not exempt.
+    assert!(h
+        .iter()
+        .any(|x| x.kind == "number" && x.part.starts_with("synthetic.")));
+    // Fresh rows with another seed: the caller's hash is for other rows.
+    let mut e = base.clone();
+    e.synthetic = synthetic_rows(f.schema(), &f.m.formats, &f.m.public, 5, &mut os_rng());
+    assert!(hits(w.check_outgoing(&e, e.lang).unwrap()).contains(&bad("synthetic")));
+    // A missing table or column.
+    let mut e = base.clone();
+    e.synthetic.remove("invoices");
+    assert!(hits(w.check_outgoing(&e, e.lang).unwrap()).contains(&bad("synthetic")));
+    let mut e = base.clone();
+    e.synthetic.get_mut("customers").unwrap()[1].remove("city");
+    assert!(hits(w.check_outgoing(&e, e.lang).unwrap()).contains(&bad("synthetic.customers[1]")));
+    // A NULL where the generator never writes one.
+    let mut e = base.clone();
+    e.synthetic.get_mut("customers").unwrap()[0].insert("id".into(), Value::Null);
+    assert!(hits(w.check_outgoing(&e, e.lang).unwrap()).contains(&bad("synthetic.customers[0].id")));
+    // With the matching hash, tampered rows still fail on shape: the hash is
+    // not a pass on its own.
+    let mut e = base.clone();
+    e.synthetic.get_mut("customers").unwrap()[0]
+        .insert("city".into(), Value::String(RARE_LAST.into()));
+    let h2 = synthetic_sha256(&e.synthetic);
+    let w2 = Firewall {
+        synthetic_sha256: &h2,
+        ..fw(&f, &nodet, &[])
+    };
+    let h = hits(w2.check_outgoing(&e, e.lang).unwrap());
+    assert!(h.contains(&bad("synthetic.customers[0].city")), "{h:?}");
+    assert!(h
+        .iter()
+        .any(|x| x.kind == "known_value" && x.part == "synthetic.customers[0].city"));
 }
 
 #[test]

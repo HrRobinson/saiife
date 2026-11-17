@@ -21,7 +21,7 @@
 use crate::public::PublicValues;
 use crate::question::Draft;
 use crate::schema::{rows_band, Bound, ColType, ColumnClass, Lang, ParamType, Schema};
-use crate::session::Session;
+use crate::session::{Session, Turn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -220,21 +220,7 @@ pub fn build_envelope(
     let context = session
         .turns
         .iter()
-        .map(|t| CloudTurn {
-            question: t.question.clone(),
-            params: t
-                .symbols
-                .iter()
-                .map(|(name, sym)| CloudParam {
-                    name: name.clone(),
-                    ty: session.key_for_symbol(sym).map_or_else(
-                        || "entity".to_string(),
-                        |(table, _)| format!("entity:{}", schema.cloud_name(&table, None)),
-                    ),
-                    symbol: Some(sym.clone()),
-                })
-                .collect(),
-        })
+        .map(|t| context_turn(t, session, schema))
         .collect();
 
     Envelope {
@@ -249,6 +235,64 @@ pub fn build_envelope(
         retry,
         list_cap,
     }
+}
+
+/// The text a context turn shows for a parameter that is not an entity
+/// (its type is not kept in the turn).
+pub const CONTEXT_VALUE: &str = "(value)";
+
+/// A context turn as the firewall wants it (P-22): its entity parameters
+/// renamed `p1..pK` in order of first use, each with its stand-in; any other
+/// `:pN` in the text becomes [`CONTEXT_VALUE`]. Every offset comes from the
+/// turn's own text and every slice goes through `str::get`.
+fn context_turn(t: &Turn, session: &Session, schema: &Schema) -> CloudTurn {
+    let q = t.question.as_str();
+    let mut out = String::with_capacity(q.len());
+    let mut renamed: Vec<(&str, String)> = Vec::new();
+    let mut params = Vec::new();
+    let mut last = 0;
+    for (a, b, name) in crate::firewall::param_refs(q) {
+        out.push_str(q.get(last..a).unwrap_or(""));
+        last = b;
+        let Some((_, sym)) = t.symbols.iter().find(|(n, _)| n == name) else {
+            out.push_str(CONTEXT_VALUE);
+            continue;
+        };
+        let new = match renamed.iter().find(|(n, _)| *n == name) {
+            Some((_, new)) => new.clone(),
+            None => {
+                let new = format!("p{}", renamed.len() + 1);
+                renamed.push((name, new.clone()));
+                params.push(CloudParam {
+                    name: new.clone(),
+                    ty: session.key_for_symbol(sym).map_or_else(
+                        || "entity".to_string(),
+                        |(table, _)| format!("entity:{}", schema.cloud_name(&table, None)),
+                    ),
+                    symbol: Some(sym.clone()),
+                });
+                new
+            }
+        };
+        out.push(':');
+        out.push_str(&new);
+    }
+    out.push_str(q.get(last..).unwrap_or(""));
+    CloudTurn {
+        question: out,
+        params,
+    }
+}
+
+/// `sha256:` + hex of the canonical JSON of synthetic rows: the caller
+/// hashes `synthetic_rows`' output before `build_envelope` and gives the
+/// hash to the firewall, which hashes the envelope's rows the same way
+/// (P-22).
+pub fn synthetic_sha256(rows: &SyntheticRows) -> String {
+    let v = serde_json::to_value(rows).unwrap_or(Value::Null);
+    let mut out = Vec::new();
+    write_canonical(&v, &mut out);
+    sha256_hex(&out)
 }
 
 /// Canonical JSON of a value: object keys sorted bytewise, no whitespace,

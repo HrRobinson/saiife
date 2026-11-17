@@ -120,7 +120,11 @@ pub fn synthetic_rows(
                         } else if class == ColumnClass::Identifier {
                             Value::String(format!("Synthetic_{n}"))
                         } else {
-                            Value::String(format!("Synthetic_{}_{n}", c.name))
+                            // The cloud name: an alias hides the real one.
+                            Value::String(format!(
+                                "Synthetic_{}_{n}",
+                                schema.cloud_name(&t.name, Some(&c.name))
+                            ))
                         }
                     }
                 };
@@ -225,6 +229,20 @@ mod tests {
             assert!(["Salg", "IT"].contains(&row["afd"].as_str().unwrap()));
             // P-9: no PublicValues entry gives null.
             assert!(row["land"].is_null());
+        }
+    }
+
+    #[test]
+    fn aliased_column_uses_the_cloud_name() {
+        let mut s = schema();
+        s.tables[0].columns[4].alias = Some("town".into());
+        let (f, p) = inputs();
+        let out = synthetic_rows(&s, &f, &p, 5, &mut counter());
+        for row in &out["staff"] {
+            assert!(!row.contains_key("by"));
+            let v = row["town"].as_str().unwrap();
+            assert!(v.starts_with("Synthetic_town_"), "{v}");
+            assert!(!v.contains("by"), "the real column name never shows");
         }
     }
 
