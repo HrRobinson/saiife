@@ -12,6 +12,14 @@ A box runs one coding agent. The agent never holds your model key. It talks to a
 
 The `codex` and `gemini` images are built only when you pass `--with codex` or `--with gemini` to the image build, with their versions pinned in `assets/box/recipe.toml`.
 
+A rebuilt image is not used until you import it and make it the default. The build writes `base-<sha256>.raw` and its `.json` manifest to the output directory. Then run:
+
+```
+saiife box image import <out-dir>/base-<sha256>.raw --default
+```
+
+or import it without `--default`, and then `saiife box image default base-<sha256>`. A box whose image lacks its agent refuses to boot and prints these commands. Gemini also needs the `[node]` pin to be set; Codex needs only `[codex]`.
+
 ## Store the key
 
 ```
@@ -54,6 +62,8 @@ The gateway forwards only the calls below, matched on method, exact path and que
 | Google | `POST /v1beta/models/{ID}:streamGenerateContent` | `alt=sse` (required) |
 | Google | `POST /v1beta/models/{ID}:generateContent` | none |
 | Google | `POST /v1beta/models/{ID}:countTokens` | none |
+
+When you bump the Codex pin in `assets/box/recipe.toml`, re-check this OpenAI list against the new Codex release (the owner smoke `model_paths_codex` lists the exact paths). For example `/v1/responses/compact` is not allow-listed because Codex 0.169 does not call it; a newer Codex that does would get 403 until it is added.
 
 ## Before release (TODO)
 

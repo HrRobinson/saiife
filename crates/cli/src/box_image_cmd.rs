@@ -1124,4 +1124,21 @@ mod imp {
         }
         Some(logs)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn with_takes_codex_or_gemini_only() {
+            assert_eq!(parse_with("codex").unwrap(), AgentKind::Codex);
+            assert_eq!(parse_with("gemini").unwrap(), AgentKind::Gemini);
+            assert_eq!(
+                parse_with("foo").unwrap_err(),
+                "--with foo: unknown agent; --with takes codex or gemini"
+            );
+            assert!(parse_with("claude-code").is_err());
+            assert!(parse_with("").is_err());
+        }
+    }
 }

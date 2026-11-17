@@ -117,7 +117,7 @@ make_agent_user() {
 # Codex (plan 42 D10, R7): the release tarball holds exactly one file, the
 # static musl binary. The archive is only unpacked, never sourced.
 install_codex() {
-  local tmp n bin
+  local tmp n bin th
   tmp=$(mktemp -d)
   tar -xzf "$MNT/codex.tar.gz" -C "$tmp" --no-same-owner --no-same-permissions
   n=$(find "$tmp" -mindepth 1 -printf x | wc -c)
@@ -130,20 +130,23 @@ install_codex() {
   rm -rf -- "$tmp"
   install -d -o root -g root -m 0755 "/etc/codex"
   install -o root -g root -m 0644 "$MNT/codex-requirements.toml" "/etc/codex/requirements.toml"
-  "/usr/local/bin/codex" --version
+  # a throwaway HOME: the probe must not leave /root/.codex behind
+  th=$(mktemp -d)
+  HOME="$th" "/usr/local/bin/codex" --version
+  rm -rf -- "$th"
 }
 
 # Gemini CLI (plan 42 D10, R9, R11, R14) on its own Node.js. The zip is
 # unpacked with Python's zipfile (members are kept under the target dir),
 # never run by the shell; one gemini.js at its root or in bundle/.
 install_gemini() {
-  local js c n tmp
+  local js c n tmp th
   if [ ! -f "$MNT/gemini.zip" ] || [ ! -f "$MNT/node.tar.xz" ]; then
     echo "gemini needs both gemini.zip and node.tar.xz" >&2
     return 1
   fi
   install -d -o root -g root -m 0755 "/opt/saiife-node"
-  tar -xJf "$MNT/node.tar.xz" -C "/opt/saiife-node" --strip-components=1 --no-same-owner
+  tar -xJf "$MNT/node.tar.xz" -C "/opt/saiife-node" --strip-components=1 --no-same-owner --no-same-permissions
   install -d -o root -g root -m 0755 "/opt/gemini-cli"
   python3 -I -m zipfile -e "$MNT/gemini.zip" "/opt/gemini-cli"
   n=0
@@ -172,7 +175,10 @@ install_gemini() {
   install -o root -g root -m 0644 "$MNT/gemini-user-settings.json" "/opt/saiife-gemini-home/.gemini/settings.json"
   install -o root -g root -m 0644 /dev/null "/opt/saiife-gemini-home/.gemini/.env"
   install -d -o root -g root -m 0755 "/opt/saiife-gemini-home/.gemini/extensions"
-  "/usr/local/bin/gemini" --version
+  # a throwaway HOME: the probe must not leave /root/.gemini behind
+  th=$(mktemp -d)
+  HOME="$th" "/usr/local/bin/gemini" --version
+  rm -rf -- "$th"
 }
 
 # Only for the payload files present: recipe.env does not say.

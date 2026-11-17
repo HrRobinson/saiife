@@ -1447,7 +1447,7 @@ pub fn codex_config() -> String {
 /// (advisory; the box is the boundary) and the Stop hook that tells the host
 /// a turn finished. Managed hooks need no trust and cannot be turned off.
 pub fn codex_requirements() -> String {
-    use saiife_agents::codex::{MATCHER, TIMEOUT_SECS};
+    use saiife_agents::codex::{MANAGED_MATCHER, TIMEOUT_SECS};
     let one = |v: toml::Value| toml::Value::Array(vec![v]);
     let v = table([
         ("allow_managed_hooks_only", true.into()),
@@ -1458,7 +1458,7 @@ pub fn codex_requirements() -> String {
                 (
                     "PreToolUse",
                     one(table([
-                        ("matcher", MATCHER.into()),
+                        ("matcher", MANAGED_MATCHER.into()),
                         (
                             "hooks",
                             one(table([
@@ -1785,8 +1785,11 @@ trust_level = "untrusted"
         assert_eq!(pre.len(), 1, "one PreToolUse group");
         let pre = pre[0].as_table().unwrap();
         assert_eq!(pre.len(), 2, "{pre:?}");
-        assert_eq!(pre["matcher"].as_str(), Some(saiife_agents::codex::MATCHER));
-        assert_eq!(pre["matcher"].as_str(), Some("^(Bash|apply_patch)$"));
+        assert_eq!(
+            pre["matcher"].as_str(),
+            Some(saiife_agents::codex::MANAGED_MATCHER)
+        );
+        assert_eq!(pre["matcher"].as_str(), Some(".*"));
         let h = pre["hooks"].as_array().unwrap();
         assert_eq!(h.len(), 1, "one PreToolUse handler");
         let h = h[0].as_table().unwrap();

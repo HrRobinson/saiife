@@ -73,7 +73,7 @@ pub struct ResolvedImage {
 /// The refusal of a box whose image lacks its agent (plan 42 D10).
 pub fn missing_agent(image_id: &str, agent: AgentKind) -> String {
     format!(
-        "the image {image_id} has no {a}: build one with \"saiife box image build --with {a}\"",
+        "the image {image_id} has no {a}: build one with \"saiife box image build --with {a}\", then import it and make it the default (\"saiife box image import <path> --default\")",
         a = agent.name()
     )
 }

@@ -846,8 +846,59 @@ pub(crate) mod tests {
 
     #[test]
     fn old_manifest_round_trips() {
-        let json = plan36_manifest_json();
-        let m = Manifest::parse(&json).unwrap();
+        // A literal plan-36 manifest (no `agents` key), not built by the
+        // serializer under test.
+        let json = r#"{
+  "version": 1,
+  "id": "base-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "virtual_gib": 20,
+  "actual_bytes": 1234,
+  "built_at": "2026-01-01T00:00:00Z",
+  "builder": "saiife 0.0.0",
+  "recipe_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "ubuntu": {
+    "release": "release-20261017",
+    "image_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "sums_signer": "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+  },
+  "vmm": {
+    "ch_version": "v0",
+    "ch_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "fw_version": "v0",
+    "fw_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "saiife": {
+    "version": "0.0.0",
+    "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "claude": {
+    "version": "0.0.0",
+    "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "packages": [
+    {
+      "name": "socat",
+      "version": "1.0"
+    }
+  ],
+  "images": [
+    {
+      "name": "busybox",
+      "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  ],
+  "boot": {
+    "kernel": {
+      "kernel": "base-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.vmlinuz",
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "cmdline": "console=ttyS0"
+    }
+  },
+  "signature": "c2lnbmF0dXJl"
+}"#;
+        assert_eq!(json, plan36_manifest_json(), "the golden is current");
+        let m = Manifest::parse(json).unwrap();
         assert!(m.agents.is_empty());
         let again = m.to_json();
         assert_eq!(again, json, "byte-identical");

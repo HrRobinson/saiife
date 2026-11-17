@@ -506,7 +506,7 @@ fn boot_refuses_missing_agent() {
         assert_eq!(
             e,
             format!(
-                "the image base-{HEX} has no {}: build one with \"saiife box image build --with {}\"",
+                "the image base-{HEX} has no {}: build one with \"saiife box image build --with {}\", then import it and make it the default (\"saiife box image import <path> --default\")",
                 agent.name(),
                 agent.name()
             )

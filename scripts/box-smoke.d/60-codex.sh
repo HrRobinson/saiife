@@ -6,7 +6,7 @@
 #
 # Owner prerequisites (each missing one is a FAIL naming the step):
 #   - a saiife built with `--features boxes`, and an image built with
-#     `--with codex` after you pinned D9 (recipe [codex] and [node]);
+#     `--with codex` after you pinned D9 (recipe [codex]; node is for gemini only);
 #   - SAIIFE_BOX_SMOKE_OPENAI_KEY_FILE=<file holding your OpenAI API key, one
 #     line, nothing else>, read by grep (-f) only: the key is never printed,
 #     never put on a command line, never written to a log or a copy;
