@@ -3,16 +3,36 @@
 
 use crate::classify::{
     checks, guess, id_shaped, identifier_share, looks_like_identifier, sqlite_err, ColumnStats,
+    UNKNOWN,
 };
 use crate::error::ShieldError;
+use crate::norm::normalize;
+use crate::schema::EntitySpec;
 use crate::schema::{ColType, ColumnClass};
 use crate::source::quote_ident as quote;
 use rusqlite::Connection;
 
 const MAX_VALUES: usize = 1000;
 
-/// Why a `public` mark must be refused for this column, or `None`. An
-/// ID-shaped name ([`id_shaped`]) is always refused, whatever its values.
+/// The most distinct values an unknown column may have and still pass as a
+/// category (S4).
+const UNKNOWN_MAX_DISTINCT: u64 = 50;
+
+/// Why a `public` mark must be refused for this column, or `None`. The
+/// gate (S4), first rule that holds wins:
+/// 1. an ID-shaped name ([`id_shaped`]): "holds names or IDs";
+/// 2. the guess is Identifier at confidence >= 0.85, or at least 20 % of
+///    the sample passes an identifier check: "holds names or IDs";
+/// 3. an amount name or a REAL column: "holds amounts";
+/// 4. the guess is FreeText: "holds free text";
+/// 5. the guess is the unknown fallback (Sensitive 0.5, [`UNKNOWN`]) and
+///    the column is not a small category (TEXT, INTEGER or BOOL, at most
+///    50 distinct values, each on at least 2 rows on average): "unknown
+///    means sensitive".
+///
+/// The Public, Quasi and other Sensitive guesses pass on to the k-floor.
+/// [`public_gate`] adds the entity columns; `propose` and `finish` both
+/// go through it with the same seeded sample.
 pub fn public_refusal(
     name: &str,
     ty: ColType,
@@ -32,7 +52,50 @@ pub fn public_refusal(
     if checks::amount_name(name) || ty == ColType::Real {
         return Some("holds amounts");
     }
+    if g.class == ColumnClass::FreeText {
+        return Some("holds free text");
+    }
+    let small_category = matches!(ty, ColType::Text | ColType::Integer | ColType::Bool)
+        && st.non_null > 0
+        && st.distinct <= UNKNOWN_MAX_DISTINCT
+        && st.distinct.saturating_mul(2) <= st.non_null;
+    if g.class == ColumnClass::Sensitive && g.reason == UNKNOWN && !small_category {
+        return Some("unknown means sensitive");
+    }
     None
+}
+
+/// C1 (spec §2.1.2): an entity's key or name column, or a foreign key
+/// named `<entity table stem>_id`, is never public.
+pub(crate) fn entity_column(entities: &[EntitySpec], table: &str, column: &str) -> bool {
+    let col = column.to_lowercase();
+    entities.iter().any(|e| {
+        if e.table == table && (e.key == column || e.names.iter().any(|n| n == column)) {
+            return true;
+        }
+        let t = e.table.to_lowercase();
+        let mut stems = vec![t.clone(), normalize(&e.word).replace(' ', "_")];
+        stems.extend(t.strip_suffix("es").map(str::to_string));
+        stems.extend(t.strip_suffix('s').map(str::to_string));
+        stems
+            .iter()
+            .any(|s| !s.is_empty() && col == format!("{s}_id"))
+    })
+}
+
+/// S4: the one public gate. [`public_refusal`], then the policy's entity
+/// columns (`propose` has no policy yet and passes none).
+pub(crate) fn public_gate(
+    entities: &[EntitySpec],
+    table: &str,
+    name: &str,
+    ty: ColType,
+    st: &ColumnStats,
+    sample: &[String],
+) -> Option<&'static str> {
+    public_refusal(name, ty, st, sample).or_else(|| {
+        entity_column(entities, table, name).then_some("an entity's key or name column")
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

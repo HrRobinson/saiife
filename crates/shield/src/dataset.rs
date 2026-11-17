@@ -216,8 +216,7 @@ use crate::index::{
     build_index, write_allow, BuildStats, IndexKey, ALLOW_FILE, BLOOM_FILE, INDEX_FILE,
 };
 use crate::lexicon::{build_lexicon, LEXICON_FILE};
-use crate::norm::normalize;
-use crate::public::{public_refusal, public_values, PublicValues};
+use crate::public::{public_gate, public_values, PublicValues};
 use crate::schema::{rows_band, ColType, ColumnClass, DatasetName, Schema};
 use crate::snapshot::{build_snapshot, open_ro, SnapshotInfo, SNAPSHOT_FILE};
 use crate::source::{quote_ident, RowSource};
@@ -701,24 +700,6 @@ fn sample_seed(snapshot_sha256: &str, table: &str, column: &str) -> u64 {
     u64::from_le_bytes(b)
 }
 
-/// C1 (spec §2.1.2): an entity's key or name column, or a foreign key
-/// named `<entity table stem>_id`, is never public.
-fn entity_column(schema: &Schema, table: &str, column: &str) -> bool {
-    let col = column.to_lowercase();
-    schema.entities.iter().any(|e| {
-        if e.table == table && (e.key == column || e.names.iter().any(|n| n == column)) {
-            return true;
-        }
-        let t = e.table.to_lowercase();
-        let mut stems = vec![t.clone(), normalize(&e.word).replace(' ', "_")];
-        stems.extend(t.strip_suffix("es").map(str::to_string));
-        stems.extend(t.strip_suffix('s').map(str::to_string));
-        stems
-            .iter()
-            .any(|s| !s.is_empty() && col == format!("{s}_id"))
-    })
-}
-
 /// Now as RFC 3339 UTC, second precision.
 fn now_utc() -> String {
     let secs = std::time::SystemTime::now()
@@ -816,10 +797,9 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
                 sample_seed(&sha, &table, &column),
             )?;
             let guess = classify::guess(&column, ty, &st, &sample);
-            let mut refusal = public_refusal(&column, ty, &st, &sample);
+            let mut refusal = public_gate(&[], &table, &column, ty, &st, &sample);
             let mut preview = None;
-            // M5: no k-floor listing of free text (it would show the
-            // repeated notes, names and all).
+            // M5: no k-floor listing of free text (the gate refuses it, S4).
             if refusal.is_none() && guess.class != ColumnClass::FreeText {
                 match public_values(&conn, &table, &column, k) {
                     Ok(pv) => preview = Some(pv),
@@ -922,9 +902,7 @@ fn finish_inner(
                 // Defence in depth for a hand-edited policy: the wizard's
                 // refusal is checked again before any value is listed.
                 let st = classify::stats(&conn, &t.name, &c.name, c.ty)?;
-                if public_refusal(&c.name, c.ty, &st, &sample).is_some()
-                    || entity_column(&policy, &t.name, &c.name)
-                {
+                if public_gate(&policy.entities, &t.name, &c.name, c.ty, &st, &sample).is_some() {
                     return Err(ShieldError::Corrupt(PUBLIC_REFUSED));
                 }
                 public.push(public_values(&conn, &t.name, &c.name, k)?);

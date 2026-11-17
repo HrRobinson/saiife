@@ -415,7 +415,8 @@ fn propose_and_finish_agree_on_borderline_columns() {
     use saiife_shield::source::{Cell, SourceTable, VecSource};
     const COLS: usize = 16;
     const ROWS: u64 = 5000;
-    let names: Vec<String> = (0..COLS).map(|c| format!("c{c:02}")).collect();
+    // Quasi-named, so the gate's only open question is the identifier share.
+    let names: Vec<String> = (0..COLS).map(|c| format!("city_{c:02}")).collect();
     let mut x: u64 = 0x5eed;
     let mut rows = Vec::with_capacity(ROWS as usize);
     for i in 0..ROWS {
@@ -560,4 +561,85 @@ fn free_text_gets_no_public_preview() {
         status.public_preview.as_ref().unwrap().column,
         "invoices.status"
     );
+}
+
+/// S4: a hand-edited policy marking a free-text column public is refused
+/// by `finish`, as `propose` refuses it.
+#[test]
+fn public_free_text_is_refused_by_finish() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 300, 3000, 9);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    let props = propose(&dir.stage().join("snapshot.sqlite"), 10).unwrap();
+    let notes = props
+        .iter()
+        .find(|p| p.table == "invoices" && p.column == "notes")
+        .unwrap();
+    assert_eq!(notes.public_refusal, Some("holds free text"));
+    mark_public(&mut schema, "invoices", "notes");
+    match finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}) {
+        Err(ShieldError::Corrupt(why)) => {
+            assert_eq!(why, "a public column holds names, IDs or amounts")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn mark_public(schema: &mut Schema, table: &str, column: &str) {
+    schema
+        .tables
+        .iter_mut()
+        .find(|t| t.name == table)
+        .unwrap()
+        .columns
+        .iter_mut()
+        .find(|c| c.name == column)
+        .unwrap()
+        .class = ColumnClass::Public;
+}
+
+/// S4: `propose` and `finish` share one public gate: for every kind of
+/// column, the verdicts agree.
+#[test]
+fn propose_and_finish_share_the_public_gate() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 300, 3000, 11);
+    let dir = ds(t.path());
+    // (table, column, kind, refused?)
+    let cases = [
+        ("customers", "email", "identifier", true),
+        ("customers", "city", "quasi", false),
+        ("customers", "credit_limit", "sensitive amount", true),
+        ("invoices", "amount", "sensitive amount", true),
+        ("invoices", "issued", "unknown (dates)", true),
+        ("invoices", "notes", "free text", true),
+        ("customers", "id", "entity key", true),
+        ("customers", "first_name", "entity name", true),
+        ("invoices", "customer_id", "ID-shaped foreign key", true),
+        ("invoices", "status", "category", false),
+        ("customers", "segment", "category", false),
+    ];
+    for (table, column, kind, refused) in cases {
+        let mut schema = stage(&dir, &csv);
+        let props = propose(&dir.stage().join("snapshot.sqlite"), 10).unwrap();
+        let p = props
+            .iter()
+            .find(|p| p.table == table && p.column == column)
+            .unwrap();
+        assert_eq!(
+            p.public_refusal.is_some(),
+            refused,
+            "propose: {kind} {table}.{column}"
+        );
+        mark_public(&mut schema, table, column);
+        let got = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {});
+        match (refused, got) {
+            (true, Err(ShieldError::Corrupt(why))) => {
+                assert_eq!(why, "a public column holds names, IDs or amounts")
+            }
+            (false, Ok(_)) => {}
+            (_, other) => panic!("finish: {kind} {table}.{column}: {other:?}"),
+        }
+    }
 }

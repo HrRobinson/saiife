@@ -435,8 +435,11 @@ pub fn guess(name: &str, ty: ColType, st: &ColumnStats, sample: &[String]) -> Gu
     {
         return g(Identifier, 0.85, "a unique ID column");
     }
-    g(Sensitive, 0.5, "unknown columns are treated as sensitive")
+    g(Sensitive, 0.5, UNKNOWN)
 }
+
+/// The reason of the fallback guess: nothing told us what the column is.
+pub const UNKNOWN: &str = "unknown columns are treated as sensitive";
 
 /// R43-5: the user must confirm this suggestion.
 pub fn uncertain(g: &Guess) -> bool {
