@@ -14,20 +14,28 @@
 //! `h2` bytes 8..16 (low bit set), hash `i` is `(h1 + i·h2) mod bits`.
 //!
 //! Which values enter (R43-10): an identifier or quasi value only if it
-//! occurs in at most `k` records of its column (`GROUP BY … HAVING n <= k`,
-//! on the raw value: a value split over spellings may enter although it is
-//! common in total, which only blocks more). `n` is `COUNT(DISTINCT key)` in
+//! occurs in at most `k` records of its column (one `GROUP BY` per column
+//! with the record count, branched on in Rust so the groups over the floor
+//! are counted in the same pass; on the raw value: a value split over
+//! spellings may enter although it is common in total, which only blocks
+//! more). A value of 5 or more tokens also enters as every contiguous
+//! 4-token window (each through [`value_forms`]), under the same floor, so
+//! a 2-to-4-token scan finds a long address (I3); `BuildStats` records the
+//! longest value's token count. `n` is `COUNT(DISTINCT key)` in
 //! an entity table (R-14: one person in many rows is one record), else
 //! `COUNT(*)`. An entity's full name (its name columns together) enters
 //! under the same floor. Free text has no floor: every phrase (split at
 //! `. ! ? ; \n`) of 3 to 40 tokens enters whole, however often it occurs
-//! (a common phrase like `paid by card` enters too). Single words of free
-//! text never enter. Allow words (schema words, aliases, the k-floor public
+//! (a common phrase like `paid by card` enters too); a piece of more than 40
+//! tokens does not enter and is counted in `BuildStats::phrases_too_long`
+//! (R-19). Single words of free text never enter. Allow words (schema words, aliases, the k-floor public
 //! values, and `allow.json` if the dataset dir has one) never enter.
 //!
 //! A value enters in every form of [`value_forms`], and a lookup tries the
 //! same forms, so the two sides always agree: the normalized text, its
-//! tokens sorted (`berg anna` = `anna berg`), a number's canonical text
+//! tokens sorted (`berg anna` = `anna berg`), for a value with `æ`, `ø` or
+//! `å` the same two of its ASCII-typed form (`ø→o`, `å→a`, `æ→ae`, so
+//! `Søren Ærø` is also `soren aero`; I2), a number's canonical text
 //! (an integer as `i64` text, `4411`; any other number as Rust's shortest
 //! round-trip `f64` text, so `12.50`, `12,5` and the REAL 12.5 are all
 //! `12.5`, and `3.0` is `3`), and a date's ISO form (`03.05.1980` is
@@ -62,6 +70,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 pub const INDEX_FILE: &str = "index.bin";
@@ -87,6 +96,12 @@ const DOMAIN_VALUE: u8 = b'n';
 const DOMAIN_PHRASE: u8 = b'p';
 const MIN_PHRASE: usize = 3;
 const MAX_PHRASE: usize = 40;
+/// Where free text is split into phrases.
+const PHRASE_SPLIT: [char; 5] = ['.', '!', '?', ';', '\n'];
+/// I3: a value of at least this many tokens also enters as its windows.
+const LONG_VALUE: usize = 5;
+/// I3: the window size (plan 44 scans 2 to 4 tokens).
+const WINDOW: usize = 4;
 
 type Entry = [u8; ENTRY];
 
@@ -108,6 +123,14 @@ pub struct BuildStats {
     pub left_out_common: u64,
     /// Free-text phrases offered to the index (before duplicates are merged).
     pub phrases: u64,
+    /// The most tokens of an identifier/quasi value (or full name) that
+    /// entered the index. Values of 5 or more tokens also entered as every
+    /// 4-token window (I3).
+    #[serde(default)]
+    pub max_value_tokens: u32,
+    /// Free-text pieces of more than 40 tokens: not indexed (R-19), counted.
+    #[serde(default)]
+    pub phrases_too_long: u64,
 }
 
 fn io(why: &str) -> ShieldError {
@@ -151,6 +174,37 @@ fn canonical_number(t: &str) -> Option<String> {
     None
 }
 
+/// I2: the Danish letters as a user without them types them (`ø` as `o`,
+/// `å` as `a`, `æ` as `ae`), or None when `s` has none. The result is
+/// folded like any value afterwards.
+fn danish_ascii(s: &str) -> Option<String> {
+    let s: String = s.nfc().collect();
+    if !s.contains(['æ', 'Æ', 'ø', 'Ø', 'å', 'Å']) {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'ø' => out.push('o'),
+            'Ø' => out.push('O'),
+            'å' => out.push('a'),
+            'Å' => out.push('A'),
+            'æ' => out.push_str("ae"),
+            'Æ' => out.push_str("Ae"),
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// The texts a value is tokenized from: itself and, with Danish letters,
+/// its [`danish_ascii`] form.
+fn variants(s: &str) -> Vec<String> {
+    let mut v = vec![s.to_string()];
+    v.extend(danish_ascii(s));
+    v
+}
+
 /// Every normalized form a value enters and is looked up under (see the
 /// module docs). Empty for a value with no letters or digits.
 fn value_forms(s: &str) -> Vec<String> {
@@ -160,14 +214,16 @@ fn value_forms(s: &str) -> Vec<String> {
             out.push(v);
         }
     };
-    let toks = tokens(s);
-    if toks.len() > 1 {
-        let mut sorted = toks.clone();
-        sorted.sort_unstable();
-        push(toks.join(" "));
-        push(sorted.join(" "));
-    } else {
-        push(toks.join(" "));
+    for text in variants(s) {
+        let toks = tokens(&text);
+        if toks.len() > 1 {
+            let mut sorted = toks.clone();
+            sorted.sort_unstable();
+            push(toks.join(" "));
+            push(sorted.join(" "));
+        } else {
+            push(toks.join(" "));
+        }
     }
     let t = s.trim();
     if let Some(n) = canonical_number(t) {
@@ -193,11 +249,37 @@ fn digits_only(t: &str) -> Option<String> {
     ok.then(|| t.chars().filter(char::is_ascii_digit).collect())
 }
 
+/// I3: for a value of [`LONG_VALUE`] or more tokens, the [`value_forms`]
+/// of every contiguous [`WINDOW`]-token window of each of its variants, so
+/// a lookup of a window (itself through `value_forms`) hits. Empty for a
+/// shorter value.
+fn window_forms(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for text in variants(s) {
+        let toks = tokens(&text);
+        if toks.len() < LONG_VALUE {
+            continue;
+        }
+        for w in toks.windows(WINDOW) {
+            for f in value_forms(&w.join(" ")) {
+                if !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The free-text pieces of a cell, split at `. ! ? ; \n`, as tokens.
+fn pieces(text: &str) -> impl Iterator<Item = Vec<String>> + '_ {
+    text.split(PHRASE_SPLIT).map(tokens)
+}
+
 /// The phrases of a free-text cell: split at `. ! ? ; \n`, each of 3 to 40
 /// tokens, normalized.
 fn phrases(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(['.', '!', '?', ';', '\n']).filter_map(|p| {
-        let t = tokens(p);
+    pieces(text).filter_map(|t| {
         (MIN_PHRASE..=MAX_PHRASE)
             .contains(&t.len())
             .then(|| t.join(" "))
@@ -663,25 +745,22 @@ pub fn build_index_with_run_bytes(
             let qc = quote_ident(&c.name);
             match c.class {
                 ColumnClass::Identifier | ColumnClass::Quasi => {
+                    // M4: one GROUP BY; the groups over the floor are
+                    // counted here, not by a second query.
                     let sql = format!(
-                        "SELECT {qc} FROM {qt} WHERE {qc} IS NOT NULL \
-                         GROUP BY {qc} HAVING {people} <= ?1"
+                        "SELECT {qc}, {people} FROM {qt} WHERE {qc} IS NOT NULL GROUP BY {qc}"
                     );
                     let mut st = snap.prepare(&sql).map_err(rd)?;
-                    let mut rows = st.query([k]).map_err(rd)?;
+                    let mut rows = st.query([]).map_err(rd)?;
                     while let Some(r) = rows.next().map_err(rd)? {
+                        if r.get::<_, i64>(1).map_err(rd)? > k {
+                            stats.left_out_common += 1;
+                            continue;
+                        }
                         if let Some(v) = cell_text(r.get_ref(0).map_err(rd)?, c.ty) {
-                            for f in value_forms(&v) {
-                                sorter.push(DOMAIN_VALUE, &f)?;
-                            }
+                            offer_value(&mut sorter, &mut stats, &v)?;
                         }
                     }
-                    stats.left_out_common += count_common(
-                        &snap,
-                        &format!("SELECT 1 FROM {qt} WHERE {qc} IS NOT NULL GROUP BY {qc}"),
-                        &people,
-                        k,
-                    )?;
                 }
                 ColumnClass::FreeText => {
                     let sql = format!("SELECT {qc} FROM {qt} WHERE {qc} IS NOT NULL");
@@ -689,9 +768,13 @@ pub fn build_index_with_run_bytes(
                     let mut rows = st.query([]).map_err(rd)?;
                     while let Some(r) = rows.next().map_err(rd)? {
                         if let Some(v) = cell_text(r.get_ref(0).map_err(rd)?, c.ty) {
-                            for p in phrases(&v) {
-                                stats.phrases += 1;
-                                sorter.push(DOMAIN_PHRASE, &p)?;
+                            for t in pieces(&v) {
+                                if t.len() > MAX_PHRASE {
+                                    stats.phrases_too_long += 1;
+                                } else if t.len() >= MIN_PHRASE {
+                                    stats.phrases += 1;
+                                    sorter.push(DOMAIN_PHRASE, &t.join(" "))?;
+                                }
                             }
                         }
                     }
@@ -715,12 +798,14 @@ pub fn build_index_with_run_bytes(
                 .map(|c| format!("{c} IS NOT NULL"))
                 .collect::<Vec<_>>()
                 .join(" OR ");
-            let sql = format!(
-                "SELECT {list} FROM {qt} WHERE {any} GROUP BY {list} HAVING {people} <= ?1"
-            );
+            let sql = format!("SELECT {list}, {people} FROM {qt} WHERE {any} GROUP BY {list}");
             let mut st = snap.prepare(&sql).map_err(rd)?;
-            let mut rows = st.query([k]).map_err(rd)?;
+            let mut rows = st.query([]).map_err(rd)?;
             while let Some(r) = rows.next().map_err(rd)? {
+                if r.get::<_, i64>(cols.len()).map_err(rd)? > k {
+                    stats.left_out_common += 1;
+                    continue;
+                }
                 let mut parts = Vec::with_capacity(cols.len());
                 for (i, n) in e.names.iter().enumerate() {
                     let ty = schema.column(&t.name, n).map_or(ColType::Text, |c| c.ty);
@@ -728,16 +813,8 @@ pub fn build_index_with_run_bytes(
                         parts.push(v);
                     }
                 }
-                for f in value_forms(&parts.join(" ")) {
-                    sorter.push(DOMAIN_VALUE, &f)?;
-                }
+                offer_value(&mut sorter, &mut stats, &parts.join(" "))?;
             }
-            stats.left_out_common += count_common(
-                &snap,
-                &format!("SELECT 1 FROM {qt} WHERE {any} GROUP BY {list}"),
-                &people,
-                k,
-            )?;
         }
     }
     drop(snap);
@@ -784,12 +861,19 @@ fn snapshot_columns(snap: &Connection, table: &str) -> Result<Vec<String>, Shiel
     Ok(cols)
 }
 
-/// How many groups of `grouped` (a `SELECT 1 … GROUP BY …`) have more than
-/// `k` records (`count` is `COUNT(*)` or `COUNT(DISTINCT key)`).
-fn count_common(snap: &Connection, grouped: &str, count: &str, k: i64) -> Result<u64, ShieldError> {
-    let sql = format!("SELECT COUNT(*) FROM ({grouped} HAVING {count} > ?1)");
-    let n: i64 = snap.query_row(&sql, [k], |r| r.get(0)).map_err(rd)?;
-    Ok(n.max(0) as u64)
+/// Offers one identifier/quasi value (or full name) under the floor: every
+/// [`value_forms`] form and, for a long value, every [`window_forms`] form.
+fn offer_value(
+    sorter: &mut Sorter<'_>,
+    stats: &mut BuildStats,
+    v: &str,
+) -> Result<(), ShieldError> {
+    let n = u32::try_from(tokens(v).len()).unwrap_or(u32::MAX);
+    stats.max_value_tokens = stats.max_value_tokens.max(n);
+    for f in value_forms(v).into_iter().chain(window_forms(v)) {
+        sorter.push(DOMAIN_VALUE, &f)?;
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------- lookup ----
@@ -1028,6 +1112,15 @@ mod tests {
         );
         assert!(value_forms(" ,; ").is_empty());
         assert_eq!(value_forms("12 34"), vec!["12 34", "1234"]);
+        assert_eq!(
+            value_forms("Søren Ærø"),
+            vec!["soeren aeroe", "aeroe soeren", "soren aero", "aero soren"]
+        );
+        assert!(window_forms("a b c d").is_empty());
+        assert_eq!(
+            window_forms("e d c b a"),
+            vec!["e d c b", "b c d e", "d c b a", "a b c d"]
+        );
         assert_eq!(digits_only("12a 34"), None);
         assert_eq!(digits_only("1234"), None);
         let p: Vec<String> = phrases("one two. three four five!\nsix seven eight nine").collect();

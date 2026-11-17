@@ -276,8 +276,10 @@ fn frequency_floor_excludes_common_values() {
     assert!(!ix.contains_value("Leeds").unwrap());
     assert!(ix.contains_value("Thorvald").unwrap());
     assert!(ix.contains_value("aeroeskoebing").unwrap());
+    assert!(ix.contains_value("Aeroskobing").unwrap());
     assert_eq!(stats.left_out_common, 2);
-    assert_eq!(stats.entries, 2);
+    // Thorvald, aeroeskoebing and (I2) its ASCII-typed form aeroskobing.
+    assert_eq!(stats.entries, 3);
     assert_eq!(stats.phrases, 0);
 }
 
@@ -885,4 +887,81 @@ fn a_public_values_error_fails_the_build() {
     let msg = e.to_string();
     assert!(msg.contains("credit_limit"), "{msg}");
     assert!(!msg.contains("high"), "{msg}");
+}
+
+/// I2: a Danish name typed in ASCII (`ø` as `o`, `å` as `a`) still hits.
+#[test]
+fn danish_name_typed_in_ascii_hits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = one_table(
+        "people",
+        vec![col("name", ColType::Text, ColumnClass::Identifier)],
+        2,
+        false,
+    );
+    let rows = vec![vec![t("Søren Ærø")], vec![t("Åse Blåbær")]];
+    let (ds, snap) = snapshot(tmp.path(), "people", &["name"], rows);
+    build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    for q in [
+        "Soren Aero",
+        "soeren aeroe",
+        "Søren Ærø",
+        "Aero Soren",
+        "Ase Blabaer",
+        "aase blaabaer",
+    ] {
+        assert!(ix.contains_value(q).unwrap(), "{q}");
+    }
+    assert!(!ix.contains_value("Soren Aaro").unwrap());
+}
+
+/// I3: a value of 5 or more tokens is also found by any 4-token window
+/// (plan 44 scans 2 to 4 tokens), under the same floor as the whole value.
+#[test]
+fn long_values_are_found_by_four_token_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = one_table(
+        "people",
+        vec![
+            col("address", ColType::Text, ColumnClass::Quasi),
+            col("street", ColType::Text, ColumnClass::Quasi),
+        ],
+        41,
+        false,
+    );
+    let mut rows = vec![vec![t("Strandvejen 12 2 th 8000 Aarhus C"), t("Kystvej 1")]];
+    for _ in 0..40 {
+        rows.push(vec![t("Fjordgade 7 1 tv 9000 Aalborg"), t("Kystvej 1")]);
+    }
+    let (ds, snap) = snapshot(tmp.path(), "people", &["address", "street"], rows);
+    let stats = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    assert!(ix
+        .contains_value("Strandvejen 12 2 th 8000 Aarhus C")
+        .unwrap());
+    assert!(ix.contains_value("12 2 th 8000").unwrap());
+    assert!(ix.contains_value("2 th 8000 Aarhus").unwrap());
+    // The common address is over the floor: neither it nor its windows.
+    assert!(!ix.contains_value("7 1 tv 9000").unwrap());
+    assert_eq!(stats.max_value_tokens, 7);
+}
+
+/// M6 / R-19: a free-text piece of more than 40 tokens is not indexed, but
+/// counted.
+#[test]
+fn over_long_phrases_are_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = one_table(
+        "notes",
+        vec![col("notes", ColType::Text, ColumnClass::FreeText)],
+        1,
+        false,
+    );
+    let long: Vec<String> = (0..45).map(|i| format!("w{i}")).collect();
+    let note = format!("{}. one two three", long.join(" "));
+    let (ds, snap) = snapshot(tmp.path(), "notes", &["notes"], vec![vec![t(&note)]]);
+    let stats = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    assert_eq!(stats.phrases, 1);
+    assert_eq!(stats.phrases_too_long, 1);
 }
