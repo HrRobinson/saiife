@@ -65,8 +65,9 @@ pub struct ResolvedImage {
     pub sha256: String,
     pub virtual_gib: u64,
     pub boot: Boot,
-    /// The agents a box on this image can run (plan 42 D10): always
-    /// `claude-code`, plus `codex`, plus `gemini` (with its Node runtime).
+    /// The agents a box on this image can run (plan 42 D10, FU2):
+    /// `claude-code` (when its managed settings are baked in), plus `codex`,
+    /// plus `gemini` (with its Node runtime).
     pub agents: Vec<String>,
 }
 
@@ -77,6 +78,12 @@ pub fn missing_agent(image_id: &str, agent: AgentKind) -> String {
         a = agent.name()
     )
 }
+
+/// The refusal of a Claude Code box whose image predates FU2: its manifest
+/// lacks [`crate::image::CLAUDE_MANAGED_SETTINGS`], so the image has no
+/// managed hooks, and setup no longer sends user ones (fail closed).
+pub const STALE_CLAUDE_IMAGE: &str =
+    "rebuild the image (saiife box image build) and import it as default";
 
 pub trait ImageResolver: Send + Sync {
     fn resolve(&self, r: &ImageRef) -> Result<ResolvedImage, String>;
@@ -880,6 +887,9 @@ impl Vmm for ChVmm {
             .resolve(&spec.image)
             .map_err(VmmError::Failed)?;
         if !image.agents.iter().any(|a| a == spec.agent.name()) {
+            if spec.agent == AgentKind::ClaudeCode {
+                return Err(VmmError::Failed(STALE_CLAUDE_IMAGE.into()));
+            }
             return Err(VmmError::Failed(missing_agent(&image.id, spec.agent)));
         }
         inner.runtime_dir(&paths).map_err(VmmError::Failed)?;

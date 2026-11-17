@@ -83,6 +83,7 @@ fn manifest_for(sha: &str) -> Manifest {
             sha256: hex('4'),
         },
         agents: Default::default(),
+        capabilities: vec![saiife_boxhost::image::CLAUDE_MANAGED_SETTINGS.into()],
         packages: Vec::new(),
         images: Vec::new(),
         boot: ManifestBoot::Firmware,

@@ -18,6 +18,7 @@ use saiife_boxhost::pins::sha256_file;
 use saiife_boxhost::tools::Tools;
 use saiife_boxhost::vmm::{
     missing_agent, ChVmm, ChVmmInit, ImageResolver, ResolvedImage, StopTimes, VmHooks,
+    STALE_CLAUDE_IMAGE,
 };
 use saiife_wire::source::BoxId;
 use std::os::unix::fs::OpenOptionsExt;
@@ -525,6 +526,43 @@ fn boot_refuses_missing_agent() {
     v2.create(&spec).unwrap();
     // Claude Code is in every image
     assert!(w.create(&v, "b2").id.as_str() == "b2");
+}
+
+/// FU2: a Claude Code box on an image without the managed-settings
+/// capability is refused before anything is made, with the rebuild hint;
+/// the same box on a current image is made.
+#[test]
+fn create_refuses_claude_on_a_stale_image() {
+    let mut w = World::new();
+    w.image.agents.clear();
+    let (v, _l) = w.vmm(&[]);
+    let dir = w.records.join("b1");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("repo.img"), b"repo").unwrap();
+    let spec = VmSpec {
+        id: BoxId::parse("b1").unwrap(),
+        size: Size {
+            disk_gib: 8,
+            ..Size::default()
+        },
+        image: ImageRef::Default,
+        agent: AgentKind::ClaudeCode,
+        dir: dir.clone(),
+    };
+    let e = failed(v.create(&spec));
+    assert_eq!(
+        e,
+        "rebuild the image (saiife box image build) and import it as default"
+    );
+    assert_eq!(e, STALE_CLAUDE_IMAGE);
+    assert!(!w.root.join("b1").exists(), "no runtime dir");
+    assert!(!w.paths("b1").root_disk().exists(), "no overlay");
+    assert!(!w.root.join("t/qemu-argv").exists(), "qemu-img never ran");
+    // a current image (the default World) makes the box
+    let w2 = World::new();
+    assert_eq!(w2.image.agents, vec!["claude-code".to_string()]);
+    let (v2, _l2) = w2.vmm(&[]);
+    assert_eq!(w2.create(&v2, "b1").id.as_str(), "b1");
 }
 
 #[test]

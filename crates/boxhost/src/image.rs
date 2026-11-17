@@ -393,6 +393,12 @@ pub struct Manifest {
     /// keeps its exact JSON (and any signature over it).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, ManifestPin>,
+    /// What the bake put in the image beyond its pins (FU2):
+    /// [`CLAUDE_MANAGED_SETTINGS`] when Claude Code's managed settings
+    /// (saiife's hooks) are baked in. Left out when empty, so an older
+    /// manifest keeps its exact JSON (and any signature over it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     pub packages: Vec<ManifestPackage>,
     pub images: Vec<PinnedImage>,
     pub boot: ManifestBoot,
@@ -402,11 +408,27 @@ pub struct Manifest {
 /// The keys of `Manifest::agents` (plan 42 fixed values).
 pub const MANIFEST_AGENTS: [&str; 3] = ["codex", "gemini", "node"];
 
+/// The capability of an image whose Claude Code hooks are in its root-owned
+/// managed settings (FU2). Setup no longer sends them per boot, so a Claude
+/// Code box on an image without it would run with no saiife hook.
+pub const CLAUDE_MANAGED_SETTINGS: &str = "claude_managed_settings";
+
+/// The values of `Manifest::capabilities` this saiife knows.
+pub const MANIFEST_CAPABILITIES: [&str; 1] = [CLAUDE_MANAGED_SETTINGS];
+
 impl Manifest {
-    /// The agents a box on this image can run (D10): always Claude Code,
-    /// Codex when baked in, Gemini only with its Node runtime.
+    /// The agents a box on this image can run (D10, FU2): Claude Code when
+    /// its managed settings are baked in, Codex when baked in, Gemini only
+    /// with its Node runtime.
     pub fn agent_names(&self) -> Vec<String> {
-        let mut v = vec![AgentKind::ClaudeCode.name().to_string()];
+        let mut v = Vec::new();
+        if self
+            .capabilities
+            .iter()
+            .any(|c| c == CLAUDE_MANAGED_SETTINGS)
+        {
+            v.push(AgentKind::ClaudeCode.name().to_string());
+        }
         if self.agents.contains_key("codex") {
             v.push(AgentKind::Codex.name().to_string());
         }
@@ -464,6 +486,13 @@ impl Manifest {
             if !is_sha256(&pin.sha256) {
                 return Err(format!(
                     "manifest agents.{k}.sha256 must be 64 lowercase hex"
+                ));
+            }
+        }
+        for c in &m.capabilities {
+            if !MANIFEST_CAPABILITIES.contains(&c.as_str()) {
+                return Err(format!(
+                    "manifest capabilities: unknown capability {c:?} (want {CLAUDE_MANAGED_SETTINGS})"
                 ));
             }
         }
@@ -839,8 +868,11 @@ pub(crate) mod tests {
     fn plan36_manifest_json() -> String {
         let mut m = manifest();
         m.signature = Some("c2lnbmF0dXJl".into());
+        // a plan-36 image predates FU2's capabilities
+        m.capabilities.clear();
         let json = m.to_json();
         assert!(!json.contains("agents"), "{json}");
+        assert!(!json.contains("capabilities"), "{json}");
         json
     }
 
@@ -900,11 +932,38 @@ pub(crate) mod tests {
         assert_eq!(json, plan36_manifest_json(), "the golden is current");
         let m = Manifest::parse(json).unwrap();
         assert!(m.agents.is_empty());
+        assert!(m.capabilities.is_empty());
+        // FU2: no managed Claude Code settings, so no Claude Code box
+        assert!(m.agent_names().is_empty());
         let again = m.to_json();
         assert_eq!(again, json, "byte-identical");
         // A signature over these bytes still holds: the bytes are the same
         // and the signature itself is kept.
         assert_eq!(m.signature.as_deref(), Some("c2lnbmF0dXJl"));
+    }
+
+    /// FU2: the capability round-trips, lists Claude Code, and an unknown
+    /// one is refused.
+    #[test]
+    fn manifest_capabilities() {
+        let m = manifest();
+        assert_eq!(m.capabilities, vec![CLAUDE_MANAGED_SETTINGS.to_string()]);
+        assert_eq!(CLAUDE_MANAGED_SETTINGS, "claude_managed_settings");
+        let json = m.to_json();
+        assert!(
+            json.contains("\"capabilities\": [\n    \"claude_managed_settings\"\n  ]"),
+            "{json}"
+        );
+        let back = Manifest::parse(&json).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.agent_names(), vec!["claude-code".to_string()]);
+        let mut old = m.clone();
+        old.capabilities.clear();
+        assert!(old.agent_names().is_empty());
+        let mut bad = m;
+        bad.capabilities.push("root_shell".into());
+        let e = Manifest::parse(&bad.to_json()).unwrap_err();
+        assert!(e.contains("unknown capability \"root_shell\""), "{e}");
     }
 
     #[test]
@@ -976,6 +1035,7 @@ pub(crate) mod tests {
                 sha256: hex('4'),
             },
             agents: BTreeMap::new(),
+            capabilities: vec![CLAUDE_MANAGED_SETTINGS.into()],
             packages: vec![ManifestPackage {
                 name: "socat".into(),
                 version: "1.0".into(),

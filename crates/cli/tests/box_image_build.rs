@@ -312,6 +312,12 @@ fn build_produces_image_and_manifest() {
         m.built_at
     );
     assert_eq!(m.recipe_sha256, sha256_file(&w.recipe).unwrap());
+    // FU2: the bake always installs Claude Code's managed settings
+    assert_eq!(
+        m.capabilities,
+        vec![saiife_boxhost::image::CLAUDE_MANAGED_SETTINGS.to_string()]
+    );
+    assert_eq!(m.agent_names()[0], "claude-code");
     assert_eq!(m.ubuntu.release, "release-20261017");
     assert_eq!(m.ubuntu.image_sha256, w.img_sha);
     assert_eq!(m.ubuntu.sums_signer, UBUNTU_CLOUD_FPR);

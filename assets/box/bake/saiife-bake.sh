@@ -131,6 +131,8 @@ install_codex() {
   rm -rf -- "$tmp"
   install -d -o root -g root -m 0755 "/etc/codex"
   install -o root -g root -m 0644 "$MNT/codex-requirements.toml" "/etc/codex/requirements.toml"
+  # the managed config layer: the model host and /work untrusted (FU2)
+  install -o root -g root -m 0644 "$MNT/codex-managed-config.toml" "/etc/codex/managed_config.toml"
   # a throwaway HOME: the probe must not leave /root/.codex behind
   th=$(mktemp -d)
   HOME="$th" "/usr/local/bin/codex" --version

@@ -772,6 +772,14 @@ mod tests {
             let got = store.resolve(&ImageRef::Pinned(m.id.clone())).unwrap();
             assert_eq!(got.agents, *want, "{name}");
         }
+        // FU2: an image baked before Claude Code's managed settings runs no
+        // Claude Code box (its other agents still run)
+        let (p, mut m) = src(&w, "old.raw", "image-old\n");
+        m.capabilities.clear();
+        m.agents.insert("codex".into(), pin('7'));
+        w.store.insert(&File::open(&p).unwrap(), &m, None).unwrap();
+        let got = store.resolve(&ImageRef::Pinned(m.id.clone())).unwrap();
+        assert_eq!(got.agents, vec!["codex".to_string()]);
     }
 
     #[test]

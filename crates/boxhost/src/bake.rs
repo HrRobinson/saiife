@@ -187,7 +187,8 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
 /// A 512 MiB vfat image labelled SAIIFE: saiife, claude,
 /// `claude-managed-settings.json` (FU2), guest/, recipe.env and an empty
 /// out/ the guest writes its results into. With Codex:
-/// `codex.tar.gz` and `codex-requirements.toml`; with Gemini: `gemini.zip`,
+/// `codex.tar.gz`, `codex-requirements.toml` and
+/// `codex-managed-config.toml`; with Gemini: `gemini.zip`,
 /// `node.tar.xz`, `gemini-system-settings.json` and
 /// `gemini-user-settings.json` (plan 42 D10, R14).
 pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<(), String> {
@@ -225,7 +226,15 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
             "codex-requirements.toml",
             crate::guest::codex_requirements(),
         )?;
-        names.extend(["codex.tar.gz", "codex-requirements.toml"]);
+        write(
+            "codex-managed-config.toml",
+            crate::guest::codex_managed_config(),
+        )?;
+        names.extend([
+            "codex.tar.gz",
+            "codex-requirements.toml",
+            "codex-managed-config.toml",
+        ]);
     }
     if let Some((gemini, node)) = &inputs.agents.gemini {
         copy(gemini, "gemini.zip")?;
@@ -651,9 +660,10 @@ mod tests {
     #[test]
     fn payload_carries_enabled_agents() {
         use crate::guest;
-        const AGENT_FILES: [&str; 6] = [
+        const AGENT_FILES: [&str; 7] = [
             "codex.tar.gz",
             "codex-requirements.toml",
+            "codex-managed-config.toml",
             "gemini.zip",
             "node.tar.xz",
             "gemini-system-settings.json",
@@ -706,6 +716,10 @@ mod tests {
             if codex {
                 assert_eq!(read("codex.tar.gz"), "codex archive");
                 assert_eq!(read("codex-requirements.toml"), guest::codex_requirements());
+                assert_eq!(
+                    read("codex-managed-config.toml"),
+                    guest::codex_managed_config()
+                );
             }
             if gemini {
                 assert_eq!(read("gemini.zip"), "gemini archive");
@@ -770,6 +784,7 @@ mod tests {
         for path in [
             guest::CLAUDE_MANAGED_SETTINGS_PATH,
             guest::CODEX_REQUIREMENTS_PATH,
+            guest::CODEX_MANAGED_CONFIG_PATH,
             guest::GEMINI_SYSTEM_SETTINGS_PATH,
             guest::GEMINI_HOME,
             guest::GEMINI_USER_SETTINGS_PATH,
@@ -789,6 +804,10 @@ mod tests {
             format!(
                 "install -o root -g root -m 0644 \"$MNT/codex-requirements.toml\" \"{}\"",
                 guest::CODEX_REQUIREMENTS_PATH
+            ),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/codex-managed-config.toml\" \"{}\"",
+                guest::CODEX_MANAGED_CONFIG_PATH
             ),
             "install -d -o root -g root -m 0755 \"/etc/gemini-cli\"".to_string(),
             format!(

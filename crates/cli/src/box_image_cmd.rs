@@ -953,6 +953,8 @@ mod imp {
                 sha256: recipe.claude.sha256.clone(),
             },
             agents: manifest_agents(recipe),
+            // the bake always installs Claude Code's managed settings (FU2)
+            capabilities: vec![saiife_boxhost::image::CLAUDE_MANAGED_SETTINGS.into()],
             packages,
             images: recipe.images.clone(),
             boot,

@@ -20,7 +20,7 @@ saiife box image import <out-dir>/base-<sha256>.raw --default
 
 or import it without `--default`, and then `saiife box image default base-<sha256>`. A box whose image lacks its agent refuses to boot and prints these commands. Gemini also needs the `[node]` pin to be set; Codex needs only `[codex]`.
 
-saiife's guard hooks in a box are baked into the image as each agent's root-owned managed settings: `/etc/claude-code/managed-settings.json` for Claude Code (only managed hooks run, no MCP servers, the gateway URL pinned), `/etc/codex/requirements.toml` for Codex and `/etc/gemini-cli/settings.json` for Gemini. A repo's own `.claude/settings.json` or `.claude/settings.local.json`, or an edit of `~/.claude/settings.json`, cannot turn them off. saiife no longer writes `~/.claude/settings.json` in a box, so Claude Code on an image built before this change runs without saiife's hooks: rebuild and import the image.
+saiife's guard hooks in a box are baked into the image as each agent's root-owned managed settings: `/etc/claude-code/managed-settings.json` for Claude Code (only managed hooks and permission rules, no MCP servers, no repo helper commands, the gateway URL, provider and proxy pinned), `/etc/codex/requirements.toml` and `/etc/codex/managed_config.toml` for Codex, and `/etc/gemini-cli/settings.json` for Gemini. A repo's own `.claude/settings.json` or `.claude/settings.local.json`, or an edit of `~/.claude/settings.json`, cannot turn them off. A Claude Code box on an image built before this change is refused with "rebuild the image (saiife box image build) and import it as default".
 
 ## Store the key
 
