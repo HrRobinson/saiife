@@ -269,3 +269,173 @@ fn never_panics_on_hostile_utf8() {
     };
     assert!(check(&f, "q?", Lang::En).is_err());
 }
+
+// ---- fix round 1 ----
+
+fn money_filled(v: f64) -> Filled {
+    let cols = vec!["x".to_string()];
+    let rs = ResultSet {
+        columns: cols.clone(),
+        rows: vec![vec![CellValue::Real(v)]],
+        truncated: false,
+        total_rows: None,
+        ms: 0,
+        row_band: "1".into(),
+    };
+    let t = parse_template("Balance is {money(x)}.", &cols, &[], 100).unwrap();
+    fill(&t, &rs, &[], Lang::En).unwrap()
+}
+
+#[test]
+fn unreadable_numerics_refused() {
+    for bad in [
+        "\u{b2}",
+        "\u{ff15}",
+        "\u{bd}",
+        "\u{663}",
+        "\u{216b}",
+        "\u{661}\u{662}",
+    ] {
+        let text = format!("Total {bad} units.");
+        let f = filled(&text, &[]);
+        for lang in [Lang::En, Lang::Da] {
+            let why = refusal(&f, "q?", lang);
+            // a foldable numeral (`²`, `５`) is a number and may be quoted from
+            // fixed text; an unreadable one never is
+            if ["\u{bd}", "\u{663}", "\u{216b}", "\u{661}\u{662}"].contains(&bad) {
+                assert!(!why.contains(bad), "{bad}: {why}");
+            }
+        }
+        // even beside a calculated number
+        let text = format!("It is 7 and {bad}.");
+        let f = filled(&text, &[("7", &["7"], &[], false)]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "{bad}");
+        // inside a printed data span
+        let text = format!("- Bob {bad} Ltd");
+        let f = filled(&text, &[(&format!("Bob {bad} Ltd"), &[], &[], false)]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "{bad}");
+        // a question's unreadable numeral is never a source
+        let f = filled(&format!("Only {bad}."), &[]);
+        assert!(check(&f, &format!("what is {bad}?"), Lang::En).is_err());
+    }
+    // inside a parameter display it is a param source
+    let f = filled(
+        "Acme \u{216b} is fine.",
+        &[("Acme \u{216b}", &[], &[], true)],
+    );
+    assert!(check(&f, "q?", Lang::En).is_ok());
+}
+
+#[test]
+fn parser_trouble_in_the_answer_refuses() {
+    for (text, lang) in [
+        ("Over 10,000 only.", Lang::En),
+        ("Over 10.000 only.", Lang::Da),
+        ("Value 10,0,0 here.", Lang::En),
+        ("About 2x more.", Lang::En),
+        ("A 15kg box.", Lang::En),
+        ("A B2B deal.", Lang::En),
+        ("Due 1 July 2026; all of July 2026 x\u{b2}. n=2", Lang::En),
+        ("I 1.3. kvartal 2026 var det.", Lang::Da),
+        ("In 31 February 2026.", Lang::En),
+    ] {
+        let f = filled(text, &[]);
+        assert!(check(&f, "how much?", lang).is_err(), "{text}");
+    }
+    // a normal answer whose numbers all come from the calculator passes
+    let f = filled(
+        "It is 12 of 40.",
+        &[("12", &["12"], &[], false), ("40", &["40"], &[], false)],
+    );
+    assert!(check(&f, "q?", Lang::En).is_ok());
+    assert!(check(&spec_filled(Lang::Da), "q?", Lang::Da).is_ok());
+}
+
+#[test]
+fn sign_flip_refused() {
+    for sign in ["-", "\u{2212}", "+"] {
+        let text = format!("Balance is {sign}18,420.00 now.");
+        let f = filled(&text, &[("18,420.00", &["18420.00"], &[], false)]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "{sign}");
+    }
+    // a printed negative passes
+    let f = money_filled(-18420.0);
+    assert_eq!(f.text, "Balance is -18,420.00.");
+    let r = check(&f, "q?", Lang::En).unwrap();
+    assert_eq!((r.numbers, r.from_calc), (1, 1));
+    // a printed positive is not a negative
+    let f = filled("Balance is -5.", &[("5", &["5"], &[], false)]);
+    assert!(check(&f, "q?", Lang::En).is_err());
+    // question signs
+    let f = filled("It fell by -5 points.", &[]);
+    assert!(check(&f, "did it fall -5?", Lang::En).is_ok());
+    assert!(check(&f, "did it fall 5?", Lang::En).is_err());
+    // a hyphen after a word is not a sign
+    let f = filled("Item A-5 ok.", &[("5", &["5"], &[], false)]);
+    let _ = check(&f, "q?", Lang::En);
+}
+
+#[test]
+fn quantity_words_refused() {
+    let en = [
+        "twice",
+        "thrice",
+        "double",
+        "triple",
+        "half",
+        "couple",
+        "pair",
+        "hundreds",
+        "thousands",
+        "millions",
+        "billions",
+        "trillion",
+        "trillions",
+        "dozens",
+        "thirteenth",
+        "nineteenth",
+        "twentieth",
+        "ninetieth",
+        "hundredth",
+        "thousandth",
+        "millionth",
+        "Twice",
+    ];
+    let da = [
+        "halvanden",
+        "halv",
+        "halvt",
+        "halve",
+        "dobbelt",
+        "dobbelte",
+        "tredobbelt",
+        "par",
+        "hundreder",
+        "tusinder",
+        "millioner",
+        "trettende",
+        "fjortende",
+        "nittende",
+        "tyvende",
+    ];
+    for (words, lang) in [(&en[..], Lang::En), (&da[..], Lang::Da)] {
+        for w in words {
+            let text = format!("It was {w} as much.");
+            let f = filled(&text, &[]);
+            let why = refusal(&f, "how much?", lang);
+            assert!(why.contains(*w), "{w}: {why}");
+            // the same word in the question is a source
+            assert!(check(&f, &format!("is it {w}?"), lang).is_ok(), "{w}");
+            // inside a printed span the word is not quoted
+            let f = filled(&text, &[(&format!("{w} as"), &[], &[], false)]);
+            let why = refusal(&f, "how much?", lang);
+            assert!(!why.contains(*w), "{w}: {why}");
+            // inside a parameter display it is fine
+            let f = filled(&text, &[(&format!("{w} as"), &[], &[], true)]);
+            assert!(check(&f, "q?", lang).is_ok(), "{w}");
+        }
+    }
+    // ordinary words stay fine
+    let f = filled("The pairing and halfway house are ordinary.", &[]);
+    assert!(check(&f, "q?", Lang::En).is_ok());
+}
