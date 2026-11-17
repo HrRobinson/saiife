@@ -146,7 +146,7 @@ impl Chatter {
         let (at, every) = match ev {
             GuestEvent::Activity => (self.activity_at, ACTIVITY_EVERY_MS),
             GuestEvent::TurnFinished => (self.turn_at, TURN_EVERY_MS),
-            GuestEvent::Ready | GuestEvent::Exited => return true,
+            GuestEvent::Ready | GuestEvent::Exited | GuestEvent::GuardChecks(_) => return true,
         };
         at.is_none_or(|t| now.saturating_sub(t) >= every)
     }
@@ -155,7 +155,7 @@ impl Chatter {
         match ev {
             GuestEvent::Activity => self.activity_at = Some(now),
             GuestEvent::TurnFinished => self.turn_at = Some(now),
-            GuestEvent::Ready | GuestEvent::Exited => {}
+            GuestEvent::Ready | GuestEvent::Exited | GuestEvent::GuardChecks(_) => {}
         }
     }
 
@@ -719,13 +719,25 @@ impl VsockGuest {
 
     /// Queues an event of `run`; bounded and coalesced so a flooding guest
     /// cannot grow memory: per box at most one pending Activity,
-    /// TurnFinished and Exited (the newest Activity/TurnFinished moves to
-    /// the back).
+    /// TurnFinished, GuardChecks and Exited (the newest Activity/TurnFinished
+    /// moves to the back; GuardChecks of the same run merge by saturating sum).
     fn push(&self, run: &Run, ev: GuestEvent) {
         let id = &run.id;
         let mut q = lock(&self.queue);
         let same = |(b, _, e): &(BoxId, u64, GuestEvent)| b == id && *e == ev;
         match ev {
+            GuestEvent::GuardChecks(n) => {
+                let merged = q.iter_mut().find_map(|(b, g, e)| match e {
+                    GuestEvent::GuardChecks(have) if b == id && *g == run.gen => Some(have),
+                    _ => None,
+                });
+                if let Some(have) = merged {
+                    *have = have.saturating_add(n);
+                    drop(q);
+                    self.queue_cv.notify_all();
+                    return;
+                }
+            }
             GuestEvent::Activity | GuestEvent::TurnFinished => {
                 if let Some(i) = q.iter().position(same) {
                     q.remove(i);
@@ -1046,6 +1058,14 @@ impl VsockGuest {
                 }
                 Event::Activity => GuestEvent::Activity,
                 Event::TurnFinished => GuestEvent::TurnFinished,
+                // FU1: counts, not chatter: straight to the queue, which
+                // merges them (the rate limit would drop some, and would
+                // forget a held-back Activity).
+                Event::GuardChecks { n } => {
+                    let Some(g) = me.upgrade() else { return };
+                    g.push(run, GuestEvent::GuardChecks(n));
+                    continue;
+                }
                 Event::Exited { .. } => {
                     run.exited.store(true, Ordering::SeqCst);
                     GuestEvent::Exited

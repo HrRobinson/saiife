@@ -956,7 +956,21 @@ async fn act(
         a::BOX_DIFF => {
             only(args, &["id"])?;
             let id = id_arg(args)?;
-            to_value(&blocking(&src, move |b| b.diff(&id)).await?)
+            let gid = id.clone();
+            let d = to_value(&blocking(&src, move |b| b.diff(&id)).await?)?;
+            // FU1: the box's guard signal; the source answered, so the
+            // frame's owner may see this box.
+            #[cfg(unix)]
+            let mut d = d;
+            #[cfg(unix)]
+            if let (Some(o), Some(rec)) = (
+                d.as_object_mut(),
+                ctx.box_manager.as_ref().and_then(|m| m.get(&gid).ok()),
+            ) {
+                o.insert("guard".into(), crate::box_land::guard_json(&rec));
+            }
+            let _ = gid;
+            Ok(d)
         }
         a::BOX_TERM_READ => {
             only(args, &["id", "after"])?;

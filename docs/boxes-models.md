@@ -28,6 +28,12 @@ Git over ssh is not supported in boxes. A box has no network device. Its only wa
 
 In-box hardening is best-effort defence in depth: the agent can already run arbitrary code in its box (passwordless sudo, FU4). What is guaranteed: the guard hook's integrity against repo config (`env -i` hooks, root-managed settings), no real credentials in the box, egress only via the gateway, and every change reviewed and landed by touch on the host. Future findings in this class are triaged against this boundary.
 
+## The guard_skipped flag (a signal)
+
+Each `saiife check --profile box` hook run inside a box tells the guest one guard check ran, and the host counts them per box (`guard_checks`), next to the agent's finished turns (`turns`). When the daemon reviews a box (`saiife box diff`, a land, the Workspace Review screen) and the box has changed files but no guard check was ever reported, it sets the box's sticky `guard_skipped` flag and writes one `guard_skipped` audit record. `saiife box diff` then prints a warning before the diff, `--json` and the Workspace answer carry `"guard": {"skipped", "checks", "turns"}`, the Review screen shows a "guard skipped" badge, the box list has `guard_skipped`, and the land's audit record says `guard_skipped: true`. Landing is not blocked: the flag is advisory.
+
+Its limits: the window is the box's whole life since spawn, so one early guard check masks a hook disabled later; a box that changed no files (a text-only run) is never flagged; the guest, and an agent with sudo in it, can send guard checks without running the hook, so the flag can be forged off; and the agent's terminal activity is not used as the "it worked" side, because a text-only turn has no tool call. The VM, the egress gateway, the diff review and the touch stay the boundary.
+
 ## Store the key
 
 ```

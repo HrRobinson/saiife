@@ -69,6 +69,10 @@ pub struct BoxInfo {
     pub updated_at: u64,
     pub queue_pos: Option<u32>,
     pub lands: u32,
+    /// FU1: the box changed files while its in-box guard reported no
+    /// checks (an advisory signal). Absent in older answers, so false.
+    #[serde(default)]
+    pub guard_skipped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -543,6 +547,7 @@ mod tests {
                 updated_at: 3,
                 queue_pos: None,
                 lands: 0,
+                guard_skipped: false,
             }],
             load: Some(Load {
                 cpu_pct: 7,
@@ -554,8 +559,18 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&o).unwrap(),
-            r#"{"boxes":[{"id":"b-1","state":"running","template":"rust","repo":"erp","task":"fix it","created_at":1,"started_at":2,"updated_at":3,"queue_pos":null,"lands":0}],"load":{"cpu_pct":7,"mem_used_mb":100,"mem_total_mb":200},"slots_total":4,"slots_free":3}"#
+            r#"{"boxes":[{"id":"b-1","state":"running","template":"rust","repo":"erp","task":"fix it","created_at":1,"started_at":2,"updated_at":3,"queue_pos":null,"lands":0,"guard_skipped":false}],"load":{"cpu_pct":7,"mem_used_mb":100,"mem_total_mb":200},"slots_total":4,"slots_free":3}"#
         );
+    }
+
+    /// FU1: an answer from before `guard_skipped` still parses, as false.
+    #[test]
+    fn box_info_without_guard_skipped_parses() {
+        let b: BoxInfo = serde_json::from_str(
+            r#"{"id":"b-1","state":"running","template":"rust","repo":"erp","task":"t","created_at":1,"started_at":null,"updated_at":3,"queue_pos":null,"lands":0}"#,
+        )
+        .unwrap();
+        assert!(!b.guard_skipped);
     }
 
     #[test]

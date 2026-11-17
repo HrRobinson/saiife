@@ -61,6 +61,17 @@ pub struct BoxRecord {
     /// (`Vmm::image_id`); `None` before, or when the driver cannot say.
     #[serde(default)]
     pub image: Option<String>,
+    /// FU1: guard checks the in-box hook reported over the box's whole life
+    /// (saturating; never reset). The guest's word: a signal, not proof.
+    #[serde(default)]
+    pub guard_checks: u64,
+    /// FU1: agent turns finished (TurnFinished events) over the box's life.
+    #[serde(default)]
+    pub turns: u64,
+    /// FU1: sticky audit flag: a review saw changed files while
+    /// `guard_checks` was zero (the in-box hook may have been disabled).
+    #[serde(default)]
+    pub guard_skipped: bool,
 }
 
 /// Single-writer by contract: the Manager's one Mutex serialises every Store

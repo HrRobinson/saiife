@@ -1924,7 +1924,8 @@ async fn run(
                         (false, Some(r)) => r,
                         _ => l.refresh(&i)?,
                     };
-                    Ok((crate::box_land::diff_answer(&r), None))
+                    let rec = m.get(&i).ok();
+                    Ok((crate::box_land::diff_answer(&r, rec.as_ref()), None))
                 })
                 .await;
             }

@@ -587,6 +587,9 @@ impl Manager {
             pending_prompt: (!a.task.is_empty()).then(|| a.task.clone()),
             error: None,
             image: None,
+            guard_checks: 0,
+            turns: 0,
+            guard_skipped: false,
         };
         if let Err(e) = g.save_new(r) {
             self.release(g, &id);
@@ -961,7 +964,9 @@ impl Manager {
     }
 
     /// Ready and Exited are transitions (`Some(change)`); Activity and
-    /// TurnFinished only update the idle clocks.
+    /// TurnFinished only update the idle clocks (TurnFinished also counts
+    /// `turns`); GuardChecks only adds to `guard_checks` (FU1: not activity,
+    /// so no clock moves).
     pub fn guest_event(&self, id: &BoxId, ev: GuestEvent) -> Result<Option<Change>, BoxError> {
         self.guest_event_with(id, ev, true)
     }
@@ -980,6 +985,10 @@ impl Manager {
         let mut r = g.get(id)?.clone();
         let from = r.state;
         let mut send = None;
+        if let GuestEvent::GuardChecks(n) = ev {
+            r.guard_checks = r.guard_checks.saturating_add(u64::from(n));
+            return g.put(r).map(|()| None);
+        }
         let out = match ev {
             GuestEvent::Ready => {
                 r.state = transition(from, Event::Ready)?;
@@ -1000,8 +1009,10 @@ impl Manager {
             }
             GuestEvent::TurnFinished => {
                 r.turn_finished_at = Some(now);
+                r.turns = r.turns.saturating_add(1);
                 None
             }
+            GuestEvent::GuardChecks(_) => None,
             GuestEvent::Exited => {
                 r.state = transition(from, Event::Finish)?;
                 Some(change(&r, from, "exited"))
@@ -1013,6 +1024,22 @@ impl Manager {
         self.deliver(send);
         saved?;
         Ok(out)
+    }
+
+    /// FU1: after a fresh review of the box: when it changed files
+    /// (`changed_files > 0`) and its in-box guard reported no check over its
+    /// whole life since spawn (counters never reset, so one early check masks
+    /// a later disable), set the sticky `guard_skipped` flag. `Ok(true)` only
+    /// the first time (the caller audits it once). Advisory: lands go on.
+    pub fn note_review(&self, id: &BoxId, changed_files: usize) -> Result<bool, BoxError> {
+        let mut g = self.lock();
+        let mut r = g.get(id)?.clone();
+        if r.guard_skipped || changed_files == 0 || r.guard_checks > 0 {
+            return Ok(false);
+        }
+        r.guard_skipped = true;
+        g.put(r)?;
+        Ok(true)
     }
 
     /// Add `note` to the box's `error` (`"<error>; <note>"`, or `note` alone).

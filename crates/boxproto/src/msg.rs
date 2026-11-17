@@ -31,6 +31,11 @@ pub enum Event {
     Started,
     Activity,
     TurnFinished,
+    /// FU1: the in-box guard hook ran `n` checks (n >= 1). A signal only:
+    /// the guest, and an agent with sudo, can forge it.
+    GuardChecks {
+        n: u32,
+    },
     Exited {
         code: Option<i32>,
     },
@@ -53,6 +58,11 @@ enum EventDef {
     Started,
     Activity,
     TurnFinished,
+    /// FU1: the in-box guard hook ran `n` checks (n >= 1). A signal only:
+    /// the guest, and an agent with sudo, can forge it.
+    GuardChecks {
+        n: u32,
+    },
     Exited {
         code: Option<i32>,
     },
@@ -62,7 +72,11 @@ impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = serde_json::Value::deserialize(d)?;
         no_extra_keys(&v, &["started", "activity", "turn_finished"]).map_err(D::Error::custom)?;
-        EventDef::deserialize(v).map_err(D::Error::custom)
+        let e = EventDef::deserialize(v).map_err(D::Error::custom)?;
+        if e == (Event::GuardChecks { n: 0 }) {
+            return Err(D::Error::custom("guard_checks n must be at least 1"));
+        }
+        Ok(e)
     }
 }
 
@@ -327,6 +341,10 @@ mod tests {
         pin(Event::Activity, json!({"t":"activity"}));
         pin(Event::TurnFinished, json!({"t":"turn_finished"}));
         pin(
+            Event::GuardChecks { n: 2 },
+            json!({"t":"guard_checks","n":2}),
+        );
+        pin(
             Event::Exited { code: Some(1) },
             json!({"t":"exited","code":1}),
         );
@@ -376,6 +394,18 @@ mod tests {
         );
     }
 
+    /// FU1: a guard_checks event counts at least one check.
+    #[test]
+    fn guard_checks_zero_is_refused() {
+        assert!(serde_json::from_value::<Event>(json!({"t":"guard_checks","n":0})).is_err());
+        assert!(serde_json::from_value::<Event>(json!({"t":"guard_checks"})).is_err());
+        assert!(serde_json::from_value::<Event>(json!({"t":"guard_checks","n":-1})).is_err());
+        assert_eq!(
+            serde_json::from_value::<Event>(json!({"t":"guard_checks","n":1})).unwrap(),
+            Event::GuardChecks { n: 1 }
+        );
+    }
+
     #[test]
     fn unknown_field_is_refused() {
         // every variant, with an extra key, must be refused by its own enum
@@ -389,6 +419,7 @@ mod tests {
         assert!(serde_json::from_value::<Event>(e("activity", json!({}))).is_err());
         assert!(serde_json::from_value::<Event>(e("turn_finished", json!({}))).is_err());
         assert!(serde_json::from_value::<Event>(e("exited", json!({"code":1}))).is_err());
+        assert!(serde_json::from_value::<Event>(e("guard_checks", json!({"n":1}))).is_err());
         assert!(serde_json::from_value::<Event>(e(
             "hello",
             json!({"proto":"p","guest":"g","uptime_ms":1,"set_up":true})

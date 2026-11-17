@@ -263,6 +263,7 @@ impl FakeState {
             updated_at: now,
             queue_pos,
             lands: 0,
+            guard_skipped: false,
         });
     }
 

@@ -37,13 +37,13 @@ const buf = (a) => new Uint8Array(a).buffer;
 const DIFF = { ok: true, result: { diff_sha256: SHA, base_commit: "0".repeat(40), files: [], unified: "", truncated: false, tests: null } };
 const LAND = { request_id: "5", class: "land", box_id: "b-done", summary: "land b-done", challenge_hex: "ab".repeat(32), short_code: "123456", created_at: 1, expires_at: 9 };
 
-function client(inbox) {
+function client(inbox, diff = DIFF) {
   const sent = [];
   return {
     sent,
     async send(action, args, opts = {}) {
       sent.push({ action, args, touch: opts.touch });
-      if (action === "box.diff") return DIFF;
+      if (action === "box.diff") return diff;
       if (action === "box.inbox") return { ok: true, result: { items: inbox } };
       if (action === "workspace.whoami") return { ok: true, result: { passkeys: [b64u(CRED)] } };
       if (action === "box.land") return { ok: true, result: {} };
@@ -86,4 +86,28 @@ test("approve without a pending land sends no land frame and shows the machine r
   const all = texts(root).join("");
   assert.ok(all.includes("Not done yet"), all);
   assert.ok(all.includes("On the machine, run:"), all);
+});
+
+// FU1: the box changed files while its in-box guard reported no checks.
+const withGuard = (guard) => ({ ok: true, result: { ...DIFF.result, ...(guard === undefined ? {} : { guard }) } });
+const badgeOf = (root) => find(root, (n) => n.tag === "span" && texts(n).join("") === "guard skipped");
+
+test("a guard_skipped box shows a warning badge with the explanation", async () => {
+  const { view } = await import("../js/views/review.js");
+  const root = view(client([], withGuard({ skipped: true, checks: 0, turns: 3 })), "b-done", { credentials });
+  await settle();
+  const b = badgeOf(root);
+  assert.ok(b, "no guard skipped badge");
+  assert.ok(b.attrs.class.split(" ").includes("badge"), b.attrs.class);
+  assert.ok(b.attrs.title.includes("its in-box guard reported no checks"), b.attrs.title);
+  assert.ok(b.attrs.title.includes("a signal only"), b.attrs.title);
+});
+
+test("no badge when the guard was not skipped or is not reported", async () => {
+  const { view } = await import("../js/views/review.js");
+  for (const g of [{ skipped: false, checks: 4, turns: 1 }, undefined, { skipped: "true" }]) {
+    const root = view(client([], withGuard(g)), "b-done", { credentials });
+    await settle();
+    assert.equal(badgeOf(root), null, JSON.stringify(g));
+  }
 });

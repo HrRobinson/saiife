@@ -693,7 +693,39 @@ impl Lands {
             .collect();
         drop(st);
         self.prune(id, &paths, n, &live);
+        // The audit write (an fsync) holds no box lock.
+        drop(_held);
+        self.note_guard(&ctx, id, rec.owner_uid, rev.summary.files.len());
         Ok(rev)
+    }
+
+    /// FU1: after a fresh review, flag a box that changed files while its
+    /// in-box guard reported no check ([`Manager::note_review`]); the first
+    /// time, one `guard_skipped` record. A signal only: the guest can forge
+    /// the counts, and nothing is blocked.
+    fn note_guard(&self, ctx: &Ctx, id: &BoxId, owner: u32, files: usize) {
+        match self.mgr.note_review(id, files) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                eprintln!(
+                    "saiifed: boxes: box {}: cannot note the guard check count: {e}",
+                    id.as_str()
+                );
+                return;
+            }
+        }
+        let rec = self.mgr.get(id).ok();
+        let mut r = self.record(ctx, "guard_skipped", id, Some(owner));
+        r.reason = Some(GUARD_SKIPPED.into());
+        let x = &mut r.extra;
+        x.insert(
+            "guard_checks".into(),
+            rec.as_ref().map_or(0, |r| r.guard_checks).into(),
+        );
+        x.insert("turns".into(), rec.as_ref().map_or(0, |r| r.turns).into());
+        x.insert("files".into(), files.into());
+        self.write(ctx, r);
     }
 
     /// Removes every `lands/<m>`, `m < n`, that is not an approved land and
@@ -982,6 +1014,9 @@ impl Lands {
         x.insert("files".into(), q.review.summary.files.len().into());
         x.insert("via".into(), via.into());
         x.insert("target_ref".into(), q.req.target_ref.clone().into());
+        // FU1: advisory; the land goes on.
+        let skipped = self.mgr.get(&id).is_ok_and(|r| r.guard_skipped);
+        x.insert("guard_skipped".into(), skipped.into());
         self.write(&ctx, crate::approvals::record_with_touch(r, ev));
         Ok(LandInfo {
             id: id.clone(),
@@ -1557,14 +1592,30 @@ fn list_some(v: &[String]) -> String {
     s
 }
 
-/// `{diff, review}`: `box.diff`'s answer over a review.
-pub fn diff_answer(r: &Review) -> serde_json::Map<String, Value> {
+/// FU1: what a `guard_skipped` flag means, for the audit and the CLI.
+pub const GUARD_SKIPPED: &str = "the box changed files but its in-box guard reported no checks; the hook may have been disabled (a signal only: the box boundary still applies)";
+
+/// FU1: `{skipped, checks, turns}`: the box's guard signal for a review.
+pub fn guard_json(r: &BoxRecord) -> Value {
+    serde_json::json!({
+        "skipped": r.guard_skipped,
+        "checks": r.guard_checks,
+        "turns": r.turns,
+    })
+}
+
+/// `{diff, review, guard}`: `box.diff`'s answer over a review (`guard`
+/// when the box's record is at hand).
+pub fn diff_answer(r: &Review, rec: Option<&BoxRecord>) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     m.insert(
         "diff".into(),
         serde_json::to_value(&r.summary).unwrap_or(Value::Null),
     );
     m.insert("review".into(), review_json(r));
+    if let Some(rec) = rec {
+        m.insert("guard".into(), guard_json(rec));
+    }
     m
 }
 

@@ -100,6 +100,7 @@ pub fn run(
         // The managed hook judges and records this call: no second record,
         // and nothing on stderr.
         drain_stdin();
+        note_guard_check(profile);
         return allow();
     }
     view.print_warnings();
@@ -107,7 +108,9 @@ pub fn run(
         closed: view.fail_closed,
         hook_exit,
     };
-    let buf = match eval::read_payload(&mut std::io::stdin().lock()) {
+    let payload = eval::read_payload(&mut std::io::stdin().lock());
+    note_guard_check(profile);
+    let buf = match payload {
         eval::Stdin::Whole(buf) => buf,
         eval::Stdin::TooLarge(head) => {
             // Not parsed: denied in every mode, whatever tool it names.
@@ -185,6 +188,43 @@ pub fn run(
         }
         Plan::Unusable(e) => unusable(fail, &audit, "", &e),
     }
+}
+
+/// FU1: how long the box hook waits, at most, for its guard_checks send.
+const GUARD_SEND_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// FU1: in a box (`--profile box`), tell the guest init one guard check
+/// ran (`guard_checks`, n = 1) on its local socket at the fixed path
+/// (`GuestEnv::system()`, never an inherited env). Best-effort: bounded,
+/// every error ignored, and it never touches the verdict, the exit code,
+/// stdout or stderr. A signal for the host's `guard_skipped` audit flag only.
+fn note_guard_check(profile: Profile) {
+    if profile == Profile::Box {
+        send_guard_check(saiife_guest::GuestEnv::system(), GUARD_SEND_WAIT);
+    }
+}
+
+/// Sends one `guard_checks` to `env`'s local socket, waiting at most
+/// `wait` (a stuck connect is left behind on its thread; the hook exits).
+pub(crate) fn send_guard_check(env: saiife_guest::GuestEnv, wait: std::time::Duration) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut env = env;
+        env.timing.local_deadline = wait;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("guard-checks".into())
+            .spawn(move || {
+                let ev = saiife_guest::Event::GuardChecks { n: 1 };
+                let _ = saiife_guest::send_local_event(&env, &ev);
+                let _ = tx.send(());
+            });
+        if spawned.is_ok() {
+            let _ = rx.recv_timeout(wait);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (env, wait);
 }
 
 /// `saiife check` (without `--managed`) got arguments it cannot parse. For
@@ -1047,6 +1087,35 @@ reason = "drops the thing"
             policy_hash("1", &["b", "a"], CONFIG_NONE, &[], Profile::Host),
             want
         );
+    }
+
+    /// FU1: the guard_checks send reaches a listener at the guest's local
+    /// socket path, as one `{"t":"guard_checks","n":1}` frame.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guard_check_send_reaches_the_local_socket() {
+        use std::os::unix::net::UnixListener;
+        let t = tempfile::tempdir().unwrap();
+        let mut env = saiife_guest::GuestEnv::system();
+        env.root = t.path().to_path_buf();
+        let sock = env.path(saiife_boxproto::ports::GUEST_LOCAL_SOCK);
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let l = UnixListener::bind(&sock).unwrap();
+        send_guard_check(env, std::time::Duration::from_secs(2));
+        let (mut s, _) = l.accept().unwrap();
+        let ev: saiife_guest::Event = saiife_boxproto::frame::read_msg(&mut s).unwrap().unwrap();
+        assert_eq!(ev, saiife_guest::Event::GuardChecks { n: 1 });
+    }
+
+    /// FU1: no socket (off the box, or the guest is gone): quiet and quick.
+    #[test]
+    fn guard_check_send_without_a_socket_is_quiet() {
+        let t = tempfile::tempdir().unwrap();
+        let mut env = saiife_guest::GuestEnv::system();
+        env.root = t.path().to_path_buf();
+        let t0 = std::time::Instant::now();
+        send_guard_check(env, std::time::Duration::from_millis(250));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

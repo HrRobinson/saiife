@@ -39,6 +39,9 @@ fn rec(i: &BoxId) -> BoxRecord {
         pending_prompt: Some("go".into()),
         error: None,
         image: Some("img-1".into()),
+        guard_checks: 0,
+        turns: 0,
+        guard_skipped: false,
     }
 }
 
@@ -98,6 +101,24 @@ fn record_without_image_loads() {
     let mut v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
     v.as_object_mut().unwrap().remove("image").unwrap();
+    fs::write(&file, v.to_string()).unwrap();
+    assert_eq!(s.load(&i).unwrap(), Some(r));
+}
+
+/// FU1: a record from before the guard fields loads with them zero.
+#[test]
+fn record_without_guard_fields_loads() {
+    let t = tempfile::tempdir().unwrap();
+    let s = open(&t);
+    let i = s.claim_id().unwrap();
+    let r = rec(&i);
+    s.save(&r).unwrap();
+    let file = s.box_dir(&i).join("box.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    for k in ["guard_checks", "turns", "guard_skipped"] {
+        v.as_object_mut().unwrap().remove(k).unwrap();
+    }
     fs::write(&file, v.to_string()).unwrap();
     assert_eq!(s.load(&i).unwrap(), Some(r));
 }

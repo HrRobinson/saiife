@@ -588,6 +588,58 @@ fn turn_finished_then_idle_is_done() {
     w.assert_saved(&i);
 }
 
+/// FU1: GuardChecks only counts (saturating); it is not activity: no idle
+/// or Done clock moves.
+#[test]
+fn guard_checks_count_and_are_not_activity() {
+    let w = world(1);
+    let i = running(&w, "a");
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    let before = w.mgr.get(&i).unwrap();
+    w.advance(30);
+    assert_eq!(
+        w.mgr.guest_event(&i, GuestEvent::GuardChecks(3)).unwrap(),
+        None
+    );
+    w.mgr
+        .guest_event(&i, GuestEvent::GuardChecks(u32::MAX))
+        .unwrap();
+    let r = w.mgr.get(&i).unwrap();
+    assert_eq!(r.guard_checks, 3 + u64::from(u32::MAX));
+    assert_eq!(r.last_activity, before.last_activity);
+    assert_eq!(r.turn_finished_at, before.turn_finished_at);
+    assert_eq!(r.updated_at, before.updated_at);
+    assert_eq!(r.turns, 1);
+    assert!(!r.guard_skipped);
+    w.assert_saved(&i);
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    assert_eq!(w.mgr.get(&i).unwrap().turns, 2);
+}
+
+/// FU1: a box that changed files with no guard check is flagged, once.
+#[test]
+fn note_review_flags_changes_without_guard_checks_once() {
+    let w = world(2);
+    let i = running(&w, "a");
+    // No changes: never flagged.
+    assert_eq!(w.mgr.note_review(&i, 0), Ok(false));
+    assert!(!w.mgr.get(&i).unwrap().guard_skipped);
+    assert_eq!(w.mgr.note_review(&i, 2), Ok(true));
+    assert!(w.mgr.get(&i).unwrap().guard_skipped);
+    w.assert_saved(&i);
+    assert_eq!(w.mgr.note_review(&i, 2), Ok(false));
+    // Sticky: a later check does not clear it.
+    w.mgr.guest_event(&i, GuestEvent::GuardChecks(1)).unwrap();
+    assert_eq!(w.mgr.note_review(&i, 2), Ok(false));
+    assert!(w.mgr.get(&i).unwrap().guard_skipped);
+    // A box whose guard reported checks is not flagged.
+    let j = running(&w, "b");
+    w.mgr.guest_event(&j, GuestEvent::GuardChecks(1)).unwrap();
+    assert_eq!(w.mgr.note_review(&j, 5), Ok(false));
+    assert!(!w.mgr.get(&j).unwrap().guard_skipped);
+    assert_eq!(w.mgr.note_review(&id("b9"), 1), Err(BoxError::NotFound));
+}
+
 #[test]
 fn exited_is_done() {
     let w = world(1);

@@ -783,6 +783,36 @@ fn turn_finished_via_local_socket() {
     assert_eq!(next_event(&mut ev, Duration::from_millis(500)), None);
 }
 
+/// FU1: the in-box guard hook's `guard_checks` goes on to the host; a burst
+/// coalesces into few events whose counts sum up.
+#[test]
+fn guard_checks_via_local_socket() {
+    let h = host();
+    let _init = start(&h.env);
+    let mut ev = welcomed(&h);
+    let local = h.env.path(saiife_boxproto::ports::GUEST_LOCAL_SOCK);
+    assert!(wait_for(|| local.exists(), T));
+    for _ in 0..5 {
+        saiife_guest::send_local_event(&h.env, &Event::GuardChecks { n: 1 }).unwrap();
+    }
+    saiife_guest::send_local_event(&h.env, &Event::GuardChecks { n: 3 }).unwrap();
+    let mut sum = 0u32;
+    let mut frames = 0;
+    let until = Instant::now() + T;
+    while sum < 8 && Instant::now() < until {
+        match next_event(&mut ev, T) {
+            Some(Event::GuardChecks { n }) => {
+                sum += n;
+                frames += 1;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(sum, 8);
+    assert!(frames <= 6, "{frames}");
+    assert_eq!(next_event(&mut ev, Duration::from_millis(500)), None);
+}
+
 #[test]
 fn slow_local_client_does_not_block() {
     let h = host();
