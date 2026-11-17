@@ -3,7 +3,7 @@
 //! `0400` and hashed. Column types are inferred in a first pass over the
 //! source; a second pass inserts the rows in batches of 10 000.
 
-use crate::dataset::{create_private_file, ensure_private_dir, seal_file, sync_dir};
+use crate::dataset::{ensure_private_dir, memory_temp_store, open_part_db, with_private_part};
 use crate::error::ShieldError;
 use crate::schema::ColType;
 use crate::source::{
@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 /// The snapshot's file name inside the dataset directory.
 pub const SNAPSHOT_FILE: &str = "snapshot.sqlite";
-const PART_FILE: &str = "snapshot.sqlite.part";
 const BATCH: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,16 +291,6 @@ fn sql_err(_: rusqlite::Error) -> ShieldError {
     ShieldError::Sqlite("could not write the snapshot".into())
 }
 
-/// Removes the part file unless the build finished.
-struct PartGuard<'a>(&'a Path, bool);
-impl Drop for PartGuard<'_> {
-    fn drop(&mut self) {
-        if !self.1 {
-            let _ = std::fs::remove_file(self.0);
-        }
-    }
-}
-
 /// Builds `out/snapshot.sqlite` from `src`. `out` is the stage directory:
 /// made 0700 if missing, else it must be ours and not a symlink (and is
 /// tightened to 0700). A CSV keeps its second-pass copy inside `out` and
@@ -324,24 +313,10 @@ fn build_in(
     out: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<SnapshotInfo, ShieldError> {
-    let path = out.join(SNAPSHOT_FILE);
-    if std::fs::symlink_metadata(&path).is_ok() {
-        return Err(ShieldError::Io("the snapshot already exists".into()));
-    }
     // A leftover part file (or anything planted at its name) refuses: the
     // caller clears a stale stage.
-    let part = out.join(PART_FILE);
-    let file = create_private_file(&part)?;
-    let mut guard = PartGuard(&part, false);
-
-    let tables = write_tables(src, &part, progress)?;
-
-    seal_file(&file)?;
-    drop(file);
-    std::fs::rename(&part, &path)
-        .map_err(|_| ShieldError::Io("could not write the snapshot".into()))?;
-    guard.1 = true;
-    sync_dir(out);
+    let (path, tables) =
+        with_private_part(out, SNAPSHOT_FILE, |part| write_tables(src, part, progress))?;
     let sha256 = match hash_file(&path) {
         Ok(h) => h,
         Err(e) => {
@@ -375,21 +350,7 @@ fn write_tables(
     }
     let tnames = unique_names(tables.iter().map(|t| t.name.as_str()), true);
 
-    // The file exists already: we just made it (create_new, 0600,
-    // O_NOFOLLOW) in a checked 0700 dir, and SQLite opens it without CREATE.
-    // No SQLITE_OPEN_NOFOLLOW: SQLite applies it to every path component, so
-    // a symlinked ancestor (macOS /var, /home -> /var/home) would refuse.
-    let conn = Connection::open_with_flags(
-        part,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(sql_err)?;
-    conn.pragma_update_and_check(None, "journal_mode", "OFF", |r| r.get::<_, String>(0))
-        .map_err(sql_err)?;
-    conn.pragma_update(None, "temp_store", "MEMORY")
-        .map_err(sql_err)?;
-    conn.pragma_update(None, "synchronous", "OFF")
-        .map_err(sql_err)?;
+    let conn = open_part_db(part, "could not write the snapshot")?;
 
     let mut out = Vec::with_capacity(tables.len());
     for (t, tname) in tables.iter().zip(tnames) {
@@ -520,14 +481,19 @@ fn hash_file(path: &Path) -> Result<String, ShieldError> {
 }
 
 /// Opens a snapshot read-only: `file:<path>?mode=ro&immutable=1`.
+/// `temp_store=MEMORY`: no sort or GROUP BY of a reader spills values to a
+/// temp file.
 pub fn open_ro(path: &Path) -> Result<Connection, ShieldError> {
-    Connection::open_with_flags(
+    let bad = || ShieldError::Sqlite("could not open the snapshot".into());
+    let conn = Connection::open_with_flags(
         sqlite_uri(path, "mode=ro&immutable=1"),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|_| ShieldError::Sqlite("could not open the snapshot".into()))
+    .map_err(|_| bad())?;
+    memory_temp_store(&conn).map_err(|_| bad())?;
+    Ok(conn)
 }
 
 #[cfg(test)]

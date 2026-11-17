@@ -9,6 +9,7 @@ use saiife_shield::norm::{normalize, sorted_key, tokens};
 use saiife_shield::schema::{ColType, ColumnClass, ColumnInfo, EntitySpec, Schema, TableInfo};
 use saiife_shield::snapshot::build_snapshot;
 use saiife_shield::source::{Cell, SourceTable, VecSource};
+use saiife_shield::ShieldError;
 use std::path::{Path, PathBuf};
 
 const COLS: [(&str, ColType, ColumnClass); 6] = [
@@ -379,8 +380,23 @@ fn errors_and_debug_carry_no_names() {
     let ds = dir.path().join("ds");
     let info = build_snapshot(&mut src, &ds, &mut |_| {}).unwrap();
     let e = build_lexicon(&info.path, &schema(1), &ds.join("lexicon.sqlite")).unwrap_err();
+    match &e {
+        ShieldError::Source {
+            file,
+            table,
+            column,
+            row,
+            why,
+        } => {
+            assert_eq!(file, "snapshot.sqlite");
+            assert_eq!(table.as_deref(), Some("customers"));
+            assert_eq!(column.as_deref(), Some("id"));
+            assert_eq!(*row, None);
+            assert_eq!(*why, "the entity key is not an integer");
+        }
+        other => panic!("expected a Source error, got {other:?}"),
+    }
     let text = format!("{e} {e:?}");
-    assert!(text.contains("customers") && text.contains("id"), "{text}");
     for v in ["Zebulon", "Anna", "Berg", "Aarhus"] {
         assert!(!text.contains(v), "{text}");
     }

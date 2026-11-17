@@ -749,3 +749,13 @@ fn sqlite_table_with_only_blob_columns_and_no_key() {
     let rows: Vec<_> = src.rows("b").unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(rows, vec![Vec::<Cell>::new(), Vec::new()]);
 }
+
+#[test]
+fn open_ro_temp_store_is_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = csv_src(b"a,b\n1,x\n", "t.csv");
+    let info = build(&mut src, dir.path()).unwrap();
+    let c = open_ro(&info.path).unwrap();
+    let ts: i64 = c.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+    assert_eq!(ts, 2, "sorts must never spill values to temp files");
+}

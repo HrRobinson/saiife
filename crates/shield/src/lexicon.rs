@@ -18,7 +18,7 @@
 //!   of the `public` columns.
 //! - `spec(tbl, show)`: each entity table's `show` columns (JSON).
 
-use crate::dataset::{create_private_file, ensure_private_dir, seal_file, sync_dir};
+use crate::dataset::{memory_temp_store, open_part_db, with_private_part};
 use crate::error::ShieldError;
 use crate::norm::{token_spans, tokens};
 use crate::schema::{ColType, ColumnClass, EntitySpec, Schema};
@@ -122,16 +122,6 @@ fn lx(_: rusqlite::Error) -> ShieldError {
     ShieldError::Sqlite("could not read the lexicon".into())
 }
 
-/// Removes the part file unless the build finished.
-struct PartGuard<'a>(&'a Path, bool);
-impl Drop for PartGuard<'_> {
-    fn drop(&mut self) {
-        if !self.1 {
-            let _ = std::fs::remove_file(self.0);
-        }
-    }
-}
-
 /// A cell as text: numbers in plain notation, a `bool` column as
 /// `true`/`false`; NULL and blobs give None.
 fn cell_text(v: ValueRef<'_>, ty: Option<ColType>) -> Option<String> {
@@ -163,41 +153,14 @@ pub fn build_lexicon(snapshot: &Path, schema: &Schema, out: &Path) -> Result<(),
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    ensure_private_dir(&dir)?;
-    if std::fs::symlink_metadata(&path).is_ok() {
-        return Err(ShieldError::Io("the lexicon already exists".into()));
-    }
     let snap = open_ro(snapshot)?;
     // A leftover part file (or anything planted at its name) refuses.
-    let part = dir.join(format!("{name}.part"));
-    let file = create_private_file(&part)?;
-    let mut guard = PartGuard(&part, false);
-
-    write_lexicon(&snap, schema, &part)?;
-
-    seal_file(&file)?;
-    drop(file);
-    std::fs::rename(&part, &path)
-        .map_err(|_| ShieldError::Io("could not write the lexicon".into()))?;
-    guard.1 = true;
-    sync_dir(&dir);
+    with_private_part(&dir, &name, |part| write_lexicon(&snap, schema, part))?;
     Ok(())
 }
 
 fn write_lexicon(snap: &Connection, schema: &Schema, part: &Path) -> Result<(), ShieldError> {
-    // The file exists already (create_new, 0600, O_NOFOLLOW, in a checked
-    // 0700 dir) and SQLite opens it without CREATE. No SQLITE_OPEN_NOFOLLOW:
-    // it applies to every path component and refuses symlinked ancestors.
-    let conn = Connection::open_with_flags(
-        part,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(wr)?;
-    conn.pragma_update_and_check(None, "journal_mode", "OFF", |r| r.get::<_, String>(0))
-        .map_err(wr)?;
-    conn.pragma_update(None, "temp_store", "MEMORY")
-        .map_err(wr)?;
-    conn.pragma_update(None, "synchronous", "OFF").map_err(wr)?;
+    let conn = open_part_db(part, "could not write the lexicon")?;
     conn.execute_batch(
         "CREATE TABLE spec(tbl TEXT NOT NULL, show TEXT NOT NULL);
          CREATE TABLE entity(norm TEXT NOT NULL, sorted TEXT NOT NULL, key INTEGER NOT NULL,
@@ -423,8 +386,8 @@ impl Lexicon {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| ShieldError::Sqlite("could not open the lexicon".into()))?;
-        conn.pragma_update(None, "temp_store", "MEMORY")
-            .map_err(lx)?;
+        memory_temp_store(&conn)
+            .map_err(|_| ShieldError::Sqlite("could not open the lexicon".into()))?;
         let mut show = HashMap::new();
         {
             let mut st = conn.prepare("SELECT tbl, show FROM spec").map_err(lx)?;
@@ -555,9 +518,23 @@ impl Lexicon {
             .map_err(lx)
     }
 
-    /// The entity names and literal values in `question`, as spans of at
-    /// most `max_tokens` tokens: longest match first, left to right, never
-    /// overlapping. An entity name wins over a literal of the same length.
+    /// The entity names and literal values in `question`.
+    ///
+    /// Exact semantics: the question is cut into normalized tokens
+    /// (R43-7). The scan is greedy, left to right. At each start token it
+    /// tries the longest run first, `min(max_tokens, tokens left)` tokens,
+    /// then one fewer, down to 1. A run is an entity when its tokens, sorted,
+    /// equal an entity name's sorted key (in any entity table; the first
+    /// table by name), else a literal when its normalized text equals a
+    /// literal's (the most common one; ties by table, column, value). An
+    /// entity beats a literal of the same length. On a hit the span is
+    /// emitted and the scan continues after its last token; with no hit it
+    /// moves on one token. So spans never overlap and come in question
+    /// order, and an earlier start wins over a longer match that starts
+    /// later. `start..end` are byte offsets into `question`, from the
+    /// first byte of the first token to the last byte of the last token,
+    /// so the separators between tokens (`, `) are inside the span.
+    /// `max_tokens == 0` finds nothing.
     pub fn find_spans(
         &self,
         question: &str,

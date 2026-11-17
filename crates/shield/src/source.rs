@@ -645,6 +645,9 @@ impl SqliteSource {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| bad("the file is not a readable SQLite database"))?;
+        // The paged SELECTs sort: never into a temp file.
+        crate::dataset::memory_temp_store(&conn)
+            .map_err(|_| bad("the file is not a readable SQLite database"))?;
         let names: Vec<String> = (|| {
             let mut st = conn.prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
@@ -900,6 +903,22 @@ impl RowSource for VecSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_source_temp_store_is_memory() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("s.db");
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch("CREATE TABLE a(x); INSERT INTO a VALUES (1);")
+            .unwrap();
+        drop(c);
+        let s = SqliteSource::open(&p).unwrap();
+        let ts: i64 = s
+            .conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ts, 2, "sorts must never spill values to temp files");
+    }
 
     #[test]
     fn delimiter_sniffing() {
