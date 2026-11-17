@@ -158,6 +158,34 @@ over Tailscale, add the https origin the phone opens, for example
 `https://<host>[:port]`; nothing else is accepted. A passkey made at one
 origin works only there.
 
+## `[workspace] push`
+
+```toml
+[workspace]
+push = true
+```
+
+Off by default. When it is on and `saiife workspace serve --hub` is connected
+to the hub, the link asks the hub to wake your phone when something waits for
+you: a box's land in the inbox (the same moment as the `box_waiting`
+notification) or a new approval request. The phone shows a fixed alert,
+"Something needs your attention.", and you open the Workspace to see what.
+
+The message to the hub is `{"t":"wake"}` and nothing else. It names no box,
+no request, no repository and no text, so the hub and the push service learn
+only that this machine wanted your attention, and when. The phone gets the
+same fixed alert for every event.
+
+- At most one wake every 30 seconds. Events in between become one wake when
+  the 30 seconds end, so a burst of boxes is one alert.
+- The link checks for new events every 5 seconds while it is connected to
+  the hub. Events while it is not connected become one wake once it is back.
+  Events from before the link started send none.
+- Without a hub link (`serve` without `--hub`, or the hub unreachable)
+  nothing is sent. Turning `push` off stops wakes at the next check.
+- Devices register for pushes in the hub, not on the machine. The hub limits
+  wakes as well.
+
 ## The steer window
 
 Steer sends a message to a running box, Revise sends a comment to a finished
