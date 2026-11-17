@@ -595,7 +595,6 @@ fn touch_required(action: &str) -> Fail {
     ))
 }
 
-/// The frame's args take only `keys`.
 /// FU1: the box's guard signal on a diff answer (unix: boxes exist there).
 #[cfg(unix)]
 fn add_guard(ctx: &Ctx, id: &BoxId, d: &mut Value) {
@@ -610,6 +609,7 @@ fn add_guard(ctx: &Ctx, id: &BoxId, d: &mut Value) {
 #[cfg(not(unix))]
 fn add_guard(_ctx: &Ctx, _id: &BoxId, _d: &mut Value) {}
 
+/// The frame's args take only `keys`.
 pub(crate) fn only(args: &Map<String, Value>, keys: &[&str]) -> Result<(), Fail> {
     match args.keys().find(|k| !keys.contains(&k.as_str())) {
         Some(k) => Err(invalid(format!("unexpected argument {k:?}"))),

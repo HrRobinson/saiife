@@ -654,24 +654,24 @@ mod tests {
     }
 
     /// A fake mcopy that keeps a copy of every file it is handed in
-    /// `<dir>/seen/` and logs its arguments.
+    /// `<dir>/seen/` and logs its arguments (no tool name, unlike `fake`).
     fn keeping_world() -> (tempfile::TempDir, Tools, PathBuf, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let log = d.path().join("calls.log");
         let seen = d.path().join("seen");
         fs::create_dir(&seen).unwrap();
-        let mk = fake(d.path(), "mkfs.vfat", &log);
+        let mk = fake(d.path(), "mkfs.vfat");
         let mc = d.path().join("mcopy");
-        fs::write(
+        // a checked-in script, linked: a file written then run here can hit
+        // ETXTBSY when another test thread forks meanwhile
+        std::os::unix::fs::symlink(
+            Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake-keeping-tool"
+            )),
             &mc,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf ' %s' \"$a\" >>'{l}'; if [ -f \"$a\" ]; then cp \"$a\" '{s}/'; fi; done\nprintf '\\n' >>'{l}'\n",
-                l = log.display(),
-                s = seen.display()
-            ),
         )
         .unwrap();
-        fs::set_permissions(&mc, fs::Permissions::from_mode(0o755)).unwrap();
         let env = move |k: &str| -> Option<OsString> {
             match k {
                 "SAIIFE_TOOL_MKFS_VFAT" => Some(mk.clone().into_os_string()),

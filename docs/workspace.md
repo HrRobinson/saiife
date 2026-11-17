@@ -111,7 +111,7 @@ that gives power needs a touch on a paired passkey.
 |---|---|
 | Signed browser key | `box.overview`, `box.list`, `box.diff`, `box.inbox`, `box.templates`, `box.term.read`, `approval.list`; `box.pause`, `box.stop`, `box.reorder`, `box.discard`, `approval.reject`; `lockdown.on`; `box.spawn` with a template that has no secrets and no egress |
 | Needs a touch | `box.land`, `box.steer`, `box.revise`, `box.resume`, `approval.approve`; `box.spawn` with a template that has secrets or egress |
-| Not from the browser | `box.push`, `box.pr` (see [Why push stays on the machine](#why-push-stays-on-the-machine)) |
+| Not from the browser | `box.push`, `box.pr` (see [Why git push stays on the machine](#why-git-push-stays-on-the-machine)) |
 | Machine only | policy, config, vault, connectors, egress; enrolling or removing devices (including pairing and revoking); `lockdown.off`; raising caps; uninstall; anything about the audit |
 
 A touch is a WebAuthn assertion from a passkey enrolled for this device. It
@@ -232,7 +232,7 @@ closes at once when you revoke the browser, and it ends after 600 seconds. A
 frame covered by a window is recorded with `window: true`. The window opens
 once the touch is verified, even if the action itself then fails.
 
-## Why push stays on the machine
+## Why git push stays on the machine
 
 `box.push` and `box.pr` send a box's work to a remote. They are not offered
 to the browser at all, because a compromised page or hub must not be able to
