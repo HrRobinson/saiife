@@ -7,7 +7,8 @@
 //! - `SELECT [DISTINCT]` items: a plain column `t.c`; `COUNT(*)`,
 //!   `COUNT([DISTINCT] t.c)`, `SUM|AVG|MIN|MAX([DISTINCT] t.c)` over one
 //!   plain column; `date(t.c, mods…)` / `strftime('<fmt>', t.c, mods…)` over
-//!   a plain DATE column; `+ - * /` only between aggregates. No literal and
+//!   a plain DATE column; in the outermost block only, one `+ - * /` between
+//!   two aggregates over base-table columns (ruling C-CAP). No literal and
 //!   no parameter in the list. `AS alias`; at most 32 items, unique names.
 //! - `FROM` a base table or a CTE, `[INNER] JOIN … ON` an AND of equalities
 //!   each on a declared key pair (ruling C-G1), checked by column origin
@@ -23,11 +24,16 @@
 //!   CTEs): only in a key-pair ON, the entity pin, GROUP BY, a plain output
 //!   column, or `COUNT(DISTINCT col)`.
 //! - Expressions are compared by a structural fingerprint (aggregate kind,
-//!   DISTINCT, column origin through CTEs), never by rendered text: no
-//!   fingerprint twice in one arithmetic tree, no two outputs of a block
-//!   with one fingerprint. `COUNT(DISTINCT key)` is an outermost output only.
+//!   DISTINCT, column origin through CTEs; operands of `+` and `*` sorted),
+//!   never by rendered text: no two outputs of a block with one fingerprint.
+//!   The two operands of an operator have disjoint normalised leaves
+//!   (`AVG(x)` = {`SUM(x)`, `COUNT(*)`}, `COUNT(col)` = `COUNT(*)`).
+//!   `COUNT(DISTINCT key)` is an outermost output only.
+//! - The validator keeps a small, predictable grammar; it does not prove
+//!   semantic equivalence (ruling C-CAP). The existence check, the preview
+//!   and approved methods cover the rest.
 //! - The rendered SQL is canonical: aggregate names upper-case, `date` /
-//!   `strftime` lower-case, parentheses kept only around arithmetic.
+//!   `strftime` lower-case, no redundant parentheses.
 //!
 //! Every `match` over the parser's AST ends in a refusal, never in an
 //! accept. Masking routes (CASE, COALESCE, IS NULL, constants, subqueries,
@@ -353,6 +359,7 @@ fn validate_cols(
         entity_params: Vec::new(),
         links: Vec::new(),
         agg_seen: false,
+        outer: true,
     };
     let out = w.query(&mut q, true)?;
     // A bound entity the method ignores answers another question.
@@ -426,7 +433,7 @@ enum Kind {
     DateOf,
     /// An aggregate over one plain column (or `COUNT(*)`).
     Agg { count: bool },
-    /// `+ - * /` between aggregates.
+    /// One `+ - * /` between two aggregates (outermost block only).
     Arith,
 }
 
@@ -454,8 +461,9 @@ struct Item {
     /// DISTINCT, date-function arguments and column origins (snapshot names,
     /// through CTEs), never from rendered text.
     fp: String,
-    /// `Agg` / `Arith`: the fingerprints of the aggregates in the tree.
-    leaves: Vec<String>,
+    /// `Agg` over a base-table column (or `COUNT(*)`): its normalised
+    /// leaves, the only kind of arithmetic operand (ruling C-CAP).
+    norm: Option<Vec<String>>,
     /// `COUNT(DISTINCT key/FK)`: allowed only as an outermost output (M2).
     key_count: bool,
 }
@@ -472,13 +480,9 @@ impl Item {
             repeats: false,
             unique: false,
             fp,
-            leaves: Vec::new(),
+            norm: None,
             key_count: false,
         }
-    }
-
-    fn is_agg(&self) -> bool {
-        matches!(self.kind, Kind::Agg { .. } | Kind::Arith)
     }
 
     fn is_col(&self) -> bool {
@@ -817,6 +821,8 @@ struct Walk<'a> {
     links: Vec<Link>,
     /// An aggregate was seen in the block being walked.
     agg_seen: bool,
+    /// The block being walked is the outermost one.
+    outer: bool,
 }
 
 impl<'a> Walk<'a> {
@@ -870,8 +876,10 @@ impl<'a> Walk<'a> {
             return construct();
         }
         let saved = std::mem::replace(&mut self.agg_seen, false);
+        let saved_outer = std::mem::replace(&mut self.outer, outer);
         let r = self.select(sel, order_by.as_mut(), outer);
         self.agg_seen = saved;
+        self.outer = saved_outer;
         let out = r?;
         // G2: an OFFSET can skip the entity's only row; none in stage 1.
         let limit = match limit_clause {
@@ -1504,22 +1512,24 @@ impl<'a> Walk<'a> {
                 let divide = sym == "/";
                 let a = self.term(left, sc, alias_ok)?;
                 let b = self.term(right, sc, alias_ok)?;
-                // One rule for constants (F5, G3, H1, M1): no fingerprint twice
-                // in one arithmetic tree (`x - x`, `(a + b) - (b + a)`,
-                // `a * b - b * a`, ...). COUNT(DISTINCT key) is no operand (M2).
-                if !a.is_agg() || !b.is_agg() || a.key_count || b.key_count {
+                // Ruling C-CAP: one operator, in the outermost block, between
+                // two aggregates over base-table columns whose normalised
+                // leaves are disjoint (`x - x`, `AVG(x) / SUM(x)` refused).
+                // COUNT(DISTINCT key) is no operand (M2).
+                let (Some(na), Some(nb)) = (&a.norm, &b.norm) else {
+                    return construct();
+                };
+                if !self.outer || a.key_count || b.key_count || na.iter().any(|l| nb.contains(l)) {
                     return construct();
                 }
-                let mut leaves = a.leaves;
-                for l in b.leaves {
-                    if leaves.contains(&l) {
-                        return construct();
-                    }
-                    leaves.push(l);
-                }
-                let fp = format!("({} {sym} {})", a.fp, b.fp);
+                // `+` and `*` commute: sort the operands of the fingerprint.
+                let (fa, fb) = if matches!(sym, "+" | "*") && b.fp < a.fp {
+                    (&b.fp, &a.fp)
+                } else {
+                    (&a.fp, &b.fp)
+                };
+                let fp = format!("({fa} {sym} {fb})");
                 let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty), fp);
-                it.leaves = leaves;
                 it.nullable = a.nullable || b.nullable || divide;
                 Ok(it)
             }
@@ -1589,9 +1599,9 @@ impl<'a> Walk<'a> {
             return construct();
         };
         let mut key_count = false;
-        let (arg_ty, arg_fp) = match arg {
+        let (arg_ty, arg_fp, base) = match arg {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if count && !distinct => {
-                (None, "*".to_string())
+                (None, "*".to_string(), true)
             }
             FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => {
                 // An output alias is not a column here.
@@ -1615,7 +1625,7 @@ impl<'a> Walk<'a> {
                 if repeated && inflates {
                     return construct();
                 }
-                (it.ty, it.fp)
+                (it.ty, it.fp, it.base)
             }
             _ => return construct(),
         };
@@ -1627,8 +1637,19 @@ impl<'a> Walk<'a> {
         };
         let d = if distinct { " distinct" } else { "" };
         let fp = format!("{l}{d}({arg_fp})");
-        let mut it = Item::new(Kind::Agg { count }, ty, fp.clone());
-        it.leaves = vec![fp];
+        // C-CAP leaves: AVG(x) is SUM(x) and COUNT(x); COUNT(x) is COUNT(*).
+        let counted = if distinct {
+            format!("count distinct({arg_fp})")
+        } else {
+            "count(*)".to_string()
+        };
+        let norm = match l {
+            "count" => vec![counted],
+            "avg" => vec![format!("sum{d}({arg_fp})"), counted],
+            _ => vec![fp.clone()],
+        };
+        let mut it = Item::new(Kind::Agg { count }, ty, fp);
+        it.norm = base.then_some(norm);
         it.key_count = key_count;
         it.nullable = !count;
         Ok(it)

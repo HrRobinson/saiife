@@ -20,7 +20,7 @@ fn col(name: &str, ty: ColType, class: ColumnClass) -> ColumnInfo {
 }
 
 /// customers(id, first_name, last_name, city, credit_limit, segment),
-/// invoices(id, customer_id, amount, status, issued),
+/// invoices(id, customer_id, amount, status, issued, discount),
 /// payments(id, customer_id, invoice_id, amount, paid); entities customers
 /// and invoices.
 fn schema() -> Schema {
@@ -52,6 +52,7 @@ fn schema() -> Schema {
                     col("amount", Real, Sensitive),
                     col("status", Text, Public),
                     col("issued", Date, Quasi),
+                    col("discount", Real, Sensitive),
                 ],
             },
             TableInfo {
@@ -189,7 +190,7 @@ fn prepares(sql: &str) {
         "CREATE TABLE customers(id INTEGER, first_name TEXT, last_name TEXT, city TEXT, \
          credit_limit REAL, segment TEXT);\
          CREATE TABLE invoices(id INTEGER, customer_id INTEGER, amount REAL, status TEXT, \
-         issued TEXT);\
+         issued TEXT, discount REAL);\
          CREATE TABLE payments(id INTEGER, customer_id INTEGER, invoice_id INTEGER, \
          amount REAL, paid TEXT);",
     )
@@ -249,7 +250,7 @@ fn entity_filters_and_count_only() {
     // Arithmetic over COUNTs, a plain list or a bare pinned column is not
     // count-only.
     for sql in [
-        format!("SELECT COUNT(*) / COUNT(i.amount) AS r {J}"),
+        format!("SELECT COUNT(*) - COUNT(DISTINCT i.status) AS r {J}"),
         format!("SELECT i.amount {J}"),
         format!("SELECT COUNT(*) AS n, c.credit_limit {J}"),
     ] {
@@ -313,7 +314,7 @@ fn wide_method_renders_and_prepares() {
          FROM invoices i WHERE i.issued >= :p3_from AND i.issued < :p3_to \
          GROUP BY i.customer_id HAVING SUM(i.amount) > :p2) \
          SELECT c.city, COUNT(DISTINCT c.id) AS n, AVG(b.total) AS avg_total, \
-         MAX(b.total) AS top, SUM(b.total) / COUNT(*) AS mean \
+         MAX(b.total) AS top, MIN(b.total) AS low \
          FROM customers c JOIN big b ON b.cid = c.id \
          WHERE c.city = :p4 GROUP BY c.city ORDER BY n DESC LIMIT 10";
     let v = ok(sql);
@@ -1487,7 +1488,7 @@ fn join_fan_out_refused() {
          GROUP BY i.customer_id), \
          pay AS (SELECT p.customer_id AS cid, SUM(p.amount) AS s FROM payments p \
          GROUP BY p.customer_id) \
-         SELECT SUM(inv.s) - SUM(pay.s) AS owed FROM customers c \
+         SELECT SUM(inv.s) AS invoiced, SUM(pay.s) AS paid FROM customers c \
          JOIN inv ON inv.cid = c.id JOIN pay ON pay.cid = c.id WHERE c.id = :p1",
     );
     assert_eq!(
@@ -1497,7 +1498,7 @@ fn join_fan_out_refused() {
             ("payments".to_string(), "customer_id".to_string())
         ]
     );
-    assert_eq!(v.aggregates_nullable, vec![0]);
+    assert_eq!(v.aggregates_nullable, vec![0, 1]);
     prepares(&v.sql);
 }
 
@@ -1668,17 +1669,14 @@ fn no_constant_differences() {
          FROM invoices i",
         "SELECT (SUM(i.amount) + MAX(i.amount)) / (MAX(i.amount) + SUM(i.amount)) AS z \
          FROM invoices i",
+        // Two operators (ruling C-CAP).
+        "SELECT (SUM(i.amount) + MAX(i.amount)) - MIN(i.amount) AS z FROM invoices i",
         "SELECT SUM(i.amount) + COUNT(*) + MAX(i.amount) - (MAX(i.amount) + (COUNT(*) + \
          SUM(i.amount))) AS z FROM invoices i",
     ] {
         assert_eq!(refused(sql), ErrorClass::ConstructNotAllowed, "{sql}");
     }
-    for sql in [
-        "SELECT (SUM(i.amount) + MAX(i.amount)) - MIN(i.amount) AS z FROM invoices i",
-        "SELECT SUM(i.amount) AS s, MAX(i.amount) AS m FROM invoices i",
-    ] {
-        prepares(&ok(sql).sql);
-    }
+    prepares(&ok("SELECT SUM(i.amount) AS s, MAX(i.amount) AS m FROM invoices i").sql);
 }
 
 /// Two per-customer CTEs over different tables (or the same body twice).
@@ -1740,14 +1738,16 @@ fn constants_compared_by_structure() {
         two_ctes(INV, inv2, "SUM(a.s) - SUM(b.s) AS z"),
         two_ctes(INV, inv2, "SUM(a.s) / SUM(b.s) AS z"),
         two_ctes(INV, inv2, "SUM(a.s) AS x, SUM(b.s) AS y"),
+        // Ruling C-CAP: no arithmetic over CTE columns, even of different
+        // origins.
+        two_ctes(INV, PAY, "SUM(a.s) / SUM(b.s) AS r"),
+        two_ctes(INV, PAY, "SUM(a.s) - SUM(b.s) AS d"),
     ] {
         assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
     }
-    // Allowed: different origins; DISTINCT is part of the fingerprint
+    // Allowed: two outputs of different origins; DISTINCT is part of the fingerprint
     // (SUM(DISTINCT x) / SUM(x) is not a constant: it varies with repeats).
     for sql in [
-        two_ctes(INV, PAY, "SUM(a.s) / SUM(b.s) AS r"),
-        two_ctes(INV, PAY, "SUM(a.s) - SUM(b.s) AS d"),
         two_ctes(INV, PAY, "SUM(a.s) AS x, SUM(b.s) AS y"),
         "SELECT SUM(DISTINCT i.amount) / SUM(i.amount) AS r FROM invoices i".to_string(),
         "SELECT MAX(i.amount) - MIN(i.amount) AS w, SUM(i.amount) / COUNT(*) AS m \
@@ -1763,9 +1763,13 @@ fn constants_compared_by_structure() {
     assert!(v.sql.contains("COUNT(*)"), "{}", v.sql);
     assert!(!v.sql.contains("(("), "{}", v.sql);
     prepares(&v.sql);
-    // Parentheses that carry precedence stay.
-    let v = ok("SELECT (SUM(i.amount) + MAX(i.amount)) * COUNT(*) AS z FROM invoices i");
-    assert!(v.sql.contains(") * COUNT(*)"), "{}", v.sql);
+    let v = ok("SELECT (SUM(i.amount)) - (MAX((i.amount))) AS z FROM invoices i");
+    assert!(!v.sql.contains("(("), "{}", v.sql);
+    assert!(
+        v.sql.contains("SUM(\"_p_i\".\"amount\") - MAX("),
+        "{}",
+        v.sql
+    );
 }
 
 #[test]
@@ -1794,6 +1798,65 @@ fn count_distinct_key_only_as_outer_output() {
         "SELECT c.city, COUNT(DISTINCT c.id) AS n FROM customers c GROUP BY c.city \
          ORDER BY n DESC LIMIT 5"
             .to_string(),
+    ] {
+        prepares(&ok(&sql).sql);
+    }
+}
+
+#[test]
+fn arithmetic_is_capped() {
+    // Ruling C-CAP: arithmetic only in the outermost SELECT, one operator,
+    // each operand one aggregate over a base-table column (or COUNT(*)),
+    // with disjoint normalised leaves (AVG(x) = {SUM(x), COUNT(*)},
+    // COUNT(col) = COUNT(*)).
+    let cte = "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s FROM invoices i \
+               GROUP BY i.customer_id)";
+    let tail = "FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1";
+    for sql in [
+        // Arithmetic over a CTE column.
+        format!("{cte} SELECT SUM(t.s) - COUNT(*) AS z {tail}"),
+        format!("{cte} SELECT SUM(t.s) / MAX(c.credit_limit) AS z {tail}"),
+        // Commutative chains hidden in CTE columns (round-5 re-review).
+        format!(
+            "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) + MAX(i.amount) AS x, \
+             MAX(i.amount) + SUM(i.amount) AS y FROM invoices i GROUP BY i.customer_id) \
+             SELECT SUM(t.x) - SUM(t.y) AS z {tail}"
+        ),
+        // A CTE with an arithmetic output.
+        "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) - MIN(i.amount) AS d \
+         FROM invoices i GROUP BY i.customer_id) SELECT t.cid FROM t"
+            .to_string(),
+        // Overlapping normalised leaves.
+        "SELECT AVG(i.amount) / SUM(i.amount) AS z FROM invoices i".to_string(),
+        "SELECT AVG(i.amount) / COUNT(i.amount) AS z FROM invoices i".to_string(),
+        "SELECT AVG(i.amount) * COUNT(*) AS z FROM invoices i".to_string(),
+        "SELECT COUNT(i.amount) - COUNT(*) AS z FROM invoices i".to_string(),
+        "SELECT SUM(i.amount) - SUM(i.amount) AS z FROM invoices i".to_string(),
+        // Two operators.
+        "SELECT SUM(i.amount) + MAX(i.amount) - MIN(i.amount) AS z FROM invoices i".to_string(),
+        "SELECT (SUM(i.amount) - SUM(i.discount)) / COUNT(*) AS z FROM invoices i".to_string(),
+        // Duplicate outputs: commutative operands are sorted.
+        "SELECT SUM(i.amount) + SUM(i.discount) AS a, SUM(i.discount) + SUM(i.amount) AS b \
+         FROM invoices i"
+            .to_string(),
+        "SELECT SUM(i.amount) * MAX(i.discount) AS a, MAX(i.discount) * SUM(i.amount) AS b \
+         FROM invoices i"
+            .to_string(),
+    ] {
+        assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    for sql in [
+        "SELECT SUM(i.amount) / SUM(i.discount) AS share FROM invoices i".to_string(),
+        "SELECT SUM(i.amount) - SUM(i.discount) AS net FROM invoices i".to_string(),
+        "SELECT SUM(i.amount) * MAX(i.discount) AS p FROM invoices i".to_string(),
+        "SELECT SUM(i.amount) + SUM(i.discount) AS a, SUM(i.amount) - SUM(i.discount) AS b, \
+         SUM(i.discount) - SUM(i.amount) AS c FROM invoices i"
+            .to_string(),
+        format!("SELECT SUM(i.amount) / MAX(c.credit_limit) AS used {J}"),
+        "SELECT MAX(i.amount) - MIN(i.amount) AS w, SUM(i.amount) / COUNT(*) AS m \
+         FROM invoices i"
+            .to_string(),
+        "SELECT AVG(i.amount) / MAX(i.amount) AS r FROM invoices i".to_string(),
     ] {
         prepares(&ok(&sql).sql);
     }
