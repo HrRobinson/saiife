@@ -396,10 +396,13 @@ fn null_masking_refused() {
             panic!("{sql}: {e:?}");
         }
     }
-    // COALESCE of a plain column with the key bound is not masking an empty result.
-    ok(
-        "SELECT SUM(COALESCE(i.amount, 0)) AS owed FROM invoices i JOIN customers c \
-        ON c.id = i.customer_id WHERE c.id = :p1",
+    // I3: COALESCE inside an aggregate's argument masks a LEFT JOIN's NULLs.
+    assert_eq!(
+        refused(
+            "SELECT SUM(COALESCE(i.amount, 0)) AS owed FROM customers c LEFT JOIN invoices i \
+             ON i.customer_id = c.id WHERE c.id = :p1"
+        ),
+        ErrorClass::NullMasking
     );
 }
 
@@ -473,17 +476,19 @@ fn escape_attempts_refused() {
     // A quoted schema name is still the schema name.
     let v = ok("SELECT \"c\".\"city\" FROM \"customers\" \"c\"");
     prepares(&v.sql);
-    // The CTE-shadow rule holds against the snapshot name behind an alias too.
+    // S1: a name the cloud never saw (the snapshot name behind an alias) is a
+    // free name: the CTE is accepted and renders under the reserved prefix.
     let a = aliased_schema();
-    assert_eq!(
-        class_of(
-            "WITH customers AS (SELECT i.id AS id FROM invoices i) \
-             SELECT x.id FROM customers x",
-            &a,
-            &ps
-        ),
-        ConstructNotAllowed
-    );
+    let v = validate(
+        "WITH customers AS (SELECT i.id AS id FROM invoices i) \
+         SELECT x.id FROM customers x",
+        &a,
+        &public(),
+        &ps,
+    )
+    .unwrap();
+    assert!(v.sql.contains("\"_p_customers\""), "{}", v.sql);
+    prepares(&v.sql);
     // Error details carry only the cloud name, capped.
     let long = "x".repeat(300);
     let e = validate(&format!("SELECT c.id FROM {long} c"), &s, &public(), &ps).unwrap_err();
@@ -723,4 +728,204 @@ fn odd_unicode_never_panics() {
             }
         }
     }
+}
+
+/// Outcome of `sql` as (class or "ok"), detail.
+fn outcome(sql: &str, s: &Schema) -> (String, Option<String>) {
+    match validate(sql, s, &public(), &params()) {
+        Ok(_) => ("ok".into(), None),
+        Err(e) => (e.class.as_str().into(), e.detail),
+    }
+}
+
+#[test]
+fn hidden_names_are_not_an_oracle() {
+    // S1 / I4: `customers` and `city` are hidden behind `clients` / `town`.
+    let a = aliased_schema();
+    let pairs = [
+        // CTE named like a hidden table vs a free name.
+        (
+            "WITH customers AS (SELECT i.id AS id FROM invoices i) SELECT x.id FROM customers x",
+            "WITH zzfree AS (SELECT i.id AS id FROM invoices i) SELECT x.id FROM zzfree x",
+        ),
+        // Table alias named like a hidden table.
+        (
+            "SELECT customers.amount FROM invoices customers",
+            "SELECT zzfree.amount FROM invoices zzfree",
+        ),
+        // Subquery alias named like a hidden table.
+        (
+            "SELECT customers.n FROM (SELECT COUNT(*) AS n FROM invoices i) customers",
+            "SELECT zzfree.n FROM (SELECT COUNT(*) AS n FROM invoices i) zzfree",
+        ),
+        // Output alias named like a hidden column, referenced.
+        (
+            "SELECT COUNT(*) AS city FROM clients c ORDER BY city",
+            "SELECT COUNT(*) AS zzfree FROM clients c ORDER BY zzfree",
+        ),
+        (
+            "SELECT c.segment, COUNT(*) AS city FROM clients c GROUP BY c.segment HAVING city > 1",
+            "SELECT c.segment, COUNT(*) AS zzfree FROM clients c GROUP BY c.segment HAVING zzfree > 1",
+        ),
+        // Unknown hidden names fail exactly like unknown free names.
+        ("SELECT c.city FROM clients c", "SELECT c.zzfree FROM clients c"),
+        ("SELECT x.id FROM customers x", "SELECT x.id FROM zzfree x"),
+    ];
+    for (hidden, free) in pairs {
+        let h = outcome(hidden, &a);
+        let f = outcome(free, &a);
+        assert_eq!(h.0, f.0, "{hidden} vs {free}");
+        let norm = |d: Option<String>| {
+            d.map(|d| {
+                d.replace("zzfree", "N")
+                    .replace("customers", "N")
+                    .replace("city", "N")
+            })
+        };
+        assert_eq!(norm(h.1), norm(f.1), "{hidden} vs {free}");
+    }
+    // Planner names render under the reserved prefix; no bare name is left
+    // for SQLite to resolve.
+    let v = validate(
+        "SELECT COUNT(*) AS city FROM clients c ORDER BY city",
+        &a,
+        &public(),
+        &params(),
+    )
+    .unwrap();
+    assert!(v.sql.contains("\"_p_c\""), "{}", v.sql);
+    assert!(!v.sql.contains("ORDER BY \"city\""), "{}", v.sql);
+    prepares(&v.sql);
+    // A schema using the reserved prefix is refused, with no detail.
+    let mut bad = schema();
+    bad.tables[1].columns[2].name = "_p_amount".into();
+    let e = validate("SELECT c.id FROM customers c", &bad, &public(), &params()).unwrap_err();
+    assert_eq!(
+        e,
+        MethodError {
+            class: ErrorClass::RuntimeError,
+            detail: None
+        }
+    );
+    let mut bad = schema();
+    bad.tables[1].name = "_P_inv".into();
+    let e = validate("SELECT c.id FROM customers c", &bad, &public(), &params()).unwrap_err();
+    assert_eq!(e.class, ErrorClass::RuntimeError);
+}
+
+#[test]
+fn masking_bypasses_refused() {
+    // S2 / I2 / M8: with an entity param in play.
+    let j = "FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
+    let forms = [
+        format!("SELECT CASE SUM(i.amount) WHEN 0 THEN 0 ELSE 1 END AS x {j}"),
+        format!("SELECT CASE WHEN SUM(i.amount) > 0 THEN SUM(i.amount) ELSE 0 END AS x {j}"),
+        format!("SELECT CASE WHEN COUNT(*) = 0 THEN 0 ELSE SUM(i.amount) END AS x {j}"),
+        format!("SELECT SUM(i.amount) IS NULL AS x {j}"),
+        format!("SELECT SUM(i.amount) IS NOT NULL AS x {j}"),
+        format!("SELECT SUM(i.amount) AND 0 AS x {j}"),
+        format!("SELECT SUM(i.amount) OR 1 AS x {j}"),
+        format!("SELECT IFNULL(SUM(i.amount), 0) AS x {j}"),
+        format!("SELECT SUM(CASE WHEN i.status = 'open' THEN i.amount ELSE 0 END) AS x {j}"),
+        format!("SELECT SUM(IFNULL(i.amount, 0)) AS x {j}"),
+        format!("SELECT SUM(NULLIF(i.amount, 0)) AS x {j}"),
+        // Through a CTE and a subquery.
+        "WITH t AS (SELECT SUM(i.amount) AS s FROM invoices i) \
+         SELECT CASE WHEN t.s IS NULL THEN 0 ELSE t.s END AS x FROM t JOIN customers c \
+         ON 1 = 1 WHERE c.id = :p1"
+            .to_string(),
+        format!("SELECT COALESCE(t.s, 0) AS x FROM (SELECT SUM(i.amount) AS s {j}) t"),
+        format!("SELECT t.s IS NULL AS x FROM (SELECT SUM(i.amount) AS s {j}) t"),
+    ];
+    for sql in &forms {
+        assert_eq!(refused(sql), ErrorClass::NullMasking, "{sql}");
+    }
+    assert_eq!(
+        refused(&format!("SELECT IIF(SUM(i.amount) IS NULL, 0, 1) AS x {j}")),
+        ErrorClass::FunctionNotAllowed
+    );
+    // Legitimate COUNT and SUM stay allowed; COUNT = 0 is a number.
+    ok(&format!("SELECT SUM(i.amount) AS owed, COUNT(*) AS n {j}"));
+    ok(&format!(
+        "SELECT SUM(CASE WHEN i.status = 'open' THEN i.amount END) AS x {j}"
+    ));
+    ok(&format!(
+        "SELECT COUNT(CASE WHEN i.status = 'open' THEN 1 END) AS x {j}"
+    ));
+    ok(&format!(
+        "SELECT COUNT(*) AS n {j} GROUP BY i.status HAVING SUM(i.amount) > 5 AND COUNT(*) > 1"
+    ));
+    ok(&format!(
+        "SELECT t.s FROM (SELECT SUM(i.amount) AS s {j}) t"
+    ));
+}
+
+#[test]
+fn entity_param_only_restricts() {
+    // I1: the entity param must restrict the rows of its own block.
+    use ErrorClass::*;
+    let cases = [
+        "SELECT SUM(CASE WHEN c.id = :p1 THEN i.amount END) AS x FROM invoices i \
+         JOIN customers c ON c.id = i.customer_id",
+        "SELECT SUM(CASE c.id WHEN :p1 THEN i.amount END) AS x FROM invoices i \
+         JOIN customers c ON c.id = i.customer_id",
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE c.id = :p1 OR i.status = 'open'",
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE NOT (c.id = :p1)",
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         GROUP BY c.id HAVING c.id = :p1",
+        "SELECT c.id = :p1 AS x FROM customers c",
+        "SELECT SUM(i.amount) AS x FROM invoices i LEFT JOIN customers c \
+         ON c.id = i.customer_id AND c.id = :p1",
+        // A correlated outer key does not restrict the outer block.
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE EXISTS (SELECT 1 FROM invoices j WHERE c.id = :p1)",
+        "SELECT SUM(i.amount) AS x FROM invoices i WHERE NOT EXISTS \
+         (SELECT 1 FROM customers c WHERE c.id = :p1 AND c.id = i.customer_id)",
+        "SELECT SUM(i.amount) AS x FROM invoices i WHERE i.customer_id NOT IN \
+         (SELECT c.id FROM customers c WHERE c.id = :p1)",
+        "SELECT SUM(i.amount) AS x FROM invoices i WHERE i.status = 'open' OR i.customer_id IN \
+         (SELECT c.id FROM customers c WHERE c.id = :p1)",
+        "SELECT SUM(i.amount) AS x FROM invoices i LEFT JOIN \
+         (SELECT c.id FROM customers c WHERE c.id = :p1) t ON t.id = i.customer_id",
+    ];
+    for sql in cases {
+        assert_eq!(refused(sql), ParamMisuse, "{sql}");
+    }
+    for sql in [
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE i.status = 'open' AND (c.id = :p1 AND 1 = 1)",
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id AND c.id = :p1",
+        "SELECT SUM(i.amount) AS x FROM invoices i WHERE i.customer_id IN \
+         (SELECT c.id FROM customers c WHERE c.id = :p1)",
+        "SELECT SUM(i.amount) AS x FROM invoices i WHERE EXISTS \
+         (SELECT 1 FROM customers c WHERE c.id = :p1 AND c.id = i.customer_id)",
+        "SELECT SUM(i.amount) AS x FROM invoices i JOIN \
+         (SELECT c.id FROM customers c WHERE c.id = :p1) t ON t.id = i.customer_id",
+    ] {
+        let v = ok(sql);
+        assert_eq!(v.entity_params, vec!["p1"], "{sql}");
+        prepares(&v.sql);
+    }
+}
+
+#[test]
+fn rowid_names_and_duplicate_outputs_refused() {
+    use ErrorClass::*;
+    for sql in [
+        // M5: planner names that SQLite could bind to the implicit rowid.
+        "SELECT COUNT(*) AS rowid FROM customers c GROUP BY rowid",
+        "SELECT COUNT(*) AS OID FROM customers c ORDER BY OID",
+        "SELECT COUNT(*) AS _rowid_ FROM customers c",
+        "SELECT r.id FROM customers rowid JOIN customers r ON r.id = rowid.id",
+        "WITH oid AS (SELECT c.id AS id FROM customers c) SELECT o.id FROM oid o",
+        // M6: duplicate top-level output names (ignoring case).
+        "SELECT c.id, i.id FROM customers c JOIN invoices i ON i.customer_id = c.id",
+        "SELECT c.id AS n, COUNT(*) AS N FROM customers c GROUP BY c.id",
+    ] {
+        assert_eq!(refused(sql), ConstructNotAllowed, "{sql}");
+    }
+    ok("SELECT c.id, i.id AS invoice_id FROM customers c JOIN invoices i ON i.customer_id = c.id");
 }

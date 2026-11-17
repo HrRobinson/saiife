@@ -35,6 +35,31 @@ pub const MAX_CTES: usize = 2;
 const NAME_MAX: usize = 64;
 /// Longest `detail` sent back to the planner (R45-8).
 const DETAIL_MAX: usize = 120;
+/// Every planner-chosen reference name (CTE, table or subquery alias) is
+/// rendered under this prefix, which no snapshot table or column may use,
+/// so SQLite can never bind a planner name to a name the cloud never saw.
+const RESERVED: &str = "_p_";
+/// Names SQLite binds to a table's implicit rowid.
+const IMPLICIT: [&str; 3] = ["rowid", "oid", "_rowid_"];
+
+fn reserved(s: &str) -> bool {
+    s.get(..RESERVED.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED))
+}
+
+fn implicit(s: &str) -> bool {
+    IMPLICIT.iter().any(|x| x.eq_ignore_ascii_case(s))
+}
+
+fn render_ref(name: &str) -> String {
+    format!("{RESERVED}{name}")
+}
+
+fn schema_uses_reserved(s: &Schema) -> bool {
+    s.tables
+        .iter()
+        .any(|t| reserved(&t.name) || t.columns.iter().any(|c| reserved(&c.name)))
+}
 
 /// R45-1 function allow-list (`cast` is the `CAST` expression, checked apart).
 const FUNCTIONS: [&str; 19] = [
@@ -260,6 +285,11 @@ fn validate_cols(
     if sql.len() > METHOD_MAX {
         return fail(ErrorClass::Syntax);
     }
+    // A schema using the reserved prefix is refused before anything else
+    // (plan 43's import refuses such names; this is the second wall).
+    if schema_uses_reserved(schema) {
+        return fail(ErrorClass::RuntimeError);
+    }
     let stmts = Parser::parse_sql(&SQLiteDialect {}, sql)
         .map_err(|_| MethodError::bare(ErrorClass::Syntax))?;
     match stmts.len() {
@@ -280,7 +310,7 @@ fn validate_cols(
         entity_params: Vec::new(),
         masking: false,
     };
-    let out = w.query(&mut q, 0, &mut Vec::new())?;
+    let out = w.query(&mut q, 0, &mut Vec::new(), true)?;
     let entity_bound = params
         .iter()
         .any(|p| matches!(p.ty, ParamType::Entity { .. }) && p.bound.is_some());
@@ -321,6 +351,8 @@ struct Info {
     agg: bool,
     /// Holds an aggregate other than `COUNT`.
     nullable_agg: bool,
+    /// A column reference resolved in the innermost query block.
+    local: bool,
 }
 
 impl Info {
@@ -339,6 +371,7 @@ impl Info {
             col: a.col || b.col,
             agg: a.agg || b.agg,
             nullable_agg: a.nullable_agg || b.nullable_agg,
+            local: false,
         }
     }
 
@@ -350,7 +383,13 @@ impl Info {
     fn with_ty(mut self, ty: Option<ColType>) -> Info {
         self.ty = ty;
         self.origin = None;
+        self.local = false;
         self
+    }
+
+    /// No column and no aggregate: a constant.
+    fn constant(&self) -> bool {
+        !self.col && !self.agg
     }
 }
 
@@ -383,16 +422,20 @@ enum Cols {
 
 #[derive(Debug)]
 struct Source {
-    /// The reference name: the same in the planner's SQL and the rendered SQL.
+    /// The reference name the planner wrote.
     name: String,
+    /// The reference name in the rendered SQL (reserved prefix).
+    render: String,
     cols: Cols,
 }
 
 #[derive(Debug, Default)]
 struct Scope {
     sources: Vec<Source>,
-    /// Planner-written output aliases, for ORDER BY / GROUP BY / HAVING.
-    aliases: Vec<(String, Info)>,
+    /// Planner-written output aliases and their (rewritten) expressions, for
+    /// ORDER BY / GROUP BY / HAVING. A reference renders as the expression,
+    /// never as a bare name SQLite would resolve itself.
+    aliases: Vec<(String, Expr, Info)>,
 }
 
 struct Cte {
@@ -406,6 +449,13 @@ struct Cx {
     alias_ok: bool,
     in_agg: bool,
     in_case_when: bool,
+    /// A top-level AND conjunct of WHERE or an INNER JOIN's ON, in a block
+    /// whose rows the entity key restricts (R45-3, review I1).
+    entity_ok: bool,
+    /// Inside an output column expression.
+    in_proj: bool,
+    /// Inside an aggregate other than COUNT (its value can be masked).
+    in_value_agg: bool,
 }
 
 /// `partner OP operand`, after flipping when the operand is on the left.
@@ -606,7 +656,15 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn query(&mut self, q: &mut Query, depth: usize, sc: &mut Vec<Scope>) -> R<Vec<OutCol>> {
+    /// One query block. `entity_ok`: an entity key in this block restricts
+    /// the rows the enclosing query reads.
+    fn query(
+        &mut self,
+        q: &mut Query,
+        depth: usize,
+        sc: &mut Vec<Scope>,
+        entity_ok: bool,
+    ) -> R<Vec<OutCol>> {
         if depth > MAX_DEPTH {
             return fail(ErrorClass::TooDeep);
         }
@@ -645,8 +703,10 @@ impl<'a> Walk<'a> {
                 }
                 let name = cte.alias.name.value.clone();
                 self.check_ref_name(&name, None, &[])?;
-                let cols = self.query(&mut cte.query, depth + 1, &mut Vec::new())?;
-                cte.alias.name = quoted(&name);
+                // A CTE's rows can be widened by how it is used: no entity
+                // key inside one.
+                let cols = self.query(&mut cte.query, depth + 1, &mut Vec::new(), false)?;
+                cte.alias.name = quoted(&render_ref(&name));
                 self.ctes.push(Cte { name, cols });
             }
         }
@@ -654,7 +714,7 @@ impl<'a> Walk<'a> {
             return construct();
         };
         sc.push(Scope::default());
-        let r = self.select(sel, order_by.as_mut(), depth, sc);
+        let r = self.select(sel, order_by.as_mut(), depth, sc, entity_ok);
         sc.pop();
         let out = r?;
         match limit_clause {
@@ -688,6 +748,7 @@ impl<'a> Walk<'a> {
         order_by: Option<&mut OrderBy>,
         depth: usize,
         sc: &mut Vec<Scope>,
+        block_ok: bool,
     ) -> R<Vec<OutCol>> {
         let s = &*sel;
         if !s.optimizer_hints.is_empty()
@@ -728,25 +789,32 @@ impl<'a> Walk<'a> {
             if self.joins > MAX_JOINS {
                 return fail(ErrorClass::TooManyJoins);
             }
-            self.factor(&mut twj.relation, depth, sc)?;
+            self.factor(&mut twj.relation, depth, sc, block_ok)?;
             for j in &mut twj.joins {
                 if j.global {
                     return construct();
                 }
-                match &j.join_operator {
+                let inner = match &j.join_operator {
                     JoinOperator::Join(JoinConstraint::On(_))
-                    | JoinOperator::Inner(JoinConstraint::On(_))
-                    | JoinOperator::Left(JoinConstraint::On(_))
-                    | JoinOperator::LeftOuter(JoinConstraint::On(_)) => {}
+                    | JoinOperator::Inner(JoinConstraint::On(_)) => true,
+                    JoinOperator::Left(JoinConstraint::On(_))
+                    | JoinOperator::LeftOuter(JoinConstraint::On(_)) => false,
                     _ => return construct(),
-                }
-                self.factor(&mut j.relation, depth, sc)?;
+                };
+                // The right side of a LEFT JOIN restricts nothing.
+                self.factor(&mut j.relation, depth, sc, block_ok && inner)?;
             }
             for j in &mut twj.joins {
                 match &mut j.join_operator {
                     JoinOperator::Join(JoinConstraint::On(e))
-                    | JoinOperator::Inner(JoinConstraint::On(e))
-                    | JoinOperator::Left(JoinConstraint::On(e))
+                    | JoinOperator::Inner(JoinConstraint::On(e)) => {
+                        let ocx = Cx {
+                            entity_ok: block_ok,
+                            ..cx
+                        };
+                        self.expr(e, sc, ocx)?;
+                    }
+                    JoinOperator::Left(JoinConstraint::On(e))
                     | JoinOperator::LeftOuter(JoinConstraint::On(e)) => {
                         self.expr(e, sc, cx)?;
                     }
@@ -756,6 +824,10 @@ impl<'a> Walk<'a> {
         }
 
         // The output columns.
+        let pcx = Cx {
+            in_proj: true,
+            ..cx
+        };
         let mut out = Vec::with_capacity(sel.projection.len());
         let mut aliases = Vec::new();
         for item in &mut sel.projection {
@@ -766,7 +838,7 @@ impl<'a> Walk<'a> {
                         Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.clone()),
                         _ => None,
                     };
-                    let info = self.expr(e, sc, cx)?;
+                    let info = self.expr(e, sc, pcx)?;
                     if let Some(name) = &written {
                         // Keep the cloud name as the output name.
                         *item = SelectItem::ExprWithAlias {
@@ -781,12 +853,12 @@ impl<'a> Walk<'a> {
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let name = alias.value.clone();
-                    if !plain_name(&name) {
+                    if !plain_name(&name) || implicit(&name) {
                         return construct();
                     }
-                    let info = self.expr(expr, sc, cx)?;
+                    let info = self.expr(expr, sc, pcx)?;
                     *alias = quoted(&name);
-                    aliases.push((name.clone(), info.clone()));
+                    aliases.push((name.clone(), expr.clone(), info.clone()));
                     out.push(OutCol {
                         name: Some(name),
                         info,
@@ -796,8 +868,21 @@ impl<'a> Walk<'a> {
             }
         }
 
+        // The template reads top-level columns by name: names are unique.
+        if depth == 0 {
+            let names: Vec<&str> = out.iter().filter_map(|c| c.name.as_deref()).collect();
+            for (i, a) in names.iter().enumerate() {
+                if names[..i].iter().any(|b| b.eq_ignore_ascii_case(a)) {
+                    return construct();
+                }
+            }
+        }
         if let Some(e) = &mut sel.selection {
-            self.expr(e, sc, cx)?;
+            let wcx = Cx {
+                entity_ok: block_ok,
+                ..cx
+            };
+            self.expr(e, sc, wcx)?;
         }
         if let Some(top) = sc.last_mut() {
             top.aliases = aliases;
@@ -831,7 +916,13 @@ impl<'a> Walk<'a> {
     }
 
     /// One FROM / JOIN source: a schema table, a CTE, or a subquery.
-    fn factor(&mut self, tf: &mut TableFactor, depth: usize, sc: &mut [Scope]) -> R<()> {
+    fn factor(
+        &mut self,
+        tf: &mut TableFactor,
+        depth: usize,
+        sc: &mut [Scope],
+        entity_ok: bool,
+    ) -> R<()> {
         match tf {
             TableFactor::Table {
                 name,
@@ -868,7 +959,7 @@ impl<'a> Walk<'a> {
                 };
                 let (cols, rendered) = if let Some(c) = self.ctes.iter().find(|c| c.name == written)
                 {
-                    (Cols::Derived(c.cols.clone()), written.clone())
+                    (Cols::Derived(c.cols.clone()), render_ref(&written))
                 } else if let Some(ti) =
                     self.schema.tables.iter().position(|t| tcloud(t) == written)
                 {
@@ -884,16 +975,17 @@ impl<'a> Walk<'a> {
                         }
                         let n = a.name.value.clone();
                         self.check_ref_name(&n, None, sc)?;
-                        a.name = quoted(&n);
+                        a.name = quoted(&render_ref(&n));
                         n
                     }
                     None => {
                         self.check_ref_name(&written, Some(&written), sc)?;
-                        if rendered != written {
-                            // The rendered SQL keeps the planner's reference name.
+                        if matches!(cols, Cols::Base(_)) {
+                            // A base table is referenced under the prefixed
+                            // cloud name; a CTE already renders prefixed.
                             *alias = Some(TableAlias {
                                 explicit: true,
-                                name: quoted(&written),
+                                name: quoted(&render_ref(&written)),
                                 columns: Vec::new(),
                                 at: None,
                             });
@@ -921,9 +1013,9 @@ impl<'a> Walk<'a> {
                 }
                 let n = a.name.value.clone();
                 self.check_ref_name(&n, None, sc)?;
-                a.name = quoted(&n);
+                a.name = quoted(&render_ref(&n));
                 // A FROM subquery cannot see the enclosing query's sources.
-                let cols = self.query(subquery, depth + 1, &mut Vec::new())?;
+                let cols = self.query(subquery, depth + 1, &mut Vec::new(), entity_ok)?;
                 self.push_source(sc, n, Cols::Derived(cols));
                 Ok(())
             }
@@ -933,26 +1025,25 @@ impl<'a> Walk<'a> {
 
     fn push_source(&self, sc: &mut [Scope], name: String, cols: Cols) {
         if let Some(s) = sc.last_mut() {
-            s.sources.push(Source { name, cols });
+            let render = render_ref(&name);
+            s.sources.push(Source { name, render, cols });
         }
     }
 
     /// A planner-chosen reference name (CTE name, table alias, or an
-    /// unaliased table's own name `own`). It must be a plain identifier and,
-    /// ignoring case as SQLite does, must not collide with a schema table
-    /// (snapshot or cloud name), a CTE, or a source in scope. An unaliased
-    /// table or CTE may of course carry its own name.
+    /// unaliased table's own name `own`). It must be a plain identifier, not
+    /// a rowid name and, ignoring case as SQLite does, must not collide with
+    /// a cloud-visible table name, a CTE, or a source in scope. Only names
+    /// the cloud was shown are compared (review S1): the outcome never
+    /// depends on a hidden snapshot name. An unaliased table or CTE may
+    /// carry its own name.
     fn check_ref_name(&self, name: &str, own: Option<&str>, sc: &[Scope]) -> R<()> {
-        if !plain_name(name) {
+        if !plain_name(name) || implicit(name) {
             return construct();
         }
         let eq = |x: &str| x.eq_ignore_ascii_case(name);
         if own != Some(name) {
-            let schema_hit = self
-                .schema
-                .tables
-                .iter()
-                .any(|t| eq(&t.name) || eq(tcloud(t)));
+            let schema_hit = self.schema.tables.iter().any(|t| eq(tcloud(t)));
             if schema_hit || self.ctes.iter().any(|c| eq(&c.name)) {
                 return construct();
             }
@@ -979,6 +1070,7 @@ impl<'a> Walk<'a> {
                             col: true,
                             agg: false,
                             nullable_agg: false,
+                            local: false,
                         };
                         let cloud = c.alias.clone().unwrap_or_else(|| c.name.clone());
                         (cloud, c.name.clone(), info)
@@ -1026,19 +1118,24 @@ impl<'a> Walk<'a> {
                 &head.join("."),
             ));
         };
-        let Some(src) = sc
+        let innermost = sc.len().saturating_sub(1);
+        let Some((level, src)) = sc
             .iter()
+            .enumerate()
             .rev()
-            .flat_map(|s| s.sources.iter())
-            .find(|s| s.name == q.value)
+            .flat_map(|(l, s)| s.sources.iter().map(move |src| (l, src)))
+            .find(|(_, s)| s.name == q.value)
         else {
             return Err(MethodError::named(ErrorClass::UnknownTable, &q.value));
         };
         match self.column_in(src, &c.value) {
-            Some(Ok((rendered, info))) => Ok((
-                Expr::CompoundIdentifier(vec![quoted(&src.name), quoted(&rendered)]),
-                info,
-            )),
+            Some(Ok((rendered, mut info))) => {
+                info.local = level == innermost;
+                Ok((
+                    Expr::CompoundIdentifier(vec![quoted(&src.render), quoted(&rendered)]),
+                    info,
+                ))
+            }
             _ => Err(MethodError::named(ErrorClass::UnknownColumn, &c.value)),
         }
     }
@@ -1048,8 +1145,9 @@ impl<'a> Walk<'a> {
         let unknown = || MethodError::named(ErrorClass::UnknownColumn, name);
         // Source columns, innermost scope first; the first scope with any
         // case-insensitive match decides.
+        let innermost = sc.len().saturating_sub(1);
         let mut col = None;
-        for s in sc.iter().rev() {
+        for (level, s) in sc.iter().enumerate().rev() {
             let hits: Vec<_> = s
                 .sources
                 .iter()
@@ -1058,37 +1156,30 @@ impl<'a> Walk<'a> {
             match hits.as_slice() {
                 [] => continue,
                 [(src, Ok((rendered, info)))] => {
-                    col = Some((src.name.clone(), rendered.clone(), info.clone()));
+                    let mut info = info.clone();
+                    info.local = level == innermost;
+                    col = Some((src.render.clone(), rendered.clone(), info));
                     break;
                 }
                 _ => return Err(unknown()),
             }
         }
-        let aliases: &[(String, Info)] = match (cx.alias_ok, sc.last()) {
+        let aliases: &[(String, Expr, Info)] = match (cx.alias_ok, sc.last()) {
             (true, Some(s)) => &s.aliases,
             _ => &[],
         };
         let alias_ci: Vec<_> = aliases
             .iter()
-            .filter(|(a, _)| a.eq_ignore_ascii_case(name))
+            .filter(|(a, _, _)| a.eq_ignore_ascii_case(name))
             .collect();
         match (col, alias_ci.as_slice()) {
             (Some((src, rendered, info)), []) => Ok((
                 Expr::CompoundIdentifier(vec![quoted(&src), quoted(&rendered)]),
                 info,
             )),
-            (None, [(a, info)]) if a == name => {
-                // SQLite must not find a source column of this name first.
-                let shadowed = sc.iter().flat_map(|s| &s.sources).any(|src| {
-                    self.columns_of(src)
-                        .iter()
-                        .any(|(_, r, _)| r.eq_ignore_ascii_case(name))
-                });
-                if shadowed {
-                    return Err(unknown());
-                }
-                Ok((Expr::Identifier(quoted(a)), info.clone()))
-            }
+            // The alias renders as its expression: no bare name is left for
+            // SQLite to bind to a source column the cloud never saw.
+            (None, [(a, expr, info)]) if a == name => Ok((expr.clone(), info.clone())),
             _ => Err(unknown()),
         }
     }
@@ -1096,6 +1187,11 @@ impl<'a> Walk<'a> {
     // ---- expressions ----
 
     fn expr(&mut self, e: &mut Expr, sc: &mut Vec<Scope>, cx: Cx) -> R<Info> {
+        // Only AND and parentheses keep an entity key's restricting position.
+        let child = Cx {
+            entity_ok: false,
+            ..cx
+        };
         match e {
             Expr::Identifier(id) => {
                 let (new, info) = self.bare(id, sc, cx)?;
@@ -1113,8 +1209,13 @@ impl<'a> Walk<'a> {
                 if let Some(cmp) = Cmp::of(op) {
                     return self.compare(left, cmp, right, sc, cx);
                 }
-                let a = self.expr(left, sc, cx)?;
-                let b = self.expr(right, sc, cx)?;
+                let scx = if matches!(op, BinaryOperator::And) {
+                    cx
+                } else {
+                    child
+                };
+                let a = self.expr(left, sc, scx)?;
+                let b = self.expr(right, sc, scx)?;
                 match op {
                     BinaryOperator::Plus
                     | BinaryOperator::Minus
@@ -1122,13 +1223,17 @@ impl<'a> Walk<'a> {
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo => Ok(Info::join(&a, &b).with_ty(num_ty(a.ty, b.ty))),
                     BinaryOperator::And | BinaryOperator::Or => {
+                        // `SUM(x) AND 0` is 0 over no rows (review M8).
+                        if cx.in_proj && (a.nullable_agg || b.nullable_agg) {
+                            self.masking = true;
+                        }
                         Ok(Info::join(&a, &b).with_ty(Some(ColType::Integer)))
                     }
                     _ => construct(),
                 }
             }
             Expr::UnaryOp { op, expr: inner } => {
-                let i = self.expr(inner, sc, cx)?;
+                let i = self.expr(inner, sc, child)?;
                 match op {
                     UnaryOperator::Plus | UnaryOperator::Minus => {
                         let ty = if is_num(i.ty) { i.ty } else { None };
@@ -1139,10 +1244,10 @@ impl<'a> Walk<'a> {
                 }
             }
             Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-                if cx.in_case_when {
+                let i = self.expr(inner, sc, child)?;
+                if cx.in_case_when || i.nullable_agg {
                     self.masking = true;
                 }
-                let i = self.expr(inner, sc, cx)?;
                 Ok(i.with_ty(Some(ColType::Integer)))
             }
             Expr::Between {
@@ -1151,9 +1256,9 @@ impl<'a> Walk<'a> {
                 low,
                 high,
             } => {
-                let i = self.expr(x, sc, cx)?;
-                self.operand(low, &i, Cmp::Between, sc, cx)?;
-                self.operand(high, &i, Cmp::Between, sc, cx)?;
+                let i = self.expr(x, sc, child)?;
+                self.operand(low, &i, Cmp::Between, sc, child)?;
+                self.operand(high, &i, Cmp::Between, sc, child)?;
                 Ok(i.with_ty(Some(ColType::Integer)))
             }
             Expr::InList {
@@ -1161,7 +1266,7 @@ impl<'a> Walk<'a> {
                 list,
                 negated,
             } => {
-                let i = self.expr(x, sc, cx)?;
+                let i = self.expr(x, sc, child)?;
                 let op = if *negated { Cmp::Ne } else { Cmp::In };
                 for item in list {
                     self.operand(item, &i, op, sc, cx)?;
@@ -1171,20 +1276,19 @@ impl<'a> Walk<'a> {
             Expr::InSubquery {
                 expr: x,
                 subquery,
-                negated: _,
+                negated,
             } => {
-                let i = self.expr(x, sc, cx)?;
-                self.query(subquery, cx.depth + 1, sc)?;
+                let i = self.expr(x, sc, child)?;
+                let ok = cx.entity_ok && !*negated;
+                self.query(subquery, cx.depth + 1, sc, ok)?;
                 Ok(i.with_ty(Some(ColType::Integer)))
             }
-            Expr::Exists {
-                subquery,
-                negated: _,
-            } => {
-                self.query(subquery, cx.depth + 1, sc)?;
+            Expr::Exists { subquery, negated } => {
+                let ok = cx.entity_ok && !*negated;
+                self.query(subquery, cx.depth + 1, sc, ok)?;
                 Ok(Info::typed(ColType::Integer))
             }
-            Expr::Function(f) => self.function(f, sc, cx),
+            Expr::Function(f) => self.function(f, sc, child),
             Expr::Case {
                 operand,
                 conditions,
@@ -1192,9 +1296,10 @@ impl<'a> Walk<'a> {
                 ..
             } => {
                 let op_info = match operand {
-                    Some(o) => Some(self.expr(o, sc, cx)?),
+                    Some(o) => Some(self.expr(o, sc, child)?),
                     None => None,
                 };
+                let mut conds = Vec::new();
                 let mut results = Vec::new();
                 for cw in conditions {
                     match &op_info {
@@ -1204,24 +1309,38 @@ impl<'a> Walk<'a> {
                                     self.masking = true;
                                 }
                             }
-                            self.operand(&mut cw.condition, oi, Cmp::Eq, sc, cx)?;
+                            conds.push(self.operand(&mut cw.condition, oi, Cmp::Eq, sc, child)?);
                         }
                         None => {
                             let wcx = Cx {
                                 in_case_when: true,
-                                ..cx
+                                ..child
                             };
-                            results.push(self.expr(&mut cw.condition, sc, wcx)?.with_ty(None));
+                            conds.push(self.expr(&mut cw.condition, sc, wcx)?);
                         }
                     }
-                    let r = self.expr(&mut cw.result, sc, cx)?;
-                    results.push(r);
+                    results.push(self.expr(&mut cw.result, sc, child)?);
                 }
                 if let Some(e) = else_result {
-                    results.push(self.expr(e, sc, cx)?);
+                    results.push(self.expr(e, sc, child)?);
+                }
+                // R45-5 with review S2/I2/I3: a CASE that touches an
+                // aggregate (or a derived aggregate column) can turn an
+                // empty result into a number; inside an aggregate, a
+                // constant branch can turn missing rows into a number.
+                // COUNT is never NULL, so only other aggregates count here.
+                let touches_agg = op_info
+                    .iter()
+                    .chain(&conds)
+                    .chain(&results)
+                    .any(|i| i.nullable_agg);
+                let const_branch = results.iter().any(Info::constant);
+                if touches_agg || (cx.in_value_agg && const_branch) {
+                    self.masking = true;
                 }
                 let ty = results.iter().find_map(|r| r.ty);
                 let mut all = results;
+                all.extend(conds);
                 if let Some(oi) = op_info {
                     all.push(oi);
                 }
@@ -1239,7 +1358,7 @@ impl<'a> Walk<'a> {
                     DataType::Text => ColType::Text,
                     _ => return construct(),
                 };
-                Ok(self.expr(x, sc, cx)?.with_ty(Some(ty)))
+                Ok(self.expr(x, sc, child)?.with_ty(Some(ty)))
             }
             Expr::Substring {
                 expr: x,
@@ -1248,9 +1367,9 @@ impl<'a> Walk<'a> {
                 special: _,
                 shorthand: true,
             } => {
-                let mut infos = vec![self.expr(x, sc, cx)?, self.expr(from, sc, cx)?];
+                let mut infos = vec![self.expr(x, sc, child)?, self.expr(from, sc, child)?];
                 if let Some(f) = substring_for {
-                    infos.push(self.expr(f, sc, cx)?);
+                    infos.push(self.expr(f, sc, child)?);
                 }
                 Ok(Info::join_all(&infos).with_ty(Some(ColType::Text)))
             }
@@ -1260,9 +1379,9 @@ impl<'a> Walk<'a> {
                 trim_what: None,
                 trim_characters,
             } => {
-                let mut infos = vec![self.expr(x, sc, cx)?];
+                let mut infos = vec![self.expr(x, sc, child)?];
                 for c in trim_characters.iter_mut().flatten() {
-                    infos.push(self.expr(c, sc, cx)?);
+                    infos.push(self.expr(c, sc, child)?);
                 }
                 Ok(Info::join_all(&infos).with_ty(Some(ColType::Text)))
             }
@@ -1294,19 +1413,24 @@ impl<'a> Walk<'a> {
         sc: &mut Vec<Scope>,
         cx: Cx,
     ) -> R<Info> {
+        // The sides lose the entity position; the placeholder keeps it.
+        let child = Cx {
+            entity_ok: false,
+            ..cx
+        };
         let info = match (side(left), side(right)) {
             (Side::Other, Side::Other) => {
-                let a = self.expr(left, sc, cx)?;
-                let b = self.expr(right, sc, cx)?;
+                let a = self.expr(left, sc, child)?;
+                let b = self.expr(right, sc, child)?;
                 Info::join(&a, &b)
             }
             (Side::Other, _) => {
-                let a = self.expr(left, sc, cx)?;
+                let a = self.expr(left, sc, child)?;
                 self.operand(right, &a, cmp, sc, cx)?;
                 a
             }
             (_, Side::Other) => {
-                let b = self.expr(right, sc, cx)?;
+                let b = self.expr(right, sc, child)?;
                 self.operand(left, &b, cmp.flip(), sc, cx)?;
                 b
             }
@@ -1325,15 +1449,25 @@ impl<'a> Walk<'a> {
         cmp: Cmp,
         sc: &mut Vec<Scope>,
         cx: Cx,
-    ) -> R<()> {
+    ) -> R<Info> {
         if let Expr::Value(v) = e {
             match &v.value {
-                Value::Placeholder(p) => return self.param(p, partner, cmp),
-                Value::SingleQuotedString(s) => return self.literal(s, partner),
+                Value::Placeholder(p) => {
+                    return self
+                        .param(p, partner, cmp, cx.entity_ok)
+                        .map(|()| Info::default())
+                }
+                Value::SingleQuotedString(s) => {
+                    return self.literal(s, partner).map(|()| Info::default())
+                }
                 _ => {}
             }
         }
-        self.expr(e, sc, cx).map(|_| ())
+        let child = Cx {
+            entity_ok: false,
+            ..cx
+        };
+        self.expr(e, sc, child)
     }
 
     /// R45-4: a k-floor public value of the compared column, or an ISO date.
@@ -1355,7 +1489,7 @@ impl<'a> Walk<'a> {
     }
 
     /// R45-3: a placeholder compared with `partner` (as `partner OP param`).
-    fn param(&mut self, text: &str, partner: &Info, cmp: Cmp) -> R<()> {
+    fn param(&mut self, text: &str, partner: &Info, cmp: Cmp, entity_ok: bool) -> R<()> {
         let misuse = || fail(ErrorClass::ParamMisuse);
         let Some((base, sfx)) = split_placeholder(text) else {
             return misuse();
@@ -1369,7 +1503,14 @@ impl<'a> Walk<'a> {
                     return misuse();
                 };
                 let on_key = partner.origin.as_ref() == Some(&(ent.table.clone(), ent.key.clone()));
-                if !matches!(cmp, Cmp::Eq | Cmp::In) || partner.agg || !on_key {
+                // The key must restrict the rows of the block that reads it:
+                // a top-level AND conjunct, on that block's own column.
+                if !entity_ok
+                    || !partner.local
+                    || !matches!(cmp, Cmp::Eq | Cmp::In)
+                    || partner.agg
+                    || !on_key
+                {
                     return misuse();
                 }
                 match &p.bound {
@@ -1467,6 +1608,7 @@ impl<'a> Walk<'a> {
         }
         let acx = Cx {
             in_agg: cx.in_agg || is_agg,
+            in_value_agg: cx.in_value_agg || (is_agg && l != "count"),
             ..cx
         };
         let date_fn = matches!(l, "date" | "strftime" | "julianday");
@@ -1503,7 +1645,10 @@ impl<'a> Walk<'a> {
                 self.masking = true;
             }
         }
-        if matches!(l, "coalesce" | "ifnull" | "nullif") && infos.iter().any(|i| i.agg) {
+        // Around an aggregate, or inside one (over a LEFT JOIN's NULLs).
+        if matches!(l, "coalesce" | "ifnull" | "nullif")
+            && (cx.in_value_agg || infos.iter().any(|i| i.nullable_agg))
+        {
             self.masking = true;
         }
         let ty = match l {
