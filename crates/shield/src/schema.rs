@@ -1,0 +1,513 @@
+//! The shared vocabulary: dataset names, column classes, the cloud-visible
+//! schema, rows bands, and the parameter types plans 44 and 45 share.
+
+use crate::error::ShieldError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp::Ordering;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::str::FromStr;
+
+/// A dataset name (R43-2): `[a-z][a-z0-9-]{0,31}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DatasetName(String);
+
+impl DatasetName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for DatasetName {
+    type Err = ShieldError;
+    fn from_str(s: &str) -> Result<Self, ShieldError> {
+        let b = s.as_bytes();
+        let ok = !b.is_empty()
+            && b.len() <= 32
+            && b[0].is_ascii_lowercase()
+            && b.iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-');
+        if ok {
+            Ok(DatasetName(s.to_string()))
+        } else {
+            Err(ShieldError::BadName)
+        }
+    }
+}
+
+impl fmt::Display for DatasetName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for DatasetName {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DatasetName {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnClass {
+    Identifier,
+    Quasi,
+    Sensitive,
+    FreeText,
+    Public,
+}
+
+impl ColumnClass {
+    /// Public 0, Quasi 1, Identifier 2, FreeText 3, Sensitive 4.
+    pub fn strictness(self) -> u8 {
+        match self {
+            ColumnClass::Public => 0,
+            ColumnClass::Quasi => 1,
+            ColumnClass::Identifier => 2,
+            ColumnClass::FreeText => 3,
+            ColumnClass::Sensitive => 4,
+        }
+    }
+
+    pub fn is_looser_than(self, o: ColumnClass) -> bool {
+        self.strictness() < o.strictness()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColType {
+    Integer,
+    Real,
+    Text,
+    Date,
+    Bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub ty: ColType,
+    pub class: ColumnClass,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableInfo {
+    pub name: String,
+    pub alias: Option<String>,
+    pub rows: u64,
+    pub columns: Vec<ColumnInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntitySpec {
+    pub table: String,
+    pub key: String,
+    pub names: Vec<String>,
+    pub show: Vec<String>,
+    pub word: String,
+    pub word_da: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Schema {
+    pub dataset: DatasetName,
+    pub tables: Vec<TableInfo>,
+    pub entities: Vec<EntitySpec>,
+}
+
+impl Schema {
+    pub fn table(&self, t: &str) -> Option<&TableInfo> {
+        self.tables.iter().find(|x| x.name == t)
+    }
+
+    pub fn column(&self, t: &str, c: &str) -> Option<&ColumnInfo> {
+        self.table(t)?.columns.iter().find(|x| x.name == c)
+    }
+
+    pub fn entity_for(&self, table: &str) -> Option<&EntitySpec> {
+        self.entities.iter().find(|e| e.table == table)
+    }
+
+    /// The name the cloud sees: the alias if there is one, else the name.
+    /// An unknown table or column gives the name unchanged.
+    pub fn cloud_name(&self, t: &str, c: Option<&str>) -> String {
+        match c {
+            None => self
+                .table(t)
+                .and_then(|x| x.alias.clone())
+                .unwrap_or_else(|| t.to_string()),
+            Some(c) => self
+                .column(t, c)
+                .and_then(|x| x.alias.clone())
+                .unwrap_or_else(|| c.to_string()),
+        }
+    }
+}
+
+/// A row count as a band: under 100, else one significant figure.
+pub fn rows_band(n: u64) -> String {
+    if n < 100 {
+        return "<100".to_string();
+    }
+    let mut mag: u64 = 1;
+    while n / mag >= 10 {
+        mag *= 10;
+    }
+    let r = n.saturating_add(mag / 2) / mag * mag;
+    let (v, unit) = if r >= 1_000_000_000 {
+        (r / 1_000_000_000, " billion")
+    } else if r >= 1_000_000 {
+        (r / 1_000_000, " million")
+    } else if r >= 1_000 {
+        (r / 1_000, " thousand")
+    } else {
+        (r, "")
+    };
+    format!("about {v}{unit}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lang {
+    En,
+    Da,
+}
+
+// ---- the parameter vocabulary (spec §2.1.6, §2.3.1) ----
+
+/// An exact decimal: `units / 10^scale`. Equality and order are by value.
+#[derive(Debug, Clone, Copy)]
+pub struct Decimal {
+    pub units: i128,
+    pub scale: u8,
+}
+
+const MAX_SCALE: u8 = 38;
+
+fn pow10(n: u8) -> Option<i128> {
+    10i128.checked_pow(u32::from(n))
+}
+
+impl Decimal {
+    /// `-?digits[.digits]`: no sign `+`, no exponent, no spaces.
+    pub fn parse_plain(s: &str) -> Option<Decimal> {
+        let (neg, rest) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (int, frac) = match rest.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (rest, ""),
+        };
+        if int.is_empty()
+            || !int.bytes().all(|b| b.is_ascii_digit())
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+            || (rest.contains('.') && frac.is_empty())
+            || frac.len() > usize::from(MAX_SCALE)
+        {
+            return None;
+        }
+        let mut units: i128 = 0;
+        for b in int.bytes().chain(frac.bytes()) {
+            units = units.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+        }
+        if neg {
+            units = -units;
+        }
+        Some(Decimal {
+            units,
+            scale: frac.len() as u8,
+        })
+    }
+
+    /// Plain notation with exactly `scale` places: `-0.30`.
+    pub fn to_plain(&self) -> String {
+        let neg = self.units < 0;
+        let digits = self.units.unsigned_abs().to_string();
+        let sc = usize::from(self.scale);
+        let body = if sc == 0 {
+            digits
+        } else {
+            let padded = format!("{digits:0>width$}", width = sc + 1);
+            let (i, f) = padded.split_at(padded.len() - sc);
+            format!("{i}.{f}")
+        };
+        if neg {
+            format!("-{body}")
+        } else {
+            body
+        }
+    }
+
+    /// Round to `places` decimals, ties to the even digit.
+    pub fn round_half_even(&self, places: u8) -> Decimal {
+        if places >= self.scale {
+            return *self;
+        }
+        let Some(div) = pow10(self.scale - places) else {
+            return Decimal {
+                units: 0,
+                scale: places,
+            };
+        };
+        let q = self.units / div;
+        let r = self.units % div;
+        let twice = r.unsigned_abs().checked_mul(2);
+        let half = div.unsigned_abs();
+        let away = match twice.map(|t| t.cmp(&half)) {
+            Some(Ordering::Greater) => true,
+            Some(Ordering::Less) => false,
+            _ => q % 2 != 0,
+        };
+        let units = if away {
+            q + if self.units < 0 { -1 } else { 1 }
+        } else {
+            q
+        };
+        Decimal {
+            units,
+            scale: places,
+        }
+    }
+
+    fn normalized(&self) -> (i128, u8) {
+        let (mut u, mut s) = (self.units, self.scale);
+        while s > 0 && u % 10 == 0 {
+            u /= 10;
+            s -= 1;
+        }
+        if u == 0 {
+            s = 0;
+        }
+        (u, s)
+    }
+}
+
+impl PartialEq for Decimal {
+    fn eq(&self, o: &Decimal) -> bool {
+        self.normalized() == o.normalized()
+    }
+}
+impl Eq for Decimal {}
+
+impl Hash for Decimal {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.normalized().hash(h);
+    }
+}
+
+impl Ord for Decimal {
+    fn cmp(&self, o: &Decimal) -> Ordering {
+        let (au, asc) = self.normalized();
+        let (bu, bsc) = o.normalized();
+        match asc.cmp(&bsc) {
+            Ordering::Equal => au.cmp(&bu),
+            Ordering::Less => {
+                // Scale a up to b's scale; an overflow means |a| is larger.
+                match pow10(bsc - asc).and_then(|p| au.checked_mul(p)) {
+                    Some(a2) => a2.cmp(&bu),
+                    None if au > 0 => Ordering::Greater,
+                    None => Ordering::Less,
+                }
+            }
+            Ordering::Greater => o.cmp(self).reverse(),
+        }
+    }
+}
+impl PartialOrd for Decimal {
+    fn partial_cmp(&self, o: &Decimal) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Serialize for Decimal {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_plain())
+    }
+}
+
+impl<'de> Deserialize<'de> for Decimal {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Decimal::parse_plain(&s).ok_or_else(|| serde::de::Error::custom("not a plain decimal"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamType {
+    Entity { table: String, word: String },
+    Amount,
+    Integer,
+    Percent,
+    Date,
+    DateRange,
+    Text { table: String, column: String },
+}
+
+impl ParamType {
+    /// `entity:customers`, `amount`, `date_range`, `text:customers.city`, ...
+    pub fn tag(&self) -> String {
+        match self {
+            ParamType::Entity { table, .. } => format!("entity:{table}"),
+            ParamType::Amount => "amount".to_string(),
+            ParamType::Integer => "integer".to_string(),
+            ParamType::Percent => "percent".to_string(),
+            ParamType::Date => "date".to_string(),
+            ParamType::DateRange => "date_range".to_string(),
+            ParamType::Text { table, column } => format!("text:{table}.{column}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bound {
+    Keys(Vec<i64>),
+    Amount(Decimal),
+    Integer(i64),
+    Percent(Decimal),
+    Date(String),
+    DateRange(String, String),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Param {
+    /// `p1`, `p2`, ...
+    pub name: String,
+    pub ty: ParamType,
+    pub bound: Option<Bound>,
+    /// Local only: never sent to the cloud.
+    pub display: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::parse_plain(s).unwrap()
+    }
+
+    #[test]
+    fn dataset_names() {
+        for ok in ["crm", "crm-2024"] {
+            assert_eq!(ok.parse::<DatasetName>().unwrap().to_string(), ok);
+        }
+        for bad in ["Crm", "2crm", "crm_x", "", &"a".repeat(33)] {
+            assert!(matches!(
+                bad.parse::<DatasetName>(),
+                Err(ShieldError::BadName)
+            ));
+        }
+        assert!("a".repeat(32).parse::<DatasetName>().is_ok());
+        let n: DatasetName = serde_json::from_str("\"crm\"").unwrap();
+        assert_eq!(serde_json::to_string(&n).unwrap(), "\"crm\"");
+        assert!(serde_json::from_str::<DatasetName>("\"Crm\"").is_err());
+    }
+
+    #[test]
+    fn class_strictness_order() {
+        use ColumnClass::*;
+        assert!(Public.is_looser_than(Sensitive));
+        assert!(!Sensitive.is_looser_than(Public));
+        assert!(Identifier.is_looser_than(FreeText));
+        assert!(!Public.is_looser_than(Public));
+        assert_eq!(Quasi.strictness(), 1);
+    }
+
+    #[test]
+    fn rows_band_values() {
+        assert_eq!(rows_band(0), "<100");
+        assert_eq!(rows_band(99), "<100");
+        assert_eq!(rows_band(100), "about 100");
+        assert_eq!(rows_band(3_041_227), "about 3 million");
+        assert_eq!(rows_band(1_500), "about 2 thousand");
+        assert_eq!(rows_band(1_000), "about 1 thousand");
+        assert_eq!(rows_band(999_999), "about 1 million");
+        assert_eq!(rows_band(5_000_000_000), "about 5 billion");
+        let _ = rows_band(u64::MAX); // must not overflow
+    }
+
+    #[test]
+    fn class_serde_names() {
+        assert_eq!(
+            serde_json::to_string(&ColumnClass::FreeText).unwrap(),
+            "\"free_text\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ColumnClass::Public).unwrap(),
+            "\"public\""
+        );
+        assert_eq!(serde_json::to_string(&Lang::Da).unwrap(), "\"da\"");
+        assert_eq!(serde_json::to_string(&ColType::Bool).unwrap(), "\"bool\"");
+    }
+
+    #[test]
+    fn decimal_value_eq() {
+        assert_eq!(dec("1.50"), dec("1.5"));
+        assert!(dec("1.5") < dec("1.51"));
+        assert!(dec("-2") < dec("-1.99"));
+        let m = dec("-0.30");
+        assert_eq!((m.units, m.scale), (-30, 2));
+        assert_eq!(m.to_plain(), "-0.30");
+        assert_eq!(dec("0.05").to_plain(), "0.05");
+        assert_eq!(dec("2.345").round_half_even(2).to_plain(), "2.34");
+        assert_eq!(dec("2.355").round_half_even(2).to_plain(), "2.36");
+        assert_eq!(dec("-2.345").round_half_even(2).to_plain(), "-2.34");
+        for bad in ["", "-", ".5", "5.", "+1", "1e3", "1 ", "--1"] {
+            assert!(Decimal::parse_plain(bad).is_none(), "{bad}");
+        }
+        let j = serde_json::to_string(&dec("1.50")).unwrap();
+        assert_eq!(j, "\"1.50\"");
+    }
+
+    #[test]
+    fn param_tags() {
+        let e = ParamType::Entity {
+            table: "customers".into(),
+            word: "customer".into(),
+        };
+        assert_eq!(e.tag(), "entity:customers");
+        let t = ParamType::Text {
+            table: "customers".into(),
+            column: "city".into(),
+        };
+        assert_eq!(t.tag(), "text:customers.city");
+        assert_eq!(ParamType::DateRange.tag(), "date_range");
+        assert_eq!(ParamType::Amount.tag(), "amount");
+    }
+
+    #[test]
+    fn schema_lookup_and_cloud_name() {
+        let s = Schema {
+            dataset: "crm".parse().unwrap(),
+            tables: vec![TableInfo {
+                name: "customers".into(),
+                alias: Some("t1".into()),
+                rows: 5,
+                columns: vec![ColumnInfo {
+                    name: "city".into(),
+                    ty: ColType::Text,
+                    class: ColumnClass::Quasi,
+                    alias: None,
+                }],
+            }],
+            entities: vec![],
+        };
+        assert_eq!(s.cloud_name("customers", None), "t1");
+        assert_eq!(s.cloud_name("customers", Some("city")), "city");
+        assert!(s.column("customers", "nope").is_none());
+        assert!(s.entity_for("customers").is_none());
+    }
+}

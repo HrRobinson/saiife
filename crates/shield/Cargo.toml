@@ -1,0 +1,27 @@
+[package]
+name = "saiife-shield"
+description = "Data Shield: schema vocabulary, snapshot, index and method checking (tokio-free)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_shield"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+ring = "=0.17.14"
+unicode-normalization = "=0.1.25"
+strsim = "=0.11.1"
+getrandom = "0.3"
+zeroize = "=1.9.1"
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+csv = "=1.4.0"
+calamine = "=0.37.0"
+
+[lints]
+workspace = true
