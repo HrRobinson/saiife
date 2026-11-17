@@ -1,46 +1,71 @@
-//! Plan 45: the SELECT-only SQL subset validator (spec §2.3.3; R45-1..R45-5,
-//! R45-8).
+//! Plan 45: the SELECT-only SQL validator (spec §2.3.3; R45-1..R45-5, R45-8;
+//! coordinator ruling C-G).
 //!
-//! The planner's method is parsed with the SQLite dialect and walked by
-//! hand. Every construct the walk does not explicitly allow is refused
-//! (`construct_not_allowed`): each `match` over the parser's AST ends in a
-//! refusal, never in an accept. Names resolve case-exact against the cloud
-//! names of the schema (aliases where set) and are rewritten to snapshot
-//! names; the SQL that runs is rendered from the rewritten AST, never taken
-//! from the planner's string (R45-2).
+//! Stage 1 accepts one narrow, allow-listed shape and nothing else:
 //!
-//! Errors carry a class and, for `unknown_table` / `unknown_column`, the
-//! cloud name that failed. Parser error texts are never kept: they can quote
-//! the input.
+//! - `WITH`: at most 2 non-recursive CTEs, each of the same shape.
+//! - `SELECT [DISTINCT]` items: a plain column `t.c`; `COUNT(*)`,
+//!   `COUNT([DISTINCT] t.c)`, `SUM|AVG|MIN|MAX([DISTINCT] t.c)` over one
+//!   plain column; `date(t.c, mods…)` / `strftime('<fmt>', t.c, mods…)` over
+//!   a plain DATE column; `+ - * /` only between aggregates. No literal and
+//!   no parameter in the list. `AS alias`; at most 32 items, unique names.
+//! - `FROM` a base table or a CTE, `[INNER] JOIN … ON` an AND of equalities
+//!   each on a declared key pair (ruling C-G1), checked by column origin
+//!   through CTE provenance; at most 4 joins in all.
+//! - `WHERE`: an AND of `col op (:pN | literal)` and `col IN (items)`, where
+//!   `col` is a plain column or a date expression over one.
+//! - `GROUP BY` plain columns or date expressions; `HAVING` an AND of
+//!   `aggregate op (:pN | literal)`; `ORDER BY` any item above, ASC/DESC;
+//!   `LIMIT`/`OFFSET` integer literals.
+//! - In an aggregating block a plain column must be grouped, except (in the
+//!   outermost block) a column of the entity table its `key = :pN` pins.
+//!
+//! Every `match` over the parser's AST ends in a refusal, never in an
+//! accept. Masking routes (CASE, COALESCE, IS NULL, constants, subqueries,
+//! LEFT JOIN, …) are outside the grammar, so `null_masking` is no longer
+//! produced here; the primary control is the executor's existence check over
+//! [`Validated::entity_filters`] (R45-6, Task 3).
+//!
+//! Names resolve case-exact against the cloud names of the schema (aliases
+//! where set) and are rewritten to snapshot names; every planner-chosen
+//! reference name renders under a reserved prefix; the SQL that runs is
+//! rendered from the rewritten AST, never taken from the planner's string
+//! (R45-2). Errors come from fixed strings and carry, for `unknown_table` /
+//! `unknown_column`, only the cloud name that failed. Parser error texts are
+//! never kept: they can quote the input.
 
 use crate::plan::{SelfCheck, METHOD_MAX};
 use crate::public::PublicValues;
 use crate::schema::{Bound, ColType, Param, ParamType, Schema, TableInfo};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Distinct, DuplicateTreatment, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectFlavor,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, UnaryOperator, Value,
+    BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByKind, OrderBySort, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, Statement, TableAlias, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
-/// R45-1 caps.
+/// Caps (R45-1, ruling C-G).
 pub const MAX_JOINS: usize = 4;
-pub const MAX_DEPTH: usize = 2;
 pub const MAX_COLUMNS: usize = 32;
 pub const MAX_CTES: usize = 2;
 /// Longest planner-written name (alias, CTE name).
 const NAME_MAX: usize = 64;
 /// Longest `detail` sent back to the planner (R45-8).
 const DETAIL_MAX: usize = 120;
-/// Every planner-chosen reference name (CTE, table or subquery alias) is
-/// rendered under this prefix, which no snapshot table or column may use,
-/// so SQLite can never bind a planner name to a name the cloud never saw.
+/// Most arguments of `date` / `strftime` (value, format and modifiers).
+const DATE_ARGS_MAX: usize = 6;
+/// Every planner-chosen reference name (CTE or table alias) is rendered
+/// under this prefix, which no snapshot table or column may use, so SQLite
+/// can never bind a planner name to a name the cloud never saw.
 const RESERVED: &str = "_p_";
 /// Names SQLite binds to a table's implicit rowid.
 const IMPLICIT: [&str; 3] = ["rowid", "oid", "_rowid_"];
+
+/// The stage-1 function allow-list (ruling C-G).
+const FUNCTIONS: [&str; 7] = ["count", "sum", "avg", "min", "max", "date", "strftime"];
 
 fn reserved(s: &str) -> bool {
     s.get(..RESERVED.len())
@@ -61,29 +86,6 @@ fn schema_uses_reserved(s: &Schema) -> bool {
         .any(|t| reserved(&t.name) || t.columns.iter().any(|c| reserved(&c.name)))
 }
 
-/// R45-1 function allow-list (`cast` is the `CAST` expression, checked apart).
-const FUNCTIONS: [&str; 19] = [
-    "count",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "total",
-    "abs",
-    "round",
-    "coalesce",
-    "ifnull",
-    "nullif",
-    "lower",
-    "upper",
-    "length",
-    "substr",
-    "trim",
-    "date",
-    "strftime",
-    "julianday",
-];
-
 /// R45-8 error classes. Those up to `TemplateSlot` go back to the planner;
 /// the run-time classes after it end the ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -99,8 +101,11 @@ pub enum ErrorClass {
     LiteralNotAllowed,
     ParamMisuse,
     ParamType,
+    /// R45-8; the stage-1 grammar leaves no masking construct to detect, so
+    /// the validator no longer produces it.
     NullMasking,
     TooManyJoins,
+    /// R45-8; unreachable in stage 1 (no subqueries; CTEs are one level).
     TooDeep,
     TooManyColumns,
     TemplateSlot,
@@ -201,6 +206,25 @@ fn fail<T>(class: ErrorClass) -> R<T> {
     Err(MethodError::bare(class))
 }
 
+/// One bound entity parameter of a method: the input of the executor's
+/// existence check (R45-6, Task 3), which counts, with its own fixed query,
+/// the rows matching the resolved key in `table` and in every `linked`
+/// table, before the method runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityFilter {
+    /// The parameter (`pN`).
+    pub param: String,
+    /// The entity's snapshot table.
+    pub table: String,
+    /// The entity's snapshot key column.
+    pub key: String,
+    /// `(snapshot table, snapshot FK column)` of every declared key pair the
+    /// method joins to `table.key` (outer block and CTEs), by column origin;
+    /// first-seen order, no duplicates. Empty when the method reads the
+    /// entity table alone.
+    pub linked: Vec<(String, String)>,
+}
+
 /// A validated method.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
@@ -214,8 +238,16 @@ pub struct Validated {
     pub params_used: Vec<String>,
     /// The entity parameters among them.
     pub entity_params: Vec<String>,
-    /// Output column indexes produced by aggregates other than `COUNT`.
+    /// Output column indexes that can be NULL over no rows: a `SUM`, `AVG`,
+    /// `MIN` or `MAX` (directly or through a CTE column), or arithmetic over
+    /// one or with `/`.
     pub aggregates_nullable: Vec<usize>,
+    /// One entry per entity parameter in `entity_params`, same order.
+    pub entity_filters: Vec<EntityFilter>,
+    /// Every output column is a `COUNT` (`COUNT(*)` / `COUNT([DISTINCT] c)`)
+    /// or a plain column the outermost block groups by. Then a linked table
+    /// with no rows for the key gives a computed 0, not `empty_for_key`.
+    pub count_only: bool,
 }
 
 /// A validated self-check, ready for the executor.
@@ -233,17 +265,18 @@ pub enum ValidatedCheck {
 }
 
 /// Validate one planner method against the schema, the public values and the
-/// draft's parameters.
+/// draft's parameters. Every bound entity parameter must be used.
 pub fn validate(
     sql: &str,
     schema: &Schema,
     public: &[PublicValues],
     params: &[Param],
 ) -> Result<Validated, MethodError> {
-    validate_cols(sql, schema, public, params).map(|(v, _)| v)
+    validate_cols(sql, schema, public, params, true).map(|(v, _)| v)
 }
 
-/// Validate a self-check; each side of `Equal` must give one column.
+/// Validate a self-check; each side of `Equal` must give one column. A side
+/// need not use the bound entity parameters (a check feeds no answer).
 pub fn validate_check(
     c: &SelfCheck,
     schema: &Schema,
@@ -262,7 +295,7 @@ pub fn validate_check(
         }
         SelfCheck::Equal { a, b } => {
             let scalar = |s: &str| -> R<Validated> {
-                let (v, n) = validate_cols(s, schema, public, params)?;
+                let (v, n) = validate_cols(s, schema, public, params, false)?;
                 if n != 1 {
                     return fail(ErrorClass::TooManyColumns);
                 }
@@ -281,6 +314,7 @@ fn validate_cols(
     schema: &Schema,
     public: &[PublicValues],
     params: &[Param],
+    all_entities: bool,
 ) -> R<(Validated, usize)> {
     if sql.len() > METHOD_MAX {
         return fail(ErrorClass::Syntax);
@@ -308,31 +342,54 @@ fn validate_cols(
         ctes: Vec::new(),
         params_used: Vec::new(),
         entity_params: Vec::new(),
-        masking: false,
-        loose_join: false,
+        links: Vec::new(),
+        agg_seen: false,
     };
-    let out = w.query(&mut q, 0, &mut Vec::new(), true)?;
-    let entity_bound = params
-        .iter()
-        .any(|p| matches!(p.ty, ParamType::Entity { .. }) && p.bound.is_some());
-    // Every output column must read data (R2-2); checked as masking, so
-    // only with an entity param in play.
-    if out.iter().any(|c| !c.info.data) {
-        w.masking = true;
+    let out = w.query(&mut q, true)?;
+    // A bound entity the method ignores answers another question.
+    if all_entities {
+        let unused = params.iter().any(|p| {
+            matches!(p.ty, ParamType::Entity { .. })
+                && p.bound.is_some()
+                && !w.entity_params.contains(&p.name)
+        });
+        if unused {
+            return fail(ErrorClass::ParamMisuse);
+        }
     }
-    let entity_in_play = entity_bound || !w.entity_params.is_empty();
-    if entity_in_play && w.loose_join {
-        return fail(ErrorClass::ParamMisuse);
-    }
-    if w.masking && entity_in_play {
-        return fail(ErrorClass::NullMasking);
+    let mut entity_filters = Vec::new();
+    for name in &w.entity_params {
+        let ent = params
+            .iter()
+            .find(|p| &p.name == name)
+            .and_then(|p| match &p.ty {
+                ParamType::Entity { table, .. } => schema.entity_for(table),
+                _ => None,
+            });
+        let Some(ent) = ent else {
+            return fail(ErrorClass::ParamMisuse);
+        };
+        let mut linked: Vec<(String, String)> = Vec::new();
+        for l in w.links.iter().filter(|l| l.entity == ent.table) {
+            let pair = (l.table.clone(), l.column.clone());
+            if !linked.contains(&pair) {
+                linked.push(pair);
+            }
+        }
+        entity_filters.push(EntityFilter {
+            param: name.clone(),
+            table: ent.table.clone(),
+            key: ent.key.clone(),
+            linked,
+        });
     }
     let aggregates_nullable = out
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.info.nullable_agg)
+        .filter(|(_, c)| c.nullable)
         .map(|(i, _)| i)
         .collect();
+    let count_only = !out.is_empty() && out.iter().all(|c| c.counted);
     let rendered = q.to_string();
     Ok((
         Validated {
@@ -342,6 +399,8 @@ fn validate_cols(
             params_used: w.params_used,
             entity_params: w.entity_params,
             aggregates_nullable,
+            entity_filters,
+            count_only,
         },
         out.len(),
     ))
@@ -349,57 +408,54 @@ fn validate_cols(
 
 // ---- the walk ----
 
-/// What the walk knows about an expression.
-#[derive(Debug, Clone, Default)]
-struct Info {
-    ty: Option<ColType>,
-    /// `(snapshot table, snapshot column)` of a plain column reference.
-    origin: Option<(String, String)>,
-    /// Reads a column somewhere.
-    col: bool,
-    /// Holds an aggregate (directly, or through a derived table's column).
-    agg: bool,
-    /// Holds an aggregate other than `COUNT`.
-    nullable_agg: bool,
-    /// A column reference resolved in the innermost query block.
-    local: bool,
-    /// Reads table data: a base column (directly, through an expression, an
-    /// aggregate, or a CTE/subquery column), or is a COUNT. A value with no
-    /// data is a number even for an absent key (review R2-2).
-    data: bool,
+/// The shape of an allowed expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A plain column reference.
+    Col,
+    /// `date(col, …)` / `strftime(fmt, col, …)` over a plain DATE column.
+    DateOf,
+    /// An aggregate over one plain column (or `COUNT(*)`).
+    Agg { count: bool },
+    /// `+ - * /` between aggregates.
+    Arith,
 }
 
-impl Info {
-    fn typed(ty: ColType) -> Info {
-        Info {
-            ty: Some(ty),
-            ..Info::default()
-        }
-    }
+/// What the walk knows about an allowed expression.
+#[derive(Debug, Clone)]
+struct Item {
+    kind: Kind,
+    ty: Option<ColType>,
+    /// `Col` only: the snapshot `(table, column)` it reads, through CTE
+    /// provenance. `None` for a CTE column that is not a plain column.
+    origin: Option<(String, String)>,
+    /// `Col` / `DateOf`: the index of its source in the block.
+    src: Option<usize>,
+    /// `Col` read straight from a base table.
+    base: bool,
+    /// Can be NULL over no rows (a non-COUNT aggregate, directly or through
+    /// a CTE column or arithmetic, or a division).
+    nullable: bool,
+}
 
-    /// Flags of both, no type, no origin.
-    fn join(a: &Info, b: &Info) -> Info {
-        Info {
-            ty: None,
+impl Item {
+    fn new(kind: Kind, ty: Option<ColType>) -> Item {
+        Item {
+            kind,
+            ty,
             origin: None,
-            col: a.col || b.col,
-            agg: a.agg || b.agg,
-            nullable_agg: a.nullable_agg || b.nullable_agg,
-            local: false,
-            data: a.data || b.data,
+            src: None,
+            base: false,
+            nullable: false,
         }
     }
 
-    fn join_all(xs: &[Info]) -> Info {
-        xs.iter()
-            .fold(Info::default(), |acc, x| Info::join(&acc, x))
+    fn is_agg(&self) -> bool {
+        matches!(self.kind, Kind::Agg { .. } | Kind::Arith)
     }
 
-    fn with_ty(mut self, ty: Option<ColType>) -> Info {
-        self.ty = ty;
-        self.origin = None;
-        self.local = false;
-        self
+    fn is_col(&self) -> bool {
+        matches!(self.kind, Kind::Col | Kind::DateOf)
     }
 }
 
@@ -415,19 +471,26 @@ fn num_ty(a: Option<ColType>, b: Option<ColType>) -> Option<ColType> {
     }
 }
 
+/// An output column of a block.
 #[derive(Debug, Clone)]
 struct OutCol {
     /// The output name (planner alias, or the cloud column name). `None`
     /// for an unnamed expression: it cannot be referenced.
     name: Option<String>,
-    info: Info,
+    ty: Option<ColType>,
+    /// A plain column (grouped, when the block aggregates): the snapshot
+    /// column it reads. Only such a column can join (addendum (b)).
+    origin: Option<(String, String)>,
+    nullable: bool,
+    /// A COUNT, or a plain column this block groups by.
+    counted: bool,
 }
 
 #[derive(Debug)]
 enum Cols {
     /// Index into `schema.tables`.
     Base(usize),
-    Derived(Vec<OutCol>),
+    Cte(Vec<OutCol>),
 }
 
 #[derive(Debug)]
@@ -443,9 +506,9 @@ struct Source {
 struct Scope {
     sources: Vec<Source>,
     /// Planner-written output aliases and their (rewritten) expressions, for
-    /// ORDER BY / GROUP BY / HAVING. A reference renders as the expression,
+    /// GROUP BY / HAVING / ORDER BY. A reference renders as the expression,
     /// never as a bare name SQLite would resolve itself.
-    aliases: Vec<(String, Expr, Info)>,
+    aliases: Vec<(String, Expr, Item)>,
 }
 
 struct Cte {
@@ -453,19 +516,13 @@ struct Cte {
     cols: Vec<OutCol>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Cx {
-    depth: usize,
-    alias_ok: bool,
-    in_agg: bool,
-    in_case_when: bool,
-    /// A top-level AND conjunct of WHERE or an INNER JOIN's ON, in a block
-    /// whose rows the entity key restricts (R45-3, review I1).
-    entity_ok: bool,
-    /// Inside an output column expression.
-    in_proj: bool,
-    /// Inside an aggregate other than COUNT (its value can be masked).
-    in_value_agg: bool,
+/// A declared key pair the method joins on (ruling C-G1).
+struct Link {
+    /// The entity's snapshot table.
+    entity: String,
+    /// The FK side: snapshot table and column.
+    table: String,
+    column: String,
 }
 
 /// `partner OP operand`, after flipping when the operand is on the left.
@@ -477,8 +534,10 @@ enum Cmp {
     Le,
     Gt,
     Ge,
-    Between,
+    /// `IN` with one item.
     In,
+    /// `IN` with more items.
+    InMany,
 }
 
 impl Cmp {
@@ -505,21 +564,14 @@ impl Cmp {
     }
 }
 
-enum Side {
-    Param,
-    Str,
-    Other,
-}
-
-fn side(e: &Expr) -> Side {
-    match e {
-        Expr::Value(v) => match &v.value {
-            Value::Placeholder(_) => Side::Param,
-            Value::SingleQuotedString(_) => Side::Str,
-            _ => Side::Other,
-        },
-        _ => Side::Other,
-    }
+/// Which clause a condition sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clause {
+    /// WHERE; `outer`: of the outermost block (entity keys allowed).
+    Where {
+        outer: bool,
+    },
+    Having,
 }
 
 fn quoted(s: &str) -> Ident {
@@ -591,24 +643,7 @@ fn modifier_ok(s: &str) -> bool {
         && matches!(unit, "day" | "days" | "month" | "months" | "year" | "years")
 }
 
-/// A string literal in a date function's argument `i`: a format (strftime's
-/// first), a time value (`now` or an ISO date), or a modifier.
-fn date_arg_ok(f: &str, i: usize, s: &str) -> bool {
-    let (fmt, time) = if f == "strftime" {
-        (Some(0), 1)
-    } else {
-        (None, 0)
-    };
-    if fmt == Some(i) {
-        strftime_format_ok(s)
-    } else if i == time {
-        s == "now" || is_iso_date(s)
-    } else {
-        i > time && modifier_ok(s)
-    }
-}
-
-/// `-?digits[.digits]` only.
+/// `digits[.digits]` only.
 fn number_ok(s: &str) -> bool {
     let (i, f) = s.split_once('.').unwrap_or((s, "0"));
     !i.is_empty()
@@ -629,6 +664,22 @@ fn int_literal(e: &Expr) -> R<()> {
         },
         _ => construct(),
     }
+}
+
+/// A literal or placeholder operand: `Value`, or `-<number>`.
+fn is_value(e: &Expr) -> bool {
+    match e {
+        Expr::Value(_) => true,
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => matches!(&**expr, Expr::Value(v) if matches!(v.value, Value::Number(..))),
+        _ => false,
+    }
+}
+
+fn is_placeholder(e: &Expr) -> bool {
+    matches!(e, Expr::Value(v) if matches!(v.value, Value::Placeholder(_)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,7 +704,7 @@ fn split_placeholder(t: &str) -> Option<(&str, Option<Suffix>)> {
 }
 
 /// The top-level AND conjuncts of an expression (through parentheses).
-fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+fn conjuncts<'e>(e: &'e mut Expr, out: &mut Vec<&'e mut Expr>) {
     match e {
         Expr::BinaryOp {
             left,
@@ -664,41 +715,17 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
             conjuncts(right, out);
         }
         Expr::Nested(i) => conjuncts(i, out),
-        _ => out.push(e),
+        other => out.push(other),
     }
 }
 
-/// The rendered qualifier of a rewritten column reference.
-fn qualifier(e: &Expr) -> Option<&str> {
+/// The rendered text of a rewritten expression, without outer parentheses:
+/// how GROUP BY items and output columns are matched.
+fn key_text(e: &Expr) -> String {
     match e {
-        Expr::Nested(i) => qualifier(i),
-        Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[0].value),
-        _ => None,
+        Expr::Nested(i) => key_text(i),
+        _ => e.to_string(),
     }
-}
-
-/// Some top-level AND conjunct of a (rewritten) ON clause is
-/// `joined.col = before.col` (either order).
-fn links(on: &Expr, joined: Option<&str>, before: &[String]) -> bool {
-    let Some(joined) = joined else {
-        return false;
-    };
-    let mut cs = Vec::new();
-    conjuncts(on, &mut cs);
-    cs.iter().any(|c| match c {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => match (qualifier(left), qualifier(right)) {
-            (Some(a), Some(b)) => {
-                let earlier = |x: &str| before.iter().any(|r| r == x);
-                (a == joined && earlier(b)) || (b == joined && earlier(a))
-            }
-            _ => false,
-        },
-        _ => false,
-    })
 }
 
 struct Walk<'a> {
@@ -709,27 +736,14 @@ struct Walk<'a> {
     ctes: Vec<Cte>,
     params_used: Vec<String>,
     entity_params: Vec<String>,
-    /// A null-masking construct was seen (R45-5); refused at the end if an
-    /// entity parameter is in play.
-    masking: bool,
-    /// A join of the outermost block has no `column = column` link to the
-    /// tables before it; refused when an entity param is in play (R2-4).
-    loose_join: bool,
+    links: Vec<Link>,
+    /// An aggregate was seen in the block being walked.
+    agg_seen: bool,
 }
 
 impl<'a> Walk<'a> {
-    /// One query block. `entity_ok`: an entity key in this block restricts
-    /// the rows the enclosing query reads.
-    fn query(
-        &mut self,
-        q: &mut Query,
-        depth: usize,
-        sc: &mut Vec<Scope>,
-        entity_ok: bool,
-    ) -> R<Vec<OutCol>> {
-        if depth > MAX_DEPTH {
-            return fail(ErrorClass::TooDeep);
-        }
+    /// One query: an optional WITH (outermost only) and one SELECT block.
+    fn query(&mut self, q: &mut Query, outer: bool) -> R<Vec<OutCol>> {
         let Query {
             with,
             body,
@@ -752,7 +766,7 @@ impl<'a> Walk<'a> {
             return construct();
         }
         if let Some(with) = with {
-            if depth != 0 || with.recursive || with.cte_tables.len() > MAX_CTES {
+            if !outer || with.recursive || with.cte_tables.len() > MAX_CTES {
                 return construct();
             }
             for cte in &mut with.cte_tables {
@@ -764,10 +778,8 @@ impl<'a> Walk<'a> {
                     return construct();
                 }
                 let name = cte.alias.name.value.clone();
-                self.check_ref_name(&name, None, &[])?;
-                // A CTE's rows can be widened by how it is used: no entity
-                // key inside one.
-                let cols = self.query(&mut cte.query, depth + 1, &mut Vec::new(), false)?;
+                self.check_ref_name(&name, None, &Scope::default())?;
+                let cols = self.query(&mut cte.query, false)?;
                 cte.alias.name = quoted(&render_ref(&name));
                 self.ctes.push(Cte { name, cols });
             }
@@ -775,9 +787,9 @@ impl<'a> Walk<'a> {
         let SetExpr::Select(sel) = body.as_mut() else {
             return construct();
         };
-        sc.push(Scope::default());
-        let r = self.select(sel, order_by.as_mut(), depth, sc, entity_ok);
-        sc.pop();
+        let saved = std::mem::replace(&mut self.agg_seen, false);
+        let r = self.select(sel, order_by.as_mut(), outer);
+        self.agg_seen = saved;
         let out = r?;
         match limit_clause {
             None => {}
@@ -808,12 +820,8 @@ impl<'a> Walk<'a> {
         &mut self,
         sel: &mut Select,
         order_by: Option<&mut OrderBy>,
-        depth: usize,
-        sc: &mut Vec<Scope>,
-        block_ok: bool,
+        outer: bool,
     ) -> R<Vec<OutCol>> {
-        // R2-4 (a): only the outermost block may carry an entity param.
-        let block_ok = block_ok && depth == 0;
         let s = &*sel;
         if !s.optimizer_hints.is_empty()
             || s.select_modifiers.is_some()
@@ -838,75 +846,39 @@ impl<'a> Walk<'a> {
         if s.projection.len() > MAX_COLUMNS {
             return fail(ErrorClass::TooManyColumns);
         }
-        let cx = Cx {
-            depth,
-            ..Cx::default()
-        };
-        let acx = Cx {
-            alias_ok: true,
-            ..cx
-        };
+        let mut sc = Scope::default();
 
-        // FROM and JOIN: register every source, then resolve the ON clauses.
+        // FROM and JOIN: register every source, then check each ON.
         if let Some(twj) = sel.from.first_mut() {
             self.joins += twj.joins.len();
             if self.joins > MAX_JOINS {
                 return fail(ErrorClass::TooManyJoins);
             }
-            self.factor(&mut twj.relation, depth, sc, block_ok)?;
+            self.factor(&mut twj.relation, &mut sc)?;
             for j in &mut twj.joins {
-                if j.global {
+                let inner = matches!(
+                    j.join_operator,
+                    JoinOperator::Join(JoinConstraint::On(_))
+                        | JoinOperator::Inner(JoinConstraint::On(_))
+                );
+                if j.global || !inner {
                     return construct();
                 }
-                let inner = match &j.join_operator {
-                    JoinOperator::Join(JoinConstraint::On(_))
-                    | JoinOperator::Inner(JoinConstraint::On(_)) => true,
-                    JoinOperator::Left(JoinConstraint::On(_))
-                    | JoinOperator::LeftOuter(JoinConstraint::On(_)) => false,
-                    _ => return construct(),
-                };
-                // The right side of a LEFT JOIN restricts nothing.
-                self.factor(&mut j.relation, depth, sc, block_ok && inner)?;
+                self.factor(&mut j.relation, &mut sc)?;
             }
-            let renders: Vec<String> = sc
-                .last()
-                .map(|s| s.sources.iter().map(|x| x.render.clone()).collect())
-                .unwrap_or_default();
             for (k, j) in twj.joins.iter_mut().enumerate() {
-                let on = match &mut j.join_operator {
-                    JoinOperator::Join(JoinConstraint::On(e))
-                    | JoinOperator::Inner(JoinConstraint::On(e)) => {
-                        let ocx = Cx {
-                            entity_ok: block_ok,
-                            ..cx
-                        };
-                        self.expr(e, sc, ocx)?;
-                        e
-                    }
-                    JoinOperator::Left(JoinConstraint::On(e))
-                    | JoinOperator::LeftOuter(JoinConstraint::On(e)) => {
-                        self.expr(e, sc, cx)?;
-                        e
-                    }
-                    _ => return construct(),
+                let (JoinOperator::Join(JoinConstraint::On(on))
+                | JoinOperator::Inner(JoinConstraint::On(on))) = &mut j.join_operator
+                else {
+                    return construct();
                 };
                 // Source k + 1 is the joined one; 0..=k come before it.
-                if depth == 0 {
-                    let joined = renders.get(k + 1).map(String::as_str);
-                    let before = renders.get(..=k).unwrap_or_default();
-                    if !links(on, joined, before) {
-                        self.loose_join = true;
-                    }
-                }
+                self.on_clause(on, k + 1, &sc)?;
             }
         }
 
         // The output columns.
-        let pcx = Cx {
-            in_proj: true,
-            ..cx
-        };
-        let mut out = Vec::with_capacity(sel.projection.len());
+        let mut items: Vec<(Option<String>, String, Item)> = Vec::new();
         let mut aliases = Vec::new();
         for item in &mut sel.projection {
             match item {
@@ -916,7 +888,8 @@ impl<'a> Walk<'a> {
                         Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.clone()),
                         _ => None,
                     };
-                    let info = self.expr(e, sc, pcx)?;
+                    let it = self.term(e, &sc, false)?;
+                    let text = key_text(e);
                     if let Some(name) = &written {
                         // Keep the cloud name as the output name.
                         *item = SelectItem::ExprWithAlias {
@@ -924,188 +897,186 @@ impl<'a> Walk<'a> {
                             alias: quoted(name),
                         };
                     }
-                    out.push(OutCol {
-                        name: written,
-                        info,
-                    });
+                    items.push((written, text, it));
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let name = alias.value.clone();
                     if !plain_name(&name) || implicit(&name) {
                         return construct();
                     }
-                    let info = self.expr(expr, sc, pcx)?;
+                    let it = self.term(expr, &sc, false)?;
                     *alias = quoted(&name);
-                    aliases.push((name.clone(), expr.clone(), info.clone()));
-                    out.push(OutCol {
-                        name: Some(name),
-                        info,
-                    });
+                    aliases.push((name.clone(), expr.clone(), it.clone()));
+                    items.push((Some(name), key_text(expr), it));
                 }
                 _ => return construct(),
             }
         }
-
-        // The template reads top-level columns by name: names are unique.
-        if depth == 0 {
-            let names: Vec<&str> = out.iter().filter_map(|c| c.name.as_deref()).collect();
-            for (i, a) in names.iter().enumerate() {
-                if names[..i].iter().any(|b| b.eq_ignore_ascii_case(a)) {
-                    return construct();
-                }
+        if sel.from.is_empty() {
+            return construct();
+        }
+        // Templates and the outer block read columns by name: names are
+        // unique (ignoring case, as SQLite does).
+        let names: Vec<&str> = items.iter().filter_map(|c| c.0.as_deref()).collect();
+        for (i, a) in names.iter().enumerate() {
+            if names[..i].iter().any(|b| b.eq_ignore_ascii_case(a)) {
+                return construct();
             }
         }
+
+        let mut pinned = Vec::new();
         if let Some(e) = &mut sel.selection {
-            let wcx = Cx {
-                entity_ok: block_ok,
-                ..cx
-            };
-            self.expr(e, sc, wcx)?;
+            let mut cs = Vec::new();
+            conjuncts(e, &mut cs);
+            for c in cs {
+                self.condition(c, &sc, Clause::Where { outer }, &mut pinned)?;
+            }
         }
-        if let Some(top) = sc.last_mut() {
-            top.aliases = aliases;
-        }
+        sc.aliases = aliases;
+        let mut groups = Vec::new();
         match &mut sel.group_by {
             GroupByExpr::Expressions(es, mods) if mods.is_empty() => {
                 for e in es {
-                    self.expr(e, sc, acx)?;
+                    let it = self.term(e, &sc, true)?;
+                    if !it.is_col() {
+                        return construct();
+                    }
+                    groups.push(key_text(e));
                 }
             }
             _ => return construct(),
         }
         if let Some(e) = &mut sel.having {
-            self.expr(e, sc, acx)?;
+            let mut cs = Vec::new();
+            conjuncts(e, &mut cs);
+            for c in cs {
+                self.condition(c, &sc, Clause::Having, &mut pinned)?;
+            }
         }
         if let Some(ob) = order_by {
             if ob.interpolate.is_some() {
                 return construct();
             }
-            let OrderByKind::Expressions(items) = &mut ob.kind else {
+            let OrderByKind::Expressions(obs) = &mut ob.kind else {
                 return construct();
             };
-            for o in items {
-                if o.with_fill.is_some() {
+            for o in obs {
+                let sort_ok = matches!(
+                    o.options.sort,
+                    None | Some(OrderBySort::Asc | OrderBySort::Desc)
+                );
+                if o.with_fill.is_some() || o.options.nulls_first.is_some() || !sort_ok {
                     return construct();
                 }
-                self.expr(&mut o.expr, sc, acx)?;
+                self.term(&mut o.expr, &sc, true)?;
             }
+        }
+
+        // Addendum (a): in an aggregating block a plain column is grouped,
+        // or (outermost only) a column of the source a `key = :pN` pins.
+        let aggregating = self.agg_seen || !groups.is_empty() || sel.having.is_some();
+        let mut out = Vec::with_capacity(items.len());
+        for (name, text, it) in items {
+            let grouped = it.is_col() && groups.contains(&text);
+            if aggregating && it.is_col() && !grouped {
+                let pin_ok = outer && it.src.is_some_and(|s| pinned.contains(&s));
+                if !pin_ok {
+                    return construct();
+                }
+            }
+            out.push(OutCol {
+                name,
+                ty: it.ty,
+                origin: if it.kind == Kind::Col {
+                    it.origin.clone()
+                } else {
+                    None
+                },
+                nullable: it.nullable,
+                counted: grouped || it.kind == (Kind::Agg { count: true }),
+            });
         }
         Ok(out)
     }
 
-    /// One FROM / JOIN source: a schema table, a CTE, or a subquery.
-    fn factor(
-        &mut self,
-        tf: &mut TableFactor,
-        depth: usize,
-        sc: &mut [Scope],
-        entity_ok: bool,
-    ) -> R<()> {
-        match tf {
-            TableFactor::Table {
-                name,
-                alias,
-                args,
-                with_hints,
-                version,
-                with_ordinality,
-                partitions,
-                json_path,
-                sample,
-                index_hints,
-            } => {
-                if args.is_some()
-                    || !with_hints.is_empty()
-                    || version.is_some()
-                    || *with_ordinality
-                    || !partitions.is_empty()
-                    || json_path.is_some()
-                    || sample.is_some()
-                    || !index_hints.is_empty()
-                {
-                    return construct();
-                }
-                let written = match name.0.as_slice() {
-                    [ObjectNamePart::Identifier(i)] => i.value.clone(),
-                    parts => {
-                        let joined: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
-                        return Err(MethodError::named(
-                            ErrorClass::UnknownTable,
-                            &joined.join("."),
-                        ));
-                    }
-                };
-                let (cols, rendered) = if let Some(c) = self.ctes.iter().find(|c| c.name == written)
-                {
-                    (Cols::Derived(c.cols.clone()), render_ref(&written))
-                } else if let Some(ti) =
-                    self.schema.tables.iter().position(|t| tcloud(t) == written)
-                {
-                    (Cols::Base(ti), self.schema.tables[ti].name.clone())
-                } else {
-                    return Err(MethodError::named(ErrorClass::UnknownTable, &written));
-                };
-                *name = ObjectName::from(vec![quoted(&rendered)]);
-                let refname = match alias {
-                    Some(a) => {
-                        if !a.columns.is_empty() || a.at.is_some() {
-                            return construct();
-                        }
-                        let n = a.name.value.clone();
-                        self.check_ref_name(&n, None, sc)?;
-                        a.name = quoted(&render_ref(&n));
-                        n
-                    }
-                    None => {
-                        self.check_ref_name(&written, Some(&written), sc)?;
-                        if matches!(cols, Cols::Base(_)) {
-                            // A base table is referenced under the prefixed
-                            // cloud name; a CTE already renders prefixed.
-                            *alias = Some(TableAlias {
-                                explicit: true,
-                                name: quoted(&render_ref(&written)),
-                                columns: Vec::new(),
-                                at: None,
-                            });
-                        }
-                        written
-                    }
-                };
-                self.push_source(sc, refname, cols);
-                Ok(())
+    /// One FROM / JOIN source: a schema table or a CTE.
+    fn factor(&mut self, tf: &mut TableFactor, sc: &mut Scope) -> R<()> {
+        let TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } = tf
+        else {
+            return construct();
+        };
+        if args.is_some()
+            || !with_hints.is_empty()
+            || version.is_some()
+            || *with_ordinality
+            || !partitions.is_empty()
+            || json_path.is_some()
+            || sample.is_some()
+            || !index_hints.is_empty()
+        {
+            return construct();
+        }
+        let written = match name.0.as_slice() {
+            [ObjectNamePart::Identifier(i)] => i.value.clone(),
+            parts => {
+                let joined: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+                return Err(MethodError::named(
+                    ErrorClass::UnknownTable,
+                    &joined.join("."),
+                ));
             }
-            TableFactor::Derived {
-                lateral,
-                subquery,
-                alias,
-                sample,
-            } => {
-                if *lateral || sample.is_some() {
-                    return construct();
-                }
-                let Some(a) = alias else {
-                    return construct();
-                };
+        };
+        let (cols, rendered) = if let Some(c) = self.ctes.iter().find(|c| c.name == written) {
+            (Cols::Cte(c.cols.clone()), render_ref(&written))
+        } else if let Some(ti) = self.schema.tables.iter().position(|t| tcloud(t) == written) {
+            (Cols::Base(ti), self.schema.tables[ti].name.clone())
+        } else {
+            return Err(MethodError::named(ErrorClass::UnknownTable, &written));
+        };
+        *name = ObjectName::from(vec![quoted(&rendered)]);
+        let refname = match alias {
+            Some(a) => {
                 if !a.columns.is_empty() || a.at.is_some() {
                     return construct();
                 }
                 let n = a.name.value.clone();
                 self.check_ref_name(&n, None, sc)?;
                 a.name = quoted(&render_ref(&n));
-                // A FROM subquery cannot see the enclosing query's sources.
-                let cols = self.query(subquery, depth + 1, &mut Vec::new(), entity_ok)?;
-                self.push_source(sc, n, Cols::Derived(cols));
-                Ok(())
+                n
             }
-            _ => construct(),
-        }
-    }
-
-    fn push_source(&self, sc: &mut [Scope], name: String, cols: Cols) {
-        if let Some(s) = sc.last_mut() {
-            let render = render_ref(&name);
-            s.sources.push(Source { name, render, cols });
-        }
+            None => {
+                self.check_ref_name(&written, Some(&written), sc)?;
+                if matches!(cols, Cols::Base(_)) {
+                    // A base table is referenced under the prefixed cloud
+                    // name; a CTE already renders prefixed.
+                    *alias = Some(TableAlias {
+                        explicit: true,
+                        name: quoted(&render_ref(&written)),
+                        columns: Vec::new(),
+                        at: None,
+                    });
+                }
+                written
+            }
+        };
+        let render = render_ref(&refname);
+        sc.sources.push(Source {
+            name: refname,
+            render,
+            cols,
+        });
+        Ok(())
     }
 
     /// A planner-chosen reference name (CTE name, table alias, or an
@@ -1115,7 +1086,7 @@ impl<'a> Walk<'a> {
     /// the cloud was shown are compared (review S1): the outcome never
     /// depends on a hidden snapshot name. An unaliased table or CTE may
     /// carry its own name.
-    fn check_ref_name(&self, name: &str, own: Option<&str>, sc: &[Scope]) -> R<()> {
+    fn check_ref_name(&self, name: &str, own: Option<&str>, sc: &Scope) -> R<()> {
         if !plain_name(name) || implicit(name) {
             return construct();
         }
@@ -1126,66 +1097,124 @@ impl<'a> Walk<'a> {
                 return construct();
             }
         }
-        if sc.iter().flat_map(|s| &s.sources).any(|s| eq(&s.name)) {
+        if sc.sources.iter().any(|s| eq(&s.name)) {
             return construct();
         }
         Ok(())
     }
 
+    /// ON: an AND of `a = b`, each a declared key pair between the joined
+    /// source and one before it, by column origin (ruling C-G1).
+    fn on_clause(&mut self, on: &mut Expr, joined: usize, sc: &Scope) -> R<()> {
+        let mut cs = Vec::new();
+        conjuncts(on, &mut cs);
+        for c in cs {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = c
+            else {
+                return construct();
+            };
+            if is_value(left) || is_value(right) {
+                return construct();
+            }
+            let a = self.term(left, sc, false)?;
+            let b = self.term(right, sc, false)?;
+            let (Kind::Col, Kind::Col) = (a.kind, b.kind) else {
+                return construct();
+            };
+            let (Some(sa), Some(sb)) = (a.src, b.src) else {
+                return construct();
+            };
+            let crosses = (sa == joined && sb < joined) || (sb == joined && sa < joined);
+            let (Some(oa), Some(ob)) = (&a.origin, &b.origin) else {
+                return construct();
+            };
+            let Some(link) = self.key_pair(oa, ob) else {
+                return construct();
+            };
+            if !crosses {
+                return construct();
+            }
+            self.links.push(link);
+        }
+        Ok(())
+    }
+
+    /// Ruling C-G1: entity key `E.table.E.key` ↔ a column named
+    /// `<E.word>_<E.key>` (ASCII-lowercased) in another table, both INTEGER.
+    fn key_pair(&self, a: &(String, String), b: &(String, String)) -> Option<Link> {
+        let int = |(t, c): &(String, String)| {
+            self.schema
+                .column(t, c)
+                .is_some_and(|x| x.ty == ColType::Integer)
+        };
+        if !int(a) || !int(b) {
+            return None;
+        }
+        self.schema.entities.iter().find_map(|e| {
+            let fk = format!("{}_{}", e.word, e.key).to_ascii_lowercase();
+            let is_key = |x: &(String, String)| x.0 == e.table && x.1 == e.key;
+            let is_fk = |x: &(String, String)| x.0 != e.table && x.1 == fk;
+            let other = if is_key(a) && is_fk(b) {
+                b
+            } else if is_key(b) && is_fk(a) {
+                a
+            } else {
+                return None;
+            };
+            Some(Link {
+                entity: e.table.clone(),
+                table: other.0.clone(),
+                column: other.1.clone(),
+            })
+        })
+    }
+
     // ---- names ----
 
-    /// The columns of a source as (cloud name, rendered name, info).
-    fn columns_of(&self, src: &Source) -> Vec<(String, String, Info)> {
-        match &src.cols {
+    /// The column `name` of one source as (rendered name, item): exactly one
+    /// case-insensitive match, and it must be the exact name.
+    fn column_in(&self, src: &Source, name: &str) -> Option<Result<(String, Item), ()>> {
+        let cols: Vec<(String, String, Item)> = match &src.cols {
             Cols::Base(ti) => {
                 let t = &self.schema.tables[*ti];
                 t.columns
                     .iter()
                     .map(|c| {
-                        let info = Info {
-                            ty: Some(c.ty),
-                            origin: Some((t.name.clone(), c.name.clone())),
-                            col: true,
-                            agg: false,
-                            nullable_agg: false,
-                            local: false,
-                            data: true,
-                        };
+                        let mut it = Item::new(Kind::Col, Some(c.ty));
+                        it.origin = Some((t.name.clone(), c.name.clone()));
+                        it.base = true;
                         let cloud = c.alias.clone().unwrap_or_else(|| c.name.clone());
-                        (cloud, c.name.clone(), info)
+                        (cloud, c.name.clone(), it)
                     })
                     .collect()
             }
-            Cols::Derived(cols) => cols
+            Cols::Cte(cols) => cols
                 .iter()
                 .filter_map(|c| {
                     let n = c.name.clone()?;
-                    let mut info = c.info.clone();
-                    info.col = true;
-                    Some((n.clone(), n, info))
+                    let mut it = Item::new(Kind::Col, c.ty);
+                    it.origin = c.origin.clone();
+                    it.nullable = c.nullable;
+                    Some((n.clone(), n, it))
                 })
                 .collect(),
-        }
-    }
-
-    /// Look `name` up in one source: exactly one case-insensitive match,
-    /// and it must be the exact name.
-    fn column_in(&self, src: &Source, name: &str) -> Option<Result<(String, Info), ()>> {
-        let cols = self.columns_of(src);
+        };
         let ci: Vec<_> = cols
             .into_iter()
             .filter(|(cloud, _, _)| cloud.eq_ignore_ascii_case(name))
             .collect();
         match ci.as_slice() {
             [] => None,
-            [(cloud, rendered, info)] if cloud == name => {
-                Some(Ok((rendered.clone(), info.clone())))
-            }
+            [(cloud, rendered, it)] if cloud == name => Some(Ok((rendered.clone(), it.clone()))),
             _ => Some(Err(())),
         }
     }
 
-    fn qualified(&self, parts: &[Ident], sc: &[Scope]) -> R<(Expr, Info)> {
+    fn qualified(&self, parts: &[Ident], sc: &Scope) -> R<(Expr, Item)> {
         let [q, c] = parts else {
             let head: Vec<&str> = parts
                 .iter()
@@ -1197,381 +1226,319 @@ impl<'a> Walk<'a> {
                 &head.join("."),
             ));
         };
-        let innermost = sc.len().saturating_sub(1);
-        let Some((level, src)) = sc
+        let Some((at, src)) = sc
+            .sources
             .iter()
             .enumerate()
-            .rev()
-            .flat_map(|(l, s)| s.sources.iter().map(move |src| (l, src)))
             .find(|(_, s)| s.name == q.value)
         else {
             return Err(MethodError::named(ErrorClass::UnknownTable, &q.value));
         };
         match self.column_in(src, &c.value) {
-            Some(Ok((rendered, mut info))) => {
-                info.local = level == innermost;
+            Some(Ok((rendered, mut it))) => {
+                it.src = Some(at);
                 Ok((
                     Expr::CompoundIdentifier(vec![quoted(&src.render), quoted(&rendered)]),
-                    info,
+                    it,
                 ))
             }
             _ => Err(MethodError::named(ErrorClass::UnknownColumn, &c.value)),
         }
     }
 
-    fn bare(&self, id: &Ident, sc: &[Scope], cx: Cx) -> R<(Expr, Info)> {
+    fn bare(&self, id: &Ident, sc: &Scope, alias_ok: bool) -> R<(Expr, Item)> {
         let name = id.value.as_str();
         let unknown = || MethodError::named(ErrorClass::UnknownColumn, name);
-        // Source columns, innermost scope first; the first scope with any
-        // case-insensitive match decides.
-        let innermost = sc.len().saturating_sub(1);
-        let mut col = None;
-        for (level, s) in sc.iter().enumerate().rev() {
-            let hits: Vec<_> = s
-                .sources
-                .iter()
-                .filter_map(|src| self.column_in(src, name).map(|r| (src, r)))
-                .collect();
-            match hits.as_slice() {
-                [] => continue,
-                [(src, Ok((rendered, info)))] => {
-                    let mut info = info.clone();
-                    info.local = level == innermost;
-                    col = Some((src.render.clone(), rendered.clone(), info));
-                    break;
-                }
-                _ => return Err(unknown()),
+        let hits: Vec<_> = sc
+            .sources
+            .iter()
+            .enumerate()
+            .filter_map(|(at, src)| self.column_in(src, name).map(|r| (at, src, r)))
+            .collect();
+        let col = match hits.as_slice() {
+            [] => None,
+            [(at, src, Ok((rendered, it)))] => {
+                let mut it = it.clone();
+                it.src = Some(*at);
+                Some((src.render.clone(), rendered.clone(), it))
             }
-        }
-        let aliases: &[(String, Expr, Info)] = match (cx.alias_ok, sc.last()) {
-            (true, Some(s)) => &s.aliases,
-            _ => &[],
+            _ => return Err(unknown()),
         };
+        let aliases: &[(String, Expr, Item)] = if alias_ok { &sc.aliases } else { &[] };
         let alias_ci: Vec<_> = aliases
             .iter()
             .filter(|(a, _, _)| a.eq_ignore_ascii_case(name))
             .collect();
         match (col, alias_ci.as_slice()) {
-            (Some((src, rendered, info)), []) => Ok((
+            (Some((src, rendered, it)), []) => Ok((
                 Expr::CompoundIdentifier(vec![quoted(&src), quoted(&rendered)]),
-                info,
+                it,
             )),
             // The alias renders as its expression: no bare name is left for
             // SQLite to bind to a source column the cloud never saw.
-            (None, [(a, expr, info)]) if a == name => Ok((expr.clone(), info.clone())),
+            (None, [(a, expr, it)]) if a == name => Ok((expr.clone(), it.clone())),
             _ => Err(unknown()),
         }
     }
 
     // ---- expressions ----
 
-    fn expr(&mut self, e: &mut Expr, sc: &mut Vec<Scope>, cx: Cx) -> R<Info> {
-        // Only AND and parentheses keep an entity key's restricting position.
-        let child = Cx {
-            entity_ok: false,
-            ..cx
-        };
+    /// An allowed expression: a column, a date expression, an aggregate, or
+    /// arithmetic between aggregates. A literal is `literal_not_allowed`, a
+    /// placeholder `param_misuse`; anything else is refused.
+    fn term(&mut self, e: &mut Expr, sc: &Scope, alias_ok: bool) -> R<Item> {
         match e {
             Expr::Identifier(id) => {
-                let (new, info) = self.bare(id, sc, cx)?;
+                let (new, it) = self.bare(id, sc, alias_ok)?;
                 *e = new;
-                Ok(info)
+                Ok(it)
             }
             Expr::CompoundIdentifier(parts) => {
-                let (new, info) = self.qualified(parts, sc)?;
+                let (new, it) = self.qualified(parts, sc)?;
                 *e = new;
-                Ok(info)
+                Ok(it)
             }
-            Expr::Value(v) => self.value(&v.value),
-            Expr::Nested(inner) => self.expr(inner, sc, cx),
+            Expr::Nested(inner) => self.term(inner, sc, alias_ok),
+            Expr::Function(f) => self.function(f, sc),
             Expr::BinaryOp { left, op, right } => {
-                if let Some(cmp) = Cmp::of(op) {
-                    return self.compare(left, cmp, right, sc, cx);
-                }
-                let scx = if matches!(op, BinaryOperator::And) {
-                    cx
-                } else {
-                    child
-                };
-                let a = self.expr(left, sc, scx)?;
-                let b = self.expr(right, sc, scx)?;
-                match op {
-                    BinaryOperator::Plus
-                    | BinaryOperator::Minus
-                    | BinaryOperator::Multiply
-                    | BinaryOperator::Divide
-                    | BinaryOperator::Modulo => Ok(Info::join(&a, &b).with_ty(num_ty(a.ty, b.ty))),
-                    BinaryOperator::And | BinaryOperator::Or => {
-                        // `SUM(x) AND 0` is 0 over no rows (review M8).
-                        if cx.in_proj && (a.nullable_agg || b.nullable_agg) {
-                            self.masking = true;
-                        }
-                        Ok(Info::join(&a, &b).with_ty(Some(ColType::Integer)))
+                let divide = match op {
+                    BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply => {
+                        false
                     }
-                    _ => construct(),
-                }
-            }
-            Expr::UnaryOp { op, expr: inner } => {
-                let i = self.expr(inner, sc, child)?;
-                match op {
-                    UnaryOperator::Plus | UnaryOperator::Minus => {
-                        let ty = if is_num(i.ty) { i.ty } else { None };
-                        Ok(i.with_ty(ty))
-                    }
-                    UnaryOperator::Not => Ok(i.with_ty(Some(ColType::Integer))),
-                    _ => construct(),
-                }
-            }
-            Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-                let i = self.expr(inner, sc, child)?;
-                if cx.in_case_when || i.nullable_agg {
-                    self.masking = true;
-                }
-                Ok(i.with_ty(Some(ColType::Integer)))
-            }
-            Expr::Between {
-                expr: x,
-                negated: _,
-                low,
-                high,
-            } => {
-                let i = self.expr(x, sc, child)?;
-                self.operand(low, &i, Cmp::Between, sc, child)?;
-                self.operand(high, &i, Cmp::Between, sc, child)?;
-                Ok(i.with_ty(Some(ColType::Integer)))
-            }
-            Expr::InList {
-                expr: x,
-                list,
-                negated,
-            } => {
-                if list.is_empty() {
-                    return construct();
-                }
-                let i = self.expr(x, sc, child)?;
-                // NULL [NOT] IN (...) is not always NULL (review R2-1).
-                if i.nullable_agg {
-                    self.masking = true;
-                }
-                let op = if *negated { Cmp::Ne } else { Cmp::In };
-                for item in list {
-                    self.operand(item, &i, op, sc, cx)?;
-                }
-                Ok(i.with_ty(Some(ColType::Integer)))
-            }
-            Expr::InSubquery {
-                expr: x,
-                subquery,
-                negated,
-            } => {
-                let i = self.expr(x, sc, child)?;
-                // NULL [NOT] IN (empty subquery) is 0 / 1 (review R2-1).
-                if i.nullable_agg {
-                    self.masking = true;
-                }
-                let ok = cx.entity_ok && !*negated;
-                self.query(subquery, cx.depth + 1, sc, ok)?;
-                Ok(i.with_ty(Some(ColType::Integer)))
-            }
-            Expr::Exists { subquery, negated } => {
-                let ok = cx.entity_ok && !*negated;
-                self.query(subquery, cx.depth + 1, sc, ok)?;
-                Ok(Info::typed(ColType::Integer))
-            }
-            Expr::Function(f) => self.function(f, sc, child),
-            Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                let op_info = match operand {
-                    Some(o) => Some(self.expr(o, sc, child)?),
-                    None => None,
-                };
-                let mut conds = Vec::new();
-                let mut results = Vec::new();
-                for cw in conditions {
-                    match &op_info {
-                        Some(oi) => {
-                            if let Expr::Value(v) = &cw.condition {
-                                if matches!(v.value, Value::Null) {
-                                    self.masking = true;
-                                }
-                            }
-                            conds.push(self.operand(&mut cw.condition, oi, Cmp::Eq, sc, child)?);
-                        }
-                        None => {
-                            let wcx = Cx {
-                                in_case_when: true,
-                                ..child
-                            };
-                            conds.push(self.expr(&mut cw.condition, sc, wcx)?);
-                        }
-                    }
-                    results.push(self.expr(&mut cw.result, sc, child)?);
-                }
-                if let Some(e) = else_result {
-                    results.push(self.expr(e, sc, child)?);
-                }
-                // R45-5 with review S2/I2/I3: a CASE that touches an
-                // aggregate (or a derived aggregate column) can turn an
-                // empty result into a number; inside an aggregate, a
-                // constant branch can turn missing rows into a number.
-                // COUNT is never NULL, so only other aggregates count here.
-                let touches_agg = op_info
-                    .iter()
-                    .chain(&conds)
-                    .chain(&results)
-                    .any(|i| i.nullable_agg);
-                // Inside a value aggregate only no ELSE or ELSE NULL keeps an
-                // empty match NULL (review R2-3).
-                let else_value = match else_result.as_deref() {
-                    None => false,
-                    Some(Expr::Value(v)) => !matches!(v.value, Value::Null),
-                    Some(_) => true,
-                };
-                if touches_agg || (cx.in_value_agg && else_value) {
-                    self.masking = true;
-                }
-                let ty = results.iter().find_map(|r| r.ty);
-                let mut all = results;
-                all.extend(conds);
-                if let Some(oi) = op_info {
-                    all.push(oi);
-                }
-                Ok(Info::join_all(&all).with_ty(ty))
-            }
-            Expr::Cast {
-                kind: CastKind::Cast,
-                expr: x,
-                data_type,
-                format: None,
-            } => {
-                let ty = match data_type {
-                    DataType::Integer(None) => ColType::Integer,
-                    DataType::Real => ColType::Real,
-                    DataType::Text => ColType::Text,
+                    BinaryOperator::Divide => true,
                     _ => return construct(),
                 };
-                Ok(self.expr(x, sc, child)?.with_ty(Some(ty)))
-            }
-            Expr::Substring {
-                expr: x,
-                substring_from: Some(from),
-                substring_for,
-                special: _,
-                shorthand: true,
-            } => {
-                let mut infos = vec![self.expr(x, sc, child)?, self.expr(from, sc, child)?];
-                if let Some(f) = substring_for {
-                    infos.push(self.expr(f, sc, child)?);
+                let a = self.term(left, sc, alias_ok)?;
+                let b = self.term(right, sc, alias_ok)?;
+                if !a.is_agg() || !b.is_agg() {
+                    return construct();
                 }
-                Ok(Info::join_all(&infos).with_ty(Some(ColType::Text)))
+                let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty));
+                it.nullable = a.nullable || b.nullable || divide;
+                Ok(it)
             }
-            Expr::Trim {
-                expr: x,
-                trim_where: None,
-                trim_what: None,
-                trim_characters,
-            } => {
-                let mut infos = vec![self.expr(x, sc, child)?];
-                for c in trim_characters.iter_mut().flatten() {
-                    infos.push(self.expr(c, sc, child)?);
+            Expr::Value(v) => match v.value {
+                Value::Placeholder(_) => fail(ErrorClass::ParamMisuse),
+                Value::Boolean(_) => construct(),
+                _ => fail(ErrorClass::LiteralNotAllowed),
+            },
+            _ => construct(),
+        }
+    }
+
+    fn function(&mut self, f: &mut Function, sc: &Scope) -> R<Item> {
+        let lname = match f.name.0.as_slice() {
+            [ObjectNamePart::Identifier(i)] if i.quote_style.is_none() => {
+                i.value.to_ascii_lowercase()
+            }
+            _ => return fail(ErrorClass::FunctionNotAllowed),
+        };
+        if !FUNCTIONS.contains(&lname.as_str()) {
+            return fail(ErrorClass::FunctionNotAllowed);
+        }
+        if f.uses_odbc_syntax
+            || f.over.is_some()
+            || f.filter.is_some()
+            || f.null_treatment.is_some()
+            || !f.within_group.is_empty()
+            || !matches!(f.parameters, FunctionArguments::None)
+        {
+            return construct();
+        }
+        let FunctionArguments::List(list) = &mut f.args else {
+            return construct();
+        };
+        if !list.clauses.is_empty() {
+            return construct();
+        }
+        match lname.as_str() {
+            "date" | "strftime" => self.date_fn(lname == "strftime", list, sc),
+            l => self.aggregate(l, list, sc),
+        }
+    }
+
+    /// `COUNT(*)`, or an aggregate over one plain column.
+    fn aggregate(&mut self, l: &str, list: &mut FunctionArgumentList, sc: &Scope) -> R<Item> {
+        let distinct = match list.duplicate_treatment {
+            None => false,
+            Some(DuplicateTreatment::Distinct) => true,
+            Some(_) => return construct(),
+        };
+        let count = l == "count";
+        let [arg] = list.args.as_mut_slice() else {
+            return construct();
+        };
+        let arg_ty = match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if count && !distinct => None,
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => {
+                // An output alias is not a column here.
+                let it = self.term(x, sc, false)?;
+                if it.kind != Kind::Col {
+                    return construct();
                 }
-                Ok(Info::join_all(&infos).with_ty(Some(ColType::Text)))
+                it.ty
+            }
+            _ => return construct(),
+        };
+        self.agg_seen = true;
+        let ty = match l {
+            "count" => Some(ColType::Integer),
+            "sum" | "avg" => Some(ColType::Real),
+            _ => arg_ty,
+        };
+        let mut it = Item::new(Kind::Agg { count }, ty);
+        it.nullable = !count;
+        Ok(it)
+    }
+
+    /// `date(col, mods…)` / `strftime(fmt, col, mods…)` over a plain DATE
+    /// column; the format and modifiers are literals from a fixed grammar.
+    fn date_fn(&mut self, strftime: bool, list: &mut FunctionArgumentList, sc: &Scope) -> R<Item> {
+        if list.duplicate_treatment.is_some() {
+            return construct();
+        }
+        let col_at = usize::from(strftime);
+        let n = list.args.len();
+        if n <= col_at || n > DATE_ARGS_MAX {
+            return construct();
+        }
+        let mut src = None;
+        for (i, a) in list.args.iter_mut().enumerate() {
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a else {
+                return construct();
+            };
+            if i == col_at {
+                let it = self.term(x, sc, false)?;
+                if it.kind != Kind::Col || it.ty != Some(ColType::Date) {
+                    return construct();
+                }
+                src = it.src;
+                continue;
+            }
+            let Expr::Value(v) = x else {
+                return construct();
+            };
+            let ok = match &v.value {
+                Value::SingleQuotedString(s) if strftime && i == 0 => strftime_format_ok(s),
+                Value::SingleQuotedString(s) => modifier_ok(s),
+                _ => false,
+            };
+            if !ok {
+                return fail(ErrorClass::LiteralNotAllowed);
+            }
+        }
+        let ty = if strftime {
+            ColType::Text
+        } else {
+            ColType::Date
+        };
+        let mut it = Item::new(Kind::DateOf, Some(ty));
+        it.src = src;
+        Ok(it)
+    }
+
+    // ---- conditions ----
+
+    /// One WHERE / HAVING conjunct: `subject op operand` or (WHERE only)
+    /// `subject IN (operands)`. The subject is a column or date expression
+    /// in WHERE, an aggregate in HAVING; an operand is a placeholder or a
+    /// literal.
+    fn condition(
+        &mut self,
+        c: &mut Expr,
+        sc: &Scope,
+        clause: Clause,
+        pinned: &mut Vec<usize>,
+    ) -> R<()> {
+        let having = clause == Clause::Having;
+        let entity_ok = clause == Clause::Where { outer: true };
+        match c {
+            Expr::BinaryOp { left, op, right } => {
+                let Some(cmp) = Cmp::of(op) else {
+                    return construct();
+                };
+                let (subject, operand, cmp) = match (is_value(left), is_value(right)) {
+                    (false, true) => (left, right, cmp),
+                    (true, false) => (right, left, cmp.flip()),
+                    (true, true) if is_placeholder(left) || is_placeholder(right) => {
+                        return fail(ErrorClass::ParamType)
+                    }
+                    _ => return construct(),
+                };
+                let it = self.subject(subject, sc, having)?;
+                self.operand(operand, &it, cmp, entity_ok, pinned)
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } if !having && !list.is_empty() => {
+                let it = self.subject(expr, sc, false)?;
+                let cmp = if list.len() == 1 {
+                    Cmp::In
+                } else {
+                    Cmp::InMany
+                };
+                for item in list {
+                    if !is_value(item) {
+                        return construct();
+                    }
+                    self.operand(item, &it, cmp, entity_ok, pinned)?;
+                }
+                Ok(())
             }
             _ => construct(),
         }
     }
 
-    /// A literal or placeholder outside a comparison.
-    fn value(&self, v: &Value) -> R<Info> {
+    fn subject(&mut self, e: &mut Expr, sc: &Scope, having: bool) -> R<Item> {
+        let it = self.term(e, sc, having)?;
+        let ok = if having {
+            matches!(it.kind, Kind::Agg { .. })
+        } else {
+            it.is_col()
+        };
+        if !ok {
+            return construct();
+        }
+        Ok(it)
+    }
+
+    /// The literal or placeholder compared with `partner`.
+    fn operand(
+        &mut self,
+        e: &Expr,
+        partner: &Item,
+        cmp: Cmp,
+        entity_ok: bool,
+        pinned: &mut Vec<usize>,
+    ) -> R<()> {
+        let v = match e {
+            Expr::Value(v) => &v.value,
+            Expr::UnaryOp { expr, .. } => match &**expr {
+                Expr::Value(v) => &v.value,
+                _ => return construct(),
+            },
+            _ => return construct(),
+        };
         match v {
-            Value::Number(s, false) if number_ok(s) => Ok(Info::typed(if s.contains('.') {
-                ColType::Real
-            } else {
-                ColType::Integer
-            })),
-            Value::SingleQuotedString(s) if is_iso_date(s) => Ok(Info::typed(ColType::Date)),
-            Value::Null => Ok(Info::default()),
-            Value::Placeholder(_) => fail(ErrorClass::ParamMisuse),
+            Value::Placeholder(p) if matches!(e, Expr::Value(_)) => {
+                self.param(p, partner, cmp, entity_ok, pinned)
+            }
+            Value::SingleQuotedString(s) if matches!(e, Expr::Value(_)) => self.literal(s, partner),
+            Value::Number(s, false) if number_ok(s) => Ok(()),
             Value::Boolean(_) => construct(),
             _ => fail(ErrorClass::LiteralNotAllowed),
         }
     }
 
-    fn compare(
-        &mut self,
-        left: &mut Expr,
-        cmp: Cmp,
-        right: &mut Expr,
-        sc: &mut Vec<Scope>,
-        cx: Cx,
-    ) -> R<Info> {
-        // The sides lose the entity position; the placeholder keeps it.
-        let child = Cx {
-            entity_ok: false,
-            ..cx
-        };
-        let info = match (side(left), side(right)) {
-            (Side::Other, Side::Other) => {
-                let a = self.expr(left, sc, child)?;
-                let b = self.expr(right, sc, child)?;
-                Info::join(&a, &b)
-            }
-            (Side::Other, _) => {
-                let a = self.expr(left, sc, child)?;
-                self.operand(right, &a, cmp, sc, cx)?;
-                a
-            }
-            (_, Side::Other) => {
-                let b = self.expr(right, sc, child)?;
-                self.operand(left, &b, cmp.flip(), sc, cx)?;
-                b
-            }
-            (Side::Param, _) | (_, Side::Param) => return fail(ErrorClass::ParamMisuse),
-            _ => return fail(ErrorClass::LiteralNotAllowed),
-        };
-        Ok(info.with_ty(Some(ColType::Integer)))
-    }
-
-    /// The other side of a comparison with `partner`: a placeholder and a
-    /// string literal are checked against it; anything else is an expression.
-    fn operand(
-        &mut self,
-        e: &mut Expr,
-        partner: &Info,
-        cmp: Cmp,
-        sc: &mut Vec<Scope>,
-        cx: Cx,
-    ) -> R<Info> {
-        if let Expr::Value(v) = e {
-            match &v.value {
-                Value::Placeholder(p) => {
-                    return self
-                        .param(p, partner, cmp, cx.entity_ok)
-                        .map(|()| Info::default())
-                }
-                Value::SingleQuotedString(s) => {
-                    return self.literal(s, partner).map(|()| Info::default())
-                }
-                _ => {}
-            }
-        }
-        let child = Cx {
-            entity_ok: false,
-            ..cx
-        };
-        self.expr(e, sc, child)
-    }
-
-    /// R45-4: a k-floor public value of the compared column, or an ISO date.
-    fn literal(&self, s: &str, partner: &Info) -> R<()> {
+    /// R45-4: a k-floor public value of the compared plain column, or an ISO
+    /// date.
+    fn literal(&self, s: &str, partner: &Item) -> R<()> {
         if is_iso_date(s) {
             return Ok(());
         }
-        if let (Some((t, c)), false) = (&partner.origin, partner.agg) {
+        if let (Kind::Col, Some((t, c))) = (partner.kind, &partner.origin) {
             let key = format!("{t}.{c}");
             let public = self
                 .public
@@ -1585,7 +1552,14 @@ impl<'a> Walk<'a> {
     }
 
     /// R45-3: a placeholder compared with `partner` (as `partner OP param`).
-    fn param(&mut self, text: &str, partner: &Info, cmp: Cmp, entity_ok: bool) -> R<()> {
+    fn param(
+        &mut self,
+        text: &str,
+        partner: &Item,
+        cmp: Cmp,
+        entity_ok: bool,
+        pinned: &mut Vec<usize>,
+    ) -> R<()> {
         let misuse = || fail(ErrorClass::ParamMisuse);
         let Some((base, sfx)) = split_placeholder(text) else {
             return misuse();
@@ -1598,14 +1572,14 @@ impl<'a> Walk<'a> {
                 let Some(ent) = self.schema.entity_for(table) else {
                     return misuse();
                 };
+                // `key = :pN` / `key IN (:pN)` on the entity table's own key,
+                // read straight from the base table, in the outermost WHERE.
                 let on_key = partner.origin.as_ref() == Some(&(ent.table.clone(), ent.key.clone()));
-                // The key must restrict the rows of the block that reads it:
-                // a top-level AND conjunct, on that block's own column.
                 if !entity_ok
-                    || !partner.local
-                    || !matches!(cmp, Cmp::Eq | Cmp::In)
-                    || partner.agg
+                    || partner.kind != Kind::Col
+                    || !partner.base
                     || !on_key
+                    || !matches!(cmp, Cmp::Eq | Cmp::In)
                 {
                     return misuse();
                 }
@@ -1613,6 +1587,9 @@ impl<'a> Walk<'a> {
                     None => {}
                     Some(Bound::Keys(k)) if k.len() == 1 => {}
                     Some(_) => return misuse(),
+                }
+                if let Some(s) = partner.src {
+                    pinned.push(s);
                 }
                 if !self.entity_params.iter().any(|n| n == base) {
                     self.entity_params.push(base.to_string());
@@ -1638,125 +1615,16 @@ impl<'a> Walk<'a> {
                 is_num(partner.ty)
             }
             (ParamType::Text { table, column }, None) => {
-                partner.origin.as_ref() == Some(&(table.clone(), column.clone())) && !partner.agg
+                partner.kind == Kind::Col
+                    && partner.origin.as_ref() == Some(&(table.clone(), column.clone()))
             }
         };
-        // A parameter compared with a constant says nothing about the data.
-        if !type_ok || !(partner.col || partner.agg) {
+        if !type_ok {
             return fail(ErrorClass::ParamType);
         }
         if !self.params_used.iter().any(|n| n == base) {
             self.params_used.push(base.to_string());
         }
         Ok(())
-    }
-
-    fn function(&mut self, f: &mut Function, sc: &mut Vec<Scope>, cx: Cx) -> R<Info> {
-        let lname = match f.name.0.as_slice() {
-            [ObjectNamePart::Identifier(i)] if i.quote_style.is_none() => {
-                i.value.to_ascii_lowercase()
-            }
-            _ => return fail(ErrorClass::FunctionNotAllowed),
-        };
-        if !FUNCTIONS.contains(&lname.as_str()) {
-            return fail(ErrorClass::FunctionNotAllowed);
-        }
-        if f.uses_odbc_syntax
-            || f.over.is_some()
-            || f.filter.is_some()
-            || f.null_treatment.is_some()
-            || !f.within_group.is_empty()
-            || !matches!(f.parameters, FunctionArguments::None)
-        {
-            return construct();
-        }
-        let FunctionArguments::List(list) = &mut f.args else {
-            return construct();
-        };
-        if !list.clauses.is_empty() {
-            return construct();
-        }
-        let n = list.args.len();
-        let l = lname.as_str();
-        let is_agg = matches!(l, "count" | "sum" | "avg" | "total")
-            || (matches!(l, "min" | "max") && n == 1);
-        let arity_ok = match l {
-            "count" | "sum" | "avg" | "total" | "abs" | "lower" | "upper" | "length" => n == 1,
-            "min" | "max" => (1..=8).contains(&n),
-            "round" | "trim" => (1..=2).contains(&n),
-            "coalesce" => (2..=8).contains(&n),
-            "ifnull" | "nullif" => n == 2,
-            "substr" => (2..=3).contains(&n),
-            "date" | "julianday" => (1..=8).contains(&n),
-            "strftime" => (2..=8).contains(&n),
-            _ => false,
-        };
-        if !arity_ok {
-            return construct();
-        }
-        match list.duplicate_treatment {
-            None => {}
-            Some(DuplicateTreatment::Distinct) if is_agg => {}
-            Some(_) => return construct(),
-        }
-        if is_agg && cx.in_agg {
-            return construct();
-        }
-        let acx = Cx {
-            in_agg: cx.in_agg || is_agg,
-            in_value_agg: cx.in_value_agg || (is_agg && l != "count"),
-            ..cx
-        };
-        let date_fn = matches!(l, "date" | "strftime" | "julianday");
-        let mut infos = Vec::with_capacity(n);
-        for (i, a) in list.args.iter_mut().enumerate() {
-            match a {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                    if let (true, Expr::Value(v)) = (date_fn, &*e) {
-                        if let Value::SingleQuotedString(s) = &v.value {
-                            if !date_arg_ok(l, i, s) {
-                                return fail(ErrorClass::LiteralNotAllowed);
-                            }
-                            infos.push(Info::typed(ColType::Text));
-                            continue;
-                        }
-                    }
-                    infos.push(self.expr(e, sc, acx)?);
-                }
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if l == "count" => {
-                    infos.push(Info::default());
-                }
-                _ => return construct(),
-            }
-        }
-        let first_ty = infos.first().and_then(|i| i.ty);
-        let mut info = Info::join_all(&infos);
-        if is_agg {
-            info.agg = true;
-            if l == "count" {
-                info.data = true;
-            }
-            if l != "count" {
-                info.nullable_agg = true;
-            }
-            if l == "total" {
-                // TOTAL() is 0.0 over no rows (R45-5, review focus 1).
-                self.masking = true;
-            }
-        }
-        // Around an aggregate, or inside one (over a LEFT JOIN's NULLs).
-        if matches!(l, "coalesce" | "ifnull" | "nullif")
-            && (cx.in_value_agg || infos.iter().any(|i| i.nullable_agg))
-        {
-            self.masking = true;
-        }
-        let ty = match l {
-            "count" | "length" => Some(ColType::Integer),
-            "sum" | "avg" | "total" | "julianday" => Some(ColType::Real),
-            "min" | "max" | "abs" | "round" | "coalesce" | "ifnull" | "nullif" => first_ty,
-            "date" => Some(ColType::Date),
-            _ => Some(ColType::Text),
-        };
-        Ok(info.with_ty(ty))
     }
 }

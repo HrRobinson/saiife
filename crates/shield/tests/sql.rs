@@ -1,12 +1,14 @@
-//! Plan 45 Task 1: the planner reply types and the SELECT-only SQL subset
-//! validator (R45-1..R45-5, R45-8).
+//! Plan 45 Task 1: the planner reply types and the SELECT-only SQL validator
+//! (R45-1..R45-5, R45-8; coordinator ruling C-G: an allow-listed shape).
 
 use saiife_shield::plan::{parse_reply, SelfCheck, PLAN_SCHEMA};
 use saiife_shield::public::PublicValues;
 use saiife_shield::schema::{
     Bound, ColType, ColumnClass, ColumnInfo, EntitySpec, Param, ParamType, Schema, TableInfo,
 };
-use saiife_shield::sql::{validate, validate_check, ErrorClass, MethodError, ValidatedCheck};
+use saiife_shield::sql::{
+    validate, validate_check, EntityFilter, ErrorClass, MethodError, ValidatedCheck,
+};
 
 fn col(name: &str, ty: ColType, class: ColumnClass) -> ColumnInfo {
     ColumnInfo {
@@ -114,8 +116,23 @@ fn params() -> Vec<Param> {
     ]
 }
 
+/// The draft without the bound entity parameter.
+fn no_entity() -> Vec<Param> {
+    params().into_iter().skip(1).collect()
+}
+
+/// A bound entity parameter must be used by the method, so the draft holds
+/// `p1` only when the method names it.
+fn ps_for(sql: &str) -> Vec<Param> {
+    if sql.contains(":p1") {
+        params()
+    } else {
+        no_entity()
+    }
+}
+
 fn ok(sql: &str) -> saiife_shield::sql::Validated {
-    match validate(sql, &schema(), &public(), &params()) {
+    match validate(sql, &schema(), &public(), &ps_for(sql)) {
         Ok(v) => v,
         Err(e) => panic!("{sql}: refused {e:?}"),
     }
@@ -129,7 +146,7 @@ fn class_of(sql: &str, schema: &Schema, params: &[Param]) -> ErrorClass {
 }
 
 fn refused(sql: &str) -> ErrorClass {
-    class_of(sql, &schema(), &params())
+    class_of(sql, &schema(), &ps_for(sql))
 }
 
 /// The rendered SQL must prepare against a real SQLite database holding the
@@ -152,6 +169,8 @@ fn prepares(sql: &str) {
 const BALANCE: &str = "SELECT SUM(i.amount) AS owed, c.credit_limit FROM invoices i \
     JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 AND i.status = 'open'";
 
+const J: &str = "FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
+
 #[test]
 fn accepts_balance_method() {
     let v = ok(BALANCE);
@@ -163,19 +182,95 @@ fn accepts_balance_method() {
     assert!(v.sql.contains(":p1"), "{}", v.sql);
     assert!(v.sql.contains("'open'"), "{}", v.sql);
     prepares(&v.sql);
-
-    // COUNT is not a nullable aggregate; a pass-through derived SUM is.
-    let v = ok(
-        "SELECT COUNT(*) AS n, MAX(i.amount) AS top FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id WHERE c.id = :p1",
-    );
+    // COUNT is not a nullable aggregate.
+    let v = ok(&format!("SELECT COUNT(*) AS n, MAX(i.amount) AS top {J}"));
     assert_eq!(v.aggregates_nullable, vec![1]);
-    let v = ok(
-        "SELECT t.owed FROM (SELECT SUM(i.amount) AS owed FROM invoices i \
-         WHERE i.status = 'paid') t",
+}
+
+#[test]
+fn entity_filters_and_count_only() {
+    let v = ok(BALANCE);
+    assert_eq!(
+        v.entity_filters,
+        vec![EntityFilter {
+            param: "p1".into(),
+            table: "customers".into(),
+            key: "id".into(),
+            linked: vec![("invoices".into(), "customer_id".into())],
+        }]
     );
-    assert_eq!(v.aggregates_nullable, vec![0]);
+    assert!(!v.count_only);
+    // COUNT-only: zero linked rows is a computed 0.
+    let v = ok(&format!(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT i.status) AS k {J} AND i.status = 'open'"
+    ));
+    assert!(v.count_only);
+    assert!(v.aggregates_nullable.is_empty());
+    assert_eq!(v.entity_filters[0].linked.len(), 1);
+    // A grouping column beside COUNT keeps count_only.
+    let v = ok(&format!(
+        "SELECT i.status, COUNT(*) AS n {J} GROUP BY i.status"
+    ));
+    assert!(v.count_only);
+    // Arithmetic over COUNTs, a plain list or a bare pinned column is not
+    // count-only.
+    for sql in [
+        format!("SELECT COUNT(*) / COUNT(i.id) AS r {J}"),
+        format!("SELECT i.amount {J}"),
+        format!("SELECT COUNT(*) AS n, c.credit_limit {J}"),
+    ] {
+        assert!(!ok(&sql).count_only, "{sql}");
+    }
+    // Linked through a CTE column: the origin is invoices.customer_id.
+    let v = ok(
+        "WITH t AS (SELECT k.customer_id AS cid, SUM(k.amount) AS s FROM invoices k \
+         GROUP BY k.customer_id) \
+         SELECT t.s FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1",
+    );
+    assert_eq!(
+        v.entity_filters[0].linked,
+        vec![("invoices".to_string(), "customer_id".to_string())]
+    );
     prepares(&v.sql);
+    // Pinned on the entity table alone: nothing linked; no entity, no filter.
+    let v = ok("SELECT c.city FROM customers c WHERE c.id = :p1");
+    assert!(v.entity_filters[0].linked.is_empty());
+    assert!(ok("SELECT COUNT(*) AS n FROM invoices i")
+        .entity_filters
+        .is_empty());
+}
+
+#[test]
+fn legitimate_methods_pass() {
+    for sql in [
+        BALANCE.to_string(),
+        // Sum of a customer's invoices in Q3.
+        format!("SELECT SUM(i.amount) AS total {J} AND i.issued >= :p3_from AND i.issued < :p3_to"),
+        // Count of open invoices.
+        "SELECT COUNT(*) AS n FROM invoices i WHERE i.status = 'open'".to_string(),
+        // A top-10 list.
+        "SELECT c.first_name, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.id, c.first_name ORDER BY total DESC LIMIT 10"
+            .to_string(),
+        // Per-month grouping.
+        "SELECT strftime('%Y-%m', i.issued) AS month, COUNT(*) AS n FROM invoices i \
+         GROUP BY month ORDER BY month"
+            .to_string(),
+        "SELECT date(i.issued, 'start of month') AS m, SUM(i.amount) AS s FROM invoices i \
+         WHERE date(i.issued) >= '2026-01-01' GROUP BY date(i.issued, 'start of month')"
+            .to_string(),
+        // HAVING.
+        "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city HAVING COUNT(*) > 2"
+            .to_string(),
+        "SELECT DISTINCT c.city FROM customers c WHERE c.city IN (:p4) ORDER BY c.city".to_string(),
+        "SELECT i.id, i.amount FROM invoices i WHERE i.amount >= 90 AND i.amount < -1.5 \
+         AND i.status IN ('open', 'paid') AND i.issued <> :p5 LIMIT 5 OFFSET 10"
+            .to_string(),
+        format!("SELECT SUM(i.amount) / COUNT(*) AS mean, AVG(DISTINCT i.amount) AS a {J}"),
+    ] {
+        let v = ok(&sql);
+        prepares(&v.sql);
+    }
 }
 
 #[test]
@@ -183,19 +278,14 @@ fn wide_method_renders_and_prepares() {
     let sql = "WITH big AS (SELECT i.customer_id AS cid, SUM(i.amount) AS total \
          FROM invoices i WHERE i.issued >= :p3_from AND i.issued < :p3_to \
          GROUP BY i.customer_id HAVING SUM(i.amount) > :p2) \
-         SELECT c.city, COUNT(*) AS n, ROUND(AVG(b.total), 2) AS avg_total, \
-         CAST(MAX(b.total) AS INTEGER) AS top, \
-         CASE WHEN COUNT(*) > 3 THEN 1 ELSE 0 END AS flag \
-         FROM big b LEFT JOIN customers c ON c.id = b.cid \
-         WHERE c.city = :p4 AND EXISTS (SELECT 1 FROM invoices j WHERE j.customer_id = c.id \
-         AND j.status IN ('open', 'paid')) \
-         AND c.id IN (SELECT k.customer_id FROM invoices k WHERE k.issued < '2026-01-01' \
-         AND strftime('%Y-%m', k.issued) = strftime('%Y-%m', date('now', '-1 month'))) \
-         GROUP BY c.city ORDER BY n DESC LIMIT 10 OFFSET 5";
+         SELECT c.city, COUNT(DISTINCT c.id) AS n, AVG(b.total) AS avg_total, \
+         MAX(b.total) AS top, SUM(b.total) / COUNT(*) AS mean \
+         FROM customers c JOIN big b ON b.cid = c.id \
+         WHERE c.city = :p4 GROUP BY c.city ORDER BY n DESC LIMIT 10 OFFSET 5";
     let v = ok(sql);
     assert_eq!(v.params_used, vec!["p3", "p2", "p4"]);
     assert!(v.entity_params.is_empty());
-    assert_eq!(v.aggregates_nullable, vec![2, 3]);
+    assert_eq!(v.aggregates_nullable, vec![2, 3, 4]);
     prepares(&v.sql);
 }
 
@@ -206,7 +296,7 @@ fn aliases_map_back() {
         "SELECT c.town, COUNT(*) AS n FROM clients c GROUP BY c.town",
         &s,
         &public(),
-        &params(),
+        &no_entity(),
     )
     .unwrap();
     assert!(v.sql.contains("customers"), "{}", v.sql);
@@ -225,15 +315,15 @@ fn aliases_map_back() {
     assert_eq!(v.entity_params, vec!["p1"]);
     prepares(&v.sql);
     // The output column keeps the cloud name the planner wrote.
-    let v = validate("SELECT town FROM clients", &s, &public(), &params()).unwrap();
+    let v = validate("SELECT town FROM clients", &s, &public(), &no_entity()).unwrap();
     assert!(v.sql.contains("AS \"town\""), "{}", v.sql);
     prepares(&v.sql);
     // The snapshot names are not the cloud's names.
     assert_eq!(
-        class_of("SELECT c.city FROM clients c", &s, &params()),
+        class_of("SELECT c.city FROM clients c", &s, &no_entity()),
         ErrorClass::UnknownColumn
     );
-    let e = validate("SELECT id FROM customers", &s, &public(), &params()).unwrap_err();
+    let e = validate("SELECT id FROM customers", &s, &public(), &no_entity()).unwrap_err();
     assert_eq!(e.class, ErrorClass::UnknownTable);
     assert_eq!(e.detail.as_deref(), Some("customers"));
 }
@@ -248,12 +338,12 @@ fn refuses_by_class() {
         JOIN invoices b ON b.customer_id = c.id JOIN invoices d ON d.customer_id = c.id \
         JOIN invoices e ON e.customer_id = c.id";
     ok(four_joins);
-    let depth2 = "SELECT c.id FROM customers c WHERE c.id IN (SELECT a.customer_id FROM \
-        invoices a WHERE a.id IN (SELECT b.id FROM invoices b))";
-    ok(depth2);
-    let depth3 = "SELECT c.id FROM customers c WHERE c.id IN (SELECT a.customer_id FROM \
-        invoices a WHERE a.id IN (SELECT b.id FROM invoices b WHERE b.id IN \
-        (SELECT d.id FROM invoices d)))";
+    // Joins count across the CTEs and the outer block.
+    let cte_joins = "WITH t AS (SELECT a.customer_id AS cid FROM invoices a \
+        JOIN customers x ON x.id = a.customer_id JOIN invoices b ON b.customer_id = x.id \
+        GROUP BY a.customer_id) \
+        SELECT c.id FROM customers c JOIN t ON t.cid = c.id \
+        JOIN invoices d ON d.customer_id = c.id JOIN invoices e ON e.customer_id = c.id";
     let wide: Vec<String> = (0..33).map(|i| format!("c.id AS x{i}")).collect();
     let wide = format!("SELECT {} FROM customers c", wide.join(", "));
     let cases: Vec<(&str, ErrorClass)> = vec![
@@ -300,15 +390,25 @@ fn refuses_by_class() {
             ConstructNotAllowed,
         ),
         (
-            "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT r.n FROM r",
+            "WITH RECURSIVE r AS (SELECT c.id AS n FROM customers c) SELECT r.n FROM r",
             ConstructNotAllowed,
         ),
         (
-            "SELECT CAST(c.id AS BLOB) AS b FROM customers c",
+            "SELECT CAST(c.id AS INTEGER) AS b FROM customers c",
             ConstructNotAllowed,
         ),
+        // No subqueries anywhere (they were depth-capped; now refused).
+        (
+            "SELECT c.id FROM customers c WHERE c.id IN (SELECT a.customer_id FROM invoices a)",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT t.n FROM (SELECT COUNT(*) AS n FROM invoices i) t",
+            ConstructNotAllowed,
+        ),
+        ("SELECT COUNT(*) AS n", ConstructNotAllowed),
         (five_joins, TooManyJoins),
-        (depth3, TooDeep),
+        (cte_joins, TooManyJoins),
         (&wide, TooManyColumns),
         (
             "SELECT i.id FROM invoices i WHERE i.status = 'disputed'",
@@ -361,50 +461,382 @@ fn refuses_by_class() {
     assert_eq!(v.entity_params, vec!["p1"]);
 }
 
+/// Ruling C-G: masking routes are refused by the grammar, entity or not.
 #[test]
-fn null_masking_refused() {
-    let masks = [
-        "SELECT COALESCE(SUM(i.amount), 0) AS owed FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id WHERE c.id = :p1",
-        "SELECT TOTAL(i.amount) AS owed FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id WHERE c.id = :p1",
-        "SELECT IFNULL(MAX(i.amount), 0) AS top FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id WHERE c.id = :p1",
-        "SELECT NULLIF(SUM(i.amount), 0) AS owed FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id WHERE c.id = :p1",
-        "SELECT CASE WHEN SUM(i.amount) IS NULL THEN 0 ELSE SUM(i.amount) END AS owed \
-         FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1",
-        "SELECT COALESCE(t.owed, 0) AS owed FROM (SELECT i.customer_id AS cid, \
-         SUM(i.amount) AS owed FROM invoices i GROUP BY i.customer_id) t \
-         JOIN customers c ON c.id = t.cid WHERE c.id = :p1",
-    ];
-    for sql in masks {
-        assert_eq!(refused(sql), ErrorClass::NullMasking, "{sql}");
-    }
-    // An entity param that is bound but not in the query still counts.
-    assert_eq!(
-        refused("SELECT TOTAL(i.amount) AS s FROM invoices i"),
-        ErrorClass::NullMasking
-    );
-    // The same without an entity param is fine.
-    let no_entity: Vec<Param> = params().into_iter().skip(1).collect();
-    for sql in [
-        "SELECT COALESCE(SUM(i.amount), 0) AS s FROM invoices i WHERE i.status = 'open'",
-        "SELECT TOTAL(i.amount) AS s FROM invoices i",
-        "SELECT IFNULL(MAX(i.amount), 0) AS top FROM invoices i",
-    ] {
-        if let Err(e) = validate(sql, &schema(), &public(), &no_entity) {
-            panic!("{sql}: {e:?}");
-        }
-    }
-    // I3: COALESCE inside an aggregate's argument masks a LEFT JOIN's NULLs.
-    assert_eq!(
-        refused(
+fn grammar_refuses_masking_routes() {
+    use ErrorClass::*;
+    let n = "FROM invoices i";
+    let cases: Vec<(String, ErrorClass)> = vec![
+        // The rework spec's list.
+        (
+            format!("SELECT SUM(CASE WHEN c.id = :p1 THEN i.amount ELSE 0 END) AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT CASE WHEN SUM(i.amount) > 0 THEN SUM(i.amount) ELSE 0 END AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (
             "SELECT SUM(COALESCE(i.amount, 0)) AS owed FROM customers c LEFT JOIN invoices i \
              ON i.customer_id = c.id WHERE c.id = :p1"
+                .to_string(),
+            ConstructNotAllowed,
         ),
-        ErrorClass::NullMasking
+        (
+            format!("SELECT SUM(COALESCE(i.amount, 0)) AS owed {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(i.amount) NOT IN (SELECT k.amount FROM invoices k) AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT 0 AS owed, COUNT(*) AS n {J}"),
+            LiteralNotAllowed,
+        ),
+        (format!("SELECT COUNT(*) + 0 AS n {J}"), LiteralNotAllowed),
+        (
+            format!("SELECT i.amount IN (SUM(i.amount), 1) AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.amount IN (SUM(i.amount), 1)"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.amount BETWEEN 1 AND 5"),
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON 1 = 1 \
+             WHERE c.id = :p1"
+                .to_string(),
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.amount \
+             WHERE c.id = :p1"
+                .to_string(),
+            ConstructNotAllowed,
+        ),
+        (
+            "WITH t AS (SELECT 0 AS z FROM invoices i) SELECT t.z FROM t".to_string(),
+            LiteralNotAllowed,
+        ),
+        (
+            "WITH t AS (SELECT i.customer_id AS cid, 0 AS z FROM invoices i \
+             GROUP BY i.customer_id) \
+             SELECT t.z FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1"
+                .to_string(),
+            LiteralNotAllowed,
+        ),
+        // Controller addendum (c).
+        (
+            format!("SELECT COUNT(*) * 0 + 1000 AS n {J}"),
+            LiteralNotAllowed,
+        ),
+        (
+            format!("SELECT julianday(i.issued) + COUNT(*) AS n {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT (1 IN (SUM(i.amount), 1)) + COUNT(*) AS n {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(c.id - c.id) AS n {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.id \
+             WHERE c.id = :p1"
+                .to_string(),
+            ConstructNotAllowed,
+        ),
+        // The old masking forms: each is outside the grammar now.
+        (
+            format!("SELECT COALESCE(SUM(i.amount), 0) AS owed {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT TOTAL(i.amount) AS owed {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT IFNULL(MAX(i.amount), 0) AS top {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT NULLIF(SUM(i.amount), 0) AS owed {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT IIF(SUM(i.amount) IS NULL, 0, 1) AS x {J}"),
+            FunctionNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(i.amount) IS NULL AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.amount IS NOT NULL"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(i.amount) AND 0 AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT CASE SUM(i.amount) WHEN 0 THEN 0 ELSE 1 END AS x {J}"),
+            ConstructNotAllowed,
+        ),
+        (format!("SELECT 1 + 2 AS owed {J}"), LiteralNotAllowed),
+        (
+            format!("SELECT -SUM(i.amount) AS owed {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(i.amount) % 2 AS owed {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(i.amount) + i.amount AS owed {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(SUM(i.amount)) AS owed {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT MAX(i.amount, 0) AS owed {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT SUM(date(i.issued)) AS owed {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT strftime('%Y', 'now') AS y {J}"),
+            LiteralNotAllowed,
+        ),
+        (
+            format!("SELECT date(i.amount) AS y {J}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} OR i.status = 'open'"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.amount > i.id"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND 1 = 1"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.amount NOT IN (1, 2)"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.amount = NULL"),
+            LiteralNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} AND i.issued >= date(:p5)"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} HAVING i.amount > 1"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {J} HAVING COUNT(*) > 1 OR COUNT(*) < 1"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {n} WHERE i.status IN ()"),
+            ConstructNotAllowed,
+        ),
+    ];
+    for (sql, want) in &cases {
+        assert_eq!(refused(sql), *want, "{sql}");
+    }
+    // Refused with or without an entity parameter.
+    for sql in [
+        format!("SELECT COALESCE(SUM(i.amount), 0) AS s {n}"),
+        format!("SELECT 0 AS owed, COUNT(*) AS n {n}"),
+        "SELECT COUNT(*) AS n FROM invoices i JOIN invoices k ON 1 = 1".to_string(),
+    ] {
+        assert!(
+            validate(&sql, &schema(), &public(), &no_entity()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn joins_only_on_declared_key_pairs() {
+    // The pair is customers.id <-> <word>_<key> = customer_id in another
+    // table, checked by column origin, not by qualifier.
+    for sql in [
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id",
+        "SELECT c.id FROM invoices i JOIN customers c ON (c.id = i.customer_id) \
+         AND i.customer_id = c.id",
+        "SELECT c2.id FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN customers c2 ON c2.id = i.customer_id",
+    ] {
+        prepares(&ok(sql).sql);
+    }
+    use ErrorClass::*;
+    for sql in [
+        "SELECT c.id FROM customers c JOIN invoices i ON i.id = c.id",
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.credit_limit",
+        "SELECT c.id FROM customers c JOIN customers k ON k.id = c.id",
+        "SELECT i.id FROM invoices i JOIN invoices k ON k.customer_id = i.customer_id",
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id AND 1 = 1",
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         AND i.status = 'open'",
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id > c.id",
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         OR i.customer_id = c.id",
+        // The ON must link the joined source to one before it.
+        "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN invoices k ON i.customer_id = c.id",
+        "SELECT c.id FROM customers c LEFT JOIN invoices i ON i.customer_id = c.id",
+        "SELECT c.id FROM customers c JOIN invoices i USING (id)",
+        "SELECT c.id FROM customers c NATURAL JOIN invoices i",
+    ] {
+        assert_eq!(refused(sql), ConstructNotAllowed, "{sql}");
+    }
+    // Addendum (b): a CTE column joins only when it is a plain (grouped)
+    // column, and its origin decides.
+    for sql in [
+        // An aggregate column is not a key.
+        "WITH t AS (SELECT k.customer_id AS cid, COUNT(*) AS n FROM invoices k \
+         GROUP BY k.customer_id) \
+         SELECT c.id FROM customers c JOIN t ON t.n = c.id",
+        // A plain column whose origin is not the FK, renamed to look like one.
+        "WITH t AS (SELECT k.id AS customer_id FROM invoices k) \
+         SELECT c.id FROM customers c JOIN t ON t.customer_id = c.id",
+        // A date expression is not a key.
+        "WITH t AS (SELECT date(k.issued) AS d FROM invoices k GROUP BY date(k.issued)) \
+         SELECT c.id FROM customers c JOIN t ON t.d = c.id",
+    ] {
+        assert_eq!(refused(sql), ConstructNotAllowed, "{sql}");
+    }
+    let v = ok("WITH t AS (SELECT k.customer_id AS cid FROM invoices k) \
+         SELECT c.id FROM customers c JOIN t ON t.cid = c.id");
+    prepares(&v.sql);
+}
+
+#[test]
+fn bare_columns_only_grouped_or_pinned() {
+    use ErrorClass::*;
+    // Addendum (a): a plain column in an aggregating block must be grouped,
+    // except a column of the entity table pinned by `key = :pN` in the
+    // outermost block.
+    for sql in [
+        // Sums all invoices for an arbitrary cid.
+        "WITH t AS (SELECT k.customer_id AS cid, SUM(k.amount) AS s FROM invoices k) \
+         SELECT t.s FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1",
+        "SELECT c.city, COUNT(*) AS n FROM customers c",
+        "SELECT i.amount, SUM(i.amount) AS s FROM invoices i GROUP BY i.status",
+        // A column of the joined (non-pinned) table.
+        "SELECT SUM(i.amount) AS s, i.status FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id WHERE c.id = :p1",
+        // An aggregate only in ORDER BY or HAVING makes the block aggregating.
+        "SELECT c.city, COUNT(*) AS n FROM customers c ORDER BY COUNT(*)",
+        "SELECT c.city FROM customers c HAVING COUNT(*) > 1",
+        // A date expression is grouped only as written.
+        "SELECT strftime('%Y', i.issued) AS y, COUNT(*) AS n FROM invoices i \
+         GROUP BY i.issued",
+    ] {
+        assert_eq!(refused(sql), ConstructNotAllowed, "{sql}");
+    }
+    for sql in [
+        BALANCE,
+        "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city",
+        "SELECT c.first_name, c.city, COUNT(i.id) AS n FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id WHERE c.id = :p1",
+        "SELECT c.city FROM customers c GROUP BY c.city",
+    ] {
+        prepares(&ok(sql).sql);
+    }
+}
+
+#[test]
+fn entity_param_positions() {
+    use ErrorClass::*;
+    for (sql, want) in [
+        // Only in the outermost WHERE.
+        (
+            "WITH t AS (SELECT c.id AS id FROM customers c WHERE c.id = :p1) \
+             SELECT t.id FROM t",
+            ParamMisuse,
+        ),
+        (
+            "SELECT c.id, COUNT(*) AS n FROM customers c GROUP BY c.id HAVING COUNT(*) = :p1",
+            ParamMisuse,
+        ),
+        // Through a CTE column, even one that came from the key.
+        (
+            "WITH t AS (SELECT c.id AS id FROM customers c) SELECT t.id FROM t \
+             WHERE t.id = :p1",
+            ParamMisuse,
+        ),
+        // A list of keys is not one pick.
+        (
+            "SELECT c.city FROM customers c WHERE c.id IN (:p1, :p1)",
+            ParamMisuse,
+        ),
+        (
+            "SELECT i.id FROM invoices i WHERE i.customer_id = :p1",
+            ParamMisuse,
+        ),
+        (
+            "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
+             ON c.id = i.customer_id AND c.id = :p1",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT c.id = :p1 AS x FROM customers c",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
+             ON c.id = i.customer_id WHERE NOT (c.id = :p1)",
+            ConstructNotAllowed,
+        ),
+    ] {
+        assert_eq!(refused(sql), want, "{sql}");
+    }
+    // A bound entity the method does not use is a method that ignores the
+    // question's subject.
+    assert_eq!(
+        class_of(
+            "SELECT SUM(i.amount) AS s FROM invoices i",
+            &schema(),
+            &params()
+        ),
+        ParamMisuse
     );
+    // Unbound, it is not required.
+    let mut ps = params();
+    ps[0].bound = None;
+    assert!(validate(
+        "SELECT SUM(i.amount) AS s FROM invoices i",
+        &schema(),
+        &public(),
+        &ps
+    )
+    .is_ok());
+    let v = ok(&format!(
+        "SELECT SUM(i.amount) AS x {J} AND i.status = 'open' AND (c.id = :p1)"
+    ));
+    assert_eq!(v.entity_params, vec!["p1"]);
+    prepares(&v.sql);
 }
 
 #[test]
@@ -470,6 +902,18 @@ fn escape_attempts_refused() {
             "SELECT c.id COLLATE nocase AS x FROM customers c",
             ConstructNotAllowed,
         ),
+        (
+            "SELECT c.city FROM customers c ORDER BY c.city NULLS FIRST",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT c.city || c.city AS x FROM customers c",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT \"count\"(c.id) AS x FROM customers c",
+            FunctionNotAllowed,
+        ),
     ];
     for (sql, want) in cases {
         assert_eq!(class_of(sql, &s, &ps), want, "{sql}");
@@ -485,7 +929,7 @@ fn escape_attempts_refused() {
          SELECT x.id FROM customers x",
         &a,
         &public(),
-        &ps,
+        &no_entity(),
     )
     .unwrap();
     assert!(v.sql.contains("\"_p_customers\""), "{}", v.sql);
@@ -526,6 +970,7 @@ fn date_range_params() {
     prepares(&v.sql);
     ok("SELECT COUNT(*) AS n FROM invoices i WHERE :p3_from <= i.issued AND :p3_to > i.issued");
     ok("SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p5");
+    ok("SELECT COUNT(*) AS n FROM invoices i WHERE date(i.issued) >= :p3_from");
     use ErrorClass::*;
     for (sql, want) in [
         (
@@ -551,6 +996,25 @@ fn date_range_params() {
         (
             "SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p3_until",
             ParamMisuse,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE :p2 = 5",
+            ErrorClass::ParamType,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE \
+             strftime('%Y-%m', i.issued) >= :p3_from",
+            ErrorClass::ParamType,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE \
+             strftime('%Y-%m', i.issued) = '2026-07'",
+            LiteralNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE \
+             date(i.issued, 'localtime') >= :p5",
+            LiteralNotAllowed,
         ),
     ] {
         assert_eq!(refused(sql), want, "{sql}");
@@ -733,7 +1197,7 @@ fn odd_unicode_never_panics() {
 
 /// Outcome of `sql` as (class or "ok"), detail.
 fn outcome(sql: &str, s: &Schema) -> (String, Option<String>) {
-    match validate(sql, s, &public(), &params()) {
+    match validate(sql, s, &public(), &ps_for(sql)) {
         Ok(_) => ("ok".into(), None),
         Err(e) => (e.class.as_str().into(), e.detail),
     }
@@ -754,10 +1218,10 @@ fn hidden_names_are_not_an_oracle() {
             "SELECT customers.amount FROM invoices customers",
             "SELECT zzfree.amount FROM invoices zzfree",
         ),
-        // Subquery alias named like a hidden table.
+        // CTE reference alias named like a hidden table.
         (
-            "SELECT customers.n FROM (SELECT COUNT(*) AS n FROM invoices i) customers",
-            "SELECT zzfree.n FROM (SELECT COUNT(*) AS n FROM invoices i) zzfree",
+            "WITH t AS (SELECT i.id AS n FROM invoices i) SELECT customers.n FROM t customers",
+            "WITH t AS (SELECT i.id AS n FROM invoices i) SELECT zzfree.n FROM t zzfree",
         ),
         // Output alias named like a hidden column, referenced.
         (
@@ -791,7 +1255,7 @@ fn hidden_names_are_not_an_oracle() {
         "SELECT COUNT(*) AS city FROM clients c ORDER BY city",
         &a,
         &public(),
-        &params(),
+        &no_entity(),
     )
     .unwrap();
     assert!(v.sql.contains("\"_p_c\""), "{}", v.sql);
@@ -815,169 +1279,6 @@ fn hidden_names_are_not_an_oracle() {
 }
 
 #[test]
-fn masking_bypasses_refused() {
-    // S2 / I2 / M8: with an entity param in play.
-    let j = "FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
-    let forms = [
-        format!("SELECT CASE SUM(i.amount) WHEN 0 THEN 0 ELSE 1 END AS x {j}"),
-        format!("SELECT CASE WHEN SUM(i.amount) > 0 THEN SUM(i.amount) ELSE 0 END AS x {j}"),
-        format!("SELECT CASE WHEN COUNT(*) = 0 THEN 0 ELSE SUM(i.amount) END AS x {j}"),
-        format!("SELECT SUM(i.amount) IS NULL AS x {j}"),
-        format!("SELECT SUM(i.amount) IS NOT NULL AS x {j}"),
-        format!("SELECT SUM(i.amount) AND 0 AS x {j}"),
-        format!("SELECT SUM(i.amount) OR 1 AS x {j}"),
-        format!("SELECT IFNULL(SUM(i.amount), 0) AS x {j}"),
-        format!("SELECT SUM(CASE WHEN i.status = 'open' THEN i.amount ELSE 0 END) AS x {j}"),
-        format!("SELECT SUM(IFNULL(i.amount, 0)) AS x {j}"),
-        format!("SELECT SUM(NULLIF(i.amount, 0)) AS x {j}"),
-        // Through a CTE and a subquery.
-        "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s FROM invoices i \
-         GROUP BY i.customer_id) \
-         SELECT CASE WHEN t.s IS NULL THEN 0 ELSE t.s END AS x FROM customers c \
-         LEFT JOIN t ON t.cid = c.id WHERE c.id = :p1"
-            .to_string(),
-        // p1 is bound: masking counts even where the query does not use it.
-        "SELECT COALESCE(t.s, 0) AS x FROM (SELECT SUM(i.amount) AS s FROM invoices i) t"
-            .to_string(),
-        "SELECT t.s IS NULL AS x FROM (SELECT SUM(i.amount) AS s FROM invoices i) t".to_string(),
-        // R2-1: NULL [NOT] IN (empty) is not NULL in SQLite.
-        format!(
-            "SELECT SUM(i.amount) NOT IN (SELECT k.amount FROM invoices k \
-             WHERE k.amount < k.amount) AS x {j}"
-        ),
-        format!(
-            "SELECT SUM(i.amount) IN (SELECT k.amount FROM invoices k \
-             WHERE k.amount < k.amount) AS x {j}"
-        ),
-        format!("SELECT SUM(i.amount) IN (1, 2) AS x {j}"),
-        format!("SELECT SUM(i.amount) NOT IN (1, 2) AS x {j}"),
-        "SELECT t.s NOT IN (1) AS x FROM (SELECT SUM(i.amount) AS s FROM invoices i) t".to_string(),
-        // R2-2: a column that reads no data is a number for an absent key.
-        format!("SELECT 0 AS owed, COUNT(*) AS n {j}"),
-        format!("SELECT 1 + 2 AS owed {j}"),
-        format!("SELECT CAST(0 AS INTEGER) AS owed {j}"),
-        "SELECT t.z FROM (SELECT 0 AS z, COUNT(*) AS n FROM invoices i) t".to_string(),
-        "WITH t AS (SELECT 0 AS z FROM invoices i) SELECT t.z FROM t".to_string(),
-        // R2-3: any ELSE but NULL inside a value aggregate.
-        format!("SELECT SUM(CASE WHEN i.amount > 0 THEN i.amount ELSE c.id - c.id END) AS x {j}"),
-        format!("SELECT SUM(CASE WHEN i.amount > 0 THEN i.amount ELSE i.amount END) AS x {j}"),
-    ];
-    for sql in &forms {
-        assert_eq!(refused(sql), ErrorClass::NullMasking, "{sql}");
-    }
-    assert_eq!(
-        refused(&format!("SELECT IIF(SUM(i.amount) IS NULL, 0, 1) AS x {j}")),
-        ErrorClass::FunctionNotAllowed
-    );
-    // Legitimate COUNT and SUM stay allowed; COUNT = 0 is a number.
-    ok(&format!("SELECT SUM(i.amount) AS owed, COUNT(*) AS n {j}"));
-    ok(&format!(
-        "SELECT SUM(CASE WHEN i.status = 'open' THEN i.amount END) AS x {j}"
-    ));
-    ok(&format!(
-        "SELECT COUNT(CASE WHEN i.status = 'open' THEN 1 END) AS x {j}"
-    ));
-    ok(&format!(
-        "SELECT COUNT(*) AS n {j} GROUP BY i.status HAVING SUM(i.amount) > 5 AND COUNT(*) > 1"
-    ));
-    ok("SELECT t.s FROM (SELECT SUM(i.amount) AS s FROM invoices i) t");
-    // R2-3: no ELSE, ELSE NULL and constant THEN branches are NULL on no rows.
-    ok(&format!(
-        "SELECT SUM(CASE WHEN i.amount > 0 THEN i.amount ELSE NULL END) AS x {j}"
-    ));
-    ok(&format!(
-        "SELECT SUM(CASE WHEN i.status = 'open' THEN 1 END) AS x {j}"
-    ));
-    // R2-1 / R2-2: the same without an entity param in play is fine.
-    let none: Vec<Param> = params().into_iter().skip(1).collect();
-    for sql in [
-        "SELECT SUM(i.amount) NOT IN (1, 2) AS x FROM invoices i",
-        "SELECT 0 AS owed, COUNT(*) AS n FROM invoices i",
-        "SELECT t.z FROM (SELECT 0 AS z, COUNT(*) AS n FROM invoices i) t",
-    ] {
-        if let Err(e) = validate(sql, &schema(), &public(), &none) {
-            panic!("{sql}: {e:?}");
-        }
-    }
-    // An empty IN list is refused outright.
-    assert_eq!(
-        refused("SELECT c.id FROM customers c WHERE c.id IN ()"),
-        ErrorClass::ConstructNotAllowed
-    );
-}
-
-#[test]
-fn entity_param_only_restricts() {
-    // I1: the entity param must restrict the rows of its own block.
-    use ErrorClass::*;
-    let cases = [
-        "SELECT SUM(CASE WHEN c.id = :p1 THEN i.amount END) AS x FROM invoices i \
-         JOIN customers c ON c.id = i.customer_id",
-        "SELECT SUM(CASE c.id WHEN :p1 THEN i.amount END) AS x FROM invoices i \
-         JOIN customers c ON c.id = i.customer_id",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
-         WHERE c.id = :p1 OR i.status = 'open'",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
-         WHERE NOT (c.id = :p1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
-         GROUP BY c.id HAVING c.id = :p1",
-        "SELECT c.id = :p1 AS x FROM customers c",
-        "SELECT SUM(i.amount) AS x FROM invoices i LEFT JOIN customers c \
-         ON c.id = i.customer_id AND c.id = :p1",
-        // A correlated outer key does not restrict the outer block.
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
-         WHERE EXISTS (SELECT 1 FROM invoices j WHERE c.id = :p1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i WHERE NOT EXISTS \
-         (SELECT 1 FROM customers c WHERE c.id = :p1 AND c.id = i.customer_id)",
-        "SELECT SUM(i.amount) AS x FROM invoices i WHERE i.customer_id NOT IN \
-         (SELECT c.id FROM customers c WHERE c.id = :p1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i WHERE i.status = 'open' OR i.customer_id IN \
-         (SELECT c.id FROM customers c WHERE c.id = :p1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i LEFT JOIN \
-         (SELECT c.id FROM customers c WHERE c.id = :p1) t ON t.id = i.customer_id",
-        // R2-4 (a): only the outermost block may carry the entity param.
-        "SELECT SUM(i.amount) AS x FROM invoices i WHERE i.customer_id IN \
-         (SELECT c.id FROM customers c WHERE c.id = :p1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i WHERE EXISTS \
-         (SELECT 1 FROM customers c WHERE c.id = :p1 AND c.id = i.customer_id)",
-        "SELECT SUM(i.amount) AS x FROM invoices i WHERE EXISTS \
-         (SELECT 1 FROM customers c WHERE c.id = :p1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN \
-         (SELECT c.id FROM customers c WHERE c.id = :p1) t ON t.id = i.customer_id",
-        // R2-4 (b): every join in the entity block correlates.
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON 1 = 1 \
-         WHERE c.id = :p1",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = :p1",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
-         ON i.status = 'open' WHERE c.id = :p1",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id JOIN invoices k ON k.id = k.id WHERE c.id = :p1",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id OR 1 = 1 WHERE c.id = :p1",
-        // Bound but unused still counts as in play.
-        "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON 1 = 1",
-    ];
-    for sql in cases {
-        assert_eq!(refused(sql), ParamMisuse, "{sql}");
-    }
-    for sql in [
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c ON c.id = i.customer_id \
-         WHERE i.status = 'open' AND (c.id = :p1 AND 1 = 1)",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id AND c.id = :p1",
-        "SELECT SUM(i.amount) AS x FROM invoices i JOIN customers c \
-         ON (i.customer_id = c.id AND 1 = 1) WHERE c.id = :p1",
-        "SELECT SUM(t.s) AS x FROM customers c JOIN (SELECT k.customer_id AS cid, \
-         SUM(k.amount) AS s FROM invoices k GROUP BY k.customer_id) t \
-         ON t.cid = c.id WHERE c.id = :p1",
-    ] {
-        let v = ok(sql);
-        assert_eq!(v.entity_params, vec!["p1"], "{sql}");
-        prepares(&v.sql);
-    }
-}
-
-#[test]
 fn rowid_names_and_duplicate_outputs_refused() {
     use ErrorClass::*;
     for sql in [
@@ -994,18 +1295,4 @@ fn rowid_names_and_duplicate_outputs_refused() {
         assert_eq!(refused(sql), ConstructNotAllowed, "{sql}");
     }
     ok("SELECT c.id, i.id AS invoice_id FROM customers c JOIN invoices i ON i.customer_id = c.id");
-}
-
-#[test]
-fn uncorrelated_join_without_entity_is_allowed() {
-    // R2-4: joins stay as they are when no entity param is in play.
-    let none: Vec<Param> = params().into_iter().skip(1).collect();
-    let v = validate(
-        "SELECT COUNT(*) AS n FROM invoices i JOIN invoices k ON 1 = 1",
-        &schema(),
-        &public(),
-        &none,
-    )
-    .unwrap();
-    prepares(&v.sql);
 }
