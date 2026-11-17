@@ -518,6 +518,12 @@ async fn run(
         (Ok(Value::Object(m)), a::WORKSPACE_TOUCH_BEGIN) => m.remove("touch_begin"),
         _ => None,
     };
+    // Nor is a revise's note (a held prompt sent ahead of it): it is the
+    // record's reason.
+    let noted = match (&mut out, action) {
+        (Ok(Value::Object(m)), a::BOX_REVISE) => m.remove(REVISE_NOTE),
+        _ => None,
+    };
     let changing = CHANGES.contains(&action);
     let (record, refused) = match &out {
         Ok(_) => (changing, None),
@@ -533,6 +539,9 @@ async fn run(
         }
         if let Some(tb) = begun {
             rec.extra.insert("touch_begin".into(), tb);
+        }
+        if let Some(Value::String(n)) = noted {
+            rec.reason = Some(n);
         }
         if let Some(ev) = evidence {
             rec.extra.insert("touch".into(), ev);
@@ -849,14 +858,21 @@ async fn steer(
         None => *window = true,
     }
     let name = action.to_string();
-    blocking(&src, move |b| match (name.as_str(), text) {
-        (a::BOX_STEER, Some(t)) => b.steer(&id, &t),
-        (a::BOX_REVISE, Some(t)) => b.revise(&id, &t),
-        _ => b.resume(&id),
+    let note = blocking(&src, move |b| match (name.as_str(), text) {
+        (a::BOX_STEER, Some(t)) => b.steer(&id, &t).map(|()| None),
+        (a::BOX_REVISE, Some(t)) => b.revise_noted(&id, &t),
+        _ => b.resume(&id).map(|()| None),
     })
     .await?;
-    Ok(json!({}))
+    // The frame takes the note into its record, not its answer.
+    Ok(match note {
+        Some(n) => json!({ REVISE_NOTE: n }),
+        None => json!({}),
+    })
 }
+
+/// The answer key `steer` passes a revise's note to `frame` in (R25/N1).
+const REVISE_NOTE: &str = "revise_note";
 
 /// The device owner's uid.
 async fn owner_uid_of(ctx: &Arc<Ctx>, v: &Verified) -> Result<u32, Fail> {

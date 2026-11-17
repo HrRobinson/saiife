@@ -27,6 +27,9 @@ const CREDS_FILE: &str = "credentials.json";
 /// up to 4 land requests of the Workspace leave room for other touches.
 const MAX_LIVE: usize = 32;
 const MAX_PER_UID: usize = 8;
+/// Live `Web` challenges per Workspace device, inside its owner's
+/// [`MAX_PER_UID`]: one browser cannot hold all of its owner's slots.
+const MAX_PER_DEVICE: usize = 4;
 
 /// Unix seconds now, from the daemon's clock (so a faked clock applies).
 pub fn unix_now() -> u64 {
@@ -195,7 +198,9 @@ impl TouchState {
 
     /// Issues a challenge for `key`, replacing one with the same key. The
     /// caps are counted without that entry, and a refused issue leaves it
-    /// as it was.
+    /// as it was. Caps: [`MAX_LIVE`] in all and [`MAX_PER_UID`] per uid
+    /// ("too many touches in progress"), and [`MAX_PER_DEVICE`] per
+    /// Workspace device for a `Web` key ("... on this device").
     ///
     /// Callers on the runtime use `spawn_blocking`, as for every other
     /// method here (R14).
@@ -214,6 +219,16 @@ impl TouchState {
         if others().count() >= MAX_LIVE || others().filter(|v| v.uid == uid).count() >= MAX_PER_UID
         {
             return Err("too many touches in progress".into());
+        }
+        if let IssueKey::Web { device, .. } = &key {
+            let on_device = m
+                .keys()
+                .filter(|k| **k != key)
+                .filter(|k| matches!(k, IssueKey::Web { device: d, .. } if d == device))
+                .count();
+            if on_device >= MAX_PER_DEVICE {
+                return Err("too many touches in progress on this device".into());
+            }
         }
         let it = Issued {
             uid,
@@ -572,13 +587,41 @@ mod tests {
     fn web_entries_share_the_caps() {
         let d = dir();
         let (t, _) = TouchState::open(d.path());
-        for i in 0..8 {
+        for i in 0..4 {
             issue(&t, web("dev-a", i), 1000, NOW).unwrap();
+            issue(&t, web("dev-b", i), 1000, NOW).unwrap();
         }
-        let e = issue(&t, web("dev-a", 8), 1000, NOW).unwrap_err();
+        let e = issue(&t, web("dev-c", 8), 1000, NOW).unwrap_err();
         assert_eq!(e, "too many touches in progress");
         // An Approve entry of the same uid counts too.
         assert!(issue(&t, IssueKey::Approve(1), 1000, NOW).is_err());
+    }
+
+    /// Task 5 (b): a device holds at most 4 live challenges, inside its
+    /// owner's 8; the refusal says which cap fired.
+    #[test]
+    fn per_device_cap_is_four_inside_the_uid_cap() {
+        let d = dir();
+        let (t, _) = TouchState::open(d.path());
+        for i in 0..4 {
+            issue(&t, web("dev-a", i), 1000, NOW).unwrap();
+        }
+        let e = issue(&t, web("dev-a", 4), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress on this device");
+        // The same key at the cap replaces (it is not counted).
+        issue(&t, web("dev-a", 0), 1000, NOW).unwrap();
+        // Another device of the same uid still begins, up to the uid's 8.
+        for i in 0..4 {
+            issue(&t, web("dev-b", i), 1000, NOW).unwrap();
+        }
+        // The uid cap fires at 8, from a device with room and from a
+        // non-web key.
+        let e = issue(&t, web("dev-c", 0), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress");
+        let e = issue(&t, IssueKey::Approve(1), 1000, NOW).unwrap_err();
+        assert_eq!(e, "too many touches in progress");
+        // Expired ones drop: the device begins again.
+        issue(&t, web("dev-a", 5), 1000, NOW + 301).unwrap();
     }
 
     /// `take` spends the entry whatever the outcome: missing is

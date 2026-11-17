@@ -22,8 +22,12 @@
 //! A Discarded record whose `vm` is still `Some` means the VMM resource may
 //! still exist (its destroy failed, for instance a VMM still stopping: a
 //! driver's destroy is bounded and does not wait out its stop ladder, R41).
-//! Every tick retries the destroy and clears `vm` once it succeeds; gc also
-//! retries it before removing the record.
+//! The tick retries the destroy and clears `vm` once it succeeds; gc also
+//! retries it before removing the record. Each tick retry that fails backs
+//! that record off (R44): the next try waits [`DESTROY_RETRY_FIRST_SECS`],
+//! doubling to at most [`DESTROY_RETRY_MAX_SECS`], so a VMM that never
+//! confirms its exit does not cost every tick a second of the lock. The
+//! backoff is in memory only and never treats the VM as gone.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -32,6 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use saiife_wire::source::{
     check_text, BoxError, BoxId, BoxState, Start, MAX_STEER_BYTES, MAX_TASK_BYTES,
 };
+pub use saiife_wire::source::{HELD_PROMPT_SENT_FIRST, MAX_REVISED_PROMPT_BYTES};
 
 use crate::capacity::{self, Committed, HostFacts};
 use crate::error::BoxesError;
@@ -49,6 +54,11 @@ pub const BOOT_TIMEOUT_SECS: u64 = 90;
 pub const WHY_BOOT_TIMED_OUT: &str = "boot timed out";
 /// A finished turn with no activity for this long → `Done`.
 pub const DONE_IDLE_SECS: u64 = 30;
+/// R44: the tick's first wait before retrying a destroy that failed
+/// again (one daemon tick); it doubles after each failure.
+pub const DESTROY_RETRY_FIRST_SECS: u64 = 5;
+/// R44: the cap on that wait.
+pub const DESTROY_RETRY_MAX_SECS: u64 = 300;
 /// Idle stop for a box whose template was deleted.
 pub const DEFAULT_IDLE_STOP_MINS: u32 = 120;
 /// Longest repo name accepted at spawn.
@@ -67,6 +77,15 @@ const LOST: &str = "the VM was gone after a daemon restart";
 pub const WHY_LOST: &str = "vm lost after restart";
 pub const WHY_RECONCILED: &str = "reconciled";
 const REORDER: &str = "reorder must list every queued box once";
+const PROMPT_NOT_DELIVERED: &str = "the box's prompt is not delivered yet; steer again once it is";
+/// A paused box sends its held prompt only once it runs again, and, under
+/// lockdown `all` (R30), only once lockdown lifts too. The manager does not
+/// know the lockdown level, so the text names both.
+const PROMPT_HELD_PAUSED: &str = "the box's prompt is not delivered yet; resume the box first \
+     (under lockdown `all` it also waits for lockdown to lift), then steer again";
+/// A VM-on revise sent the held prompt but not its comment (R25/N1).
+pub const COMMENT_AFTER_HELD_FAILED: &str = "the held prompt was sent and the box runs again, \
+     but the revise comment was not: send the comment again as a steer";
 
 /// Unix seconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -164,6 +183,39 @@ struct Inner {
     /// discard drops the entry, so a late outcome changes nothing.
     prompting: BTreeMap<BoxId, u64>,
     next_token: u64,
+    /// R44: the tick's destroy backoff of each Discarded record that still
+    /// holds a VM and whose retry failed. In memory only: after a restart
+    /// the first tick retries at once.
+    retries: BTreeMap<BoxId, Backoff>,
+}
+
+/// A destroy the tick retried and that failed again (R44).
+struct Backoff {
+    /// Tick retries that failed in a row.
+    fails: u32,
+    /// The tick skips the record before this.
+    next_at: u64,
+}
+
+impl Backoff {
+    /// Whether the tick retries now. A clock set back past the longest
+    /// wait counts as due, so it never stretches a wait.
+    fn due(&self, now: u64) -> bool {
+        now >= self.next_at || self.next_at - now > DESTROY_RETRY_MAX_SECS
+    }
+
+    /// One more failure at `now`: the wait is `DESTROY_RETRY_FIRST_SECS`
+    /// doubled for each earlier failure, at most `DESTROY_RETRY_MAX_SECS`.
+    fn failed(prev: Option<&Backoff>, now: u64) -> Backoff {
+        let fails = prev.map_or(0, |b| b.fails).saturating_add(1);
+        let wait = DESTROY_RETRY_FIRST_SECS
+            .saturating_mul(1 << (fails - 1).min(32))
+            .min(DESTROY_RETRY_MAX_SECS);
+        Backoff {
+            fails,
+            next_at: now.saturating_add(wait),
+        }
+    }
 }
 
 /// A prompt taken out under the lock, to send once it is released.
@@ -316,6 +368,7 @@ impl Manager {
             placing: BTreeSet::new(),
             prompting: BTreeMap::new(),
             next_token: 0,
+            retries: BTreeMap::new(),
         };
         let mut max_seq = 0;
         let mut changes = Vec::new();
@@ -779,6 +832,13 @@ impl Manager {
             }
             return Ok(change(&r, from, "stop"));
         };
+        // A snapshot taken while the task prompt is out to the guest (m3)
+        // may or may not hold it: the guest can have typed it already or
+        // not, and the prompt stays pending either way until its send
+        // ends. A failed send keeps it (R25), so a box restored from this
+        // snapshot can get the task twice (sent again at the next run) or,
+        // when the send succeeded after the snapshot, not at all. Neither
+        // is detectable from here; it is accepted, not handled.
         let snap = keep && from != BoxState::Starting;
         let paused_here = snap && from != BoxState::Paused;
         if paused_here {
@@ -876,6 +936,14 @@ impl Manager {
 
     /// Steer a Running or Paused box (R3). The state is checked under the
     /// lock; the message is sent with it released.
+    ///
+    /// R26: a steer never overtakes the box's prompt. While a prompt is
+    /// still to be delivered (held, or out to the guest) the steer is
+    /// `Unavailable`, to retry once it is: the guest bounds a send to a
+    /// few seconds, and a held prompt goes out at the next tick once the
+    /// box runs. Nothing can start a prompt between this check and the
+    /// steer's send: a prompt is only claimed at `Ready` (from Starting), by
+    /// the tick (only a held one) or by a revise (from Done or Landed).
     pub fn say(&self, id: &BoxId, msg: &str) -> Result<(), BoxError> {
         check_text(msg, MAX_STEER_BYTES)?;
         {
@@ -884,14 +952,43 @@ impl Manager {
             if !matches!(r.state, BoxState::Running | BoxState::Paused) {
                 return Err(BoxError::WrongState { state: r.state });
             }
+            if r.pending_prompt.is_some() || g.prompting.contains_key(id) {
+                // Paused, the held prompt waits for a resume: retrying alone
+                // never helps.
+                let why = if r.state == BoxState::Paused {
+                    PROMPT_HELD_PAUSED
+                } else {
+                    PROMPT_NOT_DELIVERED
+                };
+                return Err(BoxError::Unavailable(why.into()));
+            }
         }
         self.guest.prompt(id, msg).map_err(BoxError::from)
+    }
+
+    /// [`Manager::revise_noted`] without the note.
+    pub fn revise(&self, id: &BoxId, comment: &str) -> Result<Change, BoxError> {
+        self.revise_noted(id, comment).map(|(c, _)| c)
     }
 
     /// Done or Landed only. VM on: the comment is sent and the box runs
     /// again. VM off: the comment waits for `Ready` and the box rejoins the
     /// queue at the tail.
-    pub fn revise(&self, id: &BoxId, comment: &str) -> Result<Change, BoxError> {
+    ///
+    /// A revise is a follow-up comment: a prompt the box still holds unsent
+    /// (a stop or pause cut its send short, or lockdown held it; often the
+    /// task itself) goes first, never dropped. VM on: the held prompt is
+    /// sent, then the comment, under one send token; if only the comment
+    /// fails, the box still runs (the agent works on the held prompt) and
+    /// the error says to send the comment again. VM off: the next
+    /// `Ready` sends `held + "\n\n" + comment`, refused (`Invalid`, nothing
+    /// changed) when over [`MAX_REVISED_PROMPT_BYTES`]. The note is then
+    /// [`HELD_PROMPT_SENT_FIRST`], for the caller's record (R25/N1).
+    pub fn revise_noted(
+        &self,
+        id: &BoxId,
+        comment: &str,
+    ) -> Result<(Change, Option<&'static str>), BoxError> {
         check_text(comment, MAX_STEER_BYTES)?;
         let now = self.now();
         let mut g = self.lock();
@@ -900,17 +997,50 @@ impl Manager {
         if !matches!(from, BoxState::Done | BoxState::Landed) {
             return Err(BoxError::WrongState { state: from });
         }
+        let held = r.pending_prompt.clone();
         let why = if r.vm_on {
             let to = transition(from, Event::Revise)?;
             let token = g.claim_send(id).ok_or_else(|| {
                 BoxError::Unavailable("a prompt to the box is still being sent".into())
             })?;
-            // Sent with the lock released; the box is re-read after.
+            // Sent with the lock released, the held prompt first; the box is
+            // re-read after.
             drop(g);
-            let sent = self.guest.prompt(id, comment);
+            let mut held_out = false;
+            let mut sent = Ok(());
+            if let Some(h) = held.as_deref() {
+                sent = self.guest.prompt(id, h);
+                held_out = sent.is_ok();
+            }
+            if sent.is_ok() {
+                sent = self.guest.prompt(id, comment);
+            }
             g = self.lock();
             let ours = g.end_send(id, token);
-            sent.map_err(BoxError::from)?;
+            if let Err(e) = sent {
+                // The held prompt went out but the comment did not: it is
+                // delivered and the agent works on it, so the box (still as
+                // it was) runs again, as after a full revise, and no longer
+                // holds it. The comment's error is still returned, saying so.
+                if let Some(mut cur) = g.records.get(id).cloned().filter(|c| {
+                    held_out && ours && c.state == from && c.vm_on && c.pending_prompt == held
+                }) {
+                    cur.state = to;
+                    cur.turn_finished_at = None;
+                    cur.last_activity = now;
+                    cur.pending_prompt = None;
+                    cur.updated_at = now;
+                    let _ = g.put(cur);
+                    let why = match BoxError::from(e) {
+                        BoxError::Unavailable(m) => m,
+                        other => other.to_string(),
+                    };
+                    return Err(BoxError::Unavailable(format!(
+                        "{COMMENT_AFTER_HELD_FAILED}: {why}"
+                    )));
+                }
+                return Err(BoxError::from(e));
+            }
             r = g.get(id)?.clone();
             // The box moved on while the comment was out (stopped, requeued
             // or discarded): it is not revived.
@@ -920,18 +1050,36 @@ impl Manager {
             r.state = to;
             r.turn_finished_at = None;
             r.last_activity = now;
+            r.pending_prompt = None;
             "revise"
         } else {
+            let next = match &held {
+                Some(h) => {
+                    let joined = format!("{h}\n\n{comment}");
+                    if joined.len() > MAX_REVISED_PROMPT_BYTES {
+                        return Err(BoxError::Invalid(format!(
+                            "the box still holds its unsent prompt ({} bytes), which goes \
+                             ahead of the comment; together they are over \
+                             {MAX_REVISED_PROMPT_BYTES} bytes: shorten the comment",
+                            h.len()
+                        )));
+                    }
+                    joined
+                }
+                None => comment.to_string(),
+            };
             // A prompt still out from the box's earlier run records nothing.
             g.prompting.remove(id);
             r.state = transition(from, Event::Requeue)?;
-            r.pending_prompt = Some(comment.to_string());
             r.queue_seq = Some(g.take_seq());
+            // The next `Ready` sends it.
+            r.pending_prompt = Some(next);
             "requeue"
         };
         r.updated_at = now;
         g.put(r.clone())?;
-        Ok(change(&r, from, why))
+        let note = held.is_some().then_some(HELD_PROMPT_SENT_FIRST);
+        Ok((change(&r, from, why), note))
     }
 
     /// `ids` must be exactly the queued set; positions follow its order.
@@ -1123,8 +1271,11 @@ impl Manager {
     /// `error`) while the send is still the box's one in flight and the
     /// record still holds that prompt. A box that moved on meanwhile (a
     /// requeue gave it a newer prompt, or it was discarded) is left as is,
-    /// and a failed send to a box no longer running with its VM on (a stop
-    /// came in) keeps its prompt and records no error (R25).
+    /// and a failed send to a box no longer running with its VM on (a stop,
+    /// pause or finish came in) keeps its prompt and records no error
+    /// (R25): the tick sends it again once the box runs (after a resume, or
+    /// a daemon restart), and a revise sends it ahead of its comment, with
+    /// a note (N1).
     fn deliver(&self, out: impl IntoIterator<Item = Outgoing>) {
         for o in out {
             let sent = self.guest.prompt(&o.id, &o.text);
@@ -1139,8 +1290,9 @@ impl Manager {
             if r.pending_prompt.as_deref() != Some(o.text.as_str()) {
                 continue;
             }
-            // R25: a send that failed because the box was stopped meanwhile
-            // keeps its prompt for the next start, with no error.
+            // R25: a send that failed because the box moved on meanwhile
+            // keeps its prompt (sent again once the box runs, or ahead of a
+            // revise's comment), with no error.
             if sent.is_err() && !(r.state == BoxState::Running && r.vm_on) {
                 continue;
             }
@@ -1154,15 +1306,24 @@ impl Manager {
         }
     }
 
+    /// When the tick next retries the destroy of `id`, a Discarded record
+    /// whose VMM has not confirmed its exit (R44). `None`: no backoff (no
+    /// retry failed yet, or the exit is confirmed); the next tick retries
+    /// it if it still holds a VM.
+    pub fn destroy_retry_at(&self, id: &BoxId) -> Option<u64> {
+        self.lock().retries.get(id).map(|b| b.next_at)
+    }
+
     /// `tick_with(true)`.
     pub fn tick(&self) -> Vec<Change> {
         self.tick_with(true)
     }
 
-    /// Destroy retries for Discarded records that still hold a VM (R41),
-    /// boot timeouts, finished turns and idle stops, which only take power
-    /// away; then, with `admit`, the prompts a `Ready` under lockdown held
-    /// (for Running boxes) and the admission pass. The daemon passes
+    /// Destroy retries for Discarded records that still hold a VM (R41;
+    /// each record backed off after a failed retry, R44), boot timeouts,
+    /// finished turns and idle stops, which only take power away; then,
+    /// with `admit`, the prompts a `Ready` under lockdown held (for Running
+    /// boxes) and the admission pass. The daemon passes
     /// `admit = false` under lockdown `all` (R30): the queue and held
     /// prompts wait until it lifts.
     pub fn tick_with(&self, admit: bool) -> Vec<Change> {
@@ -1172,17 +1333,36 @@ impl Manager {
         let mut out = Vec::new();
         // Held prompts are sent after the pass, with the lock released.
         let mut sends = Vec::new();
+        // R44: a backoff ends once its record no longer awaits a destroy
+        // (confirmed elsewhere, by gc for instance, or removed).
+        let Inner {
+            records, retries, ..
+        } = &mut *g;
+        retries.retain(|id, _| {
+            records
+                .get(id)
+                .is_some_and(|r| r.state == BoxState::Discarded && r.vm.is_some())
+        });
         let ids: Vec<BoxId> = g.records.keys().cloned().collect();
         for id in ids {
             let mut r = g.records[&id].clone();
             if r.state == BoxState::Discarded {
-                // R41: retry a destroy that failed (the VMM was still stopping)
+                // R41: retry a destroy that failed (the VMM was still
+                // stopping); R44: with a per-record backoff, since each try
+                // can hold the lock about a second.
                 if let Some(h) = r.vm.clone() {
+                    if g.retries.get(&id).is_some_and(|b| !b.due(now)) {
+                        continue;
+                    }
                     if self.vmm.destroy(&h).is_ok() {
+                        g.retries.remove(&id);
                         r.vm = None;
                         r.error = r.error.take().and_then(without_destroy_failure);
                         r.updated_at = now;
                         let _ = g.put(r);
+                    } else {
+                        let b = Backoff::failed(g.retries.get(&id), now);
+                        g.retries.insert(id, b);
                     }
                 }
                 continue;
@@ -1291,6 +1471,7 @@ impl Manager {
                 r.vm = None;
                 g.records.insert(id.clone(), r);
             }
+            g.retries.remove(&id);
             match g.store.remove(&id) {
                 Ok(()) => {
                     g.records.remove(&id);

@@ -424,23 +424,29 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fake(dir: &Path, name: &str, log: &Path) -> PathBuf {
+    /// The one logging script behind every fake tool, a checked-in fixture
+    /// (mode 755): nothing is written at run time, so no write fd can leak
+    /// into a forking test thread and make the exec fail with ETXTBSY. Each
+    /// test links it under the tool's name; it logs to `calls.log` next to
+    /// the link it was started through.
+    fn fake_script() -> &'static Path {
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake-tool"
+        ))
+    }
+
+    fn fake(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
-        // one line per call: tool name, then each argument
-        let body = format!(
-            "#!/bin/sh\nprintf '%s' '{name}' >>'{l}'\nfor a in \"$@\"; do printf ' %s' \"$a\" >>'{l}'; done\nprintf '\\n' >>'{l}'\n",
-            l = log.display()
-        );
-        fs::write(&p, body).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(fake_script(), &p).unwrap();
         p
     }
 
     fn world() -> (tempfile::TempDir, Tools, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let log = d.path().join("calls.log");
-        let mk = fake(d.path(), "mkfs.vfat", &log);
-        let mc = fake(d.path(), "mcopy", &log);
+        let mk = fake(d.path(), "mkfs.vfat");
+        let mc = fake(d.path(), "mcopy");
         let env = move |k: &str| -> Option<OsString> {
             match k {
                 "SAIIFE_TOOL_MKFS_VFAT" => Some(mk.clone().into_os_string()),

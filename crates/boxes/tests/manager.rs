@@ -10,7 +10,8 @@ use saiife_boxes::capacity::{self, Committed};
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::{
     Change, DiskPlace, DiskPlacer, GcReport, GuardCounts, Manager, SpawnArgs, BOOT_TIMEOUT_SECS,
-    DONE_IDLE_SECS,
+    DESTROY_RETRY_FIRST_SECS, DESTROY_RETRY_MAX_SECS, DONE_IDLE_SECS, HELD_PROMPT_SENT_FIRST,
+    MAX_REVISED_PROMPT_BYTES,
 };
 use saiife_boxes::store::{BoxRecord, Store};
 use saiife_boxes::template::{Login, Size};
@@ -66,6 +67,8 @@ fn running(w: &World, task: &str) -> BoxId {
 fn constants_are_the_fixed_values() {
     assert_eq!(BOOT_TIMEOUT_SECS, 90);
     assert_eq!(DONE_IDLE_SECS, 30);
+    assert_eq!(DESTROY_RETRY_FIRST_SECS, 5);
+    assert_eq!(DESTROY_RETRY_MAX_SECS, 300);
 }
 
 #[test]
@@ -1791,7 +1794,11 @@ fn tick_retries_a_failed_destroy_until_it_succeeds() {
     assert!(w.mgr.tick().is_empty());
     assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
     assert!(w.mgr.get(&r.id).unwrap().vm.is_some());
+    // R44: not again before its backoff elapses
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(count(&w, &r.id, VmOp::Destroy), 2);
     // then it succeeds: vm cleared, the destroy failure dropped, saved
+    w.advance(DESTROY_RETRY_FIRST_SECS);
     assert!(w.mgr.tick().is_empty());
     assert_eq!(count(&w, &r.id, VmOp::Destroy), 3);
     let g = w.mgr.get(&r.id).unwrap();
@@ -1826,6 +1833,139 @@ fn tick_retries_a_failed_discard_destroy() {
         }
     );
     assert_eq!(count(&w, &a, VmOp::Destroy), 2);
+}
+
+/// A done box whose discard's destroy fails for good (its VMM never
+/// confirms its exit): Discarded, still holding its VM.
+fn wedged(w: &World, task: &str) -> BoxId {
+    let b = running(w, task);
+    w.mgr.done(&b).unwrap();
+    w.vmm.wedge(&b, true);
+    w.mgr.discard(&b).unwrap();
+    let g = w.mgr.get(&b).unwrap();
+    assert_eq!(g.state, BoxState::Discarded);
+    assert!(g.vm.is_some());
+    assert_eq!(count(w, &b, VmOp::Destroy), 1);
+    b
+}
+
+/// R44: the tick retries a wedged record's destroy at once, then waits
+/// `DESTROY_RETRY_FIRST_SECS`, doubling after each failure up to
+/// `DESTROY_RETRY_MAX_SECS`; a tick before the wait is over skips it. It
+/// stays Discarded with its VM throughout (fail closed).
+#[test]
+fn tick_backs_off_a_destroy_that_keeps_failing() {
+    let w = world(1);
+    let a = wedged(&w, "a");
+    assert_eq!(w.mgr.destroy_retry_at(&a), None);
+    assert!(w.mgr.tick().is_empty());
+    assert_eq!(
+        count(&w, &a, VmOp::Destroy),
+        2,
+        "the first tick retries at once"
+    );
+    let mut n = 2;
+    for wait in [5, 10, 20, 40, 80, 160, 300, 300, 300] {
+        assert_eq!(w.mgr.destroy_retry_at(&a), Some(w.now() + wait));
+        w.advance(wait - 1);
+        assert!(w.mgr.tick().is_empty());
+        assert_eq!(count(&w, &a, VmOp::Destroy), n, "skipped before {wait} s");
+        w.advance(1);
+        assert!(w.mgr.tick().is_empty());
+        n += 1;
+        assert_eq!(count(&w, &a, VmOp::Destroy), n, "retried after {wait} s");
+        let g = w.mgr.get(&a).unwrap();
+        assert_eq!(g.state, BoxState::Discarded);
+        assert!(g.vm.is_some(), "never treated as gone unconfirmed");
+    }
+}
+
+/// R44: one record's backoff holds back nothing else in the tick: a
+/// failed destroy of another record is retried on the next tick, and a
+/// boot timeout due while the wedged record waits is handled.
+#[test]
+fn a_backed_off_record_leaves_the_others_alone() {
+    let w = world(3);
+    let a = wedged(&w, "a");
+    let c = w.spawn("c").id;
+    let t0 = w.now();
+    // a fails at t0, +5, +15, +35, +75: next try at +155
+    for at in [0, 5, 15, 35, 75] {
+        w.clock.store(t0 + at, std::sync::atomic::Ordering::SeqCst);
+        assert!(w.mgr.tick().is_empty());
+    }
+    assert_eq!(count(&w, &a, VmOp::Destroy), 6);
+    let b = running(&w, "b");
+    w.mgr.done(&b).unwrap();
+    w.vmm.fail_next(VmOp::Destroy, "busy");
+    w.mgr.discard(&b).unwrap();
+    assert!(w.mgr.get(&b).unwrap().vm.is_some());
+    w.clock
+        .store(t0 + BOOT_TIMEOUT_SECS, std::sync::atomic::Ordering::SeqCst);
+    let out = w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 6, "a still waits");
+    assert_eq!(count(&w, &b, VmOp::Destroy), 2, "b is retried at once");
+    assert_eq!(w.mgr.get(&b).unwrap().vm, None);
+    assert_eq!(w.mgr.destroy_retry_at(&b), None);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].id, c);
+    assert_eq!(out[0].why, "boot timed out");
+}
+
+/// R44: once the exit is confirmed the backoff is gone: by the tick's own
+/// retry, or by gc's (which a backoff never holds back).
+#[test]
+fn a_confirmed_exit_ends_the_backoff() {
+    let w = world(2);
+    let a = wedged(&w, "a");
+    for _ in 0..4 {
+        w.mgr.tick();
+        w.advance(DESTROY_RETRY_MAX_SECS);
+    }
+    assert!(w.mgr.destroy_retry_at(&a).is_some());
+    w.vmm.wedge(&a, false);
+    w.mgr.tick();
+    let g = w.mgr.get(&a).unwrap();
+    assert_eq!(g.vm, None);
+    assert_eq!(g.error, None);
+    assert_eq!(w.mgr.destroy_retry_at(&a), None);
+    let n = count(&w, &a, VmOp::Destroy);
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), n, "nothing left to retry");
+
+    // gc confirms a backed-off record's exit and removes it
+    let b = wedged(&w, "b");
+    w.mgr.tick();
+    w.mgr.tick();
+    assert_eq!(count(&w, &b, VmOp::Destroy), 2, "the second tick waits");
+    w.vmm.wedge(&b, false);
+    let rep = w.mgr.gc();
+    assert!(rep.removed.contains(&b), "{rep:?}");
+    assert_eq!(w.mgr.destroy_retry_at(&b), None);
+    w.mgr.tick();
+    assert_eq!(count(&w, &b, VmOp::Destroy), 3);
+}
+
+/// R44: the backoff is in memory only: after a restart the tick retries a
+/// wedged record at once. A clock set back further than the cap does not
+/// stall the retries either.
+#[test]
+fn a_restart_or_a_clock_set_back_retries_at_once() {
+    let mut w = world(1);
+    let a = wedged(&w, "a");
+    w.mgr.tick();
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 2);
+    w.reopen();
+    assert_eq!(w.mgr.destroy_retry_at(&a), None);
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 3, "retried at once");
+    // a clock set back an hour: the 5 s wait is not stretched to an hour
+    w.clock
+        .store(w.now() - 3600, std::sync::atomic::Ordering::SeqCst);
+    w.mgr.tick();
+    assert_eq!(count(&w, &a, VmOp::Destroy), 4);
+    assert_eq!(w.mgr.destroy_retry_at(&a), Some(w.now() + 10));
 }
 
 #[test]
@@ -2019,8 +2159,9 @@ fn a_slow_prompt_does_not_block_the_manager() {
     t.join().unwrap().unwrap();
 }
 
-/// I2: a box stopped and requeued (with a newer prompt) while its earlier
-/// prompt was out keeps the newer prompt: the late outcome changes nothing.
+/// I2: a box stopped and requeued (with a newer prompt: the held one, then
+/// the comment) while its earlier prompt was out keeps the newer prompt:
+/// the late outcome changes nothing.
 #[test]
 fn a_late_prompt_outcome_never_touches_a_box_that_moved_on() {
     let w = world(1);
@@ -2035,7 +2176,7 @@ fn a_late_prompt_outcome_never_touches_a_box_that_moved_on() {
     mgr.revise(&a, "second").unwrap();
     t.join().unwrap();
     let r = mgr.get(&a).unwrap();
-    assert_eq!(r.pending_prompt.as_deref(), Some("second"));
+    assert_eq!(r.pending_prompt.as_deref(), Some("first\n\nsecond"));
     assert_eq!(r.error, None);
 }
 
@@ -2114,4 +2255,498 @@ fn revise_does_not_revive_a_box_stopped_meanwhile() {
     let r = mgr.get(&a).unwrap();
     assert_eq!(r.state, BoxState::Done);
     assert!(!r.vm_on);
+}
+
+/// One prompt the [`GateGuest`] holds until the test releases it.
+struct Held {
+    id: BoxId,
+    text: String,
+    /// `true`: the send succeeds; `false`: it fails (the VM went away).
+    release: std::sync::mpsc::Sender<bool>,
+}
+
+/// A guest whose every prompt waits for the test: it reports the prompt on
+/// a channel and returns only once the test releases it (no timing).
+struct GateGuest {
+    started: Mutex<std::sync::mpsc::Sender<Held>>,
+    delivered: Mutex<Vec<(BoxId, String)>>,
+}
+
+const GATE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn gate_guest() -> (Arc<GateGuest>, std::sync::mpsc::Receiver<Held>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let g = Arc::new(GateGuest {
+        started: Mutex::new(tx),
+        delivered: Mutex::new(Vec::new()),
+    });
+    (g, rx)
+}
+
+impl GateGuest {
+    fn delivered(&self) -> Vec<(BoxId, String)> {
+        self.delivered.lock().unwrap().clone()
+    }
+}
+
+impl saiife_boxes::guest::GuestLink for GateGuest {
+    fn prompt(&self, id: &BoxId, text: &str) -> Result<(), saiife_boxes::guest::GuestError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.started
+            .lock()
+            .unwrap()
+            .send(Held {
+                id: id.clone(),
+                text: text.to_string(),
+                release: tx,
+            })
+            .unwrap();
+        let ok = rx
+            .recv_timeout(GATE_BOUND)
+            .expect("the test never released a prompt");
+        if !ok {
+            return Err(saiife_boxes::guest::GuestError::NotConnected);
+        }
+        self.delivered
+            .lock()
+            .unwrap()
+            .push((id.clone(), text.to_string()));
+        Ok(())
+    }
+    fn terminal(
+        &self,
+        _id: &BoxId,
+        _after: Option<u64>,
+    ) -> Result<saiife_wire::source::TermBatch, saiife_boxes::guest::GuestError> {
+        Err(saiife_boxes::guest::GuestError::NotConnected)
+    }
+    fn diff(
+        &self,
+        _id: &BoxId,
+    ) -> Result<saiife_wire::source::DiffSummary, saiife_boxes::guest::GuestError> {
+        Err(saiife_boxes::guest::GuestError::NotConnected)
+    }
+}
+
+fn gate_manager(w: &World, g: &Arc<GateGuest>) -> Arc<Manager> {
+    let guest: Arc<dyn saiife_boxes::guest::GuestLink> = g.clone();
+    Arc::new(Manager::open(w.init(guest)).unwrap().manager)
+}
+
+/// The next prompt the guest got.
+fn next_prompt(rx: &std::sync::mpsc::Receiver<Held>) -> Held {
+    rx.recv_timeout(GATE_BOUND).expect("no prompt started")
+}
+
+/// No prompt started (every call that could send one has returned).
+fn no_prompt(rx: &std::sync::mpsc::Receiver<Held>) {
+    if let Ok(h) = rx.try_recv() {
+        panic!("an unexpected prompt to {}: {:?}", h.id.as_str(), h.text);
+    }
+}
+
+/// `Ready` for `id`, on a thread: its prompt waits for the test.
+fn ready_on_thread(mgr: &Arc<Manager>, id: &BoxId) -> std::thread::JoinHandle<()> {
+    let (m, i) = (mgr.clone(), id.clone());
+    std::thread::spawn(move || {
+        m.guest_event(&i, GuestEvent::Ready).unwrap();
+    })
+}
+
+/// R25/N1: a box paused while its task prompt was out keeps the prompt
+/// (no error); once it runs again the tick sends it, once.
+#[test]
+fn a_prompt_kept_after_a_pause_mid_send_is_sent_once_when_the_box_runs_again() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let (g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &g);
+    let t = ready_on_thread(&mgr, &a);
+    let s = next_prompt(&rx);
+    assert_eq!(s.text, "the task");
+    mgr.pause(&a).unwrap();
+    s.release.send(false).unwrap();
+    t.join().unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert_eq!(r.state, BoxState::Paused);
+    assert_eq!(r.pending_prompt.as_deref(), Some("the task"));
+    assert_eq!(r.error, None);
+    // Paused: nothing is sent.
+    mgr.tick();
+    no_prompt(&rx);
+    mgr.resume(&a).unwrap();
+    let m2 = mgr.clone();
+    let t = std::thread::spawn(move || m2.tick());
+    let s = next_prompt(&rx);
+    assert_eq!((s.id.clone(), s.text.as_str()), (a.clone(), "the task"));
+    s.release.send(true).unwrap();
+    t.join().unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert_eq!(r.pending_prompt, None);
+    assert_eq!(r.error, None);
+    mgr.tick();
+    no_prompt(&rx);
+    assert_eq!(g.delivered(), vec![(a.clone(), "the task".to_string())]);
+}
+
+/// R25/N1: a box stopped while its task prompt was out keeps the prompt;
+/// the only way back to `Ready` is a revise, a follow-up comment: the next
+/// `Ready` sends the held task then the comment, once, as one prompt (the
+/// note says so for the record).
+#[test]
+fn a_revise_after_a_stop_sends_the_held_task_then_the_comment_at_ready() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let (g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &g);
+    let t = ready_on_thread(&mgr, &a);
+    let s = next_prompt(&rx);
+    mgr.stop(&a, false).unwrap();
+    s.release.send(false).unwrap();
+    t.join().unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert_eq!(r.pending_prompt.as_deref(), Some("the task"));
+    assert_eq!(r.error, None);
+    assert_eq!(
+        mgr.revise_noted(&a, "the new text").unwrap(),
+        (
+            change(&a, BoxState::Done, BoxState::Queued, "requeue"),
+            Some(HELD_PROMPT_SENT_FIRST)
+        )
+    );
+    assert_eq!(
+        mgr.get(&a).unwrap().pending_prompt.as_deref(),
+        Some("the task\n\nthe new text")
+    );
+    assert_eq!(
+        mgr.tick(),
+        vec![change(&a, BoxState::Queued, BoxState::Starting, "admitted")]
+    );
+    no_prompt(&rx);
+    let t = ready_on_thread(&mgr, &a);
+    let s = next_prompt(&rx);
+    assert_eq!(s.text, "the task\n\nthe new text");
+    s.release.send(true).unwrap();
+    t.join().unwrap();
+    assert_eq!(mgr.get(&a).unwrap().pending_prompt, None);
+    mgr.tick();
+    no_prompt(&rx);
+    assert_eq!(
+        g.delivered(),
+        vec![(a.clone(), "the task\n\nthe new text".to_string())]
+    );
+}
+
+/// N1: a revise while the old task prompt is still out (the box was
+/// stopped meanwhile, so the agent that may get it is gone) wins: the old
+/// send's late outcome, a success or a failure, changes nothing, and the
+/// next `Ready` sends the task then the comment exactly once.
+#[test]
+fn a_revise_during_an_in_flight_send_sends_the_task_once_with_the_comment() {
+    for late_ok in [true, false] {
+        let w = world(1);
+        let a = w.spawn("the task").id;
+        let (g, rx) = gate_guest();
+        let mgr = gate_manager(&w, &g);
+        let t1 = ready_on_thread(&mgr, &a);
+        let s1 = next_prompt(&rx);
+        assert_eq!(s1.text, "the task");
+        mgr.stop(&a, false).unwrap();
+        let (_, note) = mgr.revise_noted(&a, "new").unwrap();
+        assert_eq!(note, Some(HELD_PROMPT_SENT_FIRST));
+        mgr.tick();
+        no_prompt(&rx);
+        // The box boots again while the old send is still out.
+        let t2 = ready_on_thread(&mgr, &a);
+        let s2 = next_prompt(&rx);
+        assert_eq!(s2.text, "the task\n\nnew");
+        s1.release.send(late_ok).unwrap();
+        t1.join().unwrap();
+        let r = mgr.get(&a).unwrap();
+        assert_eq!(
+            r.pending_prompt.as_deref(),
+            Some("the task\n\nnew"),
+            "late {late_ok}"
+        );
+        assert_eq!(r.error, None);
+        s2.release.send(true).unwrap();
+        t2.join().unwrap();
+        let r = mgr.get(&a).unwrap();
+        assert_eq!(r.pending_prompt, None);
+        assert_eq!(r.error, None);
+        mgr.tick();
+        no_prompt(&rx);
+        let sent: Vec<String> = g.delivered().into_iter().map(|(_, t)| t).collect();
+        let want: Vec<String> = if late_ok {
+            vec!["the task".into(), "the task\n\nnew".into()]
+        } else {
+            vec!["the task\n\nnew".into()]
+        };
+        assert_eq!(sent, want, "late {late_ok}");
+    }
+}
+
+/// N1: a send that failed while the box went Done with its VM still on
+/// (a finish raced the Ready prompt) keeps the prompt; a VM-on revise then
+/// sends it first and the comment after (noted), and nothing is left for
+/// the tick to send after the comment.
+#[test]
+fn a_vm_on_revise_sends_the_held_prompt_then_the_comment() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let (g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &g);
+    let t = ready_on_thread(&mgr, &a);
+    let s = next_prompt(&rx);
+    mgr.done(&a).unwrap();
+    s.release.send(false).unwrap();
+    t.join().unwrap();
+    let r = mgr.get(&a).unwrap();
+    assert!(r.vm_on);
+    assert_eq!(r.pending_prompt.as_deref(), Some("the task"));
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.revise_noted(&a2, "more"));
+    let s = next_prompt(&rx);
+    assert_eq!(s.text, "the task");
+    // The comment waits for the held prompt's send, under the same token:
+    // nothing else can send meanwhile.
+    no_prompt(&rx);
+    assert!(matches!(
+        mgr.say(&a, "steer"),
+        Err(BoxError::WrongState { .. })
+    ));
+    s.release.send(true).unwrap();
+    let s = next_prompt(&rx);
+    assert_eq!(s.text, "more");
+    s.release.send(true).unwrap();
+    assert_eq!(
+        t.join().unwrap().unwrap(),
+        (
+            change(&a, BoxState::Done, BoxState::Running, "revise"),
+            Some(HELD_PROMPT_SENT_FIRST)
+        )
+    );
+    assert_eq!(mgr.get(&a).unwrap().pending_prompt, None);
+    mgr.tick();
+    no_prompt(&rx);
+    assert_eq!(
+        g.delivered(),
+        vec![
+            (a.clone(), "the task".to_string()),
+            (a.clone(), "more".to_string())
+        ]
+    );
+    // A revise with nothing held notes nothing.
+    mgr.done(&a).unwrap();
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.revise_noted(&a2, "again"));
+    next_prompt(&rx).release.send(true).unwrap();
+    assert_eq!(t.join().unwrap().unwrap().1, None);
+}
+
+/// N1: a prompt held by lockdown on a box later marked done goes out ahead
+/// of a VM-on revise's comment too.
+#[test]
+fn a_lockdown_held_prompt_goes_ahead_of_a_vm_on_revise() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let (g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &g);
+    mgr.guest_event_with(&a, GuestEvent::Ready, false).unwrap();
+    mgr.done(&a).unwrap();
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.revise_noted(&a2, "more"));
+    next_prompt(&rx).release.send(true).unwrap();
+    next_prompt(&rx).release.send(true).unwrap();
+    assert_eq!(t.join().unwrap().unwrap().1, Some(HELD_PROMPT_SENT_FIRST));
+    mgr.tick();
+    no_prompt(&rx);
+    assert_eq!(
+        g.delivered(),
+        vec![
+            (a.clone(), "the task".to_string()),
+            (a.clone(), "more".to_string())
+        ]
+    );
+}
+
+/// N1: a VM-on revise whose held prompt went out but whose comment send
+/// failed returns the error and moves the box to Running, since the agent
+/// works on the delivered held prompt, which is not held any more. A held send that fails sends no
+/// comment and keeps it held.
+#[test]
+fn a_vm_on_revise_whose_comment_fails_still_counts_the_held_prompt_delivered() {
+    for held_ok in [true, false] {
+        let w = world(1);
+        let a = w.spawn("the task").id;
+        let (g, rx) = gate_guest();
+        let mgr = gate_manager(&w, &g);
+        mgr.guest_event_with(&a, GuestEvent::Ready, false).unwrap();
+        mgr.done(&a).unwrap();
+        let m2 = mgr.clone();
+        let a2 = a.clone();
+        let t = std::thread::spawn(move || m2.revise_noted(&a2, "more"));
+        let s = next_prompt(&rx);
+        assert_eq!(s.text, "the task");
+        s.release.send(held_ok).unwrap();
+        if held_ok {
+            let s = next_prompt(&rx);
+            assert_eq!(s.text, "more");
+            s.release.send(false).unwrap();
+        }
+        let e = t.join().unwrap().unwrap_err();
+        // Delivered, the held prompt is the agent's work: the box runs
+        // again (not shown as Done), and the error says to re-send the
+        // comment. Not delivered, nothing changed.
+        assert_eq!(
+            e.to_string().contains("send the comment again"),
+            held_ok,
+            "held {held_ok}: {e}"
+        );
+        no_prompt(&rx);
+        let r = mgr.get(&a).unwrap();
+        let state = if held_ok {
+            BoxState::Running
+        } else {
+            BoxState::Done
+        };
+        assert_eq!(r.state, state, "held {held_ok}");
+        if held_ok {
+            assert_eq!(r.turn_finished_at, None);
+        }
+        let want = (!held_ok).then_some("the task");
+        assert_eq!(r.pending_prompt.as_deref(), want, "held {held_ok}");
+        if held_ok {
+            // The comment goes again as a steer to the running box.
+            let m2 = mgr.clone();
+            let a2 = a.clone();
+            let t = std::thread::spawn(move || m2.say(&a2, "more"));
+            let s = next_prompt(&rx);
+            assert_eq!(s.text, "more");
+            s.release.send(true).unwrap();
+            t.join().unwrap().unwrap();
+        }
+    }
+}
+
+/// I1: VM off, the held task and the comment become one prompt, checked
+/// as a whole against [`MAX_REVISED_PROMPT_BYTES`]: over it, the revise is
+/// refused and nothing changes; at it, the revise goes through.
+#[test]
+fn a_vm_off_revise_whose_combined_prompt_is_too_long_is_refused() {
+    let w = world(1);
+    let task = "t".repeat(saiife_wire::source::MAX_TASK_BYTES);
+    let a = w.spawn(&task).id;
+    w.mgr.stop(&a, false).unwrap();
+    let before = w.mgr.get(&a).unwrap();
+    assert_eq!(before.pending_prompt.as_deref(), Some(task.as_str()));
+    // The comment alone is within its limit; with the task and the
+    // separator it is 2 bytes over.
+    let long = "c".repeat(saiife_wire::source::MAX_STEER_BYTES);
+    let e = w.mgr.revise_noted(&a, &long).unwrap_err();
+    assert!(
+        matches!(&e, BoxError::Invalid(m) if m.contains("shorten the comment")),
+        "{e}"
+    );
+    let r = w.mgr.get(&a).unwrap();
+    assert_eq!(r.state, BoxState::Done);
+    assert_eq!(r.queue_seq, None);
+    assert_eq!(r.pending_prompt.as_deref(), Some(task.as_str()));
+    // Exactly at the limit.
+    let fits = "c".repeat(MAX_REVISED_PROMPT_BYTES - task.len() - 2);
+    let (c, note) = w.mgr.revise_noted(&a, &fits).unwrap();
+    assert_eq!(c, change(&a, BoxState::Done, BoxState::Queued, "requeue"));
+    assert_eq!(note, Some(HELD_PROMPT_SENT_FIRST));
+    let joined = w.mgr.get(&a).unwrap().pending_prompt.unwrap();
+    assert_eq!(joined.len(), MAX_REVISED_PROMPT_BYTES);
+    assert_eq!(joined, format!("{task}\n\n{fits}"));
+}
+
+/// R26: a steer cannot overtake the task prompt: `say` is Unavailable
+/// while the box's prompt is out or held, and goes through once it is
+/// delivered.
+#[test]
+fn say_waits_until_the_task_prompt_is_delivered() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let (g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &g);
+    let t = ready_on_thread(&mgr, &a);
+    let s = next_prompt(&rx);
+    assert!(matches!(
+        mgr.say(&a, "steer"),
+        Err(BoxError::Unavailable(_))
+    ));
+    s.release.send(true).unwrap();
+    t.join().unwrap();
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.say(&a2, "steer"));
+    let s = next_prompt(&rx);
+    assert_eq!(s.text, "steer");
+    s.release.send(true).unwrap();
+    t.join().unwrap().unwrap();
+    assert_eq!(
+        g.delivered(),
+        vec![
+            (a.clone(), "the task".to_string()),
+            (a.clone(), "steer".to_string())
+        ]
+    );
+    // Held by lockdown: refused too.
+    let w = world(1);
+    let b = w.spawn("other").id;
+    let (_g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &_g);
+    mgr.guest_event_with(&b, GuestEvent::Ready, false).unwrap();
+    assert!(matches!(
+        mgr.say(&b, "steer"),
+        Err(BoxError::Unavailable(m)) if m.contains("steer again once it is")
+    ));
+    no_prompt(&rx);
+}
+
+/// m2: a paused box whose prompt is held sends it only once it runs, so
+/// its steer refusal says to resume the box first. Held by lockdown `all`
+/// (as here), it also waits for lockdown to lift, and the refusal says so.
+#[test]
+fn a_paused_box_with_a_held_prompt_refuses_a_steer_until_resumed() {
+    let w = world(1);
+    let a = w.spawn("the task").id;
+    let (g, rx) = gate_guest();
+    let mgr = gate_manager(&w, &g);
+    mgr.guest_event_with(&a, GuestEvent::Ready, false).unwrap();
+    mgr.pause(&a).unwrap();
+    let e = mgr.say(&a, "steer").unwrap_err();
+    assert!(
+        matches!(&e, BoxError::Unavailable(m)
+            if m.contains("resume the box first") && m.contains("lockdown to lift")),
+        "{e}"
+    );
+    no_prompt(&rx);
+    mgr.resume(&a).unwrap();
+    // Resumed, still under lockdown `all`: the prompt keeps waiting.
+    mgr.tick_with(false);
+    no_prompt(&rx);
+    assert!(mgr.say(&a, "steer").is_err());
+    no_prompt(&rx);
+    let m2 = mgr.clone();
+    let t = std::thread::spawn(move || m2.tick());
+    next_prompt(&rx).release.send(true).unwrap();
+    t.join().unwrap();
+    let m2 = mgr.clone();
+    let a2 = a.clone();
+    let t = std::thread::spawn(move || m2.say(&a2, "steer"));
+    next_prompt(&rx).release.send(true).unwrap();
+    t.join().unwrap().unwrap();
+    assert_eq!(
+        g.delivered(),
+        vec![
+            (a.clone(), "the task".to_string()),
+            (a.clone(), "steer".to_string())
+        ]
+    );
 }

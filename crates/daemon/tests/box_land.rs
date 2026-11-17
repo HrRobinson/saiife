@@ -440,7 +440,7 @@ fn waiting(w: &World) -> Vec<saiife_daemon::notifier::NotifyEvent> {
 }
 
 #[test]
-fn a_new_land_request_sends_box_waiting_once() {
+fn a_finished_run_sends_box_waiting_once() {
     let w = world(3);
     let b = w.done(ALICE, &changed());
     assert!(waiting(&w).is_empty());
@@ -462,6 +462,64 @@ fn a_new_land_request_sends_box_waiting_once() {
         assert_eq!(again[0].request_id, p[0].request_id);
     }
     assert_eq!(waiting(&w).len(), 1);
+}
+
+/// Task 5 (a): `box_waiting` is once per finished run, not per request id.
+/// The request expires and is issued again under a new id for the same
+/// review: no second event.
+#[test]
+fn a_reissued_request_for_the_same_run_sends_no_second_box_waiting() {
+    let w = world(3);
+    let i = w.done(ALICE, &changed());
+    let first = w.pending_of(&i);
+    assert_eq!(waiting(&w).len(), 1);
+    for _ in 0..3 {
+        w.clock
+            .fetch_add(saiife_touch::CHALLENGE_TTL_SECS + 1, Ordering::SeqCst);
+        let again = w.pending_of(&i);
+        assert_ne!(again.request_id, first.request_id);
+    }
+    assert_eq!(waiting(&w).len(), 1, "{:?}", waiting(&w));
+}
+
+/// Task 5 (a): a new finished run of the same box (revised, runs, Done
+/// again with a new review) notifies again, once.
+#[test]
+fn a_new_finished_run_sends_box_waiting_again() {
+    let w = world(3);
+    let i = w.done(ALICE, &changed());
+    w.pending_of(&i);
+    assert_eq!(waiting(&w).len(), 1);
+    w.mgr.revise(&i, "add docs").unwrap();
+    // The inbox polls while it runs: nothing waits.
+    assert!(w.lands.pending().is_empty());
+    w.with_repo(&i, |g| {
+        g.work.insert("docs.md".into(), C(b"docs\n".to_vec()));
+    });
+    w.mgr.done(&i).unwrap();
+    w.lands.refresh(&i).unwrap();
+    for _ in 0..3 {
+        w.pending_of(&i);
+    }
+    let q = waiting(&w);
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert!(q.iter().all(|e| e.box_id.as_deref() == Some(i.as_str())));
+}
+
+/// Task 5 (a): a new run whose result is byte-identical to the one already
+/// notified still notifies (the run finished again), when the book saw the
+/// box leave `Done` in between.
+#[test]
+fn a_new_run_with_the_same_result_notifies_again() {
+    let w = world(3);
+    let i = w.done(ALICE, &changed());
+    w.pending_of(&i);
+    w.mgr.revise(&i, "again").unwrap();
+    assert!(w.lands.pending().is_empty());
+    w.mgr.done(&i).unwrap();
+    w.lands.refresh(&i).unwrap();
+    w.pending_of(&i);
+    assert_eq!(waiting(&w).len(), 2, "{:?}", waiting(&w));
 }
 
 #[test]

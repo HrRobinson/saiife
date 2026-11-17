@@ -345,8 +345,15 @@ pub trait BoxSource: Send + Sync {
     /// The full new order of the queued boxes.
     fn reorder(&self, queue: &[BoxId]) -> Result<(), BoxError>;
     fn steer(&self, id: &BoxId, msg: &str) -> Result<(), BoxError>;
-    /// Done or Landed -> Running, with the comment as the next prompt.
+    /// Done or Landed -> Running, with the comment as the next prompt. A
+    /// prompt the box still held unsent (its task, cut short by a stop)
+    /// goes first: the comment follows it, never replaces it.
     fn revise(&self, id: &BoxId, comment: &str) -> Result<(), BoxError>;
+    /// [`BoxSource::revise`], plus [`HELD_PROMPT_SENT_FIRST`] when the box
+    /// held a prompt unsent that goes ahead of the comment, for the record.
+    fn revise_noted(&self, id: &BoxId, comment: &str) -> Result<Option<&'static str>, BoxError> {
+        self.revise(id, comment).map(|()| None)
+    }
     fn pending_actions(&self) -> Vec<PendingAction>;
     /// Evidence is `Some` for Approve, `None` for Reject.
     fn complete(
@@ -360,7 +367,15 @@ pub trait BoxSource: Send + Sync {
 }
 
 pub const MAX_STEER_BYTES: usize = 4096;
+/// The record note of a revise on a box that held a prompt unsent (plan 38
+/// R25/N1: a stop, a pause or a lockdown kept it): that prompt goes to the
+/// agent first, then the revise's comment.
+pub const HELD_PROMPT_SENT_FIRST: &str = "held prompt sent before the revise comment";
 pub const MAX_TASK_BYTES: usize = 8192;
+/// The longest prompt a revise leaves for the box: a held task plus its
+/// comment ([`MAX_TASK_BYTES`] + [`MAX_STEER_BYTES`]), the separator
+/// included. A revise whose combined text is longer is refused.
+pub const MAX_REVISED_PROMPT_BYTES: usize = MAX_TASK_BYTES + MAX_STEER_BYTES;
 
 /// Non-empty, at most `max` bytes, no NUL, no C0 controls but `\n` and `\t`,
 /// no DEL and no C1 controls. Bidi and format characters stay allowed:

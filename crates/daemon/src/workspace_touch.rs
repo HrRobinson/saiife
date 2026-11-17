@@ -654,7 +654,8 @@ pub async fn verify_frame(
 /// Tells the owner that a box waits in the Workspace inbox: the box id and
 /// the short code to match, nothing else. No URL and no request id (§9.6):
 /// nothing in a notification approves anything. Sent by `Lands::pending`
-/// once per land request id, when it first issues the request.
+/// once per finished run of a box (box and review), when it first offers
+/// that run's land request; a request issued again sends nothing.
 pub fn notify_pending(ctx: &Ctx, pa: &PendingAction) {
     let code = pa.view().short_code;
     ctx.notifier.send(crate::notifier::NotifyEvent {
