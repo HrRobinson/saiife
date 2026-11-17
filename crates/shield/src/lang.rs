@@ -3,6 +3,7 @@
 //! a [`Decimal`]. Errors carry byte ranges and fixed text, never the literal.
 
 use crate::schema::{Decimal, Lang};
+use unicode_normalization::UnicodeNormalization;
 
 // ---------------------------------------------------------------- language
 
@@ -122,7 +123,7 @@ fn mul_pow10(d: Decimal, p: u8) -> Option<Decimal> {
 }
 
 fn prev_char(text: &str, i: usize) -> Option<char> {
-    text[..i].chars().next_back()
+    text.get(..i)?.chars().next_back()
 }
 
 fn word_start(text: &str, i: usize) -> bool {
@@ -136,7 +137,7 @@ fn digits_at(b: &[u8], i: usize) -> usize {
 
 /// Width in bytes of a whitespace char usable between number parts, or 0.
 fn ws_width(text: &str, i: usize) -> usize {
-    match text[i..].chars().next() {
+    match text.get(i..).and_then(|t| t.chars().next()) {
         Some(c @ (' ' | '\t' | '\u{a0}' | '\u{202f}')) => c.len_utf8(),
         _ => 0,
     }
@@ -366,7 +367,9 @@ impl NumberWords {
             }
             if commit {
                 // A digit glued to the word ("one2") is not a number word.
-                if text[we..]
+                if text
+                    .get(we..)
+                    .unwrap_or("")
                     .chars()
                     .next()
                     .is_some_and(|c| c.is_ascii_digit())
@@ -674,20 +677,19 @@ fn saturating_digit_value(s: &str) -> Decimal {
 
 /// Suffix attached to a number: `k`/`m` multiplier, ordinal `st/nd/rd/th`.
 fn attached_suffix(text: &str, end: usize) -> Option<(usize, Suffix)> {
-    let rest = &text[end..];
-    let lower: String = rest.chars().take(3).collect::<String>().to_lowercase();
+    // Decide on the original bytes: no case-converted copy, no foreign offsets.
+    let rest = text.get(end..)?;
     let after_ok = |n: usize| {
-        rest[n..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric())
+        rest.get(n..)
+            .is_some_and(|r| r.chars().next().is_none_or(|c| !c.is_alphanumeric()))
     };
-    if (lower.starts_with('k') || lower.starts_with('m')) && after_ok(1) {
-        let p = if lower.starts_with('k') { 3 } else { 6 };
-        return Some((end + 1, Suffix::Pow(p)));
+    match rest.as_bytes().first() {
+        Some(b'k' | b'K') if after_ok(1) => return Some((end + 1, Suffix::Pow(3))),
+        Some(b'm' | b'M') if after_ok(1) => return Some((end + 1, Suffix::Pow(6))),
+        _ => {}
     }
     for s in ["st", "nd", "rd", "th"] {
-        if lower.starts_with(s) && after_ok(2) {
+        if rest.get(..2).is_some_and(|h| h.eq_ignore_ascii_case(s)) && after_ok(2) {
             return Some((end + 2, Suffix::Ordinal));
         }
     }
@@ -718,7 +720,7 @@ fn code_for(word: &str) -> Option<&'static str> {
 /// A currency before a number: `kr. 500`, `$500`, `USD 500`. Returns the
 /// index of the number's first digit and the currency.
 fn currency_prefix(text: &str, i: usize) -> Option<(usize, &'static str)> {
-    let c = text[i..].chars().next()?;
+    let c = text.get(i..).and_then(|t| t.chars().next())?;
     let (after, cur) = match c {
         '$' => (i + 1, "USD"),
         '€' => (i + c.len_utf8(), "EUR"),
@@ -748,7 +750,10 @@ fn currency_prefix(text: &str, i: usize) -> Option<(usize, &'static str)> {
 
 /// A currency after a number: `500 NOK`, `500 kr.`, `500,-`.
 fn currency_suffix(text: &str, end: usize) -> Option<(usize, &'static str)> {
-    if text[end..].starts_with(",-") || text[end..].starts_with(".-") {
+    if text
+        .get(end..)
+        .is_some_and(|r| r.starts_with(",-") || r.starts_with(".-"))
+    {
         return Some((end + 2, "kr"));
     }
     let p = skip_ws(text, end);
@@ -1078,7 +1083,10 @@ pub fn find_dates(text: &str, lang: Lang) -> Vec<(usize, usize, String)> {
                 continue;
             }
         }
-        i += text[i..].chars().next().map_or(1, char::len_utf8);
+        i += text
+            .get(i..)
+            .and_then(|t| t.chars().next())
+            .map_or(1, char::len_utf8);
     }
     out
 }
@@ -1139,7 +1147,9 @@ fn digit_literal(
         if !ordinal
             && digits_len == 4
             && (1900..=2100).contains(&value.units)
-            && !text[..span_start]
+            && !text
+                .get(..span_start)
+                .unwrap_or("")
                 .chars()
                 .next_back()
                 .is_some_and(|c| c == '-' || c == '.')
@@ -1193,10 +1203,14 @@ fn word_literal(text: &str, i: usize, lang: Lang) -> Option<(usize, Literal)> {
 /// R44-2: every literal in the question, in order of appearance, each with
 /// its byte span. A literal that does not parse refuses the question.
 pub fn find_literals(text: &str, lang: Lang) -> Result<Vec<LiteralSpan>, LiteralError> {
+    // Fail closed: a digit this parser cannot read is never passed through.
+    if let Some(&(st, en)) = non_ascii_numeric_runs(text).first() {
+        return Err(lit_err(st, en, "non-ASCII digit"));
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i < text.len() {
-        let Some(c) = text[i..].chars().next() else {
+        let Some(c) = text.get(i..).and_then(|t| t.chars().next()) else {
             break;
         };
         let w = c.len_utf8();
@@ -1253,7 +1267,7 @@ pub fn find_numbers(text: &str, lang: Lang) -> Vec<(usize, usize, Decimal)> {
     let b = text.as_bytes();
     let mut i = 0;
     while i < text.len() {
-        let Some(c) = text[i..].chars().next() else {
+        let Some(c) = text.get(i..).and_then(|t| t.chars().next()) else {
             break;
         };
         let w = c.len_utf8();
@@ -1296,6 +1310,15 @@ pub fn find_numbers(text: &str, lang: Lang) -> Vec<(usize, usize, Decimal)> {
             }
             continue;
         }
+        if c.is_numeric() {
+            // non-ASCII numeric run (ASCII digits were handled above)
+            let e = non_ascii_run_end(text, i);
+            if let Some(v) = folded_value(&text[i..e]) {
+                out.push((i, e, v));
+            }
+            i = e;
+            continue;
+        }
         if c.is_alphabetic() {
             let (_, we) = word_at(text, i).unwrap_or((i, i + w));
             if word_start(text, i) {
@@ -1311,6 +1334,52 @@ pub fn find_numbers(text: &str, lang: Lang) -> Vec<(usize, usize, Decimal)> {
         i += w;
     }
     out
+}
+
+/// End of the run of non-ASCII numeric chars starting at `i`.
+fn non_ascii_run_end(text: &str, i: usize) -> usize {
+    let n: usize = text
+        .get(i..)
+        .unwrap_or("")
+        .chars()
+        .take_while(|c| c.is_numeric() && !c.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum();
+    i + n
+}
+
+/// Every run of non-ASCII numeric characters (`²`, `５`, `١٢٣`, `½`).
+fn non_ascii_numeric_runs(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(c) = text.get(i..).and_then(|t| t.chars().next()) {
+        if c.is_numeric() && !c.is_ascii_digit() {
+            let e = non_ascii_run_end(text, i);
+            out.push((i, e));
+            i = e;
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// The value of a run when its NFKC fold is a plain ASCII number.
+fn folded_value(run: &str) -> Option<Decimal> {
+    let f: String = run.nfkc().collect();
+    if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(saturating_digit_value(&f))
+}
+
+/// Non-ASCII numeric runs that do not fold to a plain number (Arabic-Indic
+/// digits, vulgar fractions): the caller must treat each as unreadable.
+pub fn find_unreadable_numerics(text: &str) -> Vec<(usize, usize)> {
+    non_ascii_numeric_runs(text)
+        .into_iter()
+        .filter(|&(s, e)| folded_value(&text[s..e]).is_none())
+        .collect()
 }
 
 #[cfg(test)]
