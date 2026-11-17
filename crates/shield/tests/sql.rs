@@ -20,7 +20,9 @@ fn col(name: &str, ty: ColType, class: ColumnClass) -> ColumnInfo {
 }
 
 /// customers(id, first_name, last_name, city, credit_limit, segment),
-/// invoices(id, customer_id, amount, status, issued).
+/// invoices(id, customer_id, amount, status, issued),
+/// payments(id, customer_id, invoice_id, amount, paid); entities customers
+/// and invoices.
 fn schema() -> Schema {
     use ColType::*;
     use ColumnClass::*;
@@ -52,15 +54,37 @@ fn schema() -> Schema {
                     col("issued", Date, Quasi),
                 ],
             },
+            TableInfo {
+                name: "payments".into(),
+                alias: None,
+                rows: 3000,
+                columns: vec![
+                    col("id", Integer, Identifier),
+                    col("customer_id", Integer, Identifier),
+                    col("invoice_id", Integer, Identifier),
+                    col("amount", Real, Sensitive),
+                    col("paid", Date, Quasi),
+                ],
+            },
         ],
-        entities: vec![EntitySpec {
-            table: "customers".into(),
-            key: "id".into(),
-            names: vec!["first_name".into(), "last_name".into()],
-            show: vec!["city".into()],
-            word: "customer".into(),
-            word_da: "kunde".into(),
-        }],
+        entities: vec![
+            EntitySpec {
+                table: "customers".into(),
+                key: "id".into(),
+                names: vec!["first_name".into(), "last_name".into()],
+                show: vec!["city".into()],
+                word: "customer".into(),
+                word_da: "kunde".into(),
+            },
+            EntitySpec {
+                table: "invoices".into(),
+                key: "id".into(),
+                names: vec![],
+                show: vec![],
+                word: "invoice".into(),
+                word_da: "faktura".into(),
+            },
+        ],
     }
 }
 
@@ -157,7 +181,9 @@ fn prepares(sql: &str) {
         "CREATE TABLE customers(id INTEGER, first_name TEXT, last_name TEXT, city TEXT, \
          credit_limit REAL, segment TEXT);\
          CREATE TABLE invoices(id INTEGER, customer_id INTEGER, amount REAL, status TEXT, \
-         issued TEXT);",
+         issued TEXT);\
+         CREATE TABLE payments(id INTEGER, customer_id INTEGER, invoice_id INTEGER, \
+         amount REAL, paid TEXT);",
     )
     .unwrap();
     let r = db.prepare(sql).map(|_| ());
@@ -331,19 +357,21 @@ fn aliases_map_back() {
 #[test]
 fn refuses_by_class() {
     use ErrorClass::*;
+    // Four joins without fan-out: two per-customer CTEs, each with a join.
+    let four_joins = "WITH inv AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s \
+        FROM invoices i JOIN customers x ON x.id = i.customer_id GROUP BY i.customer_id), \
+        pay AS (SELECT p.customer_id AS cid, SUM(p.amount) AS s FROM payments p \
+        JOIN customers y ON y.id = p.customer_id GROUP BY p.customer_id) \
+        SELECT c.id FROM customers c JOIN inv ON inv.cid = c.id JOIN pay ON pay.cid = c.id";
+    prepares(&ok(four_joins).sql);
+    // Joins count across the CTEs and the outer block.
+    let cte_joins = four_joins.replace(
+        "JOIN pay ON pay.cid = c.id",
+        "JOIN pay ON pay.cid = c.id JOIN payments q ON q.customer_id = c.id",
+    );
     let five_joins = "SELECT c.id FROM customers c JOIN invoices a ON a.customer_id = c.id \
         JOIN invoices b ON b.customer_id = c.id JOIN invoices d ON d.customer_id = c.id \
         JOIN invoices e ON e.customer_id = c.id JOIN invoices f ON f.customer_id = c.id";
-    let four_joins = "SELECT c.id FROM customers c JOIN invoices a ON a.customer_id = c.id \
-        JOIN invoices b ON b.customer_id = c.id JOIN invoices d ON d.customer_id = c.id \
-        JOIN invoices e ON e.customer_id = c.id";
-    ok(four_joins);
-    // Joins count across the CTEs and the outer block.
-    let cte_joins = "WITH t AS (SELECT a.customer_id AS cid FROM invoices a \
-        JOIN customers x ON x.id = a.customer_id JOIN invoices b ON b.customer_id = x.id \
-        GROUP BY a.customer_id) \
-        SELECT c.id FROM customers c JOIN t ON t.cid = c.id \
-        JOIN invoices d ON d.customer_id = c.id JOIN invoices e ON e.customer_id = c.id";
     let wide: Vec<String> = (0..33).map(|i| format!("c.id AS x{i}")).collect();
     let wide = format!("SELECT {} FROM customers c", wide.join(", "));
     let cases: Vec<(&str, ErrorClass)> = vec![
@@ -408,7 +436,7 @@ fn refuses_by_class() {
         ),
         ("SELECT COUNT(*) AS n", ConstructNotAllowed),
         (five_joins, TooManyJoins),
-        (cte_joins, TooManyJoins),
+        (&cte_joins, TooManyJoins),
         (&wide, TooManyColumns),
         (
             "SELECT i.id FROM invoices i WHERE i.status = 'disputed'",
@@ -684,8 +712,6 @@ fn joins_only_on_declared_key_pairs() {
         "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id",
         "SELECT c.id FROM invoices i JOIN customers c ON (c.id = i.customer_id) \
          AND i.customer_id = c.id",
-        "SELECT c2.id FROM customers c JOIN invoices i ON i.customer_id = c.id \
-         JOIN customers c2 ON c2.id = i.customer_id",
     ] {
         prepares(&ok(sql).sql);
     }
@@ -1295,4 +1321,200 @@ fn rowid_names_and_duplicate_outputs_refused() {
         assert_eq!(refused(sql), ConstructNotAllowed, "{sql}");
     }
     ok("SELECT c.id, i.id AS invoice_id FROM customers c JOIN invoices i ON i.customer_id = c.id");
+}
+
+// ---- round 3 (findings r3) ----
+
+/// The schema with the FK column `invoices.customer_id` renamed to
+/// `snapshot` (hidden) and shown to the cloud as `alias`.
+fn fk_schema(snapshot: &str, alias: Option<&str>) -> Schema {
+    let mut s = schema();
+    s.tables[1].columns[1].name = snapshot.into();
+    s.tables[1].columns[1].alias = alias.map(Into::into);
+    s
+}
+
+fn outcome_in(sql: &str, s: &Schema) -> String {
+    match validate(sql, s, &public(), &ps_for(sql)) {
+        Ok(_) => "ok".into(),
+        Err(e) => e.class.as_str().into(),
+    }
+}
+
+#[test]
+fn key_pairs_use_cloud_names() {
+    // F1: the C-G1 pair is decided on cloud names only; the snapshot name
+    // behind an alias never changes the outcome.
+    let x = "SELECT c.id FROM customers c JOIN invoices i ON i.x = c.id";
+    let a = outcome_in(x, &fk_schema("customer_id", Some("x")));
+    let b = outcome_in(x, &fk_schema("cust_ref", Some("x")));
+    assert_eq!(
+        (a.as_str(), b.as_str()),
+        ("construct_not_allowed", "construct_not_allowed")
+    );
+    let y = "SELECT c.id FROM customers c JOIN invoices i ON i.customer_id = c.id";
+    let a = outcome_in(y, &fk_schema("customer_id", None));
+    let b = outcome_in(y, &fk_schema("cust_ref", Some("customer_id")));
+    assert_eq!((a.as_str(), b.as_str()), ("ok", "ok"));
+    // The key's cloud name counts too: `customer_<cloud key>`.
+    let mut k = schema();
+    k.tables[0].columns[0].alias = Some("nr".into());
+    assert_eq!(
+        outcome_in(
+            "SELECT c.nr FROM customers c JOIN invoices i ON i.customer_id = c.nr",
+            &k
+        ),
+        "construct_not_allowed"
+    );
+    k.tables[1].columns[1].alias = Some("customer_nr".into());
+    assert_eq!(
+        outcome_in(
+            "SELECT c.nr FROM customers c JOIN invoices i ON i.customer_nr = c.nr",
+            &k
+        ),
+        "ok"
+    );
+}
+
+#[test]
+fn no_literals_on_keys_and_type_mismatch() {
+    // F2: a literal on an entity key or an FK column defeats the pin.
+    use ErrorClass::*;
+    for sql in [
+        format!("SELECT COUNT(*) AS n {J} AND c.id = 7"),
+        format!("SELECT COUNT(*) AS n {J} AND c.id IN (7, 8)"),
+        format!("SELECT COUNT(*) AS n {J} AND c.id > -1"),
+        format!("SELECT COUNT(*) AS n {J} AND i.customer_id = 7"),
+        format!("SELECT COUNT(*) AS n {J} AND i.customer_id <> 0"),
+        format!("SELECT COUNT(*) AS n {J} AND i.id = 3"),
+        "SELECT COUNT(*) AS n FROM payments p WHERE p.invoice_id = 3".to_string(),
+        "WITH t AS (SELECT i.customer_id AS cid FROM invoices i) \
+         SELECT t.cid FROM t WHERE t.cid = 5"
+            .to_string(),
+        // Type mismatches.
+        "SELECT c.id FROM customers c WHERE c.city = 5".to_string(),
+        "SELECT i.id FROM invoices i WHERE i.issued > 3".to_string(),
+        "SELECT i.id FROM invoices i WHERE i.amount = '2026-01-01'".to_string(),
+        "SELECT i.status, COUNT(*) AS n FROM invoices i GROUP BY i.status \
+         HAVING COUNT(*) > '2026-01-01'"
+            .to_string(),
+        "SELECT i.status, MAX(i.issued) AS m FROM invoices i GROUP BY i.status \
+         HAVING MAX(i.issued) > 5"
+            .to_string(),
+    ] {
+        assert_eq!(refused(&sql), LiteralNotAllowed, "{sql}");
+    }
+    for sql in [
+        "SELECT i.id FROM invoices i WHERE i.amount >= 90 AND i.status = 'open' \
+         AND i.issued >= '2026-01-01'",
+        "SELECT i.status, COUNT(*) AS n FROM invoices i GROUP BY i.status HAVING COUNT(*) > 2",
+    ] {
+        prepares(&ok(sql).sql);
+    }
+}
+
+#[test]
+fn join_fan_out_refused() {
+    // F3: a join must not repeat the rows an aggregate reads.
+    let k = "FROM customers c JOIN invoices i ON i.customer_id = c.id";
+    for sql in [
+        // Two children of one key; one table twice.
+        "SELECT SUM(i.amount) AS s FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN invoices j ON j.customer_id = c.id WHERE c.id = :p1"
+            .to_string(),
+        "SELECT SUM(i.amount) - SUM(p.amount) AS owed FROM customers c \
+         JOIN invoices i ON i.customer_id = c.id JOIN payments p ON p.customer_id = c.id \
+         WHERE c.id = :p1"
+            .to_string(),
+        "SELECT COUNT(*) AS n FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN payments p ON p.customer_id = c.id WHERE c.id = :p1"
+            .to_string(),
+        "SELECT c2.id FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN customers c2 ON c2.id = i.customer_id"
+            .to_string(),
+        "SELECT i.id, j.id AS j_id FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN invoices j ON j.customer_id = c.id"
+            .to_string(),
+        // An aggregate over a column the join repeats.
+        format!("SELECT SUM(c.credit_limit) AS s {k}"),
+        format!("SELECT AVG(c.credit_limit) AS s {k}"),
+        format!("SELECT COUNT(c.city) AS s {k}"),
+        format!("SELECT SUM(DISTINCT c.credit_limit) AS s {k}"),
+        "SELECT SUM(i.amount) AS s FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN payments p ON p.invoice_id = i.id"
+            .to_string(),
+        // Laundered through a CTE column.
+        "WITH t AS (SELECT c.credit_limit AS cl, i.customer_id AS cid FROM customers c \
+         JOIN invoices i ON i.customer_id = c.id) SELECT SUM(t.cl) AS s FROM t"
+            .to_string(),
+        // A CTE key side that is not one row per key.
+        "WITH t AS (SELECT c.id AS cid FROM customers c JOIN invoices i \
+         ON i.customer_id = c.id) \
+         SELECT SUM(p.amount) AS s FROM t JOIN payments p ON p.customer_id = t.cid"
+            .to_string(),
+        // One join linking to two earlier sources.
+        "SELECT COUNT(*) AS n FROM customers c JOIN invoices i ON i.customer_id = c.id \
+         JOIN payments p ON p.customer_id = c.id AND p.invoice_id = i.id"
+            .to_string(),
+    ] {
+        assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    // Allowed: MIN/MAX/COUNT(*)/COUNT(DISTINCT) over the key side, a chain,
+    // and the two-child balance through per-key CTEs.
+    for sql in [
+        format!(
+            "SELECT MIN(c.credit_limit) AS m, MAX(c.credit_limit) AS x, COUNT(*) AS n, \
+             COUNT(DISTINCT c.id) AS k {k}"
+        ),
+        "SELECT SUM(p.amount) AS s, COUNT(*) AS n FROM customers c \
+         JOIN invoices i ON i.customer_id = c.id JOIN payments p ON p.invoice_id = i.id \
+         WHERE c.id = :p1"
+            .to_string(),
+        BALANCE.to_string(),
+    ] {
+        prepares(&ok(&sql).sql);
+    }
+    let v = ok(
+        "WITH inv AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s FROM invoices i \
+         GROUP BY i.customer_id), \
+         pay AS (SELECT p.customer_id AS cid, SUM(p.amount) AS s FROM payments p \
+         GROUP BY p.customer_id) \
+         SELECT SUM(inv.s) - SUM(pay.s) AS owed FROM customers c \
+         JOIN inv ON inv.cid = c.id JOIN pay ON pay.cid = c.id WHERE c.id = :p1",
+    );
+    assert_eq!(
+        v.entity_filters[0].linked,
+        vec![
+            ("invoices".to_string(), "customer_id".to_string()),
+            ("payments".to_string(), "customer_id".to_string())
+        ]
+    );
+    assert_eq!(v.aggregates_nullable, vec![0]);
+    prepares(&v.sql);
+}
+
+#[test]
+fn cte_bodies_have_no_order_or_limit() {
+    // F4: a CTE with LIMIT 1 can make a COUNT 0 for an existing entity.
+    for tail in ["ORDER BY i.customer_id", "LIMIT 1", "LIMIT 1 OFFSET 2"] {
+        let sql = format!(
+            "WITH t AS (SELECT i.customer_id AS cid FROM invoices i {tail}) \
+             SELECT COUNT(*) AS n FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1"
+        );
+        assert_eq!(refused(&sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+}
+
+#[test]
+fn identical_arith_operands_refused() {
+    // F5: `x - x` is a constant whatever the data.
+    for sql in [
+        "SELECT SUM(c.credit_limit) - SUM(c.credit_limit) AS z FROM customers c",
+        "SELECT SUM(i.amount) / SUM(i.amount) AS z FROM invoices i",
+        "SELECT (SUM(i.amount)) - SUM(i.amount) AS z FROM invoices i",
+        "SELECT COUNT(*) - COUNT(*) AS z FROM invoices i",
+    ] {
+        assert_eq!(refused(sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    ok("SELECT SUM(i.amount) - MIN(i.amount) AS z FROM invoices i");
 }

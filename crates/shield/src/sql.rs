@@ -36,7 +36,7 @@
 
 use crate::plan::{SelfCheck, METHOD_MAX};
 use crate::public::PublicValues;
-use crate::schema::{Bound, ColType, Param, ParamType, Schema, TableInfo};
+use crate::schema::{Bound, ColType, EntitySpec, Param, ParamType, Schema, TableInfo};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
@@ -436,6 +436,11 @@ struct Item {
     /// Can be NULL over no rows (a non-COUNT aggregate, directly or through
     /// a CTE column or arithmetic, or a division).
     nullable: bool,
+    /// A CTE column whose value repeated across rows of its block's join
+    /// (review F3): a sum over it would count it more than once.
+    repeats: bool,
+    /// A CTE column that is the CTE's only GROUP BY item: one row per value.
+    unique: bool,
 }
 
 impl Item {
@@ -447,6 +452,8 @@ impl Item {
             src: None,
             base: false,
             nullable: false,
+            repeats: false,
+            unique: false,
         }
     }
 
@@ -484,6 +491,10 @@ struct OutCol {
     nullable: bool,
     /// A COUNT, or a plain column this block groups by.
     counted: bool,
+    /// A plain column whose value repeats across the block's rows (F3).
+    repeats: bool,
+    /// The block's only GROUP BY item: one row per value (F3).
+    unique: bool,
 }
 
 #[derive(Debug)]
@@ -499,6 +510,8 @@ struct Source {
     name: String,
     /// The reference name in the rendered SQL (reserved prefix).
     render: String,
+    /// Which table or CTE it reads: no source twice in a block (F3).
+    ident: String,
     cols: Cols,
 }
 
@@ -509,7 +522,13 @@ struct Scope {
     /// GROUP BY / HAVING / ORDER BY. A reference renders as the expression,
     /// never as a bare name SQLite would resolve itself.
     aliases: Vec<(String, Expr, Item)>,
+    /// Per source: its rows repeat through a one-to-many join (F3).
+    repeated: Vec<bool>,
 }
+
+/// One join of a block as (key-side source, FK-side source, fan): `fan`
+/// unless the FK side is one row per key (a CTE grouped by that column).
+type Edge = (usize, usize, bool);
 
 struct Cte {
     name: String,
@@ -728,6 +747,47 @@ fn key_text(e: &Expr) -> String {
     }
 }
 
+/// The sources of one block reachable from `start` without edge `skip`
+/// (the joins of a block form a tree: each join links one new source).
+fn side(n: usize, edges: &[Edge], skip: usize, start: usize) -> Vec<bool> {
+    let mut seen = vec![false; n];
+    let mut todo = vec![start];
+    while let Some(x) = todo.pop() {
+        if seen.get(x) != Some(&false) {
+            continue;
+        }
+        seen[x] = true;
+        for (i, &(k, f, _)) in edges.iter().enumerate() {
+            if i != skip && (k == x || f == x) {
+                todo.push(if k == x { f } else { k });
+            }
+        }
+    }
+    seen
+}
+
+/// Review F3: which sources' rows the joins repeat. A fan edge (one key row,
+/// many FK rows) repeats every source on its key side. The FK sides of all
+/// fan edges must nest (one chain), else rows multiply across branches (two
+/// children of one key, or of two keys) and even COUNT(*) is inflated.
+fn fan_out(n: usize, edges: &[Edge]) -> R<Vec<bool>> {
+    let fans: Vec<(Vec<bool>, Vec<bool>)> = edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.2)
+        .map(|(i, &(k, f, _))| (side(n, edges, i, k), side(n, edges, i, f)))
+        .collect();
+    let subset = |a: &[bool], b: &[bool]| a.iter().zip(b).all(|(x, y)| !*x || *y);
+    for (i, a) in fans.iter().enumerate() {
+        for b in &fans[..i] {
+            if !subset(&a.1, &b.1) && !subset(&b.1, &a.1) {
+                return construct();
+            }
+        }
+    }
+    Ok((0..n).map(|s| fans.iter().any(|f| f.0[s])).collect())
+}
+
 struct Walk<'a> {
     schema: &'a Schema,
     public: &'a [PublicValues],
@@ -787,6 +847,10 @@ impl<'a> Walk<'a> {
         let SetExpr::Select(sel) = body.as_mut() else {
             return construct();
         };
+        // A CTE cut by LIMIT or ordered for it can drop the key's rows (F4).
+        if !outer && (order_by.is_some() || limit_clause.is_some()) {
+            return construct();
+        }
         let saved = std::mem::replace(&mut self.agg_seen, false);
         let r = self.select(sel, order_by.as_mut(), outer);
         self.agg_seen = saved;
@@ -822,34 +886,61 @@ impl<'a> Walk<'a> {
         order_by: Option<&mut OrderBy>,
         outer: bool,
     ) -> R<Vec<OutCol>> {
-        let s = &*sel;
-        if !s.optimizer_hints.is_empty()
-            || s.select_modifiers.is_some()
-            || s.top.is_some()
-            || s.exclude.is_some()
-            || s.into.is_some()
-            || !s.lateral_views.is_empty()
-            || s.prewhere.is_some()
-            || !s.connect_by.is_empty()
-            || !s.cluster_by.is_empty()
-            || !s.distribute_by.is_empty()
-            || !s.sort_by.is_empty()
-            || !s.named_window.is_empty()
-            || s.qualify.is_some()
-            || s.value_table_mode.is_some()
-            || !matches!(s.flavor, SelectFlavor::Standard)
-            || !matches!(s.distinct, None | Some(Distinct::Distinct))
-            || s.from.len() > 1
+        // Every field is named: a field a newer parser adds is a compile
+        // error here, not silently accepted (review F6).
+        let Select {
+            select_token: _,
+            optimizer_hints,
+            distinct,
+            select_modifiers,
+            top,
+            top_before_distinct: _,
+            projection,
+            exclude,
+            into,
+            from,
+            lateral_views,
+            prewhere,
+            selection,
+            connect_by,
+            group_by,
+            cluster_by,
+            distribute_by,
+            sort_by,
+            having,
+            named_window,
+            qualify,
+            window_before_qualify: _,
+            value_table_mode,
+            flavor,
+        } = sel;
+        if !optimizer_hints.is_empty()
+            || select_modifiers.is_some()
+            || top.is_some()
+            || exclude.is_some()
+            || into.is_some()
+            || !lateral_views.is_empty()
+            || prewhere.is_some()
+            || !connect_by.is_empty()
+            || !cluster_by.is_empty()
+            || !distribute_by.is_empty()
+            || !sort_by.is_empty()
+            || !named_window.is_empty()
+            || qualify.is_some()
+            || value_table_mode.is_some()
+            || !matches!(flavor, SelectFlavor::Standard)
+            || !matches!(distinct, None | Some(Distinct::Distinct))
+            || from.len() > 1
         {
             return construct();
         }
-        if s.projection.len() > MAX_COLUMNS {
+        if projection.len() > MAX_COLUMNS {
             return fail(ErrorClass::TooManyColumns);
         }
         let mut sc = Scope::default();
 
         // FROM and JOIN: register every source, then check each ON.
-        if let Some(twj) = sel.from.first_mut() {
+        if let Some(twj) = from.first_mut() {
             self.joins += twj.joins.len();
             if self.joins > MAX_JOINS {
                 return fail(ErrorClass::TooManyJoins);
@@ -866,6 +957,14 @@ impl<'a> Walk<'a> {
                 }
                 self.factor(&mut j.relation, &mut sc)?;
             }
+            // F3 (b): no table or CTE twice in a block.
+            let idents: Vec<&str> = sc.sources.iter().map(|x| x.ident.as_str()).collect();
+            for (i, a) in idents.iter().enumerate() {
+                if idents[..i].contains(a) {
+                    return construct();
+                }
+            }
+            let mut edges = Vec::with_capacity(twj.joins.len());
             for (k, j) in twj.joins.iter_mut().enumerate() {
                 let (JoinOperator::Join(JoinConstraint::On(on))
                 | JoinOperator::Inner(JoinConstraint::On(on))) = &mut j.join_operator
@@ -873,14 +972,15 @@ impl<'a> Walk<'a> {
                     return construct();
                 };
                 // Source k + 1 is the joined one; 0..=k come before it.
-                self.on_clause(on, k + 1, &sc)?;
+                edges.push(self.on_clause(on, k + 1, &sc)?);
             }
+            sc.repeated = fan_out(sc.sources.len(), &edges)?;
         }
 
         // The output columns.
         let mut items: Vec<(Option<String>, String, Item)> = Vec::new();
         let mut aliases = Vec::new();
-        for item in &mut sel.projection {
+        for item in projection.iter_mut() {
             match item {
                 SelectItem::UnnamedExpr(e) => {
                     let written = match e {
@@ -912,7 +1012,7 @@ impl<'a> Walk<'a> {
                 _ => return construct(),
             }
         }
-        if sel.from.is_empty() {
+        if from.is_empty() {
             return construct();
         }
         // Templates and the outer block read columns by name: names are
@@ -925,7 +1025,7 @@ impl<'a> Walk<'a> {
         }
 
         let mut pinned = Vec::new();
-        if let Some(e) = &mut sel.selection {
+        if let Some(e) = selection {
             let mut cs = Vec::new();
             conjuncts(e, &mut cs);
             for c in cs {
@@ -934,7 +1034,7 @@ impl<'a> Walk<'a> {
         }
         sc.aliases = aliases;
         let mut groups = Vec::new();
-        match &mut sel.group_by {
+        match group_by {
             GroupByExpr::Expressions(es, mods) if mods.is_empty() => {
                 for e in es {
                     let it = self.term(e, &sc, true)?;
@@ -946,7 +1046,7 @@ impl<'a> Walk<'a> {
             }
             _ => return construct(),
         }
-        if let Some(e) = &mut sel.having {
+        if let Some(e) = having.as_mut() {
             let mut cs = Vec::new();
             conjuncts(e, &mut cs);
             for c in cs {
@@ -974,7 +1074,7 @@ impl<'a> Walk<'a> {
 
         // Addendum (a): in an aggregating block a plain column is grouped,
         // or (outermost only) a column of the source a `key = :pN` pins.
-        let aggregating = self.agg_seen || !groups.is_empty() || sel.having.is_some();
+        let aggregating = self.agg_seen || !groups.is_empty() || having.is_some();
         let mut out = Vec::with_capacity(items.len());
         for (name, text, it) in items {
             let grouped = it.is_col() && groups.contains(&text);
@@ -994,6 +1094,8 @@ impl<'a> Walk<'a> {
                 },
                 nullable: it.nullable,
                 counted: grouped || it.kind == (Kind::Agg { count: true }),
+                repeats: it.is_col() && (it.repeats || it.src.is_some_and(|s| sc.repeated[s])),
+                unique: it.kind == Kind::Col && groups.len() == 1 && grouped,
             });
         }
         Ok(out)
@@ -1037,10 +1139,19 @@ impl<'a> Walk<'a> {
                 ));
             }
         };
-        let (cols, rendered) = if let Some(c) = self.ctes.iter().find(|c| c.name == written) {
-            (Cols::Cte(c.cols.clone()), render_ref(&written))
+        let (cols, rendered, ident) = if let Some(c) = self.ctes.iter().find(|c| c.name == written)
+        {
+            (
+                Cols::Cte(c.cols.clone()),
+                render_ref(&written),
+                format!("cte:{written}"),
+            )
         } else if let Some(ti) = self.schema.tables.iter().position(|t| tcloud(t) == written) {
-            (Cols::Base(ti), self.schema.tables[ti].name.clone())
+            (
+                Cols::Base(ti),
+                self.schema.tables[ti].name.clone(),
+                format!("table:{ti}"),
+            )
         } else {
             return Err(MethodError::named(ErrorClass::UnknownTable, &written));
         };
@@ -1074,8 +1185,10 @@ impl<'a> Walk<'a> {
         sc.sources.push(Source {
             name: refname,
             render,
+            ident,
             cols,
         });
+        sc.repeated.push(false);
         Ok(())
     }
 
@@ -1104,10 +1217,13 @@ impl<'a> Walk<'a> {
     }
 
     /// ON: an AND of `a = b`, each a declared key pair between the joined
-    /// source and one before it, by column origin (ruling C-G1).
-    fn on_clause(&mut self, on: &mut Expr, joined: usize, sc: &Scope) -> R<()> {
+    /// source and one before it, by column origin (ruling C-G1), all between
+    /// the same two sources. The key side must be one row per key: a base
+    /// table, or a CTE grouped by that column alone (review F3).
+    fn on_clause(&mut self, on: &mut Expr, joined: usize, sc: &Scope) -> R<Edge> {
         let mut cs = Vec::new();
         conjuncts(on, &mut cs);
+        let mut edge: Option<Edge> = None;
         for c in cs {
             let Expr::BinaryOp {
                 left,
@@ -1132,45 +1248,77 @@ impl<'a> Walk<'a> {
             let (Some(oa), Some(ob)) = (&a.origin, &b.origin) else {
                 return construct();
             };
-            let Some(link) = self.key_pair(oa, ob) else {
+            let Some((link, a_is_key)) = self.key_pair(oa, ob) else {
                 return construct();
             };
-            if !crosses {
+            let (key, fk) = if a_is_key { (&a, &b) } else { (&b, &a) };
+            if !crosses || !(key.base || key.unique) {
                 return construct();
+            }
+            let this = (key.src.unwrap_or(0), fk.src.unwrap_or(0), !fk.unique);
+            match edge {
+                Some(e) if e != this => return construct(),
+                _ => edge = Some(this),
             }
             self.links.push(link);
         }
-        Ok(())
+        edge.map_or_else(construct, Ok)
     }
 
-    /// Ruling C-G1: entity key `E.table.E.key` ↔ a column named
-    /// `<E.word>_<E.key>` (ASCII-lowercased) in another table, both INTEGER.
-    fn key_pair(&self, a: &(String, String), b: &(String, String)) -> Option<Link> {
-        let int = |(t, c): &(String, String)| {
-            self.schema
-                .column(t, c)
-                .is_some_and(|x| x.ty == ColType::Integer)
-        };
-        if !int(a) || !int(b) {
+    /// The C-G1 FK name of an entity, from cloud names only (review F1):
+    /// `<word>_<cloud name of the key>`, ASCII-lowercased.
+    fn fk_name(&self, e: &EntitySpec) -> String {
+        let key = self.schema.cloud_name(&e.table, Some(&e.key));
+        format!("{}_{}", e.word, key).to_ascii_lowercase()
+    }
+
+    fn is_int(&self, (t, c): &(String, String)) -> bool {
+        self.schema
+            .column(t, c)
+            .is_some_and(|x| x.ty == ColType::Integer)
+    }
+
+    fn is_entity_key(e: &EntitySpec, x: &(String, String)) -> bool {
+        x.0 == e.table && x.1 == e.key
+    }
+
+    fn is_fk_of(&self, e: &EntitySpec, x: &(String, String)) -> bool {
+        x.0 != e.table && self.schema.cloud_name(&x.0, Some(&x.1)) == self.fk_name(e)
+    }
+
+    /// Ruling C-G1 on cloud names: entity key `E.table.E.key` ↔ a column in
+    /// another table whose cloud name is [`Self::fk_name`], both INTEGER. The
+    /// outcome never depends on a snapshot name behind an alias. Returns the
+    /// link and whether `a` is the key side.
+    fn key_pair(&self, a: &(String, String), b: &(String, String)) -> Option<(Link, bool)> {
+        if !self.is_int(a) || !self.is_int(b) {
             return None;
         }
         self.schema.entities.iter().find_map(|e| {
-            let fk = format!("{}_{}", e.word, e.key).to_ascii_lowercase();
-            let is_key = |x: &(String, String)| x.0 == e.table && x.1 == e.key;
-            let is_fk = |x: &(String, String)| x.0 != e.table && x.1 == fk;
-            let other = if is_key(a) && is_fk(b) {
-                b
-            } else if is_key(b) && is_fk(a) {
-                a
+            let (other, a_is_key) = if Self::is_entity_key(e, a) && self.is_fk_of(e, b) {
+                (b, true)
+            } else if Self::is_entity_key(e, b) && self.is_fk_of(e, a) {
+                (a, false)
             } else {
                 return None;
             };
-            Some(Link {
+            let link = Link {
                 entity: e.table.clone(),
                 table: other.0.clone(),
                 column: other.1.clone(),
-            })
+            };
+            Some((link, a_is_key))
         })
+    }
+
+    /// An entity key or a C-G1 FK column: no literal may pin it (F2).
+    fn is_key_col(&self, x: &(String, String)) -> bool {
+        self.is_int(x)
+            && self
+                .schema
+                .entities
+                .iter()
+                .any(|e| Self::is_entity_key(e, x) || self.is_fk_of(e, x))
     }
 
     // ---- names ----
@@ -1199,6 +1347,8 @@ impl<'a> Walk<'a> {
                     let mut it = Item::new(Kind::Col, c.ty);
                     it.origin = c.origin.clone();
                     it.nullable = c.nullable;
+                    it.repeats = c.repeats;
+                    it.unique = c.unique;
                     Some((n.clone(), n, it))
                 })
                 .collect(),
@@ -1310,7 +1460,8 @@ impl<'a> Walk<'a> {
                 };
                 let a = self.term(left, sc, alias_ok)?;
                 let b = self.term(right, sc, alias_ok)?;
-                if !a.is_agg() || !b.is_agg() {
+                // `x - x`, `x / x` are constants whatever the data (F5).
+                if !a.is_agg() || !b.is_agg() || key_text(left) == key_text(right) {
                     return construct();
                 }
                 let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty));
@@ -1374,6 +1525,14 @@ impl<'a> Walk<'a> {
                 // An output alias is not a column here.
                 let it = self.term(x, sc, false)?;
                 if it.kind != Kind::Col {
+                    return construct();
+                }
+                // F3 (c): a SUM / AVG / COUNT(col) over a value the join
+                // repeats counts it once per repeat. COUNT(*), COUNT(DISTINCT)
+                // and MIN / MAX are not changed by repeats.
+                let repeated = it.repeats || it.src.is_some_and(|s| sc.repeated[s]);
+                let inflates = matches!(l, "sum" | "avg") || (count && !distinct);
+                if repeated && inflates {
                     return construct();
                 }
                 it.ty
@@ -1521,12 +1680,27 @@ impl<'a> Walk<'a> {
             },
             _ => return construct(),
         };
+        // F2: no literal on an entity key or an FK column (it would defeat
+        // the pin), and no number against text or a string against a number.
+        let key = partner.kind == Kind::Col
+            && partner.origin.as_ref().is_some_and(|o| self.is_key_col(o));
+        let text = matches!(partner.ty, Some(ColType::Text | ColType::Date));
+        let literal_ok = |ok: bool| {
+            if ok && !key {
+                Ok(())
+            } else {
+                fail(ErrorClass::LiteralNotAllowed)
+            }
+        };
         match v {
             Value::Placeholder(p) if matches!(e, Expr::Value(_)) => {
                 self.param(p, partner, cmp, entity_ok, pinned)
             }
-            Value::SingleQuotedString(s) if matches!(e, Expr::Value(_)) => self.literal(s, partner),
-            Value::Number(s, false) if number_ok(s) => Ok(()),
+            Value::SingleQuotedString(s) if matches!(e, Expr::Value(_)) => {
+                literal_ok(!is_num(partner.ty))?;
+                self.literal(s, partner)
+            }
+            Value::Number(s, false) if number_ok(s) => literal_ok(!text),
             Value::Boolean(_) => construct(),
             _ => fail(ErrorClass::LiteralNotAllowed),
         }
@@ -1583,6 +1757,8 @@ impl<'a> Walk<'a> {
                 {
                     return misuse();
                 }
+                // Stage 1 is exactly one key. An unbound draft param passes
+                // here; the executor asserts one key at run time (F7, Task 3).
                 match &p.bound {
                     None => {}
                     Some(Bound::Keys(k)) if k.len() == 1 => {}
