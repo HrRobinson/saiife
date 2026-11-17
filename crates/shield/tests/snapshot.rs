@@ -508,3 +508,199 @@ fn danish_text_survives() {
         ]
     );
 }
+
+// ---- fix round 1: private files, spool inside the stage, small items ----
+
+#[test]
+fn spool_stays_inside_the_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = dir.path().join("crm").join("stage");
+    let fx = dir.path().join("fx");
+    std::fs::create_dir(&fx).unwrap();
+    fixtures::write_fixture(&fx, 30, 3).unwrap();
+    let f = std::fs::File::open(fx.join("customers.csv")).unwrap();
+    let mut src = CsvSource::open(Box::new(f), "customers.csv").unwrap();
+    let mut spool_in_stage = false;
+    let mut spool_outside = false;
+    build_snapshot(&mut src, &stage, &mut |_| {
+        let names = |p: &Path| -> Vec<String> {
+            std::fs::read_dir(p)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        };
+        spool_in_stage |= names(&stage)
+            .iter()
+            .any(|n| n.starts_with(".saiife-import-"));
+        spool_outside |= names(&dir.path().join("crm"))
+            .iter()
+            .any(|n| n.starts_with(".saiife-import-"));
+    })
+    .unwrap();
+    assert!(spool_in_stage && !spool_outside);
+    let left: Vec<_> = std::fs::read_dir(&stage)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, vec!["snapshot.sqlite"]);
+}
+
+#[test]
+fn failed_csv_build_leaves_no_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = dir.path().join("stage");
+    let mut src = csv_src(b"a,b\n1,2\n3,4,5\n", "bad.csv");
+    assert!(build_snapshot(&mut src, &stage, &mut |_| {}).is_err());
+    drop(src);
+    let left: Vec<_> = std::fs::read_dir(&stage).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+    let top: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(top, vec!["stage"]);
+}
+
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn no_sidecars(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().all(|e| {
+        let n = e.unwrap().file_name().into_string().unwrap();
+        !(n.ends_with("-journal") || n.ends_with("-wal") || n.ends_with("-shm"))
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn part_file_is_private_and_no_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("a").join("b");
+    let mut src = csv_src(b"id,name\n1,Anna\n2,Berg\n", "p.csv");
+    let mut checked = 0;
+    build_snapshot(&mut src, &out, &mut |_| {
+        assert_eq!(mode_of(&out.join("snapshot.sqlite.part")), 0o600);
+        assert!(no_sidecars(&out));
+        checked += 1;
+    })
+    .unwrap();
+    assert!(checked > 0);
+    assert!(no_sidecars(&out));
+    assert_eq!(mode_of(&out.join("snapshot.sqlite")), 0o400);
+    // Every dir it made is 0700.
+    assert_eq!(mode_of(&out), 0o700);
+    assert_eq!(mode_of(&dir.path().join("a")), 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn loose_out_dir_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("ds");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut src = csv_src(b"a\n1\n", "x.csv");
+    build_snapshot(&mut src, &out, &mut |_| {}).unwrap();
+    assert_eq!(mode_of(&out), 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_part_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("ds");
+    std::fs::create_dir(&out).unwrap();
+    let target = dir.path().join("victim.txt");
+    std::fs::write(&target, b"keep").unwrap();
+    std::os::unix::fs::symlink(&target, out.join("snapshot.sqlite.part")).unwrap();
+    let mut src = csv_src(b"a\n1\n", "x.csv");
+    assert!(build_snapshot(&mut src, &out, &mut |_| {}).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    assert!(!out.join("snapshot.sqlite").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_out_dir_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("ds");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut src = csv_src(b"a\n1\n", "x.csv");
+    assert!(build_snapshot(&mut src, &link, &mut |_| {}).is_err());
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}
+
+#[test]
+fn sqlite_with_unsaved_wal_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("w.db");
+    {
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+    }
+    std::fs::write(dir.path().join("w.db-wal"), b"pending").unwrap();
+    let err = match SqliteSource::open(&p) {
+        Err(e) => e,
+        Ok(_) => panic!("a database with a -wal file must refuse"),
+    };
+    assert!(err.to_string().contains("-wal"), "{err}");
+    // An empty -wal is fine.
+    std::fs::write(dir.path().join("w.db-wal"), b"").unwrap();
+    assert!(SqliteSource::open(&p).is_ok());
+}
+
+#[test]
+fn sqlite_keeps_the_lowest_rowid_and_orders_without_rowid() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("k.db");
+    {
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch(
+            "CREATE TABLE t (a TEXT);
+             INSERT INTO t (rowid, a) VALUES (-9223372036854775808, 'min'), (5, 'five');
+             CREATE TABLE w (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;
+             INSERT INTO w VALUES (3, 'c'), (1, 'a'), (2, 'b');",
+        )
+        .unwrap();
+    }
+    let mut src = SqliteSource::open(&p).unwrap();
+    let rows: Vec<Vec<Cell>> = src.rows("t").unwrap().map(|r| r.unwrap()).collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![Cell::Text("min".into())]);
+    let ks: Vec<Cell> = src
+        .rows("w")
+        .unwrap()
+        .map(|r| r.unwrap()[0].clone())
+        .collect();
+    assert_eq!(ks, vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]);
+}
+
+#[test]
+fn huge_digit_strings_stay_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = csv_src(
+        b"acct,mixed\n12345678901234567890,1.5\n1,99999999999999999999\n",
+        "a.csv",
+    );
+    let info = build(&mut src, dir.path()).unwrap();
+    assert_eq!(
+        col_types(&info, "a"),
+        vec![
+            ("acct".into(), ColType::Text),
+            ("mixed".into(), ColType::Text)
+        ]
+    );
+    let c = open_ro(&info.path).unwrap();
+    let v: String = c
+        .query_row("SELECT acct FROM a WHERE _rowid=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "12345678901234567890");
+}

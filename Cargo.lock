@@ -2164,6 +2164,7 @@ dependencies = [
  "getrandom 0.3.4",
  "ring",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "strsim",

@@ -167,8 +167,8 @@ pub fn write_fixture(dir: &Path, rows: u64, seed: u64) -> io::Result<()> {
             ascii_fold(last)
         );
         let phone = format!(
-            "+45 {:02} {:02} {:02} {:02}",
-            20 + r.below(80),
+            // `+45 00`: no Danish number starts with 00, so these are fictional.
+            "+45 00 {:02} {:02} {:02}",
             r.below(100),
             r.below(100),
             r.below(100)
@@ -234,6 +234,10 @@ fn fixture_is_synthetic_and_deterministic() {
         let refc = line.rsplit(',').next().unwrap();
         assert!(cpr_mod11_ok(refc), "bad check digit");
         assert!(line.contains("@example.invalid"));
+        assert!(
+            line.contains(",+45 00 "),
+            "phone must use the fictional +45 00 prefix"
+        );
     }
     let inv = std::fs::read_to_string(a.path().join("invoices.csv")).unwrap();
     assert_eq!(inv.lines().count(), 101);

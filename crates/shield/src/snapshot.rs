@@ -3,6 +3,7 @@
 //! `0400` and hashed. Column types are inferred in a first pass over the
 //! source; a second pass inserts the rows in batches of 10 000.
 
+use crate::dataset::{create_private_file, ensure_private_dir, seal_file, sync_dir};
 use crate::error::ShieldError;
 use crate::schema::ColType;
 use crate::source::{
@@ -125,6 +126,10 @@ pub(crate) fn parse_real(s: &str) -> Option<f64> {
         i += n;
     }
     if i != b.len() {
+        return None;
+    }
+    // Digits only, beyond i64 (account numbers): TEXT, never a rounded REAL.
+    if i == int_len && parse_int(s).is_none() {
         return None;
     }
     s.parse::<f64>().ok().filter(|f| f.is_finite())
@@ -295,19 +300,18 @@ impl Drop for PartGuard<'_> {
     }
 }
 
-/// Builds `out/snapshot.sqlite` from `src`. `out` is the dataset directory
-/// (made if missing); a CSV keeps its second-pass copy in `out`'s parent and
-/// removes it at the end.
+/// Builds `out/snapshot.sqlite` from `src`. `out` is the stage directory:
+/// made 0700 if missing, else it must be ours and not a symlink (and is
+/// tightened to 0700). A CSV keeps its second-pass copy inside `out` and
+/// removes it at the end; every file is created 0600 and never through a
+/// symlink.
 pub fn build_snapshot(
     src: &mut dyn RowSource,
     out: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<SnapshotInfo, ShieldError> {
-    let spool = out
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    src.set_spool_dir(spool);
+    ensure_private_dir(out)?;
+    src.set_spool_dir(out);
     let r = build_in(src, out, progress);
     src.release();
     r
@@ -318,43 +322,24 @@ fn build_in(
     out: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<SnapshotInfo, ShieldError> {
-    let mut db = std::fs::DirBuilder::new();
-    db.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        db.mode(0o700);
-    }
-    db.create(out)
-        .map_err(|_| ShieldError::Io("could not make the dataset directory".into()))?;
     let path = out.join(SNAPSHOT_FILE);
-    if path.exists() {
+    if std::fs::symlink_metadata(&path).is_ok() {
         return Err(ShieldError::Io("the snapshot already exists".into()));
     }
+    // A leftover part file (or anything planted at its name) refuses: the
+    // caller clears a stale stage.
     let part = out.join(PART_FILE);
-    let _ = std::fs::remove_file(&part);
+    let file = create_private_file(&part)?;
     let mut guard = PartGuard(&part, false);
 
     let tables = write_tables(src, &part, progress)?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o400))
-            .map_err(|_| ShieldError::Io("could not seal the snapshot".into()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let mut p = std::fs::metadata(&part)
-            .map_err(|_| ShieldError::Io("could not seal the snapshot".into()))?
-            .permissions();
-        p.set_readonly(true);
-        std::fs::set_permissions(&part, p)
-            .map_err(|_| ShieldError::Io("could not seal the snapshot".into()))?;
-    }
+    seal_file(&file)?;
+    drop(file);
     std::fs::rename(&part, &path)
         .map_err(|_| ShieldError::Io("could not write the snapshot".into()))?;
     guard.1 = true;
+    sync_dir(out);
     let sha256 = match hash_file(&path) {
         Ok(h) => h,
         Err(e) => {
@@ -388,8 +373,17 @@ fn write_tables(
     }
     let tnames = unique_names(tables.iter().map(|t| t.name.as_str()), true);
 
-    let conn = Connection::open(part).map_err(sql_err)?;
+    // The file exists already (0600, ours); SQLite must not create anything.
+    let conn = Connection::open_with_flags(
+        part,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(sql_err)?;
     conn.pragma_update_and_check(None, "journal_mode", "OFF", |r| r.get::<_, String>(0))
+        .map_err(sql_err)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(sql_err)?;
     conn.pragma_update(None, "synchronous", "OFF")
         .map_err(sql_err)?;

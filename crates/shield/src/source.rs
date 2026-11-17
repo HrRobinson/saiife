@@ -280,16 +280,7 @@ impl CsvSource {
         getrandom::fill(&mut rnd).map_err(|_| ShieldError::Io("no randomness".into()))?;
         let tag: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
         let path = dir.join(format!(".saiife-import-{tag}.tmp"));
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600);
-        }
-        let f = o
-            .open(&path)
-            .map_err(|_| ShieldError::Io("could not write the import copy".into()))?;
+        let f = crate::dataset::create_private_file(&path)?;
         self.spool = Some(path);
         Ok(Some(BufWriter::with_capacity(1 << 20, f)))
     }
@@ -615,6 +606,8 @@ struct SqlTable {
     cols: String,
     /// A rowid name usable for keyset paging, or None (WITHOUT ROWID).
     key: Option<&'static str>,
+    /// For WITHOUT ROWID tables: the quoted primary key columns, in order.
+    order: String,
 }
 
 /// A SQLite database file, opened `mode=ro&immutable=1`. User tables only
@@ -636,6 +629,14 @@ impl SqliteSource {
             .len();
         if len > MAX_FILE_BYTES {
             return Err(ShieldError::Limit("a file is larger than 16 GiB"));
+        }
+        // R-10: `immutable=1` would silently ignore rows still in the WAL.
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+            return Err(bad(
+                "the database has unsaved changes (a -wal file); checkpoint it first",
+            ));
         }
         let conn = rusqlite::Connection::open_with_flags(
             sqlite_uri(path, "mode=ro&immutable=1"),
@@ -673,6 +674,7 @@ impl SqliteSource {
             let from = quote_ident(&name);
             let mut columns = Vec::new();
             let mut all = Vec::new();
+            let mut pk: Vec<(i64, String)> = Vec::new();
             {
                 let mut st = conn
                     .prepare(&format!("PRAGMA table_info({from})"))
@@ -684,6 +686,10 @@ impl SqliteSource {
                         .get::<_, Option<String>>(2)
                         .map_err(|_| tbad())?
                         .unwrap_or_default();
+                    let pk_pos: i64 = r.get(5).map_err(|_| tbad())?;
+                    if pk_pos > 0 {
+                        pk.push((pk_pos, quote_ident(&c)));
+                    }
                     all.push(c.to_ascii_lowercase());
                     if !ty.to_ascii_uppercase().contains("BLOB") {
                         columns.push(c);
@@ -702,11 +708,18 @@ impl SqliteSource {
                     conn.prepare(&format!("SELECT {k} FROM {from} LIMIT 0"))
                         .is_ok()
                 });
+            pk.sort();
+            let order = if pk.is_empty() {
+                cols.clone()
+            } else {
+                pk.into_iter().map(|p| p.1).collect::<Vec<_>>().join(", ")
+            };
             tables.push(SqlTable {
                 info: SourceTable { name, columns },
                 from,
                 cols,
                 key,
+                order,
             });
         }
         Ok(SqliteSource { file, conn, tables })
@@ -746,10 +759,11 @@ impl SqlRows<'_> {
         let skip = usize::from(self.t.key.is_some());
         let ncol = self.t.info.columns.len();
         let mut n = 0i64;
+        let mut last = None;
         while let Some(r) = rows.next().map_err(|_| fail())? {
             n += 1;
             if self.t.key.is_some() {
-                self.last = r.get(0).map_err(|_| fail())?;
+                last = Some(r.get::<_, i64>(0).map_err(|_| fail())?);
             }
             let at = self.row + self.buf.len() as u64 + 1;
             let mut cells = Vec::with_capacity(ncol);
@@ -788,6 +802,13 @@ impl SqlRows<'_> {
             self.buf.push_back(cells);
         }
         self.offset += n;
+        // `last` is the next page's first key (`>=`), so the lowest rowid
+        // (i64::MIN) is not skipped; past i64::MAX there is nothing left.
+        match last.map(|k| k.checked_add(1)) {
+            Some(Some(next)) => self.last = next,
+            Some(None) => self.done = true,
+            None => {}
+        }
         if n < PAGE {
             self.done = true;
         }
@@ -825,10 +846,13 @@ impl RowSource for SqliteSource {
         let list = if t.cols.is_empty() { "NULL" } else { &t.cols };
         let sql = match t.key {
             Some(k) => format!(
-                "SELECT {k}, {list} FROM {} WHERE {k} > ?1 ORDER BY {k} LIMIT {PAGE}",
+                "SELECT {k}, {list} FROM {} WHERE {k} >= ?1 ORDER BY {k} LIMIT {PAGE}",
                 t.from
             ),
-            None => format!("SELECT {list} FROM {} LIMIT {PAGE} OFFSET ?1", t.from),
+            None => format!(
+                "SELECT {list} FROM {} ORDER BY {} LIMIT {PAGE} OFFSET ?1",
+                t.from, t.order
+            ),
         };
         Ok(Box::new(SqlRows {
             conn: &self.conn,
