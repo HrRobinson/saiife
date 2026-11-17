@@ -230,7 +230,10 @@ fn typo_suggested_once() {
     // Over 25 % of a short query: "idx bx" (6 chars, limit 1) is 2 from
     // "ida bo"; "ida bx" is 1.
     assert!(lex.did_you_mean("Idx Bx").unwrap().is_none());
-    assert_eq!(lex.did_you_mean("Ida Bx").unwrap().unwrap().key, 5);
+    assert_eq!(lex.did_you_mean("Idaa Bo").unwrap().unwrap().key, 5);
+    // R-17's cost: a typo inside the first two letters of a token of a
+    // two-token query leaves one shared prefix, so no suggestion.
+    assert!(lex.did_you_mean("Ida Bx").unwrap().is_none());
     assert!(lex.did_you_mean("").unwrap().is_none());
 
     // Two equally close names: no guess.
@@ -313,13 +316,14 @@ fn candidates_capped() {
 
 #[test]
 fn prefix_search_capped() {
-    // 50 001 distinct names share the prefix "an" with the query, plus the
-    // one name the query is a typo of: over the cap gives no suggestion.
+    // R-17: 50 001 distinct names share BOTH prefixes ("an", "be") with the
+    // query, plus the one name the query is a typo of: the intersected set
+    // is over the cap, so no suggestion.
     let mut r = fixtures::Rng::new(43);
     let mut rs = rows(&[("Anna", "Berg", "Aarhus"), ("Zora", "Berg", "Aarhus")]);
     let letters: Vec<char> = ('a'..='z').collect();
     for i in 0..50_001u64 {
-        let mut last = String::from("Q");
+        let mut last = String::from("Be");
         let mut k = i;
         for _ in 0..4 {
             last.push(letters[(k % 26) as usize]);
@@ -338,6 +342,8 @@ fn prefix_search_capped() {
     let dir = tempfile::tempdir().unwrap();
     let lex = Lexicon::open(&build_from(dir.path(), rs)).unwrap();
     assert!(lex.did_you_mean("Anna Bergx").unwrap().is_none());
+    // A one-token query keeps the any-prefix rule: "an" is over the cap.
+    assert!(lex.did_you_mean("Andersx").unwrap().is_none());
     // Exact resolution is not affected by the cap.
     assert!(matches!(
         lex.resolve("customers", "Anna Berg").unwrap().0,
@@ -456,4 +462,33 @@ fn symlink_at_part_path_is_refused() {
     assert!(!ds.join("lexicon.sqlite").exists());
     // The planted link is left alone (not ours to remove).
     assert!(std::fs::symlink_metadata(ds.join("lexicon.sqlite.part")).is_ok());
+}
+
+/// I9 / R-17: a query of two or more tokens compares only names sharing
+/// prefixes with at least two of its tokens, so a common first-name prefix
+/// no longer hides the suggestion.
+#[test]
+fn typo_found_among_many_shared_first_prefixes() {
+    let mut rs = rows(&[("Anna", "Berg", "Aarhus")]);
+    let letters: Vec<char> = ('a'..='z').collect();
+    for i in 0..60_000u64 {
+        let mut first = String::from("An");
+        let mut k = i;
+        for _ in 0..4 {
+            first.push(letters[(k % 26) as usize]);
+            k /= 26;
+        }
+        rs.push(vec![
+            Cell::Int(i as i64 + 2),
+            t(&first),
+            t("Quist"),
+            t("Leeds"),
+            t("vip"),
+            Cell::Null,
+        ]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let lex = Lexicon::open(&build_from(dir.path(), rs)).unwrap();
+    let c = lex.did_you_mean("Ana Berg").unwrap().expect("a suggestion");
+    assert_eq!((c.key, c.display.as_str()), (1, "Anna Berg"));
 }

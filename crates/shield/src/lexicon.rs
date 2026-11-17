@@ -575,9 +575,12 @@ impl Lexicon {
     /// on normalized full names (in the given order or both sorted, whichever
     /// is closer). Qualifies at a distance ≤ 2 and ≤ 25 % of the query's
     /// length (rounded down, at least 1); given only when exactly one
-    /// distinct name has the smallest distance. The names compared share a
-    /// token's first two characters with the query; over [`SUGGEST_CAP`] of
-    /// them gives no suggestion. The candidate is the name's first row: a
+    /// distinct name has the smallest distance. The names compared (R-17):
+    /// for a one-token query, those sharing its first two characters with
+    /// a token; for a longer query, those sharing the first two characters
+    /// of at least two of its tokens (two distinct prefixes; one if all its
+    /// tokens share one prefix). Over [`SUGGEST_CAP`] of them gives no
+    /// suggestion. The candidate is the name's first row: a
     /// "yes" resolves its `display` again with [`Lexicon::resolve`].
     pub fn did_you_mean(&self, phrase: &str) -> Result<Option<Candidate>, ShieldError> {
         let qt = tokens(phrase);
@@ -596,9 +599,17 @@ impl Lexicon {
         if prefixes.len() > MAX_PREFIXES {
             return Ok(None);
         }
+        // R-17: a multi-token query intersects (two shared prefixes), so a
+        // common first-name prefix alone cannot fill the cap.
+        let need = if qt.len() >= 2 {
+            prefixes.len().min(2)
+        } else {
+            1
+        };
         let marks = vec!["?"; prefixes.len()].join(", ");
         let sql = format!(
-            "SELECT DISTINCT norm FROM prefix WHERE p IN ({marks}) LIMIT {}",
+            "SELECT norm FROM prefix WHERE p IN ({marks}) GROUP BY norm \
+             HAVING COUNT(DISTINCT p) >= {need} LIMIT {}",
             SUGGEST_CAP + 1
         );
         let mut norms: Vec<String> = Vec::new();
