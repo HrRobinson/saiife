@@ -238,14 +238,18 @@ fn calc_cannot_escape() {
             "open a TCP socket",
             "write $TMPDIR/x",
             "exec /bin/true",
+            "unshare a namespace",
+            "open a pidfd",
             "read the snapshot",
         ]
     );
-    for (p, o) in &got[..4] {
+    for (p, o) in &got[..6] {
         assert_eq!(o, "denied", "{p}");
     }
+    // The seccomp allowlist answers EPERM for what it does not list.
+    assert_eq!(got[4].1, "denied");
     // The control: the one file it may read.
-    assert_eq!(got[4].1, "allowed");
+    assert_eq!(got[6].1, "allowed");
     assert!(!d.path().join("x").exists());
     eprintln!("confinement: {conf:?}");
 }

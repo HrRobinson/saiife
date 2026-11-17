@@ -49,6 +49,10 @@ seccompiler = "=0.5.0"
 windows-service = "=0.8.1"
 winreg = "=0.56.0"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The seccomp tables are checked against libc's syscall numbers (in Cargo.lock).
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # The polkit rule's unit regex, checked against tier unit names (in Cargo.lock).

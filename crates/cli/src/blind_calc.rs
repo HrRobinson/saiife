@@ -6,7 +6,8 @@
 //! limits (CPU 15 s, address space 1 GiB, a few open files, no file writes,
 //! no core, no new process) → [`confine_helper`] (no_new_privs, a best-effort
 //! empty network namespace, Landlock read-only on the snapshot file and
-//! nothing else, seccomp against sockets, tracing and exec) → open the
+//! nothing else, the calculator's seccomp allowlist: no socket, tracing,
+//! exec, namespace or io_uring call) → open the
 //! snapshot read-only (`immutable=1`: SQLite touches no `-journal`/`-wal`
 //! file) → check its SHA-256 against the job's (`snapshot_mismatch`) →
 //! re-validate the method and its self-checks against the job's schema,
@@ -32,7 +33,9 @@ use saiife_shield::calc_proto::{
 };
 use saiife_shield::snapshot;
 use saiife_shield::sql::{validate, validate_check, ErrorClass};
-use saiife_system::sandbox::{apply_rlimits, confine_helper, Confinement, Rlimits, SandboxError};
+use saiife_system::sandbox::{
+    apply_rlimits, confine_helper, Confinement, Profile, Rlimits, SandboxError,
+};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -109,7 +112,7 @@ fn answer(input: &mut dyn std::io::Read) -> CalcAnswer {
         eprintln!("saiife: __blind-calc: {e}");
         return refuse(CLASS_SANDBOX_UNAVAILABLE, None);
     }
-    let conf = match confine_helper(&[job.snapshot.as_path()], &[]) {
+    let conf = match confine_helper(Profile::Calc, &[job.snapshot.as_path()], &[]) {
         Ok(c) => info(c),
         // The snapshot is missing or not a file: nothing to run on (no
         // method ran, nothing was allowed).
@@ -181,6 +184,13 @@ mod probe {
         }
     }
 
+    /// rustix's safe `unshare` (deprecated for `unshare_unsafe`): no
+    /// `FILES` flag, one thread.
+    #[allow(deprecated)]
+    fn unshare_net() -> rustix::io::Result<()> {
+        rustix::thread::unshare(rustix::thread::UnshareFlags::NEWNET)
+    }
+
     pub(super) fn run(snapshot: &Path) -> ResultSet {
         let probes = [
             ("read /etc/passwd", outcome(std::fs::read("/etc/passwd"))),
@@ -195,6 +205,20 @@ mod probe {
             (
                 "exec /bin/true",
                 outcome(std::process::Command::new("/bin/true").status()),
+            ),
+            (
+                "unshare a namespace",
+                outcome(unshare_net().map_err(io::Error::from)),
+            ),
+            (
+                "open a pidfd",
+                outcome(
+                    rustix::process::pidfd_open(
+                        rustix::process::getpid(),
+                        rustix::process::PidfdFlags::empty(),
+                    )
+                    .map_err(io::Error::from),
+                ),
             ),
             ("read the snapshot", outcome(std::fs::read(snapshot))),
         ];
