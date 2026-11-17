@@ -184,8 +184,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A 512 MiB vfat image labelled SAIIFE: saiife, claude, guest/, recipe.env
-/// and an empty out/ the guest writes its results into. With Codex:
+/// A 512 MiB vfat image labelled SAIIFE: saiife, claude,
+/// `claude-managed-settings.json` (FU2), guest/, recipe.env and an empty
+/// out/ the guest writes its results into. With Codex:
 /// `codex.tar.gz` and `codex-requirements.toml`; with Gemini: `gemini.zip`,
 /// `node.tar.xz`, `gemini-system-settings.json` and
 /// `gemini-user-settings.json` (plan 42 D10, R14).
@@ -199,13 +200,25 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
         .map_err(|e| format!("copy {}: {e}", inputs.claude_bin.display()))?;
     copy_tree(&inputs.guest_assets, &s.join("guest"))?;
     fs::write(s.join("recipe.env"), env).map_err(|e| format!("write recipe.env: {e}"))?;
-    let mut names = vec!["saiife", "claude", "guest", "recipe.env", "out"];
+    let mut names = vec![
+        "saiife",
+        "claude",
+        "claude-managed-settings.json",
+        "guest",
+        "recipe.env",
+        "out",
+    ];
     let copy = |src: &Path, name: &str| {
         fs::copy(src, s.join(name)).map_err(|e| format!("copy {}: {e}", src.display()))
     };
     let write = |name: &str, body: String| {
         fs::write(s.join(name), body).map_err(|e| format!("write {name}: {e}"))
     };
+    // Claude Code is always in the image, so its managed settings are too
+    write(
+        "claude-managed-settings.json",
+        crate::guest::claude_managed_settings(),
+    )?;
     if let Some(codex) = &inputs.agents.codex {
         copy(codex, "codex.tar.gz")?;
         write(
@@ -706,6 +719,13 @@ mod tests {
                     guest::gemini_user_settings()
                 );
             }
+            // Claude Code is always in the image, so its managed settings
+            // are too (FU2)
+            assert!(copy.contains("/claude-managed-settings.json "), "{copy}");
+            assert_eq!(
+                read("claude-managed-settings.json"),
+                guest::claude_managed_settings()
+            );
             // recipe.env does not change with the agents (D10)
             assert_eq!(read("recipe.env"), recipe_env(&recipe()).unwrap());
         }
@@ -740,8 +760,15 @@ mod tests {
         let user = main.find("  make_agent_user\n").unwrap();
         let agents = main.find("  install_agents\n").unwrap();
         assert!(user < agents && agents < main.find("  trim\n").unwrap());
+        // Claude Code's managed settings: always, from install_agents (FU2)
+        let claude = script_fn("install_claude_managed");
+        assert!(claude.contains(&format!("\"{}\"", guest::CLAUDE_MANAGED_SETTINGS_PATH)));
+        let agents_fn = script_fn("install_agents");
+        let first = agents_fn.lines().nth(1).map(str::trim);
+        assert_eq!(first, Some("install_claude_managed"), "{agents_fn}");
         // the R14 tree, with its owners and modes
         for path in [
+            guest::CLAUDE_MANAGED_SETTINGS_PATH,
             guest::CODEX_REQUIREMENTS_PATH,
             guest::GEMINI_SYSTEM_SETTINGS_PATH,
             guest::GEMINI_HOME,
@@ -753,6 +780,11 @@ mod tests {
         let has = |l: &str| lines.contains(&l);
         let home = guest::GEMINI_HOME;
         for l in [
+            "install -d -o root -g root -m 0755 \"/etc/claude-code\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/claude-managed-settings.json\" \"{}\"",
+                guest::CLAUDE_MANAGED_SETTINGS_PATH
+            ),
             "install -d -o root -g root -m 0755 \"/etc/codex\"".to_string(),
             format!(
                 "install -o root -g root -m 0644 \"$MNT/codex-requirements.toml\" \"{}\"",
@@ -779,9 +811,14 @@ mod tests {
             "the user settings live in the baked home"
         );
         // the archives are data: nothing from them is sourced or evaluated
-        let agents_fns = ["install_agents", "install_codex", "install_gemini"]
-            .map(script_fn)
-            .concat();
+        let agents_fns = [
+            "install_agents",
+            "install_claude_managed",
+            "install_codex",
+            "install_gemini",
+        ]
+        .map(script_fn)
+        .concat();
         for bad in ["eval ", "source ", ". \"$", "bash \"$"] {
             assert!(!agents_fns.contains(bad), "{bad}");
         }

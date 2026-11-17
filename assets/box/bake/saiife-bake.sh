@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Guest side of the box base image bake. Runs as root from cloud-init
 # (runcmd) on the bake VM; ported from the spike's spike-bake.sh. The host
-# attaches the payload disk (LABEL=SAIIFE) with saiife, claude, guest/,
-# recipe.env and an empty out/ directory, plus the optional agent files of
-# plan 42 (codex.tar.gz, gemini.zip, node.tar.xz and their configs).
+# attaches the payload disk (LABEL=SAIIFE) with saiife, claude,
+# claude-managed-settings.json, guest/, recipe.env and an empty out/
+# directory, plus the optional agent files of plan 42 (codex.tar.gz,
+# gemini.zip, node.tar.xz and their configs).
 set -euxo pipefail
 
 TTY=/dev/ttyS0
@@ -181,8 +182,17 @@ install_gemini() {
   rm -rf -- "$th"
 }
 
-# Only for the payload files present: recipe.env does not say.
+# Claude Code (FU2): its managed settings hold saiife's hooks and win over
+# every user, project and --settings value. Always: claude is always baked.
+install_claude_managed() {
+  install -d -o root -g root -m 0755 "/etc/claude-code"
+  install -o root -g root -m 0644 "$MNT/claude-managed-settings.json" "/etc/claude-code/managed-settings.json"
+}
+
+# Claude Code always; the others only for the payload files present:
+# recipe.env does not say.
 install_agents() {
+  install_claude_managed
   if [ -f "$MNT/codex.tar.gz" ]; then
     install_codex
   fi

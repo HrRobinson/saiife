@@ -1816,12 +1816,13 @@ async fn discard_and_gc_forget_the_guest_run() {
     assert_eq!(w.guest.forgotten(), vec![id(&b), id(&b2)]);
 }
 
-/// The setup of a real box: the template's command, no env, the in-box
-/// settings, and the user packs of the daemon's policy.d/packs.
+/// The setup of a real box: the template's command, the model env, the
+/// seed and the user packs of the daemon's policy.d/packs; no
+/// `~/.claude/settings.json` (FU2: the hooks are managed, in the image).
 #[tokio::test]
-async fn setup_for_has_settings_and_packs() {
+async fn setup_for_has_seed_and_packs() {
     use saiife_boxhost::guest::SetupSource;
-    use saiife_daemon::box_setup::{packs_dir, TemplateSetup, SETTINGS_PATH};
+    use saiife_daemon::box_setup::{packs_dir, TemplateSetup};
     let w = world();
     let tmp = scratch();
     let config = tmp.path().join("saiife").join("config.toml");
@@ -1838,17 +1839,18 @@ async fn setup_for_has_settings_and_packs() {
     assert_eq!(s.agent.command, vec!["claude".to_string()]);
     assert!(!s.env.is_empty(), "the model env is there");
     assert_eq!((s.rows, s.cols), (40, 120));
-    assert_eq!(s.files.len(), 3, "{:?}", s.files);
-    assert_eq!(s.files[0].path, SETTINGS_PATH);
-    assert_eq!(s.files[0].mode, 0o644);
-    assert_eq!(s.files[0].text, saiife_boxhost::guest::claude_settings());
-    assert_eq!(s.files[1].path, "/home/agent/.claude.json");
+    assert_eq!(s.files.len(), 2, "{:?}", s.files);
+    assert_eq!(s.files[0].path, "/home/agent/.claude.json");
     assert_eq!(
-        s.files[2].path,
+        s.files[1].path,
         "/home/agent/.config/saiife/packs/user.mine.toml"
     );
-    assert_eq!(s.files[2].mode, 0o644);
-    assert_eq!(s.files[2].text, pack);
+    assert_eq!(s.files[1].mode, 0o644);
+    assert_eq!(s.files[1].text, pack);
+    assert!(!s
+        .files
+        .iter()
+        .any(|f| f.path == "/home/agent/.claude/settings.json"));
     assert!(setups.setup_for(&id("b99")).is_err());
 }
 
@@ -1859,7 +1861,7 @@ async fn setup_for_has_settings_and_packs() {
 #[tokio::test]
 async fn setup_has_placeholder_env() {
     use saiife_boxhost::guest::SetupSource;
-    use saiife_daemon::box_setup::{TemplateSetup, CLAUDE_JSON_PATH, SETTINGS_PATH};
+    use saiife_daemon::box_setup::{TemplateSetup, CLAUDE_JSON_PATH};
     let w = world();
     let tmp = scratch();
     let a = w.spawn(ALICE, "t").await;
@@ -1883,9 +1885,11 @@ async fn setup_has_placeholder_env() {
     ] {
         assert_eq!(env(k).as_deref(), Some("1"), "{k}");
     }
-    // the hooks settings are still there, and the seed is once-only
-    assert_eq!(s1.files[0].path, SETTINGS_PATH);
-    assert_eq!(s1.files[0].text, saiife_boxhost::guest::claude_settings());
+    // the hooks are managed, in the image (FU2); the seed is once-only
+    assert!(!s1
+        .files
+        .iter()
+        .any(|f| f.path == "/home/agent/.claude/settings.json"));
     let seed = s1
         .files
         .iter()

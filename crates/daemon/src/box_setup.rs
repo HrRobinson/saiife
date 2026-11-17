@@ -23,8 +23,8 @@ use saiife_boxes::template::{
 };
 use saiife_boxes::BoxId;
 use saiife_boxhost::guest::{
-    claude_env, claude_json_seed, claude_settings, codex_config, codex_env, gemini_env, pack_files,
-    CastPath, SetupSource, VsockGuest, GEMINI_HOME,
+    claude_env, claude_json_seed, codex_config, codex_env, gemini_env, pack_files, CastPath,
+    SetupSource, VsockGuest, GEMINI_HOME,
 };
 use saiife_boxhost::paths::{BoxPaths, RecordPaths};
 use saiife_boxhost::placeholder::read_or_make_placeholder;
@@ -34,8 +34,6 @@ use saiife_policy::userpacks::{read_user_packs, MAX_USER_PACK_BYTES, USER_PACKS_
 
 use crate::box_ops::GuestEvents;
 
-/// Where the in-box Claude Code settings go (G11).
-pub const SETTINGS_PATH: &str = "/home/agent/.claude/settings.json";
 /// Claude Code's own state file, seeded once (never overwritten: it is sent
 /// with `keep_existing`).
 pub const CLAUDE_JSON_PATH: &str = "/home/agent/.claude.json";
@@ -164,15 +162,12 @@ fn authoritative(path: &str, text: String) -> SetupFile {
     }
 }
 
-/// Claude Code's part: the settings, plus the model env and once-only
-/// `.claude.json` seed when given (plan 38 G11, plan 40 C2).
+/// Claude Code's part: the model env and once-only `.claude.json` seed
+/// when given (plan 40 C2). Its hooks are not here: they are managed, baked
+/// into the image root owned (FU2, `claude_managed_settings`), so no
+/// `~/.claude/settings.json` is sent.
 fn claude_setup(model: Option<ModelSetup>) -> AgentSetup {
-    let mut files = vec![SetupFile {
-        path: SETTINGS_PATH.into(),
-        mode: 0o644,
-        text: claude_settings(),
-        keep_existing: false,
-    }];
+    let mut files = Vec::new();
     let mut env = Vec::new();
     if let Some(m) = model {
         env = m.env;
@@ -382,6 +377,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Claude Code's user settings file, which setup no longer writes (FU2).
+    const USER_SETTINGS: &str = "/home/agent/.claude/settings.json";
+
     fn b1() -> BoxId {
         BoxId::parse("b1").unwrap()
     }
@@ -399,8 +397,10 @@ mod tests {
         vec!["claude".into()]
     }
 
+    /// FU2: the hooks are in the image's managed settings, so no per-boot
+    /// `~/.claude/settings.json` is sent.
     #[test]
-    fn setup_is_settings_then_packs() {
+    fn setup_is_packs_without_user_settings() {
         let packs = vec![(
             "user.one".to_string(),
             "[pack]\nid = \"user.one\"\n".to_string(),
@@ -411,15 +411,13 @@ mod tests {
         assert_eq!(s.agent.cwd, "/work");
         assert!(s.env.is_empty());
         assert_eq!((s.rows, s.cols), (40, 120));
-        assert_eq!(s.files.len(), 2);
-        assert_eq!(s.files[0].path, SETTINGS_PATH);
-        assert_eq!(s.files[0].mode, 0o644);
-        assert_eq!(s.files[0].text, claude_settings());
+        assert_eq!(s.files.len(), 1);
         assert_eq!(
-            s.files[1].path,
+            s.files[0].path,
             "/home/agent/.config/saiife/packs/user.one.toml"
         );
-        assert_eq!(s.files[1].text, packs[0].1);
+        assert_eq!(s.files[0].text, packs[0].1);
+        assert!(!s.files.iter().any(|f| f.path == USER_SETTINGS));
     }
 
     fn model() -> ModelSetup {
@@ -435,11 +433,9 @@ mod tests {
         let s = build_setup(&b1(), &cmd(), Some(model()), &[]).unwrap();
         assert_eq!(s.env, model().env);
         let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, vec![SETTINGS_PATH, CLAUDE_JSON_PATH]);
-        let seed = &s.files[1];
+        assert_eq!(paths, vec![CLAUDE_JSON_PATH]);
+        let seed = &s.files[0];
         assert_eq!((seed.mode, seed.keep_existing), (0o600, true));
-        assert!(!s.files[0].keep_existing);
-        assert_eq!(s.files[0].text, claude_settings());
     }
 
     /// The seed counts against the file limit; packs are what gives way.
@@ -451,7 +447,7 @@ mod tests {
         let s = build_setup(&b1(), &cmd(), Some(model()), &packs).unwrap();
         assert_eq!(s.files.len(), MAX_FILES);
         assert!(s.files.iter().any(|f| f.path == CLAUDE_JSON_PATH));
-        assert!(s.files.iter().any(|f| f.path == SETTINGS_PATH));
+        assert!(!s.files.iter().any(|f| f.path == USER_SETTINGS));
         assert!(s.check().is_ok());
     }
 
@@ -465,13 +461,7 @@ mod tests {
         ];
         let s = build_setup(&b1(), &cmd(), None, &packs).unwrap();
         let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(
-            paths,
-            vec![
-                SETTINGS_PATH,
-                "/home/agent/.config/saiife/packs/user.ok.toml"
-            ]
-        );
+        assert_eq!(paths, vec!["/home/agent/.config/saiife/packs/user.ok.toml"]);
     }
 
     #[test]
@@ -497,7 +487,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                SETTINGS_PATH,
                 "/home/agent/.config/saiife/packs/user.a.toml",
                 "/home/agent/.config/saiife/packs/user.c.toml"
             ]
@@ -612,7 +601,7 @@ mod tests {
         );
         assert_eq!(s.files[0].text, codex_config());
         assert_eq!(s.agent.cwd, "/work");
-        assert!(!paths.contains(&SETTINGS_PATH));
+        assert!(!paths.contains(&USER_SETTINGS));
         assert!(!paths.contains(&CLAUDE_JSON_PATH));
         assert_eq!(CODEX_CONFIG_PATH, "/home/agent/.codex/config.toml");
     }
@@ -692,14 +681,15 @@ mod tests {
             .any(|c| c.contains("--dangerously-bypass-hook-trust")));
     }
 
-    /// Plan 38/40 behaviour through the new builder: a Claude Code box's
-    /// agent setup is the settings and the once-only seed.
+    /// Plan 40 behaviour through the new builder: a Claude Code box's agent
+    /// setup is the once-only seed (its hooks are managed, baked into the
+    /// image, FU2).
     #[test]
-    fn claude_agent_setup_is_settings_and_seed() {
+    fn claude_agent_setup_is_the_seed() {
         let a = agent_setup(AgentKind::ClaudeCode, ModelCred::AnthropicApiKey, "PH");
         assert_eq!(a.env, claude_env(Login::ApiKey, "PH"));
         let paths: Vec<&str> = a.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, vec![SETTINGS_PATH, CLAUDE_JSON_PATH]);
+        assert_eq!(paths, vec![CLAUDE_JSON_PATH]);
         let a = agent_setup(
             AgentKind::ClaudeCode,
             ModelCred::AnthropicSubscription,
