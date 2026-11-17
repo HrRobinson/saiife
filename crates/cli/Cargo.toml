@@ -90,6 +90,14 @@ tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `saiife __blind-calc`: the Data Shield calculator process (plan 45 R45-12).
+saiife-shield = { path = "../shield" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The calculator tests write a fixture snapshot (the version saiife-shield uses).
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Same-user approvals: an empty authorization reference whose external form
 # the daemon's `security authorize` uses (plan 13, decision 3). Safe API

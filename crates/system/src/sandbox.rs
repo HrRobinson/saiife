@@ -23,6 +23,12 @@
 //! big-endian length, then JSON), read with unbuffered reads so the rest
 //! of stdin is left for the server. Everything here is safe code: the
 //! daemon and the helper need no `unsafe` to hand over a descriptor.
+//!
+//! **Confined helpers** (plan 45 R45-12, plan 46): [`confine_helper`]
+//! confines a process that keeps running (the Data Shield calculator
+//! `saiife __blind-calc`, the name helper) to reading a few named files,
+//! with no network and a seccomp filter against sockets, tracing and exec.
+//! It fails closed.
 
 use landlock::{
     path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd,
@@ -129,6 +135,15 @@ pub enum SandboxError {
     /// A `read_paths` entry, checked at spawn.
     #[error("a read path {0}")]
     ReadPath(&'static str),
+    /// A resource limit of a confined helper could not be set.
+    #[error("cannot set the resource limits")]
+    Rlimit,
+    /// The new network namespace failed for another reason than `EPERM`.
+    #[error("cannot enter a new network namespace")]
+    Netns,
+    /// The seccomp filter could not be built or loaded.
+    #[error("cannot load the seccomp filter")]
+    Seccomp,
 }
 
 impl SandboxError {
@@ -140,6 +155,7 @@ impl SandboxError {
             SandboxError::Unavailable => "sandbox_unavailable",
             SandboxError::Ruleset | SandboxError::NotEnforced => "sandbox_failed",
             SandboxError::ReadPath(_) => "read_path_refused",
+            SandboxError::Rlimit | SandboxError::Netns | SandboxError::Seccomp => "sandbox_failed",
         }
     }
 }
@@ -407,6 +423,266 @@ pub fn apply(spec: &SpawnSpec) -> Result<(), SandboxError> {
     Ok(())
 }
 
+// --- Confined helpers: the Data Shield calculator (plan 45 R45-12) and the
+// name helper (plan 46). Unlike an MCP child, a helper confines itself and
+// keeps running: no exec, so no program or library dirs are allowed. ---
+
+/// Status and every `blind_run` say this when the calculator could not run
+/// in its box (plan 47). Nothing here runs a method unconfined.
+pub const CALC_LABEL: &str = "calculator not in a box (weaker)";
+
+/// The confinement a helper got, as [`confine_helper`] applied it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confinement {
+    /// The Landlock ABI in force (1 to 6; 6 means "6 or later").
+    pub landlock_abi: u32,
+    /// TCP bind and connect denied by Landlock (ABI 4 or later).
+    pub net_denied: bool,
+    /// Signal and abstract Unix socket scoping (ABI 6 or later).
+    pub scopes: bool,
+    /// The seccomp filter is loaded (always true when `Ok`).
+    pub seccomp: bool,
+    /// An empty network namespace: false when unprivileged user namespaces
+    /// are not allowed on this kernel (`EPERM`).
+    pub netns: bool,
+}
+
+/// Resource limits of a confined helper. [`apply_rlimits`] also sets
+/// `RLIMIT_FSIZE`, `RLIMIT_CORE` and `RLIMIT_NPROC` to 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rlimits {
+    /// `RLIMIT_CPU` in seconds; 0 leaves the CPU limit alone (the
+    /// long-lived name helper).
+    pub cpu_secs: u64,
+    /// `RLIMIT_AS` in bytes.
+    pub as_bytes: u64,
+    /// `RLIMIT_NOFILE`.
+    pub nofile: u64,
+}
+
+/// Lowers `res` to `v` (soft and hard). Never raises it: a hard limit
+/// already below `v` stays.
+fn lower_rlimit(res: rustix::process::Resource, v: u64) -> Result<(), SandboxError> {
+    use rustix::process::{getrlimit, setrlimit, Rlimit};
+    let now = getrlimit(res);
+    let v = now.maximum.map_or(v, |m| m.min(v));
+    setrlimit(
+        res,
+        Rlimit {
+            current: Some(v),
+            maximum: Some(v),
+        },
+    )
+    .map_err(|_| SandboxError::Rlimit)
+}
+
+/// Sets the helper's resource limits: CPU (unless 0), address space and
+/// open files from `r`; file size, core size and process count 0 (no file
+/// written, no core dumped, no process started).
+pub fn apply_rlimits(r: &Rlimits) -> Result<(), SandboxError> {
+    use rustix::process::Resource;
+    if r.cpu_secs > 0 {
+        lower_rlimit(Resource::Cpu, r.cpu_secs)?;
+    }
+    lower_rlimit(Resource::As, r.as_bytes)?;
+    lower_rlimit(Resource::Nofile, r.nofile)?;
+    lower_rlimit(Resource::Fsize, 0)?;
+    lower_rlimit(Resource::Core, 0)?;
+    lower_rlimit(Resource::Nproc, 0)
+}
+
+/// The syscalls the helper's seccomp filter denies with `EPERM`: no socket,
+/// no tracing or reading another process, no exec. Name, x86_64 number,
+/// aarch64 number (the kernel's tables, as seccompiler 0.5.0 lists them).
+pub(crate) const DENIED_SYSCALLS: [(&str, i64, i64); 18] = [
+    ("socket", 41, 198),
+    ("socketpair", 53, 199),
+    ("connect", 42, 203),
+    ("bind", 49, 200),
+    ("listen", 50, 201),
+    ("accept", 43, 202),
+    ("accept4", 288, 242),
+    ("sendto", 44, 206),
+    ("sendmsg", 46, 211),
+    ("sendmmsg", 307, 269),
+    ("recvfrom", 45, 207),
+    ("recvmsg", 47, 212),
+    ("recvmmsg", 299, 243),
+    ("ptrace", 101, 117),
+    ("process_vm_readv", 310, 270),
+    ("process_vm_writev", 311, 271),
+    ("execve", 59, 221),
+    ("execveat", 322, 281),
+];
+
+/// x86_64 only: the x32 ABI shares the x86_64 audit arch (so the filter's
+/// arch check lets it through) and marks its numbers with this bit. Every
+/// denied number is denied with the bit too, and so are the x32-only
+/// numbers of the denied calls (recvfrom 517, sendmsg 518, recvmsg 519,
+/// execve 520, ptrace 521, recvmmsg 537, sendmmsg 538, process_vm_readv
+/// 539, process_vm_writev 540, execveat 545).
+const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+const X32_ONLY_DENIED: [i64; 10] = [517, 518, 519, 520, 521, 537, 538, 539, 540, 545];
+
+/// The arch of this build for the filter; any other arch fails closed.
+pub(crate) fn running_arch() -> Result<seccompiler::TargetArch, SandboxError> {
+    if cfg!(target_arch = "x86_64") {
+        Ok(seccompiler::TargetArch::x86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Ok(seccompiler::TargetArch::aarch64)
+    } else {
+        Err(SandboxError::Seccomp)
+    }
+}
+
+/// The helper's filter for `arch`, compiled to BPF: default allow, the
+/// [`DENIED_SYSCALLS`] fail with `EPERM`; a call from another arch (the
+/// i386 ABI on x86_64) kills the process (seccompiler's arch check).
+pub(crate) fn seccomp_program(
+    arch: seccompiler::TargetArch,
+) -> Result<seccompiler::BpfProgram, SandboxError> {
+    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+    use std::collections::BTreeMap;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for (_, x86, arm) in DENIED_SYSCALLS {
+        match arch {
+            TargetArch::x86_64 => {
+                rules.insert(x86, vec![]);
+                rules.insert(x86 | X32_SYSCALL_BIT, vec![]);
+            }
+            TargetArch::aarch64 => {
+                rules.insert(arm, vec![]);
+            }
+            _ => return Err(SandboxError::Seccomp),
+        }
+    }
+    if arch == TargetArch::x86_64 {
+        for n in X32_ONLY_DENIED {
+            rules.insert(n | X32_SYSCALL_BIT, vec![]);
+        }
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(rustix::io::Errno::PERM.raw_os_error() as u32),
+        arch,
+    )
+    .map_err(|_| SandboxError::Seccomp)?;
+    filter.try_into().map_err(|_| SandboxError::Seccomp)
+}
+
+/// Confines the calling helper process for good. Order (R45-12):
+/// `no_new_privs`; an empty network namespace (best effort: `EPERM`, no
+/// unprivileged user namespaces, goes on with `netns: false`; any other
+/// failure refuses); a Landlock ruleset that handles every filesystem
+/// right of the ABI, TCP bind and connect (ABI 4 or later) and the scopes
+/// (ABI 6 or later), and allows only reading `read_files` (regular files)
+/// and the files beneath `read_dirs`; then the seccomp filter.
+///
+/// Fails closed: no Landlock ([`SandboxError::Unavailable`]), a ruleset
+/// that is not fully enforced, or a filter that does not load is an error,
+/// and the caller must not go on. Call it single-threaded (the namespace
+/// needs it; the filter is synced to every thread anyway).
+pub fn confine_helper(
+    read_files: &[&Path],
+    read_dirs: &[&Path],
+) -> Result<Confinement, SandboxError> {
+    confine_helper_with_abi(landlock_abi(), read_files, read_dirs)
+}
+
+/// [`confine_helper`] at a given Landlock ABI (the test seam). ABI 0
+/// refuses before anything is changed. An ABI above the kernel's fails
+/// (the ruleset is a hard requirement).
+pub fn confine_helper_with_abi(
+    abi: u32,
+    read_files: &[&Path],
+    read_dirs: &[&Path],
+) -> Result<Confinement, SandboxError> {
+    if abi == 0 {
+        return Err(SandboxError::Unavailable);
+    }
+    let program = seccomp_program(running_arch()?)?;
+    rustix::thread::set_no_new_privs(true).map_err(|_| SandboxError::NoNewPrivs)?;
+    let netns = enter_empty_netns()?;
+    let n = abi.min(6);
+    let rules = helper_rules(abi_of(n), read_files, read_dirs)?;
+    let status = restrict_helper(abi_of(n), rules).map_err(|_| SandboxError::Ruleset)?;
+    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
+        return Err(SandboxError::NotEnforced);
+    }
+    seccompiler::apply_filter_all_threads(&program).map_err(|_| SandboxError::Seccomp)?;
+    Ok(Confinement {
+        landlock_abi: n,
+        net_denied: n >= 4,
+        scopes: n >= 6,
+        seccomp: true,
+        netns,
+    })
+}
+
+/// A new user and network namespace: the helper then has no network
+/// interface but a down loopback. rustix's `unshare` is deprecated for
+/// `unshare_unsafe` (it is unsound when `CLONE_FILES` races other threads);
+/// the helper is single-threaded and does not pass `FILES`, and the
+/// workspace forbids `unsafe`.
+#[allow(deprecated)]
+fn enter_empty_netns() -> Result<bool, SandboxError> {
+    use rustix::thread::{unshare, UnshareFlags};
+    match unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWNET) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::PERM) => Ok(false),
+        Err(_) => Err(SandboxError::Netns),
+    }
+}
+
+/// One read rule per path, from an `O_PATH` descriptor opened now: a
+/// `read_files` entry must be a regular file (read only, never execute),
+/// a `read_dirs` entry a directory. A path that cannot be opened fails.
+fn helper_rules(
+    abi: ABI,
+    read_files: &[&Path],
+    read_dirs: &[&Path],
+) -> Result<Vec<PathBeneath<PathFd>>, SandboxError> {
+    use rustix::fs::FileType;
+    let read = AccessFs::from_read(abi);
+    let mut rules = Vec::with_capacity(read_files.len() + read_dirs.len());
+    let mut add = |p: &Path, want: FileType, access| {
+        let fd = PathFd::new(p).map_err(|_| SandboxError::ReadPath("cannot be opened"))?;
+        let st =
+            rustix::fs::fstat(&fd).map_err(|_| SandboxError::ReadPath("cannot be resolved"))?;
+        if FileType::from_raw_mode(st.st_mode) != want {
+            return Err(SandboxError::ReadPath("is not of the expected type"));
+        }
+        rules.push(PathBeneath::new(fd, access));
+        Ok(())
+    };
+    for f in read_files {
+        add(f, FileType::RegularFile, read & AccessFs::from_file(abi))?;
+    }
+    for d in read_dirs {
+        add(d, FileType::Directory, read)?;
+    }
+    Ok(rules)
+}
+
+fn restrict_helper(
+    abi: ABI,
+    rules: Vec<PathBeneath<PathFd>>,
+) -> Result<RestrictionStatus, landlock::RulesetError> {
+    let mut r = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(abi))?;
+    if abi as i32 >= ABI::V4 as i32 {
+        r = r.handle_access(AccessNet::from_all(abi))?;
+    }
+    if abi as i32 >= ABI::V6 as i32 {
+        r = r.scope(Scope::from_all(abi))?;
+    }
+    r.create()?
+        .add_rules(rules.into_iter().map(Ok::<_, landlock::RulesetError>))?
+        .restrict_self()
+}
+
 /// The dirs no `read_paths` entry may equal, sit beneath or contain:
 /// [`PROTECTED_DIRS`] (the fallback defaults), `$CREDENTIALS_DIRECTORY`
 /// when the helper inherited it, and the daemon's own layout from the
@@ -521,6 +797,7 @@ fn restrict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seccompiler::TargetArch;
 
     fn spec() -> SpawnSpec {
         SpawnSpec {
@@ -634,5 +911,55 @@ mod tests {
         }
         assert_eq!(Strength::from_abi(6).as_str(), "filesystem+scopes");
         assert_eq!(Strength::from_abi(6).gap(), None);
+    }
+
+    #[test]
+    fn confine_refuses_without_landlock() {
+        // ABI 0 refuses before anything is changed (this test process stays
+        // unconfined): fail closed, never run unconfined.
+        let f = Path::new("/nonexistent/snapshot.sqlite");
+        assert_eq!(
+            confine_helper_with_abi(0, &[f], &[]).unwrap_err(),
+            SandboxError::Unavailable
+        );
+        assert_eq!(SandboxError::Unavailable.code(), "sandbox_unavailable");
+        assert_eq!(CALC_LABEL, "calculator not in a box (weaker)");
+    }
+
+    #[test]
+    fn seccomp_filter_builds() {
+        for arch in [TargetArch::x86_64, TargetArch::aarch64] {
+            let prog = seccomp_program(arch).unwrap();
+            // The arch check, one chain per denied number, the default.
+            assert!(prog.len() > 3 + DENIED_SYSCALLS.len(), "{arch:?}");
+        }
+        let names: Vec<&str> = DENIED_SYSCALLS.iter().map(|d| d.0).collect();
+        assert_eq!(
+            names,
+            [
+                "socket",
+                "socketpair",
+                "connect",
+                "bind",
+                "listen",
+                "accept",
+                "accept4",
+                "sendto",
+                "sendmsg",
+                "sendmmsg",
+                "recvfrom",
+                "recvmsg",
+                "recvmmsg",
+                "ptrace",
+                "process_vm_readv",
+                "process_vm_writev",
+                "execve",
+                "execveat",
+            ]
+        );
+        // The running arch builds too (the calculator's own filter).
+        assert!(
+            running_arch().is_ok() || !cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        );
     }
 }

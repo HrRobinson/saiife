@@ -1872,6 +1872,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rpassword",
+ "rusqlite",
  "rustix",
  "rustls",
  "saiife-agents",
@@ -1889,6 +1890,7 @@ dependencies = [
  "saiife-link",
  "saiife-mcp",
  "saiife-policy",
+ "saiife-shield",
  "saiife-system",
  "saiife-touch",
  "saiife-win",
@@ -2240,6 +2242,7 @@ dependencies = [
  "saiife-ipc",
  "saiife-policy",
  "saiife-win",
+ "seccompiler",
  "serde",
  "serde_json",
  "sha2",
@@ -2305,6 +2308,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "security-framework"
@@ -2599,7 +2611,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
