@@ -8,7 +8,7 @@
 //! runs one job.
 
 use crate::schema::{rows_band, Bound, Param};
-use crate::sql::{EntityFilter, ErrorClass, Validated, ValidatedCheck};
+use crate::sql::{split_placeholder, EntityFilter, ErrorClass, Suffix, Validated, ValidatedCheck};
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, Statement};
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,14 @@ impl Ctx<'_> {
 
 /// Run `v` on `conn`, then the `checks`. `conn` is `&mut` because SQLite's
 /// progress handler is installed on it for the duration of the run.
+///
+/// `hard_heap_limit` is process-wide and SQLite only ever lowers it: call
+/// this from a dedicated process (the `__blind-calc` child; the "weaker"
+/// fallback must also use a child process), one job per process.
+///
+/// A zero `list_cap`, `wall_ms`, `steps` or a non-positive `heap_bytes` is a
+/// `runtime_error`. For `empty_result` with several entity parameters,
+/// `empty_for` names the first in `entity_filters` order.
 pub fn run(
     conn: &mut Connection,
     v: &Validated,
@@ -117,6 +125,9 @@ pub fn run(
     params: &[Param],
     caps: &Caps,
 ) -> Result<ResultSet, CalcFailure> {
+    if caps.list_cap == 0 || caps.wall_ms == 0 || caps.steps == 0 || caps.heap_bytes <= 0 {
+        return Err(class(ErrorClass::RuntimeError));
+    }
     let trip = Arc::new(AtomicU8::new(0));
     let ctx = Ctx {
         params,
@@ -210,8 +221,9 @@ fn scalars_equal(a: &ResultSet, b: &ResultSet) -> bool {
         (CellValue::Int(p), CellValue::Int(q)) => p == q,
         (CellValue::Text(p), CellValue::Text(q)) => p == q,
         _ => match (num(x), num(y)) {
-            // Sums in another order differ in the last bits only.
-            (Some(p), Some(q)) => (p - q).abs() <= 1e-9 * p.abs().max(q.abs()).max(1.0),
+            // Sums in another order differ in the last bits only; an
+            // absolute 1e-6 is far below any currency unit.
+            (Some(p), Some(q)) => (p - q).abs() <= 1e-6,
             _ => false,
         },
     }
@@ -341,39 +353,35 @@ fn single_key(params: &[Param], name: &str) -> Result<i64, CalcFailure> {
     }
 }
 
-fn bound_value(b: &Bound, part: Option<&str>) -> Option<Value> {
-    Some(match (b, part) {
-        (Bound::Keys(k), None) if k.len() == 1 => Value::Integer(k[0]),
-        (Bound::Amount(d), None) | (Bound::Percent(d), None) => {
+fn bound_value(b: &Bound, sfx: Suffix) -> Option<Value> {
+    Some(match (b, sfx) {
+        (Bound::Keys(k), Suffix::None) if k.len() == 1 => Value::Integer(k[0]),
+        (Bound::Amount(d) | Bound::Percent(d), Suffix::None) => {
             Value::Real(d.to_plain().parse::<f64>().ok()?)
         }
-        (Bound::Integer(i), None) => Value::Integer(*i),
-        (Bound::Date(s), None) | (Bound::Text(s), None) => Value::Text(s.clone()),
-        (Bound::DateRange(from, _), Some("from")) => Value::Text(from.clone()),
-        (Bound::DateRange(_, to), Some("to")) => Value::Text(to.clone()),
+        (Bound::Integer(i), Suffix::None) => Value::Integer(*i),
+        (Bound::Date(s) | Bound::Text(s), Suffix::None) => Value::Text(s.clone()),
+        (Bound::DateRange(from, _), Suffix::From) => Value::Text(from.clone()),
+        (Bound::DateRange(_, to), Suffix::To) => Value::Text(to.clone()),
         _ => return None,
     })
 }
 
 /// Bind every named parameter the statement holds (`:pN`, `:pN_from`,
-/// `:pN_to`) from `params`; an unknown or unbound one is a `runtime_error`.
+/// `:pN_to`). The name is split by the validator's own `split_placeholder`
+/// and the parameter is found by its exact base name; a suffix the parameter's
+/// type does not take, an unknown name or an unbound parameter is a
+/// `runtime_error`.
 fn bind_all(stmt: &mut Statement<'_>, params: &[Param]) -> Result<(), CalcFailure> {
     let bad = || class(ErrorClass::RuntimeError);
     for i in 1..=stmt.parameter_count() {
         let name = stmt.parameter_name(i).ok_or_else(bad)?;
-        let name = name.strip_prefix(':').ok_or_else(bad)?.to_string();
-        let value = params
-            .iter()
-            .find_map(|p| {
-                let b = p.bound.as_ref()?;
-                if p.name == name {
-                    bound_value(b, None)
-                } else if let Some(rest) = name.strip_prefix(&p.name) {
-                    bound_value(b, rest.strip_prefix('_'))
-                } else {
-                    None
-                }
-            })
+        let (base, sfx) = split_placeholder(name).ok_or_else(bad)?;
+        let p = params.iter().find(|p| p.name == base).ok_or_else(bad)?;
+        let value = p
+            .bound
+            .as_ref()
+            .and_then(|b| bound_value(b, sfx))
             .ok_or_else(bad)?;
         stmt.raw_bind_parameter(i, value).map_err(|_| bad())?;
     }

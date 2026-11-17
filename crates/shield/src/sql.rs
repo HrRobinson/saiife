@@ -772,21 +772,25 @@ fn is_placeholder(e: &Expr) -> bool {
     matches!(e, Expr::Value(v) if matches!(v.value, Value::Placeholder(_)))
 }
 
+/// The closed set of placeholder suffixes: none, `_from`, `_to`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Suffix {
+pub enum Suffix {
+    None,
     From,
     To,
 }
 
-/// `:pN`, `:pN_from`, `:pN_to` → (`pN`, suffix).
-fn split_placeholder(t: &str) -> Option<(&str, Option<Suffix>)> {
+/// `:pN`, `:pN_from`, `:pN_to` → (`pN`, suffix). The one splitter the
+/// validator and the executor share; the caller looks the base up by exact
+/// name and checks the suffix against the parameter's type.
+pub fn split_placeholder(t: &str) -> Option<(&str, Suffix)> {
     let rest = t.strip_prefix(':')?;
     let (base, sfx) = if let Some(b) = rest.strip_suffix("_from") {
-        (b, Some(Suffix::From))
+        (b, Suffix::From)
     } else if let Some(b) = rest.strip_suffix("_to") {
-        (b, Some(Suffix::To))
+        (b, Suffix::To)
     } else {
-        (rest, None)
+        (rest, Suffix::None)
     };
     let n = base.strip_prefix('p')?;
     let ok = !n.is_empty() && n.len() <= 3 && n.bytes().all(|b| b.is_ascii_digit());
@@ -1071,6 +1075,11 @@ impl<'a> Walk<'a> {
                         _ => None,
                     };
                     let it = self.term(e, &sc, false)?;
+                    // The outermost output names reach the template and the
+                    // result set: a computed item needs its own `AS alias`.
+                    if written.is_none() && outer {
+                        return construct();
+                    }
                     if let Some(name) = &written {
                         // Keep the cloud name as the output name.
                         *item = SelectItem::ExprWithAlias {
@@ -1940,7 +1949,7 @@ impl<'a> Walk<'a> {
             }
         }
         let type_ok = match (&p.ty, sfx) {
-            (ParamType::Entity { table, .. }, None) => {
+            (ParamType::Entity { table, .. }, Suffix::None) => {
                 let Some(ent) = self.schema.entity_for(table) else {
                     return misuse();
                 };
@@ -1970,25 +1979,28 @@ impl<'a> Walk<'a> {
                 }
                 true
             }
-            (ParamType::DateRange, Some(s)) => {
+            (ParamType::DateRange, s @ (Suffix::From | Suffix::To)) => {
                 if partner.ty != Some(ColType::Date) {
                     return fail(ErrorClass::ParamType);
                 }
                 let op_ok = match s {
                     Suffix::From => cmp == Cmp::Ge,
                     Suffix::To => cmp == Cmp::Lt,
+                    Suffix::None => false,
                 };
                 if !op_ok {
                     return misuse();
                 }
                 true
             }
-            (ParamType::DateRange, None) | (_, Some(_)) => return misuse(),
-            (ParamType::Date, None) => partner.ty == Some(ColType::Date),
-            (ParamType::Amount | ParamType::Integer | ParamType::Percent, None) => {
+            (ParamType::DateRange, Suffix::None) | (_, Suffix::From | Suffix::To) => {
+                return misuse()
+            }
+            (ParamType::Date, Suffix::None) => partner.ty == Some(ColType::Date),
+            (ParamType::Amount | ParamType::Integer | ParamType::Percent, Suffix::None) => {
                 is_num(partner.ty)
             }
-            (ParamType::Text { table, column }, None) => {
+            (ParamType::Text { table, column }, Suffix::None) => {
                 partner.kind == Kind::Col
                     && partner.origin.as_ref() == Some(&(table.clone(), column.clone()))
             }

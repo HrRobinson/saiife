@@ -98,8 +98,12 @@ pub fn public() -> Vec<PublicValues> {
 
 /// The bound entity parameter `p1` (a customer).
 pub fn entity(key: i64) -> Param {
+    entity_named("p1", key)
+}
+
+pub fn entity_named(name: &str, key: i64) -> Param {
     Param {
-        name: "p1".into(),
+        name: name.into(),
         ty: ParamType::Entity {
             table: "customers".into(),
             word: "customer".into(),
@@ -137,6 +141,14 @@ pub fn fixture() -> Connection {
          (2,1,200,'open','2026-02-05',0),(3,1,300,'open','2026-03-05',0),\
          (4,1,50,'paid','2026-03-06',0),(5,2,70,'open','2026-03-07',0);\
          INSERT INTO payments VALUES (1,1,4,50,'2026-03-10');",
+    )
+    .unwrap();
+    db.execute_batch(
+        "INSERT INTO customers VALUES (8,'Stor','Sum','Aalborg',1,'a'),(9,'Flyd','Tal','Aalborg',1,'a');\
+         INSERT INTO invoices VALUES (9001,8,10000000.00,'open','2026-05-01',0),\
+         (9002,8,10000000.01,'paid','2026-05-01',0),\
+         (9003,9,0.1,'open','2026-05-01',0),(9004,9,0.2,'open','2026-05-02',0),\
+         (9005,9,0.3,'paid','2026-05-03',0);",
     )
     .unwrap();
     for i in 0..250 {

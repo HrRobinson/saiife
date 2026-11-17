@@ -7,6 +7,7 @@ use common::*;
 use saiife_shield::calc::{run, CalcFailure, Caps, CellValue};
 use saiife_shield::plan::SelfCheck;
 use saiife_shield::schema::{Bound, Decimal, Param, ParamType};
+use saiife_shield::sql::validate;
 use saiife_shield::sql::{validate_check, ErrorClass, ValidatedCheck};
 
 const BALANCE: &str = "SELECT SUM(i.amount) AS owed, c.credit_limit FROM invoices i \
@@ -310,4 +311,123 @@ fn serde_round_trip() {
     ];
     let j = serde_json::to_string(&cell).unwrap();
     assert_eq!(serde_json::from_str::<Vec<CellValue>>(&j).unwrap(), cell);
+}
+
+#[test]
+fn placeholders_bind_by_exact_name() {
+    let mut db = fixture();
+    // The method uses only `:p10`; the executor's list also holds `p1`.
+    let sql = "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p10";
+    let draft = vec![entity_named("p10", 2)];
+    let val = v(sql, &draft);
+    let ps = vec![entity_named("p1", 1), entity_named("p10", 2)];
+    let rs = run(&mut db, &val, &[], &ps, &caps()).unwrap();
+    // Customer 2 has one invoice, customer 1 four: it bound p10, not p1.
+    assert_eq!(rs.rows, vec![vec![CellValue::Int(1)]]);
+    // The existence check is on p10's key: an absent p10 refuses with p10
+    // named, whatever p1 holds.
+    let ps = vec![entity_named("p1", 1), entity_named("p10", 999)];
+    let f = fail(run(&mut db, &val, &[], &ps, &caps()));
+    assert_eq!(f.empty_for.as_deref(), Some("p10"));
+    // `:p1x` and an unknown placeholder never bind; `:p1_to` on a non-range
+    // parameter neither (executor).
+    for bad in [":p1x", ":p9", ":p1_to", ":p1_from", ":zz"] {
+        let sql = format!("SELECT COUNT(*) AS n FROM invoices i WHERE i.customer_id = {bad}");
+        let mut val = v("SELECT COUNT(*) AS n FROM invoices i", &[]);
+        val.sql = sql;
+        let ps = vec![entity_named("p1", 1)];
+        let f = fail(run(&mut db, &val, &[], &ps, &caps()));
+        assert_eq!(f.class, ErrorClass::RuntimeError, "{bad}");
+    }
+}
+
+#[test]
+fn validator_refuses_inexact_placeholders() {
+    let ps = vec![entity_named("p1", 1), entity_named("p10", 2)];
+    for bad in [":p1x", ":p9", ":p1_to", ":p1_from", ":p10_to"] {
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.customer_id \
+             WHERE c.id = :p1 AND c.id = {bad}"
+        );
+        assert!(validate(&sql, &schema(), &public(), &ps).is_err(), "{bad}");
+    }
+    // A bound entity param the method does not use is refused.
+    let sql = "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p10";
+    assert!(validate(sql, &schema(), &public(), &ps).is_err());
+    // More than ten params resolve exactly.
+    let many: Vec<Param> = (1..=12)
+        .map(|n| entity_named(&format!("p{n}"), n))
+        .collect();
+    let sql = "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p12";
+    let only = vec![many[11].clone()];
+    assert!(validate(sql, &schema(), &public(), &only).is_ok());
+}
+
+#[test]
+fn equal_is_strict() {
+    let mut db = fixture();
+    let sch = schema();
+    let mut eqchk = |key: i64| {
+        let ps = vec![entity(key)];
+        let a = format!("SELECT SUM(i.amount) AS s {J} AND i.status = 'open'");
+        let b = format!("SELECT SUM(i.amount) AS t {J} AND i.status = 'paid'");
+        let c = validate_check(&SelfCheck::Equal { a, b }, &sch, &public(), &ps).unwrap();
+        let val = v(&format!("SELECT COUNT(*) AS n {J}"), &ps);
+        run(&mut db, &val, &[c], &ps, &caps())
+    };
+    // A real cent at 1e7 is a difference.
+    assert_eq!(fail(eqchk(8)).class, ErrorClass::CheckFailed);
+    // 0.1 + 0.2 equals 0.3.
+    eqchk(9).unwrap();
+}
+
+#[test]
+fn zero_caps_refused() {
+    let mut db = fixture();
+    let val = v(HEAVY, &[]);
+    for c in [
+        Caps {
+            list_cap: 0,
+            ..Caps::default()
+        },
+        Caps {
+            wall_ms: 0,
+            ..Caps::default()
+        },
+        Caps {
+            steps: 0,
+            ..Caps::default()
+        },
+        Caps {
+            heap_bytes: 0,
+            ..Caps::default()
+        },
+        Caps {
+            heap_bytes: -5,
+            ..Caps::default()
+        },
+    ] {
+        assert_eq!(
+            fail(run(&mut db, &val, &[], &[], &c)).class,
+            ErrorClass::RuntimeError
+        );
+    }
+}
+
+#[test]
+fn computed_outputs_need_an_alias() {
+    for sql in [
+        "SELECT SUM(i.amount) FROM invoices i",
+        "SELECT i.status, COUNT(*) FROM invoices i GROUP BY i.status",
+    ] {
+        let e = validate(sql, &schema(), &public(), &[]).unwrap_err();
+        assert_eq!(e.class, ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    assert!(validate(
+        "SELECT SUM(i.amount) AS s FROM invoices i",
+        &schema(),
+        &public(),
+        &[]
+    )
+    .is_ok());
 }
