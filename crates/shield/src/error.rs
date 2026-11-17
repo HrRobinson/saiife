@@ -5,7 +5,7 @@
 pub enum ShieldError {
     #[error("a dataset name is 1 to 32 characters: a lowercase letter, then lowercase letters, digits or '-'")]
     BadName,
-    #[error("{file}: {why}")]
+    #[error("{}", source_text(file, table, column, row, why))]
     Source {
         file: String,
         table: Option<String>,
@@ -23,6 +23,31 @@ pub enum ShieldError {
     Corrupt(&'static str),
 }
 
+/// `file, table t, column c, row 7: why`: names and positions only.
+fn source_text(
+    file: &str,
+    table: &Option<String>,
+    column: &Option<String>,
+    row: &Option<u64>,
+    why: &str,
+) -> String {
+    let mut s = file.to_string();
+    if let Some(t) = table {
+        s.push_str(", table ");
+        s.push_str(t);
+    }
+    if let Some(c) = column {
+        s.push_str(", column ");
+        s.push_str(c);
+    }
+    if let Some(r) = row {
+        s.push_str(&format!(", row {r}"));
+    }
+    s.push_str(": ");
+    s.push_str(why);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,6 +61,14 @@ mod tests {
             row: Some(3),
             why: "bad date",
         };
-        assert_eq!(e.to_string(), "a.csv: bad date");
+        assert_eq!(e.to_string(), "a.csv, table t, column c, row 3: bad date");
+        let e = ShieldError::Source {
+            file: "a.csv".into(),
+            table: None,
+            column: None,
+            row: Some(9),
+            why: "bad date",
+        };
+        assert_eq!(e.to_string(), "a.csv, row 9: bad date");
     }
 }
