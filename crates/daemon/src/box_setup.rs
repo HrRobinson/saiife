@@ -5,7 +5,7 @@
 //!
 //! The setup is the box template's command, the agent's model env and files
 //! (plan 40: the box's placeholder, never the real credential; for Claude
-//! Code its first-run seed and settings (G11), for Codex and Gemini their
+//! Code its first-run seed (its hooks are baked managed settings, FU2), for Codex and Gemini their
 //! config with the gateway as provider, plan 42 D5) and the user packs of
 //! this daemon's `policy.d/packs`, on a 40 x 120 terminal. A pack that
 //! cannot be sent (an invalid id, too big, over the file count) is skipped
@@ -249,9 +249,8 @@ fn user_packs(id: &BoxId, dir: &Path) -> Vec<(String, String)> {
     }
 }
 
-/// The setup of a Claude Code box `id`: [`build_agent_setup`] with the
-/// Claude Code settings, and the model env and `.claude.json` seed when
-/// given.
+/// The setup of a Claude Code box `id`: [`build_agent_setup`] with Claude
+/// Code's model env and `.claude.json` seed when given.
 pub fn build_setup(
     id: &BoxId,
     command: &[String],

@@ -1530,15 +1530,15 @@ pub const OPENSSH: &str = "/usr/bin/ssh";
 /// a root-owned wrapper ([`saiife_ssh_wrapper`]) that runs [`OPENSSH`] with
 /// only saiife's ssh config ([`SAIIFE_SSH_CONFIG_PATH`]), so the agent's
 /// `~/.ssh/config` (`ProxyCommand`, `LocalCommand`) is never read.
-pub const CLAUDE_GIT_SSH: &str = launch::GIT_SSH_WRAPPER;
+pub use launch::GIT_SSH_WRAPPER;
 
-/// The only ssh config [`CLAUDE_GIT_SSH`] reads (baked root-owned 0644).
+/// The only ssh config [`GIT_SSH_WRAPPER`] reads (baked root-owned 0644).
 pub const SAIIFE_SSH_CONFIG_PATH: &str = "/etc/ssh/saiife_ssh_config";
 
 /// Every agent's git config file (COORD-7), baked root-owned 0644 from
 /// [`GIT_FORCED_CONFIG`] ([`saiife_gitconfig`]). No `/etc/gitconfig` is
 /// baked: git reads no system file in a box (`GIT_CONFIG_NOSYSTEM=1`).
-pub const GIT_CONFIG_GLOBAL_PATH: &str = launch::GIT_CONFIG_GLOBAL_PATH;
+pub use launch::GIT_CONFIG_GLOBAL_PATH;
 
 /// The one forced git-config table (COORD-7): see
 /// [`launch::GIT_FORCED_CONFIG`]. It feeds the baked
@@ -1546,7 +1546,7 @@ pub const GIT_CONFIG_GLOBAL_PATH: &str = launch::GIT_CONFIG_GLOBAL_PATH;
 /// agent's launch env and of the settings pins.
 pub use launch::GIT_FORCED_CONFIG;
 
-/// The wrapper at [`CLAUDE_GIT_SSH`] (baked root:root 0755).
+/// The wrapper at [`GIT_SSH_WRAPPER`] (baked root:root 0755).
 pub fn saiife_ssh_wrapper() -> String {
     format!(
         "#!/bin/sh\n\
@@ -1619,11 +1619,11 @@ pub fn git_program_env() -> Vec<(String, String)> {
         .iter()
         .map(|(var, key)| (var.to_string(), launch::forced(key).to_string()))
         .collect();
-    v.extend(pairs(&[
-        ("GIT_SSH_VARIANT", "ssh".into()),
-        ("SSH_ASKPASS", "/bin/false".into()),
-        ("SSH_ASKPASS_REQUIRE", "never".into()),
-        ("SSH_SK_PROVIDER", "internal".into()),
+    v.extend(launch::pairs(&[
+        ("GIT_SSH_VARIANT", "ssh".to_string()),
+        ("SSH_ASKPASS", "/bin/false".to_string()),
+        ("SSH_ASKPASS_REQUIRE", "never".to_string()),
+        ("SSH_SK_PROVIDER", "internal".to_string()),
         ("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL.into()),
     ]));
     v
@@ -1688,11 +1688,11 @@ fn claude_base_url() -> (String, String) {
 
 /// The switches that keep the client from phoning anywhere else.
 fn claude_switches() -> Vec<(String, String)> {
-    pairs(&[
-        ("DISABLE_TELEMETRY", "1".into()),
-        ("DISABLE_ERROR_REPORTING", "1".into()),
-        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()),
-        ("DISABLE_AUTOUPDATER", "1".into()),
+    launch::pairs(&[
+        ("DISABLE_TELEMETRY", "1".to_string()),
+        ("DISABLE_ERROR_REPORTING", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
+        ("DISABLE_AUTOUPDATER", "1".to_string()),
     ])
 }
 
@@ -1751,10 +1751,6 @@ pub const NEVER_SET: [&str; 5] = [
 /// owned, 0644, baked in, so the agent in the box cannot change them.
 pub const CODEX_REQUIREMENTS_PATH: &str = "/etc/codex/requirements.toml";
 
-fn pairs(v: &[(&str, String)]) -> Vec<(String, String)> {
-    v.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
-}
-
 fn table<const N: usize>(kv: [(&str, toml::Value); N]) -> toml::Value {
     toml::Value::Table(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
@@ -1763,9 +1759,9 @@ fn table<const N: usize>(kv: [(&str, toml::Value); N]) -> toml::Value {
 /// placeholder as the OpenAI key (the forwarder swaps it) and a fixed
 /// `CODEX_HOME`, so another `HOME` cannot move Codex off saiife's config.
 pub fn codex_env(placeholder: &str) -> Vec<(String, String)> {
-    pairs(&[
+    launch::pairs(&[
         ("OPENAI_API_KEY", placeholder.to_string()),
-        ("CODEX_HOME", "/home/agent/.codex".into()),
+        ("CODEX_HOME", "/home/agent/.codex".to_string()),
     ])
 }
 
@@ -1916,13 +1912,13 @@ pub const GEMINI_USER_SETTINGS_PATH: &str = "/opt/saiife-gemini-home/.gemini/set
 /// `GEMINI_CLI_HOME` fixed to [`GEMINI_HOME`], so a `.env` the CLI reaches
 /// cannot move its home.
 pub fn gemini_env(placeholder: &str) -> Vec<(String, String)> {
-    pairs(&[
+    launch::pairs(&[
         ("GEMINI_API_KEY", placeholder.to_string()),
         (
             "GOOGLE_GEMINI_BASE_URL",
             format!("http://127.0.0.1:{}", ports::MODEL_TCP),
         ),
-        ("GEMINI_TELEMETRY_ENABLED", "false".into()),
+        ("GEMINI_TELEMETRY_ENABLED", "false".to_string()),
         ("GEMINI_CLI_HOME", GEMINI_HOME.into()),
     ])
 }
@@ -2230,7 +2226,7 @@ mod settings_tests {
     fn claude_managed_env_pins_git_ssh() {
         let v = managed();
         let env = v["env"].as_object().unwrap();
-        assert_eq!(CLAUDE_GIT_SSH, "/usr/local/libexec/saiife-ssh");
+        assert_eq!(GIT_SSH_WRAPPER, "/usr/local/libexec/saiife-ssh");
         assert_eq!(OPENSSH, "/usr/bin/ssh");
         assert_eq!(env["GIT_SSH_COMMAND"], "/usr/local/libexec/saiife-ssh");
         assert_eq!(env["GIT_SSH"], "/usr/local/libexec/saiife-ssh");
@@ -2361,6 +2357,26 @@ mod settings_tests {
                 "{name}"
             );
         }
+        // and the reverse: every MODEL_ENV entry is sent by some agent's
+        // builder, so a stale entry cannot widen the allowlist silently
+        let mut sent: Vec<String> = [
+            claude_env(Login::ApiKey, "p"),
+            claude_env(Login::Subscription, "p"),
+            codex_env("p"),
+            gemini_env("p"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(k, _)| k)
+        .collect();
+        sent.sort();
+        sent.dedup();
+        let mut known: Vec<String> = launch::MODEL_ENV
+            .iter()
+            .flat_map(|(_, vars)| vars.iter().map(|v| v.to_string()))
+            .collect();
+        known.sort();
+        assert_eq!(sent, known);
     }
 
     /// COORD-7: Codex's shell tool env is pinned in both config layers with

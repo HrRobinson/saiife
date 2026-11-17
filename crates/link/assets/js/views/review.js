@@ -48,7 +48,7 @@ function guardNote(g) {
     { class: "banner", role: "note" },
     h("span", { class: "badge", title: GUARD_SKIPPED }, "guard skipped"),
     " ",
-    GUARD_SKIPPED,
+    GUARD_SKIPPED.charAt(0).toUpperCase() + GUARD_SKIPPED.slice(1),
   );
 }
 

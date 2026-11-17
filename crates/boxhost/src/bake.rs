@@ -814,7 +814,7 @@ mod tests {
         // /etc/gitconfig any more
         let git = script_fn("install_saiife_git");
         for path in [
-            guest::CLAUDE_GIT_SSH,
+            guest::GIT_SSH_WRAPPER,
             guest::SAIIFE_SSH_CONFIG_PATH,
             guest::GIT_CONFIG_GLOBAL_PATH,
         ] {
@@ -848,7 +848,7 @@ mod tests {
             "install -d -o root -g root -m 0755 \"/usr/local/libexec\"".to_string(),
             format!(
                 "install -o root -g root -m 0755 \"$MNT/saiife-ssh\" \"{}\"",
-                guest::CLAUDE_GIT_SSH
+                guest::GIT_SSH_WRAPPER
             ),
             "install -d -o root -g root -m 0755 \"/etc/ssh\"".to_string(),
             format!(

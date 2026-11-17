@@ -2,7 +2,8 @@
 # Guest side of the box base image bake. Runs as root from cloud-init
 # (runcmd) on the bake VM; ported from the spike's spike-bake.sh. The host
 # attaches the payload disk (LABEL=SAIIFE) with saiife, claude,
-# claude-managed-settings.json, guest/, recipe.env and an empty out/
+# claude-managed-settings.json, guest/, recipe.env, git's saiife-ssh,
+# saiife-ssh-config and saiife-gitconfig, and an empty out/
 # directory, plus the optional agent files of plan 42 (codex.tar.gz,
 # gemini.zip, node.tar.xz and their configs).
 set -euxo pipefail

@@ -66,6 +66,8 @@ pub struct BoxRecord {
     #[serde(default)]
     pub guard_checks: u64,
     /// FU1: agent turns finished (TurnFinished events) over the box's life.
+    /// Approximate: the guest coalesces bursts and the host rate-limits
+    /// them, so it under-counts. Display and audit only.
     #[serde(default)]
     pub turns: u64,
     /// FU1: sticky audit flag: a review saw changed files while

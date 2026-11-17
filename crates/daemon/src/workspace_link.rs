@@ -586,6 +586,20 @@ fn touch_required(action: &str) -> Fail {
 }
 
 /// The frame's args take only `keys`.
+/// FU1: the box's guard signal on a diff answer (unix: boxes exist there).
+#[cfg(unix)]
+fn add_guard(ctx: &Ctx, id: &BoxId, d: &mut Value) {
+    if let (Some(o), Some(rec)) = (
+        d.as_object_mut(),
+        ctx.box_manager.as_ref().and_then(|m| m.get(id).ok()),
+    ) {
+        o.insert("guard".into(), crate::box_land::guard_json(&rec));
+    }
+}
+
+#[cfg(not(unix))]
+fn add_guard(_ctx: &Ctx, _id: &BoxId, _d: &mut Value) {}
+
 pub(crate) fn only(args: &Map<String, Value>, keys: &[&str]) -> Result<(), Fail> {
     match args.keys().find(|k| !keys.contains(&k.as_str())) {
         Some(k) => Err(invalid(format!("unexpected argument {k:?}"))),
@@ -957,19 +971,10 @@ async fn act(
             only(args, &["id"])?;
             let id = id_arg(args)?;
             let gid = id.clone();
-            let d = to_value(&blocking(&src, move |b| b.diff(&id)).await?)?;
+            let mut d = to_value(&blocking(&src, move |b| b.diff(&id)).await?)?;
             // FU1: the box's guard signal; the source answered, so the
             // frame's owner may see this box.
-            #[cfg(unix)]
-            let mut d = d;
-            #[cfg(unix)]
-            if let (Some(o), Some(rec)) = (
-                d.as_object_mut(),
-                ctx.box_manager.as_ref().and_then(|m| m.get(&gid).ok()),
-            ) {
-                o.insert("guard".into(), crate::box_land::guard_json(&rec));
-            }
-            let _ = gid;
+            add_guard(ctx, &gid, &mut d);
             Ok(d)
         }
         a::BOX_TERM_READ => {

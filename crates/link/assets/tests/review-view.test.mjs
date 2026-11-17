@@ -101,6 +101,10 @@ test("a guard_skipped box shows a warning badge with the explanation", async () 
   assert.ok(b.attrs.class.split(" ").includes("badge"), b.attrs.class);
   assert.ok(b.attrs.title.includes("its in-box guard reported no checks"), b.attrs.title);
   assert.ok(b.attrs.title.includes("a signal only"), b.attrs.title);
+  // the banner text starts with a capital; the title keeps the shared text
+  const note = find(root, (n) => n.tag === "p" && n.attrs.class === "banner");
+  assert.ok(note, "no banner");
+  assert.ok(texts(note).join("").includes(" The box changed files but"), texts(note).join(""));
 });
 
 test("no badge when the guard was not skipped or is not reported", async () => {

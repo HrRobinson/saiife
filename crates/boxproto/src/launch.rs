@@ -141,9 +141,10 @@ pub fn is_model_var(name: &str) -> bool {
     MODEL_ENV.iter().any(|(_, vars)| vars.contains(&name))
 }
 
-fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+/// Owned name/value pairs from borrowed or owned values.
+pub fn pairs<V: AsRef<str>>(v: &[(&str, V)]) -> Vec<(String, String)> {
     v.iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (k.to_string(), v.as_ref().to_string()))
         .collect()
 }
 
