@@ -58,6 +58,10 @@ struct FileForm {
 /// `m-<slug>-v<n>`; the slug is the first 4 words of the key, ASCII
 /// lowercased, characters outside `[a-z0-9]` dropped, empty words skipped.
 pub fn method_id(key: &str, version: u32) -> String {
+    format!("m-{}-v{}", slug(key), version)
+}
+
+fn slug(key: &str) -> String {
     let words: Vec<String> = key
         .split_whitespace()
         .map(|w| {
@@ -69,7 +73,7 @@ pub fn method_id(key: &str, version: u32) -> String {
         .filter(|w| !w.is_empty())
         .take(4)
         .collect();
-    format!("m-{}-v{}", words.join("-"), version)
+    words.join("-")
 }
 
 fn same_slot(m: &ApprovedMethod, ds: &DatasetName, lang: Lang, key: &str, tags: &[String]) -> bool {
@@ -163,7 +167,7 @@ impl MethodStore {
     pub fn save(&self, path: &Path) -> Result<(), ShieldError> {
         let dir = match path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
-            _ => Path::new("."),
+            _ => return Err(io_err("the methods path needs a directory")),
         };
         let name = path
             .file_name()
@@ -198,10 +202,14 @@ impl MethodStore {
     /// version (id from [`method_id`]); the older Active one is kept as
     /// history, suspended `replaced by vN`.
     pub fn add(&mut self, mut m: ApprovedMethod) -> &ApprovedMethod {
+        // Ids are unique by construction: n is one more than the highest
+        // version among every stored method with the same slug (any slot,
+        // any status).
+        let sl = slug(&m.template_key);
         let max = self
             .methods
             .iter()
-            .filter(|o| same_slot(o, &m.dataset, m.lang, &m.template_key, &m.param_tags))
+            .filter(|o| slug(&o.template_key) == sl)
             .map(|o| o.version)
             .max();
         if let Some(max) = max {
@@ -230,7 +238,8 @@ impl MethodStore {
 
     /// Spec §2.1.1, on every refresh: re-validate each Active method (its
     /// method and every check, with params rebuilt from `param_tags`); a
-    /// failure suspends it with `<class> <cloud name>`. Suspended methods
+    /// failure suspends it with `<class> <cloud name>`. Only methods of
+    /// `schema.dataset` are touched (the store may hold several datasets). Suspended methods
     /// are history and are not revalidated or reported.
     pub fn revalidate(
         &mut self,
@@ -239,7 +248,7 @@ impl MethodStore {
     ) -> Vec<(String, Result<(), MethodError>)> {
         let mut out = Vec::new();
         for m in self.methods.iter_mut() {
-            if m.status != MethodStatus::Active {
+            if m.status != MethodStatus::Active || m.dataset != schema.dataset {
                 continue;
             }
             let r = revalidate_one(m, schema, public);
@@ -544,5 +553,89 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         assert_eq!(MethodStore::load(&p).unwrap(), s);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_part_does_not_block_save() {
+        use std::os::unix::fs::symlink;
+        let d = scratch("stale");
+        let dir = d.join("ds");
+        std::fs::create_dir(&dir).unwrap();
+        let p = dir.join("methods.json");
+        let mut s = MethodStore::default();
+        s.add(method("balance of a", &["entity:customers"], Lang::En));
+        std::fs::write(dir.join("methods.json.part"), "half").unwrap();
+        s.save(&p).unwrap();
+        assert_eq!(MethodStore::load(&p).unwrap(), s);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // A symlink at the part path is still refused and left alone.
+        let victim = d.join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let part = dir.join("methods.json.part");
+        symlink(&victim, &part).unwrap();
+        assert!(s.save(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(std::fs::symlink_metadata(&part)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn save_refuses_a_bare_file_name() {
+        let s = MethodStore::default();
+        assert!(s.save(Path::new("methods.json")).is_err());
+    }
+
+    #[test]
+    fn ids_are_unique_across_slots() {
+        let mut s = MethodStore::default();
+        let t = ["entity:customers"];
+        let a = s.add(method("balance of a", &t, Lang::En)).id.clone();
+        let b = s.add(method("balance of a", &t, Lang::Da)).id.clone();
+        let c = s
+            .add(method("balance of a", &["date"], Lang::En))
+            .id
+            .clone();
+        let d = s
+            .add(method("balance of a customer x", &t, Lang::En))
+            .id
+            .clone();
+        let e = s
+            .add(method("balance of a customer y", &t, Lang::En))
+            .id
+            .clone();
+        let ids = [&a, &b, &c, &d, &e];
+        for (i, x) in ids.iter().enumerate() {
+            for y in &ids[i + 1..] {
+                assert_ne!(x, y);
+            }
+        }
+        assert_eq!(a, "m-balance-of-a-v1");
+        // Same slot again: a higher version, old one suspended.
+        let a2 = s.add(method("balance of a", &t, Lang::En));
+        assert_eq!(a2.id, format!("m-balance-of-a-v{}", a2.version));
+        assert!(a2.version > 1);
+        assert!(s.remove(&b));
+        assert_eq!(s.methods.len(), 5);
+        assert!(!s.remove(&b));
+    }
+
+    #[test]
+    fn revalidate_touches_only_its_dataset() {
+        let mut s = MethodStore::default();
+        s.add(method("count open", &["entity:customers"], Lang::En));
+        let mut other = method("count open", &["entity:customers"], Lang::En);
+        other.dataset = "hr".parse().unwrap();
+        s.add(other);
+        let r = s.revalidate(&schema(false), &public());
+        assert_eq!(r.len(), 1);
+        assert!(matches!(
+            s.methods[0].status,
+            MethodStatus::Suspended { .. }
+        ));
+        assert_eq!(s.methods[1].status, MethodStatus::Active);
     }
 }

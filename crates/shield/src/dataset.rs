@@ -147,6 +147,27 @@ pub(crate) fn replace_private_part<T>(
     private_part(dir, final_name, true, write)
 }
 
+/// Replace mode only: a leftover part from a crash (a regular file of ours,
+/// not a symlink) is removed so it cannot block every later save; anything
+/// else at the part path is left alone and refuses at creation.
+fn remove_stale_part(part: &Path) -> Result<(), ShieldError> {
+    let md = match std::fs::symlink_metadata(part) {
+        Ok(md) => md,
+        Err(_) => return Ok(()),
+    };
+    #[cfg(unix)]
+    let ours = {
+        use std::os::unix::fs::MetadataExt;
+        md.uid() == rustix::process::geteuid().as_raw()
+    };
+    #[cfg(not(unix))]
+    let ours = true;
+    if md.is_file() && ours {
+        std::fs::remove_file(part).map_err(|_| io("could not remove a stale part file"))?;
+    }
+    Ok(())
+}
+
 fn private_part<T>(
     dir: &Path,
     final_name: &str,
@@ -161,6 +182,9 @@ fn private_part<T>(
         Err(_) => {}
     }
     let part = dir.join(format!("{final_name}.part"));
+    if replace {
+        remove_stale_part(&part)?;
+    }
     let file = create_private_file(&part)?;
     let mut guard = PartGuard(&part, false);
     let v = write(&part)?;
