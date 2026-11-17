@@ -3,6 +3,7 @@
 //! inside one session and unrelated to any other.
 
 use crate::error::ShieldError;
+use crate::index::IndexKey;
 use ring::hmac;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -305,6 +306,17 @@ impl KeySet {
                 .sum::<usize>()
     }
 
+    /// The key of the dataset's known-value index (plan 43 R43-9), ruling
+    /// P-5. The key set holds its own random 32-byte index key (`index`,
+    /// from `generate`), independent of the stand-in key, so this is a
+    /// copy, not a derivation: the plan names no derivation because none is
+    /// needed. `rotate` changes the stand-in key only, so the index built
+    /// with this key stays valid; deleting the keys removes the index too
+    /// (plan 47 R47-2).
+    pub fn index_key(&self) -> IndexKey {
+        IndexKey(self.index.clone())
+    }
+
     /// JSON with base64 keys; the daemon seals these bytes (plan 47).
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let cap = self.bytes_bound();
@@ -543,5 +555,22 @@ mod tests {
             KeySet::from_bytes(bad),
             Err(ShieldError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn index_key_is_the_index_key_and_stable() {
+        let mut ks = KeySet::generate("2026-01-01T00:00:00Z").unwrap();
+        let a = ks.index_key();
+        assert_eq!(*a.0, *ks.index);
+        assert_ne!(*a.0, *ks.standin, "the index key is not the stand-in key");
+        assert_eq!(*ks.index_key().0, *a.0, "stable");
+        // Rotation changes the stand-in key only: the index stays usable.
+        ks.rotate("2026-02-01T00:00:00Z").unwrap();
+        assert_eq!(*ks.index_key().0, *a.0);
+        assert_ne!(*ks.index_key().0, *ks.standin);
+        // It survives the sealed bytes.
+        let back = KeySet::from_bytes(&ks.to_bytes()).unwrap();
+        assert_eq!(*back.index_key().0, *a.0);
+        assert_eq!(format!("{a:?}"), "IndexKey(..)");
     }
 }
