@@ -2167,9 +2167,11 @@ dependencies = [
  "serde",
  "serde_json",
  "strsim",
+ "tempfile",
  "thiserror 1.0.69",
  "unicode-normalization",
  "zeroize",
+ "zip",
 ]
 
 [[package]]
