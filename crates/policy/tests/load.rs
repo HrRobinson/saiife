@@ -1298,7 +1298,7 @@ fn blind_judgment_refused() {
         &format!("version = 2\n{BLIND_CRM}mode = \"judgment\"\n"),
         &[],
     );
-    assert!(e.contains("mode"), "{e}");
+    assert!(e.contains("judgment mode is a later stage"), "{e}");
 }
 
 #[test]
@@ -1325,7 +1325,10 @@ fn blind_bad_class_refused() {
         &format!("version = 2\n{BLIND_CRM}[blind.dataset.columns.\"t.c\"]\nclass = \"secret\"\n"),
         &[],
     );
-    assert!(e.contains("class"), "{e}");
+    assert!(
+        e.contains("class must be one of identifier, quasi, sensitive, free_text, public"),
+        "{e}"
+    );
     let e = blind_err(
         &format!("version = 2\n{BLIND_CRM}[blind.dataset.columns.nodot]\nclass = \"public\"\n"),
         &[],
@@ -1338,4 +1341,89 @@ fn blind_bad_class_refused() {
         &[],
     );
     assert!(e.contains("approvers"), "{e}");
+}
+
+#[test]
+fn blind_ranges() {
+    let ok = |c: &str| {
+        let (_d, cfg) = etc(c, &[]);
+        load_system(&cfg).map(|_| ())
+    };
+    for (key, lo, hi) in [("list_cap", 1u32, 10_000u32), ("session_minutes", 5, 480)] {
+        for v in [lo, hi] {
+            ok(&format!("version = 2\n[blind]\n{key} = {v}\n")).unwrap();
+        }
+        for v in [lo - 1, hi + 1] {
+            let e = blind_err(&format!("version = 2\n[blind]\n{key} = {v}\n"), &[]);
+            assert!(
+                e.contains(&format!("[blind] {key} must be {lo}..={hi}")),
+                "{e}"
+            );
+        }
+    }
+    // Per-dataset list_cap.
+    for v in [1u32, 10_000] {
+        ok(&format!("version = 2\n{BLIND_CRM}list_cap = {v}\n")).unwrap();
+    }
+    for v in [0u32, 10_001] {
+        let e = blind_err(&format!("version = 2\n{BLIND_CRM}list_cap = {v}\n"), &[]);
+        assert!(e.contains("crm: list_cap must be 1..=10000"), "{e}");
+    }
+    let e = blind_err("version = 2\n[blind]\noutbox_days = 0\n", &[]);
+    assert!(e.contains("outbox_days must be at least 1"), "{e}");
+    ok("version = 2\n[blind]\noutbox_days = 100000\n").unwrap();
+}
+
+#[test]
+fn blind_k_below_two_refused() {
+    for k in [0, 1] {
+        let e = blind_err(&format!("version = 2\n[blind]\nk = {k}\n"), &[]);
+        assert!(e.contains("[blind] k must be at least 2"), "{e}");
+        let e = blind_err(&format!("version = 2\n{BLIND_CRM}k = {k}\n"), &[]);
+        assert!(e.contains("crm: k must be at least 2"), "{e}");
+    }
+}
+
+#[test]
+fn blind_more_refusals() {
+    let long = "a".repeat(33);
+    for bad in ["Crm", long.as_str(), "1crm", "c_rm", ""] {
+        let e = blind_err(
+            &format!(
+                "version = 2\n[[blind.dataset]]\nname = \"{bad}\"\nsource = {{ kind = \"csv\", file_name = \"a.csv\" }}\n"
+            ),
+            &[],
+        );
+        assert!(
+            e.contains("name must match ^[a-z][a-z0-9-]{0,31}$"),
+            "{bad}: {e}"
+        );
+    }
+    let h = "a".repeat(64);
+    let ner = |m: &str, url: &str| {
+        format!(
+            "version = 2\n[blind.ner]\nmodel_url = \"{url}\"\nmodel_sha256 = \"{m}\"\nvocab_url = \"https://x.example/v\"\nvocab_sha256 = \"{h}\"\nlabels_url = \"https://x.example/l\"\nlabels_sha256 = \"{h}\"\n"
+        )
+    };
+    for bad in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+        let e = blind_err(&ner(&bad, "https://x.example/m"), &[]);
+        assert!(
+            e.contains("model_sha256 must be 64 lowercase hex digits"),
+            "{e}"
+        );
+    }
+    let e = blind_err(&ner(&h, "http://x.example/m"), &[]);
+    assert!(e.contains("model_url must start with https://"), "{e}");
+    let e = blind_err("version = 2\n[blind.cloud]\nsecret = \"\"\n", &[]);
+    assert!(e.contains("[blind.cloud] secret is empty"), "{e}");
+    let e = blind_err(&format!("version = 2\n{BLIND_CRM}users = [\"a b\"]\n"), &[]);
+    assert!(
+        e.contains("crm: users has an entry that is not a user name or group:<name>"),
+        "{e}"
+    );
+    let e = blind_err(
+        &format!("version = 2\n{BLIND_CRM}users = [\"group:\"]\n"),
+        &[],
+    );
+    assert!(e.contains("users has an entry"), "{e}");
 }

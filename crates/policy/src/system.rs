@@ -413,8 +413,7 @@ impl ApprovalCfg {
     /// characters. `Err` names the first bad entry.
     pub fn check_approvers(&self) -> Result<(), String> {
         for e in &self.approvers {
-            let name = e.strip_prefix("group:").unwrap_or(e);
-            if !valid_name(name) {
+            if !valid_principal(e) {
                 return Err(format!(
                     "[approval] approvers entry {e:?} is not a user name or group:<name>"
                 ));
@@ -424,8 +423,13 @@ impl ApprovalCfg {
     }
 }
 
+/// A user name or `group:<name>` entry.
+pub(crate) fn valid_principal(e: &str) -> bool {
+    valid_name(e.strip_prefix("group:").unwrap_or(e))
+}
+
 /// A user or group name (as `users::valid_name`).
-pub(crate) fn valid_name(name: &str) -> bool {
+fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && !name

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+pub const LIST_CAP_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
+pub const SESSION_MINUTES_RANGE: std::ops::RangeInclusive<u32> = 5..=480;
 pub const DEFAULT_K: u32 = 10;
 pub const DEFAULT_LIST_CAP: u32 = 100;
 pub const DEFAULT_SESSION_MINUTES: u32 = 30;
@@ -164,18 +166,20 @@ impl BlindCfg {
 
     /// `Err` names the key or dataset at fault, never a value.
     pub fn validate(&self) -> Result<(), String> {
-        for (key, v) in [
-            ("k", self.k),
-            ("list_cap", self.list_cap),
-            ("session_minutes", self.session_minutes),
-            ("outbox_days", self.outbox_days),
-        ] {
-            if v == Some(0) {
-                return Err(format!("[blind] {key} must be at least 1"));
-            }
-        }
         if self.k.is_some_and(|k| k < 2) {
             return Err("[blind] k must be at least 2".to_string());
+        }
+        if self.list_cap.is_some_and(|v| !LIST_CAP_RANGE.contains(&v)) {
+            return Err("[blind] list_cap must be 1..=10000".to_string());
+        }
+        if self
+            .session_minutes
+            .is_some_and(|v| !SESSION_MINUTES_RANGE.contains(&v))
+        {
+            return Err("[blind] session_minutes must be 5..=480".to_string());
+        }
+        if self.outbox_days == Some(0) {
+            return Err("[blind] outbox_days must be at least 1".to_string());
         }
         if let Some(n) = &self.ner {
             n.validate()?;
@@ -240,15 +244,12 @@ impl BlindDataset {
         if self.k.is_some_and(|k| k < 2) {
             return Err(format!("[[blind.dataset]] {n}: k must be at least 2"));
         }
-        if self.list_cap == Some(0) {
-            return Err(format!(
-                "[[blind.dataset]] {n}: list_cap must be at least 1"
-            ));
+        if self.list_cap.is_some_and(|v| !LIST_CAP_RANGE.contains(&v)) {
+            return Err(format!("[[blind.dataset]] {n}: list_cap must be 1..=10000"));
         }
         for (key, list) in [("users", &self.users), ("approvers", &self.approvers)] {
             for e in list {
-                let name = e.strip_prefix("group:").unwrap_or(e);
-                if !crate::system::valid_name(name) {
+                if !crate::system::valid_principal(e) {
                     return Err(format!(
                         "[[blind.dataset]] {n}: {key} has an entry that is not a user name or group:<name>"
                     ));
