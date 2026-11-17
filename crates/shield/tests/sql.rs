@@ -1121,6 +1121,7 @@ fn error_class_names_round_trip() {
         "memory_cap",
         "step_cap",
         "check_failed",
+        "empty_result",
     ];
     for n in all {
         let c = ErrorClass::from_str(n).unwrap_or_else(|| panic!("{n}"));

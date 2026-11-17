@@ -129,9 +129,13 @@ pub enum ErrorClass {
     MemoryCap,
     StepCap,
     CheckFailed,
+    /// The entity exists but the method found nothing for it (zero rows, or
+    /// every nullable aggregate NULL): a refusal distinct from `empty_for_key`
+    /// (the entity has no rows). Run-time class: never sent to the planner.
+    EmptyResult,
 }
 
-const ALL_CLASSES: [ErrorClass; 20] = [
+const ALL_CLASSES: [ErrorClass; 21] = [
     ErrorClass::Syntax,
     ErrorClass::NotSelect,
     ErrorClass::MultipleStatements,
@@ -152,6 +156,7 @@ const ALL_CLASSES: [ErrorClass; 20] = [
     ErrorClass::MemoryCap,
     ErrorClass::StepCap,
     ErrorClass::CheckFailed,
+    ErrorClass::EmptyResult,
 ];
 
 impl ErrorClass {
@@ -177,6 +182,7 @@ impl ErrorClass {
             ErrorClass::MemoryCap => "memory_cap",
             ErrorClass::StepCap => "step_cap",
             ErrorClass::CheckFailed => "check_failed",
+            ErrorClass::EmptyResult => "empty_result",
         }
     }
 
