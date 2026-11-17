@@ -91,6 +91,22 @@ fn base_name(file_name: &str) -> String {
         .to_string()
 }
 
+/// I5: the fixed reason for a file whose first row is data.
+const HEADERLESS: &str = "the first row looks like data, not column names";
+/// D1: the fixed reason for an xlsx error cell (`#DIV/0!`, `#REF!`...).
+const SHEET_ERROR: &str = "a cell holds a spreadsheet error";
+
+/// I5: a header cell that is a number, a date or an identifier (email,
+/// IBAN, phone, CPR, card number) is a data row, not column names.
+fn looks_like_data(cell: &str) -> bool {
+    use crate::snapshot::{parse_date, parse_int, parse_real};
+    let t = cell.trim();
+    parse_int(t).is_some()
+        || parse_real(t).is_some()
+        || parse_date(t).is_some()
+        || crate::classify::looks_like_identifier(t)
+}
+
 fn header_name(raw: &str, i: usize) -> String {
     let t = raw.trim();
     if t.is_empty() {
@@ -239,6 +255,11 @@ impl CsvSource {
                 "the header row is longer than 64 KiB",
             ));
         }
+        let stem = Path::new(&file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("data")
+            .to_string();
         let mut columns = Vec::with_capacity(rec.len());
         for (i, f) in rec.iter().enumerate() {
             let s = std::str::from_utf8(f).map_err(|_| {
@@ -250,13 +271,11 @@ impl CsvSource {
                     "the file is not UTF-8; save it as UTF-8",
                 )
             })?;
+            if looks_like_data(s) {
+                return Err(src_err(&file, Some(&stem), None, Some(1), HEADERLESS));
+            }
             columns.push(header_name(s, i));
         }
-        let stem = Path::new(&file)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("data")
-            .to_string();
         Ok(CsvSource {
             file,
             table: SourceTable {
@@ -449,10 +468,12 @@ pub struct XlsxSource {
     sheets: Vec<(SourceTable, calamine::Range<calamine::Data>)>,
 }
 
-fn xlsx_cell(d: &calamine::Data) -> Cell {
+/// One xlsx cell; an error cell is None (the caller refuses it, D1).
+fn xlsx_cell(d: &calamine::Data) -> Option<Cell> {
     use calamine::Data;
-    match d {
-        Data::Empty | Data::Error(_) => Cell::Null,
+    Some(match d {
+        Data::Error(_) => return None,
+        Data::Empty => Cell::Null,
         Data::Int(i) => Cell::Int(*i),
         Data::Float(f) => {
             if f.fract() == 0.0 && f.abs() < 9.0e15 {
@@ -480,7 +501,7 @@ fn xlsx_cell(d: &calamine::Data) -> Cell {
             }
         }
         Data::DateTimeIso(s) | Data::DurationIso(s) => Cell::Text(s.clone()),
-    }
+    })
 }
 
 impl XlsxSource {
@@ -521,18 +542,20 @@ impl XlsxSource {
             let Some(head) = range.rows().next() else {
                 continue;
             };
-            let columns = head
-                .iter()
-                .enumerate()
-                .map(|(i, d)| {
-                    let raw = match d {
-                        calamine::Data::String(s) => s.clone(),
-                        calamine::Data::Empty => String::new(),
-                        other => other.to_string(),
-                    };
-                    header_name(&raw, i)
-                })
-                .collect();
+            let mut columns = Vec::with_capacity(head.len());
+            for (i, d) in head.iter().enumerate() {
+                use calamine::Data;
+                let raw = match d {
+                    Data::String(s) if !looks_like_data(s) => s.clone(),
+                    Data::Empty => String::new(),
+                    Data::Error(_) => {
+                        return Err(src_err(&file, Some(&name), None, Some(1), SHEET_ERROR))
+                    }
+                    // A number, a date or an identifier in row 1 is data.
+                    _ => return Err(src_err(&file, Some(&name), None, Some(1), HEADERLESS)),
+                };
+                columns.push(header_name(&raw, i));
+            }
             sheets.push((SourceTable { name, columns }, range));
         }
         Ok(XlsxSource { file, sheets })
@@ -545,17 +568,30 @@ impl RowSource for XlsxSource {
     }
 
     fn rows(&mut self, table: &str) -> Result<RowIter<'_>, ShieldError> {
-        let (_, range) = self
+        let (info, range) = self
             .sheets
             .iter()
             .find(|s| s.0.name == table)
             .ok_or_else(|| no_table(&self.file, table))?;
-        Ok(Box::new(
-            range
-                .rows()
-                .skip(1)
-                .map(|r| Ok(r.iter().map(xlsx_cell).collect())),
-        ))
+        let file = &self.file;
+        Ok(Box::new(range.rows().enumerate().skip(1).map(
+            move |(ri, r)| {
+                r.iter()
+                    .enumerate()
+                    .map(|(ci, d)| {
+                        xlsx_cell(d).ok_or_else(|| {
+                            src_err(
+                                file,
+                                Some(&info.name),
+                                info.columns.get(ci).map(String::as_str),
+                                Some(ri as u64 + 1),
+                                SHEET_ERROR,
+                            )
+                        })
+                    })
+                    .collect()
+            },
+        )))
     }
 
     fn file_name(&self) -> &str {
@@ -638,6 +674,14 @@ impl SqliteSource {
                 "the database has unsaved changes (a -wal file); checkpoint it first",
             ));
         }
+        // D2: `immutable=1` would ignore a hot rollback journal too.
+        let mut journal = path.as_os_str().to_os_string();
+        journal.push("-journal");
+        if std::fs::metadata(&journal).is_ok_and(|m| m.len() > 0) {
+            return Err(bad(
+                "the database has an unfinished transaction (a -journal file); open and close it in SQLite first",
+            ));
+        }
         let conn = rusqlite::Connection::open_with_flags(
             sqlite_uri(path, "mode=ro&immutable=1"),
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -648,6 +692,8 @@ impl SqliteSource {
         // The paged SELECTs sort: never into a temp file.
         crate::dataset::memory_temp_store(&conn)
             .map_err(|_| bad("the file is not a readable SQLite database"))?;
+        crate::dataset::no_dqs(&conn)
+            .map_err(|()| bad("the file is not a readable SQLite database"))?;
         let names: Vec<String> = (|| {
             let mut st = conn.prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
@@ -918,6 +964,11 @@ mod tests {
             .query_row("PRAGMA temp_store", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ts, 2, "sorts must never spill values to temp files");
+        // I7: no double-quoted-string fallback.
+        assert!(s
+            .conn
+            .query_row("SELECT \"nosuchcol\" FROM a", [], |r| r.get::<_, i64>(0))
+            .is_err());
     }
 
     #[test]

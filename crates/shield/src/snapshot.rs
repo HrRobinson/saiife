@@ -3,7 +3,9 @@
 //! `0400` and hashed. Column types are inferred in a first pass over the
 //! source; a second pass inserts the rows in batches of 10 000.
 
-use crate::dataset::{ensure_private_dir, memory_temp_store, open_part_db, with_private_part};
+use crate::dataset::{
+    ensure_private_dir, memory_temp_store, no_dqs, open_part_db, with_private_part,
+};
 use crate::error::ShieldError;
 use crate::schema::ColType;
 use crate::source::{
@@ -138,6 +140,37 @@ pub(crate) fn parse_real(s: &str) -> Option<f64> {
     s.parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
+/// I6: a Danish decimal comma, `-?\d+,\d+` or `-?\d{1,3}(\.\d{3})+,\d+`
+/// (`.` groups thousands), as the exact `f64` (`1.234,50` is 1234.5).
+pub(crate) fn parse_decimal_comma(s: &str) -> Option<f64> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, s),
+    };
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let (int, frac) = body.split_once(',')?;
+    if !digits(frac) {
+        return None;
+    }
+    let mut groups = int.split('.');
+    let first = groups.next()?;
+    let rest: Vec<&str> = groups.collect();
+    let int_ok = if rest.is_empty() {
+        digits(first)
+    } else {
+        digits(first) && first.len() <= 3 && rest.iter().all(|g| g.len() == 3 && digits(g))
+    };
+    if !int_ok {
+        return None;
+    }
+    let plain = format!(
+        "{}{}.{frac}",
+        if neg { "-" } else { "" },
+        int.replace('.', "")
+    );
+    plain.parse::<f64>().ok().filter(|f| f.is_finite())
+}
+
 fn days_in(y: u32, m: u32) -> u32 {
     match m {
         2 if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) => 29,
@@ -188,6 +221,8 @@ pub(crate) fn parse_bool(s: &str) -> Option<bool> {
 struct Infer {
     int: bool,
     real: bool,
+    /// I6: every non-empty cell is a Danish decimal comma.
+    dcomma: bool,
     date: bool,
     boolean: bool,
     seen: bool,
@@ -198,6 +233,7 @@ impl Infer {
         Infer {
             int: true,
             real: true,
+            dcomma: true,
             date: true,
             boolean: true,
             seen: false,
@@ -205,12 +241,12 @@ impl Infer {
     }
 
     fn see(&mut self, c: &Cell) {
-        let (i, r, d, b) = match c {
+        let (i, r, dc, d, b) = match c {
             Cell::Null => return,
-            Cell::Int(_) => (true, true, false, false),
-            Cell::Real(_) => (false, true, false, false),
-            Cell::Date(_) => (false, false, true, false),
-            Cell::Bool(_) => (false, false, false, true),
+            Cell::Int(_) => (true, true, false, false, false),
+            Cell::Real(_) => (false, true, false, false, false),
+            Cell::Date(_) => (false, false, false, true, false),
+            Cell::Bool(_) => (false, false, false, false, true),
             Cell::Text(s) => {
                 let t = s.trim();
                 if t.is_empty() {
@@ -219,6 +255,7 @@ impl Infer {
                 (
                     self.int && parse_int(t).is_some(),
                     self.real && parse_real(t).is_some(),
+                    self.dcomma && parse_decimal_comma(t).is_some(),
                     self.date && parse_date(t).is_some(),
                     self.boolean && parse_bool(t).is_some(),
                 )
@@ -227,6 +264,7 @@ impl Infer {
         self.seen = true;
         self.int &= i;
         self.real &= r;
+        self.dcomma &= dc;
         self.date &= d;
         self.boolean &= b;
     }
@@ -236,7 +274,7 @@ impl Infer {
             ColType::Text
         } else if self.int {
             ColType::Integer
-        } else if self.real {
+        } else if self.real || self.decimal_comma() {
             ColType::Real
         } else if self.date {
             ColType::Date
@@ -245,6 +283,14 @@ impl Infer {
         } else {
             ColType::Text
         }
+    }
+}
+
+impl Infer {
+    /// The column is REAL through decimal commas (never mixed with dot
+    /// decimals, which give TEXT).
+    fn decimal_comma(&self) -> bool {
+        self.seen && !self.int && !self.real && self.dcomma
     }
 }
 
@@ -258,9 +304,10 @@ fn decl(t: ColType) -> &'static str {
     }
 }
 
-/// The stored value of a cell in a column of type `ty`; None if the cell
-/// does not fit (the source changed between the passes).
-fn convert(c: Cell, ty: ColType) -> Option<Value> {
+/// The stored value of a cell in a column of type `ty` (`dcomma`: a REAL
+/// column of decimal commas); None if the cell does not fit (the source
+/// changed between the passes).
+fn convert(c: Cell, ty: ColType, dcomma: bool) -> Option<Value> {
     if let Cell::Text(s) = &c {
         if s.trim().is_empty() {
             return Some(Value::Null);
@@ -276,6 +323,7 @@ fn convert(c: Cell, ty: ColType) -> Option<Value> {
         (ColType::Integer, Cell::Text(s)) => Value::Integer(parse_int(s.trim())?),
         (ColType::Real, Cell::Int(i)) => Value::Real(i as f64),
         (ColType::Real, Cell::Real(f)) => Value::Real(f),
+        (ColType::Real, Cell::Text(s)) if dcomma => Value::Real(parse_decimal_comma(s.trim())?),
         (ColType::Real, Cell::Text(s)) => Value::Real(parse_real(s.trim())?),
         (ColType::Date, Cell::Date(s)) => Value::Text(s),
         (ColType::Date, Cell::Text(s)) => Value::Text(parse_date(s.trim())?),
@@ -395,6 +443,7 @@ fn write_tables(
             n += 1;
         }
         let types: Vec<ColType> = inf.iter().map(Infer::ty).collect();
+        let dcomma: Vec<bool> = inf.iter().map(Infer::decimal_comma).collect();
 
         // The table.
         let qt = quote_ident(&tname);
@@ -427,7 +476,7 @@ fn write_tables(
                     return Err(CHANGED);
                 }
                 for (i, (c, ty)) in row.into_iter().zip(&types).enumerate() {
-                    let v = convert(c, *ty).ok_or(CHANGED)?;
+                    let v = convert(c, *ty, dcomma[i]).ok_or(CHANGED)?;
                     st.raw_bind_parameter(i + 1, &v).map_err(sql_err)?;
                 }
                 st.raw_execute().map_err(sql_err)?;
@@ -495,6 +544,7 @@ pub fn open_ro(path: &Path) -> Result<Connection, ShieldError> {
     )
     .map_err(|_| bad())?;
     memory_temp_store(&conn).map_err(|_| bad())?;
+    no_dqs(&conn).map_err(|()| bad())?;
     Ok(conn)
 }
 
@@ -572,5 +622,19 @@ mod tests {
             ColType::Bool
         );
         assert_eq!(ty(&[Cell::Text("0800".into())]), ColType::Text);
+        assert_eq!(ty(&[Cell::Text("12,50".into())]), ColType::Real);
+        assert_eq!(
+            ty(&[Cell::Text("12,50".into()), Cell::Text("13".into())]),
+            ColType::Text
+        );
+        assert_eq!(
+            ty(&[Cell::Text("12,50".into()), Cell::Real(1.5)]),
+            ColType::Text
+        );
+        assert_eq!(parse_decimal_comma("1.234,50"), Some(1234.5));
+        assert_eq!(parse_decimal_comma("-12,5"), Some(-12.5));
+        for bad in ["1,", ",5", "1.23,5", "1234.567,8", "12.50", "1,2,3", "a,5"] {
+            assert_eq!(parse_decimal_comma(bad), None, "{bad}");
+        }
     }
 }

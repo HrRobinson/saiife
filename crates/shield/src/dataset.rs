@@ -163,6 +163,7 @@ pub(crate) fn open_part_db(part: &Path, why: &'static str) -> Result<Connection,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(err)?;
+    no_dqs(&conn).map_err(|()| ShieldError::Sqlite(why.into()))?;
     let mode = conn
         .pragma_update_and_check(None, "journal_mode", "OFF", |r| r.get::<_, String>(0))
         .map_err(err)?;
@@ -176,6 +177,21 @@ pub(crate) fn open_part_db(part: &Path, why: &'static str) -> Result<Connection,
     conn.pragma_update(None, "synchronous", "OFF")
         .map_err(err)?;
     Ok(conn)
+}
+
+/// I7: turns off SQLite's double-quoted-string fallback (DQS) for DML and
+/// DDL, so an unknown `"column"` is an error, never a string literal.
+pub(crate) fn no_dqs(conn: &Connection) -> Result<(), ()> {
+    use rusqlite::config::DbConfig;
+    for c in [
+        DbConfig::SQLITE_DBCONFIG_DQS_DML,
+        DbConfig::SQLITE_DBCONFIG_DQS_DDL,
+    ] {
+        if conn.set_db_config(c, false).map_err(|_| ())? {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 /// Sets `temp_store=MEMORY` on a reading connection: sorts, GROUP BY and

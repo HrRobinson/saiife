@@ -18,7 +18,7 @@
 //!   of the `public` columns.
 //! - `spec(tbl, show)`: each entity table's `show` columns (JSON).
 
-use crate::dataset::{memory_temp_store, open_part_db, with_private_part};
+use crate::dataset::{memory_temp_store, no_dqs, open_part_db, with_private_part};
 use crate::error::ShieldError;
 use crate::norm::{token_spans, tokens};
 use crate::schema::{ColType, ColumnClass, EntitySpec, Schema};
@@ -388,6 +388,7 @@ impl Lexicon {
         .map_err(|_| ShieldError::Sqlite("could not open the lexicon".into()))?;
         memory_temp_store(&conn)
             .map_err(|_| ShieldError::Sqlite("could not open the lexicon".into()))?;
+        no_dqs(&conn).map_err(|()| ShieldError::Sqlite("could not open the lexicon".into()))?;
         let mut show = HashMap::new();
         {
             let mut st = conn.prepare("SELECT tbl, show FROM spec").map_err(lx)?;

@@ -132,7 +132,10 @@ fn sheet_xml(rows: &[Vec<&str>], strings: &mut Vec<String>) -> String {
             if v.is_empty() {
                 continue;
             }
-            if v.parse::<f64>().is_ok() {
+            if v.starts_with('#') {
+                // A spreadsheet error cell (`#DIV/0!`).
+                x.push_str(&format!(r#"<c r="{r}" t="e"><v>{}</v></c>"#, xml_esc(v)));
+            } else if v.parse::<f64>().is_ok() {
                 x.push_str(&format!(r#"<c r="{r}"><v>{v}</v></c>"#));
             } else {
                 strings.push(v.to_string());
@@ -758,4 +761,165 @@ fn open_ro_temp_store_is_memory() {
     let c = open_ro(&info.path).unwrap();
     let ts: i64 = c.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
     assert_eq!(ts, 2, "sorts must never spill values to temp files");
+}
+
+/// I5: a file without a header row would make its first data row the
+/// column names (which are allow-listed and sent): refused, without the
+/// cell in the error.
+#[test]
+fn headerless_csv_is_refused() {
+    for data in [
+        "Søren Ærø,soeren@example.invalid,12345678\nAnna Berg,anna@example.invalid,87654321\n",
+        "Anna;2024-01-31\nx;y\n",
+        "name,12.50\nx,1\n",
+    ] {
+        let err = match CsvSource::open(
+            Box::new(std::io::Cursor::new(data.as_bytes().to_vec())),
+            "people.csv",
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a headerless CSV must refuse"),
+        };
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "people.csv, table people, row 1: the first row looks like data, not column names"
+        );
+        for v in ["Søren", "soeren", "1234", "Anna", "2024", "12.5"] {
+            assert!(!text.contains(v) && !format!("{err:?}").contains(v), "{v}");
+        }
+    }
+    // A real header with a digit in a name is fine.
+    assert!(CsvSource::open(
+        Box::new(std::io::Cursor::new(b"id,sales_2024\n1,2\n".to_vec())),
+        "ok.csv"
+    )
+    .is_ok());
+}
+
+#[test]
+fn headerless_sheet_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("book.xlsx");
+    write_xlsx(
+        &p,
+        &[(
+            "Kunder",
+            vec![
+                vec!["4411", "Anna Berg", "anna@example.invalid"],
+                vec!["4412", "Ida Lund", "ida@example.invalid"],
+            ],
+        )],
+    );
+    let err = match XlsxSource::open(std::fs::File::open(&p).unwrap(), "book.xlsx") {
+        Err(e) => e,
+        Ok(_) => panic!("a headerless sheet must refuse"),
+    };
+    assert_eq!(
+        err.to_string(),
+        "book.xlsx, table Kunder, row 1: the first row looks like data, not column names"
+    );
+}
+
+/// I6: Danish decimal commas are REAL, converted exactly; a column that
+/// mixes them with dot decimals stays TEXT.
+#[test]
+fn decimal_comma_amounts_are_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = "navn;beløb;blandet;neg\nA;12,50;12,50;-0,5\nB;1.234,50;12.50;-1.000,25\nC;;;\n";
+    let mut src = csv_src(data.as_bytes(), "b.csv");
+    let info = build(&mut src, dir.path()).unwrap();
+    assert_eq!(
+        col_types(&info, "b"),
+        vec![
+            ("navn".into(), ColType::Text),
+            ("beloeb".into(), ColType::Real),
+            ("blandet".into(), ColType::Text),
+            ("neg".into(), ColType::Real),
+        ]
+    );
+    let c = open_ro(&info.path).unwrap();
+    let got: Vec<(Option<f64>, Option<f64>)> = c
+        .prepare("SELECT beloeb, neg FROM b ORDER BY _rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Some(12.5), Some(-0.5)),
+            (Some(1234.5), Some(-1000.25)),
+            (None, None)
+        ]
+    );
+    let mixed: String = c
+        .query_row("SELECT blandet FROM b WHERE navn = 'B'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mixed, "12.50");
+    // A dot-thousands value without a decimal part is not a decimal comma.
+    let mut src = csv_src("a;b\nx;1.234\ny;12,5\n".as_bytes(), "c.csv");
+    let info = build(&mut src, &dir.path().join("c")).unwrap();
+    assert_eq!(col_types(&info, "c")[1].1, ColType::Text);
+}
+
+/// D1: an xlsx error cell (`#DIV/0!`) refuses, naming sheet, column, row.
+#[test]
+fn xlsx_error_cell_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("book.xlsx");
+    write_xlsx(
+        &p,
+        &[(
+            "Ark",
+            vec![vec!["id", "beløb"], vec!["1", "10"], vec!["2", "#DIV/0!"]],
+        )],
+    );
+    let mut src = XlsxSource::open(std::fs::File::open(&p).unwrap(), "book.xlsx").unwrap();
+    let err = build(&mut src, dir.path()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "book.xlsx, table Ark, column beløb, row 3: a cell holds a spreadsheet error"
+    );
+}
+
+/// D2: `immutable=1` would ignore a hot rollback journal: refused like a
+/// `-wal`. An empty one is fine.
+#[test]
+fn sqlite_with_hot_journal_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("j.db");
+    {
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+    }
+    std::fs::write(dir.path().join("j.db-journal"), b"pending").unwrap();
+    let err = match SqliteSource::open(&p) {
+        Err(e) => e,
+        Ok(_) => panic!("a database with a -journal file must refuse"),
+    };
+    assert_eq!(
+        err.to_string(),
+        "j.db: the database has an unfinished transaction (a -journal file); open and close it in SQLite first"
+    );
+    std::fs::write(dir.path().join("j.db-journal"), b"").unwrap();
+    assert!(SqliteSource::open(&p).is_ok());
+}
+
+/// I7: with SQLite's double-quoted-string fallback on, an unknown
+/// `"column"` would be read as a string literal. It is off.
+#[test]
+fn open_ro_has_no_double_quoted_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = csv_src(b"a,b\nx,y\n", "t.csv");
+    let info = build(&mut src, dir.path()).unwrap();
+    let c = open_ro(&info.path).unwrap();
+    assert!(c
+        .query_row("SELECT \"nosuchcol\" FROM t", [], |r| r.get::<_, String>(0))
+        .is_err());
+    assert!(c
+        .query_row("SELECT \"a\" FROM t", [], |r| r.get::<_, String>(0))
+        .is_ok());
 }
