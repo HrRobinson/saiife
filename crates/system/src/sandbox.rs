@@ -29,6 +29,9 @@
 //! `saiife __blind-calc`, the name helper) to reading a few named files,
 //! with no network and a seccomp allowlist per helper ([`Profile`]): no
 //! socket, tracing, exec, namespace, io_uring or BPF call. It fails closed.
+//! The allowlist was traced on the glibc build; its musl entries come from
+//! musl's source, so it must also be proven on the static musl build that
+//! ships (owner smoke, CI).
 
 use landlock::{
     path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd,
@@ -503,23 +506,36 @@ pub enum Profile {
 /// A condition on a syscall's arguments; any other value is `EPERM`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArgRule {
-    /// Any arguments.
+    /// Any arguments (each such entry says in its `why` why that is safe).
     Any,
     /// `prot` (argument 2) without `PROT_EXEC`: nothing becomes executable
     /// after confinement.
     NoExec,
-    /// The target (argument 0) is this process: a signal to itself only.
+    /// The target (argument 0) is this process (`tgkill`), or its main
+    /// thread (`tkill`: tid == pid while single-threaded): a signal to
+    /// itself only.
     OwnPid,
     /// `clone` flags (argument 0) make a thread: `CLONE_THREAD` set, and
     /// nothing outside [`THREAD_CLONE_FLAGS`] (no namespace, no exit signal).
     ThreadFlags,
     /// `prctl(PR_SET_NAME, ..)` only (a thread names itself).
     SetName,
+    /// The open flags (this argument) are read-only: no `O_WRONLY`,
+    /// `O_RDWR`, `O_CREAT`, `O_TRUNC` or `O_APPEND` (`O_TMPFILE` needs a
+    /// write mode). Landlock still decides which file.
+    ReadOnlyOpen(u8),
+    /// `fcntl` commands (argument 1) `F_GETFD`, `F_SETFD` and `F_GETFL`
+    /// only: no `F_SETFL` (`O_ASYNC`), `F_SETOWN*`, `F_SETSIG`,
+    /// `F_SETLEASE`, `F_NOTIFY` (signals at another process) nor locks.
+    FcntlCmds,
+    /// File descriptor (argument 0) 1 or 2: the answer frame and stderr.
+    StdoutStderr,
 }
 
-/// One allowed syscall: name, x86_64 number, aarch64 number (the kernel's;
-/// checked against `libc::SYS_*` for the running arch in the tests, and
-/// taken from seccompiler 0.5.0's tables), the argument rule and why.
+/// One allowed syscall: name, x86_64 number, aarch64 number (-1: the arch
+/// has no such call; the kernel's numbers, checked against `libc::SYS_*`
+/// for the running arch in the tests and taken from seccompiler 0.5.0's
+/// tables), the argument rule and why.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Allowed {
     // `name` and `why` document the entry; the tests read them.
@@ -548,217 +564,75 @@ const fn allow(
     }
 }
 
-/// The calculator's allowlist. Everything else is `EPERM`. Traced: gdb
-/// `catch syscall` on the debug `saiife __blind-calc` for every job of the
-/// `blind_calc` tests and for list-cap, step-cap, heap-cap, self-check and
-/// empty-for-key jobs; after the filter loads they make exactly read,
-/// write, pread64, openat, close, fstat, newfstatat, mmap, munmap,
-/// mprotect, fcntl, getpid and exit_group, and brk on a 600 000-row
-/// snapshot (list, GROUP BY, time and step caps). The rest is the Rust runtime's
-/// and glibc's paths that the fixture is too small to reach (marked).
-const CALC_ALLOWED: [Allowed; 26] = [
-    allow(
-        "read",
-        0,
-        63,
-        ArgRule::Any,
-        "traced: the hash check reads the snapshot",
-    ),
-    allow(
-        "write",
-        1,
-        64,
-        ArgRule::Any,
-        "traced: the answer frame on stdout, stderr lines",
-    ),
-    allow(
-        "pread64",
-        17,
-        67,
-        ArgRule::Any,
-        "traced: SQLite reads pages",
-    ),
-    allow(
-        "openat",
-        257,
-        56,
-        ArgRule::Any,
-        "traced: SQLite and the hash open the snapshot (Landlock decides which file)",
-    ),
-    allow("close", 3, 57, ArgRule::Any, "traced: closing the snapshot"),
-    allow(
-        "fstat",
-        5,
-        80,
-        ArgRule::Any,
-        "traced: SQLite sizes the file",
-    ),
-    allow(
-        "newfstatat",
-        262,
-        79,
-        ArgRule::Any,
-        "traced: SQLite resolves the path, checks -journal/-wal",
-    ),
-    allow(
-        "fcntl",
-        72,
-        25,
-        ArgRule::Any,
-        "traced: SQLite sets FD_CLOEXEC on the snapshot",
-    ),
-    allow("getpid", 39, 172, ArgRule::Any, "traced: SQLite's unix VFS"),
-    allow(
-        "mmap",
-        9,
-        222,
-        ArgRule::NoExec,
-        "traced: allocations (never executable)",
-    ),
-    allow("munmap", 11, 215, ArgRule::Any, "traced: frees"),
-    allow(
-        "mprotect",
-        10,
-        226,
-        ArgRule::NoExec,
-        "traced: glibc malloc arenas (never executable)",
-    ),
+/// The calculator's allowlist. Everything else is `EPERM`.
+///
+/// Evidence: gdb `catch syscall` (with arguments) on the debug glibc
+/// `saiife __blind-calc` for every job of the `blind_calc` tests and for
+/// list-cap, step-cap, heap-cap, time-cap, self-check and empty-for-key
+/// jobs, also on a 600 000-row snapshot. After the filter loads they make
+/// exactly: read, write (fd 1), pread64, openat (`O_RDONLY|O_CLOEXEC`,
+/// `|O_NOFOLLOW`), close, fstat, newfstatat, fcntl (`F_GETFD`: std's debug
+/// check of a closed descriptor), getpid, mmap and mprotect (prot 0 or 3),
+/// munmap, brk (large snapshot) and exit_group. The other entries are
+/// marked: the runtime's paths the fixture is too small to reach, and the
+/// calls static musl (the shipped Linux build) makes instead of glibc's.
+///
+/// **The allowlist must also be proven on the musl build** (the owner's
+/// smoke runs the release binary; CI should run `blind_calc` on
+/// `x86_64-unknown-linux-musl`): the musl entries come from musl's source,
+/// not from a trace.
+const CALC_ALLOWED: [Allowed; 34] = [
+    allow("read", 0, 63, ArgRule::Any, "traced: the hash check reads the snapshot; reads only descriptors it has"),
+    allow("write", 1, 64, ArgRule::StdoutStderr, "traced: the answer frame on fd 1; stderr lines on fd 2"),
+    allow("pread64", 17, 67, ArgRule::Any, "traced: SQLite page reads; reads only descriptors it has"),
+    allow("openat", 257, 56, ArgRule::ReadOnlyOpen(2), "traced: SQLite and the hash open the snapshot read-only (Landlock decides which file)"),
+    allow("close", 3, 57, ArgRule::Any, "traced: closing the snapshot; own descriptors only"),
+    allow("fstat", 5, 80, ArgRule::Any, "traced: SQLite sizes the file; metadata of own descriptors"),
+    allow("newfstatat", 262, 79, ArgRule::Any, "traced: SQLite's lstat of the path (musl stat/fstatat too); metadata only (M6)"),
+    allow("fcntl", 72, 25, ArgRule::FcntlCmds, "traced: F_GETFD (std); F_SETFD: musl open's FD_CLOEXEC; F_GETFL"),
+    allow("getpid", 39, 172, ArgRule::Any, "traced: SQLite's unix VFS; no argument"),
+    allow("mmap", 9, 222, ArgRule::NoExec, "traced: allocations, prot 0 or 3 (never executable)"),
+    allow("munmap", 11, 215, ArgRule::Any, "traced: frees; own address space only"),
+    allow("mprotect", 10, 226, ArgRule::NoExec, "traced: glibc arenas, prot 3 (never executable)"),
     allow("exit_group", 231, 94, ArgRule::Any, "traced: the exit"),
-    allow(
-        "brk",
-        12,
-        214,
-        ArgRule::Any,
-        "traced (a 600 000-row snapshot): glibc grows the main heap",
-    ),
-    allow(
-        "mremap",
-        25,
-        216,
-        ArgRule::Any,
-        "runtime: glibc realloc of large blocks (a larger result)",
-    ),
-    allow(
-        "madvise",
-        28,
-        233,
-        ArgRule::Any,
-        "runtime: glibc returns freed memory",
-    ),
-    allow(
-        "futex",
-        202,
-        98,
-        ArgRule::Any,
-        "runtime: a std or glibc lock's slow path",
-    ),
-    allow(
-        "getrandom",
-        318,
-        278,
-        ArgRule::Any,
-        "runtime: std's HashMap keys (its fallback, /dev/urandom, is not readable)",
-    ),
-    allow(
-        "clock_gettime",
-        228,
-        113,
-        ArgRule::Any,
-        "runtime: the wall cap's clock when the vDSO cannot serve it",
-    ),
-    allow(
-        "sched_yield",
-        24,
-        124,
-        ArgRule::Any,
-        "runtime: lock spinning",
-    ),
-    allow("exit", 60, 93, ArgRule::Any, "runtime: a thread's exit"),
-    allow(
-        "rt_sigreturn",
-        15,
-        139,
-        ArgRule::Any,
-        "runtime: return from std's stack-overflow handler",
-    ),
-    allow(
-        "rt_sigaction",
-        13,
-        134,
-        ArgRule::Any,
-        "runtime: the overflow handler resets itself; abort",
-    ),
-    allow(
-        "rt_sigprocmask",
-        14,
-        135,
-        ArgRule::Any,
-        "runtime: abort unblocks SIGABRT",
-    ),
-    allow(
-        "gettid",
-        186,
-        178,
-        ArgRule::Any,
-        "runtime: abort raises SIGABRT on itself",
-    ),
-    allow(
-        "tgkill",
-        234,
-        131,
-        ArgRule::OwnPid,
-        "runtime: abort's raise, to this process only",
-    ),
+    allow("brk", 12, 214, ArgRule::Any, "traced (a 600 000-row snapshot): the heap grows; own address space only"),
+    allow("mremap", 25, 216, ArgRule::Any, "runtime: realloc of large blocks (glibc, musl mallocng); keeps prot, own memory"),
+    allow("madvise", 28, 233, ArgRule::Any, "runtime: freed memory returned (glibc, musl); own memory; the harmful advice needs CAP_SYS_ADMIN"),
+    allow("futex", 202, 98, ArgRule::Any, "runtime: a lock's slow path; no memory is shared with another process"),
+    allow("getrandom", 318, 278, ArgRule::Any, "runtime: std's HashMap keys (the /dev/urandom fallback is not readable); no effect outside"),
+    allow("clock_gettime", 228, 113, ArgRule::Any, "runtime: the wall cap's clock without the vDSO; read-only"),
+    allow("sched_yield", 24, 124, ArgRule::Any, "runtime: lock spinning; no argument"),
+    allow("exit", 60, 93, ArgRule::Any, "runtime: musl _Exit after exit_group; a thread's exit"),
+    allow("rt_sigreturn", 15, 139, ArgRule::Any, "runtime: return from std's stack-overflow handler; own frame"),
+    allow("rt_sigaction", 13, 134, ArgRule::Any, "runtime: the overflow handler resets itself, abort; own handlers only"),
+    allow("rt_sigprocmask", 14, 135, ArgRule::Any, "runtime: abort (glibc, musl) blocks and unblocks; own mask only"),
+    allow("gettid", 186, 178, ArgRule::Any, "runtime: abort raises SIGABRT on itself; no argument"),
+    allow("tgkill", 234, 131, ArgRule::OwnPid, "runtime: glibc abort's raise, to this process only"),
+    allow("tkill", 200, 130, ArgRule::OwnPid, "musl: raise() uses tkill on its own tid (== pid, one thread)"),
+    allow("faccessat", 269, 48, ArgRule::Any, "musl aarch64 and glibc aarch64: SQLite's access() (-journal/-wal check); metadata only (M6)"),
+    allow("readlinkat", 267, 78, ArgRule::Any, "musl aarch64: SQLite resolves a symlinked path; metadata only (M6)"),
+    allow("open", 2, -1, ArgRule::ReadOnlyOpen(1), "musl x86_64: open() and std's File::open use SYS_open; read-only like openat"),
+    allow("stat", 4, -1, ArgRule::Any, "musl x86_64: stat() can use SYS_stat (depends on the musl version); metadata only (M6)"),
+    allow("lstat", 6, -1, ArgRule::Any, "musl x86_64: SQLite's lstat (unixFullPathname) can use SYS_lstat; metadata only (M6)"),
+    allow("access", 21, -1, ArgRule::Any, "musl x86_64: SQLite's access() uses SYS_access; metadata only (M6)"),
+    allow("readlink", 89, -1, ArgRule::Any, "musl x86_64: SQLite resolves a symlinked path; metadata only (M6)"),
 ];
 
 /// What the name helper adds for its threads (plan 46 proves the list with
-/// its own suite under the filter and extends it from evidence).
-const NER_EXTRA: [Allowed; 6] = [
-    allow(
-        "clone",
-        56,
-        220,
-        ArgRule::ThreadFlags,
-        "threads: pthread_create (clone3 answers ENOSYS so glibc uses clone)",
-    ),
-    allow(
-        "set_robust_list",
-        273,
-        99,
-        ArgRule::Any,
-        "threads: a new thread's robust futex list",
-    ),
-    allow(
-        "rseq",
-        334,
-        293,
-        ArgRule::Any,
-        "threads: glibc registers restartable sequences",
-    ),
-    allow(
-        "sched_getaffinity",
-        204,
-        123,
-        ArgRule::Any,
-        "threads: available_parallelism",
-    ),
-    allow(
-        "sigaltstack",
-        131,
-        132,
-        ArgRule::Any,
-        "threads: std's overflow stack per thread",
-    ),
-    allow(
-        "prctl",
-        157,
-        167,
-        ArgRule::SetName,
-        "threads: std names its threads",
-    ),
+/// its own suite under the filter and extends it from evidence;
+/// `profiles_install_for_real` proves a std thread starts and joins).
+const NER_EXTRA: [Allowed; 7] = [
+    allow("clone", 56, 220, ArgRule::ThreadFlags, "threads: pthread_create falls back to clone"),
+    allow("clone3", 435, 435, ArgRule::Any, "threads: listed only so that the clone3 -> ENOSYS filter installed before the allowlist answers it (no call gets through)"),
+    allow("set_robust_list", 273, 99, ArgRule::Any, "threads: a new thread's robust futex list; own memory"),
+    allow("rseq", 334, 293, ArgRule::Any, "threads: glibc registers restartable sequences; own thread"),
+    allow("sched_getaffinity", 204, 123, ArgRule::Any, "threads: available_parallelism; read-only"),
+    allow("sigaltstack", 131, 132, ArgRule::Any, "threads: std's overflow stack per thread; own thread"),
+    allow("prctl", 157, 167, ArgRule::SetName, "threads: std names its threads"),
 ];
 
-/// Never allowed to any helper (asserted against both allowlists): name,
+/// Never allowed to any helper (asserted against both allowlists, with one
+/// scoped exception: Ner lists clone3 under the ENOSYS filter): name,
 /// x86_64 number, aarch64 number (-1: the arch has no such call).
 pub(crate) const FORBIDDEN_SYSCALLS: [(&str, i64, i64); 46] = [
     ("socket", 41, 198),
@@ -817,6 +691,13 @@ const THREAD_CLONE_FLAGS: u64 =
 const CLONE_THREAD: u64 = 0x1_0000;
 const PROT_EXEC: u64 = 0x4;
 const PR_SET_NAME: u64 = 15;
+/// `O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND` (the same values on
+/// x86_64 and aarch64).
+const OPEN_WRITE_FLAGS: u64 = 0o1 | 0o2 | 0o100 | 0o1000 | 0o2000;
+/// `F_GETFD`, `F_SETFD`, `F_GETFL`.
+const FCNTL_CMDS: [u64; 3] = [1, 2, 3];
+/// `clone3` (the same number on both arches).
+const SYS_CLONE3: i64 = 435;
 
 impl Profile {
     pub(crate) fn allowed(self) -> impl Iterator<Item = &'static Allowed> {
@@ -838,31 +719,51 @@ pub(crate) fn arch_of(name: &str) -> Result<seccompiler::TargetArch, SandboxErro
     }
 }
 
+/// The rules of one entry; several rules are alternatives (any may match).
 fn arg_rules(
     arg: ArgRule,
     pid: u32,
 ) -> Result<Vec<seccompiler::SeccompRule>, seccompiler::BackendError> {
+    use seccompiler::SeccompRule as R;
     use seccompiler::{SeccompCmpArgLen as Len, SeccompCmpOp as Op, SeccompCondition as C};
-    let rule = |conds| seccompiler::SeccompRule::new(conds).map(|r| vec![r]);
+    let one = |conds| R::new(conds).map(|r| vec![r]);
     match arg {
         ArgRule::Any => Ok(vec![]),
-        ArgRule::NoExec => rule(vec![C::new(2, Len::Qword, Op::MaskedEq(PROT_EXEC), 0)?]),
-        ArgRule::OwnPid => rule(vec![C::new(0, Len::Dword, Op::Eq, u64::from(pid))?]),
-        ArgRule::ThreadFlags => rule(vec![
+        ArgRule::NoExec => one(vec![C::new(2, Len::Qword, Op::MaskedEq(PROT_EXEC), 0)?]),
+        ArgRule::OwnPid => one(vec![C::new(0, Len::Dword, Op::Eq, u64::from(pid))?]),
+        ArgRule::ThreadFlags => one(vec![
             C::new(0, Len::Qword, Op::MaskedEq(!THREAD_CLONE_FLAGS), 0)?,
             C::new(0, Len::Qword, Op::MaskedEq(CLONE_THREAD), CLONE_THREAD)?,
         ]),
-        ArgRule::SetName => rule(vec![C::new(0, Len::Dword, Op::Eq, PR_SET_NAME)?]),
+        ArgRule::SetName => one(vec![C::new(0, Len::Dword, Op::Eq, PR_SET_NAME)?]),
+        ArgRule::ReadOnlyOpen(i) => one(vec![C::new(
+            i,
+            Len::Dword,
+            Op::MaskedEq(OPEN_WRITE_FLAGS),
+            0,
+        )?]),
+        ArgRule::FcntlCmds => FCNTL_CMDS
+            .iter()
+            .map(|&cmd| R::new(vec![C::new(1, Len::Dword, Op::Eq, cmd)?]))
+            .collect(),
+        ArgRule::StdoutStderr => [1u64, 2]
+            .iter()
+            .map(|&fd| R::new(vec![C::new(0, Len::Dword, Op::Eq, fd)?]))
+            .collect(),
     }
 }
 
-/// The helper's filters for `arch`, compiled to BPF, in install order. The
-/// first is the allowlist: the profile's calls (with their argument rules)
-/// are allowed, everything else fails with `EPERM`; a call from another
-/// arch (the i386 ABI on x86_64) kills the process, and so x32 numbers
-/// (not listed) fail. [`Profile::Ner`] adds a second that answers `clone3`
-/// with `ENOSYS`, so glibc falls back to `clone` (installed later, it wins
-/// over the first's `EPERM`). `pid` is this process (for [`ArgRule::OwnPid`]).
+/// The helper's filters for `arch`, compiled to BPF, in install order.
+///
+/// [`Profile::Ner`] first gets a filter that answers `clone3` with `ENOSYS`
+/// (glibc then falls back to `clone`) and allows everything else: it must
+/// come first, while installing the allowlist (`prctl` and `seccomp`) is
+/// still allowed. The allowlist comes last: the profile's calls with their
+/// argument rules are allowed, everything else fails with `EPERM`; a call
+/// from another arch (the i386 ABI on x86_64) kills the process, and x32
+/// numbers (not listed) fail. For `clone3` the earlier filter's `ENOSYS`
+/// is more restrictive than the allowlist's allow, so it wins.
+/// `pid` is this process (for [`ArgRule::OwnPid`]).
 pub(crate) fn seccomp_programs(
     profile: Profile,
     arch: seccompiler::TargetArch,
@@ -871,6 +772,18 @@ pub(crate) fn seccomp_programs(
     use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
     use std::collections::BTreeMap;
     let bad = |_| SandboxError::Seccomp;
+    let mut out = Vec::new();
+    if profile == Profile::Ner {
+        let enosys = rustix::io::Errno::NOSYS.raw_os_error() as u32;
+        let clone3 = SeccompFilter::new(
+            [(SYS_CLONE3, vec![])].into_iter().collect(),
+            SeccompAction::Allow,
+            SeccompAction::Errno(enosys),
+            arch,
+        )
+        .map_err(bad)?;
+        out.push(clone3.try_into().map_err(bad)?);
+    }
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for e in profile.allowed() {
         let n = match arch {
@@ -878,12 +791,17 @@ pub(crate) fn seccomp_programs(
             TargetArch::aarch64 => e.aarch64,
             _ => return Err(SandboxError::Seccomp),
         };
-        // Belt and braces: a forbidden call in a table refuses the filter.
+        if n < 0 {
+            continue;
+        }
+        // Belt and braces: a forbidden call in a table refuses the filter,
+        // but for Ner's clone3, which the earlier filter answers.
+        let ner_clone3 = profile == Profile::Ner && n == SYS_CLONE3;
         let forbidden = FORBIDDEN_SYSCALLS.iter().any(|f| match arch {
             TargetArch::x86_64 => f.1 == n,
             _ => f.2 == n,
         });
-        if forbidden {
+        if forbidden && !ner_clone3 {
             return Err(SandboxError::Seccomp);
         }
         rules.insert(n, arg_rules(e.arg, pid).map_err(bad)?);
@@ -896,19 +814,34 @@ pub(crate) fn seccomp_programs(
         arch,
     )
     .map_err(bad)?;
-    let mut out = vec![allowlist.try_into().map_err(bad)?];
-    if profile == Profile::Ner {
-        let enosys = rustix::io::Errno::NOSYS.raw_os_error() as u32;
-        let clone3 = SeccompFilter::new(
-            [(435_i64, vec![])].into_iter().collect(),
-            SeccompAction::Allow,
-            SeccompAction::Errno(enosys),
-            arch,
-        )
-        .map_err(bad)?;
-        out.push(clone3.try_into().map_err(bad)?);
-    }
+    out.push(allowlist.try_into().map_err(bad)?);
     Ok(out)
+}
+
+/// Loads `programs` in order, synced to every thread (it also sets
+/// `no_new_privs`).
+fn load_programs(programs: &[seccompiler::BpfProgram]) -> Result<(), SandboxError> {
+    for p in programs {
+        seccompiler::apply_filter_all_threads(p).map_err(|_| SandboxError::Seccomp)?;
+    }
+    Ok(())
+}
+
+/// Debug and tests only: the child of `profiles_install_for_real` installs
+/// a profile's filters for real when this is set.
+#[cfg(test)]
+pub(crate) const SECCOMP_CHILD_ENV: &str = "SAIIFE_TEST_SECCOMP_CHILD";
+
+/// Builds and loads `profile`'s filters on this process (the seccomp part
+/// of [`confine_helper`] alone; the tests' child process uses it).
+#[cfg(test)]
+pub(crate) fn install_seccomp(profile: Profile) -> Result<(), SandboxError> {
+    let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
+    load_programs(&seccomp_programs(
+        profile,
+        arch_of(std::env::consts::ARCH)?,
+        pid,
+    )?)
 }
 
 /// Confines the calling helper process for good. Order (R45-12):
@@ -955,9 +888,7 @@ pub fn confine_helper_with_abi(
     if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
         return Err(SandboxError::NotEnforced);
     }
-    for p in &programs {
-        seccompiler::apply_filter_all_threads(p).map_err(|_| SandboxError::Seccomp)?;
-    }
+    load_programs(&programs)?;
     Ok(Confinement {
         landlock_abi: n,
         net_denied: n >= 4,
@@ -1286,9 +1217,12 @@ mod tests {
         for arch in [TargetArch::x86_64, TargetArch::aarch64] {
             for profile in [Profile::Calc, Profile::Ner] {
                 let progs = seccomp_programs(profile, arch, 4242).unwrap();
-                // The arch check, one chain per allowed number, the default.
-                assert!(progs[0].len() > 3 + profile.allowed().count(), "{arch:?}");
-                // Ner adds the clone3 -> ENOSYS filter (glibc then uses clone).
+                // The allowlist is installed last: the arch check, one chain
+                // per allowed number, the default.
+                let allowlist = progs.last().unwrap();
+                assert!(allowlist.len() > 3 + profile.allowed().count(), "{arch:?}");
+                // Ner installs the clone3 -> ENOSYS filter first (glibc then
+                // uses clone), while installing a filter is still allowed.
                 assert_eq!(progs.len(), if profile == Profile::Ner { 2 } else { 1 });
             }
         }
@@ -1298,6 +1232,11 @@ mod tests {
     fn allowlists_exclude_forbidden_syscalls() {
         for profile in [Profile::Calc, Profile::Ner] {
             for (name, x86, arm) in FORBIDDEN_SYSCALLS {
+                // The one scoped exception: Ner lists clone3 so that the
+                // earlier ENOSYS filter answers it (ner_threads_and_clone3_enosys).
+                if profile == Profile::Ner && name == "clone3" {
+                    continue;
+                }
                 for e in profile.allowed() {
                     assert!(e.x86_64 != x86, "{profile:?} allows {name} on x86_64");
                     assert!(
@@ -1400,12 +1339,283 @@ mod tests {
         }
     }
 
+    // --- A small classic-BPF interpreter for the subset seccompiler emits,
+    // so the compiled rules can be checked call by call on both arches. ---
+
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_ERRNO: u32 = 0x0005_0000;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const AUDIT_X86_64: u32 = 0xC000_003E;
+    const AUDIT_AARCH64: u32 = 0xC000_00B7;
+    const EPERM: u32 = 1;
+    const ENOSYS: u32 = 38;
+
+    /// `struct seccomp_data` (little-endian): nr, arch, ip, args[6].
+    fn seccomp_data(arch: u32, nr: i64, args: [u64; 6]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(64);
+        d.extend_from_slice(&(nr as i32).to_le_bytes());
+        d.extend_from_slice(&arch.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        for a in args {
+            d.extend_from_slice(&a.to_le_bytes());
+        }
+        d
+    }
+
+    fn run_bpf(prog: &[seccompiler::sock_filter], data: &[u8]) -> u32 {
+        let mut a: u32 = 0;
+        let mut pc = 0usize;
+        loop {
+            let i = &prog[pc];
+            pc += 1;
+            match i.code {
+                0x20 => {
+                    let k = i.k as usize;
+                    a = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
+                }
+                0x54 => a &= i.k,
+                0x15 => pc += usize::from(if a == i.k { i.jt } else { i.jf }),
+                0x25 => pc += usize::from(if a > i.k { i.jt } else { i.jf }),
+                0x35 => pc += usize::from(if a >= i.k { i.jt } else { i.jf }),
+                0x05 => pc += i.k as usize,
+                0x06 => return i.k,
+                c => panic!("BPF opcode {c:#x} not modelled"),
+            }
+        }
+    }
+
+    /// The kernel's verdict over stacked filters: the most restrictive
+    /// action wins; on a tie the newest (installed last) filter's.
+    fn verdict(profile: Profile, arch: TargetArch, nr: &str, args: [u64; 6], pid: u32) -> u32 {
+        let progs = seccomp_programs(profile, arch, pid).unwrap();
+        let (audit, n) = match arch {
+            TargetArch::x86_64 => (AUDIT_X86_64, number(nr, true)),
+            _ => (AUDIT_AARCH64, number(nr, false)),
+        };
+        let data = seccomp_data(audit, n, args);
+        let mut ret = RET_ALLOW;
+        for p in progs.iter().rev() {
+            let cur = run_bpf(p, &data);
+            if ((cur & 0xffff_0000) as i32) < ((ret & 0xffff_0000) as i32) {
+                ret = cur;
+            }
+        }
+        ret
+    }
+
+    /// The number of `name` on x86_64 (`true`) or aarch64, from the tables.
+    fn number(name: &str, x86: bool) -> i64 {
+        let pick = |a: i64, b: i64| if x86 { a } else { b };
+        if let Some(e) = Profile::Ner.allowed().find(|e| e.name == name) {
+            return pick(e.x86_64, e.aarch64);
+        }
+        if let Some(f) = FORBIDDEN_SYSCALLS.iter().find(|f| f.0 == name) {
+            return pick(f.1, f.2);
+        }
+        match name {
+            "ioctl" => pick(16, 29),
+            "fcntl_unknown" => pick(72, 25),
+            _ => panic!("no number for {name}"),
+        }
+    }
+
+    fn a(args: &[u64]) -> [u64; 6] {
+        let mut out = [0u64; 6];
+        out[..args.len()].copy_from_slice(args);
+        out
+    }
+
+    const PID: u32 = 4242;
+    const ARCHES: [TargetArch; 2] = [TargetArch::x86_64, TargetArch::aarch64];
+
+    #[test]
+    fn calc_rules_match_only_traced_arguments() {
+        let allow = RET_ALLOW;
+        let eperm = RET_ERRNO | EPERM;
+        for arch in ARCHES {
+            let v = |nr, args: &[u64]| verdict(Profile::Calc, arch, nr, a(args), PID);
+            // fcntl: F_GETFD, F_SETFD, F_GETFL only (A1); F_SETFL (O_ASYNC),
+            // F_SETOWN, F_SETSIG, F_SETOWN_EX, F_SETLEASE and the locks refused.
+            for cmd in [1, 2, 3] {
+                assert_eq!(v("fcntl", &[3, cmd]), allow, "{arch:?} fcntl {cmd}");
+            }
+            for cmd in [0, 4, 5, 6, 7, 8, 10, 15, 36, 37, 38, 1024, 1025, 1030] {
+                assert_eq!(v("fcntl", &[3, cmd]), eperm, "{arch:?} fcntl {cmd}");
+            }
+            // mmap / mprotect never executable (A2).
+            for prot in [0, 1, 3] {
+                assert_eq!(v("mmap", &[0, 4096, prot, 0x22]), allow);
+                assert_eq!(v("mprotect", &[0, 4096, prot]), allow);
+            }
+            for prot in [4, 5, 7] {
+                assert_eq!(v("mmap", &[0, 4096, prot, 0x22]), eperm);
+                assert_eq!(v("mprotect", &[0, 4096, prot]), eperm);
+            }
+            // openat read-only only: O_WRONLY, O_RDWR, O_CREAT, O_TRUNC,
+            // O_APPEND refused before Landlock even looks.
+            for flags in [0, 0o2_000_000, 0o2_400_000] {
+                assert_eq!(v("openat", &[0, 0, flags]), allow, "{flags:o}");
+            }
+            for flags in [0o1, 0o2, 0o100, 0o1000, 0o2000, 0o2_000_101] {
+                assert_eq!(v("openat", &[0, 0, flags]), eperm, "{flags:o}");
+            }
+            // write: stdout and stderr only.
+            assert_eq!(v("write", &[1]), allow);
+            assert_eq!(v("write", &[2]), allow);
+            for fd in [0, 3, 9] {
+                assert_eq!(v("write", &[fd]), eperm, "write {fd}");
+            }
+            // Signals to itself only (abort).
+            assert_eq!(v("tgkill", &[u64::from(PID), u64::from(PID), 6]), allow);
+            assert_eq!(v("tgkill", &[1, 1, 9]), eperm);
+            assert_eq!(v("tkill", &[u64::from(PID), 6]), allow);
+            assert_eq!(v("tkill", &[1, 9]), eperm);
+            // Not listed at all.
+            for nr in [
+                "socket",
+                "execve",
+                "ptrace",
+                "io_uring_setup",
+                "clone",
+                "clone3",
+                "unshare",
+                "prctl",
+                "seccomp",
+                "ioctl",
+            ] {
+                assert_eq!(v(nr, &[]), eperm, "{arch:?} {nr}");
+            }
+        }
+        // Another arch's call (the i386 ABI) kills the process.
+        let progs = seccomp_programs(Profile::Calc, TargetArch::x86_64, PID).unwrap();
+        let i386 = seccomp_data(0x4000_0003, 0, a(&[]));
+        assert_eq!(run_bpf(&progs[0], &i386), RET_KILL_PROCESS);
+    }
+
+    #[test]
+    fn ner_threads_and_clone3_enosys() {
+        let thread = THREAD_CLONE_FLAGS;
+        for arch in ARCHES {
+            let v = |nr, args: &[u64]| verdict(Profile::Ner, arch, nr, a(args), PID);
+            assert_eq!(v("clone", &[thread]), RET_ALLOW, "{arch:?}");
+            // A fork (SIGCHLD exit signal), namespaces, no CLONE_THREAD.
+            for flags in [
+                17,
+                thread | 0x1000_0000,
+                thread | 0x4000_0000,
+                thread & !CLONE_THREAD,
+            ] {
+                assert_eq!(v("clone", &[flags]), RET_ERRNO | EPERM, "{flags:#x}");
+            }
+            // The earlier filter's ENOSYS wins over the allowlist's allow.
+            assert_eq!(v("clone3", &[]), RET_ERRNO | ENOSYS, "{arch:?}");
+            assert_eq!(v("prctl", &[PR_SET_NAME]), RET_ALLOW);
+            assert_eq!(v("prctl", &[38]), RET_ERRNO | EPERM);
+            assert_eq!(v("socket", &[]), RET_ERRNO | EPERM);
+        }
+    }
+
+    /// R1: the shipped Linux binaries are static musl. On x86_64 musl uses
+    /// the legacy calls; on aarch64 there are none and it uses the `*at` ones.
+    #[test]
+    fn musl_forms_are_listed() {
+        let calc: Vec<&Allowed> = Profile::Calc.allowed().collect();
+        let find = |n: &str| calc.iter().find(|e| e.name == n).copied();
+        for legacy in ["open", "stat", "lstat", "access", "readlink"] {
+            let e = find(legacy).unwrap_or_else(|| panic!("{legacy}"));
+            assert!(e.x86_64 > 0 && e.aarch64 < 0, "{legacy}");
+        }
+        for at in ["openat", "newfstatat", "faccessat", "readlinkat", "tkill"] {
+            let e = find(at).unwrap_or_else(|| panic!("{at}"));
+            assert!(e.x86_64 > 0 && e.aarch64 > 0, "{at}");
+        }
+        assert_eq!(find("open").unwrap().arg, ArgRule::ReadOnlyOpen(1));
+        assert_eq!(find("openat").unwrap().arg, ArgRule::ReadOnlyOpen(2));
+        assert_eq!(find("tkill").unwrap().arg, ArgRule::OwnPid);
+        // open on x86_64 is read-only too.
+        let v = |flags| {
+            verdict(
+                Profile::Calc,
+                TargetArch::x86_64,
+                "open",
+                a(&[0, flags]),
+                PID,
+            )
+        };
+        assert_eq!(v(0o2_000_000), RET_ALLOW);
+        assert_eq!(v(0o1), RET_ERRNO | EPERM);
+    }
+
+    /// Run by `profiles_install_for_real` in a child test process only:
+    /// installs a profile's filters for real (no Landlock, no namespace:
+    /// libtest is multi-threaded) and reports what still works.
+    #[test]
+    fn seccomp_child() {
+        let Some(name) = std::env::var_os(SECCOMP_CHILD_ENV) else {
+            return;
+        };
+        let profile = match name.to_str() {
+            Some("calc") => Profile::Calc,
+            Some("ner") => Profile::Ner,
+            _ => panic!("unknown profile"),
+        };
+        let installed = install_seccomp(profile);
+        let socket = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .err()
+            .and_then(|e| e.raw_os_error());
+        let thread = std::thread::Builder::new()
+            .name("p45-ner".into())
+            .spawn(|| 7)
+            .map(|h| h.join().unwrap_or(0))
+            .map_err(|e| e.raw_os_error());
+        let async_io = rustix::fs::fcntl_setfl(std::io::stdin(), rustix::fs::OFlags::ASYNC)
+            .err()
+            .map(|e| e.raw_os_error());
+        println!(
+            "P45-CHILD installed={:?} socket={socket:?} thread={thread:?} setfl={async_io:?}",
+            installed.is_ok()
+        );
+    }
+
+    #[test]
+    fn profiles_install_for_real() {
+        let exe = std::env::current_exe().unwrap();
+        for (name, thread) in [("calc", "thread=Err("), ("ner", "thread=Ok(7)")] {
+            let out = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "sandbox::tests::seccomp_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(SECCOMP_CHILD_ENV, name)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // libtest prints the report after "test ... " on the same line.
+            let line = stdout
+                .lines()
+                .find_map(|l| l.find("P45-CHILD").map(|i| &l[i..]))
+                .unwrap_or_else(|| panic!("{name}: no report: {stdout} {:?}", out.status));
+            assert!(line.contains("installed=true"), "{name}: {line}");
+            assert!(line.contains("socket=Some(1)"), "{name}: {line}");
+            assert!(line.contains(thread), "{name}: {line}");
+            assert!(line.contains("setfl=Some(1)"), "{name}: {line}");
+            assert!(out.status.success(), "{name}: {:?} {stdout}", out.status);
+        }
+    }
+
     /// `libc::SYS_*` of the running arch by name.
     fn libc_number(name: &str) -> Option<i64> {
         #[cfg(target_arch = "x86_64")]
         match name {
             "fork" => return Some(libc::SYS_fork),
             "vfork" => return Some(libc::SYS_vfork),
+            "open" => return Some(libc::SYS_open),
+            "stat" => return Some(libc::SYS_stat),
+            "lstat" => return Some(libc::SYS_lstat),
+            "access" => return Some(libc::SYS_access),
+            "readlink" => return Some(libc::SYS_readlink),
             _ => {}
         }
         Some(match name {
@@ -1467,6 +1677,9 @@ mod tests {
             "process_madvise" => libc::SYS_process_madvise,
             "seccomp" => libc::SYS_seccomp,
             "kill" => libc::SYS_kill,
+            "tkill" => libc::SYS_tkill,
+            "faccessat" => libc::SYS_faccessat,
+            "readlinkat" => libc::SYS_readlinkat,
             "socket" => libc::SYS_socket,
             "socketpair" => libc::SYS_socketpair,
             "connect" => libc::SYS_connect,

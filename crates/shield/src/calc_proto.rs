@@ -28,6 +28,12 @@ pub const CALC_JOB_VERSION: u32 = 1;
 /// snapshot as a control) instead of a method. Release calculators refuse it
 /// as an unknown version.
 pub const PROBE_JOB_VERSION: u32 = 999;
+/// Debug builds only: panic inside the confined part (with
+/// [`PANIC_PROBE_TEXT`]) to show a panic answers `runtime_error`.
+pub const PANIC_JOB_VERSION: u32 = 998;
+/// The panic message of [`PANIC_JOB_VERSION`]; it must reach neither the
+/// answer nor stderr.
+pub const PANIC_PROBE_TEXT: &str = "p45-panic-probe-text";
 
 /// The calculator could not confine itself (no Landlock, a ruleset that is
 /// not fully enforced, a seccomp filter that does not load, a resource

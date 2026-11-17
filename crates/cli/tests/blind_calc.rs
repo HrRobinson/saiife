@@ -237,19 +237,20 @@ fn calc_cannot_escape() {
             "read /etc/passwd",
             "open a TCP socket",
             "write $TMPDIR/x",
-            "exec /bin/true",
+            // Denied at the fork already (clone3 EPERM, NPROC 0); the
+            // allowlist unit tests are the execve proof.
+            "spawn /bin/true",
             "unshare a namespace",
             "open a pidfd",
+            "set O_ASYNC (fcntl F_SETFL)",
             "read the snapshot",
         ]
     );
-    for (p, o) in &got[..6] {
+    for (p, o) in &got[..7] {
         assert_eq!(o, "denied", "{p}");
     }
-    // The seccomp allowlist answers EPERM for what it does not list.
-    assert_eq!(got[4].1, "denied");
     // The control: the one file it may read.
-    assert_eq!(got[6].1, "allowed");
+    assert_eq!(got[7].1, "allowed");
     assert!(!d.path().join("x").exists());
     eprintln!("confinement: {conf:?}");
 }
@@ -282,4 +283,37 @@ fn calc_frames_are_bounded() {
         assert_eq!(err_class(&a), "runtime_error");
         assert!(!String::from_utf8_lossy(&out).contains("hello"));
     }
+}
+
+/// M4: a panic inside the confined part answers `runtime_error` (with the
+/// confinement), exit 0, and its message reaches neither the frame nor
+/// stderr.
+#[cfg(debug_assertions)]
+#[test]
+fn calc_panic_answers_runtime_error() {
+    let d = scratch();
+    let snap = snapshot(d.path());
+    let mut j = job(&snap, BALANCE);
+    j.v = saiife_shield::calc_proto::PANIC_JOB_VERSION;
+    let mut frame = Vec::new();
+    write_frame(&mut frame, &j, MAX_JOB_BYTES).unwrap();
+    let (code, out, err) = run_raw(frame, d.path());
+    assert_eq!(code, 0, "stderr: {err}");
+    let mut r: &[u8] = &out;
+    let a: CalcAnswer = read_frame(&mut r, MAX_ANSWER_BYTES).unwrap();
+    if refused_without_landlock(&a, "calc_panic_answers_runtime_error") {
+        return;
+    }
+    let CalcAnswer::Err {
+        class, confinement, ..
+    } = &a
+    else {
+        panic!("{a:?}")
+    };
+    assert_eq!(class, "runtime_error");
+    assert!(confinement.is_some_and(|c| c.seccomp));
+    let secret = saiife_shield::calc_proto::PANIC_PROBE_TEXT;
+    assert!(!String::from_utf8_lossy(&out).contains(secret));
+    assert!(!err.contains(secret), "{err}");
+    assert!(err.contains("internal error"), "{err}");
 }

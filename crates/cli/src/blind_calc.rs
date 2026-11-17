@@ -24,12 +24,33 @@
 //! sandbox are for good: the executor must always run in its own process,
 //! including any weaker fallback a later plan adds
 //! ([`saiife_system::sandbox::CALC_LABEL`]); never in the daemon.
+//!
+//! **A panic** (in the validator, the executor, anywhere) answers
+//! `runtime_error`: the answer path runs under `catch_unwind`, and the
+//! panic hook prints only a fixed line (a panic message could quote data).
+//!
+//! **musl.** The shipped Linux binaries are static musl; the seccomp
+//! allowlist was traced on the glibc build and its musl entries come from
+//! musl's source. It must also be proven on the musl build (the owner's
+//! smoke runs the release binary; CI should run `blind_calc` on
+//! `x86_64-unknown-linux-musl`).
+//!
+//! **Accepted (M6).** Landlock answers `EACCES` for a path outside the rules
+//! and `ENOENT` for one that does not exist, and `stat` is not a Landlock
+//! right: the calculator can learn whether a path exists and its metadata.
+//! It has no channel out but its answer to the daemon, which carries classes
+//! and the method's result only.
+//!
+//! **For plan 47 (M7).** The SHA-256 of the whole snapshot is computed here,
+//! inside `RLIMIT_CPU` (15 s) and before the method runs. A large snapshot
+//! may need the daemon to verify the hash instead (and pass an open,
+//! verified file), or a higher CPU limit for the hash.
 
 use saiife_shield::calc::{self, Caps, ResultSet};
 use saiife_shield::calc_proto::{
     read_frame, write_frame, CalcAnswer, CalcJob, ConfinementInfo, CALC_JOB_VERSION,
     CLASS_SANDBOX_UNAVAILABLE, CLASS_SNAPSHOT_MISMATCH, MAX_ANSWER_BYTES, MAX_JOB_BYTES,
-    PROBE_JOB_VERSION,
+    PANIC_JOB_VERSION, PROBE_JOB_VERSION,
 };
 use saiife_shield::snapshot;
 use saiife_shield::sql::{validate, validate_check, ErrorClass};
@@ -37,6 +58,7 @@ use saiife_system::sandbox::{
     apply_rlimits, confine_helper, Confinement, Profile, Rlimits, SandboxError,
 };
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::ExitCode;
 
 /// The exit code when no answer frame could be written (`EX_SOFTWARE`).
@@ -52,10 +74,17 @@ const CALC_RLIMITS: Rlimits = Rlimits {
 };
 
 pub fn run() -> ExitCode {
-    let answer = {
+    // A fixed line only: a panic message could quote the job's data.
+    std::panic::set_hook(Box::new(|_| {
+        eprintln!("saiife: __blind-calc: internal error");
+    }));
+    // A panic before confinement (reading the frame): `runtime_error`,
+    // nothing ran. After it, `guarded` keeps the confinement in the answer.
+    let answer = catch_unwind(|| {
         let mut stdin = std::io::stdin().lock();
         answer(&mut stdin)
-    };
+    })
+    .unwrap_or_else(|_| runtime_error(None));
     let mut out = std::io::stdout().lock();
     let written = match write_frame(&mut out, &answer, MAX_ANSWER_BYTES) {
         Ok(()) => Ok(()),
@@ -105,7 +134,8 @@ fn answer(input: &mut dyn std::io::Read) -> CalcAnswer {
         return runtime_error(None);
     };
     let probe = cfg!(debug_assertions) && job.v == PROBE_JOB_VERSION;
-    if job.v != CALC_JOB_VERSION && !probe {
+    let panic_probe = cfg!(debug_assertions) && job.v == PANIC_JOB_VERSION;
+    if job.v != CALC_JOB_VERSION && !probe && !panic_probe {
         return runtime_error(None);
     }
     if let Err(e) = apply_rlimits(&CALC_RLIMITS) {
@@ -129,12 +159,24 @@ fn answer(input: &mut dyn std::io::Read) -> CalcAnswer {
             confinement: conf,
         };
     }
-    match run_job(&job, conf) {
-        Ok(result) => CalcAnswer::Ok {
+    if panic_probe {
+        return guarded(conf, || {
+            panic!("{}", saiife_shield::calc_proto::PANIC_PROBE_TEXT)
+        });
+    }
+    guarded(conf, || run_job(&job, conf))
+}
+
+/// Runs the confined part; a panic in it answers `runtime_error` with the
+/// confinement that was in force.
+fn guarded(conf: ConfinementInfo, f: impl FnOnce() -> Result<ResultSet, CalcAnswer>) -> CalcAnswer {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(result)) => CalcAnswer::Ok {
             result,
             confinement: conf,
         },
-        Err(a) => a,
+        Ok(Err(a)) => a,
+        Err(_) => runtime_error(Some(conf)),
     }
 }
 
@@ -202,8 +244,10 @@ mod probe {
                 "write $TMPDIR/x",
                 outcome(std::fs::write(std::env::temp_dir().join("x"), b"x")),
             ),
+            // Denied at the fork (clone3 EPERM, NPROC 0) before any exec;
+            // the allowlist unit tests prove execve itself is not listed.
             (
-                "exec /bin/true",
+                "spawn /bin/true",
                 outcome(std::process::Command::new("/bin/true").status()),
             ),
             (
@@ -218,6 +262,13 @@ mod probe {
                         rustix::process::PidfdFlags::empty(),
                     )
                     .map_err(io::Error::from),
+                ),
+            ),
+            (
+                "set O_ASYNC (fcntl F_SETFL)",
+                outcome(
+                    rustix::fs::fcntl_setfl(std::io::stdin(), rustix::fs::OFlags::ASYNC)
+                        .map_err(io::Error::from),
                 ),
             ),
             ("read the snapshot", outcome(std::fs::read(snapshot))),

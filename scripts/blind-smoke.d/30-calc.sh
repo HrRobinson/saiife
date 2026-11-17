@@ -18,6 +18,12 @@
 #
 # The answer is piped (never redirected to a file): the calculator runs
 # with RLIMIT_FSIZE 0, so a write to a regular file would kill it.
+#
+# The seccomp allowlist was traced on the glibc build; the release binary
+# is static musl. This smoke is where the allowlist meets musl: an answer of
+# runtime_error on every job (with "internal error" or nothing on stderr)
+# means musl makes a call the allowlist lacks (see CALC_ALLOWED in
+# crates/system/src/sandbox.rs).
 # Defines smoke_calc; no top-level effects. Needs python3.
 
 P45_WORK=""
