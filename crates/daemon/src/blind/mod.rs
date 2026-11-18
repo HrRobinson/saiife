@@ -4,6 +4,7 @@
 //! logic. Linux only: elsewhere `blind_stub.rs` answers every op with
 //! [`UNAVAILABLE_OS`].
 
+pub mod ask;
 pub mod audit;
 pub mod calc;
 pub mod data;
@@ -43,6 +44,9 @@ pub struct Blind {
     datasets: Mutex<BTreeMap<String, DatasetState>>,
     /// Live sessions, by (uid, dataset). Never logged: a `Turn` holds text.
     pub sessions: Mutex<saiife_shield::session::Sessions>,
+    /// The open asks (plan 48 T1), by ask id. Never logged: an ask holds
+    /// the question and its candidates.
+    pub asks: Mutex<ask::Asks>,
     /// Held across a key store change (create, rotate, shred), so a check
     /// of `keys.sealed` still holds when it is written or removed.
     keys_lock: Mutex<()>,
@@ -230,6 +234,7 @@ impl Blind {
             root: root.to_path_buf(),
             datasets: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(saiife_shield::session::Sessions::new()),
+            asks: Mutex::new(ask::Asks::new()),
             keys_lock: Mutex::new(()),
             methods_locks: Mutex::new(BTreeMap::new()),
             #[cfg(debug_assertions)]
@@ -507,6 +512,12 @@ pub fn retention(ctx: &crate::ops::Ctx, now: std::time::SystemTime) {
 /// Test seams (debug builds only).
 #[cfg(debug_assertions)]
 impl Blind {
+    /// Makes `p` this daemon's planner without [`model::PLANNER_SEAM`] (an
+    /// in-process test sets its own script; the seam, when set, wins).
+    pub fn set_test_planner(&self, p: Option<Arc<model::FakePlanner>>) {
+        *lock(&self.test_planner) = p.map(|f| (std::ffi::OsString::new(), f));
+    }
+
     /// Sets the name detector a build uses in place of [`ner::apply`]'s.
     pub fn set_test_detector(&self, d: Option<Arc<dyn NameDetector>>) {
         *lock(&self.detector) = d;

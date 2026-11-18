@@ -336,6 +336,25 @@ pub struct Validated {
     pub count_only: bool,
 }
 
+impl Validated {
+    /// The outermost block's output column names, in order: the names the
+    /// planner wrote (every outermost item has its `AS` name once
+    /// validated). A template is parsed against these before the method
+    /// runs (plan 48 T1: the preview comes after the template parse).
+    pub fn output_columns(&self) -> Vec<String> {
+        let SetExpr::Select(s) = self.ast.body.as_ref() else {
+            return Vec::new();
+        };
+        s.projection
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// A validated self-check, ready for the executor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedCheck {

@@ -246,6 +246,31 @@ fn accepts_balance_method() {
     assert_eq!(v.aggregates_nullable, vec![1]);
 }
 
+/// Plan 48 T1: the template is parsed against the method's output names
+/// before the preview, so they come from the validated method itself.
+#[test]
+fn output_columns_are_the_written_names() {
+    let v = ok(BALANCE);
+    assert_eq!(v.output_columns(), ["owed", "credit_limit"]);
+    let v = ok(&format!("SELECT COUNT(*) AS n, MAX(i.amount) AS top {J}"));
+    assert_eq!(v.output_columns(), ["n", "top"]);
+    let v = ok(
+        "WITH t AS (SELECT i.customer_id, SUM(i.amount) AS total FROM invoices i \
+                GROUP BY i.customer_id) SELECT SUM(t.total) AS s FROM t \
+                JOIN customers c ON c.id = t.customer_id WHERE c.id = :p1",
+    );
+    assert_eq!(v.output_columns(), ["s"]);
+    // Aliased schema: the cloud name the planner wrote.
+    let v = validate(
+        "SELECT town FROM clients",
+        &aliased_schema(),
+        &public(),
+        &no_entity(),
+    )
+    .unwrap();
+    assert_eq!(v.output_columns(), ["town"]);
+}
+
 #[test]
 fn entity_filters_and_count_only() {
     let v = ok(BALANCE);

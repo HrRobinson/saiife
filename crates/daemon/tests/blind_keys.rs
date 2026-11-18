@@ -313,6 +313,17 @@ async fn ops_registered() {
             assert_eq!(a["message"], "dataset is required", "{op}: {a}");
             continue;
         }
+        // Plan 48 T1 built the ask: with no arguments it asks for them.
+        if *op == saiife_ipc::msg::OP_BLIND_ASK || *op == saiife_ipc::msg::OP_BLIND_ASK_ANSWER {
+            let want = if *op == saiife_ipc::msg::OP_BLIND_ASK {
+                "question is required"
+            } else {
+                "ask is required"
+            };
+            assert_eq!(a["error"], "bad_request", "{op}: {a}");
+            assert_eq!(a["message"], want, "{op}: {a}");
+            continue;
+        }
         // Task 4 built the fetch: with no `[blind.ner]` it names it.
         if *op == saiife_ipc::msg::OP_BLIND_NER_FETCH {
             assert_eq!(a["error"], "bad_request", "{op}: {a}");

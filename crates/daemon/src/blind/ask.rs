@@ -1,0 +1,1833 @@
+//! The Data Shield ask (plan 48 Task 1; spec §2.1.6, §2.1.7, §2.3.5,
+//! §2.3.6, §6.5): a small state machine per ask, keyed by a random id,
+//! owned by the uid that made it (R48-1). Each step is one IPC call: the
+//! daemon says what it needs (a pick, "did you mean", keeping a name, the
+//! method preview) and the caller sends the user's answer back.
+//!
+//! `blind.ask` fixes the dataset's live build for the whole ask
+//! ([`data::live_snapshot`], plan 48 C2), parameterizes the question
+//! locally and resolves its names (plan 44). A ready draft reuses an
+//! approved method of the same template and parameter types with no cloud
+//! call (R45-11), or goes to the planner through plan 47's send sequence.
+//! A method, its self-checks or its template that does not validate goes
+//! back to the planner as its error class, by the previous method's hash
+//! (R48-2, R-C11): the first try plus at most [`MAX_TRIES`]` - 1` retries.
+//! The preview is then built from the validated method (plan 45) and the
+//! ask waits for Run or Stop (Task 2).
+//!
+//! **Local only:** pick lists, "did you mean" suggestions, the preview and
+//! the user's words go into the answer of the step that shows them and
+//! nowhere else. Records hold the parameterized question with stand-ins
+//! (`blind_ask`), counts (`blind_resolve`) and hashes (`blind_preview`).
+//! Every refused step carries a machine `code` (R-C5) so a later step can
+//! key on it (`identifier_output`: the reveal, plan 49).
+
+use super::audit::{self, BlindRecord};
+use super::data::{self, LiveSnapshot};
+use super::model::{self, PlanError};
+use super::{keys, lock, Blind, Refusal};
+use crate::ops::Ctx;
+use saiife_ipc::msg::ErrorCode;
+use saiife_ipc::peer::PeerCred;
+use saiife_shield::envelope::{
+    build_envelope, cloud_schema, method_sha256, schema_sha256, synthetic_sha256, CloudSchema,
+    Retry, SentSummary,
+};
+use saiife_shield::firewall::{self, Expected, Firewall, Hit};
+use saiife_shield::lang::{find_numbers, number_words};
+use saiife_shield::lexicon::{Candidate, Resolve, MAX_CANDIDATES};
+use saiife_shield::methods::{ApprovedMethod, MethodStore};
+use saiife_shield::plan::PlanReply;
+use saiife_shield::preview::{preview, Preview};
+use saiife_shield::public::PublicValues;
+use saiife_shield::question::{self, Draft, Pending};
+use saiife_shield::schema::{Bound, ColumnClass, DatasetName, Lang, Param, ParamType, Schema};
+use saiife_shield::sql::{validate, validate_check, ErrorClass, MethodError, Validated};
+use saiife_shield::standin::KeySet;
+use saiife_shield::synth::{os_rng, synthetic_rows};
+use saiife_shield::template::{answer_params, check_params_covered, parse_template, spoken};
+use saiife_shield::ShieldError;
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+// ------------------------------------------------------------ values ----
+
+/// An ask lives this long after its last step; an answered one is kept as
+/// long again for `methods approve` (R48-1).
+pub const ASK_TTL: Duration = Duration::from_secs(600);
+/// Open asks per uid and per daemon (R48-1).
+pub const MAX_OPEN_PER_UID: usize = 4;
+pub const MAX_OPEN: usize = 64;
+/// The longest question, in characters.
+pub const MAX_QUESTION_CHARS: usize = 2_000;
+/// Planner requests per ask before the preview: the first try plus 3
+/// retries (R48-2, plan 45 R45-8).
+pub const MAX_TRIES: u32 = 4;
+/// Synthetic rows per table in an envelope (plan 44 R44-6: at most 5).
+const SYNTHETIC_PER_TABLE: usize = 5;
+
+/// R48-5: `--judgment`, or a plan reply with `needs_judgment`.
+pub const JUDGMENT: &str = "this question needs judgment, which needs the local composer \
+     (a later stage); exact mode cannot answer it";
+/// An ask id that is not (or no longer) there.
+pub const NO_SUCH_ASK: &str =
+    "no such ask: it ended or expired (an ask lasts 10 minutes after its last step); ask again";
+/// Another uid's ask (R48-1).
+pub const NOT_YOURS: &str = "this ask belongs to another user";
+/// A step sent while the ask still works on the last one.
+pub const ASK_BUSY: &str = "this ask is still working on its last step; wait for it";
+/// R-C8: no `[blind.ner]` pins.
+pub const NER_NOT_PINNED: &str = "Data Shield needs its local name detector first: [blind.ner] \
+     must pin the model, vocab and labels by sha256 (saiife blind init sets it up; see the Data \
+     Shield docs)";
+/// R-C8: pinned, but no detector is running.
+pub const NER_NOT_READY: &str = "the local name detector is not ready: saiife blind status \
+     shows why (saiife blind init fetches its files)";
+/// `{"keep_name": true}` on `blind.ask.answer`: only the touch keeps a name.
+pub const KEEP_NEEDS_TOUCH: &str =
+    "keeping a name as plain text needs a touch (blind:name): blind.touch.begin {purpose: name}";
+
+/// The machine codes of refused steps (R-C5).
+pub mod code {
+    /// "None of these", or a "yes" whose name no longer resolves.
+    pub const NO_MATCH: &str = "no_match";
+    /// "None of these" on a list cut at the candidate cap.
+    pub const TOO_MANY: &str = "too_many";
+    /// The user would not keep an unknown name.
+    pub const NAME_REFUSED: &str = "name_refused";
+    /// A literal that does not parse as its type.
+    pub const BAD_LITERAL: &str = "bad_literal";
+    /// The name detector failed.
+    pub const DETECTOR: &str = "detector";
+    /// The planner's method did not validate after every try.
+    pub const INVALID_METHOD: &str = "invalid_method";
+    /// R45-13: the method would print an identifier (the reveal hook).
+    pub const IDENTIFIER_OUTPUT: &str = "identifier_output";
+    /// R48-5.
+    pub const NEEDS_JUDGMENT: &str = "needs_judgment";
+    /// The planner gave no usable reply.
+    pub const PLANNER: &str = "planner";
+    /// The leak firewall stopped the request (R48-9).
+    pub const BLOCKED: &str = "blocked";
+    /// The reply held a value of the dataset.
+    pub const LEAK: &str = "leak";
+    /// The request or its reply could not be recorded (R-C9).
+    pub const UNRECORDED: &str = "unrecorded";
+}
+
+/// The head of a refusal made before anything was sent.
+pub fn head_nothing_sent(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "refused, nothing sent",
+        Lang::Da => "afvist, intet sendt",
+    }
+}
+
+/// The head of a refusal once the planner was asked.
+pub fn head_no_answer(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "I could not produce a verified answer",
+        Lang::Da => "Jeg kunne ikke give et verificeret svar",
+    }
+}
+
+// ------------------------------------------------------------- steps ----
+
+/// What the daemon shows next (JSON, tag `kind`). Holds what the user may
+/// see locally; never logged. `Debug` prints the kind only.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Step {
+    /// Namesakes: the user picks one (`n` is 1-based; 0 is "none").
+    Pick {
+        word: String,
+        written: String,
+        candidates: Vec<PickItem>,
+        too_many: bool,
+    },
+    /// An unknown name close to one known one (see [`did_you_mean_step`]).
+    DidYouMean {
+        word: String,
+        written: String,
+        suggestion: String,
+    },
+    /// An unknown name: keep it as plain text (a touch, Task 3) or stop.
+    KeepName { name: String },
+    /// The method in plain words; Run or Stop next.
+    Preview {
+        text: String,
+        /// The planner's intent line (R-C10: only without numbers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        planner_says: Option<String>,
+        /// The approved method reused (no cloud call).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approved: Option<String>,
+        sent: Sent,
+        /// The exact envelope sent (canonical JSON), with `show_sent`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        envelope: Option<String>,
+    },
+    /// The checked answer (Task 2, R48-4).
+    Answer {
+        text: String,
+        method_line: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_note: Option<String>,
+        footer: String,
+        checked: Checked,
+    },
+    /// The ask ended without an answer. `code` is fixed (see [`code`]).
+    Refused {
+        code: &'static str,
+        head: String,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        method_line: Option<String>,
+    },
+    /// The dataset is being rebuilt; ask again in a moment.
+    Refreshing { text: String },
+}
+
+/// One line of a pick list: the display name and the `show` values that
+/// are not Identifier-class (R-C2); never the key.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct PickItem {
+    pub n: usize,
+    pub label: String,
+}
+
+/// What the envelope held (counts only; zeros when nothing was sent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Sent {
+    pub tables: usize,
+    pub synthetic_rows: usize,
+    pub params: usize,
+    pub personal_values: usize,
+}
+
+impl From<SentSummary> for Sent {
+    fn from(s: SentSummary) -> Sent {
+        Sent {
+            tables: s.tables,
+            synthetic_rows: s.synthetic_rows,
+            params: s.params,
+            personal_values: s.personal_values,
+        }
+    }
+}
+
+/// The checker's count (Task 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Checked {
+    pub numbers: u32,
+    pub from_calc: u32,
+}
+
+impl Step {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Step::Pick { .. } => "pick",
+            Step::DidYouMean { .. } => "did_you_mean",
+            Step::KeepName { .. } => "keep_name",
+            Step::Preview { .. } => "preview",
+            Step::Answer { .. } => "answer",
+            Step::Refused { .. } => "refused",
+            Step::Refreshing { .. } => "refreshing",
+        }
+    }
+
+    /// A refusal without a method line.
+    pub fn refused(code: &'static str, head: &str, reason: impl Into<String>) -> Step {
+        Step::Refused {
+            code,
+            head: head.to_string(),
+            reason: reason.into(),
+            method_line: None,
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+impl std::fmt::Debug for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Step::Refused { code, .. } => write!(f, "Step::Refused({code})"),
+            s => write!(f, "Step::{}", s.kind()),
+        }
+    }
+}
+
+/// The step of a "did you mean" (R-C4: built here only, so plan 49 can
+/// change its shape in one place).
+pub fn did_you_mean_step(
+    word: &str,
+    written: &str,
+    suggestion: &Candidate,
+    schema: &Schema,
+) -> Step {
+    Step::DidYouMean {
+        word: word.to_string(),
+        written: written.to_string(),
+        suggestion: label(suggestion, schema),
+    }
+}
+
+/// The `show` values of `c` that the user may see: not empty, of a column
+/// that is not Identifier-class (R-C2). An unknown column is not shown.
+fn shown<'a>(c: &'a Candidate, schema: &Schema) -> Vec<&'a str> {
+    c.show
+        .iter()
+        .filter(|(col, v)| {
+            !v.is_empty()
+                && schema
+                    .column(&c.table, col)
+                    .is_some_and(|ci| ci.class != ColumnClass::Identifier)
+        })
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// `Anna Berg, Aarhus`: the display name and [`shown`] values.
+fn label(c: &Candidate, schema: &Schema) -> String {
+    std::iter::once(c.display.as_str())
+        .chain(shown(c, schema))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// R-C10: the planner's intent line, only when it holds no digit and no
+/// number word (the draft's language, and the other one's words that are
+/// not everyday words of this one, as the firewall reads them). Dropped
+/// whole, never edited.
+pub fn planner_says(intent: &str, lang: Lang) -> Option<String> {
+    let t = intent.trim();
+    if t.is_empty() || t.chars().any(char::is_numeric) || !find_numbers(t, lang).is_empty() {
+        return None;
+    }
+    let other = match lang {
+        Lang::En => Lang::Da,
+        Lang::Da => Lang::En,
+    };
+    for w in t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        let w = w.to_lowercase();
+        let everyday = lang == Lang::En && matches!(w.as_str(), "to" | "fire");
+        if number_words(lang).is_number_word(&w)
+            || (!everyday && number_words(other).is_number_word(&w))
+        {
+            return None;
+        }
+    }
+    Some(t.to_string())
+}
+
+// ----------------------------------------------------------- answers ----
+
+/// The parsed `blind.ask` arguments. `Debug` hides the question.
+#[derive(Clone)]
+pub struct AskArgs {
+    pub question: String,
+    pub dataset: Option<String>,
+    pub lang: Option<Lang>,
+    pub new_session: bool,
+    pub yes: bool,
+    pub limit: Option<u32>,
+    pub show_sent: bool,
+    pub judgment: bool,
+}
+
+impl std::fmt::Debug for AskArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskArgs")
+            .field("dataset", &self.dataset)
+            .field("lang", &self.lang)
+            .field("new_session", &self.new_session)
+            .field("yes", &self.yes)
+            .field("limit", &self.limit)
+            .field("show_sent", &self.show_sent)
+            .field("judgment", &self.judgment)
+            .finish_non_exhaustive()
+    }
+}
+
+fn bad(text: impl Into<String>) -> Refusal {
+    Refusal::new(ErrorCode::BadRequest, text)
+}
+
+fn unavailable(text: impl Into<String>) -> Refusal {
+    Refusal::new(ErrorCode::Unavailable, text)
+}
+
+fn flag(a: &Map<String, Value>, k: &str) -> Result<bool, Refusal> {
+    match a.get(k) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(bad(format!("{k} must be true or false"))),
+    }
+}
+
+impl AskArgs {
+    /// From the op's arguments: the question (1 to 2 000 characters), an
+    /// optional dataset, `lang` `en` or `da`, the flags and `limit`.
+    pub fn from_args(a: &Map<String, Value>) -> Result<AskArgs, Refusal> {
+        let question = a
+            .get("question")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("question is required"))?;
+        if question.trim().is_empty() {
+            return Err(bad("the question is empty"));
+        }
+        if question.chars().count() > MAX_QUESTION_CHARS {
+            return Err(bad(format!(
+                "the question is longer than {MAX_QUESTION_CHARS} characters"
+            )));
+        }
+        let dataset = match a.get("dataset") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(bad("dataset must be a name")),
+        };
+        let lang = match a.get("lang") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s == "en" => Some(Lang::En),
+            Some(Value::String(s)) if s == "da" => Some(Lang::Da),
+            Some(_) => return Err(bad("lang must be en or da")),
+        };
+        let limit = match a.get("limit") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| bad("limit must be a whole number of at least 1"))?,
+            ),
+        };
+        Ok(AskArgs {
+            question: question.to_string(),
+            dataset,
+            lang,
+            new_session: flag(a, "new_session")?,
+            yes: flag(a, "yes")?,
+            limit,
+            show_sent: flag(a, "show_sent")?,
+            judgment: flag(a, "judgment")?,
+        })
+    }
+}
+
+/// The user's answer to a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskAnswer {
+    /// 1-based; 0 is "none of these".
+    Pick(usize),
+    DidYouMean(bool),
+    KeepNameNo,
+    Run(bool),
+    /// Only from `blind.touch.commit` once the `blind:name` touch verified
+    /// (Task 3).
+    KeepNameTouched,
+}
+
+/// The answer of a "did you mean" (R-C4: parsed here only).
+fn did_you_mean_answer(v: &Value) -> Result<AskAnswer, Refusal> {
+    match v {
+        Value::Bool(b) => Ok(AskAnswer::DidYouMean(*b)),
+        _ => Err(bad("did_you_mean must be true or false")),
+    }
+}
+
+/// `{"pick": n}`, `{"did_you_mean": bool}`, `{"keep_name": false}` or
+/// `{"run": bool}`; `keep_name: true` goes through the touch.
+pub fn parse_answer(v: Option<&Value>) -> Result<AskAnswer, Refusal> {
+    let shape = "answer must be one of {\"pick\": n}, {\"did_you_mean\": bool}, \
+                 {\"keep_name\": false}, {\"run\": bool}";
+    let Some(Value::Object(m)) = v else {
+        return Err(bad(shape));
+    };
+    let mut it = m.iter();
+    let (Some((k, v)), None) = (it.next(), it.next()) else {
+        return Err(bad(shape));
+    };
+    match (k.as_str(), v) {
+        ("pick", v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(AskAnswer::Pick)
+            .ok_or_else(|| bad("pick must be a whole number")),
+        ("did_you_mean", v) => did_you_mean_answer(v),
+        ("keep_name", Value::Bool(false)) => Ok(AskAnswer::KeepNameNo),
+        ("keep_name", Value::Bool(true)) => Err(bad(KEEP_NEEDS_TOUCH)),
+        ("run", Value::Bool(b)) => Ok(AskAnswer::Run(*b)),
+        _ => Err(bad(shape)),
+    }
+}
+
+// ------------------------------------------------------------- state ----
+
+/// Where an ask is. The shape is the plan's (Tasks 2 and 3 match on it);
+/// an ask lives in a map, never on a hot path, so the size is no concern.
+#[allow(clippy::large_enum_variant)]
+pub enum AskPhase {
+    /// A step of local resolution is shown (`draft.pending[0]`).
+    Resolving(Draft),
+    /// The preview is shown; Run or Stop next (Task 2).
+    Previewing {
+        draft: Draft,
+        validated: Validated,
+        reply: PlanReply,
+        preview: Preview,
+        /// The approved method's id when one was reused.
+        approved: Option<String>,
+    },
+    /// A checked answer was shown (Task 2); kept for `methods approve`.
+    Answered {
+        draft: Draft,
+        reply: PlanReply,
+        preview: Preview,
+    },
+    /// Ended: the ask is dropped.
+    Done,
+}
+
+impl AskPhase {
+    fn word(&self) -> &'static str {
+        match self {
+            AskPhase::Resolving(_) => "resolving",
+            AskPhase::Previewing { .. } => "previewing",
+            AskPhase::Answered { .. } => "answered",
+            AskPhase::Done => "done",
+        }
+    }
+
+    /// Resolving or previewing: counts against the open-ask limits.
+    fn is_open(&self) -> bool {
+        matches!(self, AskPhase::Resolving(_) | AskPhase::Previewing { .. })
+    }
+}
+
+impl std::fmt::Debug for AskPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// What the ask was asked with, fixed at its begin.
+#[derive(Debug, Clone, Copy)]
+pub struct AskOpts {
+    pub yes: bool,
+    pub show_sent: bool,
+    /// The envelope's and the calculator's row cap (`--limit` or policy).
+    pub list_cap: u32,
+    /// The dataset's `preview_required` (R48-3, Task 2).
+    pub preview_required: bool,
+    /// The session length (policy).
+    pub session: Duration,
+}
+
+/// Resolution counts for `blind_resolve` (never a candidate).
+#[derive(Debug, Default)]
+struct Counts {
+    /// Param -> the candidates its pick list had.
+    picks: BTreeMap<String, u32>,
+    did_you_mean: u32,
+    kept_names: u32,
+    /// The latest draft's params: (name, tag, bound).
+    seen: Vec<(String, String, bool)>,
+}
+
+/// One ask. Holds the question, the user's words and the chosen
+/// candidates: local only; `Debug` prints none of them.
+pub struct AskState {
+    pub uid: u32,
+    pub dataset: DatasetName,
+    pub phase: AskPhase,
+    pub last_step: Instant,
+    /// The build the ask runs on, fixed at `blind.ask` (plan 48 C2): every
+    /// step, and the run (Task 2), use it.
+    pub snapshot: Arc<LiveSnapshot>,
+    pub opts: AskOpts,
+    /// Names a `blind:name` touch released in this ask (ruling P-28).
+    pub released: Vec<String>,
+    /// The candidate each picked or confirmed parameter resolved to (the
+    /// preview shows its non-Identifier `show` values, R-C2).
+    chosen: Vec<(String, Candidate)>,
+    counts: Counts,
+}
+
+impl std::fmt::Debug for AskState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskState")
+            .field("uid", &self.uid)
+            .field("dataset", &self.dataset)
+            .field("phase", &self.phase)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The asks of a daemon (`Blind::asks`). An ask being worked on (a step
+/// in flight) is out of the map and listed in `working`, so a second step
+/// for it is `busy` and every lookup still knows its owner.
+#[derive(Debug, Default)]
+pub struct Asks {
+    map: BTreeMap<String, AskState>,
+    working: BTreeMap<String, u32>,
+}
+
+impl Asks {
+    pub fn new() -> Asks {
+        Asks::default()
+    }
+
+    /// Drops every ask whose last step is [`ASK_TTL`] old.
+    pub fn sweep(&mut self, now: Instant) {
+        self.map
+            .retain(|_, s| now.saturating_duration_since(s.last_step) < ASK_TTL);
+    }
+
+    /// The asks kept (any phase), and those in flight.
+    pub fn len(&self) -> usize {
+        self.map.len() + self.working.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The uids of the open asks: resolving, previewing or in flight.
+    fn open_uids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.map
+            .values()
+            .filter(|s| s.phase.is_open())
+            .map(|s| s.uid)
+            .chain(self.working.values().copied())
+    }
+
+    /// Holds a new ask's slot for `uid` (R48-1 limits).
+    fn reserve(&mut self, id: &str, uid: u32) -> Result<(), Refusal> {
+        if self.open_uids().filter(|u| *u == uid).count() >= MAX_OPEN_PER_UID {
+            return Err(Refusal::new(
+                ErrorCode::Busy,
+                format!(
+                    "you have {MAX_OPEN_PER_UID} open asks: answer one, or wait for one to expire"
+                ),
+            ));
+        }
+        if self.open_uids().count() >= MAX_OPEN {
+            return Err(Refusal::new(
+                ErrorCode::Busy,
+                format!("Data Shield has {MAX_OPEN} open asks; try again in a moment"),
+            ));
+        }
+        self.working.insert(id.to_string(), uid);
+        Ok(())
+    }
+
+    /// Takes ask `id` of `uid` out to work on it.
+    fn take(&mut self, id: &str, uid: u32) -> Result<AskState, Refusal> {
+        if let Some(owner) = self.working.get(id) {
+            return Err(if *owner == uid {
+                Refusal::new(ErrorCode::Busy, ASK_BUSY)
+            } else {
+                Refusal::new(ErrorCode::Forbidden, NOT_YOURS)
+            });
+        }
+        match self.map.get(id) {
+            None => return Err(bad(NO_SUCH_ASK)),
+            Some(s) if s.uid != uid => return Err(Refusal::new(ErrorCode::Forbidden, NOT_YOURS)),
+            Some(_) => {}
+        }
+        let st = self.map.remove(id).ok_or_else(|| bad(NO_SUCH_ASK))?;
+        self.working.insert(id.to_string(), uid);
+        Ok(st)
+    }
+
+    /// Runs `f` on ask `id` of `uid` (Task 3: the touch flows read the
+    /// pending name or the answered method).
+    pub fn peek<T>(
+        &self,
+        id: &str,
+        uid: u32,
+        f: impl FnOnce(&AskState) -> T,
+    ) -> Result<T, Refusal> {
+        if let Some(owner) = self.working.get(id) {
+            return Err(if *owner == uid {
+                Refusal::new(ErrorCode::Busy, ASK_BUSY)
+            } else {
+                Refusal::new(ErrorCode::Forbidden, NOT_YOURS)
+            });
+        }
+        match self.map.get(id) {
+            None => Err(bad(NO_SUCH_ASK)),
+            Some(s) if s.uid != uid => Err(Refusal::new(ErrorCode::Forbidden, NOT_YOURS)),
+            Some(s) => Ok(f(s)),
+        }
+    }
+
+    /// Test seam: every ask's last step `by` earlier.
+    #[cfg(debug_assertions)]
+    pub fn test_backdate(&mut self, by: Duration) {
+        for s in self.map.values_mut() {
+            if let Some(t) = s.last_step.checked_sub(by) {
+                s.last_step = t;
+            }
+        }
+    }
+}
+
+/// An ask in flight: its `working` mark goes when this drops (also when
+/// the connection's task is dropped mid-step).
+struct Working {
+    blind: Arc<Blind>,
+    id: String,
+}
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        lock(&self.blind.asks).working.remove(&self.id);
+    }
+}
+
+/// Keeps `st` for its next step unless it ended.
+fn store(ctx: &Ctx, id: &str, mut st: AskState) {
+    if matches!(st.phase, AskPhase::Done) {
+        return;
+    }
+    st.last_step = Instant::now();
+    lock(&ctx.blind.asks).map.insert(id.to_string(), st);
+}
+
+fn new_id() -> Result<String, Refusal> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|_| unavailable("no randomness for an ask id"))?;
+    Ok(crate::api_ops::hex(&b))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn shield_err(e: &ShieldError) -> Refusal {
+    unavailable(format!("the ask could not go on: {e}"))
+}
+
+fn join_err() -> Refusal {
+    unavailable("the ask could not go on: a local step stopped")
+}
+
+// ----------------------------------------------------------- dataset ----
+
+/// The dataset to ask, its policy entry, and what the ask takes from
+/// policy. Named: it must be in policy and the peer may ask it; unnamed:
+/// the one dataset the peer may ask.
+async fn dataset_for(
+    ctx: &Ctx,
+    peer: &PeerCred,
+    want: Option<&str>,
+    limit: Option<u32>,
+) -> Result<(DatasetName, AskOpts), Refusal> {
+    let p = ctx.policy();
+    let blind = p
+        .system
+        .as_ref()
+        .map(|s| s.blind.clone())
+        .unwrap_or_default();
+    let name: DatasetName = match want {
+        Some(n) => {
+            let name: DatasetName = n.parse().map_err(|_| bad("not a dataset name"))?;
+            if !blind.dataset.iter().any(|d| d.name == name.as_str()) {
+                return Err(bad(format!("{name} is not in policy")));
+            }
+            if !super::ops::role_of(ctx, peer, &name).await.may_ask() {
+                return Err(Refusal::new(
+                    ErrorCode::Forbidden,
+                    format!("you have no role on {name}"),
+                ));
+            }
+            name
+        }
+        None => {
+            let mut mine = Vec::new();
+            for d in &blind.dataset {
+                if let Ok(n) = d.name.parse::<DatasetName>() {
+                    if super::ops::role_of(ctx, peer, &n).await.may_ask() {
+                        mine.push(n);
+                    }
+                }
+            }
+            match mine.len() {
+                0 => {
+                    return Err(Refusal::new(
+                        ErrorCode::Forbidden,
+                        "you may not ask any Data Shield dataset",
+                    ))
+                }
+                1 => mine.remove(0),
+                _ => {
+                    return Err(bad(
+                        "you may ask more than one dataset: pass --dataset <name>",
+                    ))
+                }
+            }
+        }
+    };
+    let d = blind
+        .dataset
+        .iter()
+        .find(|d| d.name == name.as_str())
+        .ok_or_else(|| bad(format!("{name} is not in policy")))?;
+    let cap = d.list_cap.unwrap_or_else(|| blind.list_cap());
+    if let Some(l) = limit {
+        if l > cap {
+            return Err(bad(format!("--limit must be at most {cap} for {name}")));
+        }
+    }
+    Ok((
+        name,
+        AskOpts {
+            yes: false,
+            show_sent: false,
+            list_cap: limit.unwrap_or(cap),
+            preview_required: d.preview_required,
+            session: blind.session(),
+        },
+    ))
+}
+
+/// R-C8: `[blind.ner]` pins the detector's files, and the detector runs.
+fn detector(ctx: &Ctx) -> Result<Arc<dyn saiife_shield::ner::NameDetector>, Refusal> {
+    let pinned = ctx
+        .policy()
+        .system
+        .as_ref()
+        .is_some_and(|s| s.blind.ner.is_some());
+    if !pinned {
+        return Err(unavailable(NER_NOT_PINNED));
+    }
+    ctx.blind
+        .detector()
+        .ok_or_else(|| unavailable(NER_NOT_READY))
+}
+
+async fn load_keys(ctx: &Arc<Ctx>, ds: &DatasetName) -> Result<KeySet, Refusal> {
+    let (c, d) = (Arc::clone(ctx), ds.clone());
+    tokio::task::spawn_blocking(move || keys::load(&c, &d).map_err(|e| e.refusal(&d)))
+        .await
+        .map_err(|_| join_err())?
+}
+
+// -------------------------------------------------------------- flow ----
+
+/// `blind.ask`: a new ask and its first step.
+pub async fn begin(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    args: AskArgs,
+) -> Result<(String, Step), Refusal> {
+    let (name, mut opts) = dataset_for(ctx, peer, args.dataset.as_deref(), args.limit).await?;
+    opts.yes = args.yes;
+    opts.show_sent = args.show_sent;
+    let lang0 = args.lang.unwrap_or(Lang::En);
+    let id = new_id()?;
+    if args.judgment {
+        return Ok((
+            id,
+            Step::refused(code::NEEDS_JUDGMENT, head_nothing_sent(lang0), JUDGMENT),
+        ));
+    }
+    let det = detector(ctx)?;
+    // The build, fixed for the whole ask; a refresh is a step of its own.
+    let snap = match data::live_snapshot(ctx, &name) {
+        Ok(s) => s,
+        Err(r) if r.code == ErrorCode::Busy && r.text != data::OPENING => {
+            return Ok((id, Step::Refreshing { text: r.text }))
+        }
+        Err(r) => return Err(r),
+    };
+    if snap.open.index.is_none() {
+        return Err(unavailable(format!(
+            "{name} has no known-value index: saiife blind data refresh --dataset {name}"
+        )));
+    }
+    {
+        let mut a = lock(&ctx.blind.asks);
+        a.sweep(Instant::now());
+        a.reserve(&id, peer.uid)?;
+    }
+    let _w = Working {
+        blind: Arc::clone(&ctx.blind),
+        id: id.clone(),
+    };
+    // `--new-session` starts the session over now.
+    let keys = load_keys(ctx, &name).await?;
+    lock(&ctx.blind.sessions)
+        .get_or_new(
+            peer.uid,
+            &name,
+            &keys,
+            unix_now(),
+            opts.session,
+            args.new_session,
+        )
+        .map_err(|e| shield_err(&e))?;
+    drop(keys);
+    let st = AskState {
+        uid: peer.uid,
+        dataset: name,
+        phase: AskPhase::Done,
+        last_step: Instant::now(),
+        snapshot: Arc::clone(&snap),
+        opts,
+        released: Vec::new(),
+        chosen: Vec::new(),
+        counts: Counts::default(),
+    };
+    let q = args.question;
+    let lang = args.lang;
+    let got = tokio::task::spawn_blocking(move || {
+        let lex = lock(&snap.open.lexicon);
+        question::parameterize(&q, lang, snap.schema(), &lex, &*det)
+    })
+    .await
+    .map_err(|_| join_err())?
+    .map_err(|e| shield_err(&e))?;
+    let (st, r) = resolved(ctx, &id, st, got, lang0).await;
+    store(ctx, &id, st);
+    r.map(|s| (id, s))
+}
+
+/// `blind.ask.answer`: the user's answer to ask `id`'s step.
+pub async fn step(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    id: &str,
+    a: AskAnswer,
+) -> Result<Step, Refusal> {
+    let st = {
+        let mut asks = lock(&ctx.blind.asks);
+        asks.sweep(Instant::now());
+        asks.take(id, peer.uid)?
+    };
+    let _w = Working {
+        blind: Arc::clone(&ctx.blind),
+        id: id.to_string(),
+    };
+    let (st, r) = advance(ctx, id, st, a).await;
+    store(ctx, id, st);
+    r
+}
+
+fn misfit() -> Refusal {
+    bad("that answer does not fit this step of the ask")
+}
+
+/// One answer applied.
+async fn advance(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    mut st: AskState,
+    a: AskAnswer,
+) -> (AskState, Result<Step, Refusal>) {
+    match std::mem::replace(&mut st.phase, AskPhase::Done) {
+        AskPhase::Resolving(d) => {
+            let lang = d.lang;
+            let fit = match (d.pending.first(), a) {
+                (
+                    Some(Pending::Pick {
+                        param, candidates, ..
+                    }),
+                    AskAnswer::Pick(n),
+                ) if n <= candidates.len() => {
+                    let c = n.checked_sub(1).and_then(|i| candidates.get(i));
+                    if let Some(c) = c {
+                        st.chosen.push((param.clone(), c.clone()));
+                    }
+                    Some(question::Answer::Pick(n))
+                }
+                (
+                    Some(Pending::DidYouMean {
+                        param, suggestion, ..
+                    }),
+                    AskAnswer::DidYouMean(yes),
+                ) => {
+                    if yes {
+                        st.chosen.push((param.clone(), suggestion.clone()));
+                    }
+                    Some(question::Answer::DidYouMean(yes))
+                }
+                (Some(Pending::KeepName { .. }), AskAnswer::KeepNameNo) => {
+                    Some(question::Answer::KeepName(false))
+                }
+                (Some(Pending::KeepName { name, .. }), AskAnswer::KeepNameTouched) => {
+                    st.released.push(name.clone());
+                    st.counts.kept_names += 1;
+                    Some(question::Answer::KeepName(true))
+                }
+                _ => None,
+            };
+            let Some(qa) = fit else {
+                st.phase = AskPhase::Resolving(d);
+                return (st, Err(misfit()));
+            };
+            let snap = Arc::clone(&st.snapshot);
+            let got = tokio::task::spawn_blocking(move || {
+                let lex = lock(&snap.open.lexicon);
+                question::answer(d, qa, &lex)
+            })
+            .await;
+            match got {
+                Ok(Ok(s)) => resolved(ctx, id, st, s, lang).await,
+                Ok(Err(e)) => (st, Err(shield_err(&e))),
+                Err(_) => (st, Err(join_err())),
+            }
+        }
+        p @ AskPhase::Previewing { .. } => {
+            st.phase = p;
+            match a {
+                // Task 2 runs the method.
+                AskAnswer::Run(_) => (
+                    st,
+                    Err(unavailable(
+                        "running the method is not available in this build yet",
+                    )),
+                ),
+                _ => (st, Err(misfit())),
+            }
+        }
+        p => {
+            st.phase = p;
+            (st, Err(misfit()))
+        }
+    }
+}
+
+/// After a resolution step: the next question for the user, a refusal, or
+/// (draft ready) the method and its preview.
+async fn resolved(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    mut st: AskState,
+    s: question::Step,
+    lang0: Lang,
+) -> (AskState, Result<Step, Refusal>) {
+    match s {
+        question::Step::Ask(d) => {
+            note_params(&mut st, &d);
+            let schema = st.snapshot.schema();
+            match pending_step(&mut st.counts, &d, schema) {
+                Some(step) => {
+                    st.phase = AskPhase::Resolving(d);
+                    (st, Ok(step))
+                }
+                None => (
+                    st,
+                    Err(shield_err(&ShieldError::Corrupt("no pending step"))),
+                ),
+            }
+        }
+        question::Step::Ready(d) => {
+            note_params(&mut st, &d);
+            if let Err(e) = record_resolve(ctx, id, &st).await {
+                return (st, Err(e));
+            }
+            proceed(ctx, id, st, d).await
+        }
+        question::Step::Refuse(r) => {
+            if let Err(e) = record_resolve(ctx, id, &st).await {
+                return (st, Err(e));
+            }
+            let step = question_refusal(r, lang0, &st.dataset);
+            (st, Ok(step))
+        }
+    }
+}
+
+fn note_params(st: &mut AskState, d: &Draft) {
+    st.counts.seen = d
+        .params
+        .iter()
+        .map(|p| (p.name.clone(), p.ty.tag(), p.bound.is_some()))
+        .collect();
+}
+
+/// The step that shows `d.pending[0]`.
+fn pending_step(counts: &mut Counts, d: &Draft, schema: &Schema) -> Option<Step> {
+    match d.pending.first()? {
+        Pending::Pick {
+            param,
+            word,
+            candidates,
+            too_many,
+        } => {
+            counts.picks.insert(
+                param.clone(),
+                u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+            );
+            let written = d
+                .params
+                .iter()
+                .find(|p| p.name == *param)
+                .map(|p| p.display.clone())
+                .unwrap_or_default();
+            Some(Step::Pick {
+                word: word.clone(),
+                written,
+                candidates: candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| PickItem {
+                        n: i + 1,
+                        label: label(c, schema),
+                    })
+                    .collect(),
+                too_many: *too_many,
+            })
+        }
+        Pending::DidYouMean {
+            word,
+            written,
+            suggestion,
+            ..
+        } => {
+            counts.did_you_mean += 1;
+            Some(did_you_mean_step(word, written, suggestion, schema))
+        }
+        Pending::KeepName { name, .. } => Some(Step::KeepName { name: name.clone() }),
+    }
+}
+
+/// A resolution refusal as the user sees it (nothing was sent).
+fn question_refusal(r: question::Refusal, lang: Lang, ds: &DatasetName) -> Step {
+    let head = head_nothing_sent(lang);
+    match r {
+        question::Refusal::NoMatch { word, written } => Step::refused(
+            code::NO_MATCH,
+            head,
+            match lang {
+                Lang::En => format!("no {word} named \"{written}\""),
+                Lang::Da => format!("ingen {word} ved navn \"{written}\""),
+            },
+        ),
+        question::Refusal::BadLiteral { why, .. } => Step::refused(code::BAD_LITERAL, head, why),
+        question::Refusal::NameRefused { name } => Step::refused(
+            code::NAME_REFUSED,
+            head,
+            format!(
+                "\"{name}\" is not in {ds} and was not sent; ask without it, or check the spelling"
+            ),
+        ),
+        question::Refusal::TooMany { word } => Step::refused(
+            code::TOO_MANY,
+            head,
+            format!("more than {MAX_CANDIDATES} of that {word} name; write more of the name"),
+        ),
+        question::Refusal::Detector(t) => Step::refused(code::DETECTOR, head, t),
+    }
+}
+
+async fn record(ctx: &Ctx, st: &AskState, r: BlindRecord) -> Result<(), Refusal> {
+    audit::write(
+        ctx,
+        st.uid,
+        st.dataset.as_str(),
+        r,
+        st.snapshot.open.index.as_ref(),
+    )
+    .await
+    .map_err(|_| unavailable("the ask could not be recorded; nothing was sent"))
+}
+
+/// `blind_resolve`: each parameter's tag and candidate count (a picked
+/// one: its list's length; a bound one: 1; else 0).
+async fn record_resolve(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusal> {
+    let c = &st.counts;
+    let params = c
+        .seen
+        .iter()
+        .map(|(n, tag, bound)| {
+            (
+                tag.clone(),
+                c.picks.get(n).copied().unwrap_or(u32::from(*bound)),
+            )
+        })
+        .collect();
+    let r = BlindRecord::Resolve {
+        ask: id.to_string(),
+        params,
+        did_you_mean: c.did_you_mean,
+        kept_names: c.kept_names,
+    };
+    record(ctx, st, r).await
+}
+
+/// `text` with each `:pN` that has a stand-in in `syms` replaced by it.
+fn with_standins(text: &str, syms: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(":p") {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        let digits = tail[2..].bytes().take_while(u8::is_ascii_digit).count();
+        let name = &tail[1..2 + digits];
+        match syms.iter().find(|(n, _)| digits > 0 && n == name) {
+            Some((_, s)) => out.push_str(s),
+            None => out.push_str(&tail[..2 + digits]),
+        }
+        rest = &tail[2 + digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The `blind_ask` record (the question with its stand-ins, R44-4).
+async fn record_ask(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    st: &AskState,
+    d: &Draft,
+    approved: Option<String>,
+) -> Result<(), Refusal> {
+    let keys = load_keys(ctx, &st.dataset).await?;
+    let schema = st.snapshot.schema();
+    let (question, session) = {
+        let mut ss = lock(&ctx.blind.sessions);
+        let s = ss
+            .get_or_new(
+                st.uid,
+                &st.dataset,
+                &keys,
+                unix_now(),
+                st.opts.session,
+                false,
+            )
+            .map_err(|e| shield_err(&e))?;
+        let mut syms = Vec::new();
+        for p in &d.params {
+            if let (ParamType::Entity { table, word }, Some(Bound::Keys(k))) = (&p.ty, &p.bound) {
+                if let [key] = k.as_slice() {
+                    let w = schema
+                        .entity_for(table)
+                        .map_or(word.as_str(), |e| e.word.as_str());
+                    syms.push((p.name.clone(), s.symbol_for(w, table, *key)));
+                }
+            }
+        }
+        (with_standins(&d.text, &syms), crate::api_ops::hex(&s.id.0))
+    };
+    let r = BlindRecord::Ask {
+        ask: id.to_string(),
+        dataset: st.dataset.to_string(),
+        lang: d.lang,
+        question,
+        session,
+        approved_method: approved,
+    };
+    record(ctx, st, r).await
+}
+
+/// The dataset's active approved method for this template and these
+/// parameter types (R45-11), if any.
+async fn approved_for(
+    ctx: &Arc<Ctx>,
+    st: &AskState,
+    lang: Lang,
+    key: String,
+    tags: Vec<String>,
+) -> Result<Option<ApprovedMethod>, Refusal> {
+    let path = ctx
+        .blind
+        .dataset_dir(&st.dataset)
+        .root
+        .join(data::METHODS_FILE);
+    let ds = st.dataset.clone();
+    let name = ds.to_string();
+    tokio::task::spawn_blocking(move || {
+        let store = MethodStore::load(&path)
+            .map_err(|_| unavailable(format!("the methods file of {name} cannot be read")))?;
+        Ok(store.find(&ds, lang, &key, &tags).cloned())
+    })
+    .await
+    .map_err(|_| join_err())?
+}
+
+/// A reply's method, self-checks and template against the draft (R48-2:
+/// any error here goes back to the planner). The template is parsed
+/// against the method's output names, then every bound parameter must be
+/// used (ruling F-f).
+fn check_reply(
+    r: &PlanReply,
+    schema: &Schema,
+    public: &[PublicValues],
+    params: &[Param],
+    list_cap: u32,
+) -> Result<Validated, MethodError> {
+    let v = validate(&r.method, schema, public, params)?;
+    for c in &r.checks {
+        validate_check(c, schema, public, params)?;
+    }
+    let t = parse_template(&r.template, &v.output_columns(), params, list_cap)?;
+    check_params_covered(&v, &t, params)?;
+    Ok(v)
+}
+
+/// The retry's error class (R45-8): the class, with the cloud name for the
+/// classes that carry one only when it is a name of the envelope's schema
+/// (anything else the planner wrote is not sent).
+fn retry_class(e: &MethodError, cloud: &CloudSchema) -> String {
+    let class = e.class.as_str();
+    let named = matches!(
+        e.class,
+        ErrorClass::UnknownTable | ErrorClass::UnknownColumn | ErrorClass::TemplateSlot
+    );
+    let known = |d: &str| {
+        cloud.tables.iter().any(|t| {
+            t.name == d
+                || t.columns.iter().any(|c| {
+                    c.name == d || d.strip_prefix(t.name.as_str()) == Some(&format!(".{}", c.name))
+                })
+        })
+    };
+    match &e.detail {
+        Some(d) if named && known(d) => {
+            let s = format!("{class} {d}");
+            if s.chars().count() <= firewall::MAX_ERROR_CLASS_CHARS {
+                s
+            } else {
+                class.to_string()
+            }
+        }
+        _ => class.to_string(),
+    }
+}
+
+/// R48-9: what a firewall hit would have sent, in words.
+fn hit_words(h: &Hit) -> &'static str {
+    match h.kind {
+        firewall::KNOWN_VALUE | firewall::KNOWN_PHRASE => "a value of the dataset",
+        firewall::NUMBER => "a number",
+        firewall::EMAIL => "an email address",
+        firewall::PHONE => "a phone number",
+        firewall::IBAN => "an account number",
+        firewall::CPR => "a CPR number",
+        firewall::BIRTH_DATE => "a birth date",
+        firewall::NAME => "a name",
+        firewall::OVERSIZE => "too much text",
+        _ => "a part that is not allowed",
+    }
+}
+
+/// A planner failure as the user sees it (R-C9: unreachable is
+/// unavailable; an unrecorded request is refused, nothing sent).
+fn plan_error(e: PlanError, lang: Lang) -> Result<Step, Refusal> {
+    match e {
+        PlanError::Unreachable | PlanError::Timeout => Err(unavailable(e.to_string())),
+        PlanError::Unrecorded(t) => Ok(Step::refused(
+            code::UNRECORDED,
+            head_nothing_sent(lang),
+            format!("{t}; nothing left this machine"),
+        )),
+        PlanError::Blocked(h) => {
+            let (what, part) = h
+                .first()
+                .map_or(("a part that is not allowed", "envelope"), |h| {
+                    (hit_words(h), h.part.as_str())
+                });
+            Ok(Step::refused(
+                code::BLOCKED,
+                head_nothing_sent(lang),
+                format!(
+                    "this would send {what} ({part}); nothing was sent. Rephrase the question, \
+                     or ask without the name"
+                ),
+            ))
+        }
+        PlanError::Leak(_) => Ok(Step::refused(
+            code::LEAK,
+            head_no_answer(lang),
+            e.to_string(),
+        )),
+        e => Ok(Step::refused(
+            code::PLANNER,
+            head_no_answer(lang),
+            e.to_string(),
+        )),
+    }
+}
+
+/// A ready draft: an approved method, else the planner (with retries),
+/// then the preview.
+async fn proceed(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    st: AskState,
+    d: Draft,
+) -> (AskState, Result<Step, Refusal>) {
+    let snap = Arc::clone(&st.snapshot);
+    let schema = snap.schema();
+    let public = snap.manifest.public.as_slice();
+    let list_cap = st.opts.list_cap;
+    let (key, tags) = question::template_key(&d);
+    let found = match approved_for(ctx, &st, d.lang, key, tags).await {
+        Ok(f) => f,
+        Err(e) => return (st, Err(e)),
+    };
+    // Reuse (R45-11): no cloud call; a method that no longer validates for
+    // this draft is not used.
+    if let Some(m) = found {
+        if let Ok(v) = check_reply(&m.reply, schema, public, &d.params, list_cap) {
+            if let Err(e) = record_ask(ctx, id, &st, &d, Some(m.id.clone())).await {
+                return (st, Err(e));
+            }
+            return finish_preview(
+                ctx,
+                id,
+                st,
+                d,
+                v,
+                m.reply,
+                Some(m.id),
+                Sent::default(),
+                None,
+            )
+            .await;
+        }
+    }
+    if let Err(e) = record_ask(ctx, id, &st, &d, None).await {
+        return (st, Err(e));
+    }
+    let det = match detector(ctx) {
+        Ok(d) => d,
+        Err(e) => return (st, Err(e)),
+    };
+    let Some(index) = snap.open.index.as_ref() else {
+        return (st, Err(unavailable("the dataset has no known-value index")));
+    };
+    let planner = model::planner(ctx);
+    let cloud = cloud_schema(schema, public);
+    let schema_hash = schema_sha256(&cloud);
+    // (the method received, its retry class): kept locally, sent by hash.
+    let mut prev: Option<(String, String)> = None;
+    let mut last: Option<MethodError> = None;
+    for _ in 0..MAX_TRIES {
+        let keys = match load_keys(ctx, &st.dataset).await {
+            Ok(k) => k,
+            Err(e) => return (st, Err(e)),
+        };
+        let synth = synthetic_rows(
+            schema,
+            &snap.manifest.formats,
+            public,
+            SYNTHETIC_PER_TABLE,
+            &mut os_rng(),
+        );
+        let synth_hash = synthetic_sha256(&synth);
+        let retry = prev.as_ref().map(|(m, c)| Retry::new(m, c));
+        let prev_hash = prev.as_ref().map(|(m, _)| method_sha256(m));
+        let built = {
+            let mut ss = lock(&ctx.blind.sessions);
+            ss.get_or_new(
+                st.uid,
+                &st.dataset,
+                &keys,
+                unix_now(),
+                st.opts.session,
+                false,
+            )
+            .map(|s| {
+                let env = build_envelope(&d, s, schema, public, synth, list_cap, retry);
+                (env, s.issued_symbols(), s.released_names())
+            })
+        };
+        drop(keys);
+        let (env, symbols, mut released) = match built {
+            Ok(b) => b,
+            Err(e) => return (st, Err(shield_err(&e))),
+        };
+        released.extend(st.released.iter().cloned());
+        let fw = Firewall {
+            index,
+            allow: &snap.open.allow,
+            detector: &*det,
+            released_names: &released,
+            expected: Expected {
+                list_cap,
+                lang: d.lang,
+                schema_sha256: &schema_hash,
+                synthetic_sha256: &synth_hash,
+                symbols: &symbols,
+                previous_method_sha256: prev_hash.as_deref(),
+            },
+        };
+        let got = planner.plan(ctx, st.uid, id, &st.dataset, &env, &fw).await;
+        let reply = match got {
+            Ok(r) => r,
+            Err(e) => return (st, plan_error(e, d.lang)),
+        };
+        if reply.needs_judgment {
+            return (
+                st,
+                Ok(Step::refused(
+                    code::NEEDS_JUDGMENT,
+                    head_no_answer(d.lang),
+                    JUDGMENT,
+                )),
+            );
+        }
+        match check_reply(&reply, schema, public, &d.params, list_cap) {
+            Ok(v) => {
+                let sent = Sent::from(env.summary());
+                let envelope = st
+                    .opts
+                    .show_sent
+                    .then(|| String::from_utf8_lossy(&env.canonical()).into_owned());
+                return finish_preview(ctx, id, st, d, v, reply, None, sent, envelope).await;
+            }
+            Err(e) => {
+                prev = Some((reply.method.clone(), retry_class(&e, &cloud)));
+                last = Some(e);
+            }
+        }
+    }
+    let class = last.map_or(ErrorClass::Syntax, |e| e.class);
+    let step = match class.user_reason() {
+        Some(reason) if class == ErrorClass::IdentifierOutput => {
+            Step::refused(code::IDENTIFIER_OUTPUT, head_no_answer(d.lang), reason)
+        }
+        _ => Step::refused(
+            code::INVALID_METHOD,
+            head_no_answer(d.lang),
+            format!(
+                "the planner's method was not valid after {MAX_TRIES} tries ({})",
+                class.as_str()
+            ),
+        ),
+    };
+    (st, Ok(step))
+}
+
+/// The parameters the preview names (R-C2): each entity by the user's own
+/// words (else the plain word of its type), then the non-Identifier `show`
+/// values of the record it resolved to; never the key. Blocking (the
+/// lexicon).
+fn preview_params(snap: &LiveSnapshot, d: &Draft, chosen: &[(String, Candidate)]) -> Vec<Param> {
+    let schema = snap.schema();
+    let mut ps = answer_params(d, schema);
+    let lex = lock(&snap.open.lexicon);
+    for p in ps.iter_mut() {
+        let (ParamType::Entity { table, .. }, Some(Bound::Keys(k))) = (&p.ty, &p.bound) else {
+            continue;
+        };
+        let [key] = k.as_slice() else {
+            continue;
+        };
+        let c = chosen
+            .iter()
+            .rev()
+            .find(|(n, c)| *n == p.name && c.key == *key)
+            .map(|(_, c)| c.clone())
+            .or_else(|| {
+                let w = spoken(d, &p.name)?;
+                match lex.resolve(table, &w) {
+                    Ok((Resolve::One(c), _)) if c.key == *key => Some(c),
+                    Ok((Resolve::Many(cs), _)) => cs.into_iter().find(|c| c.key == *key),
+                    _ => None,
+                }
+            });
+        if let Some(c) = c {
+            for v in shown(&c, schema) {
+                p.display.push_str(", ");
+                p.display.push_str(v);
+            }
+        }
+    }
+    ps
+}
+
+/// The preview step and record; the ask waits for Run or Stop.
+#[allow(clippy::too_many_arguments)]
+async fn finish_preview(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    mut st: AskState,
+    d: Draft,
+    v: Validated,
+    reply: PlanReply,
+    approved: Option<String>,
+    sent: Sent,
+    envelope: Option<String>,
+) -> (AskState, Result<Step, Refusal>) {
+    let snap = Arc::clone(&st.snapshot);
+    let chosen = st.chosen.clone();
+    let d2 = d.clone();
+    let params =
+        match tokio::task::spawn_blocking(move || preview_params(&snap, &d2, &chosen)).await {
+            Ok(p) => p,
+            Err(_) => return (st, Err(join_err())),
+        };
+    let p = preview(&v, &params, st.snapshot.schema(), d.lang);
+    let says = if approved.is_some() {
+        None
+    } else {
+        planner_says(&reply.intent, d.lang)
+    };
+    let r = BlindRecord::Preview {
+        ask: id.to_string(),
+        sha256: p.sha256.clone(),
+        outcome: "shown",
+        fragments: u32::try_from(p.fragments).unwrap_or(u32::MAX),
+    };
+    if let Err(e) = record(ctx, &st, r).await {
+        return (st, Err(e));
+    }
+    let step = Step::Preview {
+        text: p.text.clone(),
+        planner_says: says,
+        approved: approved.clone(),
+        sent,
+        envelope,
+    };
+    st.phase = AskPhase::Previewing {
+        draft: d,
+        validated: v,
+        reply,
+        preview: p,
+        approved,
+    };
+    (st, Ok(step))
+}
+
+// --------------------------------------------------------------- ops ----
+
+/// `blind.ask {question, dataset?, lang?, new_session?, yes?, limit?,
+/// show_sent?, judgment?}` -> `{ask, step}`.
+pub async fn begin_op(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    args: &Map<String, Value>,
+) -> Result<Value, Refusal> {
+    let a = AskArgs::from_args(args)?;
+    let (id, s) = begin(ctx, peer, a).await?;
+    Ok(json!({"ask": id, "step": s.to_value()}))
+}
+
+/// `blind.ask.answer {ask, answer}` -> `{ask, step}`.
+pub async fn answer_op(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    args: &Map<String, Value>,
+) -> Result<Value, Refusal> {
+    let id = args
+        .get("ask")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("ask is required"))?;
+    let a = parse_answer(args.get("answer"))?;
+    let s = step(ctx, peer, id, a).await?;
+    Ok(json!({"ask": id, "step": s.to_value()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answers_parse() {
+        let p = |v: Value| parse_answer(Some(&v));
+        assert_eq!(p(json!({"pick": 2})).unwrap(), AskAnswer::Pick(2));
+        assert_eq!(p(json!({"pick": 0})).unwrap(), AskAnswer::Pick(0));
+        assert_eq!(
+            p(json!({"did_you_mean": false})).unwrap(),
+            AskAnswer::DidYouMean(false)
+        );
+        assert_eq!(
+            p(json!({"keep_name": false})).unwrap(),
+            AskAnswer::KeepNameNo
+        );
+        assert_eq!(p(json!({"run": true})).unwrap(), AskAnswer::Run(true));
+        let r = p(json!({"keep_name": true})).unwrap_err();
+        assert_eq!(
+            (r.code, r.text.as_str()),
+            (ErrorCode::BadRequest, KEEP_NEEDS_TOUCH)
+        );
+        for v in [
+            json!({}),
+            json!({"pick": -1}),
+            json!({"pick": "1"}),
+            json!({"pick": 1, "run": true}),
+            json!({"did_you_mean": 1}),
+            json!({"reveal": true}),
+            json!([1]),
+        ] {
+            assert_eq!(p(v.clone()).unwrap_err().code, ErrorCode::BadRequest, "{v}");
+        }
+        assert!(parse_answer(None).is_err());
+    }
+
+    #[test]
+    fn steps_serialize_by_kind() {
+        let s = Step::refused(code::NO_MATCH, "h", "r");
+        assert_eq!(
+            s.to_value(),
+            json!({"kind": "refused", "code": "no_match", "head": "h", "reason": "r"})
+        );
+        assert_eq!(format!("{s:?}"), "Step::Refused(no_match)");
+        let s = Step::Preview {
+            text: "I'm counting.".into(),
+            planner_says: None,
+            approved: None,
+            sent: Sent::default(),
+            envelope: None,
+        };
+        assert_eq!(
+            s.to_value(),
+            json!({"kind": "preview", "text": "I'm counting.",
+                   "sent": {"tables": 0, "synthetic_rows": 0, "params": 0, "personal_values": 0}})
+        );
+        assert_eq!(format!("{s:?}"), "Step::preview");
+        assert_eq!(
+            Step::Refreshing { text: "x".into() }.to_value(),
+            json!({"kind": "refreshing", "text": "x"})
+        );
+    }
+
+    #[test]
+    fn planner_says_has_no_numbers() {
+        let s = |t: &str, l: Lang| planner_says(t, l);
+        assert_eq!(
+            s(" sums the invoices ", Lang::En).as_deref(),
+            Some("sums the invoices")
+        );
+        assert_eq!(s("sums 3 invoices", Lang::En), None);
+        assert_eq!(s("sums three invoices", Lang::En), None);
+        assert_eq!(s("sums the first invoices", Lang::En), None);
+        assert_eq!(s("lægger tre fakturaer sammen", Lang::Da), None);
+        assert_eq!(s("sums fem invoices", Lang::En), None);
+        // Everyday English words that are Danish number words stay.
+        assert_eq!(
+            s("adds up to the total", Lang::En).as_deref(),
+            Some("adds up to the total")
+        );
+        assert_eq!(s("", Lang::En), None);
+        assert_eq!(s("sums ½ of it", Lang::En), None);
+    }
+
+    #[test]
+    fn standins_replace_only_their_params() {
+        let syms = vec![("p1".to_string(), "Customer_K7QF".to_string())];
+        assert_eq!(
+            with_standins("balance of :p1 over :p2 and :p10?", &syms),
+            "balance of Customer_K7QF over :p2 and :p10?"
+        );
+        assert_eq!(with_standins("a:p b :p", &syms), "a:p b :p");
+    }
+
+    #[test]
+    fn retry_class_names_only_schema_names() {
+        use saiife_shield::envelope::{CloudColumn, CloudTable};
+        use saiife_shield::schema::ColType;
+        let cloud = CloudSchema {
+            tables: vec![CloudTable {
+                name: "invoices".into(),
+                rows: "100-999".into(),
+                columns: vec![CloudColumn {
+                    name: "amount".into(),
+                    ty: ColType::Real,
+                    class: ColumnClass::Sensitive,
+                    values: None,
+                }],
+                entity: None,
+            }],
+            joins: vec![],
+        };
+        let e = |class, d: Option<&str>| MethodError {
+            class,
+            detail: d.map(str::to_string),
+        };
+        assert_eq!(
+            retry_class(&e(ErrorClass::UnknownColumn, Some("nope")), &cloud),
+            "unknown_column"
+        );
+        assert_eq!(
+            retry_class(
+                &e(ErrorClass::UnknownColumn, Some("invoices.amount")),
+                &cloud
+            ),
+            "unknown_column invoices.amount"
+        );
+        assert_eq!(
+            retry_class(&e(ErrorClass::UnknownTable, Some("invoices")), &cloud),
+            "unknown_table invoices"
+        );
+        assert_eq!(
+            retry_class(&e(ErrorClass::ParamMisuse, Some("amount")), &cloud),
+            "param_misuse"
+        );
+        assert_eq!(
+            retry_class(&e(ErrorClass::IdentifierOutput, None), &cloud),
+            "identifier_output"
+        );
+    }
+
+    #[test]
+    fn plan_errors_map() {
+        let r = plan_error(PlanError::Unreachable, Lang::En).unwrap_err();
+        assert_eq!(r.code, ErrorCode::Unavailable);
+        let s = plan_error(
+            PlanError::Unrecorded("the request could not be recorded".into()),
+            Lang::En,
+        )
+        .unwrap();
+        assert_eq!(
+            s.to_value()["reason"],
+            "the request could not be recorded; nothing left this machine"
+        );
+        assert_eq!(s.to_value()["head"], "refused, nothing sent");
+        let s = plan_error(
+            PlanError::Blocked(vec![Hit {
+                kind: firewall::NAME,
+                part: "question".into(),
+                span: Some((0, 3)),
+            }]),
+            Lang::En,
+        )
+        .unwrap();
+        assert_eq!(
+            s.to_value()["reason"],
+            "this would send a name (question); nothing was sent. Rephrase the question, or ask \
+             without the name"
+        );
+        let s = plan_error(PlanError::Refused, Lang::Da).unwrap();
+        assert_eq!(s.to_value()["code"], code::PLANNER);
+        assert_eq!(s.to_value()["head"], head_no_answer(Lang::Da));
+    }
+
+    #[test]
+    fn ask_args_parse() {
+        let m = |v: Value| match v {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let a = AskArgs::from_args(&m(json!({"question": "q", "lang": "da", "limit": 5,
+            "yes": true, "show_sent": true, "new_session": true, "judgment": false})))
+        .unwrap();
+        assert_eq!(a.lang, Some(Lang::Da));
+        assert_eq!(a.limit, Some(5));
+        assert!(a.yes && a.show_sent && a.new_session && !a.judgment);
+        assert!(!format!("{a:?}").contains("\"q\""));
+        for v in [
+            json!({"question": "q", "yes": "true"}),
+            json!({"question": "q", "limit": -1}),
+            json!({"question": "q", "dataset": 3}),
+        ] {
+            assert!(AskArgs::from_args(&m(v.clone())).is_err(), "{v}");
+        }
+    }
+}

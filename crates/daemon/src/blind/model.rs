@@ -1068,6 +1068,13 @@ pub fn planner(ctx: &Ctx) -> Arc<dyn Planner> {
     if let Some(p) = std::env::var_os(PLANNER_SEAM) {
         return cached_fake(&ctx.blind, p);
     }
+    #[cfg(debug_assertions)]
+    if let Some((seen, f)) = super::lock(&ctx.blind.test_planner).as_ref() {
+        // Set by `Blind::set_test_planner` (no seam value).
+        if seen.is_empty() {
+            return Arc::clone(f) as Arc<dyn Planner>;
+        }
+    }
     #[cfg(not(debug_assertions))]
     let _ = ctx;
     Arc::new(AnthropicPlanner::new())

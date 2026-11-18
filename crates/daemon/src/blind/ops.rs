@@ -167,7 +167,7 @@ async fn visible(ctx: &Ctx, peer: &PeerCred) -> Vec<(DatasetName, Roles)> {
 
 /// The peer's roles on `name`: the policy entry, else what the dataset was
 /// last built with.
-async fn role_of(ctx: &Ctx, peer: &PeerCred, name: &DatasetName) -> Roles {
+pub(crate) async fn role_of(ctx: &Ctx, peer: &PeerCred, name: &DatasetName) -> Roles {
     let cfg = ctx.policy().system.and_then(|s| {
         s.blind
             .dataset
@@ -494,11 +494,22 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         saiife_ipc::msg::OP_BLIND_METHODS_LIST => {
             return reply(req.id, methods_list(ctx, &conn.peer, &req.args).await)
         }
-        // Plan 48.
-        saiife_ipc::msg::OP_BLIND_ASK
-        | saiife_ipc::msg::OP_BLIND_ASK_ANSWER
-        | saiife_ipc::msg::OP_BLIND_TOUCH_BEGIN
-        | saiife_ipc::msg::OP_BLIND_TOUCH_COMMIT => not_yet(&req.op),
+        saiife_ipc::msg::OP_BLIND_ASK => {
+            return reply(
+                req.id,
+                super::ask::begin_op(ctx, &conn.peer, &req.args).await,
+            )
+        }
+        saiife_ipc::msg::OP_BLIND_ASK_ANSWER => {
+            return reply(
+                req.id,
+                super::ask::answer_op(ctx, &conn.peer, &req.args).await,
+            )
+        }
+        // Plan 48 Task 3.
+        saiife_ipc::msg::OP_BLIND_TOUCH_BEGIN | saiife_ipc::msg::OP_BLIND_TOUCH_COMMIT => {
+            not_yet(&req.op)
+        }
         other => Refusal::new(ErrorCode::BadRequest, format!("unknown op {other:?}")),
     };
     r.to_value(req.id)
