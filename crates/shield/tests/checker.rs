@@ -946,7 +946,10 @@ fn check_refuses_a_shown_entity_the_method_ignores() {
 }
 
 #[test]
-fn check_passes_a_stated_threshold_with_a_cmp() {
+fn check_refuses_an_echoed_threshold_the_method_ignores() {
+    // Ruling F-g (final review part 3): "Is Anna Berg over 10,000?" answered
+    // by comparing her total with her credit limit, while echoing 10,000, is
+    // a confidently wrong answer. The threshold must be in the method.
     let limit = Param {
         name: "p2".into(),
         ty: ParamType::Amount,
@@ -954,7 +957,6 @@ fn check_passes_a_stated_threshold_with_a_cmp() {
         display: "10,000.00".into(),
     };
     let ps = vec![common::entity(1), limit];
-    let method = common::v(ALL_TIME, &ps);
     let cols: Vec<String> = vec!["total".into(), "credit_limit".into()];
     let tpl = parse_template(
         "Is {param(p1)} over {param(p2)}? She owes {money(total)}, \
@@ -965,14 +967,13 @@ fn check_passes_a_stated_threshold_with_a_cmp() {
     )
     .unwrap();
     let f = fill(&tpl, &total_rs(600.0, 5000.0), &ps, Lang::En).unwrap();
-    let rep = check(
-        &method,
-        &tpl,
-        &ps,
-        &f,
-        "Is Anna Berg over 10,000?",
-        Lang::En,
-    )
-    .unwrap();
+    let q = "Is Anna Berg over 10,000?";
+    check_text(&f, q, Lang::En).unwrap();
+    let ignores = common::v(ALL_TIME, &ps);
+    let r = check(&ignores, &tpl, &ps, &f, q, Lang::En).unwrap_err();
+    assert_eq!(r.class, ErrorClass::ParamMisuse);
+    // A method that applies the threshold passes the same answer.
+    let uses = common::v(&format!("{ALL_TIME} AND i.amount > :p2"), &ps);
+    let rep = check(&uses, &tpl, &ps, &f, q, Lang::En).unwrap();
     assert_eq!(rep.from_calc, 2);
 }

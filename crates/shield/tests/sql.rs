@@ -1006,7 +1006,10 @@ fn date_range_params() {
     prepares(&v.sql);
     ok("SELECT COUNT(*) AS n FROM invoices i WHERE :p3_from <= i.issued AND :p3_to > i.issued");
     ok("SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p5");
-    ok("SELECT COUNT(*) AS n FROM invoices i WHERE date(i.issued) >= :p3_from");
+    ok(
+        "SELECT COUNT(*) AS n FROM invoices i WHERE date(i.issued) >= :p3_from \
+        AND date(i.issued) < :p3_to",
+    );
     use ErrorClass::*;
     for (sql, want) in [
         (
@@ -1067,6 +1070,35 @@ fn date_range_params() {
     ] {
         assert_eq!(refused(sql), want, "{sql}");
     }
+}
+
+#[test]
+fn date_range_needs_both_halves() {
+    // Plan 45 final review part 3 (ruling F-h): "in Q3 2026" applied as
+    // `issued >= :p3_from` alone counts everything after July 1st.
+    for sql in [
+        "SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p3_from",
+        "SELECT COUNT(*) AS n FROM invoices i WHERE i.issued < :p3_to",
+        "SELECT SUM(i.amount) AS total FROM invoices i \
+         JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 AND i.issued >= :p3_from",
+        "WITH t AS (SELECT i.customer_id AS cid, COUNT(*) AS n FROM invoices i \
+         WHERE i.issued < :p3_to GROUP BY i.customer_id) SELECT SUM(t.n) AS n FROM t",
+    ] {
+        let e = validate(sql, &schema(), &public(), &ps_for(sql)).unwrap_err();
+        assert_eq!(e.class, ErrorClass::ParamMisuse, "{sql}");
+        assert_eq!(e.detail, None, "{sql}");
+    }
+    // Bound or not: the shape is the method's, not the binding's.
+    let mut bound = no_entity();
+    bound[1].bound = Some(Bound::DateRange("2026-07-01".into(), "2026-10-01".into()));
+    let sql = "SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p3_from";
+    assert_eq!(class_of(sql, &schema(), &bound), ErrorClass::ParamMisuse);
+    // Both halves: ok, in either operand order.
+    let sql =
+        "SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p3_from AND i.issued < :p3_to";
+    let v = validate(sql, &schema(), &public(), &bound).unwrap();
+    assert_eq!(v.params_used, vec!["p3"]);
+    ok("SELECT COUNT(*) AS n FROM invoices i WHERE :p3_to > i.issued AND :p3_from <= i.issued");
 }
 
 #[test]
@@ -1588,7 +1620,10 @@ fn key_columns_are_structural() {
             ParamMisuse,
         ),
         (
-            format!("SELECT COUNT(*) AS n {J} AND i.issued >= :p3_from AND i.id < :p6"),
+            format!(
+                "SELECT COUNT(*) AS n {J} AND i.issued >= :p3_from AND i.issued < :p3_to \
+                 AND i.id < :p6"
+            ),
             ParamMisuse,
         ),
         (

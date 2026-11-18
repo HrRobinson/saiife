@@ -396,12 +396,22 @@ fn validate_cols(
         ctes: Vec::new(),
         params_used: Vec::new(),
         entity_params: Vec::new(),
+        range_halves: Vec::new(),
         links: Vec::new(),
         agg_seen: false,
         outer: true,
         outer_view: None,
     };
     let out = w.query(&mut q, true)?;
+    // Plan 45 final review part 3 (ruling F-h): a date range applied by one
+    // half ("in Q3 2026" as `issued >= :pN_from` alone) is another question.
+    // Either half needs the other, anywhere in the method.
+    for (base, _) in &w.range_halves {
+        let has = |s: Suffix| w.range_halves.iter().any(|(b, x)| b == base && *x == s);
+        if !(has(Suffix::From) && has(Suffix::To)) {
+            return fail(ErrorClass::ParamMisuse);
+        }
+    }
     // A bound entity the method ignores answers another question.
     if all_entities {
         let unused = params.iter().any(|p| {
@@ -866,6 +876,8 @@ struct Walk<'a> {
     ctes: Vec<Cte>,
     params_used: Vec<String>,
     entity_params: Vec<String>,
+    /// The `DateRange` halves seen, as (`pN`, `_from` or `_to`).
+    range_halves: Vec<(String, Suffix)>,
     links: Vec<Link>,
     /// An aggregate was seen in the block being walked.
     agg_seen: bool,
@@ -2024,6 +2036,9 @@ impl<'a> Walk<'a> {
                 };
                 if !op_ok {
                     return misuse();
+                }
+                if !self.range_halves.iter().any(|(b, x)| b == base && *x == s) {
+                    self.range_halves.push((base.to_string(), s));
                 }
                 true
             }

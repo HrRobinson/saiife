@@ -464,9 +464,13 @@ fn every_bound_question_param_is_used_or_shown() {
 }
 
 #[test]
-fn only_scalar_thresholds_may_be_shown_unused() {
-    // Ruling F-f: Amount / Integer / Percent may be shown and not used (a
-    // stated threshold); Date and Text filters may not.
+fn every_bound_param_is_used_even_a_shown_threshold() {
+    // Plan 45 final review part 3 (ruling F-g): "total of invoices over 5000"
+    // answered by a method that ignores the 5000 and a template that echoes
+    // it ("Invoices over {param(p2)} total ...") is a confidently wrong
+    // number. A `cmp` slot compares two result cells and has no parameter
+    // operand, so no template can use an unused threshold legitimately:
+    // every bound parameter, threshold or filter, must be used by the method.
     let base = vec![common::entity(1)];
     let method = common::v(
         "SELECT SUM(i.amount) AS total, c.credit_limit FROM invoices i \
@@ -474,28 +478,42 @@ fn only_scalar_thresholds_may_be_shown_unused() {
         &base,
     );
     let c = cols(&["total", "credit_limit"]);
-    for (ty, bound, ok) in [
-        (ParamType::Amount, Bound::Amount(dec("10000")), true),
-        (ParamType::Integer, Bound::Integer(3), true),
-        (ParamType::Percent, Bound::Percent(dec("10")), true),
-        (ParamType::Date, Bound::Date("2026-07-01".into()), false),
+    let thresholds = [
+        (ParamType::Amount, Bound::Amount(dec("5000"))),
+        (ParamType::Integer, Bound::Integer(3)),
+        (ParamType::Percent, Bound::Percent(dec("10"))),
+    ];
+    let others = [
+        (ParamType::Date, Bound::Date("2026-07-01".into())),
         (
             ParamType::Text {
                 table: "customers".into(),
                 column: "city".into(),
             },
             Bound::Text("Aarhus".into()),
-            false,
         ),
-    ] {
+    ];
+    for (ty, bound) in thresholds.iter().chain(others.iter()) {
         let mut ps = base.clone();
         ps.push(Param {
             name: "p2".into(),
             ty: ty.clone(),
-            bound: Some(bound),
+            bound: Some(bound.clone()),
             display: "x".into(),
         });
-        let t = parse_template(
+        // Echo only.
+        let echo = parse_template(
+            "Invoices over {param(p2)} total {money(total)}.",
+            &c,
+            &ps,
+            100,
+        )
+        .unwrap();
+        let e = check_params_covered(&method, &echo, &ps).unwrap_err();
+        assert_eq!(e.class, ErrorClass::ParamMisuse, "{ty:?}");
+        assert_eq!(e.detail, None, "{ty:?}");
+        // Echo next to a cmp of cells: still refused (the cmp never reads p2).
+        let with_cmp = parse_template(
             "Is {param(p1)} over {param(p2)}? Owes {money(total)}, \
              {cmp(total, credit_limit)} the limit.",
             &c,
@@ -503,8 +521,31 @@ fn only_scalar_thresholds_may_be_shown_unused() {
             100,
         )
         .unwrap();
-        let r = check_params_covered(&method, &t, &ps);
-        assert_eq!(r.is_ok(), ok, "{ty:?}");
+        let e = check_params_covered(&method, &with_cmp, &ps).unwrap_err();
+        assert_eq!(e.class, ErrorClass::ParamMisuse, "{ty:?}");
+    }
+    // A threshold the method uses may be echoed.
+    for (ty, bound) in &thresholds[..2] {
+        let mut ps = base.clone();
+        ps.push(Param {
+            name: "p2".into(),
+            ty: ty.clone(),
+            bound: Some(bound.clone()),
+            display: "x".into(),
+        });
+        let used = common::v(
+            "SELECT SUM(i.amount) AS total, c.credit_limit FROM invoices i \
+             JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 AND i.amount > :p2",
+            &ps,
+        );
+        let echo = parse_template(
+            "Invoices over {param(p2)} total {money(total)}.",
+            &c,
+            &ps,
+            100,
+        )
+        .unwrap();
+        check_params_covered(&used, &echo, &ps).unwrap();
     }
 }
 

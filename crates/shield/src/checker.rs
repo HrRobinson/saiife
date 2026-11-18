@@ -64,9 +64,10 @@ fn refuse(reason: String) -> CheckRefusal {
 const COVER_REASON: &str = "the method does not apply every part of your question";
 
 /// The checker's entry point for an answer (R45-10, ruling F-f): the method
-/// must apply every bound filter parameter of the question
+/// must apply every bound parameter of the question, filter or threshold
 /// ([`check_params_covered`]; `param_misuse`, so an answer that shows
-/// "in Q3 2026" or a name over a method that ignores it never passes), then
+/// "in Q3 2026", "over 5,000" or a name over a method that ignores it never
+/// passes: rulings F-f, F-g), then
 /// the filled text must pass [`check_text`]. `filled` is `template` filled
 /// for `method`'s result.
 pub fn check(
