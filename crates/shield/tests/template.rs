@@ -6,8 +6,9 @@ use saiife_shield::calc::{CellValue, ResultSet};
 use saiife_shield::schema::{Bound, Decimal, Lang, Param, ParamType};
 use saiife_shield::sql::ErrorClass;
 use saiife_shield::template::{
-    check_params_covered, fill, format_date, format_int, format_money, format_number,
-    format_percent, format_ratio_percent, format_round, parse_template,
+    check_params_covered, entity_label, fill, format_date, format_int, format_money, format_number,
+    format_percent, format_ratio_percent, format_round, parse_template, preview_params,
+    shown_values,
 };
 
 fn dec(s: &str) -> Decimal {
@@ -745,4 +746,82 @@ fn no_limit_covers_a_param() {
     )
     .unwrap_err();
     assert_eq!(e.class, ErrorClass::ConstructNotAllowed);
+}
+
+// ---- plan 48 T1: entities in pick lists and the preview (R-C2) ----
+
+fn cand(key: i64, display: &str, show: &[(&str, &str)]) -> saiife_shield::lexicon::Candidate {
+    saiife_shield::lexicon::Candidate {
+        key,
+        table: "customers".into(),
+        display: display.into(),
+        show: show
+            .iter()
+            .map(|(c, v)| (c.to_string(), v.to_string()))
+            .collect(),
+    }
+}
+
+#[test]
+fn labels_show_no_identifier() {
+    let s = common::schema();
+    // city is Quasi; last_name is Identifier; nope is not a column.
+    let c = cand(
+        4411,
+        "Anna Berg",
+        &[
+            ("city", "Aarhus"),
+            ("last_name", "Berg"),
+            ("nope", "x"),
+            ("segment", ""),
+        ],
+    );
+    assert_eq!(shown_values(&c, &s), ["Aarhus"]);
+    assert_eq!(entity_label(&c, &s), "Anna Berg, Aarhus");
+    assert!(!entity_label(&c, &s).contains("4411"));
+    assert_eq!(entity_label(&cand(1, "Bo", &[]), &s), "Bo");
+}
+
+#[test]
+fn preview_params_use_the_users_words() {
+    use saiife_shield::question::Draft;
+    let s = common::schema();
+    let mut p1 = common::entity(4411);
+    p1.display = "Anna Berg (customer #4411)".into();
+    let d = Draft {
+        lang: Lang::En,
+        original: "What does anna berg owe?".into(),
+        text: "What does :p1 owe?".into(),
+        params: vec![p1],
+        pending: vec![],
+    };
+    let none = |_: &str, _: &str| Vec::new();
+    // Chosen (a pick): the user's words, then the city; never the key.
+    let chosen = vec![(
+        "p1".to_string(),
+        cand(4411, "Anna Berg", &[("city", "Odense")]),
+    )];
+    let ps = preview_params(&d, &s, &chosen, &none);
+    assert_eq!(ps[0].display, "anna berg, Odense");
+    // Not chosen: the lexicon's record with that key.
+    let look = |t: &str, w: &str| {
+        assert_eq!((t, w), ("customers", "anna berg"));
+        vec![
+            cand(9020, "Anna Berg", &[("city", "Aarhus")]),
+            cand(4411, "Anna Berg", &[("city", "Odense")]),
+        ]
+    };
+    assert_eq!(
+        preview_params(&d, &s, &[], &look)[0].display,
+        "anna berg, Odense"
+    );
+    // A chosen record of another key is not used; nothing found: words only.
+    let other = vec![(
+        "p1".to_string(),
+        cand(9020, "Anna Berg", &[("city", "Aarhus")]),
+    )];
+    assert_eq!(
+        preview_params(&d, &s, &other, &none)[0].display,
+        "anna berg"
+    );
 }

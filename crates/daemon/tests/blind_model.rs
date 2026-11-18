@@ -121,6 +121,9 @@ type Scripted = (u16, Vec<(&'static str, String)>, String);
 struct Server {
     seen: Mutex<Vec<Seen>>,
     script: Mutex<VecDeque<Scripted>>,
+    /// Stopped while the request is handled: the records after the send
+    /// fail (R-C9a).
+    stop_writer: Mutex<Option<saiife_daemon::writer::WriterHandle>>,
 }
 
 impl Server {
@@ -145,6 +148,10 @@ async fn handle(
         headers: parts.headers,
         body,
     });
+    let stop = s.stop_writer.lock().unwrap().take();
+    if let Some(w) = stop {
+        w.stop(None).await.unwrap();
+    }
     let next = s.script.lock().unwrap().pop_front();
     let (status, headers, text) = next.unwrap_or((500, vec![], String::new()));
     let mut b = Response::builder().status(status);
@@ -173,6 +180,7 @@ async fn server(p: &Pki, script: Vec<Scripted>) -> (u16, Arc<Server>) {
     let s = Arc::new(Server {
         seen: Mutex::new(Vec::new()),
         script: Mutex::new(script.into()),
+        stop_writer: Mutex::new(None),
     });
     let s2 = Arc::clone(&s);
     tokio::spawn(async move {
@@ -664,6 +672,23 @@ async fn outbox_failure_blocks_send() {
     assert!(matches!(e, PlanError::Unrecorded(_)), "{e:?}");
     assert_eq!(s.count(), 0, "nothing may reach the upstream");
     assert!(f.records("blind_send").is_empty());
+}
+
+/// R-C9a: once the request left, a record that fails means the reply is
+/// not used; it is never told as "nothing sent".
+#[tokio::test]
+async fn reply_record_failure_is_not_nothing_sent() {
+    let f = default_fx();
+    let p = pki();
+    let (port, s) = server(&p, vec![ok_answer()]).await;
+    *s.stop_writer.lock().unwrap() = Some(f.ctx.writer.clone());
+    let e = f.plan(&planner_for(&p, port)).await.unwrap_err();
+    assert_eq!(e, PlanError::ReplyUnrecorded);
+    assert_eq!(
+        e.to_string(),
+        "the planner's reply could not be recorded, so it was not used"
+    );
+    assert_eq!(s.count(), 1, "the request did leave");
 }
 
 #[tokio::test]

@@ -2273,6 +2273,9 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
             // background (an unchanged one keeps its helper).
             #[cfg(target_os = "linux")]
             tokio::spawn(crate::blind::ner::apply(Arc::clone(ctx)));
+            // R-C12: asks of uids that lost their role end now.
+            #[cfg(target_os = "linux")]
+            crate::blind::ask::policy_reloaded(ctx).await;
             {
                 let vault = ctx.vault.lock();
                 ctx.mcp.reconcile(&l.config, &vault);

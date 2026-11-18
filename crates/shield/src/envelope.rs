@@ -299,6 +299,40 @@ pub fn build_envelope(
     }
 }
 
+/// The question as a record may hold it (spec §6.5, R44-4): `d.text` with
+/// each entity parameter bound to exactly one key replaced by its session
+/// stand-in (the same [`Session::symbol_for`] that [`build_envelope`]
+/// uses); every other `:pN` stays as it is.
+pub fn logged_question(d: &Draft, session: &mut Session, schema: &Schema) -> String {
+    let q = d.text.as_str();
+    let mut out = String::with_capacity(q.len());
+    let mut last = 0;
+    for (a, b, name) in crate::firewall::param_refs(q) {
+        let sym = d
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| match (&p.ty, &p.bound) {
+                (ParamType::Entity { table, word }, Some(Bound::Keys(keys))) if keys.len() == 1 => {
+                    let w = schema
+                        .entity_for(table)
+                        .map_or(word.as_str(), |e| e.word.as_str())
+                        .to_string();
+                    Some(session.symbol_for(&w, table, keys[0]))
+                }
+                _ => None,
+            });
+        out.push_str(q.get(last..a).unwrap_or(""));
+        match sym {
+            Some(s) => out.push_str(&s),
+            None => out.push_str(q.get(a..b).unwrap_or("")),
+        }
+        last = b;
+    }
+    out.push_str(q.get(last..).unwrap_or(""));
+    out
+}
+
 /// The text a context turn shows for a parameter that is not an entity
 /// (its type is not kept in the turn).
 pub const CONTEXT_VALUE: &str = "(value)";
@@ -459,6 +493,64 @@ pub fn sha256_hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 48 T1: the question a record holds has the stand-in of each
+    /// single-key entity, the one the envelope gets, and nothing else.
+    #[test]
+    fn logged_question_has_standins_only() {
+        use crate::schema::{EntitySpec, Param, TableInfo};
+        use crate::standin::KeySet;
+        let schema = Schema {
+            dataset: "crm".parse().unwrap(),
+            tables: vec![TableInfo {
+                name: "customers".into(),
+                alias: None,
+                rows: 10,
+                columns: vec![],
+            }],
+            entities: vec![EntitySpec {
+                table: "customers".into(),
+                key: "id".into(),
+                names: vec![],
+                show: vec![],
+                word: "customer".into(),
+                word_da: "kunde".into(),
+            }],
+            joins: vec![],
+        };
+        let ent = |n: &str, keys: Vec<i64>| Param {
+            name: n.into(),
+            ty: ParamType::Entity {
+                table: "customers".into(),
+                word: "customer".into(),
+            },
+            bound: Some(Bound::Keys(keys)),
+            display: "Anna Berg".into(),
+        };
+        let d = Draft {
+            lang: Lang::En,
+            original: "x".into(),
+            text: "balance of :p1 and :p2 over :p3".into(),
+            params: vec![
+                ent("p1", vec![4411]),
+                ent("p2", vec![1, 2]),
+                Param {
+                    name: "p3".into(),
+                    ty: ParamType::Amount,
+                    bound: None,
+                    display: "500".into(),
+                },
+            ],
+            pending: vec![],
+        };
+        let keys = KeySet::generate("2026-01-01T00:00:00Z").unwrap();
+        let mut s = Session::new(1, "crm".parse().unwrap(), &keys, 0).unwrap();
+        let sym = s.symbol_for("customer", "customers", 4411);
+        assert_eq!(
+            logged_question(&d, &mut s, &schema),
+            format!("balance of {sym} and :p2 over :p3")
+        );
+    }
 
     #[test]
     fn canonical_sorts_keys_and_has_no_spaces() {

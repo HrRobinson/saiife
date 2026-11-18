@@ -143,9 +143,13 @@ pub enum PlanError {
     Leak(Vec<Hit>),
     /// The answer is not a usable reply (fixed text).
     BadReply(String),
-    /// The outbox entry or a record could not be written: nothing was sent
-    /// (before the send) or the reply is not used (after it).
+    /// The outbox entry or the `blind_send` record could not be written:
+    /// nothing was sent (R-C9a).
     Unrecorded(String),
+    /// The request was sent, but its `blind_receive` or `model` record
+    /// could not be written: the reply is not used (R-C9a). Never "nothing
+    /// sent".
+    ReplyUnrecorded,
     /// The model service could not be reached (no response).
     Unreachable,
 }
@@ -169,9 +173,13 @@ impl std::fmt::Display for PlanError {
                 f.write_str("the model's reply holds a value of the dataset; refused as a leak")
             }
             PlanError::Unreachable => f.write_str("the model service could not be reached"),
+            PlanError::ReplyUnrecorded => f.write_str(REPLY_UNRECORDED),
         }
     }
 }
+
+/// R-C9a: the text of [`PlanError::ReplyUnrecorded`].
+pub const REPLY_UNRECORDED: &str = "the planner's reply could not be recorded, so it was not used";
 
 pub type PlanFuture<'a> = Pin<Box<dyn Future<Output = Result<PlanReply, PlanError>> + Send + 'a>>;
 
@@ -748,8 +756,17 @@ impl Call<'_> {
             // 4. The key, per request, the route and the headers: all that
             // can fail before the send, before anything says it was sent.
             let ready = wire.prepare(self.ctx, cfg.secret.as_deref())?;
-            // 5. The outbox; 6. the record.
-            self.outbox(&body, &body_sha).await?;
+            // 5. The outbox; 6. the record. On the HTTP retry (attempt 2)
+            // the first request has left: a failure here is not "nothing
+            // sent" (R-C9a).
+            let after_send = |e: PlanError| {
+                if attempt > 1 {
+                    PlanError::ReplyUnrecorded
+                } else {
+                    e
+                }
+            };
+            self.outbox(&body, &body_sha).await.map_err(after_send)?;
             self.record(BlindRecord::Send {
                 ask: self.ask.to_string(),
                 envelope_sha256: self.env.sha256(),
@@ -763,7 +780,8 @@ impl Call<'_> {
                 k: cfg.k,
                 attempt,
             })
-            .await?;
+            .await
+            .map_err(after_send)?;
             // 7. The send.
             let t0 = Instant::now();
             let got = wire.exchange(ready, &body).await;
@@ -803,6 +821,8 @@ impl Call<'_> {
                 (Err(PlanError::Http(a.status)), "http", String::new())
             };
             let leak = matches!(result, Err(PlanError::Leak(_)));
+            // After the send: a record that fails means the reply is not
+            // used, never that nothing was sent (R-C9a).
             self.record(BlindRecord::Receive {
                 ask: self.ask.to_string(),
                 status: a.status,
@@ -811,7 +831,8 @@ impl Call<'_> {
                 leak,
                 stop_reason: label.into(),
             })
-            .await?;
+            .await
+            .map_err(|_| PlanError::ReplyUnrecorded)?;
             let outcome = match &result {
                 Ok(_) => "ok",
                 Err(PlanError::Leak(_)) => "leak",
@@ -829,7 +850,8 @@ impl Call<'_> {
                 ms,
                 outcome,
             )
-            .await?;
+            .await
+            .map_err(|_| PlanError::ReplyUnrecorded)?;
             if retryable && attempt == 1 {
                 attempt += 1;
                 let wait = a.retry_after.unwrap_or(RETRY_DEFAULT).min(RETRY_AFTER_MAX);

@@ -395,6 +395,22 @@ fn error_class_ok(schema: &CloudSchema, s: &str) -> bool {
         })
 }
 
+/// The `retry.error_class` for a method that failed with `e` (R45-8,
+/// ruling P-20, plan 48 R-C11): the class, with its detail only when the
+/// detail is a name [`error_class_ok`] lets through for `schema` (the
+/// envelope's own cloud schema). Anything else the planner wrote is never
+/// sent, so a retry is not blocked by its own class.
+pub fn retry_error_class(e: &crate::sql::MethodError, schema: &CloudSchema) -> String {
+    let class = e.class.as_str();
+    if let Some(d) = &e.detail {
+        let named = format!("{class} {d}");
+        if error_class_ok(schema, &named) {
+            return named;
+        }
+    }
+    class.to_string()
+}
+
 /// `sha256:` and 64 lowercase hex, as [`crate::envelope::sha256_hex`]
 /// writes it.
 fn sha256_form_ok(s: &str) -> bool {
@@ -1168,7 +1184,7 @@ fn pattern_hits(t: &Text, which: Patterns, cutoff: &str, hits: &mut Vec<Hit>) {
 
 /// Danish number words that are common English words: not a hit in an
 /// English text through the Danish list (they still are in Danish text).
-fn ambiguous_in_other(lang: Lang, word: &str) -> bool {
+pub(crate) fn ambiguous_in_other(lang: Lang, word: &str) -> bool {
     lang == Lang::Da && matches!(word.to_lowercase().as_str(), "to" | "fire")
 }
 
@@ -1700,6 +1716,34 @@ mod tests {
         assert!(!error_class_ok(&schema, "unknown_column phone"));
         assert!(!error_class_ok(&schema, "runtime_error"));
         assert!(!error_class_ok(&schema, "unknown_column  email"));
+        // Plan 48 T1: the retry class a failed method gets.
+        use crate::sql::{ErrorClass, MethodError};
+        let e = |class, d: Option<&str>| MethodError {
+            class,
+            detail: d.map(str::to_string),
+        };
+        let rc = |m: MethodError| retry_error_class(&m, &schema);
+        assert_eq!(
+            rc(e(ErrorClass::UnknownColumn, Some("nope"))),
+            "unknown_column"
+        );
+        assert_eq!(
+            rc(e(ErrorClass::UnknownColumn, Some("customers.email"))),
+            "unknown_column customers.email"
+        );
+        assert_eq!(
+            rc(e(ErrorClass::UnknownTable, Some("customers"))),
+            "unknown_table customers"
+        );
+        assert_eq!(
+            rc(e(ErrorClass::ParamMisuse, Some("email"))),
+            "param_misuse"
+        );
+        assert_eq!(
+            rc(e(ErrorClass::IdentifierOutput, None)),
+            "identifier_output"
+        );
+        assert_eq!(rc(e(ErrorClass::Syntax, Some(&"x".repeat(200)))), "syntax");
         assert_eq!(
             tag_check(&schema, "entity:customers"),
             Ok(Some(Some("customer".into())))

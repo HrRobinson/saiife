@@ -11,7 +11,7 @@ mod fixtures;
 
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::audit_query::{self, Scope};
-use saiife_daemon::blind::ask::{self, Asks};
+use saiife_daemon::blind::ask;
 use saiife_daemon::blind::model::FakePlanner;
 use saiife_daemon::ops::{Conn, Ctx, CtxInit, Mode, PolicyState};
 use saiife_daemon::vault;
@@ -192,6 +192,12 @@ fn detector() -> Arc<ListDetector> {
 /// A personal context with `crm` live, the detector set and `replies` as
 /// the planner's script.
 async fn fx(root: &Path, replies: &[String]) -> Fx {
+    fx_mode(root, replies, Mode::Personal, "").await
+}
+
+/// [`fx`] in `mode` with `extra` dataset keys (users, approvers). Locked:
+/// the daemon is uid 999; `me` (1000) and `you` (1001) are peers.
+async fn fx_mode(root: &Path, replies: &[String], mode: Mode, extra: &str) -> Fx {
     let audit = root.join("audit");
     std::fs::create_dir_all(&audit).unwrap();
     let state = root.join("state");
@@ -199,7 +205,7 @@ async fn fx(root: &Path, replies: &[String]) -> Fx {
     let cw = ChainWriter::open(
         &audit,
         WriterOptions {
-            mode: Mode::Personal.as_str().into(),
+            mode: mode.as_str().into(),
             saiife: "test".into(),
             key: None,
         },
@@ -214,8 +220,8 @@ async fn fx(root: &Path, replies: &[String]) -> Fx {
     let dirs: Arc<dyn Directory + Send + Sync> = Arc::new(FixedDirectory::from_text(PASSWD, ""));
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
-        mode: Mode::Personal,
-        own_uid: OWN,
+        mode,
+        own_uid: if mode == Mode::Personal { OWN } else { 999 },
         own_user: "me".into(),
         vault: vault::open_with_key(Zeroizing::new([5; 32]), &state.join("vault/vault.bin")),
         ..CtxInit::minimal(handle, cfg, dirs, &state)
@@ -229,9 +235,9 @@ async fn fx(root: &Path, replies: &[String]) -> Fx {
     };
     f.ctx.blind.set_test_detector(Some(detector()));
     script(&f, replies);
+    set_policy(&f, &policy_text(true, extra));
     let v = stage(&f).await;
     assert!(v.get("error").is_none(), "{v}");
-    set_policy(&f, &policy_text(true, ""));
     let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
     assert!(v.get("error").is_none(), "{v}");
     f
@@ -903,6 +909,110 @@ async fn ask_belongs_to_uid() {
     assert_eq!(step["kind"], "preview", "{step}");
 }
 
+// ---- R-C12: the role is checked again at every step ----
+
+const BOTH: &str = "users = [\"me\", \"you\"]\napprovers = [\"me\"]\n";
+const ME_ONLY: &str = "users = [\"me\"]\napprovers = [\"me\"]\n";
+
+#[tokio::test]
+async fn role_lost_ends_the_ask() {
+    let t = scratch();
+    let f = fx_mode(t.path(), &[balance()], Mode::Locked, BOTH).await;
+    let v = call_as(
+        &f,
+        OTHER,
+        OP_BLIND_ASK,
+        json!({"question": Q_ANNA, "dataset": "crm", "lang": "en"}),
+        vec![],
+    )
+    .await;
+    assert!(v.get("error").is_none(), "{v}");
+    let id = v["ask"].as_str().unwrap().to_string();
+    // The role is withdrawn (the policy changes under the ask).
+    set_policy(&f, &policy_text(true, ME_ONLY));
+    let v = answer_as(&f, OTHER, &id, json!({"pick": 1})).await;
+    assert_eq!(
+        err(&v),
+        ("forbidden".to_string(), ask::ROLE_LOST.to_string())
+    );
+    // The ask is gone, and the end is recorded; nothing was sent.
+    let v = answer_as(&f, OTHER, &id, json!({"pick": 1})).await;
+    assert_eq!(
+        err(&v),
+        ("bad_request".to_string(), ask::NO_SUCH_ASK.to_string())
+    );
+    let r = records(&f, "blind_check_refused");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0]["ask"], id.as_str());
+    assert_eq!(r[0]["reason"], "role_lost");
+    assert!(outbox(&f).is_empty());
+}
+
+#[tokio::test]
+async fn reload_drops_the_asks_of_a_lost_role() {
+    let t = scratch();
+    let f = fx_mode(t.path(), &[balance()], Mode::Locked, BOTH).await;
+    let ask_as = |uid| {
+        call_as(
+            &f,
+            uid,
+            OP_BLIND_ASK,
+            json!({"question": Q_ANNA, "dataset": "crm", "lang": "en"}),
+            vec![],
+        )
+    };
+    let yours = ask_as(OTHER).await["ask"].as_str().unwrap().to_string();
+    let mine = ask_as(OWN).await["ask"].as_str().unwrap().to_string();
+    // The reload hook (start::reload runs it after the new policy is in).
+    set_policy(&f, &policy_text(true, ME_ONLY));
+    ask::policy_reloaded(&f.ctx).await;
+    let gone = f
+        .ctx
+        .blind
+        .asks
+        .lock()
+        .unwrap()
+        .peek(&yours, OTHER, |_| ())
+        .unwrap_err();
+    assert_eq!(gone.text, ask::NO_SUCH_ASK);
+    assert_eq!(records(&f, "blind_check_refused").len(), 1);
+    // An unchanged role goes on.
+    let step = answer(&f, &mine, json!({"pick": 1})).await;
+    assert_eq!(step["kind"], "preview", "{step}");
+}
+
+#[tokio::test]
+async fn dataset_left_policy_ends_the_ask() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    let (id, _) = ask_q(&f, Q_ANNA).await;
+    let (keep, _) = ask_q(&f, Q_ANNA).await;
+    // The same policy again: nothing changes.
+    set_policy(&f, &policy_text(true, ""));
+    ask::policy_reloaded(&f.ctx).await;
+    assert_eq!(
+        answer(&f, &keep, json!({"pick": 1})).await["kind"],
+        "preview"
+    );
+    // The dataset leaves policy.
+    set_policy(&f, &ner_section_only());
+    let v = answer_as(&f, OWN, &id, json!({"pick": 1})).await;
+    assert_eq!(
+        err(&v),
+        ("forbidden".to_string(), ask::DATASET_GONE.to_string())
+    );
+    let v = answer_as(&f, OWN, &id, json!({"pick": 1})).await;
+    assert_eq!(err(&v).0, "bad_request", "{v}");
+    assert_eq!(
+        records(&f, "blind_check_refused")[0]["reason"],
+        "dataset_not_in_policy"
+    );
+}
+
+fn ner_section_only() -> String {
+    format!("version = 2\n\n{}", ner_section())
+}
+
 #[tokio::test]
 async fn asks_expire() {
     let t = scratch();
@@ -993,13 +1103,4 @@ async fn ask_args_are_checked() {
     // The only dataset is the default.
     let (_, step) = ask_with(&f, json!({"question": Q_STRANGER})).await;
     assert_eq!(step["kind"], "keep_name");
-}
-
-/// A unit check of the store through its public API (R48-1 limits).
-#[test]
-fn asks_limits_are_public() {
-    assert_eq!(ask::MAX_OPEN_PER_UID, 4);
-    assert_eq!(ask::MAX_OPEN, 64);
-    assert_eq!(ask::ASK_TTL, Duration::from_secs(600));
-    let _ = Asks::new();
 }

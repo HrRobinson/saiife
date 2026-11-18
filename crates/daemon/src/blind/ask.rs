@@ -30,22 +30,21 @@ use crate::ops::Ctx;
 use saiife_ipc::msg::ErrorCode;
 use saiife_ipc::peer::PeerCred;
 use saiife_shield::envelope::{
-    build_envelope, cloud_schema, method_sha256, schema_sha256, synthetic_sha256, CloudSchema,
+    build_envelope, cloud_schema, logged_question, method_sha256, schema_sha256, synthetic_sha256,
     Retry, SentSummary,
 };
-use saiife_shield::firewall::{self, Expected, Firewall, Hit};
-use saiife_shield::lang::{find_numbers, number_words};
+use saiife_shield::firewall::{self, retry_error_class, Expected, Firewall, Hit};
 use saiife_shield::lexicon::{Candidate, Resolve, MAX_CANDIDATES};
 use saiife_shield::methods::{ApprovedMethod, MethodStore};
-use saiife_shield::plan::PlanReply;
+use saiife_shield::plan::{intent_line, PlanReply};
 use saiife_shield::preview::{preview, Preview};
 use saiife_shield::public::PublicValues;
 use saiife_shield::question::{self, Draft, Pending};
-use saiife_shield::schema::{Bound, ColumnClass, DatasetName, Lang, Param, ParamType, Schema};
+use saiife_shield::schema::{DatasetName, Lang, Param, Schema};
 use saiife_shield::sql::{validate, validate_check, ErrorClass, MethodError, Validated};
 use saiife_shield::standin::KeySet;
 use saiife_shield::synth::{os_rng, synthetic_rows};
-use saiife_shield::template::{answer_params, check_params_covered, parse_template, spoken};
+use saiife_shield::template::{check_params_covered, entity_label, parse_template, preview_params};
 use saiife_shield::ShieldError;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -86,6 +85,16 @@ pub const NER_NOT_PINNED: &str = "Data Shield needs its local name detector firs
 /// R-C8: pinned, but no detector is running.
 pub const NER_NOT_READY: &str = "the local name detector is not ready: saiife blind status \
      shows why (saiife blind init fetches its files)";
+/// R-C12: the asker lost the role on the dataset (a policy change).
+pub const ROLE_LOST: &str =
+    "you may no longer ask this dataset (the policy changed); the ask has ended";
+/// R-C12: the dataset left policy.
+pub const DATASET_GONE: &str = "this dataset is no longer in policy; the ask has ended";
+/// A record failed before anything was sent.
+pub const UNRECORDED_NOTHING_SENT: &str = "the ask could not be recorded; nothing was sent";
+/// I3: the preview record failed after the planner was asked: the
+/// preview is not shown (never "nothing was sent").
+pub const PREVIEW_UNRECORDED: &str = "the preview could not be recorded, so it was not shown";
 /// `{"keep_name": true}` on `blind.ask.answer`: only the touch keeps a name.
 pub const KEEP_NEEDS_TOUCH: &str =
     "keeping a name as plain text needs a touch (blind:name): blind.touch.begin {purpose: name}";
@@ -274,59 +283,8 @@ pub fn did_you_mean_step(
     Step::DidYouMean {
         word: word.to_string(),
         written: written.to_string(),
-        suggestion: label(suggestion, schema),
+        suggestion: entity_label(suggestion, schema),
     }
-}
-
-/// The `show` values of `c` that the user may see: not empty, of a column
-/// that is not Identifier-class (R-C2). An unknown column is not shown.
-fn shown<'a>(c: &'a Candidate, schema: &Schema) -> Vec<&'a str> {
-    c.show
-        .iter()
-        .filter(|(col, v)| {
-            !v.is_empty()
-                && schema
-                    .column(&c.table, col)
-                    .is_some_and(|ci| ci.class != ColumnClass::Identifier)
-        })
-        .map(|(_, v)| v.as_str())
-        .collect()
-}
-
-/// `Anna Berg, Aarhus`: the display name and [`shown`] values.
-fn label(c: &Candidate, schema: &Schema) -> String {
-    std::iter::once(c.display.as_str())
-        .chain(shown(c, schema))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// R-C10: the planner's intent line, only when it holds no digit and no
-/// number word (the draft's language, and the other one's words that are
-/// not everyday words of this one, as the firewall reads them). Dropped
-/// whole, never edited.
-pub fn planner_says(intent: &str, lang: Lang) -> Option<String> {
-    let t = intent.trim();
-    if t.is_empty() || t.chars().any(char::is_numeric) || !find_numbers(t, lang).is_empty() {
-        return None;
-    }
-    let other = match lang {
-        Lang::En => Lang::Da,
-        Lang::Da => Lang::En,
-    };
-    for w in t
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-    {
-        let w = w.to_lowercase();
-        let everyday = lang == Lang::En && matches!(w.as_str(), "to" | "fire");
-        if number_words(lang).is_number_word(&w)
-            || (!everyday && number_words(other).is_number_word(&w))
-        {
-            return None;
-        }
-    }
-    Some(t.to_string())
 }
 
 // ----------------------------------------------------------- answers ----
@@ -560,6 +518,9 @@ pub struct AskState {
     /// preview shows its non-Identifier `show` values, R-C2).
     chosen: Vec<(String, Candidate)>,
     counts: Counts,
+    /// The asker's credentials of the latest step: the role is checked
+    /// again with them before every step and every planner call (R-C12).
+    peer: PeerCred,
 }
 
 impl std::fmt::Debug for AskState {
@@ -836,7 +797,10 @@ pub async fn begin(
     let (name, mut opts) = dataset_for(ctx, peer, args.dataset.as_deref(), args.limit).await?;
     opts.yes = args.yes;
     opts.show_sent = args.show_sent;
-    let lang0 = args.lang.unwrap_or(Lang::En);
+    // A refusal before a draft exists speaks the question's language.
+    let lang0 = args
+        .lang
+        .unwrap_or_else(|| saiife_shield::lang::detect_lang(&args.question));
     let id = new_id()?;
     if args.judgment {
         return Ok((
@@ -848,7 +812,10 @@ pub async fn begin(
     // The build, fixed for the whole ask; a refresh is a step of its own.
     let snap = match data::live_snapshot(ctx, &name) {
         Ok(s) => s,
-        Err(r) if r.code == ErrorCode::Busy && r.text != data::OPENING => {
+        Err(r)
+            if r.code == ErrorCode::Busy
+                && matches!(ctx.blind.state(&name), super::DatasetState::Building { .. }) =>
+        {
             return Ok((id, Step::Refreshing { text: r.text }))
         }
         Err(r) => return Err(r),
@@ -890,6 +857,7 @@ pub async fn begin(
         released: Vec::new(),
         chosen: Vec::new(),
         counts: Counts::default(),
+        peer: peer.clone(),
     };
     let q = args.question;
     let lang = args.lang;
@@ -921,9 +889,79 @@ pub async fn step(
         blind: Arc::clone(&ctx.blind),
         id: id.to_string(),
     };
+    let mut st = st;
+    st.peer = peer.clone();
+    // R-C12: the role and the dataset's place in policy, again; a lost
+    // one ends the ask (it is not stored again).
+    still_allowed(ctx, id, &st).await?;
     let (st, r) = advance(ctx, id, st, a).await;
     store(ctx, id, st);
     r
+}
+
+/// R-C12: `st.peer` may still ask `st.dataset`, which is still in policy.
+/// Otherwise a `blind_check_refused` record (fixed reason) and `forbidden`;
+/// the caller drops the ask. The ask keeps running on its held build
+/// (P47-37); only the authorization is current.
+async fn still_allowed(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusal> {
+    let in_policy = ctx.policy().system.as_ref().is_some_and(|s| {
+        s.blind
+            .dataset
+            .iter()
+            .any(|d| d.name == st.dataset.as_str())
+    });
+    let why = if !in_policy {
+        Some(("dataset_not_in_policy", DATASET_GONE))
+    } else if !super::ops::role_of(ctx, &st.peer, &st.dataset)
+        .await
+        .may_ask()
+    {
+        Some(("role_lost", ROLE_LOST))
+    } else {
+        None
+    };
+    let Some((reason, text)) = why else {
+        return Ok(());
+    };
+    let r = BlindRecord::CheckRefused {
+        ask: id.to_string(),
+        reason: reason.to_string(),
+    };
+    if audit::write(
+        ctx,
+        st.uid,
+        st.dataset.as_str(),
+        r,
+        st.snapshot.open.index.as_ref(),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!("saiifed: blind: an ask ended by a policy change was not recorded");
+    }
+    Err(Refusal::new(ErrorCode::Forbidden, text))
+}
+
+/// R-C12, after a policy reload: every kept ask whose asker lost the role
+/// (or whose dataset left policy) is dropped, with its refusal record.
+/// Asks in flight are checked by their next step or planner call.
+pub async fn policy_reloaded(ctx: &Arc<Ctx>) {
+    let kept: Vec<(String, AskState)> = {
+        let mut a = lock(&ctx.blind.asks);
+        a.sweep(Instant::now());
+        std::mem::take(&mut a.map).into_iter().collect()
+    };
+    let mut keep = Vec::new();
+    for (id, st) in kept {
+        if still_allowed(ctx, &id, &st).await.is_ok() {
+            keep.push((id, st));
+        }
+    }
+    let mut a = lock(&ctx.blind.asks);
+    for (id, st) in keep {
+        // A step that began meanwhile found no ask; nothing to merge.
+        a.map.entry(id).or_insert(st);
+    }
 }
 
 fn misfit() -> Refusal {
@@ -1086,7 +1124,7 @@ fn pending_step(counts: &mut Counts, d: &Draft, schema: &Schema) -> Option<Step>
                     .enumerate()
                     .map(|(i, c)| PickItem {
                         n: i + 1,
-                        label: label(c, schema),
+                        label: entity_label(c, schema),
                     })
                     .collect(),
                 too_many: *too_many,
@@ -1134,7 +1172,14 @@ fn question_refusal(r: question::Refusal, lang: Lang, ds: &DatasetName) -> Step 
     }
 }
 
-async fn record(ctx: &Ctx, st: &AskState, r: BlindRecord) -> Result<(), Refusal> {
+/// Writes `r`; a failure is `unavailable` with `failed`, a text that is
+/// true at that point (I3: once a request left, never "nothing was sent").
+async fn record(
+    ctx: &Ctx,
+    st: &AskState,
+    r: BlindRecord,
+    failed: &'static str,
+) -> Result<(), Refusal> {
     audit::write(
         ctx,
         st.uid,
@@ -1143,7 +1188,7 @@ async fn record(ctx: &Ctx, st: &AskState, r: BlindRecord) -> Result<(), Refusal>
         st.snapshot.open.index.as_ref(),
     )
     .await
-    .map_err(|_| unavailable("the ask could not be recorded; nothing was sent"))
+    .map_err(|_| unavailable(failed))
 }
 
 /// `blind_resolve`: each parameter's tag and candidate count (a picked
@@ -1166,26 +1211,7 @@ async fn record_resolve(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusa
         did_you_mean: c.did_you_mean,
         kept_names: c.kept_names,
     };
-    record(ctx, st, r).await
-}
-
-/// `text` with each `:pN` that has a stand-in in `syms` replaced by it.
-fn with_standins(text: &str, syms: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(":p") {
-        let (head, tail) = rest.split_at(i);
-        out.push_str(head);
-        let digits = tail[2..].bytes().take_while(u8::is_ascii_digit).count();
-        let name = &tail[1..2 + digits];
-        match syms.iter().find(|(n, _)| digits > 0 && n == name) {
-            Some((_, s)) => out.push_str(s),
-            None => out.push_str(&tail[..2 + digits]),
-        }
-        rest = &tail[2 + digits..];
-    }
-    out.push_str(rest);
-    out
+    record(ctx, st, r, UNRECORDED_NOTHING_SENT).await
 }
 
 /// The `blind_ask` record (the question with its stand-ins, R44-4).
@@ -1210,18 +1236,7 @@ async fn record_ask(
                 false,
             )
             .map_err(|e| shield_err(&e))?;
-        let mut syms = Vec::new();
-        for p in &d.params {
-            if let (ParamType::Entity { table, word }, Some(Bound::Keys(k))) = (&p.ty, &p.bound) {
-                if let [key] = k.as_slice() {
-                    let w = schema
-                        .entity_for(table)
-                        .map_or(word.as_str(), |e| e.word.as_str());
-                    syms.push((p.name.clone(), s.symbol_for(w, table, *key)));
-                }
-            }
-        }
-        (with_standins(&d.text, &syms), crate::api_ops::hex(&s.id.0))
+        (logged_question(d, s, schema), crate::api_ops::hex(&s.id.0))
     };
     let r = BlindRecord::Ask {
         ask: id.to_string(),
@@ -1231,7 +1246,7 @@ async fn record_ask(
         session,
         approved_method: approved,
     };
-    record(ctx, st, r).await
+    record(ctx, st, r, UNRECORDED_NOTHING_SENT).await
 }
 
 /// The dataset's active approved method for this template and these
@@ -1279,36 +1294,6 @@ fn check_reply(
     Ok(v)
 }
 
-/// The retry's error class (R45-8): the class, with the cloud name for the
-/// classes that carry one only when it is a name of the envelope's schema
-/// (anything else the planner wrote is not sent).
-fn retry_class(e: &MethodError, cloud: &CloudSchema) -> String {
-    let class = e.class.as_str();
-    let named = matches!(
-        e.class,
-        ErrorClass::UnknownTable | ErrorClass::UnknownColumn | ErrorClass::TemplateSlot
-    );
-    let known = |d: &str| {
-        cloud.tables.iter().any(|t| {
-            t.name == d
-                || t.columns.iter().any(|c| {
-                    c.name == d || d.strip_prefix(t.name.as_str()) == Some(&format!(".{}", c.name))
-                })
-        })
-    };
-    match &e.detail {
-        Some(d) if named && known(d) => {
-            let s = format!("{class} {d}");
-            if s.chars().count() <= firewall::MAX_ERROR_CLASS_CHARS {
-                s
-            } else {
-                class.to_string()
-            }
-        }
-        _ => class.to_string(),
-    }
-}
-
 /// R48-9: what a firewall hit would have sent, in words.
 fn hit_words(h: &Hit) -> &'static str {
     match h.kind {
@@ -1325,15 +1310,33 @@ fn hit_words(h: &Hit) -> &'static str {
     }
 }
 
-/// A planner failure as the user sees it (R-C9: unreachable is
-/// unavailable; an unrecorded request is refused, nothing sent).
-fn plan_error(e: PlanError, lang: Lang) -> Result<Step, Refusal> {
+/// A planner failure as the user sees it. `sent_before`: an earlier
+/// request of this ask left the machine, so no head may say nothing was
+/// sent (I3); R48-9's reason still speaks of this request only.
+/// Unreachable and timeout are unavailable (R-C9); an unrecorded request
+/// was not sent, an unrecorded reply was not used (R-C9a).
+fn plan_error(e: PlanError, lang: Lang, sent_before: bool) -> Result<Step, Refusal> {
+    let head = if sent_before {
+        head_no_answer(lang)
+    } else {
+        head_nothing_sent(lang)
+    };
     match e {
         PlanError::Unreachable | PlanError::Timeout => Err(unavailable(e.to_string())),
+        PlanError::Unrecorded(t) if sent_before => Ok(Step::refused(
+            code::UNRECORDED,
+            head,
+            format!("{t}; this request was not sent"),
+        )),
         PlanError::Unrecorded(t) => Ok(Step::refused(
             code::UNRECORDED,
-            head_nothing_sent(lang),
+            head,
             format!("{t}; nothing left this machine"),
+        )),
+        PlanError::ReplyUnrecorded => Ok(Step::refused(
+            code::UNRECORDED,
+            head_no_answer(lang),
+            model::REPLY_UNRECORDED,
         )),
         PlanError::Blocked(h) => {
             let (what, part) = h
@@ -1343,7 +1346,7 @@ fn plan_error(e: PlanError, lang: Lang) -> Result<Step, Refusal> {
                 });
             Ok(Step::refused(
                 code::BLOCKED,
-                head_nothing_sent(lang),
+                head,
                 format!(
                     "this would send {what} ({part}); nothing was sent. Rephrase the question, \
                      or ask without the name"
@@ -1418,6 +1421,10 @@ async fn proceed(
     let mut prev: Option<(String, String)> = None;
     let mut last: Option<MethodError> = None;
     for _ in 0..MAX_TRIES {
+        // R-C12: a policy change during a long step stops the next call.
+        if let Err(r) = still_allowed(ctx, id, &st).await {
+            return (st, Err(r));
+        }
         let keys = match load_keys(ctx, &st.dataset).await {
             Ok(k) => k,
             Err(e) => return (st, Err(e)),
@@ -1470,7 +1477,7 @@ async fn proceed(
         let got = planner.plan(ctx, st.uid, id, &st.dataset, &env, &fw).await;
         let reply = match got {
             Ok(r) => r,
-            Err(e) => return (st, plan_error(e, d.lang)),
+            Err(e) => return (st, plan_error(e, d.lang, prev.is_some())),
         };
         if reply.needs_judgment {
             return (
@@ -1492,7 +1499,7 @@ async fn proceed(
                 return finish_preview(ctx, id, st, d, v, reply, None, sent, envelope).await;
             }
             Err(e) => {
-                prev = Some((reply.method.clone(), retry_class(&e, &cloud)));
+                prev = Some((reply.method.clone(), retry_error_class(&e, &cloud)));
                 last = Some(e);
             }
         }
@@ -1514,44 +1521,6 @@ async fn proceed(
     (st, Ok(step))
 }
 
-/// The parameters the preview names (R-C2): each entity by the user's own
-/// words (else the plain word of its type), then the non-Identifier `show`
-/// values of the record it resolved to; never the key. Blocking (the
-/// lexicon).
-fn preview_params(snap: &LiveSnapshot, d: &Draft, chosen: &[(String, Candidate)]) -> Vec<Param> {
-    let schema = snap.schema();
-    let mut ps = answer_params(d, schema);
-    let lex = lock(&snap.open.lexicon);
-    for p in ps.iter_mut() {
-        let (ParamType::Entity { table, .. }, Some(Bound::Keys(k))) = (&p.ty, &p.bound) else {
-            continue;
-        };
-        let [key] = k.as_slice() else {
-            continue;
-        };
-        let c = chosen
-            .iter()
-            .rev()
-            .find(|(n, c)| *n == p.name && c.key == *key)
-            .map(|(_, c)| c.clone())
-            .or_else(|| {
-                let w = spoken(d, &p.name)?;
-                match lex.resolve(table, &w) {
-                    Ok((Resolve::One(c), _)) if c.key == *key => Some(c),
-                    Ok((Resolve::Many(cs), _)) => cs.into_iter().find(|c| c.key == *key),
-                    _ => None,
-                }
-            });
-        if let Some(c) = c {
-            for v in shown(&c, schema) {
-                p.display.push_str(", ");
-                p.display.push_str(v);
-            }
-        }
-    }
-    ps
-}
-
 /// The preview step and record; the ask waits for Run or Stop.
 #[allow(clippy::too_many_arguments)]
 async fn finish_preview(
@@ -1568,16 +1537,27 @@ async fn finish_preview(
     let snap = Arc::clone(&st.snapshot);
     let chosen = st.chosen.clone();
     let d2 = d.clone();
-    let params =
-        match tokio::task::spawn_blocking(move || preview_params(&snap, &d2, &chosen)).await {
-            Ok(p) => p,
-            Err(_) => return (st, Err(join_err())),
+    let params = match tokio::task::spawn_blocking(move || {
+        let lex = lock(&snap.open.lexicon);
+        // The lexicon's records for the user's words (R-C2); a lookup
+        // that fails finds none, so the words show alone.
+        let lookup = |table: &str, words: &str| match lex.resolve(table, words) {
+            Ok((Resolve::One(c), _)) => vec![c],
+            Ok((Resolve::Many(cs), _)) => cs,
+            _ => Vec::new(),
         };
+        preview_params(&d2, snap.schema(), &chosen, &lookup)
+    })
+    .await
+    {
+        Ok(p) => p,
+        Err(_) => return (st, Err(join_err())),
+    };
     let p = preview(&v, &params, st.snapshot.schema(), d.lang);
     let says = if approved.is_some() {
         None
     } else {
-        planner_says(&reply.intent, d.lang)
+        intent_line(&reply.intent, d.lang)
     };
     let r = BlindRecord::Preview {
         ask: id.to_string(),
@@ -1585,7 +1565,13 @@ async fn finish_preview(
         outcome: "shown",
         fragments: u32::try_from(p.fragments).unwrap_or(u32::MAX),
     };
-    if let Err(e) = record(ctx, &st, r).await {
+    // Reuse sent nothing; the planner path asked the planner.
+    let failed = if approved.is_some() {
+        UNRECORDED_NOTHING_SENT
+    } else {
+        PREVIEW_UNRECORDED
+    };
+    if let Err(e) = record(ctx, &st, r, failed).await {
         return (st, Err(e));
     }
     let step = Step::Preview {
@@ -1699,114 +1685,63 @@ mod tests {
     }
 
     #[test]
-    fn planner_says_has_no_numbers() {
-        let s = |t: &str, l: Lang| planner_says(t, l);
-        assert_eq!(
-            s(" sums the invoices ", Lang::En).as_deref(),
-            Some("sums the invoices")
-        );
-        assert_eq!(s("sums 3 invoices", Lang::En), None);
-        assert_eq!(s("sums three invoices", Lang::En), None);
-        assert_eq!(s("sums the first invoices", Lang::En), None);
-        assert_eq!(s("lægger tre fakturaer sammen", Lang::Da), None);
-        assert_eq!(s("sums fem invoices", Lang::En), None);
-        // Everyday English words that are Danish number words stay.
-        assert_eq!(
-            s("adds up to the total", Lang::En).as_deref(),
-            Some("adds up to the total")
-        );
-        assert_eq!(s("", Lang::En), None);
-        assert_eq!(s("sums ½ of it", Lang::En), None);
-    }
-
-    #[test]
-    fn standins_replace_only_their_params() {
-        let syms = vec![("p1".to_string(), "Customer_K7QF".to_string())];
-        assert_eq!(
-            with_standins("balance of :p1 over :p2 and :p10?", &syms),
-            "balance of Customer_K7QF over :p2 and :p10?"
-        );
-        assert_eq!(with_standins("a:p b :p", &syms), "a:p b :p");
-    }
-
-    #[test]
-    fn retry_class_names_only_schema_names() {
-        use saiife_shield::envelope::{CloudColumn, CloudTable};
-        use saiife_shield::schema::ColType;
-        let cloud = CloudSchema {
-            tables: vec![CloudTable {
-                name: "invoices".into(),
-                rows: "100-999".into(),
-                columns: vec![CloudColumn {
-                    name: "amount".into(),
-                    ty: ColType::Real,
-                    class: ColumnClass::Sensitive,
-                    values: None,
-                }],
-                entity: None,
-            }],
-            joins: vec![],
-        };
-        let e = |class, d: Option<&str>| MethodError {
-            class,
-            detail: d.map(str::to_string),
-        };
-        assert_eq!(
-            retry_class(&e(ErrorClass::UnknownColumn, Some("nope")), &cloud),
-            "unknown_column"
-        );
-        assert_eq!(
-            retry_class(
-                &e(ErrorClass::UnknownColumn, Some("invoices.amount")),
-                &cloud
-            ),
-            "unknown_column invoices.amount"
-        );
-        assert_eq!(
-            retry_class(&e(ErrorClass::UnknownTable, Some("invoices")), &cloud),
-            "unknown_table invoices"
-        );
-        assert_eq!(
-            retry_class(&e(ErrorClass::ParamMisuse, Some("amount")), &cloud),
-            "param_misuse"
-        );
-        assert_eq!(
-            retry_class(&e(ErrorClass::IdentifierOutput, None), &cloud),
-            "identifier_output"
-        );
-    }
-
-    #[test]
     fn plan_errors_map() {
-        let r = plan_error(PlanError::Unreachable, Lang::En).unwrap_err();
+        let r = plan_error(PlanError::Unreachable, Lang::En, false).unwrap_err();
         assert_eq!(r.code, ErrorCode::Unavailable);
-        let s = plan_error(
-            PlanError::Unrecorded("the request could not be recorded".into()),
-            Lang::En,
-        )
-        .unwrap();
+        let unrec = || PlanError::Unrecorded("the request could not be recorded".into());
+        // R-C9a: an unrecorded request before anything left.
+        let s = plan_error(unrec(), Lang::En, false).unwrap().to_value();
         assert_eq!(
-            s.to_value()["reason"],
+            s["reason"],
             "the request could not be recorded; nothing left this machine"
         );
-        assert_eq!(s.to_value()["head"], "refused, nothing sent");
-        let s = plan_error(
+        assert_eq!(s["head"], "refused, nothing sent");
+        // I3: an earlier request of the ask had left.
+        let s = plan_error(unrec(), Lang::En, true).unwrap().to_value();
+        assert_eq!(
+            s["reason"],
+            "the request could not be recorded; this request was not sent"
+        );
+        assert_eq!(s["head"], head_no_answer(Lang::En));
+        // R-C9a: an unrecorded reply was sent and not used.
+        for before in [false, true] {
+            let s = plan_error(PlanError::ReplyUnrecorded, Lang::En, before)
+                .unwrap()
+                .to_value();
+            assert_eq!(s["code"], code::UNRECORDED);
+            assert_eq!(s["head"], head_no_answer(Lang::En));
+            assert_eq!(
+                s["reason"],
+                "the planner's reply could not be recorded, so it was not used"
+            );
+            assert!(!s.to_string().contains("nothing"), "{s}");
+        }
+        let blocked = || {
             PlanError::Blocked(vec![Hit {
                 kind: firewall::NAME,
                 part: "question".into(),
                 span: Some((0, 3)),
-            }]),
-            Lang::En,
-        )
-        .unwrap();
+            }])
+        };
+        let s = plan_error(blocked(), Lang::En, false).unwrap().to_value();
         assert_eq!(
-            s.to_value()["reason"],
+            s["reason"],
             "this would send a name (question); nothing was sent. Rephrase the question, or ask \
              without the name"
         );
-        let s = plan_error(PlanError::Refused, Lang::Da).unwrap();
+        assert_eq!(s["head"], "refused, nothing sent");
+        // I3: the head is truthful on a retry; R48-9's reason is this try's.
+        let s = plan_error(blocked(), Lang::En, true).unwrap().to_value();
+        assert_eq!(s["head"], head_no_answer(Lang::En));
+        let s = plan_error(PlanError::Refused, Lang::Da, false).unwrap();
         assert_eq!(s.to_value()["code"], code::PLANNER);
         assert_eq!(s.to_value()["head"], head_no_answer(Lang::Da));
+    }
+
+    #[test]
+    fn record_failure_texts_are_truthful() {
+        assert!(UNRECORDED_NOTHING_SENT.contains("nothing was sent"));
+        assert!(!PREVIEW_UNRECORDED.contains("nothing"));
     }
 
     #[test]

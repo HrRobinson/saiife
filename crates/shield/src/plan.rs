@@ -1,6 +1,8 @@
 //! Plan 45: the planner's reply (spec §2.3.2): a method, an answer template,
 //! optional self-checks and an intent line.
 
+use crate::lang::{find_numbers, number_words};
+use crate::schema::Lang;
 use crate::sql::ErrorClass;
 use serde::{Deserialize, Serialize};
 
@@ -91,4 +93,67 @@ pub fn parse_reply(text: &str) -> Result<PlanReply, ErrorClass> {
         return Err(ErrorClass::Syntax);
     }
     Ok(r)
+}
+
+/// Plan 48 ruling R-C10: the planner's intent line as the preview may show
+/// it ("the planner says"), only when it holds no number: no numeric
+/// character, no number [`find_numbers`] reads in `lang`, and no number
+/// word of either language (the other language's words that are everyday
+/// words of this one excepted, as the firewall reads them). Otherwise
+/// `None`: the line is dropped whole, never edited.
+pub fn intent_line(intent: &str, lang: Lang) -> Option<String> {
+    let t = intent.trim();
+    if t.is_empty() || t.chars().any(char::is_numeric) || !find_numbers(t, lang).is_empty() {
+        return None;
+    }
+    let other = match lang {
+        Lang::En => Lang::Da,
+        Lang::Da => Lang::En,
+    };
+    for w in t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        let w = w.to_lowercase();
+        if number_words(lang).is_number_word(&w) {
+            return None;
+        }
+        if lang == Lang::En
+            && number_words(other).is_number_word(&w)
+            && !crate::firewall::ambiguous_in_other(other, &w)
+        {
+            return None;
+        }
+        if lang == Lang::Da && number_words(other).is_number_word(&w) {
+            return None;
+        }
+    }
+    Some(t.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intent_line_has_no_numbers() {
+        let s = |t: &str, l: Lang| intent_line(t, l);
+        assert_eq!(
+            s(" sums the invoices ", Lang::En).as_deref(),
+            Some("sums the invoices")
+        );
+        assert_eq!(s("sums 3 invoices", Lang::En), None);
+        assert_eq!(s("sums three invoices", Lang::En), None);
+        assert_eq!(s("sums the first invoices", Lang::En), None);
+        assert_eq!(s("lægger tre fakturaer sammen", Lang::Da), None);
+        assert_eq!(s("lægger three fakturaer sammen", Lang::Da), None);
+        assert_eq!(s("sums fem invoices", Lang::En), None);
+        // Everyday English words that are Danish number words stay.
+        assert_eq!(
+            s("adds up to the total", Lang::En).as_deref(),
+            Some("adds up to the total")
+        );
+        assert_eq!(s("", Lang::En), None);
+        assert_eq!(s("sums ½ of it", Lang::En), None);
+    }
 }

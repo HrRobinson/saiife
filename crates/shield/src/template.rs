@@ -9,8 +9,9 @@
 
 use crate::calc::{CellValue, ResultSet};
 use crate::grammar::{grammar_ok, Seg};
+use crate::lexicon::Candidate;
 use crate::question::Draft;
-use crate::schema::{Decimal, Lang, Param, ParamType, Schema};
+use crate::schema::{Bound, ColumnClass, Decimal, Lang, Param, ParamType, Schema};
 use crate::sql::{ErrorClass, MethodError, Validated};
 
 const DETAIL_MAX: usize = 120;
@@ -445,6 +446,78 @@ pub fn answer_params(d: &Draft, schema: &Schema) -> Vec<Param> {
             p
         })
         .collect()
+}
+
+// ---- entities in local resolution UI and the preview (R45-13, R-C2) ----
+
+/// The `show` values of `c` a user may see in local resolution UI and in
+/// the method preview (plan 48 ruling R-C2, owner rule R45-13): not empty,
+/// of a column of the entity's table that is not Identifier-class. A column
+/// the schema does not have is not shown (fail closed). Never the key.
+pub fn shown_values<'a>(c: &'a Candidate, schema: &Schema) -> Vec<&'a str> {
+    c.show
+        .iter()
+        .filter(|(col, v)| {
+            !v.is_empty()
+                && schema
+                    .column(&c.table, col)
+                    .is_some_and(|ci| ci.class != ColumnClass::Identifier)
+        })
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// A pick-list or "did you mean" label (R-C2): the display name, needed
+/// to choose, then [`shown_values`], comma-separated (`Anna Berg,
+/// Aarhus`). Local only: never logged, never sent.
+pub fn entity_label(c: &Candidate, schema: &Schema) -> String {
+    std::iter::once(c.display.as_str())
+        .chain(shown_values(c, schema))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The parameters the method preview names (R-C2): [`answer_params`] (each
+/// entity by the user's own words, else the plain word of its type), and
+/// for an entity bound to one key the [`shown_values`] of the record it
+/// resolved to. That record is the one `chosen` names for the parameter
+/// with that key (a pick, a "did you mean" yes), else the one `lookup`
+/// (the lexicon's resolve of the user's words in the entity table) gives
+/// with that key; none found: the words alone. Never the key, never a
+/// snapshot name the user did not type.
+pub fn preview_params(
+    d: &Draft,
+    schema: &Schema,
+    chosen: &[(String, Candidate)],
+    lookup: &dyn Fn(&str, &str) -> Vec<Candidate>,
+) -> Vec<Param> {
+    let mut ps = answer_params(d, schema);
+    for p in ps.iter_mut() {
+        let (ParamType::Entity { table, .. }, Some(Bound::Keys(k))) = (&p.ty, &p.bound) else {
+            continue;
+        };
+        let [key] = k.as_slice() else {
+            continue;
+        };
+        let c = chosen
+            .iter()
+            .rev()
+            .find(|(n, c)| *n == p.name && c.key == *key && c.table == *table)
+            .map(|(_, c)| c.clone())
+            .or_else(|| {
+                let w = spoken(d, &p.name)?;
+                lookup(table, &w)
+                    .into_iter()
+                    .find(|c| c.key == *key && c.table == *table)
+            });
+        if let Some(c) = c {
+            for v in shown_values(&c, schema) {
+                p.display.push_str(", ");
+                p.display.push_str(v);
+            }
+        }
+    }
+    ps
 }
 
 /// The `empty_for_key` refusal reason (R45-6, ruling F-n): en `the method
