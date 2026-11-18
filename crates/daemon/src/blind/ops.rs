@@ -275,6 +275,10 @@ fn dataset_json(ctx: &Ctx, name: &DatasetName, role: Roles) -> Value {
                 json!({"phase": format!("{phase:?}").to_lowercase(), "done": done, "total": total}),
             );
         }
+        DatasetState::Opening => {
+            d.insert("state".into(), "opening".into());
+            d.insert("reason".into(), super::OPENING.into());
+        }
         DatasetState::NeedsRefresh(why) => {
             d.insert("state".into(), "needs_refresh".into());
             d.insert("reason".into(), why.into());

@@ -1183,8 +1183,9 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     ctx.mcp.attach(Arc::downgrade(&ctx));
     // Data Shield (plan 47): the datasets built before this start, opened
     // again (keys from the vault; a locked vault leaves them unavailable).
+    // Plan 48 C2: in the background; they show `opening` until then.
     #[cfg(target_os = "linux")]
-    crate::blind::data::reopen_all(&ctx);
+    drop(crate::blind::data::reopen_all(&ctx));
     // Data Shield retention (R47-9 outbox, R47-2 retired keys), off this
     // thread; again on each daily purge tick.
     #[cfg(target_os = "linux")]

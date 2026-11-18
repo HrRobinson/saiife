@@ -15,8 +15,10 @@
 //! or error text carries a cell value.
 
 use super::audit::{self, BlindRecord};
+use super::calc::{HeldSnapshot, HELD_DIR};
 use super::ops::{effective_approvers, role, role_listed, Roles};
 use super::pg::{self, PgSource};
+pub use super::OPENING;
 use super::{keys, private_dir, write_private, Blind, DatasetState, LiveHandles, Refusal};
 use crate::ops::{Conn, Ctx};
 use saiife_ipc::msg::ErrorCode;
@@ -609,15 +611,66 @@ fn name_check(
 
 /// `live/`'s files opened for asks, after `load_manifest` checked their
 /// hashes (ruling P47-5: the manifest first; the opens verify nothing).
-fn open_handles(dir: &DatasetDir, keys: &KeySet) -> Result<LiveHandles, ShieldError> {
+/// The snapshot is held under `held/` with the manifest's hash `m` (plan
+/// 48 C2); no swap can come between: the caller holds the dataset (a
+/// build, or the start's reopen).
+fn open_handles(dir: &DatasetDir, keys: &KeySet, m: &Manifest) -> Result<LiveHandles, ShieldError> {
     let lexicon = Lexicon::open(&dir.lexicon())?;
     let index = KnownIndex::open(&dir.live(), keys.index_key())?;
     let allow = read_allow(&dir.live().join(ALLOW_FILE))?;
+    let snapshot = HeldSnapshot::hold(
+        &dir.snapshot(),
+        &dir.root.join(HELD_DIR),
+        m.snapshot_sha256.clone(),
+    )
+    .map_err(|_| ShieldError::Io("could not hold the snapshot for asks".into()))?;
     Ok(LiveHandles {
         lexicon: std::sync::Mutex::new(lexicon),
         index: Some(index),
         allow,
+        snapshot,
     })
+}
+
+/// The build an ask runs on, fixed at the ask's begin (plan 48 C2, P47-37
+/// I4): the live manifest (schema, public values, hash) and the handles
+/// (lexicon, index, allow list, the held snapshot). A refresh swap after
+/// this leaves all of it as it was; pass it to `calc::run`.
+#[derive(Debug)]
+pub struct LiveSnapshot {
+    pub dataset: DatasetName,
+    pub manifest: Arc<Manifest>,
+    pub open: Arc<LiveHandles>,
+}
+
+impl LiveSnapshot {
+    /// The build's schema.
+    pub fn schema(&self) -> &Schema {
+        &self.manifest.schema
+    }
+
+    /// The held snapshot file the calculator reads.
+    pub fn held(&self) -> &HeldSnapshot {
+        &self.open.snapshot
+    }
+}
+
+impl AsRef<HeldSnapshot> for LiveSnapshot {
+    fn as_ref(&self) -> &HeldSnapshot {
+        self.held()
+    }
+}
+
+/// The live build of `dataset` for an ask, or why there is none: busy while
+/// it refreshes or is still opening ([`OPENING`]), unavailable when it
+/// needs a refresh or was never built.
+pub fn live_snapshot(ctx: &Ctx, dataset: &DatasetName) -> Result<Arc<LiveSnapshot>, Refusal> {
+    let (manifest, open) = ctx.blind.live(dataset)?;
+    Ok(Arc::new(LiveSnapshot {
+        dataset: dataset.clone(),
+        manifest,
+        open,
+    }))
 }
 
 fn classes_of(s: &Schema) -> Classes {
@@ -759,7 +812,7 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, BuildErr> {
         }
     }
     let m = load_manifest(&b.dir).map_err(|e| After(shield_refusal(&e)))?;
-    let open = open_handles(&b.dir, &b.keys).map_err(|e| After(shield_refusal(&e)))?;
+    let open = open_handles(&b.dir, &b.keys, &m).map_err(|e| After(shield_refusal(&e)))?;
     // The new baseline: the classes now in force; the grants used are spent.
     write_private(
         &b.dir.root.join(CLASSES_FILE),
@@ -1339,7 +1392,7 @@ fn reopen(ctx: &Ctx, name: &DatasetName) -> DatasetState {
         Ok(k) => k,
         Err(e) => return DatasetState::NeedsRefresh(e.refusal(name).text),
     };
-    match open_handles(&dir, &keys) {
+    match open_handles(&dir, &keys, &m) {
         Ok(open) => DatasetState::Live {
             manifest: Arc::new(m),
             open: Arc::new(open),
@@ -1348,32 +1401,77 @@ fn reopen(ctx: &Ctx, name: &DatasetName) -> DatasetState {
     }
 }
 
-/// At daemon start: every dataset with a live build is opened again, and
-/// the SQLite copy a crash left in a dataset's `import/` (real data) goes.
-pub fn reopen_all(ctx: &Ctx) {
-    let dir = ctx.blind.root.join("datasets");
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return;
+/// Debug builds only: each background reopen waits this many ms first
+/// (a slow re-hash, for the `opening` state's tests).
+pub const REOPEN_MS_SEAM: &str = "SAIIFE_TEST_BLIND_REOPEN_MS";
+
+/// At daemon start (plan 48 C2, P47-37 I3): the daemon serves first. Now,
+/// before serving: the SQLite copy a crash left in a dataset's `import/`
+/// (real data) and the held snapshot names a crash left in `held/` go, and
+/// each dataset with a live build becomes [`DatasetState::Opening`]. Then
+/// a background thread reopens them one at a time (manifest re-hash, keys,
+/// files): live, or why not. The handle is that thread (tests join it);
+/// None when no thread could start and the reopen ran here instead.
+pub fn reopen_all(ctx: &Arc<Ctx>) -> Option<std::thread::JoinHandle<()>> {
+    let mut opening = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(ctx.blind.root.join("datasets")) {
+        for e in rd.flatten() {
+            let Some(name) = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<DatasetName>().ok())
+            else {
+                continue;
+            };
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if remove_entry(&e.path().join(IMPORT_DIR)).is_err() {
+                eprintln!(
+                    "saiifed: blind: warning: a left-over import copy of {name} could not be removed"
+                );
+            }
+            if remove_entry(&e.path().join(HELD_DIR)).is_err() {
+                eprintln!(
+                    "saiifed: blind: warning: the left-over snapshot names of {name} could not be removed"
+                );
+            }
+            if std::fs::symlink_metadata(ctx.blind.dataset_dir(&name).live()).is_ok() {
+                ctx.blind.begin_open(&name);
+                opening.push(name);
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    let hold = std::env::var(REOPEN_MS_SEAM)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
+    let names = opening.clone();
+    let c = Arc::clone(ctx);
+    let work = move || {
+        for name in opening {
+            #[cfg(debug_assertions)]
+            if let Some(d) = hold {
+                std::thread::sleep(d);
+            }
+            let s = reopen(&c, &name);
+            c.blind.end_open(&name, s);
+        }
     };
-    for e in rd.flatten() {
-        let Some(name) = e
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<DatasetName>().ok())
-        else {
-            continue;
-        };
-        if !e.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        if remove_entry(&e.path().join(IMPORT_DIR)).is_err() {
-            eprintln!(
-                "saiifed: blind: warning: a left-over import copy of {name} could not be removed"
-            );
-        }
-        match reopen(ctx, &name) {
-            DatasetState::Absent => {}
-            s => ctx.blind.set_state(&name, s),
+    match std::thread::Builder::new()
+        .name("saiife-blind-reopen".into())
+        .spawn(work)
+    {
+        Ok(h) => Some(h),
+        Err(_) => {
+            // No thread: open them here, as before plan 48 (a slow start,
+            // never a dataset left `Opening`).
+            for name in names {
+                let s = reopen(ctx, &name);
+                ctx.blind.end_open(&name, s);
+            }
+            None
         }
     }
 }

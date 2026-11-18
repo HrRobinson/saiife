@@ -622,3 +622,56 @@ async fn status_tells_damaged_keys_from_a_locked_vault() {
     assert!(w.contains("the vault is unavailable"), "{w}");
     assert!(!w.contains("cannot be opened"), "{w}");
 }
+
+/// I3 (P47-37, plan 48 C2): a daemon start serves first. Each dataset with
+/// a live build shows `opening` (its fixed reason) while the background
+/// re-hash and opens run, and every op that needs it answers busy; then it
+/// is live. `SAIIFE_TEST_BLIND_REOPEN_MS` holds each reopen back.
+#[tokio::test]
+async fn status_shows_opening_then_live() {
+    use saiife_daemon::blind::data;
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    // A daemon start: a new context over the same state.
+    f.ctx.blind.set_state(&crm(), DatasetState::Absent);
+    std::env::set_var(data::REOPEN_MS_SEAM, "3000");
+    let started = std::time::Instant::now();
+    let reopening = data::reopen_all(&f.ctx).expect("a reopen thread");
+    std::env::remove_var(data::REOPEN_MS_SEAM);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the start waited"
+    );
+    let v = status_as(&f, OWN).await;
+    let d = crm_of(&v);
+    assert_eq!(d["state"], "opening", "{v}");
+    assert_eq!(d["reason"], data::OPENING);
+    assert_eq!(
+        data::OPENING,
+        "the dataset is still opening; try again in a moment"
+    );
+    // An ask and a refresh are busy meanwhile.
+    let r = data::live_snapshot(&f.ctx, &crm()).unwrap_err();
+    assert_eq!(r.code, saiife_ipc::msg::ErrorCode::Busy);
+    assert_eq!(r.text, data::OPENING);
+    let v = call(
+        &f,
+        saiife_ipc::msg::OP_BLIND_DATA_REFRESH,
+        json!({"dataset": "crm"}),
+        vec![fd_of(&f.sqlite)],
+    )
+    .await;
+    assert_eq!(err(&v), ("busy".to_string(), data::OPENING.to_string()));
+    assert_eq!(
+        err(&stage(&f).await),
+        ("busy".to_string(), data::OPENING.to_string())
+    );
+    tokio::task::spawn_blocking(move || reopening.join().unwrap())
+        .await
+        .unwrap();
+    let v = status_as(&f, OWN).await;
+    assert_eq!(crm_of(&v)["state"], "live", "{v}");
+    assert!(crm_of(&v).get("reason").is_none(), "{v}");
+    assert!(data::live_snapshot(&f.ctx, &crm()).is_ok());
+}

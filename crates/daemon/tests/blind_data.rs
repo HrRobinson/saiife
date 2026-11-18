@@ -462,13 +462,13 @@ async fn reopen_at_start() {
     let import = ds_root(&f).join("import");
     std::fs::create_dir_all(&import).unwrap();
     std::fs::copy(&f.sqlite, import.join("source.sqlite")).unwrap();
-    data::reopen_all(&f.ctx);
+    data::reopen_all(&f.ctx).unwrap().join().unwrap();
     assert!(f.ctx.blind.live(&crm()).is_ok());
     assert!(!import.exists());
     // A locked vault: not live, never unkeyed.
     f.ctx.blind.set_state(&crm(), DatasetState::Absent);
     *f.ctx.vault.lock() = vault::VaultState::Unavailable("locked".into());
-    data::reopen_all(&f.ctx);
+    data::reopen_all(&f.ctx).unwrap().join().unwrap();
     let r = f.ctx.blind.live(&crm()).unwrap_err();
     assert_eq!(r.text, "the vault is unavailable");
 }
@@ -1386,4 +1386,220 @@ async fn corrupt_methods_file_refuses_before_the_swap() {
     assert_eq!(std::fs::read(&mp).unwrap(), b"{ not json");
     let (now, _) = f.ctx.blind.live(&crm()).unwrap();
     assert_eq!(now.snapshot_sha256, old.snapshot_sha256);
+}
+
+// ------------------------------------------------- plan 48 C2 ----
+
+/// The debug `saiife` beside this test binary (`target/debug/deps/..`).
+fn saiife_bin() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let p = exe.parent().unwrap().parent().unwrap().join("saiife");
+    assert!(
+        p.is_file(),
+        "{} is missing: run `cargo build -p saiife` first",
+        p.display()
+    );
+    p
+}
+
+/// Every invoice's count and sum: a method that tells two snapshots apart.
+const TOTALS: &str = "SELECT COUNT(*) AS n, SUM(i.amount) AS s FROM invoices i";
+
+fn totals_job(m: &saiife_shield::dataset::Manifest) -> saiife_shield::calc_proto::CalcJob {
+    saiife_shield::calc_proto::CalcJob {
+        v: saiife_shield::calc_proto::CALC_JOB_VERSION,
+        snapshot: PathBuf::new(),
+        snapshot_sha256: String::new(),
+        schema: m.schema.clone(),
+        public: m.public.clone(),
+        method: TOTALS.into(),
+        checks: vec![],
+        params: vec![],
+        caps: saiife_shield::calc::Caps::default(),
+    }
+}
+
+/// I4 (P47-37): an ask keeps the snapshot it began on. A refresh that
+/// swaps the dataset between the ask's begin and its method run does not
+/// change what the method reads: it answers from the old data.
+#[tokio::test]
+async fn ask_keeps_its_snapshot_across_a_swap() {
+    use saiife_daemon::blind::calc::{self, Outcome};
+    if saiife_system::sandbox::landlock_abi() == 0 {
+        eprintln!("ask_keeps_its_snapshot_across_a_swap: skipped: no Landlock");
+        return;
+    }
+    std::env::set_var(calc::CALC_SEAM, saiife_bin());
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    // The ask begins: its snapshot is fixed now.
+    let snap = data::live_snapshot(&f.ctx, &crm()).unwrap();
+    let before = calc::run(&f.ctx, &*snap, totals_job(&snap.manifest))
+        .await
+        .unwrap();
+    let Outcome::Ran { result: old, .. } = calc::outcome(&before) else {
+        panic!("{before:?}");
+    };
+    let old = old.clone();
+    // A refresh swaps in other data meanwhile.
+    ok(&refresh(&f, &fixture_sqlite(&f.root, 300, 12)).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert_eq!(f.ctx.blind.last_build_error(&crm()), None);
+    let now = data::live_snapshot(&f.ctx, &crm()).unwrap();
+    assert_ne!(now.manifest.snapshot_sha256, snap.manifest.snapshot_sha256);
+    assert!(
+        !ds_root(&f).join("old").exists(),
+        "the old build is unlinked"
+    );
+    // The ask's method runs after the swap: the old data, not a mismatch.
+    let after = calc::run(&f.ctx, &*snap, totals_job(&snap.manifest))
+        .await
+        .unwrap();
+    let Outcome::Ran { result, .. } = calc::outcome(&after) else {
+        panic!("{after:?}");
+    };
+    assert_eq!(result.rows, old.rows);
+    // A new ask reads the new data.
+    let fresh = calc::run(&f.ctx, &*now, totals_job(&now.manifest))
+        .await
+        .unwrap();
+    let Outcome::Ran { result, .. } = calc::outcome(&fresh) else {
+        panic!("{fresh:?}");
+    };
+    assert_ne!(result.rows, old.rows);
+    // When the last ask on the old build ends, its held name goes.
+    drop(snap);
+    let held: Vec<_> = std::fs::read_dir(ds_root(&f).join("held"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(held.len(), 1, "{held:?}");
+}
+
+/// Puts a `basic` secret `pg` into the test vault.
+fn pg_secret(f: &Fx) {
+    let mut g = f.ctx.vault.lock();
+    let vault::VaultState::Ready(v) = &mut *g else {
+        panic!("vault")
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "password".to_string(),
+        Zeroizing::new(concat!("p48", "-c2-pass").to_string()),
+    );
+    v.put(vault::Entry {
+        name: "pg".into(),
+        kind: vault::Kind::Basic,
+        fields,
+        allowed_services: vec![],
+        created_by: OWN,
+        created: "2026-11-18T00:00:00Z".into(),
+        last_used: None,
+        rotate_after: None,
+    })
+    .unwrap();
+}
+
+/// A loopback fake Postgres that logs the client in, answers the first
+/// `answered` simple queries, and then never answers again (it keeps
+/// reading, so the client is not refused: it waits).
+async fn silent_pg(answered: usize) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = l.accept().await else {
+            return;
+        };
+        // Startup (or an SSL request first, refused with `N`).
+        loop {
+            let mut len = [0u8; 4];
+            if s.read_exact(&mut len).await.is_err() {
+                return;
+            }
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+            if s.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            if body[..4] == 80_877_103u32.to_be_bytes() {
+                let _ = s.write_all(b"N").await;
+                continue;
+            }
+            break;
+        }
+        // AuthenticationOk, ReadyForQuery (idle).
+        let _ = s.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await;
+        let _ = s.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await;
+        let mut left = answered;
+        loop {
+            let mut tag = [0u8; 5];
+            if s.read_exact(&mut tag).await.is_err() {
+                return;
+            }
+            let len = u32::from_be_bytes([tag[1], tag[2], tag[3], tag[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            if s.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            if tag[0] == b'Q' && left > 0 {
+                left -= 1;
+                // CommandComplete "SET", ReadyForQuery.
+                let _ = s.write_all(&[b'C', 0, 0, 0, 8, b'S', b'E', b'T', 0]).await;
+                let _ = s.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await;
+            }
+        }
+    });
+    port
+}
+
+fn pg_src(port: u16) -> saiife_policy::blind::BlindSource {
+    saiife_policy::blind::BlindSource::Postgres {
+        host: "127.0.0.1".into(),
+        port: Some(port),
+        dbname: "crm".into(),
+        user: "me".into(),
+        password_secret: "pg".into(),
+        tables: vec!["customers".into()],
+    }
+}
+
+/// Plan 48 C2: a Postgres server that stops answering (at the read-only
+/// `SET`, or at a table's prepare) is a fixed refusal after the bounded
+/// timeout ([`pg::TIMEOUT`], 30 s; `SAIIFE_TEST_BLIND_PG_MS` shortens it in
+/// debug builds), never a hang.
+#[tokio::test]
+async fn pg_silent_server_times_out() {
+    assert_eq!(pg::TIMEOUT, Duration::from_secs(30));
+    assert_eq!(
+        pg::NO_ANSWER,
+        "the database did not answer within 30 seconds"
+    );
+    let t = scratch();
+    let f = fx(t.path());
+    pg_secret(&f);
+    std::env::set_var(pg::TIMEOUT_MS_SEAM, "300");
+    // Silent at the read-only SET (a batch_execute).
+    let port = silent_pg(0).await;
+    let started = std::time::Instant::now();
+    let e = tokio::time::timeout(
+        Duration::from_secs(20),
+        pg::pg_source(&f.ctx, &pg_src(port)),
+    )
+    .await
+    .expect("pg_source hung")
+    .unwrap_err();
+    assert_eq!(e, pg::NO_ANSWER);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // Silent at the table's prepare.
+    let port = silent_pg(1).await;
+    let e = tokio::time::timeout(
+        Duration::from_secs(20),
+        pg::pg_source(&f.ctx, &pg_src(port)),
+    )
+    .await
+    .expect("pg_source hung")
+    .unwrap_err();
+    std::env::remove_var(pg::TIMEOUT_MS_SEAM);
+    assert_eq!(e, format!("table customers: {}", pg::NO_ANSWER));
 }

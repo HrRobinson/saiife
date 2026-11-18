@@ -24,9 +24,16 @@
 //! unchanged; [`outcome`] sorts them for plan 48 by class constant, never by
 //! a string literal.
 //!
-//! The snapshot a job names comes from the live manifest
-//! ([`live_snapshot`]: `Manifest::snapshot_sha256`, the indexed file's
-//! hash), never from a staging build.
+//! **The snapshot is the ask's, fixed at its begin** (plan 48 C2, P47-37
+//! I4): [`run`] takes a [`HeldSnapshot`] (from
+//! `data::live_snapshot`, whose `LiveHandles` own it) and writes its path
+//! and the live manifest's `snapshot_sha256` into the job; what the job
+//! named is replaced. The held path is a hard link to the very file the
+//! build opened, under the dataset's `held/` dir, so a refresh that swaps
+//! `live/` (and unlinks the old snapshot) during the ask leaves the job
+//! reading the old snapshot through its own name: no `snapshot_mismatch`,
+//! no `runtime_error`. The calculator itself is unchanged (it opens the
+//! path once, checks SQLite holds that inode, hashes through its fd).
 
 use crate::ops::{Ctx, Mode};
 use saiife_shield::calc::ResultSet;
@@ -34,12 +41,14 @@ use saiife_shield::calc_proto::{
     read_frame, write_frame, CalcAnswer, CalcJob, ConfinementInfo, MAX_ANSWER_BYTES, MAX_JOB_BYTES,
 };
 pub use saiife_shield::calc_proto::{CLASS_SANDBOX_UNAVAILABLE, CLASS_SNAPSHOT_MISMATCH};
-use saiife_shield::dataset::Manifest;
-use saiife_shield::schema::DatasetName;
 use saiife_system::sandbox::{sandbox_strength, Strength};
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -158,26 +167,112 @@ pub fn outcome(a: &CalcAnswer) -> Outcome<'_> {
     }
 }
 
-/// The snapshot a job on `name`'s live build names (carries 2 and 7): the
-/// absolute path of the live `snapshot.sqlite` and the live manifest's
-/// `snapshot_sha256`.
-pub fn live_snapshot(
-    blind: &super::Blind,
-    name: &DatasetName,
-    manifest: &Manifest,
-) -> Result<(PathBuf, String), String> {
-    let path = std::path::absolute(blind.dataset_dir(name).snapshot())
-        .map_err(|_| NOT_ABSOLUTE.to_string())?;
-    Ok((path, manifest.snapshot_sha256.clone()))
+/// The dir, under a dataset's root, of the held snapshot names.
+pub const HELD_DIR: &str = "held";
+
+/// A process-wide counter: each held name is new.
+static HELD_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One build's snapshot file, held open for the asks on that build (plan
+/// 48 C2, P47-37 I4). The file stays open, and a hard link to its inode
+/// under `<dataset>/held/` (absolute, `<pid>-<n>.sqlite`) is the name the
+/// calculator opens: no refresh swap renames or unlinks it. Dropping the
+/// last holder (the `LiveHandles` it lives in, once no ask holds them)
+/// removes the name; the daemon start clears names a crash left.
+pub struct HeldSnapshot {
+    file: File,
+    path: PathBuf,
+    sha256: String,
 }
 
-/// Runs `job` in a calculator child and returns its answer. `Err` only when
-/// nothing could run: no Landlock ([`NO_LANDLOCK`]), a relative snapshot
-/// path, a job over 1 MiB, or a calculator that cannot be started.
-pub async fn run(ctx: &Ctx, mut job: CalcJob) -> Result<CalcAnswer, String> {
+impl std::fmt::Debug for HeldSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldSnapshot")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HeldSnapshot {
+    /// Holds the snapshot at `src`, whose SHA-256 is `sha256` (the live
+    /// manifest's; the caller verified it just before, with no swap
+    /// possible in between): opens it (never through a link), links its
+    /// inode into `held_dir` (made 0700) and checks the link is that inode.
+    pub fn hold(src: &Path, held_dir: &Path, sha256: String) -> io::Result<HeldSnapshot> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(src)?;
+        super::private_dir(held_dir)?;
+        let dir = std::path::absolute(held_dir)?;
+        let n = HELD_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{}-{n}.sqlite", std::process::id()));
+        // A name a crash left (pid reuse): ours to replace.
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        std::fs::hard_link(src, &path)?;
+        let held = HeldSnapshot { file, path, sha256 };
+        // `src` swapped between the open and the link: refused (dropping
+        // `held` removes the name).
+        let (a, b) = (
+            held.file.metadata()?,
+            std::fs::symlink_metadata(&held.path)?,
+        );
+        if !b.is_file() || (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            return Err(io::Error::other("the snapshot changed while it was held"));
+        }
+        Ok(held)
+    }
+
+    /// The absolute held name the calculator opens.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `sha256:` + hex of the held file (the live manifest's).
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// The open file itself.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+impl AsRef<HeldSnapshot> for HeldSnapshot {
+    fn as_ref(&self) -> &HeldSnapshot {
+        self
+    }
+}
+
+impl Drop for HeldSnapshot {
+    fn drop(&mut self) {
+        // Gone already (the dataset was removed): nothing to do.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Runs `job` on the snapshot `snap` (a `data::LiveSnapshot`, or a
+/// [`HeldSnapshot`] itself) in a calculator child and returns its answer.
+/// `job.snapshot` and `job.snapshot_sha256` are set from `snap`; what the
+/// job held there is ignored. `Err` only when nothing could run: no
+/// Landlock ([`NO_LANDLOCK`]), a relative snapshot path, a job over 1 MiB,
+/// or a calculator that cannot be started.
+pub async fn run(
+    ctx: &Ctx,
+    snap: &impl AsRef<HeldSnapshot>,
+    mut job: CalcJob,
+) -> Result<CalcAnswer, String> {
     if strength() == Strength::None {
         return Err(NO_LANDLOCK.into());
     }
+    let held = snap.as_ref();
+    job.snapshot = held.path().to_path_buf();
+    job.snapshot_sha256 = held.sha256().to_string();
     if !job.snapshot.is_absolute() {
         return Err(NOT_ABSOLUTE.into());
     }

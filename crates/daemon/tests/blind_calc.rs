@@ -12,7 +12,9 @@
 mod common;
 
 use saiife_audit::{ChainWriter, WriterOptions};
-use saiife_daemon::blind::calc::{self, Outcome, CALC_SEAM, NO_LANDLOCK, NO_LANDLOCK_SEAM};
+use saiife_daemon::blind::calc::{
+    self, HeldSnapshot, Outcome, CALC_SEAM, NO_LANDLOCK, NO_LANDLOCK_SEAM,
+};
 use saiife_daemon::ops::{Ctx, CtxInit, Mode};
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_policy::{Directory, FixedDirectory, Fsync};
@@ -123,6 +125,13 @@ fn snapshot(dir: &Path, heavy: i64) -> PathBuf {
     path
 }
 
+/// `snapshot` held as an ask holds the live one (plan 48 C2), under its
+/// dir's `held/`, with its own hash.
+fn held(snapshot: &Path) -> HeldSnapshot {
+    let dir = snapshot.parent().unwrap().join("held");
+    HeldSnapshot::hold(snapshot, &dir, hash_file(snapshot).unwrap()).unwrap()
+}
+
 /// A job as plan 48 will build it, the entity's display name still in it:
 /// `run` strips it.
 fn job(snapshot: &Path, method: &str) -> CalcJob {
@@ -164,7 +173,7 @@ async fn runs_job_in_child() {
     let ctx = ctx(d.path());
     seams(&saiife_bin(), false);
     let snap = snapshot(d.path(), 0);
-    let r = calc::run(&ctx, job(&snap, BALANCE)).await;
+    let r = calc::run(&ctx, &held(&snap), job(&snap, BALANCE)).await;
     if !landlock() {
         eprintln!("runs_job_in_child: skipped: this kernel has no Landlock");
         assert_eq!(r.unwrap_err(), NO_LANDLOCK);
@@ -202,7 +211,7 @@ async fn child_timeout_kills() {
     let mut j = job(&snap, HEAVY);
     j.params.clear();
     j.caps.wall_ms = 50;
-    let a = calc::run(&ctx, j).await.unwrap();
+    let a = calc::run(&ctx, &held(&snap), j).await.unwrap();
     assert_eq!(class(&a), "time_cap");
     assert!(matches!(calc::outcome(&a), Outcome::TimeCap));
 
@@ -217,7 +226,7 @@ async fn child_timeout_kills() {
     let mut j = job(&snap, BALANCE);
     j.caps.wall_ms = 50;
     let t = Instant::now();
-    let a = calc::run(&ctx, j).await.unwrap();
+    let a = calc::run(&ctx, &held(&snap), j).await.unwrap();
     let took = t.elapsed();
     assert_eq!(class(&a), "time_cap");
     assert!(
@@ -245,7 +254,9 @@ async fn signal_exit_is_time_cap() {
     let spin = script(d.path(), "spin.sh", "ulimit -t 1\nwhile :; do :; done");
     seams(&spin, false);
     let snap = snapshot(d.path(), 0);
-    let a = calc::run(&ctx, job(&snap, BALANCE)).await.unwrap();
+    let a = calc::run(&ctx, &held(&snap), job(&snap, BALANCE))
+        .await
+        .unwrap();
     assert_eq!(class(&a), "time_cap");
 }
 
@@ -262,7 +273,7 @@ async fn no_landlock_refuses() {
     );
     seams(&fake, true);
     let snap = snapshot(d.path(), 0);
-    let r = calc::run(&ctx, job(&snap, BALANCE)).await;
+    let r = calc::run(&ctx, &held(&snap), job(&snap, BALANCE)).await;
     std::env::remove_var(NO_LANDLOCK_SEAM);
     assert_eq!(r.unwrap_err(), NO_LANDLOCK);
     assert!(!marker.exists(), "a calculator started without Landlock");
@@ -287,7 +298,9 @@ async fn job_has_no_names() {
     );
     seams(&fake, false);
     let snap = snapshot(d.path(), 0);
-    let a = calc::run(&ctx, job(&snap, BALANCE)).await.unwrap();
+    let a = calc::run(&ctx, &held(&snap), job(&snap, BALANCE))
+        .await
+        .unwrap();
     assert_eq!(class(&a), "runtime_error");
     let bytes = std::fs::read(&dump).unwrap();
     let mut r: &[u8] = &bytes;
@@ -301,29 +314,80 @@ async fn job_has_no_names() {
     assert!(sent.snapshot.is_absolute());
 }
 
+/// Plan 48 C2: the job runs on the held snapshot, whatever path and hash
+/// the job named (a relative or stale one is replaced).
 #[tokio::test]
-async fn relative_snapshot_refused() {
+async fn job_names_the_held_snapshot() {
     let _g = SEAMS.lock().await;
     let d = scratch();
     let ctx = ctx(d.path());
-    let marker = d.path().join("started");
+    if !landlock() {
+        eprintln!("job_names_the_held_snapshot: skipped: this kernel has no Landlock");
+        return;
+    }
+    let dump = d.path().join("job.bin");
     let fake = script(
         d.path(),
-        "marker.sh",
-        &format!("echo x > {}", marker.display()),
+        "dump.sh",
+        &format!("exec /bin/cat > {}", dump.display()),
     );
     seams(&fake, false);
     let snap = snapshot(d.path(), 0);
+    let h = held(&snap);
     let mut j = job(&snap, BALANCE);
     j.snapshot = PathBuf::from("live/snapshot.sqlite");
-    let r = calc::run(&ctx, j).await;
-    if landlock() {
-        assert_eq!(
-            r.unwrap_err(),
-            "the calculator needs an absolute snapshot path"
-        );
+    j.snapshot_sha256 = format!("sha256:{}", "1".repeat(64));
+    calc::run(&ctx, &h, j).await.unwrap();
+    let bytes = std::fs::read(&dump).unwrap();
+    let sent: CalcJob = read_frame(&mut &bytes[..], MAX_JOB_BYTES).unwrap();
+    assert_eq!(sent.snapshot, h.path());
+    assert!(sent.snapshot.is_absolute());
+    assert!(sent.snapshot.starts_with(d.path().join("held")));
+    assert_eq!(sent.snapshot_sha256, hash_file(&snap).unwrap());
+    // The held name goes with the last holder.
+    let p = h.path().to_path_buf();
+    drop(h);
+    assert!(!p.exists());
+}
+
+/// Plan 48 C2 (P47-37 I4): the snapshot's path is replaced (a refresh
+/// swap renames a new file over it) after the ask held it: the job runs
+/// on the old file, not `snapshot_mismatch`.
+#[tokio::test]
+async fn held_snapshot_survives_a_swap() {
+    let _g = SEAMS.lock().await;
+    let d = scratch();
+    let ctx = ctx(d.path());
+    if !landlock() {
+        eprintln!("held_snapshot_survives_a_swap: skipped: this kernel has no Landlock");
+        return;
     }
-    assert!(!marker.exists());
+    seams(&saiife_bin(), false);
+    let snap = snapshot(d.path(), 0);
+    let h = held(&snap);
+    // The new build: the amounts doubled, renamed over the old name.
+    let other = d.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let new = snapshot(&other, 0);
+    {
+        let c = rusqlite::Connection::open(&new).unwrap();
+        c.execute("UPDATE invoices SET amount = amount * 2", [])
+            .unwrap();
+    }
+    std::fs::rename(&new, &snap).unwrap();
+    let a = calc::run(&ctx, &h, job(&snap, BALANCE)).await.unwrap();
+    let CalcAnswer::Ok { result, .. } = &a else {
+        panic!("refused: {a:?}");
+    };
+    assert_eq!(result.rows[0][0], CellValue::Real(600.0));
+    // A new hold reads the new file.
+    let a = calc::run(&ctx, &held(&snap), job(&snap, BALANCE))
+        .await
+        .unwrap();
+    let CalcAnswer::Ok { result, .. } = &a else {
+        panic!("refused: {a:?}");
+    };
+    assert_eq!(result.rows[0][0], CellValue::Real(1200.0));
 }
 
 #[tokio::test]
@@ -337,12 +401,18 @@ async fn snapshot_mismatch_passes_through() {
     }
     seams(&saiife_bin(), false);
     let snap = snapshot(d.path(), 0);
-    let mut j = job(&snap, BALANCE);
-    j.snapshot_sha256 = format!("sha256:{}", "0".repeat(64));
-    let a = calc::run(&ctx, j).await.unwrap();
+    let bogus = HeldSnapshot::hold(
+        &snap,
+        &d.path().join("held"),
+        format!("sha256:{}", "0".repeat(64)),
+    )
+    .unwrap();
+    let a = calc::run(&ctx, &bogus, job(&snap, BALANCE)).await.unwrap();
     assert!(matches!(calc::outcome(&a), Outcome::SnapshotMismatch));
     // The method ran and found nothing: `empty_result`, unchanged.
-    let a = calc::run(&ctx, job(&snap, NOTHING)).await.unwrap();
+    let a = calc::run(&ctx, &held(&snap), job(&snap, NOTHING))
+        .await
+        .unwrap();
     assert!(
         matches!(calc::outcome(&a), Outcome::EmptyResult { .. }),
         "{a:?}"
@@ -388,6 +458,8 @@ async fn missing_calculator_is_an_error() {
     }
     seams(&d.path().join("no-such-calculator"), false);
     let snap = snapshot(d.path(), 0);
-    let e = calc::run(&ctx, job(&snap, BALANCE)).await.unwrap_err();
+    let e = calc::run(&ctx, &held(&snap), job(&snap, BALANCE))
+        .await
+        .unwrap_err();
     assert!(e.starts_with("cannot start the calculator"), "{e}");
 }

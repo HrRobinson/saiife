@@ -78,6 +78,10 @@ type TestHold = (
 pub enum DatasetState {
     /// No live build known.
     Absent,
+    /// At daemon start (plan 48 C2): a live build is on disk and is being
+    /// opened in the background (manifest re-hash, keys, files). Ops that
+    /// need it answer busy with [`OPENING`] meanwhile.
+    Opening,
     /// A build is running (one at a time per dataset, ruling P47-5).
     Building {
         phase: Phase,
@@ -98,6 +102,7 @@ impl DatasetState {
     fn snapshot(&self) -> DatasetState {
         match self {
             DatasetState::Absent => DatasetState::Absent,
+            DatasetState::Opening => DatasetState::Opening,
             DatasetState::Building {
                 phase,
                 done,
@@ -122,6 +127,7 @@ impl std::fmt::Debug for DatasetState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DatasetState::Absent => f.write_str("Absent"),
+            DatasetState::Opening => f.write_str("Opening"),
             DatasetState::Building {
                 phase, done, total, ..
             } => f
@@ -140,17 +146,21 @@ impl std::fmt::Debug for DatasetState {
 }
 
 /// A live build's open files. The lexicon's SQLite connections are not
-/// `Sync`, so it is behind a lock.
+/// `Sync`, so it is behind a lock. `snapshot` is the snapshot file held
+/// for the calculator (plan 48 C2): an ask holding these handles runs its
+/// method on this build's snapshot even after a refresh swapped it out.
 pub struct LiveHandles {
     pub lexicon: Mutex<Lexicon>,
     pub index: Option<KnownIndex>,
     pub allow: AllowList,
+    pub snapshot: calc::HeldSnapshot,
 }
 
 impl std::fmt::Debug for LiveHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveHandles")
             .field("index", &self.index)
+            .field("snapshot", &self.snapshot)
             .finish_non_exhaustive()
     }
 }
@@ -180,6 +190,10 @@ impl Refusal {
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
+
+/// What a dataset that is still opening at daemon start answers (busy) and
+/// what `status` shows as its reason (plan 48 C2).
+pub const OPENING: &str = "the dataset is still opening; try again in a moment";
 
 /// The fixed refreshing answer (en).
 fn refreshing(name: &DatasetName, phase: Phase, done: u64, total: Option<u64>) -> String {
@@ -268,6 +282,7 @@ impl Blind {
                 ErrorCode::Busy,
                 refreshing(name, *phase, *done, *total),
             )),
+            DatasetState::Opening => Err(Refusal::new(ErrorCode::Busy, OPENING)),
             DatasetState::NeedsRefresh(why) => {
                 Err(Refusal::new(ErrorCode::Unavailable, why.clone()))
             }
@@ -288,14 +303,18 @@ impl Blind {
     /// the refreshing answer.
     pub(crate) fn begin_build(&self, name: &DatasetName) -> Result<DatasetState, Refusal> {
         let mut m = lock(&self.datasets);
-        if let Some(DatasetState::Building {
-            phase, done, total, ..
-        }) = m.get(name.as_str())
-        {
-            return Err(Refusal::new(
-                ErrorCode::Busy,
-                refreshing(name, *phase, *done, *total),
-            ));
+        match m.get(name.as_str()) {
+            Some(DatasetState::Building {
+                phase, done, total, ..
+            }) => {
+                return Err(Refusal::new(
+                    ErrorCode::Busy,
+                    refreshing(name, *phase, *done, *total),
+                ))
+            }
+            // Plan 48 C2: the start's reopen holds it.
+            Some(DatasetState::Opening) => return Err(Refusal::new(ErrorCode::Busy, OPENING)),
+            _ => {}
         }
         // A mark left by an earlier build is not this build's.
         lock(&self.shredded).remove(name.as_str());
@@ -307,6 +326,30 @@ impl Blind {
         };
         Ok(m.insert(name.as_str().to_string(), building)
             .unwrap_or(DatasetState::Absent))
+    }
+
+    /// Marks `name` [`DatasetState::Opening`] (daemon start, before
+    /// serving).
+    pub(crate) fn begin_open(&self, name: &DatasetName) {
+        lock(&self.datasets).insert(name.as_str().to_string(), DatasetState::Opening);
+    }
+
+    /// Ends the start's reopen of `name` with `s`, only while the dataset
+    /// is still [`DatasetState::Opening`]: a shred meanwhile
+    /// ([`Blind::mark_shredded`]) has set its own state, which stays.
+    pub(crate) fn end_open(&self, name: &DatasetName, s: DatasetState) {
+        let mut m = lock(&self.datasets);
+        if !matches!(m.get(name.as_str()), Some(DatasetState::Opening)) {
+            return;
+        }
+        match s {
+            DatasetState::Absent | DatasetState::Opening => {
+                m.remove(name.as_str());
+            }
+            s => {
+                m.insert(name.as_str().to_string(), s);
+            }
+        }
     }
 
     /// Ends the build [`Blind::begin_build`] started, with state `s`. If the
@@ -607,6 +650,19 @@ mod tests {
         let v = r.to_value(4);
         assert_eq!(v["error"], "busy");
         assert_eq!(v["id"], 4);
+        // Plan 48 C2: opening at start is busy for asks and builds; its
+        // end applies only while it is still opening.
+        b.begin_open(&ds);
+        let r = b.live(&ds).unwrap_err();
+        assert_eq!((r.code, r.text.as_str()), (ErrorCode::Busy, OPENING));
+        let r = b.begin_build(&ds).unwrap_err();
+        assert_eq!((r.code, r.text.as_str()), (ErrorCode::Busy, OPENING));
+        b.mark_shredded(&ds, "shredded".into());
+        b.end_open(&ds, DatasetState::NeedsRefresh("opened".into()));
+        assert_eq!(b.live(&ds).unwrap_err().text, "shredded");
+        b.begin_open(&ds);
+        b.end_open(&ds, DatasetState::Absent);
+        assert!(matches!(b.state(&ds), DatasetState::Absent));
         b.set_state(&ds, DatasetState::NeedsRefresh("why".into()));
         assert_eq!(b.live(&ds).unwrap_err().text, "why");
         b.set_state(&ds, DatasetState::Absent);

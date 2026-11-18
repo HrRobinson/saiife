@@ -28,6 +28,53 @@ const FILE: &str = "postgres";
 const ENDED: &str = "the database connection ended early";
 const READ: &str = "could not read the table";
 
+/// How long one session step may wait for the server (the read-only
+/// `SET`, each table's prepare, a read's `BEGIN` and `ROLLBACK`); the
+/// connect has its own 10 s. A row stream is not bounded by it.
+pub const TIMEOUT: Duration = Duration::from_secs(30);
+/// What a step that waited [`TIMEOUT`] answers (a table's prepare: with
+/// `table <name>: ` before it).
+pub const NO_ANSWER: &str = "the database did not answer within 30 seconds";
+/// Debug builds only: [`TIMEOUT`] in milliseconds.
+pub const TIMEOUT_MS_SEAM: &str = "SAIIFE_TEST_BLIND_PG_MS";
+
+/// [`TIMEOUT`]; debug builds honour [`TIMEOUT_MS_SEAM`].
+fn step_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(TIMEOUT_MS_SEAM)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    TIMEOUT
+}
+
+/// Why a bounded step failed: the server's error, or no answer in time.
+enum StepErr {
+    Pg(tokio_postgres::Error),
+    TimedOut,
+}
+
+/// `step` bounded by [`step_timeout`].
+async fn bounded<T>(
+    step: impl std::future::Future<Output = Result<T, tokio_postgres::Error>>,
+) -> Result<T, StepErr> {
+    match tokio::time::timeout(step_timeout(), step).await {
+        Ok(r) => r.map_err(StepErr::Pg),
+        Err(_) => Err(StepErr::TimedOut),
+    }
+}
+
+/// A bounded step's error as a fixed text: [`NO_ANSWER`] (after `prefix`)
+/// for a timeout, else [`pg_err`] of `what`.
+fn step_err(prefix: &str, what: &str, e: &StepErr) -> String {
+    match e {
+        StepErr::TimedOut => format!("{prefix}{NO_ANSWER}"),
+        StepErr::Pg(e) => pg_err(what, e),
+    }
+}
+
 /// One message from a table's reader.
 pub enum PgMsg {
     Row(Vec<Cell>),
@@ -284,18 +331,22 @@ pub async fn pg_source(ctx: &Ctx, src: &BlindSource) -> Result<PgSource, String>
         // Its error is the session's end; each read reports its own.
         let _ = conn.await;
     });
-    client
-        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+    bounded(client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"))
         .await
-        .map_err(|e| pg_err("could not make the session read only", &e))?;
+        .map_err(|e| step_err("", "could not make the session read only", &e))?;
     let mut plans = Vec::new();
     let mut listed = Vec::new();
     for t in tables {
         let q = quote_table(t).ok_or_else(|| format!("table {t}: not a table name"))?;
-        let stmt = client
-            .prepare(&format!("SELECT * FROM {q} LIMIT 0"))
+        let stmt = bounded(client.prepare(&format!("SELECT * FROM {q} LIMIT 0")))
             .await
-            .map_err(|e| pg_err(&format!("table {t}: could not read its columns"), &e))?;
+            .map_err(|e| {
+                step_err(
+                    &format!("table {t}: "),
+                    &format!("table {t}: could not read its columns"),
+                    &e,
+                )
+            })?;
         let mut items = Vec::new();
         let mut kinds = Vec::new();
         let mut names = Vec::new();
@@ -349,9 +400,16 @@ pub async fn pg_source(ctx: &Ctx, src: &BlindSource) -> Result<PgSource, String>
 /// and not the runtime.
 async fn produce(client: &tokio_postgres::Client, plan: &Plan, tx: &SyncSender<PgMsg>) {
     let fail = |why: &'static str| PgMsg::Fail(src_err(&plan.table, why));
-    if client.batch_execute("BEGIN READ ONLY").await.is_err() {
-        let _ = tx.send(fail("could not start a read-only transaction"));
-        return;
+    match bounded(client.batch_execute("BEGIN READ ONLY")).await {
+        Ok(()) => {}
+        Err(StepErr::TimedOut) => {
+            let _ = tx.send(fail(NO_ANSWER));
+            return;
+        }
+        Err(StepErr::Pg(_)) => {
+            let _ = tx.send(fail("could not start a read-only transaction"));
+            return;
+        }
     }
     let read = async {
         let stream = client
@@ -373,7 +431,7 @@ async fn produce(client: &tokio_postgres::Client, plan: &Plan, tx: &SyncSender<P
         Ok::<bool, &'static str>(true)
     }
     .await;
-    let _ = client.batch_execute("ROLLBACK").await;
+    let _ = bounded(client.batch_execute("ROLLBACK")).await;
     let _ = match read {
         Ok(true) => tx.send(PgMsg::End),
         Ok(false) => Ok(()),
