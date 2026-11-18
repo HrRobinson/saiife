@@ -85,6 +85,7 @@ impl Outbox {
         let path = self.dir.join(format!("{y:04}-{m:02}.jsonl"));
         let existed = std::fs::symlink_metadata(&path).is_ok();
         let mut f = OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
@@ -96,6 +97,15 @@ impl Outbox {
         }
         if md.mode() & 0o777 != 0o600 {
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        // A crash or a full disk can leave a part of a line. Start this
+        // entry on its own line, so it still parses.
+        if md.len() > 0 {
+            let mut last = [0u8; 1];
+            std::os::unix::fs::FileExt::read_exact_at(&f, &mut last, md.len() - 1)?;
+            if last[0] != b'\n' {
+                line.insert(0, b'\n');
+            }
         }
         f.write_all(&line)?;
         f.sync_all()?;
@@ -158,12 +168,11 @@ impl Outbox {
     pub fn find(&self, sha256: &str) -> io::Result<Option<OutboxEntry>> {
         for (_, _, path) in self.months()? {
             let f = open_regular(&path)?;
-            for line in io::BufReader::new(f).lines() {
+            // Bytes, not text: a cut multibyte char in a partial line is
+            // skipped like any other line that does not parse.
+            for line in io::BufReader::new(f).split(b'\n') {
                 let line = line?;
-                if !line.contains(sha256) {
-                    continue;
-                }
-                if let Ok(e) = serde_json::from_str::<OutboxEntry>(&line) {
+                if let Ok(e) = serde_json::from_slice::<OutboxEntry>(&line) {
                     if e.sha256 == sha256 {
                         return Ok(Some(e));
                     }

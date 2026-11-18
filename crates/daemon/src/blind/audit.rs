@@ -352,11 +352,58 @@ fn strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Why a field is dropped: a hit, or a lookup that failed (closed).
-fn scrub_reason(index: Option<&KnownIndex>, v: &Value) -> Option<&'static str> {
-    let index = index?;
+/// The fields of `r` that can hold free text (a question, a reason, a touch
+/// or table name, a server's stop reason). With no index to scan against
+/// these are dropped; every other string is a fixed label, an id or a hash.
+/// Exhaustive on purpose: a new variant must say which of its fields are
+/// free text.
+fn free_text(r: &BlindRecord) -> &'static [&'static str] {
+    match r {
+        BlindRecord::Ask { .. } => &["question"],
+        BlindRecord::Resolve { .. } => &[],
+        BlindRecord::Preview { .. } => &[],
+        BlindRecord::Send { .. } => &[],
+        BlindRecord::Receive { .. } => &["stop_reason"],
+        BlindRecord::Run { .. } => &[],
+        BlindRecord::CheckRefused { .. } => &["reason"],
+        BlindRecord::Approve { .. } => &["touch"],
+        BlindRecord::Keys { .. } => &["touch"],
+        BlindRecord::Refresh { .. } => &["rows", "suspended"],
+        BlindRecord::Loosen { .. } => &["column", "touch"],
+        BlindRecord::Name { .. } => &["touch"],
+    }
+}
+
+/// The strings of a field to scan. A `rows` field is (table, count) pairs:
+/// the count is a number written as text and is exempt by name; the table
+/// is scanned.
+fn scan_strings<'a>(name: &str, v: &'a Value, out: &mut Vec<&'a str>) {
+    if name == "rows" {
+        if let Value::Array(pairs) = v {
+            for p in pairs {
+                if let Some(t) = p.get(0) {
+                    strings(t, out);
+                }
+            }
+            return;
+        }
+    }
+    strings(v, out);
+}
+
+/// Why a field is dropped: a hit, a lookup that failed (closed), or no
+/// index to scan with for a field that can hold free text.
+fn scrub_reason(
+    index: Option<&KnownIndex>,
+    free: bool,
+    name: &str,
+    v: &Value,
+) -> Option<&'static str> {
     let mut all = Vec::new();
-    strings(v, &mut all);
+    scan_strings(name, v, &mut all);
+    let Some(index) = index else {
+        return (free && !all.is_empty()).then_some("no_index");
+    };
     let mut failed = false;
     for s in all {
         match text_has_known(index, s) {
@@ -368,53 +415,50 @@ fn scrub_reason(index: Option<&KnownIndex>, v: &Value) -> Option<&'static str> {
     failed.then_some("scan_failed")
 }
 
-/// Writes `r` as `uid`'s record: the scrub, then the audit writer. Fields
-/// that hit the dataset's index are left out and a `blind_log_scrubbed`
-/// record says which. Err when the writer refuses any record (the caller
-/// decides; a send must not go).
+/// Writes `r` as `uid`'s record about `dataset`: the scrub, then the audit
+/// writer. Fields that hit the dataset's index are left out and a
+/// `blind_log_scrubbed` record says which. With no index the fields that can
+/// hold free text are dropped the same way (fail closed). Err when the
+/// writer refuses any record (the caller decides; a send must not go).
 ///
-/// `input` is the kind and the dataset (`blind_keys crm`); a record that has
-/// no dataset field (an ask's steps) names its ask id instead. It is never a
-/// question.
+/// `input` is `<kind> <dataset>` for every record, the marker too, never a
+/// question; a record without its own dataset field gets `extra.dataset`.
 pub async fn write(
     ctx: &Ctx,
     uid: u32,
+    dataset: &str,
     r: BlindRecord,
     index: Option<&KnownIndex>,
 ) -> Result<(), String> {
+    let free = free_text(&r);
     let (kind, fields) = fields(r);
     let mut kept: Vec<(&str, Value)> = Vec::new();
     let mut dropped: Vec<(&str, &str)> = Vec::new();
     for (name, v) in fields {
-        match scrub_reason(index, &v) {
+        match scrub_reason(index, free.contains(&name), name, &v) {
             None => kept.push((name, v)),
             Some(why) => dropped.push((name, why)),
         }
     }
     let user = ctx.name_of(uid).await;
-    let base = |kind: &str, input: &str| {
-        let mut rec = ctx.record(kind, input);
+    let base = |kind: &str| {
+        let mut rec = ctx.record(kind, &format!("{kind} {dataset}"));
         rec.uid = Some(uid);
         rec.user = user.clone();
         rec
     };
-    let id_of = |f: &str| {
-        kept.iter()
-            .find(|(n, _)| *n == f)
-            .and_then(|(_, v)| v.as_str())
-    };
-    let input = match id_of("dataset").or_else(|| id_of("ask")) {
-        Some(id) => format!("{kind} {id}"),
-        None => kind.to_string(),
-    };
     for (field, why) in &dropped {
-        let mut rec = base("blind_log_scrubbed", &format!("blind_log_scrubbed {kind}"));
+        let mut rec = base("blind_log_scrubbed");
         rec.extra.insert("scrubbed_kind".into(), kind.into());
         rec.extra.insert("field".into(), (*field).into());
         rec.extra.insert("cause".into(), (*why).into());
+        rec.extra.insert("dataset".into(), dataset.into());
         ctx.writer.append(rec).await?;
     }
-    let mut rec = base(kind, &input);
+    let mut rec = base(kind);
+    if !kept.iter().any(|(n, _)| *n == "dataset") {
+        rec.extra.insert("dataset".into(), dataset.into());
+    }
     for (name, v) in kept {
         // `session` and `reason` are fields of the record itself; a second
         // key of the same name in `extra` would write a line that cannot be

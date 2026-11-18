@@ -1484,24 +1484,20 @@ impl Firewall<'_> {
 
 /// Does free text `s` hold a value or phrase of `index`? The scan 2 of the
 /// firewall without allow-list marks or exemptions: every token window of up
-/// to `WINDOW` tokens (all-digit windows are skipped, as for a reply), every
-/// sentence and the whole text. For the daemon's log scrub (plan 47 R47-10).
-/// A lookup error is an error: the caller must not treat the text as clean.
+/// to `WINDOW` tokens (all-digit windows included: account, phone, CPR and
+/// zip values are in the index), every sentence and the whole text. For the
+/// daemon's log scrub (plan 47 R47-10). A lookup error is an error: the
+/// caller must not treat the text as clean. Amounts (Sensitive columns) are
+/// not in the index, so the no-amounts guarantee of a log rests on the
+/// question being parameterized, not on this scan.
 pub fn text_has_known(index: &KnownIndex, s: &str) -> Result<bool, ShieldError> {
     let toks = token_spans(s);
     let n = toks.len();
-    let numeric: Vec<bool> = toks
-        .iter()
-        .map(|(x, _, _)| x.chars().all(|c| c.is_numeric()))
-        .collect();
     for i in 0..n {
         for w in 1..=WINDOW {
             let j = i + w - 1;
             if j >= n {
                 break;
-            }
-            if (i..=j).all(|k| numeric[k]) {
-                continue;
             }
             let slice = s
                 .get(toks[i].1..toks[j].2)

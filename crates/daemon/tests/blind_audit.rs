@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 use zeroize::Zeroizing;
 
 const NAME: &str = "Quillfeather Brandvold";
+const PHONE: &str = "55512340";
 const EMAIL: &str = "quillfeather.brandvold.1@example.invalid";
 
 fn scratch() -> tempfile::TempDir {
@@ -96,12 +97,14 @@ fn index(root: &Path) -> KnownIndex {
         Cell::Text("Quillfeather".into()),
         Cell::Text("Brandvold".into()),
         Cell::Text(EMAIL.into()),
+        Cell::Text(PHONE.into()),
     ]];
     for i in 0..40 {
         rows.push(vec![
             Cell::Text("Mette".into()),
             Cell::Text("Hansen".into()),
             Cell::Text(format!("mette.hansen.{i}@example.invalid")),
+            Cell::Text(format!("5550{i:04}")),
         ]);
     }
     let n = rows.len() as u64;
@@ -109,7 +112,12 @@ fn index(root: &Path) -> KnownIndex {
         tables: vec![(
             SourceTable {
                 name: "customers".into(),
-                columns: vec!["first_name".into(), "last_name".into(), "email".into()],
+                columns: vec![
+                    "first_name".into(),
+                    "last_name".into(),
+                    "email".into(),
+                    "phone".into(),
+                ],
             },
             rows,
         )],
@@ -126,6 +134,7 @@ fn index(root: &Path) -> KnownIndex {
                 col("first_name", ColumnClass::Identifier),
                 col("last_name", ColumnClass::Identifier),
                 col("email", ColumnClass::Identifier),
+                col("phone", ColumnClass::Identifier),
             ],
         }],
         entities: vec![EntitySpec {
@@ -263,7 +272,9 @@ async fn records_have_no_values() {
     let t = scratch();
     let f = fx(t.path());
     for r in every_variant() {
-        audit::write(&f.ctx, 1000, r, Some(&f.index)).await.unwrap();
+        audit::write(&f.ctx, 1000, "crm", r, Some(&f.index))
+            .await
+            .unwrap();
     }
     let recs = all_records(&f.audit, Scope::All);
     let kinds: Vec<&str> = recs.iter().filter_map(|r| r["kind"].as_str()).collect();
@@ -285,7 +296,11 @@ async fn records_have_no_values() {
     }
     assert!(!kinds.contains(&"blind_log_scrubbed"));
     let send = recs.iter().find(|r| r["kind"] == "blind_send").unwrap();
-    assert_eq!(send["input"], "blind_send a1");
+    assert_eq!(send["input"], "blind_send crm");
+    for r in &recs {
+        assert_eq!(r["dataset"], "crm", "{r}");
+        assert!(r["input"].as_str().unwrap().ends_with(" crm"), "{r}");
+    }
     assert_eq!(send["model"], "claude-opus-5-5");
     assert_eq!(send["k"], 10);
     let name = recs.iter().find(|r| r["kind"] == "blind_name").unwrap();
@@ -313,7 +328,9 @@ async fn scrub_drops_and_marks() {
         session: "s1".into(),
         approved_method: None,
     };
-    audit::write(&f.ctx, 1000, r, Some(&f.index)).await.unwrap();
+    audit::write(&f.ctx, 1000, "crm", r, Some(&f.index))
+        .await
+        .unwrap();
     let recs = all_records(&f.audit, Scope::All);
     let ask = recs.iter().find(|r| r["kind"] == "blind_ask").unwrap();
     assert!(ask.get("question").is_none(), "{ask}");
@@ -324,6 +341,7 @@ async fn scrub_drops_and_marks() {
         .unwrap();
     assert_eq!(mark["scrubbed_kind"], "blind_ask");
     assert_eq!(mark["field"], "question");
+    assert_eq!(mark["input"], "blind_log_scrubbed crm");
     assert!(!raw_log(&f.audit).contains("Quillfeather"));
 }
 
@@ -340,7 +358,9 @@ async fn scrub_catches_a_value_in_a_list() {
         suspended: vec!["notes".into(), EMAIL.into()],
         first: false,
     };
-    audit::write(&f.ctx, 1000, r, Some(&f.index)).await.unwrap();
+    audit::write(&f.ctx, 1000, "crm", r, Some(&f.index))
+        .await
+        .unwrap();
     let recs = all_records(&f.audit, Scope::All);
     let rf = recs.iter().find(|r| r["kind"] == "blind_refresh").unwrap();
     assert!(rf.get("suspended").is_none());
@@ -359,7 +379,7 @@ async fn write_fails_when_the_writer_refuses() {
         version: 1,
         touch: None,
     };
-    audit::write(&f.ctx, 1, rec, None).await.unwrap();
+    audit::write(&f.ctx, 1, "crm", rec, None).await.unwrap();
     f.ctx.writer.stop(None).await.unwrap();
     let rec = BlindRecord::Keys {
         dataset: "crm".into(),
@@ -367,7 +387,7 @@ async fn write_fails_when_the_writer_refuses() {
         version: 2,
         touch: None,
     };
-    let e = audit::write(&f.ctx, 1, rec, None).await;
+    let e = audit::write(&f.ctx, 1, "crm", rec, None).await;
     assert!(e.is_err(), "a refused write must be an error");
 }
 
@@ -472,7 +492,9 @@ async fn user_sees_own_blind_records() {
             ask: ask.into(),
             reason: "class".into(),
         };
-        audit::write(&f.ctx, uid, r, Some(&f.index)).await.unwrap();
+        audit::write(&f.ctx, uid, "crm", r, Some(&f.index))
+            .await
+            .unwrap();
     }
     let mine = all_records(&f.audit, Scope::Uid(1000));
     let asks: Vec<&str> = mine.iter().filter_map(|r| r["ask"].as_str()).collect();
@@ -482,4 +504,101 @@ async fn user_sees_own_blind_records() {
     let theirs = all_records(&f.audit, Scope::Uid(2000));
     assert_eq!(theirs.len(), 1);
     assert_eq!(theirs[0]["ask"], "theirs");
+}
+
+#[tokio::test]
+async fn scrub_catches_a_numeric_value_and_spares_counts() {
+    let t = scratch();
+    let f = fx(t.path());
+    let r = BlindRecord::CheckRefused {
+        ask: "a3".into(),
+        reason: format!("call {PHONE} back"),
+    };
+    audit::write(&f.ctx, 1000, "crm", r, Some(&f.index))
+        .await
+        .unwrap();
+    let r = BlindRecord::Refresh {
+        dataset: "crm".into(),
+        snapshot_sha256: sha('3'),
+        rows: vec![("customers".into(), "41".into())],
+        index_entries: 1,
+        ms: 1,
+        suspended: vec![],
+        first: false,
+    };
+    audit::write(&f.ctx, 1000, "crm", r, Some(&f.index))
+        .await
+        .unwrap();
+    let recs = all_records(&f.audit, Scope::All);
+    let mark = recs
+        .iter()
+        .find(|r| r["kind"] == "blind_log_scrubbed")
+        .unwrap();
+    assert_eq!(mark["field"], "reason");
+    assert!(!raw_log(&f.audit).contains(PHONE));
+    let rf = recs.iter().find(|r| r["kind"] == "blind_refresh").unwrap();
+    assert_eq!(rf["rows"][0][1], "41");
+    assert_eq!(
+        recs.iter()
+            .filter(|r| r["kind"] == "blind_log_scrubbed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn no_index_drops_free_text() {
+    let t = scratch();
+    let f = fx(t.path());
+    let r = BlindRecord::Ask {
+        ask: "a4".into(),
+        dataset: "crm".into(),
+        lang: Lang::En,
+        question: format!("what did {NAME} pay"),
+        session: "s1".into(),
+        approved_method: None,
+    };
+    audit::write(&f.ctx, 1000, "crm", r, None).await.unwrap();
+    let r = BlindRecord::Name {
+        ask: "a4".into(),
+        touch: format!("{NAME} touch"),
+        name_sha256: sha('9'),
+    };
+    audit::write(&f.ctx, 1000, "crm", r, None).await.unwrap();
+    let recs = all_records(&f.audit, Scope::All);
+    let ask = recs.iter().find(|r| r["kind"] == "blind_ask").unwrap();
+    assert!(ask.get("question").is_none());
+    assert_eq!(ask["ask"], "a4");
+    let marks: Vec<_> = recs
+        .iter()
+        .filter(|r| r["kind"] == "blind_log_scrubbed")
+        .collect();
+    assert_eq!(marks.len(), 2);
+    assert!(marks.iter().all(|m| m["cause"] == "no_index"));
+    assert!(!raw_log(&f.audit).contains("Quillfeather"));
+    let name = recs.iter().find(|r| r["kind"] == "blind_name").unwrap();
+    assert_eq!(name["name_sha256"], sha('9'));
+}
+
+#[test]
+fn outbox_survives_a_partial_line() {
+    let t = scratch();
+    let dir = t.path().join("outbox");
+    let ob = Outbox::new(dir.clone());
+    ob.append(&entry("2026-10-17T10:00:00.000Z", &sha('a'), "{\"o\":1}"))
+        .unwrap();
+    // A crash cut an entry inside a multibyte character (no newline).
+    let f = dir.join("2026-10.jsonl");
+    let mut cut = b"{\"ts\":\"2026-10-18\",\"body\":\"".to_vec();
+    cut.extend_from_slice(&"\u{e6}".as_bytes()[..1]);
+    let mut all = std::fs::read(&f).unwrap();
+    all.extend_from_slice(&cut);
+    std::fs::write(&f, all).unwrap();
+    ob.append(&entry("2026-10-19T10:00:00.000Z", &sha('b'), "{\"o\":2}"))
+        .unwrap();
+    ob.append(&entry("2026-11-19T10:00:00.000Z", &sha('c'), "{\"o\":3}"))
+        .unwrap();
+    assert_eq!(ob.find(&sha('b')).unwrap().unwrap().body, "{\"o\":2}");
+    assert_eq!(ob.find(&sha('a')).unwrap().unwrap().body, "{\"o\":1}");
+    assert_eq!(ob.find(&sha('c')).unwrap().unwrap().body, "{\"o\":3}");
 }
