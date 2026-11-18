@@ -144,6 +144,13 @@ fn build_end_to_end() {
     // `finish` adds the key and join indexes to the staged snapshot, so the
     // manifest hashes the indexed file, not the staged one.
     assert_ne!(m.snapshot_sha256, info.sha256);
+    // Plan 45 (merge of a136ebe8): the calculator (`saiife __blind-calc`)
+    // checks a job's `snapshot_sha256` against `snapshot::hash_file` of the
+    // live snapshot, so a job must carry the manifest's hash (the indexed
+    // file), never the staged one.
+    let live = saiife_shield::snapshot::hash_file(&dir.snapshot()).unwrap();
+    assert_eq!(live, m.snapshot_sha256);
+    assert_ne!(live, info.sha256);
     let names: Vec<&str> = m.schema.tables.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["customers", "invoices"]);
     assert_eq!(
