@@ -51,6 +51,7 @@ fn schema(rows: u64) -> Schema {
             word: "customer".into(),
             word_da: "kunde".into(),
         }],
+        joins: vec![],
     }
 }
 

@@ -156,6 +156,7 @@ mod tests {
         Schema {
             dataset: "demo".parse().unwrap(),
             entities: vec![],
+            joins: vec![],
             tables: vec![TableInfo {
                 name: "emp".into(),
                 alias: Some("staff".into()),

@@ -57,6 +57,7 @@ fn one_table(name: &str, cols: Vec<ColumnInfo>, rows: u64, entity: bool) -> Sche
         } else {
             vec![]
         },
+        joins: vec![],
     }
 }
 
@@ -252,22 +253,24 @@ fn numbers_and_dates_are_canonical() {
 #[test]
 fn frequency_floor_excludes_common_values() {
     let tmp = tempfile::tempdir().unwrap();
-    let cols = ["first_name", "city"];
+    // I4: no entity, so a person is a distinct full name: 40 Mettes.
+    let cols = ["first_name", "last_name", "city"];
     let schema = one_table(
         "people",
         vec![
             col("first_name", ColType::Text, ColumnClass::Identifier),
+            col("last_name", ColType::Text, ColumnClass::Identifier),
             col("city", ColType::Text, ColumnClass::Quasi),
         ],
         43,
         false,
     );
     let mut rows = Vec::new();
-    for _ in 0..40 {
-        rows.push(vec![t("Mette"), t("Leeds")]);
+    for i in 0..40 {
+        rows.push(vec![t("Mette"), t(&format!("Zz{i}son")), t("Leeds")]);
     }
     for _ in 0..3 {
-        rows.push(vec![t("Thorvald"), t("Ærøskøbing")]);
+        rows.push(vec![t("Thorvald"), t("Berg"), t("Ærøskøbing")]);
     }
     let (ds, snap) = snapshot(tmp.path(), "people", &cols, rows);
     let stats = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
@@ -278,8 +281,9 @@ fn frequency_floor_excludes_common_values() {
     assert!(ix.contains_value("aeroeskoebing").unwrap());
     assert!(ix.contains_value("Aeroskobing").unwrap());
     assert_eq!(stats.left_out_common, 2);
-    // Thorvald, aeroeskoebing and (I2) its ASCII-typed form aeroskobing.
-    assert_eq!(stats.entries, 3);
+    // Thorvald, aeroeskoebing and (I2) its ASCII-typed form aeroskobing,
+    // and the 41 rare last names.
+    assert_eq!(stats.entries, 3 + 41);
     assert_eq!(stats.phrases, 0);
 }
 
@@ -471,10 +475,11 @@ fn no_run_files_after_a_failing_build() {
     let (rows, mut schema) = many_rows(2000);
     let (_, snap) = snapshot(tmp.path(), "things", &["name", "notes"], rows);
     // A column the snapshot lacks, after columns that fill many runs: the
-    // read fails mid-build.
+    // read fails mid-build. (Quasi: an Identifier column is checked at the
+    // start of its table, as the people count reads it.)
     schema.tables[0]
         .columns
-        .push(col("missing", ColType::Text, ColumnClass::Identifier));
+        .push(col("missing", ColType::Text, ColumnClass::Quasi));
     let out = tmp.path().join("o");
     let mut calls = 0u32;
     let r =
@@ -561,10 +566,12 @@ fn no_plaintext_on_disk() {
 #[test]
 fn empty_index_is_valid() {
     let tmp = tempfile::tempdir().unwrap();
+    // I4: a value of an identifier column always enters, so only a table
+    // without indexed columns gives an empty index.
     let cols = ["first_name"];
     let schema = one_table(
         "people",
-        vec![col("first_name", ColType::Text, ColumnClass::Identifier)],
+        vec![col("first_name", ColType::Text, ColumnClass::Sensitive)],
         20,
         false,
     );
@@ -746,14 +753,123 @@ fn floor_counts_people_not_rows() {
     assert!(!ix.contains_value("Mette").unwrap());
     assert!(ix.contains_value("Zz3son").unwrap());
 
-    // The same rows in a table with no entity count rows.
+    // I4 (owner ruling): the same rows in a table with no entity count
+    // distinct identifier values (`id`, `email`), not rows.
     let tmp2 = tempfile::tempdir().unwrap();
     let mut plain = schema.clone();
     plain.entities.clear();
     let (ds2, snap2) = snapshot(tmp2.path(), "customers", &cols, denormalized_rows());
     build_index(&snap2, &plain, 10, &key(1), &ds2, &mut |_| {}).unwrap();
     let ix2 = KnownIndex::open(&ds2, key(1)).unwrap();
-    assert!(!ix2.contains_value("Quistgaard").unwrap());
+    assert!(ix2.contains_value("Quistgaard").unwrap());
+    assert!(ix2.contains_value("Ingeborg").unwrap());
+    assert!(!ix2.contains_value("Mette").unwrap(), "12 ids: common");
+}
+
+/// I4: with names as the only identifiers, a person is the composite of
+/// the name columns: 12 different Mettes are common, one Thorvald in 15
+/// rows is one person.
+#[test]
+fn names_only_table_counts_full_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cols = ["first_name", "last_name", "city"];
+    let schema = one_table(
+        "people",
+        vec![
+            col("first_name", ColType::Text, ColumnClass::Identifier),
+            col("last_name", ColType::Text, ColumnClass::Identifier),
+            col("city", ColType::Text, ColumnClass::Quasi),
+        ],
+        27,
+        false,
+    );
+    let mut rows = Vec::new();
+    for i in 0..12 {
+        rows.push(vec![t("Mette"), t(&format!("Zz{i}son")), t("Leeds")]);
+    }
+    for _ in 0..15 {
+        rows.push(vec![t("Thorvald"), t("Ærø"), t("Ærøskøbing")]);
+    }
+    let (ds, snap) = snapshot(tmp.path(), "people", &cols, rows);
+    build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    assert!(!ix.contains_value("Mette").unwrap());
+    assert!(!ix.contains_value("Leeds").unwrap());
+    assert!(ix.contains_value("Thorvald").unwrap());
+    assert!(ix.contains_value("Ærø").unwrap());
+    assert!(ix.contains_value("Ærøskøbing").unwrap());
+}
+
+/// I4: a declared join's FK column identifies the person in a table with
+/// no identifier column of its own; without the join the table has
+/// personal data (a quasi column) and nothing to count it by: refused.
+#[test]
+fn a_join_column_counts_people() {
+    use saiife_shield::schema::KeyJoin;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut src = VecSource {
+        tables: vec![
+            (
+                SourceTable {
+                    name: "customers".into(),
+                    columns: vec!["id".into(), "first_name".into(), "last_name".into()],
+                },
+                (1..=40)
+                    .map(|i| vec![Cell::Int(i), t("Mette"), t(&format!("Zz{i}son"))])
+                    .collect(),
+            ),
+            (
+                SourceTable {
+                    name: "visits".into(),
+                    columns: vec!["customer_id".into(), "city".into()],
+                },
+                (0..15)
+                    .map(|_| vec![Cell::Int(7), t("Ærøskøbing")])
+                    .chain((1..=40).map(|i| vec![Cell::Int(i), t("Leeds")]))
+                    .collect(),
+            ),
+        ],
+    };
+    let ds = tmp.path().join("ds");
+    let info = build_snapshot(&mut src, &ds, &mut |_| {}).unwrap();
+    let mut schema = one_table(
+        "customers",
+        vec![
+            col("id", ColType::Integer, ColumnClass::Identifier),
+            col("first_name", ColType::Text, ColumnClass::Identifier),
+            col("last_name", ColType::Text, ColumnClass::Identifier),
+        ],
+        40,
+        true,
+    );
+    schema.tables.push(TableInfo {
+        name: "visits".into(),
+        alias: None,
+        rows: 55,
+        columns: vec![
+            col("customer_id", ColType::Integer, ColumnClass::Sensitive),
+            col("city", ColType::Text, ColumnClass::Quasi),
+        ],
+    });
+    let e = build_index(&info.path, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "policy, table visits: holds personal data but no column identifies \
+         the person; choose the column that identifies the person"
+    );
+    schema.joins = vec![KeyJoin {
+        entity: "customers".into(),
+        key: "id".into(),
+        table: "visits".into(),
+        column: "customer_id".into(),
+    }];
+    build_index(&info.path, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
+    let ix = KnownIndex::open(&ds, key(1)).unwrap();
+    assert!(
+        ix.contains_value("Ærøskøbing").unwrap(),
+        "15 rows, 1 person"
+    );
+    assert!(!ix.contains_value("Leeds").unwrap(), "40 people");
 }
 
 #[test]
@@ -794,15 +910,21 @@ fn digit_groupings_match() {
 #[test]
 fn floor_boundary() {
     let tmp = tempfile::tempdir().unwrap();
+    // I4: each row is another person (a distinct full name).
     let schema = one_table(
         "people",
-        vec![col("first_name", ColType::Text, ColumnClass::Identifier)],
+        vec![
+            col("first_name", ColType::Text, ColumnClass::Identifier),
+            col("last_name", ColType::Text, ColumnClass::Identifier),
+        ],
         21,
         false,
     );
-    let mut rows: Vec<Vec<Cell>> = (0..10).map(|_| vec![t("Kirsten")]).collect();
-    rows.extend((0..11).map(|_| vec![t("Valdemar")]));
-    let (ds, snap) = snapshot(tmp.path(), "people", &["first_name"], rows);
+    let mut rows: Vec<Vec<Cell>> = (0..10)
+        .map(|i| vec![t("Kirsten"), t(&format!("K{i}son"))])
+        .collect();
+    rows.extend((0..11).map(|i| vec![t("Valdemar"), t(&format!("V{i}son"))]));
+    let (ds, snap) = snapshot(tmp.path(), "people", &["first_name", "last_name"], rows);
     let s = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
     let ix = KnownIndex::open(&ds, key(1)).unwrap();
     assert!(ix.contains_value("Kirsten").unwrap(), "exactly k: in");
@@ -924,17 +1046,27 @@ fn long_values_are_found_by_four_token_windows() {
     let schema = one_table(
         "people",
         vec![
+            col("email", ColType::Text, ColumnClass::Identifier),
             col("address", ColType::Text, ColumnClass::Quasi),
             col("street", ColType::Text, ColumnClass::Quasi),
         ],
         41,
         false,
     );
-    let mut rows = vec![vec![t("Strandvejen 12 2 th 8000 Aarhus C"), t("Kystvej 1")]];
-    for _ in 0..40 {
-        rows.push(vec![t("Fjordgade 7 1 tv 9000 Aalborg"), t("Kystvej 1")]);
+    // I4: the email identifies the person: 40 people share an address.
+    let mut rows = vec![vec![
+        t("p0@example.invalid"),
+        t("Strandvejen 12 2 th 8000 Aarhus C"),
+        t("Kystvej 1"),
+    ]];
+    for i in 1..=40 {
+        rows.push(vec![
+            t(&format!("p{i}@example.invalid")),
+            t("Fjordgade 7 1 tv 9000 Aalborg"),
+            t("Kystvej 1"),
+        ]);
     }
-    let (ds, snap) = snapshot(tmp.path(), "people", &["address", "street"], rows);
+    let (ds, snap) = snapshot(tmp.path(), "people", &["email", "address", "street"], rows);
     let stats = build_index(&snap, &schema, 10, &key(1), &ds, &mut |_| {}).unwrap();
     let ix = KnownIndex::open(&ds, key(1)).unwrap();
     assert!(ix

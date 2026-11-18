@@ -331,6 +331,7 @@ pub fn accept_all(name: &str, props: &[Proposal]) -> Schema {
         dataset: name.parse().expect("a valid dataset name"),
         tables,
         entities,
+        joins: vec![],
     }
 }
 
