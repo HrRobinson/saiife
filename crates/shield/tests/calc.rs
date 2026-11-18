@@ -54,7 +54,7 @@ fn runs_balance() {
 fn list_cap_and_total() {
     let mut db = fixture();
     let ps = vec![entity(7)];
-    let val = v(&format!("SELECT i.id, i.amount {J}"), &ps);
+    let val = v(&format!("SELECT i.status, i.amount {J}"), &ps);
     let rs = run(&mut db, &val, &[], &ps, &caps()).unwrap();
     assert_eq!(rs.rows.len(), 100);
     assert!(rs.truncated);
@@ -62,7 +62,7 @@ fn list_cap_and_total() {
     assert_eq!(rs.row_band, saiife_shield::schema::rows_band(250));
     // A small list is not truncated.
     let ps = vec![entity(1)];
-    let val = v(&format!("SELECT i.id, i.amount {J}"), &ps);
+    let val = v(&format!("SELECT i.status, i.amount {J}"), &ps);
     let rs = run(&mut db, &val, &[], &ps, &caps()).unwrap();
     assert_eq!(rs.rows.len(), 4);
     assert!(!rs.truncated);
@@ -196,7 +196,8 @@ fn big() -> rusqlite::Connection {
     db
 }
 
-const HEAVY: &str = "SELECT i.customer_id, SUM(i.amount) AS s FROM invoices i \
+// R45-13: grouped by the FK without outputting it (an Identifier column).
+const HEAVY: &str = "SELECT SUM(i.amount) AS s FROM invoices i \
     GROUP BY i.customer_id ORDER BY s DESC";
 
 #[test]
@@ -232,7 +233,7 @@ fn checks_run() {
     let mut db = fixture();
     let ps = vec![entity(1)];
     let val = v(
-        &format!("SELECT i.id, i.amount {J} AND i.status = 'open'"),
+        &format!("SELECT i.status, i.amount {J} AND i.status = 'open'"),
         &ps,
     );
     let sch = schema();
@@ -349,11 +350,13 @@ fn validator_refuses_inexact_placeholders() {
             "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.customer_id \
              WHERE c.id = :p1 AND c.id = {bad}"
         );
-        assert!(validate(&sql, &schema(), &public(), &ps).is_err(), "{bad}");
+        let e = validate(&sql, &schema(), &public(), &ps).unwrap_err();
+        assert_eq!(e.class, ErrorClass::ParamMisuse, "{bad}");
     }
     // A bound entity param the method does not use is refused.
     let sql = "SELECT COUNT(*) AS n FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE c.id = :p10";
-    assert!(validate(sql, &schema(), &public(), &ps).is_err());
+    let e = validate(sql, &schema(), &public(), &ps).unwrap_err();
+    assert_eq!(e.class, ErrorClass::ParamMisuse);
     // More than ten params resolve exactly.
     let many: Vec<Param> = (1..=12)
         .map(|n| entity_named(&format!("p{n}"), n))
@@ -430,4 +433,70 @@ fn computed_outputs_need_an_alias() {
         &[]
     )
     .is_ok());
+}
+
+/// orders(id INTEGER key, qty INTEGER, units INTEGER): whole-number amounts,
+/// as real datasets often keep them (kroner, øre).
+fn int_schema() -> saiife_shield::schema::Schema {
+    use saiife_shield::schema::{ColType, ColumnClass, ColumnInfo, Schema, TableInfo};
+    let col = |name: &str, ty: ColType| ColumnInfo {
+        name: name.into(),
+        ty,
+        class: ColumnClass::Sensitive,
+        alias: None,
+    };
+    Schema {
+        dataset: "crm".parse().unwrap(),
+        tables: vec![TableInfo {
+            name: "orders".into(),
+            alias: None,
+            rows: 3,
+            columns: vec![
+                col("id", ColType::Integer),
+                col("qty", ColType::Integer),
+                col("units", ColType::Integer),
+            ],
+        }],
+        entities: vec![],
+        joins: vec![],
+    }
+}
+
+#[test]
+fn integer_division_is_real() {
+    // Plan 45 final review I1: SQLite divides two INTEGERs as integers;
+    // the rendered SQL makes every `/` a real division.
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE orders(id INTEGER, qty INTEGER, units INTEGER);\
+         INSERT INTO orders VALUES (1, 1, 10), (2, 2, 10), (3, 4, 10);",
+    )
+    .unwrap();
+    let sch = int_schema();
+    let one = |db: &mut rusqlite::Connection, sql: &str| -> CellValue {
+        let val = validate(sql, &sch, &[], &[]).unwrap();
+        let rs = run(db, &val, &[], &[], &caps()).unwrap();
+        assert_eq!(rs.rows.len(), 1, "{sql}");
+        rs.rows[0][0].clone()
+    };
+    // The mean of 1, 2, 4 is 7 / 3, not 2.
+    let m = one(&mut db, "SELECT SUM(o.qty) / COUNT(*) AS m FROM orders o");
+    assert_eq!(m, CellValue::Real(7.0 / 3.0));
+    // A share below 1 is not 0.
+    let r = one(
+        &mut db,
+        "SELECT SUM(o.qty) / SUM(o.units) AS r FROM orders o",
+    );
+    assert_eq!(r, CellValue::Real(7.0 / 30.0));
+    let r = one(
+        &mut db,
+        "SELECT COUNT(DISTINCT o.qty) / SUM(o.units) AS r FROM orders o",
+    );
+    assert_eq!(r, CellValue::Real(0.1));
+    // Integer arithmetic other than `/` stays exact.
+    let d = one(
+        &mut db,
+        "SELECT SUM(o.units) - SUM(o.qty) AS d FROM orders o",
+    );
+    assert_eq!(d, CellValue::Int(23));
 }

@@ -117,11 +117,42 @@ pub struct EntitySpec {
     pub word_da: String,
 }
 
+/// One declared key relation (plan 45 ruling C-G1): the INTEGER column
+/// `table.column` holds keys of the entity `entity.key`. Snapshot names
+/// throughout (never aliases).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KeyJoin {
+    /// The entity's table ([`EntitySpec::table`]) and its key column.
+    pub entity: String,
+    pub key: String,
+    /// The FK side: another table and its INTEGER column.
+    pub table: String,
+    pub column: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     pub dataset: DatasetName,
     pub tables: Vec<TableInfo>,
     pub entities: Vec<EntitySpec>,
+    /// The key relations a method may join on, sorted and without
+    /// duplicates. `dataset::finish` checks the ones a policy declares and
+    /// adds [`Schema::conventional_joins`]; a manifest of version 1 has none
+    /// stored and gets the conventional ones on load.
+    #[serde(default)]
+    pub joins: Vec<KeyJoin>,
+}
+
+/// Plan 45 (S1) names its own CTEs and aliases `_p_...`: no snapshot table
+/// or column and no alias may start with this prefix, in any case.
+pub const RESERVED_PREFIX: &str = "_p_";
+
+/// The name starts with [`RESERVED_PREFIX`], ASCII case-insensitively
+/// (SQLite names are case-insensitive).
+pub fn is_reserved_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(..RESERVED_PREFIX.len())
+        .is_some_and(|b| b.eq_ignore_ascii_case(RESERVED_PREFIX.as_bytes()))
 }
 
 impl Schema {
@@ -135,6 +166,52 @@ impl Schema {
 
     pub fn entity_for(&self, table: &str) -> Option<&EntitySpec> {
         self.entities.iter().find(|e| e.table == table)
+    }
+
+    /// Ruling C-G1 as plan 45 applies it, on cloud names only (its review
+    /// F1): for every entity, each INTEGER column of another table whose
+    /// cloud name is `<word>_<cloud name of the key>` (ASCII lower case),
+    /// with an INTEGER key. Sorted, no duplicates.
+    pub fn conventional_joins(&self) -> Vec<KeyJoin> {
+        let mut out = Vec::new();
+        for e in &self.entities {
+            if self.column(&e.table, &e.key).map(|c| c.ty) != Some(ColType::Integer) {
+                continue;
+            }
+            let fk = format!("{}_{}", e.word, self.cloud_name(&e.table, Some(&e.key)))
+                .to_ascii_lowercase();
+            for t in self.tables.iter().filter(|t| t.name != e.table) {
+                for c in &t.columns {
+                    if c.ty == ColType::Integer && self.cloud_name(&t.name, Some(&c.name)) == fk {
+                        out.push(KeyJoin {
+                            entity: e.table.clone(),
+                            key: e.key.clone(),
+                            table: t.name.clone(),
+                            column: c.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The declared join between two snapshot columns `(table, column)`, in
+    /// either order, and whether `a` is the entity-key side.
+    pub fn key_join(&self, a: (&str, &str), b: (&str, &str)) -> Option<(&KeyJoin, bool)> {
+        let key = |j: &KeyJoin, x: (&str, &str)| x == (j.entity.as_str(), j.key.as_str());
+        let fk = |j: &KeyJoin, x: (&str, &str)| x == (j.table.as_str(), j.column.as_str());
+        self.joins.iter().find_map(|j| {
+            if key(j, a) && fk(j, b) {
+                Some((j, true))
+            } else if key(j, b) && fk(j, a) {
+                Some((j, false))
+            } else {
+                None
+            }
+        })
     }
 
     /// The name the cloud sees: the alias if there is one, else the name.
@@ -565,10 +642,98 @@ mod tests {
                 }],
             }],
             entities: vec![],
+            joins: vec![],
         };
         assert_eq!(s.cloud_name("customers", None), "t1");
         assert_eq!(s.cloud_name("customers", Some("city")), "city");
         assert!(s.column("customers", "nope").is_none());
         assert!(s.entity_for("customers").is_none());
+    }
+
+    #[test]
+    fn reserved_names() {
+        for n in ["_p_", "_p_x", "_P_total", "_p_1"] {
+            assert!(is_reserved_name(n), "{n}");
+        }
+        for n in ["", "_p", "p_x", "x_p_", "_q_x", "ø_p_"] {
+            assert!(!is_reserved_name(n), "{n}");
+        }
+    }
+
+    fn icol(name: &str, alias: Option<&str>) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            ty: ColType::Integer,
+            class: ColumnClass::Sensitive,
+            alias: alias.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn conventional_joins_use_cloud_names() {
+        let mut s = Schema {
+            dataset: "crm".parse().unwrap(),
+            tables: vec![
+                TableInfo {
+                    name: "customers".into(),
+                    alias: None,
+                    rows: 0,
+                    columns: vec![icol("id", None)],
+                },
+                TableInfo {
+                    name: "invoices".into(),
+                    alias: None,
+                    rows: 0,
+                    columns: vec![
+                        icol("customer_id", None),
+                        // Hidden name matches, cloud name does not.
+                        icol("kunde_id", Some("buyer")),
+                        // Cloud name matches through an alias.
+                        icol("cust", Some("Customer_id")),
+                        ColumnInfo {
+                            ty: ColType::Text,
+                            ..icol("customer_id_text", Some("customer_id"))
+                        },
+                    ],
+                },
+            ],
+            entities: vec![EntitySpec {
+                table: "customers".into(),
+                key: "id".into(),
+                names: vec!["id".into()],
+                show: vec![],
+                word: "customer".into(),
+                word_da: "kunde".into(),
+            }],
+            joins: vec![],
+        };
+        let j = |c: &str| KeyJoin {
+            entity: "customers".into(),
+            key: "id".into(),
+            table: "invoices".into(),
+            column: c.into(),
+        };
+        // `Customer_id` is not lower case: cloud names compare exactly, as
+        // plan 45's validator does.
+        assert_eq!(s.conventional_joins(), vec![j("customer_id")]);
+        s.tables[1].columns[2].alias = Some("customer_id".into());
+        s.tables[1].columns[0].alias = Some("first".into());
+        assert_eq!(s.conventional_joins(), vec![j("cust")]);
+        s.joins = s.conventional_joins();
+        assert_eq!(
+            s.key_join(("customers", "id"), ("invoices", "cust")),
+            Some((&j("cust"), true))
+        );
+        assert_eq!(
+            s.key_join(("invoices", "cust"), ("customers", "id")),
+            Some((&j("cust"), false))
+        );
+        assert!(s
+            .key_join(("invoices", "customer_id"), ("customers", "id"))
+            .is_none());
+        // An alias on the key renames the FK the convention looks for.
+        s.tables[0].columns[0].alias = Some("nr".into());
+        s.tables[1].columns[1].alias = Some("customer_nr".into());
+        assert_eq!(s.conventional_joins(), vec![j("kunde_id")]);
     }
 }

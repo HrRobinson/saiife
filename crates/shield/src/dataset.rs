@@ -268,8 +268,13 @@ use crate::index::{
     build_index, write_allow, BuildStats, IndexKey, ALLOW_FILE, BLOOM_FILE, INDEX_FILE,
 };
 use crate::lexicon::{build_lexicon, LEXICON_FILE};
-use crate::public::{public_gate, public_values, PublicValues};
-use crate::schema::{rows_band, ColType, ColumnClass, DatasetName, Schema};
+use crate::public::{
+    people_count, public_gate, public_values, table_people_count, PublicValues, NO_IDENTIFIER,
+};
+use crate::schema::{
+    is_reserved_name, rows_band, ColType, ColumnClass, ColumnInfo, DatasetName, KeyJoin, Schema,
+    TableInfo,
+};
 use crate::snapshot::{build_snapshot, open_ro, SnapshotInfo, SNAPSHOT_FILE};
 use crate::source::{quote_ident, RowSource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -277,8 +282,13 @@ use std::io::{self, BufWriter, Read, Write};
 
 /// The manifest's file name in `live/`.
 pub const MANIFEST_FILE: &str = "manifest.json";
-/// The manifest format version.
-pub const MANIFEST_VERSION: u32 = 1;
+/// The manifest format version written. Version 2 adds `schema.joins`;
+/// [`load_manifest`] also reads version 1 (see [`MIN_MANIFEST_VERSION`]).
+pub const MANIFEST_VERSION: u32 = 2;
+/// The oldest manifest version [`load_manifest`] reads. A version 1
+/// manifest has no `schema.joins`: they are derived on load with
+/// [`Schema::conventional_joins`], which needs only the schema.
+pub const MIN_MANIFEST_VERSION: u32 = 1;
 /// The default frequency floor.
 pub const DEFAULT_K: u32 = 10;
 /// The smallest frequency floor a build accepts.
@@ -287,8 +297,12 @@ pub const MIN_K: u32 = 2;
 /// Stage-only sidecar: the snapshot hash and the source names, from
 /// `stage_snapshot` to `finish`. Removed before the swap.
 const STAGE_INFO_FILE: &str = "stage.json";
+/// The next stage info, renamed over [`STAGE_INFO_FILE`].
+const STAGE_INFO_NEXT: &str = "stage.json.next";
 const MAX_JSON_BYTES: u64 = 64 << 20;
 const PUBLIC_REFUSED: &str = "a public column holds names, IDs or amounts";
+const RESERVED: &str = "names starting with _p_ are reserved; rename it";
+const BAD_JOIN: &str = "a join must link an entity key to an INTEGER column of another table";
 const MISMATCH: &str = "a dataset file does not match its manifest";
 
 /// The files the manifest hashes besides the snapshot.
@@ -442,8 +456,13 @@ pub struct Proposal {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StageInfo {
+    /// The snapshot as staged (no indexes); the classifier's sample seed.
     snapshot_sha256: String,
     source_names: BTreeMap<String, String>,
+    /// The snapshot after a `finish` added its indexes, so a retry on the
+    /// same stage knows the file it left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexed_sha256: Option<String>,
 }
 
 fn exists(p: &Path) -> bool {
@@ -665,7 +684,54 @@ fn check_schema(schema: &Schema, layout: &Layout) -> Result<(), ShieldError> {
             return Err(bad);
         }
     }
-    check_entities(schema, layout)
+    check_reserved(schema)?;
+    check_entities(schema, layout)?;
+    check_joins(schema)
+}
+
+/// Plan 45 S1: no snapshot name and no alias (a cloud name) starts with
+/// the planner's `_p_` prefix. Import already refuses such source names;
+/// this covers the policy's aliases and a snapshot from elsewhere.
+fn check_reserved(schema: &Schema) -> Result<(), ShieldError> {
+    for t in &schema.tables {
+        if is_reserved_name(&t.name) || t.alias.as_deref().is_some_and(is_reserved_name) {
+            return Err(policy_err(&t.name, None, RESERVED));
+        }
+        for c in &t.columns {
+            if is_reserved_name(&c.name) || c.alias.as_deref().is_some_and(is_reserved_name) {
+                return Err(policy_err(&t.name, Some(&c.name), RESERVED));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A join the policy declares links an EntitySpec's key to an INTEGER
+/// column of another schema table (the schema already matches the
+/// snapshot).
+fn check_joins(schema: &Schema) -> Result<(), ShieldError> {
+    for j in &schema.joins {
+        let entity = schema
+            .entities
+            .iter()
+            .any(|e| e.table == j.entity && e.key == j.key);
+        let fk_int = schema
+            .column(&j.table, &j.column)
+            .is_some_and(|c| c.ty == ColType::Integer);
+        if !entity || !fk_int || j.table == j.entity {
+            return Err(policy_err(&j.table, Some(&j.column), BAD_JOIN));
+        }
+    }
+    Ok(())
+}
+
+/// The declared joins and the conventional ones, sorted, no duplicates.
+fn all_joins(schema: &Schema) -> Vec<KeyJoin> {
+    let mut joins = schema.joins.clone();
+    joins.extend(schema.conventional_joins());
+    joins.sort();
+    joins.dedup();
+    joins
 }
 
 /// A fixed policy error naming a table and maybe a column (never a value).
@@ -816,6 +882,7 @@ pub fn stage_snapshot(
     let si = StageInfo {
         snapshot_sha256: info.sha256.clone(),
         source_names,
+        indexed_sha256: None,
     };
     write_json_part(
         &stage,
@@ -838,20 +905,23 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
         "could not read the snapshot",
     )?)?;
     // R-22: the source names (`CustomerID`) from the stage sidecar, when
-    // the snapshot was staged by `stage_snapshot`.
+    // the snapshot was staged by `stage_snapshot`. Its staged hash is the
+    // sample seed, as in `finish` (a failed `finish` may have added the
+    // indexes since).
     let info_path = snapshot.with_file_name(STAGE_INFO_FILE);
-    let source_names = if exists(&info_path) {
+    let (sha, source_names) = if exists(&info_path) {
         let si: StageInfo = read_json(
             open_sealed(&info_path, 0o400)?,
             "the staged build is incomplete",
         )?;
-        si.source_names
+        (si.snapshot_sha256, si.source_names)
     } else {
-        BTreeMap::new()
+        (sha, BTreeMap::new())
     };
     let conn = open_ro(snapshot)?;
     let mut out = Vec::new();
     for (table, cols) in snapshot_layout(&conn)? {
+        let mut seen = Vec::with_capacity(cols.len());
         for (column, ty) in cols {
             let st = classify::stats(&conn, &table, &column, ty)?;
             let source = source_names
@@ -869,14 +939,44 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
                 .filter(|s| classify::source_id_shaped(s))
                 .map(classify::camel_split);
             let guess = classify::guess(split.as_deref().unwrap_or(&column), ty, &st, &sample);
+            seen.push((column, ty, st, sample, source, guess));
+        }
+        // I4: the preview counts people as `finish` will, by the guessed
+        // classes (no EntitySpec or join is known yet). A table that cannot
+        // be counted lists no values.
+        let guessed = TableInfo {
+            name: table.clone(),
+            alias: None,
+            rows: 0,
+            columns: seen
+                .iter()
+                .map(|(c, ty, _, _, _, g)| ColumnInfo {
+                    name: c.clone(),
+                    ty: *ty,
+                    class: g.class,
+                    alias: None,
+                })
+                .collect(),
+        };
+        let count = match people_count(&guessed, None, &[]) {
+            Ok(c) => Some(c),
+            Err(ShieldError::Source {
+                why: NO_IDENTIFIER, ..
+            }) => None,
+            Err(e) => return Err(e),
+        };
+        for (column, ty, st, sample, source, guess) in seen {
             let mut refusal = public_gate(&[], &table, &column, source, ty, &st, &sample);
             let mut preview = None;
             // M5: no k-floor listing of free text (the gate refuses it, S4).
             if refusal.is_none() && guess.class != ColumnClass::FreeText {
-                match public_values(&conn, &table, &column, k) {
-                    Ok(pv) => preview = Some(pv),
-                    Err(ShieldError::Source { why, .. }) => refusal = Some(why),
-                    Err(e) => return Err(e),
+                match &count {
+                    Some(count) => match public_values(&conn, &table, &column, k, count) {
+                        Ok(pv) => preview = Some(pv),
+                        Err(ShieldError::Source { why, .. }) => refusal = Some(why),
+                        Err(e) => return Err(e),
+                    },
+                    None => refusal = Some(NO_IDENTIFIER),
                 }
             }
             out.push(Proposal {
@@ -900,7 +1000,8 @@ fn clear_derived(stage: &Path) -> Result<(), ShieldError> {
     for e in rd {
         let e = e.map_err(|_| io("could not read the staged build"))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        let derived = HASHED.contains(&name.as_str()) || name == MANIFEST_FILE;
+        let derived =
+            HASHED.contains(&name.as_str()) || name == MANIFEST_FILE || name == STAGE_INFO_NEXT;
         let part = name.ends_with(".part") && name != format!("{SNAPSHOT_FILE}.part");
         if derived
             || part
@@ -914,6 +1015,95 @@ fn clear_derived(stage: &Path) -> Result<(), ShieldError> {
     }
     sync_dir(stage);
     Ok(())
+}
+
+/// The (table, column) pairs `finish` indexes in the snapshot, sorted: every
+/// entity key and the FK column of every [`Schema::joins`] entry (pass the
+/// built schema, whose joins include the conventional ones). Plan 45's
+/// calculator can rely on these being indexed.
+pub fn snapshot_index_columns(schema: &Schema) -> Vec<(String, String)> {
+    let mut out: BTreeSet<(String, String)> = schema
+        .entities
+        .iter()
+        .map(|e| (e.table.clone(), e.key.clone()))
+        .collect();
+    for j in &schema.joins {
+        out.insert((j.entity.clone(), j.key.clone()));
+        out.insert((j.table.clone(), j.column.clone()));
+    }
+    out.into_iter().collect()
+}
+
+/// The name of the index on `table.column`. Snapshot names hold no `.`,
+/// so no two pairs share a name; `IF NOT EXISTS` keeps a retry idempotent.
+fn index_name(table: &str, column: &str) -> String {
+    format!("saiife_ix:{table}.{column}")
+}
+
+/// Makes a sealed file of ours writable again (0600 on unix).
+#[cfg(unix)]
+fn unseal(path: &Path, why: &'static str) -> Result<(), ShieldError> {
+    use std::os::unix::fs::PermissionsExt;
+    open_nofollow(path, false, why)?
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| io(why))
+}
+
+/// Makes a sealed file of ours writable again (clears read-only).
+#[cfg(not(unix))]
+#[allow(clippy::permissions_set_readonly_false)]
+fn unseal(path: &Path, why: &'static str) -> Result<(), ShieldError> {
+    let md = std::fs::symlink_metadata(path).map_err(|_| io(why))?;
+    if md.file_type().is_symlink() || !md.is_file() {
+        return Err(io(why));
+    }
+    let mut p = md.permissions();
+    p.set_readonly(false);
+    std::fs::set_permissions(path, p).map_err(|_| io(why))
+}
+
+/// Adds the [`snapshot_index_columns`] indexes to the sealed staged
+/// snapshot in place: unseal, create, fsync and seal 0400 again. A crash
+/// here leaves a file whose hash matches neither the staged nor an indexed
+/// one, so the next `finish` refuses it and the user stages again.
+fn index_snapshot(snap: &Path, schema: &Schema) -> Result<(), ShieldError> {
+    const WHY: &str = "could not index the snapshot";
+    unseal(snap, WHY)?;
+    let built = create_indexes(snap, schema, WHY);
+    // Sealed again on every path: a failure leaves a 0400 file whose hash
+    // the next `finish` refuses as a changed snapshot (stage again).
+    let sealed = open_nofollow(snap, true, WHY).and_then(|f| seal_file(&f));
+    built.and(sealed)
+}
+
+/// Drops the `saiife_ix:` indexes an earlier attempt made that this schema
+/// does not want, then creates the wanted ones.
+fn create_indexes(snap: &Path, schema: &Schema, why: &'static str) -> Result<(), ShieldError> {
+    let err = |_| ShieldError::Sqlite(why.into());
+    let conn = open_part_db(snap, why)?;
+    let want: Vec<(String, String)> = snapshot_index_columns(schema);
+    let names: BTreeSet<String> = want.iter().map(|(t, c)| index_name(t, c)).collect();
+    let have: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'saiife\\_ix:%' ESCAPE '\\'")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(err)?;
+    for n in have.iter().filter(|n| !names.contains(*n)) {
+        conn.execute_batch(&format!("DROP INDEX {}", quote_ident(n)))
+            .map_err(err)?;
+    }
+    for (t, c) in &want {
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            quote_ident(&index_name(t, c)),
+            quote_ident(t),
+            quote_ident(c)
+        ))
+        .map_err(err)?;
+    }
+    conn.close().map_err(|_| ShieldError::Sqlite(why.into()))
 }
 
 /// Stage 2: see the brief; `finish` and the crash seam share it.
@@ -944,20 +1134,29 @@ fn finish_inner(
         "the staged build is incomplete",
     )?;
     let snap_path = stage.join(SNAPSHOT_FILE);
-    let snapshot_sha256 = sha256_of(open_sealed(&snap_path, 0o400)?)?;
-    if snapshot_sha256 != si.snapshot_sha256 {
+    let found = sha256_of(open_sealed(&snap_path, 0o400)?)?;
+    if found != si.snapshot_sha256 && si.indexed_sha256.as_ref() != Some(&found) {
         return Err(ShieldError::Corrupt("the staged snapshot changed"));
     }
+    // The sample seed is the staged hash, as in `propose`.
+    let staged_sha256 = si.snapshot_sha256.clone();
 
     let conn = open_ro(&snap_path)?;
     let layout = snapshot_layout(&conn)?;
     check_schema(schema, &layout)?;
     let policy = schema.clone();
     let mut schema = schema.clone();
+    schema.joins = all_joins(&schema);
+    // I4: every table can be counted, or the build is refused here.
+    let counts = schema
+        .tables
+        .iter()
+        .map(|t| table_people_count(&schema, &t.name))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut public = Vec::new();
     let mut formats = BTreeMap::new();
     let mut rows_bands = BTreeMap::new();
-    for t in &mut schema.tables {
+    for (t, count) in schema.tables.iter_mut().zip(&counts) {
         let n: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM {}", quote_ident(&t.name)),
@@ -968,7 +1167,7 @@ fn finish_inner(
         t.rows = n.max(0) as u64;
         rows_bands.insert(t.name.clone(), rows_band(t.rows));
         for c in &t.columns {
-            let seed = sample_seed(&snapshot_sha256, &t.name, &c.name);
+            let seed = sample_seed(&staged_sha256, &t.name, &c.name);
             let sample = classify::sample_seeded(&conn, &t.name, &c.name, seed)?;
             if c.class == ColumnClass::Public {
                 // Defence in depth for a hand-edited policy: the wizard's
@@ -991,12 +1190,34 @@ fn finish_inner(
                 {
                     return Err(ShieldError::Corrupt(PUBLIC_REFUSED));
                 }
-                public.push(public_values(&conn, &t.name, &c.name, k)?);
+                public.push(public_values(&conn, &t.name, &c.name, k, count)?);
             }
             formats.insert(format!("{}.{}", t.name, c.name), format_of(c.ty, &sample));
         }
     }
     drop(conn);
+
+    // Bench item 2: the key and join indexes, after the bulk load. The
+    // manifest hashes the indexed file; the stage info records it so a
+    // retry of a failed `finish` accepts it.
+    index_snapshot(&snap_path, &schema)?;
+    let snapshot_sha256 = sha256_of(open_sealed(&snap_path, 0o400)?)?;
+    if snapshot_sha256 != found {
+        let next = StageInfo {
+            snapshot_sha256: staged_sha256.clone(),
+            source_names: si.source_names.clone(),
+            indexed_sha256: Some(snapshot_sha256.clone()),
+        };
+        // Replaced by a rename (atomic on unix): a crash leaves the old or
+        // the new stage info, never none.
+        const WHY: &str = "could not write the staged build";
+        let _ = remove_entry(&stage.join(STAGE_INFO_NEXT));
+        let tmp = write_json_part(&stage, STAGE_INFO_NEXT, &next, WHY)?;
+        #[cfg(not(unix))]
+        unseal(&stage.join(STAGE_INFO_FILE), WHY)?;
+        std::fs::rename(&tmp, stage.join(STAGE_INFO_FILE)).map_err(|_| io(WHY))?;
+        sync_dir(&stage);
+    }
 
     progress(BuildProgress {
         phase: Phase::Lexicon,
@@ -1180,15 +1401,22 @@ pub fn load_manifest(dir: &DatasetDir) -> Result<Manifest, ShieldError> {
     dir.recover()?;
     check_private_dir(&dir.root)?;
     check_private_dir(&dir.live())?;
-    let m: Manifest = read_json(
+    let mut m: Manifest = read_json(
         open_sealed(&dir.manifest(), 0o600)?,
         "the manifest is not valid",
     )?;
-    if m.v != MANIFEST_VERSION {
+    if !(MIN_MANIFEST_VERSION..=MANIFEST_VERSION).contains(&m.v) {
         return Err(ShieldError::Corrupt(
             "the manifest version is not supported",
         ));
     }
+    if m.v == 1 {
+        m.schema.joins = m.schema.conventional_joins();
+    }
+    // Plan 45 S1 for every version: a dataset built before the check
+    // existed may hold a `_p_` name or alias.
+    check_reserved(&m.schema)
+        .map_err(|_| ShieldError::Corrupt("a dataset name starts with the reserved _p_"))?;
     if m.dataset != name || m.schema.dataset != name {
         return Err(ShieldError::Corrupt("the manifest names another dataset"));
     }

@@ -7,7 +7,7 @@ use crate::dataset::{
     ensure_private_dir, memory_temp_store, no_dqs, open_part_db, with_private_part,
 };
 use crate::error::ShieldError;
-use crate::schema::ColType;
+use crate::schema::{is_reserved_name, ColType};
 use crate::source::{
     quote_ident, sqlite_uri, src_err, Cell, RowSource, MAX_CELL_BYTES, MAX_COLUMNS, MAX_ROWS,
     MAX_TABLES,
@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 /// The snapshot's file name inside the dataset directory.
 pub const SNAPSHOT_FILE: &str = "snapshot.sqlite";
 const BATCH: u64 = 10_000;
+/// Why a name with the planner's `_p_` prefix is refused (plan 45 S1).
+const RESERVED: &str = "names starting with _p_ are reserved; rename it";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotInfo {
@@ -417,7 +419,21 @@ fn write_tables(
     if tables.iter().any(|t| t.columns.len() > MAX_COLUMNS) {
         return Err(ShieldError::Limit("more than 512 columns in a table"));
     }
+    // Plan 45 S1: `_p_` is the planner's prefix. A source name with it is
+    // refused before anything is written. Cleaning drops a leading `_`, so
+    // no snapshot name can have it; that check is a backstop.
     let tnames = unique_names(tables.iter().map(|t| t.name.as_str()), true);
+    for (t, tname) in tables.iter().zip(&tnames) {
+        if is_reserved_name(&t.name) || is_reserved_name(tname) {
+            return Err(src_err(&file, Some(&t.name), None, None, RESERVED));
+        }
+        let cnames = unique_names(t.columns.iter().map(String::as_str), false);
+        for (c, cname) in t.columns.iter().zip(&cnames) {
+            if is_reserved_name(c) || is_reserved_name(cname) {
+                return Err(src_err(&file, Some(&t.name), Some(c), None, RESERVED));
+            }
+        }
+    }
 
     let conn = open_part_db(part, "could not write the snapshot")?;
 

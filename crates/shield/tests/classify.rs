@@ -4,7 +4,7 @@
 mod fixtures;
 
 use saiife_shield::classify::{checks, guess, sample, stats, uncertain, ColumnStats};
-use saiife_shield::public::{public_refusal, public_values};
+use saiife_shield::public::{public_refusal, public_values, PeopleCount};
 use saiife_shield::schema::{ColType, ColumnClass::*};
 use saiife_shield::snapshot::{build_snapshot, open_ro};
 use saiife_shield::source::CsvSource;
@@ -116,8 +116,8 @@ fn public_refused_for_identifiers_and_amounts() {
     assert_eq!(check("id"), Some("holds names or IDs"));
     assert_eq!(check("segment"), None);
     // No k-floor list is computed for a refused column.
-    assert!(public_values(&conn, "customers", "email", 1).is_err());
-    assert!(public_values(&conn, "customers", "credit_limit", 1).is_err());
+    assert!(public_values(&conn, "customers", "email", 1, &PeopleCount::rows()).is_err());
+    assert!(public_values(&conn, "customers", "credit_limit", 1, &PeopleCount::rows()).is_err());
 }
 
 fn mem(statuses: &[(&str, u32)]) -> rusqlite::Connection {
@@ -141,7 +141,7 @@ fn mem(statuses: &[(&str, u32)]) -> rusqlite::Connection {
 #[test]
 fn k_floor_counts() {
     let c = mem(&[("open", 12), ("paid", 30), ("disputed", 3)]);
-    let pv = public_values(&c, "t", "status", 10).unwrap();
+    let pv = public_values(&c, "t", "status", 10, &PeopleCount::rows()).unwrap();
     // M3 / R-18: `table.column` everywhere.
     assert_eq!(pv.column, "t.status");
     assert_eq!(pv.passing, vec!["open", "paid"]);
@@ -157,7 +157,7 @@ fn too_many_values_refused() {
         c.execute("INSERT INTO t (v) VALUES (?1)", [format!("v{i}")])
             .unwrap();
     }
-    let e = public_values(&c, "t", "v", 1).unwrap_err();
+    let e = public_values(&c, "t", "v", 1, &PeopleCount::rows()).unwrap_err();
     assert!(matches!(e, ShieldError::Source { .. }));
     let s = e.to_string();
     assert!(s.contains("too many values to be a category"));
@@ -279,7 +279,7 @@ fn sample_covers_the_whole_table() {
 #[test]
 fn k_floor_refuses_an_identifier_value() {
     let c = mem(&[("open", 20), ("paid", 20), ("010190-1234", 15)]);
-    let e = public_values(&c, "t", "status", 10).unwrap_err();
+    let e = public_values(&c, "t", "status", 10, &PeopleCount::rows()).unwrap_err();
     assert_eq!(
         e.to_string(),
         "snapshot, table t, column status: a value looks like a name, ID or contact detail"
@@ -346,6 +346,9 @@ fn public_refused_for_foreign_keys() {
             Some("holds names or IDs"),
             "{col}"
         );
-        assert!(public_values(&c, "invoices", col, 2).is_err(), "{col}");
+        assert!(
+            public_values(&c, "invoices", col, 2, &PeopleCount::rows()).is_err(),
+            "{col}"
+        );
     }
 }

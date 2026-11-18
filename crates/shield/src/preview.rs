@@ -659,6 +659,20 @@ fn pred_phrase(cx: &Cx, e: &Expr) -> Option<String> {
                 &format!("hvor {c} er {da} {x}"),
             ))
         }
+        // Ruling F-k: `t.c IS [NOT] NULL`.
+        Expr::IsNull(x) => {
+            let (t, c) = col_of(cx, x)?;
+            let c = cx.colname(&t, &c);
+            Some(cx.t(&format!("where {c} is empty"), &format!("hvor {c} er tom")))
+        }
+        Expr::IsNotNull(x) => {
+            let (t, c) = col_of(cx, x)?;
+            let c = cx.colname(&t, &c);
+            Some(cx.t(
+                &format!("where {c} is not empty"),
+                &format!("hvor {c} ikke er tom"),
+            ))
+        }
         // The entity pin `key IN (:pN)`.
         Expr::InList {
             expr,

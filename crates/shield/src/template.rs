@@ -8,8 +8,10 @@
 //! refuses (`check_failed`): nothing is ever printed as 0 or empty.
 
 use crate::calc::{CellValue, ResultSet};
-use crate::schema::{Decimal, Lang, Param};
-use crate::sql::{ErrorClass, MethodError};
+use crate::grammar::{grammar_ok, Seg};
+use crate::question::Draft;
+use crate::schema::{Decimal, Lang, Param, ParamType, Schema};
+use crate::sql::{ErrorClass, MethodError, Validated};
 
 const DETAIL_MAX: usize = 120;
 
@@ -211,8 +213,9 @@ fn parse_slot(
 }
 
 /// Parse a template. Unknown function, column or parameter, a row beyond
-/// `list_cap`, a bad `round` digit, or an unbalanced brace is `template_slot`
-/// carrying the planner's own slot text.
+/// `list_cap`, a bad `round` digit, an unbalanced brace, or fixed text outside
+/// the allow-listed grammar (see `grammar.rs`) is `template_slot` carrying the
+/// planner's own slot text or a short fixed reason.
 pub fn parse_template(
     s: &str,
     columns: &[String],
@@ -265,7 +268,219 @@ pub fn parse_template(
     if !text.is_empty() {
         parts.push(Part::Text(text));
     }
+    // The fixed text is an allow-listed grammar (R45-10, ruling T5-c).
+    let segs: Vec<Seg> = parts
+        .iter()
+        .map(|p| match p {
+            Part::Text(t) => Seg::Text(t),
+            Part::Slot(Slot::Cmp(..) | Slot::Param(_)) => Seg::Param,
+            Part::Slot(_) => Seg::Num,
+        })
+        .collect();
+    grammar_ok(&segs).map_err(slot_err)?;
     Ok(Template { parts })
+}
+
+impl Template {
+    /// The parameters a `{param(pN)}` slot shows, in template order, without
+    /// repeats.
+    pub fn param_slots(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for p in &self.parts {
+            if let Part::Slot(Slot::Param(n)) = p {
+                if !out.contains(&n.as_str()) {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Plan 45 final review I3 (ruling F-c, narrowed by F-f, then F-g): a bound
+/// question parameter the method ignores answers another question ("open
+/// invoices in Q3 2026" summed over all time; "Anna Berg's total" over every
+/// customer; "total of invoices over 5000" over every invoice).
+///
+/// Every bound parameter, filter (entity key, `DateRange`, `Date`, `Text`)
+/// or scalar threshold (`Amount`, `Integer`, `Percent`), must be used by the
+/// method ([`Validated::params_used`]), whether the template shows it or not:
+/// echoing "over 5,000" or "in Q3 2026" next to a number the method computed
+/// without it is the anti-goal. Ruling F-g allowed an unused threshold only
+/// as an operand of a `cmp` slot; `cmp` compares two result cells and takes
+/// no parameter operand, so that exemption has no legitimate use and none is
+/// made. The `template` argument is kept for the checker's call shape.
+///
+/// Ruling F-p (supersedes F-o): no parameter is covered by a `LIMIT`.
+/// Plan 44's binding has no row-count role, and an `Integer` equal to the
+/// limit may be a filter ("more than 10 items" answered by `LIMIT 10`).
+/// The stage-1.5 top-N task carries the rule (R45-6).
+///
+/// Otherwise `param_misuse` (no detail: R45-8 sends a detail only for the
+/// name classes). Unbound draft parameters are not judged. Found before the
+/// preview, so the planner can retry; the checker's [`crate::checker::check`]
+/// runs it again over the method and template it is given.
+pub fn check_params_covered(
+    method: &Validated,
+    _template: &Template,
+    params: &[Param],
+) -> Result<(), MethodError> {
+    let unused = params
+        .iter()
+        .any(|p| p.bound.is_some() && !method.params_used.contains(&p.name));
+    if unused {
+        return Err(MethodError {
+            class: ErrorClass::ParamMisuse,
+            detail: None,
+        });
+    }
+    Ok(())
+}
+
+// ---- entity parameters in the answer (ruling F-n) ----
+
+/// The words the user typed for parameter `param` in `d.original`, when the
+/// draft fixes them: `d.text` is `d.original` with each parameter's span
+/// replaced by `:pN` (plan 44 copies the text between them verbatim), and
+/// the span is taken only when the earliest and the latest fit of those
+/// pieces into the original agree on it. Otherwise `None`.
+pub fn spoken(d: &Draft, param: &str) -> Option<String> {
+    let segs = split_params(&d.text, d.params.len())?;
+    let n = d.params.iter().position(|p| p.name == param)? + 1;
+    let k = segs.len() - 1;
+    let o = d.original.as_str();
+    if !o.starts_with(segs[0]) {
+        return None;
+    }
+    // Earliest fit: piece i starts at least one byte after piece i-1 ends.
+    let mut early = vec![(0usize, segs[0].len())];
+    for seg in &segs[1..k] {
+        let from = early.last()?.1 + 1;
+        let at = o.get(from..)?.find(seg)? + from;
+        early.push((at, at + seg.len()));
+    }
+    let last_at = o.len().checked_sub(segs[k].len())?;
+    if o.get(last_at..)? != segs[k] || last_at < early.last()?.1 + 1 {
+        return None;
+    }
+    early.push((last_at, o.len()));
+    // Latest fit, from the end.
+    let mut late = vec![(last_at, o.len())];
+    for seg in segs[1..k].iter().rev() {
+        let until = late.last()?.0.checked_sub(1)?;
+        let at = o.get(..until)?.rfind(seg)?;
+        late.push((at, at + seg.len()));
+    }
+    late.push((0, segs[0].len()));
+    late.reverse();
+    let span = |fit: &[(usize, usize)]| (fit[n - 1].1, fit[n].0);
+    let (a, b) = span(&early);
+    if span(&late) != (a, b) || a >= b {
+        return None;
+    }
+    let s = o.get(a..b)?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// `d.text` split at `:p1`..`:pK` in order (exactly those), or `None`.
+fn split_params(text: &str, k: usize) -> Option<Vec<&str>> {
+    let mut segs = Vec::with_capacity(k + 1);
+    let mut rest = text;
+    for n in 1..=k {
+        let tok = format!(":p{n}");
+        let mut from = 0;
+        let at = loop {
+            let i = rest.get(from..)?.find(&tok)? + from;
+            let next = rest.get(i + tok.len()..).and_then(|r| r.chars().next());
+            if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                break i;
+            }
+            from = i + tok.len();
+        };
+        segs.push(rest.get(..at)?);
+        rest = rest.get(at + tok.len()..)?;
+    }
+    segs.push(rest);
+    Some(segs)
+}
+
+/// The entity type's plain word: en `the customer`, da `pågældende kunde`.
+fn plain_word(d: &Draft, schema: &Schema, table: &str, word: &str) -> String {
+    match d.lang {
+        Lang::En => format!("the {word}"),
+        Lang::Da => {
+            let w = schema
+                .entity_for(table)
+                .map_or(word, |e| e.word_da.as_str());
+            format!("pågældende {w}")
+        }
+    }
+}
+
+/// How an entity parameter is named in an answer or a refusal (ruling F-n):
+/// the user's own words ([`spoken`]), else the entity type's plain word;
+/// never the snapshot's name, `show` value or key. `None` for a parameter
+/// that is not an entity of the draft.
+fn entity_words(d: &Draft, schema: &Schema, param: &str) -> Option<String> {
+    let p = d.params.iter().find(|p| p.name == param)?;
+    let ParamType::Entity { table, word } = &p.ty else {
+        return None;
+    };
+    Some(spoken(d, param).unwrap_or_else(|| plain_word(d, schema, table, word)))
+}
+
+/// The parameters to fill an exact-mode answer with (ruling F-n): each
+/// entity parameter's `display` becomes [`spoken`] text or the plain word;
+/// every other parameter is unchanged. The checker's
+/// [`crate::checker::check`] refuses an answer whose entity slot shows
+/// anything else.
+pub fn answer_params(d: &Draft, schema: &Schema) -> Vec<Param> {
+    d.params
+        .iter()
+        .map(|p| {
+            let mut p = p.clone();
+            if let Some(w) = entity_words(d, schema, &p.name) {
+                p.display = w;
+            }
+            p
+        })
+        .collect()
+}
+
+/// The `empty_for_key` refusal reason (R45-6, ruling F-n): en `the method
+/// found no rows for <words>`, da `metoden fandt ingen rækker for <words>`,
+/// the words as in [`answer_params`].
+pub fn empty_for_key_reason(d: &Draft, schema: &Schema, param: &str) -> String {
+    let w = entity_words(d, schema, param).unwrap_or_else(|| match d.lang {
+        Lang::En => "the entity".into(),
+        Lang::Da => "den valgte".into(),
+    });
+    match d.lang {
+        Lang::En => format!("the method found no rows for {w}"),
+        Lang::Da => format!("metoden fandt ingen rækker for {w}"),
+    }
+}
+
+/// Ruling F-n, the checker's side: an entity parameter's display may be
+/// shown only when it is the user's own words (a part of the question) or
+/// the plain word of its type.
+pub fn entity_display_ok(p: &Param, question: &str, lang: Lang) -> bool {
+    let ParamType::Entity { word, .. } = &p.ty else {
+        return true;
+    };
+    let d = p.display.as_str();
+    if d.is_empty() {
+        return false;
+    }
+    if question.contains(d) {
+        return true;
+    }
+    match lang {
+        Lang::En => d == format!("the {word}"),
+        Lang::Da => d.strip_prefix("pågældende ").is_some_and(|w| {
+            !w.is_empty() && w.chars().all(|c| c.is_lowercase() && c.is_alphabetic())
+        }),
+    }
 }
 
 // ---- number formatting ----

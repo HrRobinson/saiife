@@ -6,15 +6,26 @@
 //! - `WITH`: at most 2 non-recursive CTEs, each of the same shape.
 //! - `SELECT [DISTINCT]` items: a plain column `t.c`; `COUNT(*)`,
 //!   `COUNT([DISTINCT] t.c)`, `SUM|AVG|MIN|MAX([DISTINCT] t.c)` over one
-//!   plain column; `date(t.c, mods…)` / `strftime('<fmt>', t.c, mods…)` over
-//!   a plain DATE column; in the outermost block only, one `+ - * /` between
-//!   two aggregates over base-table columns (ruling C-CAP). No literal and
-//!   no parameter in the list. `AS alias`; at most 32 items, unique names.
+//!   plain column (`SUM`/`AVG` over a number column only); `date(t.c,
+//!   mods…)` / `strftime('<fmt>', t.c, mods…)` over a plain DATE column; in
+//!   the outermost block only, one `+ - * /` between two numeric aggregates
+//!   over base-table columns (ruling C-CAP). No literal and no parameter in
+//!   the list. `AS alias`; at most 32 items, unique names.
+//! - `/` is rendered with its left operand cast to REAL (ruling F-b), so it
+//!   is never SQLite integer division; the planner cannot write `CAST`.
 //! - `FROM` a base table or a CTE, `[INNER] JOIN … ON` an AND of equalities
 //!   each on a declared key pair (ruling C-G1), checked by column origin
 //!   through CTE provenance; at most 4 joins in all.
-//! - `WHERE`: an AND of `col op (:pN | literal)` and `col IN (items)`, where
+//! - `WHERE`: an AND of `col op (:pN | literal)`, `col IN (items)` and
+//!   (ruling F-k) `t.c IS [NOT] NULL` over a plain non-key column, where
 //!   `col` is a plain column or a date expression over one.
+//! - Owner ruling 2026-11-18 (R45-13): no outermost output column yields an
+//!   Identifier-class value (judged by column origin through CTEs): a plain
+//!   Identifier column, `date`/`strftime`/`MIN`/`MAX`/`SUM`/`AVG` over one,
+//!   or arithmetic over such an aggregate is `identifier_output`. Only
+//!   `COUNT(*)`, `COUNT(col)` and `COUNT(DISTINCT col)` over an Identifier
+//!   are allowed (ruling F-j); WHERE comparisons, key-pair joins and GROUP BY
+//!   on one stay allowed when it is not output.
 //! - `GROUP BY` plain columns or date expressions; `HAVING` an AND of
 //!   `aggregate op (:pN | literal)`; `ORDER BY` any item above, ASC/DESC;
 //!   `LIMIT n` with an integer literal `n >= 1`; no `OFFSET`.
@@ -36,10 +47,11 @@
 //!   `strftime` lower-case, no redundant parentheses.
 //!
 //! Every `match` over the parser's AST ends in a refusal, never in an
-//! accept. Masking routes (CASE, COALESCE, IS NULL, constants, subqueries,
-//! LEFT JOIN, …) are outside the grammar, so `null_masking` is no longer
-//! produced here; the primary control is the executor's existence check over
-//! [`Validated::entity_filters`] (R45-6, Task 3).
+//! accept. Masking routes (CASE, COALESCE, IS NULL outside a WHERE
+//! conjunct, constants, subqueries, LEFT JOIN, …) are outside the grammar,
+//! so `null_masking` is no longer produced here; the primary control is the
+//! executor's existence check over [`Validated::entity_filters`] (R45-6,
+//! Task 3).
 //!
 //! Names resolve case-exact against the cloud names of the schema (aliases
 //! where set) and are rewritten to snapshot names; every planner-chosen
@@ -51,13 +63,14 @@
 
 use crate::plan::{SelfCheck, METHOD_MAX};
 use crate::public::PublicValues;
-use crate::schema::{Bound, ColType, EntitySpec, Param, ParamType, Schema, TableInfo};
+use crate::schema::{Bound, ColType, ColumnClass, EntitySpec, Param, ParamType, Schema, TableInfo};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
-    BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByKind, OrderBySort, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement, TableAlias, TableFactor, UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType, Distinct, DuplicateTreatment, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByKind, OrderBySort,
+    Query, Select, SelectFlavor, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -123,6 +136,11 @@ pub enum ErrorClass {
     /// R45-8; unreachable in stage 1 (no subqueries; CTEs are one level).
     TooDeep,
     TooManyColumns,
+    /// Owner ruling 2026-11-18 (R45-13): the method would output a value of
+    /// an Identifier-class column. Sent to the planner as the class only
+    /// (no detail); the user sees [`IDENTIFIER_OUTPUT_REASON`]. Plan 48
+    /// hooks its touch-gated reveal on this class.
+    IdentifierOutput,
     TemplateSlot,
     RuntimeError,
     TimeCap,
@@ -135,7 +153,7 @@ pub enum ErrorClass {
     EmptyResult,
 }
 
-const ALL_CLASSES: [ErrorClass; 21] = [
+const ALL_CLASSES: [ErrorClass; 22] = [
     ErrorClass::Syntax,
     ErrorClass::NotSelect,
     ErrorClass::MultipleStatements,
@@ -150,6 +168,7 @@ const ALL_CLASSES: [ErrorClass; 21] = [
     ErrorClass::TooManyJoins,
     ErrorClass::TooDeep,
     ErrorClass::TooManyColumns,
+    ErrorClass::IdentifierOutput,
     ErrorClass::TemplateSlot,
     ErrorClass::RuntimeError,
     ErrorClass::TimeCap,
@@ -176,6 +195,7 @@ impl ErrorClass {
             ErrorClass::TooManyJoins => "too_many_joins",
             ErrorClass::TooDeep => "too_deep",
             ErrorClass::TooManyColumns => "too_many_columns",
+            ErrorClass::IdentifierOutput => "identifier_output",
             ErrorClass::TemplateSlot => "template_slot",
             ErrorClass::RuntimeError => "runtime_error",
             ErrorClass::TimeCap => "time_cap",
@@ -190,7 +210,21 @@ impl ErrorClass {
     pub fn from_str(s: &str) -> Option<ErrorClass> {
         ALL_CLASSES.iter().copied().find(|c| c.as_str() == s)
     }
+
+    /// The plain-language refusal the user sees for a class that has a
+    /// fixed one (owner ruling 2026-11-18: `identifier_output`).
+    pub fn user_reason(self) -> Option<&'static str> {
+        match self {
+            ErrorClass::IdentifierOutput => Some(IDENTIFIER_OUTPUT_REASON),
+            _ => None,
+        }
+    }
 }
+
+/// Owner ruling 2026-11-18, verbatim: the refusal reason of
+/// [`ErrorClass::IdentifierOutput`].
+pub const IDENTIFIER_OUTPUT_REASON: &str =
+    "Data Shield doesn't show ID numbers. Revealing one needs a touch on your key.";
 
 /// A refused method: the class and, for `unknown_table` / `unknown_column` /
 /// `template_slot`, the cloud name that failed (at most 120 characters).
@@ -392,12 +426,22 @@ fn validate_cols(
         ctes: Vec::new(),
         params_used: Vec::new(),
         entity_params: Vec::new(),
+        range_halves: Vec::new(),
         links: Vec::new(),
         agg_seen: false,
         outer: true,
         outer_view: None,
     };
     let out = w.query(&mut q, true)?;
+    // Plan 45 final review part 3 (ruling F-h): a date range applied by one
+    // half ("in Q3 2026" as `issued >= :pN_from` alone) is another question.
+    // Either half needs the other, anywhere in the method.
+    for (base, _) in &w.range_halves {
+        let has = |s: Suffix| w.range_halves.iter().any(|(b, x)| b == base && *x == s);
+        if !(has(Suffix::From) && has(Suffix::To)) {
+            return fail(ErrorClass::ParamMisuse);
+        }
+    }
     // A bound entity the method ignores answers another question.
     if all_entities {
         let unused = params.iter().any(|p| {
@@ -506,6 +550,10 @@ struct Item {
     norm: Option<Vec<String>>,
     /// `COUNT(DISTINCT key/FK)`: allowed only as an outermost output (M2).
     key_count: bool,
+    /// Yields an Identifier-class value (R45-13, ruling F-j): a plain
+    /// Identifier column (by origin through CTEs), or a date function,
+    /// non-COUNT aggregate or arithmetic over one.
+    ident: bool,
 }
 
 impl Item {
@@ -522,6 +570,7 @@ impl Item {
             fp,
             norm: None,
             key_count: false,
+            ident: false,
         }
     }
 
@@ -561,6 +610,8 @@ struct OutCol {
     unique: bool,
     /// The fingerprint of the expression it exposes.
     fp: String,
+    /// It yields an Identifier-class value (R45-13).
+    ident: bool,
 }
 
 #[derive(Debug)]
@@ -862,6 +913,8 @@ struct Walk<'a> {
     ctes: Vec<Cte>,
     params_used: Vec<String>,
     entity_params: Vec<String>,
+    /// The `DateRange` halves seen, as (`pN`, `_from` or `_to`).
+    range_halves: Vec<(String, Suffix)>,
     links: Vec<Link>,
     /// An aggregate was seen in the block being walked.
     agg_seen: bool,
@@ -1074,7 +1127,7 @@ impl<'a> Walk<'a> {
                         Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.clone()),
                         _ => None,
                     };
-                    let it = self.term(e, &sc, false)?;
+                    let it = self.output(e, &sc, outer)?;
                     // The outermost output names reach the template and the
                     // result set: a computed item needs its own `AS alias`.
                     if written.is_none() && outer {
@@ -1094,7 +1147,7 @@ impl<'a> Walk<'a> {
                     if !plain_name(&name) || implicit(&name) {
                         return construct();
                     }
-                    let it = self.term(expr, &sc, false)?;
+                    let it = self.output(expr, &sc, outer)?;
                     *alias = quoted(&name);
                     aliases.push((name.clone(), expr.clone(), it.clone()));
                     items.push((Some(name), it));
@@ -1216,6 +1269,7 @@ impl<'a> Walk<'a> {
                 repeats: it.is_col() && (it.repeats || it.src.is_some_and(|s| sc.repeated[s])),
                 unique: it.kind == Kind::Col && groups.len() == 1 && grouped,
                 fp: it.fp,
+                ident: it.ident,
             });
         }
         Ok(out)
@@ -1466,6 +1520,7 @@ impl<'a> Walk<'a> {
                         let mut it = Item::new(Kind::Col, Some(c.ty), fp);
                         it.origin = Some((t.name.clone(), c.name.clone()));
                         it.base = true;
+                        it.ident = c.class == ColumnClass::Identifier;
                         let cloud = c.alias.clone().unwrap_or_else(|| c.name.clone());
                         (cloud, c.name.clone(), it)
                     })
@@ -1480,6 +1535,7 @@ impl<'a> Walk<'a> {
                     it.nullable = c.nullable;
                     it.repeats = c.repeats;
                     it.unique = c.unique;
+                    it.ident = c.ident;
                     Some((n.clone(), n, it))
                 })
                 .collect(),
@@ -1564,6 +1620,107 @@ impl<'a> Walk<'a> {
 
     // ---- expressions ----
 
+    /// One SELECT item. R45-13 (owner ruling 2026-11-18, ruling F-j): the
+    /// outermost block outputs no Identifier value (`identifier_output`); a
+    /// CTE may carry one (to join, group or count), flagged on its column.
+    ///
+    /// Class precedence (fail closed either way): in the outermost block,
+    /// `MIN`/`MAX`/`SUM`/`AVG`/`date`/`strftime` straight over an Identifier
+    /// column is `identifier_output` before the key-column rule (G1) can
+    /// call it `construct_not_allowed`; and in any block, an item the
+    /// grammar refuses as `function_not_allowed` or `construct_not_allowed`
+    /// that names an Identifier column of the block (`substr(cpr, 1, 6)`,
+    /// `lower(email)`, `cpr || ''`, `CASE`) is `identifier_output`: "any
+    /// expression whose inputs include an Identifier column counts as
+    /// yielding it" (owner), so the planner learns that no rewrite will
+    /// print it and plan 48 can offer its reveal. Name and literal classes
+    /// (`unknown_column`, `literal_not_allowed`, ...) keep their class.
+    fn output(&mut self, e: &mut Expr, sc: &Scope, outer: bool) -> R<Item> {
+        if outer && self.over_ident(e, sc) {
+            return fail(ErrorClass::IdentifierOutput);
+        }
+        let names_ident = self.names_ident(&e.to_string(), sc);
+        match self.term(e, sc, false) {
+            Ok(it) if outer && it.ident => fail(ErrorClass::IdentifierOutput),
+            Ok(it) => Ok(it),
+            Err(err)
+                if names_ident
+                    && matches!(
+                        err.class,
+                        ErrorClass::FunctionNotAllowed | ErrorClass::ConstructNotAllowed
+                    ) =>
+            {
+                fail(ErrorClass::IdentifierOutput)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// `MIN|MAX|SUM|AVG(col)`, `date(col, …)` or `strftime(fmt, col, …)`
+    /// whose column argument is a plain Identifier column.
+    fn over_ident(&self, e: &Expr, sc: &Scope) -> bool {
+        let mut e = e;
+        while let Expr::Nested(i) = e {
+            e = i;
+        }
+        let Expr::Function(f) = e else {
+            return false;
+        };
+        let [ObjectNamePart::Identifier(n)] = f.name.0.as_slice() else {
+            return false;
+        };
+        let at = match n.value.to_ascii_lowercase().as_str() {
+            "min" | "max" | "sum" | "avg" | "date" => 0,
+            "strftime" => 1,
+            _ => return false,
+        };
+        let FunctionArguments::List(list) = &f.args else {
+            return false;
+        };
+        let col = match list.args.get(at) {
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id)))) => {
+                self.bare(id, sc, false)
+            }
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(p)))) => {
+                self.qualified(p, sc)
+            }
+            _ => return false,
+        };
+        col.is_ok_and(|(_, it)| it.ident)
+    }
+
+    /// Any name token of `text` (outside single-quoted strings) that is a
+    /// column of a source in scope yielding an Identifier value. Used only
+    /// to choose the class of an item that is refused anyway.
+    fn names_ident(&self, text: &str, sc: &Scope) -> bool {
+        let mut tokens: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        for ch in text.chars() {
+            match quote {
+                Some('\'') if ch == '\'' => quote = None,
+                Some('\'') => {}
+                Some(q) if ch == q => {
+                    quote = None;
+                    tokens.push(std::mem::take(&mut cur));
+                }
+                Some(_) => cur.push(ch),
+                None if ch == '\'' || ch == '"' || ch == '`' => {
+                    tokens.push(std::mem::take(&mut cur));
+                    quote = Some(ch);
+                }
+                None if ch.is_alphanumeric() || ch == '_' => cur.push(ch),
+                None => tokens.push(std::mem::take(&mut cur)),
+            }
+        }
+        tokens.push(cur);
+        tokens.iter().filter(|t| !t.is_empty()).any(|t| {
+            sc.sources
+                .iter()
+                .any(|s| matches!(self.column_in(s, t), Some(Ok((_, it))) if it.ident))
+        })
+    }
+
     /// An allowed expression: a column, a date expression, an aggregate, or
     /// arithmetic between aggregates. A literal is `literal_not_allowed`, a
     /// placeholder `param_misuse`; anything else is refused.
@@ -1617,9 +1774,33 @@ impl<'a> Walk<'a> {
                 } else {
                     (&a.fp, &b.fp)
                 };
+                // Plan 45 final review I2: arithmetic is between numbers only
+                // (`MIN(t.date) - MAX(t.date)` would be a number SQLite makes
+                // up from text).
+                let Some(ty) = num_ty(a.ty, b.ty) else {
+                    return construct();
+                };
+                // Plan 45 final review I1 (ruling F-b): SQLite divides two
+                // INTEGERs as integers (`SUM(a) / COUNT(*)` = 2 for 1, 2, 4).
+                // Saiife's rendered SQL casts the left operand to REAL, so the
+                // division is always real and the output is REAL. The
+                // planner's grammar has no CAST; only the rendering does.
+                let ty = if divide {
+                    let inner = (**left).clone();
+                    **left = Expr::Cast {
+                        kind: CastKind::Cast,
+                        expr: Box::new(inner),
+                        data_type: DataType::Real,
+                        format: None,
+                    };
+                    ColType::Real
+                } else {
+                    ty
+                };
                 let fp = format!("({fa} {sym} {fb})");
-                let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty), fp);
+                let mut it = Item::new(Kind::Arith, Some(ty), fp);
                 it.nullable = a.nullable || b.nullable || divide;
+                it.ident = a.ident || b.ident;
                 Ok(it)
             }
             Expr::Value(v) => match v.value {
@@ -1688,9 +1869,9 @@ impl<'a> Walk<'a> {
             return construct();
         };
         let mut key_count = false;
-        let (arg_ty, arg_fp, base) = match arg {
+        let (arg_ty, arg_fp, base, arg_ident) = match arg {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if count && !distinct => {
-                (None, "*".to_string(), true)
+                (None, "*".to_string(), true, false)
             }
             FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => {
                 // An output alias is not a column here.
@@ -1714,7 +1895,14 @@ impl<'a> Walk<'a> {
                 if repeated && inflates {
                     return construct();
                 }
-                (it.ty, it.fp, it.base)
+                // Plan 45 final review I2: SUM / AVG add numbers. Over a TEXT
+                // or DATE column (by origin through CTEs) SQLite sums leading
+                // digits (`'2026-07-01'` is 2026) or gives 0.0: refused
+                // (`construct_not_allowed`). MIN / MAX / COUNT stay.
+                if matches!(l, "sum" | "avg") && !is_num(it.ty) {
+                    return construct();
+                }
+                (it.ty, it.fp, it.base, it.ident)
             }
             _ => return construct(),
         };
@@ -1741,6 +1929,9 @@ impl<'a> Walk<'a> {
         it.norm = base.then_some(norm);
         it.key_count = key_count;
         it.nullable = !count;
+        // Ruling F-j: only the COUNTs hide an Identifier; MIN / MAX (and
+        // SUM / AVG) return one of its values.
+        it.ident = arg_ident && !count;
         Ok(it)
     }
 
@@ -1756,6 +1947,7 @@ impl<'a> Walk<'a> {
             return construct();
         }
         let mut src = None;
+        let mut ident = false;
         let mut parts = Vec::with_capacity(n);
         for (i, a) in list.args.iter_mut().enumerate() {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a else {
@@ -1767,6 +1959,7 @@ impl<'a> Walk<'a> {
                     return construct();
                 }
                 src = it.src;
+                ident = it.ident;
                 parts.push(it.fp);
                 continue;
             }
@@ -1792,6 +1985,7 @@ impl<'a> Walk<'a> {
         let fp = format!("{name}({})", parts.join(","));
         let mut it = Item::new(Kind::DateOf, Some(ty), fp);
         it.src = src;
+        it.ident = ident;
         Ok(it)
     }
 
@@ -1842,6 +2036,16 @@ impl<'a> Walk<'a> {
                         return construct();
                     }
                     self.operand(item, &it, cmp, entity_ok, pinned)?;
+                }
+                Ok(())
+            }
+            // Ruling F-k: `t.c IS [NOT] NULL` on a plain column ("customers
+            // without a phone"), WHERE only. A key or FK column stays
+            // structural (G1): it could defeat the pin.
+            Expr::IsNull(x) | Expr::IsNotNull(x) if !having => {
+                let it = self.term(x, sc, false)?;
+                if it.kind != Kind::Col || self.structural(&it) {
+                    return construct();
                 }
                 Ok(())
             }
@@ -1990,6 +2194,9 @@ impl<'a> Walk<'a> {
                 };
                 if !op_ok {
                     return misuse();
+                }
+                if !self.range_halves.iter().any(|(b, x)| b == base && *x == s) {
+                    self.range_halves.push((base.to_string(), s));
                 }
                 true
             }
