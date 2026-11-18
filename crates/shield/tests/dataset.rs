@@ -141,7 +141,16 @@ fn build_end_to_end() {
 
     assert_eq!(m.v, 2);
     assert_eq!(m.dataset.as_str(), "crm");
-    assert_eq!(m.snapshot_sha256, info.sha256);
+    // `finish` adds the key and join indexes to the staged snapshot, so the
+    // manifest hashes the indexed file, not the staged one.
+    assert_ne!(m.snapshot_sha256, info.sha256);
+    // Plan 45 (merge of a136ebe8): the calculator (`saiife __blind-calc`)
+    // checks a job's `snapshot_sha256` against `snapshot::hash_file` of the
+    // live snapshot, so a job must carry the manifest's hash (the indexed
+    // file), never the staged one.
+    let live = saiife_shield::snapshot::hash_file(&dir.snapshot()).unwrap();
+    assert_eq!(live, m.snapshot_sha256);
+    assert_ne!(live, info.sha256);
     let names: Vec<&str> = m.schema.tables.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["customers", "invoices"]);
     assert_eq!(
@@ -1030,4 +1039,138 @@ fn declared_joins_are_checked() {
     schema.joins = vec![decl("invoices", "customer_id")];
     let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
     assert_eq!(m.schema.joins, vec![decl("invoices", "customer_id")]);
+}
+
+/// The (table, column) of every index in the live snapshot, sorted.
+fn snapshot_indexes(dir: &DatasetDir) -> Vec<(String, String)> {
+    let conn = saiife_shield::snapshot::open_ro(&dir.snapshot()).unwrap();
+    let mut st = conn
+        .prepare(
+            "SELECT m.tbl_name, i.name FROM sqlite_master m, pragma_index_info(m.name) i \
+             WHERE m.type = 'index' ORDER BY 1, 2",
+        )
+        .unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// Bench item 2: the snapshot gets an index on every entity key and every
+/// `Schema.joins` FK column, the planner uses them, and the manifest hash
+/// covers them.
+#[test]
+fn snapshot_gets_key_and_join_indexes() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 300, 900, 7);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    schema.entities[0].word = "customer".into();
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    let want = vec![
+        ("customers".to_string(), "id".to_string()),
+        ("invoices".to_string(), "customer_id".to_string()),
+    ];
+    assert_eq!(snapshot_indexes(&dir), want);
+    assert_eq!(
+        saiife_shield::dataset::snapshot_index_columns(&m.schema),
+        want
+    );
+    // The layout (tables and columns) is unchanged.
+    let names: Vec<&str> = m.schema.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["customers", "invoices"]);
+
+    // A NOT EXISTS over the join searches the index, not a full scan.
+    let conn = saiife_shield::snapshot::open_ro(&dir.snapshot()).unwrap();
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM customers c WHERE NOT EXISTS \
+             (SELECT 1 FROM invoices i WHERE i.customer_id = c.id)",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|p| p.contains("USING") && p.contains("INDEX")),
+        "{plan:?}"
+    );
+    drop(conn);
+
+    // The hash covers the indexes: the manifest loads, and a dropped index
+    // is caught.
+    assert_eq!(load_manifest(&dir).unwrap(), m);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.snapshot();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let c = rusqlite::Connection::open(&p).unwrap();
+        let name: String = c
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.execute_batch(&format!("DROP INDEX \"{name}\"")).unwrap();
+        drop(c);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(load_manifest(&dir), Err(ShieldError::Corrupt(_))));
+    }
+}
+
+/// A failed `finish` (validation) can be retried on the same stage: the
+/// indexes it already added do not read as a changed snapshot.
+#[test]
+fn finish_retries_on_an_indexed_stage() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 8);
+    let dir = ds(t.path());
+    // The fixture's entity word is `record`: no join yet, only the key.
+    let mut schema = stage(&dir, &csv);
+    let r = finish(
+        &dir,
+        &schema,
+        10,
+        &key(),
+        &mut |_: &Manifest| Err("no".into()),
+        &mut |_| {},
+    );
+    assert!(r.is_err());
+    // The retry has a join (by convention); its index is added too.
+    schema.entities[0].word = "customer".into();
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    assert_eq!(load_manifest(&dir).unwrap(), m);
+    assert_eq!(
+        snapshot_indexes(&dir),
+        vec![
+            ("customers".to_string(), "id".to_string()),
+            ("invoices".to_string(), "customer_id".to_string()),
+        ]
+    );
+}
+
+/// A retry with fewer joins drops the index the earlier attempt made, and
+/// a retry on the same schema leaves the indexed file as it was.
+#[test]
+fn finish_retry_drops_stale_indexes() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 9);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    schema.entities[0].word = "customer".into();
+    let fail = |_: &Manifest| -> Result<(), String> { Err("no".into()) };
+    for _ in 0..2 {
+        assert!(finish(&dir, &schema, 10, &key(), &mut { fail }, &mut |_| {}).is_err());
+    }
+    schema.entities[0].word = "record".into();
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    assert_eq!(load_manifest(&dir).unwrap(), m);
+    assert_eq!(
+        snapshot_indexes(&dir),
+        vec![("customers".to_string(), "id".to_string())]
+    );
 }

@@ -82,13 +82,22 @@ saiife-boxproto = { path = "../boxproto" }
 # The random name of a spawn's staging dir; the version saiife-boxhost uses.
 ring = "=0.17.14"
 # Signals for the worker fault seam (debug builds); no unsafe calls.
-rustix = { version = "1", features = ["process", "termios", "fs", "event"] }
+# `thread`: the calculator's debug escape probe tries `unshare`.
+rustix = { version = "1", features = ["process", "termios", "fs", "event", "thread"] }
 base64 = "=0.23.1"
 # A runtime for `saiife workspace serve`, and the SIGINT wait of `workspace pair`
 # (the version saiife-link uses).
 tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "signal"] }
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `saiife __blind-calc`: the Data Shield calculator process (plan 45 R45-12).
+saiife-shield = { path = "../shield" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The calculator tests write a fixture snapshot (the version saiife-shield uses).
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Same-user approvals: an empty authorization reference whose external form

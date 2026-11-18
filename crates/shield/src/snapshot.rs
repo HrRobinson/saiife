@@ -545,7 +545,9 @@ fn write_tables(
     Ok(out)
 }
 
-fn hash_file(path: &Path) -> Result<String, ShieldError> {
+/// `sha256:` + 64 lowercase hex of the file's bytes ([`SnapshotInfo::sha256`];
+/// the calculator checks a job's snapshot with it).
+pub fn hash_file(path: &Path) -> Result<String, ShieldError> {
     let bad = |_| ShieldError::Io("could not read the snapshot".into());
     let mut f = std::fs::File::open(path).map_err(bad)?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);

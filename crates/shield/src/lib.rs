@@ -10,6 +10,7 @@ pub mod dataset;
 pub mod envelope;
 pub mod error;
 pub mod firewall;
+pub(crate) mod grammar;
 pub mod index;
 pub mod lang;
 pub mod lexicon;

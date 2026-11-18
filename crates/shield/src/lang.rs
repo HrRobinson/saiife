@@ -699,6 +699,31 @@ fn attached_suffix(text: &str, end: usize) -> Option<(usize, Suffix)> {
     None
 }
 
+/// A scale word after a number and at least one space: its end and power
+/// of ten. Both languages' words are read, except `billion`, which is 10^9
+/// in English and 10^12 in Danish: only English reads it.
+fn scale_word_after(text: &str, end: usize, lang: Lang) -> Option<(usize, u8)> {
+    let p = skip_ws(text, end);
+    if p == end {
+        return None;
+    }
+    let (ws, we) = word_at(text, p)?;
+    let w = text[ws..we].to_lowercase();
+    let pow = match w.as_str() {
+        "hundred" | "hundrede" => 2,
+        "thousand" | "tusind" | "tusinde" => 3,
+        "million" | "millioner" | "mio" | "mill" | "mln" => 6,
+        "milliard" | "milliarder" | "mia" => 9,
+        "billion" if lang == Lang::En => 9,
+        _ => return None,
+    };
+    let mut e = we;
+    if matches!(w.as_str(), "mio" | "mia" | "mill") && text.as_bytes().get(e) == Some(&b'.') {
+        e += 1;
+    }
+    Some((e, pow))
+}
+
 #[derive(Clone, Copy)]
 enum Suffix {
     Pow(u8),
@@ -936,6 +961,23 @@ fn date_at(text: &str, i: usize, lang: Lang) -> Result<Option<(usize, Literal)>,
                 _ => Err(lit_err(i, end, "not a calendar date")),
             };
         }
+        // Year first: `2025 Q2`, `2025-Q2`, `2024/H1`.
+        if let Some((ye, y)) = year_at(text, i) {
+            let mut p = ye;
+            if matches!(b.get(p), Some(b'/' | b'-')) {
+                p += 1;
+            } else {
+                p = skip_ws(text, p);
+            }
+            if p > ye {
+                if let Some((unit, k)) = period_code(text, p) {
+                    let end = p + 2;
+                    if !glued_after(text, end) {
+                        return Ok(Some((end, unit.range(y, k, i, end)?)));
+                    }
+                }
+            }
+        }
         // D.M.YYYY
         if (1..=2).contains(&n) && b.get(i + n) == Some(&b'.') {
             let m0 = i + n + 1;
@@ -957,19 +999,20 @@ fn date_at(text: &str, i: usize, lang: Lang) -> Result<Option<(usize, Literal)>,
         return Ok(None);
     }
 
-    // Q3 2026
-    if (c == b'Q' || c == b'q') && b.get(i + 1).is_some_and(|d| (b'1'..=b'4').contains(d)) {
-        if !b.get(i + 2).is_some_and(u8::is_ascii_digit) {
-            let q = u32::from(b[i + 1] - b'0');
-            let mut p = i + 2;
-            if matches!(b.get(p), Some(b'/' | b'-')) {
-                p += 1;
+    // Q3 2026, Q3 of 2026, H1 2026 (a quarter or a half-year by its code).
+    if let Some((unit, n)) = period_code(text, i) {
+        let mut p = i + 2;
+        if matches!(b.get(p), Some(b'/' | b'-')) {
+            p += 1;
+        }
+        let p0 = p;
+        p = skip_ws(text, p);
+        if p > i + 2 {
+            if p > p0 {
+                p = skip_of(text, p);
             }
-            p = skip_ws(text, p);
             if let Some((end, y)) = year_at(text, p) {
-                if p > i + 2 {
-                    return Ok(Some((end, quarter(y, q, i, end)?)));
-                }
+                return Ok(Some((end, unit.range(y, n, i, end)?)));
             }
         }
         return Ok(None);
@@ -1023,11 +1066,16 @@ fn date_at(text: &str, i: usize, lang: Lang) -> Result<Option<(usize, Literal)>,
         let w = text[ws..we].to_lowercase();
         if w == "of" {
             p = skip_ws(text, we);
-        } else if w == "quarter" || w == "kvartal" {
+        } else if let Some(unit) = Period::word(&w) {
+            // `third quarter 2026`, `første halvår af 2024`: an ordinal
+            // only (`one quarter of 2025` is a fraction, not Q1).
+            if !ordinal_form(text, i, de, lang) {
+                return Ok(None);
+            }
             let p2 = skip_ws(text, we);
             if p2 > we {
-                if let Some((end, y)) = year_at(text, p2) {
-                    return Ok(Some((end, quarter(y, d, i, end)?)));
+                if let Some((end, y)) = year_at(text, skip_of(text, p2)) {
+                    return Ok(Some((end, unit.range(y, d, i, end)?)));
                 }
             }
             return Ok(None);
@@ -1053,11 +1101,82 @@ fn date_at(text: &str, i: usize, lang: Lang) -> Result<Option<(usize, Literal)>,
     Ok(None)
 }
 
-fn quarter(y: u32, q: u32, start: usize, end: usize) -> Result<Literal, LiteralError> {
-    if !(1..=4).contains(&q) || !(1000..=9998).contains(&y) {
-        return Err(lit_err(start, end, "not a quarter"));
+/// A part of a year named by its number: a quarter or a half-year.
+#[derive(Clone, Copy)]
+enum Period {
+    Quarter,
+    Half,
+}
+
+impl Period {
+    /// The period word after an ordinal (`third quarter`, `første halvår`).
+    fn word(w: &str) -> Option<Period> {
+        match w {
+            "quarter" | "kvartal" => Some(Period::Quarter),
+            "half" | "halvår" | "halvdel" => Some(Period::Half),
+            _ => None,
+        }
     }
-    Ok(month_range(y, (q - 1) * 3 + 1, 3))
+
+    /// The `n`th period of year `y`; a number past the last is an error.
+    fn range(self, y: u32, n: u32, start: usize, end: usize) -> Result<Literal, LiteralError> {
+        let (count, months, why) = match self {
+            Period::Quarter => (4, 3, "not a quarter"),
+            Period::Half => (2, 6, "not a half-year"),
+        };
+        if !(1..=count).contains(&n) || !(1000..=9998).contains(&y) {
+            return Err(lit_err(start, end, why));
+        }
+        Ok(month_range(y, (n - 1) * months + 1, months))
+    }
+}
+
+/// `Q1`..`Q4` or `H1`/`H2` at `i` (either case), not followed by another
+/// digit.
+fn period_code(text: &str, i: usize) -> Option<(Period, u32)> {
+    let b = text.as_bytes();
+    let unit = match b.get(i)? {
+        b'Q' | b'q' => Period::Quarter,
+        b'H' | b'h' => Period::Half,
+        _ => return None,
+    };
+    let max = match unit {
+        Period::Quarter => b'4',
+        Period::Half => b'2',
+    };
+    let d = *b.get(i + 1)?;
+    if !(b'1'..=max).contains(&d) || b.get(i + 2).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((unit, u32::from(d - b'0')))
+}
+
+/// True when `text[i..de]` (an [`ordinal_token`]) is written as an ordinal:
+/// digits with a `.` or `st`/`nd`/`rd`/`th`, or an ordinal number word.
+fn ordinal_form(text: &str, i: usize, de: usize, lang: Lang) -> bool {
+    let b = text.as_bytes();
+    if b.get(i).is_some_and(u8::is_ascii_digit) {
+        return de > i + digits_at(b, i);
+    }
+    text.get(i..de)
+        .and_then(|t| {
+            t.split(|c: char| !c.is_alphabetic())
+                .rfind(|w| !w.is_empty())
+        })
+        .is_some_and(|w| matches!(number_words(lang).lex(&w.to_lowercase()), Some(Tok::Ord(_))))
+}
+
+/// Past an `of`/`af` and the spaces after it, when one is at `p`.
+fn skip_of(text: &str, p: usize) -> usize {
+    if let Some((ws, we)) = word_at(text, p) {
+        if matches!(text[ws..we].to_lowercase().as_str(), "of" | "af") {
+            let q = skip_ws(text, we);
+            if q > we {
+                return q;
+            }
+        }
+    }
+    p
 }
 
 fn range_from(lit: &Literal) -> Option<String> {
@@ -1172,7 +1291,15 @@ fn digit_literal(
             end = e;
             ordinal = true;
         }
-        None => {}
+        None => {
+            // `1,5 thousand`, `2 mio. kr.`: the scale word is part of it.
+            if let Some((e, p)) = scale_word_after(text, end, lang) {
+                value = mul_pow10(value, p)
+                    .ok_or_else(|| lit_err(span_start, e, "number too large"))?;
+                end = e;
+                scaled = true;
+            }
+        }
     }
     if !ordinal {
         if prefix_cur.is_none() && !scaled {
@@ -1220,7 +1347,18 @@ fn digit_literal(
 /// Number words as a literal, with an optional currency after
 /// (`fem hundrede kroner`).
 fn word_literal(text: &str, i: usize, lang: Lang) -> Option<(usize, Literal)> {
-    let (end, value) = number_words(lang).parse_at(text, i)?;
+    let nw = number_words(lang);
+    // A bare scale word (`millioner`, `thousand`, `dozen`) is no number by
+    // itself (`flere millioner`, `a few thousand`): it stays text, and the
+    // parameterizer refuses it beside a number. `a million` still reads.
+    let (ws, we) = word_at(text, i)?;
+    if matches!(
+        nw.lex(&text[ws..we].to_lowercase()),
+        Some(Tok::Hundred | Tok::Scale(_) | Tok::Dozen)
+    ) {
+        return None;
+    }
+    let (end, value) = nw.parse_at(text, i)?;
     if let Some(e) = percent_suffix(text, end) {
         return Some((e, Literal::Percent(value)));
     }

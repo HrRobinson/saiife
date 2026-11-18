@@ -132,16 +132,68 @@ pub(crate) fn with_private_part<T>(
     final_name: &str,
     write: impl FnOnce(&Path) -> Result<T, ShieldError>,
 ) -> Result<(PathBuf, T), ShieldError> {
+    private_part(dir, final_name, false, write)
+}
+
+/// [`with_private_part`] for a file that is rewritten in place (the approved
+/// method store): an existing `dir/final_name` must be a regular file (never
+/// a symlink) and is replaced by the rename; the new file stays 0600 (it is
+/// fsynced, not sealed 0400). Everything else is as in `with_private_part`.
+pub(crate) fn replace_private_part<T>(
+    dir: &Path,
+    final_name: &str,
+    write: impl FnOnce(&Path) -> Result<T, ShieldError>,
+) -> Result<(PathBuf, T), ShieldError> {
+    private_part(dir, final_name, true, write)
+}
+
+/// Replace mode only: a leftover part from a crash (a regular file of ours,
+/// not a symlink) is removed so it cannot block every later save; anything
+/// else at the part path is left alone and refuses at creation.
+fn remove_stale_part(part: &Path) -> Result<(), ShieldError> {
+    let md = match std::fs::symlink_metadata(part) {
+        Ok(md) => md,
+        Err(_) => return Ok(()),
+    };
+    #[cfg(unix)]
+    let ours = {
+        use std::os::unix::fs::MetadataExt;
+        md.uid() == rustix::process::geteuid().as_raw()
+    };
+    #[cfg(not(unix))]
+    let ours = true;
+    if md.is_file() && ours {
+        std::fs::remove_file(part).map_err(|_| io("could not remove a stale part file"))?;
+    }
+    Ok(())
+}
+
+fn private_part<T>(
+    dir: &Path,
+    final_name: &str,
+    replace: bool,
+    write: impl FnOnce(&Path) -> Result<T, ShieldError>,
+) -> Result<(PathBuf, T), ShieldError> {
     ensure_private_dir(dir)?;
     let path = dir.join(final_name);
-    if std::fs::symlink_metadata(&path).is_ok() {
-        return Err(io("a dataset file already exists"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) if replace && md.is_file() => {}
+        Ok(_) => return Err(io("a dataset file already exists")),
+        Err(_) => {}
     }
     let part = dir.join(format!("{final_name}.part"));
+    if replace {
+        remove_stale_part(&part)?;
+    }
     let file = create_private_file(&part)?;
     let mut guard = PartGuard(&part, false);
     let v = write(&part)?;
-    seal_file(&file)?;
+    if replace {
+        file.sync_all()
+            .map_err(|_| io("could not write a dataset file"))?;
+    } else {
+        seal_file(&file)?;
+    }
     drop(file);
     std::fs::rename(&part, &path).map_err(|_| io("could not write a dataset file"))?;
     guard.1 = true;
@@ -245,6 +297,8 @@ pub const MIN_K: u32 = 2;
 /// Stage-only sidecar: the snapshot hash and the source names, from
 /// `stage_snapshot` to `finish`. Removed before the swap.
 const STAGE_INFO_FILE: &str = "stage.json";
+/// The next stage info, renamed over [`STAGE_INFO_FILE`].
+const STAGE_INFO_NEXT: &str = "stage.json.next";
 const MAX_JSON_BYTES: u64 = 64 << 20;
 const PUBLIC_REFUSED: &str = "a public column holds names, IDs or amounts";
 const RESERVED: &str = "names starting with _p_ are reserved; rename it";
@@ -402,8 +456,13 @@ pub struct Proposal {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StageInfo {
+    /// The snapshot as staged (no indexes); the classifier's sample seed.
     snapshot_sha256: String,
     source_names: BTreeMap<String, String>,
+    /// The snapshot after a `finish` added its indexes, so a retry on the
+    /// same stage knows the file it left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexed_sha256: Option<String>,
 }
 
 fn exists(p: &Path) -> bool {
@@ -823,6 +882,7 @@ pub fn stage_snapshot(
     let si = StageInfo {
         snapshot_sha256: info.sha256.clone(),
         source_names,
+        indexed_sha256: None,
     };
     write_json_part(
         &stage,
@@ -845,16 +905,18 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
         "could not read the snapshot",
     )?)?;
     // R-22: the source names (`CustomerID`) from the stage sidecar, when
-    // the snapshot was staged by `stage_snapshot`.
+    // the snapshot was staged by `stage_snapshot`. Its staged hash is the
+    // sample seed, as in `finish` (a failed `finish` may have added the
+    // indexes since).
     let info_path = snapshot.with_file_name(STAGE_INFO_FILE);
-    let source_names = if exists(&info_path) {
+    let (sha, source_names) = if exists(&info_path) {
         let si: StageInfo = read_json(
             open_sealed(&info_path, 0o400)?,
             "the staged build is incomplete",
         )?;
-        si.source_names
+        (si.snapshot_sha256, si.source_names)
     } else {
-        BTreeMap::new()
+        (sha, BTreeMap::new())
     };
     let conn = open_ro(snapshot)?;
     let mut out = Vec::new();
@@ -938,7 +1000,8 @@ fn clear_derived(stage: &Path) -> Result<(), ShieldError> {
     for e in rd {
         let e = e.map_err(|_| io("could not read the staged build"))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        let derived = HASHED.contains(&name.as_str()) || name == MANIFEST_FILE;
+        let derived =
+            HASHED.contains(&name.as_str()) || name == MANIFEST_FILE || name == STAGE_INFO_NEXT;
         let part = name.ends_with(".part") && name != format!("{SNAPSHOT_FILE}.part");
         if derived
             || part
@@ -952,6 +1015,95 @@ fn clear_derived(stage: &Path) -> Result<(), ShieldError> {
     }
     sync_dir(stage);
     Ok(())
+}
+
+/// The (table, column) pairs `finish` indexes in the snapshot, sorted: every
+/// entity key and the FK column of every [`Schema::joins`] entry (pass the
+/// built schema, whose joins include the conventional ones). Plan 45's
+/// calculator can rely on these being indexed.
+pub fn snapshot_index_columns(schema: &Schema) -> Vec<(String, String)> {
+    let mut out: BTreeSet<(String, String)> = schema
+        .entities
+        .iter()
+        .map(|e| (e.table.clone(), e.key.clone()))
+        .collect();
+    for j in &schema.joins {
+        out.insert((j.entity.clone(), j.key.clone()));
+        out.insert((j.table.clone(), j.column.clone()));
+    }
+    out.into_iter().collect()
+}
+
+/// The name of the index on `table.column`. Snapshot names hold no `.`,
+/// so no two pairs share a name; `IF NOT EXISTS` keeps a retry idempotent.
+fn index_name(table: &str, column: &str) -> String {
+    format!("saiife_ix:{table}.{column}")
+}
+
+/// Makes a sealed file of ours writable again (0600 on unix).
+#[cfg(unix)]
+fn unseal(path: &Path, why: &'static str) -> Result<(), ShieldError> {
+    use std::os::unix::fs::PermissionsExt;
+    open_nofollow(path, false, why)?
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| io(why))
+}
+
+/// Makes a sealed file of ours writable again (clears read-only).
+#[cfg(not(unix))]
+#[allow(clippy::permissions_set_readonly_false)]
+fn unseal(path: &Path, why: &'static str) -> Result<(), ShieldError> {
+    let md = std::fs::symlink_metadata(path).map_err(|_| io(why))?;
+    if md.file_type().is_symlink() || !md.is_file() {
+        return Err(io(why));
+    }
+    let mut p = md.permissions();
+    p.set_readonly(false);
+    std::fs::set_permissions(path, p).map_err(|_| io(why))
+}
+
+/// Adds the [`snapshot_index_columns`] indexes to the sealed staged
+/// snapshot in place: unseal, create, fsync and seal 0400 again. A crash
+/// here leaves a file whose hash matches neither the staged nor an indexed
+/// one, so the next `finish` refuses it and the user stages again.
+fn index_snapshot(snap: &Path, schema: &Schema) -> Result<(), ShieldError> {
+    const WHY: &str = "could not index the snapshot";
+    unseal(snap, WHY)?;
+    let built = create_indexes(snap, schema, WHY);
+    // Sealed again on every path: a failure leaves a 0400 file whose hash
+    // the next `finish` refuses as a changed snapshot (stage again).
+    let sealed = open_nofollow(snap, true, WHY).and_then(|f| seal_file(&f));
+    built.and(sealed)
+}
+
+/// Drops the `saiife_ix:` indexes an earlier attempt made that this schema
+/// does not want, then creates the wanted ones.
+fn create_indexes(snap: &Path, schema: &Schema, why: &'static str) -> Result<(), ShieldError> {
+    let err = |_| ShieldError::Sqlite(why.into());
+    let conn = open_part_db(snap, why)?;
+    let want: Vec<(String, String)> = snapshot_index_columns(schema);
+    let names: BTreeSet<String> = want.iter().map(|(t, c)| index_name(t, c)).collect();
+    let have: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'saiife\\_ix:%' ESCAPE '\\'")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(err)?;
+    for n in have.iter().filter(|n| !names.contains(*n)) {
+        conn.execute_batch(&format!("DROP INDEX {}", quote_ident(n)))
+            .map_err(err)?;
+    }
+    for (t, c) in &want {
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            quote_ident(&index_name(t, c)),
+            quote_ident(t),
+            quote_ident(c)
+        ))
+        .map_err(err)?;
+    }
+    conn.close().map_err(|_| ShieldError::Sqlite(why.into()))
 }
 
 /// Stage 2: see the brief; `finish` and the crash seam share it.
@@ -982,10 +1134,12 @@ fn finish_inner(
         "the staged build is incomplete",
     )?;
     let snap_path = stage.join(SNAPSHOT_FILE);
-    let snapshot_sha256 = sha256_of(open_sealed(&snap_path, 0o400)?)?;
-    if snapshot_sha256 != si.snapshot_sha256 {
+    let found = sha256_of(open_sealed(&snap_path, 0o400)?)?;
+    if found != si.snapshot_sha256 && si.indexed_sha256.as_ref() != Some(&found) {
         return Err(ShieldError::Corrupt("the staged snapshot changed"));
     }
+    // The sample seed is the staged hash, as in `propose`.
+    let staged_sha256 = si.snapshot_sha256.clone();
 
     let conn = open_ro(&snap_path)?;
     let layout = snapshot_layout(&conn)?;
@@ -1013,7 +1167,7 @@ fn finish_inner(
         t.rows = n.max(0) as u64;
         rows_bands.insert(t.name.clone(), rows_band(t.rows));
         for c in &t.columns {
-            let seed = sample_seed(&snapshot_sha256, &t.name, &c.name);
+            let seed = sample_seed(&staged_sha256, &t.name, &c.name);
             let sample = classify::sample_seeded(&conn, &t.name, &c.name, seed)?;
             if c.class == ColumnClass::Public {
                 // Defence in depth for a hand-edited policy: the wizard's
@@ -1042,6 +1196,28 @@ fn finish_inner(
         }
     }
     drop(conn);
+
+    // Bench item 2: the key and join indexes, after the bulk load. The
+    // manifest hashes the indexed file; the stage info records it so a
+    // retry of a failed `finish` accepts it.
+    index_snapshot(&snap_path, &schema)?;
+    let snapshot_sha256 = sha256_of(open_sealed(&snap_path, 0o400)?)?;
+    if snapshot_sha256 != found {
+        let next = StageInfo {
+            snapshot_sha256: staged_sha256.clone(),
+            source_names: si.source_names.clone(),
+            indexed_sha256: Some(snapshot_sha256.clone()),
+        };
+        // Replaced by a rename (atomic on unix): a crash leaves the old or
+        // the new stage info, never none.
+        const WHY: &str = "could not write the staged build";
+        let _ = remove_entry(&stage.join(STAGE_INFO_NEXT));
+        let tmp = write_json_part(&stage, STAGE_INFO_NEXT, &next, WHY)?;
+        #[cfg(not(unix))]
+        unseal(&stage.join(STAGE_INFO_FILE), WHY)?;
+        std::fs::rename(&tmp, stage.join(STAGE_INFO_FILE)).map_err(|_| io(WHY))?;
+        sync_dir(&stage);
+    }
 
     progress(BuildProgress {
         phase: Phase::Lexicon,

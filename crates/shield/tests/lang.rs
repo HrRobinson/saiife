@@ -435,3 +435,83 @@ fn euro_pound_and_pct() {
     assert_eq!(one("5,5 pct", Lang::Da), Literal::Percent(d("5.5")));
     assert_eq!(one("7 percent", Lang::En), Literal::Percent(d("7")));
 }
+
+// ------------------------------- plan 44 follow-up: bench item 1 (meaning) ----
+
+#[test]
+fn half_years_are_one_date_range() {
+    let h1 = range("2024-01-01", "2024-07-01");
+    let h2 = range("2024-07-01", "2025-01-01");
+    for (t, l, want) in [
+        ("første halvår 2024", Lang::Da, &h1),
+        ("andet halvår 2024", Lang::Da, &h2),
+        ("1. halvår 2024", Lang::Da, &h1),
+        ("2. halvår 2024", Lang::Da, &h2),
+        ("første halvår af 2024", Lang::Da, &h1),
+        ("første halvdel af 2024", Lang::Da, &h1),
+        ("first half of 2024", Lang::En, &h1),
+        ("second half of 2024", Lang::En, &h2),
+        ("first half 2024", Lang::En, &h1),
+        ("1st half of 2024", Lang::En, &h1),
+        ("H1 2024", Lang::En, &h1),
+        ("h2 2024", Lang::En, &h2),
+        ("H1/2024", Lang::En, &h1),
+        ("H2-2024", Lang::Da, &h2),
+        ("2024 H1", Lang::En, &h1),
+        ("2024-H2", Lang::Da, &h2),
+    ] {
+        assert_eq!(&one(t, l), want, "{t}");
+    }
+    assert!(find_literals("tredje halvår 2024", Lang::Da).is_err());
+    assert!(find_literals("third half of 2024", Lang::En).is_err());
+}
+
+#[test]
+fn ordinal_quarters_take_of_and_year_first() {
+    let q2 = range("2025-04-01", "2025-07-01");
+    for (t, l) in [
+        ("second quarter of 2025", Lang::En),
+        ("second quarter 2025", Lang::En),
+        ("2nd quarter of 2025", Lang::En),
+        ("andet kvartal 2025", Lang::Da),
+        ("andet kvartal af 2025", Lang::Da),
+        ("2. kvartal 2025", Lang::Da),
+        ("Q2 of 2025", Lang::En),
+        ("Q2 af 2025", Lang::Da),
+        ("2025 Q2", Lang::En),
+        ("2025-Q2", Lang::En),
+        ("2025/q2", Lang::Da),
+    ] {
+        assert_eq!(one(t, l), q2, "{t}");
+    }
+    let t = "What was the revenue in the second quarter of 2025?";
+    let v = find_literals(t, Lang::En).unwrap();
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert_eq!(&t[v[0].start..v[0].end], "second quarter of 2025");
+    assert_eq!(v[0].lit, q2);
+}
+
+#[test]
+fn a_scale_word_after_digits_is_one_amount() {
+    for (t, l, v, cur) in [
+        ("1,5 thousand", Lang::En, "1500", None),
+        ("1.5 thousand", Lang::En, "1500", None),
+        ("1,5 tusind", Lang::Da, "1500", None),
+        ("1,5 tusinde kr.", Lang::Da, "1500", Some("kr")),
+        ("2 million", Lang::En, "2000000", None),
+        ("2 millioner", Lang::Da, "2000000", None),
+        ("2 mio. kr.", Lang::Da, "2000000", Some("kr")),
+        ("3 mia", Lang::Da, "3000000000", None),
+        ("2 billion", Lang::En, "2000000000", None),
+        ("5 hundred", Lang::En, "500", None),
+        ("$2 million", Lang::En, "2000000", Some("USD")),
+    ] {
+        assert_eq!(one(t, l), amount(v, cur), "{t}");
+    }
+    // The language does not matter for the words both read alike.
+    assert_eq!(one("1,5 tusind", Lang::En), amount("1500", None));
+    // Danish `billion` is 10^12: it is not read as an English billion.
+    let v = find_literals("2 billion", Lang::Da).unwrap();
+    assert_eq!(v[0].lit, Literal::Integer(2));
+    assert_eq!((v[0].start, v[0].end), (0, 1));
+}

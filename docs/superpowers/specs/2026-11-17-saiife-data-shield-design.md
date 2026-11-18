@@ -219,6 +219,8 @@ The validator checks, before anything runs:
 - caps on joins, result rows and estimated cost; **list answers are capped at 100 rows by default** [call] (policy can change it; a list that hits the cap says so, "showing 100 of 2,314", and never pretends to be complete);
 - every entity parameter is bound to resolved keys (§2.1.6), and the method uses it only in a key comparison.
 
+Stage 1 accepts only an allow-listed SQL shape (plain columns, single-column aggregates, date functions, inner joins on declared key pairs, `AND`-only filters against parameters or allowed literals; no `CASE`, `COALESCE`, subqueries or constants in the output) and, before the method, runs a saiife-built existence check per bound entity: no rows for the key in its table, or in a table the method links to it (unless every output is a count), is a refusal. **[call: coordinator, 2026-11-17]**
+
 It then runs in the **calculator**, after the method preview (§2.3.6). The snapshot is attached read-only. Time and memory are capped; a cap hit is an error, never a partial answer.
 
 **Where the calculator runs [call]:**
