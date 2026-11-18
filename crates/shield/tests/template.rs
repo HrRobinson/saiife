@@ -684,56 +684,57 @@ fn entity_param_falls_back_to_the_plain_word() {
 }
 
 #[test]
-fn top_n_limit_covers_an_integer_param() {
-    // Ruling F-o: "top 5 cities by total" binds 5 as an Integer; the
-    // outermost `LIMIT 5` applies it.
-    let five = Param {
-        name: "p2".into(),
+fn no_limit_covers_a_param() {
+    // Ruling F-p (supersedes F-o): plan 44's binding has no row-count role,
+    // so no parameter is covered by a LIMIT. "Customers who bought more than
+    // 10 items" (p2 = 10, a filter) answered by a method with LIMIT 10 and no
+    // comparison would look right and be wrong. The part-5 "top 5 / LIMIT 5
+    // passes" assertion flips to refused: required by the finding.
+    let int = |name: &str, n: i64| Param {
+        name: name.into(),
         ty: ParamType::Integer,
-        bound: Some(Bound::Integer(5)),
-        display: "5".into(),
+        bound: Some(Bound::Integer(n)),
+        display: n.to_string(),
     };
-    let ps = vec![five];
     let c = cols(&["city", "total"]);
-    let t = parse_template("{list(city, total)}", &c, &ps, 100).unwrap();
-    let top = |n: u32| {
+    let method = |n: u32, ps: &[Param]| {
         common::v(
             &format!(
                 "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
                  ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC LIMIT {n}"
             ),
-            &ps,
+            ps,
         )
     };
-    check_params_covered(&top(5), &t, &ps).unwrap();
-    let e = check_params_covered(&top(6), &t, &ps).unwrap_err();
+    // "top 5 cities by total" with LIMIT 5: refused (no row-count role yet).
+    let ps = vec![int("p2", 5)];
+    let t = parse_template("{list(city, total)}", &c, &ps, 100).unwrap();
+    let e = check_params_covered(&method(5, &ps), &t, &ps).unwrap_err();
     assert_eq!(e.class, ErrorClass::ParamMisuse);
-    // No LIMIT at all, or a LIMIT only in a CTE body (refused anyway): unused.
-    let all = common::v(
-        "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC",
+    // "more than 10 items" with LIMIT 10 and no comparison: refused.
+    let ps = vec![int("p2", 10)];
+    let t = parse_template("{list(city, total)}", &c, &ps, 100).unwrap();
+    let e = check_params_covered(&method(10, &ps), &t, &ps).unwrap_err();
+    assert_eq!(e.class, ErrorClass::ParamMisuse);
+    // The same threshold applied as a comparison: used.
+    let used = common::v(
+        "SELECT c.city, COUNT(*) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.city HAVING COUNT(*) > :p2 LIMIT 10",
         &ps,
     );
-    assert_eq!(
-        check_params_covered(&all, &t, &ps).unwrap_err().class,
-        ErrorClass::ParamMisuse
-    );
-    // An Amount of 5 is not a row count.
-    let amount = vec![Param {
-        name: "p2".into(),
-        ty: ParamType::Amount,
-        bound: Some(Bound::Amount(dec("5"))),
-        display: "5".into(),
-    }];
-    let v5 = common::v(
-        "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC LIMIT 5",
-        &amount,
-    );
-    assert_eq!(
-        check_params_covered(&v5, &t, &amount).unwrap_err().class,
-        ErrorClass::ParamMisuse
-    );
+    check_params_covered(&used, &t, &ps).unwrap();
+    // Two params both equal to 10, both unused: neither is covered by the
+    // LIMIT, so each one alone is refused too.
+    let both = vec![int("p2", 10), int("p3", 10)];
+    let t = parse_template("{list(city, total)}", &c, &both, 100).unwrap();
+    let m = method(10, &both);
+    assert!(m.params_used.is_empty());
+    let e = check_params_covered(&m, &t, &both).unwrap_err();
+    assert_eq!(e.class, ErrorClass::ParamMisuse);
+    for one in [&both[..1], &both[1..]] {
+        let e = check_params_covered(&m, &t, one).unwrap_err();
+        assert_eq!(e.class, ErrorClass::ParamMisuse);
+    }
     // LIMIT :pN stays refused by the validator.
     let e = saiife_shield::sql::validate(
         "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
@@ -743,5 +744,5 @@ fn top_n_limit_covers_an_integer_param() {
         &ps,
     )
     .unwrap_err();
-    assert_ne!(e.class, ErrorClass::IdentifierOutput);
+    assert_eq!(e.class, ErrorClass::ConstructNotAllowed);
 }

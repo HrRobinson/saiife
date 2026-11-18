@@ -10,7 +10,7 @@
 use crate::calc::{CellValue, ResultSet};
 use crate::grammar::{grammar_ok, Seg};
 use crate::question::Draft;
-use crate::schema::{Bound, Decimal, Lang, Param, ParamType, Schema};
+use crate::schema::{Decimal, Lang, Param, ParamType, Schema};
 use crate::sql::{ErrorClass, MethodError, Validated};
 
 const DETAIL_MAX: usize = 120;
@@ -311,11 +311,10 @@ impl Template {
 /// no parameter operand, so that exemption has no legitimate use and none is
 /// made. The `template` argument is kept for the checker's call shape.
 ///
-/// Ruling F-o: a bound `Integer` parameter also counts as used when the
-/// method's outermost `LIMIT n` literal equals its bound value exactly
-/// ("top 5 cities": `LIMIT 5`); `LIMIT :pN` stays refused by the
-/// validator. This lives here, not in [`Validated::params_used`], which
-/// lists placeholders only.
+/// Ruling F-p (supersedes F-o): no parameter is covered by a `LIMIT`.
+/// Plan 44's binding has no row-count role, and an `Integer` equal to the
+/// limit may be a filter ("more than 10 items" answered by `LIMIT 10`).
+/// The stage-1.5 top-N task carries the rule (R45-6).
 ///
 /// Otherwise `param_misuse` (no detail: R45-8 sends a detail only for the
 /// name classes). Unbound draft parameters are not judged. Found before the
@@ -326,13 +325,9 @@ pub fn check_params_covered(
     _template: &Template,
     params: &[Param],
 ) -> Result<(), MethodError> {
-    let by_limit = |p: &Param| match (&p.bound, method.limit) {
-        (Some(Bound::Integer(n)), Some(l)) => u64::try_from(*n).is_ok_and(|n| n == l),
-        _ => false,
-    };
     let unused = params
         .iter()
-        .any(|p| p.bound.is_some() && !method.params_used.contains(&p.name) && !by_limit(p));
+        .any(|p| p.bound.is_some() && !method.params_used.contains(&p.name));
     if unused {
         return Err(MethodError {
             class: ErrorClass::ParamMisuse,
