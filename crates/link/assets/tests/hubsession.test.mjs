@@ -379,3 +379,17 @@ test("open() rejects with timeout at the bound even if getTicket never settles",
   await assert.rejects(p, (e) => e instanceof HubError && e.code === "timeout");
   assert.equal(closed.length, 1);
 });
+
+test("the fakes import their js deps only through fakes/deps.mjs", async () => {
+  const { readFileSync } = await import("node:fs");
+  for (const f of ["fakerelay.mjs", "fakemachine.mjs"]) {
+    const src = readFileSync(new URL(`./fakes/${f}`, import.meta.url), "utf8");
+    const from = [...src.matchAll(/^\s*(?:import|export)\b[^;]*?\bfrom\s+"([^"]+)"/gm)].map((m) => m[1]);
+    assert.ok(from.length > 0, f);
+    assert.deepEqual([...new Set(from)], ["./deps.mjs"], f);
+    assert.ok(!/import\s*\(/.test(src), f);
+  }
+  const deps = readFileSync(new URL("./fakes/deps.mjs", import.meta.url), "utf8");
+  const targets = [...deps.matchAll(/\bfrom\s+"([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(targets.length > 0 && targets.every((t) => /^\.\.\/\.\.\/js\/[a-z]+\.js$/.test(t)), targets.join(","));
+});

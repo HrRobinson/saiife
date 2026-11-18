@@ -6,8 +6,7 @@
 // machine_sig, the seal_auth check, and above all the machine-end channel
 // that seals direction "m" and opens direction "b") is written here
 // independently of BrowserChannel, so a browser/machine disagreement shows.
-import { machineHelloMsg, keysFromShared, HANDSHAKE_DOMAIN, MACHINE_HELLO_DOMAIN } from "../../js/seal.js";
-import { b64u, unb64u, deviceIdOf } from "../../js/wire.js";
+import { machineHelloMsg, keysFromShared, HANDSHAKE_DOMAIN, MACHINE_HELLO_DOMAIN, b64u, unb64u, deviceIdOf } from "./deps.mjs";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();

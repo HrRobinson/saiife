@@ -1,7 +1,7 @@
 // An in-memory relay for tests (and vendored verbatim in saiife.com): a
 // WebSocket class that behaves like relay /v1/device (hub protocol v1, D2/D3)
 // in front of a fakeMachine. Nothing here touches the network.
-import { b64u, unb64u } from "../../js/wire.js";
+import { b64u, unb64u } from "./deps.mjs";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
