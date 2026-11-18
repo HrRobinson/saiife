@@ -24,3 +24,28 @@ no text leaves it.
   config pins the model, the vocabulary and the labels file, each by its
   sha256. The helper checks every hash before it parses a byte, and refuses
   to start on a mismatch.
+
+### Preparing the model (owner recipe)
+
+saiife does not ship or download a model, and ScandiNER on Hugging Face is not
+ready to pin as it is: it ships `config.json` and `vocab.txt`, but no int8 ONNX
+file and no `labels.json`. To build the three files:
+
+1. Export the model to ONNX with `optimum` (token classification), then apply
+   dynamic int8 quantization to the ONNX file. That file is the model.
+2. Build `labels.json` (`{"id2label": {"0": "O", "1": "B-PER", ...}, "do_lower_case": ..., "max_len": 512, "inputs": [...], "strip_accents": ...}`;
+   unknown keys are refused) from the `id2label` map in the model's `config.json`. List all three BERT
+   inputs (`input_ids`, `attention_mask`, `token_type_ids`) in `inputs`. An
+   uncased model needs `strip_accents: true` set explicitly; it is not implied
+   by `do_lower_case`.
+3. Use the model's `vocab.txt` as the vocabulary.
+4. Pin the sha256 of all three files in `[blind.ner]`. The helper refuses a
+   labels file with no `PER` label.
+
+The helper cannot catch an out-of-memory condition or a stack overflow: either
+aborts it, and `saiife` then treats a helper that dies before or after its
+hello as "name detector unavailable".
+
+On arm64 the helper probes the CPU features after Landlock is applied, so
+tract may fall back to its generic kernels. Measure latency in the owner
+smoke before relying on it.

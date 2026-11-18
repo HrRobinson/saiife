@@ -50,6 +50,17 @@ jobs:
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
+      # The name detector (plan 46): the fake helper and its integration tests sit behind
+      # the `fake` feature, so the workspace steps above never build or run them.
+      - name: name detector (clippy, tests with the fake helper)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo clippy -p saiife-shield-ner --features fake --all-targets -- -D warnings
+          cargo test -p saiife-shield-ner --features fake
+        env:
+          SAIIFE_TEST_TMP: ${{ runner.temp }}/s
+          TMPDIR: ${{ runner.temp }}
       # --no-fail-fast: one failing test binary must not hide the rest.
       # A short temp base keeps unix socket paths under 108 bytes.
       # TMPDIR too: tempfile::tempdir() (and anything else using the
@@ -527,7 +538,16 @@ jobs:
           set -euo pipefail
           cargo build --release --locked --target x86_64-unknown-linux-musl -p saiife-shield-ner --bin saiife-ner
           test -x target/x86_64-unknown-linux-musl/release/saiife-ner
-          ! test -e target/x86_64-unknown-linux-musl/release/saiife-fake-ner
+          test ! -e target/x86_64-unknown-linux-musl/release/saiife-fake-ner
+      # The shipped artifact is static musl, release, LTO: run the real helper and the
+      # synthetic model under the real sandbox filter as exactly that. `cargo test
+      # --release` uses the release profile (opt-level 3, lto, strip) like the shipped
+      # build; it differs only in building the test harness and its bins with it.
+      - name: saiife-ner helper test (musl, release)
+        run: cargo test --release --locked --target x86_64-unknown-linux-musl -p saiife-shield-ner --test helper
+        env:
+          SAIIFE_TEST_TMP: ${{ runner.temp }}/s
+          TMPDIR: ${{ runner.temp }}
       # Pinned downloads are cached, keyed on the pinned SHA-256, because GitHub release
       # downloads can fail for hours. The SHA-256 check runs on a cache hit too, so a bad
       # entry fails the job; a miss downloads with retries. Saved only after the check.

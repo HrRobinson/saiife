@@ -155,6 +155,16 @@ fn best_label(row: &[f32]) -> (usize, f32) {
 
 impl NerModel {
     /// Bytes are already hash-checked by the caller.
+    ///
+    /// Sets tract's process-global single-thread knob (see
+    /// [`force_single_thread`]): loading a model affects every later tract
+    /// call in this process. A labels file without a PER label is refused,
+    /// since such a detector could never report a name.
+    ///
+    /// An out-of-memory condition or a stack overflow aborts the whole
+    /// process (Rust cannot catch either); the helper then dies, and its
+    /// client treats a death before or after the hello as "detector
+    /// unavailable".
     pub fn load(model: &[u8], vocab: &[u8], labels: &[u8]) -> Result<NerModel, NerError> {
         let labels = parse_labels(labels)?;
         let wp = WordPiece::from_vocab(vocab, labels.do_lower_case, labels.strip_accents)?;
@@ -162,6 +172,9 @@ impl NerModel {
             return Err(NerError::Model("model file too large"));
         }
         let table = labels.label_table();
+        if !table.iter().any(|l| wire_kind(l) == Some("PER")) {
+            return Err(NerError::Model("labels file has no PER label"));
+        }
         force_single_thread();
         let (plan, feeds) = guarded(|| build_plan(model, &labels.inputs, table.len()), PARSE)?;
         Ok(NerModel {

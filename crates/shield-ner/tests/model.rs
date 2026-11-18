@@ -82,3 +82,14 @@ fn labels_mismatch_refuses() {
         Err(NerError::Model("labels do not match the model output"))
     ));
 }
+
+#[test]
+fn labels_without_per_refuse() {
+    let inputs = ["input_ids", "attention_mask"];
+    // one label only: "O", so no PER
+    let r = NerModel::load(&model_bytes(&inputs), &vocab(), &labels_json(1, &inputs));
+    assert!(matches!(
+        r,
+        Err(NerError::Model("labels file has no PER label"))
+    ));
+}

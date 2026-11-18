@@ -193,6 +193,20 @@ phase_fresh() {
     ok "$FIDO_BIN is 0755 root:root and prints its hello"
     [[ "$(stat -c '%U:%G %a %F' "$NER_BIN")" == "root:root 755 regular file" ]] || fail "$NER_BIN is not a regular file, 0755 root:root: $(stat -c '%U:%G %a %F' "$NER_BIN")"
     ok "$NER_BIN is 0755 root:root"
+    # The packaged static binary must run: three tiny files and a wrong model hash end in
+    # exit 3 and `hash mismatch for model` (exit 5 would mean the confinement failed).
+    local nerd="$WORK/p46-ner-probe" nrc=0 nerr
+    mkdir -p "$nerd"
+    printf 'x' >"$nerd/model.bin"
+    printf 'x' >"$nerd/vocab.txt"
+    printf '{}' >"$nerd/labels.json"
+    nerr="$("$NER_BIN" --model "$nerd/model.bin" --vocab "$nerd/vocab.txt" --labels "$nerd/labels.json" \
+        --sha256-model "$(printf '0%.0s' {1..64})" \
+        --sha256-vocab "$(sha256sum "$nerd/vocab.txt" | cut -d' ' -f1)" \
+        --sha256-labels "$(sha256sum "$nerd/labels.json" | cut -d' ' -f1)" </dev/null 2>&1 >/dev/null)" || nrc=$?
+    [[ "$nrc" -eq 3 ]] || fail "$NER_BIN with a wrong model hash exited $nrc, want 3 (5 means confinement failed): $nerr"
+    [[ "$nerr" == *"hash mismatch for model"* ]] || fail "$NER_BIN stderr lacks 'hash mismatch for model': $nerr"
+    ok "$NER_BIN runs and refuses a wrong model hash (exit 3)"
 
     local rc=0
     # shellcheck disable=SC2024 # the redirect is meant to run as the runner user: the output file is in $WORK, the runner's

@@ -1,6 +1,6 @@
 # OWNER-RUN ONLY (sourced by scripts/blind-smoke.sh; never run by agents).
-# Plan 46 smoke: the real name detector (`saiife-ner`, release build, no
-# `fake` feature) with the owner's pinned model (Q1: ScandiNER int8, verified
+# Plan 46 smoke: the real name detector (`saiife-ner`, static musl release build as the
+# package ships it, no `fake` feature; SAIIFE_BLIND_SMOKE_NER_BIN overrides the binary) with the owner's pinned model (Q1: ScandiNER int8, verified
 # with tract here and nowhere else). Downloads model, vocab and labels over
 # https into $SMOKE_WORK, checks their SHA-256, runs the helper on 20 fixed
 # English and Danish questions (names of synthetic people, Danish letters, a
@@ -19,6 +19,15 @@ P46_WORK=""
 P46_BIN=""
 
 p46_log() { printf '%s\n' "$*" >&2; }
+
+# p46_step DESC CMD...: check, but returns non-zero when the step failed (check itself
+# always returns 0), so `p46_step ... || return 0` shows the failure in RESULTS and lets
+# the later fragments run (blind-smoke.sh runs under set -e).
+p46_step() {
+  local before="$FAILED"
+  check "$@"
+  [ "$FAILED" = "$before" ]
+}
 
 # p46_result KEY VALUE: append KEY=VALUE to RESULTS.
 p46_result() { RESULTS+=("$1=${2-}"); }
@@ -49,8 +58,15 @@ p46_fetch() {
 }
 
 p46_build() {
-  (cd "$REPO_ROOT" && cargo build --release -q -p saiife-shield-ner --bin saiife-ner) || return 1
-  P46_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release/saiife-ner"
+  # Measure what ships: the static musl release build (the package's helper), unless the
+  # owner points SAIIFE_BLIND_SMOKE_NER_BIN at another binary.
+  if [ -n "${SAIIFE_BLIND_SMOKE_NER_BIN:-}" ]; then
+    P46_BIN="$SAIIFE_BLIND_SMOKE_NER_BIN"
+  else
+    local tgt=x86_64-unknown-linux-musl
+    (cd "$REPO_ROOT" && cargo build --release --locked -q --target "$tgt" -p saiife-shield-ner --bin saiife-ner) || return 1
+    P46_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/$tgt/release/saiife-ner"
+  fi
   [ -x "$P46_BIN" ] || { p46_log "no $P46_BIN"; return 1; }
 }
 
@@ -133,14 +149,14 @@ PY
 }
 
 smoke_ner() {
-  p46_env || { p46_log "ner smoke: set the six SAIIFE_BLIND_SMOKE_NER_* variables (the owner's model choice)"; return 1; }
+  p46_step "ner: the six SAIIFE_BLIND_SMOKE_NER_* variables are set (the owner's model choice)" p46_env || return 0
   P46_WORK="$SMOKE_WORK/ner"
   mkdir -p "$P46_WORK"
   chmod 700 "$P46_WORK"
-  check "ner: build saiife-ner (release, no fake feature)" p46_build || return 0
+  p46_step "ner: build saiife-ner (static musl release, no fake feature)" p46_build || return 0
   local k
   for k in model vocab labels; do
-    check "ner: fetch and verify the $k" p46_fetch "$k" || return 0
+    p46_step "ner: fetch and verify the $k" p46_fetch "$k" || return 0
   done
   local out="$P46_WORK/run.out"
   local rc=0

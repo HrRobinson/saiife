@@ -40,7 +40,7 @@ saiife-system = { path = "../system" }
 # The exact prost tract-onnx 0.23.9 resolves to (it does not re-export it):
 # the tests encode a synthetic ModelProto.
 prost = "=0.14.4"
-tempfile = "3"
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

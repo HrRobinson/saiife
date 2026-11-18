@@ -239,8 +239,8 @@ mod tests {
                 assert_eq!(got, expect, "lower={lower} strip={strip}");
             }
         }
-        // stripped accents: decomposed and composed A-ring both reach "å"?
-        // (strip removes the ring, so only plain "a" would match: UNK here)
+        // lowercase without strip_accents: the decomposed and the composed
+        // A-ring both NFC-fold to "å" and reach the vocab's "å" and "##se".
         let e = wp(true, false).encode("A\u{030a}se");
         assert_eq!(e.words, vec![(0, 5)]);
         assert_eq!(e.ids, vec![9, 10]); // NFC folds to å + ##se
