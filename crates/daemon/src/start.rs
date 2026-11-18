@@ -1185,6 +1185,11 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     // again (keys from the vault; a locked vault leaves them unavailable).
     #[cfg(target_os = "linux")]
     crate::blind::data::reopen_all(&ctx);
+    // The name detector (plan 47 Task 4): the helper starts in the
+    // background (its hello can take a while); until then builds with
+    // public columns refuse, failing closed.
+    #[cfg(target_os = "linux")]
+    rt.spawn(crate::blind::ner::apply(Arc::clone(&ctx)));
     if let Some(a) = &box_audit {
         a.attach(&ctx);
     }
@@ -2249,6 +2254,10 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
         Ok((l, _, next)) => {
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
             ctx.forwarders.apply(&l.config.audit.forward).await;
+            // `[blind.ner]` may have changed: the detector follows, in the
+            // background (an unchanged one keeps its helper).
+            #[cfg(target_os = "linux")]
+            tokio::spawn(crate::blind::ner::apply(Arc::clone(ctx)));
             {
                 let vault = ctx.vault.lock();
                 ctx.mcp.reconcile(&l.config, &vault);

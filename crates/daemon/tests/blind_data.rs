@@ -699,6 +699,88 @@ async fn public_columns_need_the_name_detector() {
     assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Public);
 }
 
+/// plan 46's fake helper, built beside this test binary (`cargo build -p
+/// saiife-shield-ner --features fake --bin saiife-fake-ner` first).
+fn fake_ner() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let p = exe
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("saiife-fake-ner");
+    assert!(p.is_file(), "{} is missing", p.display());
+    p
+}
+
+/// Task 4 fills the detector slot: `[blind.ner]` in policy, its files in
+/// `<blind>/models/`, and the helper (the fake, through the debug seam,
+/// with `phrases`) running. Only this test sets the seam.
+async fn ner_on(f: &Fx, policy: &str, phrases: &str) {
+    use sha2::{Digest, Sha256};
+    // A running helper keeps its phrases: start from none.
+    f.ctx.blind.ner.configure(None, Mode::Personal, OWN);
+    let models = f.ctx.blind.root.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    let mut pins = Vec::new();
+    for b in [&b"model"[..], b"vocab", b"labels"] {
+        let h = format!("{:x}", Sha256::digest(b));
+        let p = models.join(&h);
+        if !p.exists() {
+            std::fs::write(&p, b).unwrap();
+        }
+        pins.push(h);
+    }
+    let dir = f.root.join("ner-helper");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let ph = dir.join("phrases.txt");
+    std::fs::write(&ph, phrases).unwrap();
+    let helper = dir.join("ner");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nexec '{}' --phrases '{}'\n",
+            fake_ner().display(),
+            ph.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var(saiife_daemon::blind::ner::HELPER_SEAM, &helper);
+    let ner = format!(
+        "\n[blind.ner]\nmodel_url = \"https://ner.example.test/m\"\nmodel_sha256 = \"{}\"\n\
+         vocab_url = \"https://ner.example.test/v\"\nvocab_sha256 = \"{}\"\n\
+         labels_url = \"https://ner.example.test/l\"\nlabels_sha256 = \"{}\"\n",
+        pins[0], pins[1], pins[2]
+    );
+    set_policy(f, &format!("{policy}{ner}"));
+    saiife_daemon::blind::ner::apply(Arc::clone(&f.ctx)).await;
+}
+
+#[tokio::test]
+async fn public_columns_checked_by_the_ner_helper() {
+    let t = scratch();
+    let f = fx(t.path());
+    ok(&stage(&f).await);
+    let policy = policy_text(&[("customers.city", "public")]);
+    // The helper finds a person's name among the public values: refused.
+    ner_on(&f, &policy, "PER\tOdense\n").await;
+    assert!(f.ctx.blind.detector().is_some());
+    let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
+    let (code, text) = err(&v);
+    assert_eq!(code, "bad_request");
+    assert_eq!(
+        text,
+        "customers.city is public but a value looks like a person's name: mark it quasi"
+    );
+    assert!(!ds_root(&f).join("live").exists());
+    // A helper that finds no name in them: built.
+    ner_on(&f, &policy, "PER\tSøren Ærø\n").await;
+    ok(&call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await);
+    assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Public);
+}
+
 #[tokio::test]
 async fn no_identifier_names_the_table() {
     let t = scratch();

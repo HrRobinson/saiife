@@ -301,6 +301,15 @@ async fn ops_registered() {
             assert_eq!(a["message"], "dataset is required", "{op}: {a}");
             continue;
         }
+        // Task 4 built the fetch: with no `[blind.ner]` it names it.
+        if *op == saiife_ipc::msg::OP_BLIND_NER_FETCH {
+            assert_eq!(a["error"], "bad_request", "{op}: {a}");
+            assert!(
+                a["message"].as_str().unwrap_or("").contains("[blind.ner]"),
+                "{op}: {a}"
+            );
+            continue;
+        }
         assert_eq!(a["error"], "unavailable", "{op}: {a}");
         assert_eq!(
             a["message"],

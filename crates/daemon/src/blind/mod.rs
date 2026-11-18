@@ -9,6 +9,7 @@ pub mod calc;
 pub mod data;
 pub mod keys;
 pub mod model;
+pub mod ner;
 pub mod ops;
 pub mod outbox;
 pub mod pg;
@@ -46,8 +47,11 @@ pub struct Blind {
     /// of `keys.sealed` still holds when it is written or removed.
     keys_lock: Mutex<()>,
     /// The name detector a build checks public values and names with
-    /// (ruling P47-6). None until the NER model is ready (Task 4).
+    /// (ruling P47-6): [`Blind::ner`] while `[blind.ner]` is configured and
+    /// its files are there ([`ner::apply`]), else None.
     detector: Mutex<Option<Arc<dyn NameDetector>>>,
+    /// The `saiife-ner` client (ruling P47-1, Task 4).
+    pub ner: Arc<ner::NerClient>,
     /// Why the last background build of a dataset failed (`status`).
     build_errors: Mutex<BTreeMap<String, String>>,
     /// Datasets whose keys were shredded while a build held them: that
@@ -207,6 +211,7 @@ impl Blind {
             sessions: Mutex::new(saiife_shield::session::Sessions::new()),
             keys_lock: Mutex::new(()),
             detector: Mutex::new(None),
+            ner: Arc::new(ner::NerClient::new()),
             build_errors: Mutex::new(BTreeMap::new()),
             shredded: Mutex::new(BTreeMap::new()),
             #[cfg(debug_assertions)]
@@ -348,6 +353,11 @@ impl Blind {
         lock(&self.detector).clone()
     }
 
+    /// Fills or empties the detector slot ([`ner::apply`]).
+    pub(crate) fn set_detector(&self, d: Option<Arc<dyn NameDetector>>) {
+        *lock(&self.detector) = d;
+    }
+
     /// Why the last background build of `name` failed; None after a build
     /// that went live.
     pub fn last_build_error(&self, name: &DatasetName) -> Option<String> {
@@ -374,7 +384,7 @@ impl Blind {
 /// Test seams (debug builds only).
 #[cfg(debug_assertions)]
 impl Blind {
-    /// Sets the name detector a build uses (Task 4 sets the real one).
+    /// Sets the name detector a build uses in place of [`ner::apply`]'s.
     pub fn set_test_detector(&self, d: Option<Arc<dyn NameDetector>>) {
         *lock(&self.detector) = d;
     }

@@ -99,6 +99,10 @@ saiife-shield = { path = "../shield" }
 tokio-postgres = "=0.7.18"
 # Streams the Postgres rows (`RowStream` is a `Stream`); as in Cargo.lock.
 futures-util = { version = "=0.3.34", default-features = false }
+# The name-detector helper's file check (plan 47 Task 4, R47-11: F2 as for
+# the FIDO helper); tokio-free. The helper itself (`saiife-shield-ner`, which
+# links tract) is never a dependency: the daemon speaks `ner_proto` only.
+saiife-fido = { path = "../fido" }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]
