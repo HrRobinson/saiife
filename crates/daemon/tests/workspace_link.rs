@@ -15,7 +15,7 @@ use saiife_ipc::frame::{body_len_max, encode_max, MAX_ANSWER_FRAME, MAX_FRAME};
 use saiife_ipc::msg::{
     Request, LINK_OPS, LINK_SOCKET_NAME, OP_HELLO, OP_STATUS, OP_WORKSPACE_FRAME,
     OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_BEGIN, OP_WORKSPACE_PAIR_CONFIRM,
-    OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_REVOKE, OP_WORKSPACE_SIGN, PROTO,
+    OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_REVOKE, OP_WORKSPACE_SIGN, OP_WORKSPACE_WAKE, PROTO,
 };
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, Fsync, GroupEntry, UserEntry};
@@ -1031,6 +1031,67 @@ async fn non_approver_needs_a_device_for_a_hub_hello() {
     assert_eq!(a["rule"], "no_active_device", "{a}");
 }
 
+/// `workspace.wake` (content-free hub wake-ups): how many Workspace events
+/// were raised and whether `[workspace] push` is on; nothing else. Strict
+/// args, never recorded.
+#[tokio::test]
+async fn wake_counts_events_and_reports_push() {
+    let w = world().await;
+    let mut link = Link::open(&w).await;
+    let before = records(&w).len();
+    let a = link.call(OP_WORKSPACE_WAKE, json!({})).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let mut keys: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["id", "ok", "push", "seq"], "{a}");
+    assert_eq!(
+        (a["push"].clone(), a["seq"].clone()),
+        (json!(false), json!(0))
+    );
+
+    // A land waiting in the inbox raises one.
+    let pa = pending_land(&w);
+    saiife_daemon::workspace_touch::notify_pending(&w.ctx, &pa);
+    w.ctx.workspace.note_wake();
+    let a = link.call(OP_WORKSPACE_WAKE, json!({})).await;
+    assert_eq!(
+        (a["push"].clone(), a["seq"].clone()),
+        (json!(false), json!(2))
+    );
+
+    // The owner opts in.
+    let cfg: saiife_policy::SystemConfig =
+        toml::from_str("version = 2\n[workspace]\npush = true\n").unwrap();
+    w.ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+    let a = link.call(OP_WORKSPACE_WAKE, json!({})).await;
+    assert_eq!(
+        (a["push"].clone(), a["seq"].clone()),
+        (json!(true), json!(2))
+    );
+
+    // It takes nothing.
+    let a = link.call(OP_WORKSPACE_WAKE, json!({"box": "b-done"})).await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(records(&w).len(), before);
+}
+
+/// Only a user who may hold the hub link (an Active device, or one who may
+/// pair) learns the count.
+#[tokio::test]
+async fn wake_needs_a_device_or_pairing_right() {
+    if me() == 0 {
+        return; // root is always an admin
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let (ws, _) = Workspace::open(dir_in(&state));
+    let w = build_as(tmp, state, ws, DaemonMode::Locked, me().wrapping_add(1)).await;
+    let mut link = Link::open(&w).await;
+    let a = link.call(OP_WORKSPACE_WAKE, json!({})).await;
+    assert_eq!(a["error"], "forbidden", "{a}");
+    assert_eq!(a["rule"], "no_active_device", "{a}");
+}
+
 #[tokio::test]
 async fn seal_signature_is_bound_to_its_device() {
     let (w, mut link, a_dev) = paired().await;
@@ -1464,6 +1525,63 @@ async fn begin_for_steer_answers_a_touch_request() {
     assert!(w.boxes.calls().is_empty());
 }
 
+/// Task 5 (b): one device holds at most 4 live touch challenges, inside
+/// its owner's 8. A fifth begin from that device is refused (`busy`, the
+/// uid cap's shape) with its own reason in the record; another device of
+/// the same owner still begins up to the owner's 8, and the uid cap fires
+/// there.
+#[tokio::test]
+async fn begin_caps_per_device_inside_the_owner_cap() {
+    let (w, mut link, a, _) = paired_with_passkey().await;
+    let (b, _) = pair_with_passkey(&w, &mut link).await;
+    let (c, _) = pair_with_passkey(&w, &mut link).await;
+    let begin = |d: &TestDevice| {
+        let sf = frame_for(
+            &w.ctx.workspace,
+            d,
+            "workspace.touch.begin",
+            begin_args("box.steer", json!({"id": "b-run"})),
+        );
+        json!({"body": sf.body, "sig": sf.sig, "via": "local"})
+    };
+    for _ in 0..4 {
+        let r = link.call(OP_WORKSPACE_FRAME, begin(&a)).await;
+        touch_request(&r);
+    }
+    let r = link.call(OP_WORKSPACE_FRAME, begin(&a)).await;
+    assert_eq!(r["ok"], false, "{r}");
+    assert_eq!(r["error"], "busy", "{r}");
+    assert_eq!(r["rule"], "busy", "{r}");
+    let dev_reason = "too many touches in progress on this device";
+    assert_eq!(r["message"], dev_reason, "{r}");
+    // Another device of the same owner: up to the owner's 8.
+    for _ in 0..4 {
+        let r = link.call(OP_WORKSPACE_FRAME, begin(&b)).await;
+        touch_request(&r);
+    }
+    // A third device has room of its own, but the owner is at 8.
+    let r = link.call(OP_WORKSPACE_FRAME, begin(&c)).await;
+    assert_eq!(r["error"], "busy", "{r}");
+    assert_eq!(r["rule"], "busy", "{r}");
+    let uid_reason = "too many touches in progress";
+    assert_eq!(r["message"], uid_reason, "{r}");
+    // Each refusal is recorded, and the record says which cap fired.
+    let denied: Vec<(Value, Value)> = records(&w)
+        .into_iter()
+        .filter(|r| field(r, "action") == "workspace.touch.begin" && r["decision"] == "deny")
+        .map(|r| (field(&r, "device").clone(), r["reason"].clone()))
+        .collect();
+    assert_eq!(
+        denied,
+        vec![
+            (json!(a.device_id()), json!(dev_reason)),
+            (json!(c.device_id()), json!(uid_reason)),
+        ],
+    );
+    // No box action ran.
+    assert!(w.boxes.calls().is_empty());
+}
+
 #[tokio::test]
 async fn begin_binds_daemon_fields() {
     let (w, mut link, d, _) = paired_with_passkey().await;
@@ -1832,21 +1950,24 @@ async fn begin_without_passkey_is_unavailable() {
 #[tokio::test]
 async fn ninth_open_touch_is_busy() {
     let (w, mut link, d, _) = paired_with_passkey().await;
+    // Two browsers of the owner, 4 each (the per-device cap, Task 5 (b)).
+    let (e, _) = pair_with_passkey(&w, &mut link).await;
     for n in 0..8 {
         let a = send(
             &w,
             &mut link,
-            &d,
+            if n % 2 == 0 { &d } else { &e },
             "workspace.touch.begin",
             begin_args("box.steer", json!({"id": "b-run"})),
         )
         .await;
         assert_eq!(a["ok"], true, "begin {n}: {a}");
     }
+    let (f, _) = pair_with_passkey(&w, &mut link).await;
     let a = send(
         &w,
         &mut link,
-        &d,
+        &f,
         "workspace.touch.begin",
         begin_args("box.steer", json!({"id": "b-run"})),
     )
@@ -2747,6 +2868,34 @@ async fn window_frames_are_marked() {
     assert_eq!(field(last, "window"), true, "{last}");
     assert!(field(last, "touch").is_null(), "{last}");
     assert_eq!(field(last, "box"), "b-run", "{last}");
+}
+
+/// R25/N1: a revise on a box that held a prompt unsent (sent ahead of the
+/// comment) says so in its frame record's reason; the answer carries
+/// nothing more.
+#[tokio::test]
+async fn a_revise_frame_record_names_a_held_prompt_sent_first() {
+    let (w, mut link, d, soft) = paired_soft().await;
+    w.boxes.hold_prompt(&BoxId::parse("b-done").unwrap());
+    let a = touched_frame(
+        &w,
+        &mut link,
+        &d,
+        &soft,
+        "box.revise",
+        json!({"id": "b-done", "comment": "again"}),
+    )
+    .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["result"], json!({}), "{a}");
+    let r = records(&w);
+    let last = r.last().unwrap();
+    assert_eq!(field(last, "action"), "box.revise", "{last}");
+    assert_eq!(
+        field(last, "reason"),
+        saiife_wire::source::HELD_PROMPT_SENT_FIRST,
+        "{last}"
+    );
 }
 
 #[tokio::test]

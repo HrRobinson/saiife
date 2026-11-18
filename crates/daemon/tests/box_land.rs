@@ -440,12 +440,15 @@ fn waiting(w: &World) -> Vec<saiife_daemon::notifier::NotifyEvent> {
 }
 
 #[test]
-fn a_new_land_request_sends_box_waiting_once() {
+fn a_finished_run_sends_box_waiting_once() {
     let w = world(3);
     let b = w.done(ALICE, &changed());
     assert!(waiting(&w).is_empty());
+    assert_eq!(w.ctx.workspace.wakes(), 0);
     let p = w.lands.pending();
     assert_eq!(p.len(), 1);
+    // One content-free hub wake-up for it (sent only if `[workspace] push`).
+    assert_eq!(w.ctx.workspace.wakes(), 1);
     let q = waiting(&w);
     assert_eq!(q.len(), 1, "{q:?}");
     assert_eq!(q[0].box_id.as_deref(), Some(b.as_str()));
@@ -462,6 +465,65 @@ fn a_new_land_request_sends_box_waiting_once() {
         assert_eq!(again[0].request_id, p[0].request_id);
     }
     assert_eq!(waiting(&w).len(), 1);
+    assert_eq!(w.ctx.workspace.wakes(), 1);
+}
+
+/// Task 5 (a): `box_waiting` is once per finished run, not per request id.
+/// The request expires and is issued again under a new id for the same
+/// review: no second event.
+#[test]
+fn a_reissued_request_for_the_same_run_sends_no_second_box_waiting() {
+    let w = world(3);
+    let i = w.done(ALICE, &changed());
+    let first = w.pending_of(&i);
+    assert_eq!(waiting(&w).len(), 1);
+    for _ in 0..3 {
+        w.clock
+            .fetch_add(saiife_touch::CHALLENGE_TTL_SECS + 1, Ordering::SeqCst);
+        let again = w.pending_of(&i);
+        assert_ne!(again.request_id, first.request_id);
+    }
+    assert_eq!(waiting(&w).len(), 1, "{:?}", waiting(&w));
+}
+
+/// Task 5 (a): a new finished run of the same box (revised, runs, Done
+/// again with a new review) notifies again, once.
+#[test]
+fn a_new_finished_run_sends_box_waiting_again() {
+    let w = world(3);
+    let i = w.done(ALICE, &changed());
+    w.pending_of(&i);
+    assert_eq!(waiting(&w).len(), 1);
+    w.mgr.revise(&i, "add docs").unwrap();
+    // The inbox polls while it runs: nothing waits.
+    assert!(w.lands.pending().is_empty());
+    w.with_repo(&i, |g| {
+        g.work.insert("docs.md".into(), C(b"docs\n".to_vec()));
+    });
+    w.mgr.done(&i).unwrap();
+    w.lands.refresh(&i).unwrap();
+    for _ in 0..3 {
+        w.pending_of(&i);
+    }
+    let q = waiting(&w);
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert!(q.iter().all(|e| e.box_id.as_deref() == Some(i.as_str())));
+}
+
+/// Task 5 (a): a new run whose result is byte-identical to the one already
+/// notified still notifies (the run finished again), when the book saw the
+/// box leave `Done` in between.
+#[test]
+fn a_new_run_with_the_same_result_notifies_again() {
+    let w = world(3);
+    let i = w.done(ALICE, &changed());
+    w.pending_of(&i);
+    w.mgr.revise(&i, "again").unwrap();
+    assert!(w.lands.pending().is_empty());
+    w.mgr.done(&i).unwrap();
+    w.lands.refresh(&i).unwrap();
+    w.pending_of(&i);
+    assert_eq!(waiting(&w).len(), 2, "{:?}", waiting(&w));
 }
 
 #[test]
@@ -943,6 +1005,81 @@ fn hostile_export_audits_diff_rejected() {
     // The next honest export is reviewed again, under a fresh number.
     let r = w.lands.refresh(&i).unwrap();
     assert_eq!(r.n, 4);
+}
+
+/// FU1: a box that changed files while its in-box guard reported no
+/// check is flagged once (one `guard_skipped` record), shown in the diff
+/// answer, and its land carries the flag; landing is not blocked.
+#[test]
+fn guard_skipped_is_flagged_once_and_shown() {
+    let w = world(2);
+    let i = w.running(ALICE, &base_tree(), &changed());
+    w.mgr.guest_event(&i, GuestEvent::TurnFinished).unwrap();
+    let s = i.as_str();
+    // Running: a review is not judged yet (a guard check may be in flight).
+    let d = w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    assert_eq!(d["guard"]["skipped"], false, "{d}");
+    assert!(w.actions("guard_skipped").is_empty());
+    w.mgr.done(&i).unwrap();
+    let d = w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    assert_eq!(
+        d["guard"],
+        json!({"skipped": true, "checks": 0, "turns": 1}),
+        "{d}"
+    );
+    w.ok(ALICE, "box.diff", json!({"box": s, "refresh": true}));
+    let g = w.actions("guard_skipped");
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0]["box"], s);
+    assert_eq!(g[0]["guard_checks"], 0);
+    assert_eq!(g[0]["turns"], 1);
+    assert_eq!(g[0]["files"], 3);
+    assert!(w.mgr.get(&i).unwrap().guard_skipped);
+    // Advisory: the land goes on, and says so.
+    w.cli_land(ALICE, &i);
+    let l = w.actions("land");
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0]["guard_skipped"], true);
+}
+
+/// FU1 (review M2): a box reviewed only while it ran is judged at its land.
+#[test]
+fn guard_skipped_is_judged_at_the_land() {
+    let w = world(2);
+    let i = w.running(ALICE, &base_tree(), &changed());
+    w.lands.refresh(&i).unwrap();
+    w.mgr.done(&i).unwrap();
+    assert!(w.actions("guard_skipped").is_empty());
+    w.cli_land(ALICE, &i);
+    let g = w.actions("guard_skipped");
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0]["files"], 3);
+    assert_eq!(w.actions("land")[0]["guard_skipped"], true);
+}
+
+/// FU1: a box whose guard reported checks is not flagged.
+#[test]
+fn guard_checks_keep_the_flag_off() {
+    let w = world(2);
+    let i = w.running(ALICE, &base_tree(), &changed());
+    w.mgr.guest_event(&i, GuestEvent::GuardChecks(4)).unwrap();
+    w.mgr.done(&i).unwrap();
+    let s = i.as_str();
+    let d = w.ok(ALICE, "box.diff", json!({"box": s}));
+    assert_eq!(
+        d["guard"],
+        json!({"skipped": false, "checks": 4, "turns": 0}),
+        "{d}"
+    );
+    assert!(w.actions("guard_skipped").is_empty());
+    w.cli_land(ALICE, &i);
+    assert_eq!(w.actions("land")[0]["guard_skipped"], false);
+    // No changes, no checks: never flagged.
+    let j = w.running(ALICE, &base_tree(), &base_tree());
+    w.mgr.done(&j).unwrap();
+    let d = w.ok(ALICE, "box.diff", json!({"box": j.as_str()}));
+    assert_eq!(d["guard"]["skipped"], false, "{d}");
+    assert!(w.actions("guard_skipped").is_empty());
 }
 
 // ---- Task 5: the control-socket ops ----

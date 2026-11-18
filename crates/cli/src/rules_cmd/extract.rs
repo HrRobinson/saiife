@@ -5,7 +5,9 @@
 //! Its targets are the commands and paths it names; a line naming none is a
 //! judgement line, listed later as not enforced.
 
-use saiifeguard::pathrule::RuleAccess;
+use saiifeguard::canon::{PathStyle, PathVars};
+use saiifeguard::pathrule::{glob_root_style, RuleAccess};
+use saiifeguard::winpath;
 use sha2::{Digest, Sha256};
 
 use super::{Candidate, SourceLine, Target};
@@ -195,8 +197,31 @@ pub(crate) fn clean(s: &str) -> String {
 /// Why a target was refused for its characters.
 pub(crate) const UNSAFE_WHY: &str = "contains a control or bidi character";
 
-/// Starts like an absolute, home or `$NAME/` path, with no whitespace.
+/// `s` as the glob of a Windows path rooted at a drive (`C:\x`, `c:/x`): the
+/// guard's canonical form of it (`c:/x`), or `None` when it is not one or the
+/// guard cannot read it.
+fn drive_glob(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let rooted =
+        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    if !rooted || has_unsafe_char(s) || s.contains(char::is_whitespace) {
+        return None;
+    }
+    let vars = PathVars::new().with_style(PathStyle::Windows);
+    winpath::canonical(s, None, &vars).filter(|c| glob_root_style(c) == Some(PathStyle::Windows))
+}
+
+/// The glob a path-like `s` stands for.
+fn path_glob(s: &str) -> String {
+    drive_glob(s).unwrap_or_else(|| s.to_string())
+}
+
+/// Starts like an absolute (POSIX or drive), home or `$NAME/` path, with no
+/// whitespace.
 fn is_path_like(s: &str) -> bool {
+    if drive_glob(s).is_some() {
+        return true;
+    }
     if has_unsafe_char(s) {
         return false;
     }
@@ -225,7 +250,7 @@ pub(crate) fn span_target(span: &str, access: RuleAccess) -> Option<Target> {
     }
     if is_path_like(span) {
         return Some(Target::Path {
-            glob: span.to_string(),
+            glob: path_glob(span),
             access,
         });
     }
@@ -288,7 +313,7 @@ fn targets(masked: &str, spans: &[(usize, String)]) -> Vec<Target> {
             found.push((
                 start + token.find(bare).unwrap_or(0),
                 Target::Path {
-                    glob: bare.to_string(),
+                    glob: path_glob(bare),
                     access,
                 },
             ));
@@ -450,6 +475,25 @@ mod tests {
         assert_eq!(c.targets, vec![cmd(&["sudo"])]);
         let c = one("Never touch: ~/.claude \u{2014} ever, caf\u{e9} or \u{201c}x\u{201d}");
         assert_eq!(c.targets, vec![path("~/.claude", RuleAccess::Any)]);
+    }
+
+    /// A Windows path, with either separator, is a path: its glob is the
+    /// guard's canonical form (drive lower-cased, `/` separated).
+    #[test]
+    fn windows_drive_paths_are_paths() {
+        let c = one(r"- Never write to C:\Windows\System32 or `D:/Secrets/*.key`.");
+        assert_eq!(
+            c.targets,
+            vec![
+                path("c:/Windows/System32", RuleAccess::Write),
+                path("d:/Secrets/*.key", RuleAccess::Write),
+            ]
+        );
+        let c = one(r"Never read `C:\Users\a\..\b\.ssh`.");
+        assert_eq!(c.targets, vec![path("c:/Users/b/.ssh", RuleAccess::Read)]);
+        // Not a path: a character Windows refuses, or no root.
+        assert!(one(r"Never run `C:\a|b`.").targets.is_empty());
+        assert!(one(r"Never touch C:secrets.").targets.is_empty());
     }
 
     #[test]

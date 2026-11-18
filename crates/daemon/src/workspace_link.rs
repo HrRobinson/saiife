@@ -18,7 +18,7 @@ use crate::workspace::SignPurpose;
 use saiife_audit::{DecisionKind, Record};
 use saiife_ipc::msg::{
     err, err_with, ok, ErrorCode, Request, LINK_OPS, OP_HELLO, OP_WORKSPACE_FRAME,
-    OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_SIGN,
+    OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_SIGN, OP_WORKSPACE_WAKE,
 };
 use saiife_ipc::peer::comm;
 use saiife_wire::device::DeviceState;
@@ -129,7 +129,7 @@ const MAX_NAME_BYTES: usize = 256;
 const HUB_NONCE: std::ops::RangeInclusive<usize> = 16..=64;
 
 /// `link.sock`: `hello`, `workspace.hello`, `workspace.pair.finish`,
-/// `workspace.frame` and `workspace.sign`. Any other op is `unknown_op`,
+/// `workspace.frame`, `workspace.sign` and `workspace.wake`. Any other op is `unknown_op`,
 /// with nothing read and nothing recorded.
 pub async fn dispatch_link(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     if !LINK_OPS.contains(&req.op.as_str()) {
@@ -141,6 +141,7 @@ pub async fn dispatch_link(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_WORKSPACE_PAIR_FINISH => pair_finish(ctx, conn, req).await,
         OP_WORKSPACE_FRAME => frame(ctx, conn, req).await,
         OP_WORKSPACE_SIGN => sign(ctx, conn, req).await,
+        OP_WORKSPACE_WAKE => wake(ctx, conn, req).await,
         _ => unknown(&req),
     }
 }
@@ -518,6 +519,12 @@ async fn run(
         (Ok(Value::Object(m)), a::WORKSPACE_TOUCH_BEGIN) => m.remove("touch_begin"),
         _ => None,
     };
+    // Nor is a revise's note (a held prompt sent ahead of it): it is the
+    // record's reason.
+    let noted = match (&mut out, action) {
+        (Ok(Value::Object(m)), a::BOX_REVISE) => m.remove(REVISE_NOTE),
+        _ => None,
+    };
     let changing = CHANGES.contains(&action);
     let (record, refused) = match &out {
         Ok(_) => (changing, None),
@@ -533,6 +540,9 @@ async fn run(
         }
         if let Some(tb) = begun {
             rec.extra.insert("touch_begin".into(), tb);
+        }
+        if let Some(Value::String(n)) = noted {
+            rec.reason = Some(n);
         }
         if let Some(ev) = evidence {
             rec.extra.insert("touch".into(), ev);
@@ -584,6 +594,20 @@ fn touch_required(action: &str) -> Fail {
         format!("{action} needs a touch: confirm it with your passkey"),
     ))
 }
+
+/// FU1: the box's guard signal on a diff answer (unix: boxes exist there).
+#[cfg(unix)]
+fn add_guard(ctx: &Ctx, id: &BoxId, d: &mut Value) {
+    if let (Some(o), Some(rec)) = (
+        d.as_object_mut(),
+        ctx.box_manager.as_ref().and_then(|m| m.get(id).ok()),
+    ) {
+        o.insert("guard".into(), crate::box_land::guard_json(&rec));
+    }
+}
+
+#[cfg(not(unix))]
+fn add_guard(_ctx: &Ctx, _id: &BoxId, _d: &mut Value) {}
 
 /// The frame's args take only `keys`.
 pub(crate) fn only(args: &Map<String, Value>, keys: &[&str]) -> Result<(), Fail> {
@@ -835,14 +859,21 @@ async fn steer(
         None => *window = true,
     }
     let name = action.to_string();
-    blocking(&src, move |b| match (name.as_str(), text) {
-        (a::BOX_STEER, Some(t)) => b.steer(&id, &t),
-        (a::BOX_REVISE, Some(t)) => b.revise(&id, &t),
-        _ => b.resume(&id),
+    let note = blocking(&src, move |b| match (name.as_str(), text) {
+        (a::BOX_STEER, Some(t)) => b.steer(&id, &t).map(|()| None),
+        (a::BOX_REVISE, Some(t)) => b.revise_noted(&id, &t),
+        _ => b.resume(&id).map(|()| None),
     })
     .await?;
-    Ok(json!({}))
+    // The frame takes the note into its record, not its answer.
+    Ok(match note {
+        Some(n) => json!({ REVISE_NOTE: n }),
+        None => json!({}),
+    })
 }
+
+/// The answer key `steer` passes a revise's note to `frame` in (R25/N1).
+const REVISE_NOTE: &str = "revise_note";
 
 /// The device owner's uid.
 async fn owner_uid_of(ctx: &Arc<Ctx>, v: &Verified) -> Result<u32, Fail> {
@@ -956,7 +987,12 @@ async fn act(
         a::BOX_DIFF => {
             only(args, &["id"])?;
             let id = id_arg(args)?;
-            to_value(&blocking(&src, move |b| b.diff(&id)).await?)
+            let gid = id.clone();
+            let mut d = to_value(&blocking(&src, move |b| b.diff(&id)).await?)?;
+            // FU1: the box's guard signal; the source answered, so the
+            // frame's owner may see this box.
+            add_guard(ctx, &gid, &mut d);
+            Ok(d)
         }
         a::BOX_TERM_READ => {
             only(args, &["id", "after"])?;
@@ -1143,6 +1179,30 @@ async fn owns_active_device(ctx: &Arc<Ctx>, peer_uid: u32) -> bool {
 /// approver, as `workspace_ops` decides for `workspace.pair.begin`).
 async fn may_pair(ctx: &Arc<Ctx>, peer: &saiife_ipc::peer::PeerCred) -> bool {
     ctx.peer_is_admin(peer).await || crate::approval_ops::is_approver(ctx, peer).await
+}
+
+/// `workspace.wake`: `{}` -> `{push, seq}` for the hub link's content-free
+/// wake-ups. Only a peer who may hold the hub link (as for a `hub_hello`
+/// sign) learns the count. Never recorded.
+async fn wake(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
+    if ctx.workspace.locked() {
+        return locked().answer(req.id);
+    }
+    if let Some(k) = req.args.keys().next() {
+        return bad(format!("workspace.wake does not take {k:?}")).answer(req.id);
+    }
+    if !owns_active_device(ctx, conn.peer.uid).await && !may_pair(ctx, &conn.peer).await {
+        return forbidden(
+            "no_active_device",
+            "hub wake-ups are only for a user with a paired device or one who may pair",
+        )
+        .answer(req.id);
+    }
+    let push = ctx.policy().system.is_some_and(|s| s.workspace.push);
+    let mut m = Map::new();
+    m.insert("push".into(), push.into());
+    m.insert("seq".into(), ctx.workspace.wakes().into());
+    ok(req.id, m)
 }
 
 async fn sign_inner(

@@ -998,7 +998,11 @@ mod tests {
 
     #[test]
     fn project_config_is_not_read() {
-        let s = Setup::new("");
+        // What is judged here is a pack set, not a speed: the guard's 50 ms
+        // default would answer `Unjudged` on a loaded host, and the allow
+        // below would then fail. 10 s keeps every evaluation inside its
+        // budget; a timed-out one answers `Unjudged`, so it cannot pass as an allow.
+        let s = Setup::new("[guard]\nbudget_ms = 10000\n");
         let project = s.dir.path().join("proj");
         std::fs::create_dir_all(project.join(".saiife")).unwrap();
         std::fs::write(
@@ -1009,13 +1013,14 @@ mod tests {
         let pool = s.pool(&TestLaunch::new(vec![]), one());
         let payload = bash(project.to_str().unwrap(), "docker volume rm data");
         // The hook, which reads the project config, denies it.
-        let packs = load_locked(&s.config()).unwrap().guard.packs;
+        let guard = load_locked(&s.config()).unwrap().guard;
+        let packs = guard.packs;
         let mut with_project = packs.clone();
         with_project.push("container.docker".into());
         let hook = eval::judge_with(
             &payload,
             &with_project,
-            Duration::from_secs(1),
+            Duration::from_millis(guard.budget_ms),
             None,
             &[],
             Some("claude"),

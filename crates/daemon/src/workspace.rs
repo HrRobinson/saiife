@@ -89,6 +89,9 @@ pub struct Workspace {
     /// Frames refused before their signature verified (never recorded;
     /// `status` shows the count as `workspace.refused_unsigned`).
     unsigned: AtomicU64,
+    /// Workspace events a hub wake-up is for, since this opened (see
+    /// [`Workspace::note_wake`]).
+    wakes: AtomicU64,
     /// Tests: replaces [`now_secs`] for this Workspace.
     clock: Option<Clock>,
 }
@@ -156,6 +159,7 @@ impl Workspace {
             dir,
             locked,
             unsigned: AtomicU64::new(0),
+            wakes: AtomicU64::new(0),
             clock: None,
         }
     }
@@ -182,6 +186,18 @@ impl Workspace {
     /// Frames refused before their signature verified, since this opened.
     pub fn refused_unsigned(&self) -> u64 {
         self.unsigned.load(Ordering::Relaxed)
+    }
+
+    /// Counts an event the owner may want a phone wake-up for (a land
+    /// waiting in the inbox, a new approval request). Only the count leaves
+    /// the daemon (`workspace.wake`); nothing about the event does.
+    pub fn note_wake(&self) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The events [`Workspace::note_wake`] counted, since this opened.
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Relaxed)
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {

@@ -86,6 +86,23 @@
 //! sessions go on. A session's messages are handled one at a time, at most
 //! [`SESSION_QUEUE`] waiting; a session that floods is closed.
 //!
+//! Wake-ups (added in v3.1; additive, still protocol v1: a hub that does
+//! not know the message drops it, as it names no session):
+//! - link → hub `{"t":"wake"}`, exactly these bytes ([`WAKE_MSG`]): asks the
+//!   hub to push its fixed, content-free alert to the devices the machine's
+//!   owner registered. It carries nothing else: no box, no request, no text,
+//!   no event kind; the hub knows the machine only from the hello.
+//!
+//! Sent only while the daemon's `[workspace] push` is on. The link asks the
+//! daemon (`workspace.wake`, every [`WAKE_POLL`] while connected) how many
+//! Workspace events it raised (a land waiting in the inbox, a new approval
+//! request); when the count grows, one wake goes out, at most one per
+//! [`WAKE_INTERVAL`] (kept across reconnects). Events inside the interval
+//! are coalesced into one wake when it ends; events while the hub link is
+//! down into one wake once it is back. Events from before the link's first
+//! poll send none. The hub limits wakes too (6 a minute per machine, one
+//! push per device registration per 30 s).
+//!
 //! Keepalive: a ping every `ws::PING_INTERVAL`; the connection is dropped
 //! as soon as no pong came for `ws::PONG_TIMEOUT` (a deadline, not checked
 //! only on the ping tick), on any WebSocket error, or when the hub closes,
@@ -98,6 +115,7 @@ use crate::{Daemon, HubConfig, HubOpts, LinkError, Rate};
 use rustls::pki_types::ServerName;
 use saiife_ipc::msg::{
     OP_WORKSPACE_FRAME, OP_WORKSPACE_HELLO, OP_WORKSPACE_PAIR_FINISH, OP_WORKSPACE_SIGN,
+    OP_WORKSPACE_WAKE,
 };
 use saiife_wire::b64;
 use saiife_wire::seal::{hub_hello_msg, Channel, MachineHandshake};
@@ -126,6 +144,13 @@ pub const SESSION_QUEUE: usize = 4;
 pub const RATE_PER_SEC: f64 = 10.0;
 /// The burst the rate allows.
 pub const RATE_BURST: f64 = 20.0;
+/// The wake-up message, byte for byte: nothing but its type.
+pub const WAKE_MSG: &str = r#"{"t":"wake"}"#;
+/// How often the daemon is asked for new Workspace events while connected.
+pub const WAKE_POLL: Duration = Duration::from_secs(5);
+/// At most one wake this often (the hub's push coalescing window; well under
+/// its 6 a minute per machine).
+pub const WAKE_INTERVAL: Duration = Duration::from_secs(30);
 /// A write to the hub that takes longer drops the connection.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Answers of all sessions waiting to be written.
@@ -203,6 +228,8 @@ impl Default for HubOpts {
                 per_sec: RATE_PER_SEC,
                 burst: RATE_BURST,
             },
+            wake_poll: WAKE_POLL,
+            wake_interval: WAKE_INTERVAL,
         }
     }
 }
@@ -248,6 +275,56 @@ impl Bucket {
 struct Limits {
     opens: Bucket,
     seal_hellos: Arc<Mutex<Bucket>>,
+    wakes: Arc<Mutex<Waker>>,
+}
+
+/// When to send a wake: the daemon's event count seen last, whether a wake
+/// is owed, and when the last one went.
+#[derive(Debug)]
+pub(crate) struct Waker {
+    interval: Duration,
+    /// `None` until the first poll (its count is the baseline).
+    seq: Option<u64>,
+    pending: bool,
+    last: Option<Instant>,
+}
+
+impl Waker {
+    pub(crate) fn new(interval: Duration) -> Waker {
+        Waker {
+            interval,
+            seq: None,
+            pending: false,
+            last: None,
+        }
+    }
+
+    /// A `workspace.wake` answer at `now`: whether to send a wake now.
+    pub(crate) fn on_poll(&mut self, push: bool, seq: u64, now: Instant) -> bool {
+        let new = match self.seq {
+            None => false,
+            Some(s) if seq > s => true,
+            // A lower count: the daemon restarted and counted anew.
+            Some(s) => seq < s && seq > 0,
+        };
+        self.seq = Some(seq);
+        if !push {
+            self.pending = false;
+            return false;
+        }
+        self.pending |= new;
+        let due = match self.last {
+            None => true,
+            Some(t) => now.saturating_duration_since(t) >= self.interval,
+        };
+        if self.pending && due {
+            self.pending = false;
+            self.last = Some(now);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Where the hub is, from its URL.
@@ -357,6 +434,7 @@ pub async fn run(cfg: HubConfig, daemon: Daemon) -> Result<(), String> {
     let mut limits = Limits {
         opens: Bucket::new(opts.opens, now),
         seal_hellos: Arc::new(Mutex::new(Bucket::new(opts.seal_hellos, now))),
+        wakes: Arc::new(Mutex::new(Waker::new(opts.wake_interval))),
     };
     let mut backoff = Backoff::new();
     loop {
@@ -498,6 +576,8 @@ enum Out {
         session: String,
         gen: u64,
     },
+    /// `{"t":"wake"}`.
+    Wake,
 }
 
 /// A session's task, aborted when its entry goes.
@@ -514,7 +594,11 @@ impl Drop for Session {
 }
 
 async fn send_json(ws: &mut Ws, v: Value) -> Result<(), String> {
-    match tokio::time::timeout(SEND_TIMEOUT, ws.send(Message::Text(v.to_string()))).await {
+    send_text(ws, v.to_string()).await
+}
+
+async fn send_text(ws: &mut Ws, t: String) -> Result<(), String> {
+    match tokio::time::timeout(SEND_TIMEOUT, ws.send(Message::Text(t))).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("a write to the hub timed out".into()),
@@ -530,6 +614,13 @@ fn close_msg(session: &str) -> Value {
 /// until they end: see [`crate::daemon`]).
 async fn serve(mut ws: Ws, daemon: &Daemon, opts: &HubOpts, limits: &mut Limits) -> String {
     let (out_tx, mut out_rx) = mpsc::channel::<Out>(OUT_QUEUE);
+    // Aborted when this connection ends.
+    let _wakes = AbortOnDrop(tokio::spawn(poll_wakes(
+        daemon.clone(),
+        Arc::clone(&limits.wakes),
+        opts.wake_poll,
+        out_tx.clone(),
+    )));
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut gen: u64 = 0;
     let mut tick = tokio::time::interval_at(
@@ -625,6 +716,7 @@ async fn serve(mut ws: Ws, daemon: &Daemon, opts: &HubOpts, limits: &mut Limits)
                     Ok(())
                 }
             }
+            Ev::Out(Out::Wake) => send_text(&mut ws, WAKE_MSG.into()).await,
             Ev::PongDeadline => {
                 if Instant::now() >= ws.last_pong() + opts.pong_timeout {
                     return "no pong from the hub".into();
@@ -639,6 +731,44 @@ async fn serve(mut ws: Ws, daemon: &Daemon, opts: &HubOpts, limits: &mut Limits)
         };
         if let Err(e) = r {
             return e;
+        }
+    }
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Asks the daemon for new Workspace events every `every` and queues a wake
+/// when [`Waker`] says so. A daemon that does not answer (or an older one
+/// without `workspace.wake`) sends nothing.
+async fn poll_wakes(
+    daemon: Daemon,
+    waker: Arc<Mutex<Waker>>,
+    every: Duration,
+    out: mpsc::Sender<Out>,
+) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Ok(ans) = daemon.call(OP_WORKSPACE_WAKE, Map::new()).await else {
+            continue;
+        };
+        let push = ans.get("push").and_then(Value::as_bool) == Some(true);
+        let Some(seq) = ans.get("seq").and_then(Value::as_u64) else {
+            continue;
+        };
+        let send = waker
+            .lock()
+            .is_ok_and(|mut w| w.on_poll(push, seq, Instant::now()));
+        if send && out.send(Out::Wake).await.is_err() {
+            return;
         }
     }
 }
@@ -938,6 +1068,45 @@ mod tests {
         assert_eq!(taken, RATE_BURST as usize);
         // A clock that goes back adds nothing.
         assert!(!b.take_at(t0));
+    }
+
+    #[test]
+    fn wake_message_is_its_type_only() {
+        assert_eq!(WAKE_MSG, r#"{"t":"wake"}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(WAKE_MSG).unwrap(),
+            json!({"t": "wake"})
+        );
+    }
+
+    #[test]
+    fn waker_baseline_push_and_interval() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut w = Waker::new(s(30));
+        // The first poll is the baseline: old events send nothing.
+        assert!(!w.on_poll(true, 5, t0));
+        assert!(!w.on_poll(true, 5, t0 + s(1)));
+        // A new event: one wake.
+        assert!(w.on_poll(true, 6, t0 + s(2)));
+        // More inside the interval: owed, not sent.
+        assert!(!w.on_poll(true, 9, t0 + s(3)));
+        assert!(!w.on_poll(true, 9, t0 + s(31)));
+        // The interval ends: one wake for all of them, then nothing owed.
+        assert!(w.on_poll(true, 9, t0 + s(32)));
+        assert!(!w.on_poll(true, 9, t0 + s(100)));
+        // Push off: events are seen but never owed, even once it is on.
+        assert!(!w.on_poll(false, 12, t0 + s(101)));
+        assert!(!w.on_poll(true, 12, t0 + s(102)));
+        assert!(w.on_poll(true, 13, t0 + s(103)));
+        // A daemon restart (a lower count) with an event: owed.
+        assert!(!w.on_poll(true, 1, t0 + s(104)));
+        assert!(w.on_poll(true, 1, t0 + s(140)));
+        // A restart with none: nothing.
+        let mut w = Waker::new(s(30));
+        assert!(!w.on_poll(true, 4, t0));
+        assert!(!w.on_poll(true, 0, t0 + s(1)));
+        assert!(!w.on_poll(true, 0, t0 + s(60)));
     }
 
     #[test]

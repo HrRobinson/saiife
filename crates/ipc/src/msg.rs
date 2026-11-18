@@ -249,6 +249,13 @@ pub const OP_WORKSPACE_FRAME: &str = "workspace.frame";
 /// device_pub?: b64u}`. `device_pub` is only given for a `seal` with
 /// `device_id`.
 pub const OP_WORKSPACE_SIGN: &str = "workspace.sign";
+/// link.sock only (hub wake-ups): `{}` -> `{push: bool, seq: u64}`. `seq`
+/// counts the Workspace events since the daemon started (a land waiting in
+/// the inbox, a new approval request); `push` is `[workspace] push`. The
+/// hub link polls it and, while `push` is on, sends the hub a content-free
+/// `{"t":"wake"}` when `seq` grows. Never recorded; the same peers as a
+/// `hub_hello` sign (an Active device, or a user who may pair).
+pub const OP_WORKSPACE_WAKE: &str = "workspace.wake";
 // Frame actions, dispatched inside `workspace.frame` (level from
 // `saiife_wire::level_for`, names equal `saiife_wire::level::actions`).
 pub const OP_BOX_OVERVIEW: &str = "box.overview";
@@ -326,6 +333,7 @@ pub const LINK_OPS: &[&str] = &[
     OP_WORKSPACE_PAIR_FINISH,
     OP_WORKSPACE_FRAME,
     OP_WORKSPACE_SIGN,
+    OP_WORKSPACE_WAKE,
 ];
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
@@ -500,7 +508,7 @@ mod tests {
 
     #[test]
     fn link_ops_are_few() {
-        assert_eq!(LINK_OPS.len(), 5);
+        assert_eq!(LINK_OPS.len(), 6);
         for op in LINK_OPS {
             assert!(
                 !op.starts_with("workspace.pair.") || *op == OP_WORKSPACE_PAIR_FINISH,

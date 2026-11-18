@@ -26,6 +26,19 @@ pub struct BakeInputs {
     /// `assets/box/guest`
     pub guest_assets: PathBuf,
     pub recipe: Recipe,
+    /// The optional agent downloads, verified against their pins.
+    pub agents: AgentArchives,
+}
+
+/// The optional agent downloads (plan 42 D10), already in the cache and
+/// verified. Whether the bake installs an agent comes only from which of
+/// these are in the payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentArchives {
+    /// `codex.tar.gz`
+    pub codex: Option<PathBuf>,
+    /// `gemini.zip` and the `node.tar.xz` it runs on.
+    pub gemini: Option<(PathBuf, PathBuf)>,
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -171,8 +184,27 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A 512 MiB vfat image labelled SAIIFE: saiife, claude, guest/, recipe.env
-/// and an empty out/ the guest writes its results into.
+/// A generated payload file's contents.
+pub type FileBody = fn() -> String;
+
+/// The payload files of git's ssh wrapper, its ssh config (FU2 fix round
+/// 5) and every agent's git config at `/etc/saiife/gitconfig` (COORD-7),
+/// with their contents. Always baked (`install_saiife_git`): every agent's
+/// launch env names the git config, whose `core.sshCommand` is the wrapper.
+pub const GIT_FILES: [(&str, FileBody); 3] = [
+    ("saiife-ssh", crate::guest::saiife_ssh_wrapper),
+    ("saiife-ssh-config", crate::guest::saiife_ssh_config),
+    ("saiife-gitconfig", crate::guest::saiife_gitconfig),
+];
+
+/// A 512 MiB vfat image labelled SAIIFE: saiife, claude,
+/// `claude-managed-settings.json` (FU2), git's ssh wrapper, ssh config and
+/// git config ([`GIT_FILES`]), guest/, recipe.env and an empty
+/// out/ the guest writes its results into. With Codex:
+/// `codex.tar.gz`, `codex-requirements.toml` and
+/// `codex-managed-config.toml`; with Gemini: `gemini.zip`,
+/// `node.tar.xz`, `gemini-system-settings.json` and
+/// `gemini-user-settings.json` (plan 42 D10, R14).
 pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<(), String> {
     let env = recipe_env(&inputs.recipe)?;
     let stage = Stage::new(out, "payload")?;
@@ -183,6 +215,65 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
         .map_err(|e| format!("copy {}: {e}", inputs.claude_bin.display()))?;
     copy_tree(&inputs.guest_assets, &s.join("guest"))?;
     fs::write(s.join("recipe.env"), env).map_err(|e| format!("write recipe.env: {e}"))?;
+    let mut names = vec![
+        "saiife",
+        "claude",
+        "claude-managed-settings.json",
+        "saiife-ssh",
+        "saiife-ssh-config",
+        "saiife-gitconfig",
+        "guest",
+        "recipe.env",
+        "out",
+    ];
+    let copy = |src: &Path, name: &str| {
+        fs::copy(src, s.join(name)).map_err(|e| format!("copy {}: {e}", src.display()))
+    };
+    let write = |name: &str, body: String| {
+        fs::write(s.join(name), body).map_err(|e| format!("write {name}: {e}"))
+    };
+    // Claude Code is always in the image, so its managed settings are too
+    write(
+        "claude-managed-settings.json",
+        crate::guest::claude_managed_settings(),
+    )?;
+    for (name, body) in GIT_FILES {
+        write(name, body())?;
+    }
+    if let Some(codex) = &inputs.agents.codex {
+        copy(codex, "codex.tar.gz")?;
+        write(
+            "codex-requirements.toml",
+            crate::guest::codex_requirements(),
+        )?;
+        write(
+            "codex-managed-config.toml",
+            crate::guest::codex_managed_config(),
+        )?;
+        names.extend([
+            "codex.tar.gz",
+            "codex-requirements.toml",
+            "codex-managed-config.toml",
+        ]);
+    }
+    if let Some((gemini, node)) = &inputs.agents.gemini {
+        copy(gemini, "gemini.zip")?;
+        copy(node, "node.tar.xz")?;
+        write(
+            "gemini-system-settings.json",
+            crate::guest::gemini_system_settings(),
+        )?;
+        write(
+            "gemini-user-settings.json",
+            crate::guest::gemini_user_settings(),
+        )?;
+        names.extend([
+            "gemini.zip",
+            "node.tar.xz",
+            "gemini-system-settings.json",
+            "gemini-user-settings.json",
+        ]);
+    }
     fs::create_dir(s.join("out")).map_err(|e| format!("create out: {e}"))?;
     fs::write(s.join("out").join(".keep"), "").map_err(|e| format!("write .keep: {e}"))?;
     sized_file(out, PAYLOAD_BYTES)?;
@@ -191,7 +282,6 @@ pub fn make_payload(tools: &Tools, out: &Path, inputs: &BakeInputs) -> Result<()
         Tool::MkfsVfat,
         &[OsStr::new("-n"), OsStr::new("SAIIFE"), out.as_os_str()],
     )?;
-    let names = ["saiife", "claude", "guest", "recipe.env", "out"];
     let mut args: Vec<OsString> = vec!["-s".into(), "-i".into(), out.into()];
     args.extend(names.iter().map(|n| s.join(n).into_os_string()));
     args.push("::".into());
@@ -334,23 +424,29 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fake(dir: &Path, name: &str, log: &Path) -> PathBuf {
+    /// The one logging script behind every fake tool, a checked-in fixture
+    /// (mode 755): nothing is written at run time, so no write fd can leak
+    /// into a forking test thread and make the exec fail with ETXTBSY. Each
+    /// test links it under the tool's name; it logs to `calls.log` next to
+    /// the link it was started through.
+    fn fake_script() -> &'static Path {
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake-tool"
+        ))
+    }
+
+    fn fake(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
-        // one line per call: tool name, then each argument
-        let body = format!(
-            "#!/bin/sh\nprintf '%s' '{name}' >>'{l}'\nfor a in \"$@\"; do printf ' %s' \"$a\" >>'{l}'; done\nprintf '\\n' >>'{l}'\n",
-            l = log.display()
-        );
-        fs::write(&p, body).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(fake_script(), &p).unwrap();
         p
     }
 
     fn world() -> (tempfile::TempDir, Tools, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let log = d.path().join("calls.log");
-        let mk = fake(d.path(), "mkfs.vfat", &log);
-        let mc = fake(d.path(), "mcopy", &log);
+        let mk = fake(d.path(), "mkfs.vfat");
+        let mc = fake(d.path(), "mcopy");
         let env = move |k: &str| -> Option<OsString> {
             match k {
                 "SAIIFE_TOOL_MKFS_VFAT" => Some(mk.clone().into_os_string()),
@@ -377,6 +473,8 @@ mod tests {
                 sha256: "a".repeat(64),
             },
             direct_kernel: true,
+            codex: None,
+            gemini: None,
         }
     }
 
@@ -525,6 +623,7 @@ mod tests {
             claude_bin: claude,
             guest_assets: g,
             recipe: recipe(),
+            agents: AgentArchives::default(),
         };
         make_payload(&tools, &payload, &inputs).unwrap();
         assert_eq!(fs::metadata(&payload).unwrap().len(), PAYLOAD_BYTES);
@@ -552,6 +651,267 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with("-stage"))
             .collect();
         assert!(left.is_empty());
+    }
+
+    /// A fake mcopy that keeps a copy of every file it is handed in
+    /// `<dir>/seen/` and logs its arguments (no tool name, unlike `fake`).
+    fn keeping_world() -> (tempfile::TempDir, Tools, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("calls.log");
+        let seen = d.path().join("seen");
+        fs::create_dir(&seen).unwrap();
+        let mk = fake(d.path(), "mkfs.vfat");
+        let mc = d.path().join("mcopy");
+        // a checked-in script, linked: a file written then run here can hit
+        // ETXTBSY when another test thread forks meanwhile
+        std::os::unix::fs::symlink(
+            Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake-keeping-tool"
+            )),
+            &mc,
+        )
+        .unwrap();
+        let env = move |k: &str| -> Option<OsString> {
+            match k {
+                "SAIIFE_TOOL_MKFS_VFAT" => Some(mk.clone().into_os_string()),
+                "SAIIFE_TOOL_MCOPY" => Some(mc.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let tools = Tools::system(d.path()).with_env(&env);
+        (d, tools, log, seen)
+    }
+
+    #[test]
+    fn payload_carries_enabled_agents() {
+        use crate::guest;
+        const AGENT_FILES: [&str; 7] = [
+            "codex.tar.gz",
+            "codex-requirements.toml",
+            "codex-managed-config.toml",
+            "gemini.zip",
+            "node.tar.xz",
+            "gemini-system-settings.json",
+            "gemini-user-settings.json",
+        ];
+        let cases: [(bool, bool); 4] = [(false, false), (true, false), (false, true), (true, true)];
+        for (codex, gemini) in cases {
+            let (d, tools, log, seen) = keeping_world();
+            let p = d.path();
+            for (n, body) in [
+                ("saiife-bin", "s"),
+                ("claude-bin", "c"),
+                ("codex-x", "codex archive"),
+                ("gemini-x", "gemini archive"),
+                ("node-x", "node archive"),
+            ] {
+                fs::write(p.join(n), body).unwrap();
+            }
+            fs::create_dir(p.join("guest")).unwrap();
+            let inputs = BakeInputs {
+                saiife_bin: p.join("saiife-bin"),
+                claude_bin: p.join("claude-bin"),
+                guest_assets: p.join("guest"),
+                recipe: recipe(),
+                agents: AgentArchives {
+                    codex: codex.then(|| p.join("codex-x")),
+                    gemini: gemini.then(|| (p.join("gemini-x"), p.join("node-x"))),
+                },
+            };
+            make_payload(&tools, &p.join("payload.img"), &inputs).unwrap();
+            let calls = fs::read_to_string(&log).unwrap();
+            let copy = calls.lines().last().unwrap();
+            let want: Vec<&str> = AGENT_FILES
+                .iter()
+                .copied()
+                .filter(|n| {
+                    if n.starts_with("codex") {
+                        codex
+                    } else {
+                        gemini
+                    }
+                })
+                .collect();
+            for n in AGENT_FILES {
+                let there = copy.contains(&format!("/{n} "));
+                assert_eq!(there, want.contains(&n), "{codex} {gemini} {n}: {copy}");
+                assert_eq!(seen.join(n).exists(), want.contains(&n), "{n}");
+            }
+            let read = |n: &str| fs::read_to_string(seen.join(n)).unwrap();
+            if codex {
+                assert_eq!(read("codex.tar.gz"), "codex archive");
+                assert_eq!(read("codex-requirements.toml"), guest::codex_requirements());
+                assert_eq!(
+                    read("codex-managed-config.toml"),
+                    guest::codex_managed_config()
+                );
+            }
+            if gemini {
+                assert_eq!(read("gemini.zip"), "gemini archive");
+                assert_eq!(read("node.tar.xz"), "node archive");
+                assert_eq!(
+                    read("gemini-system-settings.json"),
+                    guest::gemini_system_settings()
+                );
+                assert_eq!(
+                    read("gemini-user-settings.json"),
+                    guest::gemini_user_settings()
+                );
+            }
+            // Claude Code is always in the image, so its managed settings
+            // are too (FU2)
+            assert!(copy.contains("/claude-managed-settings.json "), "{copy}");
+            assert_eq!(
+                read("claude-managed-settings.json"),
+                guest::claude_managed_settings()
+            );
+            // and git's ssh wrapper, ssh config (FU2 fix round 5) and every
+            // agent's git config (COORD-7), whatever the agents
+            for (n, body) in GIT_FILES {
+                assert!(copy.contains(&format!("/{n} ")), "{n}: {copy}");
+                assert_eq!(read(n), body(), "{n}");
+            }
+            assert_eq!(read("saiife-ssh"), guest::saiife_ssh_wrapper());
+            assert_eq!(read("saiife-ssh-config"), guest::saiife_ssh_config());
+            assert_eq!(read("saiife-gitconfig"), guest::saiife_gitconfig());
+            assert_eq!(
+                read("saiife-gitconfig"),
+                saiife_boxproto::launch::gitconfig_text()
+            );
+            // recipe.env does not change with the agents (D10)
+            assert_eq!(read("recipe.env"), recipe_env(&recipe()).unwrap());
+        }
+    }
+
+    #[test]
+    fn bake_script_checks() {
+        use crate::guest;
+        let d = tempfile::tempdir().unwrap();
+        let sh = d.path().join("saiife-bake.sh");
+        fs::write(&sh, BAKE_SCRIPT).unwrap();
+        // syntax only: the script is never run on the host
+        let st = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&sh)
+            .status()
+            .unwrap();
+        assert!(st.success(), "bash -n");
+        assert!(BAKE_SCRIPT.contains("\nset -euxo pipefail\n"));
+        for l in [
+            "install_agents",
+            "--no-same-owner",
+            "python3 -I -m zipfile -e",
+            "codex-x86_64-unknown-linux-musl",
+            "--strip-components=1",
+            "exec /opt/saiife-node/bin/node %s \"$@\"",
+        ] {
+            assert!(BAKE_SCRIPT.contains(l), "{l}");
+        }
+        // after the agent user (its group owns the gemini dir), before trim
+        let main = script_fn("main");
+        let user = main.find("  make_agent_user\n").unwrap();
+        let agents = main.find("  install_agents\n").unwrap();
+        assert!(user < agents && agents < main.find("  trim\n").unwrap());
+        // Claude Code's managed settings: always, from install_agents (FU2)
+        let claude = script_fn("install_claude_managed");
+        assert!(claude.contains(&format!("\"{}\"", guest::CLAUDE_MANAGED_SETTINGS_PATH)));
+        // git's files (COORD-7): always, first, in their own function; no
+        // /etc/gitconfig any more
+        let git = script_fn("install_saiife_git");
+        for path in [
+            guest::GIT_SSH_WRAPPER,
+            guest::SAIIFE_SSH_CONFIG_PATH,
+            guest::GIT_CONFIG_GLOBAL_PATH,
+        ] {
+            assert!(git.contains(&format!("\"{path}\"")), "{path}");
+        }
+        assert_eq!(guest::GIT_CONFIG_GLOBAL_PATH, "/etc/saiife/gitconfig");
+        assert!(!BAKE_SCRIPT.contains("\"/etc/gitconfig\""));
+        let agents_fn = script_fn("install_agents");
+        let calls: Vec<&str> = agents_fn.lines().skip(1).take(2).map(str::trim).collect();
+        assert_eq!(
+            calls,
+            ["install_saiife_git", "install_claude_managed"],
+            "{agents_fn}"
+        );
+        // the R14 tree, with its owners and modes
+        for path in [
+            guest::CLAUDE_MANAGED_SETTINGS_PATH,
+            guest::CODEX_REQUIREMENTS_PATH,
+            guest::CODEX_MANAGED_CONFIG_PATH,
+            guest::GEMINI_SYSTEM_SETTINGS_PATH,
+            guest::GEMINI_HOME,
+            guest::GEMINI_USER_SETTINGS_PATH,
+        ] {
+            assert!(BAKE_SCRIPT.contains(&format!("\"{path}\"")), "{path}");
+        }
+        let lines: Vec<&str> = BAKE_SCRIPT.lines().map(str::trim).collect();
+        let has = |l: &str| lines.contains(&l);
+        let home = guest::GEMINI_HOME;
+        for l in [
+            "install -d -o root -g root -m 0755 \"/etc/claude-code\"".to_string(),
+            "install -d -o root -g root -m 0755 \"/usr/local/libexec\"".to_string(),
+            format!(
+                "install -o root -g root -m 0755 \"$MNT/saiife-ssh\" \"{}\"",
+                guest::GIT_SSH_WRAPPER
+            ),
+            "install -d -o root -g root -m 0755 \"/etc/ssh\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/saiife-ssh-config\" \"{}\"",
+                guest::SAIIFE_SSH_CONFIG_PATH
+            ),
+            "install -d -o root -g root -m 0755 \"/etc/saiife\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/saiife-gitconfig\" \"{}\"",
+                guest::GIT_CONFIG_GLOBAL_PATH
+            ),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/claude-managed-settings.json\" \"{}\"",
+                guest::CLAUDE_MANAGED_SETTINGS_PATH
+            ),
+            "install -d -o root -g root -m 0755 \"/etc/codex\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/codex-requirements.toml\" \"{}\"",
+                guest::CODEX_REQUIREMENTS_PATH
+            ),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/codex-managed-config.toml\" \"{}\"",
+                guest::CODEX_MANAGED_CONFIG_PATH
+            ),
+            "install -d -o root -g root -m 0755 \"/etc/gemini-cli\"".to_string(),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/gemini-system-settings.json\" \"{}\"",
+                guest::GEMINI_SYSTEM_SETTINGS_PATH
+            ),
+            format!("install -d -o root -g root -m 0755 \"{home}\""),
+            format!("install -d -o root -g agent -m 1775 \"{home}/.gemini\""),
+            format!(
+                "install -o root -g root -m 0644 \"$MNT/gemini-user-settings.json\" \"{}\"",
+                guest::GEMINI_USER_SETTINGS_PATH
+            ),
+            format!("install -o root -g root -m 0644 /dev/null \"{home}/.gemini/.env\""),
+            format!("install -d -o root -g root -m 0755 \"{home}/.gemini/extensions\""),
+        ] {
+            assert!(has(&l), "missing line: {l}");
+        }
+        assert!(
+            guest::GEMINI_USER_SETTINGS_PATH.starts_with(&format!("{home}/.gemini/")),
+            "the user settings live in the baked home"
+        );
+        // the archives are data: nothing from them is sourced or evaluated
+        let agents_fns = [
+            "install_agents",
+            "install_saiife_git",
+            "install_claude_managed",
+            "install_codex",
+            "install_gemini",
+        ]
+        .map(script_fn)
+        .concat();
+        for bad in ["eval ", "source ", ". \"$", "bash \"$"] {
+            assert!(!agents_fns.contains(bad), "{bad}");
+        }
     }
 
     #[test]

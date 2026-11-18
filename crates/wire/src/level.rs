@@ -85,6 +85,7 @@ pub const MACHINE_ONLY: &[&str] = &[
     "workspace.pair",
     "workspace.revoke",
     "workspace.sign",
+    "workspace.wake",
 ];
 
 /// Hand-kept copy of every `OP_*` value in crates/ipc/src/msg.rs (wire does not depend on
@@ -150,6 +151,7 @@ const IPC_OPS: &[&str] = &[
     "workspace.pair.status",
     "workspace.revoke",
     "workspace.sign",
+    "workspace.wake",
 ];
 
 /// Exact string match only: no prefixes, wildcards or case folding. `None` means deny.
@@ -344,6 +346,10 @@ mod tests {
             has_egress: e,
             login: "api-key".into(),
             credential_in_box: false,
+            agent: String::new(),
+            beta: false,
+            credential: String::new(),
+            notice: String::new(),
         };
         assert_eq!(spawn_level(&t(false, false)), Level::Signed);
         assert_eq!(spawn_level(&t(true, false)), Level::Touch);

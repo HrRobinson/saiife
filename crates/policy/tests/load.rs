@@ -726,6 +726,29 @@ fn workspace_origins_default_and_parse() {
     }
 }
 
+/// `[workspace] push` (content-free hub wake-ups): off by default and left
+/// out of the serialised form (so the policy hash) while off.
+#[test]
+fn workspace_push_is_off_by_default() {
+    let (_d, cfg) = etc("version = 2\nlocked = true\n", &[]);
+    let p = load_system(&cfg).unwrap();
+    assert!(!p.config.workspace.push);
+    assert!(p.config.workspace.is_default());
+    let (_d, cfg) = etc(
+        "version = 2\nlocked = true\n[workspace]\npush = true\n",
+        &[],
+    );
+    let p = load_system(&cfg).unwrap();
+    assert!(p.config.workspace.push);
+    assert!(!p.config.workspace.is_default());
+    assert_eq!(p.config.workspace.origins, ["http://localhost:47810"]);
+    let (_d, cfg) = etc(
+        "version = 2\nlocked = true\n[workspace]\npush = \"yes\"\n",
+        &[],
+    );
+    assert!(load_system(&cfg).is_err());
+}
+
 #[test]
 fn workspace_unknown_key_is_refused() {
     let (_d, cfg) = etc(

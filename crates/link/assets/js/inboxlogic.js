@@ -1,5 +1,5 @@
 // Pure helpers for the Approve inbox and Spawn screens. No DOM.
-import { ago } from "./format.js";
+import { ago, visible } from "./format.js";
 
 export const MAX_TASK_BYTES = 8192;
 export const MAX_REPO_CHARS = 200;
@@ -49,6 +49,21 @@ export function checkTask(s) {
   if (String(s) === "") return "Describe the task.";
   if (byteLength(s) > MAX_TASK_BYTES) return `The task is at most ${MAX_TASK_BYTES} bytes.`;
   return null;
+}
+
+export function templateLabel(t) {
+  return visible(t.name) + (t.beta === true ? " (beta)" : "");
+}
+
+export function credentialLabel(t) {
+  const c = t && t.credential;
+  if (!c || c === "gateway") return "key stays on this computer";
+  if (c === "in_box") return "credential inside box (weaker)";
+  return "credential mode unknown";
+}
+
+export function noticeText(t) {
+  return t && t.notice ? visible(t.notice) : "";
 }
 
 export function needsTouchBadge(t) {

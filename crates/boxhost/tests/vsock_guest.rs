@@ -495,6 +495,45 @@ fn chatter_is_rate_limited_per_run() {
     g.after_off(&b1());
 }
 
+/// FU1: guard_checks are counts, not chatter: never rate limited away, and
+/// a flood merges in the queue by a saturating sum.
+#[test]
+fn guard_checks_are_summed_not_rate_limited() {
+    let w = World::new(ok_handler());
+    let g = w.guest(Ok(setup()));
+    let mut s = w.hello(false);
+    let mut buf = Vec::new();
+    for i in 0..300 {
+        let e = if i % 3 == 0 {
+            Event::Activity
+        } else {
+            Event::GuardChecks { n: 2 }
+        };
+        write_msg(&mut buf, &e).unwrap();
+    }
+    s.write_all(&buf).unwrap();
+    let (mut sum, mut frames, mut activity) = (0u64, 0, 0);
+    let until = Instant::now() + T;
+    while sum < 400 && Instant::now() < until {
+        for (id, e) in g.recv_events(Duration::from_millis(50)) {
+            assert_eq!(id, b1());
+            match e {
+                GuestEvent::GuardChecks(n) => {
+                    sum += u64::from(n);
+                    frames += 1;
+                }
+                GuestEvent::Activity => activity += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!(sum, 400);
+    assert!(frames >= 1);
+    // Activity is still rate limited: the first one only, so far.
+    assert_eq!(activity, 1);
+    g.after_off(&b1());
+}
+
 /// m2: what a stopped run left queued never reaches the box's next run.
 #[test]
 fn a_stopped_runs_events_do_not_reach_the_next_run() {

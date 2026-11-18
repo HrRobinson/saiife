@@ -182,3 +182,38 @@ fn other_subcommands_still_reject_unknown_arguments() {
     let (code, _, _) = run_check(&["status", "--future-flag"], "");
     assert_eq!(code, 2);
 }
+
+/// FU1: with `--profile box` the hook also tells the guest init one guard
+/// check ran; off the box (no guest socket) that send fails silently and
+/// changes nothing: same exit codes, stdout and stderr as the host profile.
+#[test]
+fn box_profile_guard_send_changes_no_outcome() {
+    for (json, want) in [(DENY_JSON, 2), (ALLOW_JSON, 0)] {
+        let t0 = std::time::Instant::now();
+        let boxed = run_check(
+            &[
+                "check",
+                "--hook-exit",
+                "--agent",
+                "claude",
+                "--profile",
+                "box",
+            ],
+            json,
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        let host = run_check(&["check", "--hook-exit", "--agent", "claude"], json);
+        assert_eq!(boxed, host, "{json}");
+        // The verdict is the hook's own; the send adds no output.
+        assert_eq!(boxed.0, want, "{json}: {boxed:?}");
+        assert!(
+            !boxed.1.contains("guard") && !boxed.2.contains("guard"),
+            "{boxed:?}"
+        );
+        assert!(!boxed.2.contains("local.sock"), "{boxed:?}");
+        if want == 0 {
+            assert_eq!(boxed.1, "", "allow prints nothing: {boxed:?}");
+            assert_eq!(boxed.2, "", "allow prints nothing: {boxed:?}");
+        }
+    }
+}

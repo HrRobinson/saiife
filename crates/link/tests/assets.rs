@@ -299,3 +299,13 @@ fn js_unsafe_table_equals_wire() {
         }
     }
 }
+
+/// FU1 (M3): the Review badge's text is the daemon's and the CLI's.
+#[test]
+fn review_guard_text_mirrors_the_wire_constant() {
+    let src = text(&assets_dir().join("js/views/review.js"));
+    assert!(
+        src.contains(&format!("\"{}\"", saiife_wire::source::GUARD_SKIPPED_WHY)),
+        "review.js must carry GUARD_SKIPPED_WHY verbatim"
+    );
+}
