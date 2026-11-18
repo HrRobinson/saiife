@@ -2661,9 +2661,11 @@ version = "0.2.0"
 dependencies = [
  "prost",
  "saiife-shield",
+ "saiife-system",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "tract-onnx",
  "unicode-normalization",

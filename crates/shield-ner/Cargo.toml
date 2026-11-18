@@ -10,6 +10,19 @@ repository.workspace = true
 name = "saiife_shield_ner"
 path = "src/lib.rs"
 
+[features]
+# Builds `saiife-fake-ner` (the phrase-list fake helper for tests).
+fake = []
+
+[[bin]]
+name = "saiife-ner"
+path = "src/bin/saiife-ner.rs"
+
+[[bin]]
+name = "saiife-fake-ner"
+path = "src/bin/saiife-fake-ner.rs"
+required-features = ["fake"]
+
 [dependencies]
 saiife-shield = { path = "../shield" }
 serde = { version = "1", features = ["derive"] }
@@ -19,10 +32,15 @@ sha2 = "0.10"
 unicode-normalization = "=0.1.25"
 tract-onnx = "=0.23.9"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The helpers' sandbox (plan 45 T7): rlimits, Landlock, seccomp; tokio-free.
+saiife-system = { path = "../system" }
+
 [dev-dependencies]
 # The exact prost tract-onnx 0.23.9 resolves to (it does not re-export it):
 # the tests encode a synthetic ModelProto.
 prost = "=0.14.4"
+tempfile = "3"
 
 [lints]
 workspace = true

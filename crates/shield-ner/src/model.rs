@@ -23,7 +23,28 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use tract_onnx::prelude::*;
 
 /// Largest accepted model file (fp32 BERT-base NER exports are ~700 MB).
-pub const MODEL_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+///
+/// Tied to [`HELPER_AS_BYTES`]: while the model loads, the helper holds the
+/// file bytes, tract's decoded protobuf (the weights again), the typed and
+/// optimized graph (the weights a third time, packed) and scratch. Three
+/// times the cap must stay under the address-space limit with room for the
+/// allocator, the code and the run-time tensors.
+pub const MODEL_MAX_BYTES: usize = 1024 * 1024 * 1024;
+/// The `saiife-ner` helper's `RLIMIT_AS` (R46-6: 4 GiB). See
+/// [`MODEL_MAX_BYTES`].
+pub const HELPER_AS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const _: () = assert!(3 * (MODEL_MAX_BYTES as u64) + 512 * 1024 * 1024 <= HELPER_AS_BYTES);
+
+/// tract-transformers' flash attention spreads heads over rayon's global
+/// pool; the helper may start no thread (`RLIMIT_NPROC` 0), so rayon would
+/// panic. This knob keeps it on the calling thread.
+const SINGLE_THREAD_KNOB: &str = "TRACT_FLASH_SDPA_ST";
+
+/// Keeps every tract path this crate can reach on the calling thread. True
+/// when the knob exists (it is declared by tract-transformers).
+pub fn force_single_thread() -> bool {
+    tract_onnx::tract_core::knobs::set_str(SINGLE_THREAD_KNOB, "true")
+}
 
 const PARSE: NerError = NerError::Model("cannot parse the model");
 const GRAPH: NerError = NerError::Model("unsupported model graph");
@@ -141,6 +162,7 @@ impl NerModel {
             return Err(NerError::Model("model file too large"));
         }
         let table = labels.label_table();
+        force_single_thread();
         let (plan, feeds) = guarded(|| build_plan(model, &labels.inputs, table.len()), PARSE)?;
         Ok(NerModel {
             plan,
@@ -223,7 +245,17 @@ impl NerModel {
 
 #[cfg(test)]
 mod tests {
-    use super::best_label;
+    use super::{best_label, force_single_thread, SINGLE_THREAD_KNOB};
+
+    #[test]
+    fn single_thread_knob_is_set() {
+        assert!(force_single_thread());
+        let k = tract_onnx::tract_core::knobs::all()
+            .into_iter()
+            .find(|k| k.name == SINGLE_THREAD_KNOB)
+            .unwrap();
+        assert_eq!((k.current)(), "true");
+    }
 
     #[test]
     fn softmax_is_safe() {

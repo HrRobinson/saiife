@@ -5,6 +5,7 @@
 pub mod bio;
 pub mod labels;
 pub mod model;
+pub mod serve;
 pub mod wordpiece;
 
 pub use bio::{decode_bio, merge_windows, windows};
