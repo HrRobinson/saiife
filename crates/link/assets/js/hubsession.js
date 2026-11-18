@@ -65,6 +65,8 @@ export class HubSession {
   #sends = Promise.resolve();
   #calls = Promise.resolve();
   #error = null;
+  #death;
+  #killed;
   onclose = () => {};
 
   constructor({
@@ -80,6 +82,10 @@ export class HubSession {
     const isPair = typeof binding?.pairId === "string";
     if (isDevice === isPair) throw new Error("binding is a deviceId or a pairId");
     if (isDevice && !deviceKey) throw new Error("a device binding needs deviceKey");
+    this.#death = new Promise((_, rej) => {
+      this.#killed = rej;
+    });
+    this.#death.catch(() => {});
     this.#getTicket = getTicket;
     this.#machinePub = machinePub;
     this.#binding = isDevice ? { deviceId: binding.deviceId } : { pairId: binding.pairId };
@@ -112,6 +118,7 @@ export class HubSession {
     const w = this.#waiter;
     this.#waiter = null;
     if (w) w.reject(err);
+    this.#killed(err);
     try {
       if (this.#ws && this.#ws.readyState <= 1) this.#ws.close(1000);
     } catch {
@@ -204,7 +211,10 @@ export class HubSession {
     if (this.#used) throw new Error("a session opens once");
     this.#used = true;
     try {
-      await this.#open();
+      // The death promise ends open() at once when a timer or a close kills
+      // the session, even while an await with no waiter (getTicket) hangs.
+      await Promise.race([this.#open(), this.#death]);
+      if (this.#dead) throw this.#error;
     } catch (e) {
       if (!this.#dead) this.#fail(e instanceof HubError ? e : new HubError("closed", this.#stage));
       throw this.#error;
@@ -293,7 +303,9 @@ export class HubSession {
       const auth = await handshakeSig(this.#deviceKey, sessionId, machineEph, eph.publicRaw);
       this.#sendData({ t: "seal_auth", sig: b64u(auth) });
     }
-    this.#channel = await finishBrowser(eph, machineEph, sessionId);
+    const channel = await finishBrowser(eph, machineEph, sessionId);
+    if (this.#dead) throw this.#error;
+    this.#channel = channel;
     this.#stage = "open";
     this.#idle = true;
     this.#clear(whole);
@@ -360,13 +372,12 @@ function answer(a) {
   return json(200, rest);
 }
 
-function failure(e) {
-  if (e instanceof HubError && e.code === "pro_required") return json(402, { error: "pro_required" });
-  return json(503, { error: "unreachable" });
-}
-
 // A `fetch` for the vendored Client: /api/hello and /api/frame become sealed
 // requests on the session; the sealed result is the local server's answer.
+// A HubError other than pro_required makes the fetch REJECT, like a failed
+// network fetch, so Client says "The Workspace link is not reachable" (a 503
+// would read as "The saiife daemon is not reachable"). pro_required answers
+// 402 {"error":"pro_required"}; other paths 404.
 export function hubFetch(getSession) {
   return async (url, init = {}) => {
     const path = String(url).split("?")[0];
@@ -393,7 +404,8 @@ export function hubFetch(getSession) {
       const s = await getSession();
       return answer(await s.call(req));
     } catch (e) {
-      return failure(e);
+      if (e instanceof HubError && e.code === "pro_required") return json(402, { error: "pro_required" });
+      throw e;
     }
   };
 }

@@ -316,15 +316,13 @@ test("hubFetch maps /api/frame to a sealed frame and back", async () => {
   s.close();
 });
 
-test("hubFetch: unknown paths 404, a dead session 503, a refusal passes through", async () => {
+test("hubFetch: unknown paths 404, a dead session rejects, a refusal passes through", async () => {
   const f = hubFetch(async () => {
     throw new HubError("closed_by_machine", "open");
   });
   assert.equal((await f("/api/other", {})).status, 404);
   assert.deepEqual(await (await f("/api/other", {})).json(), { error: "not_found" });
-  const r = await f("/api/frame", { method: "POST", body: JSON.stringify({ body: "b", sig: "s" }) });
-  assert.equal(r.status, 503);
-  assert.deepEqual(await r.json(), { error: "unreachable" });
+  await assert.rejects(f("/api/frame", { method: "POST", body: JSON.stringify({ body: "b", sig: "s" }) }), (e) => e.code === "closed_by_machine");
   const w = await world({ answers: async () => ({ ok: false, error: "refused", rule: "r", message: "no" }) });
   const s = w.make();
   await s.open();
@@ -333,4 +331,51 @@ test("hubFetch: unknown paths 404, a dead session 503, a refusal passes through"
   assert.equal(ok.status, 200);
   assert.deepEqual(await ok.json(), { ok: false, error: "refused", rule: "r", message: "no" });
   s.close();
+});
+
+test("a 4410 during a Client call says the Workspace link is not reachable; a fresh session works", async () => {
+  let hang = true;
+  const w = await world({
+    answers: async (p) =>
+      p.t === "hello"
+        ? { ok: true, result: { machine_id: "0123456789abcdef0123456789abcdef", machine_pub: "AA", epoch: "e1", frame_version: 1 } }
+        : hang
+          ? new Promise(() => {})
+          : { ok: true, result: { stopped: true } },
+  });
+  let cur = w.make();
+  await cur.open();
+  const store = memoryStore();
+  await store.saveDevice(w.dev);
+  const c = new Client({ fetch: hubFetch(async () => cur), store, now: () => 1700000000 });
+  const p = c.send("box.stop", { box: "b1" });
+  await new Promise((r) => setTimeout(r, 30));
+  w.relay.closeAll(4410);
+  const a = await p;
+  assert.equal(a.ok, false);
+  assert.equal(a.message, "The Workspace link is not reachable");
+  hang = false;
+  cur = w.make();
+  await cur.open();
+  assert.deepEqual(await c.send("box.stop", { box: "b1" }), { ok: true, result: { stopped: true } });
+  cur.close();
+});
+
+test("open() rejects with timeout at the bound even if getTicket never settles", async () => {
+  const w = await world();
+  const timers = [];
+  const s = w.make({
+    getTicket: () => new Promise(() => {}),
+    setTimeout: (f, ms) => (timers.push({ f, ms, live: true }), timers.length - 1),
+    clearTimeout: (i) => {
+      if (timers[i]) timers[i].live = false;
+    },
+  });
+  const closed = [];
+  s.onclose = (e) => closed.push(e);
+  const p = s.open();
+  await new Promise((r) => setTimeout(r, 5));
+  timers.find((x) => x.live && x.ms === 15000).f();
+  await assert.rejects(p, (e) => e instanceof HubError && e.code === "timeout");
+  assert.equal(closed.length, 1);
 });
