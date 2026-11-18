@@ -132,3 +132,36 @@ test("fixed sizes are enforced; a shifted boundary is refused", async () => {
   await assert.rejects(seal.keysFromShared(shared, machineEph.slice(1), browserEph, sessionId));
   await assert.rejects(seal.keysFromShared(shared, machineEph, browserEph, new Uint8Array(17)));
 });
+
+test("finishBrowser zeroes the shared secret and the keys once imported", async () => {
+  const m = await seal.newEphemeral();
+  const b = await seal.newEphemeral();
+  const sid = crypto.getRandomValues(new Uint8Array(16));
+  const subtle = crypto.subtle;
+  const derived = [];
+  const imported = [];
+  const realDerive = subtle.deriveBits;
+  const realImport = subtle.importKey;
+  subtle.deriveBits = async function (...a) {
+    const out = await realDerive.apply(subtle, a);
+    derived.push(out);
+    return out;
+  };
+  subtle.importKey = function (fmt, data, ...rest) {
+    if (fmt === "raw" && data instanceof Uint8Array && data.length === 32) imported.push(data);
+    return realImport.call(subtle, fmt, data, ...rest);
+  };
+  let ch;
+  try {
+    ch = await seal.finishBrowser(b, m.publicRaw, sid);
+  } finally {
+    delete subtle.deriveBits;
+    delete subtle.importKey;
+  }
+  assert.equal(derived.length, 2); // the ECDH secret, the 64 key bytes
+  assert.equal(imported.length, 3); // HKDF input, the two AES keys
+  for (const x of [...derived.map((d) => new Uint8Array(d)), ...imported]) {
+    assert.ok(x.every((v) => v === 0), "zeroed");
+  }
+  assert.equal((await ch.seal(enc.encode("hi"))).length, 8 + 2 + 16);
+});

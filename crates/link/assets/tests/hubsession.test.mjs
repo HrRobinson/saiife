@@ -480,3 +480,92 @@ test("getTicket's HubError(pro_required) is open()'s error, and hubFetch answers
   });
   await assert.rejects(s3.open(), (e) => e instanceof HubError && e.code === "ticket_failed" && e.stage === "connect");
 });
+
+test("call() before open() resolves rejects not_open and the session lives on", async () => {
+  const w = await world();
+  const s = w.make();
+  const closed = [];
+  s.onclose = (e) => closed.push(e);
+  const opening = s.open();
+  await assert.rejects(s.call({ t: "hello" }), (e) => e instanceof HubError && e.code === "not_open");
+  await opening;
+  assert.equal((await s.call({ t: "hello" })).ok, true);
+  assert.deepEqual(closed, []);
+  s.close();
+  // The owner's close() does not fire onclose.
+  assert.deepEqual(closed, []);
+});
+
+test("a sealed unreachable answer is a 503, as on localhost", async () => {
+  const unreachable = { ok: false, error: "unreachable", rule: null, message: "the saiife daemon is not reachable" };
+  const w = await world({
+    answers: async (p) =>
+      p.t === "hello"
+        ? { ok: true, result: { machine_id: "0123456789abcdef0123456789abcdef", machine_pub: "AA", epoch: "e1", frame_version: 1 } }
+        : unreachable,
+  });
+  const s = w.make();
+  await s.open();
+  const f = hubFetch(async () => s);
+  const r = await f("/api/frame", { method: "POST", body: JSON.stringify({ body: "b", sig: "s" }) });
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), unreachable);
+  const store = memoryStore();
+  await store.saveDevice(w.dev);
+  const c = new Client({ fetch: f, store, now: () => 1700000000 });
+  const a = await c.send("box.stop", { box: "b1" });
+  assert.equal(a.ok, false);
+  assert.equal(a.error, "unreachable");
+  assert.equal(a.message, "The saiife daemon is not reachable");
+  s.close();
+});
+
+test("a machine ephemeral that is not a P-256 point is bad_answer, and seal_auth is not sent", async () => {
+  const w = await world();
+  w.machine.faults.badEph = true;
+  const closed = [];
+  const s = w.make();
+  s.onclose = (e) => closed.push(e);
+  await assert.rejects(s.open(), (e) => e instanceof HubError && e.code === "bad_answer" && e.stage === "handshake");
+  assert.equal(closed[0].code, "bad_answer");
+  assert.deepEqual(texts(w.relay).map((m) => (m.t === "msg" ? innerOf(m).t : m.t)), ["connect", "seal_hello"]);
+});
+
+test("hubFetch passes a frame's touch through", async () => {
+  const w = await world();
+  const s = w.make();
+  await s.open();
+  const touch = { credential_id: "Y3JlZA", authenticator_data: "YQ", client_data_json: "Yw", signature: "cw" };
+  const f = hubFetch(async () => s);
+  const r = await f("/api/frame", { method: "POST", body: JSON.stringify({ body: "b", sig: "s", touch }) });
+  assert.equal(r.status, 200);
+  const frame = w.machine.seen.find((p) => p.t === "frame");
+  assert.deepEqual(frame, { t: "frame", body: "b", sig: "s", touch });
+  s.close();
+});
+
+test("a binary message during a call is ignored", async () => {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const w = await world({
+    answers: async () => {
+      await gate;
+      return { ok: true, result: { n: 1 } };
+    },
+  });
+  const ws = [];
+  class Spy extends w.relay.WebSocket {
+    constructor(u) {
+      super(u);
+      ws.push(this);
+    }
+  }
+  const s = w.make({ WebSocket: Spy });
+  await s.open();
+  const p = s.call({ t: "hello" });
+  await new Promise((r) => setTimeout(r, 10));
+  ws[0].dispatchEvent(Object.assign(new Event("message"), { data: new Uint8Array([7, 7]).buffer }));
+  release();
+  assert.deepEqual((await p).result, { n: 1 });
+  s.close();
+});

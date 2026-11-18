@@ -13,7 +13,7 @@ export const PRO_SENTENCE =
   "Your trial has ended. Workspace over the internet needs Pro. The Workspace on localhost stays free.";
 const LINK = "The Workspace link is not reachable";
 const SIGN_IN = "Sign in to saiife first, then open the pairing link again";
-const NOT_MACHINE = "The machine did not prove it is the one in this pairing link";
+const NOT_MACHINE = "The connection to the machine could not be verified";
 const ANSWER = "The machine sent a pairing answer this page cannot read";
 const CRYPTO = "This browser cannot make a pairing key";
 
@@ -170,7 +170,7 @@ export function waitConfirmOverHub({
     if (now() >= deadline) return end({ kind: "timeout" });
     timer = schedule(tick, HUB_POLL_MS);
   };
-  const tick = async () => {
+  const step = async () => {
     timer = null;
     if (stopped) return;
     const session = new HubSession({
@@ -194,9 +194,22 @@ export function waitConfirmOverHub({
         }
         return notYet();
       }
-      const client = new Client({ fetch: hubFetch(async () => session), store: holding(device) });
+      // The Client turns a dead session into "not reachable"; keep the why.
+      let died = null;
+      const shim = hubFetch(async () => session);
+      const fetch = async (url, init) => {
+        try {
+          return await shim(url, init);
+        } catch (e) {
+          died = e;
+          throw e;
+        }
+      };
+      const client = new Client({ fetch, store: holding(device) });
       const a = await client.send(ACTIONS.whoami);
       if (stopped) return;
+      // A sealed answer that does not open is not the machine.
+      if (notMachine(died)) return end({ kind: "refused", message: NOT_MACHINE });
       const o = outcome(a);
       if (o === "done") return end({ kind: "done", passkey: holdsPasskey(a.result) });
       if (o === "pending" || o === "unpaired" || o === "retry") return notYet();
@@ -207,6 +220,17 @@ export function waitConfirmOverHub({
       if (current === session) current = null;
     }
   };
+  // A throw (onEnd's own included) never becomes an unhandled rejection;
+  // unless the wait has ended, it counts as "not yet".
+  const tick = () =>
+    step().catch(() => {
+      if (stopped) return;
+      try {
+        notYet();
+      } catch {
+        /* onEnd's throw is its own */
+      }
+    });
   timer = schedule(tick, HUB_POLL_MS);
   return () => {
     stopped = true;

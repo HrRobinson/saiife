@@ -52,6 +52,13 @@ function exactKeys(o, keys) {
 // refusal it must throw HubError(code, "connect"): "pro_required" when the
 // BFF answers 402, "signed_out" when it answers 401. Any other throw, or a
 // malformed answer, becomes HubError("ticket_failed", "connect").
+//
+// open() resolves once the machine's signature verified and seal_auth was
+// sent; the machine has not answered it yet, so the first call is what
+// proves the device key (a refusal shows as a 4000 close). call() before
+// open() resolved rejects HubError("not_open") and leaves the session be.
+// onclose(err) fires once when the session ends on its own (relay close,
+// timeout, bad answer); the owner's close() does not fire it.
 export class HubSession {
   #getTicket;
   #machinePub;
@@ -69,7 +76,6 @@ export class HubSession {
   #waiter = null;
   #timers = new Set();
   #channel = null;
-  #sends = Promise.resolve();
   #calls = Promise.resolve();
   #error = null;
   #death;
@@ -306,12 +312,19 @@ export class HubSession {
       throw this.#bad();
     }
     if (this.#dead) throw this.#error;
+    // The channel first: a machine_eph that is not a point sends nothing more.
+    let channel;
+    try {
+      channel = await finishBrowser(eph, machineEph, sessionId);
+    } catch {
+      throw this.#bad();
+    }
+    if (this.#dead) throw this.#error;
     if ("deviceId" in this.#binding) {
       const auth = await handshakeSig(this.#deviceKey, sessionId, machineEph, eph.publicRaw);
+      if (this.#dead) throw this.#error;
       this.#sendData({ t: "seal_auth", sig: b64u(auth) });
     }
-    const channel = await finishBrowser(eph, machineEph, sessionId);
-    if (this.#dead) throw this.#error;
     this.#channel = channel;
     this.#stage = "open";
     this.#idle = true;
@@ -334,8 +347,7 @@ export class HubSession {
 
   async #call(obj) {
     if (this.#dead) throw this.#error;
-    if (!this.#channel) throw new HubError("closed", this.#stage);
-    this.#idle = true;
+    if (!this.#channel) throw new HubError("not_open", this.#stage);
     const timer = this.#timer(CALL_MS, () => this.#fail(new HubError("timeout", "open")));
     try {
       const sealed = await this.#channel.seal(enc.encode(JSON.stringify(obj)));
@@ -374,9 +386,11 @@ function json(status, obj) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
 
+// The local server's answer (crates/link/src/local.rs answer()): 200, but
+// 503 for an unreachable daemon, so Client says the same sentence.
 function answer(a) {
   const { t: _t, ...rest } = a;
-  return json(200, rest);
+  return json(rest.ok === false && rest.error === "unreachable" ? 503 : 200, rest);
 }
 
 // A `fetch` for the vendored Client: /api/hello and /api/frame become sealed

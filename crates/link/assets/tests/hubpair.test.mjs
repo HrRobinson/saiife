@@ -11,12 +11,13 @@ import { fakeRelay } from "./fakes/fakerelay.mjs";
 const dec = new TextDecoder();
 const SIGN_IN = "Sign in to saiife first, then open the pairing link again";
 const LINK = "The Workspace link is not reachable";
-const NOT_MACHINE = "The machine did not prove it is the one in this pairing link";
+const NOT_MACHINE = "The connection to the machine could not be verified";
 const hex = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
 // A machine with one open offer, a relay in front, and the offer the page
 // parsed from the fragment.
 async function world({ refusePasskey = false, wrongCode = false } = {}) {
+  const hooks = {}; // hooks.frame(): run when the machine is asked a frame
   const pairId = b64u(crypto.getRandomValues(new Uint8Array(8)));
   const secret = crypto.getRandomValues(new Uint8Array(32));
   const log = [];
@@ -39,6 +40,7 @@ async function world({ refusePasskey = false, wrongCode = false } = {}) {
         const id = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", machine.machinePub))).slice(0, 32);
         return { ok: true, result: { machine_id: id, machine_pub: b64u(machine.machinePub), epoch: "e1", frame_version: 1 } };
       }
+      if (hooks.frame) return hooks.frame();
       return { ok: true, result: { passkeys: [] } };
     },
   });
@@ -50,7 +52,7 @@ async function world({ refusePasskey = false, wrongCode = false } = {}) {
     tickets++;
     return relay.tickets.issue();
   };
-  return { machine, relay, offer, getTicket, log, count: () => tickets };
+  return { machine, relay, offer, getTicket, log, hooks, count: () => tickets };
 }
 
 function fakeCredentials(log) {
@@ -278,14 +280,15 @@ test("confirm wait ends done once the machine activates the device", async () =>
   assert.equal(c.pending(), 0);
 });
 
+// "never saves": waitConfirmOverHub takes no store; the source check in
+// "hubpair.js uses no storage" is the guard.
 test("confirm wait times out at the deadline and never saves", async () => {
   const w = await world();
   const device = await paired(w);
   const c = clock();
   const ends = [];
-  const store = { saveDevice() { throw new Error("saved"); } };
   waitConfirmOverHub({
-    device, store, getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
+    device, getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
     schedule: c.schedule, cancel: c.cancel, now: c.now, deadline: 2 * HUB_POLL_MS, onEnd: (e) => ends.push(e),
   });
   await c.fire();
@@ -394,6 +397,69 @@ test("signed out on pairing says the sign-in sentence", async () => {
   });
   assert.equal(r.error, SIGN_IN);
   assert.equal(r.rule, "signed_out");
+});
+
+test("a bad sealed answer during the confirm wait ends refused", async () => {
+  const w = await world();
+  const device = await paired(w);
+  w.machine.pending.delete(device.deviceId);
+  w.machine.faults.badSeal = true;
+  const c = clock();
+  const ends = [];
+  waitConfirmOverHub({
+    device, getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
+    schedule: c.schedule, cancel: c.cancel, now: c.now, deadline: 60_000, onEnd: (e) => ends.push(e),
+  });
+  await c.fire();
+  assert.deepEqual(ends, [{ kind: "refused", message: NOT_MACHINE }]);
+  assert.equal(c.pending(), 0);
+});
+
+test("a 4402 in the middle of whoami ends with the Pro sentence", async () => {
+  const w = await world();
+  const device = await paired(w);
+  w.machine.pending.delete(device.deviceId);
+  w.hooks.frame = () => {
+    w.relay.closeAll(4402);
+    return new Promise(() => {});
+  };
+  const c = clock();
+  const ends = [];
+  waitConfirmOverHub({
+    device, getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
+    schedule: c.schedule, cancel: c.cancel, now: c.now, deadline: 60_000, onEnd: (e) => ends.push(e),
+  });
+  await c.fire();
+  assert.deepEqual(ends, [{ kind: "refused", message: PRO_SENTENCE }]);
+  assert.equal(c.pending(), 0);
+});
+
+test("a throw from onEnd is not an unhandled rejection", async () => {
+  const w = await world();
+  const device = await paired(w);
+  w.machine.pending.delete(device.deviceId);
+  const unhandled = [];
+  const on = (e) => unhandled.push(e);
+  process.on("unhandledRejection", on);
+  try {
+    const c = clock();
+    let calls = 0;
+    waitConfirmOverHub({
+      device, getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
+      schedule: c.schedule, cancel: c.cancel, now: c.now, deadline: 60_000,
+      onEnd: () => {
+        calls++;
+        throw new Error("handler");
+      },
+    });
+    await c.fire();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(calls, 1);
+    assert.equal(c.pending(), 0);
+  } finally {
+    process.off("unhandledRejection", on);
+  }
+  assert.deepEqual(unhandled, []);
 });
 
 test("stop cancels the timer and nothing is reported", async () => {

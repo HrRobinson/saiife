@@ -92,7 +92,9 @@ const keysOf = (o) => Object.keys(o).sort().join(",");
 //   sigFor: a binding to sign for instead of the real one,
 //   extraKey: add a key to the machine's seal_hello,
 //   badSig: flip a byte of machine_sig,
-//   rawReply: send these bytes (a Uint8Array) as the machine's first reply.
+//   rawReply: send these bytes (a Uint8Array) as the machine's first reply,
+//   badEph: send (and sign) a machine_eph that is not a P-256 point,
+//   badSeal: flip a byte of each sealed answer.
 export async function fakeMachine({
   devices = new Map(),
   offers = new Map(),
@@ -147,8 +149,9 @@ export async function fakeMachine({
       const peer = await crypto.subtle.importKey("raw", beph, ECDH, false, []);
       const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, eph.privateKey, 256));
       const keys = await keysFromShared(shared, meph, beph, sid);
-      const sig = await signHello(sid, meph, faults.sigFor ?? binding);
-      const reply = { t: "seal_hello", machine_eph: b64u(meph), session_id: b64u(sid), machine_sig: b64u(sig) };
+      const sentEph = faults.badEph ? Uint8Array.from({ length: 65 }, (_, i) => (i === 0 ? 4 : 1)) : meph;
+      const sig = await signHello(sid, sentEph, faults.sigFor ?? binding);
+      const reply = { t: "seal_hello", machine_eph: b64u(sentEph), session_id: b64u(sid), machine_sig: b64u(sig) };
       if (faults.extraKey) reply.extra = "x";
       st = { binding, beph, meph, sid, keys };
       step = hasD ? 1 : 2;
@@ -194,7 +197,9 @@ export async function fakeMachine({
       } else {
         return closed;
       }
-      return { out: [await st.channel.seal(enc.encode(JSON.stringify({ t: "result", ...res })))], close: false };
+      const out = await st.channel.seal(enc.encode(JSON.stringify({ t: "result", ...res })));
+      if (faults.badSeal) out[out.length - 1] ^= 1;
+      return { out: [out], close: false };
     }
 
     return {

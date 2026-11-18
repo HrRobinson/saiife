@@ -110,12 +110,22 @@ export class BrowserChannel {
     this.#rx = rx;
   }
 
+  // The caller's keys64 is left as it is; the copies made here are zeroed.
   static async fromKeys(keys64) {
     if (!(keys64 instanceof Uint8Array) || keys64.length !== 64) throw new Error("keys are 64 bytes");
-    const aes = (k) => crypto.subtle.importKey("raw", k, "AES-GCM", false, ["encrypt", "decrypt"]);
+    const aes = async (k) => {
+      try {
+        return await crypto.subtle.importKey("raw", k, "AES-GCM", false, ["encrypt", "decrypt"]);
+      } finally {
+        k.fill(0);
+      }
+    };
     return new BrowserChannel(await aes(keys64.slice(0, 32)), await aes(keys64.slice(32)));
   }
 
+  // One seal at a time: callers must not run two seal() concurrently, as
+  // the encrypts may finish out of counter order and the machine's strict
+  // counter check would kill the channel (HubSession serializes its calls).
   async seal(plain) {
     if (this.#dead) throw new Error("channel closed");
     if (plain.length > MAX_PLAINTEXT) throw new Error("too large");
@@ -166,9 +176,20 @@ export class BrowserChannel {
   }
 }
 
-// ECDH with the machine's ephemeral key, then the channel.
+// ECDH with the machine's ephemeral key, then the channel. The shared
+// secret and the key bytes are zeroed once imported.
 export async function finishBrowser({ privateKey, publicRaw }, machineEph, sessionId) {
   const peer = await crypto.subtle.importKey("raw", machineEph, ECDH, false, []);
   const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, privateKey, 256));
-  return BrowserChannel.fromKeys(await keysFromShared(shared, machineEph, publicRaw, sessionId));
+  let keys64;
+  try {
+    keys64 = await keysFromShared(shared, machineEph, publicRaw, sessionId);
+  } finally {
+    shared.fill(0);
+  }
+  try {
+    return await BrowserChannel.fromKeys(keys64);
+  } finally {
+    keys64.fill(0);
+  }
 }

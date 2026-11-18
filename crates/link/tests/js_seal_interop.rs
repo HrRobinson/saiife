@@ -19,15 +19,8 @@ fn node_and_rust_seal_to_each_other() {
     let home = tempfile::tempdir().unwrap();
     let mut child = Command::new("node")
         .arg(&script)
+        // node reads no keychain or desktop state: a scratch home is enough.
         .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env("XDG_DATA_HOME", home.path())
-        .env("XDG_CACHE_HOME", home.path())
-        .env("XDG_RUNTIME_DIR", home.path())
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            "unix:path=/nonexistent/wsh-c1-bus",
-        )
         .current_dir(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
