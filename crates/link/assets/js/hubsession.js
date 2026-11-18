@@ -45,6 +45,13 @@ function exactKeys(o, keys) {
   return k.length === want.length && k.every((x, i) => x === want[i]);
 }
 
+// One relay session, single use: open() once, then call() for each sealed
+// request. A new session needs a new ticket.
+//
+// getTicket() -> {ticket, url}: one fresh ticket from the BFF. For a known
+// refusal it must throw HubError(code, "connect"): "pro_required" when the
+// BFF answers 402, "signed_out" when it answers 401. Any other throw, or a
+// malformed answer, becomes HubError("ticket_failed", "connect").
 export class HubSession {
   #getTicket;
   #machinePub;

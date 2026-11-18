@@ -12,6 +12,7 @@ export const HUB_POLL_MS = 4000;
 export const PRO_SENTENCE =
   "Your trial has ended. Workspace over the internet needs Pro. The Workspace on localhost stays free.";
 const LINK = "The Workspace link is not reachable";
+const SIGN_IN = "Sign in to saiife first, then open the pairing link again";
 const NOT_MACHINE = "The machine did not prove it is the one in this pairing link";
 const ANSWER = "The machine sent a pairing answer this page cannot read";
 const CRYPTO = "This browser cannot make a pairing key";
@@ -24,9 +25,15 @@ function notMachine(e) {
   return e instanceof HubError && (e.code === "bad_answer" || (e.code === "bad_request" && e.stage === "handshake"));
 }
 
+// getTicket's refusal when the BFF answers 401 (see HubSession).
+function signedOut(e) {
+  return e instanceof HubError && e.code === "signed_out" && e.stage === "connect";
+}
+
 function hubFail(e) {
   if (e instanceof HubError && e.code === "pro_required") return { error: PRO_SENTENCE, rule: "pro_required" };
   if (notMachine(e)) return { error: NOT_MACHINE, rule: "bad_answer" };
+  if (signedOut(e)) return { error: SIGN_IN, rule: "signed_out" };
   return { error: LINK, rule: "unreachable" };
 }
 
@@ -131,7 +138,9 @@ function holding(device) {
 // HubSession is single use) and asked workspace.whoami. A close before the
 // machine's seal_hello or a 4404 (the machine has not made the device
 // active yet) means "not yet", as does an answer of pending or unknown.
-// 4402 ends refused with the Pro sentence. Returns stop(). Nothing is saved.
+// 4402 ends refused with the Pro sentence; a machine that does not prove
+// itself, signed out and a refused ticket (4401) end refused too: polling
+// would not change them. Returns stop(). Nothing is saved.
 // onEnd gets {kind:"done", passkey} | {kind:"timeout"} | {kind:"refused", message}.
 export function waitConfirmOverHub({
   device,
@@ -172,6 +181,10 @@ export function waitConfirmOverHub({
         if (stopped) return;
         if (e instanceof HubError && e.code === "pro_required") return end({ kind: "refused", message: PRO_SENTENCE });
         if (notMachine(e)) return end({ kind: "refused", message: NOT_MACHINE });
+        if (signedOut(e)) return end({ kind: "refused", message: SIGN_IN });
+        if (e instanceof HubError && e.code === "bad_ticket" && e.stage === "connect") {
+          return end({ kind: "refused", message: LINK });
+        }
         return notYet();
       }
       const client = new Client({ fetch: hubFetch(async () => session), store: holding(device) });

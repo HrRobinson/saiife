@@ -451,3 +451,32 @@ test("the relay closes 4408 when the handshake does not finish in time", async (
   await new Promise((r) => setTimeout(r, 60));
   assert.deepEqual(closes, [4408]);
 });
+
+test("getTicket's HubError(pro_required) is open()'s error, and hubFetch answers 402", async () => {
+  const w = await world();
+  const s = w.make({
+    getTicket: async () => {
+      throw new HubError("pro_required", "connect");
+    },
+  });
+  await assert.rejects(s.open(), (e) => e instanceof HubError && e.code === "pro_required" && e.stage === "connect");
+  const s2 = w.make({
+    getTicket: async () => {
+      throw new HubError("pro_required", "connect");
+    },
+  });
+  const f = hubFetch(async () => {
+    await s2.open();
+    return s2;
+  });
+  const r = await f("/api/hello", { method: "GET" });
+  assert.equal(r.status, 402);
+  assert.deepEqual(await r.json(), { error: "pro_required" });
+  // Any other throw is ticket_failed.
+  const s3 = w.make({
+    getTicket: async () => {
+      throw new Error("boom");
+    },
+  });
+  await assert.rejects(s3.open(), (e) => e instanceof HubError && e.code === "ticket_failed" && e.stage === "connect");
+});

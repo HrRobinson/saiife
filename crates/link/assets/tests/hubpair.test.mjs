@@ -2,12 +2,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { pairOverHub, waitConfirmOverHub, HUB_POLL_MS, PRO_SENTENCE } from "../js/hubpair.js";
+import { HubError } from "../js/hubsession.js";
 import { shortCode, CODES_DIFFER } from "../js/pairing.js";
 import { b64u, unb64u, deviceIdOf } from "../js/wire.js";
 import { fakeMachine } from "./fakes/fakemachine.mjs";
 import { fakeRelay } from "./fakes/fakerelay.mjs";
 
 const dec = new TextDecoder();
+const SIGN_IN = "Sign in to saiife first, then open the pairing link again";
+const LINK = "The Workspace link is not reachable";
 const NOT_MACHINE = "The machine did not prove it is the one in this pairing link";
 const hex = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
@@ -289,6 +292,46 @@ test("a wrong machine signature on the confirm wait ends refused", async () => {
   assert.deepEqual(ends, [{ kind: "refused", message: NOT_MACHINE }]);
   assert.deepEqual(w.relay.machineClosed, [4400]);
   assert.equal(c.pending(), 0);
+});
+
+async function waitEnds(w, getTicket) {
+  const device = await paired(w);
+  const c = clock();
+  const ends = [];
+  waitConfirmOverHub({
+    device, getTicket, WebSocket: w.relay.WebSocket,
+    schedule: c.schedule, cancel: c.cancel, now: c.now, deadline: 60_000, onEnd: (e) => ends.push(e),
+  });
+  await c.fire();
+  return { ends, c };
+}
+
+test("signed out on the confirm wait ends refused with the sign-in sentence", async () => {
+  const w = await world();
+  const { ends, c } = await waitEnds(w, async () => {
+    throw new HubError("signed_out", "connect");
+  });
+  assert.deepEqual(ends, [{ kind: "refused", message: SIGN_IN }]);
+  assert.equal(c.pending(), 0);
+});
+
+test("a refused ticket (4401) on the confirm wait ends refused", async () => {
+  const w = await world();
+  const { ends, c } = await waitEnds(w, async () => w.relay.tickets.issue({ close: 4401 }));
+  assert.deepEqual(ends, [{ kind: "refused", message: LINK }]);
+  assert.equal(c.pending(), 0);
+});
+
+test("signed out on pairing says the sign-in sentence", async () => {
+  const w = await world();
+  const r = await pairOverHub({
+    offer: w.offer, label: "L", WebSocket: w.relay.WebSocket, ...none,
+    getTicket: async () => {
+      throw new HubError("signed_out", "connect");
+    },
+  });
+  assert.equal(r.error, SIGN_IN);
+  assert.equal(r.rule, "signed_out");
 });
 
 test("stop cancels the timer and nothing is reported", async () => {
