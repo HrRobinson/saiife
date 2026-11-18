@@ -900,3 +900,32 @@ async fn concurrent_methods_writes_both_survive() {
     let s = saiife_shield::methods::MethodStore::load(&dir.join("methods.json")).unwrap();
     assert_eq!(s.issued.len(), 16);
 }
+
+#[tokio::test]
+async fn a_panicking_fetch_ends_failed_not_stuck() {
+    let _g = SEAMS.lock().await;
+    let t = scratch();
+    let p = pki();
+    let files = served();
+    let port = server(&p, Arc::clone(&files)).await;
+    let c = ctx(t.path(), Some(upstream(t.path(), &p)));
+    set_policy(&c, t.path(), &ner_policy(&good_cfg(port)));
+    std::env::set_var(ner::FETCH_PANIC_SEAM, "1");
+    let v = call_as(&c, OWN).await;
+    assert_eq!(v["started"], true, "{v}");
+    // The task reads the seam when it runs: keep it set until it ended.
+    let ner = wait_ner(&c, "failed").await;
+    std::env::remove_var(ner::FETCH_PANIC_SEAM);
+    assert!(
+        ner["reason"]
+            .as_str()
+            .unwrap()
+            .contains("stopped unexpectedly"),
+        "{ner}"
+    );
+    // Not stuck: a new start is accepted and finishes.
+    point(&fake_with(t.path(), "PER\tSøren Ærø\n"), None);
+    let v = call_as(&c, OWN).await;
+    assert_eq!(v["started"], true, "{v}");
+    wait_ner(&c, "ready").await;
+}

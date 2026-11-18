@@ -68,6 +68,8 @@ pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
 pub const HELPER_SEAM: &str = "SAIIFE_TEST_NER_HELPER";
 /// Debug builds only: [`ANSWER_TIMEOUT`] in milliseconds.
 pub const ANSWER_MS_SEAM: &str = "SAIIFE_TEST_NER_ANSWER_MS";
+/// Debug builds only: set, the background fetch task panics.
+pub const FETCH_PANIC_SEAM: &str = "SAIIFE_TEST_NER_FETCH_PANIC";
 /// What every "fetch the model" text ends with.
 pub const FETCH_HINT: &str = "saiife blind ner fetch";
 
@@ -1010,11 +1012,26 @@ pub async fn fetch_op(ctx: &Arc<Ctx>, peer: &PeerCred) -> Result<Value, Refusal>
         ));
     }
     let ctx = Arc::clone(ctx);
+    // A supervisor: a panic in the fetch ends in `failed`, not in a phase
+    // stuck on `fetching` (every later start would answer `busy`).
+    let work = {
+        let ctx = Arc::clone(&ctx);
+        tokio::spawn(async move {
+            #[cfg(debug_assertions)]
+            if std::env::var_os(FETCH_PANIC_SEAM).is_some() {
+                panic!("test: the fetch task panics");
+            }
+            let r = fetch(&ctx, &cfg).await.map(|_| ());
+            if r.is_ok() {
+                apply(Arc::clone(&ctx)).await;
+            }
+            r
+        })
+    };
     tokio::spawn(async move {
-        let r = fetch(&ctx, &cfg).await.map(|_| ());
-        if r.is_ok() {
-            apply(Arc::clone(&ctx)).await;
-        }
+        let r = work
+            .await
+            .unwrap_or_else(|_| Err("the name-detector fetch stopped unexpectedly".to_string()));
         ctx.blind.ner.end_fetch(r);
     });
     Ok(json!({"started": true}))
