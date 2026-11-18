@@ -303,6 +303,11 @@ pub fn parameterize(
             }))
         }
     };
+    // Bench item 1: never a period, ordinal or scale meaning split across
+    // a parameter and plain words (fail closed).
+    if let Some((a, b, why)) = split_meaning(question, &lits) {
+        return Ok(Step::Refuse(Refusal::BadLiteral { span: (a, b), why }));
+    }
     let mut raw: Vec<(usize, usize, Raw)> = Vec::new();
     let mut segments: Vec<(usize, usize)> = Vec::new();
     let mut at = 0;
@@ -440,6 +445,246 @@ pub fn parameterize(
     // run into a digit, say): otherwise fail closed.
     check(&d)?;
     Ok(step(d))
+}
+
+// ------------------------------------------------- split meanings ----
+
+/// Refused: a period, ordinal, fraction or scale word beside a literal that
+/// does not cover it (`:p1 halvår :p2`, `the :p1 quarter`, `half :p1`).
+pub const UNBOUND_WORD: &str = "a period, ordinal or scale word next to a number it does not cover";
+/// Refused: two literals with only a space or a `-`, `/`, `:` or `.`
+/// between them (`the first 10`, `2023/2024`, `uge 12 2024`).
+pub const SIDE_BY_SIDE: &str = "two numbers side by side";
+/// Refused: a range whose one scale word belongs to both ends
+/// (`between 1 and 2 million`).
+pub const ONE_SCALE_TWO_NUMBERS: &str = "one scale word for two numbers";
+
+/// The closed list, English and Danish, of words that change what a number
+/// beside them means. Lower case; compared with whole tokens.
+const SPLIT_WORDS: &[&str] = &[
+    // periods named by a number
+    "quarter",
+    "quarters",
+    "kvartal",
+    "kvartaler",
+    "kvartalet",
+    "kvartals",
+    "half",
+    "halves",
+    "halvår",
+    "halvåret",
+    "halvårs",
+    "halvdel",
+    "halvdelen",
+    "semester",
+    "semestre",
+    "semesters",
+    "trimester",
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "h1",
+    "h2",
+    // ordinals
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "første",
+    "anden",
+    "andet",
+    "tredje",
+    "fjerde",
+    // fractions
+    "halv",
+    "halve",
+    "halvt",
+    "halvanden",
+    "halvandet",
+    "kvart",
+    // scales
+    "hundred",
+    "hundreds",
+    "thousand",
+    "thousands",
+    "million",
+    "millions",
+    "billion",
+    "billions",
+    "trillion",
+    "trillions",
+    "hundrede",
+    "tusind",
+    "tusinde",
+    "tusinder",
+    "millioner",
+    "milliard",
+    "milliarder",
+    "billioner",
+    "mio",
+    "mia",
+    "mn",
+    "bn",
+    "k",
+    "tkr",
+    "mkr",
+    "dozen",
+    "dozens",
+    "dusin",
+    "snes",
+];
+
+/// Scale words: a literal holding one is scaled.
+const SCALE_WORDS: &[&str] = &[
+    "hundred",
+    "thousand",
+    "million",
+    "billion",
+    "hundrede",
+    "tusind",
+    "tusinde",
+    "millioner",
+    "milliard",
+    "milliarder",
+    "mio",
+    "mia",
+    "dozen",
+];
+
+/// Skipped when looking for the word beside a literal (`quarter of :p1`).
+const SKIPPED: &[&str] = &["of", "af", "the"];
+
+/// The words that join the two ends of a range.
+const RANGE_JOINS: &[&str] = &["and", "og", "to", "til", "or", "eller"];
+
+/// Between a literal and the word beside it.
+fn gap_char(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '-' | '\u{2013}' | '\u{2014}' | '.' | ',' | '/' | ':' | '\'' | '\u{2019}'
+        )
+}
+
+/// Between two literals that read as one number.
+fn side_char(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '-' | '\u{2013}' | '\u{2014}' | '/' | ':' | '.')
+}
+
+/// The alphanumeric token that ends right before `at`, past gap chars only.
+fn token_before(text: &str, at: usize) -> Option<(usize, usize)> {
+    let mut it = text.get(..at)?.char_indices().rev().peekable();
+    let end = loop {
+        let &(i, c) = it.peek()?;
+        if c.is_alphanumeric() {
+            break i + c.len_utf8();
+        }
+        if !gap_char(c) {
+            return None;
+        }
+        it.next();
+    };
+    let mut start = end;
+    while let Some(&(i, c)) = it.peek() {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        start = i;
+        it.next();
+    }
+    Some((start, end))
+}
+
+/// The alphanumeric token that starts right after `at`, past gap chars only.
+fn token_after(text: &str, at: usize) -> Option<(usize, usize)> {
+    let mut it = text.get(at..)?.char_indices().peekable();
+    let start = loop {
+        let &(i, c) = it.peek()?;
+        if c.is_alphanumeric() {
+            break at + i;
+        }
+        if !gap_char(c) {
+            return None;
+        }
+        it.next();
+    };
+    let mut end = start;
+    while let Some(&(i, c)) = it.peek() {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        end = at + i + c.len_utf8();
+        it.next();
+    }
+    Some((start, end))
+}
+
+/// The word beside a literal, past `of`/`af`/`the`: lower case, or None
+/// when there is none or it is part of a literal.
+fn beside(text: &str, lits: &[LiteralSpan], at: usize, before: bool) -> Option<String> {
+    let mut at = at;
+    loop {
+        let (a, b) = if before {
+            token_before(text, at)?
+        } else {
+            token_after(text, at)?
+        };
+        if lits.iter().any(|l| a < l.end && l.start < b) {
+            return None;
+        }
+        let w = text.get(a..b)?.to_lowercase();
+        if !SKIPPED.contains(&w.as_str()) {
+            return Some(w);
+        }
+        at = if before { a } else { b };
+    }
+}
+
+/// The lower-case alphanumeric tokens of `s`.
+fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// A literal written with a scale: a scale word, or `15k` / `2m`.
+fn scaled(written: &str) -> bool {
+    tokens(written).iter().any(|t| {
+        SCALE_WORDS.contains(&t.as_str())
+            || t.strip_suffix(['k', 'm'])
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// The first literal whose meaning a plain word or a second literal next
+/// to it splits (see [`UNBOUND_WORD`], [`SIDE_BY_SIDE`],
+/// [`ONE_SCALE_TWO_NUMBERS`]): its span (both literals' for a pair) and why.
+fn split_meaning(text: &str, lits: &[LiteralSpan]) -> Option<(usize, usize, &'static str)> {
+    for w in lits.windows(2) {
+        let (x, y) = (&w[0], &w[1]);
+        let gap = text.get(x.end..y.start)?;
+        if gap.chars().all(side_char) {
+            return Some((x.start, y.end, SIDE_BY_SIDE));
+        }
+        let joined = gap.chars().all(|c| c.is_alphanumeric() || gap_char(c))
+            && tokens(gap)
+                .iter()
+                .all(|t| RANGE_JOINS.contains(&t.as_str()));
+        if joined && scaled(text.get(y.start..y.end)?) && !scaled(text.get(x.start..x.end)?) {
+            return Some((x.start, y.end, ONE_SCALE_TWO_NUMBERS));
+        }
+    }
+    for l in lits {
+        for before in [true, false] {
+            let at = if before { l.start } else { l.end };
+            if beside(text, lits, at, before).is_some_and(|w| SPLIT_WORDS.contains(&w.as_str())) {
+                return Some((l.start, l.end, UNBOUND_WORD));
+            }
+        }
+    }
+    None
 }
 
 /// Resolves `phrase` in `table`: one match is bound, several are a pick,
