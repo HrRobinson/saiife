@@ -27,8 +27,9 @@ use crate::grammar::{grammar_ok, Seg};
 use crate::lang::{
     find_dates, find_literals, find_numbers, find_unreadable_numerics, number_words, Literal,
 };
-use crate::schema::{Decimal, Lang};
-use crate::template::{Filled, Printed};
+use crate::schema::{Decimal, Lang, Param};
+use crate::sql::{ErrorClass, Validated};
+use crate::template::{check_params_covered, Filled, Printed, Template};
 
 /// How many numbers and dates each source accounted for. A found number or
 /// date counts once, under the first source that accepts it (calculator,
@@ -43,6 +44,9 @@ pub struct CheckReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckRefusal {
+    /// `check_failed` for the text rules; `param_misuse` when a bound
+    /// filter parameter of the question is not applied by the method.
+    pub class: ErrorClass,
     pub reason: String,
 }
 
@@ -51,7 +55,35 @@ const DATE_REASON: &str = "a date in the answer is not from the calculator or yo
 const SPAN_REASON: &str = "the answer could not be verified";
 
 fn refuse(reason: String) -> CheckRefusal {
-    CheckRefusal { reason }
+    CheckRefusal {
+        class: ErrorClass::CheckFailed,
+        reason,
+    }
+}
+
+const COVER_REASON: &str = "the method does not apply every part of your question";
+
+/// The checker's entry point for an answer (R45-10, ruling F-f): the method
+/// must apply every bound filter parameter of the question
+/// ([`check_params_covered`]; `param_misuse`, so an answer that shows
+/// "in Q3 2026" or a name over a method that ignores it never passes), then
+/// the filled text must pass [`check_text`]. `filled` is `template` filled
+/// for `method`'s result.
+pub fn check(
+    method: &Validated,
+    template: &Template,
+    params: &[Param],
+    filled: &Filled,
+    question: &str,
+    lang: Lang,
+) -> Result<CheckReport, CheckRefusal> {
+    if check_params_covered(method, template, params).is_err() {
+        return Err(CheckRefusal {
+            class: ErrorClass::ParamMisuse,
+            reason: COVER_REASON.into(),
+        });
+    }
+    check_text(filled, question, lang)
 }
 
 #[derive(Clone, Copy)]
@@ -247,7 +279,9 @@ fn words(text: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-pub fn check(f: &Filled, question: &str, lang: Lang) -> Result<CheckReport, CheckRefusal> {
+/// The text rules alone: every number and date has a source, and the
+/// fixed text keeps the grammar. An answer goes through [`check`].
+pub fn check_text(f: &Filled, question: &str, lang: Lang) -> Result<CheckReport, CheckRefusal> {
     let text = f.text.as_str();
     for p in &f.printed {
         if p.start > p.end || text.get(p.start..p.end).is_none() {

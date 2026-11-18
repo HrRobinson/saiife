@@ -1,7 +1,9 @@
 //! Plan 45 Task 5: the strict number checker (R45-10).
 
+mod common;
+
 use saiife_shield::calc::{CellValue, ResultSet};
-use saiife_shield::checker::check;
+use saiife_shield::checker::{check, check_text};
 use saiife_shield::schema::{Bound, Decimal, Lang, Param, ParamType};
 use saiife_shield::template::{fill, parse_template, Filled, Printed};
 
@@ -68,14 +70,14 @@ fn filled(text: &str, spans: &[(&str, &[&str], &[&str], bool)]) -> Filled {
 }
 
 fn refusal(f: &Filled, q: &str, lang: Lang) -> String {
-    check(f, q, lang).unwrap_err().reason
+    check_text(f, q, lang).unwrap_err().reason
 }
 
 #[test]
 fn spec_answer_passes() {
     for lang in [Lang::En, Lang::Da] {
         let f = spec_filled(lang);
-        let r = check(&f, "how much does Anna Berg owe?", lang).unwrap();
+        let r = check_text(&f, "how much does Anna Berg owe?", lang).unwrap();
         assert_eq!(r.from_calc, 3, "{}", f.text);
         assert_eq!(r.from_params, 1);
         assert_eq!(r.from_question, 0);
@@ -87,18 +89,18 @@ fn spec_answer_passes() {
 fn checker_uses_printed_values() {
     // 0.1 + 0.2 printed as 0.30; scale-insensitive equality.
     let f = filled("Total 0.30 now.", &[("0.30", &["0.3"], &[], false)]);
-    assert_eq!(check(&f, "total?", Lang::En).unwrap().from_calc, 1);
+    assert_eq!(check_text(&f, "total?", Lang::En).unwrap().from_calc, 1);
     // a printed span whose digits do not match its recorded values refuses
     let f = filled("Total 0.31 now.", &[("0.31", &["0.30"], &[], false)]);
     let why = refusal(&f, "total?", Lang::En);
     assert!(!why.contains("0.31"), "{why}");
     // fixed text equal to a slot-printed value is from calc
     let f = filled("Owes 5.00 of 5 invoices.", &[("5.00", &["5"], &[], false)]);
-    let r = check(&f, "x?", Lang::En).unwrap();
+    let r = check_text(&f, "x?", Lang::En).unwrap();
     assert_eq!(r.from_calc, 2);
     // a number straddling a span boundary refuses
     let f = filled("Owes 1234 kr", &[("12", &["12"], &[], false)]);
-    assert!(check(&f, "x?", Lang::En).is_err());
+    assert!(check_text(&f, "x?", Lang::En).is_err());
 }
 
 #[test]
@@ -112,7 +114,7 @@ fn fixed_text_numbers_refused() {
     ];
     for (text, lang) in cases {
         let f = filled(text, &[]);
-        let why = check(&f, "how much?", lang).unwrap_err().reason;
+        let why = check_text(&f, "how much?", lang).unwrap_err().reason;
         assert!(why.contains("not from the calculator"), "{text}: {why}");
     }
     // the reason quotes the offending number from fixed text
@@ -123,17 +125,17 @@ fn fixed_text_numbers_refused() {
     );
     // a printed percent is not enough for a different fixed percent
     let f = filled("Rate 4.5% vs 15%.", &[("4.5%", &["4.5"], &[], false)]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
 }
 
 #[test]
 fn question_numbers_allowed() {
     let f = filled("Only invoices over 10,000 count.", &[]);
-    let r = check(&f, "which invoices are over 10 000?", Lang::En).unwrap();
+    let r = check_text(&f, "which invoices are over 10 000?", Lang::En).unwrap();
     assert_eq!(r.from_question, 1);
     assert_eq!(r.numbers, 1);
     let f = filled("Tre gange er nok.", &[]);
-    assert!(check(&f, "hvad med tre fakturaer?", Lang::Da).is_ok());
+    assert!(check_text(&f, "hvad med tre fakturaer?", Lang::Da).is_ok());
 }
 
 #[test]
@@ -142,7 +144,7 @@ fn param_display_numbers_allowed() {
         "Anna Berg (customer #4411) is fine.",
         &[("Anna Berg (customer #4411)", &[], &[], true)],
     );
-    let r = check(&f, "q?", Lang::En).unwrap();
+    let r = check_text(&f, "q?", Lang::En).unwrap();
     assert_eq!((r.from_params, r.numbers), (1, 1));
 }
 
@@ -169,39 +171,39 @@ fn dates_checked() {
         "Due 1 July 2026 here.",
         &[("1 July 2026", &[], &["2026-07-01"], false)],
     );
-    let r = check(&f, "q?", Lang::En).unwrap();
+    let r = check_text(&f, "q?", Lang::En).unwrap();
     assert_eq!(r.numbers, 1);
     assert_eq!(r.from_calc, 1);
     // fixed-text date not printed refuses
     let f = filled("Due 1 July 2026 here.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     // wrong printed date
     let f = filled(
         "Due 2 July 2026 here.",
         &[("2 July 2026", &[], &["2026-07-01"], false)],
     );
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     // a date written in the question is allowed
     let f = filled("Since 1 July 2026.", &[]);
-    let r = check(&f, "what changed since 1 July 2026?", Lang::En).unwrap();
+    let r = check_text(&f, "what changed since 1 July 2026?", Lang::En).unwrap();
     assert_eq!(r.from_question, 1);
     // Danish
     let f = filled("Siden 1. juli 2026.", &[]);
-    assert!(check(&f, "hvad er sket siden 1. juli 2026?", Lang::Da).is_ok());
-    assert!(check(&f, "hvad er sket?", Lang::Da).is_err());
+    assert!(check_text(&f, "hvad er sket siden 1. juli 2026?", Lang::Da).is_ok());
+    assert!(check_text(&f, "hvad er sket?", Lang::Da).is_err());
     // a range form must equal a range in the question, not a printed day
     let f = filled(
         "In Q3 2026 only.",
         &[("Q3 2026", &[], &["2026-07-01"], false)],
     );
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     let f = filled("In Q3 2026 only.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     // round 2 (R2/R5): `Q3` is glued to its digit, so even a question-sourced
     // quarter is outside the fixed-text grammar; the planner writes plainer text
-    assert!(check(&f, "what about Q3 2026?", Lang::En).is_err());
+    assert!(check_text(&f, "what about Q3 2026?", Lang::En).is_err());
     let f = filled("In 1 July 2026 only.", &[]);
-    assert!(check(&f, "what about Q3 2026?", Lang::En).is_err());
+    assert!(check_text(&f, "what about Q3 2026?", Lang::En).is_err());
 }
 
 #[test]
@@ -211,14 +213,14 @@ fn articles_not_numbers() {
     let why = refusal(&f, "q?", Lang::En);
     assert!(why.contains("not from the calculator"), "{why}");
     let f = filled("It is a fine result.", &[]);
-    assert_eq!(check(&f, "q?", Lang::En).unwrap().numbers, 0);
+    assert_eq!(check_text(&f, "q?", Lang::En).unwrap().numbers, 0);
     let f = filled("Der er en kunde og et svar.", &[]);
-    assert_eq!(check(&f, "q?", Lang::Da).unwrap().numbers, 0);
+    assert_eq!(check_text(&f, "q?", Lang::Da).unwrap().numbers, 0);
     let f = filled("Only one customer.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_err());
-    assert!(check(&f, "show one customer", Lang::En).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "show one customer", Lang::En).is_ok());
     let f = filled("Kun én kunde.", &[]);
-    assert!(check(&f, "q?", Lang::Da).is_err());
+    assert!(check_text(&f, "q?", Lang::Da).is_err());
 }
 
 #[test]
@@ -255,7 +257,7 @@ fn never_panics_on_hostile_utf8() {
             .collect();
         let f = Filled { text, printed };
         for lang in [Lang::En, Lang::Da] {
-            let _ = check(&f, &q, lang);
+            let _ = check_text(&f, &q, lang);
         }
     }
     // an invalid span is a refusal
@@ -269,7 +271,7 @@ fn never_panics_on_hostile_utf8() {
             from_param: true,
         }],
     };
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
 }
 
 // ---- fix round 1 ----
@@ -311,21 +313,21 @@ fn unreadable_numerics_refused() {
         // even beside a calculated number
         let text = format!("It is 7 and {bad}.");
         let f = filled(&text, &[("7", &["7"], &[], false)]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "{bad}");
+        assert!(check_text(&f, "q?", Lang::En).is_err(), "{bad}");
         // inside a printed data span
         let text = format!("- Bob {bad} Ltd");
         let f = filled(&text, &[(&format!("Bob {bad} Ltd"), &[], &[], false)]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "{bad}");
+        assert!(check_text(&f, "q?", Lang::En).is_err(), "{bad}");
         // a question's unreadable numeral is never a source
         let f = filled(&format!("Only {bad}."), &[]);
-        assert!(check(&f, &format!("what is {bad}?"), Lang::En).is_err());
+        assert!(check_text(&f, &format!("what is {bad}?"), Lang::En).is_err());
     }
     // inside a parameter display it is a param source
     let f = filled(
         "Acme \u{216b} is fine.",
         &[("Acme \u{216b}", &[], &[], true)],
     );
-    assert!(check(&f, "q?", Lang::En).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_ok());
 }
 
 #[test]
@@ -342,15 +344,15 @@ fn parser_trouble_in_the_answer_refuses() {
         ("In 31 February 2026.", Lang::En),
     ] {
         let f = filled(text, &[]);
-        assert!(check(&f, "how much?", lang).is_err(), "{text}");
+        assert!(check_text(&f, "how much?", lang).is_err(), "{text}");
     }
     // a normal answer whose numbers all come from the calculator passes
     let f = filled(
         "It is 12 of 40.",
         &[("12", &["12"], &[], false), ("40", &["40"], &[], false)],
     );
-    assert!(check(&f, "q?", Lang::En).is_ok());
-    assert!(check(&spec_filled(Lang::Da), "q?", Lang::Da).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_ok());
+    assert!(check_text(&spec_filled(Lang::Da), "q?", Lang::Da).is_ok());
 }
 
 #[test]
@@ -358,24 +360,24 @@ fn sign_flip_refused() {
     for sign in ["-", "\u{2212}", "+"] {
         let text = format!("Balance is {sign}18,420.00 now.");
         let f = filled(&text, &[("18,420.00", &["18420.00"], &[], false)]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "{sign}");
+        assert!(check_text(&f, "q?", Lang::En).is_err(), "{sign}");
     }
     // a printed negative passes
     let f = money_filled(-18420.0);
     assert_eq!(f.text, "Balance is -18,420.00.");
-    let r = check(&f, "q?", Lang::En).unwrap();
+    let r = check_text(&f, "q?", Lang::En).unwrap();
     assert_eq!((r.numbers, r.from_calc), (1, 1));
     // a printed positive is not a negative
     let f = filled("Balance is -5.", &[("5", &["5"], &[], false)]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     // question signs
     let f = filled("It fell by -5 points.", &[]);
     // round 2 (R1/R2): a glued sign never passes, even when the question has it
-    assert!(check(&f, "did it fall -5?", Lang::En).is_err());
-    assert!(check(&f, "did it fall 5?", Lang::En).is_err());
+    assert!(check_text(&f, "did it fall -5?", Lang::En).is_err());
+    assert!(check_text(&f, "did it fall 5?", Lang::En).is_err());
     // a hyphen after a word is not a sign
     let f = filled("Item A-5 ok.", &[("5", &["5"], &[], false)]);
-    let _ = check(&f, "q?", Lang::En);
+    let _ = check_text(&f, "q?", Lang::En);
 }
 
 #[test]
@@ -428,19 +430,19 @@ fn quantity_words_refused() {
             let why = refusal(&f, "how much?", lang);
             assert!(why.contains(*w), "{w}: {why}");
             // the same word in the question is a source
-            assert!(check(&f, &format!("is it {w}?"), lang).is_ok(), "{w}");
+            assert!(check_text(&f, &format!("is it {w}?"), lang).is_ok(), "{w}");
             // inside a printed span the word is not quoted
             let f = filled(&text, &[(&format!("{w} as"), &[], &[], false)]);
             let why = refusal(&f, "how much?", lang);
             assert!(!why.contains(*w), "{w}: {why}");
             // inside a parameter display it is fine
             let f = filled(&text, &[(&format!("{w} as"), &[], &[], true)]);
-            assert!(check(&f, "q?", lang).is_ok(), "{w}");
+            assert!(check_text(&f, "q?", lang).is_ok(), "{w}");
         }
     }
     // ordinary words stay fine
     let f = filled("The pairing and halfway house are ordinary.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_ok());
 }
 
 // ---- fix round 2: the fixed text is an allow-listed grammar (R1-R7) ----
@@ -466,7 +468,10 @@ fn both_refuse(tpl: &str, text: &str, spans: &[&str], lang: Lang) {
         .map(|s| (*s, &["1"][..], &[][..], false))
         .collect();
     let f = filled(text, &sp);
-    assert!(check(&f, "q?", lang).is_err(), "check accepted {text:?}");
+    assert!(
+        check_text(&f, "q?", lang).is_err(),
+        "check accepted {text:?}"
+    );
 }
 
 #[test]
@@ -590,12 +595,12 @@ fn grammar_refuses_lookalike_and_foreign_words() {
         let tpl = format!("It was {w} times.");
         assert!(parse_err(&tpl), "{w}");
         let f = filled(&format!("It was {w} times."), &[]);
-        assert!(check(&f, "it was it", Lang::En).is_err(), "{w}");
+        assert!(check_text(&f, "it was it", Lang::En).is_err(), "{w}");
     }
     // English number words in a Danish answer
     for w in ["three", "ten", "twenty-one", "hundred"] {
         let f = filled(&format!("Det er {w} fakturaer."), &[]);
-        assert!(check(&f, "hvor mange?", Lang::Da).is_err(), "{w}");
+        assert!(check_text(&f, "hvor mange?", Lang::Da).is_err(), "{w}");
     }
 }
 
@@ -610,10 +615,10 @@ fn grammar_refuses_roman_numerals() {
     ] {
         assert!(parse_err(t), "{t}");
         let f = filled(t, &[]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "{t}");
+        assert!(check_text(&f, "q?", Lang::En).is_err(), "{t}");
     }
     let f = filled("I think so.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_ok());
 }
 
 #[test]
@@ -649,14 +654,17 @@ fn more_quantity_words_refused() {
         let f = filled(&format!("It was {w} as much."), &[]);
         let why = refusal(&f, "how much?", Lang::En);
         assert!(why.contains(w), "{w}: {why}");
-        assert!(check(&f, &format!("is it {w}?"), Lang::En).is_ok(), "{w}");
+        assert!(
+            check_text(&f, &format!("is it {w}?"), Lang::En).is_ok(),
+            "{w}"
+        );
     }
 }
 
 #[test]
 fn grammar_still_passes_the_good_cases() {
     for lang in [Lang::En, Lang::Da] {
-        assert!(check(&spec_filled(lang), "q?", lang).is_ok());
+        assert!(check_text(&spec_filled(lang), "q?", lang).is_ok());
     }
     assert!(!parse_err("Anna owes {money(x)}, and {int(a)} more."));
     assert!(!parse_err("From {int(a)} to {int(b)} items."));
@@ -665,15 +673,15 @@ fn grammar_still_passes_the_good_cases() {
         "From 3 to 7 items.",
         &[("3", &["3"], &[], false), ("7", &["7"], &[], false)],
     );
-    assert!(check(&f, "q?", Lang::En).is_ok());
-    assert!(check(&money_filled(-18420.0), "q?", Lang::En).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_ok());
+    assert!(check_text(&money_filled(-18420.0), "q?", Lang::En).is_ok());
     let f = filled("Kunden skylder 7 kr. i alt.", &[("7", &["7"], &[], false)]);
-    assert!(check(&f, "q?", Lang::Da).is_ok());
+    assert!(check_text(&f, "q?", Lang::Da).is_ok());
     let f = filled(
         "Har du \u{e6}\u{f8}\u{e5} \u{c6}\u{d8}\u{c5} caf\u{e9}?",
         &[],
     );
-    assert!(check(&f, "q?", Lang::Da).is_ok());
+    assert!(check_text(&f, "q?", Lang::Da).is_ok());
 }
 
 // R5: digits in fixed text are delimited like a numeric slot, and need the
@@ -695,7 +703,10 @@ fn fixed_digits_are_delimited_and_sourced() {
     ] {
         assert!(parse_err(tpl), "parse accepted {tpl:?}");
         let f = filled(tpl, &[]);
-        assert!(check(&f, q, Lang::En).is_err(), "check accepted {tpl:?}");
+        assert!(
+            check_text(&f, q, Lang::En).is_err(),
+            "check accepted {tpl:?}"
+        );
     }
     // delimited and in the question: passes both
     for (tpl, q, lang) in [
@@ -705,13 +716,13 @@ fn fixed_digits_are_delimited_and_sourced() {
     ] {
         assert!(!parse_err(tpl), "parse refused {tpl:?}");
         let f = filled(tpl, &[]);
-        assert!(check(&f, q, lang).is_ok(), "check refused {tpl:?}");
+        assert!(check_text(&f, q, lang).is_ok(), "check refused {tpl:?}");
     }
     // delimited but not in the question: parse cannot know, check refuses
     for tpl in ["Call 4411 now.", "Pay 1,500.00 now.", "Phone 555 now."] {
         assert!(!parse_err(tpl), "{tpl}");
         let f = filled(tpl, &[]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "{tpl}");
+        assert!(check_text(&f, "q?", Lang::En).is_err(), "{tpl}");
     }
 }
 
@@ -721,7 +732,7 @@ fn fixed_digits_are_delimited_and_sourced() {
 #[test]
 fn semantic_claims_without_numbers_are_not_the_checkers_job() {
     let f = filled("Anna Berg owes nothing.", &[]);
-    assert!(check(&f, "what does Anna Berg owe?", Lang::En).is_ok());
+    assert!(check_text(&f, "what does Anna Berg owe?", Lang::En).is_ok());
     assert!(!parse_err("Anna Berg owes nothing."));
 }
 
@@ -741,10 +752,13 @@ fn roman_numerals_with_punctuation_or_lower_case_refused() {
     ] {
         assert!(parse_err(t), "parse accepted {t:?}");
         let f = filled(t, &[]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "check accepted {t:?}");
+        assert!(
+            check_text(&f, "q?", Lang::En).is_err(),
+            "check accepted {t:?}"
+        );
     }
     let f = filled("In Q-III Anna owed 5.", &[("5", &["5"], &[], false)]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     for t in [
         "I think so.",
         "Kunden er i byen.",
@@ -753,7 +767,10 @@ fn roman_numerals_with_punctuation_or_lower_case_refused() {
     ] {
         assert!(!parse_err(t), "parse refused {t:?}");
         let f = filled(t, &[]);
-        assert!(check(&f, "q?", Lang::En).is_ok(), "check refused {t:?}");
+        assert!(
+            check_text(&f, "q?", Lang::En).is_ok(),
+            "check refused {t:?}"
+        );
     }
 }
 
@@ -761,17 +778,17 @@ fn roman_numerals_with_punctuation_or_lower_case_refused() {
 fn number_words_of_both_languages_refused_on_every_answer() {
     for t in ["It cost fem tusind.", "Det var tre.", "A million kr."] {
         let f = filled(t, &[]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "{t}");
+        assert!(check_text(&f, "q?", Lang::En).is_err(), "{t}");
     }
     // everyday English words that are Danish numbers are exempt on English
     let f = filled("Sent to Anna on fire day, en et.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_ok());
+    assert!(check_text(&f, "q?", Lang::En).is_ok());
     // but the English lexicon still applies to Danish answers
     let f = filled("Det var three fakturaer.", &[]);
-    assert!(check(&f, "q?", Lang::Da).is_err());
+    assert!(check_text(&f, "q?", Lang::Da).is_err());
     // and a question that has the word licenses it
     let f = filled("It cost fem tusind.", &[]);
-    assert!(check(&f, "hvad med fem tusind?", Lang::En).is_ok());
+    assert!(check_text(&f, "hvad med fem tusind?", Lang::En).is_ok());
 }
 
 #[test]
@@ -790,12 +807,12 @@ fn param_and_cmp_slots_are_judged_like_numbers_for_neighbours() {
         "Anna Berg (customer #4411) million owed.",
         &[("Anna Berg (customer #4411)", &[], &[], true)],
     );
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     let f = filled(
         "About Anna Berg (customer #4411)k owed.",
         &[("Anna Berg (customer #4411)", &[], &[], true)],
     );
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     assert!(!parse_err("More than {param(p1)} invoices."));
     assert!(!parse_err("{param(p1)} owes {int(a)} invoices."));
     assert!(!parse_err("It is {cmp(a, b)} her limit."));
@@ -816,7 +833,10 @@ fn q_then_a_single_roman_letter_refused() {
     ] {
         assert!(parse_err(t), "parse accepted {t:?}");
         let f = filled(t, &[]);
-        assert!(check(&f, "q?", Lang::En).is_err(), "check accepted {t:?}");
+        assert!(
+            check_text(&f, "q?", Lang::En).is_err(),
+            "check accepted {t:?}"
+        );
     }
     for tpl in [
         "In Q-I Anna owed {money(x)}.",
@@ -825,7 +845,7 @@ fn q_then_a_single_roman_letter_refused() {
         assert!(parse_err(tpl), "parse accepted {tpl:?}");
     }
     let f = filled("In Q-I Anna owed 5.", &[("5", &["5"], &[], false)]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     for t in [
         "I think so, and I owe it.",
         "Kunden er i byen.",
@@ -833,7 +853,10 @@ fn q_then_a_single_roman_letter_refused() {
     ] {
         assert!(!parse_err(t), "parse refused {t:?}");
         let f = filled(t, &[]);
-        assert!(check(&f, "q?", Lang::En).is_ok(), "check refused {t:?}");
+        assert!(
+            check_text(&f, "q?", Lang::En).is_ok(),
+            "check refused {t:?}"
+        );
     }
 }
 
@@ -842,9 +865,114 @@ fn mil_and_mill_are_scale_words() {
     assert!(parse_err("Anna owes {int(a)} mill. kr."));
     assert!(parse_err("Anna owes {money(x)} mil"));
     let f = filled("Anna owes 5 mill. kr.", &[("5", &["5"], &[], false)]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     let f = filled("Anna owes 5 mil", &[("5", &["5"], &[], false)]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
     let f = filled("It was a mill kr.", &[]);
-    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(check_text(&f, "q?", Lang::En).is_err());
+}
+
+/// Ruling F-f (plan 45 final review part 2): the checker's entry point
+/// refuses an answer whose method does not apply a bound filter of the
+/// question, even when the template shows it.
+fn total_rs(total: f64, limit: f64) -> ResultSet {
+    ResultSet {
+        columns: vec!["total".into(), "credit_limit".into()],
+        rows: vec![vec![CellValue::Real(total), CellValue::Real(limit)]],
+        truncated: false,
+        total_rows: None,
+        ms: 0,
+        row_band: "1-9".into(),
+    }
+}
+
+fn q3() -> Param {
+    Param {
+        name: "p2".into(),
+        ty: ParamType::DateRange,
+        bound: Some(Bound::DateRange("2026-07-01".into(), "2026-10-01".into())),
+        display: "Q3 2026".into(),
+    }
+}
+
+const ALL_TIME: &str = "SELECT SUM(i.amount) AS total, c.credit_limit FROM invoices i \
+    JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
+
+#[test]
+fn check_refuses_a_shown_filter_the_method_ignores() {
+    let ps = vec![common::entity(1), q3()];
+    let cols: Vec<String> = vec!["total".into(), "credit_limit".into()];
+    let tpl = parse_template(
+        "{param(p1)} owes {money(total)} in {param(p2)}.",
+        &cols,
+        &ps,
+        100,
+    )
+    .unwrap();
+    let f = fill(&tpl, &total_rs(412.0, 5000.0), &ps, Lang::En).unwrap();
+    let q = "What does Anna Berg owe in Q3 2026?";
+    // The method lacks the date filter: refused although the text is clean.
+    let all_time = common::v(ALL_TIME, &ps);
+    check_text(&f, q, Lang::En).unwrap();
+    let r = check(&all_time, &tpl, &ps, &f, q, Lang::En).unwrap_err();
+    assert_eq!(r.class, ErrorClass::ParamMisuse);
+    // With the filter it passes.
+    let in_q3 = common::v(
+        &format!("{ALL_TIME} AND i.issued >= :p2_from AND i.issued < :p2_to"),
+        &ps,
+    );
+    check(&in_q3, &tpl, &ps, &f, q, Lang::En).unwrap();
+}
+
+#[test]
+fn check_refuses_a_shown_entity_the_method_ignores() {
+    // A method over every customer (validated against a draft without the
+    // entity) with an answer that names Anna Berg.
+    let ps = vec![common::entity(1)];
+    let everyone = common::v("SELECT SUM(i.amount) AS total FROM invoices i", &[]);
+    let cols: Vec<String> = vec!["total".into()];
+    let tpl = parse_template("{param(p1)} owes {money(total)}.", &cols, &ps, 100).unwrap();
+    let rs = ResultSet {
+        columns: cols.clone(),
+        rows: vec![vec![CellValue::Real(412.0)]],
+        truncated: false,
+        total_rows: None,
+        ms: 0,
+        row_band: "1-9".into(),
+    };
+    let f = fill(&tpl, &rs, &ps, Lang::En).unwrap();
+    let r = check(&everyone, &tpl, &ps, &f, "What does Anna owe?", Lang::En).unwrap_err();
+    assert_eq!(r.class, ErrorClass::ParamMisuse);
+}
+
+#[test]
+fn check_passes_a_stated_threshold_with_a_cmp() {
+    let limit = Param {
+        name: "p2".into(),
+        ty: ParamType::Amount,
+        bound: Some(Bound::Amount(dec("10000"))),
+        display: "10,000.00".into(),
+    };
+    let ps = vec![common::entity(1), limit];
+    let method = common::v(ALL_TIME, &ps);
+    let cols: Vec<String> = vec!["total".into(), "credit_limit".into()];
+    let tpl = parse_template(
+        "Is {param(p1)} over {param(p2)}? She owes {money(total)}, \
+         {cmp(total, credit_limit)} her limit of {money(credit_limit)}.",
+        &cols,
+        &ps,
+        100,
+    )
+    .unwrap();
+    let f = fill(&tpl, &total_rs(600.0, 5000.0), &ps, Lang::En).unwrap();
+    let rep = check(
+        &method,
+        &tpl,
+        &ps,
+        &f,
+        "Is Anna Berg over 10,000?",
+        Lang::En,
+    )
+    .unwrap();
+    assert_eq!(rep.from_calc, 2);
 }

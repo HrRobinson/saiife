@@ -451,12 +451,61 @@ fn every_bound_question_param_is_used_or_shown() {
     assert_eq!(e.detail, None);
     // Used by the method: ok.
     check_params_covered(&used, &plain, &ps).unwrap();
-    // Shown by a param slot (a threshold the answer only states): ok.
-    check_params_covered(&unused, &shown, &ps).unwrap();
+    // Ruling F-f (final review part 2): a filter the template shows but the
+    // method ignores is refused ("in Q3 2026" over an all-time total). This
+    // replaces the part-1 assertion that accepted it.
+    let e = check_params_covered(&unused, &shown, &ps).unwrap_err();
+    assert_eq!(e.class, ErrorClass::ParamMisuse);
+    check_params_covered(&used, &shown, &ps).unwrap();
     // An unbound draft parameter is not judged.
     let mut draft = ps.clone();
     draft[1].bound = None;
     check_params_covered(&unused, &plain, &draft).unwrap();
+}
+
+#[test]
+fn only_scalar_thresholds_may_be_shown_unused() {
+    // Ruling F-f: Amount / Integer / Percent may be shown and not used (a
+    // stated threshold); Date and Text filters may not.
+    let base = vec![common::entity(1)];
+    let method = common::v(
+        "SELECT SUM(i.amount) AS total, c.credit_limit FROM invoices i \
+         JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1",
+        &base,
+    );
+    let c = cols(&["total", "credit_limit"]);
+    for (ty, bound, ok) in [
+        (ParamType::Amount, Bound::Amount(dec("10000")), true),
+        (ParamType::Integer, Bound::Integer(3), true),
+        (ParamType::Percent, Bound::Percent(dec("10")), true),
+        (ParamType::Date, Bound::Date("2026-07-01".into()), false),
+        (
+            ParamType::Text {
+                table: "customers".into(),
+                column: "city".into(),
+            },
+            Bound::Text("Aarhus".into()),
+            false,
+        ),
+    ] {
+        let mut ps = base.clone();
+        ps.push(Param {
+            name: "p2".into(),
+            ty: ty.clone(),
+            bound: Some(bound),
+            display: "x".into(),
+        });
+        let t = parse_template(
+            "Is {param(p1)} over {param(p2)}? Owes {money(total)}, \
+             {cmp(total, credit_limit)} the limit.",
+            &c,
+            &ps,
+            100,
+        )
+        .unwrap();
+        let r = check_params_covered(&method, &t, &ps);
+        assert_eq!(r.is_ok(), ok, "{ty:?}");
+    }
 }
 
 #[test]

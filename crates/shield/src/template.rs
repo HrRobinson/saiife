@@ -296,15 +296,23 @@ impl Template {
     }
 }
 
-/// Plan 45 final review I3 (ruling F-c): a bound question parameter the
-/// method ignores answers another question ("open invoices in Q3 2026"
-/// summed over all time). Every bound non-entity parameter must be used by
-/// the method ([`Validated::params_used`]) or shown by a `{param(pN)}` slot
-/// of the template (a threshold the answer only states); otherwise
-/// `param_misuse` (no detail: R45-8 sends a detail only for the name
-/// classes). Bound entity parameters are
-/// already checked by the validator. Found before the preview, so the
-/// planner can retry; plan 48 calls it once both method and template parse.
+/// Plan 45 final review I3 (ruling F-c, narrowed by F-f): a bound question
+/// parameter the method ignores answers another question ("open invoices in
+/// Q3 2026" summed over all time; "Anna Berg's total" over every customer).
+///
+/// * A filter parameter (entity key, `DateRange`, `Date`, `Text`: anything
+///   that restricts rows) must be used by the method
+///   ([`Validated::params_used`]), whether the template shows it or not:
+///   showing "in Q3 2026" next to an all-time total is the anti-goal.
+/// * Only the scalar thresholds in [`shown_only_ok`] (`Amount`, `Integer`,
+///   `Percent`) may instead be shown by a `{param(pN)}` slot: a limit the
+///   answer states ("is she over 10,000?") and leaves to a `cmp` of
+///   calculator cells or to the reader; it restricts no rows.
+///
+/// Otherwise `param_misuse` (no detail: R45-8 sends a detail only for the
+/// name classes). Unbound draft parameters are not judged. Found before the
+/// preview, so the planner can retry; the checker's [`crate::checker::check`]
+/// runs it again over the method and template it is given.
 pub fn check_params_covered(
     method: &Validated,
     template: &Template,
@@ -312,11 +320,10 @@ pub fn check_params_covered(
 ) -> Result<(), MethodError> {
     let shown = template.param_slots();
     for p in params {
-        if p.bound.is_none() || matches!(p.ty, ParamType::Entity { .. }) {
+        if p.bound.is_none() || method.params_used.contains(&p.name) {
             continue;
         }
-        let used = method.params_used.contains(&p.name);
-        if !used && !shown.contains(&p.name.as_str()) {
+        if !(shown_only_ok(&p.ty) && shown.contains(&p.name.as_str())) {
             return Err(MethodError {
                 class: ErrorClass::ParamMisuse,
                 detail: None,
@@ -324,6 +331,15 @@ pub fn check_params_covered(
         }
     }
     Ok(())
+}
+
+/// The parameter kinds a template may show without the method using them:
+/// scalar thresholds only, never a filter.
+pub fn shown_only_ok(t: &ParamType) -> bool {
+    matches!(
+        t,
+        ParamType::Amount | ParamType::Integer | ParamType::Percent
+    )
 }
 
 // ---- number formatting ----

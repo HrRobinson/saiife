@@ -557,3 +557,44 @@ fn joins_come_from_the_validators_edges() {
         p.text
     );
 }
+
+#[test]
+fn every_filter_is_rendered() {
+    // Plan 45 final review part 2 (ruling F-f): the preview names every
+    // filter the method applies, so a dropped filter is visible to the user.
+    let date = Param {
+        name: "p5".into(),
+        ty: ParamType::Date,
+        bound: Some(Bound::Date("2026-05-01".into())),
+        display: "1 May 2026".into(),
+    };
+    let show = |sql: &str| {
+        let mut ps = drop_unused(sql, params());
+        ps.push(date.clone());
+        preview(&validated(sql, &ps), &ps, &schema(), Lang::En).text
+    };
+    // The entity and the date range in the outer block.
+    let t = show(BALANCE);
+    assert!(t.contains("for Anna Berg (customer #4411)"), "{t}");
+    assert!(t.contains(" in Q3 2026"), "{t}");
+    // Without them, neither is said.
+    let t = show("SELECT SUM(i.amount) AS s FROM invoices i WHERE i.status = 'open'");
+    assert!(!t.contains("Anna Berg") && !t.contains("Q3"), "{t}");
+    // A date range inside a CTE, next to an entity pin outside it.
+    let t = show(
+        "WITH t AS (SELECT i.customer_id AS cid, SUM(i.amount) AS s FROM invoices i \
+         WHERE i.issued >= :p2_from AND i.issued < :p2_to GROUP BY i.customer_id) \
+         SELECT c.city, MAX(t.s) AS top FROM customers c JOIN t ON t.cid = c.id \
+         WHERE c.id = :p1 GROUP BY c.city",
+    );
+    assert!(t.contains("for Anna Berg (customer #4411)"), "{t}");
+    assert!(
+        t.contains("issued >= 1 July 2026 AND invoices.issued < 1 October 2026"),
+        "{t}"
+    );
+    // A text and a date filter.
+    let t = show("SELECT COUNT(*) AS n FROM customers c WHERE c.city = :p4");
+    assert!(t.contains("city 'Aarhus'"), "{t}");
+    let t = show("SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p5");
+    assert!(t.contains("issued is at least 1 May 2026"), "{t}");
+}
