@@ -12,6 +12,7 @@ use crate::public::PublicValues;
 use crate::schema::{DatasetName, Lang, Param, ParamType, Schema};
 use crate::sql::{validate, validate_check, ErrorClass, MethodError};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The file format version.
@@ -47,12 +48,19 @@ pub struct ApprovedMethod {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MethodStore {
     pub methods: Vec<ApprovedMethod>,
+    /// Plan 45 final review M1: the highest version ever issued per slug,
+    /// kept after a `remove`, so an id is never issued twice (the audit
+    /// names methods by id). Absent in older files (serde default).
+    #[serde(default)]
+    pub issued: BTreeMap<String, u32>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct FileForm {
     v: u32,
     methods: Vec<ApprovedMethod>,
+    #[serde(default)]
+    issued: BTreeMap<String, u32>,
 }
 
 /// `m-<slug>-v<n>`; the slug is the first 4 words of the key, ASCII
@@ -156,7 +164,10 @@ impl MethodStore {
                 "the methods file has an unknown version",
             ));
         }
-        Ok(MethodStore { methods: f.methods })
+        Ok(MethodStore {
+            methods: f.methods,
+            issued: f.issued,
+        })
     }
 
     /// Written through the shared private-file protocol (dataset.rs): the
@@ -176,6 +187,7 @@ impl MethodStore {
         let body = serde_json::to_vec_pretty(&FileForm {
             v: FILE_VERSION,
             methods: self.methods.clone(),
+            issued: self.issued.clone(),
         })
         .map_err(|_| io_err("could not encode the methods file"))?;
         replace_private_part(dir, name, |part| {
@@ -203,14 +215,16 @@ impl MethodStore {
     /// history, suspended `replaced by vN`.
     pub fn add(&mut self, mut m: ApprovedMethod) -> &ApprovedMethod {
         // Ids are unique by construction: n is one more than the highest
-        // version among every stored method with the same slug (any slot,
-        // any status).
+        // version ever issued for the slug: among every stored method with
+        // the same slug (any slot, any status) and the high-water mark that
+        // survives a `remove` (M1).
         let sl = slug(&m.template_key);
         let max = self
             .methods
             .iter()
             .filter(|o| slug(&o.template_key) == sl)
             .map(|o| o.version)
+            .chain(self.issued.get(&sl).copied())
             .max();
         if let Some(max) = max {
             let v = max.saturating_add(1);
@@ -226,6 +240,8 @@ impl MethodStore {
             }
         }
         m.id = method_id(&m.template_key, m.version);
+        let hw = self.issued.entry(sl).or_insert(0);
+        *hw = (*hw).max(m.version);
         self.methods.push(m);
         &self.methods[self.methods.len() - 1]
     }
@@ -455,6 +471,36 @@ mod tests {
         );
         assert!(s.remove("m-balance-of-a-v1"));
         assert!(!s.remove("m-balance-of-a-v1"));
+    }
+
+    #[test]
+    fn removed_ids_are_never_reissued() {
+        let mut s = MethodStore::default();
+        let t = ["entity:customers"];
+        s.add(method("balance of a", &t, Lang::En));
+        let v2 = s.add(method("balance of a", &t, Lang::En)).id.clone();
+        assert_eq!(v2, "m-balance-of-a-v2");
+        // Removing the highest version does not free its id.
+        assert!(s.remove(&v2));
+        let v3 = s.add(method("balance of a", &t, Lang::En)).id.clone();
+        assert_eq!(v3, "m-balance-of-a-v3");
+        // Removing every method keeps the mark too, also across a save and
+        // a load.
+        assert!(s.remove("m-balance-of-a-v1"));
+        assert!(s.remove(&v3));
+        assert!(s.methods.is_empty());
+        let dir = scratch("issued");
+        let path = dir.join("methods.json");
+        s.save(&path).unwrap();
+        let mut back = MethodStore::load(&path).unwrap();
+        assert_eq!(back, s);
+        let v4 = back.add(method("balance of a", &t, Lang::En)).id.clone();
+        assert_eq!(v4, "m-balance-of-a-v4");
+        // A file without the mark (written before M1) still loads.
+        std::fs::write(&path, br#"{"v":1,"methods":[]}"#).unwrap();
+        let old = MethodStore::load(&path).unwrap();
+        assert!(old.issued.is_empty() && old.methods.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

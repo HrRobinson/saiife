@@ -536,6 +536,20 @@ fn grammar_refuses_scale_words_and_glue() {
 }
 
 #[test]
+fn grammar_refuses_compound_scale_words() {
+    // Plan 45 final review M6: also in the checker's re-check of the filled
+    // text.
+    for w in ["hundredthousand", "tenmillion", "halvmilliard", "totusinde"] {
+        let tpl = format!("It is {{money(x)}} {w} now.");
+        let text = format!("It is 18,420.00 {w} now.");
+        both_refuse(&tpl, &text, &["18,420.00"], Lang::En);
+        let tpl = format!("It is {w} {{money(x)}} now.");
+        let text = format!("It is {w} 18,420.00 now.");
+        both_refuse(&tpl, &text, &["18,420.00"], Lang::En);
+    }
+}
+
+#[test]
 fn grammar_refuses_joined_slots() {
     both_refuse(
         "{int(a)}\u{200b}{int(b)}",

@@ -313,7 +313,10 @@ fn arithmetic_and_in_lists_are_fragments() {
     let p = en("SELECT SUM(i.amount) / COUNT(*) AS x FROM invoices i");
     assert_eq!(p.fragments, 1, "{}", p.text);
     assert!(
-        p.text.contains("`SUM(invoices.amount) / COUNT(*)`"),
+        // Plan 45 final review I1: the preview shows the SQL that runs,
+        // with saiife's real-division cast.
+        p.text
+            .contains("`CAST(SUM(invoices.amount) AS REAL) / COUNT(*)`"),
         "{}",
         p.text
     );

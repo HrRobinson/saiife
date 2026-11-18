@@ -1051,6 +1051,18 @@ fn date_range_params() {
              date(i.issued, 'localtime') >= :p5",
             LiteralNotAllowed,
         ),
+        // Plan 44 M9 / plan 45 final review M7: a date range is never a
+        // count threshold.
+        (
+            "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city \
+             HAVING COUNT(*) > :p3_from",
+            ErrorClass::ParamType,
+        ),
+        (
+            "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city \
+             HAVING COUNT(*) > :p3",
+            ParamMisuse,
+        ),
     ] {
         assert_eq!(refused(sql), want, "{sql}");
     }
@@ -1940,4 +1952,56 @@ fn join_edges_and_pinned_source() {
     assert_eq!(v.joins[0].fk_table, "invoices");
     assert!(v.joins[0].fan);
     assert_eq!(v.pinned_sources, vec![1]);
+}
+
+#[test]
+fn sum_and_avg_need_a_number_column() {
+    // Plan 45 final review I2: SQLite sums the leading digits of a TEXT or
+    // DATE value ('2026-07-01' is 2026) or gives 0.0.
+    for sql in [
+        "SELECT SUM(i.status) AS s FROM invoices i",
+        "SELECT AVG(i.issued) AS a FROM invoices i",
+        "SELECT SUM(DISTINCT c.city) AS s FROM customers c",
+        "SELECT AVG(DISTINCT i.status) AS a FROM invoices i",
+        // By origin through a CTE.
+        "WITH t AS (SELECT i.customer_id AS cid, MAX(i.issued) AS d FROM invoices i \
+         GROUP BY i.customer_id) SELECT SUM(t.d) AS s FROM t",
+        // Arithmetic is between numbers only.
+        "SELECT MAX(i.issued) - MIN(i.issued) AS w FROM invoices i",
+        "SELECT COUNT(*) / MAX(i.status) AS w FROM invoices i",
+    ] {
+        assert_eq!(refused(sql), ErrorClass::ConstructNotAllowed, "{sql}");
+    }
+    // MIN / MAX / COUNT over TEXT and DATE stay.
+    let v = ok(
+        "SELECT MIN(i.issued) AS a, MAX(i.status) AS b, COUNT(i.status) AS n \
+         FROM invoices i",
+    );
+    prepares(&v.sql);
+    // A CTE count is a number.
+    ok(
+        "WITH t AS (SELECT i.customer_id AS cid, COUNT(*) AS n FROM invoices i \
+        GROUP BY i.customer_id) SELECT AVG(t.n) AS a FROM t",
+    );
+}
+
+#[test]
+fn division_renders_as_real() {
+    // Plan 45 final review I1 (ruling F-b): the left operand of `/` is cast
+    // to REAL in the rendered SQL only.
+    let v = ok("SELECT SUM(i.amount) / COUNT(*) AS m FROM invoices i");
+    assert_eq!(
+        v.sql,
+        "SELECT CAST(SUM(\"_p_i\".\"amount\") AS REAL) / COUNT(*) AS \"m\" \
+         FROM \"invoices\" \"_p_i\""
+    );
+    prepares(&v.sql);
+    // Other operators are left alone.
+    let v = ok("SELECT SUM(i.amount) - SUM(i.discount) AS d FROM invoices i");
+    assert!(!v.sql.contains("CAST"), "{}", v.sql);
+    // The planner's grammar still has no CAST.
+    assert_eq!(
+        refused("SELECT CAST(SUM(i.amount) AS REAL) / COUNT(*) AS m FROM invoices i"),
+        ErrorClass::ConstructNotAllowed
+    );
 }

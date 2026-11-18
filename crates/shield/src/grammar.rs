@@ -15,7 +15,8 @@
 //!   word or a `\n` (a new line is a hard boundary).
 //! * R3 neighbour words: the word before and after a number (skipping spaces
 //!   and punctuation, never a `\n`) is not a scale, sign or unit word
-//!   (`mio`, `thousand`, `times`, `percent`, ...).
+//!   (`mio`, `thousand`, `times`, `percent`, ...), nor a word containing a
+//!   scale stem (`hundredthousand`, `tenmillion`).
 //! * R6 Roman numerals: no piece (whitespace tokens split on punctuation,
 //!   any case) of two or more letters from `ivxlcdm`, nor `q` followed by
 //!   such letters, except a short list of real words (`ROMAN_WORDS`). A
@@ -171,8 +172,16 @@ fn split_digits<'a>(t: &'a str, out: &mut Vec<Seg<'a>>) {
     }
 }
 
+/// Scale stems (plan 45 final review M6): a word next to a number that
+/// contains one is a scale word whatever is glued to it (`hundredthousand`,
+/// `tenmillion`, `halvmilliard`). `illion` covers million, billion, trillion.
+const SCALE_STEMS: &[&str] = &[
+    "hundred", "thousand", "illion", "milliard", "tusind", "mio", "mia",
+];
+
 fn neighbour_bad(w: &str) -> bool {
-    NEIGHBOURS.contains(&w.to_ascii_lowercase().as_str())
+    let w = w.to_ascii_lowercase();
+    NEIGHBOURS.contains(&w.as_str()) || SCALE_STEMS.iter().any(|s| w.contains(s))
 }
 
 fn word_before(t: &str) -> &str {

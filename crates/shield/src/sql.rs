@@ -6,10 +6,13 @@
 //! - `WITH`: at most 2 non-recursive CTEs, each of the same shape.
 //! - `SELECT [DISTINCT]` items: a plain column `t.c`; `COUNT(*)`,
 //!   `COUNT([DISTINCT] t.c)`, `SUM|AVG|MIN|MAX([DISTINCT] t.c)` over one
-//!   plain column; `date(t.c, mods…)` / `strftime('<fmt>', t.c, mods…)` over
-//!   a plain DATE column; in the outermost block only, one `+ - * /` between
-//!   two aggregates over base-table columns (ruling C-CAP). No literal and
-//!   no parameter in the list. `AS alias`; at most 32 items, unique names.
+//!   plain column (`SUM`/`AVG` over a number column only); `date(t.c,
+//!   mods…)` / `strftime('<fmt>', t.c, mods…)` over a plain DATE column; in
+//!   the outermost block only, one `+ - * /` between two numeric aggregates
+//!   over base-table columns (ruling C-CAP). No literal and no parameter in
+//!   the list. `AS alias`; at most 32 items, unique names.
+//! - `/` is rendered with its left operand cast to REAL (ruling F-b), so it
+//!   is never SQLite integer division; the planner cannot write `CAST`.
 //! - `FROM` a base table or a CTE, `[INNER] JOIN … ON` an AND of equalities
 //!   each on a declared key pair (ruling C-G1), checked by column origin
 //!   through CTE provenance; at most 4 joins in all.
@@ -54,10 +57,11 @@ use crate::public::PublicValues;
 use crate::schema::{Bound, ColType, EntitySpec, Param, ParamType, Schema, TableInfo};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
-    BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByKind, OrderBySort, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement, TableAlias, TableFactor, UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType, Distinct, DuplicateTreatment, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByKind, OrderBySort,
+    Query, Select, SelectFlavor, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -1617,8 +1621,31 @@ impl<'a> Walk<'a> {
                 } else {
                     (&a.fp, &b.fp)
                 };
+                // Plan 45 final review I2: arithmetic is between numbers only
+                // (`MIN(t.date) - MAX(t.date)` would be a number SQLite makes
+                // up from text).
+                let Some(ty) = num_ty(a.ty, b.ty) else {
+                    return construct();
+                };
+                // Plan 45 final review I1 (ruling F-b): SQLite divides two
+                // INTEGERs as integers (`SUM(a) / COUNT(*)` = 2 for 1, 2, 4).
+                // Saiife's rendered SQL casts the left operand to REAL, so the
+                // division is always real and the output is REAL. The
+                // planner's grammar has no CAST; only the rendering does.
+                let ty = if divide {
+                    let inner = (**left).clone();
+                    **left = Expr::Cast {
+                        kind: CastKind::Cast,
+                        expr: Box::new(inner),
+                        data_type: DataType::Real,
+                        format: None,
+                    };
+                    ColType::Real
+                } else {
+                    ty
+                };
                 let fp = format!("({fa} {sym} {fb})");
-                let mut it = Item::new(Kind::Arith, num_ty(a.ty, b.ty), fp);
+                let mut it = Item::new(Kind::Arith, Some(ty), fp);
                 it.nullable = a.nullable || b.nullable || divide;
                 Ok(it)
             }
@@ -1712,6 +1739,13 @@ impl<'a> Walk<'a> {
                 let repeated = it.repeats || it.src.is_some_and(|s| sc.repeated[s]);
                 let inflates = matches!(l, "sum" | "avg") || (count && !distinct);
                 if repeated && inflates {
+                    return construct();
+                }
+                // Plan 45 final review I2: SUM / AVG add numbers. Over a TEXT
+                // or DATE column (by origin through CTEs) SQLite sums leading
+                // digits (`'2026-07-01'` is 2026) or gives 0.0: refused
+                // (`construct_not_allowed`). MIN / MAX / COUNT stay.
+                if matches!(l, "sum" | "avg") && !is_num(it.ty) {
                     return construct();
                 }
                 (it.ty, it.fp, it.base)

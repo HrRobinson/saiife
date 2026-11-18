@@ -1,11 +1,13 @@
 //! Plan 45 Task 4: answer templates and deterministic formatters.
 
+mod common;
+
 use saiife_shield::calc::{CellValue, ResultSet};
 use saiife_shield::schema::{Bound, Decimal, Lang, Param, ParamType};
 use saiife_shield::sql::ErrorClass;
 use saiife_shield::template::{
-    fill, format_date, format_int, format_money, format_number, format_percent,
-    format_ratio_percent, format_round, parse_template,
+    check_params_covered, fill, format_date, format_int, format_money, format_number,
+    format_percent, format_ratio_percent, format_round, parse_template,
 };
 
 fn dec(s: &str) -> Decimal {
@@ -414,4 +416,71 @@ fn never_panics_on_hostile_utf8() {
     assert!(f.text.is_char_boundary(p.start) && f.text.is_char_boundary(p.end));
     assert_eq!(&f.text[p.start..p.end], "- İ😀");
     assert!(p.values.is_empty());
+}
+
+#[test]
+fn every_bound_question_param_is_used_or_shown() {
+    // Plan 45 final review I3 (ruling F-c): "open invoices total in Q3 2026"
+    // answered by a method that ignores the date range is another question.
+    let q3 = Param {
+        name: "p2".into(),
+        ty: ParamType::DateRange,
+        bound: Some(Bound::DateRange("2026-07-01".into(), "2026-10-01".into())),
+        display: "Q3 2026".into(),
+    };
+    let ps = vec![common::entity(1), q3];
+    let all_time = "SELECT SUM(i.amount) AS total FROM invoices i \
+        JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
+    let in_q3 = format!("{all_time} AND i.issued >= :p2_from AND i.issued < :p2_to");
+    let unused = common::v(all_time, &ps);
+    let used = common::v(&in_q3, &ps);
+    let c = cols(&["total"]);
+    let plain = parse_template("{param(p1)} owes {money(total)}.", &c, &ps, 100).unwrap();
+    let shown = parse_template(
+        "{param(p1)} owes {money(total)} in {param(p2)}.",
+        &c,
+        &ps,
+        100,
+    )
+    .unwrap();
+    assert_eq!(plain.param_slots(), vec!["p1"]);
+    assert_eq!(shown.param_slots(), vec!["p1", "p2"]);
+    // Bound but neither used nor shown: refused.
+    let e = check_params_covered(&unused, &plain, &ps).unwrap_err();
+    assert_eq!(e.class, ErrorClass::ParamMisuse);
+    assert_eq!(e.detail, None);
+    // Used by the method: ok.
+    check_params_covered(&used, &plain, &ps).unwrap();
+    // Shown by a param slot (a threshold the answer only states): ok.
+    check_params_covered(&unused, &shown, &ps).unwrap();
+    // An unbound draft parameter is not judged.
+    let mut draft = ps.clone();
+    draft[1].bound = None;
+    check_params_covered(&unused, &plain, &draft).unwrap();
+}
+
+#[test]
+fn compound_scale_words_refused() {
+    // Plan 45 final review M6: a word next to a number that contains a scale
+    // stem is a scale word.
+    for w in [
+        "hundredthousand",
+        "tenthousand",
+        "Hundredmillion",
+        "halvmilliard",
+        "totusind",
+        "trillionen",
+        "femmio",
+        "tremia",
+    ] {
+        for tpl in [
+            format!("It is {{money(x)}} {w} now."),
+            format!("It is {w} {{money(x)}} now."),
+        ] {
+            let (c, _) = class(&tpl, &["x"]);
+            assert_eq!(c, ErrorClass::TemplateSlot, "{tpl}");
+        }
+    }
+    // A word without a stem next to a number is fine.
+    parse("It is {money(x)} kroner now.", &["x"]);
 }

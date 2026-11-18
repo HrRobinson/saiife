@@ -9,8 +9,8 @@
 
 use crate::calc::{CellValue, ResultSet};
 use crate::grammar::{grammar_ok, Seg};
-use crate::schema::{Decimal, Lang, Param};
-use crate::sql::{ErrorClass, MethodError};
+use crate::schema::{Decimal, Lang, Param, ParamType};
+use crate::sql::{ErrorClass, MethodError, Validated};
 
 const DETAIL_MAX: usize = 120;
 
@@ -278,6 +278,52 @@ pub fn parse_template(
         .collect();
     grammar_ok(&segs).map_err(slot_err)?;
     Ok(Template { parts })
+}
+
+impl Template {
+    /// The parameters a `{param(pN)}` slot shows, in template order, without
+    /// repeats.
+    pub fn param_slots(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for p in &self.parts {
+            if let Part::Slot(Slot::Param(n)) = p {
+                if !out.contains(&n.as_str()) {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Plan 45 final review I3 (ruling F-c): a bound question parameter the
+/// method ignores answers another question ("open invoices in Q3 2026"
+/// summed over all time). Every bound non-entity parameter must be used by
+/// the method ([`Validated::params_used`]) or shown by a `{param(pN)}` slot
+/// of the template (a threshold the answer only states); otherwise
+/// `param_misuse` (no detail: R45-8 sends a detail only for the name
+/// classes). Bound entity parameters are
+/// already checked by the validator. Found before the preview, so the
+/// planner can retry; plan 48 calls it once both method and template parse.
+pub fn check_params_covered(
+    method: &Validated,
+    template: &Template,
+    params: &[Param],
+) -> Result<(), MethodError> {
+    let shown = template.param_slots();
+    for p in params {
+        if p.bound.is_none() || matches!(p.ty, ParamType::Entity { .. }) {
+            continue;
+        }
+        let used = method.params_used.contains(&p.name);
+        if !used && !shown.contains(&p.name.as_str()) {
+            return Err(MethodError {
+                class: ErrorClass::ParamMisuse,
+                detail: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---- number formatting ----
