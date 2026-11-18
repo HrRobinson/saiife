@@ -407,6 +407,14 @@ pub const HELPER_NOFILE: u64 = 32;
 /// `read_files`, no network, the Ner seccomp allowlist, no new process).
 /// Call it single-threaded, before any model byte is read.
 ///
+/// The helper stays on one thread for life: `RLIMIT_NPROC` 0 makes any
+/// `clone` fail, and tract runs single-threaded
+/// ([`crate::model::force_single_thread`]; the helper suite asserts
+/// `Threads: 1` after a model run). So the Ner `clone` mask needs no
+/// `CLONE_DETACHED` (glibc and musl never pass it, and the helper never
+/// clones), and `tkill`/`tgkill`, allowed only at its own pid by the shared
+/// allowlist (`ArgRule::OwnPid`), reach the one thread there is.
+///
 /// [`Profile::Ner`]: saiife_system::sandbox::Profile::Ner
 #[cfg(target_os = "linux")]
 pub fn confine(
