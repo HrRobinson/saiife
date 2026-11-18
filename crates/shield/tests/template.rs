@@ -574,3 +574,174 @@ fn compound_scale_words_refused() {
     // A word without a stem next to a number is fine.
     parse("It is {money(x)} kroner now.", &["x"]);
 }
+
+// ---- final review part 5 ----
+
+/// A draft as plan 44 leaves it: the entity bound, its `display` the
+/// snapshot's (name, first `show` value, key). Here the show value is an
+/// email and the name and key are Identifier columns.
+fn anna_draft(original: &str, text: &str, lang: Lang) -> saiife_shield::question::Draft {
+    saiife_shield::question::Draft {
+        lang,
+        original: original.into(),
+        text: text.into(),
+        params: vec![Param {
+            name: "p1".into(),
+            ty: ParamType::Entity {
+                table: "customers".into(),
+                word: "customer".into(),
+            },
+            bound: Some(Bound::Keys(vec![4411])),
+            display: "Anna Berg, anna.berg@example.dk (customer #4411)".into(),
+        }],
+        pending: vec![],
+    }
+}
+
+const SNAPSHOT_BITS: [&str; 5] = ["Anna Berg", "anna.berg@", "example.dk", "4411", "#"];
+
+#[test]
+fn entity_param_prints_only_the_users_words() {
+    // Ruling F-n: the answer names the entity with the user's own words.
+    use saiife_shield::template::{answer_params, empty_for_key_reason, spoken};
+    let d = anna_draft("What does anna berg owe?", "What does :p1 owe?", Lang::En);
+    assert_eq!(spoken(&d, "p1").as_deref(), Some("anna berg"));
+    let ps = answer_params(&d, &common::schema());
+    assert_eq!(ps[0].display, "anna berg");
+    assert_eq!(ps[0].bound, d.params[0].bound);
+    let c = cols(&["total"]);
+    let t = parse_template("{param(p1)} owes {money(total)}.", &c, &ps, 100).unwrap();
+    let f = fill(
+        &t,
+        &rs(&["total"], vec![vec![CellValue::Real(412.0)]]),
+        &ps,
+        Lang::En,
+    )
+    .unwrap();
+    assert_eq!(f.text, "anna berg owes 412.00.");
+    let why = empty_for_key_reason(&d, &common::schema(), "p1");
+    assert_eq!(why, "the method found no rows for anna berg");
+    for bit in SNAPSHOT_BITS {
+        assert!(!f.text.contains(bit), "{bit} in {}", f.text);
+        assert!(!why.contains(bit), "{bit} in {why}");
+    }
+    // Danish.
+    let d = anna_draft("Hvad skylder Anna Berg?", "Hvad skylder :p1?", Lang::Da);
+    let ps = answer_params(&d, &common::schema());
+    assert_eq!(ps[0].display, "Anna Berg");
+    assert_eq!(
+        empty_for_key_reason(&d, &common::schema(), "p1"),
+        "metoden fandt ingen rækker for Anna Berg"
+    );
+}
+
+#[test]
+fn entity_param_falls_back_to_the_plain_word() {
+    // Ruling F-n: when the user's span cannot be told apart, the entity
+    // type's plain word.
+    use saiife_shield::template::{answer_params, empty_for_key_reason, spoken};
+    let mut d = anna_draft("Berg and Berg and Berg", ":p1 and :p2", Lang::En);
+    let mut p2 = d.params[0].clone();
+    p2.name = "p2".into();
+    d.params.push(p2);
+    assert_eq!(spoken(&d, "p1"), None);
+    assert_eq!(spoken(&d, "p2"), None);
+    let ps = answer_params(&d, &common::schema());
+    assert_eq!(ps[0].display, "the customer");
+    assert_eq!(ps[1].display, "the customer");
+    assert_eq!(
+        empty_for_key_reason(&d, &common::schema(), "p1"),
+        "the method found no rows for the customer"
+    );
+    let mut da = d.clone();
+    da.lang = Lang::Da;
+    assert_eq!(
+        answer_params(&da, &common::schema())[0].display,
+        "pågældende kunde"
+    );
+    // A draft whose text does not fit its original: the plain word too.
+    let d = anna_draft("What does anna owe?", "What is :p1 owing?", Lang::En);
+    assert_eq!(spoken(&d, "p1"), None);
+    assert_eq!(
+        answer_params(&d, &common::schema())[0].display,
+        "the customer"
+    );
+    // Non-entity parameters keep their display.
+    let mut d = anna_draft(
+        "anna: invoices over 5000",
+        ":p1: invoices over :p2",
+        Lang::En,
+    );
+    d.params.push(Param {
+        name: "p2".into(),
+        ty: ParamType::Amount,
+        bound: Some(Bound::Amount(dec("5000"))),
+        display: "5,000.00".into(),
+    });
+    let ps = answer_params(&d, &common::schema());
+    assert_eq!(ps[0].display, "anna");
+    assert_eq!(ps[1].display, "5,000.00");
+}
+
+#[test]
+fn top_n_limit_covers_an_integer_param() {
+    // Ruling F-o: "top 5 cities by total" binds 5 as an Integer; the
+    // outermost `LIMIT 5` applies it.
+    let five = Param {
+        name: "p2".into(),
+        ty: ParamType::Integer,
+        bound: Some(Bound::Integer(5)),
+        display: "5".into(),
+    };
+    let ps = vec![five];
+    let c = cols(&["city", "total"]);
+    let t = parse_template("{list(city, total)}", &c, &ps, 100).unwrap();
+    let top = |n: u32| {
+        common::v(
+            &format!(
+                "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+                 ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC LIMIT {n}"
+            ),
+            &ps,
+        )
+    };
+    check_params_covered(&top(5), &t, &ps).unwrap();
+    let e = check_params_covered(&top(6), &t, &ps).unwrap_err();
+    assert_eq!(e.class, ErrorClass::ParamMisuse);
+    // No LIMIT at all, or a LIMIT only in a CTE body (refused anyway): unused.
+    let all = common::v(
+        "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC",
+        &ps,
+    );
+    assert_eq!(
+        check_params_covered(&all, &t, &ps).unwrap_err().class,
+        ErrorClass::ParamMisuse
+    );
+    // An Amount of 5 is not a row count.
+    let amount = vec![Param {
+        name: "p2".into(),
+        ty: ParamType::Amount,
+        bound: Some(Bound::Amount(dec("5"))),
+        display: "5".into(),
+    }];
+    let v5 = common::v(
+        "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC LIMIT 5",
+        &amount,
+    );
+    assert_eq!(
+        check_params_covered(&v5, &t, &amount).unwrap_err().class,
+        ErrorClass::ParamMisuse
+    );
+    // LIMIT :pN stays refused by the validator.
+    let e = saiife_shield::sql::validate(
+        "SELECT c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.city ORDER BY total DESC LIMIT :p2",
+        &common::schema(),
+        &common::public(),
+        &ps,
+    )
+    .unwrap_err();
+    assert_ne!(e.class, ErrorClass::IdentifierOutput);
+}

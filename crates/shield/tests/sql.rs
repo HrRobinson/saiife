@@ -1259,6 +1259,53 @@ fn identifier_output_owner_ruling() {
 }
 
 #[test]
+fn identifier_sums_dates_and_arithmetic() {
+    // Final review part 5, item 4 (ruling F-j): SUM / AVG, date / strftime
+    // and arithmetic over an Identifier column yield it.
+    let mut s = schema();
+    for (t, c) in [("customers", "credit_limit"), ("invoices", "issued")] {
+        let col = s
+            .tables
+            .iter_mut()
+            .find(|x| x.name == t)
+            .and_then(|x| x.columns.iter_mut().find(|y| y.name == c))
+            .unwrap();
+        col.class = ColumnClass::Identifier;
+    }
+    for sql in [
+        "SELECT SUM(c.credit_limit) AS s FROM customers c",
+        "SELECT AVG(c.credit_limit) AS a FROM customers c",
+        "SELECT c.city, SUM(c.credit_limit) AS s FROM customers c GROUP BY c.city",
+        "SELECT date(i.issued) AS d FROM invoices i",
+        "SELECT date(i.issued, 'start of month') AS d FROM invoices i",
+        "SELECT strftime('%Y', i.issued) AS y FROM invoices i",
+        "SELECT strftime('%Y-%m', i.issued) AS m, COUNT(*) AS n FROM invoices i \
+         GROUP BY strftime('%Y-%m', i.issued)",
+        "SELECT SUM(c.credit_limit) - COUNT(*) AS x FROM customers c",
+        "SELECT SUM(c.credit_limit) / COUNT(*) AS x FROM customers c",
+        "SELECT COUNT(*) * AVG(c.credit_limit) AS x FROM customers c",
+        "WITH t AS (SELECT c.city AS city, SUM(c.credit_limit) AS s FROM customers c \
+         GROUP BY c.city) SELECT t.city, t.s FROM t",
+        "WITH t AS (SELECT date(i.issued) AS d FROM invoices i GROUP BY date(i.issued)) \
+         SELECT t.d FROM t",
+    ] {
+        let e = validate(sql, &s, &public(), &ps_for(sql)).unwrap_err();
+        assert_eq!(e.class, ErrorClass::IdentifierOutput, "{sql}");
+    }
+    // Counting them, filtering or grouping by them without output: allowed.
+    for sql in [
+        "SELECT COUNT(DISTINCT c.credit_limit) AS n FROM customers c",
+        "SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= '2026-01-01'",
+        "SELECT COUNT(*) AS n FROM invoices i GROUP BY strftime('%Y', i.issued)",
+    ] {
+        match validate(sql, &s, &public(), &ps_for(sql)) {
+            Ok(v) => prepares(&v.sql),
+            Err(e) => panic!("{sql}: refused {e:?}"),
+        }
+    }
+}
+
+#[test]
 fn is_null_where_conjunct() {
     // Ruling F-k: `t.c IS [NOT] NULL` on a plain column, WHERE only
     // ("customers without a phone").

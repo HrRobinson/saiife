@@ -47,10 +47,11 @@
 //!   `strftime` lower-case, no redundant parentheses.
 //!
 //! Every `match` over the parser's AST ends in a refusal, never in an
-//! accept. Masking routes (CASE, COALESCE, IS NULL outside a WHERE conjunct, constants, subqueries,
-//! LEFT JOIN, …) are outside the grammar, so `null_masking` is no longer
-//! produced here; the primary control is the executor's existence check over
-//! [`Validated::entity_filters`] (R45-6, Task 3).
+//! accept. Masking routes (CASE, COALESCE, IS NULL outside a WHERE
+//! conjunct, constants, subqueries, LEFT JOIN, …) are outside the grammar,
+//! so `null_masking` is no longer produced here; the primary control is the
+//! executor's existence check over [`Validated::entity_filters`] (R45-6,
+//! Task 3).
 //!
 //! Names resolve case-exact against the cloud names of the schema (aliases
 //! where set) and are rewritten to snapshot names; every planner-chosen
@@ -331,6 +332,9 @@ pub struct Validated {
     /// or a plain column the outermost block groups by. Then a linked table
     /// with no rows for the key gives a computed 0, not `empty_for_key`.
     pub count_only: bool,
+    /// The outermost `LIMIT n` literal, if any. Ruling F-o: a bound
+    /// `Integer` parameter equal to it counts as used ("top 5").
+    pub limit: Option<u64>,
 }
 
 /// A validated self-check, ready for the executor.
@@ -430,6 +434,7 @@ fn validate_cols(
         agg_seen: false,
         outer: true,
         outer_view: None,
+        limit: None,
     };
     let out = w.query(&mut q, true)?;
     // Plan 45 final review part 3 (ruling F-h): a date range applied by one
@@ -500,6 +505,7 @@ fn validate_cols(
             aggregates_nullable,
             entity_filters,
             count_only,
+            limit: w.limit,
         },
         out.len(),
     ))
@@ -789,7 +795,7 @@ fn number_ok(s: &str) -> bool {
 
 /// A `LIMIT` count: an integer literal of at least 1 (G2: `LIMIT 0` gives a
 /// false "no rows" for an existing entity).
-fn limit_literal(e: &Expr) -> R<()> {
+fn limit_literal(e: &Expr) -> R<u64> {
     match e {
         Expr::Value(v) => match &v.value {
             Value::Number(s, false)
@@ -798,7 +804,7 @@ fn limit_literal(e: &Expr) -> R<()> {
                     && s.bytes().all(|b| b.is_ascii_digit())
                     && s.bytes().any(|b| b != b'0') =>
             {
-                Ok(())
+                s.parse().or_else(|_| construct())
             }
             _ => construct(),
         },
@@ -921,6 +927,8 @@ struct Walk<'a> {
     outer: bool,
     /// The outermost block's sources, join edges and pinned sources.
     outer_view: Option<(Vec<String>, Vec<JoinEdge>, Vec<usize>)>,
+    /// The outermost `LIMIT n`.
+    limit: Option<u64>,
 }
 
 impl<'a> Walk<'a> {
@@ -990,7 +998,10 @@ impl<'a> Walk<'a> {
             Some(_) => return construct(),
         };
         if let Some(l) = limit {
-            limit_literal(l)?;
+            let n = limit_literal(l)?;
+            if outer {
+                self.limit = Some(n);
+            }
         }
         Ok(out)
     }

@@ -900,7 +900,10 @@ const ALL_TIME: &str = "SELECT SUM(i.amount) AS total, c.credit_limit FROM invoi
 
 #[test]
 fn check_refuses_a_shown_filter_the_method_ignores() {
-    let ps = vec![common::entity(1), q3()];
+    // Ruling F-n: the entity is named by the user's own words.
+    let mut anna = common::entity(1);
+    anna.display = "Anna Berg".into();
+    let ps = vec![anna, q3()];
     let cols: Vec<String> = vec!["total".into(), "credit_limit".into()];
     let tpl = parse_template(
         "{param(p1)} owes {money(total)} in {param(p2)}.",
@@ -956,7 +959,9 @@ fn check_refuses_an_echoed_threshold_the_method_ignores() {
         bound: Some(Bound::Amount(dec("10000"))),
         display: "10,000.00".into(),
     };
-    let ps = vec![common::entity(1), limit];
+    let mut anna = common::entity(1);
+    anna.display = "Anna Berg".into();
+    let ps = vec![anna, limit];
     let cols: Vec<String> = vec!["total".into(), "credit_limit".into()];
     let tpl = parse_template(
         "Is {param(p1)} over {param(p2)}? She owes {money(total)}, \
@@ -976,4 +981,57 @@ fn check_refuses_an_echoed_threshold_the_method_ignores() {
     let uses = common::v(&format!("{ALL_TIME} AND i.amount > :p2"), &ps);
     let rep = check(&uses, &tpl, &ps, &f, q, Lang::En).unwrap();
     assert_eq!(rep.from_calc, 2);
+}
+
+#[test]
+fn check_refuses_an_entity_shown_with_snapshot_values() {
+    // Ruling F-n: an entity parameter prints only the user's own words (or
+    // the entity's plain word); a display read from the snapshot (name,
+    // show column, key) is refused even when its numbers are sources.
+    let q = "What does anna berg owe?";
+    let method = common::v(
+        "SELECT SUM(i.amount) AS total FROM invoices i \
+         JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1",
+        &[common::entity(1)],
+    );
+    let cols: Vec<String> = vec!["total".into()];
+    let rs = ResultSet {
+        columns: cols.clone(),
+        rows: vec![vec![CellValue::Real(412.0)]],
+        truncated: false,
+        total_rows: None,
+        ms: 0,
+        row_band: "1-9".into(),
+    };
+    let with = |display: &str| {
+        let mut p = common::entity(1);
+        p.display = display.into();
+        vec![p]
+    };
+    for display in [
+        "Anna Berg, anna.berg@example.dk (customer #1)",
+        "Anna Berg",
+        "customer #1",
+    ] {
+        let ps = with(display);
+        let tpl = parse_template("{param(p1)} owes {money(total)}.", &cols, &ps, 100).unwrap();
+        let f = fill(&tpl, &rs, &ps, Lang::En).unwrap();
+        let r = check(&method, &tpl, &ps, &f, q, Lang::En).unwrap_err();
+        assert_eq!(r.class, ErrorClass::CheckFailed, "{display}");
+    }
+    for (display, lang) in [
+        ("anna berg", Lang::En),
+        ("the customer", Lang::En),
+        ("pågældende kunde", Lang::Da),
+    ] {
+        let ps = with(display);
+        let tpl = parse_template("{param(p1)} owes {money(total)}.", &cols, &ps, 100).unwrap();
+        let f = fill(&tpl, &rs, &ps, lang).unwrap();
+        check(&method, &tpl, &ps, &f, q, lang).unwrap();
+    }
+    // An entity the template does not show is not judged here.
+    let ps = with("Anna Berg (customer #1)");
+    let tpl = parse_template("It is {money(total)}.", &cols, &ps, 100).unwrap();
+    let f = fill(&tpl, &rs, &ps, Lang::En).unwrap();
+    check(&method, &tpl, &ps, &f, q, Lang::En).unwrap();
 }

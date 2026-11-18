@@ -29,7 +29,7 @@ use crate::lang::{
 };
 use crate::schema::{Decimal, Lang, Param};
 use crate::sql::{ErrorClass, Validated};
-use crate::template::{check_params_covered, Filled, Printed, Template};
+use crate::template::{check_params_covered, entity_display_ok, Filled, Printed, Template};
 
 /// How many numbers and dates each source accounted for. A found number or
 /// date counts once, under the first source that accepts it (calculator,
@@ -62,6 +62,7 @@ fn refuse(reason: String) -> CheckRefusal {
 }
 
 const COVER_REASON: &str = "the method does not apply every part of your question";
+const ENTITY_REASON: &str = "the answer names a record by values from the data";
 
 /// The checker's entry point for an answer (R45-10, ruling F-f): the method
 /// must apply every bound parameter of the question, filter or threshold
@@ -83,6 +84,15 @@ pub fn check(
             class: ErrorClass::ParamMisuse,
             reason: COVER_REASON.into(),
         });
+    }
+    // Ruling F-n: an entity a `{param(pN)}` slot shows is named only by the
+    // user's own words or its type's plain word (`template::answer_params`).
+    let shown = template.param_slots();
+    let bad = params
+        .iter()
+        .any(|p| shown.contains(&p.name.as_str()) && !entity_display_ok(p, question, lang));
+    if bad {
+        return Err(refuse(ENTITY_REASON.into()));
     }
     check_text(filled, question, lang)
 }
