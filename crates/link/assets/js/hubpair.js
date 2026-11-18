@@ -18,9 +18,15 @@ const CRYPTO = "This browser cannot make a pairing key";
 
 const P256 = { name: "ECDSA", namedCurve: "P-256" };
 
+// The machine did not prove itself: the page's own check (bad_answer), or
+// the relay's check of machine_sig, which closes 4400 at the handshake.
+function notMachine(e) {
+  return e instanceof HubError && (e.code === "bad_answer" || (e.code === "bad_request" && e.stage === "handshake"));
+}
+
 function hubFail(e) {
   if (e instanceof HubError && e.code === "pro_required") return { error: PRO_SENTENCE, rule: "pro_required" };
-  if (e instanceof HubError && e.code === "bad_answer") return { error: NOT_MACHINE, rule: "bad_answer" };
+  if (notMachine(e)) return { error: NOT_MACHINE, rule: "bad_answer" };
   return { error: LINK, rule: "unreachable" };
 }
 
@@ -165,7 +171,7 @@ export function waitConfirmOverHub({
       } catch (e) {
         if (stopped) return;
         if (e instanceof HubError && e.code === "pro_required") return end({ kind: "refused", message: PRO_SENTENCE });
-        if (e instanceof HubError && e.code === "bad_answer") return end({ kind: "refused", message: NOT_MACHINE });
+        if (notMachine(e)) return end({ kind: "refused", message: NOT_MACHINE });
         return notYet();
       }
       const client = new Client({ fetch: hubFetch(async () => session), store: holding(device) });

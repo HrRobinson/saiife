@@ -17,7 +17,7 @@ async function newDevice() {
 }
 
 // A machine that knows one device, a relay in front, and a session factory.
-async function world({ answers } = {}) {
+async function world({ answers, relayOpts = {} } = {}) {
   const dev = await newDevice();
   const machine = await fakeMachine({
     devices: new Map([[dev.deviceId, dev.publicRaw]]),
@@ -28,7 +28,7 @@ async function world({ answers } = {}) {
           ? { ok: true, result: { machine_id: dev.machineId, machine_pub: b64u(machine.machinePub), epoch: "e1", frame_version: 1 } }
           : { ok: true, result: { echo: p.t } }),
   });
-  const relay = fakeRelay({ machine });
+  const relay = fakeRelay({ machine, ...relayOpts });
   let tickets = 0;
   const make = (extra = {}) =>
     new HubSession({
@@ -74,22 +74,26 @@ test("opens a device session and answers hello", async () => {
   s.close();
 });
 
+// A relay that forwards the machine's seal_hello unchecked: the page must
+// not rely on the relay's check.
+const lying = { relayOpts: { checkMachineHello: false } };
+
 test("refuses a machine_sig made for another binding", async () => {
-  const w = await world();
+  const w = await world(lying);
   w.machine.faults.sigFor = { deviceId: "d-0000000000000000" };
   const s = w.make();
   await assert.rejects(s.open(), (e) => e instanceof HubError && e.code === "bad_answer" && e.stage === "handshake");
 });
 
 test("refuses a seal_hello with an extra key", async () => {
-  const w = await world();
+  const w = await world(lying);
   w.machine.faults.extraKey = true;
   const s = w.make();
   await assert.rejects(s.open(), (e) => e.code === "bad_answer");
 });
 
 test("nothing but seal_hello is sent before the machine signature verifies", async () => {
-  const w = await world();
+  const w = await world(lying);
   w.machine.faults.badSig = true;
   const closed = [];
   const s = w.make();
@@ -392,4 +396,58 @@ test("the fakes import their js deps only through fakes/deps.mjs", async () => {
   const deps = readFileSync(new URL("./fakes/deps.mjs", import.meta.url), "utf8");
   const targets = [...deps.matchAll(/\bfrom\s+"([^"]+)"/g)].map((m) => m[1]);
   assert.ok(targets.length > 0 && targets.every((t) => /^\.\.\/\.\.\/js\/[a-z]+\.js$/.test(t)), targets.join(","));
+});
+
+// A raw device socket on the fake relay, up to `ready`.
+async function rawSocket(relay) {
+  const ws = new relay.WebSocket("wss://relay.test/v1/device");
+  const closes = [];
+  const msgs = [];
+  ws.addEventListener("close", (e) => closes.push(e.code));
+  ws.addEventListener("message", (e) => msgs.push(e.data));
+  await new Promise((r) => setTimeout(r, 5));
+  ws.send(JSON.stringify({ t: "connect", v: 1, ticket: relay.tickets.issue().ticket }));
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(JSON.parse(msgs[0]).t, "ready");
+  return { ws, closes, msgs };
+}
+
+const helloData = (o) => JSON.stringify({ t: "msg", data: b64u(new TextEncoder().encode(JSON.stringify(o))) });
+
+test("the relay checks machine_sig and closes both ways with 4400", async () => {
+  const w = await world();
+  w.machine.faults.badSig = true;
+  await assert.rejects(w.make().open(), (e) => e instanceof HubError && e.code === "bad_request" && e.stage === "handshake");
+  assert.deepEqual(w.relay.machineClosed, [4400]);
+  // A machine_sig for another binding is the same.
+  delete w.machine.faults.badSig;
+  w.machine.faults.sigFor = { deviceId: "d-0000000000000000" };
+  await assert.rejects(w.make().open(), (e) => e.code === "bad_request");
+  assert.deepEqual(w.relay.machineClosed, [4400, 4400]);
+});
+
+test("the relay closes 4400 for a device msg sent before the machine's seal_hello", async () => {
+  const w = await world();
+  const { ws, closes } = await rawSocket(w.relay);
+  const eph = new Uint8Array(65);
+  eph[0] = 4;
+  ws.send(helloData({ t: "seal_hello", browser_eph: b64u(eph), device_id: w.dev.deviceId }));
+  ws.send(JSON.stringify({ t: "msg", data: "AAAA" }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(closes, [4400]);
+});
+
+test("the relay closes 4400 for a browser_eph that is not 65 bytes", async () => {
+  const w = await world();
+  const { ws, closes } = await rawSocket(w.relay);
+  ws.send(helloData({ t: "seal_hello", browser_eph: b64u(new Uint8Array(64)), device_id: w.dev.deviceId }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(closes, [4400]);
+});
+
+test("the relay closes 4408 when the handshake does not finish in time", async () => {
+  const w = await world({ relayOpts: { handshakeWindowMs: 20 } });
+  const { closes } = await rawSocket(w.relay);
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(closes, [4408]);
 });

@@ -8,6 +8,7 @@ import { fakeMachine } from "./fakes/fakemachine.mjs";
 import { fakeRelay } from "./fakes/fakerelay.mjs";
 
 const dec = new TextDecoder();
+const NOT_MACHINE = "The machine did not prove it is the one in this pairing link";
 const hex = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
 // A machine with one open offer, a relay in front, and the offer the page
@@ -98,7 +99,9 @@ test("wrong machine signature is refused before the pair message", async () => {
   const w = await world();
   w.machine.faults.badSig = true;
   const r = await pairOverHub({ offer: w.offer, label: "L", getTicket: w.getTicket, WebSocket: w.relay.WebSocket, ...none });
-  assert.ok(r.error);
+  // The relay's check (4400 at the handshake) reads like the page's own.
+  assert.equal(r.error, NOT_MACHINE);
+  assert.deepEqual(w.relay.machineClosed, [4400]);
   assert.equal(w.log.length, 0);
   assert.equal(w.machine.seen.length, 0);
   // Only connect and the seal_hello left this page.
@@ -114,7 +117,8 @@ test("a machine that is not the one in the offer is refused", async () => {
   const r = await pairOverHub({
     offer: w.offer, label: "L", getTicket: async () => relay.tickets.issue(), WebSocket: relay.WebSocket, ...none,
   });
-  assert.ok(r.error);
+  assert.equal(r.error, NOT_MACHINE);
+  assert.equal(r.rule, "bad_answer");
   assert.equal(other.seen.length, 0);
 });
 
@@ -267,6 +271,23 @@ test("4402 on the confirm wait ends refused with the Pro sentence", async () => 
   });
   await c.fire();
   assert.deepEqual(ends, [{ kind: "refused", message: PRO_SENTENCE }]);
+  assert.equal(c.pending(), 0);
+});
+
+test("a wrong machine signature on the confirm wait ends refused", async () => {
+  const w = await world();
+  const device = await paired(w);
+  w.machine.pending.delete(device.deviceId);
+  w.machine.faults.badSig = true;
+  const c = clock();
+  const ends = [];
+  waitConfirmOverHub({
+    device, getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
+    schedule: c.schedule, cancel: c.cancel, now: c.now, deadline: 60_000, onEnd: (e) => ends.push(e),
+  });
+  await c.fire();
+  assert.deepEqual(ends, [{ kind: "refused", message: NOT_MACHINE }]);
+  assert.deepEqual(w.relay.machineClosed, [4400]);
   assert.equal(c.pending(), 0);
 });
 
