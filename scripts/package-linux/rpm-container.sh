@@ -26,6 +26,7 @@ OUT=/tmp/p18-t3-rpm
 mkdir -p "$OUT"
 PKG_BIN=/usr/libexec/saiife/saiife
 FIDO_BIN=/usr/libexec/saiife/saiife-fido
+NER_BIN=/usr/libexec/saiife/saiife-ner
 REFUSAL='locked mode is not supported here'
 REMOVAL='saiife: removing the package uninstalls locked mode'
 
@@ -77,6 +78,8 @@ phase_fresh() {
         fail "$FIDO_BIN printed no single hello line: $hello"
     fi
     ok "$FIDO_BIN is 0755 root:root and prints its hello"
+    grep -qx -- "-rwxr-xr-x root root $NER_BIN" "$OUT/files.txt" || fail "$NER_BIN is not 0755 root:root in the rpm"
+    ok "$NER_BIN is 0755 root:root"
     [ ! -e /opt/saiife ] || fail "/opt/saiife exists in a container"
     [ ! -e /etc/systemd/system/saiifed.service ] || fail "the unit exists in a container"
     ok "no /opt/saiife and no unit"
@@ -112,7 +115,7 @@ phase_remove() {
     has "$OUT/remove.out" 'nothing to uninstall' || fail "dnf remove output lacks 'nothing to uninstall'"
     ok "prerm found nothing to uninstall"
     if rpm -q saiife >/dev/null 2>&1; then fail "rpm still knows saiife"; fi
-    [ ! -e "$PKG_BIN" ] && [ ! -e "$FIDO_BIN" ] && [ ! -L /usr/bin/saiife ] && [ ! -e /usr/libexec/saiife ] || fail "the payload is not gone"
+    [ ! -e "$PKG_BIN" ] && [ ! -e "$FIDO_BIN" ] && [ ! -e "$NER_BIN" ] && [ ! -L /usr/bin/saiife ] && [ ! -e /usr/libexec/saiife ] || fail "the payload is not gone"
     ok "the payload is gone"
 }
 

@@ -355,8 +355,50 @@ jobs:
           path: fido-out/saiife-fido
           if-no-files-found: error
 
+  # The static musl saiife-ner name detector (plan 46), per architecture. Only the deb and rpm
+  # carry it. Built without the `fake` feature and never with --all-features: saiife-fake-ner has
+  # test-only panic switches and must not ship.
+  ner-helper:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: rustup target add "${{ matrix.target }}"
+      - name: install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build saiife-ner
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET" -p saiife-shield-ner --bin saiife-ner
+          ls -l "target/$TARGET/release/saiife-ner"
+          test ! -e "target/$TARGET/release/saiife-fake-ner"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ner-helper-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/saiife-ner
+          if-no-files-found: error
+
   linux-packages:
-    needs: [check-version, build, fido-helper]
+    needs: [check-version, build, fido-helper, ner-helper]
     strategy:
       fail-fast: false
       matrix:
@@ -382,6 +424,10 @@ jobs:
         with:
           name: fido-helper-${{ matrix.arch }}
           path: fido-helper
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ner-helper-${{ matrix.arch }}
+          path: ner-helper
       - name: extract the release binary
         shell: bash
         run: |
@@ -454,7 +500,7 @@ jobs:
           NFPM_RPM_PASSPHRASE: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.PKG_GPG_PASSPHRASE || '' }}
         run: |
           set -euo pipefail
-          bash packaging/linux/build.sh "$SAIIFE_BIN" fido-helper/saiife-fido "$VERSION" "$ARCH" pkg
+          bash packaging/linux/build.sh "$SAIIFE_BIN" fido-helper/saiife-fido ner-helper/saiife-ner "$VERSION" "$ARCH" pkg
           ls -l pkg
       # With a key, an unsigned rpm is a failed release, never a quiet one.
       - name: check the rpm signature

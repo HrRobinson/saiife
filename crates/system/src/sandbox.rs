@@ -1512,6 +1512,11 @@ mod tests {
             assert_eq!(v("prctl", &[PR_SET_NAME]), RET_ALLOW);
             assert_eq!(v("prctl", &[38]), RET_ERRNO | EPERM);
             assert_eq!(v("socket", &[]), RET_ERRNO | EPERM);
+            // Plan 46: signals to its own pid only, as for Calc.
+            assert_eq!(v("tkill", &[u64::from(PID), 6]), RET_ALLOW);
+            assert_eq!(v("tkill", &[1, 9]), RET_ERRNO | EPERM);
+            assert_eq!(v("tgkill", &[u64::from(PID), u64::from(PID), 6]), RET_ALLOW);
+            assert_eq!(v("tgkill", &[1, 1, 9]), RET_ERRNO | EPERM);
         }
     }
 

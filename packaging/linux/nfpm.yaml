@@ -1,5 +1,5 @@
 # nfpm config for the saiife deb and rpm (plan 18, decisions 1 and 3).
-# The package owns only the staging binary, its symlink, the FIDO helper and the docs.
+# The package owns only the staging binary, its symlink, the FIDO and name-detector helpers and the docs.
 # Everything locked mode lays down is written by `saiife system install --fleet`
 # in postinst and recorded in installed.toml; no packaged path may overlap it.
 # build.sh stages the files and exports SAIIFE_STAGE, SAIIFE_VERSION, SAIIFE_ARCH
@@ -37,6 +37,15 @@ contents:
   - src: ${SAIIFE_STAGE}/saiife-fido
     expand: true
     dst: /usr/libexec/saiife/saiife-fido
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  # The name detector (plan 46): the static, sandboxed saiife-ner, built
+  # `-p saiife-shield-ner --release --bin saiife-ner` without the `fake` feature.
+  - src: ${SAIIFE_STAGE}/saiife-ner
+    expand: true
+    dst: /usr/libexec/saiife/saiife-ner
     file_info:
       mode: 0755
       owner: root
