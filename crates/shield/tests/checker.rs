@@ -786,3 +786,51 @@ fn param_and_cmp_slots_are_judged_like_numbers_for_neighbours() {
     assert!(!parse_err("{param(p1)} owes {int(a)} invoices."));
     assert!(!parse_err("It is {cmp(a, b)} her limit."));
 }
+
+// ---- fix round 4 ----
+
+#[test]
+fn q_then_a_single_roman_letter_refused() {
+    for t in [
+        "In Q-I Anna owed it.",
+        "In Q.I Anna owed it.",
+        "In Q/I Anna owed it.",
+        "In Q-V Anna owed it.",
+        "In Q I Anna owed it.",
+        "In Q III Anna owed it.",
+        "In q iv Anna owed it.",
+    ] {
+        assert!(parse_err(t), "parse accepted {t:?}");
+        let f = filled(t, &[]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "check accepted {t:?}");
+    }
+    for tpl in [
+        "In Q-I Anna owed {money(x)}.",
+        "In Q I Anna owed {money(x)}.",
+    ] {
+        assert!(parse_err(tpl), "parse accepted {tpl:?}");
+    }
+    let f = filled("In Q-I Anna owed 5.", &[("5", &["5"], &[], false)]);
+    assert!(check(&f, "q?", Lang::En).is_err());
+    for t in [
+        "I think so, and I owe it.",
+        "Kunden er i byen.",
+        "Kunden bor i Aarhus, i Danmark.",
+    ] {
+        assert!(!parse_err(t), "parse refused {t:?}");
+        let f = filled(t, &[]);
+        assert!(check(&f, "q?", Lang::En).is_ok(), "check refused {t:?}");
+    }
+}
+
+#[test]
+fn mil_and_mill_are_scale_words() {
+    assert!(parse_err("Anna owes {int(a)} mill. kr."));
+    assert!(parse_err("Anna owes {money(x)} mil"));
+    let f = filled("Anna owes 5 mill. kr.", &[("5", &["5"], &[], false)]);
+    assert!(check(&f, "q?", Lang::En).is_err());
+    let f = filled("Anna owes 5 mil", &[("5", &["5"], &[], false)]);
+    assert!(check(&f, "q?", Lang::En).is_err());
+    let f = filled("It was a mill kr.", &[]);
+    assert!(check(&f, "q?", Lang::En).is_err());
+}

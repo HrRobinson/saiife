@@ -203,6 +203,8 @@ const QUANTITY_WORDS: &[&str] = &[
     "halvdelen",
     "billion",
     "billioner",
+    "mil",
+    "mill",
 ];
 
 /// Suffixes that make a word a quantity word when a stem of at least three

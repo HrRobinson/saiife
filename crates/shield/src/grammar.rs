@@ -18,7 +18,9 @@
 //!   (`mio`, `thousand`, `times`, `percent`, ...).
 //! * R6 Roman numerals: no piece (whitespace tokens split on punctuation,
 //!   any case) of two or more letters from `ivxlcdm`, nor `q` followed by
-//!   such letters, except a short list of real words (`ROMAN_WORDS`).
+//!   such letters, except a short list of real words (`ROMAN_WORDS`). A
+//!   piece that is exactly `q` makes the next piece (across punctuation or
+//!   whitespace) a Roman numeral even as a single letter (`Q-I`, `Q I`).
 //! * Parameter displays and comparison words are judged like numbers for R2
 //!   and R3 (`{p1} million`, `about {p1}k`), though not for number separation.
 
@@ -75,6 +77,8 @@ const NEIGHBOURS: &[&str] = &[
     "procent",
     "per",
     "pct",
+    "mil",
+    "mill",
 ];
 
 fn allowed_char(c: char) -> bool {
@@ -103,7 +107,7 @@ fn charset_ok(t: &str) -> bool {
 /// token of two or more letters is a Roman numeral (`xii`, `mcm`, `MMXXVI`).
 /// A single letter is never refused (`i` is Danish "in" and English "I").
 const ROMAN_WORDS: &[&str] = &[
-    "mix", "dim", "lid", "civil", "vivid", "mild", "vild", "id", "did", "mid", "mil", "mill", "ill",
+    "mix", "dim", "lid", "civil", "vivid", "mild", "vild", "id", "did", "mid", "ill",
 ];
 
 fn is_roman(s: &str) -> bool {
@@ -119,11 +123,22 @@ fn roman_piece(piece: &str) -> bool {
     (p.chars().count() >= 2 && is_roman(&p)) || p.strip_prefix('q').is_some_and(is_roman)
 }
 
-/// Every piece of a whitespace token split on all punctuation is judged
-/// (`Q-III`, `II/III`, `MMXXVI's`).
-fn roman_token(tok: &str) -> bool {
-    tok.split(|c: char| PUNCT.contains(c))
-        .any(|piece| !piece.is_empty() && roman_piece(piece))
+/// Every piece of the text split on whitespace and all punctuation is judged
+/// (`Q-III`, `II/III`, `MMXXVI's`). A piece that is exactly `q` makes the
+/// next piece a Roman numeral even as a single letter (`Q-I`, `Q.I`, `Q I`).
+fn has_roman(t: &str) -> bool {
+    let mut after_q = false;
+    for piece in t
+        .split(|c: char| c.is_whitespace() || PUNCT.contains(c))
+        .filter(|p| !p.is_empty())
+    {
+        let p = piece.to_ascii_lowercase();
+        if roman_piece(&p) || (after_q && is_roman(&p)) {
+            return true;
+        }
+        after_q = p == "q";
+    }
+    false
 }
 
 /// Split a text into text pieces and digit tokens (`10,000`, `4.5`).
@@ -185,7 +200,7 @@ pub(crate) fn grammar_ok(segs: &[Seg]) -> Result<(), &'static str> {
                 if !charset_ok(t) {
                     return Err("fixed text has a character outside the allowed set");
                 }
-                if t.split_whitespace().any(roman_token) {
+                if has_roman(t) {
                     return Err("fixed text has a Roman numeral");
                 }
                 split_digits(t, &mut items);
