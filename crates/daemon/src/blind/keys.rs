@@ -193,11 +193,10 @@ pub fn shred(ctx: &Ctx, ds: &DatasetName) -> Result<(), KeyError> {
     let p = dir.root.join(KEYS_FILE);
     // Sessions first: no ask derives from the old key after this point.
     lock(&ctx.blind.sessions).drop_dataset(ds);
-    ctx.blind.set_state(
+    // A build holding the dataset keeps it; it ends NeedsRefresh, not Live.
+    ctx.blind.mark_shredded(
         ds,
-        super::DatasetState::NeedsRefresh(format!(
-            "the keys of {ds} were deleted: saiife blind data refresh --dataset {ds}"
-        )),
+        format!("the keys of {ds} were deleted: saiife blind data refresh --dataset {ds}"),
     );
     match std::fs::symlink_metadata(&p) {
         Ok(md) if md.is_file() => {

@@ -73,6 +73,43 @@ pub(crate) async fn role(ctx: &Ctx, peer: &PeerCred, ds: Option<&BlindDataset>) 
     }
 }
 
+/// The peer's roles from explicit lists, with no `[approval]` fallback: a
+/// dataset whose policy entry is gone keeps the users and approvers it was
+/// last built with (fail closed: with empty lists only an admin manages).
+/// The personal broker's own user is all three, as in [`role`].
+pub(crate) async fn role_listed(
+    ctx: &Ctx,
+    peer: &PeerCred,
+    users: &[String],
+    approvers: &[String],
+) -> Roles {
+    if ctx.mode == Mode::Personal {
+        let own = ctx.peer_is_own(peer);
+        return Roles {
+            admin: own,
+            approver: own,
+            user: own,
+        };
+    }
+    Roles {
+        admin: ctx.peer_is_admin(peer).await,
+        approver: crate::approval_ops::peer_listed(ctx, peer, approvers).await,
+        user: crate::approval_ops::peer_listed(ctx, peer, users).await,
+    }
+}
+
+/// The approvers `role` counts for `ds`: its own, or `[approval]
+/// approvers` when it names none.
+pub(crate) fn effective_approvers(ctx: &Ctx, ds: &BlindDataset) -> Vec<String> {
+    if !ds.approvers.is_empty() {
+        return ds.approvers.clone();
+    }
+    match ctx.policy().system {
+        Some(s) => s.approval.approvers.clone(),
+        None => Vec::new(),
+    }
+}
+
 /// What an op answers until its task builds it.
 pub fn not_yet(op: &str) -> Refusal {
     Refusal::new(

@@ -48,6 +48,10 @@ pub struct Blind {
     detector: Mutex<Option<Arc<dyn NameDetector>>>,
     /// Why the last background build of a dataset failed (`status`).
     build_errors: Mutex<BTreeMap<String, String>>,
+    /// Datasets whose keys were shredded while a build held them: that
+    /// build must not go live (the text it ends with instead). Locked only
+    /// inside the `datasets` lock.
+    shredded: Mutex<BTreeMap<String, String>>,
     /// Test seam: stop a build when it reports this phase.
     #[cfg(debug_assertions)]
     test_hold: Mutex<Option<TestHold>>,
@@ -202,6 +206,7 @@ impl Blind {
             keys_lock: Mutex::new(()),
             detector: Mutex::new(None),
             build_errors: Mutex::new(BTreeMap::new()),
+            shredded: Mutex::new(BTreeMap::new()),
             #[cfg(debug_assertions)]
             test_hold: Mutex::new(None),
             #[cfg(debug_assertions)]
@@ -280,6 +285,8 @@ impl Blind {
                 refreshing(name, *phase, *done, *total),
             ));
         }
+        // A mark left by an earlier build is not this build's.
+        lock(&self.shredded).remove(name.as_str());
         let building = DatasetState::Building {
             phase: Phase::Snapshot,
             done: 0,
@@ -288,6 +295,38 @@ impl Blind {
         };
         Ok(m.insert(name.as_str().to_string(), building)
             .unwrap_or(DatasetState::Absent))
+    }
+
+    /// Ends the build [`Blind::begin_build`] started, with state `s`. If the
+    /// keys were shredded meanwhile, a `Live` end becomes `NeedsRefresh`
+    /// (its index was made with the shredded key); any other end stays.
+    pub(crate) fn end_build(&self, name: &DatasetName, s: DatasetState) {
+        let mut m = lock(&self.datasets);
+        let shred = lock(&self.shredded).remove(name.as_str());
+        let s = match (shred, s) {
+            (Some(why), DatasetState::Live { .. }) => DatasetState::NeedsRefresh(why),
+            (_, s) => s,
+        };
+        match s {
+            DatasetState::Absent => {
+                m.remove(name.as_str());
+            }
+            s => {
+                m.insert(name.as_str().to_string(), s);
+            }
+        }
+    }
+
+    /// The keys of `name` were shredded (R47-2): `NeedsRefresh(why)` now,
+    /// or, while a build holds the dataset, when that build ends (the
+    /// build keeps the dataset, so no second build starts meanwhile).
+    pub(crate) fn mark_shredded(&self, name: &DatasetName, why: String) {
+        let mut m = lock(&self.datasets);
+        if matches!(m.get(name.as_str()), Some(DatasetState::Building { .. })) {
+            lock(&self.shredded).insert(name.as_str().to_string(), why);
+        } else {
+            m.insert(name.as_str().to_string(), DatasetState::NeedsRefresh(why));
+        }
     }
 
     /// A running build's progress (what the refreshing answer shows).

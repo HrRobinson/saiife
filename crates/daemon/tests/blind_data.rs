@@ -70,6 +70,11 @@ fn fixture_sqlite(root: &Path, customers: u64, seed: u64) -> PathBuf {
 }
 
 fn fx(root: &Path) -> Fx {
+    fx_mode(root, Mode::Personal)
+}
+
+/// [`fx`] for a locked daemon (own uid 999; `me` and `you` are peers).
+fn fx_mode(root: &Path, mode: Mode) -> Fx {
     let audit = root.join("audit");
     std::fs::create_dir_all(&audit).unwrap();
     let state = root.join("state");
@@ -77,7 +82,7 @@ fn fx(root: &Path) -> Fx {
     let cw = ChainWriter::open(
         &audit,
         WriterOptions {
-            mode: "personal".into(),
+            mode: mode.as_str().into(),
             saiife: "test".into(),
             key: None,
         },
@@ -92,8 +97,8 @@ fn fx(root: &Path) -> Fx {
     let dirs: Arc<dyn Directory + Send + Sync> = Arc::new(FixedDirectory::from_text(PASSWD, ""));
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
-        mode: Mode::Personal,
-        own_uid: OWN,
+        mode,
+        own_uid: if mode == Mode::Personal { OWN } else { 999 },
         own_user: "me".into(),
         vault: vault::open_with_key(Zeroizing::new([5; 32]), &state.join("vault/vault.bin")),
         ..CtxInit::minimal(handle, cfg, dirs, &state)
@@ -873,4 +878,235 @@ async fn pg_live() {
     .await
     .unwrap();
     eprintln!("rows: {a}");
+}
+
+/// I1: keys shredded while a refresh holds the dataset: no second build
+/// starts, and the refresh ends needing a refresh, never live.
+#[tokio::test]
+async fn shred_during_refresh_never_goes_live() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    let (reached, release) = f.ctx.blind.test_hold_at(Phase::Index);
+    ok(&refresh(&f, &f.sqlite).await);
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(120)).unwrap())
+        .await
+        .unwrap();
+    saiife_daemon::blind::keys::shred(&f.ctx, &crm()).unwrap();
+    // Still held by the refresh: busy for asks, for a refresh, for rm.
+    assert_eq!(
+        f.ctx.blind.live(&crm()).unwrap_err().code,
+        saiife_ipc::msg::ErrorCode::Busy
+    );
+    assert_eq!(err(&refresh(&f, &f.sqlite).await).0, "busy");
+    assert_eq!(
+        err(&call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await).0,
+        "busy"
+    );
+    release.send(()).unwrap();
+    f.ctx.blind.test_wait_builds().await;
+    let r = f.ctx.blind.live(&crm()).unwrap_err();
+    assert_eq!(r.code, saiife_ipc::msg::ErrorCode::Unavailable);
+    assert_eq!(
+        r.text,
+        "the keys of crm were deleted: saiife blind data refresh --dataset crm"
+    );
+}
+
+/// I1: an rm whose removal fails leaves the dataset unavailable, not live.
+#[tokio::test]
+async fn rm_whose_remove_fails_is_not_live() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    let stuck = ds_root(&f).join("stuck");
+    std::fs::create_dir(&stuck).unwrap();
+    std::fs::write(stuck.join("f"), b"x").unwrap();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let v = call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await;
+    let (code, text) = err(&v);
+    assert_eq!(code, "unavailable");
+    assert!(text.starts_with("could not remove crm"), "{text}");
+    let r = f.ctx.blind.live(&crm()).unwrap_err();
+    assert_eq!(r.code, saiife_ipc::msg::ErrorCode::Unavailable);
+    assert!(!matches!(
+        f.ctx.blind.state(&crm()),
+        DatasetState::Live { .. }
+    ));
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+    ok(&call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await);
+    assert!(!ds_root(&f).exists());
+}
+
+/// I2/S4 (P47-21): a commit whose record fails changes nothing.
+#[tokio::test]
+async fn commit_record_failure_changes_nothing() {
+    let t = scratch();
+    let f = fx(t.path());
+    ok(&stage(&f).await);
+    set_policy(&f, &policy_text(&[]));
+    f.ctx.writer.stop(None).await.unwrap();
+    let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
+    let (code, text) = err(&v);
+    assert_eq!(code, "unavailable");
+    assert!(
+        text.starts_with("crm was not changed: the build could not be recorded"),
+        "{text}"
+    );
+    let root = ds_root(&f);
+    assert!(matches!(f.ctx.blind.state(&crm()), DatasetState::Absent));
+    assert!(!root.join("live").exists());
+    assert!(root.join("stage/snapshot.sqlite").exists());
+    assert!(root.join("staged.json").exists());
+    assert!(!root.join("classes.json").exists());
+}
+
+/// I2/S4 (P47-21): a refresh whose record fails keeps the old build live,
+/// its baseline and the grants.
+#[tokio::test]
+async fn refresh_record_failure_changes_nothing() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    let (old, _) = f.ctx.blind.live(&crm()).unwrap();
+    set_policy(&f, &policy_text(&[("customers.city", "public")]));
+    let lp = ds_root(&f).join("loosen.json");
+    let grants = json!({"grants": [{
+        "column": "customers.city", "class": "public",
+        "touched_at": "2026-11-18T10:00:00Z", "by": "me"
+    }]});
+    std::fs::write(&lp, grants.to_string()).unwrap();
+    f.ctx
+        .blind
+        .set_test_detector(Some(Arc::new(ListDetector::new(&[(
+            "Søren",
+            SpanLabel::Person,
+        )]))));
+    let classes_before = std::fs::read(ds_root(&f).join("classes.json")).unwrap();
+    f.ctx.writer.stop(None).await.unwrap();
+    ok(&refresh(&f, &fixture_sqlite(&f.root, 300, 13)).await);
+    f.ctx.blind.test_wait_builds().await;
+    let e = f.ctx.blind.last_build_error(&crm()).unwrap();
+    assert!(
+        e.starts_with("crm was not changed: the build could not be recorded"),
+        "{e}"
+    );
+    let (now, _) = f.ctx.blind.live(&crm()).unwrap();
+    assert_eq!(now.snapshot_sha256, old.snapshot_sha256);
+    assert_eq!(
+        load_manifest(&f.ctx.blind.dataset_dir(&crm()))
+            .unwrap()
+            .snapshot_sha256,
+        old.snapshot_sha256
+    );
+    assert!(ds_root(&f).join("stage/snapshot.sqlite").exists());
+    assert_eq!(
+        std::fs::read(ds_root(&f).join("classes.json")).unwrap(),
+        classes_before
+    );
+    let left: Value = serde_json::from_slice(&std::fs::read(&lp).unwrap()).unwrap();
+    assert_eq!(left, grants);
+    assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Quasi);
+}
+
+/// S3: a dataset whose policy entry is gone keeps its last approvers; the
+/// global `[approval]` approvers do not take over. A name never built: only
+/// an admin.
+#[tokio::test]
+async fn rm_without_policy_entry_keeps_its_approvers() {
+    let t = scratch();
+    let f = fx_mode(t.path(), Mode::Locked);
+    let global = "version = 2\n\n[approval]\napprovers = [\"you\"]\n";
+    let with =
+        format!(
+        "{global}\n{}",
+        policy_text(&[]).replacen("version = 2\n\n", "", 1).replacen(
+            "source = { kind = \"sqlite\", file_name = \"crm.sqlite\" }\n",
+            "source = { kind = \"sqlite\", file_name = \"crm.sqlite\" }\napprovers = [\"me\"]\n",
+            1
+        )
+    );
+    set_policy(&f, &with);
+    ok(&stage(&f).await);
+    ok(&call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await);
+    // The policy entry removed: `you` (a global approver only) may not rm.
+    set_policy(&f, global);
+    let v = call_as(
+        &f,
+        OTHER,
+        OP_BLIND_DATA_RM,
+        json!({"dataset": "crm"}),
+        vec![],
+    )
+    .await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    assert!(ds_root(&f).exists());
+    // Nor stage a name nothing is known about.
+    let v = call_as(
+        &f,
+        OTHER,
+        OP_BLIND_DATA_STAGE,
+        json!({"dataset": "hr", "kind": "sqlite"}),
+        vec![fd_of(&f.sqlite)],
+    )
+    .await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    // `me`, the dataset's own approver, still may.
+    ok(&call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await);
+    assert!(!ds_root(&f).exists());
+}
+
+/// S5: a commit refuses a stage read from another source than the policy
+/// names (another file, another kind).
+#[tokio::test]
+async fn commit_refuses_another_source() {
+    let t = scratch();
+    let f = fx(t.path());
+    ok(&stage(&f).await);
+    let want = (
+        "bad_request".to_string(),
+        "crm was staged from another source than the policy names: \
+         saiife blind data stage --dataset crm"
+            .to_string(),
+    );
+    set_policy(
+        &f,
+        &policy_text(&[]).replace("file_name = \"crm.sqlite\"", "file_name = \"other.sqlite\""),
+    );
+    let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
+    assert_eq!(err(&v), want);
+    set_policy(
+        &f,
+        &policy_text(&[]).replace("kind = \"sqlite\"", "kind = \"csv\""),
+    );
+    let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
+    assert_eq!(err(&v), want);
+    assert!(!ds_root(&f).join("live").exists());
+    set_policy(&f, &policy_text(&[]));
+    ok(&call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await);
+}
+
+/// P47-22: a live dataset that lost `classes.json` keeps its classes; a
+/// loosening still needs a grant.
+#[tokio::test]
+async fn lost_baseline_keeps_the_live_classes() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    std::fs::remove_file(ds_root(&f).join("classes.json")).unwrap();
+    set_policy(&f, &policy_text(&[("customers.city", "public")]));
+    assert_eq!(
+        data::warnings(&f.ctx, &crm()),
+        ["customers.city was made public in policy without a blind:loosen touch; still quasi"]
+    );
+    ok(&refresh(&f, &f.sqlite).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert_eq!(f.ctx.blind.last_build_error(&crm()), None);
+    assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Quasi);
+    // An unreadable one: the same.
+    std::fs::write(ds_root(&f).join("classes.json"), b"{not json").unwrap();
+    ok(&refresh(&f, &f.sqlite).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert_eq!(f.ctx.blind.last_build_error(&crm()), None);
+    assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Quasi);
 }

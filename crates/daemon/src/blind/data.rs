@@ -15,7 +15,7 @@
 //! or error text carries a cell value.
 
 use super::audit::{self, BlindRecord};
-use super::ops::{role, Roles};
+use super::ops::{effective_approvers, role, role_listed, Roles};
 use super::pg::{self, PgSource};
 use super::{keys, private_dir, write_private, Blind, DatasetState, LiveHandles, Refusal};
 use crate::ops::{Conn, Ctx};
@@ -51,6 +51,8 @@ pub const CLASSES_FILE: &str = "classes.json";
 pub const LOOSEN_FILE: &str = "loosen.json";
 /// What `stage` saw (names and types only), for `commit`.
 const STAGED_FILE: &str = "staged.json";
+/// The users and approvers the dataset was last built with (S3).
+const ACCESS_FILE: &str = "access.json";
 /// Where a SQLite source is copied while it is read (`stage/` is emptied by
 /// the snapshot, so the copy cannot live there).
 const IMPORT_DIR: &str = "import";
@@ -86,6 +88,8 @@ struct LoosenFile {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Staged {
+    /// [`source_id`] of what was read.
+    source: String,
     snapshot_sha256: String,
     tables: Vec<StagedTable>,
 }
@@ -251,9 +255,12 @@ pub fn warnings(ctx: &Ctx, name: &DatasetName) -> Vec<String> {
         return Vec::new();
     };
     let dir = ctx.blind.dataset_dir(name);
-    let (Ok(base), Ok(grants)) = (read_classes(&dir), read_grants(&dir)) else {
-        return Vec::new();
-    };
+    // P47-22: no readable baseline is the live build's classes.
+    let base = read_small::<Classes>(&dir.root.join(CLASSES_FILE))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| classes_of(&manifest.schema));
+    let grants = read_grants(&dir).unwrap_or_default();
     effective_schema(&cfg, &manifest, &base, &grants).1
 }
 
@@ -287,12 +294,6 @@ fn read_small<T: serde::de::DeserializeOwned>(p: &Path) -> io::Result<Option<T>>
     serde_json::from_slice(&b)
         .map(Some)
         .map_err(|_| io::Error::other("not valid"))
-}
-
-fn read_classes(dir: &DatasetDir) -> Result<Classes, Refusal> {
-    read_small(&dir.root.join(CLASSES_FILE))
-        .map(Option::unwrap_or_default)
-        .map_err(|e| unavailable(format!("{CLASSES_FILE} cannot be read: {e}")))
 }
 
 fn read_grants(dir: &DatasetDir) -> Result<Vec<LoosenGrant>, Refusal> {
@@ -443,8 +444,10 @@ fn shield_refusal(e: &ShieldError) -> Refusal {
 
 // ------------------------------------------------------------ build ----
 
-/// Holds a dataset in `Building`; dropped without [`BuildGuard::done`], it
-/// puts back the state it replaced (a failed build leaves the old one live).
+/// Holds a dataset in `Building`. Dropped without [`BuildGuard::done`], it
+/// puts back the state it replaced (a build that failed before its swap
+/// leaves the old one live). Both go through [`Blind::end_build`], so keys
+/// shredded meanwhile never end `Live`.
 struct BuildGuard {
     blind: Arc<Blind>,
     name: DatasetName,
@@ -465,43 +468,79 @@ impl BuildGuard {
         matches!(self.previous, Some(DatasetState::Live { .. }))
     }
 
-    /// The index of the build that was live, for the record scrub.
-    fn previous_index(&self) -> Option<Arc<LiveHandles>> {
+    /// The build that was live: its handles (the record scrub) and manifest.
+    fn previous_live(&self) -> Option<(Arc<Manifest>, Arc<LiveHandles>)> {
         match &self.previous {
-            Some(DatasetState::Live { open, .. }) => Some(Arc::clone(open)),
+            Some(DatasetState::Live { manifest, open }) => {
+                Some((Arc::clone(manifest), Arc::clone(open)))
+            }
             _ => None,
         }
     }
 
     fn done(mut self, s: DatasetState) {
         self.previous = None;
-        self.blind.set_state(&self.name, s);
+        self.blind.end_build(&self.name, s);
     }
 }
 
 impl Drop for BuildGuard {
     fn drop(&mut self) {
         if let Some(p) = self.previous.take() {
-            self.blind.set_state(&self.name, p);
+            self.blind.end_build(&self.name, p);
         }
     }
 }
 
+/// Who may manage a dataset whose policy entry is gone (S3): the users and
+/// approvers it was last built with. Written with every build.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Access {
+    users: Vec<String>,
+    /// The approvers in force then (the dataset's, or `[approval]`'s).
+    approvers: Vec<String>,
+}
+
 /// What a build needs besides the snapshot.
 struct BuildIn {
-    blind: Arc<Blind>,
+    ctx: Arc<Ctx>,
+    /// The runtime the record is written on (from the blocking thread).
+    rt: tokio::runtime::Handle,
     name: DatasetName,
     dir: DatasetDir,
     cfg: BlindDataset,
     k: u32,
     keys: KeySet,
     detector: Option<Arc<dyn NameDetector>>,
+    access: Access,
+    /// The build that was live, if any.
+    prev: Option<Arc<Manifest>>,
+    uid: u32,
+    first: bool,
+    started: Instant,
 }
 
 /// A build that went live.
 struct Built {
     manifest: Arc<Manifest>,
     open: Arc<LiveHandles>,
+}
+
+/// Why a build did not go live.
+enum BuildErr {
+    /// Before the swap: `live/` and the state are as they were.
+    Before(Refusal),
+    /// After the swap: the new build is on disk but cannot be used; the
+    /// dataset ends `NeedsRefresh`, never the old `Live` (ruling P47-21).
+    After(Refusal),
+}
+
+/// The state a build that failed after its swap leaves.
+fn after_swap(name: &DatasetName) -> DatasetState {
+    DatasetState::NeedsRefresh(format!(
+        "{name} was rebuilt but cannot be opened: saiife blind data refresh --dataset {name}"
+    ))
 }
 
 /// Ruling P47-6: public values and the names the cloud sees are checked
@@ -573,24 +612,99 @@ fn open_handles(dir: &DatasetDir, keys: &KeySet) -> Result<LiveHandles, ShieldEr
     })
 }
 
-/// Builds the staged snapshot of `layout` and opens it (blocking).
-fn build(b: BuildIn, layout: &Layout) -> Result<Built, Refusal> {
-    let baseline = read_classes(&b.dir)?;
-    let grants = read_grants(&b.dir)?;
+fn classes_of(s: &Schema) -> Classes {
+    let mut classes = Classes::default();
+    for t in &s.tables {
+        for c in &t.columns {
+            classes.0.insert(format!("{}.{}", t.name, c.name), c.class);
+        }
+    }
+    classes
+}
+
+/// The class baseline (R47-6). With a live build, a missing or unreadable
+/// `classes.json` falls back to the live manifest's classes (ruling
+/// P47-22): a lost file must not let a loosening through.
+fn baseline_for(b: &BuildIn) -> Result<Classes, Refusal> {
+    let read = read_small::<Classes>(&b.dir.root.join(CLASSES_FILE));
+    let live = std::fs::symlink_metadata(b.dir.live()).is_ok();
+    match (read, live) {
+        (Ok(Some(c)), _) => Ok(c),
+        (Ok(None), false) => Ok(Classes::default()),
+        (Err(e), false) => Err(unavailable(format!("{CLASSES_FILE} cannot be read: {e}"))),
+        (_, true) => {
+            let m = match &b.prev {
+                Some(m) => Arc::clone(m),
+                None => Arc::new(load_manifest(&b.dir).map_err(|_| {
+                    unavailable(format!(
+                        "the class baseline of {0} cannot be read: \
+                         saiife blind data rm --dataset {0} starts over",
+                        b.name
+                    ))
+                })?),
+            };
+            Ok(classes_of(&m.schema))
+        }
+    }
+}
+
+/// Records the build `m` before its swap (ruling P47-21): the index for the
+/// scrub is the staged one. An error stops the build: nothing is swapped.
+fn record_in_stage(b: &BuildIn, m: &Manifest) -> Result<(), Refusal> {
+    let index =
+        KnownIndex::open(&b.dir.stage(), b.keys.index_key()).map_err(|e| shield_refusal(&e))?;
+    let r = BlindRecord::Refresh {
+        dataset: m.dataset.to_string(),
+        snapshot_sha256: m.snapshot_sha256.clone(),
+        rows: m
+            .rows_bands
+            .iter()
+            .map(|(t, band)| (t.clone(), band.clone()))
+            .collect(),
+        index_entries: m.index.entries,
+        ms: ms_since(b.started),
+        // plan 47 T2b: the methods `MethodStore::revalidate` suspends.
+        suspended: Vec::new(),
+        first: b.first,
+    };
+    b.rt.block_on(audit::write(
+        &b.ctx,
+        b.uid,
+        b.name.as_str(),
+        r,
+        Some(&index),
+    ))
+    .map_err(|e| {
+        unavailable(format!(
+            "{} was not changed: the build could not be recorded: {e}",
+            b.name
+        ))
+    })
+}
+
+/// Builds the staged snapshot of `layout`, records it, swaps it live and
+/// opens it (blocking).
+fn build(b: BuildIn, layout: &Layout) -> Result<Built, BuildErr> {
+    use BuildErr::{After, Before};
+    let baseline = baseline_for(&b).map_err(Before)?;
+    let grants = read_grants(&b.dir).map_err(Before)?;
     let (schema, _warnings, applied) = schema_for(&b.cfg, &b.name, layout, &baseline, &grants);
     let detector = b.detector.as_deref();
     // Before any work: a schema with public columns needs the detector.
-    name_check(&b.name, detector, &schema, &[])?;
+    name_check(&b.name, detector, &schema, &[]).map_err(Before)?;
+    write_private(&b.dir.root.join(ACCESS_FILE), &json_bytes(&b.access))
+        .map_err(|e| Before(unavailable(format!("could not write {ACCESS_FILE}: {e}"))))?;
     let mut verdict: Option<Refusal> = None;
     let mut validate = |m: &Manifest| -> Result<(), String> {
-        if let Err(r) = name_check(&b.name, detector, &m.schema, &m.public) {
+        let r = name_check(&b.name, detector, &m.schema, &m.public)
+            // plan 47 T2b: MethodStore::revalidate after plan 45 merges
+            .and_then(|()| record_in_stage(&b, m));
+        r.map_err(|r| {
             verdict = Some(r);
-            return Err(String::new());
-        }
-        // plan 47 T2b: MethodStore::revalidate after plan 45 merges
-        Ok(())
+            String::new()
+        })
     };
-    let (blind, name) = (Arc::clone(&b.blind), b.name.clone());
+    let (blind, name) = (Arc::clone(&b.ctx.blind), b.name.clone());
     let built = finish(
         &b.dir,
         &schema,
@@ -600,19 +714,17 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, Refusal> {
         &mut |p| blind.progress(&name, p),
     );
     if let Err(e) = built {
-        return Err(verdict.unwrap_or_else(|| shield_refusal(&e)));
+        return Err(Before(verdict.unwrap_or_else(|| shield_refusal(&e))));
     }
-    let m = load_manifest(&b.dir).map_err(|e| shield_refusal(&e))?;
-    let open = open_handles(&b.dir, &b.keys).map_err(|e| shield_refusal(&e))?;
+    // Swapped: from here a failure leaves the dataset needing a refresh.
+    let m = load_manifest(&b.dir).map_err(|e| After(shield_refusal(&e)))?;
+    let open = open_handles(&b.dir, &b.keys).map_err(|e| After(shield_refusal(&e)))?;
     // The new baseline: the classes now in force; the grants used are spent.
-    let mut classes = Classes::default();
-    for t in &m.schema.tables {
-        for c in &t.columns {
-            classes.0.insert(format!("{}.{}", t.name, c.name), c.class);
-        }
-    }
-    write_private(&b.dir.root.join(CLASSES_FILE), &json_bytes(&classes))
-        .map_err(|e| unavailable(format!("could not write {CLASSES_FILE}: {e}")))?;
+    write_private(
+        &b.dir.root.join(CLASSES_FILE),
+        &json_bytes(&classes_of(&m.schema)),
+    )
+    .map_err(|e| After(unavailable(format!("could not write {CLASSES_FILE}: {e}"))))?;
     if !applied.is_empty() {
         let left = LoosenFile {
             grants: grants
@@ -623,12 +735,39 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, Refusal> {
                 .collect(),
         };
         write_private(&b.dir.root.join(LOOSEN_FILE), &json_bytes(&left))
-            .map_err(|e| unavailable(format!("could not write {LOOSEN_FILE}: {e}")))?;
+            .map_err(|e| After(unavailable(format!("could not write {LOOSEN_FILE}: {e}"))))?;
     }
     Ok(Built {
         manifest: Arc::new(m),
         open: Arc::new(open),
     })
+}
+
+/// Ends a build's guard by its result: live, as it was (before the swap),
+/// or needing a refresh (after it). The refusal, if any.
+fn end_build(
+    guard: BuildGuard,
+    name: &DatasetName,
+    res: Result<Built, BuildErr>,
+) -> Result<Arc<Manifest>, Refusal> {
+    match res {
+        Ok(built) => {
+            let m = Arc::clone(&built.manifest);
+            guard.done(DatasetState::Live {
+                manifest: built.manifest,
+                open: built.open,
+            });
+            Ok(m)
+        }
+        Err(BuildErr::Before(r)) => {
+            drop(guard);
+            Err(r)
+        }
+        Err(BuildErr::After(r)) => {
+            guard.done(after_swap(name));
+            Err(r)
+        }
+    }
 }
 
 /// The dataset's keys, made on its first build (or after a shred).
@@ -638,32 +777,6 @@ fn load_or_create(ctx: &Ctx, name: &DatasetName) -> Result<KeySet, Refusal> {
         Err(keys::KeyError::Missing) => keys::create(ctx, name).map_err(|e| e.refusal(name)),
         Err(e) => Err(e.refusal(name)),
     }
-}
-
-/// Records the build that just went live (R47-10). An error fails the op.
-async fn record_refresh(
-    ctx: &Ctx,
-    uid: u32,
-    built: &Built,
-    ms: u64,
-    first: bool,
-) -> Result<(), String> {
-    let m = &built.manifest;
-    let r = BlindRecord::Refresh {
-        dataset: m.dataset.to_string(),
-        snapshot_sha256: m.snapshot_sha256.clone(),
-        rows: m
-            .rows_bands
-            .iter()
-            .map(|(t, b)| (t.clone(), b.clone()))
-            .collect(),
-        index_entries: m.index.entries,
-        ms,
-        // plan 47 T2b: the methods `MethodStore::revalidate` suspends.
-        suspended: Vec::new(),
-        first,
-    };
-    audit::write(ctx, uid, m.dataset.as_str(), r, built.open.index.as_ref()).await
 }
 
 /// The commit's answer: names, bands and counts only.
@@ -714,9 +827,51 @@ fn manage_refusal(name: &DatasetName) -> Refusal {
     )
 }
 
-async fn may_manage(ctx: &Ctx, peer: &PeerCred, cfg: Option<&BlindDataset>) -> bool {
-    let r: Roles = role(ctx, peer, cfg).await;
+/// R47-3 with the policy entry. Without one (S3): the users and approvers
+/// the dataset was last built with; none known (or unreadable): admins only.
+async fn may_manage(
+    ctx: &Ctx,
+    peer: &PeerCred,
+    name: &DatasetName,
+    cfg: Option<&BlindDataset>,
+) -> bool {
+    let r: Roles = match cfg {
+        Some(c) => role(ctx, peer, Some(c)).await,
+        None => {
+            let p = ctx.blind.dataset_dir(name).root.join(ACCESS_FILE);
+            let a = read_small::<Access>(&p).ok().flatten().unwrap_or_default();
+            role_listed(ctx, peer, &a.users, &a.approvers).await
+        }
+    };
     r.may_manage()
+}
+
+/// The identity of a source (S5): its kind and file name, or its database,
+/// user and tables; a hash, no values.
+fn source_id(src: &BlindSource) -> String {
+    let v = match src {
+        BlindSource::Csv { file_name }
+        | BlindSource::Xlsx { file_name }
+        | BlindSource::Sqlite { file_name } => json!([kind_of(src), base_name(file_name)]),
+        BlindSource::Postgres {
+            host,
+            port,
+            dbname,
+            user,
+            tables,
+            ..
+        } => json!(["postgres", host, port, dbname, user, tables]),
+    };
+    let d = ring::digest::digest(&ring::digest::SHA256, v.to_string().as_bytes());
+    crate::api_ops::hex(d.as_ref())
+}
+
+fn file_source(kind: FileKind, file_name: String) -> BlindSource {
+    match kind {
+        FileKind::Csv => BlindSource::Csv { file_name },
+        FileKind::Xlsx => BlindSource::Xlsx { file_name },
+        FileKind::Sqlite => BlindSource::Sqlite { file_name },
+    }
 }
 
 /// `blind.data.stage {dataset, kind, file_name?}` (+ one fd for a file
@@ -734,7 +889,7 @@ pub async fn stage(
         .ok_or_else(|| bad("kind is required: csv, xlsx, sqlite or postgres"))?
         .to_string();
     let policy = policy_dataset(ctx, &name);
-    if !may_manage(ctx, &conn.peer, policy.as_ref().map(|p| &p.0)).await {
+    if !may_manage(ctx, &conn.peer, &name, policy.as_ref().map(|p| &p.0)).await {
         return Err(manage_refusal(&name));
     }
     if let Some((cfg, _)) = &policy {
@@ -755,14 +910,27 @@ pub async fn stage(
             }),
     };
     let input = match file_kind(&kind) {
-        Some(fk) => Input::File {
-            kind: fk,
-            file: one_file(fds, &kind)?,
-            name: args
+        Some(fk) => {
+            let policy_name = match policy.as_ref().map(|p| &p.0.source) {
+                Some(
+                    BlindSource::Csv { file_name }
+                    | BlindSource::Xlsx { file_name }
+                    | BlindSource::Sqlite { file_name },
+                ) => Some(base_name(file_name)),
+                _ => None,
+            };
+            let file_name = args
                 .get("file_name")
                 .and_then(Value::as_str)
-                .map_or_else(|| format!("{name}.{kind}"), base_name),
-        },
+                .map(base_name)
+                .or(policy_name)
+                .unwrap_or_else(|| format!("{name}.{kind}"));
+            Input::File {
+                kind: fk,
+                file: one_file(fds, &kind)?,
+                name: file_name,
+            }
+        }
         None if kind == "postgres" => {
             let Some((cfg, _)) = &policy else {
                 return Err(not_in_policy(&name));
@@ -770,12 +938,17 @@ pub async fn stage(
             drop(fds);
             let guard = BuildGuard::begin(&ctx.blind, &name)?;
             let p = pg::pg_source(ctx, &cfg.source).await.map_err(unavailable)?;
-            return run_stage(ctx, guard, name, Input::Pg(p), k).await;
+            let id = source_id(&cfg.source);
+            return run_stage(ctx, guard, name, Input::Pg(p), id, k).await;
         }
         None => return Err(bad("kind must be csv, xlsx, sqlite or postgres")),
     };
+    let id = match &input {
+        Input::File { kind, name, .. } => source_id(&file_source(*kind, name.clone())),
+        Input::Pg(_) => String::new(),
+    };
     let guard = BuildGuard::begin(&ctx.blind, &name)?;
-    run_stage(ctx, guard, name, input, k).await
+    run_stage(ctx, guard, name, input, id, k).await
 }
 
 fn base_name(s: &str) -> String {
@@ -791,6 +964,7 @@ async fn run_stage(
     guard: BuildGuard,
     name: DatasetName,
     input: Input,
+    source: String,
     k: u32,
 ) -> Result<Value, Refusal> {
     let dir = ctx.blind.dataset_dir(&name);
@@ -808,6 +982,7 @@ async fn run_stage(
         drop(copy);
         let info = info?;
         let staged = Staged {
+            source,
             snapshot_sha256: info.sha256.clone(),
             tables: info
                 .tables
@@ -861,9 +1036,18 @@ fn proposal_json(p: &Proposal) -> Value {
     Value::Object(c)
 }
 
+/// The users and approvers in force for `cfg` (kept for S3).
+fn access_of(ctx: &Ctx, cfg: &BlindDataset) -> Access {
+    Access {
+        users: cfg.users.clone(),
+        approvers: effective_approvers(ctx, cfg),
+    }
+}
+
 /// `blind.data.commit {dataset}`: builds the staged snapshot with the
-/// policy's classes, swaps it live, writes `classes.json` and records
-/// `blind_refresh` (first). The dataset must be in the policy in force.
+/// policy's classes, records `blind_refresh` (first) before the swap, then
+/// swaps it live and writes `classes.json`. The dataset must be in the
+/// policy in force, staged from the source the policy names.
 pub async fn commit(
     ctx: &Arc<Ctx>,
     peer: &PeerCred,
@@ -872,7 +1056,7 @@ pub async fn commit(
     let name = dataset_arg(args)?;
     let started = Instant::now();
     let (cfg, k) = policy_dataset(ctx, &name).ok_or_else(|| not_in_policy(&name))?;
-    if !may_manage(ctx, peer, Some(&cfg)).await {
+    if !may_manage(ctx, peer, &name, Some(&cfg)).await {
         return Err(manage_refusal(&name));
     }
     let guard = BuildGuard::begin(&ctx.blind, &name)?;
@@ -888,6 +1072,12 @@ pub async fn commit(
     if !dir.stage().is_dir() {
         return Err(nothing());
     }
+    if staged.source != source_id(&cfg.source) {
+        return Err(bad(format!(
+            "{name} was staged from another source than the policy names: \
+             saiife blind data stage --dataset {name}"
+        )));
+    }
     let layout: Layout = staged
         .tables
         .into_iter()
@@ -895,33 +1085,33 @@ pub async fn commit(
         .collect();
     let keys = load_or_create(ctx, &name)?;
     let b = BuildIn {
-        blind: Arc::clone(&ctx.blind),
+        ctx: Arc::clone(ctx),
+        rt: tokio::runtime::Handle::current(),
         name: name.clone(),
         dir: dir.clone(),
-        cfg: cfg.clone(),
+        access: access_of(ctx, &cfg),
+        cfg,
         k,
         keys,
         detector: ctx.blind.detector(),
+        prev: guard.previous_live().map(|p| p.0),
+        uid: peer.uid,
+        first: true,
+        started,
     };
-    let built = tokio::task::spawn_blocking(move || build(b, &layout))
+    let res = tokio::task::spawn_blocking(move || build(b, &layout))
         .await
-        .map_err(join_err)??;
-    guard.done(DatasetState::Live {
-        manifest: Arc::clone(&built.manifest),
-        open: Arc::clone(&built.open),
-    });
+        .unwrap_or_else(|e| Err(BuildErr::After(join_err(e))));
+    let m = end_build(guard, &name, res)?;
     ctx.blind.set_build_error(&name, None);
     let _ = remove_entry(&dir.root.join(STAGED_FILE));
-    record_refresh(ctx, peer.uid, &built, ms_since(started), true)
-        .await
-        .map_err(|e| unavailable(format!("{name} is live but could not be recorded: {e}")))?;
     let w = warnings(ctx, &name);
-    Ok(Value::Object(summary(&built.manifest, w)))
+    Ok(Value::Object(summary(&m, w)))
 }
 
 /// `blind.data.refresh {dataset}` (+ one fd for a file source): answers at
 /// once; the build runs on a blocking task, `status` shows its phase, and
-/// it records `blind_refresh` when live.
+/// it records `blind_refresh` before its swap.
 pub async fn refresh(
     ctx: &Arc<Ctx>,
     conn: &Conn,
@@ -931,7 +1121,7 @@ pub async fn refresh(
     let name = dataset_arg(args)?;
     let started = Instant::now();
     let (cfg, k) = policy_dataset(ctx, &name).ok_or_else(|| not_in_policy(&name))?;
-    if !may_manage(ctx, &conn.peer, Some(&cfg)).await {
+    if !may_manage(ctx, &conn.peer, &name, Some(&cfg)).await {
         return Err(manage_refusal(&name));
     }
     let kind = kind_of(&cfg.source);
@@ -950,16 +1140,21 @@ pub async fn refresh(
     };
     let guard = BuildGuard::begin(&ctx.blind, &name)?;
     let keys = load_or_create(ctx, &name)?;
-    let first = !guard.had_live();
-    let uid = conn.peer.uid;
+    let source = cfg.source.clone();
     let b = BuildIn {
-        blind: Arc::clone(&ctx.blind),
+        ctx: Arc::clone(ctx),
+        rt: tokio::runtime::Handle::current(),
         name: name.clone(),
         dir: ctx.blind.dataset_dir(&name),
-        cfg: cfg.clone(),
+        access: access_of(ctx, &cfg),
+        cfg,
         k,
         keys,
         detector: ctx.blind.detector(),
+        prev: guard.previous_live().map(|p| p.0),
+        uid: conn.peer.uid,
+        first: !guard.had_live(),
+        started,
     };
     let task_ctx = Arc::clone(ctx);
     let h = tokio::spawn(async move {
@@ -967,35 +1162,19 @@ pub async fn refresh(
         let name = b.name.clone();
         let input = match file {
             Some((kind, file, name)) => Ok(Input::File { kind, file, name }),
-            None => pg::pg_source(&ctx, &cfg.source)
+            None => pg::pg_source(&ctx, &source)
                 .await
                 .map(Input::Pg)
                 .map_err(unavailable),
         };
         let res = match input {
-            Err(r) => Err(r),
+            Err(r) => Err(BuildErr::Before(r)),
             Ok(input) => tokio::task::spawn_blocking(move || refresh_build(b, input))
                 .await
-                .unwrap_or_else(|e| Err(join_err(e))),
+                .unwrap_or_else(|e| Err(BuildErr::After(join_err(e)))),
         };
-        match res {
-            Ok(built) => {
-                guard.done(DatasetState::Live {
-                    manifest: Arc::clone(&built.manifest),
-                    open: Arc::clone(&built.open),
-                });
-                let rec = record_refresh(&ctx, uid, &built, ms_since(started), first).await;
-                ctx.blind.set_build_error(
-                    &name,
-                    rec.err()
-                        .map(|e| format!("{name} is live but could not be recorded: {e}")),
-                );
-            }
-            Err(r) => {
-                drop(guard);
-                ctx.blind.set_build_error(&name, Some(r.text));
-            }
-        }
+        let why = end_build(guard, &name, res).err().map(|r| r.text);
+        ctx.blind.set_build_error(&name, why);
     });
     ctx.blind.track_build(h);
     let mut a = Map::new();
@@ -1004,18 +1183,19 @@ pub async fn refresh(
 }
 
 /// The snapshot from `input`, then the build (blocking).
-fn refresh_build(b: BuildIn, input: Input) -> Result<Built, Refusal> {
+fn refresh_build(b: BuildIn, input: Input) -> Result<Built, BuildErr> {
+    let before = BuildErr::Before;
     // This build replaces any staged one: a later commit must not pair an
     // old `staged.json` with this stage.
     remove_entry(&b.dir.root.join(STAGED_FILE))
-        .map_err(|e| unavailable(format!("could not clear {STAGED_FILE}: {e}")))?;
-    let (mut src, copy) = open_input(&b.dir, input)?;
-    let (blind, name) = (Arc::clone(&b.blind), b.name.clone());
+        .map_err(|e| before(unavailable(format!("could not clear {STAGED_FILE}: {e}"))))?;
+    let (mut src, copy) = open_input(&b.dir, input).map_err(before)?;
+    let (blind, name) = (Arc::clone(&b.ctx.blind), b.name.clone());
     let info = stage_snapshot(&b.dir, src.as_mut(), &mut |p| blind.progress(&name, p))
         .map_err(|e| shield_refusal(&e));
     drop(src);
     drop(copy);
-    let info = info?;
+    let info = info.map_err(before)?;
     let layout: Layout = info
         .tables
         .iter()
@@ -1031,7 +1211,8 @@ fn refresh_build(b: BuildIn, input: Input) -> Result<Built, Refusal> {
 
 /// `blind.data.rm {dataset}`: records `blind_keys` (delete, "dataset
 /// removed"), shreds the keys (R47-2) and removes the dataset's directory.
-/// A dataset that is not there is not an error.
+/// A dataset that is not there is not an error. Once the keys are being
+/// shredded the dataset never shows `Live` again, whatever fails.
 pub async fn rm(
     ctx: &Arc<Ctx>,
     peer: &PeerCred,
@@ -1039,10 +1220,10 @@ pub async fn rm(
 ) -> Result<Value, Refusal> {
     let name = dataset_arg(args)?;
     let cfg = policy_dataset(ctx, &name).map(|p| p.0);
-    if !may_manage(ctx, peer, cfg.as_ref()).await {
+    if !may_manage(ctx, peer, &name, cfg.as_ref()).await {
         return Err(manage_refusal(&name));
     }
-    let guard = BuildGuard::begin(&ctx.blind, &name)?;
+    let mut guard = BuildGuard::begin(&ctx.blind, &name)?;
     let dir = ctx.blind.dataset_dir(&name);
     let mut a = Map::new();
     if std::fs::symlink_metadata(&dir.root).is_err() {
@@ -1051,7 +1232,7 @@ pub async fn rm(
         return Ok(Value::Object(a));
     }
     let version = keys::load(ctx, &name).map_or(0, |k| k.version);
-    let live = guard.previous_index();
+    let live = guard.previous_live().map(|p| p.1);
     // The record first: a removal that cannot be recorded does not happen.
     audit::write(
         ctx,
@@ -1069,6 +1250,10 @@ pub async fn rm(
     .await
     .map_err(|e| unavailable(format!("the removal of {name} could not be recorded: {e}")))?;
     drop(live);
+    // From here the old build is gone for asks, whatever fails (I1).
+    guard.previous = Some(DatasetState::NeedsRefresh(format!(
+        "{name} was being removed: saiife blind data rm --dataset {name}"
+    )));
     keys::shred(ctx, &name).map_err(|e| e.refusal(&name))?;
     let root = dir.root.clone();
     tokio::task::spawn_blocking(move || {
