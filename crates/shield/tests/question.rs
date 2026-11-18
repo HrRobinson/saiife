@@ -794,9 +794,10 @@ fn never_panics_on_arbitrary_text() {
         check(step, &f, &mut r, &mut t);
     }
     // A floor: most generated questions parse, many ask, and answers lead
-    // to Ready drafts.
+    // to Ready drafts. (Random pieces often put two literals side by side
+    // or beside a period word, which the split-meaning rules refuse.)
     assert!(
-        t.parsed >= 300 && t.asked >= 50 && t.answered_ready >= 20,
+        t.parsed >= 250 && t.asked >= 50 && t.answered_ready >= 20,
         "{t:?}"
     );
 }
@@ -1075,7 +1076,7 @@ fn minus_sign_stays_in_the_text() {
 
 // ------------------------------- plan 44 follow-up: bench item 1 (meaning) ----
 
-use saiife_shield::question::{ONE_SCALE_TWO_NUMBERS, SIDE_BY_SIDE, UNBOUND_WORD};
+use saiife_shield::question::{DECOMPOSED, ONE_SCALE_TWO_NUMBERS, SIDE_BY_SIDE, UNBOUND_WORD};
 
 /// The closed word list the parameterizer must never leave beside a `:pN`
 /// (with `of`/`af`/`the` skipped): a period, an ordinal, a fraction or a
@@ -1239,8 +1240,6 @@ fn an_unbound_period_ordinal_or_scale_word_refuses() {
         "What was the revenue in Q1-Q2 2024?",
         // A fraction beside a scale: `half :p1` (= a million).
         "Which customers owe more than half a million?",
-        "Hvilke kunder skylder mere end en halv million?",
-        "Hvilke kunder skylder mere end halvanden million?",
         // A scale word the language does not read (Danish billion = 10^12).
         "Hvilke kunder skylder mere end 2 billioner kr.?",
         "Which customers owe more than 2 bn?",
@@ -1262,8 +1261,6 @@ fn numbers_side_by_side_refuse() {
         "What was the revenue in 2023/2024?",
         "Who has number 010203-4560?",
         "Hvad var omsætningen i uge 12 2024?",
-        // `dozen` alone reads as 12: `:p1 :p2`.
-        "Which customers owe more than 3 dozen?",
     ] {
         assert_eq!(bad_literal_why(run(&f, q, &none())), SIDE_BY_SIDE, "{q}");
     }
@@ -1365,4 +1362,95 @@ fn never_a_split_over_phrasings() {
             }
         }
     }
+}
+
+/// Review fixes (bench item 1): more ways a meaning could split, each
+/// refused.
+#[test]
+fn review_split_cases_refuse() {
+    let f = fx();
+    for q in [
+        // A period code, a filler word, then the year.
+        "What was the revenue in Q2 in 2025?",
+        "What was the revenue for H1 FY 2024?",
+        // Month ranges.
+        "What was the revenue in jan-mar 2024?",
+        "What was the revenue from January to March 2024?",
+        "Hvad var omsætningen fra 1. januar til 31. marts 2024?",
+        // Two ordinals or codes sharing one period.
+        "What was the revenue in the 1st and 2nd quarter 2025?",
+        "Hvad var omsætningen i første og andet halvår 2024?",
+        "What was the revenue in Q1 and Q2 2024?",
+        // A number word of the other language beside a number.
+        "Ørsted revenue over two 2024",
+        // Brackets.
+        "What was the revenue in H1 (2024)?",
+        // Abbreviations and ordinal months.
+        "Hvad var omsætningen i 2. kvt. 2024?",
+        "What was the revenue in the 2nd qtr 2025?",
+        "What was the revenue in the 3rd month of 2024?",
+        "Hvilke kunder skylder over 2 bln?",
+        // A bare scale word with a number word before it.
+        "Which customers owe more than 3 dozen?",
+        // A unit on one end of a range.
+        "Which customers owe between 10 and 20 percent?",
+        "Which customers owe 100 to 200 kr?",
+    ] {
+        match run(&f, q, &none()) {
+            Step::Refuse(Refusal::BadLiteral { .. }) => {}
+            Step::Ready(d) | Step::Ask(d) => panic!("{q} -> {:?}", d.params),
+            other => panic!("{q} -> {other:?}"),
+        }
+    }
+}
+
+/// Review fixes: what binds instead of splitting.
+#[test]
+fn review_binding_cases() {
+    let f = fx();
+    // A decomposed å in `halvår` hides the period word: refused.
+    assert_eq!(
+        bad_literal_why(run(
+            &f,
+            "Hvad var omsætningen i første halva\u{30a}r 2024?",
+            &none(),
+        )),
+        DECOMPOSED
+    );
+    // A bare scale word after a fraction is no number: nothing is split.
+    for q in [
+        "Hvilke kunder skylder mere end en halv million?",
+        "Hvilke kunder skylder mere end halvanden million?",
+    ] {
+        assert!(ready(run(&f, q, &none())).params.is_empty(), "{q}");
+    }
+    // A number word the detected language does not read is no parameter
+    // (`two` beside a bare `million`): nothing is split.
+    let d = ready(run(&f, "Ørsted revenue over two million", &none()));
+    assert!(d.params.is_empty());
+    // `2 mill. kr.` and `2 mln` are one amount.
+    let d = ready(run(&f, "Which customers owe over 2 mln?", &none()));
+    assert_eq!(d.params[0].bound, Some(Bound::Amount(dec("2000000"))));
+    let d = ready(run(&f, "Hvilke kunder skylder over 2 mill. kr.?", &none()));
+    assert_eq!(d.text, "Hvilke kunder skylder over :p1?");
+    assert_eq!(d.params[0].bound, Some(Bound::Amount(dec("2000000"))));
+    // A bare scale word is not a number: no parameter.
+    let d = ready(run(
+        &f,
+        "Hvilke kunder skylder flere millioner kr.?",
+        &none(),
+    ));
+    assert!(d.params.is_empty());
+    // A cardinal is not an ordinal: `one quarter of 2025` is not Q1.
+    match run(&f, "What was one quarter of 2025 revenue?", &none()) {
+        Step::Refuse(Refusal::BadLiteral { why, .. }) => assert_eq!(why, UNBOUND_WORD),
+        other => panic!("{other:?}"),
+    }
+    // A plain count of months still binds.
+    let d = ready(run(
+        &f,
+        "What was the revenue in the last 3 months?",
+        &none(),
+    ));
+    assert_eq!(d.text, "What was the revenue in the last :p1 months?");
 }

@@ -1145,3 +1145,25 @@ fn finish_retries_on_an_indexed_stage() {
         ]
     );
 }
+
+/// A retry with fewer joins drops the index the earlier attempt made, and
+/// a retry on the same schema leaves the indexed file as it was.
+#[test]
+fn finish_retry_drops_stale_indexes() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 9);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    schema.entities[0].word = "customer".into();
+    let fail = |_: &Manifest| -> Result<(), String> { Err("no".into()) };
+    for _ in 0..2 {
+        assert!(finish(&dir, &schema, 10, &key(), &mut { fail }, &mut |_| {}).is_err());
+    }
+    schema.entities[0].word = "record".into();
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    assert_eq!(load_manifest(&dir).unwrap(), m);
+    assert_eq!(
+        snapshot_indexes(&dir),
+        vec![("customers".to_string(), "id".to_string())]
+    );
+}

@@ -245,6 +245,8 @@ pub const MIN_K: u32 = 2;
 /// Stage-only sidecar: the snapshot hash and the source names, from
 /// `stage_snapshot` to `finish`. Removed before the swap.
 const STAGE_INFO_FILE: &str = "stage.json";
+/// The next stage info, renamed over [`STAGE_INFO_FILE`].
+const STAGE_INFO_NEXT: &str = "stage.json.next";
 const MAX_JSON_BYTES: u64 = 64 << 20;
 const PUBLIC_REFUSED: &str = "a public column holds names, IDs or amounts";
 const RESERVED: &str = "names starting with _p_ are reserved; rename it";
@@ -946,7 +948,8 @@ fn clear_derived(stage: &Path) -> Result<(), ShieldError> {
     for e in rd {
         let e = e.map_err(|_| io("could not read the staged build"))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        let derived = HASHED.contains(&name.as_str()) || name == MANIFEST_FILE;
+        let derived =
+            HASHED.contains(&name.as_str()) || name == MANIFEST_FILE || name == STAGE_INFO_NEXT;
         let part = name.ends_with(".part") && name != format!("{SNAPSHOT_FILE}.part");
         if derived
             || part
@@ -1014,20 +1017,41 @@ fn unseal(path: &Path, why: &'static str) -> Result<(), ShieldError> {
 fn index_snapshot(snap: &Path, schema: &Schema) -> Result<(), ShieldError> {
     const WHY: &str = "could not index the snapshot";
     unseal(snap, WHY)?;
-    {
-        let conn = open_part_db(snap, WHY)?;
-        for (t, c) in snapshot_index_columns(schema) {
-            conn.execute_batch(&format!(
-                "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
-                quote_ident(&index_name(&t, &c)),
-                quote_ident(&t),
-                quote_ident(&c)
-            ))
-            .map_err(|_| ShieldError::Sqlite(WHY.into()))?;
-        }
-        conn.close().map_err(|_| ShieldError::Sqlite(WHY.into()))?;
+    let built = create_indexes(snap, schema, WHY);
+    // Sealed again on every path: a failure leaves a 0400 file whose hash
+    // the next `finish` refuses as a changed snapshot (stage again).
+    let sealed = open_nofollow(snap, true, WHY).and_then(|f| seal_file(&f));
+    built.and(sealed)
+}
+
+/// Drops the `saiife_ix:` indexes an earlier attempt made that this schema
+/// does not want, then creates the wanted ones.
+fn create_indexes(snap: &Path, schema: &Schema, why: &'static str) -> Result<(), ShieldError> {
+    let err = |_| ShieldError::Sqlite(why.into());
+    let conn = open_part_db(snap, why)?;
+    let want: Vec<(String, String)> = snapshot_index_columns(schema);
+    let names: BTreeSet<String> = want.iter().map(|(t, c)| index_name(t, c)).collect();
+    let have: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'saiife\\_ix:%' ESCAPE '\\'")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(err)?;
+    for n in have.iter().filter(|n| !names.contains(*n)) {
+        conn.execute_batch(&format!("DROP INDEX {}", quote_ident(n)))
+            .map_err(err)?;
     }
-    seal_file(&open_nofollow(snap, true, WHY)?)
+    for (t, c) in &want {
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            quote_ident(&index_name(t, c)),
+            quote_ident(t),
+            quote_ident(c)
+        ))
+        .map_err(err)?;
+    }
+    conn.close().map_err(|_| ShieldError::Sqlite(why.into()))
 }
 
 /// Stage 2: see the brief; `finish` and the crash seam share it.
@@ -1132,14 +1156,15 @@ fn finish_inner(
             source_names: si.source_names.clone(),
             indexed_sha256: Some(snapshot_sha256.clone()),
         };
-        remove_entry(&stage.join(STAGE_INFO_FILE))
-            .map_err(|_| io("could not write the staged build"))?;
-        write_json_part(
-            &stage,
-            STAGE_INFO_FILE,
-            &next,
-            "could not write the staged build",
-        )?;
+        // Replaced by a rename (atomic on unix): a crash leaves the old or
+        // the new stage info, never none.
+        const WHY: &str = "could not write the staged build";
+        let _ = remove_entry(&stage.join(STAGE_INFO_NEXT));
+        let tmp = write_json_part(&stage, STAGE_INFO_NEXT, &next, WHY)?;
+        #[cfg(not(unix))]
+        unseal(&stage.join(STAGE_INFO_FILE), WHY)?;
+        std::fs::rename(&tmp, stage.join(STAGE_INFO_FILE)).map_err(|_| io(WHY))?;
+        sync_dir(&stage);
     }
 
     progress(BuildProgress {

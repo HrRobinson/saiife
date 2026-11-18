@@ -712,13 +712,13 @@ fn scale_word_after(text: &str, end: usize, lang: Lang) -> Option<(usize, u8)> {
     let pow = match w.as_str() {
         "hundred" | "hundrede" => 2,
         "thousand" | "tusind" | "tusinde" => 3,
-        "million" | "millioner" | "mio" => 6,
+        "million" | "millioner" | "mio" | "mill" | "mln" => 6,
         "milliard" | "milliarder" | "mia" => 9,
         "billion" if lang == Lang::En => 9,
         _ => return None,
     };
     let mut e = we;
-    if matches!(w.as_str(), "mio" | "mia") && text.as_bytes().get(e) == Some(&b'.') {
+    if matches!(w.as_str(), "mio" | "mia" | "mill") && text.as_bytes().get(e) == Some(&b'.') {
         e += 1;
     }
     Some((e, pow))
@@ -1067,7 +1067,11 @@ fn date_at(text: &str, i: usize, lang: Lang) -> Result<Option<(usize, Literal)>,
         if w == "of" {
             p = skip_ws(text, we);
         } else if let Some(unit) = Period::word(&w) {
-            // `third quarter 2026`, `første halvår af 2024`.
+            // `third quarter 2026`, `første halvår af 2024`: an ordinal
+            // only (`one quarter of 2025` is a fraction, not Q1).
+            if !ordinal_form(text, i, de, lang) {
+                return Ok(None);
+            }
             let p2 = skip_ws(text, we);
             if p2 > we {
                 if let Some((end, y)) = year_at(text, skip_of(text, p2)) {
@@ -1145,6 +1149,21 @@ fn period_code(text: &str, i: usize) -> Option<(Period, u32)> {
         return None;
     }
     Some((unit, u32::from(d - b'0')))
+}
+
+/// True when `text[i..de]` (an [`ordinal_token`]) is written as an ordinal:
+/// digits with a `.` or `st`/`nd`/`rd`/`th`, or an ordinal number word.
+fn ordinal_form(text: &str, i: usize, de: usize, lang: Lang) -> bool {
+    let b = text.as_bytes();
+    if b.get(i).is_some_and(u8::is_ascii_digit) {
+        return de > i + digits_at(b, i);
+    }
+    text.get(i..de)
+        .and_then(|t| {
+            t.split(|c: char| !c.is_alphabetic())
+                .rfind(|w| !w.is_empty())
+        })
+        .is_some_and(|w| matches!(number_words(lang).lex(&w.to_lowercase()), Some(Tok::Ord(_))))
 }
 
 /// Past an `of`/`af` and the spaces after it, when one is at `p`.
@@ -1328,7 +1347,18 @@ fn digit_literal(
 /// Number words as a literal, with an optional currency after
 /// (`fem hundrede kroner`).
 fn word_literal(text: &str, i: usize, lang: Lang) -> Option<(usize, Literal)> {
-    let (end, value) = number_words(lang).parse_at(text, i)?;
+    let nw = number_words(lang);
+    // A bare scale word (`millioner`, `thousand`, `dozen`) is no number by
+    // itself (`flere millioner`, `a few thousand`): it stays text, and the
+    // parameterizer refuses it beside a number. `a million` still reads.
+    let (ws, we) = word_at(text, i)?;
+    if matches!(
+        nw.lex(&text[ws..we].to_lowercase()),
+        Some(Tok::Hundred | Tok::Scale(_) | Tok::Dozen)
+    ) {
+        return None;
+    }
+    let (end, value) = nw.parse_at(text, i)?;
     if let Some(e) = percent_suffix(text, end) {
         return Some((e, Literal::Percent(value)));
     }
