@@ -10,51 +10,50 @@ use saiife_policy::blind::BlindDataset;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Who a peer is to a dataset (R47-3). Ordered: each role may do what the
-/// ones below it may.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Role {
-    /// Nothing.
-    None,
-    /// In the dataset's `users`: may ask.
-    User,
-    /// In the dataset's `approvers` (`[approval] approvers` when that is
-    /// empty): may ask, approve and manage the dataset.
-    Approver,
+/// Who a peer is to a dataset (R47-3, ruling P47-13). Each flag is
+/// computed on its own: an admin may also be listed, and only the lists
+/// give `ask`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Roles {
     /// Root or an `[admin]` group member (locked); the daemon's own user
-    /// (personal, where it is the approver too).
-    Admin,
+    /// (personal).
+    pub admin: bool,
+    /// In the dataset's `approvers` (`[approval] approvers` when that is
+    /// empty or there is no dataset yet); the own user (personal).
+    pub approver: bool,
+    /// In the dataset's `users`; the own user (personal).
+    pub user: bool,
 }
 
-impl Role {
-    /// `ask` (users and approvers).
+impl Roles {
+    /// `ask`: users and approvers only. Root and `[admin]` members ask only
+    /// when listed.
     pub fn may_ask(self) -> bool {
-        self >= Role::User
+        self.user || self.approver
     }
 
     /// `data stage` of a new name, `data commit`, `data refresh`, `data rm`,
-    /// `ner fetch`, and approving.
+    /// `ner fetch`: admins and approvers.
     pub fn may_manage(self) -> bool {
-        self >= Role::Approver
+        self.admin || self.approver
     }
 }
 
-/// The peer's role for `ds` (`None`: a dataset not yet in policy, so only
-/// admins and `[approval] approvers` count). The personal broker's own user
-/// is [`Role::Admin`], as `approval_ops::is_approver` makes it the approver.
+/// The peer's roles for `ds` (`None`: a dataset not yet in policy, so only
+/// admin and `[approval] approvers` count). The personal broker's own user
+/// is all three, as `approval_ops::is_approver` makes it the approver.
 // Task 2 (`data stage`, `commit`, `refresh`, `rm`) is the first caller.
 #[allow(dead_code)]
-pub(crate) async fn role(ctx: &Ctx, peer: &PeerCred, ds: Option<&BlindDataset>) -> Role {
+pub(crate) async fn role(ctx: &Ctx, peer: &PeerCred, ds: Option<&BlindDataset>) -> Roles {
     if ctx.mode == Mode::Personal {
-        return if ctx.peer_is_own(peer) {
-            Role::Admin
-        } else {
-            Role::None
+        let own = ctx.peer_is_own(peer);
+        return Roles {
+            admin: own,
+            approver: own,
+            user: own,
         };
     }
-    if ctx.peer_is_admin(peer).await {
-        return Role::Admin;
-    }
+    let admin = ctx.peer_is_admin(peer).await;
     let own = ds.map(|d| d.approvers.as_slice()).unwrap_or_default();
     let approvers = if own.is_empty() {
         match ctx.policy().system {
@@ -64,12 +63,15 @@ pub(crate) async fn role(ctx: &Ctx, peer: &PeerCred, ds: Option<&BlindDataset>) 
     } else {
         own.to_vec()
     };
-    if crate::approval_ops::peer_listed(ctx, peer, &approvers).await {
-        return Role::Approver;
-    }
-    match ds {
-        Some(d) if crate::approval_ops::peer_listed(ctx, peer, &d.users).await => Role::User,
-        _ => Role::None,
+    let approver = crate::approval_ops::peer_listed(ctx, peer, &approvers).await;
+    let user = match ds {
+        Some(d) => crate::approval_ops::peer_listed(ctx, peer, &d.users).await,
+        None => false,
+    };
+    Roles {
+        admin,
+        approver,
+        user,
     }
 }
 
@@ -120,10 +122,13 @@ bob:x:1002:1002::/home/bob:/bin/sh
 cat:x:1003:1003::/home/cat:/bin/sh
 dan:x:1004:1004::/home/dan:/bin/sh
 eve:x:1005:1005::/home/eve:/bin/sh
+fay:x:1006:1006::/home/fay:/bin/sh
+gil:x:1007:1007::/home/gil:/bin/sh
 ";
     const GROUP: &str = "\
 ops:x:2000:dan
-sec:x:2001:eve
+sec:x:2001:eve,fay
+qa:x:2002:gil
 ";
 
     fn peer(uid: u32) -> PeerCred {
@@ -177,7 +182,7 @@ sec:x:2001:eve
         )
     }
 
-    async fn roles_of(c: &Ctx, uids: &[u32]) -> Vec<Role> {
+    async fn roles_of(c: &Ctx, uids: &[u32]) -> Vec<Roles> {
         let p = c.policy();
         let ds = p
             .system
@@ -190,26 +195,58 @@ sec:x:2001:eve
         out
     }
 
+    /// (admin, approver, user).
+    fn r(admin: bool, approver: bool, user: bool) -> Roles {
+        Roles {
+            admin,
+            approver,
+            user,
+        }
+    }
+
     #[tokio::test]
     async fn roles() {
         let t = tempfile::tempdir().unwrap();
-        let all = [0, 1001, 1002, 1003, 1004, 1005];
+        let all = [0, 1001, 1002, 1003, 1004, 1005, 1006, 1007];
         // Locked, the dataset's own approvers.
         let c = ctx(
             t.path(),
             Mode::Locked,
             999,
-            &format!("{BASE}{}", dataset("\"ann\", \"group:ops\"", "\"bob\"")),
+            &format!(
+                "{BASE}{}",
+                dataset(
+                    "\"ann\", \"group:ops\", \"fay\", \"bob\"",
+                    "\"bob\", \"group:qa\""
+                )
+            ),
         );
+        let got = roles_of(&c, &all).await;
         assert_eq!(
-            roles_of(&c, &all).await,
+            got,
             [
-                Role::Admin,    // root
-                Role::User,     // ann, in users
-                Role::Approver, // bob, the dataset's approver
-                Role::None,     // cat: [approval] only counts when the dataset names none
-                Role::User,     // dan, through group:ops
-                Role::Admin,    // eve, an [admin] group
+                r(true, false, false),  // root, unlisted
+                r(false, false, true),  // ann, in users
+                r(false, true, true),   // bob, in users and the dataset's approver
+                r(false, false, false), // cat: [approval] counts only when the dataset names none
+                r(false, false, true),  // dan, through group:ops
+                r(true, false, false),  // eve, an [admin] group, unlisted
+                r(true, false, true),   // fay, an [admin] group and in users
+                r(false, true, false),  // gil, through group:qa in approvers
+            ]
+        );
+        let may: Vec<(bool, bool)> = got.iter().map(|x| (x.may_manage(), x.may_ask())).collect();
+        assert_eq!(
+            may,
+            [
+                (true, false), // unlisted root manages, does not ask (R47-3, P47-13)
+                (false, true),
+                (true, true),
+                (false, false),
+                (false, true),
+                (true, false), // unlisted admin group member: the same
+                (true, true),  // a listed admin does both
+                (true, true),  // an approver asks too
             ]
         );
         // Empty `approvers`: `[approval] approvers`.
@@ -222,13 +259,17 @@ sec:x:2001:eve
         );
         assert_eq!(
             roles_of(&c, &[1001, 1002, 1003]).await,
-            [Role::User, Role::None, Role::Approver]
+            [
+                r(false, false, true),
+                r(false, false, false),
+                r(false, true, false)
+            ]
         );
         // No dataset in policy: admins and `[approval] approvers`.
-        assert_eq!(role(&c, &peer(1003), None).await, Role::Approver);
-        assert_eq!(role(&c, &peer(1001), None).await, Role::None);
-        assert_eq!(role(&c, &peer(0), None).await, Role::Admin);
-        // Personal: the own user is admin and approver; nobody else is anything.
+        assert_eq!(role(&c, &peer(1003), None).await, r(false, true, false));
+        assert_eq!(role(&c, &peer(1001), None).await, Roles::default());
+        assert_eq!(role(&c, &peer(0), None).await, r(true, false, false));
+        // Personal: the own user is all of them; nobody else is anything.
         let t3 = tempfile::tempdir().unwrap();
         let c = ctx(
             t3.path(),
@@ -238,11 +279,10 @@ sec:x:2001:eve
         );
         assert_eq!(
             roles_of(&c, &[1001, 1002, 0]).await,
-            [Role::Admin, Role::None, Role::None]
+            [r(true, true, true), Roles::default(), Roles::default()]
         );
         let own = role(&c, &peer(1001), None).await;
         assert!(own.may_manage() && own.may_ask());
-        assert!(Role::User.may_ask() && !Role::User.may_manage());
-        assert!(!Role::None.may_ask());
+        assert!(!Roles::default().may_ask() && !Roles::default().may_manage());
     }
 }
