@@ -42,7 +42,25 @@ pub const MAX_LIMIT: u64 = 5000;
 /// so the envelope and JSON escaping never push it over.
 pub const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 /// The kinds a caller sees of its own records.
-pub const USER_KINDS: [&str; 3] = ["guard", "connector", "approval"];
+pub const USER_KINDS: &[&str] = &[
+    "guard",
+    "connector",
+    "approval",
+    "blind_ask",
+    "blind_resolve",
+    "blind_preview",
+    "blind_send",
+    "blind_receive",
+    "blind_run",
+    "blind_check_refused",
+    "blind_approve",
+    "blind_reveal",
+    "blind_keys",
+    "blind_refresh",
+    "blind_loosen",
+    "blind_name",
+    "blind_log_scrubbed",
+];
 /// Longest filter string.
 const MAX_FILTER: usize = 4096;
 

@@ -4,8 +4,10 @@
 //! logic. Linux only: elsewhere `blind_stub.rs` answers every op with
 //! [`UNAVAILABLE_OS`].
 
+pub mod audit;
 pub mod keys;
 pub mod ops;
+pub mod outbox;
 
 use saiife_ipc::msg::ErrorCode;
 use saiife_shield::dataset::{DatasetDir, Manifest, Phase};
@@ -177,6 +179,11 @@ impl Blind {
             sessions: Mutex::new(saiife_shield::session::Sessions::new()),
             keys_lock: Mutex::new(()),
         }
+    }
+
+    /// The outbox under `<root>/outbox`.
+    pub fn outbox(&self) -> outbox::Outbox {
+        outbox::Outbox::new(self.root.join("outbox"))
     }
 
     /// `<root>/datasets/<name>`.

@@ -1482,6 +1482,50 @@ impl Firewall<'_> {
     }
 }
 
+/// Does free text `s` hold a value or phrase of `index`? The scan 2 of the
+/// firewall without allow-list marks or exemptions: every token window of up
+/// to `WINDOW` tokens (all-digit windows are skipped, as for a reply), every
+/// sentence and the whole text. For the daemon's log scrub (plan 47 R47-10).
+/// A lookup error is an error: the caller must not treat the text as clean.
+pub fn text_has_known(index: &KnownIndex, s: &str) -> Result<bool, ShieldError> {
+    let toks = token_spans(s);
+    let n = toks.len();
+    let numeric: Vec<bool> = toks
+        .iter()
+        .map(|(x, _, _)| x.chars().all(|c| c.is_numeric()))
+        .collect();
+    for i in 0..n {
+        for w in 1..=WINDOW {
+            let j = i + w - 1;
+            if j >= n {
+                break;
+            }
+            if (i..=j).all(|k| numeric[k]) {
+                continue;
+            }
+            let slice = s
+                .get(toks[i].1..toks[j].2)
+                .ok_or(ShieldError::Corrupt("a token span is not valid"))?;
+            if index.contains_value(slice)? {
+                return Ok(true);
+            }
+        }
+    }
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if PHRASE_SPLIT.contains(&c) {
+            if !s[start..i].trim().is_empty() && index.contains_phrase(&s[start..i])? {
+                return Ok(true);
+            }
+            start = i + c.len_utf8();
+        }
+    }
+    if !s[start..].trim().is_empty() && index.contains_phrase(&s[start..])? {
+        return Ok(true);
+    }
+    Ok(!s.trim().is_empty() && index.contains_phrase(s)?)
+}
+
 /// The index-free scans (patterns) over an envelope, as the summary counts
 /// them: part 1's checks are not counted.
 pub(crate) fn standalone_hits(e: &Envelope) -> Vec<Hit> {
