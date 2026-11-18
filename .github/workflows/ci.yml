@@ -200,12 +200,12 @@ jobs:
             echo "::warning::managed hook bench round $round of 3 over the 50 ms p95 budget"
           done
           exit 1
-      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin, saiife-win, saiife-wire, saiife-boxes, saiife-boxhost, saiife-boxproto, saiife-guest, saiife-fido and saiife-shield must not
+      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin, saiife-win, saiife-wire, saiife-boxes, saiife-boxhost, saiife-boxproto, saiife-guest, saiife-fido, saiife-shield and saiife-shield-ner must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
         if: ${{ success() || (!cancelled() && matrix.os == 'windows-latest') }}
         shell: bash
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win -p saiife-dev -p saiife-touch -p saiife-wire -p saiife-boxes -p saiife-boxhost -p saiife-boxproto -p saiife-guest -p saiife-fido -p saiife-shield | grep -c tokio)" = 0
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win -p saiife-dev -p saiife-touch -p saiife-wire -p saiife-boxes -p saiife-boxhost -p saiife-boxproto -p saiife-guest -p saiife-fido -p saiife-shield -p saiife-shield-ner | grep -c tokio)" = 0
       # tract (the name detector's inference engine) is only in crates/shield-ner and the saiife-ner
       # binary (plan 46): the saiife binary never links it.
       - name: no tract in saiife
