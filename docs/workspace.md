@@ -288,18 +288,21 @@ your machine over the hub, so it works away from your desk.
   somewhere else.
 - The Workspace over the internet needs Pro. The 14-day trial has no card.
   When it ends, the page says so. The Workspace on localhost stays free.
-- Touches from this page need its origin in the machine's config. `saiife
-  workspace pair` prints the line when it is missing:
+- Touches from this page need its origin in the machine's config. When it
+  is missing, `saiife workspace pair` says so before the QR code and prints
+  the line to add to your `[workspace]` table:
 
-```toml
-[workspace]
-origins = ["http://localhost:47810", "https://workspace.saiife.com"]
-```
+  ```toml
+  origins = ["http://localhost:47810", "https://workspace.saiife.com"]
+  ```
 
-  The built-in default stays `http://localhost:47810`; nothing is added
-  without you. The WebAuthn RP id is then `workspace.saiife.com`, so touch
-  passkeys made there work only on that host. If the Workspace moves to
-  another host, pair the touch passkeys again.
+  Add it, reload the daemon, then run `saiife workspace pair` again. A
+  pairing made without it has no touches: the touch passkey is checked
+  against the origins when the pairing finishes. The built-in default stays
+  `http://localhost:47810`; nothing is added without you. The WebAuthn RP id
+  is then `workspace.saiife.com`, so touch passkeys made there work only on
+  that host. If the Workspace moves to another host, pair the touch passkeys
+  again.
 
 Honest limits of the hosted page:
 
