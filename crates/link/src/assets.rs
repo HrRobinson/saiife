@@ -56,6 +56,7 @@ pub static ASSETS: &[Asset] = &[
     asset!("js/keystore.js"),
     asset!("js/wire.js"),
     asset!("js/seal.js"),
+    asset!("js/hubsession.js"),
     asset!("js/pairing.js"),
     asset!("js/views/pair.js"),
     asset!("js/overviewlogic.js"),
