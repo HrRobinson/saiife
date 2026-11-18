@@ -203,7 +203,31 @@ pub(crate) fn calculator(s: Strength) -> Value {
     Value::Object(m)
 }
 
-fn ner_json(s: NerState) -> Value {
+/// The `ner` part of `status`: the detector's state, or while a fetch runs
+/// (or after one failed) the fetch's: `fetching` with `file`, `bytes_done`
+/// and `bytes_total` (when the upstream announced it), or `failed` with
+/// the `reason`.
+fn ner_json(ner: &super::ner::NerClient) -> Value {
+    use super::ner::FetchPhase;
+    match ner.fetch_phase() {
+        FetchPhase::Fetching(_) => {
+            let mut m = serde_json::Map::new();
+            m.insert("state".into(), "fetching".into());
+            if let Some(p) = ner.fetch_progress() {
+                m.insert("file".into(), p.file.into());
+                m.insert("bytes_done".into(), p.bytes_done.into());
+                if let Some(t) = p.bytes_total {
+                    m.insert("bytes_total".into(), t.into());
+                }
+            }
+            Value::Object(m)
+        }
+        FetchPhase::Failed(why) => json!({"state": "failed", "reason": why}),
+        FetchPhase::Idle => ner_state_json(ner.state()),
+    }
+}
+
+fn ner_state_json(s: NerState) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("state".into(), s.word().into());
     match s {
@@ -372,7 +396,7 @@ async fn status(ctx: &Arc<Ctx>, peer: &PeerCred) -> Result<Value, Refusal> {
     Ok(json!({
         "datasets": datasets,
         "calculator": calculator(super::calc::strength()),
-        "ner": ner_json(ctx.blind.ner.state()),
+        "ner": ner_json(&ctx.blind.ner),
         "cloud": {"secret_present": secret_present, "model": model},
         "sessions": {"yours": yours},
     }))

@@ -28,9 +28,9 @@
 use super::ops::role;
 use super::{lock, private_dir, Refusal};
 use crate::ops::{Ctx, Mode};
-use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 use saiife_broker::request::Built;
+use saiife_broker::upstream::BodyProgress;
 use saiife_fido::client::{check_helper, HelperError};
 use saiife_ipc::msg::ErrorCode;
 use saiife_ipc::peer::PeerCred;
@@ -43,6 +43,7 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -241,8 +242,9 @@ pub async fn fetch(ctx: &Ctx, cfg: &NerCfg) -> Result<NerFiles, String> {
             headers: HeaderMap::new(),
             body: None,
         };
+        ctx.blind.ner.fetching(which);
         let r = up
-            .send(b, read_limit)
+            .send_with_progress(b, read_limit, Some(ctx.blind.ner.body.as_ref()))
             .await
             .map_err(|e| format!("cannot fetch the name-detector {which}: {e}"))?;
         if r.status != 200 {
@@ -256,18 +258,22 @@ pub async fn fetch(ctx: &Ctx, cfg: &NerCfg) -> Result<NerFiles, String> {
                 "the name-detector {which} is larger than [blind.ner] max_bytes ({max} bytes)"
             ));
         }
-        let got = sha256_hex(&r.body);
-        if got != pin {
-            return Err(format!(
-                "the name-detector {which} does not match its pinned sha256 (got {got}): \
-                 nothing was stored"
-            ));
-        }
-        let body: Bytes = r.body;
-        tokio::task::spawn_blocking(move || write_readonly(&path, &body))
-            .await
-            .map_err(|e| format!("cannot store the name-detector {which}: {e}"))?
-            .map_err(|e| format!("cannot store the name-detector {which}: {e}"))?;
+        // The hash of up to 1 GiB and the write run off the async workers.
+        let (body, want) = (r.body, pin.to_string());
+        let stored = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let got = sha256_hex(&body);
+            if got != want {
+                return Err(format!(
+                    "the name-detector {which} does not match its pinned sha256 (got {got}): \
+                     nothing was stored"
+                ));
+            }
+            write_readonly(&path, &body)
+                .map_err(|e| format!("cannot store the name-detector {which}: {e}"))
+        })
+        .await
+        .map_err(|e| format!("cannot store the name-detector {which}: {e}"))?;
+        stored?;
     }
     Ok(files_for(&root, cfg))
 }
@@ -371,6 +377,31 @@ pub struct NerClient {
     inner: Mutex<Inner>,
     /// Kept apart, so `state` never waits for a request.
     state: Mutex<NerState>,
+    /// The model fetch (`blind.ner.fetch`, plan 48 C3).
+    fetch: Mutex<FetchPhase>,
+    /// How far the file being fetched is read.
+    body: Arc<BodyProgress>,
+}
+
+/// Where the background model fetch is (`blind status`). The texts hold
+/// no values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchPhase {
+    /// None running; the last one (if any) ended well.
+    Idle,
+    /// Fetching this file: `model`, `vocab` or `labels`.
+    Fetching(&'static str),
+    /// The last fetch ended on this reason.
+    Failed(String),
+}
+
+/// What `status` shows of a running fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchProgress {
+    pub file: &'static str,
+    pub bytes_done: u64,
+    /// The announced size, when the upstream gave one.
+    pub bytes_total: Option<u64>,
 }
 
 impl Default for NerClient {
@@ -384,7 +415,57 @@ impl NerClient {
         NerClient {
             inner: Mutex::new(Inner::default()),
             state: Mutex::new(NerState::NotConfigured),
+            fetch: Mutex::new(FetchPhase::Idle),
+            body: Arc::new(BodyProgress::default()),
         }
+    }
+
+    /// The fetch's phase.
+    pub fn fetch_phase(&self) -> FetchPhase {
+        lock(&self.fetch).clone()
+    }
+
+    /// The running fetch's file and bytes; None when none runs.
+    pub fn fetch_progress(&self) -> Option<FetchProgress> {
+        let FetchPhase::Fetching(file) = self.fetch_phase() else {
+            return None;
+        };
+        let total = self.body.total.load(Ordering::Relaxed);
+        Some(FetchProgress {
+            file,
+            bytes_done: self.body.done.load(Ordering::Relaxed),
+            bytes_total: (total > 0).then_some(total),
+        })
+    }
+
+    /// Starts a fetch (false: one runs already).
+    fn begin_fetch(&self) -> bool {
+        let mut g = lock(&self.fetch);
+        if matches!(*g, FetchPhase::Fetching(_)) {
+            return false;
+        }
+        *g = FetchPhase::Fetching("model");
+        self.body.done.store(0, Ordering::Relaxed);
+        self.body.total.store(0, Ordering::Relaxed);
+        true
+    }
+
+    /// Moves a running fetch on to `which` (a bare [`fetch`] call outside
+    /// the op shows nothing).
+    fn fetching(&self, which: &'static str) {
+        let mut g = lock(&self.fetch);
+        if matches!(*g, FetchPhase::Fetching(_)) {
+            *g = FetchPhase::Fetching(which);
+            self.body.done.store(0, Ordering::Relaxed);
+            self.body.total.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn end_fetch(&self, r: Result<(), String>) {
+        *lock(&self.fetch) = match r {
+            Ok(()) => FetchPhase::Idle,
+            Err(e) => FetchPhase::Failed(e),
+        };
     }
 
     pub fn state(&self) -> NerState {
@@ -904,8 +985,11 @@ async fn may_fetch(ctx: &Ctx, peer: &PeerCred) -> bool {
     false
 }
 
-/// `blind.ner.fetch {}`: fetches the pinned files, then starts the
-/// detector. Answers the three hashes and the detector's state.
+/// `blind.ner.fetch {}`: starts fetching the pinned files in the
+/// background and answers `{started: true}` at once (R-C6); `busy` while
+/// one runs. `blind status` (`ner`) shows the file and the bytes, then
+/// `ready` or `failed` with the reason. When the files are there the
+/// detector is started.
 pub async fn fetch_op(ctx: &Arc<Ctx>, peer: &PeerCred) -> Result<Value, Refusal> {
     if !may_fetch(ctx, peer).await {
         return Err(Refusal::new(
@@ -919,21 +1003,21 @@ pub async fn fetch_op(ctx: &Arc<Ctx>, peer: &PeerCred) -> Result<Value, Refusal>
             "no [blind.ner] in policy: name the model files and their sha256 there, then reload",
         ));
     };
-    fetch(ctx, &cfg)
-        .await
-        .map_err(|e| Refusal::new(ErrorCode::Unavailable, e))?;
-    apply(Arc::clone(ctx)).await;
-    let state = ctx.blind.ner.state();
-    let mut v = json!({
-        "model": cfg.model_sha256,
-        "vocab": cfg.vocab_sha256,
-        "labels": cfg.labels_sha256,
-        "detector": state.word(),
-    });
-    if let NerState::Missing(why) | NerState::Failed(why) = &state {
-        v["reason"] = Value::from(why.as_str());
+    if !ctx.blind.ner.begin_fetch() {
+        return Err(Refusal::new(
+            ErrorCode::Busy,
+            "the name-detector model is being fetched already: saiife blind status shows how far",
+        ));
     }
-    Ok(v)
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        let r = fetch(&ctx, &cfg).await.map(|_| ());
+        if r.is_ok() {
+            apply(Arc::clone(&ctx)).await;
+        }
+        ctx.blind.ner.end_fetch(r);
+    });
+    Ok(json!({"started": true}))
 }
 
 #[cfg(test)]

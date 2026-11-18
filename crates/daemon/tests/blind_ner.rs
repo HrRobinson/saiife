@@ -33,7 +33,7 @@ use saiife_policy::blind::NerCfg;
 use saiife_policy::{Directory, FixedDirectory, Fsync};
 use saiife_shield::ner::{DetectError, NameDetector, SpanLabel};
 use saiife_shield::ner_proto::MAX_TEXT;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -107,10 +107,12 @@ fn pki() -> Pki {
 }
 
 /// The files the upstream serves, by path, and how often each was asked.
-#[derive(Default)]
 struct Files {
     by_path: BTreeMap<String, Vec<u8>>,
     asked: Mutex<Vec<String>>,
+    /// Each answer takes one permit (plenty by default; a test starts it
+    /// at none to hold the downloads).
+    gate: tokio::sync::Semaphore,
 }
 
 impl Files {
@@ -125,6 +127,7 @@ async fn handle(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = req.uri().path().to_string();
     f.asked.lock().unwrap().push(path.clone());
+    f.gate.acquire().await.unwrap().forget();
     Ok(match f.by_path.get(&path) {
         Some(b) => Response::new(Full::new(Bytes::from(b.clone()))),
         None => Response::builder()
@@ -252,6 +255,7 @@ fn served() -> Arc<Files> {
             ("/m/labels.json".to_string(), LABELS.to_vec()),
         ]),
         asked: Mutex::new(Vec::new()),
+        gate: tokio::sync::Semaphore::new(1_000_000),
     })
 }
 
@@ -273,6 +277,30 @@ fn listing(dir: &Path) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------- fetch ----
+
+/// Waits until `status`'s `ner.state` is `word`; the `ner` object.
+async fn wait_ner(c: &Arc<Ctx>, word: &str) -> Value {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let v = status_ner(c).await;
+        if v["state"] == word {
+            return v;
+        }
+        assert!(Instant::now() < end, "ner state stays {v}, not {word}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn status_ner(c: &Arc<Ctx>) -> Value {
+    let conn = Conn::new(peer(OWN), None);
+    let req = IpcRequest {
+        id: 4,
+        op: saiife_ipc::msg::OP_BLIND_STATUS.into(),
+        args: serde_json::Map::new(),
+    };
+    let v = saiife_daemon::blind::ops::handle(c, &conn, req).await;
+    v["ner"].clone()
+}
 
 #[tokio::test]
 async fn fetch_checks_hash() {
@@ -741,9 +769,8 @@ async fn fetch_op() {
     // The own user: fetched, and the build's detector is the client.
     point(&fake_with(t.path(), "PER\tSøren Ærø\n"), None);
     let v = call_as(&c, OWN).await;
-    assert!(v.get("error").is_none(), "{v}");
-    assert_eq!(v["model"], json!(sha(MODEL)));
-    assert_eq!(v["detector"], "ready", "{v}");
+    assert_eq!(v["started"], true, "{v}");
+    wait_ner(&c, "ready").await;
     assert_eq!(files.asked(), 3);
     let d = c.blind.detector().expect("the detector slot is filled");
     let spans = d.detect("Hvad skylder Søren Ærø?").unwrap();
@@ -756,4 +783,120 @@ async fn fetch_op() {
     ner::apply(Arc::clone(&c)).await;
     assert!(c.blind.detector().is_none());
     assert_eq!(c.blind.ner.state(), NerState::NotConfigured);
+}
+
+// ------------------------------------------------- plan 48 C3 carries ----
+
+#[tokio::test]
+async fn fetch_op_returns_before_the_download_and_status_shows_it() {
+    let _g = SEAMS.lock().await;
+    let t = scratch();
+    let p = pki();
+    let files = served();
+    // The upstream holds every answer until the test lets it.
+    let held = Arc::new(Files {
+        by_path: files.by_path.clone(),
+        asked: Mutex::new(Vec::new()),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let port = server(&p, Arc::clone(&held)).await;
+    let c = ctx(t.path(), Some(upstream(t.path(), &p)));
+    set_policy(&c, t.path(), &ner_policy(&good_cfg(port)));
+    point(&fake_with(t.path(), "PER\tSøren Ærø\n"), None);
+
+    let v = call_as(&c, OWN).await;
+    assert_eq!(v["started"], true, "{v}");
+    // Back at once; the download has not finished.
+    let ner = status_ner(&c).await;
+    assert_eq!(ner["state"], "fetching", "{ner}");
+    assert_eq!(ner["file"], "model", "{ner}");
+    assert_eq!(ner["bytes_done"], 0, "{ner}");
+    // A second start while it runs: busy.
+    let v = call_as(&c, OWN).await;
+    assert_eq!(v["error"], "busy", "{v}");
+
+    // Let the model through: the next file is fetched, then ready.
+    held.gate.add_permits(1_000);
+    let ner = wait_ner(&c, "ready").await;
+    assert!(ner.get("file").is_none(), "{ner}");
+    assert_eq!(held.asked(), 3);
+    assert!(matches!(c.blind.ner.state(), NerState::Ready { .. }));
+}
+
+#[tokio::test]
+async fn fetch_op_reports_a_failed_fetch() {
+    let _g = SEAMS.lock().await;
+    let t = scratch();
+    let p = pki();
+    let files = served();
+    let port = server(&p, Arc::clone(&files)).await;
+    let c = ctx(t.path(), Some(upstream(t.path(), &p)));
+    let wrong = sha(b"another model");
+    let bad = cfg(port, &wrong, &sha(VOCAB), &sha(LABELS), None);
+    set_policy(&c, t.path(), &ner_policy(&bad));
+    let v = call_as(&c, OWN).await;
+    assert_eq!(v["started"], true, "{v}");
+    let ner = wait_ner(&c, "failed").await;
+    let why = ner["reason"].as_str().unwrap();
+    assert!(why.contains("does not match its pinned sha256"), "{ner}");
+    // A new start is allowed after a failure.
+    let v = call_as(&c, OWN).await;
+    assert_eq!(v["started"], true, "{v}");
+}
+
+#[tokio::test]
+async fn one_fake_planner_per_daemon() {
+    let _g = SEAMS.lock().await;
+    let t = scratch();
+    let c = ctx(t.path(), None);
+    let file = t.path().join("replies.txt");
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+    std::env::set_var(saiife_daemon::blind::model::PLANNER_SEAM, &file);
+    let a = saiife_daemon::blind::model::planner(&c);
+    let b = saiife_daemon::blind::model::planner(&c);
+    std::env::remove_var(saiife_daemon::blind::model::PLANNER_SEAM);
+    assert!(Arc::ptr_eq(&a, &b), "the same planner twice");
+}
+
+#[tokio::test]
+async fn concurrent_methods_writes_both_survive() {
+    use saiife_daemon::blind::data::with_methods;
+    let t = scratch();
+    let c = ctx(t.path(), None);
+    let ds = "crm".parse::<saiife_shield::schema::DatasetName>().unwrap();
+    let dir = c.blind.dataset_dir(&ds).root;
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let (c, ds) = (Arc::clone(&c), ds.clone());
+        tasks.push(tokio::spawn(async move {
+            with_methods(&c, &ds, move |s| {
+                // A slow load-modify-save: without the lock the others'
+                // entries are lost.
+                std::thread::sleep(Duration::from_millis(5));
+                s.issued.insert(format!("slug{i}"), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let s = saiife_shield::methods::MethodStore::load(&dir.join("methods.json")).unwrap();
+    assert_eq!(s.issued.len(), 16);
+    // A refusal saves nothing.
+    let e = with_methods(&c, &ds, |s| -> Result<(), _> {
+        s.issued.clear();
+        Err(saiife_daemon::blind::Refusal::new(
+            saiife_ipc::msg::ErrorCode::Denied,
+            "no",
+        ))
+    })
+    .await;
+    assert!(e.is_err());
+    let s = saiife_shield::methods::MethodStore::load(&dir.join("methods.json")).unwrap();
+    assert_eq!(s.issued.len(), 16);
 }

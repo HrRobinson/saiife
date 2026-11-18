@@ -46,6 +46,13 @@ pub struct Blind {
     /// Held across a key store change (create, rotate, shred), so a check
     /// of `keys.sealed` still holds when it is written or removed.
     keys_lock: Mutex<()>,
+    /// One lock per dataset for `methods.json` load, change, save
+    /// (ruling P47-27; [`data::with_methods`]).
+    methods_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// Debug builds only: the one scripted planner of this daemon, with
+    /// the seam value it was read from.
+    #[cfg(debug_assertions)]
+    test_planner: Mutex<Option<(std::ffi::OsString, Arc<model::FakePlanner>)>>,
     /// The name detector a build checks public values and names with
     /// (ruling P47-6): [`Blind::ner`] while `[blind.ner]` is configured and
     /// its files are there ([`ner::apply`]), else None.
@@ -224,6 +231,9 @@ impl Blind {
             datasets: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(saiife_shield::session::Sessions::new()),
             keys_lock: Mutex::new(()),
+            methods_locks: Mutex::new(BTreeMap::new()),
+            #[cfg(debug_assertions)]
+            test_planner: Mutex::new(None),
             detector: Mutex::new(None),
             ner: Arc::new(ner::NerClient::new()),
             build_errors: Mutex::new(BTreeMap::new()),
@@ -291,6 +301,15 @@ impl Blind {
                 format!("{name} has not been built: saiife blind data refresh --dataset {name}"),
             )),
         }
+    }
+
+    /// The dataset's `methods.json` lock (see [`data::with_methods`]).
+    pub(crate) fn methods_lock(&self, name: &DatasetName) -> Arc<Mutex<()>> {
+        Arc::clone(
+            lock(&self.methods_locks)
+                .entry(name.as_str().to_string())
+                .or_default(),
+        )
     }
 
     pub(crate) fn keys_lock(&self) -> MutexGuard<'_, ()> {

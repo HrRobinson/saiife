@@ -998,12 +998,16 @@ impl FakePlanner {
         ))
     }
 
-    fn next_answer(&self) -> Answer {
-        let next = self
-            .replies
+    /// The next scripted reply, if any is left.
+    pub fn take_reply(&self) -> Option<String> {
+        self.replies
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .pop_front();
+            .pop_front()
+    }
+
+    fn next_answer(&self) -> Answer {
+        let next = self.take_reply();
         let v = match next {
             Some(text) => serde_json::json!({
                 "type": "message",
@@ -1055,21 +1059,60 @@ impl Planner for FakePlanner {
 
 /// The planner the ask flow uses: the Anthropic one; in debug builds a
 /// [`FakePlanner`] when [`PLANNER_SEAM`] names a file of replies.
-pub fn planner(_ctx: &Ctx) -> Arc<dyn Planner> {
+///
+/// The fake is made once per daemon (kept in [`super::Blind`]): a scripted
+/// reply sequence goes on across asks instead of starting over. A changed
+/// seam value makes a new one.
+pub fn planner(ctx: &Ctx) -> Arc<dyn Planner> {
     #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os(PLANNER_SEAM) {
-        let f = FakePlanner::from_file(std::path::Path::new(&p)).unwrap_or_else(|_| {
-            eprintln!("saiifed: blind: the test planner's replies cannot be read");
-            FakePlanner::new(Vec::new())
-        });
-        return Arc::new(f);
+        return cached_fake(&ctx.blind, p);
     }
+    #[cfg(not(debug_assertions))]
+    let _ = ctx;
     Arc::new(AnthropicPlanner::new())
+}
+
+/// The daemon's one scripted planner for the seam value `p`.
+#[cfg(debug_assertions)]
+fn cached_fake(blind: &super::Blind, p: std::ffi::OsString) -> Arc<FakePlanner> {
+    let mut slot = super::lock(&blind.test_planner);
+    if let Some((seen, f)) = slot.as_ref() {
+        if *seen == p {
+            return Arc::clone(f);
+        }
+    }
+    let f = FakePlanner::from_file(std::path::Path::new(&p)).unwrap_or_else(|_| {
+        eprintln!("saiifed: blind: the test planner's replies cannot be read");
+        FakePlanner::new(Vec::new())
+    });
+    let f = Arc::new(f);
+    *slot = Some((p, Arc::clone(&f)));
+    f
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_fake_planner_per_daemon_continues_its_script() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("replies.txt");
+        std::fs::write(&file, "first\nsecond\n").unwrap();
+        let blind = super::super::Blind::open(&t.path().join("blind"));
+        let reply = |p: &Arc<FakePlanner>| p.take_reply();
+        let a = cached_fake(&blind, file.clone().into_os_string());
+        let b = cached_fake(&blind, file.clone().into_os_string());
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(reply(&a).as_deref(), Some("first"));
+        assert_eq!(reply(&b).as_deref(), Some("second"));
+        assert_eq!(reply(&a), None);
+        // Another daemon starts its own script.
+        let other = super::super::Blind::open(&t.path().join("blind2"));
+        let c = cached_fake(&other, file.into_os_string());
+        assert_eq!(reply(&c).as_deref(), Some("first"));
+    }
 
     #[test]
     fn wire_schema_is_plan_schema_without_the_refused_keywords() {

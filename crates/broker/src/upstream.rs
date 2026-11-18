@@ -20,6 +20,7 @@ use rustls::{ClientConfig, RootCertStore};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -68,6 +69,14 @@ impl std::fmt::Debug for UpstreamResponse {
             .field("truncated", &self.truncated)
             .finish()
     }
+}
+
+/// How far a response body is read: bytes so far and the announced
+/// Content-Length (0: not announced). Written by the reader, read by anyone.
+#[derive(Debug, Default)]
+pub struct BodyProgress {
+    pub done: std::sync::atomic::AtomicU64,
+    pub total: std::sync::atomic::AtomicU64,
 }
 
 pub struct Upstream {
@@ -395,7 +404,18 @@ impl Upstream {
     /// Sends `b`, follows same-origin redirects and reads the body up to
     /// `read_limit` bytes, all within the timeout.
     pub async fn send(&self, b: Built, read_limit: usize) -> Result<UpstreamResponse, BrokerError> {
-        match tokio::time::timeout(self.timeout, self.exchange(b, read_limit)).await {
+        self.send_with_progress(b, read_limit, None).await
+    }
+
+    /// [`Upstream::send`], counting the body as it is read into `progress`
+    /// (plan 48 C3: a long model download shows how far it is).
+    pub async fn send_with_progress(
+        &self,
+        b: Built,
+        read_limit: usize,
+        progress: Option<&BodyProgress>,
+    ) -> Result<UpstreamResponse, BrokerError> {
+        match tokio::time::timeout(self.timeout, self.exchange(b, read_limit, progress)).await {
             Ok(r) => r,
             Err(_) => Err(BrokerError::Timeout),
         }
@@ -405,6 +425,7 @@ impl Upstream {
         &self,
         mut b: Built,
         read_limit: usize,
+        progress: Option<&BodyProgress>,
     ) -> Result<UpstreamResponse, BrokerError> {
         let start =
             origin(&b.uri).ok_or_else(|| up("request", "the URL needs a host and no userinfo"))?;
@@ -444,7 +465,17 @@ impl Upstream {
                 continue;
             }
             let (parts, body) = resp.into_parts();
-            let (body, truncated) = read_capped(body, read_limit).await?;
+            if let Some(p) = progress {
+                let n = parts
+                    .headers
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                p.total.store(n, Ordering::Relaxed);
+                p.done.store(0, Ordering::Relaxed);
+            }
+            let (body, truncated) = read_capped(body, read_limit, progress).await?;
             drop(guard);
             return Ok(UpstreamResponse {
                 status,
@@ -523,7 +554,11 @@ where
 }
 
 /// Reads at most `limit` bytes; `true` when more was available.
-async fn read_capped(mut body: Incoming, limit: usize) -> Result<(Bytes, bool), BrokerError> {
+async fn read_capped(
+    mut body: Incoming,
+    limit: usize,
+    progress: Option<&BodyProgress>,
+) -> Result<(Bytes, bool), BrokerError> {
     let mut buf = BytesMut::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| up("response body", e))?;
@@ -535,6 +570,9 @@ async fn read_capped(mut body: Incoming, limit: usize) -> Result<(Bytes, bool), 
             return Ok((buf.freeze(), true));
         }
         buf.extend_from_slice(&data);
+        if let Some(p) = progress {
+            p.done.store(buf.len() as u64, Ordering::Relaxed);
+        }
     }
     Ok((buf.freeze(), false))
 }

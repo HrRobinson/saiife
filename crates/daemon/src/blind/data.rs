@@ -713,7 +713,10 @@ fn baseline_for(b: &BuildIn) -> Result<Classes, Refusal> {
 /// (spec §2.1.1, plan 45). Returns the updated store (to be saved after the
 /// swap) and the ids newly suspended. A broken method never refuses the
 /// build; an unreadable methods file does (fail closed, fixed text).
-fn revalidate_methods(b: &BuildIn, m: &Manifest) -> Result<(MethodStore, Vec<String>), Refusal> {
+///
+/// Read-only here (the ids go in the build's record); the pass that saves
+/// runs after the swap, under the dataset's methods lock ([`with_methods`]).
+fn revalidate_methods(b: &BuildIn, m: &Manifest) -> Result<Vec<String>, Refusal> {
     let mut store = MethodStore::load(&b.dir.root.join(METHODS_FILE)).map_err(|_| {
         unavailable(format!(
             "{} was not changed: its approved methods cannot be read",
@@ -726,7 +729,60 @@ fn revalidate_methods(b: &BuildIn, m: &Manifest) -> Result<(MethodStore, Vec<Str
         .filter(|(_, r)| r.is_err())
         .map(|(id, _)| id)
         .collect();
-    Ok((store, suspended))
+    Ok(suspended)
+}
+
+/// The methods-file text of a store that cannot be read.
+fn methods_unreadable(name: &str) -> Refusal {
+    unavailable(format!(
+        "{name}: its approved methods cannot be read or saved"
+    ))
+}
+
+/// Loads `<dataset>/methods.json`, applies `f` and saves it, all under the
+/// dataset's methods lock (ruling P47-27: two writers never lose each
+/// other's change). `f` is not run when the file cannot be read; nothing is
+/// saved when `f` refuses. Blocking: call from a blocking thread, or use
+/// [`with_methods`].
+pub(crate) fn with_methods_blocking<T>(
+    blind: &super::Blind,
+    dataset: &DatasetName,
+    f: impl FnOnce(&mut MethodStore) -> Result<T, Refusal>,
+) -> Result<T, Refusal> {
+    locked_methods(blind, dataset, |s| f(s).map(|t| (t, true)))
+}
+
+/// [`with_methods_blocking`] where `f` also says whether to save.
+fn locked_methods<T>(
+    blind: &super::Blind,
+    dataset: &DatasetName,
+    f: impl FnOnce(&mut MethodStore) -> Result<(T, bool), Refusal>,
+) -> Result<T, Refusal> {
+    let guard = blind.methods_lock(dataset);
+    let _held = super::lock(&guard);
+    let path = blind.dataset_dir(dataset).root.join(METHODS_FILE);
+    let mut store = MethodStore::load(&path).map_err(|_| methods_unreadable(dataset.as_str()))?;
+    let (out, save) = f(&mut store)?;
+    if save {
+        store
+            .save(&path)
+            .map_err(|_| methods_unreadable(dataset.as_str()))?;
+    }
+    Ok(out)
+}
+
+/// [`with_methods_blocking`] on a blocking thread: `f` gets the dataset's
+/// store, loaded under the methods lock, and what it changed is saved
+/// atomically before the lock is let go.
+pub async fn with_methods<T: Send + 'static>(
+    ctx: &Arc<Ctx>,
+    dataset: &DatasetName,
+    f: impl FnOnce(&mut MethodStore) -> Result<T, Refusal> + Send + 'static,
+) -> Result<T, Refusal> {
+    let (ctx, dataset) = (Arc::clone(ctx), dataset.clone());
+    tokio::task::spawn_blocking(move || with_methods_blocking(&ctx.blind, &dataset, f))
+        .await
+        .map_err(|_| unavailable("the methods change did not finish"))?
 }
 
 /// Records the build `m` before its swap (ruling P47-21): the index for the
@@ -775,17 +831,12 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, BuildErr> {
     write_private(&b.dir.root.join(ACCESS_FILE), &json_bytes(&b.access))
         .map_err(|e| Before(unavailable(format!("could not write {ACCESS_FILE}: {e}"))))?;
     let mut verdict: Option<Refusal> = None;
-    // The methods as re-validated: saved only once the swap has happened.
-    let mut methods: Option<(MethodStore, Vec<String>)> = None;
+
     let mut validate = |m: &Manifest| -> Result<(), String> {
         // P47-21 order: name check, re-validation, record.
         let r = name_check(&b.name, detector, &m.schema, &m.public)
             .and_then(|()| revalidate_methods(&b, m))
-            .and_then(|(store, suspended)| {
-                let r = record_in_stage(&b, m, suspended.clone());
-                methods = Some((store, suspended));
-                r
-            });
+            .and_then(|suspended| record_in_stage(&b, m, suspended));
         r.map_err(|r| {
             verdict = Some(r);
             String::new()
@@ -804,14 +855,17 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, BuildErr> {
         return Err(Before(verdict.unwrap_or_else(|| shield_refusal(&e))));
     }
     // Swapped: from here a failure leaves the dataset needing a refresh.
-    if let Some((store, suspended)) = methods {
-        if !suspended.is_empty() {
-            store
-                .save(&b.dir.root.join(METHODS_FILE))
-                .map_err(|e| After(shield_refusal(&e)))?;
-        }
-    }
     let m = load_manifest(&b.dir).map_err(|e| After(shield_refusal(&e)))?;
+    // The re-validation is saved now, on the file as it stands (an approval
+    // made during the build is checked against the new schema too).
+    locked_methods(&b.ctx.blind, &b.name, |store| {
+        let failed = store
+            .revalidate(&m.schema, &m.public)
+            .iter()
+            .any(|(_, r)| r.is_err());
+        Ok(((), failed))
+    })
+    .map_err(After)?;
     let open = open_handles(&b.dir, &b.keys, &m).map_err(|e| After(shield_refusal(&e)))?;
     // The new baseline: the classes now in force; the grants used are spent.
     write_private(
