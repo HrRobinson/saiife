@@ -86,11 +86,6 @@ fn name_has(name: &str, word: &str) -> bool {
     padded.contains(&w)
 }
 
-/// [`name_has`] for the other modules.
-pub(crate) fn name_part(name: &str, word: &str) -> bool {
-    name_has(name, word)
-}
-
 fn name_in(name: &str, words: &[&str]) -> bool {
     words.iter().any(|w| name_has(name, w))
 }

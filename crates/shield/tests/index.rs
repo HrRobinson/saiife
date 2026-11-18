@@ -475,8 +475,8 @@ fn no_run_files_after_a_failing_build() {
     let (rows, mut schema) = many_rows(2000);
     let (_, snap) = snapshot(tmp.path(), "things", &["name", "notes"], rows);
     // A column the snapshot lacks, after columns that fill many runs: the
-    // read fails mid-build. (Quasi: an Identifier column is checked before
-    // the build starts, as the people count reads it.)
+    // read fails mid-build. (Quasi: an Identifier column is checked at the
+    // start of its table, as the people count reads it.)
     schema.tables[0]
         .columns
         .push(col("missing", ColType::Text, ColumnClass::Quasi));

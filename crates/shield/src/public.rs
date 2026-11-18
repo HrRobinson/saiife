@@ -125,30 +125,50 @@ impl PeopleCount {
     }
 }
 
-/// A name column (`name`, `first_name`, `navn`, `efternavn`, ...): it
-/// names a person but two people can share it.
-fn name_column(n: &str) -> bool {
-    ["name", "navn", "fornavn", "efternavn"]
-        .iter()
-        .any(|w| crate::classify::name_part(n, w))
+/// A part of a person's own name (`first_name`, `efternavn`, `name`,
+/// ...), exact names only: `product_name` or `company_name` is not one.
+/// Two people can share a part, so the parts count together, as a full
+/// name, never one by one.
+fn person_name_part(n: &str) -> bool {
+    const PARTS: &[&str] = &[
+        "name",
+        "navn",
+        "first_name",
+        "last_name",
+        "full_name",
+        "middle_name",
+        "given_name",
+        "surname",
+        "fornavn",
+        "efternavn",
+        "mellemnavn",
+        "fulde_navn",
+    ];
+    PARTS.contains(&n.to_ascii_lowercase().as_str())
 }
 
 /// I4 (owner ruling), the one counting rule of every frequency floor (the
-/// index's k-floor, `public_values`, the wizard's preview). A table's
-/// floors count, first that applies:
-/// 1. with an EntitySpec: distinct entity keys (R-14);
-/// 2. else, with id columns (Identifier columns that are not name columns,
-///    and `links`: FK columns of declared joins): the smallest of their
-///    distinct counts. The smallest, not a composite: a per-row id
-///    (`order_id`) beside a per-person one (`customer_id`) must not count
-///    every order as a person, and undercounting only keeps more values
-///    rare (fails closed). A value of an id column counts as 1: an
-///    identifier is never a common value;
-/// 3. else, with name columns of class Identifier: distinct full names
-///    (the composite of the name columns, NULLs ignored);
-/// 4. else, a table with personal data (an Identifier or Quasi column, or
-///    a link) is refused with [`NO_IDENTIFIER`];
-/// 5. else rows.
+/// index's k-floor, `public_values`, the wizard's preview).
+/// - With an EntitySpec: distinct entity keys (R-14).
+/// - Else the smallest of these candidates' distinct counts: each
+///   Identifier column that is not a part of a person's name, each FK
+///   column of a declared join (`links`), and the full name (the person
+///   name parts of class Identifier together, NULLs ignored). The
+///   smallest, not one composite of everything: a per-row `order_id`
+///   beside `customer_id` or a name must not count every order as a
+///   person, and every extra candidate can only lower the count, which
+///   keeps more values rare (fails closed). A value of a candidate column
+///   counts as 1 in its own group: an identifier is never common. TEXT
+///   values compare after `lower(trim(..))`, so `S@x.dk` and `s@x.dk ` are
+///   one person (SQLite's `lower` folds ASCII only: `Ø`/`ø` stay two,
+///   an overcount of at most the spellings).
+/// - No candidate, but personal data (a Quasi column): refused with
+///   [`NO_IDENTIFIER`].
+/// - Else (no Identifier, Quasi or link: no personal data) rows.
+///
+/// Known limit: a table whose only identifier is a per-row id
+/// (`order_id`) beside quasi columns counts rows; the wizard (plan 48)
+/// must ask for the column that identifies the person.
 pub fn people_count(
     t: &TableInfo,
     entity_key: Option<&str>,
@@ -157,53 +177,57 @@ pub fn people_count(
     if let Some(k) = entity_key {
         return Ok(PeopleCount(format!("COUNT(DISTINCT {})", quote(k))));
     }
-    let ident = |c: &&crate::schema::ColumnInfo| c.class == ColumnClass::Identifier;
-    let mut ids: Vec<&str> = t
+    let value = |name: &str| -> String {
+        let q = quote(name);
+        match t.columns.iter().find(|c| c.name == name).map(|c| c.ty) {
+            Some(ColType::Text) => format!("lower(trim({q}))"),
+            _ => q,
+        }
+    };
+    let ident: Vec<&str> = t
         .columns
         .iter()
-        .filter(|c| ident(c) && !name_column(&c.name))
+        .filter(|c| c.class == ColumnClass::Identifier)
         .map(|c| c.name.as_str())
         .collect();
-    for l in links {
-        if !ids.contains(l) {
-            ids.push(l);
+    let mut cands: Vec<String> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for c in ident.iter().filter(|c| !person_name_part(c)).chain(links) {
+        if !seen.contains(c) {
+            seen.push(c);
+            cands.push(format!("COUNT(DISTINCT {})", value(c)));
         }
     }
-    let distinct = |c: &str| format!("COUNT(DISTINCT {})", quote(c));
-    match ids.len() {
-        0 => {}
-        1 => return Ok(PeopleCount(distinct(ids[0]))),
-        _ => {
-            let parts: Vec<String> = ids.iter().map(|c| distinct(c)).collect();
-            return Ok(PeopleCount(format!("MIN({})", parts.join(", "))));
-        }
-    }
-    let names: Vec<String> = t
-        .columns
+    let names: Vec<&str> = ident
         .iter()
-        .filter(ident)
-        .map(|c| quote(&c.name))
+        .copied()
+        .filter(|c| person_name_part(c) && !seen.contains(c))
         .collect();
     match names.len() {
         0 => {}
-        1 => return Ok(PeopleCount(format!("COUNT(DISTINCT {})", names[0]))),
+        1 => cands.push(format!("COUNT(DISTINCT {})", value(names[0]))),
         _ => {
             // `quote()` renders each value as an SQL literal, so the
             // joined text is unambiguous; all NULL is no name at all.
             let all_null = names
                 .iter()
-                .map(|n| format!("{n} IS NULL"))
+                .map(|n| format!("{} IS NULL", quote(n)))
                 .collect::<Vec<_>>()
                 .join(" AND ");
             let joined = names
                 .iter()
-                .map(|n| format!("quote({n})"))
+                .map(|n| format!("quote({})", value(n)))
                 .collect::<Vec<_>>()
                 .join(" || ',' || ");
-            return Ok(PeopleCount(format!(
+            cands.push(format!(
                 "COUNT(DISTINCT CASE WHEN {all_null} THEN NULL ELSE {joined} END)"
-            )));
+            ));
         }
+    }
+    match cands.len() {
+        0 => {}
+        1 => return Ok(PeopleCount(cands.remove(0))),
+        _ => return Ok(PeopleCount(format!("MIN({})", cands.join(", ")))),
     }
     if t.columns.iter().any(|c| c.class == ColumnClass::Quasi) {
         return Err(ShieldError::Source {
@@ -338,7 +362,7 @@ mod tests {
         }
     }
 
-    /// I4: the one counting rule, case by case.
+    /// I4: the one counting rule, case by case (`table` gives TEXT columns).
     #[test]
     fn people_count_rules() {
         use ColumnClass::*;
@@ -350,34 +374,33 @@ mod tests {
             sql(&cust, Some("id"), &[]).unwrap(),
             "COUNT(DISTINCT \"id\")"
         );
-        // Name columns are not ids: `name` is left out.
-        assert_eq!(sql(&cust, None, &[]).unwrap(), "COUNT(DISTINCT \"id\")");
+        // Every candidate in one MIN: the ids and the name.
+        assert_eq!(
+            sql(&cust, None, &[]).unwrap(),
+            "MIN(COUNT(DISTINCT lower(trim(\"id\"))), \
+             COUNT(DISTINCT lower(trim(\"name\"))))"
+        );
         let orders = table(&[
             ("order_id", Identifier),
-            ("email", Identifier),
+            ("product_name", Identifier),
             ("first_name", Identifier),
+            ("last_name", Identifier),
             ("city", Quasi),
         ]);
         assert_eq!(
             sql(&orders, None, &["customer_id"]).unwrap(),
-            "MIN(COUNT(DISTINCT \"order_id\"), COUNT(DISTINCT \"email\"), \
-             COUNT(DISTINCT \"customer_id\"))"
-        );
-        let names = table(&[
-            ("fornavn", Identifier),
-            ("efternavn", Identifier),
-            ("by", Quasi),
-        ]);
-        assert_eq!(
-            sql(&names, None, &[]).unwrap(),
-            "COUNT(DISTINCT CASE WHEN \"fornavn\" IS NULL AND \"efternavn\" IS NULL \
-             THEN NULL ELSE quote(\"fornavn\") || ',' || quote(\"efternavn\") END)"
+            "MIN(COUNT(DISTINCT lower(trim(\"order_id\"))), \
+             COUNT(DISTINCT lower(trim(\"product_name\"))), \
+             COUNT(DISTINCT \"customer_id\"), \
+             COUNT(DISTINCT CASE WHEN \"first_name\" IS NULL AND \"last_name\" IS NULL \
+             THEN NULL ELSE quote(lower(trim(\"first_name\"))) || ',' || \
+             quote(lower(trim(\"last_name\"))) END))"
         );
         // A link alone is enough.
         let visits = table(&[("customer_id", Sensitive), ("city", Quasi)]);
         assert_eq!(
             sql(&visits, None, &["customer_id"]).unwrap(),
-            "COUNT(DISTINCT \"customer_id\")"
+            "COUNT(DISTINCT lower(trim(\"customer_id\")))"
         );
         let e = people_count(&visits, None, &[]).unwrap_err();
         assert!(matches!(
@@ -391,6 +414,49 @@ mod tests {
         let plain = table(&[("status", Public), ("amount", Sensitive), ("n", FreeText)]);
         assert_eq!(sql(&plain, None, &[]).unwrap(), "COUNT(*)");
         assert_eq!(PeopleCount::rows().sql(), "COUNT(*)");
+    }
+
+    /// C1 (review): with only a per-row id and a name, the name keeps a
+    /// repeat customer one person; case and spaces do not split one.
+    #[test]
+    fn per_row_id_does_not_count_orders_as_people() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE t (order_id TEXT, name TEXT, email TEXT, city TEXT);
+             INSERT INTO t VALUES ('1', 'Søren Ærø', 'S@x.dk', 'Ærøskøbing'),
+                                  ('2', 'Søren Ærø', 's@x.dk ', 'Ærøskøbing'),
+                                  ('3', 'Søren Ærø', NULL, 'Ærøskøbing');",
+        )
+        .unwrap();
+        use ColumnClass::*;
+        let t = table(&[
+            ("order_id", Identifier),
+            ("name", Identifier),
+            ("city", Quasi),
+        ]);
+        let count = people_count(&t, None, &[]).unwrap();
+        let n: i64 = c
+            .query_row(
+                &format!("SELECT {} FROM t GROUP BY city", count.sql()),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let t = table(&[
+            ("order_id", Identifier),
+            ("email", Identifier),
+            ("city", Quasi),
+        ]);
+        let count = people_count(&t, None, &[]).unwrap();
+        let n: i64 = c
+            .query_row(
+                &format!("SELECT {} FROM t GROUP BY city", count.sql()),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "one email in two spellings; NULL is nobody");
     }
 
     /// The composite never merges two different name pairs.

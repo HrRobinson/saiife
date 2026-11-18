@@ -838,6 +838,50 @@ fn repeat_customer_stays_in_the_index() {
     assert_eq!(channel.passing, vec!["shop".to_string()], "web: 1 person");
 }
 
+/// C1 (review): with the classes `propose` guesses (`order_id` a unique ID,
+/// `customer_id` unknown), and with no `customer_id` at all, the name still
+/// keeps the repeat customer one person.
+#[test]
+fn repeat_customer_stays_with_guessed_classes() {
+    for drop_customer_id in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let dir = ds(t.path());
+        let mut body = orders_csv();
+        if drop_customer_id {
+            body = body
+                .lines()
+                .map(|l| {
+                    let mut f: Vec<&str> = l.split(',').collect();
+                    f.remove(1);
+                    f.join(",") + "\n"
+                })
+                .collect();
+        }
+        let props = stage_csv(&dir, t.path(), "orders.csv", &body);
+        let schema = fixtures::accept_all("crm", &props);
+        assert_eq!(
+            schema.column("orders", "order_id").unwrap().class,
+            ColumnClass::Identifier
+        );
+        if !drop_customer_id {
+            assert_ne!(
+                schema.column("orders", "customer_id").unwrap().class,
+                ColumnClass::Identifier
+            );
+        }
+        finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+        let idx = KnownIndex::open(&dir.live(), key()).unwrap();
+        assert!(
+            idx.contains_value("Søren Ærø").unwrap(),
+            "{drop_customer_id}"
+        );
+        assert!(
+            idx.contains_value("Ærøskøbing").unwrap(),
+            "{drop_customer_id}"
+        );
+    }
+}
+
 /// I4: a table with personal data and no column that identifies the person
 /// cannot be counted: the build is refused with a reason naming the table.
 #[test]
@@ -942,6 +986,11 @@ fn joins_are_derived_and_stored() {
     let old = load_manifest(&dir).unwrap();
     assert_eq!(old.v, 1);
     assert_eq!(old.schema.joins, want);
+    // A v1 dataset with a reserved alias is refused on load.
+    j["schema"]["tables"][1]["alias"] = "_p_inv".into();
+    std::fs::write(&path, serde_json::to_string(&j).unwrap()).unwrap();
+    assert!(matches!(load_manifest(&dir), Err(ShieldError::Corrupt(_))));
+    j["schema"]["tables"][1]["alias"] = serde_json::Value::Null;
     j["v"] = 3.into();
     std::fs::write(&path, serde_json::to_string(&j).unwrap()).unwrap();
     assert!(matches!(load_manifest(&dir), Err(ShieldError::Corrupt(_))));

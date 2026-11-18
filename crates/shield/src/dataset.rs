@@ -896,19 +896,25 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
                 })
                 .collect(),
         };
-        let count = people_count(&guessed, None, &[]);
+        let count = match people_count(&guessed, None, &[]) {
+            Ok(c) => Some(c),
+            Err(ShieldError::Source {
+                why: NO_IDENTIFIER, ..
+            }) => None,
+            Err(e) => return Err(e),
+        };
         for (column, ty, st, sample, source, guess) in seen {
             let mut refusal = public_gate(&[], &table, &column, source, ty, &st, &sample);
             let mut preview = None;
             // M5: no k-floor listing of free text (the gate refuses it, S4).
             if refusal.is_none() && guess.class != ColumnClass::FreeText {
                 match &count {
-                    Ok(count) => match public_values(&conn, &table, &column, k, count) {
+                    Some(count) => match public_values(&conn, &table, &column, k, count) {
                         Ok(pv) => preview = Some(pv),
                         Err(ShieldError::Source { why, .. }) => refusal = Some(why),
                         Err(e) => return Err(e),
                     },
-                    Err(_) => refusal = Some(NO_IDENTIFIER),
+                    None => refusal = Some(NO_IDENTIFIER),
                 }
             }
             out.push(Proposal {
@@ -1231,6 +1237,10 @@ pub fn load_manifest(dir: &DatasetDir) -> Result<Manifest, ShieldError> {
     if m.v == 1 {
         m.schema.joins = m.schema.conventional_joins();
     }
+    // Plan 45 S1 for every version: a dataset built before the check
+    // existed may hold a `_p_` name or alias.
+    check_reserved(&m.schema)
+        .map_err(|_| ShieldError::Corrupt("a dataset name starts with the reserved _p_"))?;
     if m.dataset != name || m.schema.dataset != name {
         return Err(ShieldError::Corrupt("the manifest names another dataset"));
     }

@@ -301,6 +301,8 @@ fn write_literals(
                 continue;
             }
             let q = quote_ident(&c.name);
+            // How many rows hold the value: never a privacy floor
+            // (floors count people: `public::people_count`, I4).
             let sql = format!(
                 "SELECT {q}, COUNT(*) FROM {} WHERE {q} IS NOT NULL GROUP BY {q}",
                 quote_ident(&t.name)
