@@ -38,8 +38,11 @@ function hubFail(e) {
 }
 
 // The whole pairing over one pairing-only session bound to offer.pairId.
-// The machine proves itself by its signature (machinePub from the offer)
-// before anything is made or sent. Nothing is saved.
+// The device key and the passkey are made at call time, the user's tap
+// (iOS lets credentials.create run only then), while the session opens.
+// Nothing is sent until the machine proves itself by its signature
+// (machinePub from the offer); if it does not, the key and the passkey are
+// dropped unsent. Nothing is saved.
 // -> {deviceId, shortCode, device, passkey} | {error, rule?}
 export async function pairOverHub({
   offer,
@@ -47,40 +50,44 @@ export async function pairOverHub({
   getTicket,
   credentials = globalThis.navigator && globalThis.navigator.credentials,
   hasPublicKey = typeof globalThis.PublicKeyCredential !== "undefined",
-  hostname,
+  hostname = globalThis.location && globalThis.location.hostname,
   WebSocket = globalThis.WebSocket,
 }) {
   const why = checkLabel(label);
   if (why) return { error: why };
   const session = new HubSession({ getTicket, machinePub: offer.machinePub, binding: { pairId: offer.pairId }, WebSocket });
+  // Started now, all three at once; awaited in order below.
+  const opened = session.open();
+  opened.catch(() => {});
+  const made = (async () => {
+    const keys = await crypto.subtle.generateKey(P256, false, ["sign", "verify"]);
+    const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", keys.publicKey));
+    const deviceId = await deviceIdOf(publicRaw);
+    return { keys, publicRaw, deviceId };
+  })();
+  made.catch(() => {});
+  const madePasskey = made.then(
+    ({ keys, publicRaw, deviceId }) =>
+      makePasskey({ credentials, hasPublicKey, hostname, pairId: offer.pairId, publicRaw, deviceId, label, key: keys.privateKey }),
+    () => null,
+  );
   try {
     try {
-      await session.open();
+      await opened;
     } catch (e) {
       return hubFail(e);
     }
 
     let keys, publicRaw, deviceId, tag, code;
     try {
-      keys = await crypto.subtle.generateKey(P256, false, ["sign", "verify"]);
-      publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", keys.publicKey));
-      deviceId = await deviceIdOf(publicRaw);
+      ({ keys, publicRaw, deviceId } = await made);
       tag = await proof(offer.secret, offer.pairId, publicRaw);
       code = await shortCode(offer.machinePub, publicRaw, offer.secret);
     } catch {
       return { error: CRYPTO };
     }
 
-    let passkey = await makePasskey({
-      credentials,
-      hasPublicKey,
-      hostname,
-      pairId: offer.pairId,
-      publicRaw,
-      deviceId,
-      label,
-      key: keys.privateKey,
-    });
+    let passkey = await madePasskey;
     const send = (pk) =>
       session.call({
         t: "pair",

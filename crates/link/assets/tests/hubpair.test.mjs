@@ -142,6 +142,68 @@ test("a passkey is sent, and passkey_refused retries without it on the same sess
   assert.equal(w.count(), 1);
 });
 
+test("the device key and the passkey are made at the tap, before open() resolves (iOS)", async () => {
+  const w = await world();
+  const order = [];
+  let created;
+  const madeIt = new Promise((r) => (created = r));
+  const creds = {
+    async create(opts) {
+      order.push("create");
+      created();
+      return fakeCredentials([]).create(opts);
+    },
+  };
+  class Spy extends w.relay.WebSocket {
+    #n = 0;
+    constructor(u) {
+      super(u);
+      this.addEventListener("message", () => {
+        if (++this.#n === 2) order.push("machine_hello");
+      });
+    }
+  }
+  const r = await pairOverHub({
+    offer: w.offer, label: "L", WebSocket: Spy, credentials: creds, hasPublicKey: true, hostname: "workspace.saiife.com",
+    // The ticket waits for the passkey prompt (at most 500 ms), so the
+    // prompt cannot come after the session opened.
+    getTicket: async () => {
+      await Promise.race([madeIt, new Promise((res) => setTimeout(res, 500))]);
+      order.push("ticket");
+      return w.relay.tickets.issue();
+    },
+  });
+  assert.equal(r.error, undefined);
+  assert.equal(r.passkey, true);
+  assert.deepEqual(order, ["create", "ticket", "machine_hello"]);
+});
+
+for (const [name, setup] of [
+  ["the relay's check", (w) => ((w.machine.faults.badSig = true), w)],
+  ["the page's check", async (w) => {
+    const other = await fakeMachine({ offers: new Map([[w.offer.pairId, { secret: w.offer.secret }]]) });
+    const relay = fakeRelay({ machine: other });
+    return { ...w, relay, getTicket: async () => relay.tickets.issue() };
+  }],
+]) {
+  test(`a bad machine signature (${name}) sends nothing more, even with a passkey made`, async () => {
+    const w0 = await world();
+    const w = await setup(w0);
+    const created = [];
+    const r = await pairOverHub({
+      offer: w.offer, label: "L", getTicket: w.getTicket, WebSocket: w.relay.WebSocket,
+      credentials: fakeCredentials(created), hasPublicKey: true, hostname: "workspace.saiife.com",
+    });
+    assert.equal(r.error, NOT_MACHINE);
+    assert.equal(r.device, undefined);
+    assert.equal(created.length, 1);
+    const texts = w.relay.sent.filter((x) => typeof x === "string").map((x) => JSON.parse(x));
+    assert.deepEqual(texts.map((t) => t.t), ["connect", "msg"]);
+    assert.equal(JSON.parse(dec.decode(unb64u(texts[1].data))).t, "seal_hello");
+    assert.equal(w0.log.length, 0);
+  });
+}
+
 test("a passkey the machine takes is reported", async () => {
   const w = await world();
   const r = await pairOverHub({
