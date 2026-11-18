@@ -9,7 +9,9 @@
 //! nothing else, the calculator's seccomp allowlist: no socket, tracing,
 //! exec, namespace or io_uring call) → open the
 //! snapshot read-only (`immutable=1`: SQLite touches no `-journal`/`-wal`
-//! file) → check its SHA-256 against the job's (`snapshot_mismatch`) →
+//! file) → check SQLite holds the very file the calculator opened, then
+//! its SHA-256 through that open file against the job's
+//! (`snapshot_mismatch`; plan 47 carry 5: no path is read twice) →
 //! re-validate the method and its self-checks against the job's schema,
 //! public values and parameters (a refusal answers its class) → run it with
 //! the job's caps → write one answer frame (at most 64 MiB) → exit 0.
@@ -44,7 +46,9 @@
 //! **For plan 47 (M7).** The SHA-256 of the whole snapshot is computed here,
 //! inside `RLIMIT_CPU` (15 s) and before the method runs. A large snapshot
 //! may need the daemon to verify the hash instead (and pass an open,
-//! verified file), or a higher CPU limit for the hash.
+//! verified file), or a higher CPU limit for the hash. Measured in plan 47
+//! Task 5: 200 MiB hash in about 0.5 s, so the limit holds snapshots of
+//! several GiB.
 
 use saiife_shield::calc::{self, Caps, ResultSet};
 use saiife_shield::calc_proto::{
@@ -58,6 +62,7 @@ use saiife_system::sandbox::{
     apply_rlimits, confine_helper, Confinement, Profile, Rlimits, SandboxError,
 };
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::ExitCode;
 
@@ -183,8 +188,18 @@ fn guarded(conf: ConfinementInfo, f: impl FnOnce() -> Result<ResultSet, CalcAnsw
 /// The confined part: open, check the hash, re-validate, run.
 fn run_job(job: &CalcJob, conf: ConfinementInfo) -> Result<ResultSet, CalcAnswer> {
     let conf = Some(conf);
+    // Plan 47 carry 5 (plan 45 M4): the hash and SQLite's reads are of one
+    // file. Open it once, let SQLite open it, check every regular file
+    // this process holds is that same inode, then hash through our open
+    // descriptor (`/proc/self/fd/N` reaches the open file itself, not the
+    // name). A path swapped in between is caught here, not hashed.
+    let held = std::fs::File::open(&job.snapshot).map_err(|_| runtime_error(conf))?;
     let mut conn = snapshot::open_ro(&job.snapshot).map_err(|_| runtime_error(conf))?;
-    match snapshot::hash_file(&job.snapshot) {
+    if !one_file_open(&held) {
+        return Err(runtime_error(conf));
+    }
+    let via_fd = std::path::PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+    match snapshot::hash_file(&via_fd) {
         Ok(h) if h == job.snapshot_sha256 => {}
         Ok(_) => return Err(refuse(CLASS_SNAPSHOT_MISMATCH, conf)),
         Err(_) => return Err(runtime_error(conf)),
@@ -203,6 +218,47 @@ fn run_job(job: &CalcJob, conf: ConfinementInfo) -> Result<ResultSet, CalcAnswer
         empty_for: f.empty_for,
         confinement: conf,
     })
+}
+
+/// Whether `held` and SQLite's descriptor are one inode: every regular
+/// file open in this process (descriptors 3 up to the `RLIMIT_NOFILE` of
+/// [`CALC_RLIMITS`], so every one opened since) is `held`'s inode, and there
+/// are at least two (ours and SQLite's: it opens the file at once). `stat`
+/// through `/proc/self/fd/N` follows the open file, and `stat` is not a
+/// Landlock right. No `/proc`: false (fails closed).
+fn one_file_open(held: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = held.metadata() else {
+        return false;
+    };
+    let open: Vec<(u64, u64)> = (3..CALC_RLIMITS.nofile)
+        .filter_map(|fd| std::fs::metadata(format!("/proc/self/fd/{fd}")).ok())
+        .filter(|o| o.is_file())
+        .map(|o| (o.dev(), o.ino()))
+        .collect();
+    all_one_inode((m.dev(), m.ino()), &open)
+}
+
+/// `open` (the regular files held, as (device, inode)) is `held` at least
+/// twice and nothing else.
+fn all_one_inode(held: (u64, u64), open: &[(u64, u64)]) -> bool {
+    open.len() >= 2 && open.iter().all(|o| *o == held)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one_inode_or_refused() {
+        let a = (1, 10);
+        assert!(super::all_one_inode(a, &[a, a]));
+        assert!(super::all_one_inode(a, &[a, a, a]));
+        // SQLite's descriptor not found: refused.
+        assert!(!super::all_one_inode(a, &[a]));
+        assert!(!super::all_one_inode(a, &[]));
+        // SQLite opened another file (the path was swapped): refused.
+        assert!(!super::all_one_inode(a, &[a, (1, 11)]));
+        assert!(!super::all_one_inode(a, &[a, (2, 10)]));
+    }
 }
 
 /// Debug builds only (`calc_cannot_escape`): what the confined calculator

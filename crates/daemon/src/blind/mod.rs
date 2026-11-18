@@ -5,6 +5,7 @@
 //! [`UNAVAILABLE_OS`].
 
 pub mod audit;
+pub mod calc;
 pub mod data;
 pub mod keys;
 pub mod ops;
