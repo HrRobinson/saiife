@@ -27,12 +27,15 @@
 //! user wrote, or a candidate (ruling P-14).
 
 use crate::error::ShieldError;
-use crate::lang::{detect_lang, find_literals, find_literals_detected, Literal, LiteralSpan};
+use crate::lang::{
+    detect_lang, find_literals, find_literals_detected, number_words, Literal, LiteralSpan,
+};
 use crate::lexicon::{Candidate, Lexicon, Resolve, SpanHit};
 use crate::ner::{DetectError, NameDetector, NameSpan, SpanLabel};
 use crate::norm::token_spans;
 use crate::schema::{Bound, Lang, Param, ParamType, Schema};
 use std::fmt;
+use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 /// The longest run of tokens the lexicon span finder tries at each start.
 /// The lexicon does not record its longest entity name, so this is a fixed
@@ -303,6 +306,32 @@ pub fn parameterize(
             }))
         }
     };
+    // Bench item 1: never a period, ordinal or scale meaning split across
+    // a parameter and plain words (fail closed).
+    if let Some((a, b, why)) = split_meaning(question, &lits) {
+        return Ok(Step::Refuse(Refusal::BadLiteral { span: (a, b), why }));
+    }
+    // A decomposed letter (`halva` + U+030A from macOS input or a PDF)
+    // hides a word from the parsers: the composed text must read the same.
+    if !is_nfc(question) {
+        let nfc: String = question.nfc().collect();
+        let found = if detected {
+            find_literals_detected(&nfc, lang)
+        } else {
+            find_literals(&nfc, lang)
+        };
+        let same = found.is_ok_and(|n| {
+            n.len() == lits.len()
+                && n.iter().zip(&lits).all(|(a, b)| a.lit == b.lit)
+                && split_meaning(&nfc, &n).is_none()
+        });
+        if !same {
+            return Ok(Step::Refuse(Refusal::BadLiteral {
+                span: (0, question.len()),
+                why: DECOMPOSED,
+            }));
+        }
+    }
     let mut raw: Vec<(usize, usize, Raw)> = Vec::new();
     let mut segments: Vec<(usize, usize)> = Vec::new();
     let mut at = 0;
@@ -440,6 +469,268 @@ pub fn parameterize(
     // run into a digit, say): otherwise fail closed.
     check(&d)?;
     Ok(step(d))
+}
+
+// ------------------------------------------------- split meanings ----
+
+/// Refused: a period, ordinal or scale word beside a literal that does not
+/// cover it (`:p1 halvår :p2`, `the :p1 quarter`, `half :p1`, `Q2 in :p1`).
+pub const UNBOUND_WORD: &str = "a period, ordinal or scale word next to a number it does not cover";
+/// Refused: the question read in composed Unicode (NFC) has other numbers,
+/// or splits one: a decomposed letter hid a word.
+pub const DECOMPOSED: &str = "a decomposed letter changes how a number reads; retype the question";
+/// Refused: two literals with only a space or a `-`, `/`, `:` or `.`
+/// between them (`the first 10`, `2023/2024`, `uge 12 2024`).
+pub const SIDE_BY_SIDE: &str = "two numbers side by side";
+/// Refused: a range whose one scale word, unit or period belongs to both
+/// ends (`between 1 and 2 million`, `10 and 20 percent`, `1st and 2nd
+/// quarter 2025`).
+pub const ONE_SCALE_TWO_NUMBERS: &str = "one scale word, unit or period for two numbers";
+
+/// The closed list, English and Danish, of words that change what a number
+/// beside them means. Lower case; compared with whole tokens.
+#[rustfmt::skip]
+const SPLIT_WORDS: &[&str] = &[
+    // periods named by a number
+    "quarter", "quarters", "kvartal", "kvartaler", "kvartalet", "kvartals", "kvt", "qtr",
+    "qtrs", "half", "halves", "halvår", "halvåret", "halvårs", "halvdel", "halvdelen",
+    "semester", "semestre", "semesters", "trimester", "q1", "q2", "q3", "q4", "h1", "h2",
+    // months (not `may`, an English verb)
+    "january", "januar", "february", "februar", "march", "marts", "april", "maj", "june",
+    "juni", "july", "juli", "august", "september", "october", "oktober", "november",
+    "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "okt",
+    "nov", "dec",
+    // ordinals
+    "first", "second", "third", "fourth", "første", "anden", "andet", "tredje", "fjerde",
+    // fractions
+    "halv", "halve", "halvt", "halvanden", "halvandet", "kvart",
+    // scales
+    "hundred", "hundreds", "thousand", "thousands", "million", "millions", "billion",
+    "billions", "trillion", "trillions", "hundrede", "tusind", "tusinde", "tusinder",
+    "millioner", "milliard", "milliarder", "billioner", "mio", "mia", "mn", "bn", "mill", "mln",
+    "bln", "k", "tkr", "mkr", "dozen", "dozens", "dusin", "snes",
+];
+
+/// Units of time: split only beside an ordinal (`the 3rd month of`) or a
+/// date (`month of :p1`); `the last 3 months` binds.
+#[rustfmt::skip]
+const ORDINAL_UNITS: &[&str] = &[
+    "month", "months", "måned", "måneder", "week", "weeks", "uge", "uger", "day", "days",
+    "dag", "dage",
+];
+
+/// Ordinal number words, English and Danish.
+#[rustfmt::skip]
+const ORDINAL_WORDS: &[&str] = &[
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+    "tenth", "eleventh", "twelfth", "første", "anden", "andet", "tredje", "fjerde", "femte",
+    "sjette", "syvende", "ottende", "niende", "tiende", "ellevte", "tolvte",
+];
+
+/// Period codes: left as text anywhere in a question with a literal, they
+/// may narrow it (`Q2 in :p1`, `H1 FY :p1`).
+const PERIOD_CODES: &[&str] = &["q1", "q2", "q3", "q4", "h1", "h2"];
+
+/// Scale words: a literal holding one is scaled.
+#[rustfmt::skip]
+const SCALE_WORDS: &[&str] = &[
+    "hundred", "thousand", "million", "billion", "hundrede", "tusind", "tusinde", "millioner",
+    "milliard", "milliarder", "mio", "mia", "mill", "mln",
+];
+
+/// The words that join the two ends of a range.
+const RANGE_JOINS: &[&str] = &["and", "og", "to", "til", "or", "eller"];
+
+/// Skipped when looking for the word beside a literal (`quarter of :p1`,
+/// `January to :p1`): `of`/`af`/`the` and the range joins.
+fn skipped(w: &str) -> bool {
+    matches!(w, "of" | "af" | "the") || RANGE_JOINS.contains(&w)
+}
+
+/// Between a literal and the word beside it: anything but a letter, a
+/// digit or a sentence end.
+fn gap_char(c: char) -> bool {
+    !c.is_alphanumeric() && !matches!(c, '?' | '!')
+}
+
+/// Between two literals that read as one number.
+fn side_char(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '-' | '\u{2013}' | '\u{2014}' | '/' | ':' | '.')
+}
+
+/// The alphanumeric token that ends right before `at`, past gap chars only.
+fn token_before(text: &str, at: usize) -> Option<(usize, usize)> {
+    let mut it = text.get(..at)?.char_indices().rev().peekable();
+    let end = loop {
+        let &(i, c) = it.peek()?;
+        if c.is_alphanumeric() {
+            break i + c.len_utf8();
+        }
+        if !gap_char(c) {
+            return None;
+        }
+        it.next();
+    };
+    let mut start = end;
+    while let Some(&(i, c)) = it.peek() {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        start = i;
+        it.next();
+    }
+    Some((start, end))
+}
+
+/// The alphanumeric token that starts right after `at`, past gap chars only.
+fn token_after(text: &str, at: usize) -> Option<(usize, usize)> {
+    let mut it = text.get(at..)?.char_indices().peekable();
+    let start = loop {
+        let &(i, c) = it.peek()?;
+        if c.is_alphanumeric() {
+            break at + i;
+        }
+        if !gap_char(c) {
+            return None;
+        }
+        it.next();
+    };
+    let mut end = start;
+    while let Some(&(i, c)) = it.peek() {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        end = at + i + c.len_utf8();
+        it.next();
+    }
+    Some((start, end))
+}
+
+/// The word beside a literal, past the [`skipped`] words: lower case, or
+/// None when there is none or it is part of a literal.
+fn beside(text: &str, lits: &[LiteralSpan], at: usize, before: bool) -> Option<String> {
+    let mut at = at;
+    loop {
+        let (a, b) = if before {
+            token_before(text, at)?
+        } else {
+            token_after(text, at)?
+        };
+        if lits.iter().any(|l| a < l.end && l.start < b) {
+            return None;
+        }
+        let w = text.get(a..b)?.to_lowercase();
+        if !skipped(&w) {
+            return Some(w);
+        }
+        at = if before { a } else { b };
+    }
+}
+
+/// The lower-case alphanumeric tokens of `s`.
+fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// A literal written with a scale: a scale word, or `15k` / `2m`.
+fn scaled(written: &str) -> bool {
+    tokens(written).iter().any(|t| {
+        SCALE_WORDS.contains(&t.as_str())
+            || t.strip_suffix(['k', 'm'])
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// A literal written as an ordinal: `3rd`, `3.` (Danish), `third`, `tredje`.
+fn ordinal_written(text: &str, l: &LiteralSpan) -> bool {
+    let w = text.get(l.start..l.end).unwrap_or("").to_lowercase();
+    let digits = w.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let suffixed = digits.len() < w.len()
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && ["st", "nd", "rd", "th"].iter().any(|s| w.ends_with(s));
+    let dotted = !w.is_empty()
+        && w.bytes().all(|b| b.is_ascii_digit())
+        && text.as_bytes().get(l.end) == Some(&b'.');
+    suffixed
+        || dotted
+        || tokens(&w)
+            .last()
+            .is_some_and(|t| ORDINAL_WORDS.contains(&t.as_str()))
+}
+
+/// A number word of either language that is not also a common word
+/// (Danish `to` is English `to`).
+fn number_word(w: &str) -> bool {
+    w != "to"
+        && (number_words(Lang::En).is_number_word(w) || number_words(Lang::Da).is_number_word(w))
+}
+
+/// The first literal whose meaning a plain word or a second literal next
+/// to it splits (see [`UNBOUND_WORD`], [`SIDE_BY_SIDE`],
+/// [`ONE_SCALE_TWO_NUMBERS`]): its span (both literals' for a pair) and why.
+/// Fails closed: a span that does not fit is a refusal.
+fn split_meaning(text: &str, lits: &[LiteralSpan]) -> Option<(usize, usize, &'static str)> {
+    let first = lits.first()?;
+    let refuse = Some((first.start, first.end, UNBOUND_WORD));
+    for w in lits.windows(2) {
+        let (x, y) = (&w[0], &w[1]);
+        let (Some(gap), Some(xs), Some(ys)) = (
+            text.get(x.end..y.start),
+            text.get(x.start..x.end),
+            text.get(y.start..y.end),
+        ) else {
+            return refuse;
+        };
+        if gap.chars().all(side_char) {
+            return Some((x.start, y.end, SIDE_BY_SIDE));
+        }
+        let joined = gap.chars().all(|c| c.is_alphanumeric() || gap_char(c))
+            && tokens(gap)
+                .iter()
+                .all(|t| RANGE_JOINS.contains(&t.as_str()));
+        // `1 and 2 million`, `10 and 20 percent`, `1st and 2nd quarter`.
+        let one_unit = match (&x.lit, &y.lit) {
+            (Literal::Integer(_), Literal::Integer(_)) => false,
+            (Literal::Integer(_), _) => true,
+            _ => scaled(ys) && !scaled(xs),
+        };
+        if joined && one_unit {
+            return Some((x.start, y.end, ONE_SCALE_TWO_NUMBERS));
+        }
+    }
+    // A period code left as text anywhere (`Q2 in :p1`).
+    let mut at = 0;
+    for t in text.split(|c: char| !c.is_alphanumeric()) {
+        let (a, b) = (at, at + t.len());
+        at = b + text
+            .get(b..)
+            .and_then(|r| r.chars().next())
+            .map_or(0, char::len_utf8);
+        if PERIOD_CODES.contains(&t.to_lowercase().as_str())
+            && !lits.iter().any(|l| a < l.end && l.start < b)
+        {
+            return refuse;
+        }
+    }
+    for l in lits {
+        let date = matches!(l.lit, Literal::Date(_) | Literal::DateRange { .. });
+        let ordinal = ordinal_written(text, l);
+        for before in [true, false] {
+            let at = if before { l.start } else { l.end };
+            let Some(w) = beside(text, lits, at, before) else {
+                continue;
+            };
+            let unit = ORDINAL_UNITS.contains(&w.as_str()) && (date || ordinal);
+            if SPLIT_WORDS.contains(&w.as_str()) || unit || number_word(&w) {
+                return Some((l.start, l.end, UNBOUND_WORD));
+            }
+        }
+    }
+    None
 }
 
 /// Resolves `phrase` in `table`: one match is bound, several are a pick,
