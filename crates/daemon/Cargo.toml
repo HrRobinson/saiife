@@ -128,6 +128,9 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 # Data Shield tests (plan 47): plan 43's fixture generator writes CSVs.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 csv = "=1.4.0"
+# The methods tests drop a column from the fixture database (plan 47 T2b);
+# the version saiife-shield pins.
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 
 [lints]
 workspace = true

@@ -2216,6 +2216,7 @@ dependencies = [
  "percent-encoding",
  "rcgen",
  "ring",
+ "rusqlite",
  "rustix",
  "rustls",
  "saiife-audit",

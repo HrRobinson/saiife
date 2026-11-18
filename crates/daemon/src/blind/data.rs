@@ -28,6 +28,7 @@ use saiife_shield::dataset::{
 };
 use saiife_shield::index::{read_allow, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
+use saiife_shield::methods::MethodStore;
 use saiife_shield::ner::{NameDetector, SpanLabel};
 use saiife_shield::public::{PublicValues, NO_IDENTIFIER};
 use saiife_shield::schema::{
@@ -53,6 +54,8 @@ pub const LOOSEN_FILE: &str = "loosen.json";
 const STAGED_FILE: &str = "staged.json";
 /// The users and approvers the dataset was last built with (S3).
 const ACCESS_FILE: &str = "access.json";
+/// The dataset's approved methods (plan 45).
+const METHODS_FILE: &str = "methods.json";
 /// Where a SQLite source is copied while it is read (`stage/` is emptied by
 /// the snapshot, so the copy cannot live there).
 const IMPORT_DIR: &str = "import";
@@ -648,9 +651,29 @@ fn baseline_for(b: &BuildIn) -> Result<Classes, Refusal> {
     }
 }
 
+/// Re-validates the dataset's approved methods against the new build `m`
+/// (spec §2.1.1, plan 45). Returns the updated store (to be saved after the
+/// swap) and the ids newly suspended. A broken method never refuses the
+/// build; an unreadable methods file does (fail closed, fixed text).
+fn revalidate_methods(b: &BuildIn, m: &Manifest) -> Result<(MethodStore, Vec<String>), Refusal> {
+    let mut store = MethodStore::load(&b.dir.root.join(METHODS_FILE)).map_err(|_| {
+        unavailable(format!(
+            "{} was not changed: its approved methods cannot be read",
+            b.name
+        ))
+    })?;
+    let suspended = store
+        .revalidate(&m.schema, &m.public)
+        .into_iter()
+        .filter(|(_, r)| r.is_err())
+        .map(|(id, _)| id)
+        .collect();
+    Ok((store, suspended))
+}
+
 /// Records the build `m` before its swap (ruling P47-21): the index for the
 /// scrub is the staged one. An error stops the build: nothing is swapped.
-fn record_in_stage(b: &BuildIn, m: &Manifest) -> Result<(), Refusal> {
+fn record_in_stage(b: &BuildIn, m: &Manifest, suspended: Vec<String>) -> Result<(), Refusal> {
     let index =
         KnownIndex::open(&b.dir.stage(), b.keys.index_key()).map_err(|e| shield_refusal(&e))?;
     let r = BlindRecord::Refresh {
@@ -663,8 +686,7 @@ fn record_in_stage(b: &BuildIn, m: &Manifest) -> Result<(), Refusal> {
             .collect(),
         index_entries: m.index.entries,
         ms: ms_since(b.started),
-        // plan 47 T2b: the methods `MethodStore::revalidate` suspends.
-        suspended: Vec::new(),
+        suspended,
         first: b.first,
     };
     b.rt.block_on(audit::write(
@@ -695,10 +717,17 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, BuildErr> {
     write_private(&b.dir.root.join(ACCESS_FILE), &json_bytes(&b.access))
         .map_err(|e| Before(unavailable(format!("could not write {ACCESS_FILE}: {e}"))))?;
     let mut verdict: Option<Refusal> = None;
+    // The methods as re-validated: saved only once the swap has happened.
+    let mut methods: Option<(MethodStore, Vec<String>)> = None;
     let mut validate = |m: &Manifest| -> Result<(), String> {
+        // P47-21 order: name check, re-validation, record.
         let r = name_check(&b.name, detector, &m.schema, &m.public)
-            // plan 47 T2b: MethodStore::revalidate after plan 45 merges
-            .and_then(|()| record_in_stage(&b, m));
+            .and_then(|()| revalidate_methods(&b, m))
+            .and_then(|(store, suspended)| {
+                let r = record_in_stage(&b, m, suspended.clone());
+                methods = Some((store, suspended));
+                r
+            });
         r.map_err(|r| {
             verdict = Some(r);
             String::new()
@@ -717,6 +746,13 @@ fn build(b: BuildIn, layout: &Layout) -> Result<Built, BuildErr> {
         return Err(Before(verdict.unwrap_or_else(|| shield_refusal(&e))));
     }
     // Swapped: from here a failure leaves the dataset needing a refresh.
+    if let Some((store, suspended)) = methods {
+        if !suspended.is_empty() {
+            store
+                .save(&b.dir.root.join(METHODS_FILE))
+                .map_err(|e| After(shield_refusal(&e)))?;
+        }
+    }
     let m = load_manifest(&b.dir).map_err(|e| After(shield_refusal(&e)))?;
     let open = open_handles(&b.dir, &b.keys).map_err(|e| After(shield_refusal(&e)))?;
     // The new baseline: the classes now in force; the grants used are spent.

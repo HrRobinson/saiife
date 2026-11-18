@@ -21,8 +21,11 @@ use saiife_ipc::msg::{
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, FixedDirectory, Fsync};
 use saiife_shield::dataset::{load_manifest, stage_snapshot, DatasetDir, Phase};
+use saiife_shield::methods::{ApprovedMethod, MethodStatus, MethodStore};
+use saiife_shield::plan::PlanReply;
+
 use saiife_shield::ner::{ListDetector, SpanLabel};
-use saiife_shield::schema::{ColumnClass, DatasetName};
+use saiife_shield::schema::{ColumnClass, DatasetName, Lang};
 use saiife_shield::source::{Cell, RowSource, SourceTable};
 use serde_json::{json, Value};
 use std::os::fd::OwnedFd;
@@ -1109,4 +1112,154 @@ async fn lost_baseline_keeps_the_live_classes() {
     f.ctx.blind.test_wait_builds().await;
     assert_eq!(f.ctx.blind.last_build_error(&crm()), None);
     assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Quasi);
+}
+
+/// An active approved method of `crm` with a parameterless query.
+fn approved(key: &str, sql: &str) -> ApprovedMethod {
+    ApprovedMethod {
+        id: String::new(),
+        version: 1,
+        dataset: crm(),
+        lang: Lang::En,
+        template_key: key.into(),
+        param_tags: vec![],
+        reply: PlanReply {
+            method: sql.into(),
+            template: "{int(n)}".into(),
+            checks: vec![],
+            intent: "count".into(),
+            needs_judgment: false,
+        },
+        preview_sha256: "ab".into(),
+        approved_by: "me".into(),
+        approved_at: "2026-11-18T10:00:00Z".into(),
+        touch: "key-1 #1".into(),
+        status: MethodStatus::Active,
+    }
+}
+
+/// `methods.json` with a method that stays valid and one on
+/// `customers.credit_limit`; their ids.
+fn store_methods(f: &Fx) -> (String, String) {
+    let mut s = MethodStore::default();
+    let good = s
+        .add(approved(
+            "count invoices",
+            "SELECT COUNT(*) AS n FROM invoices",
+        ))
+        .id
+        .clone();
+    let bad = s
+        .add(approved(
+            "count credit",
+            "SELECT COUNT(credit_limit) AS n FROM customers",
+        ))
+        .id
+        .clone();
+    s.save(&ds_root(f).join("methods.json")).unwrap();
+    (good, bad)
+}
+
+fn status_of(f: &Fx, id: &str) -> MethodStatus {
+    MethodStore::load(&ds_root(f).join("methods.json"))
+        .unwrap()
+        .methods
+        .into_iter()
+        .find(|m| m.id == id)
+        .unwrap()
+        .status
+}
+
+/// The fixture database without `customers.credit_limit`.
+fn sqlite_without_credit(f: &Fx) -> PathBuf {
+    let out = f.root.join("crm.sqlite.new");
+    std::fs::copy(&f.sqlite, &out).unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let c = rusqlite::Connection::open(&out).unwrap();
+    c.execute_batch("ALTER TABLE customers DROP COLUMN credit_limit")
+        .unwrap();
+    out
+}
+
+#[tokio::test]
+async fn refresh_suspends_broken_methods() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    let (good, bad) = store_methods(&f);
+    // The same data: nothing is suspended, the record says so.
+    ok(&refresh(&f, &f.sqlite).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert_eq!(f.ctx.blind.last_build_error(&crm()), None);
+    assert_eq!(status_of(&f, &bad), MethodStatus::Active);
+    assert_eq!(records(&f, "blind_refresh")[1]["suspended"], json!([]));
+    // The new build lacks the column: that method is suspended and named.
+    ok(&refresh(&f, &sqlite_without_credit(&f)).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert_eq!(f.ctx.blind.last_build_error(&crm()), None);
+    assert!(f.ctx.blind.live(&crm()).is_ok());
+    assert_eq!(status_of(&f, &good), MethodStatus::Active);
+    match status_of(&f, &bad) {
+        MethodStatus::Suspended { reason } => {
+            assert!(reason.contains("credit_limit"), "{reason}");
+            assert!(!reason.contains("SELECT"), "{reason}");
+        }
+        s => panic!("not suspended: {s:?}"),
+    }
+    let r = records(&f, "blind_refresh");
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[2]["suspended"], json!([bad]));
+    assert_eq!(
+        mode(&ds_root(&f).join("methods.json")),
+        0o600,
+        "methods.json is private"
+    );
+    // Suspended methods are history: the next refresh does not name it again.
+    ok(&refresh(&f, &sqlite_without_credit(&f)).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert_eq!(records(&f, "blind_refresh")[3]["suspended"], json!([]));
+    // No method text in the audit log.
+    assert!(!raw_log(&f).contains("COUNT(credit_limit)"));
+}
+
+#[tokio::test]
+async fn failed_refresh_leaves_methods_unchanged() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    store_methods(&f);
+    let mp = ds_root(&f).join("methods.json");
+    let before = std::fs::read(&mp).unwrap();
+    // Fails before validation (not a database).
+    let junk = f.root.join("junk.sqlite");
+    std::fs::write(&junk, b"not a database at all").unwrap();
+    ok(&refresh(&f, &junk).await);
+    f.ctx.blind.test_wait_builds().await;
+    assert!(f.ctx.blind.last_build_error(&crm()).is_some());
+    assert_eq!(std::fs::read(&mp).unwrap(), before);
+    // Fails after validation found a broken method: the record cannot be
+    // written, so nothing is swapped and nothing is suspended.
+    f.ctx.writer.stop(None).await.unwrap();
+    ok(&refresh(&f, &sqlite_without_credit(&f)).await);
+    f.ctx.blind.test_wait_builds().await;
+    let e = f.ctx.blind.last_build_error(&crm()).unwrap();
+    assert!(e.starts_with("crm was not changed"), "{e}");
+    assert_eq!(std::fs::read(&mp).unwrap(), before);
+}
+
+#[tokio::test]
+async fn corrupt_methods_file_refuses_before_the_swap() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    let mp = ds_root(&f).join("methods.json");
+    std::fs::write(&mp, b"{ not json").unwrap();
+    let (old, _) = f.ctx.blind.live(&crm()).unwrap();
+    ok(&refresh(&f, &f.sqlite).await);
+    f.ctx.blind.test_wait_builds().await;
+    let e = f.ctx.blind.last_build_error(&crm()).unwrap();
+    assert!(e.starts_with("crm was not changed"), "{e}");
+    assert_eq!(std::fs::read(&mp).unwrap(), b"{ not json");
+    let (now, _) = f.ctx.blind.live(&crm()).unwrap();
+    assert_eq!(now.snapshot_sha256, old.snapshot_sha256);
 }
