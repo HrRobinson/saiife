@@ -1076,6 +1076,9 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         eprintln!("saiife: warning: {why}: touch approvals are unavailable");
     }
     let touch = Arc::new(touch);
+    // Data Shield (plan 47): `<state>/blind`, 0700.
+    #[cfg(target_os = "linux")]
+    let blind = Arc::new(crate::blind::Blind::open(&state_dir.join("blind")));
     // The Workspace link's machine key and paired devices (plan 29); a
     // file that cannot be used leaves the Workspace with no trusted device.
     let (workspace, workspace_warning) =
@@ -1174,6 +1177,8 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         box_template_warnings,
         box_images,
         box_disk_root,
+        #[cfg(target_os = "linux")]
+        blind,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
     if let Some(a) = &box_audit {

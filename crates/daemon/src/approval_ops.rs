@@ -84,6 +84,14 @@ pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
         Some(s) => s.approval.approvers.clone(),
         None => return false,
     };
+    peer_listed(ctx, peer, &approvers).await
+}
+
+/// Whether `peer` is named in `approvers` (user names and `group:<name>`
+/// entries, as `[approval] approvers`). Lookups are the context's cached,
+/// off-thread ones; any failure is no. Mode-blind: the caller decides what
+/// the personal broker's own user is.
+pub(crate) async fn peer_listed(ctx: &Ctx, peer: &PeerCred, approvers: &[String]) -> bool {
     if approvers.is_empty() {
         return false;
     }
@@ -110,7 +118,7 @@ pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
             .await;
     }
     let mut groups: Option<Vec<String>> = None;
-    for a in &approvers {
+    for a in approvers {
         match a.strip_prefix("group:") {
             Some(g) => {
                 if groups.is_none() {

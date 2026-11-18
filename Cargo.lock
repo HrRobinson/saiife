@@ -1998,6 +1998,7 @@ dependencies = [
  "saiife-keychain",
  "saiife-mcp",
  "saiife-policy",
+ "saiife-shield",
  "saiife-system",
  "saiife-touch",
  "saiife-win",

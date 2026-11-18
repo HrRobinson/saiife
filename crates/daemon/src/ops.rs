@@ -425,6 +425,9 @@ pub struct Ctx {
     pub workspace: Arc<crate::workspace::Workspace>,
     /// What Workspace frames act on (no boxes unless a build wires some).
     pub boxes: Arc<dyn saiife_wire::BoxSource>,
+    /// Data Shield (plan 47): `<state>/blind`.
+    #[cfg(target_os = "linux")]
+    pub blind: Arc<crate::blind::Blind>,
 }
 
 /// When each (uid, kind) notice was last written; shared with the hook
@@ -482,6 +485,9 @@ pub struct CtxInit {
     /// The Workspace serves the fake demo boxes (`fake-boxes` test builds),
     /// not the manager: frames then read `boxes` as it is.
     pub workspace_demo: bool,
+    /// See [`Ctx::blind`]. `minimal` opens it at `state_dir/blind`.
+    #[cfg(target_os = "linux")]
+    pub blind: Arc<crate::blind::Blind>,
 }
 
 impl CtxInit {
@@ -544,6 +550,8 @@ impl CtxInit {
             box_images: None,
             box_disk_root: None,
             workspace_demo: false,
+            #[cfg(target_os = "linux")]
+            blind: Arc::new(crate::blind::Blind::open(&state_dir.join("blind"))),
         }
     }
 }
@@ -791,6 +799,8 @@ impl Ctx {
             // Workspace (plan 29)
             workspace: i.workspace,
             boxes: i.boxes,
+            #[cfg(target_os = "linux")]
+            blind: i.blind,
         }
     }
 
@@ -1394,6 +1404,8 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             crate::workspace_ops::handle(ctx, conn, req).await
         }
         op if crate::box_ops::OPS.contains(&op) => crate::box_ops::handle(ctx, conn, req).await,
+        // Data Shield (plan 47): control socket, machine local only.
+        op if crate::blind::OPS.contains(&op) => crate::blind::ops::handle(ctx, conn, req).await,
         other => {
             // An fd op this daemon does not serve: what it was passed goes.
             #[cfg(unix)]

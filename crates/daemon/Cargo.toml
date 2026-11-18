@@ -91,6 +91,9 @@ saiife-boxproto = { path = "../boxproto" }
 # (no blocking-api: each call runs on a thread that blocks on the runtime).
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
+# Data Shield (plan 47): the logic behind the `blind.*` ops (tokio-free).
+# The daemon only wires I/O. Linux only in this release.
+saiife-shield = { path = "../shield" }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]
