@@ -16,8 +16,11 @@
 //! * R3 neighbour words: the word before and after a number (skipping spaces
 //!   and punctuation, never a `\n`) is not a scale, sign or unit word
 //!   (`mio`, `thousand`, `times`, `percent`, ...).
-//! * R6 Roman numerals: no whitespace-delimited token of two or more
-//!   letters from `IVXLCDM`, and no `Q` followed by such letters.
+//! * R6 Roman numerals: no piece (whitespace tokens split on punctuation,
+//!   any case) of two or more letters from `ivxlcdm`, nor `q` followed by
+//!   such letters, except a short list of real words (`ROMAN_WORDS`).
+//! * Parameter displays and comparison words are judged like numbers for R2
+//!   and R3 (`{p1} million`, `about {p1}k`), though not for number separation.
 
 /// One piece of an answer: fixed text, a numeric or date slot (or a digit
 /// token), or any other printed output (a parameter display, a comparison).
@@ -25,7 +28,9 @@
 pub(crate) enum Seg<'a> {
     Text(&'a str),
     Num,
-    Other,
+    /// A parameter display or a comparison word: judged like a number for
+    /// delimiting (R2) and neighbour words (R3), but not for number separation.
+    Param,
 }
 
 const PUNCT: &str = ".,:;!?'\"()/-&";
@@ -94,16 +99,31 @@ fn charset_ok(t: &str) -> bool {
     })
 }
 
+/// Real words (lower case) made only of `IVXLCDM`; every other all-Roman
+/// token of two or more letters is a Roman numeral (`xii`, `mcm`, `MMXXVI`).
+/// A single letter is never refused (`i` is Danish "in" and English "I").
+const ROMAN_WORDS: &[&str] = &[
+    "mix", "dim", "lid", "civil", "vivid", "mild", "vild", "id", "did", "mid", "mil", "mill", "ill",
+];
+
 fn is_roman(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| "IVXLCDM".contains(c))
+    !s.is_empty() && s.chars().all(|c| "ivxlcdm".contains(c))
 }
 
-fn roman_token(tok: &str) -> bool {
-    let t = tok.trim_matches(|c: char| PUNCT.contains(c));
-    if t.chars().count() >= 2 && is_roman(t) {
-        return true;
+/// One punctuation-free piece, any case.
+fn roman_piece(piece: &str) -> bool {
+    let p = piece.to_ascii_lowercase();
+    if ROMAN_WORDS.contains(&p.as_str()) {
+        return false;
     }
-    t.strip_prefix('Q').is_some_and(is_roman)
+    (p.chars().count() >= 2 && is_roman(&p)) || p.strip_prefix('q').is_some_and(is_roman)
+}
+
+/// Every piece of a whitespace token split on all punctuation is judged
+/// (`Q-III`, `II/III`, `MMXXVI's`).
+fn roman_token(tok: &str) -> bool {
+    tok.split(|c: char| PUNCT.contains(c))
+        .any(|piece| !piece.is_empty() && roman_piece(piece))
 }
 
 /// Split a text into text pieces and digit tokens (`10,000`, `4.5`).
@@ -176,9 +196,11 @@ pub(crate) fn grammar_ok(segs: &[Seg]) -> Result<(), &'static str> {
     items.retain(|s| !matches!(s, Seg::Text("")));
     let mut last_num: Option<usize> = None;
     for (i, s) in items.iter().enumerate() {
-        if !matches!(s, Seg::Num) {
-            continue;
-        }
+        let is_num = match s {
+            Seg::Num => true,
+            Seg::Param => false,
+            Seg::Text(_) => continue,
+        };
         let prev = match i.checked_sub(1).map(|p| items[p]) {
             None => None,
             Some(Seg::Text(t)) if t.ends_with([' ', '\n']) => Some(t),
@@ -211,6 +233,9 @@ pub(crate) fn grammar_ok(segs: &[Seg]) -> Result<(), &'static str> {
             || next.is_some_and(|t| neighbour_bad(word_after(t)))
         {
             return Err("a number sits next to a scale, sign or unit word");
+        }
+        if !is_num {
+            continue;
         }
         if let Some(l) = last_num {
             let between = &items[l + 1..i];

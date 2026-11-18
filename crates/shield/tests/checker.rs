@@ -710,3 +710,79 @@ fn semantic_claims_without_numbers_are_not_the_checkers_job() {
     assert!(check(&f, "what does Anna Berg owe?", Lang::En).is_ok());
     assert!(!parse_err("Anna Berg owes nothing."));
 }
+
+// ---- fix round 3 ----
+
+#[test]
+fn roman_numerals_with_punctuation_or_lower_case_refused() {
+    for t in [
+        "In Q-III Anna owed it.",
+        "In Q.III only.",
+        "Parts II/III only.",
+        "Parts XI-XII only.",
+        "In MMXXVI's year.",
+        "In xii only.",
+        "Part iv only.",
+        "Year mcm only.",
+    ] {
+        assert!(parse_err(t), "parse accepted {t:?}");
+        let f = filled(t, &[]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "check accepted {t:?}");
+    }
+    let f = filled("In Q-III Anna owed 5.", &[("5", &["5"], &[], false)]);
+    assert!(check(&f, "q?", Lang::En).is_err());
+    for t in [
+        "I think so.",
+        "Kunden er i byen.",
+        "A mix of civil and vivid, mild things.",
+        "Please id the lid.",
+    ] {
+        assert!(!parse_err(t), "parse refused {t:?}");
+        let f = filled(t, &[]);
+        assert!(check(&f, "q?", Lang::En).is_ok(), "check refused {t:?}");
+    }
+}
+
+#[test]
+fn number_words_of_both_languages_refused_on_every_answer() {
+    for t in ["It cost fem tusind.", "Det var tre.", "A million kr."] {
+        let f = filled(t, &[]);
+        assert!(check(&f, "q?", Lang::En).is_err(), "{t}");
+    }
+    // everyday English words that are Danish numbers are exempt on English
+    let f = filled("Sent to Anna on fire day, en et.", &[]);
+    assert!(check(&f, "q?", Lang::En).is_ok());
+    // but the English lexicon still applies to Danish answers
+    let f = filled("Det var three fakturaer.", &[]);
+    assert!(check(&f, "q?", Lang::Da).is_err());
+    // and a question that has the word licenses it
+    let f = filled("It cost fem tusind.", &[]);
+    assert!(check(&f, "hvad med fem tusind?", Lang::En).is_ok());
+}
+
+#[test]
+fn param_and_cmp_slots_are_judged_like_numbers_for_neighbours() {
+    for tpl in [
+        "{param(p1)} million owed.",
+        "About {param(p1)}k owed.",
+        "About {param(p1)}, mio. owed.",
+        "Is {cmp(a, b)}x it.",
+        "Over {cmp(a, b)}% it.",
+    ] {
+        assert!(parse_err(tpl), "{tpl}");
+    }
+    // check side: a param display glued to a scale word
+    let f = filled(
+        "Anna Berg (customer #4411) million owed.",
+        &[("Anna Berg (customer #4411)", &[], &[], true)],
+    );
+    assert!(check(&f, "q?", Lang::En).is_err());
+    let f = filled(
+        "About Anna Berg (customer #4411)k owed.",
+        &[("Anna Berg (customer #4411)", &[], &[], true)],
+    );
+    assert!(check(&f, "q?", Lang::En).is_err());
+    assert!(!parse_err("More than {param(p1)} invoices."));
+    assert!(!parse_err("{param(p1)} owes {int(a)} invoices."));
+    assert!(!parse_err("It is {cmp(a, b)} her limit."));
+}

@@ -272,7 +272,7 @@ pub fn parse_template(
         .iter()
         .map(|p| match p {
             Part::Text(t) => Seg::Text(t),
-            Part::Slot(Slot::Cmp(..) | Slot::Param(_)) => Seg::Other,
+            Part::Slot(Slot::Cmp(..) | Slot::Param(_)) => Seg::Param,
             Part::Slot(_) => Seg::Num,
         })
         .collect();

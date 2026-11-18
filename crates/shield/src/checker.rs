@@ -12,8 +12,8 @@
 //! digits) refuses, a sign glued to a number belongs to it (`-18,420.00` is
 //! not `18,420.00`), a date span is classified on its own and refuses on any
 //! parser error, and a quantity word the number lexicon lacks (`twice`,
-//! `halvt`, `hundreds`) refuses unless the question has it (a Danish answer
-//! also runs the English number words). Roman numerals are not read as
+//! `halvt`, `hundreds`) refuses unless the question has it (every answer also runs the other
+//! language's number words). Roman numerals are not read as
 //! numbers: the fixed-text grammar refuses them outright (R6), and so does
 //! any slash date, whose `/` fails the delimiting rules or the date parser.
 //!
@@ -211,6 +211,11 @@ const QUANTITY_SUFFIXES: &[&str] = &[
     "tredivte", "dobbelt", "dobbelte", "fold", "del", "dele", "vis", "illionth",
 ];
 
+/// Danish number words that are everyday English words, exempt on English
+/// answers (ruling T5-e). No English number word is an everyday Danish word,
+/// so a Danish answer has no exemption.
+const DANISH_EVERYDAY_ENGLISH: &[&str] = &["to", "fire", "en", "et"];
+
 fn is_quantity_word(w: &str) -> bool {
     QUANTITY_WORDS.contains(&w)
         || (w.len() > 6 && (w.ends_with("teenth") || w.ends_with("tieth")))
@@ -375,8 +380,14 @@ pub fn check(f: &Filled, question: &str, lang: Lang) -> Result<CheckReport, Chec
     // question.
     let q_words: Vec<String> = words(question).into_iter().map(|(_, _, w)| w).collect();
     for (s, e, w) in words(text) {
-        // A Danish answer also runs the English number-word lexicon.
-        let number_word = lang == Lang::Da && number_words(Lang::En).is_number_word(&w);
+        // Every answer also runs the other language's number words.
+        let number_word = match lang {
+            Lang::Da => number_words(Lang::En).is_number_word(&w),
+            Lang::En => {
+                !DANISH_EVERYDAY_ENGLISH.contains(&w.as_str())
+                    && number_words(Lang::Da).is_number_word(&w)
+            }
+        };
         if !(is_quantity_word(&w) || number_word) || q_words.contains(&w) {
             continue;
         }
@@ -410,7 +421,7 @@ fn fixed_text_grammar(f: &Filled) -> Result<(), CheckRefusal> {
         };
         segs.push(Seg::Text(fixed));
         let numeric = !p.from_param && !(p.values.is_empty() && p.dates.is_empty());
-        segs.push(if numeric { Seg::Num } else { Seg::Other });
+        segs.push(if numeric { Seg::Num } else { Seg::Param });
         at = p.end;
     }
     let Some(tail) = f.text.get(at..) else {
