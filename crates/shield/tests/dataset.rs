@@ -139,7 +139,7 @@ fn build_end_to_end() {
         ]
     );
 
-    assert_eq!(m.v, 1);
+    assert_eq!(m.v, 2);
     assert_eq!(m.dataset.as_str(), "crm");
     assert_eq!(m.snapshot_sha256, info.sha256);
     let names: Vec<&str> = m.schema.tables.iter().map(|t| t.name.as_str()).collect();
@@ -433,13 +433,18 @@ fn propose_and_finish_agree_on_borderline_columns() {
                 format!("w{i}c{c}")
             }));
         }
+        // I4: quasi columns are personal data; the email identifies the
+        // person, so the floors can count people.
+        r.push(Cell::Text(format!("p{i}@example.invalid")));
         rows.push(r);
     }
+    let mut src_cols = names.clone();
+    src_cols.push("email".into());
     let mut src = VecSource {
         tables: vec![(
             SourceTable {
                 name: "t".into(),
-                columns: names.clone(),
+                columns: src_cols,
             },
             rows,
         )],
@@ -457,7 +462,7 @@ fn propose_and_finish_agree_on_borderline_columns() {
     }
     // Mark every column `propose` did not refuse as public: `finish` must
     // accept them all.
-    let columns = names
+    let mut columns: Vec<ColumnInfo> = names
         .iter()
         .zip(&first)
         .map(|(n, refused)| ColumnInfo {
@@ -471,6 +476,12 @@ fn propose_and_finish_agree_on_borderline_columns() {
             alias: None,
         })
         .collect();
+    columns.push(ColumnInfo {
+        name: "email".into(),
+        ty: ColType::Text,
+        class: ColumnClass::Identifier,
+        alias: None,
+    });
     let schema = Schema {
         dataset: "crm".parse().unwrap(),
         tables: vec![TableInfo {
@@ -480,6 +491,7 @@ fn propose_and_finish_agree_on_borderline_columns() {
             columns,
         }],
         entities: vec![],
+        joins: vec![],
     };
     assert!(first.iter().any(|r| !r), "some column must pass");
     finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
@@ -713,6 +725,7 @@ fn camel_case_id_names_are_never_public() {
                 columns,
             }],
             entities: vec![],
+            joins: vec![],
         }
     };
     for c in ["employeeid", "customerid"] {
@@ -734,4 +747,238 @@ fn camel_case_id_names_are_never_public() {
         &mut |_| {},
     )
     .unwrap();
+}
+
+// ---- plan 43 follow-up: I4 (owner ruling), `_p_` names, Schema.joins ----
+
+/// Writes one CSV into its own directory and stages it.
+fn stage_csv(
+    dir: &DatasetDir,
+    base: &Path,
+    file: &str,
+    body: &str,
+) -> Vec<saiife_shield::dataset::Proposal> {
+    let csv_dir = base.join(format!("csv-{file}"));
+    std::fs::create_dir_all(&csv_dir).unwrap();
+    std::fs::write(csv_dir.join(file), body).unwrap();
+    let mut src = fixtures::MultiSource::csv_dir(&csv_dir).unwrap();
+    stage_snapshot(dir, &mut src, &mut |_| {}).unwrap();
+    propose(&dir.stage().join("snapshot.sqlite"), 10).unwrap()
+}
+
+fn set_class(schema: &mut Schema, table: &str, column: &str, class: ColumnClass) {
+    schema
+        .tables
+        .iter_mut()
+        .find(|t| t.name == table)
+        .unwrap()
+        .columns
+        .iter_mut()
+        .find(|c| c.name == column)
+        .unwrap()
+        .class = class;
+}
+
+/// One repeat customer (15 orders) and 40 one-time customers in a single
+/// orders table with no EntitySpec.
+fn orders_csv() -> String {
+    let mut s = String::from("order_id,customer_id,name,city,channel,amount\n");
+    let mut oid = 1000;
+    for _ in 0..15 {
+        oid += 1;
+        s.push_str(&format!("{oid},7,Søren Ærø,Ærøskøbing,web,12.50\n"));
+    }
+    for i in 0..40 {
+        oid += 1;
+        s.push_str(&format!(
+            "{oid},{},Mette Zz{i}son,Leeds,shop,9.75\n",
+            100 + i
+        ));
+    }
+    s
+}
+
+/// I4 (owner ruling): in a table with personal data and no EntitySpec,
+/// the k-floor counts distinct identifier values, not rows: a repeat
+/// customer with more than k orders is still one person and stays in the
+/// index; a public value only he holds is not a category.
+#[test]
+fn repeat_customer_stays_in_the_index() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = ds(t.path());
+    let props = stage_csv(&dir, t.path(), "orders.csv", &orders_csv());
+    let mut schema = fixtures::accept_all("crm", &props);
+    assert!(schema.entities.is_empty());
+    for (c, class) in [
+        ("order_id", ColumnClass::Identifier),
+        ("customer_id", ColumnClass::Identifier),
+        ("name", ColumnClass::Identifier),
+        ("city", ColumnClass::Quasi),
+        ("channel", ColumnClass::Public),
+        ("amount", ColumnClass::Sensitive),
+    ] {
+        set_class(&mut schema, "orders", c, class);
+    }
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    let idx = KnownIndex::open(&dir.live(), key()).unwrap();
+    assert!(
+        idx.contains_value("Søren Ærø").unwrap(),
+        "15 rows, 1 person"
+    );
+    assert!(
+        idx.contains_value("Ærøskøbing").unwrap(),
+        "15 rows, 1 person"
+    );
+    assert!(!idx.contains_value("Leeds").unwrap(), "40 people: common");
+    let channel = m
+        .public
+        .iter()
+        .find(|p| p.column == "orders.channel")
+        .unwrap();
+    assert_eq!(channel.passing, vec!["shop".to_string()], "web: 1 person");
+}
+
+/// I4: a table with personal data and no column that identifies the person
+/// cannot be counted: the build is refused with a reason naming the table.
+#[test]
+fn personal_table_without_identifier_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = ds(t.path());
+    let mut body = String::from("city,postcode,segment,amount\n");
+    for i in 0..300 {
+        body.push_str(&format!(
+            "{},{},{},{}.50\n",
+            ["Odense", "Aalborg", "Ærøskøbing"][i % 3],
+            5000 + i % 7,
+            ["a", "b"][i % 2],
+            i
+        ));
+    }
+    let props = stage_csv(&dir, t.path(), "visits.csv", &body);
+    let p = |c: &str| props.iter().find(|p| p.column == c).unwrap();
+    assert_eq!(p("city").guess.class, ColumnClass::Quasi);
+    // The preview cannot count people either.
+    assert_eq!(p("segment").public_preview, None);
+    assert_eq!(
+        p("segment").public_refusal,
+        Some(saiife_shield::public::NO_IDENTIFIER)
+    );
+    let mut schema = fixtures::accept_all("crm", &props);
+    for (c, class) in [
+        ("city", ColumnClass::Quasi),
+        ("postcode", ColumnClass::Quasi),
+        ("segment", ColumnClass::Sensitive),
+        ("amount", ColumnClass::Sensitive),
+    ] {
+        set_class(&mut schema, "visits", c, class);
+    }
+    let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "policy, table visits: holds personal data but no column identifies \
+         the person; choose the column that identifies the person"
+    );
+    assert!(!dir.live().exists());
+}
+
+/// Plan 45 S1: a policy alias is a cloud name; one starting with `_p_`
+/// (the planner's prefix) is refused by `finish`.
+#[test]
+fn reserved_p_prefix_alias_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 4);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    schema.tables[1].columns[2].alias = Some("_P_amount".into());
+    let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "policy, table invoices, column {}: names starting with _p_ are reserved; rename it",
+            schema.tables[1].columns[2].name
+        )
+    );
+    let mut schema = stage(&dir, &csv);
+    schema.tables[0].alias = Some("_p_people".into());
+    assert!(finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).is_err());
+}
+
+/// Schema.joins: derived by `finish` from the EntitySpecs and the C-G1
+/// convention (`<word>_<key>` INTEGER in another table, by cloud names),
+/// stored in the manifest (v2) and loaded back; a v1 manifest gets them
+/// derived on load.
+#[test]
+fn joins_are_derived_and_stored() {
+    use saiife_shield::schema::KeyJoin;
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 5);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    schema.entities[0].word = "customer".into();
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    let want = vec![KeyJoin {
+        entity: "customers".into(),
+        key: "id".into(),
+        table: "invoices".into(),
+        column: "customer_id".into(),
+    }];
+    assert_eq!(m.v, 2);
+    assert_eq!(m.schema.joins, want);
+    assert_eq!(
+        m.schema
+            .key_join(("invoices", "customer_id"), ("customers", "id"))
+            .map(|(j, a_is_key)| (j.clone(), a_is_key)),
+        Some((want[0].clone(), false))
+    );
+    assert_eq!(load_manifest(&dir).unwrap().schema.joins, want);
+
+    // A v1 manifest (no joins field) still loads, with derived joins.
+    let path = dir.manifest();
+    let mut j: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    j["v"] = 1.into();
+    j["schema"].as_object_mut().unwrap().remove("joins");
+    std::fs::write(&path, serde_json::to_string(&j).unwrap()).unwrap();
+    let old = load_manifest(&dir).unwrap();
+    assert_eq!(old.v, 1);
+    assert_eq!(old.schema.joins, want);
+    j["v"] = 3.into();
+    std::fs::write(&path, serde_json::to_string(&j).unwrap()).unwrap();
+    assert!(matches!(load_manifest(&dir), Err(ShieldError::Corrupt(_))));
+}
+
+/// A join the policy declares is kept when it links an entity key to an
+/// INTEGER column of another table, and refused otherwise.
+#[test]
+fn declared_joins_are_checked() {
+    use saiife_shield::schema::KeyJoin;
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 6);
+    let dir = ds(t.path());
+    let decl = |table: &str, column: &str| KeyJoin {
+        entity: "customers".into(),
+        key: "id".into(),
+        table: table.into(),
+        column: column.into(),
+    };
+    for (table, column) in [
+        ("invoices", "amount"), // REAL
+        ("invoices", "nope"),   // not a column
+        ("customers", "id"),    // the entity's own table
+    ] {
+        let mut schema = stage(&dir, &csv);
+        schema.joins = vec![decl(table, column)];
+        let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+        assert!(
+            e.to_string()
+                .ends_with("a join must link an entity key to an INTEGER column of another table"),
+            "{table}.{column}: {e}"
+        );
+    }
+    let mut schema = stage(&dir, &csv);
+    // The fixture's entity word is `record`: no convention join, only
+    // the declared one.
+    schema.joins = vec![decl("invoices", "customer_id")];
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    assert_eq!(m.schema.joins, vec![decl("invoices", "customer_id")]);
 }

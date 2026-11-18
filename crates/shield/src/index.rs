@@ -22,9 +22,12 @@
 //! 4-token window (each through [`value_forms`]), under the same floor, so
 //! a 2-to-4-token scan finds a long address (I3), at most 64 windows per
 //! value (R-22: the first ones); `BuildStats` records the longest value's
-//! token count. `n` is `COUNT(DISTINCT key)` in
-//! an entity table (R-14: one person in many rows is one record), else
-//! `COUNT(*)`. An entity's full name (its name columns together) enters
+//! token count. The record count is [`crate::public::people_count`]'s
+//! (I4, owner ruling): distinct keys in an entity table (R-14: one person
+//! in many rows is one record), distinct identifier values in another
+//! table with personal data (a table with personal data and no identifier
+//! refuses the build), rows only in a table without personal data. An
+//! entity's full name (its name columns together) enters
 //! under the same floor. Free text has no floor: every phrase (split at
 //! `. ! ? ; \n`) of 3 to 40 tokens enters whole, however often it occurs
 //! (a common phrase like `paid by card` enters too); a piece of more than 40
@@ -58,7 +61,7 @@
 use crate::dataset::{create_private_file, ensure_private_dir, sync_dir, with_private_part};
 use crate::error::ShieldError;
 use crate::norm::{normalize, tokens};
-use crate::public::{public_values, PublicValues};
+use crate::public::{public_values, table_people_count, PeopleCount, PublicValues};
 use crate::schema::{ColType, ColumnClass, Schema};
 use crate::snapshot::{open_ro, parse_date, parse_int, parse_real};
 use crate::source::quote_ident;
@@ -681,19 +684,27 @@ pub fn build_index_with_run_bytes(
             return Err(io("a dataset file already exists"));
         }
     }
+    // I4: every table's count first, so a table that cannot be counted
+    // refuses the build before anything is read or written.
+    let counts: Vec<PeopleCount> = schema
+        .tables
+        .iter()
+        .map(|t| table_people_count(schema, &t.name))
+        .collect::<Result<_, _>>()?;
     let snap = open_ro(snapshot)?;
 
     let mut allow = schema_words(schema);
-    for t in &schema.tables {
+    for (t, count) in schema.tables.iter().zip(&counts) {
         for c in t.columns.iter().filter(|c| c.class == ColumnClass::Public) {
-            let pv =
-                public_values(&snap, &t.name, &c.name, k).map_err(|_| ShieldError::Source {
+            let pv = public_values(&snap, &t.name, &c.name, k, count).map_err(|_| {
+                ShieldError::Source {
                     file: "snapshot".into(),
                     table: Some(t.name.clone()),
                     column: Some(c.name.clone()),
                     row: None,
                     why: "the public column's values could not be read",
-                })?;
+                }
+            })?;
             allow.extend(pv.passing.iter().map(|v| normalize(v)));
         }
     }
@@ -720,7 +731,7 @@ pub fn build_index_with_run_bytes(
     };
 
     let k = i64::from(k);
-    for t in &schema.tables {
+    for (t, count) in schema.tables.iter().zip(&counts) {
         let qt = quote_ident(&t.name);
         let have = snapshot_columns(&snap, &t.name)?;
         let need = |c: &str| -> Result<(), ShieldError> {
@@ -736,16 +747,23 @@ pub fn build_index_with_run_bytes(
                 })
             }
         };
-        // R-14: in an entity table the floor counts people (distinct keys),
-        // not rows: one customer in many rows of a denormalized table is
-        // one record.
-        let people = match schema.entity_for(&t.name) {
-            Some(e) => {
-                need(&e.key)?;
-                format!("COUNT(DISTINCT {})", quote_ident(&e.key))
-            }
-            None => "COUNT(*)".to_string(),
-        };
+        // R-14 / I4: the floor counts people, not rows: one customer in
+        // many rows is one record. Every column the count reads must be in
+        // the snapshot.
+        if let Some(e) = schema.entity_for(&t.name) {
+            need(&e.key)?;
+        }
+        for c in t
+            .columns
+            .iter()
+            .filter(|c| c.class == ColumnClass::Identifier)
+        {
+            need(&c.name)?;
+        }
+        for j in schema.joins.iter().filter(|j| j.table == t.name) {
+            need(&j.column)?;
+        }
+        let people = count.sql();
         for c in &t.columns {
             if matches!(
                 c.class,

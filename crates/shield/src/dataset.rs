@@ -216,8 +216,13 @@ use crate::index::{
     build_index, write_allow, BuildStats, IndexKey, ALLOW_FILE, BLOOM_FILE, INDEX_FILE,
 };
 use crate::lexicon::{build_lexicon, LEXICON_FILE};
-use crate::public::{public_gate, public_values, PublicValues};
-use crate::schema::{rows_band, ColType, ColumnClass, DatasetName, Schema};
+use crate::public::{
+    people_count, public_gate, public_values, table_people_count, PublicValues, NO_IDENTIFIER,
+};
+use crate::schema::{
+    is_reserved_name, rows_band, ColType, ColumnClass, ColumnInfo, DatasetName, KeyJoin, Schema,
+    TableInfo,
+};
 use crate::snapshot::{build_snapshot, open_ro, SnapshotInfo, SNAPSHOT_FILE};
 use crate::source::{quote_ident, RowSource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -225,8 +230,13 @@ use std::io::{self, BufWriter, Read, Write};
 
 /// The manifest's file name in `live/`.
 pub const MANIFEST_FILE: &str = "manifest.json";
-/// The manifest format version.
-pub const MANIFEST_VERSION: u32 = 1;
+/// The manifest format version written. Version 2 adds `schema.joins`;
+/// [`load_manifest`] also reads version 1 (see [`MIN_MANIFEST_VERSION`]).
+pub const MANIFEST_VERSION: u32 = 2;
+/// The oldest manifest version [`load_manifest`] reads. A version 1
+/// manifest has no `schema.joins`: they are derived on load with
+/// [`Schema::conventional_joins`], which needs only the schema.
+pub const MIN_MANIFEST_VERSION: u32 = 1;
 /// The default frequency floor.
 pub const DEFAULT_K: u32 = 10;
 /// The smallest frequency floor a build accepts.
@@ -237,6 +247,8 @@ pub const MIN_K: u32 = 2;
 const STAGE_INFO_FILE: &str = "stage.json";
 const MAX_JSON_BYTES: u64 = 64 << 20;
 const PUBLIC_REFUSED: &str = "a public column holds names, IDs or amounts";
+const RESERVED: &str = "names starting with _p_ are reserved; rename it";
+const BAD_JOIN: &str = "a join must link an entity key to an INTEGER column of another table";
 const MISMATCH: &str = "a dataset file does not match its manifest";
 
 /// The files the manifest hashes besides the snapshot.
@@ -613,7 +625,54 @@ fn check_schema(schema: &Schema, layout: &Layout) -> Result<(), ShieldError> {
             return Err(bad);
         }
     }
-    check_entities(schema, layout)
+    check_reserved(schema)?;
+    check_entities(schema, layout)?;
+    check_joins(schema)
+}
+
+/// Plan 45 S1: no snapshot name and no alias (a cloud name) starts with
+/// the planner's `_p_` prefix. Import already refuses such source names;
+/// this covers the policy's aliases and a snapshot from elsewhere.
+fn check_reserved(schema: &Schema) -> Result<(), ShieldError> {
+    for t in &schema.tables {
+        if is_reserved_name(&t.name) || t.alias.as_deref().is_some_and(is_reserved_name) {
+            return Err(policy_err(&t.name, None, RESERVED));
+        }
+        for c in &t.columns {
+            if is_reserved_name(&c.name) || c.alias.as_deref().is_some_and(is_reserved_name) {
+                return Err(policy_err(&t.name, Some(&c.name), RESERVED));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A join the policy declares links an EntitySpec's key to an INTEGER
+/// column of another schema table (the schema already matches the
+/// snapshot).
+fn check_joins(schema: &Schema) -> Result<(), ShieldError> {
+    for j in &schema.joins {
+        let entity = schema
+            .entities
+            .iter()
+            .any(|e| e.table == j.entity && e.key == j.key);
+        let fk_int = schema
+            .column(&j.table, &j.column)
+            .is_some_and(|c| c.ty == ColType::Integer);
+        if !entity || !fk_int || j.table == j.entity {
+            return Err(policy_err(&j.table, Some(&j.column), BAD_JOIN));
+        }
+    }
+    Ok(())
+}
+
+/// The declared joins and the conventional ones, sorted, no duplicates.
+fn all_joins(schema: &Schema) -> Vec<KeyJoin> {
+    let mut joins = schema.joins.clone();
+    joins.extend(schema.conventional_joins());
+    joins.sort();
+    joins.dedup();
+    joins
 }
 
 /// A fixed policy error naming a table and maybe a column (never a value).
@@ -800,6 +859,7 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
     let conn = open_ro(snapshot)?;
     let mut out = Vec::new();
     for (table, cols) in snapshot_layout(&conn)? {
+        let mut seen = Vec::with_capacity(cols.len());
         for (column, ty) in cols {
             let st = classify::stats(&conn, &table, &column, ty)?;
             let source = source_names
@@ -817,14 +877,38 @@ pub fn propose(snapshot: &Path, k: u32) -> Result<Vec<Proposal>, ShieldError> {
                 .filter(|s| classify::source_id_shaped(s))
                 .map(classify::camel_split);
             let guess = classify::guess(split.as_deref().unwrap_or(&column), ty, &st, &sample);
+            seen.push((column, ty, st, sample, source, guess));
+        }
+        // I4: the preview counts people as `finish` will, by the guessed
+        // classes (no EntitySpec or join is known yet). A table that cannot
+        // be counted lists no values.
+        let guessed = TableInfo {
+            name: table.clone(),
+            alias: None,
+            rows: 0,
+            columns: seen
+                .iter()
+                .map(|(c, ty, _, _, _, g)| ColumnInfo {
+                    name: c.clone(),
+                    ty: *ty,
+                    class: g.class,
+                    alias: None,
+                })
+                .collect(),
+        };
+        let count = people_count(&guessed, None, &[]);
+        for (column, ty, st, sample, source, guess) in seen {
             let mut refusal = public_gate(&[], &table, &column, source, ty, &st, &sample);
             let mut preview = None;
             // M5: no k-floor listing of free text (the gate refuses it, S4).
             if refusal.is_none() && guess.class != ColumnClass::FreeText {
-                match public_values(&conn, &table, &column, k) {
-                    Ok(pv) => preview = Some(pv),
-                    Err(ShieldError::Source { why, .. }) => refusal = Some(why),
-                    Err(e) => return Err(e),
+                match &count {
+                    Ok(count) => match public_values(&conn, &table, &column, k, count) {
+                        Ok(pv) => preview = Some(pv),
+                        Err(ShieldError::Source { why, .. }) => refusal = Some(why),
+                        Err(e) => return Err(e),
+                    },
+                    Err(_) => refusal = Some(NO_IDENTIFIER),
                 }
             }
             out.push(Proposal {
@@ -902,10 +986,17 @@ fn finish_inner(
     check_schema(schema, &layout)?;
     let policy = schema.clone();
     let mut schema = schema.clone();
+    schema.joins = all_joins(&schema);
+    // I4: every table can be counted, or the build is refused here.
+    let counts = schema
+        .tables
+        .iter()
+        .map(|t| table_people_count(&schema, &t.name))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut public = Vec::new();
     let mut formats = BTreeMap::new();
     let mut rows_bands = BTreeMap::new();
-    for t in &mut schema.tables {
+    for (t, count) in schema.tables.iter_mut().zip(&counts) {
         let n: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM {}", quote_ident(&t.name)),
@@ -939,7 +1030,7 @@ fn finish_inner(
                 {
                     return Err(ShieldError::Corrupt(PUBLIC_REFUSED));
                 }
-                public.push(public_values(&conn, &t.name, &c.name, k)?);
+                public.push(public_values(&conn, &t.name, &c.name, k, count)?);
             }
             formats.insert(format!("{}.{}", t.name, c.name), format_of(c.ty, &sample));
         }
@@ -1128,14 +1219,17 @@ pub fn load_manifest(dir: &DatasetDir) -> Result<Manifest, ShieldError> {
     dir.recover()?;
     check_private_dir(&dir.root)?;
     check_private_dir(&dir.live())?;
-    let m: Manifest = read_json(
+    let mut m: Manifest = read_json(
         open_sealed(&dir.manifest(), 0o600)?,
         "the manifest is not valid",
     )?;
-    if m.v != MANIFEST_VERSION {
+    if !(MIN_MANIFEST_VERSION..=MANIFEST_VERSION).contains(&m.v) {
         return Err(ShieldError::Corrupt(
             "the manifest version is not supported",
         ));
+    }
+    if m.v == 1 {
+        m.schema.joins = m.schema.conventional_joins();
     }
     if m.dataset != name || m.schema.dataset != name {
         return Err(ShieldError::Corrupt("the manifest names another dataset"));

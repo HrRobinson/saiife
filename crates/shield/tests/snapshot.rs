@@ -955,3 +955,37 @@ fn decimal_comma_only_where_unambiguous() {
     let info = build(&mut src, &dir.path().join("amb")).unwrap();
     assert_eq!(col_types(&info, "amb")[1].1, ColType::Text);
 }
+
+/// Plan 45 S1: `_p_` is the planner's prefix for its own names; a table or
+/// column whose name starts with it (any case) is refused at import with a
+/// reason, before anything is written.
+#[test]
+fn reserved_p_prefix_names_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = csv_src(b"id,_p_total\n1,2\n", "t.csv");
+    let e = build(&mut src, dir.path()).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "t.csv, table t, column _p_total: names starting with _p_ are reserved; rename it"
+    );
+    let mut src = csv_src(b"id,_P_Sum\n1,2\n", "t.csv");
+    assert!(build(&mut src, dir.path()).is_err(), "any case");
+    let mut src = VecSource {
+        tables: vec![(
+            SourceTable {
+                name: "_p_orders".into(),
+                columns: vec!["id".into()],
+            },
+            vec![vec![Cell::Int(1)]],
+        )],
+    };
+    let e = build(&mut src, dir.path()).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "data, table _p_orders: names starting with _p_ are reserved; rename it"
+    );
+    assert!(!dir.path().join("ds").join("snapshot.sqlite").exists());
+    // Not the prefix: kept.
+    let mut src = csv_src(b"id,p_total,x_p_y\n1,2,3\n", "t.csv");
+    build(&mut src, dir.path()).unwrap();
+}
