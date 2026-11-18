@@ -8,6 +8,7 @@ pub mod audit;
 pub mod calc;
 pub mod data;
 pub mod keys;
+pub mod model;
 pub mod ops;
 pub mod outbox;
 pub mod pg;
