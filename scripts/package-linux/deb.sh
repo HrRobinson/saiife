@@ -9,6 +9,7 @@
 
 PKG_BIN=/usr/libexec/saiife/saiife
 FIDO_BIN=/usr/libexec/saiife/saiife-fido
+NER_BIN=/usr/libexec/saiife/saiife-ner
 FLEET_DIR=/etc/saiife/fleet
 SYS_CONFIG=/etc/saiife/config.toml
 INSTALLED_TOML=/etc/saiife/installed.toml
@@ -190,6 +191,8 @@ phase_fresh() {
         fail "$FIDO_BIN printed no single hello line: $hello"
     fi
     ok "$FIDO_BIN is 0755 root:root and prints its hello"
+    [[ "$(stat -c '%U:%G %a %F' "$NER_BIN")" == "root:root 755 regular file" ]] || fail "$NER_BIN is not a regular file, 0755 root:root: $(stat -c '%U:%G %a %F' "$NER_BIN")"
+    ok "$NER_BIN is 0755 root:root"
 
     local rc=0
     # shellcheck disable=SC2024 # the redirect is meant to run as the runner user: the output file is in $WORK, the runner's
@@ -396,7 +399,7 @@ phase_purge() {
     local left="" p
     for p in /opt/saiife "$SYS_CONFIG" "$INSTALLED_TOML" /etc/saiife/credstore /var/lib/saiife /var/log/saiife \
         /run/saiife /etc/systemd/system/saiifed.service /usr/share/polkit-1/actions/com.saiife.approve.policy \
-        "$CLAUDE_MANAGED" /usr/libexec/saiife "$FIDO_BIN" /usr/bin/saiife; do
+        "$CLAUDE_MANAGED" /usr/libexec/saiife "$FIDO_BIN" "$NER_BIN" /usr/bin/saiife; do
         if sudo -n test -e "$p" || sudo -n test -L "$p"; then left="$left $p"; fi
     done
     [[ -z "$left" ]] || fail "left behind after purge:$left"

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 // matches layout::PACKAGE_BINARY (Task 1)
 const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
 const FIDO_HELPER: &str = "/usr/libexec/saiife/saiife-fido";
+const NER_HELPER: &str = "/usr/libexec/saiife/saiife-ner";
 
 fn linux_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux")
@@ -93,6 +94,24 @@ fn guard_catches_bad_paths() {
 #[test]
 fn package_ships_the_staging_binary() {
     assert!(dsts().iter().any(|d| d == PACKAGE_BINARY));
+}
+
+#[test]
+fn ner_helper_is_packaged() {
+    let yaml = read("nfpm.yaml");
+    assert_eq!(layout::NER_HELPER, NER_HELPER);
+    assert!(dsts().iter().any(|d| d == NER_HELPER));
+    let entry = yaml
+        .split("  - ")
+        .find(|e| e.contains(&format!("dst: {NER_HELPER}")))
+        .expect("ner helper entry");
+    assert!(entry.contains("src: ${SAIIFE_STAGE}/saiife-ner"), "{entry}");
+    assert!(entry.contains("mode: 0755"), "{entry}");
+    assert!(
+        entry.contains("owner: root") && entry.contains("group: root"),
+        "{entry}"
+    );
+    check_dst(NER_HELPER).unwrap();
 }
 
 #[test]
@@ -222,6 +241,7 @@ fn build_sh(version: &str) -> (Option<i32>, String) {
         .args([
             "/nonexistent/p18-saiife",
             "/nonexistent/p41-saiife-fido",
+            "/nonexistent/p46-saiife-ner",
             version,
             "amd64",
         ])
