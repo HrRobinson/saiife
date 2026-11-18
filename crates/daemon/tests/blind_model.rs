@@ -547,7 +547,7 @@ const PROMPT_SHA256: &str =
 const PINNED_BODY: &str = concat!(
     r#"{"model":"claude-opus-5-5","max_tokens":16000,"system":<SYSTEM>,"#,
     r#""messages":[{"role":"user","content":"{\"context\":[],\"kind\":\"saiife-blind-plan\",\"lang\":\"en\",\"list_cap\":50,\"params\":[],\"question\":\"how many customers are there in each city\",\"retry\":null,\"schema\":{\"tables\":[{\"columns\":[{\"class\":\"quasi\",\"name\":\"city\",\"ty\":\"text\"}],\"entity\":\"customer\",\"name\":\"customers\",\"rows\":\"10-99\"}]},\"synthetic\":{\"customers\":[]},\"v\":1}"}],"#,
-    r#""output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","additionalProperties":false,"required":["method","template","intent"],"properties":{"method":{"type":"string","maxLength":8192},"template":{"type":"string","maxLength":4096},"checks":{"type":"array","maxItems":4,"items":{"oneOf":[{"type":"object","additionalProperties":false,"required":["kind","min","max"],"properties":{"kind":{"const":"rows_between"},"min":{"type":"integer","minimum":0},"max":{"type":"integer","minimum":0}}},{"type":"object","additionalProperties":false,"required":["kind","a","b"],"properties":{"kind":{"const":"equal"},"a":{"type":"string","maxLength":8192},"b":{"type":"string","maxLength":8192}}}]}},"intent":{"type":"string","maxLength":300},"needs_judgment":{"type":"boolean"}}}}},"#,
+    r#""output_config":{"effort":"high","format":{"type":"json_schema","schema":{"additionalProperties":false,"properties":{"checks":{"items":{"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"rows_between"},"max":{"type":"integer"},"min":{"type":"integer"}},"required":["kind","min","max"],"type":"object"},{"additionalProperties":false,"properties":{"a":{"type":"string"},"b":{"type":"string"},"kind":{"const":"equal"}},"required":["kind","a","b"],"type":"object"}]},"type":"array"},"intent":{"type":"string"},"method":{"type":"string"},"needs_judgment":{"type":"boolean"},"template":{"type":"string"}},"required":["method","template","intent"],"type":"object"}}},"#,
     r#""fallbacks":"default"}"#
 );
 
@@ -565,9 +565,21 @@ fn request_body_is_pinned() {
     // The content is the canonical envelope, byte for byte.
     let content = v["messages"][0]["content"].as_str().unwrap();
     assert_eq!(content.as_bytes(), pin_envelope().canonical());
-    // The schema is PLAN_SCHEMA.
-    let schema: Value = serde_json::from_str(saiife_shield::plan::PLAN_SCHEMA).unwrap();
+    // The schema is the wire form of PLAN_SCHEMA (ruling P47-30): no
+    // keyword the API refuses.
+    let schema: Value = serde_json::from_slice(&model::wire_schema()).unwrap();
     assert_eq!(v["output_config"]["format"]["schema"], schema);
+    let text = String::from_utf8(body).unwrap();
+    for k in [
+        "maxLength",
+        "minLength",
+        "minimum",
+        "maximum",
+        "maxItems",
+        "oneOf",
+    ] {
+        assert!(!text.contains(k), "{k}");
+    }
 }
 
 #[tokio::test]
@@ -818,6 +830,34 @@ async fn no_key_refuses() {
     assert!(text.contains(NO_KEY_HINT), "{text}");
     assert_eq!(s.count(), 0);
     assert!(f.outbox_lines().is_empty());
+}
+
+/// Ruling P47-32: what can fail before the send fails before the outbox
+/// and the `blind_send` record, so nothing says a request went out.
+#[tokio::test]
+async fn nothing_recorded_when_send_cannot_start() {
+    let p = pki();
+    let (port, s) = server(&p, vec![ok_answer()]).await;
+    // A key that is not a usable header value.
+    let mut e = token_entry(SECRET, Kind::Token, "token", &["blind-model"]);
+    e.fields.insert(
+        "token".into(),
+        Zeroizing::new(format!("{}\u{1}x", fake_key())),
+    );
+    let f = fx(Some(e));
+    let r = f.plan(&planner_for(&p, port)).await.unwrap_err();
+    assert!(matches!(r, PlanError::NoKey(_)), "{r:?}");
+    assert!(f.outbox_lines().is_empty());
+    assert!(f.records("blind_send").is_empty());
+    assert_eq!(s.count(), 0);
+    // No upstream client: the context of a test has none.
+    let f = default_fx();
+    let r = f.plan(&AnthropicPlanner::new()).await.unwrap_err();
+    assert_eq!(r, PlanError::Unreachable);
+    assert!(f.outbox_lines().is_empty());
+    assert!(f.records("blind_send").is_empty());
+    assert!(f.records("model").is_empty());
+    assert_eq!(s.count(), 0);
 }
 
 #[tokio::test]

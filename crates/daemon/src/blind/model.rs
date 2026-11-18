@@ -9,7 +9,7 @@
 //!    bytes as the user message's content string.
 //! 3. The frame check: the body re-parsed and every field compared with the
 //!    constant frame (model, `max_tokens`, [`SYSTEM_PROMPT`], effort,
-//!    format/schema = `PLAN_SCHEMA`, fallbacks), the content byte-equal to
+//!    format/schema = [`wire_schema`], fallbacks), the content byte-equal to
 //!    the checked envelope, and the whole body byte-equal to the frame
 //!    rebuilt from the compiled constants. Anything else is
 //!    [`PlanError::Blocked`] with a hit on part `frame`.
@@ -203,28 +203,81 @@ fn json_str(s: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(serde_json::to_string(s).unwrap_or_default().as_bytes());
 }
 
-/// `PLAN_SCHEMA` without the whitespace outside its strings (its own key
-/// order kept).
-fn compact_schema() -> String {
-    let mut out = String::with_capacity(PLAN_SCHEMA.len());
-    let (mut in_str, mut esc) = (false, false);
-    for c in PLAN_SCHEMA.chars() {
-        if in_str {
-            out.push(c);
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_str = false;
+/// Schema keywords the structured-outputs API does not support (ruling
+/// P47-30); `parse_reply` enforces each bound locally (`METHOD_MAX`,
+/// `TEMPLATE_MAX`, `INTENT_MAX_CHARS`, `CHECKS_MAX`; `u64` for `min`/`max`).
+const WIRE_DROPPED: [&str; 7] = [
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+    "multipleOf",
+    "maxItems",
+    "minItems",
+];
+
+/// `v` without the [`WIRE_DROPPED`] keywords and with `oneOf` as `anyOf`, at
+/// every level. The keys of a `properties` object are names, not keywords.
+fn wire_value(v: &Value, names: bool) -> Value {
+    match v {
+        Value::Object(o) => {
+            let mut out = serde_json::Map::new();
+            for (k, x) in o {
+                if !names && WIRE_DROPPED.contains(&k.as_str()) {
+                    continue;
+                }
+                let key = if !names && k == "oneOf" {
+                    "anyOf"
+                } else {
+                    k.as_str()
+                };
+                out.insert(key.to_string(), wire_value(x, !names && k == "properties"));
             }
-        } else if c == '"' {
-            in_str = true;
-            out.push(c);
-        } else if !c.is_whitespace() {
-            out.push(c);
+            Value::Object(out)
         }
+        Value::Array(a) => Value::Array(a.iter().map(|x| wire_value(x, false)).collect()),
+        x => x.clone(),
     }
+}
+
+/// `v` as JSON with every object's keys sorted, no whitespace.
+fn write_sorted(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            out.push(b'{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                json_str(k, out);
+                out.push(b':');
+                write_sorted(&o[k.as_str()], out);
+            }
+            out.push(b'}');
+        }
+        Value::Array(a) => {
+            out.push(b'[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_sorted(x, out);
+            }
+            out.push(b']');
+        }
+        x => out.extend_from_slice(x.to_string().as_bytes()),
+    }
+}
+
+/// The schema sent as `output_config.format.schema` (ruling P47-30):
+/// `PLAN_SCHEMA` without the keywords the API refuses and with `oneOf` as
+/// `anyOf`, keys sorted. Derived, so the two cannot drift.
+pub fn wire_schema() -> Vec<u8> {
+    let v: Value = serde_json::from_str(PLAN_SCHEMA).unwrap_or(Value::Null);
+    let mut out = Vec::with_capacity(PLAN_SCHEMA.len());
+    write_sorted(&wire_value(&v, false), &mut out);
     out
 }
 
@@ -241,14 +294,14 @@ fn frame(model: &str, system: &str, content: &str) -> Vec<u8> {
     b.extend_from_slice(b"}],\"output_config\":{\"effort\":");
     json_str(EFFORT, &mut b);
     b.extend_from_slice(b",\"format\":{\"type\":\"json_schema\",\"schema\":");
-    b.extend_from_slice(compact_schema().as_bytes());
+    b.extend_from_slice(&wire_schema());
     b.extend_from_slice(b"}},\"fallbacks\":\"default\"}");
     b
 }
 
 /// The exact request body for `env` (R47-7): `model`, `max_tokens`,
 /// `system`, one user message whose content is the canonical envelope,
-/// `output_config` (effort, the plan schema), `fallbacks`. No `thinking`,
+/// `output_config` (effort, [`wire_schema`]), `fallbacks`. No `thinking`,
 /// no sampling parameters.
 pub fn request_body(model: &str, env: &Envelope) -> Vec<u8> {
     let bytes = env.canonical();
@@ -286,7 +339,7 @@ fn check_frame(body: &[u8], model: &str, env_bytes: &[u8]) -> Result<(), PlanErr
         let Ok(v) = serde_json::from_slice::<Value>(body) else {
             return false;
         };
-        let Ok(schema) = serde_json::from_str::<Value>(PLAN_SCHEMA) else {
+        let Ok(schema) = serde_json::from_slice::<Value>(&wire_schema()) else {
             return false;
         };
         let msgs = &v["messages"];
@@ -448,20 +501,26 @@ impl Wire<'_> {
         }
     }
 
-    fn needs_key(&self) -> bool {
-        matches!(self, Wire::Http(_))
+    /// Everything a send needs that can fail before it (ruling P47-32):
+    /// the key from the vault, the route and the key header. None for the
+    /// scripted planner.
+    fn prepare(&self, ctx: &Ctx, secret: Option<&str>) -> Result<Option<Ready>, PlanError> {
+        match self {
+            Wire::Http(p) => {
+                let key = read_key(ctx, secret)?;
+                p.prepare(ctx, &key).map(Some)
+            }
+            #[cfg(debug_assertions)]
+            Wire::Script(_) => Ok(None),
+        }
     }
 
-    async fn exchange(
-        &self,
-        ctx: &Ctx,
-        body: &[u8],
-        key: Option<&Zeroizing<String>>,
-    ) -> Result<Answer, PlanError> {
-        match self {
-            Wire::Http(p) => p.exchange(ctx, body, key).await,
+    async fn exchange(&self, ready: Option<Ready>, body: &[u8]) -> Result<Answer, PlanError> {
+        match (self, ready) {
+            (Wire::Http(_), Some(r)) => r.send(body).await,
+            (Wire::Http(_), None) => Err(PlanError::Unreachable),
             #[cfg(debug_assertions)]
-            Wire::Script(f) => Ok(f.next_answer()),
+            (Wire::Script(f), _) => Ok(f.next_answer()),
         }
     }
 }
@@ -674,12 +733,9 @@ impl Call<'_> {
         let n = |x: usize| u32::try_from(x).unwrap_or(u32::MAX);
         let mut attempt = 1u32;
         loop {
-            // 4. The key, per request.
-            let key = if wire.needs_key() {
-                Some(read_key(self.ctx, cfg.secret.as_deref())?)
-            } else {
-                None
-            };
+            // 4. The key, per request, the route and the headers: all that
+            // can fail before the send, before anything says it was sent.
+            let ready = wire.prepare(self.ctx, cfg.secret.as_deref())?;
             // 5. The outbox; 6. the record.
             self.outbox(&body, &body_sha).await?;
             self.record(BlindRecord::Send {
@@ -698,8 +754,7 @@ impl Call<'_> {
             .await?;
             // 7. The send.
             let t0 = Instant::now();
-            let got = wire.exchange(self.ctx, &body, key.as_ref()).await;
-            drop(key);
+            let got = wire.exchange(ready, &body).await;
             let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
             let a = match got {
                 Ok(a) => a,
@@ -837,30 +892,38 @@ impl AnthropicPlanner {
         Ok((API_URL.to_string(), up.with_timeout(TIMEOUT)))
     }
 
-    async fn exchange(
-        &self,
-        ctx: &Ctx,
-        body: &[u8],
-        key: Option<&Zeroizing<String>>,
-    ) -> Result<Answer, PlanError> {
+    /// The route, the URI and the headers of one send, before the outbox.
+    fn prepare(&self, ctx: &Ctx, key: &Zeroizing<String>) -> Result<Ready, PlanError> {
         let (url, up) = self.route(ctx)?;
         let uri: Uri = url.parse().map_err(|_| PlanError::Unreachable)?;
-        let no_key = || PlanError::NoKey("the model key is not a usable header value".into());
-        let key = key.ok_or_else(no_key)?;
-        let mut k = HeaderValue::from_str(key.trim()).map_err(|_| no_key())?;
+        let mut k = HeaderValue::from_str(key.trim())
+            .map_err(|_| PlanError::NoKey("the model key is not a usable header value".into()))?;
         k.set_sensitive(true);
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", k);
         headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
         headers.insert("anthropic-beta", HeaderValue::from_static(API_BETA));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(Ready { uri, up, headers })
+    }
+}
+
+/// A send whose every fallible step is done: only the exchange is left.
+struct Ready {
+    uri: Uri,
+    up: Upstream,
+    headers: HeaderMap,
+}
+
+impl Ready {
+    async fn send(self, body: &[u8]) -> Result<Answer, PlanError> {
         let b = Built {
             method: Method::POST,
-            uri,
-            headers,
+            uri: self.uri,
+            headers: self.headers,
             body: Some(Bytes::copy_from_slice(body)),
         };
-        match up.send(b, READ_LIMIT).await {
+        match self.up.send(b, READ_LIMIT).await {
             Ok(r) => Ok(Answer::of(r)),
             Err(BrokerError::Timeout) => Err(PlanError::Timeout),
             Err(_) => Err(PlanError::Unreachable),
@@ -997,11 +1060,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_schema_is_plan_schema() {
-        let a: Value = serde_json::from_str(&compact_schema()).unwrap();
-        let b: Value = serde_json::from_str(PLAN_SCHEMA).unwrap();
-        assert_eq!(a, b);
-        assert!(!compact_schema().contains(char::is_whitespace));
+    fn wire_schema_is_plan_schema_without_the_refused_keywords() {
+        let wire: Value = serde_json::from_slice(&wire_schema()).unwrap();
+        // None of the keywords the API refuses, and no oneOf, anywhere.
+        fn keys(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::Object(o) => o.iter().for_each(|(k, x)| {
+                    out.push(k.clone());
+                    keys(x, out);
+                }),
+                Value::Array(a) => a.iter().for_each(|x| keys(x, out)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        keys(&wire, &mut all);
+        for k in WIRE_DROPPED.iter().chain(&["oneOf"]) {
+            assert!(!all.iter().any(|x| x == k), "{k}");
+        }
+        // PLAN_SCHEMA minus them, by a plainer walk (no property of the
+        // plan schema is named like a keyword), equals the wire one.
+        fn plain(v: &Value) -> Value {
+            match v {
+                Value::Object(o) => Value::Object(
+                    o.iter()
+                        .filter(|(k, _)| !WIRE_DROPPED.contains(&k.as_str()))
+                        .map(|(k, x)| {
+                            let k = if k == "oneOf" {
+                                "anyOf".into()
+                            } else {
+                                k.clone()
+                            };
+                            (k, plain(x))
+                        })
+                        .collect(),
+                ),
+                Value::Array(a) => Value::Array(a.iter().map(plain).collect()),
+                x => x.clone(),
+            }
+        }
+        let plan = plain(&serde_json::from_str(PLAN_SCHEMA).unwrap());
+        assert_eq!(wire, plan);
+        // The types, required lists and consts are still there.
+        assert_eq!(
+            wire["required"],
+            serde_json::json!(["method", "template", "intent"])
+        );
+        assert_eq!(
+            wire["properties"]["checks"]["items"]["anyOf"][0]["properties"]["kind"]["const"],
+            "rows_between"
+        );
+        // Deterministic: sorted keys, no whitespace.
+        assert_eq!(wire_schema(), wire_schema());
+        assert!(!wire_schema().iter().any(u8::is_ascii_whitespace));
+    }
+
+    #[test]
+    fn parse_reply_keeps_the_dropped_bounds() {
+        use saiife_shield::plan::{CHECKS_MAX, INTENT_MAX_CHARS, METHOD_MAX, TEMPLATE_MAX};
+        let reply = |m: usize, t: usize, i: usize, checks: usize, a: usize| {
+            let c: Vec<Value> = (0..checks)
+                .map(|_| serde_json::json!({"kind": "equal", "a": "x".repeat(a), "b": "y"}))
+                .collect();
+            serde_json::json!({
+                "method": "m".repeat(m),
+                "template": "t".repeat(t),
+                "intent": "i".repeat(i),
+                "checks": c,
+            })
+            .to_string()
+        };
+        assert!(parse_reply(&reply(
+            METHOD_MAX,
+            TEMPLATE_MAX,
+            INTENT_MAX_CHARS,
+            CHECKS_MAX,
+            METHOD_MAX
+        ))
+        .is_ok());
+        assert!(parse_reply(&reply(METHOD_MAX + 1, 1, 1, 0, 1)).is_err());
+        assert!(parse_reply(&reply(1, TEMPLATE_MAX + 1, 1, 0, 1)).is_err());
+        assert!(parse_reply(&reply(1, 1, INTENT_MAX_CHARS + 1, 0, 1)).is_err());
+        assert!(parse_reply(&reply(1, 1, 1, CHECKS_MAX + 1, 1)).is_err());
+        assert!(parse_reply(&reply(1, 1, 1, 1, METHOD_MAX + 1)).is_err());
+        // `minimum: 0` on rows_between: a negative bound does not parse.
+        let neg = r#"{"method":"m","template":"t","intent":"i","checks":[{"kind":"rows_between","min":-1,"max":2}]}"#;
+        assert!(parse_reply(neg).is_err());
     }
 
     #[test]
