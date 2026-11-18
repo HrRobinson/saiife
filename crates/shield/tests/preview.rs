@@ -84,6 +84,7 @@ fn schema() -> Schema {
                 word_da: "faktura".into(),
             },
         ],
+        joins: vec![],
     }
 }
 

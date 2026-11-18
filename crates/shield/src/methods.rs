@@ -331,6 +331,7 @@ mod tests {
                 word: "customer".into(),
                 word_da: "kunde".into(),
             }],
+            joins: vec![],
         }
     }
 

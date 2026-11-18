@@ -457,6 +457,7 @@ fn int_schema() -> saiife_shield::schema::Schema {
             ],
         }],
         entities: vec![],
+        joins: vec![],
     }
 }
 
