@@ -304,7 +304,7 @@ fn clause_phrases() {
     );
     let p = en("SELECT i.status, COUNT(*) AS n FROM invoices i WHERE i.status = 'open' GROUP BY i.status ORDER BY i.status");
     assert!(p.text.contains("ordered by status"), "{}", p.text);
-    let p = en("SELECT i.id FROM invoices i LIMIT 3");
+    let p = en("SELECT i.amount FROM invoices i LIMIT 3");
     assert!(p.text.contains("3"), "{}", p.text);
     assert!(p.fragments >= 1, "{}", p.text);
 }
@@ -598,4 +598,18 @@ fn every_filter_is_rendered() {
     assert!(t.contains("city 'Aarhus'"), "{t}");
     let t = show("SELECT COUNT(*) AS n FROM invoices i WHERE i.issued >= :p5");
     assert!(t.contains("issued is at least 1 May 2026"), "{t}");
+}
+
+#[test]
+fn is_null_phrases() {
+    // Ruling F-k: `t.c IS [NOT] NULL` reads as "is empty" / "is not empty".
+    let p = en("SELECT COUNT(*) AS n FROM customers c WHERE c.city IS NULL");
+    assert!(p.text.contains("where city is empty"), "{}", p.text);
+    assert_eq!(p.fragments, 0, "{}", p.text);
+    let p = da("SELECT COUNT(*) AS n FROM customers c WHERE c.city IS NULL");
+    assert!(p.text.contains("hvor city er tom"), "{}", p.text);
+    let p = en("SELECT COUNT(*) AS n FROM customers c WHERE c.city IS NOT NULL");
+    assert!(p.text.contains("where city is not empty"), "{}", p.text);
+    let p = da("SELECT COUNT(*) AS n FROM customers c WHERE c.city IS NOT NULL");
+    assert!(p.text.contains("hvor city ikke er tom"), "{}", p.text);
 }

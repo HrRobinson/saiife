@@ -12,7 +12,8 @@ fn heap_cap() {
     let mut db = fixture();
     heavy(&db, 200_000);
     let val = v(
-        "SELECT i.id, SUM(i.amount) AS s FROM invoices i GROUP BY i.id ORDER BY s DESC",
+        // R45-13: grouped by the key without outputting it.
+        "SELECT SUM(i.amount) AS s FROM invoices i GROUP BY i.id ORDER BY s DESC",
         &[],
     );
     let c = Caps {

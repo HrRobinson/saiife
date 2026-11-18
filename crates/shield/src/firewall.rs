@@ -141,7 +141,7 @@ pub const PARAM_TYPES: [&str; 7] = [
 /// Plan 45 R45-8: the error classes that can go back to the planner (the
 /// ones found before the preview). Keep in step with plan 45's
 /// `ErrorClass`; the run-time classes never go back (ruling P-20).
-pub const PLANNER_ERROR_CLASSES: [&str; 15] = [
+pub const PLANNER_ERROR_CLASSES: [&str; 16] = [
     "syntax",
     "not_select",
     "multiple_statements",
@@ -156,6 +156,7 @@ pub const PLANNER_ERROR_CLASSES: [&str; 15] = [
     "too_many_joins",
     "too_deep",
     "too_many_columns",
+    "identifier_output",
     "template_slot",
 ];
 /// R45-8: the classes sent with the cloud name that failed.

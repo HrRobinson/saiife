@@ -19,10 +19,16 @@ fn col(name: &str, ty: ColType, class: ColumnClass) -> ColumnInfo {
     }
 }
 
-/// customers(id, first_name, last_name, city, credit_limit, segment),
-/// invoices(id, customer_id, amount, status, issued, discount),
-/// payments(id, customer_id, invoice_id, amount, paid); entities customers
-/// and invoices.
+/// customers(id, first_name, last_name, city, credit_limit, segment, cpr,
+/// email, phone), invoices(id, customer_id, amount, status, issued,
+/// discount), payments(id, customer_id, invoice_id, amount, paid); entities
+/// customers and invoices.
+///
+/// R45-13 (owner ruling 2026-11-18): names, `cpr`, `email` and `phone` are
+/// Identifier columns. The key and FK columns are classed Sensitive here, so
+/// the many tests that output a key as scaffolding keep testing their own
+/// rule (G1 key columns, joins, names); [`ident_keys`] classes them
+/// Identifier, as plan 43's classifier does for a unique `id` column.
 fn schema() -> Schema {
     use ColType::*;
     use ColumnClass::*;
@@ -34,12 +40,15 @@ fn schema() -> Schema {
                 alias: None,
                 rows: 500,
                 columns: vec![
-                    col("id", Integer, Identifier),
+                    col("id", Integer, Sensitive),
                     col("first_name", Text, Identifier),
                     col("last_name", Text, Identifier),
                     col("city", Text, Quasi),
                     col("credit_limit", Real, Sensitive),
                     col("segment", Text, Public),
+                    col("cpr", Text, Identifier),
+                    col("email", Text, Identifier),
+                    col("phone", Text, Identifier),
                 ],
             },
             TableInfo {
@@ -47,8 +56,8 @@ fn schema() -> Schema {
                 alias: None,
                 rows: 5000,
                 columns: vec![
-                    col("id", Integer, Identifier),
-                    col("customer_id", Integer, Identifier),
+                    col("id", Integer, Sensitive),
+                    col("customer_id", Integer, Sensitive),
                     col("amount", Real, Sensitive),
                     col("status", Text, Public),
                     col("issued", Date, Quasi),
@@ -60,9 +69,9 @@ fn schema() -> Schema {
                 alias: None,
                 rows: 3000,
                 columns: vec![
-                    col("id", Integer, Identifier),
-                    col("customer_id", Integer, Identifier),
-                    col("invoice_id", Integer, Identifier),
+                    col("id", Integer, Sensitive),
+                    col("customer_id", Integer, Sensitive),
+                    col("invoice_id", Integer, Sensitive),
                     col("amount", Real, Sensitive),
                     col("paid", Date, Quasi),
                 ],
@@ -88,6 +97,19 @@ fn schema() -> Schema {
         ],
         joins: vec![],
     }
+}
+
+/// The fixture with its key and FK columns classed Identifier.
+fn ident_keys() -> Schema {
+    let mut s = schema();
+    for t in &mut s.tables {
+        for c in &mut t.columns {
+            if c.name == "id" || c.name.ends_with("_id") {
+                c.class = ColumnClass::Identifier;
+            }
+        }
+    }
+    s
 }
 
 fn aliased_schema() -> Schema {
@@ -189,7 +211,7 @@ fn prepares(sql: &str) {
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(
         "CREATE TABLE customers(id INTEGER, first_name TEXT, last_name TEXT, city TEXT, \
-         credit_limit REAL, segment TEXT);\
+         credit_limit REAL, segment TEXT, cpr TEXT, email TEXT, phone TEXT);\
          CREATE TABLE invoices(id INTEGER, customer_id INTEGER, amount REAL, status TEXT, \
          issued TEXT, discount REAL);\
          CREATE TABLE payments(id INTEGER, customer_id INTEGER, invoice_id INTEGER, \
@@ -285,8 +307,8 @@ fn legitimate_methods_pass() {
         // Count of open invoices.
         "SELECT COUNT(*) AS n FROM invoices i WHERE i.status = 'open'".to_string(),
         // A top-10 list.
-        "SELECT c.first_name, SUM(i.amount) AS total FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id GROUP BY c.id, c.first_name ORDER BY total DESC LIMIT 10"
+        "SELECT c.id, c.city, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.id, c.city ORDER BY total DESC LIMIT 10"
             .to_string(),
         // Per-month grouping.
         "SELECT strftime('%Y-%m', i.issued) AS month, COUNT(*) AS n FROM invoices i \
@@ -616,8 +638,10 @@ fn grammar_refuses_masking_routes() {
             format!("SELECT SUM(i.amount) IS NULL AS x {J}"),
             ConstructNotAllowed,
         ),
+        // Ruling F-k: `IS [NOT] NULL` only as a WHERE conjunct on a plain
+        // non-key column (see `is_null_where_conjunct`).
         (
-            format!("SELECT COUNT(*) AS n {J} AND i.amount IS NOT NULL"),
+            format!("SELECT COUNT(*) AS n {J} HAVING SUM(i.amount) IS NOT NULL"),
             ConstructNotAllowed,
         ),
         (
@@ -794,7 +818,7 @@ fn bare_columns_only_grouped_or_pinned() {
     for sql in [
         BALANCE,
         "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city",
-        "SELECT c.first_name, c.city, COUNT(i.amount) AS n FROM invoices i JOIN customers c \
+        "SELECT c.credit_limit, c.city, COUNT(i.amount) AS n FROM invoices i JOIN customers c \
          ON c.id = i.customer_id WHERE c.id = :p1",
         "SELECT c.city FROM customers c GROUP BY c.city",
     ] {
@@ -905,7 +929,7 @@ fn escape_attempts_refused() {
         ("SELECT c.id FROM \"Customers\" c", UnknownTable),
         ("SELECT c.id FROM \"customers \" c", UnknownTable),
         // An alias used with a column not in that table.
-        ("SELECT c.email FROM customers AS c", UnknownColumn),
+        ("SELECT c.issued FROM customers AS c", UnknownColumn),
         ("SELECT c.amount FROM customers AS c", UnknownColumn),
         ("SELECT c.rowid FROM customers AS c", UnknownColumn),
         ("SELECT x.id FROM customers AS c", UnknownTable),
@@ -1102,6 +1126,212 @@ fn date_range_needs_both_halves() {
 }
 
 #[test]
+fn identifier_output_owner_ruling() {
+    // R45-13, owner ruling 2026-11-18 + ruling F-j: exact mode never prints
+    // a value of an Identifier column.
+    use ErrorClass::*;
+    let ident = |sql: &str, s: &Schema| {
+        let e = validate(sql, s, &public(), &ps_for(sql)).unwrap_err();
+        assert_eq!(e.class, IdentifierOutput, "{sql}");
+        assert_eq!(e.detail, None, "{sql}");
+    };
+    for sql in [
+        // The owner's cases.
+        "SELECT c.cpr FROM customers c",
+        "SELECT c.email FROM customers c",
+        "SELECT c.phone FROM customers c",
+        "SELECT c.cpr FROM customers c WHERE c.id = :p1",
+        // Names are Identifier columns too.
+        "SELECT c.first_name, c.last_name FROM customers c WHERE c.id = :p1",
+        // Through an expression: a function outside the allow-list over one
+        // is identifier_output, not function_not_allowed (class precedence).
+        "SELECT substr(c.cpr, 1, 6) AS x FROM customers c",
+        "SELECT lower(c.email) AS x FROM customers c",
+        "SELECT c.cpr || '' AS x FROM customers c",
+        "SELECT CASE WHEN c.phone IS NULL THEN 0 ELSE 1 END AS x FROM customers c",
+        "SELECT substr(c.cpr, 1, 6) AS x FROM customers c WHERE c.id = :p1",
+        // MIN / MAX return one of its values (F-j).
+        "SELECT MIN(c.email) AS m FROM customers c",
+        "SELECT MAX(c.cpr) AS m FROM customers c WHERE c.city = :p4",
+        "SELECT c.city, MAX(c.phone) AS m FROM customers c GROUP BY c.city",
+        // GROUP BY it and output it.
+        "SELECT c.email, COUNT(*) AS n FROM customers c GROUP BY c.email",
+        // Through a CTE column, by origin.
+        "WITH t AS (SELECT c.email AS e FROM customers c) SELECT t.e FROM t",
+        "WITH t AS (SELECT c.city AS city, MIN(c.phone) AS p FROM customers c \
+         GROUP BY c.city) SELECT t.city, t.p FROM t",
+        "WITH t AS (SELECT c.cpr AS k, COUNT(*) AS n FROM customers c GROUP BY c.cpr) \
+         SELECT t.k, t.n FROM t",
+        "WITH t AS (SELECT c.cpr AS k FROM customers c) SELECT MAX(t.k) AS m FROM t",
+        // Through an output alias referenced again.
+        "SELECT c.email AS contact FROM customers c ORDER BY contact",
+    ] {
+        ident(sql, &schema());
+    }
+    // A substr in a CTE is refused there too.
+    ident(
+        "WITH t AS (SELECT substr(c.cpr, 1, 6) AS d FROM customers c) SELECT COUNT(*) AS n FROM t",
+        &schema(),
+    );
+    // A key classed Identifier (plan 43 does this for a unique `id`): a plain
+    // output, and MIN/MAX over it (before G1 would say construct).
+    let k = ident_keys();
+    for sql in [
+        "SELECT c.id FROM customers c",
+        "SELECT i.id, i.amount FROM invoices i WHERE i.amount > :p2",
+        "SELECT i.customer_id, SUM(i.amount) AS s FROM invoices i GROUP BY i.customer_id",
+        "SELECT MIN(c.id) AS m FROM customers c",
+        "WITH t AS (SELECT i.customer_id AS cid FROM invoices i GROUP BY i.customer_id) \
+         SELECT t.cid FROM t",
+    ] {
+        ident(sql, &k);
+    }
+    // Name and literal classes keep their class.
+    for (sql, want) in [
+        (
+            "SELECT COUNT(DISTINCT c.email) + 1 AS x FROM customers c",
+            LiteralNotAllowed,
+        ),
+        ("SELECT c.zzz FROM customers c", UnknownColumn),
+    ] {
+        assert_eq!(refused(sql), want, "{sql}");
+    }
+    // Allowed (owner + F-j): COUNT, COUNT DISTINCT, IS [NOT] NULL, WHERE
+    // comparisons, GROUP BY without output, joins on an Identifier key.
+    for sql in [
+        "SELECT COUNT(DISTINCT c.email) AS n FROM customers c",
+        "SELECT COUNT(c.phone) AS n FROM customers c",
+        "SELECT COUNT(*) AS n FROM customers c WHERE c.phone IS NULL",
+        "SELECT c.city, COUNT(*) AS n FROM customers c WHERE c.email IS NOT NULL GROUP BY c.city",
+        "SELECT COUNT(*) AS n FROM customers c GROUP BY c.email",
+        "SELECT c.city, COUNT(*) AS n FROM customers c GROUP BY c.city, c.cpr",
+        "WITH t AS (SELECT c.email AS e, COUNT(*) AS n FROM customers c GROUP BY c.email) \
+         SELECT COUNT(*) AS k, MAX(t.n) AS most FROM t",
+        "WITH t AS (SELECT c.cpr AS k FROM customers c) SELECT COUNT(DISTINCT t.k) AS n FROM t",
+        "SELECT COUNT(*) AS n FROM customers c ORDER BY n",
+    ] {
+        prepares(&ok(sql).sql);
+    }
+    // A WHERE comparison with an Identifier column.
+    let mut ps = no_entity();
+    ps.push(Param {
+        name: "p9".into(),
+        ty: saiife_shield::schema::ParamType::Text {
+            table: "customers".into(),
+            column: "email".into(),
+        },
+        bound: None,
+        display: String::new(),
+    });
+    let sql = "SELECT COUNT(*) AS n FROM customers c WHERE c.email = :p9";
+    prepares(&validate(sql, &schema(), &public(), &ps).unwrap().sql);
+    for sql in [
+        "SELECT SUM(i.amount) AS s FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE c.id = :p1",
+        "SELECT COUNT(DISTINCT i.customer_id) AS n FROM invoices i",
+        "SELECT c.city, SUM(i.amount) AS s FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.id, c.city ORDER BY s DESC LIMIT 5",
+    ] {
+        match validate(sql, &k, &public(), &ps_for(sql)) {
+            Ok(v) => prepares(&v.sql),
+            Err(e) => panic!("{sql}: refused {e:?}"),
+        }
+    }
+    // The class: its name, the planner list, the user's reason (verbatim).
+    assert_eq!(IdentifierOutput.as_str(), "identifier_output");
+    assert_eq!(
+        IdentifierOutput.user_reason(),
+        Some("Data Shield doesn't show ID numbers. Revealing one needs a touch on your key.")
+    );
+    assert_eq!(
+        saiife_shield::sql::IDENTIFIER_OUTPUT_REASON,
+        IdentifierOutput.user_reason().unwrap()
+    );
+    assert_eq!(ConstructNotAllowed.user_reason(), None);
+    assert!(saiife_shield::firewall::PLANNER_ERROR_CLASSES.contains(&"identifier_output"));
+    // A self-check side is held to the same rule.
+    let c = saiife_shield::plan::SelfCheck::Equal {
+        a: "SELECT MAX(c.cpr) AS m FROM customers c".into(),
+        b: "SELECT MIN(c.cpr) AS m FROM customers c".into(),
+    };
+    let e = validate_check(&c, &schema(), &public(), &no_entity()).unwrap_err();
+    assert_eq!(e.class, IdentifierOutput);
+}
+
+#[test]
+fn is_null_where_conjunct() {
+    // Ruling F-k: `t.c IS [NOT] NULL` on a plain column, WHERE only
+    // ("customers without a phone").
+    for sql in [
+        "SELECT COUNT(*) AS n FROM customers c WHERE c.phone IS NULL",
+        "SELECT COUNT(*) AS n FROM customers c WHERE c.phone IS NOT NULL",
+        "SELECT COUNT(*) AS n FROM invoices i WHERE i.amount IS NOT NULL AND i.status = 'open'",
+        "SELECT COUNT(*) AS n FROM customers c WHERE (c.email IS NULL) AND c.city = :p4",
+        "WITH t AS (SELECT c.city AS city, COUNT(*) AS n FROM customers c \
+         WHERE c.phone IS NULL GROUP BY c.city) SELECT t.city, t.n FROM t",
+        "SELECT SUM(i.amount) AS s FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE c.id = :p1 AND i.issued IS NULL",
+    ] {
+        let v = ok(sql);
+        assert!(
+            v.sql.contains(" IS NULL") || v.sql.contains(" IS NOT NULL"),
+            "{}",
+            v.sql
+        );
+        prepares(&v.sql);
+    }
+    use ErrorClass::*;
+    for (sql, want) in [
+        // A key / FK column stays structural (G1).
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE i.customer_id IS NULL",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM customers c WHERE c.id IS NOT NULL",
+            ConstructNotAllowed,
+        ),
+        // Not a plain column.
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE date(i.issued) IS NULL",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE :p2 IS NULL",
+            ParamMisuse,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i WHERE NULL IS NULL",
+            LiteralNotAllowed,
+        ),
+        // Not in HAVING, the SELECT list, an ON, or under NOT / OR.
+        (
+            "SELECT COUNT(*) AS n FROM invoices i HAVING COUNT(*) IS NOT NULL",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT i.amount IS NULL AS x FROM invoices i",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM invoices i JOIN customers c \
+             ON c.id = i.customer_id AND c.phone IS NULL",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM customers c WHERE NOT c.phone IS NULL",
+            ConstructNotAllowed,
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM customers c WHERE c.phone IS NULL OR c.email IS NULL",
+            ConstructNotAllowed,
+        ),
+    ] {
+        assert_eq!(refused(sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn checks_validate() {
     let s = schema();
     let ps = params();
@@ -1160,6 +1390,7 @@ fn error_class_names_round_trip() {
         "too_many_joins",
         "too_deep",
         "too_many_columns",
+        "identifier_output",
         "template_slot",
         "runtime_error",
         "time_cap",
@@ -1672,8 +1903,8 @@ fn key_columns_are_structural() {
     // The structural places stay open.
     for sql in [
         format!("SELECT COUNT(DISTINCT i.customer_id) AS k, COUNT(DISTINCT i.id) AS m {J}"),
-        "SELECT c.id, c.first_name, SUM(i.amount) AS total FROM invoices i JOIN customers c \
-         ON c.id = i.customer_id GROUP BY c.id, c.first_name ORDER BY total DESC LIMIT 10"
+        "SELECT c.id, c.segment, SUM(i.amount) AS total FROM invoices i JOIN customers c \
+         ON c.id = i.customer_id GROUP BY c.id, c.segment ORDER BY total DESC LIMIT 10"
             .to_string(),
         format!(
             "{cte} SELECT COUNT(*) AS n FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1"

@@ -54,7 +54,7 @@ fn runs_balance() {
 fn list_cap_and_total() {
     let mut db = fixture();
     let ps = vec![entity(7)];
-    let val = v(&format!("SELECT i.id, i.amount {J}"), &ps);
+    let val = v(&format!("SELECT i.status, i.amount {J}"), &ps);
     let rs = run(&mut db, &val, &[], &ps, &caps()).unwrap();
     assert_eq!(rs.rows.len(), 100);
     assert!(rs.truncated);
@@ -62,7 +62,7 @@ fn list_cap_and_total() {
     assert_eq!(rs.row_band, saiife_shield::schema::rows_band(250));
     // A small list is not truncated.
     let ps = vec![entity(1)];
-    let val = v(&format!("SELECT i.id, i.amount {J}"), &ps);
+    let val = v(&format!("SELECT i.status, i.amount {J}"), &ps);
     let rs = run(&mut db, &val, &[], &ps, &caps()).unwrap();
     assert_eq!(rs.rows.len(), 4);
     assert!(!rs.truncated);
@@ -196,7 +196,8 @@ fn big() -> rusqlite::Connection {
     db
 }
 
-const HEAVY: &str = "SELECT i.customer_id, SUM(i.amount) AS s FROM invoices i \
+// R45-13: grouped by the FK without outputting it (an Identifier column).
+const HEAVY: &str = "SELECT SUM(i.amount) AS s FROM invoices i \
     GROUP BY i.customer_id ORDER BY s DESC";
 
 #[test]
@@ -232,7 +233,7 @@ fn checks_run() {
     let mut db = fixture();
     let ps = vec![entity(1)];
     let val = v(
-        &format!("SELECT i.id, i.amount {J} AND i.status = 'open'"),
+        &format!("SELECT i.status, i.amount {J} AND i.status = 'open'"),
         &ps,
     );
     let sch = schema();
