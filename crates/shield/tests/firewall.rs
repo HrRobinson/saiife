@@ -8,14 +8,14 @@ mod fixtures;
 use saiife_shield::dataset::{finish, propose, stage_snapshot, DatasetDir, Manifest};
 use saiife_shield::envelope::{
     build_envelope, cloud_schema, method_sha256, schema_sha256, sha256_hex, synthetic_sha256,
-    CloudParam, CloudTurn, Envelope, Retry, SyntheticRows,
+    CloudJoin, CloudParam, CloudTurn, Envelope, Retry, SyntheticRows,
 };
 use saiife_shield::firewall::{Expected, Firewall, Hit, Verdict, MAX_FREE_TEXT_CHARS};
 use saiife_shield::index::{read_allow, AllowList, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
 use saiife_shield::ner::{DetectError, ListDetector, NameDetector, NameSpan, SpanLabel};
 use saiife_shield::question::{parameterize, Draft, Step};
-use saiife_shield::schema::{Bound, ColumnClass, Lang, Param, ParamType, Schema};
+use saiife_shield::schema::{Bound, ColumnClass, KeyJoin, Lang, Param, ParamType, Schema};
 use saiife_shield::session::{Session, Turn};
 use saiife_shield::standin::KeySet;
 use saiife_shield::synth::{os_rng, synthetic_rows};
@@ -185,7 +185,7 @@ impl Tw<'_> {
         let syms = e.map(symbols).unwrap_or_default();
         let mh = e
             .and_then(|e| e.retry.as_ref())
-            .map(|r| method_sha256(&r.previous_method));
+            .map(|r| r.previous_method_sha256.clone());
         let x = Expected {
             list_cap: LIST_CAP,
             lang,
@@ -679,10 +679,10 @@ fn unknown_fields_are_refused_at_every_level() {
         released: vec![],
     });
     let mut e = envelope(&f, &mut s, &clean_draft(&f));
-    e.retry = Some(Retry {
-        previous_method: "SELECT x FROM customers WHERE id = :p1".into(),
-        error_class: "syntax".into(),
-    });
+    e.retry = Some(Retry::new(
+        "SELECT x FROM customers WHERE id = :p1",
+        "syntax",
+    ));
     let nodet = none();
     let w = fw(&f, &nodet, &[]);
     assert_eq!(w.check_bytes(&e.canonical()).unwrap(), Verdict::Pass);
@@ -947,10 +947,10 @@ fn retry_error_class_is_from_the_planner_list() {
     let base = envelope(&f, &mut s, &clean_draft(&f));
     let with = |class: &str| {
         let mut e = base.clone();
-        e.retry = Some(Retry {
-            previous_method: "SELECT nope FROM customers WHERE id = :p1".into(),
-            error_class: class.into(),
-        });
+        e.retry = Some(Retry::new(
+            "SELECT nope FROM customers WHERE id = :p1",
+            class,
+        ));
         w.check_outgoing(&e, e.lang).unwrap()
     };
     for ok in [
@@ -979,16 +979,109 @@ fn retry_error_class_is_from_the_planner_list() {
             "{bad}: {h:?}"
         );
     }
-    // The previous method is scanned for values.
+    // `identifier_output` goes back as the class only (R48-2a).
+    assert_eq!(with("identifier_output"), Verdict::Pass);
+    let h = hits(with("identifier_output email"));
+    assert!(h.contains(&bad_part("retry.error_class")), "{h:?}");
+}
+
+/// Plan 48 C1 (R-C11, P47-29): a retry carries the previous method's hash
+/// and the error class, never the method text.
+#[test]
+fn retry_sends_the_method_hash_never_its_text() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    // A method holding a real value and numeric literals (the validator
+    // refused it as `literal_not_allowed`).
+    let method = format!(
+        "SELECT * FROM customers WHERE last_name = '{RARE_LAST}' AND credit_limit > 18420 AND id = 401"
+    );
     let mut e = base.clone();
-    e.retry = Some(Retry {
-        previous_method: format!("SELECT * FROM customers WHERE last_name = '{RARE_LAST}'"),
-        error_class: "literal_not_allowed".into(),
-    });
-    let h = hits(w.check_outgoing(&e, e.lang).unwrap());
-    assert!(h
-        .iter()
-        .any(|x| x.kind == "known_value" && x.part == "retry.previous_method"));
+    e.retry = Some(Retry::new(&method, "literal_not_allowed"));
+    let r = e.retry.as_ref().unwrap();
+    assert_eq!(r.previous_method_sha256, method_sha256(&method));
+    assert_eq!(r.error_class, "literal_not_allowed");
+    let c = String::from_utf8(e.canonical()).unwrap();
+    for needle in [
+        RARE_LAST,
+        "18420",
+        "credit_limit >",
+        "SELECT",
+        "last_name =",
+    ] {
+        assert!(!c.contains(needle), "{needle} reached the envelope");
+    }
+    assert!(c.contains(&format!(
+        r#""retry":{{"error_class":"literal_not_allowed","previous_method_sha256":"{}"}}"#,
+        method_sha256(&method)
+    )));
+    // It passes: the numbers and the name stayed home.
+    let v = w.check_outgoing(&e, e.lang).unwrap();
+    assert_eq!(v, Verdict::Pass, "{:?}", hits(v.clone()));
+    assert_eq!(w.check_bytes(&e.canonical()).unwrap(), Verdict::Pass);
+    assert_eq!(e.summary().personal_values, 0);
+}
+
+#[test]
+fn retry_hash_must_be_the_callers_and_well_formed() {
+    let f = fx();
+    let mut s = session(&f);
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    let issued = vec![base.params[0].symbol.clone().unwrap()];
+    let check = |e: &Envelope, mh: Option<&str>| {
+        let x = Expected {
+            list_cap: LIST_CAP,
+            lang: e.lang,
+            schema_sha256: &f.schema_hash,
+            synthetic_sha256: &f.hash,
+            symbols: &issued,
+            previous_method_sha256: mh,
+        };
+        w.firewall(x, |fw| {
+            let a = hits(fw.check_outgoing(e, e.lang).unwrap());
+            assert_eq!(a, hits(fw.check_bytes(&e.canonical()).unwrap()));
+            a
+        })
+    };
+    let received = "SELECT nope FROM customers WHERE id = :p1";
+    let mut e = base.clone();
+    e.retry = Some(Retry::new(received, "unknown_column credit_limit"));
+    assert_eq!(check(&e, Some(&method_sha256(received))), vec![]);
+    // A hash of another method than the one the daemon received.
+    let other = method_sha256("SELECT nope FROM customers WHERE id = :p1 ");
+    assert_eq!(
+        check(&e, Some(&other)),
+        vec![bad_part("retry.previous_method_sha256")]
+    );
+    // Not the `sha256:` + 64 lowercase hex form, even when the caller
+    // expects exactly those bytes.
+    let upper = method_sha256(received)
+        .to_uppercase()
+        .replace("SHA256:", "sha256:");
+    let short = method_sha256(received)[..40].to_string();
+    for bad in [
+        upper.clone(),
+        short,
+        format!("sha256:{RARE_LAST}"),
+        received.to_string(),
+        String::new(),
+    ] {
+        let mut e = base.clone();
+        e.retry = Some(Retry {
+            previous_method_sha256: bad.clone(),
+            error_class: "syntax".into(),
+        });
+        let h = check(&e, Some(&bad));
+        assert!(
+            h.contains(&bad_part("retry.previous_method_sha256")),
+            "{bad}: {h:?}"
+        );
+    }
 }
 
 #[test]
@@ -1418,6 +1511,112 @@ fn schema_is_pinned_by_the_callers_hash() {
     }
 }
 
+/// Plan 48 C1 (P47-28): the schema's key relations reach the planner by
+/// cloud names, under the schema hash.
+#[test]
+fn declared_joins_reach_the_planner_by_cloud_names() {
+    const FK_ALIAS: &str = "client_ref";
+    const KEY_ALIAS: &str = "client_no";
+    let f = fx_with(|s| {
+        let key = s
+            .entities
+            .iter()
+            .find(|e| e.table == "customers")
+            .unwrap()
+            .key
+            .clone();
+        let c = s.tables.iter_mut().find(|t| t.name == "invoices").unwrap();
+        c.columns
+            .iter_mut()
+            .find(|c| c.name == "customer_id")
+            .unwrap()
+            .alias = Some(FK_ALIAS.into());
+        let c = s.tables.iter_mut().find(|t| t.name == "customers").unwrap();
+        c.columns.iter_mut().find(|c| c.name == key).unwrap().alias = Some(KEY_ALIAS.into());
+        s.joins = vec![KeyJoin {
+            entity: "customers".into(),
+            key,
+            table: "invoices".into(),
+            column: "customer_id".into(),
+        }];
+    });
+    let mut s = session(&f);
+    let base = envelope(&f, &mut s, &clean_draft(&f));
+    assert_eq!(
+        base.schema.joins,
+        vec![CloudJoin {
+            entity: "customers".into(),
+            key: KEY_ALIAS.into(),
+            table: "invoices".into(),
+            column: FK_ALIAS.into(),
+        }]
+    );
+    let c = String::from_utf8(base.canonical()).unwrap();
+    assert!(
+        !c.contains("customer_id"),
+        "a snapshot name reached the planner"
+    );
+    assert!(c.contains(&format!(
+        r#""joins":[{{"column":"{FK_ALIAS}","entity":"customers","key":"{KEY_ALIAS}","table":"invoices"}}]"#
+    )));
+    let nodet = none();
+    let w = fw(&f, &nodet, &[]);
+    let v = w.check_outgoing(&base, base.lang).unwrap();
+    assert_eq!(v, Verdict::Pass, "{:?}", hits(v.clone()));
+    assert_eq!(w.check_bytes(&base.canonical()).unwrap(), Verdict::Pass);
+    // The schema hash covers the joins.
+    let mut bare = base.schema.clone();
+    bare.joins.clear();
+    assert_ne!(schema_sha256(&bare), schema_sha256(&base.schema));
+    // Every join name is one of the envelope's own tables and columns.
+    type Edit = Box<dyn Fn(&mut CloudJoin)>;
+    let cases: Vec<(&str, Edit)> = vec![
+        ("unknown column", Box::new(|j| j.column = "nope".into())),
+        (
+            "snapshot name",
+            Box::new(|j| j.column = "customer_id".into()),
+        ),
+        ("unknown table", Box::new(|j| j.table = "orders".into())),
+        ("unknown key", Box::new(|j| j.key = "nope".into())),
+        ("not an entity", Box::new(|j| j.entity = "invoices".into())),
+        (
+            "a column of another table",
+            Box::new(|j| j.column = KEY_ALIAS.into()),
+        ),
+        ("a value", Box::new(|j| j.column = RARE_LAST.into())),
+    ];
+    for (what, edit) in &cases {
+        let mut e = base.clone();
+        edit(&mut e.schema.joins[0]);
+        let h = hits(w.check_outgoing(&e, e.lang).unwrap());
+        assert!(h.contains(&bad_part("schema.joins[0]")), "{what}: {h:?}");
+        assert!(h.contains(&bad_part("schema")), "{what}: {h:?}");
+        assert_eq!(h, hits(w.check_bytes(&e.canonical()).unwrap()), "{what}");
+    }
+    // A duplicate join.
+    let mut e = base.clone();
+    e.schema.joins.push(e.schema.joins[0].clone());
+    let h = hits(w.check_outgoing(&e, e.lang).unwrap());
+    assert!(h.contains(&bad_part("schema.joins[1]")), "{h:?}");
+}
+
+#[test]
+fn conventional_joins_are_sent_by_cloud_names() {
+    let f = fx();
+    let mut s = session(&f);
+    let e = envelope(&f, &mut s, &clean_draft(&f));
+    assert!(
+        e.schema
+            .joins
+            .iter()
+            .any(|j| j.entity == "customers" && j.table == "invoices" && j.column == "customer_id"),
+        "{:?}",
+        e.schema.joins
+    );
+    let v = fw(&f, &none(), &[]).check_outgoing(&e, e.lang).unwrap();
+    assert_eq!(v, Verdict::Pass, "{:?}", hits(v.clone()));
+}
+
 #[test]
 fn lang_symbols_and_retry_are_the_callers() {
     let f = fx();
@@ -1466,10 +1665,10 @@ fn lang_symbols_and_retry_are_the_callers() {
     });
     // The retry: exactly the method the caller received.
     let mut e = base.clone();
-    e.retry = Some(Retry {
-        previous_method: "SELECT nope FROM customers WHERE id = :p1".into(),
-        error_class: "unknown_column credit_limit".into(),
-    });
+    e.retry = Some(Retry::new(
+        "SELECT nope FROM customers WHERE id = :p1",
+        "unknown_column credit_limit",
+    ));
     let right = Some(method_sha256("SELECT nope FROM customers WHERE id = :p1"));
     let wrong = Some(method_sha256("SELECT nope FROM customers WHERE id = :p1 "));
     expected(base.lang, &issued, right.clone(), &|fw| {
@@ -1479,7 +1678,7 @@ fn lang_symbols_and_retry_are_the_callers() {
     });
     expected(base.lang, &issued, wrong, &|fw| {
         let h = hits(fw.check_outgoing(&e, e.lang).unwrap());
-        assert_eq!(h, vec![bad_part("retry.previous_method")]);
+        assert_eq!(h, vec![bad_part("retry.previous_method_sha256")]);
     });
     expected(base.lang, &issued, None, &|fw| {
         let h = hits(fw.check_outgoing(&e, e.lang).unwrap());

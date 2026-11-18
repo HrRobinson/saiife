@@ -530,6 +530,7 @@ fn pin_envelope() -> Envelope {
                 }],
                 entity: Some("customer".into()),
             }],
+            joins: vec![],
         },
         synthetic: BTreeMap::from([("customers".to_string(), Vec::new())]),
         question: QUESTION.into(),
@@ -542,7 +543,7 @@ fn pin_envelope() -> Envelope {
 
 /// The SYSTEM_PROMPT is pinned by its hash; the body around it by bytes.
 const PROMPT_SHA256: &str =
-    "sha256:55d767bb8fe2540d820a24966f3cad614976bc37143545a46914dcf02f239946";
+    "sha256:85548a9c4616b82c2ec65cc486916ae0145fcd9762195321d904a07998363187";
 
 const PINNED_BODY: &str = concat!(
     r#"{"model":"claude-opus-5-5","max_tokens":16000,"system":<SYSTEM>,"#,

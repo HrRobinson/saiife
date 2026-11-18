@@ -54,6 +54,25 @@ pub struct Envelope {
 #[serde(deny_unknown_fields)]
 pub struct CloudSchema {
     pub tables: Vec<CloudTable>,
+    /// The key relations a method may join on, by cloud names (plan 48 C1,
+    /// ruling P47-28). Left out of the bytes when empty, so a schema
+    /// without joins hashes as it did before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<CloudJoin>,
+}
+
+/// One key relation ([`crate::schema::KeyJoin`]) as the cloud sees it:
+/// every name is the cloud name (the alias if there is one). The column
+/// `table.column` holds keys of the entity `entity.key`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudJoin {
+    /// The entity's cloud table and the cloud name of its key column.
+    pub entity: String,
+    pub key: String,
+    /// The FK side: another cloud table and its INTEGER column.
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,9 +123,24 @@ pub struct CloudTurn {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retry {
-    pub previous_method: String,
+    /// [`method_sha256`] of the method the planner sent before (plan 48
+    /// C1, ruling R-C11): the method text itself never goes back out.
+    pub previous_method_sha256: String,
     /// A plan 45 R45-8 planner class, optionally one space and a cloud name.
     pub error_class: String,
+}
+
+impl Retry {
+    /// The retry after `previous_method` (the method text as the daemon
+    /// received it from the planner) failed with `error_class`. Only the
+    /// method's hash is kept. The caller gives the firewall the same
+    /// [`method_sha256`] of the method it received, never this field.
+    pub fn new(previous_method: &str, error_class: &str) -> Retry {
+        Retry {
+            previous_method_sha256: method_sha256(previous_method),
+            error_class: error_class.to_string(),
+        }
+    }
 }
 
 /// What a sent envelope held, for the audit record (plan 47).
@@ -160,7 +194,9 @@ fn param_tag(schema: &Schema, ty: &ParamType) -> String {
 /// [`build_envelope`] and by the caller that hashes it for the firewall
 /// ([`schema_sha256`], ruling P-26). Cloud names, row bands, types,
 /// classes, each public column's k-floor list as `public_values` gives it,
-/// and the English entity word.
+/// the English entity word, and the key relations by cloud names (the
+/// schema's joins; a schema without stored joins gets the C-G1 ones, as
+/// the validator does), sorted, without duplicates.
 pub fn cloud_schema(schema: &Schema, public: &[PublicValues]) -> CloudSchema {
     let tables = schema
         .tables
@@ -189,7 +225,23 @@ pub fn cloud_schema(schema: &Schema, public: &[PublicValues]) -> CloudSchema {
             entity: schema.entity_for(&t.name).map(|e| e.word.clone()),
         })
         .collect();
-    CloudSchema { tables }
+    let keyed = if schema.joins.is_empty() {
+        schema.conventional_joins()
+    } else {
+        schema.joins.clone()
+    };
+    let mut joins: Vec<CloudJoin> = keyed
+        .iter()
+        .map(|j| CloudJoin {
+            entity: schema.cloud_name(&j.entity, None),
+            key: schema.cloud_name(&j.entity, Some(&j.key)),
+            table: schema.cloud_name(&j.table, None),
+            column: schema.cloud_name(&j.table, Some(&j.column)),
+        })
+        .collect();
+    joins.sort();
+    joins.dedup();
+    CloudSchema { tables, joins }
 }
 
 /// Builds the envelope of a draft. An entity parameter gets its session
@@ -309,7 +361,8 @@ pub fn schema_sha256(schema: &CloudSchema) -> String {
 }
 
 /// The hash of a retry's previous method, as the caller received it from
-/// the planner (P-26): canonical JSON of the string.
+/// the planner (P-26): canonical JSON of the string. [`Retry::new`] puts it
+/// in the envelope; the caller gives the firewall its own copy.
 pub fn method_sha256(method: &str) -> String {
     part_sha256(method)
 }
@@ -413,6 +466,61 @@ mod tests {
         let mut out = Vec::new();
         write_canonical(&v, &mut out);
         assert_eq!(out, br#"{"a":{"c":null,"d":[1,"x y"]},"b":1}"#);
+    }
+
+    /// Plan 48 C1: a schema without joins has the bytes (and so the hash)
+    /// it had before `joins` existed, and those bytes still parse.
+    #[test]
+    fn empty_joins_leave_the_schema_bytes_unchanged() {
+        const BEFORE: &str = r#"{"tables":[{"columns":[{"class":"quasi","name":"city","ty":"text"}],"entity":"customer","name":"customers","rows":"<100"}]}"#;
+        let s = CloudSchema {
+            tables: vec![CloudTable {
+                name: "customers".into(),
+                rows: "<100".into(),
+                columns: vec![CloudColumn {
+                    name: "city".into(),
+                    ty: ColType::Text,
+                    class: ColumnClass::Quasi,
+                    values: None,
+                }],
+                entity: Some("customer".into()),
+            }],
+            joins: vec![],
+        };
+        let mut out = Vec::new();
+        write_canonical(&serde_json::to_value(&s).unwrap(), &mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), BEFORE);
+        assert_eq!(
+            schema_sha256(&s),
+            "sha256:37d1ca0e2fac6aec9d76194a4e38e48cf05c128539cd52d9a0af0b5a71703863"
+        );
+        assert_eq!(serde_json::from_str::<CloudSchema>(BEFORE).unwrap(), s);
+        let mut j = s.clone();
+        j.joins.push(CloudJoin {
+            entity: "customers".into(),
+            key: "id".into(),
+            table: "invoices".into(),
+            column: "customer_id".into(),
+        });
+        assert_ne!(schema_sha256(&j), schema_sha256(&s));
+    }
+
+    #[test]
+    fn retry_holds_the_hash_and_class_only() {
+        let r = Retry::new("SELECT 18420 FROM t", "literal_not_allowed");
+        assert_eq!(
+            r.previous_method_sha256,
+            method_sha256("SELECT 18420 FROM t")
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        let mut out = Vec::new();
+        write_canonical(&v, &mut out);
+        let c = String::from_utf8(out).unwrap();
+        assert!(!c.contains("18420") && !c.contains("SELECT"), "{c}");
+        assert!(serde_json::from_str::<Retry>(
+            r#"{"previous_method":"SELECT 1","error_class":"syntax"}"#
+        )
+        .is_err());
     }
 
     #[test]

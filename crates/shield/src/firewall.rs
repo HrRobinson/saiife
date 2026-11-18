@@ -7,19 +7,20 @@
 //!    k-floor values); row counts are bands; free text is capped (R44-7);
 //!    parameter names, tags and stand-ins (R44-4) have their fixed forms;
 //!    `retry.error_class` is a plan 45 planner class ([`PLANNER_ERROR_CLASSES`],
-//!    ruling P-20); every synthetic value has the exact shape the generator
+//!    ruling P-20) and `retry.previous_method_sha256` is `sha256:` and 64
+//!    lowercase hex; every name of a schema join is a table or column of
+//!    the envelope's own schema (plan 48 C1); every synthetic value has the exact shape the generator
 //!    (`synth.rs`, R44-6) makes for its column. A part that fails is
 //!    `bad_part` (`oversize` for a size).
 //! 2. **Known values.** Every token and every 2-4-token window of every
 //!    free-text string (the question, the context questions, synthetic text
-//!    values, the retry's previous method) goes through
+//!    values) goes through
 //!    [`KnownIndex::contains_value`], except windows whose every token is
 //!    covered by an allow-list word; every whole sentence (split as
 //!    [`crate::index::split_phrases`] splits) and the whole text go through
 //!    [`KnownIndex::contains_phrase`].
 //! 3. **Numbers** (R44-8, ruling P-4) over the question, the context
-//!    questions, the retry's previous method and synthetic text (minus the
-//!    generator's own numbers):
+//!    questions and synthetic text (minus the generator's own numbers):
 //!    every run of numeric characters, every number [`find_numbers`] finds
 //!    (both languages; the other language's words that are common words of
 //!    this one, Danish `to` and `fire` in English, are left out), every
@@ -41,8 +42,9 @@
 //! ([`crate::envelope::schema_sha256`]) to the hash of
 //! [`crate::envelope::cloud_schema`]'s output, so every name, band, class,
 //! entity word and public value list is pinned byte for byte; every
-//! stand-in is one the session issued; a retry carries exactly the method
-//! the caller received ([`crate::envelope::method_sha256`]). The form checks
+//! stand-in is one the session issued; a retry carries exactly the hash of
+//! the method the caller received ([`crate::envelope::method_sha256`]) and
+//! never the method text (plan 48 C1, ruling R-C11). The form checks
 //! (row bands as [`rows_band`] renders them, allow-list words, R44-4
 //! symbols, parameter names `p1..pK` in order, each used as `:pN` in its
 //! own text) stay as defence in depth. Synthetic rows (R44-6) hold exactly
@@ -78,8 +80,8 @@
 //! text. Error texts are fixed strings.
 
 use crate::envelope::{
-    method_sha256, schema_sha256, synthetic_sha256, CloudColumn, CloudParam, CloudSchema, Envelope,
-    ENVELOPE_KIND, ENVELOPE_VERSION,
+    schema_sha256, synthetic_sha256, CloudColumn, CloudParam, CloudSchema, Envelope, ENVELOPE_KIND,
+    ENVELOPE_VERSION,
 };
 use crate::error::ShieldError;
 use crate::index::{AllowList, KnownIndex};
@@ -111,9 +113,6 @@ pub const MAX_FREE_TEXT_CHARS: usize = 1_000;
 pub const MAX_CONTEXT_TURNS: usize = 10;
 /// R44-7 / P-20: `retry.error_class`.
 pub const MAX_ERROR_CLASS_CHARS: usize = 120;
-/// The retry's previous method (plan 45 caps the method itself; this is a
-/// backstop so a huge text is refused before it is scanned).
-pub const MAX_METHOD_CHARS: usize = 20_000;
 /// R44-6: synthetic rows per table.
 pub const MAX_SYNTHETIC_ROWS: usize = 5;
 /// The whole HTTP body `check_bytes` accepts.
@@ -223,7 +222,7 @@ pub struct Expected<'a> {
     /// [`crate::session::Session::issued_symbols`], called after
     /// `build_envelope`.
     pub symbols: &'a [String],
-    /// [`method_sha256`] of the previous method received from the planner,
+    /// [`crate::envelope::method_sha256`] of the previous method received from the planner,
     /// for a retry; `None` for a first request.
     pub previous_method_sha256: Option<&'a str>,
 }
@@ -247,8 +246,7 @@ type Tokens = Vec<(String, usize, usize)>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
-    /// Every scan (question, context questions, synthetic text, the
-    /// retry's previous method).
+    /// Every scan (question, context questions, synthetic text).
     Free,
     /// Incoming text: known values and patterns.
     Method,
@@ -395,6 +393,16 @@ fn error_class_ok(schema: &CloudSchema, s: &str) -> bool {
                         || name.strip_prefix(t.name.as_str()) == Some(&format!(".{}", c.name))
                 })
         })
+}
+
+/// `sha256:` and 64 lowercase hex, as [`crate::envelope::sha256_hex`]
+/// writes it.
+fn sha256_form_ok(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 /// Exactly a [`rows_band`] output: the number it names, rendered again,
@@ -638,6 +646,35 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
         }
     }
 
+    // The joins (plan 48 C1): every name is one of the envelope's own
+    // tables and columns (an entity table and its column; another table
+    // and its INTEGER column), from the allow list, no duplicates.
+    for (ji, j) in e.schema.joins.iter().enumerate() {
+        let jp = format!("schema.joins[{ji}]");
+        let table = |n: &str| e.schema.tables.iter().find(|t| t.name == n);
+        let column =
+            |t: &str, c: &str| table(t).and_then(|t| t.columns.iter().find(|x| x.name == c));
+        let ok = table(&j.entity).is_some_and(|t| t.entity.is_some())
+            && column(&j.entity, &j.key).is_some()
+            && j.table != j.entity
+            && column(&j.table, &j.column).is_some_and(|c| c.ty == ColType::Integer)
+            && [&j.entity, &j.key, &j.table, &j.column]
+                .iter()
+                .all(|n| allowed(allow, n))
+            && !e.schema.joins[..ji].contains(j);
+        if !ok {
+            hit(hits, BAD_PART, &jp, None);
+        }
+        for (k, n) in [
+            ("entity", &j.entity),
+            ("key", &j.key),
+            ("table", &j.table),
+            ("column", &j.column),
+        ] {
+            texts.push(Text::new(format!("{jp}.{k}"), n, Class::Typed));
+        }
+    }
+
     // Synthetic rows: exactly the schema's tables and columns, the caller's
     // hash, each value of the generator's exact shape.
     let hash_ok =
@@ -748,11 +785,12 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
                 }
             }
         }
-        // P-26: a retry carries exactly the method the caller received.
+        // P-26, R-C11: a retry carries exactly the hash of the method the
+        // caller received.
         match (&e.retry, x.expected.previous_method_sha256) {
             (None, None) => {}
-            (Some(r), Some(h)) if method_sha256(&r.previous_method) == h => {}
-            (Some(_), Some(_)) => hit(hits, BAD_PART, &p("retry.previous_method"), None),
+            (Some(r), Some(h)) if r.previous_method_sha256 == h => {}
+            (Some(_), Some(_)) => hit(hits, BAD_PART, &p("retry.previous_method_sha256"), None),
             _ => hit(hits, BAD_PART, &p("retry"), None),
         }
     }
@@ -767,13 +805,16 @@ fn envelope_parts(e: &Envelope, expect: Option<&Expect<'_>>, hits: &mut Vec<Hit>
             &r.error_class,
             Class::Typed,
         ));
-        let mut m = Text::new(p("retry.previous_method"), &r.previous_method, Class::Free);
-        m.params = e.params.iter().map(|x| x.name.clone()).collect();
-        if r.previous_method.chars().count() > MAX_METHOD_CHARS {
-            hit(hits, OVERSIZE, &m.part, None);
-            m.oversize = true;
+        // The hash only (R-C11): its form is fixed, and the caller's pin
+        // above ties it to the method the daemon received.
+        if !sha256_form_ok(&r.previous_method_sha256) {
+            hit(hits, BAD_PART, &p("retry.previous_method_sha256"), None);
         }
-        texts.push(m);
+        texts.push(Text::new(
+            p("retry.previous_method_sha256"),
+            &r.previous_method_sha256,
+            Class::Typed,
+        ));
     }
     texts
 }
@@ -1646,7 +1687,11 @@ mod tests {
                 }],
                 entity: Some("customer".into()),
             }],
+            joins: vec![],
         };
+        assert!(sha256_form_ok(&crate::envelope::method_sha256("SELECT 1")));
+        assert!(!sha256_form_ok("sha256:ABC"));
+        assert!(!sha256_form_ok("SELECT 1"));
         assert!(error_class_ok(&schema, "syntax"));
         assert!(error_class_ok(&schema, "unknown_column email"));
         assert!(error_class_ok(&schema, "unknown_column customers.email"));
