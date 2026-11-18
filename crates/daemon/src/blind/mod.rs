@@ -5,14 +5,17 @@
 //! [`UNAVAILABLE_OS`].
 
 pub mod audit;
+pub mod data;
 pub mod keys;
 pub mod ops;
 pub mod outbox;
+pub mod pg;
 
 use saiife_ipc::msg::ErrorCode;
-use saiife_shield::dataset::{DatasetDir, Manifest, Phase};
+use saiife_shield::dataset::{BuildProgress, DatasetDir, Manifest, Phase};
 use saiife_shield::index::{AllowList, KnownIndex};
 use saiife_shield::lexicon::Lexicon;
+use saiife_shield::ner::NameDetector;
 use saiife_shield::schema::DatasetName;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -40,7 +43,26 @@ pub struct Blind {
     /// Held across a key store change (create, rotate, shred), so a check
     /// of `keys.sealed` still holds when it is written or removed.
     keys_lock: Mutex<()>,
+    /// The name detector a build checks public values and names with
+    /// (ruling P47-6). None until the NER model is ready (Task 4).
+    detector: Mutex<Option<Arc<dyn NameDetector>>>,
+    /// Why the last background build of a dataset failed (`status`).
+    build_errors: Mutex<BTreeMap<String, String>>,
+    /// Test seam: stop a build when it reports this phase.
+    #[cfg(debug_assertions)]
+    test_hold: Mutex<Option<TestHold>>,
+    /// Test seam: the background builds, to wait for.
+    #[cfg(debug_assertions)]
+    test_builds: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// The phase to stop at, the "reached" signal and the "go on" wait.
+#[cfg(debug_assertions)]
+type TestHold = (
+    Phase,
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// Where a dataset is. A dataset not in the map is [`DatasetState::Absent`].
 pub enum DatasetState {
@@ -178,6 +200,12 @@ impl Blind {
             datasets: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(saiife_shield::session::Sessions::new()),
             keys_lock: Mutex::new(()),
+            detector: Mutex::new(None),
+            build_errors: Mutex::new(BTreeMap::new()),
+            #[cfg(debug_assertions)]
+            test_hold: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            test_builds: Mutex::new(Vec::new()),
         }
     }
 
@@ -235,6 +263,121 @@ impl Blind {
 
     pub(crate) fn keys_lock(&self) -> MutexGuard<'_, ()> {
         lock(&self.keys_lock)
+    }
+
+    /// Starts a build of `name` (ruling P47-5: one at a time per dataset,
+    /// decided under the state lock): the state becomes `Building` and the
+    /// one it replaced is returned. A build already running: `busy`, with
+    /// the refreshing answer.
+    pub(crate) fn begin_build(&self, name: &DatasetName) -> Result<DatasetState, Refusal> {
+        let mut m = lock(&self.datasets);
+        if let Some(DatasetState::Building {
+            phase, done, total, ..
+        }) = m.get(name.as_str())
+        {
+            return Err(Refusal::new(
+                ErrorCode::Busy,
+                refreshing(name, *phase, *done, *total),
+            ));
+        }
+        let building = DatasetState::Building {
+            phase: Phase::Snapshot,
+            done: 0,
+            total: None,
+            started: Instant::now(),
+        };
+        Ok(m.insert(name.as_str().to_string(), building)
+            .unwrap_or(DatasetState::Absent))
+    }
+
+    /// A running build's progress (what the refreshing answer shows).
+    pub(crate) fn progress(&self, name: &DatasetName, p: BuildProgress) {
+        if let Some(DatasetState::Building {
+            phase, done, total, ..
+        }) = lock(&self.datasets).get_mut(name.as_str())
+        {
+            (*phase, *done, *total) = (p.phase, p.done, p.total);
+        }
+        #[cfg(debug_assertions)]
+        self.test_maybe_hold(p.phase);
+    }
+
+    /// The name detector, if one is ready.
+    pub fn detector(&self) -> Option<Arc<dyn NameDetector>> {
+        lock(&self.detector).clone()
+    }
+
+    /// Why the last background build of `name` failed; None after a build
+    /// that went live.
+    pub fn last_build_error(&self, name: &DatasetName) -> Option<String> {
+        lock(&self.build_errors).get(name.as_str()).cloned()
+    }
+
+    pub(crate) fn set_build_error(&self, name: &DatasetName, why: Option<String>) {
+        let mut m = lock(&self.build_errors);
+        match why {
+            Some(w) => m.insert(name.as_str().to_string(), w),
+            None => m.remove(name.as_str()),
+        };
+    }
+
+    /// Keeps a background build's task (debug builds: tests wait for it).
+    pub(crate) fn track_build(&self, h: tokio::task::JoinHandle<()>) {
+        #[cfg(debug_assertions)]
+        lock(&self.test_builds).push(h);
+        #[cfg(not(debug_assertions))]
+        drop(h);
+    }
+}
+
+/// Test seams (debug builds only).
+#[cfg(debug_assertions)]
+impl Blind {
+    /// Sets the name detector a build uses (Task 4 sets the real one).
+    pub fn set_test_detector(&self, d: Option<Arc<dyn NameDetector>>) {
+        *lock(&self.detector) = d;
+    }
+
+    /// The next build that reports `phase` stops there: it signals the
+    /// first receiver and waits until the sender is used (or dropped).
+    pub fn test_hold_at(
+        &self,
+        phase: Phase,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        *lock(&self.test_hold) = Some((phase, reached_tx, go_rx));
+        (reached_rx, go_tx)
+    }
+
+    fn test_maybe_hold(&self, phase: Phase) {
+        let hold = {
+            let mut h = lock(&self.test_hold);
+            match &*h {
+                Some((p, _, _)) if *p == phase => h.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, reached, go)) = hold {
+            let _ = reached.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Waits for every background build started so far.
+    pub async fn test_wait_builds(&self) {
+        loop {
+            let hs: Vec<_> = lock(&self.test_builds).drain(..).collect();
+            if hs.is_empty() {
+                return;
+            }
+            for h in hs {
+                let _ = h.await;
+            }
+        }
     }
 }
 

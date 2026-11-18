@@ -295,6 +295,12 @@ async fn ops_registered() {
         };
         let a = saiife_daemon::ops::dispatch(&c, &peer(), req).await;
         assert_eq!(a["ok"], false, "{op}: {a}");
+        // Task 2 built the data ops: with no arguments they ask for one.
+        if op.starts_with("blind.data.") {
+            assert_eq!(a["error"], "bad_request", "{op}: {a}");
+            assert_eq!(a["message"], "dataset is required", "{op}: {a}");
+            continue;
+        }
         assert_eq!(a["error"], "unavailable", "{op}: {a}");
         assert_eq!(
             a["message"],

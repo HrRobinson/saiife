@@ -242,6 +242,7 @@ fn every_variant() -> Vec<BlindRecord> {
             action: "create",
             version: 1,
             touch: None,
+            reason: None,
         },
         BlindRecord::Refresh {
             dataset: "crm".into(),
@@ -378,6 +379,7 @@ async fn write_fails_when_the_writer_refuses() {
         action: "create",
         version: 1,
         touch: None,
+        reason: None,
     };
     audit::write(&f.ctx, 1, "crm", rec, None).await.unwrap();
     f.ctx.writer.stop(None).await.unwrap();
@@ -386,6 +388,7 @@ async fn write_fails_when_the_writer_refuses() {
         action: "rotate",
         version: 2,
         touch: None,
+        reason: None,
     };
     let e = audit::write(&f.ctx, 1, "crm", rec, None).await;
     assert!(e.is_err(), "a refused write must be an error");

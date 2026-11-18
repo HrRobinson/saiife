@@ -88,6 +88,21 @@ pub struct BlindDataset {
     pub columns: BTreeMap<String, ColumnCfg>,
     #[serde(default)]
     pub entity: Vec<EntityCfg>,
+    /// Key relations beyond the conventional `<word>_id` ones (plan 43
+    /// follow-up): checked when the dataset is built.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<JoinCfg>,
+}
+
+/// One declared key relation: the INTEGER column `table.column` holds keys
+/// of the entity whose table is `entity` and key column is `key`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinCfg {
+    pub entity: String,
+    pub key: String,
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -301,6 +316,16 @@ impl BlindDataset {
                 if w.as_deref() == Some("") {
                     return Err(format!("[[blind.dataset]] {n}: entity {t}: {key} is empty"));
                 }
+            }
+        }
+        for j in &self.joins {
+            if [&j.entity, &j.key, &j.table, &j.column]
+                .iter()
+                .any(|v| v.is_empty())
+            {
+                return Err(format!(
+                    "[[blind.dataset]] {n}: a join needs entity, key, table and column"
+                ));
             }
         }
         if let BlindSource::Postgres { host, .. } = &self.source {

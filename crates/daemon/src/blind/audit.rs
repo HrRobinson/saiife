@@ -93,6 +93,8 @@ pub enum BlindRecord {
         action: &'static str,
         version: u32,
         touch: Option<String>,
+        /// A fixed label (`dataset removed`), or none.
+        reason: Option<&'static str>,
     },
     Refresh {
         dataset: String,
@@ -271,6 +273,7 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
             action,
             version,
             touch,
+            reason,
         } => (
             "blind_keys",
             vec![
@@ -278,6 +281,7 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
                 ("action", json!(action)),
                 ("version", json!(version)),
                 ("touch", json!(touch)),
+                ("reason", json!(reason)),
             ],
         ),
         BlindRecord::Refresh {

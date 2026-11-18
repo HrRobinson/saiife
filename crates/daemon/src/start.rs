@@ -1181,6 +1181,10 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         blind,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
+    // Data Shield (plan 47): the datasets built before this start, opened
+    // again (keys from the vault; a locked vault leaves them unavailable).
+    #[cfg(target_os = "linux")]
+    crate::blind::data::reopen_all(&ctx);
     if let Some(a) = &box_audit {
         a.attach(&ctx);
     }

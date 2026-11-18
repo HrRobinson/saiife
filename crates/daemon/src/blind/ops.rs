@@ -42,8 +42,6 @@ impl Roles {
 /// The peer's roles for `ds` (`None`: a dataset not yet in policy, so only
 /// admin and `[approval] approvers` count). The personal broker's own user
 /// is all three, as `approval_ops::is_approver` makes it the approver.
-// Task 2 (`data stage`, `commit`, `refresh`, `rm`) is the first caller.
-#[allow(dead_code)]
 pub(crate) async fn role(ctx: &Ctx, peer: &PeerCred, ds: Option<&BlindDataset>) -> Roles {
     if ctx.mode == Mode::Personal {
         let own = ctx.peer_is_own(peer);
@@ -85,18 +83,41 @@ pub fn not_yet(op: &str) -> Refusal {
 
 /// Every op in [`super::OPS`].
 pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
-    // No op takes passed descriptors yet: they are closed now.
-    drop(conn.take_fds());
-    // Each later task replaces its arm.
-    let _ = ctx;
+    // Only `data stage` and `data refresh` take passed descriptors; any
+    // other op closes them now.
+    if !matches!(
+        req.op.as_str(),
+        saiife_ipc::msg::OP_BLIND_DATA_STAGE | saiife_ipc::msg::OP_BLIND_DATA_REFRESH
+    ) {
+        drop(conn.take_fds());
+    }
+    let data = match req.op.as_str() {
+        saiife_ipc::msg::OP_BLIND_DATA_STAGE => {
+            Some(super::data::stage(ctx, conn, &req.args).await)
+        }
+        saiife_ipc::msg::OP_BLIND_DATA_COMMIT => {
+            Some(super::data::commit(ctx, &conn.peer, &req.args).await)
+        }
+        saiife_ipc::msg::OP_BLIND_DATA_REFRESH => {
+            Some(super::data::refresh(ctx, conn, &req.args).await)
+        }
+        saiife_ipc::msg::OP_BLIND_DATA_RM => {
+            Some(super::data::rm(ctx, &conn.peer, &req.args).await)
+        }
+        _ => None,
+    };
+    match data {
+        Some(Ok(Value::Object(m))) => return saiife_ipc::msg::ok(req.id, m),
+        Some(Ok(_)) => {
+            return Refusal::new(ErrorCode::Unavailable, "internal: not an object").to_value(req.id)
+        }
+        Some(Err(r)) => return r.to_value(req.id),
+        None => {}
+    }
     let r = match req.op.as_str() {
         saiife_ipc::msg::OP_BLIND_STATUS | saiife_ipc::msg::OP_BLIND_METHODS_LIST => {
             not_yet(&req.op)
         }
-        saiife_ipc::msg::OP_BLIND_DATA_STAGE
-        | saiife_ipc::msg::OP_BLIND_DATA_COMMIT
-        | saiife_ipc::msg::OP_BLIND_DATA_REFRESH
-        | saiife_ipc::msg::OP_BLIND_DATA_RM => not_yet(&req.op),
         saiife_ipc::msg::OP_BLIND_NER_FETCH => not_yet(&req.op),
         // Plan 48.
         saiife_ipc::msg::OP_BLIND_ASK
