@@ -2,6 +2,7 @@
 //! has no remote surface (R47-3). Tasks 2 to 6 and plan 48 fill in the ops;
 //! until then each answers [`not_yet`].
 
+use super::keys::KeyError;
 use super::ner::NerState;
 use super::{DatasetState, Refusal};
 use crate::ops::{Conn, Ctx, Mode};
@@ -194,9 +195,7 @@ async fn role_of(ctx: &Ctx, peer: &PeerCred, name: &DatasetName) -> Roles {
 /// The calculator's line: the weaker label when it cannot be put in a box.
 pub(crate) fn calculator(s: Strength) -> Value {
     let mut m = serde_json::Map::new();
-    if s == Strength::None {
-        m.insert("label".into(), CALC_LABEL.into());
-    }
+    m.insert("label".into(), CALC_LABEL.into());
     m.insert("landlock".into(), s.as_str().into());
     if let Some(g) = s.gap() {
         m.insert("gap".into(), g.into());
@@ -290,10 +289,17 @@ fn dataset_json(ctx: &Ctx, name: &DatasetName, role: Roles) -> Value {
     d.insert("rows".into(), rows);
     d.insert("snapshot_sha256".into(), sha);
     d.insert("built_at".into(), built);
-    d.insert(
-        "keys_version".into(),
-        super::keys::load(ctx, name).map_or(Value::Null, |k| k.version.into()),
-    );
+    // Review Focus 3: a locked vault and damaged keys are told apart; a
+    // dataset with no keys (never built) has nothing to warn about.
+    let keys_version = match super::keys::load(ctx, name) {
+        Ok(k) => Value::from(k.version),
+        Err(KeyError::Missing) => Value::Null,
+        Err(e) => {
+            warnings.push(e.refusal(name).text);
+            Value::Null
+        }
+    };
+    d.insert("keys_version".into(), keys_version);
     let (mut active, mut suspended) = (0u32, Vec::new());
     match MethodStore::load(&dir.root.join(super::data::METHODS_FILE)) {
         Ok(s) => {
@@ -657,11 +663,11 @@ qa:x:2002:gil
         );
         let f = calculator(Strength::Filesystem);
         assert!(
-            f.get("label").is_none() && f["landlock"] == "filesystem" && f.get("gap").is_some()
+            f["label"] == CALC_LABEL && f["landlock"] == "filesystem" && f.get("gap").is_some()
         );
         assert_eq!(
             calculator(Strength::FilesystemAndScopes),
-            json!({"landlock": "filesystem+scopes"})
+            json!({"label": CALC_LABEL, "landlock": "filesystem+scopes"})
         );
     }
 }

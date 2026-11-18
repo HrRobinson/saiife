@@ -297,6 +297,9 @@ async fn status_shows_weaker_label() {
     assert!(v["calculator"]["gap"]
         .as_str()
         .is_some_and(|g| !g.is_empty()));
+    // The label is there at full strength too (P47-33).
+    let v = status_as(&f, OWN).await;
+    assert_eq!(v["calculator"]["label"], "calculator not in a box (weaker)");
     // The dataset itself.
     let d = crm_of(&v);
     assert_eq!(d["state"], "live");
@@ -583,4 +586,39 @@ async fn methods_list_scoped() {
     )
     .await;
     assert_eq!(err(&v).0, "forbidden", "{v}");
+}
+
+#[tokio::test]
+async fn status_tells_damaged_keys_from_a_locked_vault() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    f.ctx.blind.test_wait_builds().await;
+    let v = status_as(&f, OWN).await;
+    assert_eq!(crm_of(&v)["keys_version"], 1);
+    assert_eq!(crm_of(&v)["warnings"], json!([]), "{v}");
+    // A flipped byte in keys.sealed.
+    let p = ds_root(&f).join("keys.sealed");
+    let good = std::fs::read(&p).unwrap();
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&p, &bad).unwrap();
+    let v = status_as(&f, OWN).await;
+    let d = crm_of(&v);
+    assert_eq!(d["keys_version"], Value::Null);
+    assert_eq!(
+        d["warnings"],
+        json!([
+            "the dataset keys cannot be opened: saiife blind keys delete --dataset crm starts over"
+        ]),
+        "{v}"
+    );
+    // A locked vault: its own warning.
+    std::fs::write(&p, &good).unwrap();
+    *f.ctx.vault.lock() = VaultState::Unavailable("locked".into());
+    let v = status_as(&f, OWN).await;
+    let w = crm_of(&v)["warnings"].to_string();
+    assert!(w.contains("the vault is unavailable"), "{w}");
+    assert!(!w.contains("cannot be opened"), "{w}");
 }
