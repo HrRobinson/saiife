@@ -14,6 +14,11 @@ const ECDH = { name: "ECDH", namedCurve: "P-256" };
 const ECDSA = { name: "ECDSA", namedCurve: "P-256" };
 const enc = new TextEncoder();
 
+// The relay is untrusted and supplies these: fixed sizes, never guessed.
+function need(name, x, len) {
+  if (!(x instanceof Uint8Array) || x.length !== len) throw new Error(`${name} must be ${len} bytes`);
+}
+
 function concat(...parts) {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let at = 0;
@@ -33,6 +38,8 @@ export async function newEphemeral() {
 
 // What the machine key signs: session_id ‖ machine_eph ‖ ("d:"|"p:") id.
 export function machineHelloMsg(sessionId, machineEph, binding) {
+  need("sessionId", sessionId, 16);
+  need("machineEph", machineEph, 65);
   const hasDevice = typeof binding?.deviceId === "string";
   const hasPair = typeof binding?.pairId === "string";
   if (hasDevice === hasPair) throw new Error("binding is a deviceId or a pairId");
@@ -43,7 +50,8 @@ export function machineHelloMsg(sessionId, machineEph, binding) {
 // True only for a valid machine signature (domain-prefixed, raw r‖s).
 export async function verifyMachineHello(machinePub, sessionId, machineEph, binding, sig64) {
   try {
-    if (sig64.length !== 64) return false;
+    need("machinePub", machinePub, 65);
+    need("sig", sig64, 64);
     const key = await crypto.subtle.importKey("raw", machinePub, ECDSA, false, ["verify"]);
     const msg = concat(enc.encode(MACHINE_HELLO_DOMAIN), machineHelloMsg(sessionId, machineEph, binding));
     return await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, sig64, msg);
@@ -54,6 +62,9 @@ export async function verifyMachineHello(machinePub, sessionId, machineEph, bind
 
 // The device key's seal_auth signature over session_id ‖ machine_eph ‖ browser_eph.
 export async function handshakeSig(deviceKey, sessionId, machineEph, browserEph) {
+  need("sessionId", sessionId, 16);
+  need("machineEph", machineEph, 65);
+  need("browserEph", browserEph, 65);
   const msg = concat(enc.encode(HANDSHAKE_DOMAIN), sessionId, machineEph, browserEph);
   const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, deviceKey, msg);
   return new Uint8Array(sig);
@@ -61,6 +72,10 @@ export async function handshakeSig(deviceKey, sessionId, machineEph, browserEph)
 
 // HKDF-SHA256: [0..32] browser to machine, [32..64] machine to browser.
 export async function keysFromShared(shared, machineEph, browserEph, sessionId) {
+  need("shared", shared, 32);
+  need("machineEph", machineEph, 65);
+  need("browserEph", browserEph, 65);
+  need("sessionId", sessionId, 16);
   const ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
   const info = concat(enc.encode(KEYS_INFO), machineEph, browserEph, sessionId);
   const bits = await crypto.subtle.deriveBits(

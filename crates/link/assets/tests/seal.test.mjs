@@ -108,3 +108,27 @@ test("two ends derive the same channel", async () => {
   const twin = await seal.BrowserChannel.fromKeys(k);
   assert.deepEqual(await ch.seal(enc.encode("hi")), await twin.seal(enc.encode("hi")));
 });
+
+test("fixed sizes are enforced; a shifted boundary is refused", async () => {
+  const sid = unb64u(mh.session_id_b64u);
+  const eph = unb64u(mh.machine_eph_b64u);
+  const pub = unb64u(mh.machine_pub_b64u);
+  const dev = { deviceId: mh.device_id };
+  const sig = unb64u(mh.machine_hello_device_sig_b64u);
+  // Same concatenated bytes, boundary moved by one.
+  const sid17 = new Uint8Array([...sid, eph[0]]);
+  const eph64 = eph.slice(1);
+  assert.deepEqual([...sid17, ...eph64], [...sid, ...eph]);
+  assert.throws(() => seal.machineHelloMsg(sid17, eph64, dev));
+  assert.equal(await seal.verifyMachineHello(pub, sid17, eph64, dev, sig), false);
+  assert.equal(await seal.verifyMachineHello(pub.slice(1), sid, eph, dev, sig), false);
+  assert.equal(await seal.verifyMachineHello([...pub], sid, eph, dev, sig), false);
+  const P256 = { name: "ECDSA", namedCurve: "P-256" };
+  const kp = await crypto.subtle.generateKey(P256, false, ["sign", "verify"]);
+  await assert.rejects(seal.handshakeSig(kp.privateKey, sid17, eph64, browserEph));
+  await assert.rejects(seal.handshakeSig(kp.privateKey, sid, eph, browserEph.slice(1)));
+  const shared = unhex(sv.shared_secret_hex);
+  await assert.rejects(seal.keysFromShared(shared.slice(1), machineEph, browserEph, sessionId));
+  await assert.rejects(seal.keysFromShared(shared, machineEph.slice(1), browserEph, sessionId));
+  await assert.rejects(seal.keysFromShared(shared, machineEph, browserEph, new Uint8Array(17)));
+});
