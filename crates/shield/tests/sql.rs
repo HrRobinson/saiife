@@ -4,7 +4,8 @@
 use saiife_shield::plan::{parse_reply, SelfCheck, PLAN_SCHEMA};
 use saiife_shield::public::PublicValues;
 use saiife_shield::schema::{
-    Bound, ColType, ColumnClass, ColumnInfo, EntitySpec, Param, ParamType, Schema, TableInfo,
+    Bound, ColType, ColumnClass, ColumnInfo, EntitySpec, KeyJoin, Param, ParamType, Schema,
+    TableInfo,
 };
 use saiife_shield::sql::{
     validate, validate_check, EntityFilter, ErrorClass, MethodError, ValidatedCheck,
@@ -2316,6 +2317,169 @@ fn division_renders_as_real() {
     // The planner's grammar still has no CAST.
     assert_eq!(
         refused("SELECT CAST(SUM(i.amount) AS REAL) / COUNT(*) AS m FROM invoices i"),
+        ErrorClass::ConstructNotAllowed
+    );
+}
+
+/// Plan 47 Task 45j: the fixture with `invoices.customer_id` renamed to the
+/// non-conventional `cust`, and the policy-declared joins
+/// `invoices.cust -> customers.id` and `payments.invoice_id -> invoices.id`
+/// (`payments.customer_id -> customers.id` is NOT declared).
+fn declared_schema() -> Schema {
+    let mut s = schema();
+    s.tables[1].columns[1].name = "cust".into();
+    let j = |entity: &str, table: &str, column: &str| KeyJoin {
+        entity: entity.into(),
+        key: "id".into(),
+        table: table.into(),
+        column: column.into(),
+    };
+    s.joins = vec![
+        j("customers", "invoices", "cust"),
+        j("invoices", "payments", "invoice_id"),
+    ];
+    s.joins.sort();
+    s
+}
+
+fn declared_ok(sql: &str, schema: &Schema) -> saiife_shield::sql::Validated {
+    match validate(sql, schema, &public(), &ps_for(sql)) {
+        Ok(v) => v,
+        Err(e) => panic!("{sql}: refused {e:?}"),
+    }
+}
+
+#[test]
+fn declared_join_validates() {
+    let s = declared_schema();
+    let sql = "SELECT SUM(i.amount) AS owed FROM invoices i JOIN customers c ON i.cust = c.id \
+               WHERE c.id = :p1";
+    let v = declared_ok(sql, &s);
+    assert_eq!(
+        v.entity_filters,
+        vec![EntityFilter {
+            param: "p1".into(),
+            table: "customers".into(),
+            key: "id".into(),
+            linked: vec![("invoices".into(), "cust".into())],
+        }]
+    );
+    assert_eq!(v.joins.len(), 1);
+    assert_eq!(v.joins[0].key_table, "customers");
+    assert_eq!(v.joins[0].fk_table, "invoices");
+    assert!(v.joins[0].fan);
+    // A declared join keeps working through a CTE (origin tracking).
+    declared_ok(
+        "WITH t AS (SELECT k.cust AS cid, SUM(k.amount) AS s FROM invoices k \
+         GROUP BY k.cust) SELECT t.s FROM customers c JOIN t ON t.cid = c.id WHERE c.id = :p1",
+        &s,
+    );
+    // The declared FK is structural, exactly as a conventional FK is.
+    use ErrorClass::*;
+    let j = "FROM invoices i JOIN customers c ON c.id = i.cust WHERE c.id = :p1";
+    for (sql, want) in [
+        (format!("SELECT MAX(i.cust) AS m {j}"), ConstructNotAllowed),
+        (
+            format!("SELECT COUNT(i.cust) AS m {j}"),
+            ConstructNotAllowed,
+        ),
+        (
+            format!("SELECT COUNT(*) AS n {j} AND i.cust = :p6"),
+            ParamMisuse,
+        ),
+        (
+            "SELECT i.cust, i.amount FROM invoices i ORDER BY i.cust LIMIT 3".to_string(),
+            ConstructNotAllowed,
+        ),
+    ] {
+        assert_eq!(class_of(&sql, &s, &ps_for(&sql)), want, "{sql}");
+    }
+    declared_ok(&format!("SELECT COUNT(DISTINCT i.cust) AS k {j}"), &s);
+    // Selecting the FK as output: refused as the conventional FK is once it
+    // is classed Identifier.
+    let mut ident = s.clone();
+    ident.tables[1].columns[1].class = ColumnClass::Identifier;
+    let mut conv = ident_keys();
+    conv.joins.clear();
+    let out = "SELECT i.cust AS k FROM invoices i";
+    assert_eq!(
+        class_of(out, &ident, &ps_for(out)),
+        class_of(
+            "SELECT i.customer_id AS k FROM invoices i",
+            &conv,
+            &no_entity()
+        )
+    );
+    assert_eq!(class_of(out, &ident, &ps_for(out)), IdentifierOutput);
+    // Without the declaration the same method is refused: `cust` is not a
+    // C-G1 name.
+    let mut plain = s.clone();
+    plain.joins.clear();
+    assert_eq!(class_of(sql, &plain, &ps_for(sql)), ConstructNotAllowed);
+}
+
+#[test]
+fn undeclared_join_refused() {
+    // The declared set is authoritative when present: `payments.customer_id`
+    // follows C-G1 but is not declared, so it is no join.
+    let s = declared_schema();
+    let sql = "SELECT SUM(p.amount) AS s FROM payments p JOIN customers c \
+               ON p.customer_id = c.id WHERE c.id = :p1";
+    assert_eq!(
+        class_of(sql, &s, &ps_for(sql)),
+        ErrorClass::ConstructNotAllowed
+    );
+    // ... and not a key column either (a plain integer column there).
+    declared_ok("SELECT MAX(p.customer_id) AS m FROM payments p", &s);
+    // The declared one beside it still joins.
+    declared_ok(
+        "SELECT SUM(p.amount) AS s FROM payments p JOIN invoices i ON p.invoice_id = i.id",
+        &s,
+    );
+    // A declared pair under a cloud alias: decided by the snapshot pair
+    // the alias resolves to, never by the alias text (review F1).
+    let mut aliased = s.clone();
+    aliased.tables[1].columns[1].alias = Some("customer_id".into());
+    declared_ok(
+        "SELECT SUM(i.amount) AS s FROM invoices i JOIN customers c \
+         ON i.customer_id = c.id WHERE c.id = :p1",
+        &aliased,
+    );
+    let mut renamed = s.clone();
+    renamed.tables[2].columns[1].alias = Some("cust".into());
+    let sql = "SELECT SUM(p.amount) AS s FROM payments p JOIN customers c \
+               ON p.cust = c.id WHERE c.id = :p1";
+    assert_eq!(
+        class_of(sql, &renamed, &ps_for(sql)),
+        ErrorClass::ConstructNotAllowed
+    );
+}
+
+#[test]
+fn empty_joins_keep_convention() {
+    // `joins: vec![]` means the C-G1 joins, as plan 45 decided them.
+    let s = schema();
+    assert!(s.joins.is_empty());
+    let v = ok(
+        "SELECT SUM(p.amount) AS s FROM payments p JOIN customers c \
+                ON p.customer_id = c.id WHERE c.id = :p1",
+    );
+    assert_eq!(
+        v.entity_filters[0].linked,
+        vec![("payments".into(), "customer_id".into())]
+    );
+    // The same set stated explicitly gives the same outcome.
+    let mut explicit = schema();
+    explicit.joins = explicit.conventional_joins();
+    assert!(!explicit.joins.is_empty());
+    for sql in [
+        BALANCE,
+        "SELECT SUM(p.amount) AS s FROM payments p JOIN invoices i ON p.invoice_id = i.id",
+    ] {
+        assert_eq!(declared_ok(sql, &explicit), ok(sql), "{sql}");
+    }
+    assert_eq!(
+        refused("SELECT MAX(p.customer_id) AS m FROM payments p"),
         ErrorClass::ConstructNotAllowed
     );
 }

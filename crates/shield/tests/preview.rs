@@ -4,7 +4,8 @@ use saiife_shield::plan::{parse_reply, PlanReply};
 use saiife_shield::preview::preview;
 use saiife_shield::public::PublicValues;
 use saiife_shield::schema::{
-    Bound, ColType, ColumnClass, ColumnInfo, EntitySpec, Lang, Param, ParamType, Schema, TableInfo,
+    Bound, ColType, ColumnClass, ColumnInfo, EntitySpec, KeyJoin, Lang, Param, ParamType, Schema,
+    TableInfo,
 };
 use saiife_shield::sql::{validate, Validated};
 
@@ -612,4 +613,38 @@ fn is_null_phrases() {
     assert!(p.text.contains("where city is not empty"), "{}", p.text);
     let p = da("SELECT COUNT(*) AS n FROM customers c WHERE c.city IS NOT NULL");
     assert!(p.text.contains("hvor city ikke er tom"), "{}", p.text);
+}
+
+#[test]
+fn declared_join_is_an_edge() {
+    // Plan 47 Task 45j: a policy-declared, non-conventional join
+    // (`invoices.cust -> customers.id`) is a JoinEdge the preview describes.
+    let mut s = schema();
+    s.tables[1].columns[1].name = "cust".into();
+    s.joins = vec![KeyJoin {
+        entity: "customers".into(),
+        key: "id".into(),
+        table: "invoices".into(),
+        column: "cust".into(),
+    }];
+    let sql = "SELECT SUM(i.amount) AS s FROM invoices i JOIN customers c ON c.id = i.cust";
+    let ps = drop_unused(sql, params());
+    let v = match validate(sql, &s, &public(), &ps) {
+        Ok(v) => v,
+        Err(e) => panic!("{sql}: refused {e:?}"),
+    };
+    assert_eq!(v.joins.len(), 1);
+    let e = &v.joins[0];
+    assert_eq!((e.joined, e.key, e.fk), (1, 1, 0));
+    assert_eq!(
+        (e.key_table.as_str(), e.fk_table.as_str()),
+        ("customers", "invoices")
+    );
+    assert!(e.fan);
+    let p = preview(&v, &ps, &s, Lang::En);
+    assert_eq!(
+        p.text,
+        "I'm summing all invoices (amount) matched with their customers."
+    );
+    assert_eq!(p.fragments, 0);
 }

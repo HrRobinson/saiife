@@ -14,8 +14,10 @@
 //! - `/` is rendered with its left operand cast to REAL (ruling F-b), so it
 //!   is never SQLite integer division; the planner cannot write `CAST`.
 //! - `FROM` a base table or a CTE, `[INNER] JOIN … ON` an AND of equalities
-//!   each on a declared key pair (ruling C-G1), checked by column origin
-//!   through CTE provenance; at most 4 joins in all.
+//!   each on a declared key pair, checked by column origin through CTE
+//!   provenance; at most 4 joins in all. The pairs are the schema's joins
+//!   (`Schema::joins`: the policy's declared ones and the ruling C-G1 ones),
+//!   or the C-G1 ones when a schema stores none (plan 47 Task 45j).
 //! - `WHERE`: an AND of `col op (:pN | literal)`, `col IN (items)` and
 //!   (ruling F-k) `t.c IS [NOT] NULL` over a plain non-key column, where
 //!   `col` is a plain column or a date expression over one.
@@ -31,7 +33,7 @@
 //!   `LIMIT n` with an integer literal `n >= 1`; no `OFFSET`.
 //! - In an aggregating block a plain column must be grouped, except (in the
 //!   outermost block) a column of the entity table its `key = :pN` pins.
-//! - Entity key and C-G1 FK columns are structural (judged by origin through
+//! - Entity key and declared FK columns are structural (judged by origin through
 //!   CTEs): only in a key-pair ON, the entity pin, GROUP BY, a plain output
 //!   column, or `COUNT(DISTINCT col)`.
 //! - Expressions are compared by a structural fingerprint (aggregate kind,
@@ -417,6 +419,19 @@ fn validate_cols(
     }
     let Some(Statement::Query(mut q)) = stmts.into_iter().next() else {
         return fail(ErrorClass::NotSelect);
+    };
+    // Plan 47 Task 45j: key pairs come from the schema's joins (the policy's
+    // declared ones plus the C-G1 ones, `dataset::finish`). A schema without
+    // stored joins gets the C-G1 set, as plan 45 decided it.
+    let filled;
+    let schema = if schema.joins.is_empty() {
+        filled = Schema {
+            joins: schema.conventional_joins(),
+            ..schema.clone()
+        };
+        &filled
+    } else {
+        schema
     };
     let mut w = Walk {
         schema,
@@ -1439,13 +1454,6 @@ impl<'a> Walk<'a> {
         edge.map_or_else(construct, Ok)
     }
 
-    /// The C-G1 FK name of an entity, from cloud names only (review F1):
-    /// `<word>_<cloud name of the key>`, ASCII-lowercased.
-    fn fk_name(&self, e: &EntitySpec) -> String {
-        let key = self.schema.cloud_name(&e.table, Some(&e.key));
-        format!("{}_{}", e.word, key).to_ascii_lowercase()
-    }
-
     fn is_int(&self, (t, c): &(String, String)) -> bool {
         self.schema
             .column(t, c)
@@ -1456,47 +1464,50 @@ impl<'a> Walk<'a> {
         x.0 == e.table && x.1 == e.key
     }
 
-    fn is_fk_of(&self, e: &EntitySpec, x: &(String, String)) -> bool {
-        x.0 != e.table && self.schema.cloud_name(&x.0, Some(&x.1)) == self.fk_name(e)
-    }
-
-    /// Ruling C-G1 on cloud names: entity key `E.table.E.key` ↔ a column in
-    /// another table whose cloud name is [`Self::fk_name`], both INTEGER. The
-    /// outcome never depends on a snapshot name behind an alias. Returns the
-    /// link and whether `a` is the key side.
+    /// A declared key pair (plan 47 Task 45j): [`Schema::key_join`] over the
+    /// effective joins (see [`validate_cols`]) between the two snapshot
+    /// origins, both INTEGER, the key side an entity's key in another table
+    /// than the FK. The pairs are snapshot `(table, column)` names resolved
+    /// from the schema, so the outcome never depends on a snapshot name
+    /// behind an alias (review F1). Returns the link and whether `a` is the
+    /// key side.
     fn key_pair(&self, a: &(String, String), b: &(String, String)) -> Option<(Link, bool)> {
         if !self.is_int(a) || !self.is_int(b) {
             return None;
         }
-        self.schema.entities.iter().find_map(|e| {
-            let (other, a_is_key) = if Self::is_entity_key(e, a) && self.is_fk_of(e, b) {
-                (b, true)
-            } else if Self::is_entity_key(e, b) && self.is_fk_of(e, a) {
-                (a, false)
-            } else {
-                return None;
-            };
-            let link = Link {
-                entity: e.table.clone(),
-                table: other.0.clone(),
-                column: other.1.clone(),
-            };
-            Some((link, a_is_key))
-        })
+        let (j, a_is_key) = self.schema.key_join((&a.0, &a.1), (&b.0, &b.1))?;
+        let is_entity = self
+            .schema
+            .entity_for(&j.entity)
+            .is_some_and(|e| e.key == j.key);
+        if !is_entity || j.table == j.entity {
+            return None;
+        }
+        let link = Link {
+            entity: j.entity.clone(),
+            table: j.table.clone(),
+            column: j.column.clone(),
+        };
+        Some((link, a_is_key))
     }
 
-    /// An entity key or a C-G1 FK column.
+    /// An entity key or the FK column of an effective join.
     fn is_key_col(&self, x: &(String, String)) -> bool {
         self.is_int(x)
-            && self
+            && (self
                 .schema
                 .entities
                 .iter()
-                .any(|e| Self::is_entity_key(e, x) || self.is_fk_of(e, x))
+                .any(|e| Self::is_entity_key(e, x))
+                || self
+                    .schema
+                    .joins
+                    .iter()
+                    .any(|j| x.0 == j.table && x.1 == j.column))
     }
 
     /// G1: a plain column whose origin (through CTEs) is an entity key or a
-    /// C-G1 FK column is structural. It may appear only in a key-pair ON,
+    /// declared FK column is structural. It may appear only in a key-pair ON,
     /// the entity pin (`key = :pN` / `key IN (:pN)`), GROUP BY, a plain
     /// output column, or `COUNT(DISTINCT col)`. Anywhere else (a comparison
     /// with a literal, a non-entity parameter or a column; inside another
