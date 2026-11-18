@@ -2,7 +2,8 @@
 
 The Workspace is a web page that shows your boxes and lets you steer them from
 a browser. Today it runs on your own machine, at `http://localhost:47810`. When
-the hub ships, the same page will also be served from app.saiife.com.
+the hub ships, the same page will also be served from workspace.saiife.com
+(see [Workspace on workspace.saiife.com](#workspace-on-workspacesaiifecom)).
 
 Boxes run on Linux only and are not in a release yet. Where the daemon runs no
 boxes, the page has nothing to show, except on the demo build (see
@@ -269,10 +270,51 @@ release.
 SAIIFE_WORKSPACE_FAKE_BOXES=1 cargo run -p saiife-daemon --features fake-boxes
 ```
 
+## Workspace on workspace.saiife.com
+
+The same page is also served at `https://workspace.saiife.com`. It reaches
+your machine over the hub, so it works away from your desk.
+
+- Sign in at app.saiife.com first. The Workspace page links there when you are
+  signed out and brings you back.
+- Run `saiife workspace serve --hub <wss url>` on the machine, so it is
+  connected to the hub.
+- Run `saiife workspace pair` (without `--local`). It shows a QR code and a
+  link that starts with `https://workspace.saiife.com/#pair=`. Open it in the
+  browser you want to pair. The check of the short code and the accept in the
+  terminal are the same as on localhost.
+- The first pairing claims the machine for your account. A machine your
+  account does not own cannot be reached with a device that is only paired
+  somewhere else.
+- The Workspace over the internet needs Pro. The 14-day trial has no card.
+  When it ends, the page says so. The Workspace on localhost stays free.
+- Touches from this page need its origin in the machine's config. `saiife
+  workspace pair` prints the line when it is missing:
+
+```toml
+[workspace]
+origins = ["http://localhost:47810", "https://workspace.saiife.com"]
+```
+
+  The built-in default stays `http://localhost:47810`; nothing is added
+  without you. The WebAuthn RP id is then `workspace.saiife.com`, so touch
+  passkeys made there work only on that host. If the Workspace moves to
+  another host, pair the touch passkeys again.
+
+Honest limits of the hosted page:
+
+- It is served by workspace.saiife.com. That is a separate origin from
+  app.saiife.com on purpose: the browser's device key and passkeys are kept
+  apart from the app's scripts. If workspace.saiife.com is compromised, it can
+  still mislead what you see and use the key while the page is open. The
+  signature still binds the real action.
+- The hub carries sealed messages. It sees who connects and how much, not what
+  is in them.
+
 ## Honest limits
 
 - The page is JavaScript served to your browser. If the thing that serves it
-  is compromised (on app.saiife.com, the hub front end), it can mislead what
+  is compromised (on workspace.saiife.com, the hosted page), it can mislead what
   you see. The signature still binds the real action, and the daemon accepts
   only actions it created. A native app or pinned build would close this. It
   is not in v3.0. On localhost the page comes from `saiife-link` on your own

@@ -194,7 +194,7 @@ fn wire_code(e: &WireError) -> ErrorCode {
 }
 
 /// `workspace.pair.begin {label?}` -> `{pair_id, fragment, machine_id,
-/// expires_at}`. The fragment holds the offer's secret: it is only in this
+/// expires_at, origins}`. The fragment holds the offer's secret: it is only in this
 /// answer, never in a record or a log.
 async fn begin(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
@@ -237,6 +237,12 @@ async fn begin(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     m.insert("fragment".into(), pair::fragment(&offer).into());
     m.insert("machine_id".into(), offer.machine_id.clone().into());
     m.insert("expires_at".into(), offer.expires_at.into());
+    // The effective `[workspace] origins`, so `pair` can say when the hosted
+    // Workspace's origin is missing.
+    m.insert(
+        "origins".into(),
+        crate::workspace_touch::origins(ctx).into(),
+    );
     ok(id, m)
 }
 
@@ -815,6 +821,7 @@ mod tests {
         assert_eq!(b["ok"], true, "{b}");
         assert!(b["fragment"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(b["machine_id"], f.ctx.workspace.machine_id());
+        assert_eq!(b["origins"], json!(["http://localhost:47810"]));
         let d = TestDevice::generate();
         finish(&f, &b, &d);
         let c = call(

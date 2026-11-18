@@ -53,8 +53,33 @@ pub fn pair_url(local: bool, port: u16, fragment: &str) -> String {
     if local {
         format!("http://localhost:{port}/#pair={fragment}")
     } else {
-        format!("https://app.saiife.com/workspace#pair={fragment}")
+        format!("https://workspace.saiife.com/#pair={fragment}")
     }
+}
+
+#[cfg(unix)]
+/// The origin of the hosted Workspace.
+const HUB_ORIGIN: &str = "https://workspace.saiife.com";
+
+#[cfg(unix)]
+/// What to tell the owner when the hosted Workspace's origin is not in the
+/// machine's effective `[workspace] origins` (touches from there would be
+/// refused). None when it is there. The daemon's built-in origins stay
+/// localhost-only; this only prints the line to add.
+pub fn origins_hint(origins: &[String]) -> Option<String> {
+    if origins.iter().any(|o| o == HUB_ORIGIN) {
+        return None;
+    }
+    let list: Vec<String> = origins
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(HUB_ORIGIN))
+        .map(|o| format!("{o:?}"))
+        .collect();
+    Some(format!(
+        "Touches from workspace.saiife.com need this in the machine's config:\n[workspace]\norigins = [{}]",
+        list.join(", ")
+    ))
 }
 
 #[cfg(unix)]
@@ -81,7 +106,7 @@ pub fn run(config: Option<PathBuf>, action: WorkspaceAction) -> ExitCode {
 
 #[cfg(unix)]
 mod imp {
-    use super::{pair_url, qr_text, WorkspaceAction};
+    use super::{origins_hint, pair_url, qr_text, WorkspaceAction};
     use crate::broker::{self, Target};
     use crate::secret_cmd::linux::{call_to, Stop};
     use crate::text::sanitize;
@@ -280,6 +305,15 @@ mod imp {
             let _ = write!(io.out, "{}", qr_text(&url));
         }
         let _ = writeln!(io.out, "{url}");
+        if !local {
+            let origins: Option<Vec<String>> = offer
+                .get("origins")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(sanitize).collect());
+            if let Some(h) = origins.and_then(|o| origins_hint(&o)) {
+                let _ = writeln!(io.out, "{h}");
+            }
+        }
         let _ = writeln!(io.out, "Waiting for the browser (5 min)…");
         let _ = io.out.flush();
         let (label, code, _device) = loop {
@@ -435,16 +469,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pair_url_shapes() {
+    fn pair_url_is_workspace_origin() {
         let local = pair_url(true, 47810, "abc_-");
         assert_eq!(local, "http://localhost:47810/#pair=abc_-");
         let hub = pair_url(false, 47810, "abc_-");
-        assert_eq!(hub, "https://app.saiife.com/workspace#pair=abc_-");
+        assert_eq!(hub, "https://workspace.saiife.com/#pair=abc_-");
         for u in [&local, &hub] {
             let (before, after) = u.split_once('#').unwrap();
             assert_eq!(after, "pair=abc_-");
             assert!(!before.contains("abc_-") && !before.contains('?'), "{u}");
         }
+    }
+
+    #[test]
+    fn pair_url_hint_when_origin_missing() {
+        let h = origins_hint(&["http://localhost:47810".to_string()]).unwrap();
+        assert!(h.contains("https://workspace.saiife.com"), "{h}");
+        assert!(
+            h.contains(r#"origins = ["http://localhost:47810", "https://workspace.saiife.com"]"#),
+            "{h}"
+        );
+        assert!(h.contains("[workspace]"), "{h}");
+    }
+
+    #[test]
+    fn no_hint_when_present() {
+        let o = vec![
+            "http://localhost:47810".to_string(),
+            "https://workspace.saiife.com".to_string(),
+        ];
+        assert_eq!(origins_hint(&o), None);
     }
 
     #[test]
