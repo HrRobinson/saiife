@@ -22,6 +22,23 @@ pub enum TouchClass {
     Test,
     /// A Workspace steer window (plan 31).
     Steer,
+    /// Data Shield (plan 43, spec §2.1.4): release judgment-mode fiction
+    /// derived from `sensitive` columns, or an answer the k-guard cannot
+    /// bring to k by generalizing (later stages).
+    BlindRelease,
+    /// Data Shield: a real `identifier`, `quasi` or `sensitive` value
+    /// would leave (G1).
+    BlindReveal,
+    /// Data Shield: rotate or delete a dataset key.
+    BlindKeys,
+    /// Data Shield: make a column class less strict.
+    BlindLoosen,
+    /// Data Shield: approve a method for reuse (also needs the approver
+    /// role).
+    BlindApprove,
+    /// Data Shield: send a proper name the dataset does not know in the
+    /// stripped question (§2.1.7).
+    BlindName,
 }
 
 impl TouchClass {
@@ -36,6 +53,12 @@ impl TouchClass {
             Self::Remove => "touch_remove",
             Self::Test => "touch_test",
             Self::Steer => "steer",
+            Self::BlindRelease => "blind:release",
+            Self::BlindReveal => "blind:reveal",
+            Self::BlindKeys => "blind:keys",
+            Self::BlindLoosen => "blind:loosen",
+            Self::BlindApprove => "blind:approve",
+            Self::BlindName => "blind:name",
         }
     }
 
@@ -50,6 +73,12 @@ impl TouchClass {
             "touch_remove" => Self::Remove,
             "touch_test" => Self::Test,
             "steer" => Self::Steer,
+            "blind:release" => Self::BlindRelease,
+            "blind:reveal" => Self::BlindReveal,
+            "blind:keys" => Self::BlindKeys,
+            "blind:loosen" => Self::BlindLoosen,
+            "blind:approve" => Self::BlindApprove,
+            "blind:name" => Self::BlindName,
             _ => return None,
         })
     }
@@ -184,7 +213,7 @@ mod tests {
         }
     }
 
-    const ALL: [TouchClass; 8] = [
+    const ALL: [TouchClass; 14] = [
         TouchClass::Land,
         TouchClass::PushProtected,
         TouchClass::Deploy,
@@ -193,6 +222,12 @@ mod tests {
         TouchClass::Enrol,
         TouchClass::Remove,
         TouchClass::Test,
+        TouchClass::BlindRelease,
+        TouchClass::BlindReveal,
+        TouchClass::BlindKeys,
+        TouchClass::BlindLoosen,
+        TouchClass::BlindApprove,
+        TouchClass::BlindName,
     ];
 
     #[test]
@@ -268,9 +303,19 @@ mod tests {
 
     #[test]
     fn needs_uv_table() {
-        let want = [true, false, true, true, false, true, true, true];
+        let want = [
+            true, false, true, true, false, true, true, true, true, true, true, true, true, true,
+        ];
         for (c, w) in ALL.iter().zip(want) {
             assert_eq!(c.needs_uv(), w, "{}", c.name());
+        }
+    }
+
+    #[test]
+    fn blind_classes_need_uv() {
+        for c in &ALL[8..] {
+            assert!(c.name().starts_with("blind:"));
+            assert!(c.needs_uv(), "{}", c.name());
         }
     }
 

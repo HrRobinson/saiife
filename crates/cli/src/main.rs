@@ -30,6 +30,9 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+// `__blind-calc`, the Data Shield calculator process (plan 45).
+#[cfg(target_os = "linux")]
+mod blind_calc;
 #[cfg(unix)]
 mod box_attach;
 mod box_cmd;
@@ -273,6 +276,11 @@ enum Cmd {
     /// spec on stdin, confines itself, execs the server.
     #[command(name = "__mcp-spawn", hide = true)]
     McpSpawn,
+    /// The Data Shield calculator (the daemon runs it, plan 45): reads one
+    /// job frame on stdin, confines itself, runs the method on the
+    /// read-only snapshot, writes one answer frame. Linux only.
+    #[command(name = "__blind-calc", hide = true)]
+    BlindCalc,
     /// The box VMM launcher (the daemon runs it): checks a box's vm.json,
     /// then execs the pinned Cloud Hypervisor. Unix only.
     #[command(name = "__box-vmm", hide = true)]
@@ -511,7 +519,9 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         Cmd::Daemon { .. } => None,
         // No wildcard: a new subcommand must be put on one side or the other here, or this
         // does not compile.
-        Cmd::System { .. }
+        // Says itself that it needs Linux (exit 5).
+        Cmd::BlindCalc
+        | Cmd::System { .. }
         | Cmd::Doctor { .. }
         | Cmd::Audit { .. }
         | Cmd::Approvals { .. }
@@ -607,6 +617,16 @@ fn main() -> ExitCode {
     }
     if let Cmd::Guest { cmd } = cli.command {
         return guest_cmd(cmd);
+    }
+    // Before any config is read: the calculator needs none.
+    if let Cmd::BlindCalc = cli.command {
+        #[cfg(target_os = "linux")]
+        return blind_calc::run();
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("saiife: Data Shield runs on Linux in this release");
+            return ExitCode::from(5);
+        }
     }
     if let Cmd::McpSpawn = cli.command {
         #[cfg(target_os = "linux")]
@@ -858,6 +878,7 @@ fn main() -> ExitCode {
         Cmd::Check { .. }
         | Cmd::Eval { .. }
         | Cmd::McpSpawn
+        | Cmd::BlindCalc
         | Cmd::BoxVmm { .. }
         | Cmd::Guest { .. }
         | Cmd::Daemon { .. }
