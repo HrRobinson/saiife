@@ -53,9 +53,9 @@ pub const LOOSEN_FILE: &str = "loosen.json";
 /// What `stage` saw (names and types only), for `commit`.
 const STAGED_FILE: &str = "staged.json";
 /// The users and approvers the dataset was last built with (S3).
-const ACCESS_FILE: &str = "access.json";
+pub(crate) const ACCESS_FILE: &str = "access.json";
 /// The dataset's approved methods (plan 45).
-const METHODS_FILE: &str = "methods.json";
+pub(crate) const METHODS_FILE: &str = "methods.json";
 /// Where a SQLite source is copied while it is read (`stage/` is emptied by
 /// the snapshot, so the copy cannot live there).
 const IMPORT_DIR: &str = "import";
@@ -278,7 +278,7 @@ fn policy_dataset(ctx: &Ctx, name: &DatasetName) -> Option<(BlindDataset, u32)> 
 // ------------------------------------------------------------ files ----
 
 /// A small JSON file of ours: missing is `None`; never through a link.
-fn read_small<T: serde::de::DeserializeOwned>(p: &Path) -> io::Result<Option<T>> {
+pub(crate) fn read_small<T: serde::de::DeserializeOwned>(p: &Path) -> io::Result<Option<T>> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -499,10 +499,10 @@ impl Drop for BuildGuard {
 /// approvers it was last built with. Written with every build.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Access {
-    users: Vec<String>,
+pub(crate) struct Access {
+    pub(crate) users: Vec<String>,
     /// The approvers in force then (the dataset's, or `[approval]`'s).
-    approvers: Vec<String>,
+    pub(crate) approvers: Vec<String>,
 }
 
 /// What a build needs besides the snapshot.

@@ -261,6 +261,11 @@ impl Sessions {
         }
     }
 
+    /// How many live sessions `uid` has (`blind status`).
+    pub fn count_for(&self, uid: u32) -> usize {
+        self.map.keys().filter(|(u, _)| *u == uid).count()
+    }
+
     pub fn drop_dataset(&mut self, ds: &DatasetName) {
         self.map.retain(|(_, d), _| d != ds);
     }

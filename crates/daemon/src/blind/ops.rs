@@ -2,12 +2,19 @@
 //! has no remote surface (R47-3). Tasks 2 to 6 and plan 48 fill in the ops;
 //! until then each answers [`not_yet`].
 
-use super::Refusal;
+use super::ner::NerState;
+use super::{DatasetState, Refusal};
 use crate::ops::{Conn, Ctx, Mode};
 use saiife_ipc::msg::{ErrorCode, Request};
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::blind::BlindDataset;
+use saiife_shield::dataset::{snapshot_index_columns, MANIFEST_VERSION};
+use saiife_shield::methods::{MethodStatus, MethodStore};
+use saiife_shield::schema::DatasetName;
+use saiife_system::sandbox::{Strength, CALC_LABEL};
+use serde_json::json;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Who a peer is to a dataset (R47-3, ruling P47-13). Each flag is
@@ -118,6 +125,302 @@ pub fn not_yet(op: &str) -> Refusal {
     )
 }
 
+fn reply(id: u64, r: Result<Value, Refusal>) -> Value {
+    match r {
+        Ok(Value::Object(m)) => saiife_ipc::msg::ok(id, m),
+        Ok(_) => Refusal::new(ErrorCode::Unavailable, "internal: not an object").to_value(id),
+        Err(r) => r.to_value(id),
+    }
+}
+
+// ----------------------------------------------------------- status ----
+
+/// The datasets the peer has a role on: in policy, or kept on disk with
+/// the users and approvers they were last built with (S3).
+async fn visible(ctx: &Ctx, peer: &PeerCred) -> Vec<(DatasetName, Roles)> {
+    let policy: Vec<BlindDataset> = ctx
+        .policy()
+        .system
+        .map(|s| s.blind.dataset.clone())
+        .unwrap_or_default();
+    let mut names: BTreeSet<DatasetName> = BTreeSet::new();
+    for d in &policy {
+        if let Ok(n) = d.name.parse() {
+            names.insert(n);
+        }
+    }
+    for n in ctx.blind.state_names() {
+        if let Ok(n) = n.parse() {
+            names.insert(n);
+        }
+    }
+    let mut out = Vec::new();
+    for n in names {
+        let r = role_of(ctx, peer, &n).await;
+        if r.admin || r.approver || r.user {
+            out.push((n, r));
+        }
+    }
+    out
+}
+
+/// The peer's roles on `name`: the policy entry, else what the dataset was
+/// last built with.
+async fn role_of(ctx: &Ctx, peer: &PeerCred, name: &DatasetName) -> Roles {
+    let cfg = ctx.policy().system.and_then(|s| {
+        s.blind
+            .dataset
+            .iter()
+            .find(|d| d.name == name.as_str())
+            .cloned()
+    });
+    match cfg {
+        Some(c) => role(ctx, peer, Some(&c)).await,
+        None => {
+            let p = ctx
+                .blind
+                .dataset_dir(name)
+                .root
+                .join(super::data::ACCESS_FILE);
+            let a = super::data::read_small::<super::data::Access>(&p)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            role_listed(ctx, peer, &a.users, &a.approvers).await
+        }
+    }
+}
+
+/// The calculator's line: the weaker label when it cannot be put in a box.
+pub(crate) fn calculator(s: Strength) -> Value {
+    let mut m = serde_json::Map::new();
+    if s == Strength::None {
+        m.insert("label".into(), CALC_LABEL.into());
+    }
+    m.insert("landlock".into(), s.as_str().into());
+    if let Some(g) = s.gap() {
+        m.insert("gap".into(), g.into());
+    }
+    Value::Object(m)
+}
+
+fn ner_json(s: NerState) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("state".into(), s.word().into());
+    match s {
+        NerState::Ready { labels, .. } => {
+            m.insert("labels".into(), json!(labels));
+        }
+        NerState::Missing(why) | NerState::Failed(why) => {
+            m.insert("reason".into(), why.into());
+        }
+        NerState::NotConfigured => {}
+    }
+    Value::Object(m)
+}
+
+fn role_json(r: Roles) -> Value {
+    json!({"admin": r.admin, "approver": r.approver, "user": r.user})
+}
+
+fn method_status(s: &MethodStatus) -> Value {
+    match s {
+        MethodStatus::Active => json!({"state": "active"}),
+        MethodStatus::Suspended { reason } => json!({"state": "suspended", "reason": reason}),
+    }
+}
+
+/// The fixed warning for a build that predates the current floors or
+/// indexes.
+fn rebuild_warning(name: &DatasetName, why: &str) -> String {
+    format!("{name} {why}: saiife blind data refresh --dataset {name}")
+}
+
+/// What `status` shows of one dataset; blocking (reads its files).
+fn dataset_json(ctx: &Ctx, name: &DatasetName, role: Roles) -> Value {
+    let dir = ctx.blind.dataset_dir(name);
+    let mut warnings: Vec<String> = Vec::new();
+    let mut d = serde_json::Map::new();
+    d.insert("name".into(), name.as_str().into());
+    let (mut sha, mut built, mut rows) = (Value::Null, Value::Null, json!([]));
+    match ctx.blind.state(name) {
+        DatasetState::Live { manifest, .. } => {
+            d.insert("state".into(), "live".into());
+            sha = manifest.snapshot_sha256.clone().into();
+            built = manifest.built_at.clone().into();
+            rows = manifest
+                .rows_bands
+                .iter()
+                .map(|(t, b)| json!([t, b]))
+                .collect();
+            warnings.extend(super::data::warnings(ctx, name));
+            if manifest.v < MANIFEST_VERSION {
+                warnings.push(rebuild_warning(
+                    name,
+                    "was built when floors counted rows, not people",
+                ));
+            }
+            if lacks_indexes(&dir, &manifest.schema) {
+                warnings.push(rebuild_warning(
+                    name,
+                    "was built without its snapshot indexes",
+                ));
+            }
+        }
+        DatasetState::Building {
+            phase, done, total, ..
+        } => {
+            d.insert("state".into(), "refreshing".into());
+            d.insert(
+                "progress".into(),
+                json!({"phase": format!("{phase:?}").to_lowercase(), "done": done, "total": total}),
+            );
+        }
+        DatasetState::NeedsRefresh(why) => {
+            d.insert("state".into(), "needs_refresh".into());
+            d.insert("reason".into(), why.into());
+        }
+        DatasetState::Absent => {
+            d.insert("state".into(), "not_built".into());
+        }
+    }
+    if let Some(e) = ctx.blind.last_build_error(name) {
+        warnings.push(format!("the last refresh failed: {e}"));
+    }
+    d.insert("rows".into(), rows);
+    d.insert("snapshot_sha256".into(), sha);
+    d.insert("built_at".into(), built);
+    d.insert(
+        "keys_version".into(),
+        super::keys::load(ctx, name).map_or(Value::Null, |k| k.version.into()),
+    );
+    let (mut active, mut suspended) = (0u32, Vec::new());
+    match MethodStore::load(&dir.root.join(super::data::METHODS_FILE)) {
+        Ok(s) => {
+            for m in &s.methods {
+                match &m.status {
+                    MethodStatus::Active => active += 1,
+                    MethodStatus::Suspended { reason } => {
+                        suspended.push(json!({"id": m.id, "reason": reason}));
+                    }
+                }
+            }
+        }
+        Err(_) => warnings.push(format!("the methods file of {name} cannot be read")),
+    }
+    d.insert(
+        "methods".into(),
+        json!({"active": active, "suspended": suspended}),
+    );
+    d.insert("warnings".into(), json!(warnings));
+    d.insert("role".into(), role_json(role));
+    Value::Object(d)
+}
+
+/// Whether the live snapshot lacks the join indexes the schema wants
+/// (built before shield a136ebe8). An unreadable snapshot is not reported
+/// here: the open failed already and says so.
+fn lacks_indexes(
+    dir: &saiife_shield::dataset::DatasetDir,
+    schema: &saiife_shield::schema::Schema,
+) -> bool {
+    let want = snapshot_index_columns(schema).len();
+    if want == 0 {
+        return false;
+    }
+    let Ok(c) = saiife_shield::snapshot::open_ro(&dir.snapshot()) else {
+        return false;
+    };
+    let n: Result<i64, _> = c.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+         AND name LIKE 'saiife\\_ix:%' ESCAPE '\\'",
+        [],
+        |r| r.get(0),
+    );
+    n.is_ok_and(|n| (n as usize) < want)
+}
+
+/// `blind.status {}` (R47-3): only the datasets the caller has a role on;
+/// admins see all.
+async fn status(ctx: &Arc<Ctx>, peer: &PeerCred) -> Result<Value, Refusal> {
+    let list = visible(ctx, peer).await;
+    let c = Arc::clone(ctx);
+    let datasets = tokio::task::spawn_blocking(move || {
+        list.into_iter()
+            .map(|(n, r)| dataset_json(&c, &n, r))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| Refusal::new(ErrorCode::Internal, "status failed"))?;
+    let p = ctx.policy();
+    let cloud = p.system.as_ref().and_then(|s| s.blind.cloud.as_ref());
+    let model = cloud
+        .and_then(|c| c.model.clone())
+        .unwrap_or_else(|| saiife_policy::blind::DEFAULT_CLOUD_MODEL.into());
+    let secret_present = cloud.is_some_and(|c| super::model::key_present(ctx, &c.secret));
+    let yours = super::lock(&ctx.blind.sessions).count_for(peer.uid);
+    Ok(json!({
+        "datasets": datasets,
+        "calculator": calculator(super::calc::strength()),
+        "ner": ner_json(ctx.blind.ner.state()),
+        "cloud": {"secret_present": secret_present, "model": model},
+        "sessions": {"yours": yours},
+    }))
+}
+
+/// `blind.methods.list {dataset}`: the approved methods' metadata (never
+/// their text) to the dataset's users and approvers (R47-3).
+async fn methods_list(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    args: &serde_json::Map<String, Value>,
+) -> Result<Value, Refusal> {
+    let name: DatasetName = args
+        .get("dataset")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Refusal::new(ErrorCode::BadRequest, "dataset is required"))?
+        .parse()
+        .map_err(|_| Refusal::new(ErrorCode::BadRequest, "not a dataset name"))?;
+    let r = role_of(ctx, peer, &name).await;
+    if !r.may_ask() {
+        return Err(Refusal::new(
+            ErrorCode::Forbidden,
+            format!("you have no role on {name}"),
+        ));
+    }
+    let path = ctx
+        .blind
+        .dataset_dir(&name)
+        .root
+        .join(super::data::METHODS_FILE);
+    let store = tokio::task::spawn_blocking(move || MethodStore::load(&path))
+        .await
+        .map_err(|_| Refusal::new(ErrorCode::Internal, "methods.list failed"))?
+        .map_err(|_| {
+            Refusal::new(
+                ErrorCode::Unavailable,
+                format!("the methods file of {name} cannot be read"),
+            )
+        })?;
+    let methods: Vec<Value> = store
+        .methods
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "version": m.version,
+                "lang": m.lang,
+                "template_key": m.template_key,
+                "param_tags": m.param_tags,
+                "approved_by": m.approved_by,
+                "approved_at": m.approved_at,
+                "status": method_status(&m.status),
+            })
+        })
+        .collect();
+    Ok(json!({"methods": methods}))
+}
+
 /// Every op in [`super::OPS`].
 pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     // Only `data stage` and `data refresh` take passed descriptors; any
@@ -153,8 +456,9 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         None => {}
     }
     let r = match req.op.as_str() {
-        saiife_ipc::msg::OP_BLIND_STATUS | saiife_ipc::msg::OP_BLIND_METHODS_LIST => {
-            not_yet(&req.op)
+        saiife_ipc::msg::OP_BLIND_STATUS => return reply(req.id, status(ctx, &conn.peer).await),
+        saiife_ipc::msg::OP_BLIND_METHODS_LIST => {
+            return reply(req.id, methods_list(ctx, &conn.peer, &req.args).await)
         }
         // Plan 48.
         saiife_ipc::msg::OP_BLIND_ASK
@@ -342,5 +646,22 @@ qa:x:2002:gil
         let own = role(&c, &peer(1001), None).await;
         assert!(own.may_manage() && own.may_ask());
         assert!(!Roles::default().may_ask() && !Roles::default().may_manage());
+    }
+
+    #[test]
+    fn calculator_line_by_strength() {
+        assert_eq!(
+            calculator(Strength::None),
+            json!({"label": CALC_LABEL, "landlock": "none",
+                   "gap": "no Landlock: sandboxed servers do not start"})
+        );
+        let f = calculator(Strength::Filesystem);
+        assert!(
+            f.get("label").is_none() && f["landlock"] == "filesystem" && f.get("gap").is_some()
+        );
+        assert_eq!(
+            calculator(Strength::FilesystemAndScopes),
+            json!({"landlock": "filesystem+scopes"})
+        );
     }
 }

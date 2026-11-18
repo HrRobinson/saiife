@@ -240,6 +240,11 @@ impl Blind {
             .map_or(DatasetState::Absent, DatasetState::snapshot)
     }
 
+    /// The names that have a state (a build, live, or needing a refresh).
+    pub fn state_names(&self) -> Vec<String> {
+        lock(&self.datasets).keys().cloned().collect()
+    }
+
     /// Sets the dataset's state; `Absent` removes it from the map.
     pub fn set_state(&self, name: &DatasetName, s: DatasetState) {
         let mut m = lock(&self.datasets);

@@ -386,6 +386,27 @@ fn check_frame(body: &[u8], model: &str, env_bytes: &[u8]) -> Result<(), PlanErr
 /// sent as an API key.
 const OAUTH_PREFIX: &str = concat!("sk-", "ant-", "oat");
 
+/// The token of the vault secret `name` when it may be the model key: a
+/// token secret allowing [`MODEL_SERVICE`], not blank, not a subscription
+/// token.
+fn usable_token<'a>(v: &'a crate::vault::Vault, name: &str) -> Option<&'a Zeroizing<String>> {
+    let e = v.get(name)?;
+    if !e.allowed_services.iter().any(|s| s == MODEL_SERVICE) || e.kind != Kind::Token {
+        return None;
+    }
+    let t = e.fields.get("token")?;
+    (!t.trim().is_empty() && !t.trim_start().starts_with(OAUTH_PREFIX)).then_some(t)
+}
+
+/// Whether the policy's model secret is in the vault and usable (`status`).
+/// Never reads the key out.
+pub fn key_present(ctx: &Ctx, name: &str) -> bool {
+    match &*ctx.vault.lock() {
+        VaultState::Ready(v) => usable_token(v, name).is_some(),
+        _ => false,
+    }
+}
+
 /// The API key: the vault token secret `name`, which must allow
 /// [`MODEL_SERVICE`]. Read per request, as the box forwarder does; the
 /// lock is held for the lookup only. API keys only: an OAuth2 or any other
@@ -407,17 +428,7 @@ fn read_key(ctx: &Ctx, name: Option<&str>) -> Result<Zeroizing<String>, PlanErro
     let VaultState::Ready(v) = &mut *g else {
         return Err(PlanError::NoKey("the vault is not available".into()));
     };
-    let e = v.get(name).ok_or_else(missing)?;
-    if !e.allowed_services.iter().any(|s| s == MODEL_SERVICE) {
-        return Err(missing());
-    }
-    let token = match (e.kind, e.fields.get("token")) {
-        (Kind::Token, Some(t)) => t.clone(),
-        _ => return Err(missing()),
-    };
-    if token.trim().is_empty() || token.trim_start().starts_with(OAUTH_PREFIX) {
-        return Err(missing());
-    }
+    let token = usable_token(v, name).ok_or_else(missing)?.clone();
     v.touch(name, &crate::ops::now_ts());
     Ok(token)
 }

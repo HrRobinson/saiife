@@ -163,7 +163,7 @@ pub async fn run(ctx: &Ctx, mut job: CalcJob) -> Result<CalcAnswer, String> {
 }
 
 /// The Landlock strength; debug builds honour [`NO_LANDLOCK_SEAM`].
-fn strength() -> Strength {
+pub(crate) fn strength() -> Strength {
     #[cfg(debug_assertions)]
     if std::env::var_os(NO_LANDLOCK_SEAM).is_some_and(|v| v == "1") {
         return Strength::None;

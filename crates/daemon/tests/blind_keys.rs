@@ -294,7 +294,19 @@ async fn ops_registered() {
             args: serde_json::Map::new(),
         };
         let a = saiife_daemon::ops::dispatch(&c, &peer(), req).await;
+        // Task 7 built `status`: no arguments, an answer (tested in
+        // blind_status.rs).
+        if *op == saiife_ipc::msg::OP_BLIND_STATUS {
+            assert_eq!(a["ok"], true, "{op}: {a}");
+            continue;
+        }
         assert_eq!(a["ok"], false, "{op}: {a}");
+        // And `methods.list` asks for its dataset.
+        if *op == saiife_ipc::msg::OP_BLIND_METHODS_LIST {
+            assert_eq!(a["error"], "bad_request", "{op}: {a}");
+            assert_eq!(a["message"], "dataset is required", "{op}: {a}");
+            continue;
+        }
         // Task 2 built the data ops: with no arguments they ask for one.
         if op.starts_with("blind.data.") {
             assert_eq!(a["error"], "bad_request", "{op}: {a}");
