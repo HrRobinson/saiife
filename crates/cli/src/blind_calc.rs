@@ -44,11 +44,13 @@
 //! and the method's result only.
 //!
 //! **For plan 47 (M7).** The SHA-256 of the whole snapshot is computed here,
-//! inside `RLIMIT_CPU` (15 s) and before the method runs. A large snapshot
-//! may need the daemon to verify the hash instead (and pass an open,
-//! verified file), or a higher CPU limit for the hash. Measured in plan 47
-//! Task 5: 200 MiB hash in about 0.5 s, so the limit holds snapshots of
-//! several GiB.
+//! in the child, before the method runs: under the daemon's wall timer
+//! (`caps.wall_ms` plus 5 s of slack) and the 15 s `RLIMIT_CPU` it shares
+//! with the method. Measured in plan 47 Task 5 at about 2.4 ns per byte
+//! warm (200 MiB in about 0.5 s), so the 5 s slack covers roughly 2 GB of
+//! hashing; less when the file is cold or the method itself is slow. A
+//! larger snapshot needs the daemon to verify the hash instead (and pass an
+//! open, verified file), or a longer budget for the hash.
 
 use saiife_shield::calc::{self, Caps, ResultSet};
 use saiife_shield::calc_proto::{

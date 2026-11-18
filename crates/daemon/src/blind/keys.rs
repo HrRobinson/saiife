@@ -182,6 +182,21 @@ pub fn rotate(ctx: &Ctx, ds: &DatasetName) -> Result<u32, KeyError> {
     Ok(keys.version)
 }
 
+/// Retired stand-in keys older than [`RETIRED_DAYS`] at `now_secs` dropped
+/// (R47-2, at start and daily); the file is rewritten only when one went.
+/// Whether one went.
+pub fn purge_retired(ctx: &Ctx, ds: &DatasetName, now_secs: u64) -> Result<bool, KeyError> {
+    let _g = ctx.blind.keys_lock();
+    let mut keys = load(ctx, ds)?;
+    let before = keys.retired.len();
+    keys.purge_retired(now_secs, RETIRED_DAYS);
+    if keys.retired.len() == before {
+        return Ok(false);
+    }
+    store(ctx, ds, &keys)?;
+    Ok(true)
+}
+
 /// Crypto-shredding (R47-2): `keys.sealed` overwritten once with zeros,
 /// fsynced and unlinked; every session of the dataset dropped; the index
 /// built with the old index key removed; the dataset marked needs-refresh

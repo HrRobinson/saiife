@@ -1185,6 +1185,13 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     // again (keys from the vault; a locked vault leaves them unavailable).
     #[cfg(target_os = "linux")]
     crate::blind::data::reopen_all(&ctx);
+    // Data Shield retention (R47-9 outbox, R47-2 retired keys), off this
+    // thread; again on each daily purge tick.
+    #[cfg(target_os = "linux")]
+    {
+        let c = Arc::clone(&ctx);
+        rt.spawn_blocking(move || crate::blind::retention(&c, std::time::SystemTime::now()));
+    }
     // The name detector (plan 47 Task 4): the helper starts in the
     // background (its hello can take a while); until then builds with
     // public columns refuse, failing closed.
@@ -2059,6 +2066,13 @@ async fn serve(
                 tokio::task::spawn_blocking(move || {
                     crate::import_backup::purge(&dir, crate::import_backup::now())
                 });
+                #[cfg(target_os = "linux")]
+                {
+                    let c = Arc::clone(&ctx);
+                    tokio::task::spawn_blocking(move || {
+                        crate::blind::retention(&c, std::time::SystemTime::now())
+                    });
+                }
             }
             _ = sweep_tick.tick() => {
                 if ctx.approvals.is_ok() {

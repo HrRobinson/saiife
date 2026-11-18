@@ -386,6 +386,62 @@ impl Blind {
     }
 }
 
+/// Data Shield retention (R47-9, R47-2), at start and daily, on the
+/// blocking pool: outbox month files older than `[blind] outbox_days`
+/// removed, and each dataset's retired stand-in keys older than
+/// [`keys::RETIRED_DAYS`] purged. A dataset whose keys cannot be opened
+/// (vault locked, file damaged) is skipped. Every failure is a fixed log
+/// line, never a value.
+pub fn retention(ctx: &crate::ops::Ctx, now: std::time::SystemTime) {
+    let days = ctx
+        .policy()
+        .system
+        .map(|s| s.blind.outbox_days())
+        .unwrap_or_else(|| saiife_policy::blind::BlindCfg::default().outbox_days());
+    if let Err(e) = ctx.blind.outbox().purge(now, days) {
+        eprintln!(
+            "saiifed: blind: warning: old outbox files could not be removed: {}",
+            e.kind()
+        );
+    }
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let Ok(rd) = std::fs::read_dir(ctx.blind.root.join(DATASETS_DIR)) else {
+        return;
+    };
+    let mut vault_logged = false;
+    for e in rd.flatten() {
+        let Some(name) = e
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<DatasetName>().ok())
+        else {
+            continue;
+        };
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match keys::purge_retired(ctx, &name, secs) {
+            Ok(_) | Err(keys::KeyError::Missing) => {}
+            Err(keys::KeyError::VaultUnavailable) => {
+                if !vault_logged {
+                    eprintln!(
+                        "saiifed: blind: the vault is unavailable; retired dataset keys are purged later"
+                    );
+                    vault_logged = true;
+                }
+            }
+            Err(keys::KeyError::Damaged) => eprintln!(
+                "saiifed: blind: warning: the keys of {name} cannot be opened; their retired keys stay"
+            ),
+            Err(_) => eprintln!(
+                "saiifed: blind: warning: the retired keys of {name} could not be purged"
+            ),
+        }
+    }
+}
+
 /// Test seams (debug builds only).
 #[cfg(debug_assertions)]
 impl Blind {

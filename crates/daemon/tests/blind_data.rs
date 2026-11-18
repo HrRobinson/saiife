@@ -433,6 +433,12 @@ async fn commit_builds_live() {
     // A second commit has no stage to build from.
     let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
     assert_eq!(err(&v).0, "bad_request");
+    // A commit over the live build is not the first.
+    ok(&stage(&f).await);
+    ok(&call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await);
+    let r = records(&f, "blind_refresh");
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert_eq!(r[1]["first"], false);
     // Only a manager commits.
     let v = call_as(
         &f,
@@ -452,8 +458,13 @@ async fn reopen_at_start() {
     build_live(&f, &[]).await;
     // A daemon start: a new context over the same state.
     f.ctx.blind.set_state(&crm(), DatasetState::Absent);
+    // A crash left the SQLite import copy (real data): it goes.
+    let import = ds_root(&f).join("import");
+    std::fs::create_dir_all(&import).unwrap();
+    std::fs::copy(&f.sqlite, import.join("source.sqlite")).unwrap();
     data::reopen_all(&f.ctx);
     assert!(f.ctx.blind.live(&crm()).is_ok());
+    assert!(!import.exists());
     // A locked vault: not live, never unkeyed.
     f.ctx.blind.set_state(&crm(), DatasetState::Absent);
     *f.ctx.vault.lock() = vault::VaultState::Unavailable("locked".into());
@@ -715,8 +726,16 @@ fn fake_ner() -> PathBuf {
 
 /// Task 4 fills the detector slot: `[blind.ner]` in policy, its files in
 /// `<blind>/models/`, and the helper (the fake, through the debug seam,
-/// with `phrases`) running. Only this test sets the seam.
+/// with `phrases`) running. Only these tests set the seam.
 async fn ner_on(f: &Fx, policy: &str, phrases: &str) {
+    ner_on_mode(f, policy, phrases, 0o700).await;
+}
+
+/// The helper seam is process-wide: one test at a time sets it.
+static NER_SEAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// [`ner_on`] with the helper file's mode `perm`.
+async fn ner_on_mode(f: &Fx, policy: &str, phrases: &str, perm: u32) {
     use sha2::{Digest, Sha256};
     // A running helper keeps its phrases: start from none.
     f.ctx.blind.ner.configure(None, Mode::Personal, OWN);
@@ -746,7 +765,7 @@ async fn ner_on(f: &Fx, policy: &str, phrases: &str) {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(perm)).unwrap();
     std::env::set_var(saiife_daemon::blind::ner::HELPER_SEAM, &helper);
     let ner = format!(
         "\n[blind.ner]\nmodel_url = \"https://ner.example.test/m\"\nmodel_sha256 = \"{}\"\n\
@@ -760,6 +779,7 @@ async fn ner_on(f: &Fx, policy: &str, phrases: &str) {
 
 #[tokio::test]
 async fn public_columns_checked_by_the_ner_helper() {
+    let _seam = NER_SEAM.lock().await;
     let t = scratch();
     let f = fx(t.path());
     ok(&stage(&f).await);
@@ -779,6 +799,28 @@ async fn public_columns_checked_by_the_ner_helper() {
     ner_on(&f, &policy, "PER\tSøren Ærø\n").await;
     ok(&call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await);
     assert_eq!(class_in_live(&f, "customers.city"), ColumnClass::Public);
+}
+
+#[tokio::test]
+async fn unsafe_ner_helper_refuses_with_its_reason() {
+    let _seam = NER_SEAM.lock().await;
+    let t = scratch();
+    let f = fx(t.path());
+    ok(&stage(&f).await);
+    let policy = policy_text(&[("customers.city", "public")]);
+    // A helper writable by others: the commit names why, not "try again".
+    ner_on_mode(&f, &policy, "PER\tSøren\n", 0o666).await;
+    assert!(f.ctx.blind.detector().is_some());
+    let v = call(&f, OP_BLIND_DATA_COMMIT, json!({"dataset": "crm"}), vec![]).await;
+    let (code, text) = err(&v);
+    assert_eq!(code, "unavailable");
+    assert!(
+        text.starts_with("the name detector is not available: ")
+            && text.contains("writable by group or others"),
+        "{text}"
+    );
+    assert!(!text.contains("try again"), "{text}");
+    assert!(!ds_root(&f).join("live").exists());
 }
 
 #[tokio::test]

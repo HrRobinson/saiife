@@ -29,7 +29,7 @@ use saiife_shield::dataset::{
 use saiife_shield::index::{read_allow, KnownIndex, ALLOW_FILE};
 use saiife_shield::lexicon::Lexicon;
 use saiife_shield::methods::MethodStore;
-use saiife_shield::ner::{NameDetector, SpanLabel};
+use saiife_shield::ner::{DetectError, NameDetector, SpanLabel};
 use saiife_shield::public::{PublicValues, NO_IDENTIFIER};
 use saiife_shield::schema::{
     rows_band, ColType, ColumnClass, ColumnInfo, DatasetName, EntitySpec, KeyJoin, Schema,
@@ -571,7 +571,12 @@ fn name_check(
     let person = |text: &str| -> Result<bool, Refusal> {
         d.detect(text)
             .map(|spans| spans.iter().any(|s| s.label == SpanLabel::Person))
-            .map_err(|_| unavailable("the name detector failed: try again"))
+            .map_err(|e| match e {
+                // Fixed texts and paths (an unsafe or missing helper):
+                // not something a retry mends.
+                DetectError::Unavailable(_) => unavailable(e.to_string()),
+                DetectError::Failed => unavailable("the name detector failed: try again"),
+            })
     };
     for t in &schema.tables {
         for c in &t.columns {
@@ -1132,7 +1137,7 @@ pub async fn commit(
         detector: ctx.blind.detector(),
         prev: guard.previous_live().map(|p| p.0),
         uid: peer.uid,
-        first: true,
+        first: !guard.had_live(),
         started,
     };
     let res = tokio::task::spawn_blocking(move || build(b, &layout))
@@ -1343,7 +1348,8 @@ fn reopen(ctx: &Ctx, name: &DatasetName) -> DatasetState {
     }
 }
 
-/// At daemon start: every dataset with a live build is opened again.
+/// At daemon start: every dataset with a live build is opened again, and
+/// the SQLite copy a crash left in a dataset's `import/` (real data) goes.
 pub fn reopen_all(ctx: &Ctx) {
     let dir = ctx.blind.root.join("datasets");
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -1359,6 +1365,11 @@ pub fn reopen_all(ctx: &Ctx) {
         };
         if !e.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
+        }
+        if remove_entry(&e.path().join(IMPORT_DIR)).is_err() {
+            eprintln!(
+                "saiifed: blind: warning: a left-over import copy of {name} could not be removed"
+            );
         }
         match reopen(ctx, &name) {
             DatasetState::Absent => {}

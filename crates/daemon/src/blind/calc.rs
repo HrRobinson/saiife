@@ -76,8 +76,9 @@ const STDERR_CAP: usize = 4096;
 /// The longest stderr line logged, in chars.
 const LOG_CHARS: usize = 200;
 
-/// A calculator answer as plan 48 handles it.
-#[derive(Debug, PartialEq)]
+/// A calculator answer as plan 48 handles it. `Debug` prints the kind,
+/// the classes and counts only: a result holds real aggregates.
+#[derive(PartialEq)]
 pub enum Outcome<'a> {
     /// The method ran; its result and the sandbox it ran in.
     Ran {
@@ -99,6 +100,35 @@ pub enum Outcome<'a> {
         class: &'a str,
         empty_for: Option<&'a str>,
     },
+}
+
+impl std::fmt::Debug for Outcome<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Ran {
+                result,
+                confinement,
+            } => f
+                .debug_struct("Ran")
+                .field("columns", &result.columns.len())
+                .field("rows", &result.rows.len())
+                .field("truncated", &result.truncated)
+                .field("confinement", confinement)
+                .finish_non_exhaustive(),
+            Outcome::SnapshotMismatch => f.write_str("SnapshotMismatch"),
+            Outcome::EmptyResult { empty_for } => f
+                .debug_struct("EmptyResult")
+                .field("empty_for", &empty_for.is_some())
+                .finish(),
+            Outcome::TimeCap => f.write_str("TimeCap"),
+            Outcome::SandboxUnavailable => f.write_str("SandboxUnavailable"),
+            Outcome::Refused { class, empty_for } => f
+                .debug_struct("Refused")
+                .field("class", class)
+                .field("empty_for", &empty_for.is_some())
+                .finish(),
+        }
+    }
 }
 
 /// Sorts an answer by its class constant.
@@ -348,6 +378,38 @@ mod tests {
                 empty_for: Some("p1")
             }
         );
+    }
+
+    #[test]
+    fn outcome_debug_holds_no_value() {
+        use saiife_shield::calc::CellValue;
+        let a = CalcAnswer::Ok {
+            result: ResultSet {
+                columns: vec!["revenue_of_soeren".into()],
+                rows: vec![vec![
+                    CellValue::Text("Østergård".into()),
+                    CellValue::Int(987_654_321),
+                ]],
+                total_rows: None,
+                truncated: false,
+                ms: 3,
+                row_band: "1-9".into(),
+            },
+            confinement: ConfinementInfo {
+                landlock_abi: 6,
+                net_denied: true,
+                scopes: true,
+                seccomp: true,
+                netns: true,
+            },
+        };
+        let d = format!("{:?}", outcome(&a));
+        assert!(d.starts_with("Ran { columns: 1, rows: 1,"), "{d}");
+        for v in ["Østergård", "987654321", "soeren"] {
+            assert!(!d.contains(v), "{v} in {d}");
+        }
+        let d = format!("{:?}", outcome(&err("check_failed", Some("p1"))));
+        assert_eq!(d, "Refused { class: \"check_failed\", empty_for: true }");
     }
 
     #[test]

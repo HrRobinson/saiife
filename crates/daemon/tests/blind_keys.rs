@@ -332,3 +332,55 @@ async fn ops_registered() {
     assert!(FD_OPS.contains(&OP_BLIND_DATA_STAGE));
     assert!(FD_OPS.contains(&OP_BLIND_DATA_REFRESH));
 }
+
+/// The start/daily retention hook (R47-9, R47-2), called directly.
+#[tokio::test]
+async fn retention_purges_old_outbox_months_and_retired_keys() {
+    use saiife_daemon::blind::outbox::OutboxEntry;
+    use std::os::unix::fs::MetadataExt;
+    use std::time::SystemTime;
+    let t = scratch();
+    let c = ctx(t.path(), Some([7; 32]));
+    // Outbox: no policy, so the default 365 days.
+    let ob = c.blind.outbox();
+    for ts in ["2025-01-15T00:00:00.000Z", "2025-12-15T00:00:00.000Z"] {
+        ob.append(&OutboxEntry {
+            ts: ts.into(),
+            sha256: "0".repeat(64),
+            uid: 1000,
+            dataset: "crm".into(),
+            ask: "a1".into(),
+            body: "{}".into(),
+        })
+        .unwrap();
+    }
+    let dir = c.blind.root.join("outbox");
+    // 2026-11-18: a month that ended before 2025-11-18 goes.
+    let nov18 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_960_000);
+    saiife_daemon::blind::retention(&c, nov18);
+    assert!(!dir.join("2025-01.jsonl").exists());
+    assert!(dir.join("2025-12.jsonl").exists());
+    // Retired keys: kept within 30 days, purged after.
+    let ds = crm();
+    keys::create(&c, &ds).unwrap();
+    keys::rotate(&c, &ds).unwrap();
+    let rotated = SystemTime::now();
+    let p = sealed_path(&c, &ds);
+    let ino = std::fs::metadata(&p).unwrap().ino();
+    let day = Duration::from_secs(86_400);
+    saiife_daemon::blind::retention(&c, rotated + 29 * day);
+    assert_eq!(keys::load(&c, &ds).unwrap().retired.len(), 1);
+    // Nothing went: the file is not rewritten.
+    assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino);
+    saiife_daemon::blind::retention(&c, rotated + 31 * day);
+    let k = keys::load(&c, &ds).unwrap();
+    assert!(k.retired.is_empty());
+    assert_eq!(k.version, 2);
+    assert_eq!(mode_of(&p), 0o600);
+    // A locked vault: skipped, nothing changed or removed.
+    keys::rotate(&c, &ds).unwrap();
+    let rotated = SystemTime::now();
+    *c.vault.lock() = VaultState::Unavailable("locked".into());
+    saiife_daemon::blind::retention(&c, rotated + 31 * day);
+    assert!(p.is_file());
+}

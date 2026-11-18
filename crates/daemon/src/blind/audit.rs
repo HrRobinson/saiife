@@ -14,7 +14,8 @@ use saiife_shield::schema::{ColumnClass, Lang};
 use serde_json::{json, Value};
 
 /// What Data Shield records. The `&'static str` fields are fixed labels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` prints the kind only (a `question` or a column is not for logs).
+#[derive(Clone, PartialEq, Eq)]
 pub enum BlindRecord {
     Ask {
         ask: String,
@@ -119,6 +120,34 @@ pub enum BlindRecord {
         /// [`name_sha256`].
         name_sha256: String,
     },
+}
+
+impl BlindRecord {
+    /// The record's kind (its `kind` in the log).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BlindRecord::Ask { .. } => "blind_ask",
+            BlindRecord::Resolve { .. } => "blind_resolve",
+            BlindRecord::Preview { .. } => "blind_preview",
+            BlindRecord::Send { .. } => "blind_send",
+            BlindRecord::Receive { .. } => "blind_receive",
+            BlindRecord::Run { .. } => "blind_run",
+            BlindRecord::CheckRefused { .. } => "blind_check_refused",
+            BlindRecord::Approve { .. } => "blind_approve",
+            BlindRecord::Keys { .. } => "blind_keys",
+            BlindRecord::Refresh { .. } => "blind_refresh",
+            BlindRecord::Loosen { .. } => "blind_loosen",
+            BlindRecord::Name { .. } => "blind_name",
+        }
+    }
+}
+
+impl std::fmt::Debug for BlindRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlindRecord")
+            .field("kind", &self.kind())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The record's kind, its fields (the `ask`, `dataset` and `session` ones
@@ -477,4 +506,35 @@ pub async fn write(
     }
     ctx.writer.append(rec).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_prints_the_kind_only() {
+        let r = BlindRecord::Ask {
+            ask: "ask-1".into(),
+            dataset: "crm".into(),
+            lang: Lang::En,
+            question: "revenue of Søren Østergård".into(),
+            session: "sess-1".into(),
+            approved_method: None,
+        };
+        let d = format!("{r:?}");
+        assert_eq!(d, "BlindRecord { kind: \"blind_ask\", .. }");
+        assert!(!d.contains("Søren"), "{d}");
+        // The kinds agree with what is written.
+        assert_eq!(r.kind(), fields(r.clone()).0);
+        let l = BlindRecord::Loosen {
+            dataset: "crm".into(),
+            column: "customers.city".into(),
+            from: ColumnClass::Quasi,
+            to: ColumnClass::Public,
+            touch: "t".into(),
+        };
+        assert!(!format!("{l:?}").contains("city"));
+        assert_eq!(l.kind(), fields(l.clone()).0);
+    }
 }

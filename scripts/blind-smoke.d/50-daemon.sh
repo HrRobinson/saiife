@@ -41,6 +41,9 @@ p47_env() {
   export XDG_DATA_HOME="$P47_WORK/xdg/data"
   export XDG_STATE_HOME="$P47_WORK/xdg/state"
   export XDG_RUNTIME_DIR="$P47_WORK/run"
+  # The vault key's keyring item is not per-HOME: keep off the owner's
+  # login keyring.
+  export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
   chmod 700 "$XDG_RUNTIME_DIR"
 }
