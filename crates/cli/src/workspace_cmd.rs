@@ -53,8 +53,40 @@ pub fn pair_url(local: bool, port: u16, fragment: &str) -> String {
     if local {
         format!("http://localhost:{port}/#pair={fragment}")
     } else {
-        format!("https://app.saiife.com/workspace#pair={fragment}")
+        format!("https://workspace.saiife.com/#pair={fragment}")
     }
+}
+
+#[cfg(unix)]
+/// The origin of the hosted Workspace.
+const HUB_ORIGIN: &str = "https://workspace.saiife.com";
+
+#[cfg(unix)]
+/// What to tell the owner when the hosted Workspace's origin is not in the
+/// machine's effective `[workspace] origins` (touches from there would be
+/// refused). None when it is there. The daemon's built-in origins stay
+/// localhost-only; this only prints the line to add. `pair` prints it before
+/// the URL: the pairing's passkey is checked against the origins at
+/// pair.finish, so a pairing made before the change has no touches.
+pub fn origins_hint(origins: &[String]) -> Option<String> {
+    if origins.iter().any(|o| o == HUB_ORIGIN) {
+        return None;
+    }
+    let list: Vec<String> = origins
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(HUB_ORIGIN))
+        // TOML string quoting (Rust's Debug quoting is not TOML).
+        .map(|o| toml::Value::String(o.to_string()).to_string())
+        .collect();
+    Some(format!(
+        "Touches from workspace.saiife.com need this in the machine's config:\n\
+         Add to your [workspace] table:\n\
+         origins = [{}]\n\
+         Add it, reload the daemon, then run saiife workspace pair again. \
+         A pairing made without it has no touches.",
+        list.join(", ")
+    ))
 }
 
 #[cfg(unix)]
@@ -81,7 +113,7 @@ pub fn run(config: Option<PathBuf>, action: WorkspaceAction) -> ExitCode {
 
 #[cfg(unix)]
 mod imp {
-    use super::{pair_url, qr_text, WorkspaceAction};
+    use super::{origins_hint, pair_url, qr_text, WorkspaceAction};
     use crate::broker::{self, Target};
     use crate::secret_cmd::linux::{call_to, Stop};
     use crate::text::sanitize;
@@ -275,6 +307,17 @@ mod imp {
         let fragment = text(&offer, "fragment")?;
         let expires_at = offer.get("expires_at").and_then(Value::as_u64).unwrap_or(0);
         let url = pair_url(local, port, &fragment);
+        // Before the QR code and the URL: a pairing made before the origin is
+        // in the config has no touches.
+        if !local {
+            let origins: Option<Vec<String>> = offer
+                .get("origins")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(sanitize).collect());
+            if let Some(h) = origins.and_then(|o| origins_hint(&o)) {
+                let _ = writeln!(io.out, "{h}");
+            }
+        }
         // The fragment is a secret: it is shown here, once, inside the URL.
         if io.tty {
             let _ = write!(io.out, "{}", qr_text(&url));
@@ -411,6 +454,48 @@ mod imp {
         use super::*;
 
         #[test]
+        fn pair_prints_the_origins_hint_before_the_url() {
+            let mut calls = Vec::new();
+            let mut call = |op: &str, _a: Map<String, Value>| -> Result<Map<String, Value>, Stop> {
+                calls.push(op.to_string());
+                let v = if op == OP_WORKSPACE_PAIR_BEGIN {
+                    json!({"pair_id": "p1", "fragment": "frag", "expires_at": 10,
+                           "origins": ["http://localhost:47810"]})
+                } else {
+                    json!({"state": "expired"})
+                };
+                Ok(v.as_object().unwrap().clone())
+            };
+            for local in [false, true] {
+                let mut out = Vec::new();
+                let mut input = std::io::Cursor::new(Vec::new());
+                let cancel = Cancel::default();
+                let mut io = PairIo {
+                    out: &mut out,
+                    input: &mut input,
+                    tty: false,
+                    now: &|| 0,
+                    sleep: &|| {},
+                    cancel: &cancel,
+                };
+                assert!(pair_flow(&mut call, &mut io, None, local, 47810).is_err());
+                let text = String::from_utf8(out).unwrap();
+                let hint = text.find("Touches from workspace.saiife.com");
+                let url = text.find("#pair=frag").unwrap();
+                if local {
+                    assert_eq!(hint, None, "{text}");
+                } else {
+                    assert!(hint.unwrap() < url, "{text}");
+                    assert!(
+                        text.contains("A pairing made without it has no touches."),
+                        "{text}"
+                    );
+                }
+            }
+            assert_eq!(calls[0], OP_WORKSPACE_PAIR_BEGIN);
+        }
+
+        #[test]
         fn confirm_prompt_sanitizes_label() {
             let p = confirm_prompt("\x1b[2J evil", "123 456");
             assert!(!p.contains('\x1b'), "{p:?}");
@@ -435,16 +520,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pair_url_shapes() {
+    fn pair_url_is_workspace_origin() {
         let local = pair_url(true, 47810, "abc_-");
         assert_eq!(local, "http://localhost:47810/#pair=abc_-");
         let hub = pair_url(false, 47810, "abc_-");
-        assert_eq!(hub, "https://app.saiife.com/workspace#pair=abc_-");
+        assert_eq!(hub, "https://workspace.saiife.com/#pair=abc_-");
         for u in [&local, &hub] {
             let (before, after) = u.split_once('#').unwrap();
             assert_eq!(after, "pair=abc_-");
             assert!(!before.contains("abc_-") && !before.contains('?'), "{u}");
         }
+    }
+
+    #[test]
+    fn pair_url_hint_when_origin_missing() {
+        let h = origins_hint(&["http://localhost:47810".to_string()]).unwrap();
+        let lines: Vec<&str> = h.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "Touches from workspace.saiife.com need this in the machine's config:",
+                "Add to your [workspace] table:",
+                r#"origins = ["http://localhost:47810", "https://workspace.saiife.com"]"#,
+                "Add it, reload the daemon, then run saiife workspace pair again. \
+                 A pairing made without it has no touches.",
+            ],
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn pair_url_hint_line_is_toml() {
+        // TOML string escaping, not Rust Debug quoting (which writes
+        // `\u{301}`, not TOML).
+        let odd = ["http://a\"b\\c".to_string(), "http://e\u{301}".to_string()];
+        let h = origins_hint(&odd).unwrap();
+        let line = h.lines().find(|l| l.starts_with("origins = ")).unwrap();
+        let t: toml::Table = toml::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        let got: Vec<&str> = t["origins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                odd[0].as_str(),
+                odd[1].as_str(),
+                "https://workspace.saiife.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_hint_when_present() {
+        let o = vec![
+            "http://localhost:47810".to_string(),
+            "https://workspace.saiife.com".to_string(),
+        ];
+        assert_eq!(origins_hint(&o), None);
     }
 
     #[test]
