@@ -3,7 +3,7 @@ import { h } from "../dom.js";
 import { visible } from "../format.js";
 import { ACTIONS, outcome } from "../actions.js";
 import { Client } from "../wire.js";
-import { taskCounter, checkRepo, checkTask, needsTouchBadge, spawnArgs } from "../inboxlogic.js";
+import { templateLabel, credentialLabel, noticeText, taskCounter, checkRepo, checkTask, needsTouchBadge, spawnArgs } from "../inboxlogic.js";
 import { show } from "../touchprompt.js";
 import { leaveIfUnpaired } from "../unpaired.js";
 import { touch } from "../touch.js";
@@ -32,6 +32,12 @@ export function view(client) {
       visible(t.description),
       needsTouchBadge(t) ? " " : "",
       needsTouchBadge(t) ? h("span", { class: "badge" }, "needs a touch") : "",
+      t.beta ? " " : "",
+      t.beta ? h("span", { class: "badge" }, "beta") : "",
+      " ",
+      h("span", { class: "muted" }, credentialLabel(t)),
+      noticeText(t) ? " " : "",
+      noticeText(t) ? h("span", { class: "muted" }, noticeText(t)) : "",
     );
   }
 
@@ -43,7 +49,7 @@ export function view(client) {
       return;
     }
     templates = a.result;
-    select.replaceChildren(...templates.map((t) => h("option", { value: t.name }, visible(t.name))));
+    select.replaceChildren(...templates.map((t) => h("option", { value: t.name }, templateLabel(t))));
     describe();
     buttons(templates.length > 0);
     if (templates.length === 0) out.replaceChildren(h("p", { class: "muted" }, "No templates are set up."));

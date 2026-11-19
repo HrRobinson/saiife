@@ -2,12 +2,25 @@
 release = "release-20261017"
 sha256 = "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94"
 [packages]
-apt = ["docker.io", "socat", "git", "ca-certificates", "curl", "build-essential", "pkg-config", "python3", "python3-venv", "cloud-guest-utils"]
+apt = ["docker.io", "socat", "git", "ca-certificates", "curl", "build-essential", "pkg-config", "python3", "python3-venv", "cloud-guest-utils", "openssh-client"]
 [images]
 pull = []
 [claude]
 version = "UNPINNED"
 url = "UNPINNED"
 sha256 = "UNPINNED"
+[codex]
+enabled = false
+version = "UNPINNED"
+url = "UNPINNED"      # https://github.com/openai/codex/releases/download/rust-v<ver>/codex-x86_64-unknown-linux-musl.tar.gz
+sha256 = "UNPINNED"
+[gemini]
+enabled = false
+version = "UNPINNED"
+url = "UNPINNED"      # https://github.com/google-gemini/gemini-cli/releases/download/v<ver>/gemini-cli-bundle.zip
+sha256 = "UNPINNED"
+node_version = "UNPINNED"
+node_url = "UNPINNED" # https://nodejs.org/dist/v<ver>/node-v<ver>-linux-x64.tar.xz
+node_sha256 = "UNPINNED"
 [boot]
 direct_kernel = false

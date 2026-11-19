@@ -32,8 +32,32 @@
 # builds can be compared with the same script. SAIIFE_BENCH_TMP=<dir> is where
 # the scratch dir goes (default: next to the repo, then the system's).
 #
+# With --latency-tests it times nothing itself: it runs the two #[ignore]d
+# wall-clock tests that no CI job runs (a loaded runner fails them), each with
+# --ignored --exact, and exits non-zero if either fails. Run it on a quiet
+# machine. It builds no release binary and runs no init. The ch_vmm one is
+# Linux-only (the boxhost fake), so it is skipped elsewhere with a message:
+#   saiife-guard  --test corpus_lock  many_operands_cost_little_time
+#   saiife-boxhost --features fake --test ch_vmm  destroy_returns_within_its_budget
+#
 # Usage: [BENCH_MAX_P95_MS=<ms>] scripts/bench-check.sh [--managed] [N]   (default N = 50)
+#        scripts/bench-check.sh --latency-tests
 set -euo pipefail
+
+if [[ "${1:-}" == "--latency-tests" ]]; then
+  repo="$(cd "$(dirname "$0")/.." && pwd)"
+  manifest=(--manifest-path "$repo/Cargo.toml")
+  rc=0
+  cargo test "${manifest[@]}" -p saiife-guard --test corpus_lock -- \
+    --ignored --exact many_operands_cost_little_time || rc=1
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    cargo test "${manifest[@]}" -p saiife-boxhost --features fake --test ch_vmm -- \
+      --ignored --exact destroy_returns_within_its_budget || rc=1
+  else
+    echo "skipping destroy_returns_within_its_budget: the boxhost fake is Linux-only"
+  fi
+  exit "$rc"
+fi
 
 managed=0
 if [[ "${1:-}" == "--managed" ]]; then

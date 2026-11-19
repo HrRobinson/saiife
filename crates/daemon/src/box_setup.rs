@@ -3,9 +3,10 @@
 //! gateway hook ([`LateHooks`]) and where a box's terminal recording goes
 //! ([`cast_path`]).
 //!
-//! The setup is the box template's command, the model env and first-run
-//! seed of Claude Code (plan 40: the box's placeholder, never the real
-//! credential), the in-box Claude Code settings (G11) and the user packs of
+//! The setup is the box template's command, the agent's model env and files
+//! (plan 40: the box's placeholder, never the real credential; for Claude
+//! Code its first-run seed (its hooks are baked managed settings, FU2), for Codex and Gemini their
+//! config with the gateway as provider, plan 42 D5) and the user packs of
 //! this daemon's `policy.d/packs`, on a 40 x 120 terminal. A pack that
 //! cannot be sent (an invalid id, too big, over the file count) is skipped
 //! with one stderr line naming it: a spawn is never refused for a pack.
@@ -17,10 +18,13 @@ use std::time::Duration;
 use saiife_boxes::guest::GuestEvent;
 use saiife_boxes::manager::Manager;
 use saiife_boxes::store::Store;
-use saiife_boxes::template::{AgentKind, Login, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED};
+use saiife_boxes::template::{
+    AgentKind, Login, ModelCred, SUBSCRIPTION_GATED, SUBSCRIPTION_LOGIN_CLEARED,
+};
 use saiife_boxes::BoxId;
 use saiife_boxhost::guest::{
-    claude_env, claude_json_seed, claude_settings, pack_files, CastPath, SetupSource, VsockGuest,
+    claude_env, claude_json_seed, codex_config, codex_env, gemini_env, pack_files, CastPath,
+    SetupSource, VsockGuest, GEMINI_HOME,
 };
 use saiife_boxhost::paths::{BoxPaths, RecordPaths};
 use saiife_boxhost::placeholder::read_or_make_placeholder;
@@ -30,8 +34,6 @@ use saiife_policy::userpacks::{read_user_packs, MAX_USER_PACK_BYTES, USER_PACKS_
 
 use crate::box_ops::GuestEvents;
 
-/// Where the in-box Claude Code settings go (G11).
-pub const SETTINGS_PATH: &str = "/home/agent/.claude/settings.json";
 /// Claude Code's own state file, seeded once (never overwritten: it is sent
 /// with `keep_existing`).
 pub const CLAUDE_JSON_PATH: &str = "/home/agent/.claude.json";
@@ -108,17 +110,123 @@ impl SetupSource for TemplateSetup {
         // lock or on an async runtime), so the file I/O may block. Every
         // fresh guest init asks again (plan 38 R22): the placeholder is
         // read back, so a re-setup carries the same env and approval.
-        let model = match t.agent {
+        // A placeholder file of another agent's shape (the template was
+        // switched after spawn) is refused, never remade (plan 42 D3).
+        let p = read_or_make_placeholder(&record, t.model_cred())
+            .map_err(|e| format!("the box's model placeholder: {e}"))?;
+        let packs = user_packs(id, &self.packs);
+        match t.agent {
             AgentKind::ClaudeCode => {
-                let p = read_or_make_placeholder(&record, t.login)
-                    .map_err(|e| format!("the box's model placeholder: {e}"))?;
-                Some(ModelSetup {
+                let model = Some(ModelSetup {
                     env: claude_env(t.login, &p),
                     seed: claude_json_seed(&p),
-                })
+                });
+                build_setup(id, &t.command, model, &packs)
             }
-        };
-        build_setup(id, &t.command, model, &user_packs(id, &self.packs))
+            AgentKind::Codex | AgentKind::Gemini => build_agent_setup(
+                id,
+                &t.command,
+                agent_setup(t.agent, t.model_cred(), &p),
+                &packs,
+            ),
+        }
+    }
+}
+
+/// Where the in-box Codex config goes (plan 42 D5).
+pub const CODEX_CONFIG_PATH: &str = "/home/agent/.codex/config.toml";
+
+/// The agent's working directory in most boxes: the repo.
+pub const WORK_CWD: &str = "/work";
+/// Gemini CLI's working directory (plan 42 R9a, R11): its baked root-owned
+/// home, so no settings, `.env` or project agents of the repo load; the repo
+/// is an include directory of the built-in command.
+pub const GEMINI_CWD: &str = GEMINI_HOME;
+
+/// What an agent kind adds to a box's setup: its model env, its files and
+/// the directory it runs in.
+pub struct AgentSetup {
+    pub env: Vec<(String, String)>,
+    pub files: Vec<SetupFile>,
+    pub cwd: String,
+}
+
+/// A 0600 file saiife's setup rewrites on every setup (the agent's own
+/// edits last until the next cold boot).
+fn authoritative(path: &str, text: String) -> SetupFile {
+    SetupFile {
+        path: path.into(),
+        mode: 0o600,
+        text,
+        keep_existing: false,
+    }
+}
+
+/// Claude Code's part: the model env and once-only `.claude.json` seed
+/// when given (plan 40 C2). Its hooks are not here: they are managed, baked
+/// into the image root owned (FU2, `claude_managed_settings`), so no
+/// `~/.claude/settings.json` is sent.
+fn claude_setup(model: Option<ModelSetup>) -> AgentSetup {
+    let mut files = Vec::new();
+    let mut env = Vec::new();
+    if let Some(m) = model {
+        env = m.env;
+        files.push(SetupFile {
+            path: CLAUDE_JSON_PATH.into(),
+            mode: 0o600,
+            text: m.seed,
+            keep_existing: true,
+        });
+    }
+    AgentSetup {
+        env,
+        files,
+        cwd: WORK_CWD.into(),
+    }
+}
+
+/// The env, files and cwd of `agent` with the box's `placeholder` (plan 42
+/// D5, R9, R11: Gemini's settings, system and user, are baked into the
+/// image root owned (`gemini_system_settings`, `gemini_user_settings`), so
+/// a gemini box gets no setup file, and it runs in [`GEMINI_CWD`]).
+/// `cred` picks Claude Code's login variable; Codex and Gemini have one
+/// login each. Codex's hooks are not here: they are managed, baked into the
+/// image (R7, `codex_requirements`). No agent gets another agent's files.
+pub fn agent_setup(agent: AgentKind, cred: ModelCred, placeholder: &str) -> AgentSetup {
+    match agent {
+        AgentKind::ClaudeCode => {
+            // A Claude Code template's `model_cred()` is always an
+            // Anthropic one, and `setup_for` refuses a box whose placeholder
+            // is another agent's before any setup is built, so the other
+            // creds never reach here; should one, it gets the api-key
+            // variable, never an OAuth one.
+            debug_assert!(
+                matches!(
+                    cred,
+                    ModelCred::AnthropicApiKey | ModelCred::AnthropicSubscription
+                ),
+                "claude-code with {cred:?}"
+            );
+            let login = match cred {
+                ModelCred::AnthropicApiKey => Login::ApiKey,
+                ModelCred::AnthropicSubscription => Login::Subscription,
+                ModelCred::OpenAiApiKey | ModelCred::GoogleApiKey => Login::ApiKey,
+            };
+            claude_setup(Some(ModelSetup {
+                env: claude_env(login, placeholder),
+                seed: claude_json_seed(placeholder),
+            }))
+        }
+        AgentKind::Codex => AgentSetup {
+            env: codex_env(placeholder),
+            files: vec![authoritative(CODEX_CONFIG_PATH, codex_config())],
+            cwd: WORK_CWD.into(),
+        },
+        AgentKind::Gemini => AgentSetup {
+            env: gemini_env(placeholder),
+            files: Vec::new(),
+            cwd: GEMINI_CWD.into(),
+        },
     }
 }
 
@@ -141,33 +249,33 @@ fn user_packs(id: &BoxId, dir: &Path) -> Vec<(String, String)> {
     }
 }
 
-/// The setup of box `id`: `command`, the model env and `.claude.json` seed
-/// when given (they count against the env and file limits; only packs are
-/// skippable), the Claude Code settings, then each pack that fits (invalid
-/// id, a text over [`MAX_FILE_TEXT`], past [`MAX_FILES`] files or past
-/// [`MAX_USER_PACK_BYTES`] of packs: skipped, one line each). `Setup::check` runs last; its error is the answer.
+/// The setup of a Claude Code box `id`: [`build_agent_setup`] with Claude
+/// Code's model env and `.claude.json` seed when given.
 pub fn build_setup(
     id: &BoxId,
     command: &[String],
     model: Option<ModelSetup>,
     packs: &[(String, String)],
 ) -> Result<Setup, String> {
-    let mut files = vec![SetupFile {
-        path: SETTINGS_PATH.into(),
-        mode: 0o644,
-        text: claude_settings(),
-        keep_existing: false,
-    }];
-    let mut env = Vec::new();
-    if let Some(m) = model {
-        env = m.env;
-        files.push(SetupFile {
-            path: CLAUDE_JSON_PATH.into(),
-            mode: 0o600,
-            text: m.seed,
-            keep_existing: true,
-        });
-    }
+    build_agent_setup(id, command, claude_setup(model), packs)
+}
+
+/// The setup of box `id`: `command`, the agent's env and files (they count
+/// against the env and file limits; only packs are skippable), then each
+/// pack that fits (invalid id, a text over [`MAX_FILE_TEXT`], past
+/// [`MAX_FILES`] files or past [`MAX_USER_PACK_BYTES`] of packs: skipped,
+/// one line each). `Setup::check` runs last; its error is the answer.
+pub fn build_agent_setup(
+    id: &BoxId,
+    command: &[String],
+    agent: AgentSetup,
+    packs: &[(String, String)],
+) -> Result<Setup, String> {
+    let AgentSetup {
+        env,
+        mut files,
+        cwd,
+    } = agent;
     let mut pack_bytes = 0usize;
     for (pid, text) in packs {
         let skip = |why: &str| log(id, &format!("user pack {pid:?} skipped: {why}"));
@@ -195,7 +303,7 @@ pub fn build_setup(
         agent: AgentSpec {
             command: command.to_vec(),
             user: "agent".into(),
-            cwd: "/work".into(),
+            cwd,
         },
         env,
         files,
@@ -268,6 +376,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Claude Code's user settings file, which setup no longer writes (FU2).
+    const USER_SETTINGS: &str = "/home/agent/.claude/settings.json";
+
     fn b1() -> BoxId {
         BoxId::parse("b1").unwrap()
     }
@@ -285,8 +396,10 @@ mod tests {
         vec!["claude".into()]
     }
 
+    /// FU2: the hooks are in the image's managed settings, so no per-boot
+    /// `~/.claude/settings.json` is sent.
     #[test]
-    fn setup_is_settings_then_packs() {
+    fn setup_is_packs_without_user_settings() {
         let packs = vec![(
             "user.one".to_string(),
             "[pack]\nid = \"user.one\"\n".to_string(),
@@ -297,15 +410,13 @@ mod tests {
         assert_eq!(s.agent.cwd, "/work");
         assert!(s.env.is_empty());
         assert_eq!((s.rows, s.cols), (40, 120));
-        assert_eq!(s.files.len(), 2);
-        assert_eq!(s.files[0].path, SETTINGS_PATH);
-        assert_eq!(s.files[0].mode, 0o644);
-        assert_eq!(s.files[0].text, claude_settings());
+        assert_eq!(s.files.len(), 1);
         assert_eq!(
-            s.files[1].path,
+            s.files[0].path,
             "/home/agent/.config/saiife/packs/user.one.toml"
         );
-        assert_eq!(s.files[1].text, packs[0].1);
+        assert_eq!(s.files[0].text, packs[0].1);
+        assert!(!s.files.iter().any(|f| f.path == USER_SETTINGS));
     }
 
     fn model() -> ModelSetup {
@@ -321,11 +432,9 @@ mod tests {
         let s = build_setup(&b1(), &cmd(), Some(model()), &[]).unwrap();
         assert_eq!(s.env, model().env);
         let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, vec![SETTINGS_PATH, CLAUDE_JSON_PATH]);
-        let seed = &s.files[1];
+        assert_eq!(paths, vec![CLAUDE_JSON_PATH]);
+        let seed = &s.files[0];
         assert_eq!((seed.mode, seed.keep_existing), (0o600, true));
-        assert!(!s.files[0].keep_existing);
-        assert_eq!(s.files[0].text, claude_settings());
     }
 
     /// The seed counts against the file limit; packs are what gives way.
@@ -337,7 +446,7 @@ mod tests {
         let s = build_setup(&b1(), &cmd(), Some(model()), &packs).unwrap();
         assert_eq!(s.files.len(), MAX_FILES);
         assert!(s.files.iter().any(|f| f.path == CLAUDE_JSON_PATH));
-        assert!(s.files.iter().any(|f| f.path == SETTINGS_PATH));
+        assert!(!s.files.iter().any(|f| f.path == USER_SETTINGS));
         assert!(s.check().is_ok());
     }
 
@@ -351,13 +460,7 @@ mod tests {
         ];
         let s = build_setup(&b1(), &cmd(), None, &packs).unwrap();
         let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(
-            paths,
-            vec![
-                SETTINGS_PATH,
-                "/home/agent/.config/saiife/packs/user.ok.toml"
-            ]
-        );
+        assert_eq!(paths, vec!["/home/agent/.config/saiife/packs/user.ok.toml"]);
     }
 
     #[test]
@@ -383,7 +486,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                SETTINGS_PATH,
                 "/home/agent/.config/saiife/packs/user.a.toml",
                 "/home/agent/.config/saiife/packs/user.c.toml"
             ]
@@ -468,5 +570,332 @@ mod tests {
             *spy.0.lock().unwrap(),
             vec!["boot b1", "refused b1 bad", "off b1"]
         );
+    }
+
+    fn other_agents() -> [(AgentKind, ModelCred, &'static str); 2] {
+        [
+            (AgentKind::Codex, ModelCred::OpenAiApiKey, "codex"),
+            (AgentKind::Gemini, ModelCred::GoogleApiKey, "gemini"),
+        ]
+    }
+
+    fn one_pack() -> Vec<(String, String)> {
+        vec![("user.one".to_string(), "a = 1".to_string())]
+    }
+
+    #[test]
+    fn codex_box_has_no_claude_files() {
+        let cmd = vec!["codex".to_string()];
+        let a = agent_setup(AgentKind::Codex, ModelCred::OpenAiApiKey, "PH");
+        let s = build_agent_setup(&b1(), &cmd, a, &one_pack()).unwrap();
+        assert_eq!(s.agent.command, cmd);
+        assert_eq!(s.env, codex_env("PH"));
+        let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                CODEX_CONFIG_PATH,
+                "/home/agent/.config/saiife/packs/user.one.toml"
+            ]
+        );
+        assert_eq!(s.files[0].text, codex_config());
+        assert_eq!(s.agent.cwd, "/work");
+        assert!(!paths.contains(&USER_SETTINGS));
+        assert!(!paths.contains(&CLAUDE_JSON_PATH));
+        assert_eq!(CODEX_CONFIG_PATH, "/home/agent/.codex/config.toml");
+    }
+
+    #[test]
+    fn gemini_box_has_no_claude_files() {
+        let cmd: Vec<String> = ["gemini", "--include-directories", "/work"]
+            .map(String::from)
+            .to_vec();
+        let a = agent_setup(AgentKind::Gemini, ModelCred::GoogleApiKey, "PH");
+        let s = build_agent_setup(&b1(), &cmd, a, &one_pack()).unwrap();
+        assert_eq!(s.agent.command, cmd);
+        assert_eq!(s.env, gemini_env("PH"));
+        let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        // R11: Gemini's settings are baked into the image; only packs travel.
+        assert_eq!(
+            paths,
+            vec!["/home/agent/.config/saiife/packs/user.one.toml"]
+        );
+        assert_eq!(s.agent.cwd, "/opt/saiife-gemini-home");
+        assert_eq!(GEMINI_CWD, GEMINI_HOME);
+    }
+
+    /// R11: a gemini box's setup has no files at all (without packs).
+    #[test]
+    fn gemini_setup_has_no_files() {
+        let a = agent_setup(AgentKind::Gemini, ModelCred::GoogleApiKey, "PH");
+        assert!(a.files.is_empty());
+        let s = build_agent_setup(&b1(), &["gemini".to_string()], a, &[]).unwrap();
+        assert!(s.files.is_empty(), "{:?}", s.files);
+    }
+
+    #[test]
+    fn agent_files_are_0600_and_authoritative() {
+        use saiife_boxhost::placeholder::placeholder;
+        for (agent, cred, _) in other_agents() {
+            let ph = placeholder(cred).unwrap();
+            let a = agent_setup(agent, cred, &ph);
+            let want = usize::from(agent == AgentKind::Codex);
+            assert_eq!(a.files.len(), want, "{agent:?}");
+            assert!(a.env.iter().any(|(_, v)| *v == ph), "{agent:?}");
+            for f in &a.files {
+                assert_eq!((f.mode, f.keep_existing), (0o600, false), "{}", f.path);
+                assert!(!f.text.contains(&ph), "no placeholder in {}", f.path);
+                assert!(!f.text.contains(&ph[ph.len() - 20..]), "{}", f.path);
+            }
+        }
+    }
+
+    /// R7: Codex runs without a hook-trust bypass and with no user-level
+    /// hooks: saiife's are managed, in the image.
+    #[test]
+    fn codex_setup_has_no_hook_bypass() {
+        let a = agent_setup(AgentKind::Codex, ModelCred::OpenAiApiKey, "PH");
+        for f in &a.files {
+            assert!(
+                !f.text.contains("--dangerously-bypass-hook-trust"),
+                "{}",
+                f.path
+            );
+            let v: toml::Table = toml::from_str(&f.text).unwrap();
+            assert!(!v.contains_key("hooks"), "{}", f.path);
+            assert!(!f.text.contains("[[hooks"), "{}", f.path);
+        }
+        for (k, v) in &a.env {
+            assert!(!v.contains("--dangerously-bypass-hook-trust"), "{k}");
+            assert!(!v.contains("hooks"), "{k}");
+        }
+        let builtin = saiife_boxes::template::builtin();
+        let codex = builtin
+            .iter()
+            .find(|t| t.agent == AgentKind::Codex)
+            .unwrap();
+        assert!(!codex
+            .command
+            .iter()
+            .any(|c| c.contains("--dangerously-bypass-hook-trust")));
+    }
+
+    /// Plan 40 behaviour through the new builder: a Claude Code box's agent
+    /// setup is the once-only seed (its hooks are managed, baked into the
+    /// image, FU2).
+    #[test]
+    fn claude_agent_setup_is_the_seed() {
+        let a = agent_setup(AgentKind::ClaudeCode, ModelCred::AnthropicApiKey, "PH");
+        assert_eq!(a.env, claude_env(Login::ApiKey, "PH"));
+        let paths: Vec<&str> = a.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec![CLAUDE_JSON_PATH]);
+        let a = agent_setup(
+            AgentKind::ClaudeCode,
+            ModelCred::AnthropicSubscription,
+            "PH",
+        );
+        assert_eq!(a.env, claude_env(Login::Subscription, "PH"));
+    }
+
+    #[cfg(feature = "fake-vmm")]
+    mod with_manager {
+        use super::*;
+        use saiife_boxes::capacity::{self, HostFacts};
+        use saiife_boxes::guest::fake::FakeGuest;
+        use saiife_boxes::guest::GuestLink;
+        use saiife_boxes::manager::{ManagerInit, SpawnArgs};
+        use saiife_boxes::template::{BoxTemplate, Size};
+        use saiife_boxes::vmm::fake::FakeVmm;
+        use saiife_boxhost::placeholder::OTHER_AGENT;
+
+        fn tmpl(name: &str, agent: AgentKind) -> BoxTemplate {
+            let mut t = saiife_boxes::template::builtin()
+                .into_iter()
+                .find(|t| t.agent == agent)
+                .unwrap();
+            t.name = name.into();
+            t
+        }
+
+        fn manager(state: &Path, templates: Vec<BoxTemplate>) -> Arc<Manager> {
+            let host = HostFacts {
+                mem_total_mib: 8192 + 3 * capacity::charge_mib(&Size::default()),
+                mem_avail_mib: 4096,
+                threads: 12,
+                disk_free_mib: 1024 * 1024,
+                cpu_pct: None,
+            };
+            let guest: Arc<dyn GuestLink> = Arc::new(FakeGuest::new());
+            Arc::new(
+                Manager::open(ManagerInit {
+                    store: Store::open(crate::box_ops::dir_in(state)).unwrap(),
+                    vmm: Arc::new(FakeVmm::new()),
+                    guest,
+                    templates,
+                    host: Arc::new(move || host),
+                    clock: Arc::new(|| 1_000_000),
+                    disk_place: crate::box_ops::disk_place(),
+                })
+                .unwrap()
+                .manager,
+            )
+        }
+
+        fn spawn(m: &Manager, template: &str) -> BoxId {
+            m.spawn(&SpawnArgs {
+                template: template.into(),
+                repo: "shop".into(),
+                repo_dir: None,
+                task: String::new(),
+                start: saiife_wire::source::Start::Queue,
+                owner_uid: 2000,
+                repo_image: None,
+                base_manifest: None,
+            })
+            .unwrap()
+            .id
+        }
+
+        fn setups(t: &tempfile::TempDir, m: &Arc<Manager>) -> Arc<TemplateSetup> {
+            let s = TemplateSetup::new(t.path().join("packs"));
+            s.attach(m);
+            s
+        }
+
+        fn env_of(s: &Setup, k: &str) -> Option<String> {
+            s.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        }
+
+        /// The setup never holds a vault value: a secret stored under each
+        /// route's service is absent from the serialized setup of a codex
+        /// and a gemini box (only the placeholder travels).
+        #[test]
+        fn setup_has_no_secret_for_every_agent() {
+            let t = scratch();
+            let state = t.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let key_file = t.path().join("vault-key");
+            std::fs::write(&key_file, [7u8; 32]).unwrap();
+            std::fs::set_permissions(
+                &key_file,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )
+            .unwrap();
+            let mut vault = crate::vault::open(&key_file, &state.join("vault").join("vault.bin"));
+            let crate::vault::VaultState::Ready(v) = &mut vault else {
+                panic!("vault not ready");
+            };
+            let secret = concat!("REAL", "SECRET", "-", "0123456789abcdef");
+            for (name, service) in [
+                ("openai", "box-model-openai"),
+                ("gemini", "box-model-google"),
+                ("anthropic", "box-model-anthropic"),
+            ] {
+                v.put(crate::vault::Entry {
+                    name: name.into(),
+                    kind: crate::vault::Kind::Token,
+                    fields: [(
+                        "token".to_string(),
+                        zeroize::Zeroizing::new(secret.to_string()),
+                    )]
+                    .into(),
+                    allowed_services: vec![service.into()],
+                    created_by: 0,
+                    created: "2026-11-16T00:00:00Z".into(),
+                    last_used: None,
+                    rotate_after: None,
+                })
+                .unwrap();
+            }
+            let m = manager(
+                &state,
+                vec![tmpl("cx", AgentKind::Codex), tmpl("gm", AgentKind::Gemini)],
+            );
+            let (c, g) = (spawn(&m, "cx"), spawn(&m, "gm"));
+            let s = setups(&t, &m);
+            for (b, var) in [(c, "OPENAI_API_KEY"), (g, "GEMINI_API_KEY")] {
+                let setup = s.setup_for(&b).unwrap();
+                let ph = env_of(&setup, var).unwrap();
+                for f in &setup.files {
+                    assert!(!f.text.contains(&ph), "placeholder in {}", f.path);
+                }
+                let json = serde_json::to_string(&setup).unwrap();
+                assert!(json.contains(var), "the setup is real");
+                assert!(!json.contains(secret));
+                assert!(!json.contains("REALSECRET"));
+            }
+        }
+
+        /// A second setup of one box carries the same env and placeholder,
+        /// per agent; another box of the same agent differs.
+        #[test]
+        fn second_setup_same_placeholder_per_agent() {
+            let t = scratch();
+            let m = manager(
+                &t.path().join("state"),
+                vec![tmpl("cx", AgentKind::Codex), tmpl("gm", AgentKind::Gemini)],
+            );
+            let s = setups(&t, &m);
+            for (template, var, prefix) in [
+                ("cx", "OPENAI_API_KEY", "saiife-openai-"),
+                ("gm", "GEMINI_API_KEY", "saiife-google-"),
+            ] {
+                let b = spawn(&m, template);
+                let s1 = s.setup_for(&b).unwrap();
+                let s2 = s.setup_for(&b).unwrap();
+                assert_eq!(s1, s2);
+                let ph = env_of(&s1, var).unwrap();
+                assert!(ph.starts_with(prefix), "{ph}");
+                let rec = saiife_boxhost::layout::record_dir(m.root(), &b);
+                assert_eq!(
+                    std::fs::read_to_string(rec.join("placeholder")).unwrap(),
+                    format!("{ph}\n")
+                );
+                let other = spawn(&m, template);
+                assert_ne!(env_of(&s.setup_for(&other).unwrap(), var).unwrap(), ph);
+            }
+        }
+
+        /// R9a, R11: a gemini box runs in its baked home with the repo as an include
+        /// directory; codex and claude-code run in the repo.
+        #[test]
+        fn agent_cwd_per_agent() {
+            let t = scratch();
+            let m = manager(
+                &t.path().join("state"),
+                vec![
+                    tmpl("cc", AgentKind::ClaudeCode),
+                    tmpl("cx", AgentKind::Codex),
+                    tmpl("gm", AgentKind::Gemini),
+                ],
+            );
+            let s = setups(&t, &m);
+            let of = |template: &str| s.setup_for(&spawn(&m, template)).unwrap().agent;
+            let gm_setup = s.setup_for(&spawn(&m, "gm")).unwrap();
+            assert!(gm_setup.files.is_empty(), "{:?}", gm_setup.files);
+            let gm = gm_setup.agent;
+            assert_eq!(gm.cwd, "/opt/saiife-gemini-home");
+            assert_eq!(gm.command, ["gemini", "--include-directories", "/work"]);
+            assert_eq!(of("cx").cwd, "/work");
+            assert_eq!(of("cc").cwd, "/work");
+        }
+
+        /// A box spawned as codex whose template now names gemini sets up
+        /// nothing: the placeholder is another agent's, never remade.
+        #[test]
+        fn switched_agent_setup_is_refused() {
+            let t = scratch();
+            let state = t.path().join("state");
+            let first = manager(&state, vec![tmpl("t", AgentKind::Codex)]);
+            let b = spawn(&first, "t");
+            setups(&t, &first).setup_for(&b).unwrap();
+            let file = saiife_boxhost::paths::RecordPaths::of(first.root(), &b).placeholder();
+            let before = std::fs::read(&file).unwrap();
+            drop(first);
+            let m = manager(&state, vec![tmpl("t", AgentKind::Gemini)]);
+            let e = setups(&t, &m).setup_for(&b).unwrap_err();
+            assert!(e.contains(OTHER_AGENT), "{e}");
+            assert_eq!(std::fs::read(&file).unwrap(), before);
+        }
     }
 }

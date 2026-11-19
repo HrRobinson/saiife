@@ -47,6 +47,8 @@ struct FakeState {
     templates: Vec<Template>,
     load: Option<Load>,
     calls: Vec<FakeCall>,
+    /// Boxes that hold a prompt unsent: their next revise drops it.
+    held: Vec<BoxId>,
 }
 
 pub struct FakeBoxSource {
@@ -66,6 +68,10 @@ fn templates() -> Vec<Template> {
             has_egress: false,
             login: "api-key".into(),
             credential_in_box: false,
+            agent: "claude-code".into(),
+            beta: false,
+            credential: "gateway".into(),
+            notice: String::new(),
         },
         Template {
             name: "claude-gh".into(),
@@ -74,6 +80,10 @@ fn templates() -> Vec<Template> {
             has_egress: true,
             login: "api-key".into(),
             credential_in_box: false,
+            agent: "claude-code".into(),
+            beta: false,
+            credential: "gateway".into(),
+            notice: String::new(),
         },
     ]
 }
@@ -255,6 +265,7 @@ impl FakeState {
             updated_at: now,
             queue_pos,
             lands: 0,
+            guard_skipped: false,
         });
     }
 
@@ -289,6 +300,7 @@ impl FakeBoxSource {
                 templates: templates(),
                 load: None,
                 calls: Vec::new(),
+                held: Vec::new(),
             }),
         }
     }
@@ -380,6 +392,18 @@ impl FakeBoxSource {
             );
         }
         src
+    }
+
+    /// Fake-only: the box holds a prompt unsent (a stop cut its send
+    /// short). The next revise of it that succeeds reports
+    /// [`HELD_PROMPT_SENT_FIRST`], once however often this was called (the
+    /// held prompt goes out with that revise); a refused revise keeps it
+    /// held, and later revises report nothing.
+    pub fn hold_prompt(&self, id: &BoxId) {
+        let mut s = self.lock();
+        if !s.held.contains(id) {
+            s.held.push(id.clone());
+        }
     }
 
     /// Every mutating call so far, in order (failed calls are recorded too).
@@ -593,6 +617,10 @@ impl BoxSource for FakeBoxSource {
     }
 
     fn revise(&self, i: &BoxId, comment: &str) -> Result<(), BoxError> {
+        self.revise_noted(i, comment).map(|_| ())
+    }
+
+    fn revise_noted(&self, i: &BoxId, comment: &str) -> Result<Option<&'static str>, BoxError> {
         let mut s = self.lock();
         s.calls
             .push(FakeCall::Revise(i.clone(), comment.to_string()));
@@ -601,7 +629,10 @@ impl BoxSource for FakeBoxSource {
             return Err(BoxError::WrongState { state });
         }
         check_text(comment, MAX_STEER_BYTES)?;
-        s.set_state(i, BoxState::Running)
+        s.set_state(i, BoxState::Running)?;
+        let held = s.held.len();
+        s.held.retain(|h| h != i);
+        Ok((s.held.len() != held).then_some(HELD_PROMPT_SENT_FIRST))
     }
 
     fn pending_actions(&self) -> Vec<PendingAction> {

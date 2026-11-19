@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test fixture (bake tests): logs one line per call, the tool name (the name
+# of the link it was started through) then each argument, to calls.log next
+# to that link.
+l="${0%/*}/calls.log"
+printf '%s' "${0##*/}" >>"$l"
+for a in "$@"; do printf ' %s' "$a" >>"$l"; done
+printf '\n' >>"$l"

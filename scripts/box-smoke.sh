@@ -18,6 +18,9 @@
 #   SAIIFE_BOX_SMOKE_SUBSCRIPTION=1        also run the subscription leg (only after
 #                                          the owner's terms check, local build)
 #   SAIIFE_BOX_SMOKE_SUB_KEY_FILE=<file>   the `claude setup-token` token, same rules
+# Knobs of the codex and gemini fragments (60-codex.sh, 70-gemini.sh; beta):
+#   SAIIFE_BOX_SMOKE_OPENAI_KEY_FILE=<file>  the OpenAI API key (one line), grep only
+#   SAIIFE_BOX_SMOKE_GEMINI_KEY_FILE=<file>  the Gemini API key (one line), grep only
 #
 # Usage:
 #   bash scripts/box-smoke.sh [--list | --only <name> | --help]

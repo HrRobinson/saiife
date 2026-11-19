@@ -482,23 +482,57 @@ pub const EVERYDAY_COMMANDS: &[&str] = &[
     "python3 main.py",
 ];
 
+/// Everyday paths a POSIX host's agent touches (absolute, as it spells them).
 pub const EVERYDAY_PATHS: &[(&str, Access)] = &[
-    ("$PROJECT/src/main.rs", Access::Write),
-    ("$PROJECT/README.md", Access::Read),
-    ("~/notes.txt", Access::Read),
+    ("/saiife-probe/project/src/main.rs", Access::Write),
+    ("/saiife-probe/project/README.md", Access::Read),
+    ("/saiife-probe/home/notes.txt", Access::Read),
     ("/tmp/x", Access::Write),
 ];
 
-const PROBE_HOME: &str = "/saiife-probe/home";
-const PROBE_PROJECT: &str = "/saiife-probe/project";
+/// The same everyday paths on a Windows host, spelled as it spells them.
+pub const EVERYDAY_PATHS_WINDOWS: &[(&str, Access)] = &[
+    (r"C:\saiife-probe\project\src\main.rs", Access::Write),
+    (r"C:\saiife-probe\project\README.md", Access::Read),
+    (r"C:\saiife-probe\home\notes.txt", Access::Read),
+    (r"C:\saiife-probe\home\AppData\Local\Temp\x", Access::Write),
+];
+
+/// The probe's home, project and everyday paths for a host of `style`.
+fn probe(
+    style: PathStyle,
+) -> (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, Access)],
+) {
+    match style {
+        PathStyle::Posix => (
+            "/saiife-probe/home",
+            "/saiife-probe/project",
+            EVERYDAY_PATHS,
+        ),
+        PathStyle::Windows => (
+            r"C:\saiife-probe\home",
+            r"C:\saiife-probe\project",
+            EVERYDAY_PATHS_WINDOWS,
+        ),
+    }
+}
 
 /// Everyday commands and paths that `pack` denies: a rule that broad would
-/// make the agent unusable, so the caller warns before it is saved.
+/// make the agent unusable, so the caller warns before it is saved. The
+/// paths are those of a host of the style the pack was loaded for, and the
+/// guard reads them as it reads that host's (on Windows: case-folded, either
+/// separator), so a rule broad on Windows is found on Windows.
 pub fn broad_findings(pack: &Pack) -> Vec<Broad> {
+    let style = pack.loaded_for();
+    let (home, project, paths) = probe(style);
     let vars = PathVars::new()
-        .with_cwd(PROBE_PROJECT)
-        .with_var("PROJECT", PROBE_PROJECT)
-        .with_var("HOME", PROBE_HOME);
+        .with_style(style)
+        .with_cwd(project)
+        .with_var("PROJECT", project)
+        .with_var("HOME", home);
     let engine = Engine::new(vec![pack.clone()]).with_paths(vars);
     let mut out = Vec::new();
     for cmd in EVERYDAY_COMMANDS {
@@ -509,18 +543,11 @@ pub fn broad_findings(pack: &Pack) -> Vec<Broad> {
             });
         }
     }
-    for (p, access) in EVERYDAY_PATHS {
-        let path = if let Some(rest) = p.strip_prefix("$PROJECT") {
-            format!("{PROBE_PROJECT}{rest}")
-        } else if let Some(rest) = p.strip_prefix('~') {
-            format!("{PROBE_HOME}{rest}")
-        } else {
-            (*p).to_string()
-        };
-        if let Decision::Deny { pattern, .. } = engine.evaluate_path(*access, &path) {
+    for (path, access) in paths {
+        if let Decision::Deny { pattern, .. } = engine.evaluate_path(*access, path) {
             out.push(Broad {
                 rule: pattern,
-                example: path,
+                example: (*path).to_string(),
             });
         }
     }
@@ -674,19 +701,32 @@ line_sha256 = "cd"
     }
 
     fn one(text: &str, profile: Profile) -> Vec<Pack> {
-        load_user_packs(&[UserSrc { source: "t", text }], PathStyle::Posix, profile).unwrap()
+        one_in(text, PathStyle::host(), profile)
+    }
+
+    fn one_in(text: &str, style: PathStyle, profile: Profile) -> Vec<Pack> {
+        load_user_packs(&[UserSrc { source: "t", text }], style, profile).unwrap()
+    }
+
+    /// A repo root and a home in this host's form.
+    fn roots() -> (&'static Path, &'static Path) {
+        if cfg!(windows) {
+            (Path::new(r"C:\repo"), Path::new(r"C:\Users\u"))
+        } else {
+            (Path::new("/repo"), Path::new("/home/u"))
+        }
     }
 
     const PATHS: &str = "[pack]\nid = \"user.t\"\n[[deny_path]]\nglob = \"**/.git/hooks/**\"\naccess = \"write\"\nreason = \"no hooks\"\n[[deny_path]]\nglob = \"$PROJECT/CLAUDE.md\"\naccess = \"write\"\nreason = \"no claude\"\n";
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn diff_hits_flags_protected_paths() {
         let packs = one(PATHS, Profile::Box);
+        let (repo, home) = roots();
         let hits = diff_hits(
             &packs,
-            Path::new("/repo"),
-            Path::new("/home/u"),
+            repo,
+            home,
             &["src/a.rs", ".git/hooks/pre-commit", "CLAUDE.md"],
         );
         assert_eq!(hits.len(), 2, "{hits:?}");
@@ -714,21 +754,15 @@ line_sha256 = "cd"
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn diff_hits_skips_host_rules() {
         let text = PATHS.replace("access = ", "where = \"host\"\naccess = ");
         let packs = one(&text, Profile::Box);
-        let hits = diff_hits(
-            &packs,
-            Path::new("/repo"),
-            Path::new("/home/u"),
-            &[".git/hooks/pre-commit", "CLAUDE.md"],
-        );
+        let (repo, home) = roots();
+        let hits = diff_hits(&packs, repo, home, &[".git/hooks/pre-commit", "CLAUDE.md"]);
         assert!(hits.is_empty(), "{hits:?}");
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn broad_findings_flag_the_hostile() {
         let broad = one(
             "[pack]\nid = \"user.b\"\ntriggers = [\"ls\"]\n[[deny]]\nid = \"d\"\npattern = '^\\S+'\nreason = \"r\"\n",
@@ -737,21 +771,61 @@ line_sha256 = "cd"
         let f = broad_findings(&broad[0]);
         assert_eq!(f[0].example, "ls");
         assert_eq!(f[0].rule, "^\\S+");
+        // Every path below this host's root, spelled as this host spells it.
+        let (glob, main_rs) = if cfg!(windows) {
+            ("?:/**", r"C:\saiife-probe\project\src\main.rs")
+        } else {
+            ("/**", "/saiife-probe/project/src/main.rs")
+        };
         let paths = one(
-            "[pack]\nid = \"user.b\"\n[[deny_path]]\nglob = \"/**\"\nreason = \"r\"\n",
+            &format!("[pack]\nid = \"user.b\"\n[[deny_path]]\nglob = \"{glob}\"\nreason = \"r\"\n"),
             Profile::Host,
         );
         let f = broad_findings(&paths[0]);
-        assert!(
-            f.iter()
-                .any(|b| b.example == "/saiife-probe/project/src/main.rs"),
-            "{f:?}"
-        );
+        assert!(f.iter().any(|b| b.example == main_rs), "{f:?}");
         let ok = one(
             "[pack]\nid = \"user.b\"\ntriggers = [\"pkill\"]\n[[deny]]\nid = \"d\"\npattern = '^pkill(?:\\s|$)'\nreason = \"r\"\n",
             Profile::Host,
         );
         assert!(broad_findings(&ok[0]).is_empty());
+    }
+
+    /// The probes follow the style the pack was loaded for, so a Windows
+    /// host's broad rules are found (on any host: Windows paths are text).
+    #[test]
+    fn broad_findings_probe_windows_paths_for_a_windows_pack() {
+        let deny = |glob: &str, access: &str| {
+            let text = format!(
+                "[pack]\nid = \"user.b\"\n[[deny_path]]\nglob = \"{glob}\"\naccess = \"{access}\"\nreason = \"r\"\n"
+            );
+            let packs = one_in(&text, PathStyle::Windows, Profile::Host);
+            broad_findings(&packs[0])
+                .into_iter()
+                .map(|b| b.example)
+                .collect::<Vec<_>>()
+        };
+        let main_rs = r"C:\saiife-probe\project\src\main.rs";
+        assert!(deny("c:/**", "any").contains(&main_rs.to_string()));
+        // Case-folded as the Windows guard compares names.
+        assert!(deny("C:/SAIIFE-PROBE/PROJECT/**", "write").contains(&main_rs.to_string()));
+        assert_eq!(
+            deny("~/**", "read"),
+            vec![r"C:\saiife-probe\home\notes.txt".to_string()]
+        );
+        // The everyday `cat README.md` reads it too, from the project dir.
+        assert_eq!(
+            deny("$PROJECT/**/*.MD", "read"),
+            vec![
+                "cat README.md".to_string(),
+                r"C:\saiife-probe\project\README.md".to_string()
+            ]
+        );
+        let temp = deny("**/Temp/**", "write");
+        assert_eq!(temp.len(), 1, "{temp:?}");
+        assert!(temp[0].ends_with(r"\Temp\x"), "{temp:?}");
+        // A POSIX-rooted glob never matches a Windows path (W6): not broad.
+        assert!(deny("/**", "any").is_empty());
+        assert!(deny("$PROJECT/docs/**", "any").is_empty());
     }
 
     fn load_err(text: &str) -> String {

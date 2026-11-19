@@ -430,18 +430,13 @@ mod tests {
     use crate::rules_cmd::extract::line_sha256;
     use crate::rules_cmd::propose::{propose, verify};
     use crate::rules_cmd::{Candidate, Choice, Origin, Target};
-    use saiifeguard::canon::{PathStyle, PathVars};
+    use saiifeguard::canon::PathStyle;
     use saiifeguard::pack::RuleWhere;
     use saiifeguard::pathrule::RuleAccess;
     use saiifeguard::profile::Profile;
     use saiifeguard::userpack::{load_user_packs, view, RuleKind, UnenforcedWhy, UserSrc};
 
-    fn vars() -> PathVars {
-        PathVars::new()
-            .with_cwd("/saiife-test/project")
-            .with_var("PROJECT", "/saiife-test/project")
-            .with_var("HOME", "/saiife-test/home")
-    }
+    use crate::rules_cmd::test_host::{vars, HOSTS, HOSTS_TYPED};
 
     fn src(line: u32, text: &str) -> SourceLine {
         SourceLine {
@@ -468,11 +463,10 @@ mod tests {
     const FILE: &str = "/saiife-test/project/CLAUDE.md";
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn render_round_trips_through_view() {
         let l1 = src(1, "- Never run `deploy-prod`.");
         let l2 = src(2, "- Never run `terraform apply`.");
-        let l3 = src(3, "- Never write to /etc/hosts.");
+        let l3 = src(3, &format!("- Never write to {HOSTS_TYPED}."));
         let l4 = src(4, "- Never run `pkill`.");
         let l5 = src(5, "- Never be rude.");
         let pack = NewPack {
@@ -495,7 +489,7 @@ mod tests {
                 decided(
                     &l3,
                     Target::Path {
-                        glob: "/etc/hosts".into(),
+                        glob: HOSTS.into(),
                         access: RuleAccess::Write,
                     },
                     Choice::Enforce,
@@ -548,8 +542,8 @@ mod tests {
             .collect();
         assert_eq!(paths.len(), 2, "{text}");
         assert!(paths.iter().all(|r| r.where_ == RuleWhere::Host));
-        assert_eq!(paths[0].text, "/etc/hosts");
-        assert_eq!(paths[1].text, "/etc/hosts/**");
+        assert_eq!(paths[0].text, HOSTS);
+        assert_eq!(paths[1].text, format!("{HOSTS}/**"));
         assert_eq!(paths[0].source.as_ref().unwrap().line, 3);
 
         assert_eq!(v.unenforced.len(), 2, "{text}");

@@ -305,12 +305,7 @@ mod tests {
     use super::*;
     use crate::rules_cmd::extract::line_sha256;
 
-    fn vars() -> PathVars {
-        PathVars::new()
-            .with_cwd("/saiife-test/project")
-            .with_var("PROJECT", "/saiife-test/project")
-            .with_var("HOME", "/saiife-test/home")
-    }
+    use crate::rules_cmd::test_host::vars;
 
     fn src(line: u32) -> SourceLine {
         let text = "- Never destroy the staging infra".to_string();
@@ -413,14 +408,35 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn llm_path_rule_keeps_its_access() {
-        let j = r#"{"rules":[{"kind":"path","line":4,"path":"/saiife-test/secrets","access":"read","block":["/saiife-test/secrets/k"],"allow":["/saiife-test/other/k"]}]}"#;
-        let v = parse(j, &[4]).unwrap();
+        // The LLM's path and examples as this host spells them.
+        let (dir, k, other) = if cfg!(windows) {
+            (
+                r"C:\\saiife-test\\secrets",
+                r"C:\\saiife-test\\secrets\\k",
+                r"C:\\saiife-test\\other\\k",
+            )
+        } else {
+            (
+                "/saiife-test/secrets",
+                "/saiife-test/secrets/k",
+                "/saiife-test/other/k",
+            )
+        };
+        let j = format!(
+            r#"{{"rules":[{{"kind":"path","line":4,"path":"{dir}","access":"read","block":["{k}"],"allow":["{other}"]}}]}}"#
+        );
+        let v = parse(&j, &[4]).unwrap();
         let p = to_proposal(&v[0].0, &src(4), "CLAUDE.md", &vars()).unwrap();
-        let super::super::ProposalKind::Path { access, .. } = p.kind else {
+        let super::super::ProposalKind::Path { access, globs } = p.kind else {
             panic!()
         };
         assert_eq!(access, RuleAccess::Read);
+        let glob = if cfg!(windows) {
+            "c:/saiife-test/secrets"
+        } else {
+            "/saiife-test/secrets"
+        };
+        assert_eq!(globs[0], glob);
     }
 }

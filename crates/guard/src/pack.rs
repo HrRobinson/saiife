@@ -955,6 +955,11 @@ impl Pack {
         self.marked == 0 || self.loaded_for == style
     }
 
+    /// The host style the pack was loaded for.
+    pub fn loaded_for(&self) -> PathStyle {
+        self.loaded_for
+    }
+
     /// The rules are compiled on first use.
     pub fn is_lazy(&self) -> bool {
         self.lazy.is_some()

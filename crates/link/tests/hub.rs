@@ -952,3 +952,127 @@ async fn session_churn_stays_within_the_daemon_permits() {
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
 }
+
+// ------------------------------------------------- content-free wake-ups
+
+/// The one wake the link ever sends, byte for byte: no box, no text.
+const WAKE: &str = r#"{"t":"wake"}"#;
+
+/// `[workspace] push = true` in the daemon's policy.
+fn push_on(w: &World) {
+    let cfg: saiife_policy::SystemConfig =
+        serde_json::from_value(json!({"version": 2, "workspace": {"push": true}})).unwrap();
+    w.ctx.policy.lock().unwrap().system = Some(Arc::new(cfg));
+}
+
+/// Wake polls every 20 ms, at most one wake per `interval`.
+fn wake_opts(interval: Duration) -> HubOpts {
+    HubOpts {
+        wake_poll: Duration::from_millis(20),
+        wake_interval: interval,
+        ..HubOpts::default()
+    }
+}
+
+/// A land waiting in the inbox: its `box_waiting` (box id, short code).
+fn box_waiting(w: &World) {
+    let pa = saiife_wire::source::BoxSource::pending_actions(&*w.boxes)
+        .into_iter()
+        .next()
+        .unwrap();
+    saiife_daemon::workspace_touch::notify_pending(&w.ctx, &pa);
+}
+
+impl Conn {
+    /// The next text message within `d`, as sent.
+    async fn text_within(&mut self, d: Duration) -> Option<String> {
+        match tokio::time::timeout(d, self.ws.recv()).await {
+            Err(_) => None,
+            Ok(Ok(Message::Text(t))) => Some(t),
+            Ok(other) => panic!("not text: {other:?}"),
+        }
+    }
+}
+
+/// Raises `box_waiting` every 10 ms until the link sends something; that
+/// must be the wake, exactly. Returns when it came.
+async fn burst_until_wake(w: &World, c: &mut Conn) -> Instant {
+    let t = Instant::now();
+    loop {
+        assert!(t.elapsed() < WAIT, "no wake");
+        box_waiting(w);
+        if let Some(m) = c.text_within(Duration::from_millis(10)).await {
+            assert_eq!(m, WAKE);
+            return Instant::now();
+        }
+    }
+}
+
+/// A flood of `box_waiting` is one wake, and that wake is exactly
+/// `{"t":"wake"}`: no box id, no code, no text.
+#[tokio::test]
+async fn a_burst_is_one_content_free_wake() {
+    let (w, _hub, mut c, _) = up_with(wake_opts(Duration::from_secs(3600))).await;
+    push_on(&w);
+    burst_until_wake(&w, &mut c).await;
+    // The burst goes on: nothing more within the interval.
+    for _ in 0..100 {
+        box_waiting(&w);
+        assert_eq!(c.text_within(Duration::from_millis(10)).await, None);
+    }
+    assert_eq!(c.text_within(Duration::from_millis(500)).await, None);
+}
+
+/// At most one wake per interval; events inside it are not lost but
+/// coalesced into one wake when it ends.
+#[tokio::test]
+async fn wakes_are_spaced_and_coalesced() {
+    let gap = Duration::from_millis(400);
+    let (w, _hub, mut c, _) = up_with(wake_opts(gap)).await;
+    push_on(&w);
+    let first = burst_until_wake(&w, &mut c).await;
+    // More events at once: held back, then one wake when the interval ends.
+    for _ in 0..20 {
+        box_waiting(&w);
+    }
+    let m = c.text_within(WAIT).await;
+    let second = Instant::now();
+    assert_eq!(m.as_deref(), Some(WAKE));
+    assert!(
+        second - first >= gap - Duration::from_millis(50),
+        "{:?}",
+        second - first
+    );
+    // Nothing left over.
+    assert_eq!(c.text_within(gap * 2).await, None);
+}
+
+/// `[workspace] push` off (the default): no wake, however many events.
+#[tokio::test]
+async fn no_wake_while_push_is_off() {
+    let (w, _hub, mut c, _) = up_with(wake_opts(Duration::from_millis(50))).await;
+    for _ in 0..100 {
+        box_waiting(&w);
+        assert_eq!(c.text_within(Duration::from_millis(10)).await, None);
+    }
+    assert_eq!(c.text_within(Duration::from_millis(500)).await, None);
+}
+
+/// Events from before there was a hub link send nothing when it comes up.
+#[tokio::test]
+async fn no_wake_for_events_from_before_the_link() {
+    let w = world().await;
+    push_on(&w);
+    for _ in 0..20 {
+        box_waiting(&w);
+    }
+    let ca = ca();
+    let mut hub = FakeHub::start(&ca).await;
+    let daemon = Daemon::new(w.run.clone(), me());
+    let opts = wake_opts(Duration::from_millis(50));
+    tokio::spawn(hub::run(hub.config(&ca.roots, opts), daemon));
+    let mut c = hub.next().await;
+    assert_eq!(c.text_within(Duration::from_millis(800)).await, None);
+    // A new one does.
+    burst_until_wake(&w, &mut c).await;
+}

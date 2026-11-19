@@ -279,15 +279,9 @@ mod tests {
     use crate::rules_cmd::extract::line_sha256;
     use crate::rules_cmd::propose::{propose, verify};
     use crate::rules_cmd::{Candidate, Origin};
-    use saiifeguard::canon::PathVars;
     use std::io::Cursor;
 
-    fn vars() -> PathVars {
-        PathVars::new()
-            .with_cwd("/saiife-test/project")
-            .with_var("PROJECT", "/saiife-test/project")
-            .with_var("HOME", "/saiife-test/home")
-    }
+    use crate::rules_cmd::test_host::vars;
 
     fn src(line: u32) -> SourceLine {
         let text = format!("- Never do thing {line}.");
@@ -349,13 +343,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn ask_only_where_offered() {
         let (r, out) = run(vec![prop(1, cmd(&["shred"]))], false, "a\ne\n\n\n");
         assert_eq!(r.unwrap()[0].choice, Choice::Enforce);
         assert!(out.contains("enforce, skip, edit? [e/s/x] (s): "), "{out}");
         let path = Target::Path {
-            glob: "/etc/hosts".into(),
+            glob: crate::rules_cmd::test_host::HOSTS.into(),
             access: RuleAccess::Write,
         };
         let (r, _) = run(vec![prop(1, path)], true, "a\ne\n\n");
@@ -379,7 +372,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "POSIX path examples")]
     fn edit_reproposes() {
         let (r, _) = run(
             vec![prop(1, cmd(&["shred"]))],
@@ -398,7 +390,10 @@ mod tests {
         let (r, out) = run(
             vec![prop(1, cmd(&["shred"]))],
             true,
-            "x\n/etc/hosts\nx\n\nx\na|b\ns\n",
+            &format!(
+                "x\n{}\nx\n\nx\na|b\ns\n",
+                crate::rules_cmd::test_host::HOSTS_TYPED
+            ),
         );
         let d = r.unwrap();
         assert!(matches!(d[0].p.kind, ProposalKind::Path { .. }), "{out}");

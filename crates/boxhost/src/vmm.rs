@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use saiife_boxes::template::ImageRef;
+use saiife_boxes::template::{AgentKind, ImageRef};
 use saiife_boxes::vmm::{VmHandle, VmSpec, VmStatus, Vmm, VmmError};
 use saiife_wire::source::BoxId;
 
@@ -65,7 +65,25 @@ pub struct ResolvedImage {
     pub sha256: String,
     pub virtual_gib: u64,
     pub boot: Boot,
+    /// The agents a box on this image can run (plan 42 D10, FU2):
+    /// `claude-code` (when its managed settings are baked in), plus `codex`,
+    /// plus `gemini` (with its Node runtime).
+    pub agents: Vec<String>,
 }
+
+/// The refusal of a box whose image lacks its agent (plan 42 D10).
+pub fn missing_agent(image_id: &str, agent: AgentKind) -> String {
+    format!(
+        "the image {image_id} has no {a}: build one with \"saiife box image build --with {a}\", then import it and make it the default (\"saiife box image import <path> --default\")",
+        a = agent.name()
+    )
+}
+
+/// The refusal of a Claude Code box whose image predates FU2: its manifest
+/// lacks [`crate::image::CLAUDE_MANAGED_SETTINGS`], so the image has no
+/// managed hooks, and setup no longer sends user ones (fail closed).
+pub const STALE_CLAUDE_IMAGE: &str =
+    "rebuild the image (saiife box image build) and import it as default";
 
 pub trait ImageResolver: Send + Sync {
     fn resolve(&self, r: &ImageRef) -> Result<ResolvedImage, String>;
@@ -126,7 +144,8 @@ struct Run {
     paths: BoxPaths,
     /// Set by the reaper when it ends.
     done: AtomicBool,
-    /// Set (before `done`) when the reaper saw the VMM exit.
+    /// Set (before `done`, and both before `after_off`) when the reaper
+    /// saw the VMM exit.
     confirmed: AtomicBool,
 }
 
@@ -503,15 +522,22 @@ impl ChVmmInit {
         } else {
             self.ladder(run);
         }
-        if self.gone(&run.id) {
-            self.after_off(&run.id);
-            remove_sockets(&run.paths);
+        // The run is marked off (confirmed, then done) BEFORE `after_off`:
+        // whoever sees the Off a hook reports can boot at once. A boot,
+        // stop or destroy that finds the run off joins this reaper first,
+        // so `after_off` and the socket removal still precede the next run.
+        let confirmed = self.gone(&run.id);
+        if confirmed {
             run.confirmed.store(true, Ordering::SeqCst);
         } else {
             // `ChVmm::settle` confirms it later (status, stop, boot, destroy).
             log(&run.id, "the VMM did not stop; it may still be running");
         }
         run.done.store(true, Ordering::SeqCst);
+        if confirmed {
+            self.after_off(&run.id);
+            remove_sockets(&run.paths);
+        }
     }
 
     /// Undo a failed boot after every hook's `before_boot` succeeded.
@@ -862,11 +888,19 @@ impl Vmm for ChVmm {
                 "the box dir is too long: a socket path would be {n} bytes, over {MAX_SOCK_PATH}"
             )));
         }
-        inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
+        // The image first: a box whose image lacks its agent is refused
+        // before anything is made (plan 42 D10).
         let image = inner
             .images
             .resolve(&spec.image)
             .map_err(VmmError::Failed)?;
+        if !image.agents.iter().any(|a| a == spec.agent.name()) {
+            if spec.agent == AgentKind::ClaudeCode {
+                return Err(VmmError::Failed(STALE_CLAUDE_IMAGE.into()));
+            }
+            return Err(VmmError::Failed(missing_agent(&image.id, spec.agent)));
+        }
+        inner.runtime_dir(&paths).map_err(VmmError::Failed)?;
         if spec.size.disk_gib < image.virtual_gib {
             return Err(VmmError::Failed(format!(
                 "the box disk ({} GiB) is smaller than the base image ({} GiB)",
@@ -970,7 +1004,7 @@ impl Vmm for ChVmm {
             g.insert(h.id.clone(), Slot::Starting { stop: false })
         };
         if let Some(Slot::Run(e)) = old {
-            let _ = e.reaper.join(); // done: returns at once
+            let _ = e.reaper.join(); // done: returns once its after_off has run
         }
         let r = self.boot_inner(h, &paths).and_then(|()| {
             match self.spawn_reaper(&h.id, paths.clone(), false) {
@@ -1134,7 +1168,7 @@ impl Vmm for ChVmm {
                 None => return Err(VmmError::Failed("the VMM is still stopping".into())),
             }
         };
-        let _ = e.reaper.join(); // done: returns at once
+        let _ = e.reaper.join(); // done: returns once its after_off has run
         self.inner.remove_runtime(&h.id)
     }
 }

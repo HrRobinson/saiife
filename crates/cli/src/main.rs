@@ -51,6 +51,7 @@ mod check;
 mod check_managed;
 mod collection;
 mod connect_cmd;
+mod deadline_scale;
 mod dev_cmd;
 #[cfg(any(unix, windows))]
 mod doctor_cmd;

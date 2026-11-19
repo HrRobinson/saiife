@@ -264,8 +264,10 @@ fn records(audit: &Path, event: &str) -> Vec<Record> {
         .collect()
 }
 
+/// The `event` records, waiting for `n` up to a ceiling that only a failure
+/// reaches.
 async fn wait_records(audit: &Path, event: &str, n: usize) -> Vec<Record> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let got = records(audit, event);
         if got.len() >= n || Instant::now() >= deadline {
@@ -292,6 +294,26 @@ fn short(wait: Duration) -> Option<Opts> {
         wait,
         ..Opts::default()
     })
+}
+
+/// A co-sign wait no loaded machine runs out of before the hook table's
+/// [`RECONNECT_GRACE`] ends (the connection limit past it): an answer that
+/// came from the no-verdict path, not the wait, says so by its body
+/// (`NoVerdict`, where the wait's end is `NoReport`), not by a clock.
+fn long_wait() -> Option<Opts> {
+    Some(Opts {
+        wait: Duration::from_secs(60),
+        conn_limit: Duration::from_secs(120),
+        ..Opts::default()
+    })
+}
+
+/// The production values give the no-verdict deny before the co-sign wait
+/// ends; the tests that wait for it use [`long_wait`] for the margin.
+#[test]
+fn reconnect_grace_ends_before_the_cosign_wait() {
+    assert!(RECONNECT_GRACE < Opts::default().wait);
+    assert!(Opts::default().wait < Opts::default().conn_limit);
 }
 
 #[tokio::test]
@@ -344,14 +366,17 @@ async fn recorded_deny_gets_deny_body() {
 
 #[tokio::test]
 async fn killed_hook_gets_deny_at_once() {
-    let d = daemon(Some(Opts::default())).await;
+    let d = daemon(long_wait()).await;
     let p = payload("toolu_4", "ls");
     let h = Client::hook(&d.sock, &p).await;
     let start = Instant::now();
     drop(h);
     let a = post(d.addr.unwrap(), p.clone()).await;
+    // Answered once the hook table gives up on the hook (after its grace for
+    // a reconnect), not at the end of the co-sign wait: that would be
+    // `NoReport`.
     assert_deny(&a, CosignDeny::NoVerdict);
-    assert!(start.elapsed() < RECONNECT_GRACE + Duration::from_secs(1));
+    assert!(start.elapsed() >= RECONNECT_GRACE, "{:?}", start.elapsed());
     let got = wait_records(&d.audit, "cosign_denied", 1).await;
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].reason.as_deref(), Some(CosignDeny::NoVerdict.text()));
@@ -1055,34 +1080,57 @@ async fn rejudge_failure_denies_and_records() {
 /// deadline (here the co-sign wait, shorter than `REJUDGE_TIMEOUT`).
 #[tokio::test]
 async fn rejudge_timeout_denies() {
-    let rj: Arc<dyn Rejudge> = Arc::new(|_: RejudgeRequest| {
-        std::thread::sleep(Duration::from_secs(3));
+    const WAIT: Duration = Duration::from_secs(1);
+    // The re-judge says when it started and what deadline it was given, then
+    // runs until the test lets it go: it cannot answer before the co-signer
+    // has.
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(std::time::Instant, std::time::Instant)>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (seen_tx, go_rx) = (std::sync::Mutex::new(seen_tx), std::sync::Mutex::new(go_rx));
+    let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ret = Arc::clone(&returned);
+    let rj: Arc<dyn Rejudge> = Arc::new(move |req: RejudgeRequest| {
+        let _ = seen_tx
+            .lock()
+            .unwrap()
+            .send((std::time::Instant::now(), req.deadline));
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+        ret.store(true, std::sync::atomic::Ordering::SeqCst);
         RejudgeAnswer::Allow
     });
-    let d = daemon_with(short(Duration::from_secs(1)), Some(rj)).await;
+    let d = daemon_with(short(WAIT), Some(rj)).await;
     let body = fixture("bash-allow.json");
     let mut h = Client::hook(&d.sock, &body).await;
     h.verdict(DecisionKind::Allow, "ls -la").await;
-    let start = Instant::now();
     assert_deny(
         &post(d.addr.unwrap(), body).await,
         CosignDeny::RejudgeFailed,
     );
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        start.elapsed()
-    );
-    assert_eq!(wait_records(&d.audit, "rejudge_failed", 1).await.len(), 1);
+    let answered = std::time::Instant::now();
+    // The re-judge had not answered: the deny is its deadline's.
+    assert!(!returned.load(std::sync::atomic::Ordering::SeqCst));
+    let (started, deadline) = seen_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    // Not before the deadline.
+    assert!(answered >= deadline, "{:?} early", deadline - answered);
+    // The deadline is the co-sign wait (from the request's arrival, before the
+    // re-judge started), not `REJUDGE_TIMEOUT` from its start.
+    assert!(deadline <= started + WAIT, "{:?}", deadline - started);
+    go_tx.send(()).unwrap();
+    let got = wait_records(&d.audit, "rejudge_failed", 1).await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].extra["error"], "the re-judge timed out");
 }
 
 #[tokio::test]
 async fn no_verdict_wins_over_a_running_rejudge() {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let rx = std::sync::Mutex::new(rx);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let called = Arc::clone(&calls);
     let rj: Arc<dyn Rejudge> = Arc::new(move |_: RejudgeRequest| {
+        called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Runs until the test has its answer.
-        let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+        let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
         RejudgeAnswer::Deny {
             reason: "x".into(),
             pack: None,
@@ -1091,15 +1139,19 @@ async fn no_verdict_wins_over_a_running_rejudge() {
             askable: false,
         }
     });
-    let d = daemon_with(Some(Opts::default()), Some(rj)).await;
+    let d = daemon_with(long_wait(), Some(rj)).await;
     let body = payload("toolu_nv", "ls");
     let h = Client::hook(&d.sock, &body).await;
     let start = Instant::now();
     drop(h);
     assert_deny(&post(d.addr.unwrap(), body).await, CosignDeny::NoVerdict);
-    assert!(start.elapsed() < RECONNECT_GRACE + Duration::from_secs(1));
-    tx.send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(start.elapsed() >= RECONNECT_GRACE, "{:?}", start.elapsed());
+    let _ = tx.send(());
+    // The call's own records are written (one writer, in order); a judgment
+    // never started, so none of its records can follow.
+    assert_eq!(wait_records(&d.audit, "no_verdict", 1).await.len(), 1);
+    assert_eq!(wait_records(&d.audit, "cosign_denied", 1).await.len(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(records(&d.audit, "rejudge_denied").is_empty());
     assert!(records(&d.audit, "rejudge_failed").is_empty());
 }
