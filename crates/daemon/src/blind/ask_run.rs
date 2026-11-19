@@ -16,8 +16,8 @@
 //! code (never the reason: it can name the user's words).
 //!
 //! `blind_run` holds the method's hash (or the approved id), the snapshot
-//! hash, the calculator's label and confinement, and the answer's sha256;
-//! the answer text is never logged.
+//! hash, the calculator's label and confinement, and the answer's keyed
+//! MAC ([`audit::answer_mac`]); the answer text is never logged.
 
 use super::*;
 use crate::blind::calc::{self, Outcome};
@@ -79,7 +79,7 @@ pub(super) async fn run_or_stop(
         return (st, Err(r));
     }
     if accepted {
-        let r = preview_record(id, &preview, "accepted");
+        let r = preview_record(id, &st.preview_mac, &preview, "accepted");
         if let Err(e) = record(ctx, &st, r, ACCEPT_UNRECORDED).await {
             return (st, Err(e));
         }
@@ -105,11 +105,18 @@ pub(super) async fn run_or_stop(
     (st, r)
 }
 
-/// `blind_preview` of `outcome` for `p`.
-pub(super) fn preview_record(id: &str, p: &Preview, outcome: &'static str) -> BlindRecord {
+/// `blind_preview` of `outcome` for `p`; `mac` is its
+/// [`audit::preview_mac`] (never the preview's bare sha256: the text holds
+/// the user's words).
+pub(super) fn preview_record(
+    id: &str,
+    mac: &str,
+    p: &Preview,
+    outcome: &'static str,
+) -> BlindRecord {
     BlindRecord::Preview {
         ask: id.to_string(),
-        sha256: p.sha256.clone(),
+        preview_mac: mac.to_string(),
         outcome,
         fragments: u32::try_from(p.fragments).unwrap_or(u32::MAX),
     }
@@ -123,7 +130,8 @@ async fn stop(
     p: &Preview,
     reused: bool,
 ) -> Result<Step, Refusal> {
-    record(ctx, st, preview_record(id, p, "stopped"), STOP_UNRECORDED).await?;
+    let r = preview_record(id, &st.preview_mac, p, "stopped");
+    record(ctx, st, r, STOP_UNRECORDED).await?;
     // A reused method sent nothing; otherwise the planner was asked.
     let head = if reused {
         head_nothing_sent(d.lang)
@@ -135,15 +143,14 @@ async fn stop(
 
 /// The session keeps this ask's turn (R44-5): later asks send it as
 /// context, with the same stand-ins.
-async fn push_turn(ctx: &Arc<Ctx>, st: &AskState, d: &Draft) -> Result<(), Refusal> {
-    let keys = load_keys(ctx, &st.dataset).await?;
+fn push_turn(ctx: &Ctx, st: &AskState, d: &Draft, keys: &KeySet) -> Result<(), Refusal> {
     let schema = st.snapshot.schema();
     let mut ss = lock(&ctx.blind.sessions);
     let s = ss
         .get_or_new(
             st.uid,
             &st.dataset,
-            &keys,
+            keys,
             unix_now(),
             st.opts.session,
             false,
@@ -168,7 +175,20 @@ async fn execute(
 ) -> Result<Step, Refusal> {
     let lang = d.lang;
     let line = method_line(&preview.text, lang);
-    push_turn(ctx, st, d).await?;
+    // T2 review M2: a failure here still leaves its refusal record.
+    let keys = match load_keys(ctx, &st.dataset).await {
+        Ok(k) => k,
+        Err(e) => {
+            refused_record(ctx, id, st, "keys_unavailable").await;
+            return Err(e);
+        }
+    };
+    if let Err(e) = push_turn(ctx, st, d, &keys) {
+        refused_record(ctx, id, st, "session_unavailable").await;
+        return Err(e);
+    }
+    let index_key = keys.index_key();
+    drop(keys);
     let snap = &st.snapshot;
     let schema = snap.schema();
     let job = CalcJob {
@@ -219,7 +239,10 @@ async fn execute(
         landlock_abi: conf.landlock_abi,
         seccomp: conf.seccomp,
         netns: conf.netns,
-        answer_sha256: checked.as_ref().ok().map(|(f, _)| sha256_hex(&f.text)),
+        answer_mac: checked
+            .as_ref()
+            .ok()
+            .map(|(f, _)| audit::answer_mac(&index_key, &f.text)),
     };
     record(ctx, st, r, RUN_UNRECORDED).await?;
     let (filled, report) = match checked {
@@ -328,10 +351,4 @@ async fn after_run_refusal(
         reason,
         method_line: Some(line),
     }
-}
-
-/// Lowercase hex SHA-256 of `s`.
-fn sha256_hex(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    crate::api_ops::hex(&Sha256::digest(s.as_bytes()))
 }

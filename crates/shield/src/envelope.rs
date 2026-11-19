@@ -18,10 +18,12 @@
 //! `build_envelope` writes no file and does not touch the session's turns:
 //! the caller pushes the turn after the firewall passed (plan 48).
 
+use crate::plan::ContextParam;
 use crate::public::PublicValues;
 use crate::question::Draft;
-use crate::schema::{rows_band, Bound, ColType, ColumnClass, Lang, ParamType, Schema};
-use crate::session::{Session, Turn};
+use crate::schema::{rows_band, Bound, ColType, ColumnClass, Lang, Param, ParamType, Schema};
+use crate::session::{ContextEntity, Session, Turn};
+use crate::sql::{ErrorClass, MethodError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -361,6 +363,52 @@ pub fn turn_for(d: &Draft, session: &mut Session, schema: &Schema, released: Vec
     }
 }
 
+/// Plan 44 R44-5, plan 48 T2: a reply's context references bound as
+/// parameters. Each [`ContextParam`] must name the next free parameter
+/// (`p<k+1>`, `p<k+2>`, ... after the draft's `k`) and a symbol that
+/// `known` (the [`Session::context_entities`] taken when the envelope was
+/// built) holds, once; it becomes an entity parameter bound to that one
+/// key, whose display is the plain type word (plan 48 R-C2: never a name
+/// the user did not type in this question). The validator, the template
+/// and the checker then see it like any resolved parameter. Anything else
+/// (a symbol not in the context, a repeat, a wrong name, an entity the
+/// schema lacks) is `param_misuse`: retried before the preview, never
+/// bound. No references: the draft unchanged.
+pub fn bind_context(
+    d: &Draft,
+    refs: &[ContextParam],
+    known: &[ContextEntity],
+    schema: &Schema,
+) -> Result<Draft, MethodError> {
+    let misuse = || MethodError {
+        class: ErrorClass::ParamMisuse,
+        detail: None,
+    };
+    let mut out = d.clone();
+    for (i, r) in refs.iter().enumerate() {
+        if r.name != format!("p{}", d.params.len() + 1 + i)
+            || refs[..i].iter().any(|o| o.symbol == r.symbol)
+        {
+            return Err(misuse());
+        }
+        let e = known
+            .iter()
+            .find(|e| e.symbol == r.symbol)
+            .ok_or_else(misuse)?;
+        let spec = schema.entity_for(&e.table).ok_or_else(misuse)?;
+        out.params.push(Param {
+            name: r.name.clone(),
+            ty: ParamType::Entity {
+                table: e.table.clone(),
+                word: spec.word.clone(),
+            },
+            bound: Some(Bound::Keys(vec![e.key])),
+            display: spec.word.clone(),
+        });
+    }
+    Ok(out)
+}
+
 /// The text a context turn shows for a parameter that is not an entity
 /// (its type is not kept in the turn).
 pub const CONTEXT_VALUE: &str = "(value)";
@@ -582,8 +630,76 @@ mod tests {
         // single-key entity's stand-in.
         let t = turn_for(&d, &mut s, &schema, vec!["Zed Quorra".into()]);
         assert_eq!(t.question, "balance of :p1 and :p2 over :p3");
-        assert_eq!(t.symbols, vec![("p1".to_string(), sym)]);
+        assert_eq!(t.symbols, vec![("p1".to_string(), sym.clone())]);
         assert_eq!(t.released, vec!["Zed Quorra".to_string()]);
+
+        // T2 review I1 (R44-5): only a kept turn's symbols are context.
+        assert!(s.context_entities().is_empty());
+        let other = s.symbol_for("customer", "customers", 9);
+        s.push_turn(t);
+        let known = s.context_entities();
+        assert_eq!(known.len(), 1);
+        assert_eq!(
+            (known[0].symbol.as_str(), known[0].key),
+            (sym.as_str(), 4411)
+        );
+        assert!(!format!("{known:?}").contains("4411"));
+        let cp = |name: &str, symbol: &str| ContextParam {
+            name: name.into(),
+            symbol: symbol.into(),
+        };
+        // A follow-up with no parameter of its own binds the next name.
+        let q = Draft {
+            lang: Lang::En,
+            original: "and her open invoices?".into(),
+            text: "and her open invoices?".into(),
+            params: vec![],
+            pending: vec![],
+        };
+        assert_eq!(bind_context(&q, &[], &known, &schema).unwrap().params, []);
+        let b = bind_context(&q, &[cp("p1", &sym)], &known, &schema).unwrap();
+        assert_eq!(b.params.len(), 1);
+        assert_eq!(b.params[0].bound, Some(Bound::Keys(vec![4411])));
+        assert_eq!(b.params[0].display, "customer");
+        assert_eq!(
+            b.params[0].ty,
+            ParamType::Entity {
+                table: "customers".into(),
+                word: "customer".into()
+            }
+        );
+        // The user did not type it: the answer names the plain word.
+        let ap = crate::template::answer_params(&b, &schema);
+        assert_eq!(ap[0].display, "the customer");
+        // After the draft's own parameters; the question's words stay.
+        let b = bind_context(&d, &[cp("p4", &sym)], &known, &schema).unwrap();
+        assert_eq!(b.params.len(), 4);
+        assert_eq!(crate::template::spoken(&b, "p4"), None);
+        assert_eq!(
+            crate::template::spoken(&b, "p1"),
+            crate::template::spoken(&d, "p1")
+        );
+        // Fail closed: a wrong name, an issued symbol of no kept turn, an
+        // unknown symbol, a repeat; and nothing without context.
+        let misuse = |r: Result<Draft, MethodError>| {
+            assert_eq!(r.err().map(|e| e.class), Some(ErrorClass::ParamMisuse));
+        };
+        misuse(bind_context(&q, &[cp("p2", &sym)], &known, &schema));
+        misuse(bind_context(&d, &[cp("p1", &sym)], &known, &schema));
+        misuse(bind_context(&q, &[cp("p1", &other)], &known, &schema));
+        misuse(bind_context(
+            &q,
+            &[cp("p1", "Customer_ZZZZ")],
+            &known,
+            &schema,
+        ));
+        misuse(bind_context(
+            &q,
+            &[cp("p1", &sym), cp("p2", &sym)],
+            &known,
+            &schema,
+        ));
+        misuse(bind_context(&q, &[cp("p1", &sym)], &[], &schema));
     }
 
     #[test]

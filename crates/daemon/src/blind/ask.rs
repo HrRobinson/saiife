@@ -33,8 +33,8 @@ use crate::ops::Ctx;
 use saiife_ipc::msg::ErrorCode;
 use saiife_ipc::peer::PeerCred;
 use saiife_shield::envelope::{
-    build_envelope, cloud_schema, logged_question, method_sha256, schema_sha256, synthetic_sha256,
-    Retry, SentSummary,
+    bind_context, build_envelope, cloud_schema, logged_question, method_sha256, schema_sha256,
+    synthetic_sha256, Retry, SentSummary,
 };
 use saiife_shield::firewall::{self, retry_error_class, Expected, Firewall, Hit};
 use saiife_shield::lexicon::{Candidate, Resolve, MAX_CANDIDATES};
@@ -560,6 +560,9 @@ pub struct AskState {
     peer: PeerCred,
     /// What the envelope of the previewed method held (the footer's count).
     sent: Sent,
+    /// [`audit::preview_mac`] of the preview, for its `blind_preview`
+    /// records (shown or auto, then accepted or stopped).
+    preview_mac: String,
 }
 
 impl std::fmt::Debug for AskState {
@@ -945,6 +948,7 @@ pub async fn begin(
         counts: Counts::default(),
         peer: peer.clone(),
         sent: Sent::default(),
+        preview_mac: String::new(),
     };
     let q = args.question;
     let lang = args.lang;
@@ -1497,7 +1501,9 @@ async fn proceed(
     };
     // Reuse (R45-11): no cloud call; a method that no longer validates for
     // this draft is not used.
-    if let Some(m) = found {
+    // A method that binds a context symbol (R44-5) is tied to the session
+    // it was planned in: never reused.
+    if let Some(m) = found.filter(|m| m.reply.context.is_empty()) {
         if let Ok(v) = check_reply(&m.reply, schema, public, &d.params, list_cap) {
             if let Err(e) = record_ask(ctx, id, &st, &d, Some(m.id.clone())).await {
                 return (st, Err(e));
@@ -1563,11 +1569,13 @@ async fn proceed(
             )
             .map(|s| {
                 let env = build_envelope(&d, s, schema, public, synth, list_cap, retry);
-                (env, s.issued_symbols(), s.released_names())
+                // The context as sent: what a reply may refer to (R44-5).
+                let known = s.context_entities();
+                (env, s.issued_symbols(), s.released_names(), known)
             })
         };
         drop(keys);
-        let (env, symbols, mut released) = match built {
+        let (env, symbols, mut released, known) = match built {
             Ok(b) => b,
             Err(e) => return (st, Err(shield_err(&e))),
         };
@@ -1601,8 +1609,13 @@ async fn proceed(
                 )),
             );
         }
-        match check_reply(&reply, schema, public, &d.params, list_cap) {
-            Ok(v) => {
+        // R44-5: the reply's context references become parameters bound to
+        // the keys of this session's earlier turns; then the usual checks.
+        let bound = bind_context(&d, &reply.context, &known, schema).and_then(|d2| {
+            check_reply(&reply, schema, public, &d2.params, list_cap).map(|v| (d2, v))
+        });
+        match bound {
+            Ok((d, v)) => {
                 let sent = Sent::from(env.summary());
                 let envelope = st
                     .opts
@@ -1674,7 +1687,12 @@ async fn finish_preview(
     // `--yes` (R48-3): the preview is not waited for; it is recorded as
     // `auto` and becomes the answer's method line.
     let outcome = if st.opts.yes { "auto" } else { "shown" };
-    let r = run::preview_record(id, &p, outcome);
+    // Keyed (T2 review I2): the preview holds the user's words.
+    st.preview_mac = match load_keys(ctx, &st.dataset).await {
+        Ok(k) => audit::preview_mac(&k.index_key(), &p.text),
+        Err(e) => return (st, Err(e)),
+    };
+    let r = run::preview_record(id, &st.preview_mac, &p, outcome);
     // Reuse sent nothing; the planner path asked the planner.
     let failed = if approved.is_some() {
         UNRECORDED_NOTHING_SENT

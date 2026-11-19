@@ -35,7 +35,9 @@ pub enum BlindRecord {
     },
     Preview {
         ask: String,
-        sha256: String,
+        /// [`preview_mac`] of the preview text (it holds the user's words
+        /// and `show` values: never a bare hash).
+        preview_mac: String,
         /// `shown`, `accepted`, `stopped` or `auto`.
         outcome: &'static str,
         fragments: u32,
@@ -73,9 +75,10 @@ pub enum BlindRecord {
         landlock_abi: u32,
         seccomp: bool,
         netns: bool,
-        /// Lowercase hex SHA-256 of the answer shown (R48-4, spec §6.5:
-        /// the text itself is never logged); none when it was refused.
-        answer_sha256: Option<String>,
+        /// [`answer_mac`] of the answer shown (R48-4, spec §6.5: the text
+        /// itself is never logged; a bare hash of a short answer could be
+        /// guessed back); none when it was refused.
+        answer_mac: Option<String>,
     },
     CheckRefused {
         ask: String,
@@ -196,14 +199,14 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
         ),
         BlindRecord::Preview {
             ask,
-            sha256,
+            preview_mac,
             outcome,
             fragments,
         } => (
             "blind_preview",
             vec![
                 ("ask", json!(ask)),
-                ("sha256", json!(sha256)),
+                ("preview_mac", json!(preview_mac)),
                 ("outcome", json!(outcome)),
                 ("fragments", json!(fragments)),
             ],
@@ -264,7 +267,7 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
             landlock_abi,
             seccomp,
             netns,
-            answer_sha256,
+            answer_mac,
         } => (
             "blind_run",
             vec![
@@ -277,7 +280,7 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
                 ("landlock_abi", json!(landlock_abi)),
                 ("seccomp", json!(seccomp)),
                 ("netns", json!(netns)),
-                ("answer_sha256", json!(answer_sha256)),
+                ("answer_mac", json!(answer_mac)),
             ],
         ),
         BlindRecord::CheckRefused { ask, reason } => (
@@ -378,6 +381,29 @@ pub fn name_sha256(key: &IndexKey, name: &str) -> String {
     c.update(b"saiife-blind-name-v1\0");
     c.update(normalize(name).as_bytes());
     crate::api_ops::hex(c.sign().as_ref())
+}
+
+/// HMAC-SHA256 under the dataset's index key (the blind key store's, as
+/// [`name_sha256`]) over a domain label and the exact text, hex. For text
+/// that is secret and easy to guess (an answer, a preview): an audit
+/// reader without the key cannot confirm a guess offline; with it, equal
+/// texts link. The labels keep the three uses apart.
+fn audit_mac(key: &IndexKey, domain: &[u8], text: &str) -> String {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key.0[..]);
+    let mut c = ring::hmac::Context::with_key(&k);
+    c.update(domain);
+    c.update(text.as_bytes());
+    crate::api_ops::hex(c.sign().as_ref())
+}
+
+/// `blind_run.answer_mac`: [`audit_mac`] of the answer text shown.
+pub fn answer_mac(key: &IndexKey, answer: &str) -> String {
+    audit_mac(key, b"saiife-blind-answer-v1\0", answer)
+}
+
+/// `blind_preview.preview_mac`: [`audit_mac`] of the preview text.
+pub fn preview_mac(key: &IndexKey, preview: &str) -> String {
+    audit_mac(key, b"saiife-blind-preview-v1\0", preview)
 }
 
 /// Every string inside `v`, nested ones too.

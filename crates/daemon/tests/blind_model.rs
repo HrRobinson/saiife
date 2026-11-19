@@ -551,12 +551,12 @@ fn pin_envelope() -> Envelope {
 
 /// The SYSTEM_PROMPT is pinned by its hash; the body around it by bytes.
 const PROMPT_SHA256: &str =
-    "sha256:85548a9c4616b82c2ec65cc486916ae0145fcd9762195321d904a07998363187";
+    "sha256:7f86f4190edc8395d23fd460fe9f1f00d63fa0b5bf26b5a5210db066b3a1559c";
 
 const PINNED_BODY: &str = concat!(
     r#"{"model":"claude-opus-5-5","max_tokens":16000,"system":<SYSTEM>,"#,
     r#""messages":[{"role":"user","content":"{\"context\":[],\"kind\":\"saiife-blind-plan\",\"lang\":\"en\",\"list_cap\":50,\"params\":[],\"question\":\"how many customers are there in each city\",\"retry\":null,\"schema\":{\"tables\":[{\"columns\":[{\"class\":\"quasi\",\"name\":\"city\",\"ty\":\"text\"}],\"entity\":\"customer\",\"name\":\"customers\",\"rows\":\"10-99\"}]},\"synthetic\":{\"customers\":[]},\"v\":1}"}],"#,
-    r#""output_config":{"effort":"high","format":{"type":"json_schema","schema":{"additionalProperties":false,"properties":{"checks":{"items":{"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"rows_between"},"max":{"type":"integer"},"min":{"type":"integer"}},"required":["kind","min","max"],"type":"object"},{"additionalProperties":false,"properties":{"a":{"type":"string"},"b":{"type":"string"},"kind":{"const":"equal"}},"required":["kind","a","b"],"type":"object"}]},"type":"array"},"intent":{"type":"string"},"method":{"type":"string"},"needs_judgment":{"type":"boolean"},"template":{"type":"string"}},"required":["method","template","intent"],"type":"object"}}},"#,
+    r#""output_config":{"effort":"high","format":{"type":"json_schema","schema":{"additionalProperties":false,"properties":{"checks":{"items":{"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"rows_between"},"max":{"type":"integer"},"min":{"type":"integer"}},"required":["kind","min","max"],"type":"object"},{"additionalProperties":false,"properties":{"a":{"type":"string"},"b":{"type":"string"},"kind":{"const":"equal"}},"required":["kind","a","b"],"type":"object"}]},"type":"array"},"context":{"items":{"additionalProperties":false,"properties":{"name":{"type":"string"},"symbol":{"type":"string"}},"required":["name","symbol"],"type":"object"},"type":"array"},"intent":{"type":"string"},"method":{"type":"string"},"needs_judgment":{"type":"boolean"},"template":{"type":"string"}},"required":["method","template","intent"],"type":"object"}}},"#,
     r#""fallbacks":"default"}"#
 );
 

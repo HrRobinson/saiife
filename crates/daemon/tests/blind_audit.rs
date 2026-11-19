@@ -189,7 +189,7 @@ fn every_variant() -> Vec<BlindRecord> {
         },
         BlindRecord::Preview {
             ask: "a1".into(),
-            sha256: sha('a'),
+            preview_mac: audit::preview_mac(&key(), PREVIEW),
             outcome: "shown",
             fragments: 3,
         },
@@ -224,7 +224,7 @@ fn every_variant() -> Vec<BlindRecord> {
             landlock_abi: 4,
             seccomp: true,
             netns: true,
-            answer_sha256: Some(sha('3')),
+            answer_mac: Some(audit::answer_mac(&key(), ANSWER)),
         },
         BlindRecord::CheckRefused {
             ask: "a1".into(),
@@ -316,6 +316,45 @@ async fn records_have_no_values() {
     for v in [NAME, "Quillfeather", "Brandvold", EMAIL] {
         assert!(!raw.contains(v), "{v} in the audit log");
     }
+    // T2 review: the answer and the preview are keyed, never bare hashes.
+    let run = recs.iter().find(|r| r["kind"] == "blind_run").unwrap();
+    assert_eq!(run["answer_mac"], audit::answer_mac(&key(), ANSWER));
+    assert!(run.get("answer_sha256").is_none(), "{run}");
+    let pv = recs.iter().find(|r| r["kind"] == "blind_preview").unwrap();
+    assert_eq!(pv["preview_mac"], audit::preview_mac(&key(), PREVIEW));
+    assert!(pv.get("sha256").is_none(), "{pv}");
+    for t in [ANSWER, PREVIEW] {
+        assert!(!raw.contains(&plain_sha256(t)), "a bare hash of {t:?}");
+    }
+}
+
+/// An answer and a preview as the audit fixture keys them.
+const ANSWER: &str = "Quillfeather Brandvold owes 18,420.00 NOK across 3 open invoices.";
+const PREVIEW: &str = "I'm summing all invoices (amount) for Quillfeather Brandvold.";
+
+fn plain_sha256(s: &str) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Coordinator finding T2: the answer's MAC is keyed per dataset: two
+/// dataset keys give two MACs for one answer, neither the bare sha256;
+/// the three uses (name, answer, preview) are kept apart.
+#[test]
+fn answer_and_preview_macs_are_keyed() {
+    let other = IndexKey(Zeroizing::new([0x5a; 32]));
+    let a = audit::answer_mac(&key(), ANSWER);
+    assert_eq!(a, audit::answer_mac(&key(), ANSWER));
+    assert_ne!(a, audit::answer_mac(&other, ANSWER));
+    assert_ne!(a, plain_sha256(ANSWER));
+    assert_eq!(a.len(), 64);
+    assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_ne!(
+        audit::preview_mac(&key(), PREVIEW),
+        audit::preview_mac(&other, PREVIEW)
+    );
+    assert_ne!(audit::preview_mac(&key(), ANSWER), a);
+    assert_ne!(audit::name_sha256(&key(), ANSWER), a);
 }
 
 #[tokio::test]

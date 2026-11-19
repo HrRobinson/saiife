@@ -497,6 +497,7 @@ fn approved(key: &str, sql: &str) -> ApprovedMethod {
             checks: vec![],
             intent: "count".into(),
             needs_judgment: false,
+            context: vec![],
         },
         preview_sha256: "ab".into(),
         approved_by: "me".into(),

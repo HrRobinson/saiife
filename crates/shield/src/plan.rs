@@ -11,6 +11,12 @@ pub const METHOD_MAX: usize = 8 * 1024;
 pub const TEMPLATE_MAX: usize = 4 * 1024;
 pub const INTENT_MAX_CHARS: usize = 300;
 pub const CHECKS_MAX: usize = 4;
+/// Plan 48 T2 (R44-5): at most this many context references per reply.
+pub const CONTEXT_MAX: usize = 4;
+/// The longest parameter name and stand-in symbol a context reference may
+/// hold (`p12`; `Customer_K7QF01`, an entity word plus a 4 or 6 char tag).
+pub const CONTEXT_NAME_MAX: usize = 8;
+pub const CONTEXT_SYMBOL_MAX: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +30,24 @@ pub struct PlanReply {
     /// template may then be empty.
     #[serde(default)]
     pub needs_judgment: bool,
+    /// Plan 44 R44-5, plan 48 T2: entities of earlier questions of the
+    /// session the method uses ("and her open invoices?"), each as a new
+    /// parameter bound to the context symbol's key. Left out of the JSON
+    /// when empty, so stored replies keep their bytes and ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextParam>,
+}
+
+/// One context reference: the method's parameter `name` (the next free
+/// `pN` after the question's) stands for the entity whose stand-in is
+/// `symbol` in an earlier turn of the session. Bound by
+/// [`crate::envelope::bind_context`]; a symbol the session's context does
+/// not hold fails closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextParam {
+    pub name: String,
+    pub symbol: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +96,20 @@ pub const PLAN_SCHEMA: &str = r#"{
       }
     },
     "intent": { "type": "string", "maxLength": 300 },
-    "needs_judgment": { "type": "boolean" }
+    "needs_judgment": { "type": "boolean" },
+    "context": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "symbol"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 8 },
+          "symbol": { "type": "string", "maxLength": 64 }
+        }
+      }
+    }
   }
 }"#;
 
@@ -89,6 +126,10 @@ pub fn parse_reply(text: &str) -> Result<PlanReply, ErrorClass> {
         || r.template.len() > TEMPLATE_MAX
         || r.intent.chars().count() > INTENT_MAX_CHARS
         || !checks_ok
+        || r.context.len() > CONTEXT_MAX
+        || r.context
+            .iter()
+            .any(|c| c.name.len() > CONTEXT_NAME_MAX || c.symbol.len() > CONTEXT_SYMBOL_MAX)
     {
         return Err(ErrorClass::Syntax);
     }
@@ -134,6 +175,40 @@ pub fn intent_line(intent: &str, lang: Lang) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 48 T2 (R44-5): `context` is optional, capped, strict, and left
+    /// out of a reply's JSON when empty (stored replies keep their bytes).
+    #[test]
+    fn context_references_parse_and_are_capped() {
+        let base = r#"{"method":"m","template":"t","intent":"i""#;
+        let r = parse_reply(&format!("{base}}}")).unwrap();
+        assert!(r.context.is_empty());
+        assert!(!serde_json::to_string(&r).unwrap().contains("context"));
+        let one = r#","context":[{"name":"p1","symbol":"Customer_K7QF"}]"#;
+        let r = parse_reply(&format!("{base}{one}}}")).unwrap();
+        assert_eq!(
+            r.context,
+            vec![ContextParam {
+                name: "p1".into(),
+                symbol: "Customer_K7QF".into()
+            }]
+        );
+        let item = r#"{"name":"p1","symbol":"Customer_K7QF"}"#;
+        let five = [item; CONTEXT_MAX + 1].join(",");
+        for bad in [
+            format!(r#"{base},"context":[{five}]}}"#),
+            format!(r#"{base},"context":[{{"name":"p1","symbol":"S","x":1}}]}}"#),
+            format!(r#"{base},"context":[{{"name":"p123456789","symbol":"S"}}]}}"#),
+            format!(
+                r#"{base},"context":[{{"name":"p1","symbol":"{}"}}]}}"#,
+                "S".repeat(CONTEXT_SYMBOL_MAX + 1)
+            ),
+        ] {
+            assert_eq!(parse_reply(&bad), Err(ErrorClass::Syntax), "{bad}");
+        }
+        let v: serde_json::Value = serde_json::from_str(PLAN_SCHEMA).unwrap();
+        assert_eq!(v["properties"]["context"]["maxItems"], CONTEXT_MAX);
+    }
 
     #[test]
     fn intent_line_has_no_numbers() {

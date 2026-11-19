@@ -345,9 +345,22 @@ pub fn check_params_covered(
 /// replaced by `:pN` (plan 44 copies the text between them verbatim), and
 /// the span is taken only when the earliest and the latest fit of those
 /// pieces into the original agree on it. Otherwise `None`.
+///
+/// A parameter bound from the session's context (plan 48 T2,
+/// [`crate::envelope::bind_context`]) follows the question's own and is not
+/// in `d.text`: the user did not type it here, so it is `None`.
 pub fn spoken(d: &Draft, param: &str) -> Option<String> {
-    let segs = split_params(&d.text, d.params.len())?;
+    let refs = crate::firewall::param_refs(&d.text);
+    let in_text = d
+        .params
+        .iter()
+        .take_while(|p| refs.iter().any(|r| r.2 == p.name))
+        .count();
     let n = d.params.iter().position(|p| p.name == param)? + 1;
+    if n > in_text {
+        return None;
+    }
+    let segs = split_params(&d.text, in_text)?;
     let k = segs.len() - 1;
     let o = d.original.as_str();
     if !o.starts_with(segs[0]) {

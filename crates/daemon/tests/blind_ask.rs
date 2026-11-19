@@ -370,7 +370,10 @@ async fn call_as(f: &Fx, uid: u32, op: &str, args: Value, fds: Vec<OwnedFd>) -> 
         op: op.into(),
         args,
     };
-    saiife_daemon::blind::ops::handle(&f.ctx, &conn, req).await
+    // Boxed: the op's future is large in a debug build, and a test that
+    // makes many calls keeps each call site's in its own future, on the
+    // test thread's stack (2 MiB).
+    Box::pin(saiife_daemon::blind::ops::handle(&f.ctx, &conn, req)).await
 }
 
 async fn call(f: &Fx, op: &str, args: Value, fds: Vec<OwnedFd>) -> Value {
@@ -490,6 +493,7 @@ fn approved(f: &Fx, q: &str, method: &str, template: &str, status: MethodStatus)
             checks: vec![],
             intent: "approved".into(),
             needs_judgment: false,
+            context: vec![],
         },
         preview_sha256: "0".repeat(64),
         approved_by: "me".into(),
@@ -1257,6 +1261,13 @@ fn sha_hex(s: &str) -> String {
     d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The dataset's index key: the audit MACs' key.
+fn index_key(f: &Fx) -> saiife_shield::index::IndexKey {
+    saiife_daemon::blind::keys::load(&f.ctx, &crm())
+        .unwrap()
+        .index_key()
+}
+
 fn is_answered(f: &Fx, id: &str) -> Result<bool, String> {
     f.ctx
         .blind
@@ -1303,12 +1314,24 @@ async fn answer_spec_example() {
     assert_eq!(step["checked"], json!({"numbers": 3, "from_calc": 3}));
     assert!(step.get("cap_note").is_none(), "{step}");
     assert_eq!(outcomes(&f), ["shown", "accepted"]);
-    // The answer is never logged; its hash is.
+    // The answer is never logged; its keyed MAC is (coordinator finding
+    // T2), and so is the preview's (review I2): no bare sha256 of either.
     let runs = records(&f, "blind_run");
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["answer_sha256"], sha_hex(ANSWER_SPEC).as_str());
+    let k = index_key(&f);
+    let mac = saiife_daemon::blind::audit::answer_mac(&k, ANSWER_SPEC);
+    assert_eq!(runs[0]["answer_mac"], mac.as_str());
+    assert!(runs[0].get("answer_sha256").is_none(), "{:?}", runs[0]);
+    let text = preview["text"].as_str().unwrap();
+    let pmac = saiife_daemon::blind::audit::preview_mac(&k, text);
+    for r in records(&f, "blind_preview") {
+        assert_eq!(r["preview_mac"], pmac.as_str(), "{r}");
+        assert!(r.get("sha256").is_none(), "{r}");
+    }
     let logs = raw_dir(&f.audit);
     assert!(!logs.contains("18,420.00") && !logs.contains("Anna"));
+    assert!(!logs.contains(&sha_hex(ANSWER_SPEC)), "a bare answer hash");
+    assert!(!logs.contains(&sha_hex(text)), "a bare preview hash");
     assert!(records(&f, "blind_check_refused").is_empty());
     // Kept for `methods approve` (R48-1); another run does not fit.
     assert_eq!(is_answered(&f, &id), Ok(true));
@@ -1451,7 +1474,7 @@ async fn checker_refusal_end_to_end() {
     // The method ran; no answer was shown.
     let runs = records(&f, "blind_run");
     assert_eq!(runs.len(), 1);
-    assert!(runs[0]["answer_sha256"].is_null(), "{:?}", runs[0]);
+    assert!(runs[0]["answer_mac"].is_null(), "{:?}", runs[0]);
     // The brief's `in Q3` itself never reaches the run: the template parse
     // refuses it before the preview (`template_slot`, retried, R48-2).
     let t = scratch();
@@ -1566,31 +1589,30 @@ async fn preview_required_blocks_yes() {
     assert_eq!(step["kind"], "preview", "{step}");
 }
 
-/// Plan 44 R44-5: the session keeps the turn; the next ask's context holds
-/// its stand-in and the same customer gets the same symbol, so the method
-/// binds the same key; `--new-session` starts over. A question that only
-/// points back ("and her open invoices?") still binds only what it
-/// resolved itself: the method has no `:p1` to use.
+/// The follow-up's method: her invoices through a context symbol.
+const M_HERS: &str = "SELECT COUNT(*) AS n FROM invoices i \
+    JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
+const T_HERS: &str = "There are {int(n)} invoices for {param(p1)}.";
+/// The follow-up names no one (and no public value: `open` would be a
+/// parameter of its own).
+const Q_HERS: &str = "And her invoices?";
+
+/// A reply whose `:p1` is the context entity `symbol` (R44-5).
+fn context_reply(symbol: &str) -> String {
+    json!({"method": M_HERS, "template": T_HERS, "intent": "counts her invoices",
+           "context": [{"name": "p1", "symbol": symbol}]})
+    .to_string()
+}
+
+/// Plan 44 R44-5 (T2 review I1): the session keeps the turn; "and her
+/// invoices?" names no one, the planner uses the first turn's stand-in
+/// through `context`, and the method binds the key that turn resolved; the
+/// answer names her by the plain word only (R-C2). After `--new-session`
+/// the old symbol is refused (fail closed) and the customer gets another.
 #[tokio::test]
 async fn follow_up_uses_session_symbol() {
     let t = scratch();
-    let count = "SELECT COUNT(*) AS n FROM invoices i \
-                 JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
-    let t_count = "{param(p1)} has {int(n)} invoices.";
-    let counts = reply(count, t_count, "counts the invoices");
-    let f = fx(
-        t.path(),
-        &[
-            balance(),
-            counts.clone(),
-            counts.clone(),
-            counts.clone(),
-            counts.clone(),
-            counts.clone(),
-            counts,
-        ],
-    )
-    .await;
+    let f = fx(t.path(), &[balance()]).await;
     if no_calc("follow_up_uses_session_symbol") {
         return;
     }
@@ -1602,42 +1624,79 @@ async fn follow_up_uses_session_symbol() {
     let first = envelope_of(&outbox(&f)[0]);
     let sym = first["params"][0]["symbol"].as_str().unwrap().to_string();
     assert!(first["context"].as_array().unwrap().is_empty());
-    // The same customer again: the context holds the first turn, and the
-    // same stand-in binds the same key.
-    let (id, step) = ask_q(&f, "And the invoices of Søren Østergård?").await;
+    // The follow-up: no parameter of its own; the context holds the turn.
+    script(&f, &[context_reply(&sym)]);
+    let (id, step) = ask_q(&f, Q_HERS).await;
     assert_eq!(step["kind"], "preview", "{step}");
     let env = envelope_of(&outbox(&f)[1]);
+    assert!(env["params"].as_array().unwrap().is_empty(), "{env}");
     assert_eq!(
         env["context"],
         json!([{"question": "What is the balance of :p1?",
                 "params": [{"name": "p1", "ty": "entity:customers", "symbol": sym}]}])
     );
-    assert_eq!(env["params"][0]["symbol"], sym.as_str());
+    let text = step["text"].as_str().unwrap();
+    assert!(text.contains("the customer"), "{text}");
+    assert!(
+        !text.contains("Søren") && !text.contains("København"),
+        "{text}"
+    );
     let step = answer(&f, &id, json!({"run": true})).await;
-    assert_eq!(step["text"], "Søren Østergård has 250 invoices.");
-    // Only pointing back: the context has the stand-in, the question no
-    // parameter, so a method using `:p1` is not valid (R44-5).
-    let (_, step) = ask_q(&f, "And her invoices?").await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    // Søren's 250 invoices: his key was bound.
+    assert_eq!(step["text"], "There are 250 invoices for the customer.");
+    // The brief's own words: `open` is the question's `:p1` (a public
+    // value), so the context entity is the next name, `p2`.
+    let open = json!({
+        "method": "SELECT COUNT(*) AS n FROM invoices i \
+                   JOIN customers c ON c.id = i.customer_id \
+                   WHERE c.id = :p2 AND i.status = :p1",
+        "template": "There are {int(n)} {param(p1)} invoices for {param(p2)}.",
+        "intent": "counts her open invoices",
+        "context": [{"name": "p2", "symbol": sym}]});
+    script(&f, &[open.to_string()]);
+    let (id, step) = ask_q(&f, "And her open invoices?").await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    let step = answer(&f, &id, json!({"run": true})).await;
+    // Every second of Søren's invoices is open.
+    assert_eq!(
+        step["text"], "There are 125 open invoices for the customer.",
+        "{step}"
+    );
+    // A symbol the context does not hold is never bound (retried, refused).
+    script(&f, &vec![context_reply("Customer_ZZZZ"); 4]);
+    let (_, step) = ask_q(&f, Q_HERS).await;
     assert_refused(
         &step,
         "invalid_method",
         "the planner's method was not valid after 4 tries (param_misuse)",
     );
-    let env = envelope_of(&outbox(&f)[2]);
-    assert!(env["params"].as_array().unwrap().is_empty(), "{env}");
-    assert_eq!(env["context"][0]["params"][0]["symbol"], sym.as_str());
-    // A new session: no context, another stand-in.
+    // A new session: no context, so the old symbol fails closed too ...
+    script(&f, &vec![context_reply(&sym); 4]);
     let (_, step) = ask_with(
         &f,
-        json!({"question": "And the invoices of Søren Østergård?", "dataset": "crm",
+        json!({"question": Q_HERS, "dataset": "crm",
                "lang": "en", "new_session": true}),
     )
     .await;
-    assert_eq!(step["kind"], "preview", "{step}");
+    assert_refused(
+        &step,
+        "invalid_method",
+        "the planner's method was not valid after 4 tries (param_misuse)",
+    );
     let ob = outbox(&f);
     let env = envelope_of(ob.last().unwrap());
     assert!(env["context"].as_array().unwrap().is_empty(), "{env}");
-    assert_ne!(env["params"][0]["symbol"], sym.as_str());
+    // ... and the customer named again gets another stand-in.
+    script(&f, &[balance()]);
+    let (_, step) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    let ob = outbox(&f);
+    let env = envelope_of(ob.last().unwrap());
+    let sym2 = env["params"][0]["symbol"].as_str().unwrap();
+    assert!(sym2.starts_with("Customer_"), "{sym2}");
+    assert_ne!(sym2, sym.as_str());
+    assert_eq!(records(&f, "blind_run").len(), 3);
 }
 
 #[tokio::test]

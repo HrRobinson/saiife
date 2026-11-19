@@ -82,7 +82,11 @@ it.
 - Name every output column with AS.
 
 Never ask for, guess or write a real name, e-mail, phone number, address, account number or any \
-other real value, and never write a stand-in symbol into the method: use the parameter.
+other real value, and never write a stand-in symbol into the method: use the parameter. To use \
+an entity of an earlier question in the context that this question does not name (\"and her \
+open invoices?\"), add {\"name\": \"pN\", \"symbol\": its stand-in} to context, with N the next \
+number after the question's own parameters, and use :pN in the method. Use only symbols the \
+context holds.
 
 Write the answer template: short fixed text with slots in braces that saiife fills locally from \
 the method's result. A cell is a result column name (first row) or rN.column (row N, from 0). \

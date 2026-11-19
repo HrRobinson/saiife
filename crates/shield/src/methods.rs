@@ -359,6 +359,7 @@ mod tests {
                 checks: vec![SelfCheck::RowsBetween { min: 0, max: 1 }],
                 intent: "count".into(),
                 needs_judgment: false,
+                context: vec![],
             },
             preview_sha256: "ab".into(),
             approved_by: "boss".into(),

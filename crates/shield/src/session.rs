@@ -219,12 +219,54 @@ impl Session {
         v
     }
 
+    /// The entities the live context turns name (R44-5), each once: what a
+    /// planner reply may refer to by symbol
+    /// ([`crate::envelope::bind_context`]). Only symbols that a kept turn
+    /// holds and that still resolve (a collided short form does not);
+    /// take it when the envelope is built, so it is the context that was
+    /// sent.
+    pub fn context_entities(&self) -> Vec<ContextEntity> {
+        let mut v: Vec<ContextEntity> = Vec::new();
+        for (_, sym) in self.turns.iter().flat_map(|t| t.symbols.iter()) {
+            if v.iter().any(|e| e.symbol == *sym) {
+                continue;
+            }
+            if let Some((table, key)) = self.key_for_symbol(sym) {
+                v.push(ContextEntity {
+                    symbol: sym.clone(),
+                    table,
+                    key,
+                });
+            }
+        }
+        v
+    }
+
     /// Keeps the last 10 turns.
     pub fn push_turn(&mut self, t: Turn) {
         self.turns.push_back(t);
         while self.turns.len() > MAX_TURNS {
             self.turns.pop_front();
         }
+    }
+}
+
+/// An entity of the session's context: its stand-in and the key it stands
+/// for. Local only (the key never leaves); `Debug` shows the symbol and
+/// table, never the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ContextEntity {
+    pub symbol: String,
+    pub table: String,
+    pub key: i64,
+}
+
+impl std::fmt::Debug for ContextEntity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextEntity")
+            .field("symbol", &self.symbol)
+            .field("table", &self.table)
+            .finish_non_exhaustive()
     }
 }
 
