@@ -23,6 +23,7 @@ use saiife_ipc::msg::{
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, FixedDirectory, Fsync};
 use saiife_shield::dataset::{stage_snapshot, DatasetDir, Phase};
+use saiife_shield::lexicon::MAX_CANDIDATES;
 use saiife_shield::methods::{method_id, ApprovedMethod, MethodStatus, MethodStore};
 use saiife_shield::ner::{ListDetector, SpanLabel};
 use saiife_shield::plan::PlanReply;
@@ -41,6 +42,18 @@ use zeroize::Zeroizing;
 const OWN: u32 = 1000;
 const OTHER: u32 = 1001;
 const PASSWD: &str = "me:x:1000:1000::/home/me:/bin/sh\nyou:x:1001:1001::/home/you:/bin/sh\n";
+
+/// [`PASSWD`] and `u0`..`u15` (uids 2000..2015), for the daemon-wide cap.
+fn passwd() -> String {
+    let mut s = PASSWD.to_string();
+    for i in 0..16 {
+        s.push_str(&format!(
+            "u{i}:x:{u}:{u}::/home/u{i}:/bin/sh\n",
+            u = 2000 + i
+        ));
+    }
+    s
+}
 
 /// The balance method and its template (cloud names: no aliases here).
 const M_BAL: &str = "SELECT SUM(i.amount) AS owed, COUNT(*) AS n FROM invoices i \
@@ -74,6 +87,11 @@ struct Fx {
 /// Plan 43's fixture with three customers set by hand: 1 Søren Østergård
 /// (København), 2 Anna Berg (Aarhus), 3 Anna Berg (Odense). Any other row
 /// with one of those names is renamed, so the names are unique as stated.
+/// Task 2: 21 customers named Ida Holm (more than a pick list holds); the
+/// invoices of 1 to 3 are set by hand: Søren has [`SOREN_INVOICES`] (one a
+/// day from 2025-01-01), Anna of Aarhus 3 open ones of 18,420.00 together
+/// and a paid one, with a credit limit of 15,000.00, and Anna of Odense
+/// none.
 fn fixture_sqlite(root: &Path) -> PathBuf {
     let csv = root.join("csv");
     std::fs::create_dir_all(&csv).unwrap();
@@ -86,10 +104,18 @@ fn fixture_sqlite(root: &Path) -> PathBuf {
         .map(|r| r.unwrap().iter().map(str::to_string).collect())
         .collect();
     for r in rows.iter_mut() {
-        if (r[1] == "Søren" && r[2] == "Østergård") || (r[1] == "Anna" && r[2] == "Berg") {
+        if (r[1] == "Søren" && r[2] == "Østergård")
+            || (r[1] == "Anna" && r[2] == "Berg")
+            || (r[1] == "Ida" && r[2] == "Holm")
+        {
             r[2] = "Hansen".into();
         }
     }
+    for r in rows.iter_mut().skip(10).take(MAX_CANDIDATES + 1) {
+        r[1] = "Ida".into();
+        r[2] = "Holm".into();
+    }
+    rows[1][9] = "15000.00".into();
     for (i, (first, last, city)) in [
         ("Søren", "Østergård", "København"),
         ("Anna", "Berg", "Aarhus"),
@@ -109,6 +135,7 @@ fn fixture_sqlite(root: &Path) -> PathBuf {
     }
     w.flush().unwrap();
     drop(w);
+    set_invoices(&csv.join("invoices.csv"));
     let mut src = fixtures::MultiSource::csv_dir(&csv).unwrap();
     let dir = DatasetDir {
         root: root.join("make").join("crm"),
@@ -118,6 +145,65 @@ fn fixture_sqlite(root: &Path) -> PathBuf {
     std::fs::copy(&info.path, &out).unwrap();
     std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600)).unwrap();
     out
+}
+
+/// Søren's invoices (more than the 100-row list cap).
+const SOREN_INVOICES: usize = 250;
+
+/// The invoices of customers 1 to 3 as [`fixture_sqlite`] says.
+fn set_invoices(path: &Path) {
+    let mut rd = csv::Reader::from_path(path).unwrap();
+    let head = rd.headers().unwrap().clone();
+    let mut rows: Vec<Vec<String>> = rd
+        .records()
+        .map(|r| r.unwrap().iter().map(str::to_string).collect())
+        .filter(|r: &Vec<String>| !["1", "2", "3"].contains(&r[1].as_str()))
+        .collect();
+    let mut id = 100_000;
+    let mut add = |cid: &str, amount: &str, status: &str, issued: &str| {
+        id += 1;
+        let r = [&id.to_string(), cid, amount, status, issued, ""];
+        rows.push(r.iter().map(|s| s.to_string()).collect());
+    };
+    for (amount, issued) in [
+        ("6000.00", "2025-02-03"),
+        ("7000.00", "2025-03-04"),
+        ("5420.00", "2025-04-05"),
+    ] {
+        add("2", amount, "open", issued);
+    }
+    add("2", "999.00", "paid", "2025-01-02");
+    let day0 = 20_089; // 2025-01-01, in days since 1970-01-01
+    for n in 0..SOREN_INVOICES {
+        let status = if n % 2 == 0 { "paid" } else { "open" };
+        add(
+            "1",
+            &format!("{}.00", 100 + n),
+            status,
+            &iso_day(day0 + n as i64),
+        );
+    }
+    let mut w = csv::Writer::from_path(path).unwrap();
+    w.write_record(&head).unwrap();
+    for r in &rows {
+        w.write_record(r).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+/// `YYYY-MM-DD` of a day number (days since 1970-01-01).
+fn iso_day(days: i64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 const COLUMNS: &[(&str, &str)] = &[
@@ -135,7 +221,8 @@ const COLUMNS: &[(&str, &str)] = &[
     ("invoices.id", "identifier"),
     ("invoices.customer_id", "identifier"),
     ("invoices.amount", "sensitive"),
-    ("invoices.status", "quasi"),
+    // Public (k-floor values): a method may name `'open'` (plan 48 T2).
+    ("invoices.status", "public"),
     ("invoices.issued", "quasi"),
     ("invoices.notes", "free_text"),
 ];
@@ -217,7 +304,7 @@ async fn fx_mode(root: &Path, replies: &[String], mode: Mode, extra: &str) -> Fx
         fsync: Fsync::Always,
     };
     let (handle, _join) = writer::spawn(cw, cfg, None).unwrap();
-    let dirs: Arc<dyn Directory + Send + Sync> = Arc::new(FixedDirectory::from_text(PASSWD, ""));
+    let dirs: Arc<dyn Directory + Send + Sync> = Arc::new(FixedDirectory::from_text(&passwd(), ""));
     let ctx = Arc::new(Ctx::new(CtxInit {
         audit_dir: audit.clone(),
         mode,
@@ -226,6 +313,7 @@ async fn fx_mode(root: &Path, replies: &[String], mode: Mode, extra: &str) -> Fx
         vault: vault::open_with_key(Zeroizing::new([5; 32]), &state.join("vault/vault.bin")),
         ..CtxInit::minimal(handle, cfg, dirs, &state)
     }));
+    calc_seam();
     let sqlite = fixture_sqlite(root);
     let f = Fx {
         ctx,
@@ -1103,4 +1191,665 @@ async fn ask_args_are_checked() {
     // The only dataset is the default.
     let (_, step) = ask_with(&f, json!({"question": Q_STRANGER})).await;
     assert_eq!(step["kind"], "keep_name");
+}
+
+// ------------------------------------------------------ plan 48 Task 2 ----
+// Run, fill, check and answer (R48-3, R48-4, R48-2b, R-C3, R-C5, R-C12).
+// The calculator is the debug `saiife` of this target dir (`cargo build -p
+// saiife` first) through `SAIIFE_TEST_BLIND_CALC`; a kernel without
+// Landlock skips the tests that run a method.
+
+/// The spec's example (§5.2): Anna's open invoices against her limit.
+const M_SPEC: &str = "SELECT SUM(i.amount) AS owed, COUNT(*) AS n, \
+    c.credit_limit AS credit_limit FROM invoices i \
+    JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 AND i.status = 'open'";
+const T_SPEC: &str = "{param(p1)} owes {money(owed, NOK)} across {int(n)} open invoices. \
+    That is {cmp(owed, credit_limit)} her limit of {money(credit_limit, NOK)}.";
+const ANSWER_SPEC: &str = "Anna Berg owes 18,420.00 NOK across 3 open invoices. \
+    That is above her limit of 15,000.00 NOK.";
+
+/// The calculator seam, the same for every test (set once).
+fn calc_seam() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let exe = std::env::current_exe().unwrap();
+        let p = exe.parent().unwrap().parent().unwrap().join("saiife");
+        assert!(
+            p.is_file(),
+            "{} is missing: run `cargo build -p saiife` first",
+            p.display()
+        );
+        std::env::set_var(saiife_daemon::blind::calc::CALC_SEAM, p);
+    });
+}
+
+/// No Landlock: the method cannot run here, so the test is skipped.
+fn no_calc(name: &str) -> bool {
+    let none = saiife_system::sandbox::landlock_abi() == 0;
+    if none {
+        eprintln!("{name}: skipped: this kernel has no Landlock");
+    }
+    none
+}
+
+/// `q`, then pick `n`: (ask id, the preview step).
+async fn picked(f: &Fx, q: &str, n: usize) -> (String, Value) {
+    let (id, step) = ask_q(f, q).await;
+    assert_eq!(step["kind"], "pick", "{step}");
+    let step = answer(f, &id, json!({ "pick": n })).await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    (id, step)
+}
+
+fn run_line(preview: &Value, lang: Lang) -> String {
+    saiife_shield::answer::method_line(preview["text"].as_str().unwrap(), lang)
+}
+
+fn outcomes(f: &Fx) -> Vec<String> {
+    records(f, "blind_preview")
+        .iter()
+        .map(|r| r["outcome"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn sha_hex(s: &str) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn is_answered(f: &Fx, id: &str) -> Result<bool, String> {
+    f.ctx
+        .blind
+        .asks
+        .lock()
+        .unwrap()
+        .peek(id, OWN, |s| {
+            matches!(s.phase, ask::AskPhase::Answered { .. })
+        })
+        .map_err(|r| r.text)
+}
+
+/// A refusal after the run (R48-4): the head, the reason, the method line;
+/// its `blind_check_refused` names the code, never the text.
+fn assert_refused_after_run(f: &Fx, step: &Value, code: &str, reason: &str, preview: &Value) {
+    assert_refused(step, code, reason);
+    assert_eq!(step["head"], ask::head_no_answer(Lang::En), "{step}");
+    assert_eq!(step["method_line"], run_line(preview, Lang::En).as_str());
+    let r = records(f, "blind_check_refused");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0]["reason"], code);
+}
+
+#[tokio::test]
+async fn answer_spec_example() {
+    let t = scratch();
+    let f = fx(t.path(), &[reply(M_SPEC, T_SPEC, "sums the open invoices")]).await;
+    if no_calc("answer_spec_example") {
+        return;
+    }
+    let (id, preview) = picked(&f, Q_ANNA, 1).await;
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    // R-C3: the user's words, never the key.
+    assert_eq!(step["text"], ANSWER_SPEC);
+    let line = step["method_line"].as_str().unwrap();
+    assert_eq!(line, run_line(&preview, Lang::En));
+    assert!(line.starts_with("── method: summed all invoices"), "{line}");
+    assert!(!line.contains("I'm") && !line.contains("#2"), "{line}");
+    assert_eq!(
+        step["footer"],
+        "── exact · new method · 0 personal values sent · 3/3 numbers checked"
+    );
+    assert_eq!(step["checked"], json!({"numbers": 3, "from_calc": 3}));
+    assert!(step.get("cap_note").is_none(), "{step}");
+    assert_eq!(outcomes(&f), ["shown", "accepted"]);
+    // The answer is never logged; its hash is.
+    let runs = records(&f, "blind_run");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["answer_sha256"], sha_hex(ANSWER_SPEC).as_str());
+    let logs = raw_dir(&f.audit);
+    assert!(!logs.contains("18,420.00") && !logs.contains("Anna"));
+    assert!(records(&f, "blind_check_refused").is_empty());
+    // Kept for `methods approve` (R48-1); another run does not fit.
+    assert_eq!(is_answered(&f, &id), Ok(true));
+    let v = answer_as(&f, OWN, &id, json!({"run": true})).await;
+    assert_eq!(err(&v).0, "bad_request", "{v}");
+    assert_eq!(records(&f, "blind_run").len(), 1);
+}
+
+/// R-C3: a template that prints the key (here as fixed text) is refused
+/// by the checker; the key never reaches the user.
+#[tokio::test]
+async fn key_in_template_refused_by_checker() {
+    let t = scratch();
+    let tpl = "{param(p1)} is customer 2 and owes {money(owed, NOK)} across {int(n)} \
+               open invoices.";
+    let f = fx(t.path(), &[reply(M_SPEC, tpl, "x")]).await;
+    if no_calc("key_in_template_refused_by_checker") {
+        return;
+    }
+    let (id, preview) = picked(&f, Q_ANNA, 1).await;
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_refused_after_run(
+        &f,
+        &step,
+        "check_failed",
+        "the number 2 is not from the calculator or your question",
+        &preview,
+    );
+    assert!(step.get("text").is_none(), "{step}");
+}
+
+#[tokio::test]
+async fn danish_answer() {
+    let t = scratch();
+    let m = "SELECT SUM(i.amount) AS owed, COUNT(*) AS n FROM invoices i \
+             JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 AND i.status = 'open'";
+    let tpl = "{param(p1)} skylder {money(owed, NOK)} fordelt på {int(n)} åbne fakturaer.";
+    let f = fx(
+        t.path(),
+        &[reply(m, tpl, "lægger de åbne fakturaer sammen")],
+    )
+    .await;
+    if no_calc("danish_answer") {
+        return;
+    }
+    let (id, step) = ask_with(
+        &f,
+        json!({"question": "Hvad er saldoen for Anna Berg?", "dataset": "crm", "lang": "da"}),
+    )
+    .await;
+    assert_eq!(step["kind"], "pick", "{step}");
+    let preview = answer(&f, &id, json!({"pick": 1})).await;
+    assert_eq!(preview["kind"], "preview", "{preview}");
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    assert_eq!(
+        step["text"],
+        "Anna Berg skylder 18.420,00 NOK fordelt på 3 åbne fakturaer."
+    );
+    let line = step["method_line"].as_str().unwrap();
+    assert_eq!(line, run_line(&preview, Lang::Da));
+    assert!(line.starts_with("── metode: lagde alle"), "{line}");
+    assert_eq!(
+        step["footer"],
+        "── præcis · ny metode · 0 personlige værdier sendt · 2/2 tal tjekket"
+    );
+}
+
+/// Review Focus 1: a resolved customer without invoices is never "owes 0".
+#[tokio::test]
+async fn no_rows_for_key_refuses_end_to_end() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    if no_calc("no_rows_for_key_refuses_end_to_end") {
+        return;
+    }
+    // Anna Berg of Odense has no invoices.
+    let (id, preview) = picked(&f, Q_ANNA, 2).await;
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_refused_after_run(
+        &f,
+        &step,
+        "empty_for_key",
+        "the method found no rows for Anna Berg",
+        &preview,
+    );
+    assert!(records(&f, "blind_run").is_empty());
+    // The ask has ended.
+    let v = answer_as(&f, OWN, &id, json!({"run": true})).await;
+    assert_eq!(err(&v).0, "bad_request", "{v}");
+}
+
+/// The method ran and matched nothing: `empty_result`, worded like
+/// `empty_for_key` (one text: `template::empty_result_reason`).
+#[tokio::test]
+async fn empty_result_refuses() {
+    let t = scratch();
+    let m = "SELECT SUM(i.amount) AS owed FROM invoices i \
+             JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 AND i.status = 'overdue'";
+    let f = fx(
+        t.path(),
+        &[reply(m, "{param(p1)} owes {money(owed)}.", "x")],
+    )
+    .await;
+    if no_calc("empty_result_refuses") {
+        return;
+    }
+    let (id, preview) = picked(&f, Q_ANNA, 1).await;
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_refused_after_run(
+        &f,
+        &step,
+        "empty_result",
+        saiife_shield::template::empty_result_reason(Lang::En),
+        &preview,
+    );
+}
+
+#[tokio::test]
+async fn checker_refusal_end_to_end() {
+    let t = scratch();
+    // "in Q3" is outside the template grammar (`Q3`: a number not set off
+    // by a space), so the planner would be asked again before the preview;
+    // the same claim in words passes the parse and the checker refuses it.
+    let tpl = "{param(p1)} owes {money(owed, NOK)} across {int(n)} invoices in the third \
+               quarter.";
+    let f = fx(t.path(), &[reply(M_BAL, tpl, "x")]).await;
+    if no_calc("checker_refusal_end_to_end") {
+        return;
+    }
+    let (id, preview) = picked(&f, Q_ANNA, 1).await;
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_refused_after_run(
+        &f,
+        &step,
+        "check_failed",
+        "the number third is not from the calculator or your question",
+        &preview,
+    );
+    // The method ran; no answer was shown.
+    let runs = records(&f, "blind_run");
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0]["answer_sha256"].is_null(), "{:?}", runs[0]);
+    // The brief's `in Q3` itself never reaches the run: the template parse
+    // refuses it before the preview (`template_slot`, retried, R48-2).
+    let t = scratch();
+    let q3 = "{param(p1)} owes {money(owed, NOK)} across {int(n)} invoices in Q3.";
+    let f = fx(t.path(), &vec![reply(M_BAL, q3, "x"); 4]).await;
+    let (id, _) = ask_q(&f, Q_ANNA).await;
+    let step = answer(&f, &id, json!({"pick": 1})).await;
+    assert_refused(
+        &step,
+        "invalid_method",
+        "the planner's method was not valid after 4 tries (template_slot)",
+    );
+    assert!(records(&f, "blind_run").is_empty());
+}
+
+#[tokio::test]
+async fn list_cap_note() {
+    let t = scratch();
+    let m = "SELECT MAX(i.issued) AS issued, SUM(i.amount) AS amount FROM invoices i \
+             JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1 GROUP BY i.id";
+    let f = fx(
+        t.path(),
+        &[reply(m, "{list(issued, amount)}", "lists the invoices")],
+    )
+    .await;
+    if no_calc("list_cap_note") {
+        return;
+    }
+    let (id, step) = ask_q(&f, "List the invoices of Søren Østergård.").await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    assert_eq!(step["cap_note"], "showing 100 of 250");
+    let text = step["text"].as_str().unwrap();
+    assert_eq!(text.lines().count(), 100);
+    // Date cells print as dates (plan 45 carry).
+    assert_eq!(text.lines().next(), Some("- 1 January 2025 · 100.00"));
+    assert!(!text.contains("2025-01"), "{text}");
+    assert_eq!(
+        step["footer"],
+        "── exact · new method · 0 personal values sent · 200/200 numbers checked"
+    );
+}
+
+#[tokio::test]
+async fn stop_refuses() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    let (id, step) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    let step = answer(&f, &id, json!({"run": false})).await;
+    assert_refused(&step, "stopped", "stopped before the method ran");
+    assert!(step.get("method_line").is_none(), "{step}");
+    assert_eq!(outcomes(&f), ["shown", "stopped"]);
+    assert!(records(&f, "blind_run").is_empty());
+    let v = answer_as(&f, OWN, &id, json!({"run": true})).await;
+    assert_eq!(err(&v).0, "bad_request", "{v}");
+}
+
+#[tokio::test]
+async fn yes_runs_but_shows_method() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    if no_calc("yes_runs_but_shows_method") {
+        return;
+    }
+    let (_, step) = ask_with(
+        &f,
+        json!({"question": Q_SOREN, "dataset": "crm", "lang": "en", "yes": true}),
+    )
+    .await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    // 250 invoices of 100.00 to 349.00.
+    assert_eq!(
+        step["text"],
+        "Søren Østergård owes 56,125.00 NOK across 250 invoices."
+    );
+    let preview = plan45_preview(&f, M_BAL, 1, "Søren Østergård, København");
+    assert_eq!(
+        step["method_line"],
+        saiife_shield::answer::method_line(&preview, Lang::En).as_str()
+    );
+    assert_eq!(outcomes(&f), ["auto"]);
+    assert_eq!(records(&f, "blind_run").len(), 1);
+}
+
+#[tokio::test]
+async fn preview_required_blocks_yes() {
+    let t = scratch();
+    let f = fx_mode(
+        t.path(),
+        &[balance()],
+        Mode::Personal,
+        "preview_required = true\n",
+    )
+    .await;
+    let (_, step) = ask_with(
+        &f,
+        json!({"question": Q_SOREN, "dataset": "crm", "lang": "en", "yes": true}),
+    )
+    .await;
+    assert_refused(
+        &step,
+        "preview_required",
+        &ask::preview_required_text("crm"),
+    );
+    assert_eq!(step["head"], ask::head_nothing_sent(Lang::En));
+    assert!(outbox(&f).is_empty());
+    assert!(records(&f, "blind_ask").is_empty());
+    // Without --yes: the preview.
+    let (_, step) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(step["kind"], "preview", "{step}");
+}
+
+/// Plan 44 R44-5: the session keeps the turn; the next ask's context holds
+/// its stand-in and the same customer gets the same symbol, so the method
+/// binds the same key; `--new-session` starts over. A question that only
+/// points back ("and her open invoices?") still binds only what it
+/// resolved itself: the method has no `:p1` to use.
+#[tokio::test]
+async fn follow_up_uses_session_symbol() {
+    let t = scratch();
+    let count = "SELECT COUNT(*) AS n FROM invoices i \
+                 JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1";
+    let t_count = "{param(p1)} has {int(n)} invoices.";
+    let counts = reply(count, t_count, "counts the invoices");
+    let f = fx(
+        t.path(),
+        &[
+            balance(),
+            counts.clone(),
+            counts.clone(),
+            counts.clone(),
+            counts.clone(),
+            counts.clone(),
+            counts,
+        ],
+    )
+    .await;
+    if no_calc("follow_up_uses_session_symbol") {
+        return;
+    }
+    let (id, _) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(
+        answer(&f, &id, json!({"run": true})).await["kind"],
+        "answer"
+    );
+    let first = envelope_of(&outbox(&f)[0]);
+    let sym = first["params"][0]["symbol"].as_str().unwrap().to_string();
+    assert!(first["context"].as_array().unwrap().is_empty());
+    // The same customer again: the context holds the first turn, and the
+    // same stand-in binds the same key.
+    let (id, step) = ask_q(&f, "And the invoices of Søren Østergård?").await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    let env = envelope_of(&outbox(&f)[1]);
+    assert_eq!(
+        env["context"],
+        json!([{"question": "What is the balance of :p1?",
+                "params": [{"name": "p1", "ty": "entity:customers", "symbol": sym}]}])
+    );
+    assert_eq!(env["params"][0]["symbol"], sym.as_str());
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_eq!(step["text"], "Søren Østergård has 250 invoices.");
+    // Only pointing back: the context has the stand-in, the question no
+    // parameter, so a method using `:p1` is not valid (R44-5).
+    let (_, step) = ask_q(&f, "And her invoices?").await;
+    assert_refused(
+        &step,
+        "invalid_method",
+        "the planner's method was not valid after 4 tries (param_misuse)",
+    );
+    let env = envelope_of(&outbox(&f)[2]);
+    assert!(env["params"].as_array().unwrap().is_empty(), "{env}");
+    assert_eq!(env["context"][0]["params"][0]["symbol"], sym.as_str());
+    // A new session: no context, another stand-in.
+    let (_, step) = ask_with(
+        &f,
+        json!({"question": "And the invoices of Søren Østergård?", "dataset": "crm",
+               "lang": "en", "new_session": true}),
+    )
+    .await;
+    assert_eq!(step["kind"], "preview", "{step}");
+    let ob = outbox(&f);
+    let env = envelope_of(ob.last().unwrap());
+    assert!(env["context"].as_array().unwrap().is_empty(), "{env}");
+    assert_ne!(env["params"][0]["symbol"], sym.as_str());
+}
+
+#[tokio::test]
+async fn blind_run_has_weaker_label() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    if no_calc("blind_run_has_weaker_label") {
+        return;
+    }
+    let (id, _) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(
+        answer(&f, &id, json!({"run": true})).await["kind"],
+        "answer"
+    );
+    let runs = records(&f, "blind_run");
+    assert_eq!(runs.len(), 1);
+    let r = &runs[0];
+    assert_eq!(r["ask"], id.as_str());
+    assert_eq!(r["calculator"], saiife_system::sandbox::CALC_LABEL);
+    assert!(r["calculator"].as_str().unwrap().contains("weaker"));
+    assert!(r["landlock_abi"].as_u64().unwrap() > 0, "{r}");
+    assert_eq!(r["seccomp"], true);
+    assert!(r["netns"].is_boolean(), "{r}");
+    assert_eq!(
+        r["method"],
+        saiife_shield::envelope::method_sha256(M_BAL).as_str()
+    );
+    let (m, _) = f.ctx.blind.live(&crm()).unwrap();
+    assert_eq!(r["snapshot_sha256"], m.snapshot_sha256.as_str());
+    // The band, unless the scrub took it (a band like `1-9` can match the
+    // dataset's known values; plan 47's record scrub, fail closed).
+    let scrubbed = records(&f, "blind_log_scrubbed")
+        .iter()
+        .any(|s| s["scrubbed_kind"] == "blind_run" && s["field"] == "rows_band");
+    assert!(r["rows_band"] == "1-9" || scrubbed, "{r}");
+}
+
+/// R-C12: the run checks the role again; a lost one ends the ask, nothing
+/// runs.
+#[tokio::test]
+async fn run_rechecks_the_role() {
+    let t = scratch();
+    let f = fx_mode(t.path(), &[balance()], Mode::Locked, BOTH).await;
+    let v = call_as(
+        &f,
+        OTHER,
+        OP_BLIND_ASK,
+        json!({"question": Q_SOREN, "dataset": "crm", "lang": "en"}),
+        vec![],
+    )
+    .await;
+    assert_eq!(v["step"]["kind"], "preview", "{v}");
+    let id = v["ask"].as_str().unwrap().to_string();
+    set_policy(&f, &policy_text(true, ME_ONLY));
+    let v = answer_as(&f, OTHER, &id, json!({"run": true})).await;
+    assert_eq!(
+        err(&v),
+        ("forbidden".to_string(), ask::ROLE_LOST.to_string())
+    );
+    assert!(records(&f, "blind_run").is_empty());
+    assert_eq!(records(&f, "blind_check_refused")[0]["reason"], "role_lost");
+    let v = answer_as(&f, OTHER, &id, json!({"run": true})).await;
+    assert_eq!(err(&v).0, "bad_request", "{v}");
+}
+
+/// M8: answered asks (kept for `methods approve`) are bounded per uid;
+/// the oldest goes first, and none of them blocks a new ask.
+#[tokio::test]
+async fn answered_asks_are_bounded() {
+    let t = scratch();
+    let f = fx(t.path(), &vec![balance(); ask::MAX_ANSWERED_PER_UID + 1]).await;
+    if no_calc("answered_asks_are_bounded") {
+        return;
+    }
+    let mut ids = Vec::new();
+    for _ in 0..=ask::MAX_ANSWERED_PER_UID {
+        let (id, step) = ask_with(
+            &f,
+            json!({"question": Q_SOREN, "dataset": "crm", "lang": "en", "yes": true}),
+        )
+        .await;
+        assert_eq!(step["kind"], "answer", "{step}");
+        ids.push(id);
+    }
+    assert_eq!(is_answered(&f, &ids[0]), Err(ask::NO_SUCH_ASK.to_string()));
+    for id in &ids[1..] {
+        assert_eq!(is_answered(&f, id), Ok(true));
+    }
+    // Open asks are counted apart.
+    for _ in 0..ask::MAX_OPEN_PER_UID {
+        assert_eq!(ask_q(&f, Q_ANNA).await.1["kind"], "pick");
+    }
+}
+
+// ---- T1 review M6: flows T1 did not test ----
+
+#[tokio::test]
+async fn too_many_pick_refuses() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    let (id, step) = ask_q(&f, "What is the balance of Ida Holm?").await;
+    assert_eq!(step["kind"], "pick", "{step}");
+    assert_eq!(step["too_many"], true);
+    assert_eq!(step["candidates"].as_array().unwrap().len(), MAX_CANDIDATES);
+    let step = answer(&f, &id, json!({"pick": 0})).await;
+    assert_refused(
+        &step,
+        "too_many",
+        &format!("more than {MAX_CANDIDATES} of that customer name; write more of the name"),
+    );
+    assert!(outbox(&f).is_empty());
+}
+
+#[tokio::test]
+async fn reply_leak_refuses() {
+    let t = scratch();
+    let f = fx(
+        t.path(),
+        &[reply(M_BAL, T_BAL, "sums what Søren Østergård owes")],
+    )
+    .await;
+    let (_, step) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(step["kind"], "refused", "{step}");
+    assert_eq!(step["code"], "leak", "{step}");
+    assert_eq!(step["head"], ask::head_no_answer(Lang::En));
+    assert_eq!(outbox(&f).len(), 1);
+}
+
+#[tokio::test]
+async fn envelope_block_refuses() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    let (_, step) = ask_q(&f, BLOCKED_Q).await;
+    assert_eq!(step["kind"], "refused", "{step}");
+    assert_eq!(step["code"], "blocked", "{step}");
+    assert_eq!(step["head"], ask::head_nothing_sent(Lang::En));
+    let reason = step["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("this would send ")
+            && reason
+                .ends_with("; nothing was sent. Rephrase the question, or ask without the name"),
+        "{reason}"
+    );
+    assert!(outbox(&f).is_empty());
+    assert!(records(&f, "blind_send").is_empty());
+}
+
+/// A question whose envelope the firewall stops: a customer's email
+/// address left in the text.
+const BLOCKED_Q: &str = "What is the balance of Søren Østergård, soren.oster@example.invalid?";
+
+/// R48-1: at most 64 open asks per daemon (`busy`).
+#[tokio::test]
+async fn daemon_open_asks_are_capped() {
+    let t = scratch();
+    let users: Vec<String> = (0..16).map(|i| format!("\"u{i}\"")).collect();
+    let extra = format!(
+        "users = [\"me\", \"you\", {}]\napprovers = [\"me\"]\n",
+        users.join(", ")
+    );
+    let f = fx_mode(t.path(), &[], Mode::Locked, &extra).await;
+    let ask_as = |uid: u32| {
+        call_as(
+            &f,
+            uid,
+            OP_BLIND_ASK,
+            json!({"question": Q_ANNA, "dataset": "crm", "lang": "en"}),
+            vec![],
+        )
+    };
+    for u in 0..16 {
+        for _ in 0..ask::MAX_OPEN_PER_UID {
+            let v = ask_as(2000 + u).await;
+            assert_eq!(v["step"]["kind"], "pick", "{v}");
+        }
+    }
+    assert_eq!(f.ctx.blind.asks.lock().unwrap().len(), ask::MAX_OPEN);
+    let v = ask_as(OWN).await;
+    assert_eq!(
+        err(&v),
+        (
+            "busy".to_string(),
+            format!(
+                "Data Shield has {} open asks; try again in a moment",
+                ask::MAX_OPEN
+            )
+        )
+    );
+}
+
+/// R48-4: a reused method's footer names it; `blind_run` holds its id.
+#[tokio::test]
+async fn approved_method_footer() {
+    let t = scratch();
+    let f = fx(t.path(), &[]).await;
+    if no_calc("approved_method_footer") {
+        return;
+    }
+    let mid = approved(&f, Q_ANNA, M_BAL, T_BAL, MethodStatus::Active);
+    let (id, preview) = picked(&f, Q_ANNA, 1).await;
+    assert_eq!(preview["approved"], mid.as_str());
+    let step = answer(&f, &id, json!({"run": true})).await;
+    assert_eq!(
+        step["text"],
+        "Anna Berg owes 19,419.00 NOK across 4 invoices."
+    );
+    assert_eq!(
+        step["footer"],
+        format!(
+            "── exact · method {mid} (approved) · 0 personal values sent · 2/2 numbers checked"
+        )
+    );
+    assert_eq!(records(&f, "blind_run")[0]["method"], mid.as_str());
+    assert!(outbox(&f).is_empty());
 }

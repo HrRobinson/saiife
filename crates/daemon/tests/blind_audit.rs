@@ -224,6 +224,7 @@ fn every_variant() -> Vec<BlindRecord> {
             landlock_abi: 4,
             seccomp: true,
             netns: true,
+            answer_sha256: Some(sha('3')),
         },
         BlindRecord::CheckRefused {
             ask: "a1".into(),

@@ -73,6 +73,9 @@ pub enum BlindRecord {
         landlock_abi: u32,
         seccomp: bool,
         netns: bool,
+        /// Lowercase hex SHA-256 of the answer shown (R48-4, spec §6.5:
+        /// the text itself is never logged); none when it was refused.
+        answer_sha256: Option<String>,
     },
     CheckRefused {
         ask: String,
@@ -261,6 +264,7 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
             landlock_abi,
             seccomp,
             netns,
+            answer_sha256,
         } => (
             "blind_run",
             vec![
@@ -273,6 +277,7 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
                 ("landlock_abi", json!(landlock_abi)),
                 ("seccomp", json!(seccomp)),
                 ("netns", json!(netns)),
+                ("answer_sha256", json!(answer_sha256)),
             ],
         ),
         BlindRecord::CheckRefused { ask, reason } => (

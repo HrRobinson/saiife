@@ -21,6 +21,9 @@
 //! (`blind_ask`), counts (`blind_resolve`) and hashes (`blind_preview`).
 //! Every refused step carries a machine `code` (R-C5) so a later step can
 //! key on it (`identifier_output`: the reveal, plan 49).
+//!
+//! The run after the preview (Task 2) is in the child module `run`
+//! (`ask_run.rs`).
 
 use super::audit::{self, BlindRecord};
 use super::data::{self, LiveSnapshot};
@@ -52,6 +55,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "ask_run.rs"]
+mod run;
+pub use run::{
+    ACCEPT_UNRECORDED, FILL_FAILED, RUN_UNRECORDED, SANDBOX_TEXT, SELF_CHECK_FAILED, STOPPED,
+    STOP_UNRECORDED, TIME_CAP_TEXT,
+};
+
 // ------------------------------------------------------------ values ----
 
 /// An ask lives this long after its last step; an answered one is kept as
@@ -60,6 +70,11 @@ pub const ASK_TTL: Duration = Duration::from_secs(600);
 /// Open asks per uid and per daemon (R48-1).
 pub const MAX_OPEN_PER_UID: usize = 4;
 pub const MAX_OPEN: usize = 64;
+/// Answered asks kept for `methods approve` (R48-1), per uid and per
+/// daemon (T1 review M8): over either, the oldest answered ask goes. They
+/// do not count against the open-ask limits.
+pub const MAX_ANSWERED_PER_UID: usize = 4;
+pub const MAX_ANSWERED: usize = 64;
 /// The longest question, in characters.
 pub const MAX_QUESTION_CHARS: usize = 2_000;
 /// Planner requests per ask before the preview: the first try plus 3
@@ -95,6 +110,10 @@ pub const UNRECORDED_NOTHING_SENT: &str = "the ask could not be recorded; nothin
 /// I3: the preview record failed after the planner was asked: the
 /// preview is not shown (never "nothing was sent").
 pub const PREVIEW_UNRECORDED: &str = "the preview could not be recorded, so it was not shown";
+/// R48-3: `--yes` on a dataset whose policy wants the preview.
+pub fn preview_required_text(dataset: &str) -> String {
+    format!("{dataset} needs the method preview before it runs: ask again without --yes")
+}
 /// `{"keep_name": true}` on `blind.ask.answer`: only the touch keeps a name.
 pub const KEEP_NEEDS_TOUCH: &str =
     "keeping a name as plain text needs a touch (blind:name): blind.touch.begin {purpose: name}";
@@ -125,6 +144,24 @@ pub mod code {
     pub const LEAK: &str = "leak";
     /// The request or its reply could not be recorded (R-C9).
     pub const UNRECORDED: &str = "unrecorded";
+    /// `--yes` on a dataset whose policy wants the preview (R48-3).
+    pub const PREVIEW_REQUIRED: &str = "preview_required";
+    /// The user stopped at the preview (Task 2).
+    pub const STOPPED: &str = "stopped";
+    /// After the run (Task 2): the entity has no rows (R45-6).
+    pub const EMPTY_FOR_KEY: &str = "empty_for_key";
+    /// After the run: the method matched nothing.
+    pub const EMPTY_RESULT: &str = "empty_result";
+    /// After the run: the checker (or a self-check, or the fill) refused.
+    pub const CHECK_FAILED: &str = "check_failed";
+    /// After the run: the method does not apply every part of the question.
+    pub const PARAM_MISUSE: &str = "param_misuse";
+    /// After the run: the dataset changed under the job.
+    pub const SNAPSHOT_MISMATCH: &str = "snapshot_mismatch";
+    /// After the run: the time or step cap.
+    pub const TIME_CAP: &str = "time_cap";
+    /// After the run: any other calculator refusal.
+    pub const CALC_REFUSED: &str = "calc_refused";
 }
 
 /// The head of a refusal made before anything was sent.
@@ -521,6 +558,8 @@ pub struct AskState {
     /// The asker's credentials of the latest step: the role is checked
     /// again with them before every step and every planner call (R-C12).
     peer: PeerCred,
+    /// What the envelope of the previewed method held (the footer's count).
+    sent: Sent,
 }
 
 impl std::fmt::Debug for AskState {
@@ -569,6 +608,36 @@ impl Asks {
             .filter(|s| s.phase.is_open())
             .map(|s| s.uid)
             .chain(self.working.values().copied())
+    }
+
+    /// Drops the oldest answered asks until one more of `uid`'s fits under
+    /// [`MAX_ANSWERED_PER_UID`] and [`MAX_ANSWERED`].
+    fn make_room_answered(&mut self, uid: u32) {
+        let answered = |s: &AskState| matches!(s.phase, AskPhase::Answered { .. });
+        loop {
+            let mine = self
+                .map
+                .values()
+                .filter(|s| s.uid == uid && answered(s))
+                .count();
+            let all = self.map.values().filter(|s| answered(s)).count();
+            let pick_mine = mine >= MAX_ANSWERED_PER_UID;
+            if !pick_mine && all < MAX_ANSWERED {
+                return;
+            }
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(_, s)| answered(s) && (!pick_mine || s.uid == uid))
+                .min_by_key(|(_, s)| s.last_step)
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => {
+                    self.map.remove(&id);
+                }
+                None => return,
+            }
+        }
     }
 
     /// Holds a new ask's slot for `uid` (R48-1 limits).
@@ -656,13 +725,19 @@ impl Drop for Working {
     }
 }
 
-/// Keeps `st` for its next step unless it ended.
+/// Keeps `st` for its next step unless it ended. An answered ask makes
+/// room first: at most [`MAX_ANSWERED_PER_UID`] per uid and
+/// [`MAX_ANSWERED`] per daemon are kept, the oldest go (T1 review M8).
 fn store(ctx: &Ctx, id: &str, mut st: AskState) {
     if matches!(st.phase, AskPhase::Done) {
         return;
     }
     st.last_step = Instant::now();
-    lock(&ctx.blind.asks).map.insert(id.to_string(), st);
+    let mut a = lock(&ctx.blind.asks);
+    if matches!(st.phase, AskPhase::Answered { .. }) {
+        a.make_room_answered(st.uid);
+    }
+    a.map.insert(id.to_string(), st);
 }
 
 fn new_id() -> Result<String, Refusal> {
@@ -802,6 +877,17 @@ pub async fn begin(
         .lang
         .unwrap_or_else(|| saiife_shield::lang::detect_lang(&args.question));
     let id = new_id()?;
+    // R48-3: such a dataset never runs a method unseen.
+    if args.yes && opts.preview_required {
+        return Ok((
+            id,
+            Step::refused(
+                code::PREVIEW_REQUIRED,
+                head_nothing_sent(lang0),
+                preview_required_text(name.as_str()),
+            ),
+        ));
+    }
     if args.judgment {
         return Ok((
             id,
@@ -858,6 +944,7 @@ pub async fn begin(
         chosen: Vec::new(),
         counts: Counts::default(),
         peer: peer.clone(),
+        sent: Sent::default(),
     };
     let q = args.question;
     let lang = args.lang;
@@ -904,15 +991,38 @@ pub async fn step(
 /// the caller drops the ask. The ask keeps running on its held build
 /// (P47-37); only the authorization is current.
 async fn still_allowed(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusal> {
-    let in_policy = ctx.policy().system.as_ref().is_some_and(|s| {
-        s.blind
-            .dataset
-            .iter()
-            .any(|d| d.name == st.dataset.as_str())
-    });
+    allowed(ctx, id, &Asker::of(st)).await
+}
+
+/// Who an ask belongs to, as R-C12 checks it (a copy: the check awaits).
+struct Asker {
+    uid: u32,
+    dataset: DatasetName,
+    peer: PeerCred,
+    snapshot: Arc<LiveSnapshot>,
+}
+
+impl Asker {
+    fn of(st: &AskState) -> Asker {
+        Asker {
+            uid: st.uid,
+            dataset: st.dataset.clone(),
+            peer: st.peer.clone(),
+            snapshot: Arc::clone(&st.snapshot),
+        }
+    }
+}
+
+/// [`still_allowed`] on a copy of the ask's owner.
+async fn allowed(ctx: &Ctx, id: &str, w: &Asker) -> Result<(), Refusal> {
+    let in_policy = ctx
+        .policy()
+        .system
+        .as_ref()
+        .is_some_and(|s| s.blind.dataset.iter().any(|d| d.name == w.dataset.as_str()));
     let why = if !in_policy {
         Some(("dataset_not_in_policy", DATASET_GONE))
-    } else if !super::ops::role_of(ctx, &st.peer, &st.dataset)
+    } else if !super::ops::role_of(ctx, &w.peer, &w.dataset)
         .await
         .may_ask()
     {
@@ -929,10 +1039,10 @@ async fn still_allowed(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusal
     };
     if audit::write(
         ctx,
-        st.uid,
-        st.dataset.as_str(),
+        w.uid,
+        w.dataset.as_str(),
         r,
-        st.snapshot.open.index.as_ref(),
+        w.snapshot.open.index.as_ref(),
     )
     .await
     .is_err()
@@ -944,23 +1054,31 @@ async fn still_allowed(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusal
 
 /// R-C12, after a policy reload: every kept ask whose asker lost the role
 /// (or whose dataset left policy) is dropped, with its refusal record.
-/// Asks in flight are checked by their next step or planner call.
+/// Asks in flight are checked by their next step or planner call. The
+/// asks stay in the map while their copies are checked (T1 re-review
+/// RR1): a step meanwhile finds its ask, and the open-ask limits hold;
+/// only the asks that failed are removed afterwards.
 pub async fn policy_reloaded(ctx: &Arc<Ctx>) {
-    let kept: Vec<(String, AskState)> = {
+    let kept: Vec<(String, Asker)> = {
         let mut a = lock(&ctx.blind.asks);
         a.sweep(Instant::now());
-        std::mem::take(&mut a.map).into_iter().collect()
+        a.map
+            .iter()
+            .map(|(id, st)| (id.clone(), Asker::of(st)))
+            .collect()
     };
-    let mut keep = Vec::new();
-    for (id, st) in kept {
-        if still_allowed(ctx, &id, &st).await.is_ok() {
-            keep.push((id, st));
+    let mut gone = Vec::new();
+    for (id, w) in kept {
+        if allowed(ctx, &id, &w).await.is_err() {
+            gone.push((id, w.uid));
         }
     }
     let mut a = lock(&ctx.blind.asks);
-    for (id, st) in keep {
-        // A step that began meanwhile found no ask; nothing to merge.
-        a.map.entry(id).or_insert(st);
+    for (id, uid) in gone {
+        // A step that took the ask meanwhile checks it again itself.
+        if a.map.get(&id).is_some_and(|s| s.uid == uid) {
+            a.map.remove(&id);
+        }
     }
 }
 
@@ -1031,13 +1149,7 @@ async fn advance(
         p @ AskPhase::Previewing { .. } => {
             st.phase = p;
             match a {
-                // Task 2 runs the method.
-                AskAnswer::Run(_) => (
-                    st,
-                    Err(unavailable(
-                        "running the method is not available in this build yet",
-                    )),
-                ),
+                AskAnswer::Run(go) => run::run_or_stop(ctx, id, st, go, true).await,
                 _ => (st, Err(misfit())),
             }
         }
@@ -1559,12 +1671,10 @@ async fn finish_preview(
     } else {
         intent_line(&reply.intent, d.lang)
     };
-    let r = BlindRecord::Preview {
-        ask: id.to_string(),
-        sha256: p.sha256.clone(),
-        outcome: "shown",
-        fragments: u32::try_from(p.fragments).unwrap_or(u32::MAX),
-    };
+    // `--yes` (R48-3): the preview is not waited for; it is recorded as
+    // `auto` and becomes the answer's method line.
+    let outcome = if st.opts.yes { "auto" } else { "shown" };
+    let r = run::preview_record(id, &p, outcome);
     // Reuse sent nothing; the planner path asked the planner.
     let failed = if approved.is_some() {
         UNRECORDED_NOTHING_SENT
@@ -1581,6 +1691,7 @@ async fn finish_preview(
         sent,
         envelope,
     };
+    st.sent = sent;
     st.phase = AskPhase::Previewing {
         draft: d,
         validated: v,
@@ -1588,6 +1699,9 @@ async fn finish_preview(
         preview: p,
         approved,
     };
+    if st.opts.yes {
+        return run::run_or_stop(ctx, id, st, true, false).await;
+    }
     (st, Ok(step))
 }
 
