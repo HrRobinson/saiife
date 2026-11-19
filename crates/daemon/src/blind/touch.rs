@@ -217,6 +217,11 @@ pub const NOT_ANSWERED: &str =
 pub const USES_CONTEXT: &str = "this method refers to someone from an earlier question in the \
      session, so it only works in that session and cannot be approved for reuse; ask again \
      with the name in the question, then approve that";
+/// `approve` of an ask that kept a name as plain text (T3 review I1): the
+/// name would be saved in the template key, and maybe in the method, and
+/// listed by `methods ls`.
+pub const KEPT_NAME: &str = "this answer kept a name as plain text, so it cannot be approved \
+     for reuse: a kept name is never saved; ask again without keeping the name";
 /// The approval was stored but its record failed: undone.
 pub const APPROVE_UNRECORDED: &str = "the approval could not be recorded, so it was not kept";
 /// A change whose record failed: not made.
@@ -399,7 +404,24 @@ fn approvable(f: &ForApprove) -> Result<(), Refusal> {
     if !f.reply.context.is_empty() {
         return Err(bad(USES_CONTEXT));
     }
+    if f.kept_name || holds_released(f) {
+        return Err(bad(KEPT_NAME));
+    }
     Ok(())
+}
+
+/// Whether a name released in the session when the method was planned is
+/// in anything approve would store (key, method, template, checks,
+/// intent): normalized as the index folds names.
+fn holds_released(f: &ForApprove) -> bool {
+    use saiife_shield::norm::normalize;
+    // The whole reply as stored (method, template, checks, intent).
+    let reply = serde_json::to_string(&f.reply).unwrap_or_default();
+    let stored = [normalize(&f.template_key), normalize(&reply)];
+    f.released
+        .iter()
+        .map(|n| normalize(n))
+        .any(|n| !n.trim().is_empty() && stored.iter().any(|s| s.contains(n.as_str())))
 }
 
 async fn plan_approve(ctx: &Ctx, peer: &PeerCred, a: &Map<String, Value>) -> Result<Plan, Refusal> {
@@ -1053,6 +1075,47 @@ mod tests {
         .to_value(1);
         assert_eq!(v["message"], t.as_str());
         assert_eq!(v["rule"], "touch_unavailable");
+    }
+
+    /// T3 review I1: an ask that kept a name, or a stored text holding a
+    /// name released earlier in the session, is never approved (`approvable`
+    /// runs at begin and again at commit).
+    #[test]
+    fn kept_names_are_never_approved() {
+        use saiife_shield::plan::PlanReply;
+        let base = ForApprove {
+            dataset: "crm".parse().unwrap(),
+            lang: saiife_shield::schema::Lang::En,
+            template_key: "what is the balance of :p1".into(),
+            param_tags: vec!["entity:customers".into()],
+            reply: PlanReply {
+                method: "SELECT COUNT(*) AS n FROM customers c".into(),
+                template: "There are {int(n)} customers.".into(),
+                checks: vec![],
+                intent: "counts".into(),
+                needs_judgment: false,
+                context: vec![],
+            },
+            preview_text: "p".into(),
+            preview_mac: "m".into(),
+            reused: None,
+            kept_name: false,
+            released: vec!["Zed Quorra".into()],
+        };
+        assert!(approvable(&base).is_ok(), "an unrelated released name");
+        let refused = |f: &ForApprove| approvable(f).unwrap_err().text;
+        let mut f = base.clone();
+        f.kept_name = true;
+        assert_eq!(refused(&f), KEPT_NAME);
+        let mut f = base.clone();
+        f.template_key = "what is the balance of zed quorra".into();
+        assert_eq!(refused(&f), KEPT_NAME);
+        let mut f = base.clone();
+        f.reply.template = "ZED QUORRA has {int(n)} rows.".into();
+        assert_eq!(refused(&f), KEPT_NAME);
+        let mut f = base.clone();
+        f.reply.intent = "about Zed  Quorra".into();
+        assert_eq!(refused(&f), KEPT_NAME);
     }
 
     #[test]

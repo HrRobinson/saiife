@@ -1105,3 +1105,51 @@ async fn approve_refuses_a_context_method() {
     );
     assert_eq!(pending(&f), 0);
 }
+
+/// T3 review I1: an answer whose question kept a name is never approved:
+/// the name would be saved in the template key (and maybe the method) and
+/// listed by `methods ls`. Refused before any challenge.
+#[tokio::test]
+async fn approve_refuses_an_ask_that_kept_a_name() {
+    let t = scratch();
+    let f = fx(t.path(), &[reply(M_COUNT, T_COUNT)]).await;
+    if no_calc("approve_refuses_an_ask_that_kept_a_name") {
+        return;
+    }
+    let s = enrol(&f, OWN);
+    let (id, step) = ask_as(&f, OWN, Q_STRANGER).await;
+    assert_eq!(step["kind"], "keep_name", "{step}");
+    let v = touch_as(
+        &f,
+        OWN,
+        &s,
+        json!({"purpose": "name", "ask": id, "name": "Zed Quorra"}),
+    )
+    .await;
+    assert_eq!(v["step"]["kind"], "preview", "{v}");
+    let step = answer_as(&f, OWN, &id, json!({"run": true})).await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    let v = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
+    assert_eq!(
+        err(&v),
+        ("bad_request".to_string(), touch::KEPT_NAME.to_string())
+    );
+    assert_eq!(pending(&f), 0);
+    // Nothing saved, nothing listed, nothing logged with the name.
+    assert!(methods(&f).methods.is_empty());
+    let mj = f.ctx.blind.dataset_dir(&crm()).root.join("methods.json");
+    let text = std::fs::read_to_string(&mj).unwrap_or_default();
+    assert!(!text.contains("Zed") && !text.contains("zed"), "{text}");
+    let v = call(
+        &f,
+        saiife_ipc::msg::OP_BLIND_METHODS_LIST,
+        json!({"dataset": "crm"}),
+        vec![],
+    )
+    .await;
+    ok(&v);
+    assert_eq!(v["methods"], json!([]));
+    assert!(records(&f, "blind_approve").is_empty());
+    let logs = raw_dir(&f.audit).to_lowercase();
+    assert!(!logs.contains("zed") && !logs.contains("quorra"));
+}

@@ -573,6 +573,10 @@ pub struct AskState {
     template: Option<(String, Vec<String>)>,
     /// The approved method the preview reused, if any.
     reused: Option<String>,
+    /// Every name the firewall let pass as released when the method was
+    /// planned (the session's and this ask's): approve refuses a method
+    /// that holds one (plan 48 T3 review I1).
+    planned_released: Vec<String>,
 }
 
 /// What `methods approve` takes from an answered ask (plan 48 T3).
@@ -590,6 +594,10 @@ pub struct ForApprove {
     pub preview_mac: String,
     /// The approved method the ask reused, if any.
     pub reused: Option<String>,
+    /// Whether this ask kept a name through a `blind:name` touch.
+    pub kept_name: bool,
+    /// The names released when the method was planned (session and ask).
+    pub released: Vec<String>,
 }
 
 impl std::fmt::Debug for ForApprove {
@@ -633,6 +641,8 @@ impl AskState {
             preview_text: preview.text.clone(),
             preview_mac: self.preview_mac.clone(),
             reused: self.reused.clone(),
+            kept_name: !self.released.is_empty() || self.counts.kept_names > 0,
+            released: self.planned_released.clone(),
         })
     }
 }
@@ -1033,6 +1043,7 @@ pub async fn begin(
         preview_mac: String::new(),
         template: None,
         reused: None,
+        planned_released: Vec::new(),
     };
     let q = args.question;
     let lang = args.lang;
@@ -1700,6 +1711,7 @@ async fn proceed(
             Err(e) => return (st, Err(shield_err(&e))),
         };
         released.extend(st.released.iter().cloned());
+        st.planned_released.clone_from(&released);
         let fw = Firewall {
             index,
             allow: &snap.open.allow,
