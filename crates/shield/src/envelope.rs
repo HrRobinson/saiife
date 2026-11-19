@@ -333,6 +333,34 @@ pub fn logged_question(d: &Draft, session: &mut Session, schema: &Schema) -> Str
     out
 }
 
+/// The session turn of an ask whose method ran (plan 48 T2, R44-5): the
+/// parameterized question `d.text`, each entity parameter bound to exactly
+/// one key with its session stand-in (the same [`Session::symbol_for`] as
+/// [`build_envelope`]), and the names a `blind:name` touch released in the
+/// ask. The caller pushes it with [`Session::push_turn`]; later envelopes
+/// send it as context.
+pub fn turn_for(d: &Draft, session: &mut Session, schema: &Schema, released: Vec<String>) -> Turn {
+    let symbols = d
+        .params
+        .iter()
+        .filter_map(|p| match (&p.ty, &p.bound) {
+            (ParamType::Entity { table, word }, Some(Bound::Keys(keys))) if keys.len() == 1 => {
+                let w = schema
+                    .entity_for(table)
+                    .map_or(word.as_str(), |e| e.word.as_str())
+                    .to_string();
+                Some((p.name.clone(), session.symbol_for(&w, table, keys[0])))
+            }
+            _ => None,
+        })
+        .collect();
+    Turn {
+        question: d.text.clone(),
+        symbols,
+        released,
+    }
+}
+
 /// The text a context turn shows for a parameter that is not an entity
 /// (its type is not kept in the turn).
 pub const CONTEXT_VALUE: &str = "(value)";
@@ -550,6 +578,12 @@ mod tests {
             logged_question(&d, &mut s, &schema),
             format!("balance of {sym} and :p2 over :p3")
         );
+        // Plan 48 T2: the turn keeps the parameterized text and only the
+        // single-key entity's stand-in.
+        let t = turn_for(&d, &mut s, &schema, vec!["Zed Quorra".into()]);
+        assert_eq!(t.question, "balance of :p1 and :p2 over :p3");
+        assert_eq!(t.symbols, vec![("p1".to_string(), sym)]);
+        assert_eq!(t.released, vec!["Zed Quorra".to_string()]);
     }
 
     #[test]

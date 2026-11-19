@@ -534,6 +534,16 @@ pub fn empty_for_key_reason(d: &Draft, schema: &Schema, param: &str) -> String {
     }
 }
 
+/// The `empty_result` refusal reason (plan 48 T2): the method ran and found
+/// nothing (zero rows, or every aggregate NULL). Worded like
+/// [`empty_for_key_reason`]; the one text for it everywhere.
+pub fn empty_result_reason(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "the method found no matching rows",
+        Lang::Da => "metoden fandt ingen rækker, der passer",
+    }
+}
+
 /// Ruling F-n, the checker's side: an entity parameter's display may be
 /// shown only when it is the user's own words (a part of the question) or
 /// the plain word of its type.
@@ -904,7 +914,16 @@ fn fill_slot(s: &Slot, r: &ResultSet, params: &[Param], lang: Lang) -> Result<Ou
                         col: col.clone(),
                     };
                     match cell(r, &c)? {
-                        // Text is verbatim and is not a number source.
+                        // A date cell (ISO `YYYY-MM-DD`, how the snapshot
+                        // stores a `DATE`) prints as a date in the
+                        // answer's language and is a date source, as a
+                        // `{date(..)}` slot is (plan 48 T2).
+                        v @ CellValue::Text(_) if format_date(v, lang).is_some() => {
+                            let (t, iso) = format_date(v, lang).ok_or_else(check_failed)?;
+                            o.text.push_str(&t);
+                            o.dates.push(iso);
+                        }
+                        // Other text is verbatim and is not a number source.
                         CellValue::Text(t) => o.text.push_str(t),
                         v => {
                             let (t, d) = format_number(v, lang).ok_or_else(check_failed)?;

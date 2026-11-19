@@ -825,3 +825,60 @@ fn preview_params_use_the_users_words() {
         "anna berg"
     );
 }
+
+// ---- plan 48 T2: date cells in a list, the empty_result reason ----
+
+#[test]
+fn list_date_cells_print_as_dates() {
+    use saiife_shield::checker::check_text;
+    // A list of invoices with due dates: the date cells (ISO text, how the
+    // snapshot stores a DATE) print as dates and are date sources.
+    let r = rs(
+        &["due", "owed"],
+        vec![
+            vec![
+                CellValue::Text("2026-03-15".into()),
+                CellValue::Real(1200.5),
+            ],
+            vec![CellValue::Text("2026-12-01".into()), CellValue::Int(80)],
+        ],
+    );
+    let t = parse("{list(due, owed)}", &["due", "owed"]);
+    let f = fill(&t, &r, &[], Lang::En).unwrap();
+    assert_eq!(f.text, "- 15 March 2026 · 1,200.50\n- 1 December 2026 · 80");
+    assert_eq!(f.printed[0].dates, vec!["2026-03-15", "2026-12-01"]);
+    assert_eq!(f.printed[0].values, vec![dec("1200.50"), dec("80")]);
+    let rep = check_text(&f, "Which invoices are due?", Lang::En).unwrap();
+    assert_eq!(rep.numbers, rep.from_calc);
+    let f = fill(&t, &r, &[], Lang::Da).unwrap();
+    assert_eq!(
+        f.text,
+        "- 15. marts 2026 · 1.200,50\n- 1. december 2026 · 80"
+    );
+    check_text(&f, "Hvilke fakturaer forfalder?", Lang::Da).unwrap();
+    // Text that is not a date stays verbatim.
+    let r = rs(
+        &["due"],
+        vec![
+            vec![CellValue::Text("open".into())],
+            vec![CellValue::Text("2026-02-30".into())],
+        ],
+    );
+    let t = parse("{list(due)}", &["due"]);
+    let f = fill(&t, &r, &[], Lang::En).unwrap();
+    assert_eq!(f.text, "- open\n- 2026-02-30");
+    assert!(f.printed[0].dates.is_empty());
+}
+
+#[test]
+fn empty_result_reason_reads_like_empty_for_key() {
+    use saiife_shield::template::empty_result_reason;
+    assert_eq!(
+        empty_result_reason(Lang::En),
+        "the method found no matching rows"
+    );
+    assert_eq!(
+        empty_result_reason(Lang::Da),
+        "metoden fandt ingen rækker, der passer"
+    );
+}

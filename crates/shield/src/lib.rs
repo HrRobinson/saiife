@@ -2,6 +2,7 @@
 //! checking behind the blind-data path. Tokio-free (spec §4.2).
 #![forbid(unsafe_code)]
 
+pub mod answer;
 pub mod calc;
 pub mod calc_proto;
 pub mod checker;
