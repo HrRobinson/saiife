@@ -278,6 +278,15 @@ trait PipeOpen {
     fn open(&self) -> io::Result<Self::Stream>;
     /// The owner of the pipe behind this very handle, as a SID.
     fn owner_sid(&self, stream: &Self::Stream) -> io::Result<String>;
+    /// The time the retry loop reads. A seam for the tests, which run it on a clock of
+    /// their own; the real pipe keeps the default.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    /// Wait out the pause before a busy pipe is opened again (the default sleeps).
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 /// How long to wait before opening a busy pipe again (W11).
@@ -297,11 +306,15 @@ fn connect_pipe_via<O: PipeOpen>(
 ) -> Result<Client, ClientError> {
     let path = Path::new(name);
     let stream = loop {
-        let left = remaining(deadline).ok_or(ClientError::Timeout)?;
+        // As `remaining`, on the opener's clock.
+        let left = deadline.saturating_duration_since(opener.now());
+        if left < Duration::from_millis(1) {
+            return Err(ClientError::Timeout);
+        }
         match opener.open() {
             Ok(s) => break s,
             Err(e) if e.raw_os_error() == Some(saiife_win::pipe::ERROR_PIPE_BUSY) => {
-                std::thread::sleep(left.min(PIPE_BUSY_RETRY));
+                opener.pause(left.min(PIPE_BUSY_RETRY));
             }
             Err(e) => return Err(ClientError::Connect(e)),
         }
@@ -779,7 +792,7 @@ mod pipe_tests {
     use crate::frame::{encode, read_frame};
     use saiife_win::pipe::ERROR_PIPE_BUSY;
     use serde_json::json;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -852,6 +865,10 @@ mod pipe_tests {
         busy_for: Cell<u32>,
         opens: Cell<u32>,
         open_err: Option<i32>,
+        /// The retry loop's clock: it moves only when the loop pauses, so no test of
+        /// it depends on how fast the machine is.
+        clock: Cell<Instant>,
+        pauses: RefCell<Vec<Duration>>,
     }
 
     fn fake(owner: &str, reply: Vec<u8>) -> Fake {
@@ -864,6 +881,8 @@ mod pipe_tests {
             busy_for: Cell::new(0),
             opens: Cell::new(0),
             open_err: None,
+            clock: Cell::new(Instant::now()),
+            pauses: RefCell::new(Vec::new()),
         }
     }
 
@@ -886,6 +905,15 @@ mod pipe_tests {
                 write_hangs: self.script.write_hangs,
                 drip: self.script.drip,
             })
+        }
+
+        fn now(&self) -> Instant {
+            self.clock.get()
+        }
+
+        fn pause(&self, d: Duration) {
+            self.pauses.borrow_mut().push(d);
+            self.clock.set(self.clock.get() + d);
         }
 
         fn owner_sid(&self, _: &Stream) -> io::Result<String> {
@@ -963,18 +991,33 @@ mod pipe_tests {
         assert_eq!(f.opens.get(), 4);
     }
 
+    /// On the fake's clock, which moves only by the pauses: 100 ms of deadline is exactly
+    /// ten 10 ms pauses, then the timeout, on a machine of any speed.
     #[test]
     fn busy_pipe_is_retried_until_the_deadline() {
         let s = system_sid();
         let f = fake(&s, hello_reply());
         f.busy_for.set(u32::MAX);
-        let t = Instant::now();
-        let r = connect_pipe_via(&f, NAME, &s, dl(100));
+        let r = connect_pipe_via(&f, NAME, &s, f.now() + Duration::from_millis(100));
         assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
-        assert!(t.elapsed() < Duration::from_millis(500));
         // Every 10 ms, so a handful of tries, not a spin.
-        assert!((2..=20).contains(&f.opens.get()), "{}", f.opens.get());
+        assert_eq!(f.opens.get(), 10);
+        assert_eq!(*f.pauses.borrow(), vec![PIPE_BUSY_RETRY; 10]);
         assert!(sent(&f).is_empty());
+    }
+
+    /// The last pause is cut to what is left of the deadline, never past it.
+    #[test]
+    fn the_last_busy_pause_ends_at_the_deadline() {
+        let s = system_sid();
+        let f = fake(&s, hello_reply());
+        f.busy_for.set(u32::MAX);
+        let start = f.now();
+        let r = connect_pipe_via(&f, NAME, &s, start + Duration::from_millis(25));
+        assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
+        let ms = Duration::from_millis;
+        assert_eq!(*f.pauses.borrow(), vec![ms(10), ms(10), ms(5)]);
+        assert_eq!(f.now(), start + ms(25));
     }
 
     /// A pipe that does not exist is no reason to wait: only a busy one is.
@@ -992,7 +1035,7 @@ mod pipe_tests {
     fn expired_deadline_never_opens() {
         let s = system_sid();
         let f = fake(&s, hello_reply());
-        let r = connect_pipe_via(&f, NAME, &s, Instant::now());
+        let r = connect_pipe_via(&f, NAME, &s, f.now());
         assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
         assert_eq!(f.opens.get(), 0);
     }

@@ -97,6 +97,7 @@ pub fn info(r: &BoxRecord, queue_pos: Option<u32>) -> BoxInfo {
         updated_at: r.updated_at,
         queue_pos,
         lands: r.lands,
+        guard_skipped: r.guard_skipped,
     }
 }
 
@@ -294,8 +295,12 @@ impl BoxSource for ManagerSource {
     }
 
     fn revise(&self, id: &BoxId, comment: &str) -> Result<(), BoxError> {
+        self.revise_noted(id, comment).map(|_| ())
+    }
+
+    fn revise_noted(&self, id: &BoxId, comment: &str) -> Result<Option<&'static str>, BoxError> {
         self.visible(id)?;
-        self.mgr.revise(id, comment).map(|_| ())
+        self.mgr.revise_noted(id, comment).map(|(_, note)| note)
     }
 
     /// Without a land book nothing is ever pending.

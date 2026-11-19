@@ -345,7 +345,9 @@ async fn store_new(
         .await;
         return Err("unrecorded".into());
     }
-    // A new request only (a dedupe hit returned above).
+    // A new request only (a dedupe hit returned above). It may be approved
+    // from the Workspace with a touch: a hub wake-up (content-free).
+    ctx.workspace.note_wake();
     ctx.notify(
         saiife_policy::Event::ApprovalCreated,
         Some(r.id),
@@ -2576,11 +2578,18 @@ mod tests {
             gateway: Some(Arc::new(g)),
             ..crate::ops::PolicyState::invalid(0)
         };
+        assert_eq!(ctx.workspace.wakes(), 0);
         let mut marked = pending(None, None);
         marked.capability = Some("objects:write".into());
         let id = create(&ctx, &marked, "claude").await.unwrap();
         let r = ctx.approvals.as_ref().unwrap().get(id).unwrap();
         assert_eq!(r.touch_class.as_deref(), Some("deploy"));
+        // A new request raises one content-free hub wake-up; the same one
+        // again (deduped) raises none.
+        assert_eq!(ctx.workspace.wakes(), 1);
+        let again = create(&ctx, &marked, "claude").await.unwrap();
+        assert_eq!(again, id);
+        assert_eq!(ctx.workspace.wakes(), 1);
 
         let mut plain = pending(Some("other"), None);
         plain.capability = Some("objects:read".into());

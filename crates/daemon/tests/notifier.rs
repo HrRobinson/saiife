@@ -197,18 +197,29 @@ impl World {
             .collect()
     }
 
-    /// Waits until `n` records satisfy `f`.
+    /// Waits until `n` records satisfy `f`, while they keep coming: it gives
+    /// up only after [`STALL`] without a new one, never at a total that a
+    /// loaded machine delivering many events in turn could run past.
     async fn wait(&self, n: usize, f: impl Fn(&Value) -> bool) -> Vec<Value> {
-        let end = Instant::now() + Duration::from_secs(20);
+        let mut seen = 0;
+        let mut end = Instant::now() + STALL;
         loop {
             let got: Vec<Value> = self.records().into_iter().filter(|r| f(r)).collect();
             if got.len() >= n || Instant::now() > end {
                 return got;
             }
+            if got.len() > seen {
+                seen = got.len();
+                end = Instant::now() + STALL;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
+
+/// How long [`World::wait`] waits for the next record before it gives up:
+/// a ceiling only a failure reaches.
+const STALL: Duration = Duration::from_secs(30);
 
 fn result_is(r: &Value, res: &str) -> bool {
     r["kind"] == "notify" && r["result"] == res
@@ -498,8 +509,15 @@ async fn queue_full_drops_oldest_and_records() {
     assert_eq!(n.queued(), 256);
     assert_eq!(n.dropped(), 44);
     n.start(Arc::downgrade(&w.env));
-    let sent = w.wait(256, |r| result_is(r, "sent")).await;
-    assert_eq!(sent.len(), 256);
+    // Every delivery's record, whatever its result: one that failed on a
+    // loaded machine fails the test by its reason, not by a wait.
+    let done = w
+        .wait(256, |r| {
+            r["target"] == "q" && (result_is(r, "sent") || result_is(r, "failed"))
+        })
+        .await;
+    assert_eq!(done.len(), 256, "{:?}", w.records());
+    assert!(done.iter().all(|r| result_is(r, "sent")), "{done:?}");
     let dropped = w.wait(1, |r| result_is(r, "dropped")).await;
     assert_eq!(dropped.len(), 1, "{:?}", w.records());
     assert_eq!(dropped[0]["reason"], "queue_full");

@@ -289,18 +289,12 @@ mod tests {
     use crate::rules_cmd::propose::{propose, verify};
     use crate::rules_cmd::store::{render, NewPack};
     use crate::rules_cmd::{Origin, Target};
-    use saiifeguard::canon::PathVars;
     use saiifeguard::pack::RuleWhere;
     use saiifeguard::userpack::view;
 
     const FILE: &str = "/saiife-test/project/CLAUDE.md";
 
-    fn vars() -> PathVars {
-        PathVars::new()
-            .with_cwd("/saiife-test/project")
-            .with_var("PROJECT", "/saiife-test/project")
-            .with_var("HOME", "/saiife-test/home")
-    }
+    use crate::rules_cmd::test_host::vars;
 
     fn src(line: u32, text: &str) -> SourceLine {
         SourceLine {

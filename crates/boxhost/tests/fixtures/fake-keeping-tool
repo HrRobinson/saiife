@@ -1,0 +1,10 @@
+#!/bin/sh
+# Test fixture (bake tests): a fake mcopy that logs each argument, without
+# the tool name, to calls.log next to the link it was started through, and
+# keeps a copy of every file argument in seen/ there.
+d="${0%/*}"
+for a in "$@"; do
+    printf ' %s' "$a" >>"$d/calls.log"
+    if [ -f "$a" ]; then cp "$a" "$d/seen/"; fi
+done
+printf '\n' >>"$d/calls.log"

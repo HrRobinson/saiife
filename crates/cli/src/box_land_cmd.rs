@@ -352,17 +352,36 @@ pub(crate) fn review_lines(diff: &Value, review: Option<&Value>, stat: bool) -> 
     out
 }
 
+/// FU1: the warning `box diff` prints before the diff when the box changed
+/// files while its in-box guard reported no checks (`guard.skipped`).
+pub(crate) fn guard_warning(guard: Option<&Value>) -> Option<String> {
+    let skipped = guard
+        .and_then(|g| g.get("skipped"))
+        .and_then(Value::as_bool);
+    (skipped == Some(true)).then(|| {
+        format!(
+            "warning: guard_skipped: {}",
+            saiife_wire::source::GUARD_SKIPPED_WHY
+        )
+    })
+}
+
 fn diff(t: &Target, id: &BoxId, as_json: bool, stat: bool) -> Result<(), Stop> {
     let mut c = connect(t)?;
     let a = call(&mut c, t, "box.diff", args([("box", json!(id.as_str()))]))?;
     let d = a.get("diff").cloned().unwrap_or(Value::Null);
     let r = a.get("review").cloned();
+    let g = a.get("guard").cloned();
     if as_json {
-        outln!(
-            "{}",
-            crate::box_cmd::ascii_json(&json!({"diff": d, "review": r.unwrap_or(Value::Null)}))
-        );
+        let mut o = json!({"diff": d, "review": r.unwrap_or(Value::Null)});
+        if let Some(g) = g {
+            o["guard"] = g;
+        }
+        outln!("{}", crate::box_cmd::ascii_json(&o));
         return Ok(());
+    }
+    if let Some(w) = guard_warning(g.as_ref()) {
+        outln!("{w}");
     }
     for l in review_lines(&d, r.as_ref(), stat) {
         outln!("{l}");
@@ -1419,6 +1438,29 @@ mod tests {
         i.diff_sha256 = "B".repeat(64);
         assert!(check_info(&i, &id).is_err());
         assert!(check_info(&info(""), &BoxId::parse("b2").unwrap()).is_err());
+    }
+
+    #[test]
+    fn guard_warning_only_when_skipped() {
+        let w = guard_warning(Some(&json!({"skipped": true, "checks": 0, "turns": 2}))).unwrap();
+        assert_eq!(
+            w,
+            format!(
+                "warning: guard_skipped: {}",
+                saiife_wire::source::GUARD_SKIPPED_WHY
+            )
+        );
+        assert!(
+            w.starts_with("warning: guard_skipped: the box changed files"),
+            "{w}"
+        );
+        assert!(w.contains("a signal only"), "{w}");
+        assert_eq!(
+            guard_warning(Some(&json!({"skipped": false, "checks": 3, "turns": 2}))),
+            None
+        );
+        assert_eq!(guard_warning(Some(&json!({"skipped": "yes"}))), None);
+        assert_eq!(guard_warning(None), None);
     }
 
     #[test]

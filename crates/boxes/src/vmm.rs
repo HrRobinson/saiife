@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use saiife_wire::source::BoxId;
 
-use crate::template::{ImageRef, Size};
+use crate::template::{AgentKind, ImageRef, Size};
 
 pub use crate::store::VmHandle;
 
@@ -16,6 +16,9 @@ pub struct VmSpec {
     pub id: BoxId,
     pub size: Size,
     pub image: ImageRef,
+    /// The template's agent: the driver refuses an image without it
+    /// (plan 42 D10).
+    pub agent: AgentKind,
     pub dir: PathBuf,
 }
 

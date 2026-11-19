@@ -7,7 +7,7 @@ use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_boxes::capacity::{self, HostFacts};
 use saiife_boxes::guest::fake::FakeGuest;
 use saiife_boxes::guest::{GuestEvent, GuestLink};
-use saiife_boxes::manager::{Manager, ManagerInit, DONE_IDLE_SECS};
+use saiife_boxes::manager::{Manager, ManagerInit, DONE_IDLE_SECS, HELD_PROMPT_SENT_FIRST};
 use saiife_boxes::store::Store;
 use saiife_boxes::template::{self, Size};
 use saiife_boxes::vmm::fake::{FakeVmm, VmOp};
@@ -773,7 +773,7 @@ async fn templates_lists_warnings() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["claude-code"], "{a}");
+    assert_eq!(names, ["claude-code", "codex", "gemini"], "{a}");
     let warns = a["warnings"].as_array().unwrap();
     assert_eq!(warns.len(), 1, "{a}");
     assert!(
@@ -1816,12 +1816,13 @@ async fn discard_and_gc_forget_the_guest_run() {
     assert_eq!(w.guest.forgotten(), vec![id(&b), id(&b2)]);
 }
 
-/// The setup of a real box: the template's command, no env, the in-box
-/// settings, and the user packs of the daemon's policy.d/packs.
+/// The setup of a real box: the template's command, the model env, the
+/// seed and the user packs of the daemon's policy.d/packs; no
+/// `~/.claude/settings.json` (FU2: the hooks are managed, in the image).
 #[tokio::test]
-async fn setup_for_has_settings_and_packs() {
+async fn setup_for_has_seed_and_packs() {
     use saiife_boxhost::guest::SetupSource;
-    use saiife_daemon::box_setup::{packs_dir, TemplateSetup, SETTINGS_PATH};
+    use saiife_daemon::box_setup::{packs_dir, TemplateSetup};
     let w = world();
     let tmp = scratch();
     let config = tmp.path().join("saiife").join("config.toml");
@@ -1838,17 +1839,18 @@ async fn setup_for_has_settings_and_packs() {
     assert_eq!(s.agent.command, vec!["claude".to_string()]);
     assert!(!s.env.is_empty(), "the model env is there");
     assert_eq!((s.rows, s.cols), (40, 120));
-    assert_eq!(s.files.len(), 3, "{:?}", s.files);
-    assert_eq!(s.files[0].path, SETTINGS_PATH);
-    assert_eq!(s.files[0].mode, 0o644);
-    assert_eq!(s.files[0].text, saiife_boxhost::guest::claude_settings());
-    assert_eq!(s.files[1].path, "/home/agent/.claude.json");
+    assert_eq!(s.files.len(), 2, "{:?}", s.files);
+    assert_eq!(s.files[0].path, "/home/agent/.claude.json");
     assert_eq!(
-        s.files[2].path,
+        s.files[1].path,
         "/home/agent/.config/saiife/packs/user.mine.toml"
     );
-    assert_eq!(s.files[2].mode, 0o644);
-    assert_eq!(s.files[2].text, pack);
+    assert_eq!(s.files[1].mode, 0o644);
+    assert_eq!(s.files[1].text, pack);
+    assert!(!s
+        .files
+        .iter()
+        .any(|f| f.path == "/home/agent/.claude/settings.json"));
     assert!(setups.setup_for(&id("b99")).is_err());
 }
 
@@ -1859,7 +1861,7 @@ async fn setup_for_has_settings_and_packs() {
 #[tokio::test]
 async fn setup_has_placeholder_env() {
     use saiife_boxhost::guest::SetupSource;
-    use saiife_daemon::box_setup::{TemplateSetup, CLAUDE_JSON_PATH, SETTINGS_PATH};
+    use saiife_daemon::box_setup::{TemplateSetup, CLAUDE_JSON_PATH};
     let w = world();
     let tmp = scratch();
     let a = w.spawn(ALICE, "t").await;
@@ -1883,9 +1885,11 @@ async fn setup_has_placeholder_env() {
     ] {
         assert_eq!(env(k).as_deref(), Some("1"), "{k}");
     }
-    // the hooks settings are still there, and the seed is once-only
-    assert_eq!(s1.files[0].path, SETTINGS_PATH);
-    assert_eq!(s1.files[0].text, saiife_boxhost::guest::claude_settings());
+    // the hooks are managed, in the image (FU2); the seed is once-only
+    assert!(!s1
+        .files
+        .iter()
+        .any(|f| f.path == "/home/agent/.claude/settings.json"));
     let seed = s1
         .files
         .iter()
@@ -2133,6 +2137,116 @@ async fn revise_after_a_cold_stop_runs_again() {
         .prompts()
         .contains(&(b.clone(), "again".to_string())));
     assert!(!w.mgr().get(&b).unwrap().keep);
+}
+
+/// R25/N1 (I1): a box stopped before its task prompt went out holds it; a
+/// revise is a follow-up comment, so the next Ready sends the task then the
+/// comment as one prompt, and the revise record says the held prompt goes
+/// first.
+#[tokio::test]
+async fn a_revise_record_names_the_held_prompt_sent_first() {
+    let w = world();
+    let a = w.spawn(ALICE, "add a cart").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    w.ok(ALICE, "box.stop", json!({"box": b.as_str()})).await;
+    assert_eq!(
+        w.mgr().get(&b).unwrap().pending_prompt.as_deref(),
+        Some("add a cart")
+    );
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "again"}),
+    )
+    .await;
+    let recs = w.records();
+    let last = recs.last().unwrap();
+    assert_eq!(last["action"], "revise", "{last}");
+    assert_eq!(last["reason"], HELD_PROMPT_SENT_FIRST, "{last}");
+    box_ops::tick_once(&w.ctx).await;
+    w.mgr().guest_event(&b, GuestEvent::Ready).unwrap();
+    assert_eq!(
+        w.guest.prompts(),
+        vec![(b.clone(), "add a cart\n\nagain".to_string())]
+    );
+    // A revise with nothing held has no reason.
+    w.mgr().done(&b).unwrap();
+    w.ok(
+        ALICE,
+        "box.revise",
+        json!({"box": b.as_str(), "comment": "more"}),
+    )
+    .await;
+    let recs = w.records();
+    let last = recs.last().unwrap();
+    assert_eq!(last["action"], "revise", "{last}");
+    assert!(last["reason"].is_null(), "{last}");
+}
+
+/// I1: VM off, the held task plus the comment is checked as one prompt; a
+/// combined text over the limit is refused (invalid) and the box stays as
+/// it was, still holding its task.
+#[tokio::test]
+async fn a_revise_whose_combined_prompt_is_too_long_is_refused() {
+    let w = world();
+    let task = "t".repeat(saiife_wire::source::MAX_TASK_BYTES);
+    let a = w.spawn(ALICE, &task).await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    w.ok(ALICE, "box.stop", json!({"box": b.as_str()})).await;
+    let n = w.records().len();
+    let comment = "c".repeat(saiife_wire::source::MAX_STEER_BYTES);
+    let r = w
+        .call(
+            ALICE,
+            "box.revise",
+            json!({"box": b.as_str(), "comment": comment}),
+        )
+        .await;
+    assert_refused(&r, "bad_request", "invalid");
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .contains("shorten the comment"),
+        "{r}"
+    );
+    let rec = w.mgr().get(&b).unwrap();
+    assert_eq!(rec.state.to_string_lossy(), "done");
+    assert_eq!(rec.pending_prompt.as_deref(), Some(task.as_str()));
+    // A refusal record at most: never a revise that went through.
+    assert!(
+        w.records()[n..]
+            .iter()
+            .all(|r| r["reason"] != HELD_PROMPT_SENT_FIRST),
+        "{:?}",
+        &w.records()[n..]
+    );
+}
+
+/// m2: a paused box whose prompt is still held (here by lockdown) refuses
+/// a steer with "resume the box first".
+#[tokio::test]
+async fn a_steer_to_a_paused_box_with_a_held_prompt_says_resume_first() {
+    let w = world();
+    let a = w.spawn(ALICE, "add a cart").await;
+    let b = id(a["box"]["id"].as_str().unwrap());
+    w.mgr()
+        .guest_event_with(&b, GuestEvent::Ready, false)
+        .unwrap();
+    w.ok(ALICE, "box.pause", json!({"box": b.as_str()})).await;
+    let r = w
+        .call(ALICE, "box.steer", json!({"box": b.as_str(), "msg": "hi"}))
+        .await;
+    assert_eq!(r["ok"], false, "{r}");
+    assert_eq!(r["error"], "unavailable", "{r}");
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .contains("resume the box first"),
+        "{r}"
+    );
+    assert!(w.guest.prompts().is_empty());
 }
 
 /// A world whose manager holds the built-in template plus a `fallback`

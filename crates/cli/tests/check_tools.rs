@@ -20,9 +20,20 @@ struct Out {
 /// (see `common::FixtureHome`); return the answer and the audit records in
 /// `audit_dir`, both spelled with `/home/u` again.
 fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> (Out, Vec<Record>) {
+    check_bytes_with(audit_dir, agent, stdin, &[])
+}
+
+/// [`check_bytes`] with `env` set on the hook process.
+fn check_bytes_with(
+    audit_dir: &Path,
+    agent: &str,
+    stdin: &[u8],
+    env: &[(&str, &str)],
+) -> (Out, Vec<Record>) {
     let home = common::FixtureHome::new();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, audit_dir);
+    cmd.envs(env.iter().copied());
     let mut child = cmd
         .args(["check", "--hook-exit", "--agent", agent])
         .current_dir(audit_dir)
@@ -625,14 +636,22 @@ fn a_glob_too_large_to_judge_is_a_recorded_fail_open() {
     for i in 0..4200 {
         std::fs::write(p.path().join(format!("f{i}.txt")), "").unwrap();
     }
-    let (out, rec) = run_bytes(
+    // The 50 ms latency budget is scaled up 100 times (a debug-build seam, see
+    // `deadline_scale`): a slow machine must reach the glob-size limit, which is a
+    // count of directory entries, not run out of time first and record the budget.
+    let audit = tempfile::tempdir().unwrap();
+    let (out, mut recs) = check_bytes_with(
+        audit.path(),
         "gemini",
         &payload(
             "read_many_files",
             p.path(),
             serde_json::json!({"include": ["*.txt"]}),
         ),
+        &[("SAIIFE_TEST_DEADLINE_SCALE", "100")],
     );
+    assert_eq!(recs.len(), 1, "exactly one record");
+    let rec = recs.remove(0);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
     assert_eq!(rec.reason.as_deref(), Some("glob too large to judge"));

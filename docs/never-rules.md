@@ -174,14 +174,19 @@ file you name is refused in both cases.
 A line is a candidate when it says `never`, `don't`, `do not`, `must not` and
 the like, or starts with `no`. Code fences and HTML comments are skipped.
 Commands in backticks (and short lists after a colon) become command rules;
-paths starting with `/`, `~/` or `$VAR/` become path rules. A path becomes two
-rules, the path and `path/**` (`/` becomes only `/**`). The access (`read`, `write` or `any`) comes from
+paths starting with `/`, `~/`, `$VAR/` or a drive (`C:\Windows`, `c:/x`) become
+path rules; a drive path is kept as the guard reads it (`c:/Windows`). A path becomes two
+rules, the path and `path/**` (`/` becomes only `/**`, `C:\` only `c:/**`). The access (`read`, `write` or `any`) comes from
 the words of the line. A line with a control, bidi or format character is never
 turned into a rule.
 
 Every proposal is compiled as a one-rule pack and must pass its own examples:
 it blocks what it should and allows a near miss. One that fails is listed as
-unverified and never offered. The table shows each proposal with what it
+unverified and never offered. The check runs as this host judges paths: on
+Windows the examples are spelled with `\` and names compare case-folded, and
+the everyday paths behind `BROAD` are Windows ones (`C:\…\src\main.rs`). A
+path rule for the other system (`/etc` on Windows, `C:\Windows` elsewhere)
+never blocks here, so it is unverified. The table shows each proposal with what it
 blocks and what it allows, then one question per rule:
 
 | Answer | Meaning |

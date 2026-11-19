@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { className, timeLeft, taskCounter, checkRepo, checkTask, needsTouchBadge, spawnArgs, MAX_TASK_BYTES } from "../js/inboxlogic.js";
+import { className, timeLeft, taskCounter, checkRepo, checkTask, needsTouchBadge, spawnArgs, templateLabel, credentialLabel, noticeText, MAX_TASK_BYTES } from "../js/inboxlogic.js";
 
 test("class names as words", () => {
   assert.equal(className("land"), "Land into repo");
@@ -54,4 +54,30 @@ test("prompt action", () => {
 
 test("steer class has words (TouchClass::Steer)", () => {
   assert.equal(className("steer"), "Steer a box");
+});
+
+test("templateLabel marks beta", () => {
+  assert.equal(templateLabel({ name: "codex", beta: true }), "codex (beta)");
+  assert.equal(templateLabel({ name: "claude-code" }), "claude-code");
+  assert.equal(templateLabel({ name: "x", beta: "yes" }), "x");
+});
+
+test("credentialLabel follows the credential mode", () => {
+  assert.equal(credentialLabel({ credential: "gateway" }), "key stays on this computer");
+  assert.equal(credentialLabel({}), "key stays on this computer");
+  assert.equal(credentialLabel({ credential: "in_box" }), "credential inside box (weaker)");
+  assert.equal(credentialLabel({ credential: "weird" }), "credential mode unknown");
+});
+
+test("templateLabel and credentialLabel take untrusted names through visible()", () => {
+  const s = templateLabel({ name: "a‮b", beta: true });
+  assert.ok(!s.includes("‮"), s);
+  assert.ok(s.includes("U+202E"), s);
+  assert.equal(credentialLabel({ credential: "a‮b" }), "credential mode unknown");
+});
+
+test("noticeText shows the notice through visible()", () => {
+  assert.equal(noticeText({}), "");
+  assert.equal(noticeText({ notice: "use a key" }), "use a key");
+  assert.ok(!noticeText({ notice: "a‮b" }).includes("‮"));
 });

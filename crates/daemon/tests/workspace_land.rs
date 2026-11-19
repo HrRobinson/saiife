@@ -543,6 +543,10 @@ struct Seen {
     rid: String,
     challenge: [u8; 32],
     diff_sha256: String,
+    /// FU1: the box's guard signal from `box.diff`.
+    guard: Value,
+    /// FU1: the overview's `guard_skipped` for the box.
+    listed_skipped: Value,
 }
 
 async fn browse_land(w: &World, link: &mut Link, b: &Browser, id: &BoxId) -> Seen {
@@ -554,6 +558,7 @@ async fn browse_land(w: &World, link: &mut Link, b: &Browser, id: &BoxId) -> See
         .find(|x| x["id"] == id.as_str())
         .unwrap_or_else(|| panic!("{} not in the overview: {o}", id.as_str()));
     assert_eq!(mine["state"], "done", "{o}");
+    let listed_skipped = mine["guard_skipped"].clone();
     let inbox = send(w, link, b, "box.inbox", json!({})).await;
     assert_eq!(inbox["ok"], true, "{inbox}");
     let items = inbox["result"]["items"].as_array().unwrap();
@@ -568,6 +573,8 @@ async fn browse_land(w: &World, link: &mut Link, b: &Browser, id: &BoxId) -> See
         rid: item["request_id"].as_str().unwrap().to_string(),
         challenge: unhex32(item["challenge_hex"].as_str().unwrap()),
         diff_sha256: d["result"]["diff_sha256"].as_str().unwrap().to_string(),
+        guard: d["result"]["guard"].clone(),
+        listed_skipped,
     }
 }
 
@@ -621,6 +628,12 @@ async fn browser_lands_through_the_late_book() {
     assert_eq!(seen.rid, p.request_id.to_string());
     assert_eq!(seen.challenge, challenge(&p.record));
     assert_eq!(seen.diff_sha256, p.record.fields["diff_sha256"]);
+    // FU1: changed files, no guard check: flagged, in the diff and the list.
+    assert_eq!(
+        seen.guard,
+        json!({"skipped": true, "checks": 0, "turns": 0})
+    );
+    assert_eq!(seen.listed_skipped, true);
     let a = send_touch(
         &w,
         &mut link,

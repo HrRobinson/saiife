@@ -179,7 +179,7 @@ pub fn run(env: &GuestEnv) -> Result<(), String> {
 }
 
 /// local.sock: each connection on its own short-lived thread with a deadline;
-/// only `turn_finished` goes on.
+/// only `turn_finished` and `guard_checks` (FU1) go on.
 fn serve_local(env: &GuestEnv, l: UnixListener, signals: &Arc<Signals>) {
     let active = Arc::new(AtomicUsize::new(0));
     for s in l.incoming() {
@@ -197,8 +197,10 @@ fn serve_local(env: &GuestEnv, l: UnixListener, signals: &Arc<Signals>) {
             .name("guest-local-conn".into())
             .spawn(move || {
                 let mut r = DeadlineReader::new(&s, within).take(LOCAL_MAX);
-                if let Ok(Some(Event::TurnFinished)) = read_msg::<Event>(&mut r) {
-                    signals.turn_finished();
+                match read_msg::<Event>(&mut r) {
+                    Ok(Some(Event::TurnFinished)) => signals.turn_finished(),
+                    Ok(Some(Event::GuardChecks { n })) => signals.guard_checks(n),
+                    _ => {}
                 }
                 done.fetch_sub(1, Ordering::SeqCst);
             });

@@ -18,6 +18,7 @@
 
 pub mod egress;
 pub mod model;
+mod routes;
 
 use crate::ops::{Ctx, Mode};
 use saiife_audit::DecisionKind;
@@ -354,6 +355,19 @@ type DeniedKey = (BoxId, Option<String>, &'static str);
 struct Denied(HashMap<DeniedKey, (u64, u64)>);
 
 impl Denied {
+    /// How many of `id`'s keys whose host starts with `prefix` wrote a
+    /// record in the current window.
+    fn live_with_prefix(&self, id: &BoxId, prefix: &str, now: u64) -> usize {
+        self.0
+            .iter()
+            .filter(|((b, h, _), (at, _))| {
+                b == id
+                    && h.as_deref().is_some_and(|h| h.starts_with(prefix))
+                    && now.saturating_sub(*at) < DENIED_WINDOW_MS
+            })
+            .count()
+    }
+
     /// `Some(suppressed)` when a record is due.
     fn admit(&mut self, mut key: DeniedKey, now: u64) -> Option<u64> {
         if !self.0.contains_key(&key) {

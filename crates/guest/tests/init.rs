@@ -17,6 +17,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const T: Duration = Duration::from_secs(10);
+/// Ceiling of the PTY condition waits: the agent has to start and print under
+/// whatever load the host has. It is reached only when the wait has failed,
+/// never a margin a passing run depends on.
+const PTY_CEIL: Duration = Duration::from_secs(60);
 
 /// The fake tools, written once before any test spawns anything (a script
 /// still open for writing while another thread forks would be ETXTBSY).
@@ -203,14 +207,18 @@ fn next_event(s: &mut UnixStream, within: Duration) -> Option<Event> {
 fn pty_until(s: &mut UnixStream, needle: &str, within: Duration) -> String {
     let until = Instant::now() + within;
     let mut got = Vec::new();
-    while Instant::now() < until {
-        s.set_read_timeout(Some(Duration::from_millis(200)))
+    // One read timeout for the whole wait: a timeout in the middle of a
+    // frame would drop its bytes and desynchronise the stream, so it may
+    // only ever fire at the ceiling, where the wait has failed anyway.
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        s.set_read_timeout(Some(left.max(Duration::from_millis(1))))
             .unwrap();
         match read_frame(s) {
             Ok(Some(Frame::Bytes(b))) => got.extend_from_slice(&b),
             Ok(Some(Frame::Json(v))) => panic!("json on pty: {v}"),
+            // EOF: the agent is gone, nothing more will come
             Ok(None) => break,
-            Err(_) => {}
+            Err(_) => break,
         }
         if String::from_utf8_lossy(&got).contains(needle) {
             break;
@@ -226,7 +234,7 @@ fn setup(cmd: &[&str]) -> Setup {
             user: "agent".into(),
             cwd: "/work".into(),
         },
-        env: vec![("FOO".into(), "bar".into())],
+        env: vec![("OPENAI_API_KEY".into(), "bar".into())],
         files: vec![],
         rows: 40,
         cols: 120,
@@ -425,7 +433,7 @@ fn setup_writes_files_and_env() {
     let text = std::fs::read_to_string(&envf).unwrap();
     assert!(text.starts_with("HOME=/home/agent\nUSER=agent\n"), "{text}");
     assert!(text.contains("HTTPS_PROXY=http://127.0.0.1:3128\n"));
-    assert!(text.ends_with("FOO=bar\n"), "{text}");
+    assert!(text.ends_with("OPENAI_API_KEY=bar\n"), "{text}");
     assert_eq!(std::fs::metadata(&envf).unwrap().mode() & 0o7777, 0o600);
     // First setup: /work handed to the agent (never following links), the marker set.
     let work = h.env.path("/work");
@@ -438,7 +446,31 @@ fn setup_writes_files_and_env() {
     // The agent got exactly the fixed env plus the setup's; nothing inherited.
     let mut pty = accept(&h.pty, T);
     // `env` prints in no fixed order: read up to the line after it
-    let out = pty_until(&mut pty, "END-OF-ENV", T);
+    let out = pty_until(&mut pty, "END-OF-ENV", PTY_CEIL);
+    // COORD-7: exactly the allowlist (the shell adds PWD, SHLVL and `_`;
+    // the fake runuser adds nothing, the real one the same HOME, SHELL,
+    // USER and LOGNAME values)
+    let mut got: Vec<String> = out
+        .split("END-OF-ENV")
+        .next()
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            !["PWD=", "SHLVL=", "_=", "OLDPWD="]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .collect();
+    got.sort();
+    let mut want: Vec<String> =
+        saiife_boxproto::launch::launch_env(&[("OPENAI_API_KEY".into(), "bar".into())])
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+    want.sort();
+    assert_eq!(got, want, "{out}");
     for want in [
         "HOME=/home/agent",
         "USER=agent",
@@ -447,13 +479,40 @@ fn setup_writes_files_and_env() {
         "LANG=C.UTF-8",
         "HTTP_PROXY=http://127.0.0.1:3128",
         "NO_PROXY=localhost,127.0.0.1",
-        "FOO=bar",
+        "GIT_CONFIG_GLOBAL=/etc/saiife/gitconfig",
+        "OPENAI_API_KEY=bar",
     ] {
         assert!(out.contains(want), "{want} missing in {out}");
     }
     assert!(!out.contains("CARGO"), "inherited env: {out}");
     assert!(!out.contains("TMPDIR"), "inherited env: {out}");
     let _ = next_event(&mut ev, Duration::from_millis(10));
+}
+
+/// COORD-7: a setup that names a loader, shell or git variable is refused
+/// by the guest's own check; nothing is written or started.
+#[test]
+fn setup_check_refuses_non_model_env() {
+    let h = host();
+    let _init = start(&h.env);
+    let _ev = welcomed(&h);
+    for n in [
+        "LD_PRELOAD",
+        "BASH_ENV",
+        "NODE_OPTIONS",
+        "GIT_CONFIG_COUNT",
+        "PATH",
+    ] {
+        let mut s = setup(&["/bin/true"]);
+        s.env.push((n.into(), "/work/x".into()));
+        assert!(
+            matches!(request(&h.env, &Request::Setup(s)), Reply::Err { .. }),
+            "{n}"
+        );
+    }
+    assert!(!h.env.path("/var/lib/saiife-guest/setup-done").exists());
+    assert!(!h.env.path("/etc/saiife-guest/agent.env").exists());
+    assert_eq!(calls(&h.env), "");
 }
 
 #[test]
@@ -729,6 +788,36 @@ fn turn_finished_via_local_socket() {
     saiife_guest::send_local_event(&h.env, &Event::Started).unwrap();
     saiife_guest::send_local_event(&h.env, &Event::TurnFinished).unwrap();
     assert_eq!(next_event(&mut ev, T), Some(Event::TurnFinished));
+    assert_eq!(next_event(&mut ev, Duration::from_millis(500)), None);
+}
+
+/// FU1: the in-box guard hook's `guard_checks` goes on to the host; a burst
+/// coalesces into few events whose counts sum up.
+#[test]
+fn guard_checks_via_local_socket() {
+    let h = host();
+    let _init = start(&h.env);
+    let mut ev = welcomed(&h);
+    let local = h.env.path(saiife_boxproto::ports::GUEST_LOCAL_SOCK);
+    assert!(wait_for(|| local.exists(), T));
+    for _ in 0..5 {
+        saiife_guest::send_local_event(&h.env, &Event::GuardChecks { n: 1 }).unwrap();
+    }
+    saiife_guest::send_local_event(&h.env, &Event::GuardChecks { n: 3 }).unwrap();
+    let mut sum = 0u32;
+    let mut frames = 0;
+    let until = Instant::now() + T;
+    while sum < 8 && Instant::now() < until {
+        match next_event(&mut ev, T) {
+            Some(Event::GuardChecks { n }) => {
+                sum += n;
+                frames += 1;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(sum, 8);
+    assert!(frames <= 6, "{frames}");
     assert_eq!(next_event(&mut ev, Duration::from_millis(500)), None);
 }
 

@@ -1,6 +1,6 @@
 //! A fake VMM (feature `fake`): a state machine in a mutex, with a call log.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -37,6 +37,8 @@ struct State {
     /// Whether `<dir>/repo.img` was there when `create` ran.
     repo_disk: HashMap<BoxId, bool>,
     fail: Vec<(VmOp, String)>,
+    /// Boxes whose VMM never confirms its exit: every `destroy` errs.
+    wedged: HashSet<BoxId>,
     calls: Vec<VmCall>,
     /// What `image_id` answers for every handle.
     image: Option<String>,
@@ -61,6 +63,17 @@ impl FakeVmm {
     /// The next call of `op` errs `Failed(msg)`.
     pub fn fail_next(&self, op: VmOp, msg: &str) {
         self.lock().fail.push((op, msg.to_string()));
+    }
+
+    /// While `on`, every `destroy` of `id` errs like a VMM that never
+    /// confirms its exit (it is still logged).
+    pub fn wedge(&self, id: &BoxId, on: bool) {
+        let mut s = self.lock();
+        if on {
+            s.wedged.insert(id.clone());
+        } else {
+            s.wedged.remove(id);
+        }
     }
 
     /// Force a status, e.g. `Gone` to simulate a crash.
@@ -192,6 +205,9 @@ impl Vmm for FakeVmm {
 
     fn destroy(&self, h: &VmHandle) -> Result<(), VmmError> {
         let mut s = self.enter(VmOp::Destroy, &h.id)?;
+        if s.wedged.contains(&h.id) {
+            return Err(VmmError::Failed("the VMM is still stopping".into()));
+        }
         s.status.insert(h.id.clone(), VmStatus::Gone);
         Ok(())
     }
@@ -218,6 +234,7 @@ mod tests {
                 disk_gib: 30,
             },
             image: ImageRef::Default,
+            agent: crate::template::AgentKind::ClaudeCode,
             dir: dir.to_path_buf(),
         }
     }

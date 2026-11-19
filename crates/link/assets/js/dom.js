@@ -3,7 +3,7 @@
 
 const PLAIN = new Set([
   "class", "id", "type", "name", "value", "placeholder", "for", "role",
-  "disabled", "rows", "maxlength", "href",
+  "disabled", "rows", "maxlength", "href", "title",
 ]);
 const PREFIXED = /^(aria|data)-[a-z0-9-]+$/;
 const EVENT = /^[a-z]+$/;

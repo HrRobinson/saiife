@@ -205,9 +205,11 @@ struct State {
     /// The last export number asked for, per box.
     last_export: BTreeMap<BoxId, u32>,
     pushes: BTreeMap<u64, Push>,
-    /// The request ids `box_waiting` was sent for (kept as long as their
-    /// request).
-    notified: BTreeSet<u64>,
+    /// Per `Done` box, the whole-review hash `box_waiting` was sent for:
+    /// once per finished run, however often its request id is issued
+    /// again. Dropped when the book sees the box out of `Done` (revised,
+    /// landed, discarded or gone), so the next finished run sends again.
+    notified: BTreeMap<BoxId, String>,
 }
 
 /// The box's current base (R-P3).
@@ -471,7 +473,7 @@ impl Lands {
                 rejected: BTreeMap::new(),
                 last_export: BTreeMap::new(),
                 pushes: BTreeMap::new(),
-                notified: BTreeSet::new(),
+                notified: BTreeMap::new(),
             }),
             boxes: Mutex::new(BTreeMap::new()),
         })
@@ -693,7 +695,35 @@ impl Lands {
             .collect();
         drop(st);
         self.prune(id, &paths, n, &live);
+        // The audit write (an fsync) holds no box lock.
+        drop(_held);
+        self.note_guard(&ctx, id, rec.owner_uid, rev.summary.files.len());
         Ok(rev)
+    }
+
+    /// FU1: after a fresh review, flag a box that changed files while its
+    /// in-box guard reported no check ([`Manager::note_review`]); the first
+    /// time, one `guard_skipped` record. A signal only: the guest can forge
+    /// the counts, and nothing is blocked.
+    fn note_guard(&self, ctx: &Ctx, id: &BoxId, owner: u32, files: usize) {
+        let c = match self.mgr.note_review(id, files) {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!(
+                    "saiifed: boxes: box {}: cannot note the guard check count: {e}",
+                    id.as_str()
+                );
+                return;
+            }
+        };
+        let mut r = self.record(ctx, "guard_skipped", id, Some(owner));
+        r.reason = Some(GUARD_SKIPPED.into());
+        let x = &mut r.extra;
+        x.insert("guard_checks".into(), c.guard_checks.into());
+        x.insert("turns".into(), c.turns.into());
+        x.insert("files".into(), files.into());
+        self.write(ctx, r);
     }
 
     /// Removes every `lands/<m>`, `m < n`, that is not an approved land and
@@ -974,6 +1004,9 @@ impl Lands {
         // The box's files are done with: the audit write (an fsync) holds
         // no box lock.
         drop(held);
+        // FU1: a review made while the box ran was not judged (M2); the
+        // land is the last look (the box is Landed now).
+        self.note_guard(&ctx, &id, q.req.owner, q.review.summary.files.len());
         let mut r = self.record(&ctx, "land", &id, Some(q.req.owner));
         let x = &mut r.extra;
         x.insert("land".into(), n.into());
@@ -982,6 +1015,9 @@ impl Lands {
         x.insert("files".into(), q.review.summary.files.len().into());
         x.insert("via".into(), via.into());
         x.insert("target_ref".into(), q.req.target_ref.clone().into());
+        // FU1: advisory; the land goes on.
+        let skipped = self.mgr.get(&id).is_ok_and(|r| r.guard_skipped);
+        x.insert("guard_skipped".into(), skipped.into());
         self.write(&ctx, crate::approvals::record_with_touch(r, ev));
         Ok(LandInfo {
             id: id.clone(),
@@ -1319,17 +1355,15 @@ impl LandBook for Lands {
         done.sort_by(|a, b| {
             (a.owner_uid, a.updated_at, &a.id).cmp(&(b.owner_uid, b.updated_at, &b.id))
         });
-        let mut want: Vec<(BoxRecord, Option<PendingAction>)> = Vec::new();
+        let mut want: Vec<(BoxRecord, String, Option<PendingAction>)> = Vec::new();
         {
             let mut st = lock(&self.state);
             let live: BTreeSet<BoxId> = self.mgr.list().into_iter().map(|r| r.id).collect();
             st.reviews.retain(|k, _| live.contains(k));
             st.rejected.retain(|k, _| live.contains(k));
             st.requests.retain(|_, q| live.contains(&q.req.id));
-            let State {
-                requests, notified, ..
-            } = &mut *st;
-            notified.retain(|rid| requests.contains_key(rid));
+            let done_ids: BTreeSet<&BoxId> = done.iter().map(|r| &r.id).collect();
+            st.notified.retain(|k, _| done_ids.contains(k));
             let mut per: BTreeMap<u32, usize> = BTreeMap::new();
             for r in done {
                 let Some(c) = st.reviews.get(&r.id) else {
@@ -1365,34 +1399,34 @@ impl LandBook for Lands {
                     })
                     .max_by_key(|q| q.req.request_id)
                     .map(Self::action);
-                want.push((r, have));
+                want.push((r, sha, have));
             }
         }
         let mut out = Vec::new();
-        for (r, have) in want {
-            match have {
-                Some(p) => out.push(p),
+        for (r, sha, have) in want {
+            let pa = match have {
+                Some(p) => p,
                 None => {
-                    if let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, false, now) {
-                        let mut st = lock(&self.state);
-                        let Some(q) = st.requests.get(&rid) else {
-                            continue;
-                        };
-                        let pa = Self::action(q);
-                        // `box_waiting`: once per request id, here where the
-                        // id is first issued, so a later list (the
-                        // Workspace's own inbox poll) never sends it again.
-                        let first = st.notified.insert(rid);
-                        drop(st);
-                        if first {
-                            if let Ok(ctx) = self.ctx() {
-                                crate::workspace_touch::notify_pending(&ctx, &pa);
-                            }
-                        }
-                        out.push(pa);
-                    }
+                    let Ok((rid, _, _)) = self.begin(&r.id, r.owner_uid, None, false, now) else {
+                        continue;
+                    };
+                    let st = lock(&self.state);
+                    let Some(q) = st.requests.get(&rid) else {
+                        continue;
+                    };
+                    Self::action(q)
+                }
+            };
+            // `box_waiting`: once per finished run (box and review), not per
+            // request id: a request issued again past its expiry, or a later
+            // list (the Workspace's own inbox poll), never sends it again.
+            let first = lock(&self.state).notified.insert(r.id.clone(), sha.clone()) != Some(sha);
+            if first {
+                if let Ok(ctx) = self.ctx() {
+                    crate::workspace_touch::notify_pending(&ctx, &pa);
                 }
             }
+            out.push(pa);
         }
         out
     }
@@ -1557,14 +1591,30 @@ fn list_some(v: &[String]) -> String {
     s
 }
 
-/// `{diff, review}`: `box.diff`'s answer over a review.
-pub fn diff_answer(r: &Review) -> serde_json::Map<String, Value> {
+/// FU1: what a `guard_skipped` flag means (the one shared text).
+pub use saiife_wire::source::GUARD_SKIPPED_WHY as GUARD_SKIPPED;
+
+/// FU1: `{skipped, checks, turns}`: the box's guard signal for a review.
+pub fn guard_json(r: &BoxRecord) -> Value {
+    serde_json::json!({
+        "skipped": r.guard_skipped,
+        "checks": r.guard_checks,
+        "turns": r.turns,
+    })
+}
+
+/// `{diff, review, guard}`: `box.diff`'s answer over a review (`guard`
+/// when the box's record is at hand).
+pub fn diff_answer(r: &Review, rec: Option<&BoxRecord>) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     m.insert(
         "diff".into(),
         serde_json::to_value(&r.summary).unwrap_or(Value::Null),
     );
     m.insert("review".into(), review_json(r));
+    if let Some(rec) = rec {
+        m.insert("guard".into(), guard_json(rec));
+    }
     m
 }
 
