@@ -265,6 +265,7 @@ async fn execute(
             numbers: n(report.numbers),
             from_calc: n(report.from_calc),
         },
+        envelope: None,
     })
 }
 
@@ -350,5 +351,6 @@ async fn after_run_refusal(
         head: head_no_answer(lang).to_string(),
         reason,
         method_line: Some(line),
+        envelope: None,
     }
 }

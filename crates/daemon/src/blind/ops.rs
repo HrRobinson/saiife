@@ -455,6 +455,58 @@ async fn methods_list(
     Ok(json!({"methods": methods}))
 }
 
+/// The refusal of `blind.outbox.show` to a caller who is not an auditor.
+pub const OUTBOX_NOT_AUDITOR: &str = "the outbox is for root and the saiife-audit group";
+
+/// `blind.outbox.show {sha256}` -> `{entry: {ts, sha256, uid, dataset, ask,
+/// body}}` (plan 48 T4): the exact request body that left for the model.
+/// Root or a member of the audit group, checked on the current groups as
+/// `audit.query` with `all` is; in personal mode the own user, whose outbox
+/// it is.
+async fn outbox_show(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    args: &serde_json::Map<String, Value>,
+) -> Result<Value, Refusal> {
+    let sha = args
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Refusal::new(ErrorCode::BadRequest, "sha256 is required"))?;
+    // As the audit prints it (`sha256:<hex>`, the outbox's own form), or
+    // the bare hex.
+    let hex = sha.strip_prefix("sha256:").unwrap_or(sha);
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Refusal::new(
+            ErrorCode::BadRequest,
+            "sha256 must be 64 lowercase hex digits",
+        ));
+    }
+    let allowed = if ctx.mode == Mode::Personal {
+        ctx.peer_is_own(peer)
+    } else {
+        let dir = Arc::clone(&ctx.directory);
+        let p = peer.clone();
+        tokio::task::spawn_blocking(move || crate::audit_query::peer_may_read_all(dir.as_ref(), &p))
+            .await
+            .unwrap_or(false)
+    };
+    if !allowed {
+        return Err(Refusal::new(ErrorCode::Forbidden, OUTBOX_NOT_AUDITOR));
+    }
+    let ob = ctx.blind.outbox();
+    let want = format!("sha256:{hex}");
+    let found = tokio::task::spawn_blocking(move || ob.find(&want))
+        .await
+        .map_err(|_| Refusal::new(ErrorCode::Internal, "outbox.show failed"))?
+        .map_err(|_| Refusal::new(ErrorCode::Unavailable, "the outbox cannot be read"))?;
+    let e = found
+        .ok_or_else(|| Refusal::new(ErrorCode::BadRequest, "no outbox entry has that sha256"))?;
+    Ok(json!({"entry": {
+        "ts": e.ts, "sha256": e.sha256, "uid": e.uid, "dataset": e.dataset,
+        "ask": e.ask, "body": e.body,
+    }}))
+}
+
 /// Every op in [`super::OPS`].
 pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     // Only `data stage` and `data refresh` take passed descriptors; any
@@ -493,6 +545,9 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         saiife_ipc::msg::OP_BLIND_STATUS => return reply(req.id, status(ctx, &conn.peer).await),
         saiife_ipc::msg::OP_BLIND_METHODS_LIST => {
             return reply(req.id, methods_list(ctx, &conn.peer, &req.args).await)
+        }
+        saiife_ipc::msg::OP_BLIND_OUTBOX_SHOW => {
+            return reply(req.id, outbox_show(ctx, &conn.peer, &req.args).await)
         }
         saiife_ipc::msg::OP_BLIND_ASK => {
             return reply(

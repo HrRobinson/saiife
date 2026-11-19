@@ -601,6 +601,81 @@ async fn show_sent_returns_the_exact_envelope() {
     assert_eq!(step["envelope"], body["messages"][0]["content"]);
 }
 
+/// Plan 48 T4: `blind.outbox.show` gives the exact body by its sha256, to
+/// the personal broker's own user, and in locked mode to root (or the
+/// audit group) only.
+#[tokio::test]
+async fn outbox_show_is_for_auditors() {
+    use saiife_ipc::msg::OP_BLIND_OUTBOX_SHOW;
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    let _ = ask_q(&f, Q_SOREN).await;
+    let ob = outbox(&f);
+    let sha = ob[0]["sha256"].as_str().unwrap().to_string();
+    let v = call(&f, OP_BLIND_OUTBOX_SHOW, json!({"sha256": sha}), vec![]).await;
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(v["entry"]["body"], ob[0]["body"]);
+    assert_eq!(v["entry"]["sha256"], sha.as_str());
+    assert_eq!(v["entry"]["dataset"], "crm");
+    // The bare hex finds it too.
+    let bare = sha.strip_prefix("sha256:").unwrap();
+    let v = call(&f, OP_BLIND_OUTBOX_SHOW, json!({"sha256": bare}), vec![]).await;
+    assert_eq!(v["entry"]["body"], ob[0]["body"], "{v}");
+    let v = call_as(
+        &f,
+        OTHER,
+        OP_BLIND_OUTBOX_SHOW,
+        json!({"sha256": sha}),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        err(&v),
+        (
+            "forbidden".into(),
+            saiife_daemon::blind::ops::OUTBOX_NOT_AUDITOR.into()
+        )
+    );
+    for (a, want) in [
+        (json!({}), "sha256 is required"),
+        (
+            json!({"sha256": "ABC"}),
+            "sha256 must be 64 lowercase hex digits",
+        ),
+        (
+            json!({"sha256": "0".repeat(64)}),
+            "no outbox entry has that sha256",
+        ),
+    ] {
+        let v = call(&f, OP_BLIND_OUTBOX_SHOW, a, vec![]).await;
+        assert_eq!(err(&v), ("bad_request".into(), want.into()));
+    }
+    // Locked: root reads it; a listed user does not.
+    let t2 = scratch();
+    let f = fx_mode(t2.path(), &[balance()], Mode::Locked, BOTH).await;
+    let v = call_as(
+        &f,
+        OWN,
+        OP_BLIND_ASK,
+        json!({"question": Q_SOREN, "dataset": "crm", "lang": "en"}),
+        vec![],
+    )
+    .await;
+    assert!(v.get("error").is_none(), "{v}");
+    let sha = outbox(&f)[0]["sha256"].as_str().unwrap().to_string();
+    let v = call_as(
+        &f,
+        OWN,
+        OP_BLIND_OUTBOX_SHOW,
+        json!({"sha256": sha}),
+        vec![],
+    )
+    .await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    let v = call_as(&f, 0, OP_BLIND_OUTBOX_SHOW, json!({"sha256": sha}), vec![]).await;
+    assert!(v.get("error").is_none(), "{v}");
+}
+
 #[tokio::test]
 async fn pick_then_preview() {
     let t = scratch();
@@ -1559,6 +1634,30 @@ async fn yes_runs_but_shows_method() {
     );
     assert_eq!(outcomes(&f), ["auto"]);
     assert_eq!(records(&f, "blind_run").len(), 1);
+    // No preview step, no envelope without show_sent.
+    assert!(step.get("envelope").is_none(), "{step}");
+}
+
+/// T2 M3: `yes` with `show_sent` shows no preview, so the answer carries
+/// the exact envelope sent.
+#[tokio::test]
+async fn yes_show_sent_carries_the_envelope() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    if no_calc("yes_show_sent_carries_the_envelope") {
+        return;
+    }
+    let (_, step) = ask_with(
+        &f,
+        json!({"question": Q_SOREN, "dataset": "crm", "lang": "en", "yes": true,
+               "show_sent": true}),
+    )
+    .await;
+    assert_eq!(step["kind"], "answer", "{step}");
+    let ob = outbox(&f);
+    assert_eq!(ob.len(), 1);
+    let body: Value = serde_json::from_str(ob[0]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(step["envelope"], body["messages"][0]["content"]);
 }
 
 #[tokio::test]

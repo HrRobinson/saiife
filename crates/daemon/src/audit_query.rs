@@ -60,9 +60,13 @@ pub const USER_KINDS: &[&str] = &[
     "blind_loosen",
     "blind_name",
     "blind_log_scrubbed",
+    // A refused touch of the caller's own (fixed texts only, plan 48 T3).
+    "blind_touch",
 ];
 /// Longest filter string.
 const MAX_FILTER: usize = 4096;
+/// The `kind_prefix` values a query may name (plan 48 T4).
+pub const KIND_PREFIXES: &[&str] = &["blind_"];
 
 /// Whose records a query may see.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +84,9 @@ pub enum Scope {
 pub struct Query {
     pub filter: Filter,
     pub kind: Option<String>,
+    /// Only records whose kind starts with this ([`KIND_PREFIXES`] only:
+    /// `blind_`, for `saiife blind audit`).
+    pub kind_prefix: Option<String>,
     pub service: Option<String>,
     pub all: bool,
     pub limit: u64,
@@ -196,8 +203,8 @@ fn opt_u64(args: &Map<String, Value>, k: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// `{since?, kind?, service?, agent?, project?, blocked?, all?, limit?,
-/// after_seq?, after?}`. `since` is a Unix time in seconds; `limit` is 1..=5000
+/// `{since?, kind?, kind_prefix?, service?, agent?, project?, blocked?,
+/// all?, limit?, after_seq?, after?}`. `since` is a Unix time in seconds; `limit` is 1..=5000
 /// (default 5000).
 pub fn parse(args: &Map<String, Value>) -> Result<Query, String> {
     let since = match args.get("since") {
@@ -222,6 +229,15 @@ pub fn parse(args: &Map<String, Value>) -> Result<Query, String> {
             blocked_only: opt_bool(args, "blocked")?,
         },
         kind: opt_str(args, "kind")?,
+        kind_prefix: match opt_str(args, "kind_prefix")? {
+            Some(p) if !KIND_PREFIXES.contains(&p.as_str()) => {
+                return Err(format!(
+                    "kind_prefix must be one of: {}",
+                    KIND_PREFIXES.join(", ")
+                ))
+            }
+            p => p,
+        },
         service: opt_str(args, "service")?,
         all: opt_bool(args, "all")?,
         limit,
@@ -246,6 +262,9 @@ pub fn in_scope(r: &Record, scope: &Scope) -> bool {
 pub fn matches(r: &Record, q: &Query) -> bool {
     q.filter.matches(r)
         && q.kind.as_deref().is_none_or(|k| r.kind() == k)
+        && q.kind_prefix
+            .as_deref()
+            .is_none_or(|p| r.kind().starts_with(p))
         && q.service
             .as_deref()
             .is_none_or(|s| r.extra.get("service").and_then(Value::as_str) == Some(s))
@@ -563,6 +582,29 @@ mod tests {
         // Another uid sees only its own.
         let p = page(&mixed(), Scope::Uid(OTHER), &q(json!({})));
         assert_eq!(inputs(&p), ["other-guard", "other-conn", "other-approval"]);
+    }
+
+    /// Plan 48 T4: `kind_prefix` narrows to the `blind_*` kinds; no other
+    /// prefix is accepted, and the uid scope still comes first.
+    #[test]
+    fn kind_prefix_is_blind_only() {
+        let mut rs = mixed();
+        rs.push(rec(10, "blind_ask", Some(ME), "my-ask"));
+        rs.push(rec(11, "blind_send", Some(OTHER), "other-send"));
+        rs.push(rec(12, "blind_touch", Some(ME), "my-touch"));
+        let p = page(&rs, Scope::Uid(ME), &q(json!({"kind_prefix": "blind_"})));
+        assert_eq!(inputs(&p), ["my-ask", "my-touch"]);
+        let p = page(&rs, Scope::All, &q(json!({"kind_prefix": "blind_"})));
+        assert_eq!(inputs(&p), ["my-ask", "other-send", "my-touch"]);
+        for bad in ["", "gu", "blind", "approval"] {
+            let mut a = Map::new();
+            a.insert("kind_prefix".into(), json!(bad));
+            let e = parse(&a).unwrap_err();
+            assert_eq!(e, "kind_prefix must be one of: blind_", "{bad}");
+        }
+        let mut a = Map::new();
+        a.insert("kind_prefix".into(), json!(7));
+        assert!(parse(&a).is_err());
     }
 
     /// Windows: the token decides, and the label says nothing.

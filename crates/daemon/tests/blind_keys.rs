@@ -346,6 +346,12 @@ async fn ops_registered() {
             assert_eq!(a["message"], want, "{op}: {a}");
             continue;
         }
+        // Plan 48 T4: the outbox entry by its sha256.
+        if *op == saiife_ipc::msg::OP_BLIND_OUTBOX_SHOW {
+            assert_eq!(a["error"], "bad_request", "{op}: {a}");
+            assert_eq!(a["message"], "sha256 is required", "{op}: {a}");
+            continue;
+        }
         panic!("{op} has no expectation here: {a}");
     }
     assert!(FD_OPS.contains(&OP_BLIND_DATA_STAGE));

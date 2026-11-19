@@ -33,6 +33,8 @@ mod audit_locked;
 // `__blind-calc`, the Data Shield calculator process (plan 45).
 #[cfg(target_os = "linux")]
 mod blind_calc;
+// `saiife blind ask | status | audit`: Data Shield (plan 48; Linux only).
+mod blind_cmd;
 #[cfg(unix)]
 mod box_attach;
 mod box_cmd;
@@ -456,6 +458,15 @@ enum Cmd {
         #[command(subcommand)]
         action: box_cmd::BoxAction,
     },
+    /// Data Shield (Linux): ask questions about a local dataset; only
+    /// stand-ins and synthetic rows reach the cloud planner.
+    Blind {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: blind_cmd::BlindAction,
+    },
     /// Local dev environments: compose stacks behind one HTTPS proxy (preview).
     Dev {
         #[command(subcommand)]
@@ -522,6 +533,7 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         // does not compile.
         // Says itself that it needs Linux (exit 5).
         Cmd::BlindCalc
+        | Cmd::Blind { .. }
         | Cmd::System { .. }
         | Cmd::Doctor { .. }
         | Cmd::Audit { .. }
@@ -810,6 +822,13 @@ fn main() -> ExitCode {
     {
         return box_cmd::run(system_config, action);
     }
+    if let Cmd::Blind {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return blind_cmd::run(system_config, action);
+    }
     if let Cmd::Dev { action } = cli.command {
         return dev_cmd::run(action);
     }
@@ -896,6 +915,7 @@ fn main() -> ExitCode {
         | Cmd::Policy { .. }
         | Cmd::Env { .. }
         | Cmd::Box { .. }
+        | Cmd::Blind { .. }
         | Cmd::Dev { .. }
         | Cmd::Rules { .. }
         | Cmd::Approve { .. }

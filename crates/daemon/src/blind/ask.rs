@@ -228,6 +228,10 @@ pub enum Step {
         cap_note: Option<String>,
         footer: String,
         checked: Checked,
+        /// With `show_sent` and `yes` (no preview step is shown): the
+        /// exact envelope sent, as the preview would carry it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        envelope: Option<String>,
     },
     /// The ask ended without an answer. `code` is fixed (see [`code`]).
     Refused {
@@ -236,6 +240,9 @@ pub enum Step {
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         method_line: Option<String>,
+        /// As in [`Step::Answer`]: a `yes` run's envelope with `show_sent`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        envelope: Option<String>,
     },
     /// The dataset is being rebuilt; ask again in a moment.
     Refreshing { text: String },
@@ -296,7 +303,17 @@ impl Step {
             head: head.to_string(),
             reason: reason.into(),
             method_line: None,
+            envelope: None,
         }
+    }
+
+    /// `self` carrying `envelope` (an answer or a refusal of a `yes` run,
+    /// which shows no preview; T2 M3). Other kinds are left as they are.
+    pub fn with_envelope(mut self, e: Option<String>) -> Step {
+        if let Step::Answer { envelope, .. } | Step::Refused { envelope, .. } = &mut self {
+            *envelope = e;
+        }
+        self
     }
 
     pub fn to_value(&self) -> Value {
@@ -1834,12 +1851,19 @@ async fn finish_preview(
     if let Err(e) = record(ctx, &st, r, failed).await {
         return (st, Err(e));
     }
-    let step = Step::Preview {
-        text: p.text.clone(),
-        planner_says: says,
-        approved: approved.clone(),
-        sent,
-        envelope,
+    // `--yes --show-sent` shows no preview: the envelope goes with the
+    // run's step instead (T2 M3).
+    let (step, yes_envelope) = if st.opts.yes {
+        (None, envelope)
+    } else {
+        let s = Step::Preview {
+            text: p.text.clone(),
+            planner_says: says,
+            approved: approved.clone(),
+            sent,
+            envelope,
+        };
+        (Some(s), None)
     };
     st.sent = sent;
     st.reused = approved.clone();
@@ -1850,10 +1874,13 @@ async fn finish_preview(
         preview: p,
         approved,
     };
-    if st.opts.yes {
-        return run::run_or_stop(ctx, id, st, true, false).await;
+    match step {
+        Some(step) => (st, Ok(step)),
+        None => {
+            let (st, r) = run::run_or_stop(ctx, id, st, true, false).await;
+            (st, r.map(|s| s.with_envelope(yes_envelope)))
+        }
     }
-    (st, Ok(step))
 }
 
 // --------------------------------------------------------------- ops ----

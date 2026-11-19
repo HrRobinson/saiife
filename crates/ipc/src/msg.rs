@@ -325,6 +325,10 @@ pub const OP_BLIND_ASK_ANSWER: &str = "blind.ask.answer";
 pub const OP_BLIND_TOUCH_BEGIN: &str = "blind.touch.begin";
 /// Plan 48: finishes a touch flow.
 pub const OP_BLIND_TOUCH_COMMIT: &str = "blind.touch.commit";
+/// Plan 48: `{sha256}` -> `{entry}`, the outbox entry of that body (what
+/// left for the model). Root or a `saiife-audit` member, as `audit.query`
+/// with `all`; the personal broker's own user.
+pub const OP_BLIND_OUTBOX_SHOW: &str = "blind.outbox.show";
 /// Every `blind.*` op.
 pub const BLIND_OPS: &[&str] = &[
     OP_BLIND_STATUS,
@@ -338,6 +342,7 @@ pub const BLIND_OPS: &[&str] = &[
     OP_BLIND_ASK_ANSWER,
     OP_BLIND_TOUCH_BEGIN,
     OP_BLIND_TOUCH_COMMIT,
+    OP_BLIND_OUTBOX_SHOW,
 ];
 /// The ops whose `ok` answer is followed by one fd byte (`fdpass::FD_BYTE`)
 /// carrying exactly one descriptor: read it with
@@ -552,7 +557,7 @@ mod tests {
 
     #[test]
     fn blind_ops_are_named_and_two_take_fds() {
-        assert_eq!(BLIND_OPS.len(), 11);
+        assert_eq!(BLIND_OPS.len(), 12);
         for op in BLIND_OPS {
             assert!(op.starts_with("blind."), "{op}");
             assert!(!LINK_OPS.contains(op), "{op}");
