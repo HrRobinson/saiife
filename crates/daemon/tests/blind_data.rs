@@ -1255,7 +1255,7 @@ fn approved(key: &str, sql: &str) -> ApprovedMethod {
             needs_judgment: false,
             context: vec![],
         },
-        preview_sha256: "ab".into(),
+        preview_mac: "ab".into(),
         approved_by: "me".into(),
         approved_at: "2026-11-18T10:00:00Z".into(),
         touch: "key-1 #1".into(),

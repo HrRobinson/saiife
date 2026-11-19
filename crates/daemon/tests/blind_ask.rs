@@ -495,7 +495,7 @@ fn approved(f: &Fx, q: &str, method: &str, template: &str, status: MethodStatus)
             needs_judgment: false,
             context: vec![],
         },
-        preview_sha256: "0".repeat(64),
+        preview_mac: "0".repeat(64),
         approved_by: "me".into(),
         approved_at: "2026-11-18T00:00:00Z".into(),
         touch: "soft 1".into(),

@@ -123,7 +123,7 @@ fn not_in_policy(d: &DatasetName) -> Refusal {
     ))
 }
 
-fn class_name(c: ColumnClass) -> &'static str {
+pub(crate) fn class_name(c: ColumnClass) -> &'static str {
     match c {
         ColumnClass::Identifier => "identifier",
         ColumnClass::Quasi => "quasi",
@@ -267,6 +267,42 @@ pub fn warnings(ctx: &Ctx, name: &DatasetName) -> Vec<String> {
         .unwrap_or_else(|| classes_of(&manifest.schema));
     let grants = read_grants(&dir).unwrap_or_default();
     effective_schema(&cfg, &manifest, &base, &grants).1
+}
+
+/// The class `column` (`table.column`) of the live build `m` is held at
+/// (plan 48 T3, R48-8: the `from` of a loosening): the class baseline
+/// (`classes.json`), else the live build's own class (ruling P47-22).
+/// None: no such column.
+pub(crate) fn class_in_force(
+    ctx: &Ctx,
+    name: &DatasetName,
+    m: &Manifest,
+    column: &str,
+) -> Option<ColumnClass> {
+    let live = classes_of(&m.schema);
+    let have = live.0.get(column).copied()?;
+    let dir = ctx.blind.dataset_dir(name);
+    let base = read_small::<Classes>(&dir.root.join(CLASSES_FILE))
+        .ok()
+        .flatten();
+    Some(base.and_then(|b| b.0.get(column).copied()).unwrap_or(have))
+}
+
+/// Adds the `blind:loosen` grant `g` to `loosen.json` (plan 48 T3,
+/// R48-8): it replaces an unspent grant for the same column. Held as a
+/// build (one at a time per dataset, P47-5), so a refresh that spends
+/// grants never loses this one; busy while a refresh runs.
+pub(crate) fn add_grant(ctx: &Ctx, name: &DatasetName, g: LoosenGrant) -> Result<(), Refusal> {
+    let guard = BuildGuard::begin(&ctx.blind, name)?;
+    let dir = ctx.blind.dataset_dir(name);
+    let mut grants = read_grants(&dir)?;
+    grants.retain(|o| o.column != g.column);
+    grants.push(g);
+    let f = LoosenFile { grants };
+    let r = write_private(&dir.root.join(LOOSEN_FILE), &json_bytes(&f))
+        .map_err(|e| unavailable(format!("could not write {LOOSEN_FILE}: {e}")));
+    drop(guard);
+    r
 }
 
 /// The dataset in the policy in force, and its `k`.

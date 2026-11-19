@@ -103,6 +103,10 @@ pub const NER_NOT_READY: &str = "the local name detector is not ready: saiife bl
 /// R-C12: the asker lost the role on the dataset (a policy change).
 pub const ROLE_LOST: &str =
     "you may no longer ask this dataset (the policy changed); the ask has ended";
+/// R-C12 at a `blind:approve` commit (plan 48 T3): the approver role is
+/// gone.
+pub const APPROVER_LOST: &str = "you are no longer an approver of this dataset (the policy \
+                                 changed); nothing was approved and the ask has ended";
 /// R-C12: the dataset left policy.
 pub const DATASET_GONE: &str = "this dataset is no longer in policy; the ask has ended";
 /// A record failed before anything was sent.
@@ -563,6 +567,74 @@ pub struct AskState {
     /// [`audit::preview_mac`] of the preview, for its `blind_preview`
     /// records (shown or auto, then accepted or stopped).
     preview_mac: String,
+    /// The template key and type tags of the user's own question, taken
+    /// before any context parameter was bound (plan 48 T3: approve uses
+    /// these, never the bound draft's).
+    template: Option<(String, Vec<String>)>,
+    /// The approved method the preview reused, if any.
+    reused: Option<String>,
+}
+
+/// What `methods approve` takes from an answered ask (plan 48 T3).
+#[derive(Clone)]
+pub struct ForApprove {
+    pub dataset: DatasetName,
+    pub lang: Lang,
+    /// From the original question ([`AskState`]'s `template`).
+    pub template_key: String,
+    pub param_tags: Vec<String>,
+    pub reply: PlanReply,
+    /// The preview text the answer ran with.
+    pub preview_text: String,
+    /// Its [`audit::preview_mac`].
+    pub preview_mac: String,
+    /// The approved method the ask reused, if any.
+    pub reused: Option<String>,
+}
+
+impl std::fmt::Debug for ForApprove {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForApprove")
+            .field("dataset", &self.dataset)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AskState {
+    /// The name a `keep_name` step waits on, if that is the pending step.
+    pub fn keep_name_pending(&self) -> Option<&str> {
+        match &self.phase {
+            AskPhase::Resolving(d) => match d.pending.first() {
+                Some(Pending::KeepName { name, .. }) => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// What approving this ask would store: only an ask that ended with a
+    /// checked answer (Task 2's `Answered`).
+    pub fn for_approve(&self) -> Option<ForApprove> {
+        let AskPhase::Answered {
+            draft,
+            reply,
+            preview,
+        } = &self.phase
+        else {
+            return None;
+        };
+        let (template_key, param_tags) = self.template.clone()?;
+        Some(ForApprove {
+            dataset: self.dataset.clone(),
+            lang: draft.lang,
+            template_key,
+            param_tags,
+            reply: reply.clone(),
+            preview_text: preview.text.clone(),
+            preview_mac: self.preview_mac.clone(),
+            reused: self.reused.clone(),
+        })
+    }
 }
 
 impl std::fmt::Debug for AskState {
@@ -702,6 +774,16 @@ impl Asks {
             Some(s) if s.uid != uid => Err(Refusal::new(ErrorCode::Forbidden, NOT_YOURS)),
             Some(s) => Ok(f(s)),
         }
+    }
+
+    /// Drops ask `id` of `uid` when it is kept (not in flight): `methods
+    /// approve` ends the ask it approved. Whether it was there.
+    pub fn forget(&mut self, id: &str, uid: u32) -> bool {
+        if self.map.get(id).is_some_and(|s| s.uid == uid) {
+            self.map.remove(id);
+            return true;
+        }
+        false
     }
 
     /// Test seam: every ask's last step `by` earlier.
@@ -949,6 +1031,8 @@ pub async fn begin(
         peer: peer.clone(),
         sent: Sent::default(),
         preview_mac: String::new(),
+        template: None,
+        reused: None,
     };
     let q = args.question;
     let lang = args.lang;
@@ -995,7 +1079,27 @@ pub async fn step(
 /// the caller drops the ask. The ask keeps running on its held build
 /// (P47-37); only the authorization is current.
 async fn still_allowed(ctx: &Ctx, id: &str, st: &AskState) -> Result<(), Refusal> {
-    allowed(ctx, id, &Asker::of(st)).await
+    allowed(ctx, id, &Asker::of(st), false).await
+}
+
+/// R-C12 for a touch commit on ask `id` of `peer` (plan 48 T3): the
+/// dataset is still in policy and `peer` still may ask it (`approver`: is
+/// still its approver). On a failure the ask ends (dropped, unless a step
+/// holds it), a `blind_check_refused` record is written and the answer is
+/// `forbidden`.
+pub(crate) async fn recheck(
+    ctx: &Ctx,
+    id: &str,
+    peer: &PeerCred,
+    approver: bool,
+) -> Result<(), Refusal> {
+    let mut w = lock(&ctx.blind.asks).peek(id, peer.uid, Asker::of)?;
+    w.peer = peer.clone();
+    if let Err(r) = allowed(ctx, id, &w, approver).await {
+        lock(&ctx.blind.asks).forget(id, peer.uid);
+        return Err(r);
+    }
+    Ok(())
 }
 
 /// Who an ask belongs to, as R-C12 checks it (a copy: the check awaits).
@@ -1017,20 +1121,29 @@ impl Asker {
     }
 }
 
-/// [`still_allowed`] on a copy of the ask's owner.
-async fn allowed(ctx: &Ctx, id: &str, w: &Asker) -> Result<(), Refusal> {
+/// [`still_allowed`] on a copy of the ask's owner (`approver`: the
+/// approver role, not only `may_ask`).
+async fn allowed(ctx: &Ctx, id: &str, w: &Asker, approver: bool) -> Result<(), Refusal> {
     let in_policy = ctx
         .policy()
         .system
         .as_ref()
         .is_some_and(|s| s.blind.dataset.iter().any(|d| d.name == w.dataset.as_str()));
+    let has_role = in_policy && {
+        let r = super::ops::role_of(ctx, &w.peer, &w.dataset).await;
+        if approver {
+            r.approver
+        } else {
+            r.may_ask()
+        }
+    };
     let why = if !in_policy {
         Some(("dataset_not_in_policy", DATASET_GONE))
-    } else if !super::ops::role_of(ctx, &w.peer, &w.dataset)
-        .await
-        .may_ask()
-    {
-        Some(("role_lost", ROLE_LOST))
+    } else if !has_role {
+        Some((
+            "role_lost",
+            if approver { APPROVER_LOST } else { ROLE_LOST },
+        ))
     } else {
         None
     };
@@ -1073,7 +1186,7 @@ pub async fn policy_reloaded(ctx: &Arc<Ctx>) {
     };
     let mut gone = Vec::new();
     for (id, w) in kept {
-        if allowed(ctx, &id, &w).await.is_err() {
+        if allowed(ctx, &id, &w, false).await.is_err() {
             gone.push((id, w.uid));
         }
     }
@@ -1352,7 +1465,12 @@ async fn record_ask(
                 false,
             )
             .map_err(|e| shield_err(&e))?;
-        (logged_question(d, s, schema), crate::api_ops::hex(&s.id.0))
+        // A name a `blind:name` touch kept (this ask's or an earlier turn's)
+        // is logged by its keyed hash only (`blind_name`, plan 48 T3).
+        let mut kept = s.released_names();
+        kept.extend(st.released.iter().cloned());
+        let q = saiife_shield::envelope::mask_released(&logged_question(d, s, schema), &kept);
+        (q, crate::api_ops::hex(&s.id.0))
     };
     let r = BlindRecord::Ask {
         ask: id.to_string(),
@@ -1495,6 +1613,8 @@ async fn proceed(
     let public = snap.manifest.public.as_slice();
     let list_cap = st.opts.list_cap;
     let (key, tags) = question::template_key(&d);
+    let mut st = st;
+    st.template = Some((key.clone(), tags.clone()));
     let found = match approved_for(ctx, &st, d.lang, key, tags).await {
         Ok(f) => f,
         Err(e) => return (st, Err(e)),
@@ -1710,6 +1830,7 @@ async fn finish_preview(
         envelope,
     };
     st.sent = sent;
+    st.reused = approved.clone();
     st.phase = AskPhase::Previewing {
         draft: d,
         validated: v,

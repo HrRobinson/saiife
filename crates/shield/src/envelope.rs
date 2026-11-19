@@ -335,6 +335,28 @@ pub fn logged_question(d: &Draft, session: &mut Session, schema: &Schema) -> Str
     out
 }
 
+/// What a logged question shows for a name a `blind:name` touch kept.
+pub const KEPT_NAME: &str = "[kept name]";
+
+/// A logged question (from [`logged_question`]) with each name a
+/// `blind:name` touch released replaced by [`KEPT_NAME`] (plan 48 T3,
+/// spec §6.5): the name went to the planner as typed, but the audit holds
+/// only its keyed hash (`blind_name`). Longer names are masked first, so
+/// a released name inside another one is masked whole.
+pub fn mask_released(question: &str, released: &[String]) -> String {
+    let mut names: Vec<&str> = released
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = question.to_string();
+    for n in names {
+        out = out.replace(n, KEPT_NAME);
+    }
+    out
+}
+
 /// The session turn of an ask whose method ran (plan 48 T2, R44-5): the
 /// parameterized question `d.text`, each entity parameter bound to exactly
 /// one key with its session stand-in (the same [`Session::symbol_for`] as
@@ -569,6 +591,21 @@ pub fn sha256_hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 48 T3: a kept name is masked whole in the logged question.
+    #[test]
+    fn released_names_are_masked_in_the_log() {
+        let rel = vec!["Zed".to_string(), "Zed Quorra".to_string(), " ".to_string()];
+        assert_eq!(
+            mask_released("What does Zed Quorra owe Zed?", &rel),
+            "What does [kept name] owe [kept name]?"
+        );
+        assert_eq!(
+            mask_released("What is :p1 owed?", &rel),
+            "What is :p1 owed?"
+        );
+        assert_eq!(mask_released("as is", &[]), "as is");
+    }
 
     /// Plan 48 T1: the question a record holds has the stand-in of each
     /// single-key entity, the one the envelope gets, and nothing else.

@@ -103,6 +103,36 @@ pub(crate) fn public_gate(
     })
 }
 
+/// R48-8 (plan 48 T3): why `table.column` of a built snapshot may not be
+/// made `public` after init, or `None`: the same gate as [`public_gate`]
+/// (with the schema's entity columns), over the column's stats and a fresh
+/// sample read from `conn`. A column the schema lacks is refused too.
+pub fn snapshot_public_refusal(
+    conn: &Connection,
+    schema: &Schema,
+    table: &str,
+    column: &str,
+) -> Result<Option<&'static str>, ShieldError> {
+    let ty = schema
+        .tables
+        .iter()
+        .find(|t| t.name == table)
+        .and_then(|t| t.columns.iter().find(|c| c.name == column))
+        .map(|c| c.ty)
+        .ok_or(ShieldError::Corrupt("no such column in the dataset"))?;
+    let st = crate::classify::stats(conn, table, column, ty)?;
+    let sample = crate::classify::sample(conn, table, column)?;
+    Ok(public_gate(
+        &schema.entities,
+        table,
+        column,
+        None,
+        ty,
+        &st,
+        &sample,
+    ))
+}
+
 /// I4 (owner ruling): why a table's frequency floors cannot be counted.
 pub const NO_IDENTIFIER: &str = "holds personal data but no column identifies the person; \
                                  choose the column that identifies the person";

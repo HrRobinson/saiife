@@ -506,9 +506,11 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                 super::ask::answer_op(ctx, &conn.peer, &req.args).await,
             )
         }
-        // Plan 48 Task 3.
-        saiife_ipc::msg::OP_BLIND_TOUCH_BEGIN | saiife_ipc::msg::OP_BLIND_TOUCH_COMMIT => {
-            not_yet(&req.op)
+        saiife_ipc::msg::OP_BLIND_TOUCH_BEGIN => {
+            return super::touch::begin_op(ctx, &conn.peer, req.id, &req.args).await
+        }
+        saiife_ipc::msg::OP_BLIND_TOUCH_COMMIT => {
+            return super::touch::commit_op(ctx, &conn.peer, req.id, &req.args).await
         }
         other => Refusal::new(ErrorCode::BadRequest, format!("unknown op {other:?}")),
     };

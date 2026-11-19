@@ -14,6 +14,7 @@ pub mod ner;
 pub mod ops;
 pub mod outbox;
 pub mod pg;
+pub mod touch;
 
 use saiife_ipc::msg::ErrorCode;
 use saiife_shield::dataset::{BuildProgress, DatasetDir, Manifest, Phase};
@@ -47,6 +48,9 @@ pub struct Blind {
     /// The open asks (plan 48 T1), by ask id. Never logged: an ask holds
     /// the question and its candidates.
     pub asks: Mutex<ask::Asks>,
+    /// The touches begun and not yet committed (plan 48 T3), by request
+    /// id. Never logged: one holds a kept name or a column.
+    pub touches: Mutex<touch::Touches>,
     /// Held across a key store change (create, rotate, shred), so a check
     /// of `keys.sealed` still holds when it is written or removed.
     keys_lock: Mutex<()>,
@@ -235,6 +239,7 @@ impl Blind {
             datasets: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(saiife_shield::session::Sessions::new()),
             asks: Mutex::new(ask::Asks::new()),
+            touches: Mutex::new(touch::Touches::new()),
             keys_lock: Mutex::new(()),
             methods_locks: Mutex::new(BTreeMap::new()),
             #[cfg(debug_assertions)]

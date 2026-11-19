@@ -333,12 +333,20 @@ async fn ops_registered() {
             );
             continue;
         }
-        assert_eq!(a["error"], "unavailable", "{op}: {a}");
-        assert_eq!(
-            a["message"],
-            format!("{op} is not available in this build yet"),
-            "{op}: {a}"
-        );
+        // Plan 48 T3 built the touches: with no arguments they ask for them.
+        if *op == saiife_ipc::msg::OP_BLIND_TOUCH_BEGIN
+            || *op == saiife_ipc::msg::OP_BLIND_TOUCH_COMMIT
+        {
+            let want = if *op == saiife_ipc::msg::OP_BLIND_TOUCH_BEGIN {
+                "purpose is required"
+            } else {
+                "request_id is required"
+            };
+            assert_eq!(a["error"], "bad_request", "{op}: {a}");
+            assert_eq!(a["message"], want, "{op}: {a}");
+            continue;
+        }
+        panic!("{op} has no expectation here: {a}");
     }
     assert!(FD_OPS.contains(&OP_BLIND_DATA_STAGE));
     assert!(FD_OPS.contains(&OP_BLIND_DATA_REFRESH));

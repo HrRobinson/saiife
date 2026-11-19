@@ -37,7 +37,11 @@ pub struct ApprovedMethod {
     pub template_key: String,
     pub param_tags: Vec<String>,
     pub reply: PlanReply,
-    pub preview_sha256: String,
+    /// The keyed MAC of the preview text the approver touched for (plan 48
+    /// T3: HMAC-SHA256 under the dataset's index key, as the audit's
+    /// `preview_mac`); never a bare hash, as the text holds the user's
+    /// words.
+    pub preview_mac: String,
     pub approved_by: String,
     pub approved_at: String,
     /// Credential label and sign count, from plan 48.
@@ -361,7 +365,7 @@ mod tests {
                 needs_judgment: false,
                 context: vec![],
             },
-            preview_sha256: "ab".into(),
+            preview_mac: "ab".into(),
             approved_by: "boss".into(),
             approved_at: "2026-11-17T10:00:00Z".into(),
             touch: "key-1 #3".into(),
