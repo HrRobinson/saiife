@@ -610,6 +610,79 @@ fn init_asks_for_the_identifier() {
     assert_eq!(code(&o), 0, "{:?}", text(&o));
 }
 
+/// Plan 48 C5 (D51-4): a source whose entity key repeats is refused by the
+/// build; `init` and `data add` print the fixed reason (names and a count,
+/// no value) and write no policy for it.
+#[test]
+fn init_and_data_add_refuse_repeated_keys() {
+    let w = world(
+        Opts {
+            ner_in_config: true,
+            secret: true,
+        },
+        &[],
+    );
+    let db = w.crm(false);
+    let c = rusqlite::Connection::open(&db).unwrap();
+    // The fixture's `id` is a primary key: copy the table without it.
+    c.execute_batch(
+        "CREATE TABLE c2 AS SELECT * FROM customers; DROP TABLE customers; \
+         ALTER TABLE c2 RENAME TO customers; \
+         UPDATE customers SET id = (SELECT MIN(id) FROM customers) \
+         WHERE id = (SELECT MAX(id) FROM customers);",
+    )
+    .unwrap();
+    drop(c);
+    let want = "customers.id has repeated or empty values; each row needs its own id \
+                (2 rows affected)";
+    assert_eq!(
+        saiife_shield::error::repeated_key_reason("customers", "id", 2),
+        want
+    );
+    let o = w.blind(
+        &s(&[
+            "init",
+            "--dataset",
+            "crm",
+            "--file",
+            db.to_str().unwrap(),
+            "--accept-guesses",
+            "--entity",
+            ENTITY,
+            "--cloud-secret",
+            SECRET,
+            "--skip-test",
+            "--yes",
+        ]),
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(err.contains(want), "{err}");
+    assert!(!w.dropin_dir().join("blind-crm.toml").exists());
+    assert_ne!(w.crm_status()["state"], "live");
+    let o = w.blind(
+        &s(&[
+            "data",
+            "add",
+            "--dataset",
+            "crm",
+            "--file",
+            db.to_str().unwrap(),
+            "--accept-guesses",
+            "--entity",
+            ENTITY,
+        ]),
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(err.contains(want), "{err}");
+    assert!(!w.dropin_dir().join("blind-crm.toml").exists());
+}
+
 #[test]
 fn data_add_writes_and_commits() {
     let w = world(

@@ -120,6 +120,13 @@ pub struct EntitySpec {
 /// One declared key relation (plan 45 ruling C-G1): the INTEGER column
 /// `table.column` holds keys of the entity `entity.key`. Snapshot names
 /// throughout (never aliases).
+///
+/// **Invariant (plan 48 C5, owner ruling D51-4):** in a built dataset the
+/// key side `entity.key` is UNIQUE and NON-NULL (no NULL, no empty value,
+/// no value on two rows); `dataset::finish` refuses a build otherwise. So
+/// each FK row matches at most one key row, and the validator's join rules
+/// (`sql.rs`: a key-side row repeats only along a fan edge) hold. The FK
+/// side `table.column` may repeat.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct KeyJoin {
     /// The entity's table ([`EntitySpec::table`]) and its key column.

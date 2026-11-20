@@ -918,9 +918,13 @@ fn side(n: usize, edges: &[Edge], skip: usize, start: usize) -> Vec<bool> {
 }
 
 /// Review F3: which sources' rows the joins repeat. A fan edge (one key row,
-/// many FK rows) repeats every source on its key side. The FK sides of all
-/// fan edges must nest (one chain), else rows multiply across branches (two
-/// children of one key, or of two keys) and even COUNT(*) is inflated.
+/// many FK rows) repeats every source on its key side. This rests on the
+/// key-uniqueness invariant (plan 48 C5, D51-4; see
+/// [`crate::schema::KeyJoin`]): a join's key side is unique and non-null in
+/// every built dataset, so one FK row meets at most one key row and its own
+/// edge never repeats the FK side. The FK sides of all fan edges must nest
+/// (one chain), else rows multiply across branches (two children of one
+/// key, or of two keys) and even COUNT(*) is inflated.
 fn fan_out(n: usize, edges: &[Edge]) -> R<Vec<bool>> {
     let fans: Vec<(Vec<bool>, Vec<bool>)> = edges
         .iter()

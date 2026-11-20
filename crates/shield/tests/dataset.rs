@@ -1174,3 +1174,179 @@ fn finish_retry_drops_stale_indexes() {
         vec![("customers".to_string(), "id".to_string())]
     );
 }
+
+// ---- plan 48 C5 (owner ruling D51-4): key columns are unique, non-null ----
+
+/// Rewrites the `id` of the given rows of `customers.csv` (0-based data
+/// rows) to `to(row)`.
+fn set_customer_ids(csv: &Path, rows: &[usize], to: &dyn Fn(usize) -> String) {
+    let p = csv.join("customers.csv");
+    let mut r = csv::Reader::from_path(&p).unwrap();
+    let h = r.headers().unwrap().clone();
+    let i = h.iter().position(|c| c == "id").unwrap();
+    let mut recs: Vec<csv::StringRecord> = r.records().map(Result::unwrap).collect();
+    for &row in rows {
+        let mut f: Vec<String> = recs[row].iter().map(str::to_string).collect();
+        f[i] = to(row);
+        recs[row] = csv::StringRecord::from(f);
+    }
+    let mut w = csv::Writer::from_path(&p).unwrap();
+    w.write_record(&h).unwrap();
+    for rec in &recs {
+        w.write_record(rec).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn first_customer_id(csv: &Path) -> String {
+    let mut r = csv::Reader::from_path(csv.join("customers.csv")).unwrap();
+    let h = r.headers().unwrap().clone();
+    let i = h.iter().position(|c| c == "id").unwrap();
+    r.records().next().unwrap().unwrap()[i].to_string()
+}
+
+fn assert_repeated_key(e: &ShieldError, table: &str, column: &str, rows: u64) {
+    let want = saiife_shield::error::repeated_key_reason(table, column, rows);
+    assert_eq!(e.to_string(), want);
+    assert_eq!(
+        want,
+        format!(
+            "{table}.{column} has repeated or empty values; each row needs its own {column} \
+             ({rows} rows affected)"
+        )
+    );
+    match e {
+        ShieldError::RepeatedKey {
+            table: t,
+            column: c,
+            rows: n,
+        } => assert_eq!((t.as_str(), c.as_str(), *n), (table, column, rows)),
+        other => panic!("not a repeated-key refusal: {other:?}"),
+    }
+}
+
+/// A repeated entity key is refused with the table, the column and the
+/// count of rows that share a key, and no value; nothing goes live.
+#[test]
+fn repeated_entity_key_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 21);
+    let first = first_customer_id(&csv);
+    // Rows 1 and 2 take row 0's id: three rows share one key.
+    set_customer_ids(&csv, &[1, 2], &|_| first.clone());
+    let dir = ds(t.path());
+    let schema = stage(&dir, &csv);
+    let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+    assert_repeated_key(&e, "customers", "id", 3);
+    assert!(!dir.live().exists());
+    // The staged snapshot got no indexes (refused before them).
+    let conn = saiife_shield::snapshot::open_ro(&dir.stage().join("snapshot.sqlite")).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// Empty and whitespace-only keys (NULL in the snapshot) are refused.
+#[test]
+fn empty_entity_key_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 22);
+    set_customer_ids(&csv, &[3, 7, 9], &|r| {
+        if r == 9 {
+            "   ".into()
+        } else {
+            String::new()
+        }
+    });
+    let dir = ds(t.path());
+    let schema = stage(&dir, &csv);
+    let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+    assert_repeated_key(&e, "customers", "id", 3);
+    assert!(!dir.live().exists());
+}
+
+/// Repeated and empty keys together: every affected row is counted once.
+#[test]
+fn repeated_and_empty_keys_are_counted_together() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 23);
+    let first = first_customer_id(&csv);
+    set_customer_ids(&csv, &[1], &|_| first.clone());
+    set_customer_ids(&csv, &[5], &|_| String::new());
+    let dir = ds(t.path());
+    let schema = stage(&dir, &csv);
+    let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+    assert_repeated_key(&e, "customers", "id", 3);
+}
+
+/// Clean data builds; the FK side of a join repeats (many invoices per
+/// customer) and is not required to be unique.
+#[test]
+fn clean_keys_build_and_fk_side_may_repeat() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 1200, 24);
+    let dir = ds(t.path());
+    let mut schema = stage(&dir, &csv);
+    schema.entities[0].word = "customer".into();
+    let m = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap();
+    assert_eq!(m.schema.joins.len(), 1);
+    let conn = saiife_shield::snapshot::open_ro(&dir.snapshot()).unwrap();
+    let (n, d): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(customer_id), COUNT(DISTINCT customer_id) FROM invoices",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(n > d, "the fixture repeats customer_id: {n} {d}");
+}
+
+/// The key side of a join (declared, and by convention) is checked: with
+/// repeated keys the build is refused, naming the key side, never the FK.
+#[test]
+fn join_key_side_with_repeats_is_refused() {
+    use saiife_shield::schema::KeyJoin;
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 25);
+    let first = first_customer_id(&csv);
+    set_customer_ids(&csv, &[4], &|_| first.clone());
+    let dir = ds(t.path());
+    for conventional in [false, true] {
+        let mut schema = stage(&dir, &csv);
+        if conventional {
+            schema.entities[0].word = "customer".into();
+        } else {
+            schema.joins = vec![KeyJoin {
+                entity: "customers".into(),
+                key: "id".into(),
+                table: "invoices".into(),
+                column: "customer_id".into(),
+            }];
+        }
+        let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+        assert_repeated_key(&e, "customers", "id", 2);
+        assert!(!dir.live().exists());
+    }
+}
+
+/// A rebuild of a live dataset whose new data repeats a key is refused and
+/// the old build stays live, unchanged.
+#[test]
+fn rebuild_with_repeated_keys_keeps_the_live_build() {
+    let t = tempfile::tempdir().unwrap();
+    let csv = fixture(t.path(), "csv", 200, 400, 26);
+    let dir = ds(t.path());
+    let live = build(&dir, &csv);
+    let csv2 = fixture(t.path(), "csv2", 200, 400, 27);
+    let first = first_customer_id(&csv2);
+    set_customer_ids(&csv2, &[1], &|_| first.clone());
+    let schema = stage(&dir, &csv2);
+    let e = finish(&dir, &schema, 10, &key(), &mut ok, &mut |_| {}).unwrap_err();
+    assert_repeated_key(&e, "customers", "id", 2);
+    assert_eq!(load_manifest(&dir).unwrap(), live);
+}

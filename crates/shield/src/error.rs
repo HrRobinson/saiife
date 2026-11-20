@@ -21,6 +21,27 @@ pub enum ShieldError {
     Sqlite(String),
     #[error("corrupt data: {0}")]
     Corrupt(&'static str),
+    /// Plan 48 C5 (D51-4): a key-side column (an entity key, or the key
+    /// side of a join) holds repeated or empty values. Names and a count
+    /// only, never a value: the text is [`repeated_key_reason`].
+    #[error("{}", repeated_key_reason(table, column, *rows))]
+    RepeatedKey {
+        table: String,
+        column: String,
+        /// The rows without a key of their own: every row whose key is
+        /// empty, or shared with another row.
+        rows: u64,
+    },
+}
+
+/// The fixed refusal of a build whose key-side column `table.column` has
+/// repeated or empty values in `rows` rows (plan 48 C5, D51-4). It holds
+/// names and a count only, so it is safe to show and to send anywhere.
+pub fn repeated_key_reason(table: &str, column: &str, rows: u64) -> String {
+    format!(
+        "{table}.{column} has repeated or empty values; each row needs its own {column} \
+         ({rows} rows affected)"
+    )
 }
 
 /// `file, table t, column c, row 7: why`: names and positions only.

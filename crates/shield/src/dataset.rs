@@ -725,6 +725,62 @@ fn check_joins(schema: &Schema) -> Result<(), ShieldError> {
     Ok(())
 }
 
+/// The key-side columns of `schema` (with its joins built), sorted: every
+/// EntitySpec key and the entity side of every [`Schema::joins`] entry.
+/// The FK side of a join may repeat (many invoices to one customer) and is
+/// not here.
+fn key_side_columns(schema: &Schema) -> BTreeSet<(&str, &str)> {
+    let mut out: BTreeSet<(&str, &str)> = schema
+        .entities
+        .iter()
+        .map(|e| (e.table.as_str(), e.key.as_str()))
+        .collect();
+    for j in &schema.joins {
+        out.insert((j.entity.as_str(), j.key.as_str()));
+    }
+    out
+}
+
+/// **Invariant (plan 48 C5, owner ruling D51-4):** in a built snapshot every
+/// key-side column ([`key_side_columns`]) is UNIQUE and NON-NULL: no NULL,
+/// no empty or whitespace-only text, no value on two rows. A join from an
+/// FK to it therefore matches at most one row, so it never multiplies the
+/// rows of the other side; the validator's join rules
+/// ([`Schema::key_join`], `sql.rs`) and the calculator rely on this.
+///
+/// Checked in SQL on the staged snapshot, before any index exists, with
+/// two queries per column: the empty rows (one scan) and the rows whose key
+/// another row shares (`GROUP BY` the key, `HAVING COUNT(*) > 1`: one scan
+/// and one sort in memory, `O(n log n)`; about 4 s at 3M keys in random
+/// order, where `COUNT(DISTINCT)` and its temp B-tree took 5.4 s). The refusal
+/// names the table, the column and the count of affected rows, never a
+/// value ([`crate::error::repeated_key_reason`]).
+fn check_unique_keys(conn: &Connection, schema: &Schema) -> Result<(), ShieldError> {
+    for (t, c) in key_side_columns(schema) {
+        let (tq, cq) = (quote_ident(t), quote_ident(c));
+        // NULL (the loader's empty and whitespace-only cell), or empty text
+        // in a snapshot from elsewhere.
+        let empty = format!("({cq} IS NULL OR (typeof({cq}) = 'text' AND TRIM({cq}) = ''))");
+        let count = |sql: String| -> Result<i64, ShieldError> {
+            conn.query_row(&sql, [], |r| r.get(0)).map_err(snap_err)
+        };
+        let empties = count(format!("SELECT COUNT(*) FROM {tq} WHERE {empty}"))?;
+        // Every row whose key another row shares.
+        let shared = count(format!(
+            "SELECT COALESCE(SUM(n), 0) FROM (SELECT COUNT(*) AS n FROM {tq} \
+             WHERE NOT {empty} GROUP BY {cq} HAVING COUNT(*) > 1)"
+        ))?;
+        if empties + shared > 0 {
+            return Err(ShieldError::RepeatedKey {
+                table: t.to_string(),
+                column: c.to_string(),
+                rows: (empties + shared) as u64,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The declared joins and the conventional ones, sorted, no duplicates.
 fn all_joins(schema: &Schema) -> Vec<KeyJoin> {
     let mut joins = schema.joins.clone();
@@ -1147,6 +1203,8 @@ fn finish_inner(
     let policy = schema.clone();
     let mut schema = schema.clone();
     schema.joins = all_joins(&schema);
+    // C5 (D51-4): after the load, before the indexes and the manifest.
+    check_unique_keys(&conn, &schema)?;
     // I4: every table can be counted, or the build is refused here.
     let counts = schema
         .tables

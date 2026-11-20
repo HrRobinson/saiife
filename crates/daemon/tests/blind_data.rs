@@ -552,6 +552,36 @@ async fn refresh_reports_a_failed_build() {
     assert_eq!(records(&f, "blind_refresh").len(), 1);
 }
 
+/// Plan 48 C5 (D51-4): a refresh whose new data repeats an entity key is
+/// refused with the fixed reason (names and a count, no value), recorded
+/// for `status`, and the old build stays live, unchanged.
+#[tokio::test]
+async fn refresh_with_repeated_keys_keeps_the_live_build() {
+    let t = scratch();
+    let f = fx(t.path());
+    build_live(&f, &[]).await;
+    let before = load_manifest(&f.ctx.blind.dataset_dir(&crm())).unwrap();
+    let dup = f.root.join("dup.sqlite");
+    std::fs::copy(&f.sqlite, &dup).unwrap();
+    std::fs::set_permissions(&dup, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let c = rusqlite::Connection::open(&dup).unwrap();
+    c.execute_batch(
+        "UPDATE customers SET id = (SELECT MIN(id) FROM customers) \
+         WHERE id = (SELECT MAX(id) FROM customers)",
+    )
+    .unwrap();
+    drop(c);
+    ok(&refresh(&f, &dup).await);
+    f.ctx.blind.test_wait_builds().await;
+    let want = saiife_shield::error::repeated_key_reason("customers", "id", 2);
+    assert_eq!(f.ctx.blind.last_build_error(&crm()), Some(want));
+    assert!(f.ctx.blind.live(&crm()).is_ok());
+    assert_eq!(
+        load_manifest(&f.ctx.blind.dataset_dir(&crm())).unwrap(),
+        before
+    );
+}
+
 #[test]
 fn loosen_without_grant_is_ignored() {
     let cfg: saiife_policy::SystemConfig =

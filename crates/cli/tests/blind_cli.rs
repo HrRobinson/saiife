@@ -740,6 +740,43 @@ fn data_refresh_progress_then_live() {
     assert_eq!(code(&o), 2, "{:?}", text(&o));
 }
 
+/// Plan 48 C5 (D51-4): a refresh whose new data repeats an entity key
+/// fails with the fixed reason (names and a count, no value); the old
+/// build stays live.
+#[test]
+fn data_refresh_prints_the_repeated_key_reason() {
+    let f = fx(&[]);
+    let before = crm_status(&f)["snapshot_sha256"].clone();
+    let dup = f.b.path().join("dup.sqlite");
+    fs::copy(f.b.path().join("crm.sqlite"), &dup).unwrap();
+    let c = rusqlite::Connection::open(&dup).unwrap();
+    // The fixture's `id` is a primary key: copy the table without it.
+    c.execute_batch(
+        "CREATE TABLE c2 AS SELECT * FROM customers; DROP TABLE customers; \
+         ALTER TABLE c2 RENAME TO customers; \
+         UPDATE customers SET id = (SELECT MIN(id) FROM customers) \
+         WHERE id = (SELECT MAX(id) FROM customers);",
+    )
+    .unwrap();
+    drop(c);
+    let o = f.blind(
+        &["data", "refresh", "--file", dup.to_str().unwrap()],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 5, "{out}\n{err}");
+    let want = saiife_shield::error::repeated_key_reason("customers", "id", 2);
+    assert!(
+        err.contains(&format!("saiife: the refresh of crm failed: {want}")),
+        "{err}"
+    );
+    assert!(out.is_empty(), "{out}");
+    let s = crm_status(&f);
+    assert_eq!(s["state"], "live", "{s}");
+    assert_eq!(s["snapshot_sha256"], before, "{s}");
+}
+
 #[test]
 fn data_rm_confirms_name() {
     let f = fx(&[]);
