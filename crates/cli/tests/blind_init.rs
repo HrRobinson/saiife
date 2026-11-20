@@ -229,7 +229,7 @@ fn init_scripted_end_to_end() {
         "2/6 Columns   ",
         "3/6 Models    name detector  m  sha256 ",
         "4/6 Cloud     Claude, API key in vault: anthropic ✓",
-        "5/6 Rules     exact mode by default · k = 10 · preview before every run · English, Danish",
+        "5/6 Rules     exact mode by default · k = 10 · preview before every run unless --yes · English, Danish",
         "6/6 Test      \"How many customers are there?\"",
         "Done. Ask with: saiife blind ask \"…\"",
     ] {
@@ -671,4 +671,114 @@ fn data_add_writes_and_commits() {
         "{err}"
     );
     assert!(!w.dropin_dir().join("blind-crm2.toml").exists());
+}
+
+#[test]
+fn rerun_keeps_the_dataset_settings() {
+    // T6 review I1: a second init or data add keeps k, preview_required,
+    // users, entities and classes; a loosening is refused.
+    let w = world(
+        Opts {
+            ner_in_config: true,
+            secret: true,
+        },
+        &[],
+    );
+    let db = w.crm(false);
+    let me = common::daemon::own_user();
+    let mut first = s(&[
+        "init",
+        "--dataset",
+        "crm",
+        "--file",
+        db.to_str().unwrap(),
+        "--accept-guesses",
+        "--entity",
+        ENTITY,
+        "--cloud-secret",
+        SECRET,
+        "--k",
+        "20",
+        "--preview-required",
+        "--class",
+        "invoices.customer_id=identifier",
+        "--skip-test",
+        "--yes",
+    ]);
+    first.extend(s(&["--users", &me]));
+    let o = w.blind(&first, "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    // The ruling: verbatim when the preview is required.
+    assert!(
+        out.contains(
+            "5/6 Rules     exact mode by default · k = 20 · preview before every run · English, Danish"
+        ),
+        "{out}"
+    );
+    let d = w.dropin_dir().join("blind-crm.toml");
+    let kept = |d: &Path| {
+        let t = toml_of(d);
+        let ds = t["blind"]["dataset"][0].clone();
+        assert_eq!(ds["k"].as_integer(), Some(20), "{t}");
+        assert_eq!(ds["preview_required"].as_bool(), Some(true), "{t}");
+        assert_eq!(
+            ds["users"],
+            toml::Value::Array(vec![me.clone().into()]),
+            "{t}"
+        );
+        assert_eq!(ds["entity"][0]["word_da"].as_str(), Some("kunde"), "{t}");
+        assert_eq!(class_of(d, "invoices.customer_id"), "identifier");
+    };
+    kept(&d);
+    // data add again, no flags: all kept.
+    let add = s(&[
+        "data",
+        "add",
+        "--dataset",
+        "crm",
+        "--file",
+        db.to_str().unwrap(),
+    ]);
+    let o = w.blind(&add, "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(out.contains("None need you."), "{out}");
+    kept(&d);
+    // init again, no dataset flags: all kept, the preview still required.
+    let o = w.blind(
+        &s(&[
+            "init",
+            "--dataset",
+            "crm",
+            "--file",
+            db.to_str().unwrap(),
+            "--skip-test",
+            "--yes",
+        ]),
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        out.contains("k = 20 · preview before every run · "),
+        "{out}"
+    );
+    kept(&d);
+    // A lower k, or a user added: refused, the file as it was.
+    let before = fs::read(&d).unwrap();
+    for extra in [vec!["--k", "5"], vec!["--users", "someone-else"]] {
+        let mut args = add.clone();
+        args.extend(s(&extra));
+        let o = w.blind(&args, "", false);
+        let (out, err) = text(&o);
+        assert_eq!(code(&o), 2, "{out}\n{err}");
+        assert!(
+            err.contains("crm is in policy already, and ") && err.contains("would loosen it"),
+            "{err}"
+        );
+        assert!(!out.contains("1/2 Data"), "{out}");
+        assert_eq!(fs::read(&d).unwrap(), before);
+    }
 }

@@ -432,6 +432,9 @@ mod imp {
         approvers: Vec<String>,
         k: Option<u32>,
         preview_required: bool,
+        /// The dataset as policy defines it now (a re-run): what no flag
+        /// changes stays (list_cap, joins, classes, aliases, entities).
+        base: Option<BlindDataset>,
     }
 
     impl Plan {
@@ -469,11 +472,15 @@ mod imp {
                 mode: "exact".into(),
                 k: self.k,
                 preview_required: self.preview_required,
-                list_cap: None,
+                list_cap: self.base.as_ref().and_then(|b| b.list_cap),
                 tables,
                 columns,
                 entity: self.entities.clone(),
-                joins: Vec::new(),
+                joins: self
+                    .base
+                    .as_ref()
+                    .map(|b| b.joins.clone())
+                    .unwrap_or_default(),
             }
         }
     }
@@ -702,6 +709,7 @@ mod imp {
     fn data_step(
         t: &Target,
         a: &DataArgs,
+        base: Option<&BlindDataset>,
         ds: &str,
         of: usize,
         p: &mut dyn Prompter,
@@ -733,20 +741,27 @@ mod imp {
                 password_secret: secret,
                 tables: a.postgres_tables.clone(),
             };
-            // The source only, so the daemon can read it; Rules writes the rest.
-            let first = BlindDataset {
-                name: ds.to_string(),
-                source: source.clone(),
-                users: a.users.clone(),
-                approvers: a.approvers.clone(),
-                mode: "exact".into(),
-                k: a.k,
-                preview_required: false,
-                list_cap: None,
-                tables: BTreeMap::new(),
-                columns: BTreeMap::new(),
-                entity: Vec::new(),
-                joins: Vec::new(),
+            // The source only, so the daemon can read it; Rules writes the
+            // rest. A dataset in policy keeps everything else meanwhile.
+            let first = match base {
+                Some(b) => BlindDataset {
+                    source: source.clone(),
+                    ..b.clone()
+                },
+                None => BlindDataset {
+                    name: ds.to_string(),
+                    source: source.clone(),
+                    users: a.users.clone(),
+                    approvers: a.approvers.clone(),
+                    mode: "exact".into(),
+                    k: a.k,
+                    preview_required: false,
+                    list_cap: None,
+                    tables: BTreeMap::new(),
+                    columns: BTreeMap::new(),
+                    entity: Vec::new(),
+                    joins: Vec::new(),
+                },
             };
             write_and_reload(t, None, &first, undo)?;
             let r = call(
@@ -967,9 +982,31 @@ mod imp {
         plan: &mut Plan,
     ) -> Result<(), Stop> {
         let refused = |m: String| Stop::Refused(m);
-        let mut classes: BTreeMap<String, String> =
-            st.cols.iter().map(|c| (c.key(), c.guess.clone())).collect();
-        let mut by_flag: BTreeSet<String> = BTreeSet::new();
+        // A re-run starts from the classes and aliases policy has now; a
+        // column policy lists needs nobody again.
+        let old = plan.base.clone();
+        let old_cols = old.as_ref().map(|b| b.columns.clone()).unwrap_or_default();
+        let mut classes: BTreeMap<String, String> = st
+            .cols
+            .iter()
+            .map(|c| {
+                let class = old_cols
+                    .get(&c.key())
+                    .map_or_else(|| c.guess.clone(), |x| x.class.clone());
+                (c.key(), class)
+            })
+            .collect();
+        for (key, c) in &old_cols {
+            if let (Some(al), Some(_)) = (&c.alias, st.col(key)) {
+                plan.col_alias.insert(key.clone(), al.clone());
+            }
+        }
+        for (tb, c) in old.iter().flat_map(|b| b.tables.iter()) {
+            if let (Some(al), true) = (&c.alias, st.has_table(tb)) {
+                plan.table_alias.insert(tb.clone(), al.clone());
+            }
+        }
+        let mut by_flag: BTreeSet<String> = old_cols.keys().cloned().collect();
         for (key, class) in &a.classes {
             set_class(st, &mut classes, key, class, k).map_err(refused)?;
             by_flag.insert(key.clone());
@@ -1087,10 +1124,17 @@ mod imp {
                 }
             }
         }
-        // The entity tables: the flags, else the guess (confirmed or edited).
+        // The entity tables: the flags, else the ones policy has now, else
+        // the guess (confirmed or edited).
+        let old_entities = old.as_ref().map(|b| b.entity.clone()).unwrap_or_default();
         if !a.entities.is_empty() {
             for spec in &a.entities {
                 plan.entities.push(parse_entity(spec, st).map_err(refused)?);
+            }
+        } else if !old_entities.is_empty() {
+            for e in old_entities {
+                outln!("{INDENT}entity  {}  (kept)", sanitize(&entity_spec(&e)));
+                plan.entities.push(e);
             }
         } else {
             for e in guess_entities(st, &classes) {
@@ -1637,18 +1681,99 @@ mod imp {
     // ------------------------------------------------------- the runs ----
 
     /// The dataset's settings before its columns are chosen.
-    fn plan_for(ds: &str, source: BlindSource, a: &DataArgs, preview_required: bool) -> Plan {
-        Plan {
-            name: ds.to_string(),
-            source,
-            classes: BTreeMap::new(),
-            col_alias: BTreeMap::new(),
-            table_alias: BTreeMap::new(),
-            entities: Vec::new(),
-            users: a.users.clone(),
-            approvers: a.approvers.clone(),
-            k: a.k,
-            preview_required,
+    /// The Rules line (controller ruling: "unless --yes" when the dataset
+    /// does not require the preview).
+    pub(crate) fn rules_text(k: u32, preview_required: bool) -> String {
+        let preview = if preview_required {
+            "preview before every run"
+        } else {
+            "preview before every run unless --yes"
+        };
+        format!("exact mode by default · k = {k} · {preview} · English, Danish")
+    }
+
+    /// The dataset's settings before its columns are chosen. A dataset in
+    /// policy keeps its k, users, approvers and preview_required unless a
+    /// flag changes them; a change that loosens it (a lower k, a user or
+    /// approver added) is refused: no touch can grant it (`blind:loosen`
+    /// grants a column's class only), so it is a hand edit of the file.
+    /// `preview_required` can only be turned on here.
+    fn plan_for(
+        t: &Target,
+        k: &Known,
+        ds: &str,
+        a: &DataArgs,
+        want_preview: bool,
+        existing: Option<&BlindDataset>,
+    ) -> Result<PlanStart, Stop> {
+        let Some(old) = existing else {
+            return Ok(PlanStart {
+                users: a.users.clone(),
+                approvers: a.approvers.clone(),
+                k: a.k,
+                preview_required: want_preview,
+                base: None,
+            });
+        };
+        let path = policy_file::dataset_path(t, ds).map_err(Stop::Refused)?;
+        let shown = sanitize(ds);
+        let by_hand = |what: &str| {
+            Stop::Refused(format!(
+                "{shown} is in policy already, and {what} would loosen it, which saiife blind does not do: edit {} by hand (remove its first line), then saiife policy reload",
+                sanitize(&path.display().to_string())
+            ))
+        };
+        let new_k = a.k.or(old.k);
+        let eff = |x: Option<u32>| x.or(k.full.k).unwrap_or(DEFAULT_K);
+        if eff(new_k) < eff(old.k) {
+            return Err(by_hand(&format!(
+                "a lower k ({} instead of {})",
+                eff(new_k),
+                eff(old.k)
+            )));
+        }
+        let list = |given: &[String], had: &[String], what: &str| -> Result<Vec<String>, Stop> {
+            if given.is_empty() {
+                return Ok(had.to_vec());
+            }
+            match given.iter().find(|u| !had.contains(u)) {
+                Some(u) => Err(by_hand(&format!("adding {what} {}", sanitize(u)))),
+                None => Ok(given.to_vec()),
+            }
+        };
+        Ok(PlanStart {
+            users: list(&a.users, &old.users, "the user")?,
+            approvers: list(&a.approvers, &old.approvers, "the approver")?,
+            k: new_k,
+            preview_required: old.preview_required || want_preview,
+            base: Some(old.clone()),
+        })
+    }
+
+    /// What [`plan_for`] keeps or sets.
+    struct PlanStart {
+        users: Vec<String>,
+        approvers: Vec<String>,
+        k: Option<u32>,
+        preview_required: bool,
+        base: Option<BlindDataset>,
+    }
+
+    impl PlanStart {
+        fn plan(self, ds: &str, source: BlindSource) -> Plan {
+            Plan {
+                name: ds.to_string(),
+                source,
+                classes: BTreeMap::new(),
+                col_alias: BTreeMap::new(),
+                table_alias: BTreeMap::new(),
+                entities: Vec::new(),
+                users: self.users,
+                approvers: self.approvers,
+                k: self.k,
+                preview_required: self.preview_required,
+                base: self.base,
+            }
         }
     }
 
@@ -1680,8 +1805,9 @@ mod imp {
         let ds = dataset_name(&a.data, p, "saiife blind init")?;
         let existing = writable(t, &ds, &k)?;
         let shown_k = stage_k(&k, existing.as_ref());
-        let (source, st) = data_step(t, &a.data, &ds, 6, p, undo)?;
-        let mut plan = plan_for(&ds, source, &a.data, a.preview_required);
+        let start = plan_for(t, &k, &ds, &a.data, a.preview_required, existing.as_ref())?;
+        let (source, st) = data_step(t, &a.data, existing.as_ref(), &ds, 6, p, undo)?;
+        let mut plan = start.plan(&ds, source);
         columns_step(&a.data, &st, shown_k, 6, "saiife blind init", p, &mut plan)?;
         if !models_step(t, a, &mut k, p, undo)? {
             return Ok(Outcome::Stopped);
@@ -1691,8 +1817,9 @@ mod imp {
         }
         let kk = plan.k.or(k.full.k).unwrap_or(DEFAULT_K);
         outln!(
-            "{}exact mode by default · k = {kk} · preview before every run · English, Danish",
-            head(5, 6, "Rules")
+            "{}{}",
+            head(5, 6, "Rules"),
+            rules_text(kk, plan.preview_required)
         );
         let globals = (k.mine != k.mine0).then_some(&k.mine);
         build(t, &mut plan, globals, &st, p, undo)?;
@@ -1748,9 +1875,9 @@ mod imp {
         let ds = dataset_name(a, p, "saiife blind data add")?;
         let existing = writable(t, &ds, &k)?;
         let shown_k = stage_k(&k, existing.as_ref());
-        let preview_required = existing.as_ref().is_some_and(|d| d.preview_required);
-        let (source, st) = data_step(t, a, &ds, 2, p, undo)?;
-        let mut plan = plan_for(&ds, source, a, preview_required);
+        let start = plan_for(t, &k, &ds, a, false, existing.as_ref())?;
+        let (source, st) = data_step(t, a, existing.as_ref(), &ds, 2, p, undo)?;
+        let mut plan = start.plan(&ds, source);
         columns_step(a, &st, shown_k, 2, "saiife blind data add", p, &mut plan)?;
         build(t, &mut plan, None, &st, p, undo)?;
         let path = policy_file::dataset_path(t, &ds).map_err(Stop::Refused)?;
@@ -1815,6 +1942,18 @@ mod imp {
             assert_eq!(
                 tables_text(&staged()),
                 "2 tables (customers: about 100 rows, visits: under 100 rows)"
+            );
+        }
+
+        #[test]
+        fn rules_line() {
+            assert_eq!(
+                rules_text(10, true),
+                "exact mode by default · k = 10 · preview before every run · English, Danish"
+            );
+            assert_eq!(
+                rules_text(20, false),
+                "exact mode by default · k = 20 · preview before every run unless --yes · English, Danish"
             );
         }
 
