@@ -102,6 +102,20 @@ const IPC_OPS: &[&str] = &[
     "audit.append",
     "audit.query",
     "audit.rotate_key",
+    // Data Shield (plans 47, 48): local CLI only, never a remote Workspace device.
+    "blind.ask",
+    "blind.ask.answer",
+    "blind.data.commit",
+    "blind.data.refresh",
+    "blind.data.revoke",
+    "blind.data.rm",
+    "blind.data.stage",
+    "blind.methods.list",
+    "blind.ner.fetch",
+    "blind.outbox.show",
+    "blind.status",
+    "blind.touch.begin",
+    "blind.touch.commit",
     "box.done",
     // fd passing (plan 37): control socket only.
     "box.fds",
@@ -278,6 +292,24 @@ mod tests {
     fn box_fds_is_machine_only() {
         assert_eq!(level_for("box.fds"), Some(Level::MachineOnly));
         assert!(!REMOTE.iter().any(|(n, _)| *n == "box.fds"));
+    }
+
+    #[test]
+    fn blind_ops_are_never_remote() {
+        let src = include_str!("../../ipc/src/msg.rs");
+        let mut n = 0;
+        for line in src.lines() {
+            let Some(i) = line.find(": &str = \"blind.") else {
+                continue;
+            };
+            let rest = &line[i + ": &str = \"".len()..];
+            let op = &rest[..rest.find('"').unwrap()];
+            n += 1;
+            assert_eq!(level_for(op), Some(Level::MachineOnly), "{op}");
+            assert!(!REMOTE.iter().any(|(r, _)| *r == op), "{op} is remote");
+        }
+        assert!(n >= 13, "found {n}");
+        assert_eq!(level_for("blind.unknown"), None);
     }
 
     #[test]

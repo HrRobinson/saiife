@@ -11,6 +11,13 @@ pub mod approval_ops;
 pub mod approvals;
 pub mod approvers;
 pub mod audit_query;
+/// Data Shield (plan 47): the `blind.*` ops, dataset states and the sealed
+/// key store. Linux only; elsewhere every op answers that it runs on Linux.
+#[cfg(target_os = "linux")]
+pub mod blind;
+#[cfg(not(target_os = "linux"))]
+#[path = "blind_stub.rs"]
+pub mod blind;
 pub mod box_images;
 // The per-box gateway: allow-listed CONNECT egress and the model port (plan 38).
 #[cfg(unix)]

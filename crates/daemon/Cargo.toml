@@ -91,6 +91,18 @@ saiife-boxproto = { path = "../boxproto" }
 # (no blocking-api: each call runs on a thread that blocks on the runtime).
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
+# Data Shield (plan 47): the logic behind the `blind.*` ops (tokio-free).
+# The daemon only wires I/O. Linux only in this release.
+saiife-shield = { path = "../shield" }
+# The Postgres source (plan 47 R47-4): local only, no TLS crate (default
+# features: the tokio runtime glue). 0.7.18 is from 2026-06-12.
+tokio-postgres = "=0.7.18"
+# Streams the Postgres rows (`RowStream` is a `Stream`); as in Cargo.lock.
+futures-util = { version = "=0.3.34", default-features = false }
+# The name-detector helper's file check (plan 47 Task 4, R47-11: F2 as for
+# the FIDO helper); tokio-free. The helper itself (`saiife-shield-ner`, which
+# links tract) is never a dependency: the daemon speaks `ner_proto` only.
+saiife-fido = { path = "../fido" }
 
 # The named pipe server, token peers and the service entry (plan 19b, W1).
 [target.'cfg(windows)'.dependencies]
@@ -116,6 +128,13 @@ hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
+# Data Shield tests (plan 47): plan 43's fixture generator writes CSVs.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+csv = "=1.4.0"
+# The methods tests drop a column from the fixture database (plan 47 T2b);
+# the version saiife-shield pins.
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 
 [lints]
 workspace = true

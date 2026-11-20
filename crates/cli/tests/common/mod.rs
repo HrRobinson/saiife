@@ -4,6 +4,8 @@
 //! under test. Nothing touches the real user's directories.
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+pub mod blind;
 #[cfg(unix)]
 pub mod daemon;
 #[cfg(unix)]

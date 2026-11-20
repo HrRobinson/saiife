@@ -27,6 +27,10 @@ if [ -n "${SAIIFE_TEST_TMP:-}" ]; then
   export SAIIFE_TEST_TMP
 fi
 cargo test --workspace --no-run --quiet
+# The daemon's Data Shield tests (blind_data, blind_ner) run the fake name
+# detector, a `fake`-feature bin the workspace build never makes (CI builds it
+# in its name-detector step first).
+cargo build -p saiife-shield-ner --features fake --bin saiife-fake-ner --quiet
 # Sanity checks: inside the namespace there must be no network, and the
 # tests must not run as root.
 if offline curl -sS --max-time 3 https://example.com >/dev/null 2>&1; then

@@ -300,6 +300,55 @@ pub const OP_BOX_LAND_APPLIED: &str = "box.land.applied";
 pub const OP_BOX_PUSH_BEGIN: &str = "box.push.begin";
 /// `{request_id, ok, detail}` -> `{}`.
 pub const OP_BOX_PUSH_DONE: &str = "box.push.done";
+// Data Shield (plan 47): control socket, machine local only. Linux only;
+// elsewhere every one answers `unavailable`, "Data Shield runs on Linux in
+// this release".
+/// `{dataset?}` -> the datasets' states.
+pub const OP_BLIND_STATUS: &str = "blind.status";
+/// After a `box.fds` of the source file (file sources): stages a dataset.
+pub const OP_BLIND_DATA_STAGE: &str = "blind.data.stage";
+/// Commits a staged dataset.
+pub const OP_BLIND_DATA_COMMIT: &str = "blind.data.commit";
+/// Rebuilds a dataset (after a `box.fds` of the source file for file sources).
+pub const OP_BLIND_DATA_REFRESH: &str = "blind.data.refresh";
+/// Removes a dataset.
+pub const OP_BLIND_DATA_RM: &str = "blind.data.rm";
+/// Plan 48: `{dataset, column, class}` -> `{revoked}`: withdraws an
+/// unspent `blind:loosen` grant (its policy write failed). Tightens only,
+/// so no touch.
+pub const OP_BLIND_DATA_REVOKE: &str = "blind.data.revoke";
+/// Fetches the NER model.
+pub const OP_BLIND_NER_FETCH: &str = "blind.ner.fetch";
+/// Lists a dataset's saved methods.
+pub const OP_BLIND_METHODS_LIST: &str = "blind.methods.list";
+/// Plan 48: a question about a dataset.
+pub const OP_BLIND_ASK: &str = "blind.ask";
+/// Plan 48: the answer to an ask's follow-up.
+pub const OP_BLIND_ASK_ANSWER: &str = "blind.ask.answer";
+/// Plan 48: starts a touch flow.
+pub const OP_BLIND_TOUCH_BEGIN: &str = "blind.touch.begin";
+/// Plan 48: finishes a touch flow.
+pub const OP_BLIND_TOUCH_COMMIT: &str = "blind.touch.commit";
+/// Plan 48: `{sha256}` -> `{entry}`, the outbox entry of that body (what
+/// left for the model). Root or a `saiife-audit` member, as `audit.query`
+/// with `all`; the personal broker's own user.
+pub const OP_BLIND_OUTBOX_SHOW: &str = "blind.outbox.show";
+/// Every `blind.*` op.
+pub const BLIND_OPS: &[&str] = &[
+    OP_BLIND_STATUS,
+    OP_BLIND_DATA_STAGE,
+    OP_BLIND_DATA_COMMIT,
+    OP_BLIND_DATA_REFRESH,
+    OP_BLIND_DATA_RM,
+    OP_BLIND_DATA_REVOKE,
+    OP_BLIND_NER_FETCH,
+    OP_BLIND_METHODS_LIST,
+    OP_BLIND_ASK,
+    OP_BLIND_ASK_ANSWER,
+    OP_BLIND_TOUCH_BEGIN,
+    OP_BLIND_TOUCH_COMMIT,
+    OP_BLIND_OUTBOX_SHOW,
+];
 /// The ops whose `ok` answer is followed by one fd byte (`fdpass::FD_BYTE`)
 /// carrying exactly one descriptor: read it with
 /// `client::Client::call_recv_fds`.
@@ -325,7 +374,12 @@ pub const OP_BOX_IMAGE_DEFAULT: &str = "box.image.default";
 /// default.
 pub const OP_BOX_IMAGE_RM: &str = "box.image.rm";
 /// The ops that take the descriptors of the `box.fds` just before them.
-pub const FD_OPS: &[&str] = &[OP_BOX_SPAWN, OP_BOX_IMAGE_IMPORT];
+pub const FD_OPS: &[&str] = &[
+    OP_BOX_SPAWN,
+    OP_BOX_IMAGE_IMPORT,
+    OP_BLIND_DATA_STAGE,
+    OP_BLIND_DATA_REFRESH,
+];
 /// The only ops link.sock answers; every other name is `unknown_op`.
 pub const LINK_OPS: &[&str] = &[
     OP_HELLO,
@@ -504,6 +558,17 @@ mod tests {
             serde_json::to_value(ErrorCode::UpstreamFailed).unwrap(),
             "upstream_failed"
         );
+    }
+
+    #[test]
+    fn blind_ops_are_named_and_two_take_fds() {
+        assert_eq!(BLIND_OPS.len(), 13);
+        for op in BLIND_OPS {
+            assert!(op.starts_with("blind."), "{op}");
+            assert!(!LINK_OPS.contains(op), "{op}");
+        }
+        let fd: Vec<&&str> = BLIND_OPS.iter().filter(|o| FD_OPS.contains(o)).collect();
+        assert_eq!(fd, [&OP_BLIND_DATA_STAGE, &OP_BLIND_DATA_REFRESH]);
     }
 
     #[test]

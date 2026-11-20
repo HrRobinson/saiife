@@ -665,3 +665,63 @@ fn never_rules_page_names_its_limits() {
         assert!(raw.contains(h), "never-rules.md lacks the heading {h:?}");
     }
 }
+
+// ---- docs/data-shield.md (plan 48) ----
+
+#[test]
+fn data_shield_page_states_its_guarantees_and_limits() {
+    let t = flat(&page_text("docs/data-shield.md"));
+    for needle in [
+        "exactly what the shown method computes",
+        "pseudonymized data is still personal data",
+        "never claims anonymization",
+        "calculator not in a box (weaker)",
+        "identifier_output",
+        "api keys only",
+        "linux only",
+        "what stage 1 does not do",
+        "unless --yes",
+        "saiife policy reload",
+        "repeated or empty values",
+        "use the session context",
+        "sha256",
+        "saiife blind ask",
+        "saiife blind methods approve",
+        "saiife blind data refresh",
+        "saiife blind keys rotate",
+        "saiife blind audit",
+        "saiife blind status",
+        "saiife blind init",
+        "showing 100 of 2,314",
+        // Plan 48 final review I2: the keep-name touch, what is logged,
+        // exit 5 for a refreshing dataset, data rm's touch.
+        "blind:name",
+        "stays released for the rest of the session",
+        "sent to the planner as plain text",
+        "the audit log holds the parameterized question",
+        "answer_mac",
+        "dataset refreshing",
+        "saiife blind data rm --dataset d",
+    ] {
+        assert!(t.contains(needle), "data-shield.md lacks: {needle}");
+    }
+    // The old, wrong claims are gone.
+    for wrong in [
+        "never asks for that touch",
+        "never questions, names or answers",
+        "answer's sha256 is logged",
+        "customer #4411",
+    ] {
+        assert!(!t.contains(wrong), "data-shield.md still says: {wrong}");
+    }
+    // The guarantees G1 to G3 are all named.
+    for g in ["g1", "g2", "g3"] {
+        assert!(t.contains(g), "data-shield.md lacks {g}");
+    }
+}
+
+#[test]
+fn readme_links_the_data_shield_page() {
+    let readme = fs::read_to_string(root().join("README.md")).unwrap();
+    assert!(readme.contains("docs/data-shield.md"));
+}

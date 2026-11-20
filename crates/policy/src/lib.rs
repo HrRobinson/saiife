@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blind;
 pub mod capability;
 pub mod decide;
 pub mod duration;
@@ -24,6 +25,9 @@ pub mod userpacks;
 pub mod users;
 pub mod view;
 
+pub use blind::{
+    BlindCfg, BlindDataset, BlindSource, CloudModelCfg, ColumnCfg, EntityCfg, NerCfg, TableCfg,
+};
 pub use capability::Capability;
 pub use decide::{decide, Request, Verdict};
 pub use duration::parse_duration;

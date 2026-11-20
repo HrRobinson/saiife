@@ -1237,3 +1237,260 @@ fn user_packs_key_in_config_is_unknown() {
     let (_d, cfg) = etc("version = 2\nuser_packs = []\n", &[]);
     assert!(matches!(load_system(&cfg), Err(PolicyError::Parse { .. })));
 }
+
+// ---- [blind] (plan 43 task 2) ----
+
+const BLIND_CRM: &str =
+    "[[blind.dataset]]\nname = \"crm\"\nsource = { kind = \"csv\", file_name = \"crm.csv\" }\n";
+
+fn blind_err(config: &str, dropins: &[(&str, &str)]) -> String {
+    let (_d, cfg) = etc(config, dropins);
+    match load_system(&cfg) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected an error"),
+    }
+}
+
+fn blind_hash(config: &str) -> String {
+    use saiife_policy::{active_packs, effective_policy, policy_hash};
+    let (_d, cfg) = etc(config, &[]);
+    let p = load_system(&cfg).unwrap();
+    let (packs, _) = active_packs(&p.config, &[], None);
+    policy_hash(&effective_policy(&p.config, &packs, None, None))
+}
+
+#[test]
+fn blind_absent_keeps_hash() {
+    use saiife_policy::effective_policy;
+    let (_d, cfg) = etc("version = 2\n", &[]);
+    let p = load_system(&cfg).unwrap();
+    assert!(p.config.blind.is_default());
+    let v = effective_policy(&p.config, &[], None, None);
+    assert!(v["system"].get("blind").is_none());
+}
+
+#[test]
+fn blind_changes_hash() {
+    let a = blind_hash("version = 2\n");
+    let b = blind_hash(&format!("version = 2\n{BLIND_CRM}"));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn blind_dataset_in_dropin() {
+    let (_d, cfg) = etc("version = 2\n", &[("blind-crm.toml", BLIND_CRM)]);
+    let p = load_system(&cfg).unwrap();
+    assert_eq!(p.config.blind.dataset.len(), 1);
+    assert_eq!(p.config.blind.dataset[0].mode, "exact");
+    assert_eq!(p.config.blind.k_for(&p.config.blind.dataset[0]), 10);
+    let e = blind_err(
+        "version = 2\n",
+        &[("blind-a.toml", BLIND_CRM), ("blind-b.toml", BLIND_CRM)],
+    );
+    assert!(
+        e.contains("blind-a.toml") && e.contains("blind-b.toml"),
+        "{e}"
+    );
+}
+
+#[test]
+fn blind_global_once() {
+    let h = "a".repeat(64);
+    let ner = format!(
+        "[blind.ner]\nmodel_url = \"https://x.example/m\"\nmodel_sha256 = \"{h}\"\nvocab_url = \"https://x.example/v\"\nvocab_sha256 = \"{h}\"\nlabels_url = \"https://x.example/l\"\nlabels_sha256 = \"{h}\"\n"
+    );
+    let (_d, cfg) = etc("version = 2\n", &[("b1.toml", &ner)]);
+    assert!(load_system(&cfg).unwrap().config.blind.ner.is_some());
+    let e = blind_err("version = 2\n", &[("b1.toml", &ner), ("b2.toml", &ner)]);
+    assert!(
+        e.contains("blind.ner is already set") && e.contains("b1.toml"),
+        "{e}"
+    );
+    let e = blind_err(&format!("version = 2\n{ner}"), &[("b2.toml", &ner)]);
+    assert!(e.contains("blind.ner is already set"), "{e}");
+    let e = blind_err(
+        "version = 2\n[blind]\nk = 5\n",
+        &[("b2.toml", "[blind]\nk = 6\n")],
+    );
+    assert!(e.contains("blind.k is already set"), "{e}");
+}
+
+#[test]
+fn blind_judgment_refused() {
+    let e = blind_err(
+        &format!("version = 2\n{BLIND_CRM}mode = \"judgment\"\n"),
+        &[],
+    );
+    assert!(e.contains("judgment mode is a later stage"), "{e}");
+}
+
+#[test]
+fn blind_remote_postgres_refused() {
+    let pg = |host: &str| {
+        format!(
+            "version = 2\n[[blind.dataset]]\nname = \"pg\"\nsource = {{ kind = \"postgres\", host = \"{host}\", dbname = \"d\", user = \"u\", password_secret = \"s\", tables = [\"t\"] }}\n"
+        )
+    };
+    for ok in ["/run/postgresql", "localhost", "127.0.0.1", "::1"] {
+        let (_d, cfg) = etc(&pg(ok), &[]);
+        load_system(&cfg).unwrap();
+    }
+    let e = blind_err(&pg("db.example.com"), &[]);
+    assert!(
+        e.contains("remote Postgres needs TLS, which is a later stage"),
+        "{e}"
+    );
+}
+
+#[test]
+fn blind_bad_class_refused() {
+    let e = blind_err(
+        &format!("version = 2\n{BLIND_CRM}[blind.dataset.columns.\"t.c\"]\nclass = \"secret\"\n"),
+        &[],
+    );
+    assert!(
+        e.contains("class must be one of identifier, quasi, sensitive, free_text, public"),
+        "{e}"
+    );
+    let e = blind_err(
+        &format!("version = 2\n{BLIND_CRM}[blind.dataset.columns.nodot]\nclass = \"public\"\n"),
+        &[],
+    );
+    assert!(e.contains("table.column"), "{e}");
+    let e = blind_err("version = 2\n[blind]\nk = 1\n", &[]);
+    assert!(e.contains("k must be at least 2"), "{e}");
+    let e = blind_err(
+        &format!("version = 2\n{BLIND_CRM}approvers = [\"-x\"]\n"),
+        &[],
+    );
+    assert!(e.contains("approvers"), "{e}");
+}
+
+#[test]
+fn blind_ranges() {
+    let ok = |c: &str| {
+        let (_d, cfg) = etc(c, &[]);
+        load_system(&cfg).map(|_| ())
+    };
+    for (key, lo, hi) in [("list_cap", 1u32, 10_000u32), ("session_minutes", 5, 480)] {
+        for v in [lo, hi] {
+            ok(&format!("version = 2\n[blind]\n{key} = {v}\n")).unwrap();
+        }
+        for v in [lo - 1, hi + 1] {
+            let e = blind_err(&format!("version = 2\n[blind]\n{key} = {v}\n"), &[]);
+            assert!(
+                e.contains(&format!("[blind] {key} must be {lo}..={hi}")),
+                "{e}"
+            );
+        }
+    }
+    // Per-dataset list_cap.
+    for v in [1u32, 10_000] {
+        ok(&format!("version = 2\n{BLIND_CRM}list_cap = {v}\n")).unwrap();
+    }
+    for v in [0u32, 10_001] {
+        let e = blind_err(&format!("version = 2\n{BLIND_CRM}list_cap = {v}\n"), &[]);
+        assert!(e.contains("crm: list_cap must be 1..=10000"), "{e}");
+    }
+    let e = blind_err("version = 2\n[blind]\noutbox_days = 0\n", &[]);
+    assert!(e.contains("outbox_days must be at least 1"), "{e}");
+    ok("version = 2\n[blind]\noutbox_days = 100000\n").unwrap();
+}
+
+#[test]
+fn blind_k_below_two_refused() {
+    for k in [0, 1] {
+        let e = blind_err(&format!("version = 2\n[blind]\nk = {k}\n"), &[]);
+        assert!(e.contains("[blind] k must be at least 2"), "{e}");
+        let e = blind_err(&format!("version = 2\n{BLIND_CRM}k = {k}\n"), &[]);
+        assert!(e.contains("crm: k must be at least 2"), "{e}");
+    }
+}
+
+#[test]
+fn blind_more_refusals() {
+    let long = "a".repeat(33);
+    for bad in ["Crm", long.as_str(), "1crm", "c_rm", ""] {
+        let e = blind_err(
+            &format!(
+                "version = 2\n[[blind.dataset]]\nname = \"{bad}\"\nsource = {{ kind = \"csv\", file_name = \"a.csv\" }}\n"
+            ),
+            &[],
+        );
+        assert!(
+            e.contains("name must match ^[a-z][a-z0-9-]{0,31}$"),
+            "{bad}: {e}"
+        );
+    }
+    let h = "a".repeat(64);
+    let ner = |m: &str, url: &str| {
+        format!(
+            "version = 2\n[blind.ner]\nmodel_url = \"{url}\"\nmodel_sha256 = \"{m}\"\nvocab_url = \"https://x.example/v\"\nvocab_sha256 = \"{h}\"\nlabels_url = \"https://x.example/l\"\nlabels_sha256 = \"{h}\"\n"
+        )
+    };
+    for bad in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+        let e = blind_err(&ner(&bad, "https://x.example/m"), &[]);
+        assert!(
+            e.contains("model_sha256 must be 64 lowercase hex digits"),
+            "{e}"
+        );
+    }
+    let e = blind_err(&ner(&h, "http://x.example/m"), &[]);
+    assert!(e.contains("model_url must start with https://"), "{e}");
+    let e = blind_err("version = 2\n[blind.cloud]\nsecret = \"\"\n", &[]);
+    assert!(e.contains("[blind.cloud] secret is empty"), "{e}");
+    let e = blind_err(&format!("version = 2\n{BLIND_CRM}users = [\"a b\"]\n"), &[]);
+    assert!(
+        e.contains("crm: users has an entry that is not a user name or group:<name>"),
+        "{e}"
+    );
+    let e = blind_err(
+        &format!("version = 2\n{BLIND_CRM}users = [\"group:\"]\n"),
+        &[],
+    );
+    assert!(e.contains("users has an entry"), "{e}");
+}
+
+/// M7: an entity needs a table, a key and name columns; words, when set,
+/// are not empty; one entity per table.
+#[test]
+fn blind_entity_validated() {
+    let ent = |body: &str| format!("version = 2\n{BLIND_CRM}[[blind.dataset.entity]]\n{body}");
+    let ok = "table = \"customers\"\nkey = \"id\"\nnames = [\"first_name\"]\n";
+    let (_d, cfg) = etc(&ent(ok), &[]);
+    load_system(&cfg).unwrap();
+    let cases = [
+        (
+            "table = \"\"\nkey = \"id\"\nnames = [\"n\"]\n",
+            "crm: entity table is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"\"\nnames = [\"n\"]\n",
+            "crm: entity customers: key is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = []\n",
+            "crm: entity customers: names is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = [\"\"]\n",
+            "crm: entity customers: names has an empty entry",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = [\"n\"]\nword = \"\"\n",
+            "crm: entity customers: word is empty",
+        ),
+        (
+            "table = \"customers\"\nkey = \"id\"\nnames = [\"n\"]\nword_da = \"\"\n",
+            "crm: entity customers: word_da is empty",
+        ),
+        (
+            &format!("{ok}[[blind.dataset.entity]]\n{ok}"),
+            "crm: entity customers is given twice",
+        ),
+    ];
+    for (body, want) in cases {
+        let e = blind_err(&ent(body), &[]);
+        assert!(e.contains(want), "{want}: {e}");
+    }
+}

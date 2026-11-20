@@ -42,7 +42,7 @@ pub fn unix_now() -> u64 {
 /// What a challenge was issued for. The uid in `Enrol`, `Remove` and
 /// `Test` is the peer's; a `Web` key is per device. `Land` and `Push`
 /// carry a box land or push request id (plan 39, owner-approved contract
-/// addition).
+/// addition); `Blind` a Data Shield touch request id (plan 48).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IssueKey {
     Approve(u64),
@@ -56,6 +56,8 @@ pub enum IssueKey {
     },
     Land(u64),
     Push(u64),
+    /// A Data Shield touch (plan 48 T3): `blind.touch.begin`'s request id.
+    Blind(u64),
 }
 
 /// One live challenge.

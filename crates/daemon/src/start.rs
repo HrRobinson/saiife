@@ -1076,6 +1076,9 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         eprintln!("saiife: warning: {why}: touch approvals are unavailable");
     }
     let touch = Arc::new(touch);
+    // Data Shield (plan 47): `<state>/blind`, 0700.
+    #[cfg(target_os = "linux")]
+    let blind = Arc::new(crate::blind::Blind::open(&state_dir.join("blind")));
     // The Workspace link's machine key and paired devices (plan 29); a
     // file that cannot be used leaves the Workspace with no trusted device.
     let (workspace, workspace_warning) =
@@ -1174,8 +1177,27 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
         box_template_warnings,
         box_images,
         box_disk_root,
+        #[cfg(target_os = "linux")]
+        blind,
     }));
     ctx.mcp.attach(Arc::downgrade(&ctx));
+    // Data Shield (plan 47): the datasets built before this start, opened
+    // again (keys from the vault; a locked vault leaves them unavailable).
+    // Plan 48 C2: in the background; they show `opening` until then.
+    #[cfg(target_os = "linux")]
+    drop(crate::blind::data::reopen_all(&ctx));
+    // Data Shield retention (R47-9 outbox, R47-2 retired keys), off this
+    // thread; again on each daily purge tick.
+    #[cfg(target_os = "linux")]
+    {
+        let c = Arc::clone(&ctx);
+        rt.spawn_blocking(move || crate::blind::retention(&c, std::time::SystemTime::now()));
+    }
+    // The name detector (plan 47 Task 4): the helper starts in the
+    // background (its hello can take a while); until then builds with
+    // public columns refuse, failing closed.
+    #[cfg(target_os = "linux")]
+    rt.spawn(crate::blind::ner::apply(Arc::clone(&ctx)));
     if let Some(a) = &box_audit {
         a.attach(&ctx);
     }
@@ -2045,6 +2067,13 @@ async fn serve(
                 tokio::task::spawn_blocking(move || {
                     crate::import_backup::purge(&dir, crate::import_backup::now())
                 });
+                #[cfg(target_os = "linux")]
+                {
+                    let c = Arc::clone(&ctx);
+                    tokio::task::spawn_blocking(move || {
+                        crate::blind::retention(&c, std::time::SystemTime::now())
+                    });
+                }
             }
             _ = sweep_tick.tick() => {
                 if ctx.approvals.is_ok() {
@@ -2240,6 +2269,13 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
         Ok((l, _, next)) => {
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
             ctx.forwarders.apply(&l.config.audit.forward).await;
+            // `[blind.ner]` may have changed: the detector follows, in the
+            // background (an unchanged one keeps its helper).
+            #[cfg(target_os = "linux")]
+            tokio::spawn(crate::blind::ner::apply(Arc::clone(ctx)));
+            // R-C12: asks of uids that lost their role end now.
+            #[cfg(target_os = "linux")]
+            crate::blind::ask::policy_reloaded(ctx).await;
             {
                 let vault = ctx.vault.lock();
                 ctx.mcp.reconcile(&l.config, &vault);

@@ -28,6 +28,10 @@ allow = [
     "Unicode-3.0",
     # option-ext only (file-level copyleft, unmodified).
     "MPL-2.0",
+    # Permissive (OSI approved, no copyleft, notice only in source copies):
+    # foldhash (hashbrown under tract, the name detector) and zlib-rs
+    # (flate2 under calamine's zip, Data Shield spreadsheet import).
+    "Zlib",
     # This project's own license, on the workspace crates.
     "FSL-1.1-ALv2",
 ]
