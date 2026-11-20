@@ -159,7 +159,7 @@ impl PeopleCount {
 /// ...), exact names only: `product_name` or `company_name` is not one.
 /// Two people can share a part, so the parts count together, as a full
 /// name, never one by one.
-fn person_name_part(n: &str) -> bool {
+pub fn person_name_part(n: &str) -> bool {
     const PARTS: &[&str] = &[
         "name",
         "navn",

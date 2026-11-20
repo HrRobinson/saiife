@@ -1,5 +1,5 @@
-//! `saiife blind ask | status | audit` (plan 48 T4) and `keys | methods |
-//! data` (T5): Data Shield through the daemon's `blind.*` ops. Exit codes: 0 answered (or shown), 2 refused
+//! `saiife blind ask | status | audit` (plan 48 T4), `keys | methods |
+//! data` (T5) and `init`, `data add` (T6): Data Shield through the daemon's `blind.*` ops. Exit codes: 0 answered (or shown), 2 refused
 //! (a refusal, a stop, a firewall block, the checker, a role), 5 unavailable
 //! (the daemon, the vault, the name detector, Landlock, not Linux).
 //!
@@ -15,6 +15,7 @@ use clap::Subcommand;
 pub mod admin;
 #[cfg(target_os = "linux")]
 mod ask;
+pub mod init;
 #[cfg(target_os = "linux")]
 pub mod policy_file;
 #[cfg(target_os = "linux")]
@@ -91,8 +92,12 @@ pub enum BlindAction {
         #[command(subcommand)]
         action: admin::MethodsAction,
     },
-    /// A dataset's data: refresh it from its source, remove it, or change a
-    /// column's class (a looser class takes a touch, blind:loosen).
+    /// Set up Data Shield in six steps: Data, Columns, Models, Cloud,
+    /// Rules, Test. Writes policy.d/blind.toml and policy.d/blind-<dataset>.toml
+    /// (in locked mode as root). Every step has a flag for scripts.
+    Init(Box<init::InitArgs>),
+    /// A dataset's data: add one, refresh it from its source, remove it, or
+    /// change a column's class (a looser class takes a touch, blind:loosen).
     Data {
         #[command(subcommand)]
         action: admin::DataAction,
@@ -178,6 +183,7 @@ pub fn run(config: Option<PathBuf>, a: BlindAction) -> ExitCode {
         BlindAction::Keys { action } => admin::keys(&t, action, &mut prompt::Stdin::new()),
         BlindAction::Methods { action } => admin::methods(&t, action),
         BlindAction::Data { action } => admin::data(&t, action, &mut prompt::Stdin::new()),
+        BlindAction::Init(a) => init::init(&t, *a, &mut prompt::Stdin::new()),
     };
     match r {
         Ok(code) => code,
@@ -260,7 +266,7 @@ mod imp {
         v.get(k).and_then(Value::as_str).unwrap_or("")
     }
 
-    fn u(v: &Value, k: &str) -> u64 {
+    pub(super) fn u(v: &Value, k: &str) -> u64 {
         v.get(k).and_then(Value::as_u64).unwrap_or(0)
     }
 
@@ -285,7 +291,7 @@ mod imp {
     }
 
     /// The name detector's line: its state, or a fetch's progress (C3).
-    fn ner_line(n: &Value) -> String {
+    pub(super) fn ner_line(n: &Value) -> String {
         let state = s(n, "state");
         match state {
             "ready" => {
@@ -311,7 +317,7 @@ mod imp {
                     sanitize(s(n, "file"))
                 )
             }
-            "not_configured" | "" => {
+            "not configured" | "not_configured" | "" => {
                 "name detector: not set up ([blind.ner] is not in policy)".into()
             }
             other => {
@@ -791,6 +797,11 @@ mod imp {
             assert_eq!(
                 ner_line(&json!({"state": "ready", "labels": ["PER"]})),
                 "name detector: ready (PER)"
+            );
+            // The daemon's word (`NerState::word`).
+            assert_eq!(
+                ner_line(&json!({"state": "not configured"})),
+                "name detector: not set up ([blind.ner] is not in policy)"
             );
         }
 

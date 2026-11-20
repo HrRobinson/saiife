@@ -44,8 +44,6 @@ pub(crate) fn dataset_path(t: &Target, name: &str) -> Result<PathBuf, String> {
 }
 
 /// `policy.d/blind.toml`.
-// `saiife blind init` (plan 48 T6) writes the globals.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn globals_path(t: &Target) -> PathBuf {
     dropin_dir(t).join("blind.toml")
 }
@@ -69,7 +67,7 @@ fn modes(t: &Target) -> (u32, u32) {
 }
 
 /// The drop-in dir of a locked host is root's.
-fn may_write(t: &Target) -> Result<(), String> {
+pub(crate) fn may_write(t: &Target) -> Result<(), String> {
     if t.is_locked() && !rustix::process::geteuid().is_root() {
         return Err(format!(
             "{} is root's on a locked host: run this as root (sudo saiife blind …)",
@@ -144,7 +142,6 @@ pub(crate) fn write_dataset(t: &Target, d: &BlindDataset) -> Result<PathBuf, Str
 
 /// `policy.d/blind.toml` holding the `[blind]` globals of `g` (its
 /// datasets go in their own files).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_globals(t: &Target, g: &BlindCfg) -> Result<PathBuf, String> {
     let path = globals_path(t);
     let file = DropIn {
@@ -175,6 +172,19 @@ pub(crate) fn read_dataset(t: &Target, name: &str) -> Result<Option<BlindDataset
         .ok_or_else(|| format!("{} does not define the dataset {name}", path.display()))
 }
 
+/// The `[blind]` globals of `policy.d/blind.toml`; the default when there
+/// is no such file. A file without the marker is refused.
+pub(crate) fn read_globals(t: &Target) -> Result<BlindCfg, String> {
+    let path = globals_path(t);
+    let Some(bytes) = read_ours(&path)? else {
+        return Ok(BlindCfg::default());
+    };
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+    let d: DropIn =
+        toml::from_str(&text).map_err(|e| format!("{} does not parse: {e}", path.display()))?;
+    Ok(d.blind)
+}
+
 /// A file as it was before a write, to put back when the reload fails.
 pub(crate) struct Previous {
     path: PathBuf,
@@ -195,6 +205,11 @@ pub(crate) fn previous(path: &Path) -> Result<Previous, String> {
 }
 
 impl Previous {
+    /// The file this is the previous state of.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The previous file back, or the new one removed.
     pub(crate) fn restore(self, t: &Target) -> Result<(), String> {
         match self.bytes {
@@ -331,7 +346,9 @@ mod tests {
             ..BlindCfg::default()
         };
         let before = previous(&globals_path(&t)).unwrap();
+        assert_eq!(read_globals(&t).unwrap(), BlindCfg::default());
         let p = write_globals(&t, &g).unwrap();
+        assert_eq!(read_globals(&t).unwrap().k, Some(12));
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.starts_with(&format!("{MARKER}\n")), "{text}");
         assert!(text.contains("k = 12"), "{text}");

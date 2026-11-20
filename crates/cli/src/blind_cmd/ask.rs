@@ -68,7 +68,7 @@ fn tell(t: &str) {
 }
 
 /// `customer` -> `customers` (the English pick header).
-fn plural(word: &str) -> String {
+pub(super) fn plural(word: &str) -> String {
     let consonant_y = word.len() > 1
         && word.ends_with('y')
         && !word[..word.len() - 1].ends_with(['a', 'e', 'i', 'o', 'u']);
@@ -82,12 +82,12 @@ fn plural(word: &str) -> String {
 }
 
 /// A yes to a `(y/N)` prompt: y, yes, j, ja (any case).
-fn is_yes(a: &str) -> bool {
+pub(super) fn is_yes(a: &str) -> bool {
     matches!(a.to_lowercase().as_str(), "y" | "yes" | "j" | "ja")
 }
 
 /// A yes to `Run it? (Y/n)`: empty is yes.
-fn is_run(a: &str) -> bool {
+pub(super) fn is_run(a: &str) -> bool {
     a.is_empty() || is_yes(a)
 }
 
@@ -119,7 +119,7 @@ fn keep_name_prompt(name: &str, dataset: &str) -> String {
     )
 }
 
-fn run_prompt(lang: Lang) -> &'static str {
+pub(super) fn run_prompt(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Run it? (Y/n) ",
         Lang::Da => "Kør den? (J/n) ",
@@ -177,7 +177,7 @@ fn mine(t: &Target, given: Option<&str>) -> Mine {
 }
 
 /// The ask's reply: its id and step.
-fn reply(v: serde_json::Map<String, Value>) -> Result<(String, Value), Stop> {
+pub(super) fn reply(v: serde_json::Map<String, Value>) -> Result<(String, Value), Stop> {
     let id = v
         .get("ask")
         .and_then(Value::as_str)
@@ -188,7 +188,7 @@ fn reply(v: serde_json::Map<String, Value>) -> Result<(String, Value), Stop> {
     Ok((id, step))
 }
 
-fn answer(t: &Target, id: &str, a: Value) -> Result<Value, Stop> {
+pub(super) fn answer(t: &Target, id: &str, a: Value) -> Result<Value, Stop> {
     let v = call(
         t,
         "blind.ask.answer",
@@ -201,7 +201,7 @@ fn answer(t: &Target, id: &str, a: Value) -> Result<Value, Stop> {
 /// Ends an ask that cannot be answered here (no terminal): every pending
 /// step answered "no" until the daemon ends it, so its slot is freed. What
 /// the daemon says is not shown: the caller says why.
-fn end_quietly(t: &Target, id: &str, mut step: Value) {
+pub(super) fn end_quietly(t: &Target, id: &str, mut step: Value) {
     for _ in 0..4 {
         let a = match s(&step, "kind") {
             "pick" => json!({"pick": 0}),
@@ -219,7 +219,7 @@ fn end_quietly(t: &Target, id: &str, mut step: Value) {
 
 /// The envelope (`--show-sent`) on stdout: a header, then the JSON as sent
 /// (ASCII-escaped, the same data).
-fn print_envelope(step: &Value) {
+pub(super) fn print_envelope(step: &Value) {
     let Some(e) = step.get("envelope").and_then(Value::as_str) else {
         return;
     };

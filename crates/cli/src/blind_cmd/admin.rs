@@ -57,6 +57,10 @@ pub enum MethodsAction {
 
 #[derive(Subcommand)]
 pub enum DataAction {
+    /// Add a dataset: its source and its columns' classes (the Data and
+    /// Columns steps of saiife blind init), then policy.d/blind-<dataset>.toml
+    /// written and the dataset built.
+    Add(Box<super::init::DataArgs>),
     /// Build the dataset again from its source, showing the progress until
     /// it is live. A file source is opened here and passed to the daemon.
     Refresh {
@@ -87,7 +91,7 @@ pub enum DataAction {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) use imp::{data, keys, methods};
+pub(super) use imp::{data, keys, methods, open_source, parse_class};
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -323,6 +327,7 @@ mod imp {
     /// `saiife blind data refresh | rm | class`.
     pub(crate) fn data(t: &Target, a: DataAction, p: &mut dyn Prompter) -> Result<ExitCode, Stop> {
         match a {
+            DataAction::Add(a) => super::super::init::data_add(t, *a, p),
             DataAction::Refresh { dataset, file } => refresh(t, dataset, file, p),
             DataAction::Rm { dataset } => {
                 let shown = sanitize(&dataset);
@@ -427,7 +432,7 @@ mod imp {
     }
 
     /// The source file, read only; never a directory or a FIFO.
-    fn open_source(f: &Path) -> Result<std::fs::File, Stop> {
+    pub(crate) fn open_source(f: &Path) -> Result<std::fs::File, Stop> {
         use std::os::unix::fs::OpenOptionsExt;
         let shown = sanitize(&f.display().to_string());
         let file = std::fs::OpenOptions::new()
@@ -468,10 +473,49 @@ mod imp {
             .map(sanitize)
     }
 
+    /// Where a refresh is, from its dataset's status.
+    #[derive(Debug, PartialEq)]
+    pub(crate) enum Phase {
+        /// Still going (`refreshing`, or `opening`: the build is being
+        /// opened); the progress line to show, if any.
+        Going(Option<String>),
+        /// Live, with its warnings.
+        Live(Vec<String>),
+        /// The refresh failed: why.
+        Failed(String),
+    }
+
+    /// The refresh's [`Phase`] from a dataset's `blind.status` entry
+    /// (states: live, refreshing, opening, needs_refresh, not_built).
+    pub(crate) fn phase_of(d: &Value) -> Phase {
+        match s(d, "state") {
+            "refreshing" => Phase::Going(Some(phase_line(d))),
+            // T5 review m3: a build being opened is not a failure.
+            "opening" => Phase::Going(None),
+            "live" => match failure(d) {
+                Some(why) => Phase::Failed(why),
+                None => Phase::Live(
+                    d.get("warnings")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(sanitize)
+                        .collect(),
+                ),
+            },
+            other => Phase::Failed(
+                failure(d)
+                    .or_else(|| Some(sanitize(s(d, "reason"))).filter(|r| !r.is_empty()))
+                    .unwrap_or_else(|| sanitize(other)),
+            ),
+        }
+    }
+
     /// Polls `blind.status` once a second, printing each new phase, until
     /// the dataset is live (exit 0) or the refresh failed (exit 5). A
     /// dataset that is no longer shown ends the wait at once.
-    fn watch(t: &Target, ds: &str) -> Result<ExitCode, Stop> {
+    pub(crate) fn watch(t: &Target, ds: &str) -> Result<ExitCode, Stop> {
         let shown = sanitize(ds);
         let mut last = String::new();
         for _ in 0..MAX_POLLS {
@@ -486,36 +530,21 @@ mod imp {
                     "{shown} is no longer shown to you: see saiife blind status"
                 )));
             };
-            match s(&d, "state") {
-                "refreshing" => {
-                    let l = phase_line(&d);
-                    if l != last {
+            match phase_of(&d) {
+                Phase::Going(line) => {
+                    if let Some(l) = line.filter(|l| *l != last) {
                         eprintln!("{l}");
                         last = l;
                     }
                 }
-                "live" => {
-                    if let Some(why) = failure(&d) {
-                        return Err(Stop::Unavailable(format!(
-                            "the refresh of {shown} failed: {why}"
-                        )));
-                    }
+                Phase::Live(warnings) => {
                     outln!("{shown} is live");
-                    for w in d
-                        .get("warnings")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                    {
-                        outln!("  ! {}", sanitize(w));
+                    for w in warnings {
+                        outln!("  ! {w}");
                     }
                     return Ok(ExitCode::SUCCESS);
                 }
-                other => {
-                    let why = failure(&d)
-                        .or_else(|| Some(sanitize(s(&d, "reason"))).filter(|r| !r.is_empty()))
-                        .unwrap_or_else(|| sanitize(other));
+                Phase::Failed(why) => {
                     return Err(Stop::Unavailable(format!(
                         "the refresh of {shown} failed: {why}"
                     )));
@@ -529,7 +558,7 @@ mod imp {
     }
 
     /// The class of `name` (one of [`COLUMN_CLASSES`]).
-    fn parse_class(name: &str) -> Option<ColumnClass> {
+    pub(crate) fn parse_class(name: &str) -> Option<ColumnClass> {
         if !COLUMN_CLASSES.contains(&name) {
             return None;
         }
@@ -546,6 +575,9 @@ mod imp {
 
     /// `saiife blind data class <dataset> <table.column> <class>` (R48-8).
     fn class_cmd(t: &Target, ds: &str, column: &str, class: &str) -> Result<ExitCode, Stop> {
+        // T5 review m1: on a locked host only root writes policy; refused
+        // before any touch is taken or any grant written.
+        policy_file::may_write(t).map_err(Stop::Refused)?;
         let to = parse_class(class).ok_or_else(|| {
             Stop::Refused(format!(
                 "the class must be one of: {}",
@@ -658,6 +690,33 @@ mod imp {
             assert_eq!(
                 failure(&json!({"warnings": ["x", "the last refresh failed: bad \u{1b}"]})),
                 Some("bad \\x1b".to_string())
+            );
+        }
+
+        #[test]
+        fn opening_is_still_going() {
+            // T5 review m3: `opening` is not a failed refresh.
+            assert_eq!(
+                phase_of(&json!({"state": "opening", "reason": "the dataset is still opening"})),
+                Phase::Going(None)
+            );
+            assert_eq!(
+                phase_of(&json!({"state": "refreshing",
+                                 "progress": {"phase": "index", "done": 1, "total": 2}})),
+                Phase::Going(Some("  index 1/2".into()))
+            );
+            assert_eq!(
+                phase_of(&json!({"state": "live", "warnings": ["w"]})),
+                Phase::Live(vec!["w".into()])
+            );
+            assert_eq!(
+                phase_of(&json!({"state": "live",
+                                 "warnings": ["the last refresh failed: bad file"]})),
+                Phase::Failed("bad file".into())
+            );
+            assert_eq!(
+                phase_of(&json!({"state": "needs_refresh", "reason": "its keys were deleted"})),
+                Phase::Failed("its keys were deleted".into())
             );
         }
 

@@ -16,9 +16,9 @@
 
 mod common;
 
+use common::blind::{fixture_sqlite, ner_policy, private, seams};
 use common::personal::{dl, TestBroker};
 use serde_json::{json, Value};
-use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::fd::AsFd;
@@ -46,87 +46,6 @@ fn reply(intent: &str) -> String {
 
 fn balance() -> String {
     reply("sums the invoices of the customer")
-}
-
-const FIRST: &[&str] = &[
-    "Mette", "Jens", "Lars", "Freja", "Mads", "Ida", "Niels", "Karen", "Emil", "Oliver", "Emma",
-    "James", "Sophie", "Thomas", "Lucy",
-];
-const LAST: &[&str] = &[
-    "Jensen", "Nielsen", "Hansen", "Pedersen", "Andersen", "Larsen", "Møller", "Smith",
-];
-const CITY: &[&str] = &["Aalborg", "Esbjerg", "London", "Leeds", "Vejle"];
-
-/// The synthetic `crm`: customers 1 Søren Østergård (København), 2 Anna
-/// Berg (Aarhus), 3 Anna Berg (Odense), then made-up names that are each
-/// unique; every customer has invoices, both statuses held by many.
-/// With `email`, customers also have a made-up `email` (`p<id>@mail.example`).
-fn fixture_sqlite(path: &Path, email: bool) {
-    let c = rusqlite::Connection::open(path).unwrap();
-    c.execute_batch(
-        "CREATE TABLE customers (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, city TEXT);
-         CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT);",
-    )
-    .unwrap();
-    if email {
-        c.execute_batch("ALTER TABLE customers ADD COLUMN email TEXT;")
-            .unwrap();
-    }
-    let mut people: Vec<(String, String, String)> = vec![
-        ("Søren".into(), "Østergård".into(), "København".into()),
-        ("Anna".into(), "Berg".into(), "Aarhus".into()),
-        ("Anna".into(), "Berg".into(), "Odense".into()),
-    ];
-    for (i, l) in LAST.iter().enumerate() {
-        for (j, f) in FIRST.iter().enumerate() {
-            people.push((
-                f.to_string(),
-                l.to_string(),
-                CITY[(i + j) % CITY.len()].to_string(),
-            ));
-        }
-    }
-    let mut inv = 1000;
-    for (n, (f, l, city)) in people.iter().enumerate() {
-        let id = n as i64 + 1;
-        if email {
-            c.execute(
-                "INSERT INTO customers VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, f, l, city, format!("p{id}@mail.example")],
-            )
-            .unwrap();
-        } else {
-            c.execute(
-                "INSERT INTO customers VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![id, f, l, city],
-            )
-            .unwrap();
-        }
-        let amounts: Vec<(f64, &str)> = match id {
-            1 => vec![(100.0, "paid"), (200.0, "open"), (300.0, "open")],
-            2 => vec![(1000.0, "open"), (500.5, "paid")],
-            3 => vec![(42.0, "open")],
-            _ => vec![(10.0 + id as f64, "paid"), (20.0 + id as f64, "open")],
-        };
-        for (a, st) in amounts {
-            inv += 1;
-            c.execute(
-                "INSERT INTO invoices VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![inv, id, a, st],
-            )
-            .unwrap();
-        }
-    }
-}
-
-/// The config head: `[blind.ner]` pinning the three files the test wrote.
-fn ner_policy(pins: &[String]) -> String {
-    format!(
-        "version = 2\n\n[blind.ner]\nmodel_url = \"https://ner.example.test/m\"\nmodel_sha256 = \"{}\"\n\
-         vocab_url = \"https://ner.example.test/v\"\nvocab_sha256 = \"{}\"\n\
-         labels_url = \"https://ner.example.test/l\"\nlabels_sha256 = \"{}\"\n\n",
-        pins[0], pins[1], pins[2]
-    )
 }
 
 /// The `crm` dataset (with `email`: its column, Identifier-class).
@@ -168,28 +87,6 @@ struct Opts {
     email: bool,
 }
 
-/// `target/debug/saiife-fake-ner`, beside this test's binary dir.
-fn fake_ner() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let p = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("saiife-fake-ner");
-    assert!(
-        p.is_file(),
-        "{} is missing: run `cargo build -p saiife-shield-ner --features fake --bin saiife-fake-ner` first",
-        p.display()
-    );
-    p
-}
-
-fn private(p: &Path) {
-    fs::create_dir_all(p).unwrap();
-    fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
-}
-
 struct Fx {
     b: TestBroker,
 }
@@ -211,49 +108,8 @@ fn fx_with(replies: &[String], extra: &str) -> Fx {
 }
 
 fn fx_opts(replies: &[String], extra: &str, o: Opts) -> Fx {
-    use sha2::{Digest, Sha256};
     let mut b = TestBroker::prepare();
-    // The NER files, pinned by sha256 (R-C8), where a fetch would put them.
-    for d in ["s/saiife", "s/saiife/broker", "s/saiife/broker/blind"] {
-        private(&b.path().join(d));
-    }
-    let models = b.state_dir().join("blind/models");
-    private(&models);
-    let mut pins = Vec::new();
-    for x in [&b"model"[..], b"vocab", b"labels"] {
-        let h = format!("{:x}", Sha256::digest(x));
-        fs::write(models.join(&h), x).unwrap();
-        pins.push(h);
-    }
-    // The fake detector: one made-up stranger is a person.
-    let helper_dir = b.path().join("ner");
-    private(&helper_dir);
-    let phrases = helper_dir.join("phrases.txt");
-    fs::write(&phrases, "PER\tZed Quorra\n").unwrap();
-    let helper = helper_dir.join("ner");
-    fs::write(
-        &helper,
-        format!(
-            "#!/bin/sh\nexec '{}' --phrases '{}'\n",
-            fake_ner().display(),
-            phrases.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    let script = b.path().join("planner.txt");
-    fs::write(&script, replies.join("\n") + "\n").unwrap();
-    let seams: [(&str, OsString); 3] = [
-        ("SAIIFE_TEST_NER_HELPER", helper.into()),
-        ("SAIIFE_TEST_BLIND_PLANNER", script.into()),
-        (
-            "SAIIFE_TEST_BLIND_CALC",
-            env!("CARGO_BIN_EXE_saiife").into(),
-        ),
-    ];
-    for (k, v) in seams {
-        b.env.push((k.to_string(), Some(v)));
-    }
+    let pins = seams(&mut b, replies);
     match o.dropin {
         None => b.write_config(&format!(
             "{}{}",
@@ -1190,4 +1046,83 @@ fn keep_name_touch_failure_ends_the_ask() {
 
 fn mode_of(p: &Path) -> u32 {
     fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn refresh_brings_needs_refresh_back_live() {
+    // T5 review: a dataset in needs_refresh (its keys deleted) is live
+    // again after `data refresh`, with new keys.
+    let f = fx(&[]);
+    let key = enrol(&f, "k1");
+    let o = f.blind_key(
+        &["keys", "delete", "--dataset", "crm"],
+        "crm\n",
+        true,
+        Some(&key),
+    );
+    assert_eq!(code(&o), 0, "{:?}", text(&o));
+    let s = crm_status(&f);
+    assert_eq!(s["state"], "needs_refresh", "{s}");
+    let db = f.b.path().join("crm.sqlite");
+    let o = f.blind(
+        &["data", "refresh", "--file", db.to_str().unwrap()],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert_eq!(out.lines().next(), Some("crm is live"), "{out}");
+    let s = crm_status(&f);
+    assert_eq!(s["state"], "live", "{s}");
+    assert!(s["keys_version"].is_u64(), "{s}");
+}
+
+#[test]
+fn data_class_on_a_locked_host_needs_root_before_the_touch() {
+    // T5 review m1: a user who is not root is refused before any touch or
+    // grant, even for a loosening.
+    use std::os::unix::fs::MetadataExt;
+    if fs::metadata("/proc/self").unwrap().uid() == 0 {
+        return;
+    }
+    let tmp = common::tmp::short_tempdir();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "version = 2\nlocked = true\n\n[daemon]\nuser = {:?}\nsocket_dir = {:?}\n",
+            common::daemon::own_user(),
+            tmp.path().join("run").display().to_string()
+        ),
+    )
+    .unwrap();
+    let dir = tmp.path().join("policy.d");
+    fs::create_dir(&dir).unwrap();
+    let file = dir.join("blind-crm.toml");
+    let body = format!("{MARKER}\n{}", dataset_policy("", false));
+    fs::write(&file, &body).unwrap();
+    let key = soft_key(&tmp.path().join("soft.json"));
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["blind", "--system-config"])
+        .arg(&cfg)
+        .args(["data", "class", "crm", "invoices.amount", "quasi"])
+        .env("HOME", tmp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_RUNTIME_DIR", tmp.path().join("no-runtime"))
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("SAIIFE_TEST_TOUCH_SOFT", &key)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert_eq!(
+        err,
+        format!(
+            "saiife: {} is root's on a locked host: run this as root (sudo saiife blind …)\n",
+            dir.display()
+        )
+    );
+    assert!(!err.contains("touch your key"), "{err}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), body);
 }
