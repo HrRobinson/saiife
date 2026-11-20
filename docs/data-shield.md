@@ -19,8 +19,15 @@ produce refuses the whole answer.
 ## Guarantees and their limits
 
 - **G1. No real personal value leaves this machine** unless a person approved
-  it with a touch, and the approval is in the audit log. Exact mode has no
-  path that sends a real value, so it never asks for that touch.
+  it with a touch, and the approval is in the audit log. In stage 1 there is
+  one such path, `blind:name`: a person's name in your question that is not
+  in the dataset (an outsider) can be kept. `ask` then asks
+  `"<name>" is not in <dataset>. Send it as plain text to the planner? This needs a touch (blind:name). (y/N)`.
+  The touch shows the exact name. After it, the name is sent to the planner
+  as plain text, and it stays released for the rest of the session: later
+  questions in that session send it too. The audit log records the release
+  by a keyed hash of the name, never the name. Without that touch no real
+  value is sent.
 - **G2. Numbers in exact mode are exactly what the shown method computes on
   the real data.** No number is made up, mistyped or rounded wrong. G2 does
   not promise that the method answers the question you meant: a valid method
@@ -117,19 +124,29 @@ saiife blind ask "What does Anna Berg owe, and is she over her limit?" [--judgme
 
 ```
 Found 2 customers named Anna Berg:
-  1) Anna Berg, Aarhus, customer #4411
-  2) Anna Berg, Odense, customer #9020
+  1) Anna Berg, Aarhus
+  2) Anna Berg, Odense
 Which one? 1
-I'm summing all invoices for Anna Berg (customer #4411) with status 'open',
+I'm summing all invoices for Anna Berg, Aarhus with status 'open',
 and comparing the total with her credit limit.
 Run it? (Y/n) y
 
 Anna Berg owes 18,420.00 NOK across 3 open invoices. That is above her limit of 15,000.00 NOK.
-── method: summed all invoices for Anna Berg (customer #4411) with status 'open'; compared with customers.credit_limit
+── method: summed all invoices for Anna Berg, Aarhus with status 'open'; compared with customers.credit_limit
 ── exact · method m-balance-v2 (approved) · 0 personal values sent · 3/3 numbers checked
 ```
 
-The candidate list and the preview are shown on this machine only. Pick lists,
+The candidate list and the preview are shown on this machine only. They name
+a record by its display name and the `show` columns that are not identifiers
+(a city, say); never its key, and never an email, ID or phone number. When
+two records share a name, the number in the list tells them apart.
+
+A person's name that is not in the dataset is not sent by default. `ask`
+offers to keep it as plain text, which takes a `blind:name` touch (see G1);
+the name then stays released for the session. Answer no and the question is
+refused, nothing sent.
+
+The rest of the ask: Pick lists,
 "did you mean" and the preview need a terminal; without one `ask` refuses (or,
 for the preview, takes `--yes`). `--yes` is refused for a dataset that requires
 the preview. A list answer is capped at 100 rows and says so ("showing 100 of
@@ -138,7 +155,8 @@ records is a refusal, never 0.
 
 A refusal shows the refusal head, the reason and the method line. Exit codes: 0
 answered, 2 refused (a refusal, stop, firewall block or checker), 5 unavailable
-(daemon, vault, detector, Landlock, or not Linux).
+(daemon, vault, detector, Landlock, dataset refreshing or still opening, or not
+Linux).
 
 Exact mode never prints Identifier values. A method that would print one (an ID
 number, say) is refused with the code `identifier_output` and the reason "Data
@@ -168,7 +186,8 @@ saiife blind status [--json]                 # datasets, calculator label, name 
 saiife blind audit [--since 7d] [--user u] [--sent <sha256>] [--json]
 saiife blind keys rotate [--dataset d]       # touch (blind:keys)
 saiife blind keys delete --dataset d         # crypto-shredding, touch, you type the name
-saiife blind data add | rm
+saiife blind data add
+saiife blind data rm --dataset d             # crypto-shredding, touch (blind:keys), you type the name
 saiife blind data refresh [--dataset d] [--file f]
 saiife blind data class <dataset> <table.column> <class>
 ```
@@ -178,23 +197,37 @@ saiife blind data class <dataset> <table.column> <class>
 - `data class`: a stricter class is written to policy at once; a looser one
   takes a touch (blind:loosen) first. A move to `public` refuses names, IDs and
   amounts.
+- `data rm` removes the snapshot, the keys and the approved methods. Deleting
+  the keys is crypto-shredding, so it takes the same `blind:keys` touch as
+  `keys delete`, after you type the dataset name.
 - `audit --user` needs the auditor role (root or `saiife-audit`).
 
 ## Roles and touches
 
 - **Users** may ask. **Approvers** also approve and remove methods. **Admins**
   manage keys and data. Roles come from the dataset's policy.
-- Touches (a FIDO2 key, see [Touch approvals](touch.md)): `blind:approve`,
-  `blind:keys`, `blind:loosen`. `blind:reveal` and `blind:release` are never
-  issued in stage 1.
+- Touches (a FIDO2 key, see [Touch approvals](touch.md)):
+  - `blind:name`: keep an outsider's name as plain text in a question (the
+    asker; see G1).
+  - `blind:approve`: approve or remove a method.
+  - `blind:keys`: rotate or delete keys, and `data rm`.
+  - `blind:loosen`: make a column's class looser.
+
+  `blind:reveal` and `blind:release` are never issued in stage 1.
 
 ## Files
 
 Everything is under `<state>/blind/`, mode 0700 (files 0600). Each dataset has a
 read-only snapshot, its index and its keys. `outbox/YYYY-MM.jsonl` holds the
 exact bytes of every request to the planner, readable by root or the auditor
-group. The audit log holds hashes, never questions, names or answers (an
-answer's sha256 is logged, its text is not).
+group (on a personal install, by the user the daemon runs as).
+
+The audit log holds the parameterized question: names, IDs and literals are
+replaced by stand-ins, and a name kept with `blind:name` is shown as
+`[kept name]`. It never holds a real value or an answer's text. An answer is
+recorded only as a keyed MAC (`answer_mac`, keyed with the dataset's own key),
+not as a plain hash, so a guessed answer cannot be checked against the log. A
+kept name is recorded the same way, by keyed hash.
 
 ## What stage 1 does not do
 

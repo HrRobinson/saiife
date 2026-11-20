@@ -107,6 +107,7 @@ const IPC_OPS: &[&str] = &[
     "blind.ask.answer",
     "blind.data.commit",
     "blind.data.refresh",
+    "blind.data.revoke",
     "blind.data.rm",
     "blind.data.stage",
     "blind.methods.list",
@@ -307,7 +308,7 @@ mod tests {
             assert_eq!(level_for(op), Some(Level::MachineOnly), "{op}");
             assert!(!REMOTE.iter().any(|(r, _)| *r == op), "{op} is remote");
         }
-        assert!(n >= 12, "found {n}");
+        assert!(n >= 13, "found {n}");
         assert_eq!(level_for("blind.unknown"), None);
     }
 

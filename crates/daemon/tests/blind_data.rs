@@ -17,6 +17,7 @@ use saiife_daemon::vault;
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_ipc::msg::{
     Request, OP_BLIND_DATA_COMMIT, OP_BLIND_DATA_REFRESH, OP_BLIND_DATA_RM, OP_BLIND_DATA_STAGE,
+    OP_BLIND_TOUCH_BEGIN, OP_BLIND_TOUCH_COMMIT,
 };
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, FixedDirectory, Fsync};
@@ -200,6 +201,38 @@ async fn call(f: &Fx, op: &str, args: Value, fds: Vec<OwnedFd>) -> Value {
 
 fn crm() -> DatasetName {
     "crm".parse().unwrap()
+}
+
+/// `saiife blind data rm` as the CLI runs it (plan 48 final review I1):
+/// the `data_rm` purpose's `blind:keys` touch with a soft key enrolled
+/// for `uid`. The commit's answer.
+async fn rm_touched(f: &Fx, uid: u32) -> Value {
+    use saiife_touch::soft::SoftAuthenticator;
+    use saiife_touch::{TouchRequest, LOCAL_RP_ID};
+    let s = SoftAuthenticator::new_es256();
+    f.ctx
+        .touch
+        .add(s.credential(LOCAL_RP_ID, uid, "soft"))
+        .unwrap();
+    let b = call_as(
+        f,
+        uid,
+        OP_BLIND_TOUCH_BEGIN,
+        json!({"purpose": "data_rm", "dataset": "crm"}),
+        vec![],
+    )
+    .await;
+    assert!(b.get("error").is_none(), "{b}");
+    let tr: TouchRequest = serde_json::from_value(b["touch"].clone()).unwrap();
+    let asr = serde_json::to_value(s.assert_ctap(LOCAL_RP_ID, &tr.challenge)).unwrap();
+    call_as(
+        f,
+        uid,
+        OP_BLIND_TOUCH_COMMIT,
+        json!({"request_id": b["request_id"], "assertion": asr}),
+        vec![],
+    )
+    .await
 }
 
 fn ok(v: &Value) -> &Value {
@@ -885,7 +918,11 @@ async fn rm_shreds() {
     build_live(&f, &[]).await;
     let root = ds_root(&f);
     assert!(root.join("keys.sealed").exists());
+    // I1: keys are shredded only with a touch.
     let v = call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    assert!(root.join("keys.sealed").exists());
+    let v = rm_touched(&f, OWN).await;
     ok(&v);
     assert!(!root.exists());
     assert!(matches!(f.ctx.blind.state(&crm()), DatasetState::Absent));
@@ -1080,7 +1117,7 @@ async fn rm_whose_remove_fails_is_not_live() {
     std::fs::create_dir(&stuck).unwrap();
     std::fs::write(stuck.join("f"), b"x").unwrap();
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let v = call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await;
+    let v = rm_touched(&f, OWN).await;
     let (code, text) = err(&v);
     assert_eq!(code, "unavailable");
     assert!(text.starts_with("could not remove crm"), "{text}");
@@ -1208,8 +1245,8 @@ async fn rm_without_policy_entry_keeps_its_approvers() {
     )
     .await;
     assert_eq!(err(&v).0, "forbidden", "{v}");
-    // `me`, the dataset's own approver, still may.
-    ok(&call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await);
+    // `me`, the dataset's own approver, still may (with the touch).
+    ok(&rm_touched(&f, OWN).await);
     assert!(!ds_root(&f).exists());
 }
 

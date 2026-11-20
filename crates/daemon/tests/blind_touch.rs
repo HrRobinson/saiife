@@ -18,7 +18,8 @@ use saiife_daemon::vault;
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_ipc::msg::{
     Request, OP_BLIND_ASK, OP_BLIND_ASK_ANSWER, OP_BLIND_DATA_COMMIT, OP_BLIND_DATA_REFRESH,
-    OP_BLIND_DATA_STAGE, OP_BLIND_TOUCH_BEGIN, OP_BLIND_TOUCH_COMMIT,
+    OP_BLIND_DATA_REVOKE, OP_BLIND_DATA_RM, OP_BLIND_DATA_STAGE, OP_BLIND_TOUCH_BEGIN,
+    OP_BLIND_TOUCH_COMMIT,
 };
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, FixedDirectory, Fsync};
@@ -1158,4 +1159,183 @@ async fn approve_refuses_an_ask_that_kept_a_name() {
     assert!(records(&f, "blind_approve").is_empty());
     let logs = raw_dir(&f.audit).to_lowercase();
     assert!(!logs.contains("zed") && !logs.contains("quorra"));
+}
+
+// ------------------------------------------- plan 48 final review ----
+
+/// I1 (spec §6.3): removing a dataset shreds its keys, so it takes the
+/// `blind:keys` touch; a raw `blind.data.rm` without one is refused and
+/// nothing is shredded.
+#[tokio::test]
+async fn data_rm_needs_the_keys_touch() {
+    let t = scratch();
+    let f = fx(t.path(), &[]).await;
+    let root = f.ctx.blind.dataset_dir(&crm()).root;
+    assert!(root.join("keys.sealed").exists());
+    let v = call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await;
+    assert_eq!(
+        err(&v),
+        (
+            "forbidden".to_string(),
+            saiife_daemon::blind::data::rm_needs_touch(&crm())
+        )
+    );
+    assert!(root.join("keys.sealed").exists());
+    assert!(f.ctx.blind.live(&crm()).is_ok());
+    assert!(records(&f, "blind_keys").is_empty());
+    // Another uid has no role: forbidden, no challenge.
+    let _o = enrol(&f, OTHER);
+    let v = begin_as(&f, OTHER, json!({"purpose": "data_rm", "dataset": "crm"})).await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    assert!(v.get("touch").is_none());
+    assert_eq!(pending(&f), 0);
+    // With the touch: removed, recorded with it.
+    let s = enrol(&f, OWN);
+    let b = begin_as(&f, OWN, json!({"purpose": "data_rm", "dataset": "crm"})).await;
+    ok(&b);
+    assert_eq!(b["class"], "blind:keys");
+    assert_eq!(
+        summary(&b),
+        "remove crm and delete its keys: its stand-ins can never be linked back to anyone"
+    );
+    let v = commit_as(&f, OWN, &b, &assertion(&s, &b)).await;
+    ok(&v);
+    assert_eq!(v["removed"], true, "{v}");
+    assert!(!root.exists());
+    assert!(matches!(f.ctx.blind.state(&crm()), DatasetState::Absent));
+    let r = records(&f, "blind_keys");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0]["action"], "delete");
+    assert_eq!(r[0]["reason"], "dataset removed");
+    touched(&r[0], 1);
+    // Nothing left: a raw rm is no error (no keys to shred).
+    let v = call(&f, OP_BLIND_DATA_RM, json!({"dataset": "crm"}), vec![]).await;
+    ok(&v);
+    assert_eq!(v["removed"], false, "{v}");
+}
+
+/// m1 (R48-1): an answered ask past its lifetime cannot be approved, even
+/// when no other ask swept it.
+#[tokio::test]
+async fn approve_after_the_ask_lifetime_is_refused() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    if no_calc("approve_after_the_ask_lifetime_is_refused") {
+        return;
+    }
+    let _s = enrol(&f, OWN);
+    let (id, _) = answered(&f, OWN).await;
+    f.ctx
+        .blind
+        .asks
+        .lock()
+        .unwrap()
+        .test_backdate(ask::ASK_TTL + Duration::from_secs(1));
+    let v = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
+    assert_eq!(
+        err(&v),
+        ("bad_request".to_string(), ask::NO_SUCH_ASK.to_string())
+    );
+    assert_eq!(pending(&f), 0);
+    assert!(methods(&f).methods.is_empty());
+}
+
+/// m5: two approve touches begun on one ask, committed at once: the
+/// method is stored once; the other commit is refused cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_approve_touches_store_once() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    if no_calc("two_approve_touches_store_once") {
+        return;
+    }
+    let s = enrol(&f, OWN);
+    let (id, _) = answered(&f, OWN).await;
+    let b1 = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
+    ok(&b1);
+    let b2 = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
+    ok(&b2);
+    let (a1, a2) = (assertion(&s, &b1), assertion(&s, &b2));
+    let (v1, v2) = tokio::join!(commit_as(&f, OWN, &b1, &a1), commit_as(&f, OWN, &b2, &a2));
+    let oks = [&v1, &v2]
+        .iter()
+        .filter(|v| v.get("error").is_none())
+        .count();
+    assert_eq!(oks, 1, "{v1}\n{v2}");
+    let refused = if v1.get("error").is_some() { &v1 } else { &v2 };
+    let (code, text) = err(refused);
+    assert!(
+        (code == "bad_request" && text == ask::NO_SUCH_ASK)
+            || (code == "busy" && text == ask::ASK_BUSY),
+        "{refused}"
+    );
+    assert_eq!(methods(&f).methods.len(), 1);
+    assert_eq!(records(&f, "blind_approve").len(), 1);
+    // The approved ask is done.
+    let v = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
+    assert_eq!(
+        err(&v),
+        ("bad_request".to_string(), ask::NO_SUCH_ASK.to_string())
+    );
+}
+
+/// m6: a grant whose policy write failed is withdrawn by
+/// `blind.data.revoke` (no touch: it only tightens); only a manager may.
+#[tokio::test]
+async fn loosen_grant_can_be_revoked() {
+    let t = scratch();
+    let f = fx(t.path(), &[]).await;
+    let s = enrol(&f, OWN);
+    let v = touch_as(
+        &f,
+        OWN,
+        &s,
+        json!({"purpose": "loosen", "dataset": "crm", "column": "customers.credit_limit", "to": "quasi"}),
+    )
+    .await;
+    ok(&v);
+    let root = f.ctx.blind.dataset_dir(&crm()).root;
+    let grants = || -> usize {
+        let g: Value =
+            serde_json::from_slice(&std::fs::read(root.join("loosen.json")).unwrap()).unwrap();
+        g["grants"].as_array().unwrap().len()
+    };
+    assert_eq!(grants(), 1);
+    let args = json!({"dataset": "crm", "column": "customers.credit_limit", "class": "quasi"});
+    let v = call_as(&f, OTHER, OP_BLIND_DATA_REVOKE, args.clone(), vec![]).await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    assert_eq!(grants(), 1);
+    // Another class is not this grant.
+    let v = call(
+        &f,
+        OP_BLIND_DATA_REVOKE,
+        json!({"dataset": "crm", "column": "customers.credit_limit", "class": "public"}),
+        vec![],
+    )
+    .await;
+    ok(&v);
+    assert_eq!(v["revoked"], false, "{v}");
+    let v = call(&f, OP_BLIND_DATA_REVOKE, args.clone(), vec![]).await;
+    ok(&v);
+    assert_eq!(v["revoked"], true, "{v}");
+    assert_eq!(grants(), 0);
+    let v = call(&f, OP_BLIND_DATA_REVOKE, args, vec![]).await;
+    assert_eq!(v["revoked"], false, "{v}");
+    // The policy loosened by hand now: no grant, so the class stays.
+    set_policy(
+        &f,
+        &policy("", &[("customers.credit_limit", "quasi")], true),
+    );
+    let v = call(
+        &f,
+        OP_BLIND_DATA_REFRESH,
+        json!({"dataset": "crm"}),
+        vec![fd_of(&f.sqlite)],
+    )
+    .await;
+    assert_eq!(v["started"], true, "{v}");
+    f.ctx.blind.test_wait_builds().await;
+    let classes: Value =
+        serde_json::from_slice(&std::fs::read(root.join("classes.json")).unwrap()).unwrap();
+    assert_eq!(classes["customers.credit_limit"], "sensitive");
 }

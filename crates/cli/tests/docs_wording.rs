@@ -693,8 +693,26 @@ fn data_shield_page_states_its_guarantees_and_limits() {
         "saiife blind status",
         "saiife blind init",
         "showing 100 of 2,314",
+        // Plan 48 final review I2: the keep-name touch, what is logged,
+        // exit 5 for a refreshing dataset, data rm's touch.
+        "blind:name",
+        "stays released for the rest of the session",
+        "sent to the planner as plain text",
+        "the audit log holds the parameterized question",
+        "answer_mac",
+        "dataset refreshing",
+        "saiife blind data rm --dataset d",
     ] {
         assert!(t.contains(needle), "data-shield.md lacks: {needle}");
+    }
+    // The old, wrong claims are gone.
+    for wrong in [
+        "never asks for that touch",
+        "never questions, names or answers",
+        "answer's sha256 is logged",
+        "customer #4411",
+    ] {
+        assert!(!t.contains(wrong), "data-shield.md still says: {wrong}");
     }
     // The guarantees G1 to G3 are all named.
     for g in ["g1", "g2", "g3"] {

@@ -7,7 +7,10 @@
 //! - `blind.data.commit` builds the staged snapshot with the policy's
 //!   classes, makes it live and writes `classes.json` (the baseline).
 //! - `blind.data.refresh` re-reads the source and builds, in the background.
-//! - `blind.data.rm` shreds the keys and removes the dataset's directory.
+//! - `blind.data.rm` removes the dataset's directory; one with keys only
+//!   through the `blind:keys` touch (`blind.touch.begin {purpose:
+//!   data_rm}`), which also shreds the keys (spec §6.3).
+//! - `blind.data.revoke` withdraws an unspent `blind:loosen` grant.
 //!
 //! One build at a time per dataset: the state is `Building` while one runs
 //! (an ask gets the refreshing answer; an ask already running keeps its
@@ -303,6 +306,56 @@ pub(crate) fn add_grant(ctx: &Ctx, name: &DatasetName, g: LoosenGrant) -> Result
         .map_err(|e| unavailable(format!("could not write {LOOSEN_FILE}: {e}")));
     drop(guard);
     r
+}
+
+/// `blind.data.revoke {dataset, column, class}` (plan 48 final review m6):
+/// withdraws the unspent `blind:loosen` grant that `column` may become
+/// `class`, when the policy write or reload after its touch failed, so a
+/// later hand edit to the same class cannot spend it without a fresh
+/// touch. It only tightens, so it takes no touch; the role is `data`'s.
+/// `{revoked: bool}`: whether such a grant was there.
+pub async fn revoke(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    args: &Map<String, Value>,
+) -> Result<Value, Refusal> {
+    let name = dataset_arg(args)?;
+    let str_of = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad(format!("{k} is required")))
+    };
+    let column = str_of("column")?.to_string();
+    let class: ColumnClass = serde_json::from_value(Value::String(str_of("class")?.into()))
+        .map_err(|_| bad("class is not a column class"))?;
+    if !may_rm(ctx, peer, &name).await {
+        return Err(manage_refusal(&name));
+    }
+    let (c, d) = (Arc::clone(ctx), name.clone());
+    let revoked = tokio::task::spawn_blocking(move || -> Result<bool, Refusal> {
+        let guard = BuildGuard::begin(&c.blind, &d)?;
+        let dir = c.blind.dataset_dir(&d);
+        let mut grants = read_grants(&dir)?;
+        let before = grants.len();
+        grants.retain(|g| !(g.column == column && g.class == class));
+        let gone = grants.len() != before;
+        let r = if gone {
+            write_private(
+                &dir.root.join(LOOSEN_FILE),
+                &json_bytes(&LoosenFile { grants }),
+            )
+            .map_err(|e| unavailable(format!("could not write {LOOSEN_FILE}: {e}")))
+        } else {
+            Ok(())
+        };
+        drop(guard);
+        r.map(|()| gone)
+    })
+    .await
+    .map_err(join_err)??;
+    let mut a = Map::new();
+    a.insert("revoked".into(), Value::Bool(revoked));
+    Ok(Value::Object(a))
 }
 
 /// The dataset in the policy in force, and its `k`.
@@ -1401,18 +1454,46 @@ fn refresh_build(b: BuildIn, input: Input) -> Result<Built, BuildErr> {
     build(b, &layout)
 }
 
-/// `blind.data.rm {dataset}`: records `blind_keys` (delete, "dataset
-/// removed"), shreds the keys (R47-2) and removes the dataset's directory.
-/// A dataset that is not there is not an error. Once the keys are being
-/// shredded the dataset never shows `Live` again, whatever fails.
+/// The refusal of a `blind.data.rm` that would shred keys with no touch
+/// (spec §6.3): `saiife blind data rm` takes the `blind:keys` touch.
+pub fn rm_needs_touch(name: &DatasetName) -> String {
+    format!(
+        "removing {name} deletes its stand-in keys, which needs a touch (blind:keys): saiife blind data rm --dataset {name}"
+    )
+}
+
+/// `blind.data.rm {dataset}`: removes a dataset that has no keys (a build
+/// that failed, keys deleted already). A dataset with keys is refused
+/// ([`rm_needs_touch`]): its removal is crypto-shredding, the `data_rm`
+/// purpose of `blind.touch.begin` (plan 48 final review I1).
 pub async fn rm(
     ctx: &Arc<Ctx>,
     peer: &PeerCred,
     args: &Map<String, Value>,
 ) -> Result<Value, Refusal> {
     let name = dataset_arg(args)?;
-    let cfg = policy_dataset(ctx, &name).map(|p| p.0);
-    if !may_manage(ctx, peer, &name, cfg.as_ref()).await {
+    rm_as(ctx, peer, &name, None).await
+}
+
+/// Whether `peer` may remove `name` (R47-3; S3 without a policy entry).
+pub(crate) async fn may_rm(ctx: &Ctx, peer: &PeerCred, name: &DatasetName) -> bool {
+    let cfg = policy_dataset(ctx, name).map(|p| p.0);
+    may_manage(ctx, peer, name, cfg.as_ref()).await
+}
+
+/// The removal: records `blind_keys` (delete, "dataset removed", with the
+/// `touch` when one was taken), shreds the keys (R47-2) and removes the
+/// dataset's directory. Without a touch, a dataset with keys is refused.
+/// A dataset that is not there is not an error. Once the keys are being
+/// shredded the dataset never shows `Live` again, whatever fails.
+pub(crate) async fn rm_as(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    name: &DatasetName,
+    touch: Option<String>,
+) -> Result<Value, Refusal> {
+    let name = name.clone();
+    if !may_rm(ctx, peer, &name).await {
         return Err(manage_refusal(&name));
     }
     let mut guard = BuildGuard::begin(&ctx.blind, &name)?;
@@ -1422,6 +1503,11 @@ pub async fn rm(
         guard.done(DatasetState::Absent);
         a.insert("removed".into(), Value::Bool(false));
         return Ok(Value::Object(a));
+    }
+    // I1 (spec §6.3): shredding keys takes a touch; checked under the
+    // build guard, so no build makes keys meanwhile.
+    if touch.is_none() && keys::present(ctx, &name) {
+        return Err(Refusal::new(ErrorCode::Forbidden, rm_needs_touch(&name)));
     }
     let version = keys::load(ctx, &name).map_or(0, |k| k.version);
     let live = guard.previous_live().map(|p| p.1);
@@ -1434,7 +1520,7 @@ pub async fn rm(
             dataset: name.to_string(),
             action: "delete",
             version,
-            touch: None,
+            touch,
             reason: Some("dataset removed"),
         },
         live.as_ref().and_then(|h| h.index.as_ref()),

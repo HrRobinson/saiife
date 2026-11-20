@@ -3,7 +3,7 @@
 mod common;
 
 use saiife_shield::calc::{CellValue, ResultSet};
-use saiife_shield::schema::{Bound, Decimal, Lang, Param, ParamType};
+use saiife_shield::schema::{Bound, ColumnClass, Decimal, Lang, Param, ParamType};
 use saiife_shield::sql::ErrorClass;
 use saiife_shield::template::{
     check_params_covered, entity_label, fill, format_date, format_int, format_money, format_number,
@@ -780,6 +780,26 @@ fn labels_show_no_identifier() {
     assert_eq!(entity_label(&c, &s), "Anna Berg, Aarhus");
     assert!(!entity_label(&c, &s).contains("4411"));
     assert_eq!(entity_label(&cand(1, "Bo", &[]), &s), "Bo");
+}
+
+/// Plan 48 final review m4 (R-C2): the entity's key is never shown, even
+/// when an operator classed it quasi and listed it in `show`.
+#[test]
+fn labels_never_show_the_key() {
+    let mut s = common::schema();
+    let key = s.entity_for("customers").unwrap().key.clone();
+    for t in s.tables.iter_mut().filter(|t| t.name == "customers") {
+        for c in t.columns.iter_mut().filter(|c| c.name == key) {
+            c.class = ColumnClass::Quasi;
+        }
+    }
+    let c = cand(4411, "Anna Berg", &[(&key, "4411"), ("city", "Aarhus")]);
+    assert_eq!(shown_values(&c, &s), ["Aarhus"]);
+    assert_eq!(entity_label(&c, &s), "Anna Berg, Aarhus");
+    // A table with no entity shows nothing (fail closed).
+    let mut other = cand(1, "Bo", &[("paid", "2026-01-02")]);
+    other.table = "payments".into();
+    assert!(shown_values(&other, &s).is_empty());
 }
 
 #[test]

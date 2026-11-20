@@ -530,6 +530,9 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         saiife_ipc::msg::OP_BLIND_DATA_RM => {
             Some(super::data::rm(ctx, &conn.peer, &req.args).await)
         }
+        saiife_ipc::msg::OP_BLIND_DATA_REVOKE => {
+            Some(super::data::revoke(ctx, &conn.peer, &req.args).await)
+        }
         saiife_ipc::msg::OP_BLIND_NER_FETCH => Some(super::ner::fetch_op(ctx, &conn.peer).await),
         _ => None,
     };

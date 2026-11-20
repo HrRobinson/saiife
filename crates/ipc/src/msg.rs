@@ -313,6 +313,10 @@ pub const OP_BLIND_DATA_COMMIT: &str = "blind.data.commit";
 pub const OP_BLIND_DATA_REFRESH: &str = "blind.data.refresh";
 /// Removes a dataset.
 pub const OP_BLIND_DATA_RM: &str = "blind.data.rm";
+/// Plan 48: `{dataset, column, class}` -> `{revoked}`: withdraws an
+/// unspent `blind:loosen` grant (its policy write failed). Tightens only,
+/// so no touch.
+pub const OP_BLIND_DATA_REVOKE: &str = "blind.data.revoke";
 /// Fetches the NER model.
 pub const OP_BLIND_NER_FETCH: &str = "blind.ner.fetch";
 /// Lists a dataset's saved methods.
@@ -336,6 +340,7 @@ pub const BLIND_OPS: &[&str] = &[
     OP_BLIND_DATA_COMMIT,
     OP_BLIND_DATA_REFRESH,
     OP_BLIND_DATA_RM,
+    OP_BLIND_DATA_REVOKE,
     OP_BLIND_NER_FETCH,
     OP_BLIND_METHODS_LIST,
     OP_BLIND_ASK,
@@ -557,7 +562,7 @@ mod tests {
 
     #[test]
     fn blind_ops_are_named_and_two_take_fds() {
-        assert_eq!(BLIND_OPS.len(), 12);
+        assert_eq!(BLIND_OPS.len(), 13);
         for op in BLIND_OPS {
             assert!(op.starts_with("blind."), "{op}");
             assert!(!LINK_OPS.contains(op), "{op}");

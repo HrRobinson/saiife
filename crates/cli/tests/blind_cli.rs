@@ -780,19 +780,48 @@ fn data_refresh_prints_the_repeated_key_reason() {
 #[test]
 fn data_rm_confirms_name() {
     let f = fx(&[]);
-    let o = f.blind(&["data", "rm", "--dataset", "crm"], "crn\n", true);
+    let key = enrol(&f, "k1");
+    // A wrong name: nothing done, no touch asked.
+    let o = f.blind_key(
+        &["data", "rm", "--dataset", "crm"],
+        "crn\n",
+        true,
+        Some(&key),
+    );
     let (out, err) = text(&o);
     assert_eq!(code(&o), 2, "{out}\n{err}");
     assert!(
         err.contains("This removes crm: its snapshot, its stand-in keys and its approved methods. Type the dataset name to go on: "),
         "{err}"
     );
+    assert!(!err.contains("touch your key"), "{err}");
     assert_eq!(crm_status(&f)["state"], "live");
-    let o = f.blind(&["data", "rm", "--dataset", "crm"], "crm\n", true);
+    // The name typed, then the blind:keys touch (plan 48 final review I1).
+    let o = f.blind_key(
+        &["data", "rm", "--dataset", "crm"],
+        "crm\n",
+        true,
+        Some(&key),
+    );
     let (out, err) = text(&o);
     assert_eq!(code(&o), 0, "{out}\n{err}");
-    assert_eq!(out, "removed crm\n");
+    assert!(
+        err.contains("saiife: touch your key to remove crm and delete its keys"),
+        "{err}"
+    );
+    assert_eq!(out.lines().next(), Some("removed crm"), "{out}");
     assert_eq!(crm_status(&f)["state"], "not_built");
+}
+
+/// I1: without a touch key, `data rm` removes nothing.
+#[test]
+fn data_rm_needs_a_touch() {
+    let f = fx(&[]);
+    let o = f.blind(&["data", "rm", "--dataset", "crm"], "crm\n", true);
+    let (out, err) = text(&o);
+    assert_ne!(code(&o), 0, "{out}\n{err}");
+    assert!(!out.contains("removed crm"), "{out}");
+    assert_eq!(crm_status(&f)["state"], "live");
 }
 
 #[test]
@@ -882,6 +911,46 @@ fn data_class_restores_on_bad_reload() {
     );
     assert!(err.contains("was put back as it was"), "{err}");
     assert_eq!(fs::read(dropin(&f)).unwrap(), before);
+    fs::remove_file(&broken).unwrap();
+}
+
+/// m6 (plan 48 final review): a loosening whose policy did not load
+/// withdraws its grant, so a later hand edit cannot spend it untouched.
+#[test]
+fn data_class_loosen_bad_reload_withdraws_the_grant() {
+    let f = fx_opts(
+        &[],
+        "",
+        Opts {
+            dropin: Some(true),
+            email: false,
+        },
+    );
+    let before = fs::read(dropin(&f)).unwrap();
+    let key = enrol(&f, "k1");
+    let broken = f.b.config_dir().join("policy.d/zz-broken.toml");
+    fs::write(&broken, "[[[ not toml\n").unwrap();
+    let o = f.blind_key(
+        &["data", "class", "crm", "invoices.amount", "quasi"],
+        "",
+        false,
+        Some(&key),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains("saiife: touch your key to make invoices.amount quasi"),
+        "{err}"
+    );
+    assert!(err.contains("was put back as it was"), "{err}");
+    assert!(
+        err.contains("the blind:loosen grant was withdrawn"),
+        "{err}"
+    );
+    assert_eq!(fs::read(dropin(&f)).unwrap(), before);
+    let grants = f.b.state_dir().join("blind/datasets/crm/loosen.json");
+    let g: Value = serde_json::from_str(&fs::read_to_string(&grants).unwrap()).unwrap();
+    assert_eq!(g["grants"], json!([]), "{g}");
     fs::remove_file(&broken).unwrap();
 }
 

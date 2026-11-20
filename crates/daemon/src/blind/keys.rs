@@ -144,6 +144,16 @@ fn store(ctx: &Ctx, ds: &DatasetName, keys: &KeySet) -> Result<(), KeyError> {
     super::write_private(&path_of(ctx, ds), &sealed).map_err(io_err)
 }
 
+/// Whether the dataset has key material on disk (`keys.sealed`, damaged
+/// or not, even a link): removing it is crypto-shredding, a `blind:keys`
+/// touch (spec §6.3). An entry that cannot be checked counts as there.
+pub fn present(ctx: &Ctx, ds: &DatasetName) -> bool {
+    match std::fs::symlink_metadata(path_of(ctx, ds)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
+}
+
 /// The dataset's keys.
 pub fn load(ctx: &Ctx, ds: &DatasetName) -> Result<KeySet, KeyError> {
     vault_ready(ctx)?;

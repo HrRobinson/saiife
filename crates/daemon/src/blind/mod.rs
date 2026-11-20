@@ -449,6 +449,13 @@ impl Blind {
         };
     }
 
+    /// Test seam: sets the state of `name` as the daemon's start would
+    /// ([`DatasetState::Opening`]) or puts back one [`Blind::state`] gave.
+    #[cfg(debug_assertions)]
+    pub fn test_set_state(&self, name: &DatasetName, s: DatasetState) {
+        lock(&self.datasets).insert(name.as_str().to_string(), s);
+    }
+
     /// Keeps a background build's task (debug builds: tests wait for it).
     pub(crate) fn track_build(&self, h: tokio::task::JoinHandle<()>) {
         #[cfg(debug_assertions)]

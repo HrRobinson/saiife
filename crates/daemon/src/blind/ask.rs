@@ -680,6 +680,11 @@ impl std::fmt::Debug for AskState {
     }
 }
 
+/// Whether ask `s` is past its lifetime ([`ASK_TTL`] since its last step).
+fn expired(s: &AskState, now: Instant) -> bool {
+    now.saturating_duration_since(s.last_step) >= ASK_TTL
+}
+
 /// The asks of a daemon (`Blind::asks`). An ask being worked on (a step
 /// in flight) is out of the map and listed in `working`, so a second step
 /// for it is `busy` and every lookup still knows its owner.
@@ -696,8 +701,7 @@ impl Asks {
 
     /// Drops every ask whose last step is [`ASK_TTL`] old.
     pub fn sweep(&mut self, now: Instant) {
-        self.map
-            .retain(|_, s| now.saturating_duration_since(s.last_step) < ASK_TTL);
+        self.map.retain(|_, s| !expired(s, now));
     }
 
     /// The asks kept (any phase), and those in flight.
@@ -778,6 +782,7 @@ impl Asks {
             });
         }
         match self.map.get(id) {
+            Some(s) if expired(s, Instant::now()) => return Err(bad(NO_SUCH_ASK)),
             None => return Err(bad(NO_SUCH_ASK)),
             Some(s) if s.uid != uid => return Err(Refusal::new(ErrorCode::Forbidden, NOT_YOURS)),
             Some(_) => {}
@@ -802,7 +807,10 @@ impl Asks {
                 Refusal::new(ErrorCode::Forbidden, NOT_YOURS)
             });
         }
+        // m1 (plan 48 final review): an ask past its lifetime is gone,
+        // swept or not (R48-1), also for the touch flows.
         match self.map.get(id) {
+            Some(s) if expired(s, Instant::now()) => Err(bad(NO_SUCH_ASK)),
             None => Err(bad(NO_SUCH_ASK)),
             Some(s) if s.uid != uid => Err(Refusal::new(ErrorCode::Forbidden, NOT_YOURS)),
             Some(s) => Ok(f(s)),
@@ -841,6 +849,48 @@ impl Drop for Working {
     fn drop(&mut self) {
         lock(&self.blind.asks).working.remove(&self.id);
     }
+}
+
+/// An ask held out of the map by a touch commit that acts on it (plan 48
+/// final review m5): a second commit on the same ask meanwhile is `busy`
+/// and, once this one approved it, finds no ask. Dropped unfinished, the
+/// ask goes back as it was.
+pub(crate) struct Held {
+    blind: Arc<Blind>,
+    id: String,
+    st: Option<AskState>,
+}
+
+impl Held {
+    /// The held ask.
+    pub(crate) fn state(&self) -> Option<&AskState> {
+        self.st.as_ref()
+    }
+
+    /// The action is done: the ask ends (it is not put back).
+    pub(crate) fn finish(mut self) {
+        self.st = None;
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut a = lock(&self.blind.asks);
+        a.working.remove(&self.id);
+        if let Some(st) = self.st.take() {
+            a.map.insert(self.id.clone(), st);
+        }
+    }
+}
+
+/// Takes ask `id` of `uid` out of the map for a touch commit ([`Held`]).
+pub(crate) fn hold(ctx: &Ctx, id: &str, uid: u32) -> Result<Held, Refusal> {
+    let st = lock(&ctx.blind.asks).take(id, uid)?;
+    Ok(Held {
+        blind: Arc::clone(&ctx.blind),
+        id: id.to_string(),
+        st: Some(st),
+    })
 }
 
 /// Keeps `st` for its next step unless it ended. An answered ask makes
@@ -1016,9 +1066,14 @@ pub async fn begin(
     // The build, fixed for the whole ask; a refresh is a step of its own.
     let snap = match data::live_snapshot(ctx, &name) {
         Ok(s) => s,
+        // m3 (plan 48 final review): still opening at start is the same
+        // passing unavailability as a refresh (exit 5), with its own text.
         Err(r)
             if r.code == ErrorCode::Busy
-                && matches!(ctx.blind.state(&name), super::DatasetState::Building { .. }) =>
+                && matches!(
+                    ctx.blind.state(&name),
+                    super::DatasetState::Building { .. } | super::DatasetState::Opening
+                ) =>
         {
             return Ok((id, Step::Refreshing { text: r.text }))
         }

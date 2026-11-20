@@ -465,13 +465,17 @@ pub fn answer_params(d: &Draft, schema: &Schema) -> Vec<Param> {
 
 /// The `show` values of `c` a user may see in local resolution UI and in
 /// the method preview (plan 48 ruling R-C2, owner rule R45-13): not empty,
-/// of a column of the entity's table that is not Identifier-class. A column
-/// the schema does not have is not shown (fail closed). Never the key.
+/// of a column of the entity's table that is not Identifier-class and is
+/// not the entity's key, whatever its class (plan 48 final review m4). A
+/// column the schema does not have, or a table with no entity, is not
+/// shown (fail closed). Never the key.
 pub fn shown_values<'a>(c: &'a Candidate, schema: &Schema) -> Vec<&'a str> {
+    let key = schema.entity_for(&c.table).map(|e| e.key.as_str());
     c.show
         .iter()
         .filter(|(col, v)| {
             !v.is_empty()
+                && key.is_some_and(|k| k != col.as_str())
                 && schema
                     .column(&c.table, col)
                     .is_some_and(|ci| ci.class != ColumnClass::Identifier)

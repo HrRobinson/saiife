@@ -332,11 +332,11 @@ mod imp {
             DataAction::Rm { dataset } => {
                 let shown = sanitize(&dataset);
                 confirm_name(p, &rm_prompt(&shown), &dataset)?;
-                let r = call(
+                // Spec §6.3: removing a dataset shreds its keys, a
+                // `blind:keys` touch (plan 48 final review I1).
+                let r = touch(
                     t,
-                    "blind.data.rm",
-                    args([("dataset", json!(dataset))]),
-                    READ_TIMEOUT,
+                    args([("purpose", json!("data_rm")), ("dataset", json!(dataset))]),
                 )?;
                 if r.get("removed").and_then(Value::as_bool) == Some(true) {
                     outln!("removed {shown}");
@@ -630,15 +630,42 @@ mod imp {
             alias: None,
         });
         entry.class = class.to_string();
-        policy_file::write_dataset(t, &d).map_err(|e| Stop::Refused(sanitize(&e)))?;
+        // m6 (plan 48 final review): a grant whose policy change failed is
+        // withdrawn, so a later hand edit cannot spend it without a touch.
+        let withdraw = || -> String {
+            if !looser {
+                return String::new();
+            }
+            let r = call(
+                t,
+                "blind.data.revoke",
+                args([
+                    ("dataset", json!(ds)),
+                    ("column", json!(column)),
+                    ("class", json!(class)),
+                ]),
+                READ_TIMEOUT,
+            );
+            match r {
+                Ok(_) => "; the blind:loosen grant was withdrawn".into(),
+                Err(Stop::Refused(e) | Stop::Unavailable(e)) => format!(
+                    "; the blind:loosen grant could not be withdrawn: {}",
+                    sanitize(&e)
+                ),
+            }
+        };
+        if let Err(e) = policy_file::write_dataset(t, &d) {
+            return Err(Stop::Refused(format!("{}{}", sanitize(&e), withdraw())));
+        }
         if let Err(why) = policy_file::reload(t) {
             let back = match before.restore(t) {
                 Ok(()) => format!("{shown_path} was put back as it was"),
                 Err(e) => format!("and {} could not be put back: {}", shown_path, sanitize(&e)),
             };
             return Err(Stop::Refused(format!(
-                "the policy did not load, so the change was not made: {}; {back}",
-                sanitize(&why)
+                "the policy did not load, so the change was not made: {}; {back}{}",
+                sanitize(&why),
+                withdraw()
             )));
         }
         let how = if looser {

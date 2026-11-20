@@ -15,6 +15,7 @@
 //! | `approve {ask}` | `blind:approve` | an approver who asked it | `MethodStore::add`, `blind_approve {add}` |
 //! | `method_rm {dataset, method}` | `blind:approve` | an approver | the method removed, `blind_approve {remove}` |
 //! | `keys {dataset, action}` | `blind:keys` | an approver or admin | `blind_keys`, then `keys::rotate` / `keys::shred` |
+//! | `data_rm {dataset}` | `blind:keys` | an approver or admin | `blind_keys {delete, dataset removed}`, then the keys shredded and the dataset removed |
 //! | `loosen {dataset, column, to}` | `blind:loosen` | an approver or admin | `blind_loosen`, then the grant in `loosen.json` |
 //!
 //! There is no `blind:reveal` or `blind:show` purpose here (R-C5: plan
@@ -103,6 +104,8 @@ enum Action {
     Keys {
         delete: bool,
     },
+    /// `saiife blind data rm`: crypto-shredding with the rest (spec §6.3).
+    DataRm,
     Loosen {
         column: String,
         from: ColumnClass,
@@ -117,6 +120,7 @@ impl Action {
             Action::Approve { .. } => "approve",
             Action::MethodRm { .. } => "method_rm",
             Action::Keys { .. } => "keys",
+            Action::DataRm => "data_rm",
             Action::Loosen { .. } => "loosen",
         }
     }
@@ -529,6 +533,33 @@ async fn plan_keys(
     })
 }
 
+/// `data_rm {dataset}`: the removal `blind.data.rm` refuses without a
+/// touch (plan 48 final review I1). The role is `data rm`'s own (R47-3,
+/// also for a dataset whose policy entry is gone, S3).
+async fn plan_data_rm(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    a: &Map<String, Value>,
+) -> Result<Plan, Refusal> {
+    let ds = dataset_arg(a)?;
+    if !data::may_rm(ctx, peer, &ds).await {
+        return Err(Refusal::new(ErrorCode::Forbidden, rm_role_text(&ds)));
+    }
+    Ok(Plan {
+        summary: format!(
+            "remove {ds} and delete its keys: its stand-ins can never be linked back to anyone"
+        ),
+        fields: fields(&[("dataset", ds.as_str()), ("action", "remove")]),
+        class: TouchClass::BlindKeys,
+        dataset: ds,
+        action: Action::DataRm,
+    })
+}
+
+fn rm_role_text(ds: &DatasetName) -> String {
+    format!("only an admin or an approver of {ds} may change its data")
+}
+
 async fn plan_loosen(
     ctx: &Arc<Ctx>,
     peer: &PeerCred,
@@ -593,9 +624,13 @@ pub async fn begin(
         "approve" => plan_approve(ctx, peer, a).await?,
         "method_rm" => plan_method_rm(ctx, peer, a).await?,
         "keys" => plan_keys(ctx, peer, a).await?,
+        "data_rm" => plan_data_rm(ctx, peer, a).await?,
         "loosen" => plan_loosen(ctx, peer, a).await?,
         _ => {
-            return Err(bad("purpose must be one of name, approve, method_rm, keys, loosen").into())
+            return Err(bad(
+                "purpose must be one of name, approve, method_rm, keys, data_rm, loosen",
+            )
+            .into())
         }
     };
     let uid = peer.uid;
@@ -760,6 +795,7 @@ pub async fn commit(
         }
         Action::MethodRm { id } => commit_method_rm(ctx, peer, &ds, id, touch).await,
         Action::Keys { delete } => commit_keys(ctx, peer, &ds, delete, touch).await,
+        Action::DataRm => commit_data_rm(ctx, peer, &ds, touch).await,
         Action::Loosen { column, from, to } => {
             commit_loosen(ctx, peer, &ds, column, from, to, touch).await
         }
@@ -856,8 +892,12 @@ async fn commit_approve(
     // R-C12 (T2 M6): an ask answered while a reload took the role is
     // caught here.
     ask::recheck(ctx, id, peer, true).await?;
-    let f = lock(&ctx.blind.asks)
-        .peek(id, peer.uid, |s| s.for_approve())?
+    // m5: the ask is held until the approval is done, so a second touch
+    // begun on the same ask cannot store the method again.
+    let held = ask::hold(ctx, id, peer.uid)?;
+    let f = held
+        .state()
+        .and_then(|s| s.for_approve())
         .ok_or_else(|| Failure::mismatch(ASK_CHANGED))?;
     if f.dataset != *ds
         || method_sha256(&f.reply.method) != sha
@@ -905,7 +945,7 @@ async fn commit_approve(
         return Err(e.into());
     }
     // The ask is done: approved once.
-    lock(&ctx.blind.asks).forget(id, peer.uid);
+    held.finish();
     Ok(json!({"method": stored.id, "version": stored.version}))
 }
 
@@ -981,6 +1021,27 @@ async fn commit_keys(
         Some(v) => json!({"action": action, "version": v}),
         None => json!({"action": action}),
     })
+}
+
+/// R-C12: the role is checked again (a reload may have taken it); then
+/// the removal, recorded with the touch.
+async fn commit_data_rm(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    ds: &DatasetName,
+    touch: Touched,
+) -> Result<Value, Failure> {
+    if !data::may_rm(ctx, peer, ds).await {
+        return Err(Refusal::new(
+            ErrorCode::Forbidden,
+            format!(
+                "{} (the policy changed); nothing was changed",
+                rm_role_text(ds)
+            ),
+        )
+        .into());
+    }
+    Ok(data::rm_as(ctx, peer, ds, Some(touch.record)).await?)
 }
 
 async fn commit_loosen(

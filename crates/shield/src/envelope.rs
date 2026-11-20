@@ -341,19 +341,44 @@ pub const KEPT_NAME: &str = "[kept name]";
 /// A logged question (from [`logged_question`]) with each name a
 /// `blind:name` touch released replaced by [`KEPT_NAME`] (plan 48 T3,
 /// spec §6.5): the name went to the planner as typed, but the audit holds
-/// only its keyed hash (`blind_name`). Longer names are masked first, so
-/// a released name inside another one is masked whole.
+/// only its keyed hash (`blind_name`). The match is the firewall's: on
+/// [`crate::norm::normalize`]d tokens (case, accents and punctuation
+/// folded; plan 48 final review m2), so `zed QUORRA` is masked as `Zed
+/// Quorra` is. Longer names are masked first, so a released name inside
+/// another one is masked whole.
 pub fn mask_released(question: &str, released: &[String]) -> String {
-    let mut names: Vec<&str> = released
+    let mut names: Vec<Vec<String>> = released
         .iter()
-        .map(String::as_str)
-        .filter(|n| !n.trim().is_empty())
+        .map(|n| crate::norm::tokens(n))
+        .filter(|t| !t.is_empty())
         .collect();
-    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    let mut out = question.to_string();
-    for n in names {
-        out = out.replace(n, KEPT_NAME);
+    names.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    let q = crate::norm::token_spans(question);
+    let mut covered = vec![false; q.len()];
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for n in &names {
+        let k = n.len();
+        let mut i = 0;
+        while i + k <= q.len() {
+            let hit = (0..k).all(|j| !covered[i + j] && q[i + j].0 == n[j]);
+            if hit {
+                covered[i..i + k].iter_mut().for_each(|c| *c = true);
+                ranges.push((q[i].1, q[i + k - 1].2));
+                i += k;
+            } else {
+                i += 1;
+            }
+        }
     }
+    ranges.sort_unstable();
+    let mut out = String::with_capacity(question.len());
+    let mut at = 0;
+    for (a, b) in ranges {
+        out.push_str(&question[at..a]);
+        out.push_str(KEPT_NAME);
+        at = b;
+    }
+    out.push_str(&question[at..]);
     out
 }
 
@@ -605,6 +630,23 @@ mod tests {
             "What is :p1 owed?"
         );
         assert_eq!(mask_released("as is", &[]), "as is");
+    }
+
+    /// Plan 48 final review m2: a released name is masked in any case or
+    /// accent form, as the firewall matches it (normalized), and only as
+    /// whole tokens.
+    #[test]
+    fn released_names_are_masked_normalized() {
+        let rel = vec!["Zed Quorra".to_string(), "Søren".to_string()];
+        assert_eq!(
+            mask_released("What does zed QUORRA owe?", &rel),
+            "What does [kept name] owe?"
+        );
+        assert_eq!(
+            mask_released("Is SOEREN, or søren, owed by Zed-Quorra?", &rel),
+            "Is [kept name], or [kept name], owed by [kept name]?"
+        );
+        assert_eq!(mask_released("Zedekiah owes", &rel), "Zedekiah owes");
     }
 
     /// Plan 48 T1: the question a record holds has the stand-in of each

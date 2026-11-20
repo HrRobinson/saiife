@@ -11,8 +11,8 @@ mod fixtures;
 
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::audit_query::{self, Scope};
-use saiife_daemon::blind::ask;
 use saiife_daemon::blind::model::FakePlanner;
+use saiife_daemon::blind::{ask, DatasetState};
 use saiife_daemon::ops::{Conn, Ctx, CtxInit, Mode, PolicyState};
 use saiife_daemon::vault;
 use saiife_daemon::writer::{self, WriterConfig};
@@ -934,6 +934,25 @@ async fn refreshing_answer() {
     assert!(outbox(&f).is_empty());
     release.send(()).unwrap();
     f.ctx.blind.test_wait_builds().await;
+    let (_, step) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(step["kind"], "preview", "{step}");
+}
+
+/// m3 (plan 48 final review): a dataset still opening at start is the
+/// refreshing step (exit 5 in the CLI), with the opening text.
+#[tokio::test]
+async fn opening_answer() {
+    let t = scratch();
+    let f = fx(t.path(), &[balance()]).await;
+    let live = f.ctx.blind.state(&crm());
+    f.ctx.blind.test_set_state(&crm(), DatasetState::Opening);
+    let (_, step) = ask_q(&f, Q_SOREN).await;
+    assert_eq!(
+        step,
+        json!({"kind": "refreshing", "text": saiife_daemon::blind::OPENING})
+    );
+    assert!(outbox(&f).is_empty());
+    f.ctx.blind.test_set_state(&crm(), live);
     let (_, step) = ask_q(&f, Q_SOREN).await;
     assert_eq!(step["kind"], "preview", "{step}");
 }
