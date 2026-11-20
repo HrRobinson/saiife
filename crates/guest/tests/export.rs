@@ -870,6 +870,24 @@ impl World {
         )
         .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // ETXTBSY: a test thread that forked while the write fd was open
+        // holds it until its exec, and the guest's first git run (the
+        // base's rev-parse) would fail as "the box's base does not exist".
+        // Once one exec succeeds no writer is left; later forks never
+        // inherit the closed fd.
+        let mut tries = 0;
+        loop {
+            match Command::new(&p).arg("--version").output() {
+                Err(e) if e.raw_os_error() == Some(26) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r => {
+                    assert!(r.unwrap().status.success(), "the fake git does not run");
+                    break;
+                }
+            }
+        }
         self.env.tools.git = p;
     }
 }

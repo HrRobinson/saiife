@@ -987,6 +987,15 @@ fn joins_are_derived_and_stored() {
 
     // A v1 manifest (no joins field) still loads, with derived joins.
     let path = dir.manifest();
+    // The build leaves the manifest 0600 on unix but sealed (read-only) on
+    // Windows: clear the flag so the test can rewrite it.
+    #[cfg(not(unix))]
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        let mut p = std::fs::metadata(&path).unwrap().permissions();
+        p.set_readonly(false);
+        std::fs::set_permissions(&path, p).unwrap();
+    }
     let mut j: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     j["v"] = 1.into();
