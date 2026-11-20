@@ -21,7 +21,7 @@ getrandom = "0.3"
 zeroize = "=1.9.1"
 rusqlite = { version = "=0.41.1", features = ["bundled", "hooks"] }
 csv = "=1.4.0"
-calamine = "=0.37.0"
+calamine = "=0.38.0"
 sqlparser = "=0.63.0"
 
 [target.'cfg(unix)'.dependencies]
