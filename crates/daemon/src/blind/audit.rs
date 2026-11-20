@@ -120,6 +120,13 @@ pub enum BlindRecord {
         to: ColumnClass,
         touch: String,
     },
+    /// `blind.data.revoke` withdrew an unspent loosen grant (no touch: it
+    /// only tightens).
+    LoosenRevoke {
+        dataset: String,
+        column: String,
+        class: ColumnClass,
+    },
     Name {
         ask: String,
         touch: String,
@@ -143,6 +150,7 @@ impl BlindRecord {
             BlindRecord::Keys { .. } => "blind_keys",
             BlindRecord::Refresh { .. } => "blind_refresh",
             BlindRecord::Loosen { .. } => "blind_loosen",
+            BlindRecord::LoosenRevoke { .. } => "blind_loosen_revoke",
             BlindRecord::Name { .. } => "blind_name",
         }
     }
@@ -357,6 +365,18 @@ fn fields(r: BlindRecord) -> (&'static str, Vec<(&'static str, Value)>) {
                 ("touch", json!(touch)),
             ],
         ),
+        BlindRecord::LoosenRevoke {
+            dataset,
+            column,
+            class: c,
+        } => (
+            "blind_loosen_revoke",
+            vec![
+                ("dataset", json!(dataset)),
+                ("column", json!(column)),
+                ("class", class(c)),
+            ],
+        ),
         BlindRecord::Name {
             ask,
             touch,
@@ -434,6 +454,7 @@ fn free_text(r: &BlindRecord) -> &'static [&'static str] {
         BlindRecord::Keys { .. } => &["touch"],
         BlindRecord::Refresh { .. } => &["rows", "suspended"],
         BlindRecord::Loosen { .. } => &["column", "touch"],
+        BlindRecord::LoosenRevoke { .. } => &["column"],
         BlindRecord::Name { .. } => &["touch"],
     }
 }

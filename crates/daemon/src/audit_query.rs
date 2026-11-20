@@ -58,6 +58,7 @@ pub const USER_KINDS: &[&str] = &[
     "blind_keys",
     "blind_refresh",
     "blind_loosen",
+    "blind_loosen_revoke",
     "blind_name",
     "blind_log_scrubbed",
     // A refused touch of the caller's own (fixed texts only, plan 48 T3).

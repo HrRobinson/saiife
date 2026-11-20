@@ -10,7 +10,8 @@
 //! - `blind.data.rm` removes the dataset's directory; one with keys only
 //!   through the `blind:keys` touch (`blind.touch.begin {purpose:
 //!   data_rm}`), which also shreds the keys (spec §6.3).
-//! - `blind.data.revoke` withdraws an unspent `blind:loosen` grant.
+//! - `blind.data.revoke` withdraws an unspent `blind:loosen` grant (its
+//!   author or an admin; recorded first, `blind_loosen_revoke`).
 //!
 //! One build at a time per dataset: the state is `Building` while one runs
 //! (an ask gets the refreshing answer; an ask already running keeps its
@@ -312,8 +313,12 @@ pub(crate) fn add_grant(ctx: &Ctx, name: &DatasetName, g: LoosenGrant) -> Result
 /// withdraws the unspent `blind:loosen` grant that `column` may become
 /// `class`, when the policy write or reload after its touch failed, so a
 /// later hand edit to the same class cannot spend it without a fresh
-/// touch. It only tightens, so it takes no touch; the role is `data`'s.
-/// `{revoked: bool}`: whether such a grant was there.
+/// touch. It only tightens, so it takes no touch; the role is `data`'s,
+/// and the grant must be the peer's own unless the peer is an admin (M-b:
+/// one approver cannot withdraw another's pending touch). The record
+/// first (`blind_loosen_revoke`): a withdrawal that cannot be recorded
+/// does not happen (M-a). `{revoked: bool}`: whether such a grant was
+/// there.
 pub async fn revoke(
     ctx: &Arc<Ctx>,
     peer: &PeerCred,
@@ -328,33 +333,64 @@ pub async fn revoke(
     let column = str_of("column")?.to_string();
     let class: ColumnClass = serde_json::from_value(Value::String(str_of("class")?.into()))
         .map_err(|_| bad("class is not a column class"))?;
-    if !may_rm(ctx, peer, &name).await {
+    let cfg = policy_dataset(ctx, &name).map(|p| p.0);
+    let roles = data_roles(ctx, peer, &name, cfg.as_ref()).await;
+    if !roles.may_manage() {
         return Err(manage_refusal(&name));
     }
-    let (c, d) = (Arc::clone(ctx), name.clone());
-    let revoked = tokio::task::spawn_blocking(move || -> Result<bool, Refusal> {
-        let guard = BuildGuard::begin(&c.blind, &d)?;
-        let dir = c.blind.dataset_dir(&d);
-        let mut grants = read_grants(&dir)?;
-        let before = grants.len();
-        grants.retain(|g| !(g.column == column && g.class == class));
-        let gone = grants.len() != before;
-        let r = if gone {
-            write_private(
-                &dir.root.join(LOOSEN_FILE),
-                &json_bytes(&LoosenFile { grants }),
-            )
-            .map_err(|e| unavailable(format!("could not write {LOOSEN_FILE}: {e}")))
-        } else {
-            Ok(())
-        };
+    let me = ctx
+        .name_of(peer.uid)
+        .await
+        .unwrap_or_else(|| peer.uid.to_string());
+    let guard = BuildGuard::begin(&ctx.blind, &name)?;
+    let dir = ctx.blind.dataset_dir(&name);
+    let mut grants = read_grants(&dir)?;
+    let Some(at) = grants
+        .iter()
+        .position(|g| g.column == column && g.class == class)
+    else {
         drop(guard);
-        r.map(|()| gone)
-    })
+        let mut a = Map::new();
+        a.insert("revoked".into(), Value::Bool(false));
+        return Ok(Value::Object(a));
+    };
+    if !roles.admin && grants[at].by != me {
+        return Err(Refusal::new(
+            ErrorCode::Forbidden,
+            format!(
+                "only the approver who loosened {column} ({}) or an admin may revoke the grant",
+                grants[at].by
+            ),
+        ));
+    }
+    let live = guard.previous_live().map(|p| p.1);
+    audit::write(
+        ctx,
+        peer.uid,
+        name.as_str(),
+        BlindRecord::LoosenRevoke {
+            dataset: name.to_string(),
+            column: column.clone(),
+            class,
+        },
+        live.as_ref().and_then(|h| h.index.as_ref()),
+    )
     .await
-    .map_err(join_err)??;
+    .map_err(|e| {
+        unavailable(format!(
+            "the grant was not revoked: the revoke could not be recorded: {e}"
+        ))
+    })?;
+    drop(live);
+    grants.remove(at);
+    let path = dir.root.join(LOOSEN_FILE);
+    tokio::task::spawn_blocking(move || write_private(&path, &json_bytes(&LoosenFile { grants })))
+        .await
+        .map_err(join_err)?
+        .map_err(|e| unavailable(format!("could not write {LOOSEN_FILE}: {e}")))?;
+    drop(guard);
     let mut a = Map::new();
-    a.insert("revoked".into(), Value::Bool(revoked));
+    a.insert("revoked".into(), Value::Bool(true));
     Ok(Value::Object(a))
 }
 
@@ -1072,15 +1108,24 @@ async fn may_manage(
     name: &DatasetName,
     cfg: Option<&BlindDataset>,
 ) -> bool {
-    let r: Roles = match cfg {
+    data_roles(ctx, peer, name, cfg).await.may_manage()
+}
+
+/// The peer's roles for `name`'s data ([`may_manage`]'s lists).
+async fn data_roles(
+    ctx: &Ctx,
+    peer: &PeerCred,
+    name: &DatasetName,
+    cfg: Option<&BlindDataset>,
+) -> Roles {
+    match cfg {
         Some(c) => role(ctx, peer, Some(c)).await,
         None => {
             let p = ctx.blind.dataset_dir(name).root.join(ACCESS_FILE);
             let a = read_small::<Access>(&p).ok().flatten().unwrap_or_default();
             role_listed(ctx, peer, &a.users, &a.approvers).await
         }
-    };
-    r.may_manage()
+    }
 }
 
 /// The identity of a source (S5): its kind and file name, or its database,

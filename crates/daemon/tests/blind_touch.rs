@@ -1339,3 +1339,75 @@ async fn loosen_grant_can_be_revoked() {
         serde_json::from_slice(&std::fs::read(root.join("classes.json")).unwrap()).unwrap();
     assert_eq!(classes["customers.credit_limit"], "sensitive");
 }
+
+/// Users and approvers where both `me` and `you` approve (and so manage).
+const BOTH_APPROVE: &str = "users = [\"me\", \"you\"]\napprovers = [\"me\", \"you\"]\n";
+
+/// The grants in `crm`'s `loosen.json`.
+fn grant_count(f: &Fx) -> usize {
+    let root = f.ctx.blind.dataset_dir(&crm()).root;
+    let g: Value =
+        serde_json::from_slice(&std::fs::read(root.join("loosen.json")).unwrap()).unwrap();
+    g["grants"].as_array().unwrap().len()
+}
+
+/// M-a (plan 48 parked): a revoke that withdraws a grant is recorded
+/// (`blind_loosen_revoke`), as every other blind change is; one that finds
+/// nothing changes nothing and records nothing.
+#[tokio::test]
+async fn loosen_revoke_is_recorded() {
+    let t = scratch();
+    let f = fx(t.path(), &[]).await;
+    let s = enrol(&f, OWN);
+    let v = touch_as(
+        &f,
+        OWN,
+        &s,
+        json!({"purpose": "loosen", "dataset": "crm", "column": "customers.credit_limit", "to": "quasi"}),
+    )
+    .await;
+    ok(&v);
+    let none = json!({"dataset": "crm", "column": "customers.credit_limit", "class": "public"});
+    let v = call(&f, OP_BLIND_DATA_REVOKE, none, vec![]).await;
+    assert_eq!(v["revoked"], false, "{v}");
+    assert!(records(&f, "blind_loosen_revoke").is_empty());
+    let args = json!({"dataset": "crm", "column": "customers.credit_limit", "class": "quasi"});
+    let v = call(&f, OP_BLIND_DATA_REVOKE, args, vec![]).await;
+    assert_eq!(v["revoked"], true, "{v}");
+    let r = records(&f, "blind_loosen_revoke");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0]["dataset"], "crm");
+    assert_eq!(r[0]["column"], "customers.credit_limit");
+    assert_eq!(r[0]["class"], "quasi");
+    assert_eq!(r[0]["user"], "me");
+    assert_eq!(r[0]["uid"], OWN);
+}
+
+/// M-b (plan 48 parked): another manager may not withdraw a pending
+/// loosen grant; its author or an admin may.
+#[tokio::test]
+async fn loosen_revoke_is_the_authors_or_an_admins() {
+    let t = scratch();
+    let f = fx_mode(t.path(), &[], Mode::Locked, BOTH_APPROVE).await;
+    let s = enrol(&f, OWN);
+    let loosen = json!({"purpose": "loosen", "dataset": "crm", "column": "customers.credit_limit", "to": "quasi"});
+    let args = json!({"dataset": "crm", "column": "customers.credit_limit", "class": "quasi"});
+    ok(&touch_as(&f, OWN, &s, loosen.clone()).await);
+    assert_eq!(grant_count(&f), 1);
+    // `you` approves too, but did not take the touch.
+    let v = call_as(&f, OTHER, OP_BLIND_DATA_REVOKE, args.clone(), vec![]).await;
+    assert_eq!(err(&v).0, "forbidden", "{v}");
+    assert_eq!(grant_count(&f), 1);
+    assert!(records(&f, "blind_loosen_revoke").is_empty());
+    // An admin (root) may.
+    let v = call_as(&f, 0, OP_BLIND_DATA_REVOKE, args.clone(), vec![]).await;
+    assert_eq!(v["revoked"], true, "{v}");
+    assert_eq!(grant_count(&f), 0);
+    // So may its author.
+    ok(&touch_as(&f, OWN, &s, loosen).await);
+    assert_eq!(grant_count(&f), 1);
+    let v = call_as(&f, OWN, OP_BLIND_DATA_REVOKE, args, vec![]).await;
+    assert_eq!(v["revoked"], true, "{v}");
+    assert_eq!(grant_count(&f), 0);
+    assert_eq!(records(&f, "blind_loosen_revoke").len(), 2);
+}
