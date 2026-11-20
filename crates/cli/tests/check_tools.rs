@@ -70,11 +70,19 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
+/// The 50 ms judging budget scaled up 100 times (the debug-build seam
+/// `deadline_scale`): these tests are about what the hook decides, not how
+/// fast. Unscaled, a loaded Windows runner (a cold temp dir to canonicalize,
+/// a virus scan of the fresh process) spent the budget once and the hook
+/// failed open: `claude/read.json` was allowed with exit 0 and no message
+/// (PR #48's flake).
+const DECIDE_NOT_RACE: &[(&str, &str)] = &[("SAIIFE_TEST_DEADLINE_SCALE", "100")];
+
 /// Run one fixture in a fresh audit dir; return the output and the single
 /// record it wrote.
 fn run(name: &str, agent: &str) -> (Out, Record) {
     let dir = tempfile::tempdir().unwrap();
-    let (out, mut recs) = check_bytes(dir.path(), agent, &fixture(name));
+    let (out, mut recs) = check_bytes_with(dir.path(), agent, &fixture(name), DECIDE_NOT_RACE);
     assert_eq!(recs.len(), 1, "{name}: exactly one record");
     (out, recs.remove(0))
 }
@@ -231,7 +239,13 @@ fn file_tool_fixtures_are_judged_by_path_rules() {
         assert_eq!(rec.tool, tool, "{name}");
         assert_eq!(rec.input, input, "{name}");
         if deny {
-            assert_eq!(out.code, 2, "{name}: {}", out.stderr);
+            // The record says why a deny did not come (a spent budget is
+            // `error_allowed`, "guard exceeded its latency budget").
+            assert_eq!(
+                out.code, 2,
+                "{name}: stderr {:?}, recorded {:?} ({:?})",
+                out.stderr, rec.decision, rec.reason
+            );
             assert!(
                 out.stderr.contains("BLOCKED by core.secrets"),
                 "{name}: {}",
@@ -322,7 +336,7 @@ fn variant(name: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
 
 fn run_bytes(agent: &str, stdin: &[u8]) -> (Out, Record) {
     let dir = tempfile::tempdir().unwrap();
-    let (out, mut recs) = check_bytes(dir.path(), agent, stdin);
+    let (out, mut recs) = check_bytes_with(dir.path(), agent, stdin, DECIDE_NOT_RACE);
     assert_eq!(recs.len(), 1, "exactly one record");
     (out, recs.remove(0))
 }
