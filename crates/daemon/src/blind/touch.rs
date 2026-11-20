@@ -13,7 +13,7 @@
 //! |---|---|---|---|
 //! | `name {ask, name}` | `blind:name` | the asker | `blind_name`, then the ask goes on as if `keep_name: true` |
 //! | `approve {ask}` | `blind:approve` | an approver who asked it | `MethodStore::add`, `blind_approve {add}` |
-//! | `method_rm {dataset, id}` | `blind:approve` | an approver | the method removed, `blind_approve {remove}` |
+//! | `method_rm {dataset, method}` | `blind:approve` | an approver | the method removed, `blind_approve {remove}` |
 //! | `keys {dataset, action}` | `blind:keys` | an approver or admin | `blind_keys`, then `keys::rotate` / `keys::shred` |
 //! | `loosen {dataset, column, to}` | `blind:loosen` | an approver or admin | `blind_loosen`, then the grant in `loosen.json` |
 //!
@@ -395,7 +395,7 @@ async fn plan_name(ctx: &Ctx, peer: &PeerCred, a: &Map<String, Value>) -> Result
 }
 
 /// Why an answered ask cannot be approved, if it cannot.
-fn approvable(f: &ForApprove) -> Result<(), Refusal> {
+pub(crate) fn approvable(f: &ForApprove) -> Result<(), Refusal> {
     if let Some(m) = &f.reused {
         return Err(bad(format!(
             "this answer came from approved method {m}; it is approved already"
@@ -469,7 +469,9 @@ async fn plan_method_rm(
     a: &Map<String, Value>,
 ) -> Result<Plan, Refusal> {
     let ds = dataset_arg(a)?;
-    let id = str_arg(a, "id")?.to_string();
+    // `method`, not `id`: the IPC frame's own `id` would take an `id` arg
+    // (plan 48 T5).
+    let id = str_arg(a, "method")?.to_string();
     need_role(ctx, peer, &ds, Need::Approver).await?;
     let store = load_store(ctx, &ds).await?;
     let m = store

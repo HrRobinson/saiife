@@ -449,6 +449,8 @@ async fn answered(f: &Fx, uid: u32) -> (String, Value) {
     let step = answer_as(f, uid, &id, json!({"run": true})).await;
     assert_eq!(step["kind"], "answer", "{step}");
     assert_eq!(step["text"], ANSWER_ANNA);
+    // T4 M1: a new method of the user's own words: approve would take it.
+    assert_eq!(step["approvable"], true, "{step}");
     (id, preview)
 }
 
@@ -587,6 +589,7 @@ async fn approve_needs_role_and_touch() {
     // A reused answer is approved already.
     let step = answer_as(&f, OWN, &id2, json!({"run": true})).await;
     assert_eq!(step["kind"], "answer", "{step}");
+    assert_eq!(step["approvable"], false, "{step}");
     let v = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id2})).await;
     assert_eq!(err(&v).0, "bad_request", "{v}");
     assert!(err(&v).1.contains("approved already"), "{v}");
@@ -823,14 +826,14 @@ async fn method_rm_by_touch() {
     let v = begin_as(
         &f,
         OWN,
-        json!({"purpose": "method_rm", "dataset": "crm", "id": "m-nope-v1"}),
+        json!({"purpose": "method_rm", "dataset": "crm", "method": "m-nope-v1"}),
     )
     .await;
     assert_eq!(err(&v).0, "bad_request", "{v}");
     let b = begin_as(
         &f,
         OWN,
-        json!({"purpose": "method_rm", "dataset": "crm", "id": mid}),
+        json!({"purpose": "method_rm", "dataset": "crm", "method": mid}),
     )
     .await;
     ok(&b);
@@ -1098,6 +1101,8 @@ async fn approve_refuses_a_context_method() {
         step["text"], "There are 4 invoices for the customer.",
         "{step}"
     );
+    // T4 M1: the answer says approve would refuse it.
+    assert_eq!(step["approvable"], false, "{step}");
     let v = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
     assert_eq!(
         err(&v),
@@ -1129,6 +1134,7 @@ async fn approve_refuses_an_ask_that_kept_a_name() {
     assert_eq!(v["step"]["kind"], "preview", "{v}");
     let step = answer_as(&f, OWN, &id, json!({"run": true})).await;
     assert_eq!(step["kind"], "answer", "{step}");
+    assert_eq!(step["approvable"], false, "{step}");
     let v = begin_as(&f, OWN, json!({"purpose": "approve", "ask": id})).await;
     assert_eq!(
         err(&v),

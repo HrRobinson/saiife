@@ -1,4 +1,5 @@
-//! `saiife blind ask | status | audit` end to end (plan 48 T4): a personal
+//! `saiife blind ask | status | audit` (plan 48 T4) and `keys | methods |
+//! data` (T5) end to end: a personal
 //! broker (`saiife daemon --user`) with every path in a temp dir, a
 //! synthetic `crm` dataset (made-up Danish and English names only) staged
 //! and committed through the plan 47 ops, the scripted planner
@@ -59,13 +60,18 @@ const CITY: &[&str] = &["Aalborg", "Esbjerg", "London", "Leeds", "Vejle"];
 /// The synthetic `crm`: customers 1 Søren Østergård (København), 2 Anna
 /// Berg (Aarhus), 3 Anna Berg (Odense), then made-up names that are each
 /// unique; every customer has invoices, both statuses held by many.
-fn fixture_sqlite(path: &Path) {
+/// With `email`, customers also have a made-up `email` (`p<id>@mail.example`).
+fn fixture_sqlite(path: &Path, email: bool) {
     let c = rusqlite::Connection::open(path).unwrap();
     c.execute_batch(
         "CREATE TABLE customers (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, city TEXT);
          CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT);",
     )
     .unwrap();
+    if email {
+        c.execute_batch("ALTER TABLE customers ADD COLUMN email TEXT;")
+            .unwrap();
+    }
     let mut people: Vec<(String, String, String)> = vec![
         ("Søren".into(), "Østergård".into(), "København".into()),
         ("Anna".into(), "Berg".into(), "Aarhus".into()),
@@ -83,11 +89,19 @@ fn fixture_sqlite(path: &Path) {
     let mut inv = 1000;
     for (n, (f, l, city)) in people.iter().enumerate() {
         let id = n as i64 + 1;
-        c.execute(
-            "INSERT INTO customers VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![id, f, l, city],
-        )
-        .unwrap();
+        if email {
+            c.execute(
+                "INSERT INTO customers VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, f, l, city, format!("p{id}@mail.example")],
+            )
+            .unwrap();
+        } else {
+            c.execute(
+                "INSERT INTO customers VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, f, l, city],
+            )
+            .unwrap();
+        }
         let amounts: Vec<(f64, &str)> = match id {
             1 => vec![(100.0, "paid"), (200.0, "open"), (300.0, "open")],
             2 => vec![(1000.0, "open"), (500.5, "paid")],
@@ -105,28 +119,53 @@ fn fixture_sqlite(path: &Path) {
     }
 }
 
-/// `[blind.ner]` pinning the three files the test wrote, then `crm`.
-fn policy(pins: &[String], extra: &str) -> String {
+/// The config head: `[blind.ner]` pinning the three files the test wrote.
+fn ner_policy(pins: &[String]) -> String {
     format!(
         "version = 2\n\n[blind.ner]\nmodel_url = \"https://ner.example.test/m\"\nmodel_sha256 = \"{}\"\n\
          vocab_url = \"https://ner.example.test/v\"\nvocab_sha256 = \"{}\"\n\
-         labels_url = \"https://ner.example.test/l\"\nlabels_sha256 = \"{}\"\n\n\
-         [[blind.dataset]]\nname = \"crm\"\n\
+         labels_url = \"https://ner.example.test/l\"\nlabels_sha256 = \"{}\"\n\n",
+        pins[0], pins[1], pins[2]
+    )
+}
+
+/// The `crm` dataset (with `email`: its column, Identifier-class).
+fn dataset_policy(extra: &str, email: bool) -> String {
+    let email = if email {
+        "\"customers.email\" = { class = \"identifier\" }\n"
+    } else {
+        ""
+    };
+    format!(
+        "[[blind.dataset]]\nname = \"crm\"\n\
          source = {{ kind = \"sqlite\", file_name = \"crm.sqlite\" }}\n{extra}\n\
          [blind.dataset.columns]\n\
          \"customers.id\" = {{ class = \"identifier\" }}\n\
          \"customers.first_name\" = {{ class = \"identifier\" }}\n\
          \"customers.last_name\" = {{ class = \"identifier\" }}\n\
-         \"customers.city\" = {{ class = \"quasi\" }}\n\
+         \"customers.city\" = {{ class = \"quasi\" }}\n{email}\
          \"invoices.id\" = {{ class = \"identifier\" }}\n\
          \"invoices.customer_id\" = {{ class = \"identifier\" }}\n\
          \"invoices.amount\" = {{ class = \"sensitive\" }}\n\
          \"invoices.status\" = {{ class = \"public\" }}\n\n\
          [[blind.dataset.entity]]\ntable = \"customers\"\nkey = \"id\"\n\
          names = [\"first_name\", \"last_name\"]\nshow = [\"city\"]\n\
-         word = \"customer\"\nword_da = \"kunde\"\n",
-        pins[0], pins[1], pins[2]
+         word = \"customer\"\nword_da = \"kunde\"\n"
     )
+}
+
+/// The first line of the drop-ins `saiife blind` writes.
+const MARKER: &str = "# written by saiife blind";
+
+/// How the fixture is laid out.
+#[derive(Default, Clone, Copy)]
+struct Opts {
+    /// `crm` in `policy.d/blind-crm.toml` instead of `config.toml`; `true`
+    /// with the marker (as `saiife blind` writes it), `false` without (a
+    /// hand-written file).
+    dropin: Option<bool>,
+    /// customers have an `email` column.
+    email: bool,
 }
 
 /// `target/debug/saiife-fake-ner`, beside this test's binary dir.
@@ -168,6 +207,10 @@ fn fx(replies: &[String]) -> Fx {
 }
 
 fn fx_with(replies: &[String], extra: &str) -> Fx {
+    fx_opts(replies, extra, Opts::default())
+}
+
+fn fx_opts(replies: &[String], extra: &str, o: Opts) -> Fx {
     use sha2::{Digest, Sha256};
     let mut b = TestBroker::prepare();
     // The NER files, pinned by sha256 (R-C8), where a fetch would put them.
@@ -211,11 +254,30 @@ fn fx_with(replies: &[String], extra: &str) -> Fx {
     for (k, v) in seams {
         b.env.push((k.to_string(), Some(v)));
     }
-    b.write_config(&policy(&pins, extra));
+    match o.dropin {
+        None => b.write_config(&format!(
+            "{}{}",
+            ner_policy(&pins),
+            dataset_policy(extra, o.email)
+        )),
+        Some(marker) => {
+            b.write_config(&ner_policy(&pins));
+            let dir = b.config_dir().join("policy.d");
+            private(&dir);
+            let head = if marker {
+                MARKER
+            } else {
+                "# my own crm policy"
+            };
+            let p = dir.join("blind-crm.toml");
+            fs::write(&p, format!("{head}\n{}", dataset_policy(extra, o.email))).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
     b.spawn_and_wait();
     let f = Fx { b };
     f.wait_ner_ready();
-    f.load_crm();
+    f.load_crm(o.email);
     f
 }
 
@@ -241,9 +303,9 @@ impl Fx {
     }
 
     /// Stage (the file passed as a descriptor) and commit `crm`.
-    fn load_crm(&self) {
+    fn load_crm(&self, email: bool) {
         let db = self.b.path().join("crm.sqlite");
-        fixture_sqlite(&db);
+        fixture_sqlite(&db, email);
         let file = fs::File::open(&db).unwrap();
         let mut c = self.b.client();
         let args = json!({"dataset": "crm", "kind": "sqlite", "file_name": "crm.sqlite"});
@@ -268,6 +330,11 @@ impl Fx {
     /// `saiife blind <args>` with `stdin` as its input; `seam` sets
     /// `SAIIFE_TEST_BLIND_STDIN=1`.
     fn blind(&self, args: &[&str], stdin: &str, seam: bool) -> Output {
+        self.blind_key(args, stdin, seam, None)
+    }
+
+    /// [`Fx::blind`] with `key` as the touch key (`SAIIFE_TEST_TOUCH_SOFT`).
+    fn blind_key(&self, args: &[&str], stdin: &str, seam: bool, key: Option<&Path>) -> Output {
         let mut all = vec!["blind"];
         all.extend_from_slice(args);
         let mut cmd = self.b.cli(&all);
@@ -276,6 +343,9 @@ impl Fx {
             .stderr(Stdio::piped());
         if seam {
             cmd.env("SAIIFE_TEST_BLIND_STDIN", "1");
+        }
+        if let Some(k) = key {
+            cmd.env("SAIIFE_TEST_TOUCH_SOFT", k);
         }
         let mut child = cmd.spawn().unwrap();
         child
@@ -585,4 +655,539 @@ fn ask_keep_name_takes_a_touch() {
     assert_eq!(code(&o), 2, "{out}\n{err}");
     assert!(out.starts_with("refused, nothing sent\n"), "{out}");
     assert_eq!(f.outbox().len(), 1);
+}
+
+// ------------------------------------------------- keys, methods, data ----
+
+/// A soft key enrolled for the broker's user (`saiife touch enrol`).
+fn enrol(f: &Fx, name: &str) -> PathBuf {
+    let key = soft_key(&f.b.path().join(name));
+    let o =
+        f.b.cli(&["touch", "enrol", "--label", name])
+            .env("SAIIFE_TEST_TOUCH_SOFT", &key)
+            .output()
+            .unwrap();
+    assert_eq!(code(&o), 0, "{:?}", text(&o));
+    key
+}
+
+fn crm_status(f: &Fx) -> Value {
+    f.status()["datasets"][0].clone()
+}
+
+fn dropin(f: &Fx) -> PathBuf {
+    f.b.config_dir().join("policy.d/blind-crm.toml")
+}
+
+/// The class of `column` in `policy.d/blind-crm.toml`.
+fn dropin_class(f: &Fx, column: &str) -> String {
+    let t: toml::Value = toml::from_str(&fs::read_to_string(dropin(f)).unwrap()).unwrap();
+    t["blind"]["dataset"][0]["columns"][column]["class"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn keys_rotate_with_soft_key() {
+    let f = fx(&[]);
+    let key = enrol(&f, "k1");
+    assert_eq!(crm_status(&f)["keys_version"], 1);
+    let o = f.blind_key(&["keys", "rotate"], "", false, Some(&key));
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        err.contains("saiife: touch your key to rotate the stand-in key of crm (code "),
+        "{err}"
+    );
+    assert_eq!(out, "rotated the stand-in key of crm: version 2\n");
+    assert_eq!(crm_status(&f)["keys_version"], 2);
+    // Without a key enrolled for the touch: nothing rotated.
+    let other = soft_key(&f.b.path().join("other.json"));
+    let o = f.blind_key(
+        &["keys", "rotate", "--dataset", "crm"],
+        "",
+        false,
+        Some(&other),
+    );
+    assert_ne!(code(&o), 0, "{:?}", text(&o));
+    assert_eq!(crm_status(&f)["keys_version"], 2);
+}
+
+#[test]
+fn keys_delete_confirms_name() {
+    let f = fx(&[]);
+    let key = enrol(&f, "k1");
+    // A wrong name: nothing done, no touch asked.
+    let o = f.blind_key(
+        &["keys", "delete", "--dataset", "crm"],
+        "crn\n",
+        true,
+        Some(&key),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains("This deletes the stand-in keys of crm: its stand-ins can never be linked back to anyone, and it needs a refresh. Type the dataset name to go on: "),
+        "{err}"
+    );
+    assert!(
+        err.contains("saiife: that is not crm; nothing was done"),
+        "{err}"
+    );
+    assert!(!err.contains("touch your key"), "{err}");
+    assert!(out.is_empty(), "{out}");
+    // No terminal: refused before anything.
+    let o = f.blind_key(
+        &["keys", "delete", "--dataset", "crm"],
+        "crm\n",
+        false,
+        Some(&key),
+    );
+    assert_eq!(code(&o), 2, "{:?}", text(&o));
+    let s = crm_status(&f);
+    assert_eq!(s["keys_version"], 1, "{s}");
+    assert_eq!(s["state"], "live", "{s}");
+    // The name typed, then the touch: the keys are gone.
+    let o = f.blind_key(
+        &["keys", "delete", "--dataset", "crm"],
+        "crm\n",
+        true,
+        Some(&key),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        err.contains("saiife: touch your key to delete the keys of crm"),
+        "{err}"
+    );
+    assert_eq!(
+        out,
+        "deleted the stand-in keys of crm\nit needs a refresh: saiife blind data refresh --dataset crm\n"
+    );
+    let s = crm_status(&f);
+    assert_eq!(s["state"], "needs_refresh", "{s}");
+    assert!(s["keys_version"].is_null(), "{s}");
+}
+
+#[test]
+fn methods_ls_approve_rm() {
+    let f = fx(&[balance()]);
+    let key = enrol(&f, "k1");
+    let o = f.blind(&["methods", "ls"], "", false);
+    assert_eq!(code(&o), 0, "{:?}", text(&o));
+    assert_eq!(text(&o).0, "no approved methods for crm\n");
+    // An answered ask; the hint names it.
+    let o = f.blind(&["ask", "--yes", Q_SOREN], "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    let hint = "approve this method for reuse: saiife blind methods approve ";
+    let ask = err
+        .lines()
+        .find_map(|l| l.strip_prefix(hint))
+        .unwrap_or_else(|| panic!("no hint in {err}"))
+        .to_string();
+    let o = f.blind_key(&["methods", "approve", &ask], "", false, Some(&key));
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        err.contains("saiife: touch your key to approve for reuse: "),
+        "{err}"
+    );
+    let id = out
+        .strip_prefix("approved method ")
+        .and_then(|r| r.strip_suffix(" (version 1) for reuse\n"))
+        .unwrap_or_else(|| panic!("{out}"))
+        .to_string();
+    assert!(id.starts_with("m-"), "{id}");
+    // `ls` shows it: metadata, never the method's text.
+    let o = f.blind(&["methods", "ls", "--dataset", "crm"], "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].starts_with(&format!("{id}  v1  en  active  approved by ")),
+        "{out}"
+    );
+    assert!(lines[1].starts_with("  template \""), "{out}");
+    assert!(!out.contains("SELECT"), "{out}");
+    // `rm` removes it.
+    let o = f.blind_key(&["methods", "rm", &id], "", false, Some(&key));
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        err.contains(&format!(
+            "saiife: touch your key to remove approved method {id}"
+        )),
+        "{err}"
+    );
+    assert_eq!(out, format!("removed approved method {id} from crm\n"));
+    let o = f.blind(&["methods", "ls"], "", false);
+    assert_eq!(text(&o).0, "no approved methods for crm\n");
+}
+
+#[test]
+fn data_refresh_progress_then_live() {
+    let f = fx(&[]);
+    let before = crm_status(&f)["built_at"].clone();
+    let db = f.b.path().join("crm.sqlite");
+    let o = f.blind(
+        &["data", "refresh", "--file", db.to_str().unwrap()],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(err.starts_with("refreshing crm\n"), "{err}");
+    assert_eq!(out.lines().next(), Some("crm is live"), "{out}");
+    let s = crm_status(&f);
+    assert_eq!(s["state"], "live", "{s}");
+    assert!(s["built_at"].is_string() && before.is_string(), "{s}");
+    // No terminal and no --file: refused before anything.
+    let o = f.blind(&["data", "refresh", "--dataset", "crm"], "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains("the refresh of crm reads its source file: pass --file <path>"),
+        "{err}"
+    );
+    // The file asked for at the prompt.
+    let o = f.blind(&["data", "refresh"], &format!("{}\n", db.display()), true);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        err.contains("The source file of crm (crm.sqlite): "),
+        "{err}"
+    );
+    assert_eq!(out.lines().next(), Some("crm is live"), "{out}");
+    // A file that is not the dataset's: the refresh fails, and the wait
+    // ends with the daemon's reason (the old build stays live).
+    let junk = f.b.path().join("junk.sqlite");
+    fs::write(&junk, "not a database").unwrap();
+    let o = f.blind(
+        &["data", "refresh", "--file", junk.to_str().unwrap()],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 5, "{out}\n{err}");
+    assert!(err.contains("saiife: the refresh of crm failed: "), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(crm_status(&f)["state"], "live");
+    // A missing file: refused, nothing sent.
+    let o = f.blind(
+        &["data", "refresh", "--file", "/nonexistent/crm.sqlite"],
+        "",
+        false,
+    );
+    assert_eq!(code(&o), 2, "{:?}", text(&o));
+}
+
+#[test]
+fn data_rm_confirms_name() {
+    let f = fx(&[]);
+    let o = f.blind(&["data", "rm", "--dataset", "crm"], "crn\n", true);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains("This removes crm: its snapshot, its stand-in keys and its approved methods. Type the dataset name to go on: "),
+        "{err}"
+    );
+    assert_eq!(crm_status(&f)["state"], "live");
+    let o = f.blind(&["data", "rm", "--dataset", "crm"], "crm\n", true);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert_eq!(out, "removed crm\n");
+    assert_eq!(crm_status(&f)["state"], "not_built");
+}
+
+#[test]
+fn data_class_tighten_writes_policy() {
+    let f = fx_opts(
+        &[],
+        "",
+        Opts {
+            dropin: Some(true),
+            email: false,
+        },
+    );
+    let o = f.blind(
+        &["data", "class", "crm", "customers.city", "sensitive"],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(!err.contains("touch your key"), "{err}");
+    let path = dropin(&f);
+    assert_eq!(
+        out,
+        format!(
+            "customers.city is now sensitive in {} (stricter, so no touch was needed; it was quasi)\n\
+             it applies at the next refresh: saiife blind data refresh --dataset crm\n",
+            path.display()
+        )
+    );
+    let written = fs::read_to_string(&path).unwrap();
+    assert_eq!(written.lines().next(), Some(MARKER), "{written}");
+    assert_eq!(dropin_class(&f, "customers.city"), "sensitive");
+    // Everything else is as it was.
+    assert_eq!(dropin_class(&f, "invoices.amount"), "sensitive");
+    assert_eq!(dropin_class(&f, "customers.city"), "sensitive");
+    assert_eq!(mode_of(&path), 0o600);
+    // The daemon loaded it: no warning, still live.
+    let s = crm_status(&f);
+    assert_eq!(s["state"], "live", "{s}");
+    assert_eq!(s["warnings"], json!([]), "{s}");
+    // The same class again changes nothing.
+    let o = f.blind(
+        &["data", "class", "crm", "customers.city", "sensitive"],
+        "",
+        false,
+    );
+    assert_eq!(code(&o), 0);
+    assert_eq!(
+        text(&o).0,
+        "customers.city is sensitive in policy already; nothing was changed\n"
+    );
+    // Not a class, not a column: refused.
+    let o = f.blind(
+        &["data", "class", "crm", "customers.city", "secret"],
+        "",
+        false,
+    );
+    assert_eq!(code(&o), 2);
+    let o = f.blind(&["data", "class", "crm", "city", "quasi"], "", false);
+    assert_eq!(code(&o), 2);
+}
+
+#[test]
+fn data_class_restores_on_bad_reload() {
+    let f = fx_opts(
+        &[],
+        "",
+        Opts {
+            dropin: Some(true),
+            email: false,
+        },
+    );
+    let before = fs::read(dropin(&f)).unwrap();
+    // Another drop-in that does not load: the reload is rejected.
+    let broken = f.b.config_dir().join("policy.d/zz-broken.toml");
+    fs::write(&broken, "[[[ not toml\n").unwrap();
+    let o = f.blind(
+        &["data", "class", "crm", "customers.city", "sensitive"],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains("saiife: the policy did not load, so the change was not made: "),
+        "{err}"
+    );
+    assert!(err.contains("was put back as it was"), "{err}");
+    assert_eq!(fs::read(dropin(&f)).unwrap(), before);
+    fs::remove_file(&broken).unwrap();
+}
+
+#[test]
+fn data_class_in_config_toml_is_refused() {
+    // `crm` is in config.toml, which saiife blind never writes.
+    let f = fx(&[]);
+    let o = f.blind(
+        &["data", "class", "crm", "customers.city", "sensitive"],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(err.contains("crm is not defined in "), "{err}");
+    assert!(!dropin(&f).exists());
+}
+
+#[test]
+fn data_class_loosen_needs_touch() {
+    let f = fx_opts(
+        &[],
+        "",
+        Opts {
+            dropin: Some(true),
+            email: false,
+        },
+    );
+    let before = fs::read(dropin(&f)).unwrap();
+    // A key that is not enrolled: the daemon refuses the touch.
+    let stranger = soft_key(&f.b.path().join("stranger.json"));
+    let o = f.blind_key(
+        &["data", "class", "crm", "invoices.amount", "quasi"],
+        "",
+        false,
+        Some(&stranger),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains("refused: loosen needs a touch (blind:loosen) and no touch device is enrolled for you: saiife touch enrol"),
+        "{err}"
+    );
+    assert_eq!(fs::read(dropin(&f)).unwrap(), before);
+    let grants = f.b.state_dir().join("blind/datasets/crm/loosen.json");
+    assert!(!grants.exists());
+    // With the touch: the grant, then the policy.
+    let key = enrol(&f, "k1");
+    let o = f.blind_key(
+        &["data", "class", "crm", "invoices.amount", "quasi"],
+        "",
+        false,
+        Some(&key),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(
+        err.contains("saiife: touch your key to make invoices.amount quasi (now sensitive) (code "),
+        "{err}"
+    );
+    assert!(
+        out.contains("(looser, with a blind:loosen touch; it was sensitive)"),
+        "{out}"
+    );
+    assert_eq!(dropin_class(&f, "invoices.amount"), "quasi");
+    let g: Value = serde_json::from_str(&fs::read_to_string(&grants).unwrap()).unwrap();
+    assert_eq!(g["grants"][0]["column"], "invoices.amount", "{g}");
+    assert_eq!(g["grants"][0]["class"], "quasi", "{g}");
+    // The grant covers it: no "without a blind:loosen touch" warning.
+    let s = crm_status(&f);
+    assert_eq!(s["warnings"], json!([]), "{s}");
+}
+
+#[test]
+fn data_class_public_refused_for_email() {
+    let f = fx_opts(
+        &[],
+        "",
+        Opts {
+            dropin: Some(true),
+            email: true,
+        },
+    );
+    let key = enrol(&f, "k1");
+    let before = fs::read(dropin(&f)).unwrap();
+    let o = f.blind_key(
+        &["data", "class", "crm", "customers.email", "public"],
+        "",
+        false,
+        Some(&key),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert_eq!(
+        err.trim_end(),
+        "saiife: customers.email cannot be public: it holds names or IDs"
+    );
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(fs::read(dropin(&f)).unwrap(), before);
+    assert!(!f
+        .b
+        .state_dir()
+        .join("blind/datasets/crm/loosen.json")
+        .exists());
+}
+
+#[test]
+fn policy_file_marker_protects_hand_written() {
+    let f = fx_opts(
+        &[],
+        "",
+        Opts {
+            dropin: Some(false),
+            email: false,
+        },
+    );
+    let before = fs::read(dropin(&f)).unwrap();
+    let o = f.blind(
+        &["data", "class", "crm", "customers.city", "sensitive"],
+        "",
+        false,
+    );
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 2, "{out}\n{err}");
+    assert!(
+        err.contains(&format!(
+            "{} was not written by saiife blind (its first line is not \"{MARKER}\"), so it is left as it is",
+            dropin(&f).display()
+        )),
+        "{err}"
+    );
+    assert_eq!(fs::read(dropin(&f)).unwrap(), before);
+}
+
+#[test]
+fn context_follow_up_shows_no_approve_hint() {
+    // T4 M1: the hint follows the daemon's `approvable`, not the footer.
+    let f = fx(&[balance()]);
+    let hint = "approve this method for reuse: saiife blind methods approve ";
+    let o = f.blind(&["ask", "--yes", "--show-sent", Q_SOREN], "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(err.contains(hint), "{err}");
+    let ob = f.outbox();
+    let body: Value = serde_json::from_str(ob[0]["body"].as_str().unwrap()).unwrap();
+    let sent: Value =
+        serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+    let sym = sent["params"][0]["symbol"].as_str().unwrap().to_string();
+    // The follow-up's reply binds that stand-in (added to the script now).
+    let hers = json!({
+        "method": "SELECT COUNT(*) AS n FROM invoices i \
+                   JOIN customers c ON c.id = i.customer_id WHERE c.id = :p1",
+        "template": "There are {int(n)} invoices for {param(p1)}.",
+        "intent": "counts her invoices",
+        "context": [{"name": "p1", "symbol": sym}]});
+    let script = f.b.path().join("planner.txt");
+    let mut lines = fs::read_to_string(&script).unwrap();
+    lines.push_str(&format!("{hers}\n"));
+    fs::write(&script, lines).unwrap();
+    let o = f.blind(&["ask", "--yes", "And his invoices?"], "", false);
+    let (out, err) = text(&o);
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert_eq!(
+        out.lines().next(),
+        Some("There are 3 invoices for the customer."),
+        "{out}"
+    );
+    assert!(out.contains("new method"), "{out}");
+    assert!(!err.contains(hint), "{err}");
+}
+
+#[test]
+fn keep_name_touch_failure_ends_the_ask() {
+    // T4 M2: a touch that fails after `blind.touch.begin` ends the ask, so
+    // its slot is free at once (at most 4 open asks per user, R48-1).
+    let f = fx(&[]);
+    enrol(&f, "k1");
+    let stranger = soft_key(&f.b.path().join("stranger.json"));
+    for _ in 0..5 {
+        let o = f.blind_key(
+            &["ask", "What is the balance of Zed Quorra?"],
+            "y\n",
+            true,
+            Some(&stranger),
+        );
+        let (out, err) = text(&o);
+        assert_ne!(code(&o), 0, "{out}\n{err}");
+        assert!(err.contains("saiife: touch your key to keep"), "{err}");
+    }
+    // Five failed touches later, a new ask still gets a step (not busy).
+    let o = f.blind(&["ask", Q_ANNA], "0\n", true);
+    let (out, err) = text(&o);
+    assert!(
+        err.contains("Found 2 customers named Anna Berg:"),
+        "{out}\n{err}"
+    );
+    assert!(f.outbox().is_empty());
+}
+
+fn mode_of(p: &Path) -> u32 {
+    fs::metadata(p).unwrap().permissions().mode() & 0o777
 }

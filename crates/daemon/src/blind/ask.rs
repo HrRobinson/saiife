@@ -232,6 +232,12 @@ pub enum Step {
         /// exact envelope sent, as the preview would carry it.
         #[serde(skip_serializing_if = "Option::is_none")]
         envelope: Option<String>,
+        /// Whether `blind.methods.approve` would take this answer's
+        /// method (plan 48 T5, T4 M1): a new method, not bound to an
+        /// earlier question (`USES_CONTEXT`), with no kept name
+        /// (`KEPT_NAME`). The role is not part of it: the CLI shows the
+        /// approve hint to approvers only.
+        approvable: bool,
     },
     /// The ask ended without an answer. `code` is fixed (see [`code`]).
     Refused {

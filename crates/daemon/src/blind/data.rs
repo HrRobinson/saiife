@@ -1323,6 +1323,9 @@ pub async fn refresh(
         }
     };
     let guard = BuildGuard::begin(&ctx.blind, &name)?;
+    // An earlier failure is not this refresh's (plan 48 T5: the CLI reads
+    // a failure from `status` while it waits).
+    ctx.blind.set_build_error(&name, None);
     let keys = load_or_create(ctx, &name)?;
     let source = cfg.source.clone();
     let b = BuildIn {
@@ -1357,6 +1360,11 @@ pub async fn refresh(
                 .await
                 .unwrap_or_else(|e| Err(BuildErr::After(join_err(e)))),
         };
+        // The failure first, then the state: a `status` in between never
+        // shows the old build live as if this refresh had worked.
+        if let Err(BuildErr::Before(r) | BuildErr::After(r)) = &res {
+            ctx.blind.set_build_error(&name, Some(r.text.clone()));
+        }
         let why = end_build(guard, &name, res).err().map(|r| r.text);
         ctx.blind.set_build_error(&name, why);
     });

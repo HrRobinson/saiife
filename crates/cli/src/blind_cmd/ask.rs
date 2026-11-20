@@ -12,7 +12,7 @@
 //! `refreshing` and `--judgment` steps end the ask, and their ids were never
 //! kept by the daemon (T1 M3), so nothing is sent on them.
 
-use super::imp::{args, call, s, Stop, ASK_TIMEOUT, READ_TIMEOUT};
+use super::imp::{args, call, s, Args as CallArgs, Stop, ASK_TIMEOUT, READ_TIMEOUT};
 use super::Prompter;
 use crate::broker::Target;
 use crate::text::sanitize;
@@ -246,21 +246,13 @@ fn touch_request(b: &serde_json::Map<String, Value>) -> Result<(String, TouchReq
     Ok((rid.to_string(), r))
 }
 
-/// Keep `name` as plain text: a `blind:name` touch, then the ask goes on
-/// (the commit answers its next step).
-fn keep_name_touch(t: &Target, id: &str, name: &str) -> Result<Value, Stop> {
-    // No key, no challenge spent.
+/// A `blind:*` touch (plan 48 T3's flow): the key first (no key, no
+/// challenge spent), `blind.touch.begin` with `begin`, the summary on
+/// stderr, the assertion, then `blind.touch.commit` on a new connection (a
+/// touch may take 120 s). The commit's answer.
+pub(super) fn touch(t: &Target, begin: CallArgs) -> Result<serde_json::Map<String, Value>, Stop> {
     let key = crate::touch_cmd::pick().map_err(Stop::Unavailable)?;
-    let b = call(
-        t,
-        "blind.touch.begin",
-        args([
-            ("purpose", json!("name")),
-            ("ask", json!(id)),
-            ("name", json!(name)),
-        ]),
-        READ_TIMEOUT,
-    )?;
+    let b = call(t, "blind.touch.begin", begin, READ_TIMEOUT)?;
     let (rid, r) = touch_request(&b)?;
     eprintln!(
         "saiife: touch your key to {} (code {})",
@@ -273,12 +265,24 @@ fn keep_name_touch(t: &Target, id: &str, name: &str) -> Result<Value, Stop> {
     })?;
     let asr = serde_json::to_value(asr)
         .map_err(|e| Stop::Unavailable(format!("cannot encode the touch: {e}")))?;
-    // A touch may take 120 s: the commit goes on a new connection.
-    let v = call(
+    call(
         t,
         "blind.touch.commit",
         args([("request_id", json!(rid)), ("assertion", asr)]),
         ASK_TIMEOUT,
+    )
+}
+
+/// Keep `name` as plain text: a `blind:name` touch, then the ask goes on
+/// (the commit answers its next step).
+fn keep_name_touch(t: &Target, id: &str, name: &str) -> Result<Value, Stop> {
+    let v = touch(
+        t,
+        args([
+            ("purpose", json!("name")),
+            ("ask", json!(id)),
+            ("name", json!(name)),
+        ]),
     )?;
     Ok(reply(v)?.1)
 }
@@ -378,7 +382,16 @@ fn handle(
                 .unwrap_or_else(|| "the dataset".into());
             let q = keep_name_prompt(&sanitize(&name), &sanitize(&ds));
             if p.line(&q).map(|l| is_yes(&l)).unwrap_or(false) {
-                return Ok(Next::Step(keep_name_touch(t, id, &name)?));
+                return match keep_name_touch(t, id, &name) {
+                    Ok(next) => Ok(Next::Step(next)),
+                    // T4 M2: a key that is missing or said no, or a commit
+                    // that failed, ends the ask (best effort) instead of
+                    // holding its slot until it expires.
+                    Err(e) => {
+                        end_quietly(t, id, step.clone());
+                        Err(e)
+                    }
+                };
             }
             Ok(Next::Answer(json!({"keep_name": false})))
         }
@@ -409,10 +422,10 @@ fn handle(
             }
             say(s(step, "method_line"));
             say(s(step, "footer"));
-            // R48-6: a new method, to approvers only.
-            let footer = s(step, "footer");
-            let new = footer.contains("new method") || footer.contains("ny metode");
-            if new && mine(t, a.dataset.as_deref()).approver {
+            // R48-6: a method approve would take (the daemon says so,
+            // T4 M1), to approvers only.
+            let approvable = step.get("approvable").and_then(Value::as_bool) == Some(true);
+            if approvable && mine(t, a.dataset.as_deref()).approver {
                 eprintln!("{}", approve_hint(&sanitize(id)));
             }
             Ok(Next::Done(ExitCode::SUCCESS))

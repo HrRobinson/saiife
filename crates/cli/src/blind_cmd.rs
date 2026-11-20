@@ -1,5 +1,5 @@
-//! `saiife blind ask | status | audit` (plan 48 T4): Data Shield through
-//! the daemon's `blind.*` ops. Exit codes: 0 answered (or shown), 2 refused
+//! `saiife blind ask | status | audit` (plan 48 T4) and `keys | methods |
+//! data` (T5): Data Shield through the daemon's `blind.*` ops. Exit codes: 0 answered (or shown), 2 refused
 //! (a refusal, a stop, a firewall block, the checker, a role), 5 unavailable
 //! (the daemon, the vault, the name detector, Landlock, not Linux).
 //!
@@ -12,8 +12,11 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 
+pub mod admin;
 #[cfg(target_os = "linux")]
 mod ask;
+#[cfg(target_os = "linux")]
+pub mod policy_file;
 #[cfg(target_os = "linux")]
 mod prompt;
 
@@ -75,6 +78,24 @@ pub enum BlindAction {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+    },
+    /// A dataset's stand-in keys: rotate or delete them (a touch on your
+    /// key, blind:keys).
+    Keys {
+        #[command(subcommand)]
+        action: admin::KeysAction,
+    },
+    /// Approved methods: list, approve an answered ask's method for reuse,
+    /// remove one (approve and remove take a touch, blind:approve).
+    Methods {
+        #[command(subcommand)]
+        action: admin::MethodsAction,
+    },
+    /// A dataset's data: refresh it from its source, remove it, or change a
+    /// column's class (a looser class takes a touch, blind:loosen).
+    Data {
+        #[command(subcommand)]
+        action: admin::DataAction,
     },
 }
 
@@ -154,6 +175,9 @@ pub fn run(config: Option<PathBuf>, a: BlindAction) -> ExitCode {
             Some(sha) => imp::sent(&t, &sha, json),
             None => imp::audit(&t, &since, user.as_deref(), json),
         },
+        BlindAction::Keys { action } => admin::keys(&t, action, &mut prompt::Stdin::new()),
+        BlindAction::Methods { action } => admin::methods(&t, action),
+        BlindAction::Data { action } => admin::data(&t, action, &mut prompt::Stdin::new()),
     };
     match r {
         Ok(code) => code,
@@ -202,18 +226,34 @@ mod imp {
     /// exit 5, like a daemon that cannot be reached; every other refusal
     /// (bad_request, forbidden, busy) is 2.
     pub(super) fn call(t: &Target, op: &str, a: Args, timeout: Duration) -> Result<Args, Stop> {
+        call_fds(t, op, a, &[], timeout)
+    }
+
+    /// [`call`] passing `fds` with the request (a source file, R47-5).
+    pub(super) fn call_fds(
+        t: &Target,
+        op: &str,
+        a: Args,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        timeout: Duration,
+    ) -> Result<Args, Stop> {
         let down = |e: &ClientError| Stop::Unavailable(broker::unreachable(t, e));
         let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
-        c.call(op, a, Instant::now() + timeout)
-            .map_err(|e| match e {
-                ClientError::Refused { code, message }
-                    if code == "unavailable" || code == "vault_unavailable" =>
-                {
-                    Stop::Unavailable(message)
-                }
-                ClientError::Refused { message, .. } => Stop::Refused(message),
-                other => down(&other),
-            })
+        let deadline = Instant::now() + timeout;
+        let r = if fds.is_empty() {
+            c.call(op, a, deadline)
+        } else {
+            c.call_with_fds(op, a, fds, deadline)
+        };
+        r.map_err(|e| match e {
+            ClientError::Refused { code, message }
+                if code == "unavailable" || code == "vault_unavailable" =>
+            {
+                Stop::Unavailable(message)
+            }
+            ClientError::Refused { message, .. } => Stop::Refused(message),
+            other => down(&other),
+        })
     }
 
     pub(super) fn s<'a>(v: &'a Value, k: &str) -> &'a str {

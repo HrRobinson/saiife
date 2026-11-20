@@ -1003,6 +1003,10 @@ impl Planner for AnthropicPlanner {
 #[cfg(debug_assertions)]
 pub struct FakePlanner {
     replies: Mutex<VecDeque<String>>,
+    /// [`FakePlanner::from_file`]: the file, read again at each reply (a
+    /// test may add replies after an ask, e.g. one naming a stand-in that
+    /// ask's envelope showed), and how many lines were used.
+    file: Option<(std::path::PathBuf, Mutex<usize>)>,
 }
 
 #[cfg(debug_assertions)]
@@ -1010,22 +1014,33 @@ impl FakePlanner {
     pub fn new(replies: Vec<String>) -> FakePlanner {
         FakePlanner {
             replies: Mutex::new(replies.into()),
+            file: None,
         }
     }
 
-    /// One reply per non-empty line of `path`.
+    /// One reply per non-empty line of `path`, read when a reply is
+    /// taken: lines added later are answered in their turn.
     pub fn from_file(path: &std::path::Path) -> std::io::Result<FakePlanner> {
-        let text = std::fs::read_to_string(path)?;
-        Ok(FakePlanner::new(
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(str::to_string)
-                .collect(),
-        ))
+        std::fs::read_to_string(path)?;
+        Ok(FakePlanner {
+            replies: Mutex::new(VecDeque::new()),
+            file: Some((path.to_path_buf(), Mutex::new(0))),
+        })
     }
 
     /// The next scripted reply, if any is left.
     pub fn take_reply(&self) -> Option<String> {
+        if let Some((path, used)) = &self.file {
+            let text = std::fs::read_to_string(path).ok()?;
+            let mut used = used.lock().unwrap_or_else(|p| p.into_inner());
+            let next = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .nth(*used)
+                .map(str::to_string)?;
+            *used += 1;
+            return Some(next);
+        }
         self.replies
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1141,6 +1156,10 @@ mod tests {
         assert_eq!(reply(&a).as_deref(), Some("first"));
         assert_eq!(reply(&b).as_deref(), Some("second"));
         assert_eq!(reply(&a), None);
+        // A line added later is answered in its turn (plan 48 T5).
+        std::fs::write(&file, "first\nsecond\n\nthird\n").unwrap();
+        assert_eq!(reply(&a).as_deref(), Some("third"));
+        assert_eq!(reply(&b), None);
         // Another daemon starts its own script.
         let other = super::super::Blind::open(&t.path().join("blind2"));
         let c = cached_fake(&other, file.into_os_string());

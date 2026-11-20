@@ -84,7 +84,7 @@ pub(super) async fn run_or_stop(
             return (st, Err(e));
         }
     }
-    let r = execute(
+    let mut r = execute(
         ctx,
         id,
         &st,
@@ -95,12 +95,17 @@ pub(super) async fn run_or_stop(
         approved.as_deref(),
     )
     .await;
-    if matches!(r, Ok(Step::Answer { .. })) {
+    if let Ok(Step::Answer { approvable, .. }) = &mut r {
         st.phase = AskPhase::Answered {
             draft,
             reply,
             preview,
         };
+        // T4 M1: what approve would say, decided here, not from the
+        // footer's words.
+        *approvable = st
+            .for_approve()
+            .is_some_and(|f| crate::blind::touch::approvable(&f).is_ok());
     }
     (st, r)
 }
@@ -266,6 +271,7 @@ async fn execute(
             from_calc: n(report.from_calc),
         },
         envelope: None,
+        approvable: false,
     })
 }
 
