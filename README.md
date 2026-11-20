@@ -138,6 +138,8 @@ model.
   Gemini CLI, not for Claude Code), how each shell is read, and the limits.
 - [Fleet install](docs/fleet.md): `.deb`, `.rpm`, macOS `.pkg` and Windows `.msi`
   packages, with Ansible, Jamf, Intune and GPO recipes.
+- [Data Shield](docs/data-shield.md): ask exact questions about a sensitive
+  dataset without a real personal value reaching the cloud (Linux, preview).
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
 - [Touch approvals](docs/touch.md): approve with a FIDO2 key; `doctor` checks the key is usable.
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
