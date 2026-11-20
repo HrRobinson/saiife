@@ -6,6 +6,8 @@
 //! and the name detector a fixed list.
 #![cfg(target_os = "linux")]
 
+#[path = "common/bins.rs"]
+mod bins;
 #[path = "../../shield/tests/fixtures.rs"]
 mod fixtures;
 
@@ -1310,14 +1312,7 @@ const ANSWER_SPEC: &str = "Anna Berg owes 18,420.00 NOK across 3 open invoices. 
 fn calc_seam() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let exe = std::env::current_exe().unwrap();
-        let p = exe.parent().unwrap().parent().unwrap().join("saiife");
-        assert!(
-            p.is_file(),
-            "{} is missing: run `cargo build -p saiife` first",
-            p.display()
-        );
-        std::env::set_var(saiife_daemon::blind::calc::CALC_SEAM, p);
+        std::env::set_var(saiife_daemon::blind::calc::CALC_SEAM, bins::saiife());
     });
 }
 

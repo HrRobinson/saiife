@@ -8,6 +8,8 @@
 #![cfg(target_os = "linux")]
 
 // The shield executor tests' fixture (it allows its own dead code).
+#[path = "common/bins.rs"]
+mod bins;
 #[path = "../../shield/tests/common/mod.rs"]
 mod common;
 
@@ -52,16 +54,9 @@ fn scratch() -> tempfile::TempDir {
     tempfile::tempdir_in(base).unwrap()
 }
 
-/// The debug `saiife` beside this test binary (`target/debug/deps/..`).
+/// The debug `saiife` in the profile dir (`target/debug`).
 fn saiife_bin() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let p = exe.parent().unwrap().parent().unwrap().join("saiife");
-    assert!(
-        p.is_file(),
-        "{} is missing: run `cargo build -p saiife` first",
-        p.display()
-    );
-    p
+    bins::saiife()
 }
 
 /// Points the seams: the calculator to run, and whether Landlock is hidden.

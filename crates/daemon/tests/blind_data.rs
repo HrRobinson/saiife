@@ -4,6 +4,8 @@
 //! people only), passed as an open descriptor as the CLI passes it.
 #![cfg(target_os = "linux")]
 
+#[path = "common/bins.rs"]
+mod bins;
 #[path = "../../shield/tests/fixtures.rs"]
 mod fixtures;
 
@@ -776,15 +778,7 @@ async fn public_columns_need_the_name_detector() {
 /// plan 46's fake helper, built beside this test binary (`cargo build -p
 /// saiife-shield-ner --features fake --bin saiife-fake-ner` first).
 fn fake_ner() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let p = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("saiife-fake-ner");
-    assert!(p.is_file(), "{} is missing", p.display());
-    p
+    bins::fake_ner()
 }
 
 /// Task 4 fills the detector slot: `[blind.ner]` in policy, its files in
@@ -1458,16 +1452,9 @@ async fn corrupt_methods_file_refuses_before_the_swap() {
 
 // ------------------------------------------------- plan 48 C2 ----
 
-/// The debug `saiife` beside this test binary (`target/debug/deps/..`).
+/// The debug `saiife` in the profile dir (`target/debug`).
 fn saiife_bin() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let p = exe.parent().unwrap().parent().unwrap().join("saiife");
-    assert!(
-        p.is_file(),
-        "{} is missing: run `cargo build -p saiife` first",
-        p.display()
-    );
-    p
+    bins::saiife()
 }
 
 /// Every invoice's count and sum: a method that tells two snapshots apart.

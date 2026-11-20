@@ -11,6 +11,8 @@
 //! client tests take one lock and run one at a time.
 #![cfg(target_os = "linux")]
 
+#[path = "common/bins.rs"]
+mod bins;
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::Full;
@@ -409,21 +411,9 @@ fn stored(ctx: &Ctx) -> NerCfg {
 
 // --------------------------------------------------------------- helpers ----
 
-/// plan 46's fake helper, built beside this test binary.
+/// plan 46's fake helper, in the profile dir (`target/debug`).
 fn fake_ner() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let p = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("saiife-fake-ner");
-    assert!(
-        p.is_file(),
-        "{} is missing: run `cargo build -p saiife-shield-ner --features fake --bin saiife-fake-ner` first",
-        p.display()
-    );
-    p
+    bins::fake_ner()
 }
 
 /// A helper script `name` in its own 0700 dir under `root` (mode 0700).

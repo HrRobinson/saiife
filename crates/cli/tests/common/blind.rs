@@ -102,15 +102,23 @@ pub fn ner_policy(pins: &[String]) -> String {
     )
 }
 
-/// `target/debug/saiife-fake-ner`, beside this test's binary dir.
+/// `target/debug/saiife-fake-ner`, in the profile dir. Cargo's old layout
+/// runs a test from `target/debug/deps/`, the new build dir layout (the
+/// default from Rust 1.100) from `target/debug/build/<package>/<hash>/out/`:
+/// the profile dir is the parent of the nearest `deps` or `build` above it.
 pub fn fake_ner() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let p = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("saiife-fake-ner");
+    let profile = exe
+        .ancestors()
+        .find(|d| {
+            matches!(
+                d.file_name().and_then(|n| n.to_str()),
+                Some("deps" | "build")
+            )
+        })
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("no target profile dir above {}", exe.display()));
+    let p = profile.join("saiife-fake-ner");
     assert!(
         p.is_file(),
         "{} is missing: run `cargo build -p saiife-shield-ner --features fake --bin saiife-fake-ner` first",
