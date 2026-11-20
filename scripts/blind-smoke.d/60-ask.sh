@@ -21,6 +21,11 @@
 # Run after `data` has run: bash scripts/blind-smoke.sh --only data, then
 # --only ask. Defines smoke_ask; no top-level effects.
 #
+# The prompts (pick list, did-you-mean, Run it?) are driven through the
+# debug-only SAIIFE_TEST_BLIND_STDIN seam, so this smoke needs the debug
+# build (never a release one) and does not test the real-terminal path; the
+# touch key, model, planner and calculator are real.
+#
 # Needs: python3 (sqlite3 module), the debug `saiife` build (it reads the
 # prompts' answers from stdin: SAIIFE_TEST_BLIND_STDIN=1, debug builds only),
 # a FIDO2 key, and these variables:
@@ -63,9 +68,12 @@ p48_need() {
 }
 
 p48_build() {
-  (cd "$REPO_ROOT" && cargo build --locked -q -p saiife) || return 1
+  (cd "$REPO_ROOT" && cargo build --locked -q -p saiife &&
+    cargo build --locked -q -p saiife-shield-ner --bin saiife-ner) || return 1
   P48_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/saiife"
   [ -x "$P48_BIN" ] || { p48_log "no $P48_BIN"; return 1; }
+  # A personal daemon looks for the name helper beside its own executable.
+  [ -x "$(dirname "$P48_BIN")/saiife-ner" ] || { p48_log "no saiife-ner beside $P48_BIN"; return 1; }
 }
 
 p48_env() {
@@ -163,7 +171,7 @@ p48_dir() { find "$P48_WORK/xdg" "$P48_WORK/home" -maxdepth 6 -type d -name "$1"
 p48_setup() {
   "$P48_BIN" secret add anthropic --kind token --service blind-model \
     --from-file "$SAIIFE_BLIND_SMOKE_KEY_FILE" || return 1
-  if ! "$P48_BIN" touch ls 2>/dev/null | grep -q .; then
+  if [ "$("$P48_BIN" touch ls --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)" = 0 ]; then
     p48_log "enrolling your touch key (PIN, then touch)"
     "$P48_BIN" touch enrol --label smoke-key || return 1
   fi
@@ -223,13 +231,16 @@ p48_reused() {
 p48_refresh_keeps_method() {
   "$P48_BIN" blind data refresh --dataset shop --file "$P48_WORK/shop.sqlite" || return 1
   "$P48_BIN" blind methods ls --dataset shop | tee "$P48_WORK/methods.out"
-  grep -qi "active\|approved" "$P48_WORK/methods.out"
+  # The state word of a method line (every line also says "approved by").
+  grep -qwE "active" "$P48_WORK/methods.out"
 }
 
 # No asked name in anything under $1 (the audit log, the outbox).
 p48_no_names_in() {
   local dir="$1" n
   [ -n "$dir" ] && [ -d "$dir" ] || { p48_log "no directory to search"; return 1; }
+  # Not vacuous: there must be something there to search.
+  [ -n "$(find "$dir" -type f -size +0 2>/dev/null | head -n 1)" ] || { p48_log "$dir holds no records"; return 1; }
   for n in "${P48_NAMES[@]}"; do
     if grep -rqiF -- "$n" "$dir"; then
       p48_log "found \"$n\" under $dir"
@@ -263,7 +274,7 @@ smoke_ask() {
 }
 
 p48_run() {
-    check "ask: the model fetch showed progress" grep -qiE "fetch|download|MB" "$P48_WORK/init.out"
+    check "ask: the model fetch showed progress, or the model was ready" grep -qE "MB of|Ready|ready" "$P48_WORK/init.out"
     check "ask: status shows the calculator's weaker label" bash -c \
       "\"$P48_BIN\" blind status | grep -q 'calculator not in a box (weaker)'"
 
